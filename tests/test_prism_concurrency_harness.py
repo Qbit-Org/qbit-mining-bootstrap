@@ -125,13 +125,26 @@ class StatementClassificationTests(unittest.TestCase):
     def test_deferred_state_machines_name_their_follow_up(self) -> None:
         for sql, expected in (
             ("INSERT INTO qbit_share_ledger (share_id)", "share submission"),
-            ("UPDATE qbit_block_candidate_outbox SET state", "landing"),
+            ("INSERT INTO qbit_ctv_fanouts (block_hash)", "CTV fanout"),
         ):
             with self.subTest(sql=sql):
                 with self.assertRaises(UnsupportedStatement) as caught:
                     classify(sql)
                 self.assertIn(expected, str(caught.exception))
                 self.assertIn("#128", str(caught.exception))
+
+    def test_a_landing_statement_shape_that_moved_fails_loudly(self) -> None:
+        """A landing table alone is not a classification.
+
+        The deferred marker for the outbox is gone now that landing is
+        modelled, so an outbox statement whose shape the classifier does not
+        recognise has to reach the unmodelled-statement error rather than
+        being answered by whichever landing evaluator matched loosest.
+        """
+        with self.assertRaises(UnsupportedStatement) as caught:
+            classify("UPDATE qbit_block_candidate_outbox SET quarantined = true")
+        self.assertIn("does not model this statement", str(caught.exception))
+        self.assertIn("_LANDING_SIGNATURES", str(caught.exception))
 
     def test_classifier_extracts_the_configured_ttl(self) -> None:
         with LeaseHarness(lease_ttl_seconds=17.5) as harness:

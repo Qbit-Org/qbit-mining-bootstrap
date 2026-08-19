@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic concurrency harness for PRISM's writer-lease lifecycle.
+"""Deterministic concurrency harness for PRISM's stateful owners.
 
 Why this exists
 ---------------
@@ -10,7 +10,7 @@ interleave around a PostgreSQL row, and the bad schedule is rare enough that
 running the coordinator and hoping never produces it. Reviews caught them;
 tests could not express them.
 
-This module makes the schedule an input rather than an accident. Three pieces:
+This module makes the schedule an input rather than an accident. Four pieces:
 
 ``DeterministicScheduler``
     Real threads, one baton. Exactly one actor runs at a time, and it only
@@ -28,8 +28,8 @@ This module makes the schedule an input rather than an accident. Three pieces:
     the earliest pending timeout.
 
 ``FakePostgres``
-    An in-memory model of the one table the lease lifecycle uses, with the
-    PostgreSQL semantics that lifecycle actually depends on: exclusive tuple
+    An in-memory model of the tables PRISM's owners contend on, with the
+    PostgreSQL semantics those owners actually depend on: exclusive tuple
     locks held for the lifetime of a transaction, ``FOR NO KEY UPDATE SKIP
     LOCKED`` declining to queue, per-statement READ COMMITTED snapshots,
     ``lock_timeout``/``statement_timeout``, session-scoped advisory locks,
@@ -37,6 +37,15 @@ This module makes the schedule an input rather than an accident. Three pieces:
     ``xmax``. Explicit transactions are modelled as BEGIN / statement /
     COMMIT with a checkpoint in between, because that gap is the whole of
     #123.
+
+``HarnessLock`` / ``HarnessRLock`` / ``HarnessCondition``
+    Process-local synchronisation the scheduler can see. A contended acquire
+    parks at a named checkpoint instead of wedging the baton, and a timed
+    wait measures the virtual clock. The lease scenarios never needed these:
+    they interleave two *processes* around one row, so no two actors ever
+    contended a lock inside one coordinator. The landing topology does —
+    the payout-balance serializer, the publication order guard and the
+    per-hash disposition lease are exactly what its two tails share.
 
 Substitution goes through ports, not monkeypatching
 ---------------------------------------------------
@@ -47,20 +56,38 @@ no ``time`` module is patched, so the code under test is the shipped code:
 the real retry loop, the real CAS SQL, the real adoption arithmetic, the real
 fail-closed branches.
 
+The synchronisation primitives are the one deliberate exception, and they are
+a different kind of substitution: a harness lock preserves the semantics of
+the lock it replaces exactly and changes only how a waiter blocks, so the
+decision logic under test is untouched. Landing scenarios install them on the
+coordinator's lock attributes at construction, the same way the coordinator
+itself installs a ``threading.RLock`` there.
+
 What is modelled and what is not
 --------------------------------
 Modelled: the writer-lease statements ``PsqlShareLedger`` emits — startup
 acquisition, same-identity adoption, renewal, release, and the guard-session
-verification probe.
+verification probe — plus the landing statements it emits against
+``qbit_pool_blocks`` and ``qbit_block_candidate_outbox``: prepared-row
+persistence, the ``qbit_confirm_pool_block`` publication-ordinal allocator
+and its read-back, the durable ordinal floor, pool-block state, prepared
+rejection and the outbox terminal update.
 
 Not modelled: everything else. ``FakePostgres`` classifies each statement and
 raises ``UnsupportedStatement`` on anything it does not recognise, including
-the share-ledger and block-candidate statements, which belong to the
-follow-up state machines named in issue #128. That is deliberate: a fake that
-silently answers an unrecognised statement drifts away from production
-without anyone noticing, so this one fails loudly instead. The classifier is
-anchored on fragments of the production SQL, so a change to that SQL breaks
-classification rather than quietly changing meaning.
+the share-ledger statements, which belong to the follow-up state machines
+named in issue #128. That is deliberate: a fake that silently answers an
+unrecognised statement drifts away from production without anyone noticing,
+so this one fails loudly instead. The classifier is anchored on fragments of
+the production SQL, so a change to that SQL breaks classification rather than
+quietly changing meaning.
+
+Where a modelled statement is a large CTE — ``persist_accepted_block`` writes
+pool-block, bundle, payout-entry and carry-forward rows in one statement —
+the model reproduces the effects the landing decisions read back, not the
+whole statement. The classifier still pins the statement's identity on its
+production fragments, so the day persist grows an effect a landing consults,
+that fragment set is where the model is extended.
 """
 
 from __future__ import annotations
@@ -463,6 +490,332 @@ class DeterministicScheduler:
 
 
 # --------------------------------------------------------------------------
+# Scheduler-aware synchronisation
+# --------------------------------------------------------------------------
+
+
+class HarnessLock:
+    """A mutex the scheduler can see, drop-in for ``threading.Lock``.
+
+    The code under test acquires and releases exactly as it would a real
+    lock; the only difference is what happens when the lock is already held.
+    A real lock would block the actor thread outside the baton, so the
+    controller would time out and report a stall on a wait that is in fact
+    legitimate. This one parks the waiter at ``lock:<name>`` and lets the
+    controller schedule the holder, which is what makes a contended
+    process-local lock an *interleaving point* rather than a harness limit.
+
+    Ownership is per actor, not per OS thread: actors are threads here, but
+    naming the actor is what lets the trace read as a schedule.
+
+    Grants are FIFO. PostgreSQL's tuple-lock queue is modelled that way for
+    the same reason (see ``_await_lease_lock``): without a queue the model
+    could express a grant order that neither a real futex-backed lock nor
+    the scheduler would produce, and the schedule is an input here.
+    """
+
+    reentrant = False
+
+    def __init__(self, scheduler: DeterministicScheduler, name: str) -> None:
+        self.scheduler = scheduler
+        self.name = name
+        self._owner: Actor | None = None
+        self._depth = 0
+        self._waiters: list[Actor] = []
+
+    # -- observation -------------------------------------------------------
+
+    @property
+    def owner(self) -> Actor | None:
+        return self._owner
+
+    def locked(self) -> bool:
+        return self._owner is not None
+
+    def held_by_current(self) -> bool:
+        return self._owner is self.scheduler.current()
+
+    # -- acquisition -------------------------------------------------------
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        actor = self.scheduler.current()
+        if self._owner is actor:
+            if not self.reentrant:
+                raise HarnessError(
+                    f"actor {actor.name!r} re-acquired non-reentrant lock "
+                    f"{self.name!r}; production would deadlock here"
+                )
+            self._depth += 1
+            return True
+        deadline = (
+            None
+            if timeout is None or timeout < 0
+            else self.scheduler.clock.monotonic() + max(0.0, float(timeout))
+        )
+
+        def granted() -> bool:
+            if self._owner is not None:
+                return False
+            return not self._waiters or self._waiters[0] is actor
+
+        if granted():
+            self._take(actor)
+            return True
+        if not blocking:
+            return False
+        self._waiters.append(actor)
+        try:
+            while not granted():
+                if (
+                    deadline is not None
+                    and self.scheduler.clock.monotonic() >= deadline
+                ):
+                    return False
+                self.scheduler.block(
+                    f"lock:{self.name}",
+                    ready=granted,
+                    wake_at=deadline,
+                )
+        finally:
+            self._waiters.remove(actor)
+        self._take(actor)
+        return True
+
+    def _take(self, actor: Actor) -> None:
+        self._owner = actor
+        self._depth = 1
+
+    def release(self) -> None:
+        actor = self.scheduler.current()
+        if self._owner is None:
+            raise HarnessError(f"lock {self.name!r} released while unheld")
+        if self._owner is not actor:
+            raise HarnessError(
+                f"lock {self.name!r} released by {actor.name!r} but held by "
+                f"{self._owner.name!r}"
+            )
+        self._depth -= 1
+        if self._depth == 0:
+            self._owner = None
+
+    def __enter__(self) -> bool:
+        return self.acquire()
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.release()
+
+
+class HarnessRLock(HarnessLock):
+    """``threading.RLock`` for actors: the owner may re-enter."""
+
+    reentrant = True
+
+
+class HarnessSemaphore:
+    """``threading.BoundedSemaphore`` for actors.
+
+    The ledger's read slots are a semaphore, and ``_operation_gate`` treats
+    it exactly like the writer lock — same ``acquire(timeout=)`` contract,
+    same ``LedgerOperationTimeout`` on expiry. Modelling it means a scenario
+    can exhaust read concurrency on purpose rather than discovering that the
+    harness quietly never blocks there.
+    """
+
+    def __init__(
+        self,
+        scheduler: DeterministicScheduler,
+        name: str,
+        *,
+        value: int = 1,
+    ) -> None:
+        self.scheduler = scheduler
+        self.name = name
+        self.initial = int(value)
+        self._value = int(value)
+        self._waiters: list[Actor] = []
+
+    @property
+    def value(self) -> int:
+        return self._value
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        actor = self.scheduler.current()
+        deadline = (
+            None
+            if timeout is None or timeout < 0
+            else self.scheduler.clock.monotonic() + max(0.0, float(timeout))
+        )
+
+        def granted() -> bool:
+            if self._value <= 0:
+                return False
+            return not self._waiters or self._waiters[0] is actor
+
+        if granted():
+            self._value -= 1
+            return True
+        if not blocking:
+            return False
+        self._waiters.append(actor)
+        try:
+            while not granted():
+                if (
+                    deadline is not None
+                    and self.scheduler.clock.monotonic() >= deadline
+                ):
+                    return False
+                self.scheduler.block(
+                    f"semaphore:{self.name}",
+                    ready=granted,
+                    wake_at=deadline,
+                )
+        finally:
+            self._waiters.remove(actor)
+        self._value -= 1
+        return True
+
+    def release(self) -> None:
+        if self._value >= self.initial:
+            raise HarnessError(f"semaphore {self.name!r} released too many times")
+        self._value += 1
+
+    def __enter__(self) -> bool:
+        return self.acquire()
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.release()
+
+
+class HarnessCondition:
+    """``threading.Condition`` over a harness lock and the virtual clock.
+
+    ``wait`` releases the lock, parks, and re-acquires before returning, so a
+    predicate loop written against a real condition behaves identically. A
+    timed wait measures the virtual clock, which is what lets a scenario put
+    a heartbeat-slice wait (``_await_unfenced_appends_predating_anchor``, the
+    ledger admission slices) under a watchdog without anything sleeping.
+    """
+
+    def __init__(
+        self,
+        lock: HarnessLock | None = None,
+        *,
+        scheduler: DeterministicScheduler | None = None,
+        name: str = "condition",
+    ) -> None:
+        if lock is None:
+            if scheduler is None:
+                raise HarnessError("a condition needs a lock or a scheduler")
+            lock = HarnessRLock(scheduler, name)
+        self._lock = lock
+        self.scheduler = lock.scheduler
+        self.name = name
+        # Monotonic notify counter. A waiter records the value it parked on,
+        # so a notify that arrives while the controller has the baton is
+        # never lost the way a missed edge would be.
+        self._generation = 0
+
+    def __enter__(self) -> bool:
+        return self._lock.acquire()
+
+    def __exit__(self, *exc_info: object) -> None:
+        self._lock.release()
+
+    def acquire(self, *args: Any, **kwargs: Any) -> bool:
+        return self._lock.acquire(*args, **kwargs)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        if not self._lock.held_by_current():
+            raise HarnessError(
+                f"cannot wait on condition {self.name!r} without holding its lock"
+            )
+        parked_generation = self._generation
+        depth = self._lock._depth
+        self._lock._depth = 1
+        self._lock.release()
+        clock = self.scheduler.clock
+        wake_at = (
+            None if timeout is None else clock.monotonic() + max(0.0, float(timeout))
+        )
+        notified = False
+        while True:
+            if self._generation != parked_generation:
+                notified = True
+                break
+            if wake_at is not None and clock.monotonic() >= wake_at:
+                break
+            self.scheduler.block(
+                f"cond:{self.name}",
+                ready=lambda: self._generation != parked_generation,
+                wake_at=wake_at,
+            )
+        self._lock.acquire()
+        self._lock._depth = depth
+        return notified
+
+    def wait_for(
+        self,
+        predicate: Callable[[], bool],
+        timeout: float | None = None,
+    ) -> bool:
+        clock = self.scheduler.clock
+        deadline = (
+            None if timeout is None else clock.monotonic() + max(0.0, float(timeout))
+        )
+        while not predicate():
+            if deadline is None:
+                self.wait()
+                continue
+            remaining = deadline - clock.monotonic()
+            if remaining <= 0:
+                break
+            self.wait(remaining)
+        return predicate()
+
+    def notify(self, n: int = 1) -> None:
+        self.notify_all()
+
+    def notify_all(self) -> None:
+        self._generation += 1
+
+
+class HarnessEvent:
+    """``threading.Event`` for actors, with a clock-backed ``wait``."""
+
+    def __init__(self, scheduler: DeterministicScheduler, name: str = "event") -> None:
+        self.scheduler = scheduler
+        self.name = name
+        self._set = False
+
+    def is_set(self) -> bool:
+        return self._set
+
+    def set(self) -> None:
+        self._set = True
+
+    def clear(self) -> None:
+        self._set = False
+
+    def wait(self, timeout: float | None = None) -> bool:
+        clock = self.scheduler.clock
+        wake_at = (
+            None if timeout is None else clock.monotonic() + max(0.0, float(timeout))
+        )
+        while not self._set:
+            if wake_at is not None and clock.monotonic() >= wake_at:
+                break
+            self.scheduler.block(
+                f"event:{self.name}",
+                ready=lambda: self._set,
+                wake_at=wake_at,
+            )
+        return self._set
+
+
+# --------------------------------------------------------------------------
 # Statement classification
 # --------------------------------------------------------------------------
 
@@ -475,14 +828,43 @@ class LeaseOp(str, Enum):
     VERIFY = "verify"
 
 
+class LandingOp(str, Enum):
+    """Statements the block-candidate landing tails emit.
+
+    Names follow the ``PsqlShareLedger`` method that emits them rather than
+    the SQL verb, because a scenario reads the trace as landing steps.
+    """
+
+    PERSIST_BLOCK = "persist_block"
+    CONFIRM_BLOCK = "confirm_block"
+    CONFIRMED_SEQUENCE = "confirmed_sequence"
+    PUBLICATION_FLOOR = "publication_floor"
+    POOL_BLOCK_STATE = "pool_block_state"
+    REJECT_PREPARED = "reject_prepared"
+    OUTBOX_RECORD = "outbox_record"
+    OUTBOX_ATTEMPT = "outbox_attempt"
+    OUTBOX_FINISH = "outbox_finish"
+    ALL_SHARES = "all_shares"
+    PRIOR_BALANCES = "prior_balances"
+    PRIOR_BALANCES_AS_OF = "prior_balances_as_of"
+    SHARE_STATS = "share_stats"
+
+
+StatementKind = LeaseOp | LandingOp
+
+
 @dataclass(frozen=True)
 class Statement:
-    kind: LeaseOp
+    kind: StatementKind
     payload: dict[str, Any]
     lease_ttl_seconds: float | None
     authority_margin_seconds: float | None
     advisory_lock: tuple[int, int] | None
     sql: str
+
+    @property
+    def is_landing(self) -> bool:
+        return isinstance(self.kind, LandingOp)
 
 
 _PAYLOAD_RE = re.compile(
@@ -539,19 +921,135 @@ _SIGNATURES: tuple[tuple[LeaseOp, tuple[str, ...]], ...] = (
     ),
 )
 
-# Statements that belong to the state machines issue #128 defers to follow-up
-# PRs. Recognised only so the failure names the right follow-up instead of
-# reading as an unexplained harness gap.
+# The landing statements, same discipline: every fragment is lifted verbatim
+# from lab/prism/share_ledger.py. Ordered most specific first, because two
+# pool-block reads differ only by which columns they project.
+_LANDING_SIGNATURES: tuple[tuple[LandingOp, tuple[str, ...]], ...] = (
+    (
+        LandingOp.PERSIST_BLOCK,
+        (
+            "INSERT INTO qbit_pool_blocks (",
+            "existing_block AS (",
+            "INSERT INTO qbit_pool_audit_bundles (",
+        ),
+    ),
+    (
+        LandingOp.CONFIRM_BLOCK,
+        ("'confirmed_count', qbit_confirm_pool_block(",),
+    ),
+    (
+        LandingOp.REJECT_PREPARED,
+        ("'rejected_count', qbit_reject_prepared_pool_block(",),
+    ),
+    (
+        LandingOp.POOL_BLOCK_STATE,
+        (
+            "'state', (",
+            "'maturity_state', maturity_state,",
+            "FROM qbit_pool_blocks",
+        ),
+    ),
+    (
+        LandingOp.CONFIRMED_SEQUENCE,
+        (
+            "'audit_publication_sequence', (",
+            "FROM qbit_pool_blocks",
+            "AND chain_state = 'confirmed'",
+        ),
+    ),
+    (
+        LandingOp.PUBLICATION_FLOOR,
+        (
+            "'audit_publication_sequence_floor',",
+            "COALESCE(MAX(audit_publication_sequence), 0)",
+        ),
+    ),
+    (
+        LandingOp.OUTBOX_RECORD,
+        (
+            "INSERT INTO qbit_block_candidate_outbox (",
+            "'block candidate payload mismatch'",
+        ),
+    ),
+    (
+        LandingOp.OUTBOX_FINISH,
+        (
+            "UPDATE qbit_block_candidate_outbox",
+            "completed_at = clock_timestamp(),",
+            "candidate = NULL",
+        ),
+    ),
+    (
+        LandingOp.OUTBOX_ATTEMPT,
+        (
+            "UPDATE qbit_block_candidate_outbox",
+            "SET attempt_count = attempt_count + 1,",
+        ),
+    ),
+    (
+        LandingOp.ALL_SHARES,
+        (
+            "'share_seq', share_seq,",
+            "FROM qbit_share_ledger",
+            "WHERE accepted;",
+        ),
+    ),
+    (
+        LandingOp.SHARE_STATS,
+        (
+            "'accepted_share_count', count(*),",
+            "FROM qbit_share_ledger",
+        ),
+    ),
+    (
+        LandingOp.PRIOR_BALANCES_AS_OF,
+        (
+            "'recipient_id', miner_id,",
+            "FROM qbit_payout_carry_forward carry",
+            "AND block.block_height <= target.block_height",
+        ),
+    ),
+    (
+        LandingOp.PRIOR_BALANCES,
+        (
+            "'recipient_id', miner_id,",
+            "FROM qbit_current_carry_forward_balances();",
+        ),
+    ),
+)
+
+# Statements that belong to the state machines issue #128 still defers.
+# Recognised only so the failure names the right follow-up instead of reading
+# as an unexplained harness gap.
 _DEFERRED_SIGNATURES: tuple[tuple[str, str], ...] = (
     ("INSERT INTO qbit_share_ledger", "share submission and dedupe"),
-    ("qbit_pool_blocks", "block candidate landing"),
-    ("qbit_block_candidate_outbox", "block candidate landing"),
     ("qbit_ctv_fanouts", "CTV fanout broadcasting"),
 )
 
+# Landing statement arguments. The ledger inlines them as SQL literals, so
+# the model reads them back out of the statement rather than being told.
+_POOL_FUNCTION_RE = re.compile(
+    r"qbit_(?:confirm|reject_prepared)_pool_block\(\s*"
+    r"'([0-9a-f]+)',\s*(-?\d+),\s*"
+    r"'((?:[^']|'')*)',\s*(\d+),\s*'((?:[^']|'')*)'",
+    re.DOTALL,
+)
+# The lease CTE every outbox statement opens with, which inlines the writer
+# identity rather than carrying it in a jsonb payload.
+_LEASE_IDENTITY_RE = re.compile(
+    r"writer_id = '((?:[^']|'')*)'\s*"
+    r"AND writer_epoch = (\d+)\s*"
+    r"AND writer_session_token = '((?:[^']|'')*)'",
+    re.DOTALL,
+)
+_POOL_BLOCK_HASH_RE = re.compile(r"WHERE block_hash = '([0-9a-f]+)'")
+_OUTBOX_STATE_RE = re.compile(r"SET state = '(submitted|abandoned)'")
+_OUTBOX_ERROR_RE = re.compile(r"last_error = (NULL|'(?:[^']|'')*')")
+_OUTBOX_SHA_RE = re.compile(r"candidate_sha256 <> '([0-9a-f]+)'")
+
 
 def classify(sql: str) -> Statement:
-    """Map one production statement onto the lease operation it performs."""
+    """Map one production statement onto the operation it performs."""
     for op, fragments in _SIGNATURES:
         if all(fragment in sql for fragment in fragments):
             return Statement(
@@ -566,28 +1064,116 @@ def classify(sql: str) -> Statement:
                 advisory_lock=_extract_advisory_lock(sql),
                 sql=sql,
             )
+    for landing_op, fragments in _LANDING_SIGNATURES:
+        if all(fragment in sql for fragment in fragments):
+            return Statement(
+                kind=landing_op,
+                payload=_landing_payload(landing_op, sql),
+                lease_ttl_seconds=_extract_interval(sql, first=True),
+                authority_margin_seconds=None,
+                advisory_lock=None,
+                sql=sql,
+            )
     for marker, state_machine in _DEFERRED_SIGNATURES:
         if marker in sql:
             raise UnsupportedStatement(
                 f"{marker} belongs to the {state_machine} state machine, which "
                 "issue #128 defers to a follow-up PR; this harness models the "
-                "writer-lease lifecycle only"
+                "writer-lease lifecycle and block candidate landing"
             )
     raise UnsupportedStatement(
         "FakePostgres does not model this statement. Either the production "
-        "lease SQL changed shape (update _SIGNATURES) or the scenario reached "
-        "a state machine this harness does not cover:\n"
+        "SQL changed shape (update _SIGNATURES or _LANDING_SIGNATURES) or the "
+        "scenario reached a state machine this harness does not cover:\n"
         f"{sql.strip()[:400]}"
     )
+
+
+def _unquote(literal: str) -> str:
+    """Undo ``PsqlShareLedger._text_literal`` quoting."""
+    return literal.replace("''", "'")
+
+
+def _lease_identity(op: LandingOp, sql: str) -> dict[str, Any]:
+    match = _LEASE_IDENTITY_RE.search(sql)
+    if match is None:
+        raise UnsupportedStatement(
+            f"{op.value} statement carried no writer lease identity"
+        )
+    return {
+        "writer_id": _unquote(match.group(1)),
+        "writer_epoch": int(match.group(2)),
+        "writer_session_token": _unquote(match.group(3)),
+    }
+
+
+def _landing_payload(op: LandingOp, sql: str) -> dict[str, Any]:
+    """Recover the arguments a landing statement inlined as SQL literals."""
+    if op is LandingOp.PERSIST_BLOCK:
+        return _extract_payload(sql)
+    if op in {LandingOp.CONFIRM_BLOCK, LandingOp.REJECT_PREPARED}:
+        match = _POOL_FUNCTION_RE.search(sql)
+        if match is None:
+            raise UnsupportedStatement(
+                f"{op.value} statement did not name a block hash and height"
+            )
+        return {
+            "block_hash": match.group(1),
+            "active_tip_height": int(match.group(2)),
+            "writer_id": _unquote(match.group(3)),
+            "writer_epoch": int(match.group(4)),
+            "writer_session_token": _unquote(match.group(5)),
+        }
+    if op in {LandingOp.POOL_BLOCK_STATE, LandingOp.CONFIRMED_SEQUENCE}:
+        match = _POOL_BLOCK_HASH_RE.search(sql)
+        if match is None:
+            raise UnsupportedStatement(f"{op.value} statement named no block hash")
+        return {"block_hash": match.group(1)}
+    if op is LandingOp.OUTBOX_RECORD:
+        hash_match = _POOL_BLOCK_HASH_RE.search(sql)
+        sha_match = _OUTBOX_SHA_RE.search(sql)
+        if hash_match is None or sha_match is None:
+            raise UnsupportedStatement(
+                "outbox record statement named no block hash or payload digest"
+            )
+        return {
+            "block_hash": hash_match.group(1),
+            "candidate_sha256": sha_match.group(1),
+            **_lease_identity(op, sql),
+        }
+    if op in {LandingOp.OUTBOX_ATTEMPT, LandingOp.OUTBOX_FINISH}:
+        hash_match = _POOL_BLOCK_HASH_RE.search(sql)
+        if hash_match is None:
+            raise UnsupportedStatement(f"{op.value} statement named no block hash")
+        payload: dict[str, Any] = {
+            "block_hash": hash_match.group(1),
+            **_lease_identity(op, sql),
+        }
+        if op is LandingOp.OUTBOX_FINISH:
+            state_match = _OUTBOX_STATE_RE.search(sql)
+            if state_match is None:
+                raise UnsupportedStatement(
+                    "outbox finish statement named no terminal state"
+                )
+            payload["state"] = state_match.group(1)
+            error_match = _OUTBOX_ERROR_RE.search(sql)
+            raw_error = None if error_match is None else error_match.group(1)
+            payload["last_error"] = (
+                None
+                if raw_error in (None, "NULL")
+                else str(raw_error)[1:-1].replace("''", "'")
+            )
+        return payload
+    return {}
 
 
 def _extract_payload(sql: str) -> dict[str, Any]:
     match = _PAYLOAD_RE.search(sql)
     if match is None:
-        raise UnsupportedStatement("lease statement carried no jsonb payload")
+        raise UnsupportedStatement("statement carried no jsonb payload")
     payload = json.loads(match.group(2))
     if not isinstance(payload, dict):
-        raise UnsupportedStatement("lease statement payload was not an object")
+        raise UnsupportedStatement("statement payload was not an object")
     return payload
 
 
@@ -631,12 +1217,49 @@ class LeaseRow:
 
 
 @dataclass
+class PoolBlockRow:
+    """One ``qbit_pool_blocks`` row.
+
+    ``audit_publication_sequence`` is the durable publication ordinal the
+    audit store gates on. It is assigned once, by the confirmation that first
+    moves the row to ``confirmed``, and survives every later disposition —
+    which is why an exact replay must not burn a second ordinal and why the
+    floor is a MAX over this column rather than a counter.
+    """
+
+    block_hash: str
+    block_height: int
+    parent_hash: str
+    chain_state: str = "prepared"
+    maturity_state: str = "immature"
+    audit_publication_sequence: int | None = None
+
+
+@dataclass
+class OutboxRow:
+    """One ``qbit_block_candidate_outbox`` row: the durable replay source."""
+
+    block_hash: str
+    candidate_sha256: str
+    state: str = "pending"
+    attempt_count: int = 0
+    last_error: str | None = None
+
+
+@dataclass
 class Transaction:
     xid: str
     backend: Backend
     explicit: bool
     holds_lease_lock: bool = False
     staged_lease: LeaseRow | None = None
+    # Landing writes are staged for the same reason lease writes are: a
+    # deadline-scoped statement sends COMMIT as a separate message, so there
+    # is a window in which this transaction can see its own pool-block row
+    # and nobody else can. #133 lives inside exactly such a window, so a
+    # model that published the write at statement time could hide it.
+    staged_pool_blocks: dict[str, PoolBlockRow] = field(default_factory=dict)
+    staged_outbox: dict[str, OutboxRow] = field(default_factory=dict)
     orphaned: bool = False
 
 
@@ -673,12 +1296,22 @@ class FakePostgres:
         self.clock = clock
         self.lease: LeaseRow | None = None
         self.statements: list[Statement] = []
+        # Landing tables. Insertion-ordered dicts, because the trace and every
+        # assertion made against them has to be order-stable across runs.
+        self.pool_blocks: dict[str, PoolBlockRow] = {}
+        self.outbox: dict[str, OutboxRow] = {}
+        self.shares: list[dict[str, Any]] = []
+        self.carry_forward_balances: list[dict[str, Any]] = []
         self._lease_lock_holder: Transaction | None = None
         self._lease_lock_waiters: list[Transaction] = []
         self._backends: list[Backend] = []
         self._advisory_owners: dict[tuple[int, int], Backend] = {}
         self._next_pid = 1
         self._next_xid = 1
+        # qbit_audit_publication_sequence_seq. A sequence, not MAX + 1: the
+        # allocator burns a value per fresh confirmation and never reuses
+        # one, which is why the floor read below is a separate MAX.
+        self._audit_publication_sequence = 0
 
     # -- sessions ----------------------------------------------------------
 
@@ -742,11 +1375,21 @@ class FakePostgres:
         if transaction.staged_lease is not None:
             self.lease = replace(transaction.staged_lease, xmax=None)
             transaction.staged_lease = None
+        self.pool_blocks.update(transaction.staged_pool_blocks)
+        self.outbox.update(transaction.staged_outbox)
+        transaction.staged_pool_blocks.clear()
+        transaction.staged_outbox.clear()
         self._release_lease_lock(transaction)
         transaction.backend.transaction = None
 
     def _rollback(self, transaction: Transaction) -> None:
         transaction.staged_lease = None
+        # The publication ordinal is deliberately not rolled back: nextval is
+        # non-transactional, so an aborted confirmation burns its value and
+        # leaves a gap. The floor read is a MAX precisely so a gap is
+        # harmless.
+        transaction.staged_pool_blocks.clear()
+        transaction.staged_outbox.clear()
         self._release_lease_lock(transaction)
         transaction.backend.transaction = None
 
@@ -843,6 +1486,14 @@ class FakePostgres:
         tag: str,
         timeout_kind: str = "lock",
     ) -> Any:
+        if statement.is_landing:
+            return self._evaluate_landing(
+                statement,
+                transaction,
+                timeout_seconds,
+                tag,
+                timeout_kind,
+            )
         if statement.kind is LeaseOp.VERIFY:
             return self._evaluate_verify(statement, transaction, tag)
 
@@ -1196,6 +1847,359 @@ class FakePostgres:
             ),
             "lease_locked_by_this_process": bool(locked_by_this_process),
         }
+
+    # -- block candidate landing -------------------------------------------
+
+    def _visible_pool_block(
+        self,
+        transaction: Transaction,
+        block_hash: str,
+    ) -> PoolBlockRow | None:
+        """READ COMMITTED: committed rows plus this transaction's own writes."""
+        staged = transaction.staged_pool_blocks.get(block_hash)
+        if staged is not None:
+            return staged
+        return self.pool_blocks.get(block_hash)
+
+    def _visible_pool_blocks(
+        self,
+        transaction: Transaction,
+    ) -> dict[str, PoolBlockRow]:
+        merged = dict(self.pool_blocks)
+        merged.update(transaction.staged_pool_blocks)
+        return merged
+
+    def _stage_pool_block(
+        self,
+        transaction: Transaction,
+        row: PoolBlockRow,
+    ) -> PoolBlockRow:
+        staged = replace(row)
+        transaction.staged_pool_blocks[staged.block_hash] = staged
+        return staged
+
+    def _visible_outbox_row(
+        self,
+        transaction: Transaction,
+        block_hash: str,
+    ) -> OutboxRow | None:
+        staged = transaction.staged_outbox.get(block_hash)
+        if staged is not None:
+            return staged
+        return self.outbox.get(block_hash)
+
+    def _renew_lease_for_landing(
+        self,
+        statement: Statement,
+        transaction: Transaction,
+        timeout_seconds: float | None,
+        tag: str,
+        timeout_kind: str,
+    ) -> bool:
+        """The ``lease AS (UPDATE ...)`` CTE every landing statement opens with.
+
+        Every landing statement fences itself on the writer lease and renews
+        it in the same round trip. Modelling that is not decoration: a
+        deposed writer's landing statement fails here, which is the only
+        thing standing between a fenced-out process and a durable pool-block
+        write. The identity comes out of the statement itself — inlined as
+        literals by the ledger — so the model never has to be told which
+        writer a session belongs to.
+
+        The renewal is an ordinary UPDATE on the lease tuple, so it obeys the
+        same rules as every other one: a predicate the snapshot already
+        excludes returns zero rows without queueing, and a matching predicate
+        takes the tuple lock and waits behind whoever holds it. A landing
+        stalled behind an orphaned lease transaction is a real outage shape,
+        and the model has to be able to express it.
+        """
+        payload = statement.payload
+        writer_id = payload.get("writer_id")
+        writer_epoch = payload.get("writer_epoch")
+        session_token = payload.get("writer_session_token")
+        if writer_id is None or session_token is None:
+            # A statement whose identity the classifier could not recover is
+            # a model gap, not a lease failure; fail loudly rather than
+            # inventing a fence outcome.
+            raise UnsupportedStatement(
+                f"{statement.kind.value} statement carried no writer identity"
+            )
+        identity = {
+            "writer_id": writer_id,
+            "writer_epoch": writer_epoch,
+            "writer_session_token": session_token,
+        }
+
+        def matches(row: LeaseRow | None) -> bool:
+            return row is not None and self._is_exact_session(row, identity)
+
+        if not matches(self._visible_lease(transaction)):
+            return False
+        self._await_lease_lock(
+            statement,
+            transaction,
+            timeout_seconds,
+            tag,
+            timeout_kind,
+        )
+        current = self._visible_lease(transaction)
+        if not matches(current):
+            return False
+        assert current is not None
+        now = self.clock.now()
+        ttl = statement.lease_ttl_seconds
+        if ttl is not None:
+            self._stage(
+                transaction,
+                replace(
+                    current,
+                    lease_expires_at=now + timedelta(seconds=ttl),
+                    updated_at=now,
+                    xmax=None,
+                ),
+            )
+        return True
+
+    def _evaluate_landing(
+        self,
+        statement: Statement,
+        transaction: Transaction,
+        timeout_seconds: float | None,
+        tag: str,
+        timeout_kind: str,
+    ) -> Any:
+        kind = statement.kind
+        assert isinstance(kind, LandingOp)
+        payload = statement.payload
+        # Reads that open no lease CTE at all.
+        if kind is LandingOp.PUBLICATION_FLOOR:
+            return {
+                "audit_publication_sequence_floor": max(
+                    [
+                        row.audit_publication_sequence or 0
+                        for row in self._visible_pool_blocks(transaction).values()
+                    ],
+                    default=0,
+                )
+            }
+        if kind is LandingOp.ALL_SHARES:
+            return [dict(share) for share in self.shares]
+        if kind is LandingOp.SHARE_STATS:
+            # The evidence annotations, not an accounting input: the audit
+            # envelope carries them and the publication replay path reuses
+            # the originally durable values rather than re-reading.
+            return {
+                "accepted_share_count": len(self.shares),
+                "distinct_miner_count": len(
+                    {str(share.get("miner_id")) for share in self.shares}
+                ),
+                "max_share_seq": max(
+                    (int(share.get("share_seq", 0)) for share in self.shares),
+                    default=0,
+                ),
+            }
+        if kind in {LandingOp.PRIOR_BALANCES, LandingOp.PRIOR_BALANCES_AS_OF}:
+            # The durable carry-forward view. A landing reads it to prove the
+            # payout base under its coinbase has not moved since the job was
+            # issued, so a scenario that wants to fail that check moves this
+            # list rather than reaching into the coordinator. The as-of
+            # variant restricts the same view to blocks at or below one
+            # confirmed height; with no payout entries modelled the two
+            # coincide, and a scenario that needs them to differ is asking
+            # for the settlement machine, which #128 lists separately.
+            return [dict(balance) for balance in self.carry_forward_balances]
+        if kind is LandingOp.POOL_BLOCK_STATE:
+            row = self._visible_pool_block(transaction, str(payload["block_hash"]))
+            return {
+                "state": None
+                if row is None
+                else {
+                    "block_hash": row.block_hash,
+                    "block_height": row.block_height,
+                    "parent_hash": row.parent_hash,
+                    "chain_state": row.chain_state,
+                    "maturity_state": row.maturity_state,
+                    "audit_publication_sequence": row.audit_publication_sequence,
+                }
+            }
+        if kind is LandingOp.CONFIRMED_SEQUENCE:
+            row = self._visible_pool_block(transaction, str(payload["block_hash"]))
+            confirmed = (
+                row is not None
+                and row.chain_state == "confirmed"
+                and row.maturity_state != "reversed"
+            )
+            return {
+                "audit_publication_sequence": (
+                    row.audit_publication_sequence if confirmed else None
+                )
+            }
+
+        lease_held = self._renew_lease_for_landing(
+            statement,
+            transaction,
+            timeout_seconds,
+            tag,
+            timeout_kind,
+        )
+        if kind in {LandingOp.CONFIRM_BLOCK, LandingOp.REJECT_PREPARED}:
+            if not lease_held:
+                # The PL/pgSQL function RAISEs rather than returning a value,
+                # so the caller sees an error, not a zero count.
+                raise RuntimeError("writer lease is not active")
+            if kind is LandingOp.CONFIRM_BLOCK:
+                return {
+                    "backend": "postgres-psql",
+                    "confirmed_count": self._confirm_pool_block(
+                        transaction,
+                        str(payload["block_hash"]),
+                        int(payload["active_tip_height"]),
+                    ),
+                }
+            return {
+                "backend": "postgres-psql",
+                "rejected_count": self._reject_prepared_pool_block(
+                    transaction,
+                    str(payload["block_hash"]),
+                ),
+            }
+
+        if not lease_held:
+            return {"error": "writer lease is not active"}
+        if kind is LandingOp.PERSIST_BLOCK:
+            return self._persist_pool_block(statement, transaction)
+        if kind is LandingOp.OUTBOX_RECORD:
+            return self._record_outbox_row(statement, transaction)
+        if kind in {LandingOp.OUTBOX_ATTEMPT, LandingOp.OUTBOX_FINISH}:
+            row = self._visible_outbox_row(transaction, str(payload["block_hash"]))
+            if row is None or row.state != "pending":
+                return {"updated": 0}
+            staged = replace(row)
+            if kind is LandingOp.OUTBOX_ATTEMPT:
+                staged.attempt_count += 1
+            else:
+                staged.state = str(payload["state"])
+                staged.last_error = payload.get("last_error")
+            transaction.staged_outbox[staged.block_hash] = staged
+            return {"updated": 1}
+        raise UnsupportedStatement(f"unhandled landing operation {kind}")
+
+    def _confirm_pool_block(
+        self,
+        transaction: Transaction,
+        block_hash: str,
+        active_tip_height: int,
+    ) -> int:
+        """``qbit_confirm_pool_block``: allocate the publication ordinal.
+
+        The ordinal comes from a sequence, not from ``MAX + 1``. That
+        distinction is the whole of the allocator's contract: an exact replay
+        of an already-confirmed row matches zero rows in the UPDATE and so
+        burns nothing, while a terminally disposed row reports the superseded
+        disposition (-1) instead of a plain miss. The durable floor read is a
+        separate MAX, which is what lets a *later* ordinal publish first and
+        leave an earlier one behind the floor — the state #133 turns on.
+        """
+        row = self._visible_pool_block(transaction, block_hash)
+        if (
+            row is not None
+            and row.block_height == active_tip_height
+            and row.chain_state == "prepared"
+            and row.maturity_state == "immature"
+        ):
+            self._audit_publication_sequence += 1
+            staged = self._stage_pool_block(transaction, row)
+            staged.chain_state = "confirmed"
+            staged.audit_publication_sequence = self._audit_publication_sequence
+            return 1
+        if (
+            row is not None
+            and row.block_height == active_tip_height
+            and row.chain_state == "confirmed"
+            and row.maturity_state != "reversed"
+        ):
+            return 1
+        if row is not None and (
+            row.chain_state in {"inactive", "rejected", "reversed"}
+            or row.maturity_state == "reversed"
+        ):
+            return -1
+        return 0
+
+    def _reject_prepared_pool_block(
+        self,
+        transaction: Transaction,
+        block_hash: str,
+    ) -> int:
+        row = self._visible_pool_block(transaction, block_hash)
+        if (
+            row is None
+            or row.chain_state != "prepared"
+            or row.maturity_state != "immature"
+        ):
+            return 0
+        staged = self._stage_pool_block(transaction, row)
+        staged.chain_state = "rejected"
+        staged.maturity_state = "reversed"
+        return 1
+
+    def _persist_pool_block(
+        self,
+        statement: Statement,
+        transaction: Transaction,
+    ) -> dict[str, Any]:
+        """``persist_accepted_block``, reduced to what a landing reads back.
+
+        The production statement writes the pool block, its audit bundle, the
+        payout entries and the carry-forward deltas in one CTE. The landing
+        decisions downstream read the prepared row (through
+        ``pool_block_state`` and the confirmation) and the returned counts;
+        the payout rows are the reorg reconciler's and the settlement
+        machine's business, neither of which this harness drives yet. The
+        counts below are therefore reported from what is modelled, and the
+        row shape stays honest: a re-persist of an existing block reports the
+        existing row rather than inserting a second one.
+        """
+        payload = statement.payload
+        block_hash = str(payload["block_hash"])
+        existing = self._visible_pool_block(transaction, block_hash)
+        if existing is None:
+            transaction.staged_pool_blocks[block_hash] = PoolBlockRow(
+                block_hash=block_hash,
+                block_height=int(payload["block_height"]),
+                parent_hash=str(payload["parent_hash"]),
+            )
+        elif existing.block_height != int(payload["block_height"]):
+            raise RuntimeError("pool block height conflicts")
+        accounts = payload.get("accounts") or []
+        return {
+            "backend": "postgres-psql",
+            "share_count": len(self.shares),
+            "block_count": 1,
+            "bundle_count": 1,
+            "payout_entry_count": len(accounts),
+            "carry_forward_count": 0,
+            "onchain_output_count": 0,
+        }
+
+    def _record_outbox_row(
+        self,
+        statement: Statement,
+        transaction: Transaction,
+    ) -> dict[str, Any]:
+        payload = statement.payload
+        block_hash = str(payload["block_hash"])
+        digest = str(payload["candidate_sha256"])
+        existing = self._visible_outbox_row(transaction, block_hash)
+        if existing is None:
+            transaction.staged_outbox[block_hash] = OutboxRow(
+                block_hash=block_hash,
+                candidate_sha256=digest,
+            )
+            return {"inserted": 1, "state": "pending"}
+        if existing.candidate_sha256 != digest:
+            return {"error": "block candidate payload mismatch"}
+        return {"inserted": 0, "state": existing.state}
 
     # -- helpers -----------------------------------------------------------
 
@@ -1606,16 +2610,27 @@ class Coordinator:
         self.harness.scheduler.trace.append(f"{self.name}@vanished")
 
 
-class LeaseHarness:
-    """Front end: build coordinators, step them, advance time, read the trace."""
+class HarnessBase:
+    """What every state machine's harness owns, whichever one it drives.
+
+    Issue #128 names four owners and this covers the second of them, so the
+    boundary matters more than it would for a one-off: the clock, the
+    scheduler, the PostgreSQL model, the stepping vocabulary and the output
+    capture are the same for landing as for the lease lifecycle, and will be
+    the same again for tip refresh and share submission. What differs is only
+    what a harness *builds* — coordinators here, a pool with two landing
+    tails there — so that is all a subclass supplies.
+
+    ``run_scenario`` and ``assert_deterministic`` are typed against this
+    class rather than against any one harness, which is what stops the
+    determinism check from being re-derived per state machine.
+    """
 
     def __init__(
         self,
         *,
-        lease_ttl_seconds: float = 60.0,
         capture_output: bool = True,
         baton_timeout_seconds: float = BATON_TIMEOUT_SECONDS,
-        **default_ledger_kwargs: Any,
     ) -> None:
         self.clock = VirtualClock()
         self.scheduler = DeterministicScheduler(
@@ -1623,18 +2638,21 @@ class LeaseHarness:
             baton_timeout_seconds=baton_timeout_seconds,
         )
         self.server = FakePostgres(self.scheduler, self.clock)
-        self.coordinators: dict[str, Coordinator] = {}
         self.sleeps: list[tuple[str, float]] = []
-        self._default_ledger_kwargs = {
-            "lease_ttl_seconds": lease_ttl_seconds,
-            **default_ledger_kwargs,
-        }
-        self._session_counter = 0
         self._output = io.StringIO()
-        self._redirect: contextlib.AbstractContextManager[Any] | None = None
+        self._errors = io.StringIO()
+        self._redirects: list[contextlib.AbstractContextManager[Any]] = []
         if capture_output:
-            self._redirect = contextlib.redirect_stdout(self._output)
-            self._redirect.__enter__()
+            # Kept apart rather than merged. The coordinator reserves stdout
+            # for a strict JSON-lines protocol in worker processes and routes
+            # audit-path diagnostics to stderr, so which stream a message
+            # arrives on is itself an assertion a scenario may want to make.
+            self._redirects = [
+                contextlib.redirect_stdout(self._output),
+                contextlib.redirect_stderr(self._errors),
+            ]
+            for redirect in self._redirects:
+                redirect.__enter__()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -1646,17 +2664,139 @@ class LeaseHarness:
 
     def close(self) -> None:
         self.scheduler.close()
-        if self._redirect is not None:
-            self._redirect.__exit__(None, None, None)
-            self._redirect = None
+        for redirect in reversed(self._redirects):
+            redirect.__exit__(None, None, None)
+        self._redirects = []
 
     @property
     def output(self) -> str:
         return self._output.getvalue()
 
     @property
+    def errors(self) -> str:
+        return self._errors.getvalue()
+
+    @property
     def trace(self) -> list[str]:
         return list(self.scheduler.trace)
+
+    # -- synchronisation ---------------------------------------------------
+
+    def lock(self, name: str) -> HarnessLock:
+        return HarnessLock(self.scheduler, name)
+
+    def rlock(self, name: str) -> HarnessRLock:
+        return HarnessRLock(self.scheduler, name)
+
+    def condition(self, name: str) -> HarnessCondition:
+        return HarnessCondition(self.rlock(name), name=name)
+
+    def event(self, name: str) -> HarnessEvent:
+        return HarnessEvent(self.scheduler, name)
+
+    def semaphore(self, name: str, value: int) -> HarnessSemaphore:
+        return HarnessSemaphore(self.scheduler, name, value=value)
+
+    # -- clock -------------------------------------------------------------
+
+    def sleep(self, seconds: float) -> None:
+        """Park until the virtual clock reaches the wake time."""
+        actor = self.scheduler.current()
+        self.sleeps.append((actor.name, float(seconds)))
+        wake_at = self.clock.monotonic() + float(seconds)
+        while self.clock.monotonic() < wake_at:
+            self.scheduler.block(f"sleep:{seconds:g}", wake_at=wake_at)
+
+    def advance(self, seconds: float) -> float:
+        return self.clock.advance(seconds)
+
+    def advance_to_next_deadline(self) -> float | None:
+        """Jump to the earliest pending sleep or timeout.
+
+        Returns the new virtual monotonic time, or None when no actor is
+        waiting on time at all — which is itself a finding: an actor blocked
+        with no deadline can only be released by another actor, and if none
+        can run, nothing bounds the wait.
+        """
+        deadline = self.scheduler.next_deadline()
+        if deadline is None:
+            return None
+        return self.clock.advance_to(max(deadline, self.clock.monotonic()))
+
+    # -- stepping ----------------------------------------------------------
+
+    def _actor(self, who: Any) -> Actor:
+        if isinstance(who, Actor):
+            return who
+        actor = getattr(who, "actor", None)
+        if isinstance(actor, Actor):
+            return actor
+        raise HarnessError(f"{who!r} is not an actor and does not own one")
+
+    def step(self, who: Any) -> str:
+        return self.scheduler.step(self._actor(who))
+
+    def run_until(self, who: Any, label: str, *, limit: int = 200) -> str:
+        return self.scheduler.run_until(self._actor(who), label, limit=limit)
+
+    def run_until_blocked(self, who: Any, label: str, *, limit: int = 200) -> str:
+        """Step until the actor parks at ``label`` and is genuinely stuck there."""
+        actor = self._actor(who)
+        stop = self.scheduler.run_until(actor, label, limit=limit)
+        if not actor.blocked:
+            raise HarnessError(
+                f"actor {actor.name!r} reached {label!r} but is not blocked"
+            )
+        return stop
+
+    def drain(self, order: list[Any] | None = None, *, limit: int = 500) -> None:
+        """Step runnable actors in a fixed order until none can progress.
+
+        Order is explicit and never depends on thread timing, so a drained
+        run is as reproducible as a hand-written schedule.
+        """
+        actors = (
+            [self._actor(who) for who in order]
+            if order is not None
+            else list(self.scheduler.actors.values())
+        )
+        for _ in range(limit):
+            progressed = False
+            for actor in actors:
+                if actor.runnable():
+                    self.scheduler.step(actor)
+                    progressed = True
+            if not progressed:
+                return
+        raise HarnessError(f"drain did not quiesce within {limit} rounds")
+
+    # -- observation -------------------------------------------------------
+
+    def statement_kinds(self) -> list[str]:
+        return [statement.kind.value for statement in self.server.statements]
+
+
+class LeaseHarness(HarnessBase):
+    """Front end: build coordinators, step them, advance time, read the trace."""
+
+    def __init__(
+        self,
+        *,
+        lease_ttl_seconds: float = 60.0,
+        capture_output: bool = True,
+        baton_timeout_seconds: float = BATON_TIMEOUT_SECONDS,
+        **default_ledger_kwargs: Any,
+    ) -> None:
+        super().__init__(
+            capture_output=capture_output,
+            baton_timeout_seconds=baton_timeout_seconds,
+        )
+        self.coordinators: dict[str, Coordinator] = {}
+        self._default_ledger_kwargs = {
+            "lease_ttl_seconds": lease_ttl_seconds,
+            **default_ledger_kwargs,
+        }
+        self._session_counter = 0
 
     # -- construction ------------------------------------------------------
 
@@ -1689,91 +2829,6 @@ class LeaseHarness:
         self.coordinators[name] = coordinator
         return coordinator
 
-    # -- clock -------------------------------------------------------------
-
-    def sleep(self, seconds: float) -> None:
-        """``lease_retry_sleep``: park until the virtual clock reaches the wake time."""
-        actor = self.scheduler.current()
-        self.sleeps.append((actor.name, float(seconds)))
-        wake_at = self.clock.monotonic() + float(seconds)
-        while self.clock.monotonic() < wake_at:
-            self.scheduler.block(f"sleep:{seconds:g}", wake_at=wake_at)
-
-    def advance(self, seconds: float) -> float:
-        return self.clock.advance(seconds)
-
-    def advance_to_next_deadline(self) -> float | None:
-        """Jump to the earliest pending sleep or timeout.
-
-        Returns the new virtual monotonic time, or None when no actor is
-        waiting on time at all — which is itself a finding: an actor blocked
-        with no deadline can only be released by another actor, and if none
-        can run, nothing bounds the wait.
-        """
-        deadline = self.scheduler.next_deadline()
-        if deadline is None:
-            return None
-        return self.clock.advance_to(max(deadline, self.clock.monotonic()))
-
-    # -- stepping ----------------------------------------------------------
-
-    def _actor(self, who: Coordinator | Actor) -> Actor:
-        return who.actor if isinstance(who, Coordinator) else who
-
-    def step(self, who: Coordinator | Actor) -> str:
-        return self.scheduler.step(self._actor(who))
-
-    def run_until(
-        self,
-        who: Coordinator | Actor,
-        label: str,
-        *,
-        limit: int = 200,
-    ) -> str:
-        return self.scheduler.run_until(self._actor(who), label, limit=limit)
-
-    def run_until_blocked(
-        self,
-        who: Coordinator | Actor,
-        label: str,
-        *,
-        limit: int = 200,
-    ) -> str:
-        """Step until the actor parks at ``label`` and is genuinely stuck there."""
-        actor = self._actor(who)
-        stop = self.scheduler.run_until(actor, label, limit=limit)
-        if not actor.blocked:
-            raise HarnessError(
-                f"actor {actor.name!r} reached {label!r} but is not blocked"
-            )
-        return stop
-
-    def drain(
-        self,
-        order: list[Coordinator | Actor] | None = None,
-        *,
-        limit: int = 500,
-    ) -> None:
-        """Step runnable actors in a fixed order until none can progress.
-
-        Order is explicit and never depends on thread timing, so a drained
-        run is as reproducible as a hand-written schedule.
-        """
-        actors = (
-            [self._actor(who) for who in order]
-            if order is not None
-            else list(self.scheduler.actors.values())
-        )
-        for _ in range(limit):
-            progressed = False
-            for actor in actors:
-                if actor.runnable():
-                    self.scheduler.step(actor)
-                    progressed = True
-            if not progressed:
-                return
-        raise HarnessError(f"drain did not quiesce within {limit} rounds")
-
     # -- observation -------------------------------------------------------
 
     def lease_row(self) -> LeaseRow | None:
@@ -1782,9 +2837,6 @@ class LeaseHarness:
     def lease_holder_session(self) -> str | None:
         row = self.server.lease
         return None if row is None else row.writer_session_token
-
-    def statement_kinds(self) -> list[str]:
-        return [statement.kind.value for statement in self.server.statements]
 
 
 # --------------------------------------------------------------------------
@@ -1807,9 +2859,20 @@ class ScenarioRun:
         )
 
 
-def run_scenario(scenario: Callable[[LeaseHarness], Any], **harness_kwargs: Any) -> ScenarioRun:
-    """Execute ``scenario`` against a fresh harness and record what happened."""
-    harness = LeaseHarness(**harness_kwargs)
+def run_scenario(
+    scenario: Callable[[Any], Any],
+    *,
+    harness_factory: Callable[..., HarnessBase] = LeaseHarness,
+    **harness_kwargs: Any,
+) -> ScenarioRun:
+    """Execute ``scenario`` against a fresh harness and record what happened.
+
+    ``harness_factory`` names which state machine's harness to build. It
+    defaults to the lease lifecycle only because that is what landed first;
+    nothing here knows anything about leases, and a scenario for any owner
+    deriving from ``HarnessBase`` runs unchanged.
+    """
+    harness = harness_factory(**harness_kwargs)
     try:
         outcome = scenario(harness)
         return ScenarioRun(trace=tuple(harness.trace), outcome=outcome)
@@ -1819,9 +2882,10 @@ def run_scenario(scenario: Callable[[LeaseHarness], Any], **harness_kwargs: Any)
 
 def assert_deterministic(
     test: Any,
-    scenario: Callable[[LeaseHarness], Any],
+    scenario: Callable[[Any], Any],
     *,
     repeats: int = 25,
+    harness_factory: Callable[..., HarnessBase] = LeaseHarness,
     **harness_kwargs: Any,
 ) -> ScenarioRun:
     """Run ``scenario`` repeatedly and require an identical trace and outcome.
@@ -1835,7 +2899,14 @@ def assert_deterministic(
     """
     if repeats < 2:
         raise HarnessError("determinism needs at least two runs to mean anything")
-    runs = [run_scenario(scenario, **harness_kwargs) for _ in range(repeats)]
+    runs = [
+        run_scenario(
+            scenario,
+            harness_factory=harness_factory,
+            **harness_kwargs,
+        )
+        for _ in range(repeats)
+    ]
     first = runs[0]
     for index, run in enumerate(runs[1:], start=2):
         if run.trace != first.trace:
@@ -1862,15 +2933,25 @@ __all__ = [
     "FakeLeaseGuard",
     "FakePostgres",
     "FakeSqlBackend",
+    "HarnessBase",
+    "HarnessCondition",
     "HarnessError",
+    "HarnessEvent",
+    "HarnessLock",
+    "HarnessRLock",
+    "HarnessSemaphore",
+    "LandingOp",
     "LeaseHarness",
     "LeaseOp",
     "LeaseRow",
     "LockTimeout",
     "NotRunnable",
+    "OutboxRow",
+    "PoolBlockRow",
     "ScenarioRun",
     "SchedulerStall",
     "Statement",
+    "StatementKind",
     "Transaction",
     "UnsupportedStatement",
     "VirtualClock",
