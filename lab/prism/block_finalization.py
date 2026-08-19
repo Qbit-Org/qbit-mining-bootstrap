@@ -1318,7 +1318,12 @@ class BlockFinalizationService:
                         active_tip_height=expected_height,
                     )
                     confirmed_count = int(confirmation.get("confirmed_count", 0))
-                    if confirmed_count == 1:
+                    # 1 is the fresh flip and 2 the idempotent replay of a row
+                    # this writer already confirmed. Both leave a confirmed
+                    # row addressed by the ordinal the flip allocated -- the
+                    # replay allocates nothing -- so both carry a publication
+                    # identity and both complete the candidate.
+                    if confirmed_count in {1, 2}:
                         audit_publication_identity = (
                             self.runtime._audit_publication_identity(
                                 block_hash=block_hash,
@@ -1329,7 +1334,16 @@ class BlockFinalizationService:
                 self.runtime._record_block_submitter_phase(
                     "confirm-accepted-block:complete"
                 )
-                if confirmed_count != 1:
+                # 2 is the ledger's idempotent disposition: this writer had
+                # already confirmed the row, so the call changed nothing. It
+                # completes the candidate exactly like a fresh flip, and its
+                # payout publication falls through the covered-replay checks
+                # below -- a covered confirmation forces no publication of its
+                # own, because the state it would republish is the state its
+                # original flip already published (issue #61). Those checks are
+                # not weakened by it: a source left unpublished or a leaked
+                # delivery fence still publishes here, exactly as before.
+                if confirmed_count not in {1, 2}:
                     # -1 is the ledger's superseded disposition: the row was
                     # terminally disposed (reorg quarantine, rejection, or
                     # reversal) before this confirmation landed. That is
@@ -1403,6 +1417,13 @@ class BlockFinalizationService:
                 payout_publication_fenced = (
                     self.runtime._payout_state_publication_fenced()
                 )
+                # These two are the whole publication decision, for a fresh
+                # confirmation and a covered replay alike: nothing pending and
+                # nothing fenced means the published payout state already
+                # covers this candidate, so republishing it would bump the
+                # payout generation, wipe the job-bundle cache, and abort every
+                # in-flight refresh for identical state. Never make the
+                # disposition alone force a publication past them.
                 if payout_publication_required or payout_publication_fenced:
                     # A covered replay normally has no publication work. The
                     # exception is a leaked delivery fence whose source already

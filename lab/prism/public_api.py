@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -41,6 +42,17 @@ PUBLIC_ERROR_CODES = {
     "rate_limited": "rate_limited",
     "internal_error": "internal_error",
     "qbit_rpc_unavailable": "upstream_unavailable",
+    # A cached response outlived its staleness budget and the public read
+    # service refused to serve it. Reported as upstream_unavailable, which is
+    # already in the documented error enum, because the condition is exactly
+    # that: the data behind this route is too old to answer with.
+    "stale_read_model": "upstream_unavailable",
+    # The public read tier's replica is missing, writable, or its replication
+    # stream has gone silent past the configured bound, so this route has no
+    # data it is willing to answer with. Same documented wire code as
+    # stale_read_model for the same reason: from a client's side the two are
+    # one condition.
+    "replica_unavailable": "upstream_unavailable",
 }
 
 
@@ -49,6 +61,19 @@ class PublicCachePolicy:
     ttl_seconds: int
     stale_while_revalidate_seconds: int
     immutable: bool = False
+
+
+@dataclass(frozen=True)
+class RawJsonBody:
+    """Pre-serialized JSON response body served byte-for-byte.
+
+    Content-addressed artifact responses must satisfy
+    sha256(response bytes) == the advertised artifact sha256, so the exact
+    canonical bytes bypass write_json's generic sorted-key re-serialization
+    and its trailing newline.
+    """
+
+    body: bytes
 
 
 @dataclass
@@ -276,6 +301,8 @@ def cacheable_payload_size(payload: object) -> bool:
     max_bytes = env_nonnegative_int("PRISM_PUBLIC_CACHE_MAX_RESPONSE_BYTES", 1_048_576)
     if max_bytes <= 0:
         return False
+    if isinstance(payload, RawJsonBody):
+        return len(payload.body) <= max_bytes
     body_size = len(json.dumps(payload, sort_keys=True).encode()) + 1
     return body_size <= max_bytes
 
@@ -865,6 +892,17 @@ def settlement_artifacts(coordinator: Any, *, block_hash: str) -> dict[str, obje
 
 
 def direct_coinbase_settlement_payload(ledger: Any, *, block_hash: str) -> dict[str, object] | None:
+    read_model = getattr(ledger, "dashboard_direct_coinbase_settlement", None)
+    if callable(read_model):
+        try:
+            payload = read_model(block_hash=block_hash)
+        except RuntimeError as exc:
+            if audit_bundle_body_read_failed(exc):
+                return None
+            raise
+        return payload if isinstance(payload, dict) else None
+    # In-memory ledger only: audit_bundle() is a writer-lock read on the
+    # Postgres ledger, so a public settlement lookup must not reach it.
     getter = getattr(ledger, "audit_bundle", None)
     if not callable(getter):
         return None
@@ -949,6 +987,23 @@ def fanout(coordinator: Any, *, fanout_txid: str) -> dict[str, object]:
 
 
 def artifact(coordinator: Any, *, sha256: str) -> object:
+    document = getattr(coordinator.ledger, "dashboard_public_artifact_document", None)
+    if callable(document):
+        row = document(sha256=sha256)
+        if not isinstance(row, dict):
+            raise PublicApiError(404, "not_found", "unknown public PRISM artifact")
+        canonical_json = row.get("canonical_json")
+        if isinstance(canonical_json, str):
+            body = canonical_json.encode()
+            if hashlib.sha256(body).hexdigest() == sha256:
+                return RawJsonBody(body=body)
+            # Stored canonical text that does not hash to its content address
+            # is a store-integrity fault; fall through to the re-serialized
+            # response rather than serve bytes that contradict the address.
+        payload = row.get("payload")
+        if payload is None:
+            raise PublicApiError(404, "not_found", "unknown public PRISM artifact")
+        return payload
     getter = getattr(coordinator.ledger, "dashboard_public_artifact", None)
     if not callable(getter):
         raise PublicApiError(404, "not_found", "unknown public PRISM artifact")
@@ -1518,6 +1573,11 @@ def percent_string(part: int | str | Decimal, total: int | str | Decimal) -> str
 
 
 def owed_balance_for_recipient(ledger: Any, recipient_id: str) -> int:
+    read_model = getattr(ledger, "dashboard_miner_owed_balance_bits", None)
+    if callable(read_model):
+        return int(read_model(recipient_id=recipient_id))
+    # In-memory ledger only: current_owed_balances() is a writer-lock read on
+    # the Postgres ledger, and returns every recipient's balance to filter one.
     return sum(
         int(balance.get("balance_sats", 0))
         for balance in ledger.current_owed_balances()

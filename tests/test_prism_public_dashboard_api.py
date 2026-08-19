@@ -18,9 +18,28 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from lab.prism import direct_stratum, public_api
-from lab.prism.prism_coordinator import make_audit_handler
-from lab.prism.share_ledger import PendingShare, PsqlShareLedger, SingleWriterShareLedger
+from lab.prism import direct_stratum, public_api, public_read_service
+from lab.prism.share_ledger import (
+    PendingShare,
+    PsqlShareLedger,
+    SingleWriterShareLedger,
+    canonical_json_text,
+    sha256_json_hex,
+)
+
+
+def make_public_handler(coordinator: object) -> type:
+    """Serve /public/v1 through the process that owns it.
+
+    These routes left the coordinator's audit listener in issue #145, so the
+    handler under test here is the extracted public read service's. It wraps
+    the same public_api.dispatch behind the same PublicResponseCache, which is
+    what keeps these assertions meaningful across the move;
+    tests/test_prism_public_read_service.py pins that equivalence directly.
+    """
+
+    service = public_read_service.PublicReadService(coordinator)  # type: ignore[arg-type]
+    return public_read_service.make_handler(service)
 
 
 class FanoutPublicRowTests(unittest.TestCase):
@@ -528,6 +547,95 @@ class MissingAuditBundleBodyLedger(FakePublicLedger):
         return super().dashboard_public_artifact(sha256=sha256)
 
 
+def sample_ctv_manifest_set() -> dict[str, object]:
+    # Mirrors the tests/test_prism_share_ledger.py fixture: the minimal
+    # manifest set that passes ctv_fanout_recovery_payload validation.
+    parent_coinbase_txid = "11" * 32
+    precommitment = {
+        "chunk_index": 0,
+        "chunk_count": 1,
+        "block_height": 123450,
+        "settlement_mode": "ctv_fanout",
+        "fanout_tx_template_hex": "0300000001",
+        "fanout_output_sum_sats": 25_000,
+        "anchor_vout": 1,
+        "ctv_hash_hex": "33" * 32,
+    }
+    manifest = {
+        "schema": "qbit.prism.ctv-fanout-manifest.v1",
+        "precommitment": precommitment,
+        "precommitment_sha256_hex": "44" * 32,
+        "commitment_witness_leaf_hex": "55" * 32,
+        "parent_coinbase_txid": parent_coinbase_txid,
+        "parent_coinbase_tx_hex": "0200000001",
+        "parent_coinbase_vout": 2,
+        "covenant_output_value_sats": 25_000,
+        "fanout_tx_hex": "0300000002",
+        "fanout_txid": "22" * 32,
+    }
+    return {
+        "schema": "qbit.prism.ctv-fanout-manifest-set.v1",
+        "block_height": 123450,
+        "settlement_mode": "ctv_fanout",
+        "parent_coinbase_txid": parent_coinbase_txid,
+        "fanout_count": 1,
+        "fanout_output_sum_sats": 25_000,
+        "covenant_output_value_sats": 25_000,
+        "manifests": [manifest],
+    }
+
+
+class CanonicalArtifactPublicLedger(FakePublicLedger):
+    """Artifacts whose canonical text and advertised sha256 are genuine."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.manifest_set = sample_ctv_manifest_set()
+        self.manifest = self.manifest_set["manifests"][0]  # type: ignore[index]
+        self.manifest_sha256 = sha256_json_hex(self.manifest)
+        self.manifest_set_sha256 = sha256_json_hex(self.manifest_set)
+        self.audit_bundle = {
+            "schema": "qbit.prism.audit-bundle.v1",
+            "found_block": {"block_height": 123450},
+            "accepted_shares": [{"share_seq": 1}],
+        }
+        # Audit bundles are hashed over Rust struct-declaration-order bytes;
+        # a compact non-sorted dump reproduces that contract closely enough
+        # that neither served serialization can match the advertised hash.
+        self.audit_bundle_sha256 = hashlib.sha256(
+            json.dumps(self.audit_bundle, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    def dashboard_public_artifact(self, *, sha256: str) -> dict[str, object] | None:
+        if sha256 == self.audit_bundle_sha256:
+            return self.audit_bundle
+        if sha256 == self.manifest_set_sha256:
+            return self.manifest_set
+        if sha256 == self.manifest_sha256:
+            return self.manifest
+        return None
+
+    def dashboard_public_artifact_document(self, *, sha256: str) -> dict[str, object] | None:
+        payload = self.dashboard_public_artifact(sha256=sha256)
+        if payload is None:
+            return None
+        canonical_json = None
+        if sha256 == self.manifest_set_sha256:
+            canonical_json = canonical_json_text(self.manifest_set)
+        if sha256 == self.manifest_sha256:
+            canonical_json = canonical_json_text(self.manifest)
+        return {"payload": payload, "canonical_json": canonical_json}
+
+
+class TamperedCanonicalArtifactPublicLedger(CanonicalArtifactPublicLedger):
+    def dashboard_public_artifact_document(self, *, sha256: str) -> dict[str, object] | None:
+        document = super().dashboard_public_artifact_document(sha256=sha256)
+        if document is None or document.get("canonical_json") is None:
+            return document
+        # Same document, different bytes: must never be served raw.
+        return {**document, "canonical_json": str(document["canonical_json"]) + " "}
+
+
 class DirectCoinbasePublicLedger(FakePublicLedger):
     block_hash = "00000000000026e9383a5aeae5fe5c3297f24884f29c4cf1585f71829491f0d9"
     block_height = 23342
@@ -664,7 +772,7 @@ class MemoryCoordinator:
 
 class PrismPublicDashboardApiTests(unittest.TestCase):
     def setUp(self) -> None:
-        handler = make_audit_handler(FakeCoordinator())  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator())  # type: ignore[arg-type]
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -748,7 +856,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_missing_compact_bits_fail_endpoints_before_reward_ledger_reads(self) -> None:
         ledger = FakePublicLedger()
-        handler = make_audit_handler(
+        handler = make_public_handler(
             FakeCoordinator(ledger=ledger, rpc=FakeRpc(template_bits=None))
         )  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -845,7 +953,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_hashrate_series_fetches_lookback_and_trims_pre_range_points(self) -> None:
         ledger = RangeBoundaryPublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1031,7 +1139,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_origin_cache_separates_legacy_and_reward_leaderboards(self) -> None:
         ledger = FakePublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1099,7 +1207,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_public_api_successes_emit_cache_headers_and_hit_origin_cache(self) -> None:
         ledger = FakePublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1142,7 +1250,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_public_api_errors_are_no_store_and_not_cached(self) -> None:
         ledger = BrokenPublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1164,7 +1272,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_public_api_coalesces_concurrent_origin_cache_misses(self) -> None:
         ledger = SlowPublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1205,7 +1313,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         # An oversize (non-cacheable) response must still coalesce concurrent
         # waiters onto the owner's single origin call instead of re-running it.
         ledger = SlowPublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1315,7 +1423,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_public_api_cache_headers_use_route_specific_ttls(self) -> None:
         ledger = FakePublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1425,7 +1533,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
             public_api.scaled_network_difficulty("00000000")
 
     def test_unexpected_public_api_errors_do_not_leak_internal_details(self) -> None:
-        handler = make_audit_handler(FakeCoordinator(BrokenPublicLedger()))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(BrokenPublicLedger()))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1450,7 +1558,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertEqual(payload["error"], {"code": "internal_error", "message": "internal server error", "request_id": None})
 
     def test_public_value_errors_do_not_leak_internal_details(self) -> None:
-        handler = make_audit_handler(FakeCoordinator(ValueErrorPublicLedger()))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ValueErrorPublicLedger()))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1503,7 +1611,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_settlement_artifacts_returns_direct_coinbase_bundle_without_fanouts(self) -> None:
         ledger = DirectCoinbasePublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1541,7 +1649,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
     def test_settlement_artifacts_supports_externalized_direct_coinbase_audit_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ledger = ExternalizedDirectCoinbasePublicLedger(tmp)
-            handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+            handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
             server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -1568,7 +1676,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ledger = ExternalizedDirectCoinbasePublicLedger(tmp)
             ledger.body_uri.unlink()
-            handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+            handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
             server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -2039,6 +2147,93 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertEqual(ledger.request, ("miner-a", 1_000))
 
 
+class PublicArtifactByteExactnessTests(unittest.TestCase):
+    """GET /public/v1/artifacts/{sha256} must return the exact bytes the
+    advertised sha256 was computed over, or no external verifier can confirm
+    any artifact. This was the missing regression coverage: the hash side
+    serializes with canonical_json_text (compact separators) while the
+    generic write_json path re-serializes with default separators plus a
+    trailing newline."""
+
+    def serve(self, ledger: FakePublicLedger) -> str:
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop() -> None:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.addCleanup(stop)
+        return f"http://127.0.0.1:{server.server_port}"
+
+    def fetch_artifact(self, base_url: str, sha256: str) -> tuple[bytes, dict[str, str]]:
+        with urllib.request.urlopen(f"{base_url}/public/v1/artifacts/{sha256}", timeout=5) as response:
+            return response.read(), dict(response.headers)
+
+    def test_manifest_artifact_bytes_hash_to_advertised_sha256(self) -> None:
+        ledger = CanonicalArtifactPublicLedger()
+        base_url = self.serve(ledger)
+        for sha256, document in (
+            (ledger.manifest_sha256, ledger.manifest),
+            (ledger.manifest_set_sha256, ledger.manifest_set),
+        ):
+            with self.subTest(sha256=sha256):
+                body, headers = self.fetch_artifact(base_url, sha256)
+
+                self.assertEqual(hashlib.sha256(body).hexdigest(), sha256)
+                self.assertEqual(json.loads(body), document)
+                self.assertEqual(headers.get("Content-Type"), "application/json")
+                self.assertEqual(int(headers["Content-Length"]), len(body))
+
+    def test_artifact_bytes_stay_exact_across_cache_hits(self) -> None:
+        ledger = CanonicalArtifactPublicLedger()
+        base_url = self.serve(ledger)
+
+        first, first_headers = self.fetch_artifact(base_url, ledger.manifest_set_sha256)
+        second, second_headers = self.fetch_artifact(base_url, ledger.manifest_set_sha256)
+
+        self.assertEqual(first, second)
+        self.assertEqual(hashlib.sha256(second).hexdigest(), ledger.manifest_set_sha256)
+        for headers in (first_headers, second_headers):
+            self.assertIn("immutable", headers.get("CDN-Cache-Control", ""))
+
+    def test_uppercase_artifact_path_serves_the_same_exact_bytes(self) -> None:
+        ledger = CanonicalArtifactPublicLedger()
+        base_url = self.serve(ledger)
+
+        body, _headers = self.fetch_artifact(base_url, ledger.manifest_sha256.upper())
+
+        self.assertEqual(hashlib.sha256(body).hexdigest(), ledger.manifest_sha256)
+
+    def test_tampered_canonical_text_falls_back_to_reserialized_document(self) -> None:
+        # Stored canonical text that no longer hashes to its content address
+        # must never be served as the exact bytes; the endpoint keeps the
+        # legacy re-serialized response instead.
+        ledger = TamperedCanonicalArtifactPublicLedger()
+        base_url = self.serve(ledger)
+
+        body, _headers = self.fetch_artifact(base_url, ledger.manifest_sha256)
+
+        self.assertEqual(body, json.dumps(ledger.manifest, sort_keys=True).encode() + b"\n")
+        self.assertEqual(json.loads(body), ledger.manifest)
+
+    @unittest.expectedFailure
+    def test_audit_bundle_artifact_bytes_hash_to_advertised_sha256(self) -> None:
+        # Audit bundles are hashed over Rust struct-declaration-order bytes
+        # that are not persisted, so their responses still cannot verify.
+        # Remove this marker when the audit-bundle canonical bytes are stored
+        # and served raw like the manifest kinds.
+        ledger = CanonicalArtifactPublicLedger()
+        base_url = self.serve(ledger)
+
+        body, _headers = self.fetch_artifact(base_url, ledger.audit_bundle_sha256)
+
+        self.assertEqual(hashlib.sha256(body).hexdigest(), ledger.audit_bundle_sha256)
+
+
 class PrismPublicDashboardMemoryLedgerTests(unittest.TestCase):
     def test_memory_ledger_public_read_models_are_empty_safe(self) -> None:
         coordinator = MemoryCoordinator()
@@ -2058,7 +2253,7 @@ class PrismPublicDashboardMemoryLedgerTests(unittest.TestCase):
                 ntime=1,
             )
         )
-        handler = make_audit_handler(coordinator)  # type: ignore[arg-type]
+        handler = make_public_handler(coordinator)  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -2076,6 +2271,37 @@ class PrismPublicDashboardMemoryLedgerTests(unittest.TestCase):
         self.assertEqual(payload["schema"], "prism.dashboard.leaderboard.v1")
         self.assertEqual(payload["pagination"]["total_count"], 1)
         self.assertEqual(payload["rows"][0]["recipient_id"], "miner-a")
+
+    def test_memory_ledger_artifact_responses_verify_end_to_end(self) -> None:
+        # Full path: the real record path persists the canonical text, and the
+        # HTTP response returns those exact bytes for every manifest kind.
+        coordinator = MemoryCoordinator()
+        manifest_set = sample_ctv_manifest_set()
+        manifest = manifest_set["manifests"][0]  # type: ignore[index]
+        manifest_set_sha256 = sha256_json_hex(manifest_set)
+        manifest_sha256 = sha256_json_hex(manifest)
+        coordinator.ledger.persist_ctv_fanout_manifest_set(
+            block_hash="aa" * 32,
+            manifest_set=manifest_set,
+            manifest_set_sha256=manifest_set_sha256,
+        )
+        handler = make_public_handler(coordinator)  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for sha256 in (manifest_set_sha256, manifest_sha256):
+                with self.subTest(sha256=sha256):
+                    with urllib.request.urlopen(
+                        f"http://127.0.0.1:{server.server_port}/public/v1/artifacts/{sha256}",
+                        timeout=5,
+                    ) as response:
+                        body = response.read()
+                    self.assertEqual(hashlib.sha256(body).hexdigest(), sha256)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
 
 if __name__ == "__main__":

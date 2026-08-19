@@ -1999,12 +1999,51 @@ with store.publication_order_guard():
                 created_at="later-still",
             )
             self.assertFalse(advanced_floor_replay.published)
+            # The confirm disposition is observational, like the share
+            # counters above: the flip that published this evidence reported a
+            # fresh confirmation (1), and an outbox replay of the same durable
+            # row reports the idempotent arm (2) -- which is the whole point of
+            # that split (issue #61). Reuse the durable value rather than
+            # stranding the replay as a payload conflict.
+            idempotent_disposition_replay = store.publish_success(
+                identity=identity,
+                report=self.report(block_height=4),
+                persistence=self.persistence(),
+                evidence={"confirmation": {"confirmed_count": 2}},
+                created_at="idempotent",
+            )
+            self.assertFalse(idempotent_disposition_replay.published)
+            self.assertEqual(
+                idempotent_disposition_replay.evidence["confirmation"],
+                {"confirmed_count": 1},
+            )
+            # Only the disposition is observational. Everything else the
+            # confirmation carries -- the publication ordinal above all -- is
+            # block identity and still conflicts when it changes.
             with self.assertRaisesRegex(RuntimeError, "replay payload conflict"):
                 store.publish_success(
                     identity=identity,
                     report=self.report(block_height=4),
                     persistence=self.persistence(),
-                    evidence={"confirmation": {"confirmed_count": 2}},
+                    evidence={
+                        "confirmation": {
+                            "confirmed_count": 2,
+                            "audit_publication_sequence": 9,
+                        }
+                    },
+                    created_at="later",
+                )
+            # A changed evidence payload outside the confirmation is unchanged
+            # in its treatment.
+            with self.assertRaisesRegex(RuntimeError, "replay payload conflict"):
+                store.publish_success(
+                    identity=identity,
+                    report=self.report(block_height=4),
+                    persistence=self.persistence(),
+                    evidence={
+                        "confirmation": {"confirmed_count": 1},
+                        "job_share_count": 7,
+                    },
                     created_at="later",
                 )
 

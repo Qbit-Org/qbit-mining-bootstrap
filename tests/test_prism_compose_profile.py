@@ -38,6 +38,7 @@ class PrismComposeProfileTests(unittest.TestCase):
                 "QBIT_NODE_EXTRA_ARG": "-listen=1",
                 "PRISM_STRATUM_PORT": "43340",
                 "PRISM_STRATUM_PORT_HOST": "127.0.0.1:43340",
+                "PRISM_STRATUM_HIGHDIFF_PORT": "44334",
                 "PRISM_PUBLIC_STRATUM_URL": "stratum+tcp://public-pool.example:3335",
                 "PRISM_PUBLIC_STRATUM_HIGHDIFF_URL": "stratum+tcp://public-pool.example:4334",
                 "PRISM_PUBLIC_POOL_FEE_BPS": "200",
@@ -189,22 +190,7 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS"], "1800")
         self.assertEqual(env["PRISM_STRATUM_BIND"], "0.0.0.0")
         self.assertEqual(env["PRISM_STRATUM_PORT"], "43340")
-        self.assertEqual(env["PRISM_PUBLIC_STRATUM_URL"], "stratum+tcp://public-pool.example:3335")
-        self.assertEqual(env["PRISM_PUBLIC_STRATUM_HIGHDIFF_URL"], "stratum+tcp://public-pool.example:4334")
-        self.assertEqual(env["PRISM_PUBLIC_POOL_FEE_BPS"], "200")
-        self.assertEqual(env["PRISM_PUBLIC_CACHE_ENABLED"], "1")
-        self.assertEqual(env["PRISM_PUBLIC_CACHE_TTL_SECONDS"], "5")
-        self.assertEqual(env["PRISM_PUBLIC_CACHE_STALE_WHILE_REVALIDATE_SECONDS"], "30")
-        self.assertEqual(env["PRISM_PUBLIC_AGGREGATE_CACHE_TTL_SECONDS"], "30")
-        self.assertEqual(env["PRISM_PUBLIC_AGGREGATE_CACHE_STALE_WHILE_REVALIDATE_SECONDS"], "30")
         self.assertEqual(env["PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS"], "30")
-        self.assertEqual(env["PRISM_PUBLIC_CONFIG_CACHE_TTL_SECONDS"], "300")
-        self.assertEqual(env["PRISM_PUBLIC_CONFIG_CACHE_STALE_WHILE_REVALIDATE_SECONDS"], "3600")
-        self.assertEqual(env["PRISM_PUBLIC_ARTIFACT_CACHE_TTL_SECONDS"], "86400")
-        self.assertEqual(env["PRISM_PUBLIC_ARTIFACT_CACHE_STALE_WHILE_REVALIDATE_SECONDS"], "86400")
-        self.assertEqual(env["PRISM_PUBLIC_CACHE_MAX_ENTRIES"], "512")
-        self.assertEqual(env["PRISM_PUBLIC_CACHE_MAX_RESPONSE_BYTES"], "1048576")
-        self.assertEqual(env["PRISM_PUBLIC_CACHE_DEBUG_HEADERS"], "0")
         self.assertEqual(env["PRISM_AUDIT_BIND"], "127.0.0.1")
         self.assertEqual(env["PRISM_AUDIT_PORT"], "3341")
         self.assertEqual(env["PRISM_AUDIT_SHARE_SEGMENT_SIZE"], "10000")
@@ -283,6 +269,266 @@ class PrismComposeProfileTests(unittest.TestCase):
         nofile = self.config["services"]["prism-coordinator"]["ulimits"]["nofile"]
 
         self.assertEqual(nofile, {"soft": 60000, "hard": 65000})
+
+    # -- the extracted public read tier (issue #145) ------------------------
+
+    def test_public_api_runs_the_public_read_service_from_the_prism_image(self) -> None:
+        service = self.config["services"]["prism-public-api"]
+
+        self.assertEqual(service["command"], ["python3", "-m", "lab.prism.public_read_service"])
+        self.assertEqual(
+            service["build"]["dockerfile"],
+            "lab/prism/Dockerfile",
+        )
+        self.assertEqual(
+            service["image"],
+            self.config["services"]["prism-coordinator"]["image"],
+        )
+        self.assertEqual(service.get("restart"), "on-failure")
+
+    def test_public_api_survives_coordinator_restarts(self) -> None:
+        # The public tier must not depend on the coordinator: independence from
+        # coordinator restarts is a large part of why the surface was extracted.
+        # It waits on the standby it reads, which is also not the coordinator's
+        # primary -- so a primary restart does not take the dashboard with it.
+        depends_on = self.config["services"]["prism-public-api"].get("depends_on", {})
+
+        self.assertIn("prism-postgres-replica", depends_on)
+        self.assertEqual(
+            depends_on["prism-postgres-replica"]["condition"],
+            "service_healthy",
+        )
+        self.assertNotIn("prism-coordinator", depends_on)
+
+    def test_public_api_mounts_the_audit_volume_read_only(self) -> None:
+        volumes = self.config["services"]["prism-public-api"].get("volumes", [])
+        audit = [
+            volume
+            for volume in volumes
+            if isinstance(volume, dict) and volume.get("source") == "prism-audit-data"
+        ]
+
+        self.assertEqual(1, len(audit), f"expected one audit mount in {volumes!r}")
+        self.assertTrue(
+            audit[0].get("read_only"),
+            f"the audit artifact volume must be mounted read-only: {audit[0]!r}",
+        )
+
+    def test_public_api_receives_the_moved_public_knobs(self) -> None:
+        env = self._service_environment("prism-public-api")
+
+        self.assertEqual(env["PRISM_PUBLIC_STRATUM_URL"], "stratum+tcp://public-pool.example:3335")
+        self.assertEqual(env["PRISM_PUBLIC_STRATUM_HIGHDIFF_URL"], "stratum+tcp://public-pool.example:4334")
+        self.assertEqual(env["PRISM_PUBLIC_POOL_FEE_BPS"], "200")
+        self.assertEqual(env["PRISM_PUBLIC_CACHE_ENABLED"], "1")
+        self.assertEqual(env["PRISM_PUBLIC_CACHE_TTL_SECONDS"], "5")
+        self.assertEqual(env["PRISM_PUBLIC_AGGREGATE_CACHE_TTL_SECONDS"], "30")
+        self.assertEqual(env["PRISM_PUBLIC_CONFIG_CACHE_TTL_SECONDS"], "300")
+        self.assertEqual(env["PRISM_PUBLIC_ARTIFACT_CACHE_TTL_SECONDS"], "86400")
+        self.assertEqual(env["PRISM_PUBLIC_CACHE_MAX_ENTRIES"], "512")
+        self.assertEqual(env["PRISM_PUBLIC_CACHE_DEBUG_HEADERS"], "0")
+        self.assertEqual(
+            env["PRISM_DATABASE_URL"],
+            "postgresql://qbit:change-this@prism-postgres-replica:5432/qbit",
+        )
+        self.assertEqual(env["PRISM_AUDIT_DIR"], "/var/lib/qbit-prism/audit")
+        self.assertEqual(env["QBIT_RPC_HOST"], "qbitd")
+
+    def test_public_api_receives_the_advertised_stratum_ports(self) -> None:
+        # The service runs no Stratum listener, but mining-configuration still
+        # renders from these: PRISM_STRATUM_PORT is the primary endpoint's
+        # fallback port and the High-diff endpoint appears only when
+        # PRISM_STRATUM_HIGHDIFF_PORT is set. Without the pass-through the
+        # rendered body silently drops the high-diff listener the coordinator
+        # is running.
+        env = self._service_environment("prism-public-api")
+
+        self.assertEqual(env["PRISM_STRATUM_PORT"], "43340")
+        self.assertEqual(env["PRISM_STRATUM_HIGHDIFF_PORT"], "44334")
+
+    def test_the_coordinator_no_longer_carries_the_moved_public_knobs(self) -> None:
+        # The coordinator serves no route that reads these any more; leaving
+        # them behind would imply it still did.
+        env = self._service_environment("prism-coordinator")
+
+        for name in (
+            "PRISM_PUBLIC_STRATUM_URL",
+            "PRISM_PUBLIC_POOL_NAME",
+            "PRISM_PUBLIC_CACHE_ENABLED",
+            "PRISM_PUBLIC_CACHE_TTL_SECONDS",
+            "PRISM_PUBLIC_ARTIFACT_CACHE_TTL_SECONDS",
+            "PRISM_PUBLIC_EXPLORER_TX_URL_PREFIX",
+        ):
+            with self.subTest(name=name):
+                self.assertNotIn(name, env)
+
+    def test_the_reward_window_cache_knob_stays_on_both(self) -> None:
+        # Read by the ledger itself, and both processes construct one.
+        for service in ("prism-coordinator", "prism-public-api"):
+            with self.subTest(service=service):
+                env = self._service_environment(service)
+                self.assertEqual(env["PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS"], "30")
+
+    def test_public_api_never_receives_writer_or_signing_configuration(self) -> None:
+        # A read tier that could acquire a writer lease or sign a manifest
+        # would not be a read tier.
+        env = self._service_environment("prism-public-api")
+
+        self.assertEqual(env.get("PRISM_ALLOW_MEMORY_LEDGER"), "0")
+        for name in env:
+            self.assertFalse(
+                name.startswith("PRISM_LEDGER_WRITER_"),
+                f"{name} must not reach the public read tier",
+            )
+        for name in (
+            "PRISM_MANIFEST_SIGNING_SEED_HEX",
+            "PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX",
+            "PRISM_POSTGRES_INIT_SCHEMA",
+        ):
+            with self.subTest(name=name):
+                self.assertNotIn(name, env)
+
+    def test_public_api_publishes_its_port_and_healthcheck(self) -> None:
+        service = self.config["services"]["prism-public-api"]
+        published = {
+            str(port.get("published"))
+            for port in service.get("ports", [])
+            if isinstance(port, dict)
+        }
+        self.assertIn("3342", published)
+
+        command = " ".join(service["healthcheck"]["test"])
+        self.assertIn("/healthz", command)
+        self.assertIn("urllib.request.urlopen", command)
+
+    def test_primary_pins_the_hba_file_carrying_the_replication_rules(self) -> None:
+        postgres = self.config["services"]["prism-postgres"]
+
+        self.assertEqual(
+            postgres["command"],
+            ["postgres", "-c", "hba_file=/etc/postgresql/pg_hba.conf"],
+        )
+        mounts = [
+            volume
+            for volume in postgres.get("volumes", [])
+            if isinstance(volume, dict)
+            and volume.get("target") == "/etc/postgresql/pg_hba.conf"
+        ]
+        self.assertEqual(
+            len(mounts), 1, f"missing pg_hba mount in {postgres.get('volumes')!r}"
+        )
+        self.assertTrue(mounts[0].get("read_only", False))
+        self.assertEqual(
+            mounts[0].get("source"),
+            str(ROOT / "config/prism-postgres/pg_hba.conf"),
+        )
+
+    def test_primary_hba_file_authorizes_replication_and_keeps_local_access(
+        self,
+    ) -> None:
+        rules = [
+            line.split()
+            for line in (ROOT / "config/prism-postgres/pg_hba.conf")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+
+        # The image's initdb bootstrap, pg_isready and `docker exec psql` all
+        # come in over the unix socket, and this file replaces the generated
+        # one, so losing the local rule would break the existing healthcheck.
+        self.assertEqual(rules[0][:4], ["local", "all", "all", "trust"])
+        self.assertIn(["host", "all", "all", "127.0.0.1/32", "scram-sha-256"], rules)
+        self.assertIn(["host", "all", "all", "::1/128", "scram-sha-256"], rules)
+        self.assertIn(["host", "all", "all", "0.0.0.0/0", "scram-sha-256"], rules)
+        self.assertIn(["host", "all", "all", "::/0", "scram-sha-256"], rules)
+        # Compose cannot interpolate this file, so the replication rules name
+        # the default superuser literally.
+        self.assertIn(
+            ["host", "replication", "qbit", "0.0.0.0/0", "scram-sha-256"], rules
+        )
+        self.assertIn(["host", "replication", "qbit", "::/0", "scram-sha-256"], rules)
+
+    def test_replica_bootstraps_from_the_primary(self) -> None:
+        replica = self.config["services"]["prism-postgres-replica"]
+        env = self._service_environment("prism-postgres-replica")
+
+        self.assertEqual(replica["image"], "postgres:16-alpine")
+        self.assertEqual(
+            replica["depends_on"]["prism-postgres"]["condition"], "service_healthy"
+        )
+        self.assertEqual(
+            replica["entrypoint"], ["/usr/local/bin/prism-replica-entrypoint.sh"]
+        )
+        self.assertEqual(
+            env["PRISM_POSTGRES_REPLICATION_SLOT"], "prism_public_replica"
+        )
+        # The data directory is cloned by pg_basebackup, so these credentials
+        # exist for the replication connection and the healthcheck's psql.
+        self.assertEqual(env["POSTGRES_USER"], "qbit")
+        self.assertEqual(env["POSTGRES_DB"], "qbit")
+        self.assertEqual(env["PGPASSWORD"], env["POSTGRES_PASSWORD"])
+
+        targets = {
+            volume.get("target"): volume
+            for volume in replica.get("volumes", [])
+            if isinstance(volume, dict)
+        }
+        self.assertEqual(
+            targets["/var/lib/postgresql/data"].get("source"),
+            "prism-postgres-replica-data",
+        )
+        self.assertEqual(
+            targets["/usr/local/bin/prism-replica-entrypoint.sh"].get("source"),
+            str(ROOT / "config/prism-postgres/replica-entrypoint.sh"),
+        )
+
+    def test_replica_bootstrap_script_retries_and_creates_the_slot(self) -> None:
+        script = (ROOT / "config/prism-postgres/replica-entrypoint.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("pg_basebackup", script)
+        self.assertIn("--wal-method=stream", script)
+        self.assertIn("--write-recovery-conf", script)
+        self.assertIn('--slot="$REPLICATION_SLOT"', script)
+        self.assertIn("--create-slot", script)
+        # A cold `docker compose up` must survive the primary not being
+        # reachable yet, on a bounded budget rather than forever.
+        self.assertIn("PRISM_POSTGRES_REPLICA_BASEBACKUP_ATTEMPTS:-60", script)
+        self.assertIn("PRISM_POSTGRES_REPLICA_BASEBACKUP_RETRY_SECONDS:-5", script)
+        # Hand off to the stock entrypoint, which skips init on a populated
+        # data directory and drops privileges to the postgres account.
+        self.assertIn("exec docker-entrypoint.sh postgres", script)
+        # A bind mount aimed by mistake at a real cluster must stop the script
+        # rather than be cleared by the incomplete-bootstrap path below it.
+        self.assertIn("pg_controldata", script)
+
+    def test_replica_healthcheck_requires_a_live_standby(self) -> None:
+        command = " ".join(
+            self.config["services"]["prism-postgres-replica"]["healthcheck"]["test"]
+        )
+
+        # An out-of-band promotion must report unhealthy rather than quietly
+        # become a second writable cluster behind the public read tier.
+        self.assertIn("pg_is_in_recovery()", command)
+        self.assertIn("pg_isready", command)
+
+    def test_public_read_service_reads_the_replica_not_the_primary(self) -> None:
+        env = self._service_environment("prism-public-api")
+
+        self.assertIn("prism-postgres-replica", env["PRISM_DATABASE_URL"])
+        self.assertNotIn("@prism-postgres:", env["PRISM_DATABASE_URL"])
+        self.assertEqual(env["PRISM_PUBLIC_REPLICA_MODE"], "require")
+        depends_on = self.config["services"]["prism-public-api"]["depends_on"]
+        self.assertEqual({"prism-postgres-replica"}, set(depends_on))
+        self.assertEqual(
+            "service_healthy", depends_on["prism-postgres-replica"]["condition"]
+        )
+
+        # The coordinator keeps the primary; the split is the point.
+        coordinator = self._service_environment("prism-coordinator")
+        self.assertIn("@prism-postgres:", coordinator["PRISM_DATABASE_URL"])
 
     def _service_environment(self, name: str) -> dict[str, str]:
         raw_env = self.config["services"][name]["environment"]

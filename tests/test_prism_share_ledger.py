@@ -42,6 +42,7 @@ from lab.prism.share_ledger import (
     _NativePostgresLeaseGuard,
     _prism_window_shares,
     _writer_lease_advisory_lock_key,
+    canonical_json_text,
     sha256_json_hex,
 )
 
@@ -1211,6 +1212,42 @@ class PrismShareLedgerTests(unittest.TestCase):
         )
 
         self.assertIsNone(ledger.dashboard_public_artifact(sha256=audit_bundle_sha256))
+
+    def test_memory_ledger_public_artifact_document_returns_hashed_text(self) -> None:
+        # The canonical text is the exact byte sequence the advertised sha256
+        # was computed over; serving anything else breaks external
+        # verification of content-addressed artifacts.
+        ledger = SingleWriterShareLedger()
+        block_hash = "aa" * 32
+        audit_bundle_sha256 = "77" * 32
+        manifest_set = {
+            **sample_ctv_manifest_set(),
+            "audit_bundle_sha256": audit_bundle_sha256,
+            "audit_bundle": {"schema": "qbit.prism.audit-bundle.v1"},
+        }
+        manifest = manifest_set["manifests"][0]  # type: ignore[index]
+        manifest_set_sha256 = sha256_json_hex(manifest_set)
+
+        ledger.persist_ctv_fanout_manifest_set(
+            block_hash=block_hash,
+            manifest_set=manifest_set,
+            manifest_set_sha256=manifest_set_sha256,
+        )
+
+        set_document = ledger.dashboard_public_artifact_document(sha256=manifest_set_sha256)
+        manifest_document = ledger.dashboard_public_artifact_document(sha256=sha256_json_hex(manifest))
+        bundle_document = ledger.dashboard_public_artifact_document(sha256=audit_bundle_sha256)
+
+        self.assertEqual(set_document["canonical_json"], canonical_json_text(manifest_set))  # type: ignore[index]
+        self.assertEqual(set_document["payload"], manifest_set)  # type: ignore[index]
+        self.assertEqual(manifest_document["canonical_json"], canonical_json_text(manifest))  # type: ignore[index]
+        self.assertEqual(
+            hashlib.sha256(str(set_document["canonical_json"]).encode()).hexdigest(),  # type: ignore[index]
+            manifest_set_sha256,
+        )
+        self.assertEqual(bundle_document["payload"], {"schema": "qbit.prism.audit-bundle.v1"})  # type: ignore[index]
+        self.assertIsNone(bundle_document["canonical_json"])  # type: ignore[index]
+        self.assertIsNone(ledger.dashboard_public_artifact_document(sha256="99" * 32))
 
     def test_reorg_watch_blocks_keeps_height_mature_immature_rows(self) -> None:
         ledger = QueryCapturePsqlShareLedger()
@@ -4422,6 +4459,54 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertIn("FROM qbit_pool_audit_bundles", query)
         self.assertIn("body_uri", query)
 
+    def test_psql_public_artifact_document_reads_persisted_text_in_one_query(self) -> None:
+        manifest_set = sample_ctv_manifest_set()
+        manifest_set_json = canonical_json_text(manifest_set)
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {
+                    "has_audit_row": False,
+                    "audit_bundle": None,
+                    "audit_bundle_sha256": None,
+                    "body_uri": None,
+                    "fallback": manifest_set,
+                    "fallback_canonical": manifest_set_json,
+                },
+            ]
+        )
+
+        document = ledger.dashboard_public_artifact_document(sha256=sha256_json_hex(manifest_set))
+
+        self.assertEqual(document, {"payload": manifest_set, "canonical_json": manifest_set_json})
+        # The payload and its canonical text come from the same statement so a
+        # request touches each artifact table at most once.
+        query = ledger.lease_queries[-1]
+        self.assertIn("SELECT audit_bundle, audit_bundle_sha256, body_uri", query)
+        self.assertIn("SELECT manifest_set, manifest_set_json", query)
+        self.assertIn("FROM qbit_ctv_fanout_sets", query)
+        self.assertIn("SELECT manifest, manifest_json", query)
+        self.assertIn("FROM qbit_ctv_fanout_artifacts", query)
+        self.assertEqual(query.count("FROM qbit_ctv_fanout_sets"), 1)
+        self.assertEqual(query.count("FROM qbit_ctv_fanout_artifacts"), 1)
+
+    def test_psql_public_artifact_document_returns_none_when_unmatched(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {
+                    "has_audit_row": False,
+                    "audit_bundle": None,
+                    "audit_bundle_sha256": None,
+                    "body_uri": None,
+                    "fallback": None,
+                    "fallback_canonical": None,
+                },
+            ]
+        )
+
+        self.assertIsNone(ledger.dashboard_public_artifact_document(sha256="aa" * 32))
+
     def test_psql_public_artifact_exists_rejects_missing_external_body(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ledger = FakeLeasePsqlShareLedger(
@@ -5914,6 +5999,39 @@ class NativeClientSelectionTests(unittest.TestCase):
                     psql_command="psql postgres://example.invalid/qbit",
                     native_client_mode="1",
                 )
+
+    def test_auto_native_psycopg_import_fallback_warns(self) -> None:
+        stdout = io.StringIO()
+        with unittest.mock.patch.dict(sys.modules, {"psycopg": None}):
+            with contextlib.redirect_stdout(stdout):
+                ledger = CannedQueryPsqlShareLedger(
+                    [acquired_lease_result()],
+                    native_client_mode="auto",
+                )
+        self.assertIsNone(ledger._native)
+        self.assertEqual(ledger.execution_backend, "psql-subprocess")
+        self.assertIn(
+            "psycopg import failed; falling back to the psql subprocess backend",
+            stdout.getvalue(),
+        )
+
+    def test_psql_run_sql_uses_single_transaction(self) -> None:
+        recorded: dict[str, object] = {}
+
+        def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            recorded["cmd"] = list(cmd)
+            return types.SimpleNamespace(returncode=0, stdout="{}\n", stderr="")
+
+        ledger = CannedQueryPsqlShareLedger([acquired_lease_result()])
+        with unittest.mock.patch.object(
+            share_ledger_module.subprocess, "run", side_effect=fake_run
+        ):
+            output = ledger._run_sql("SELECT '{}'::json;")
+        self.assertEqual(output, "{}\n")
+        cmd = recorded["cmd"]
+        self.assertIn("--single-transaction", cmd)
+        self.assertIn("--no-psqlrc", cmd)
+        self.assertIn("ON_ERROR_STOP=1", cmd)
 
     def test_parse_single_json_value_contract(self) -> None:
         self.assertEqual(parse_single_json_value('{"a": 1}'), {"a": 1})

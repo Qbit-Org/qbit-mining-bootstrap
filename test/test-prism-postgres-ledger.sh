@@ -859,19 +859,39 @@ assert_equal(
     "wrong-height confirmation exposes no publication ordinal",
 )
 confirmed = replacement.confirm_accepted_block(block_hash="44" * 32, active_tip_height=7)
-assert_equal(confirmed["confirmed_count"], 1, "confirmed block count")
+assert_equal(confirmed["confirmed_count"], 1, "fresh confirmation reports the flip disposition")
 first_publication_sequence = int(confirmed["audit_publication_sequence"])
 if first_publication_sequence <= 0:
     raise SystemExit("first confirmed block received a non-positive publication ordinal")
+allocator_after_flip = replacement._run_json(
+    "SELECT json_build_object('last_value', last_value, 'is_called', is_called) "
+    "FROM qbit_audit_publication_sequence_seq;"
+)
 confirmed_replay = replacement.confirm_accepted_block(
     block_hash="44" * 32,
     active_tip_height=7,
 )
-assert_equal(confirmed_replay["confirmed_count"], 1, "exact confirmation replay count")
+# The idempotent arm is the durable discriminator this contract exists for:
+# the UPDATE matched nothing, so the row keeps the ordinal its flip
+# allocated and the caller can tell a replay from a genuinely new
+# confirmation that has to publish payout state (issue #61).
+assert_equal(
+    confirmed_replay["confirmed_count"],
+    2,
+    "exact confirmation replay reports the idempotent disposition",
+)
 assert_equal(
     int(confirmed_replay["audit_publication_sequence"]),
     first_publication_sequence,
     "exact confirmation replay preserves publication ordinal",
+)
+assert_equal(
+    replacement._run_json(
+        "SELECT json_build_object('last_value', last_value, 'is_called', is_called) "
+        "FROM qbit_audit_publication_sequence_seq;"
+    ),
+    allocator_after_flip,
+    "exact confirmation replay burns no publication ordinal",
 )
 assert_equal(
     replacement.dashboard_miner_pending_maturity_bits(recipient_id="miner-b"),
@@ -1135,6 +1155,23 @@ assert_equal(
     reactivated_publication_sequence,
     first_publication_sequence,
     "reactivated block preserves its published ordinal",
+)
+reactivated_confirmation = replacement.confirm_accepted_block(
+    block_hash="44" * 32,
+    active_tip_height=7,
+)
+# Reactivation restores 'confirmed' without returning the row to 'prepared',
+# so a confirmation arriving after it is an idempotent replay too -- and it
+# still addresses the ordinal the original flip allocated.
+assert_equal(
+    reactivated_confirmation["confirmed_count"],
+    2,
+    "confirmation after reactivation reports the idempotent disposition",
+)
+assert_equal(
+    int(reactivated_confirmation["audit_publication_sequence"]),
+    first_publication_sequence,
+    "confirmation after reactivation preserves the published ordinal",
 )
 if not replacement.current_owed_balances():
     raise SystemExit("reactivated block did not restore owed balances")
