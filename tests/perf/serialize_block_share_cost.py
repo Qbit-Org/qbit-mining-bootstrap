@@ -366,14 +366,26 @@ class ScenarioTiming:
     serialize_block_only: Timing
     hex_encode_only: Timing
 
+    # False once the share path stops serializing the block: the term is then
+    # measured in isolation and is no longer a component of the composite, so
+    # a ratio between them is not a share of anything. Set from the assembled
+    # submission rather than inferred from the numbers, because at the 0-tx
+    # point the isolated term is still smaller than the composite and the
+    # ratio would look plausible while meaning nothing.
+    composite_includes_term: bool = True
+
     @property
     def term_share_percent(self) -> float:
+        if not self.composite_includes_term:
+            return float("nan")
         if self.composite.thread_cpu_us <= 0:
             return float("nan")
         return 100.0 * self.serialize_term.thread_cpu_us / self.composite.thread_cpu_us
 
     @property
     def composite_less_term_us(self) -> float:
+        if not self.composite_includes_term:
+            return float("nan")
         return self.composite.thread_cpu_us - self.serialize_term.thread_cpu_us
 
 
@@ -421,8 +433,21 @@ def time_scenario(scenario: Scenario, *, reps: int, min_batch_seconds: float) ->
     block_bytes = serialize_block(header, full_coinbase_hex, transaction_hexes)
 
     kwargs = {"reps": reps, "min_batch_seconds": min_batch_seconds}
+    # Does the composite still contain the term on the tree under measurement?
+    # The driver's jobs use difficulty-65,536 bits, so their submissions are
+    # ordinary shares -- which is the path worth measuring, and also the path
+    # that stops serializing the block once the share-path gate is in.
+    composite_includes_term = bool(
+        assemble(
+            job,
+            extranonce2_hex=extranonce2_hex,
+            ntime_hex=NTIME_HEX,
+            nonce_hex=NONCE_HEX,
+        ).block_hex
+    )
     return ScenarioTiming(
         scenario=scenario,
+        composite_includes_term=composite_includes_term,
         # The whole per-share call as the coordinator invokes it.
         composite=measure(
             lambda: assemble(
@@ -804,8 +829,38 @@ def describe_environment() -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
-def _fmt(value: float, digits: int = 2) -> str:
+def _term_scope_note(rows: list[dict[str, Any]]) -> str | None:
+    """Explain an ``n/a`` term column instead of leaving the reader to guess."""
+
+    if all(row.get("composite_includes_term", True) for row in rows):
+        return None
+    return (
+        "`term % of composite` and `composite - term` read **n/a**: on this "
+        "tree `assemble_submission` serializes the block only for a hash that "
+        "solved one, so an ordinary share's composite does not contain the "
+        "term and a ratio between the two is not a share of anything. The "
+        "term column is still the isolated cost of serializing a block of "
+        "that size, which is what a block landing pays. For an after-fix "
+        "delta compare `serialize_term_us` and the composite separately."
+    )
+
+
+def _json_number(value: float) -> float | None:
+    return None if value != value else value
+
+
+def _fmt(value: float | None, digits: int = 2) -> str:
+    # None/NaN marks a quantity that is undefined on this tree rather than
+    # merely unmeasured -- printing "nan" invites the reader to treat it as a
+    # number. Undefined cells render as "n/a" and carry no unit suffix.
+    if value is None or value != value:
+        return "n/a"
     return f"{value:,.{digits}f}"
+
+
+def _fmt_percent(value: float | None, digits: int = 1) -> str:
+    text = _fmt(value, digits)
+    return text if text == "n/a" else f"{text}%"
 
 
 def render_report(results: dict[str, Any]) -> str:
@@ -891,10 +946,14 @@ def render_report(results: dict[str, Any]) -> str:
             f"| {row['block_bytes']:,} | {row['transaction_count']:,} | "
             f"{row['nominal_tx_bytes']} | {row['merkle_branch_levels']} | "
             f"{_fmt(row['composite_us'])} | {_fmt(row['serialize_term_us'])} | "
-            f"{_fmt(row['term_percent'], 1)}% | {_fmt(row['composite_less_term_us'])} | "
+            f"{_fmt_percent(row['term_percent'])} | {_fmt(row['composite_less_term_us'])} | "
             f"{_fmt(row['composite_wall_us'])} |"
         )
     add("")
+    axis1_note = _term_scope_note(results["axis1"])
+    if axis1_note:
+        add(axis1_note)
+        add("")
     add("Term split: `serialize_block` (bytes out) vs the caller's `.hex()` re-encode.")
     add("")
     add("| block bytes | `serialize_block` us | `.hex()` re-encode us | sum us | term measured us |")
@@ -922,9 +981,13 @@ def render_report(results: dict[str, Any]) -> str:
             f"| {row['transaction_count']:,} | {row['block_bytes']:,} | "
             f"{row['nominal_tx_bytes']} | {row['merkle_branch_levels']} | "
             f"{_fmt(row['composite_us'])} | {_fmt(row['serialize_term_us'])} | "
-            f"{_fmt(row['term_percent'], 1)}% |"
+            f"{_fmt_percent(row['term_percent'])} |"
         )
     add("")
+    axis2_note = _term_scope_note(results["axis2"])
+    if axis2_note:
+        add(axis2_note)
+        add("")
     fit = results["axis2_fit"]
     add(
         f"Least-squares fit of the term against transaction count at fixed bytes: "
@@ -1175,8 +1238,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "serialize_term_wall_us": timing.serialize_term.wall_us,
             "serialize_block_only_us": timing.serialize_block_only.thread_cpu_us,
             "hex_encode_only_us": timing.hex_encode_only.thread_cpu_us,
-            "term_percent": timing.term_share_percent,
-            "composite_less_term_us": timing.composite_less_term_us,
+            # null rather than NaN: NaN is not valid strict JSON, and the
+            # quantity is undefined -- not merely unmeasured -- once the share
+            # path no longer serializes the block.
+            "composite_includes_term": timing.composite_includes_term,
+            "term_percent": _json_number(timing.term_share_percent),
+            "composite_less_term_us": _json_number(timing.composite_less_term_us),
             "raw": {
                 "composite": timing.composite.as_json(),
                 "serialize_term": timing.serialize_term.as_json(),

@@ -1615,6 +1615,106 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         self.assertEqual(intent["block_hex"], "")
 
+    def test_b1_replayed_intent_re_encodes_without_tripping_the_guard(self) -> None:
+        """Decode erases duck-typing, so the guard must exempt a replay.
+
+        An embedder that retains no block bytes writes ``""`` and is tolerated.
+        ``block_candidate_from_intent`` then rebuilds every replayed candidate
+        as a real ``DirectQbitSubmission``, so that tolerated value comes back
+        wearing the strict type. The only caller that re-encodes a replayed
+        candidate is the credit-on-accept append, which runs after the block
+        has landed -- raising there would fail a credit for a block already in
+        the chain. Re-persisting an intent the row already holds is not the
+        write the guard exists to stop.
+        """
+        server, state, _ledger = submit_coordinator()
+        pending = PendingShare(
+            share_id="replay-share",
+            miner_id="miner-a",
+            order_key="miner-a",
+            p2mr_program_hex="11" * 32,
+            share_difficulty=1,
+            network_difficulty=1,
+            template_height=10,
+            job_id="job-1",
+            job_issued_at_ms=1,
+            accepted_at_ms=2,
+            ntime=3,
+        )
+        written = block_candidate_intent(
+            block_candidate(
+                server,
+                state,
+                SimpleNamespace(
+                    block_hash_hex="cf" * 32,
+                    coinbase_tx_hex="11",
+                    share_pass=True,
+                    block_pass=True,
+                ),
+                pending_share=pending,
+                credit_share_on_accept=True,
+            )
+        )
+        self.assertEqual(written["block_hex"], "")
+
+        replayed = dataclasses.replace(
+            block_candidate_from_intent(written),
+            durable_replay=True,
+        )
+        # Decode really does hand back the strict type; without the replay
+        # exemption this is exactly what would trip the guard.
+        self.assertIsInstance(
+            replayed.submission,
+            direct_stratum.DirectQbitSubmission,
+        )
+        self.assertEqual(replayed.submission.block_hex, "")
+
+        self.assertEqual(block_candidate_intent(replayed)["block_hex"], "")
+
+    def test_b1_replayed_intent_preserves_a_real_serialized_block(self) -> None:
+        """The ordinary replay: block bytes survive the round trip intact."""
+        server, state, _ledger = submit_coordinator()
+        pending = PendingShare(
+            share_id="replay-real-share",
+            miner_id="miner-a",
+            order_key="miner-a",
+            p2mr_program_hex="11" * 32,
+            share_difficulty=1,
+            network_difficulty=1,
+            template_height=10,
+            job_id="job-1",
+            job_issued_at_ms=1,
+            accepted_at_ms=2,
+            ntime=3,
+        )
+        written = block_candidate_intent(
+            block_candidate(
+                server,
+                state,
+                direct_stratum.DirectQbitSubmission(
+                    coinbase_tx_hex="11",
+                    coinbase_txid_preimage_hex="",
+                    header_hex="",
+                    block_hex="0badc0de",
+                    block_hash_hex="da" * 32,
+                    block_hash_int=1,
+                    share_pass=True,
+                    block_pass=True,
+                    applied_version_hex="",
+                ),
+                pending_share=pending,
+                credit_share_on_accept=True,
+            )
+        )
+
+        replayed = dataclasses.replace(
+            block_candidate_from_intent(written),
+            durable_replay=True,
+        )
+
+        self.assertEqual(replayed.submission.block_hex, "0badc0de")
+        self.assertEqual(block_candidate_intent(replayed)["block_hex"], "0badc0de")
+
     def test_b1_service_owns_queue_and_structured_attempt_results(self) -> None:
         server, state, _ledger = submit_coordinator()
         service = server._ensure_block_candidate_service()
