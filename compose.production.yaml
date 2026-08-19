@@ -66,6 +66,21 @@ services:
         bind:
           create_host_path: false
 
+  # The standby the public read tier serves from. Its data directory is cloned
+  # by pg_basebackup rather than initdb, so it takes no WAL bind of its own --
+  # the base backup lays the cluster down under this one source. Provisioning,
+  # slot management and the WAL-retention risk: docs/prism-postgres-replica.md.
+  prism-postgres-replica:
+    image: ${PRISM_POSTGRES_IMAGE:-invalid.invalid/qbit-mining-bootstrap/postgres:production-image-not-configured}
+    pull_policy: always
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: ${PRISM_POSTGRES_REPLICA_DATA_SOURCE:-/production-source-not-configured/postgres-replica/data}
+        target: /var/lib/postgresql/data
+        bind:
+          create_host_path: false
+
   # Same image as the coordinator, overlaid the same way; the audit root is
   # bound read-only here because this tier only publishes evidence it reads.
   prism-public-api:

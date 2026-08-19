@@ -99,6 +99,24 @@ UNBOUNDED_STALENESS_BUDGET = "unbounded"
 DEFAULT_READINESS_PROBE_INTERVAL_SECONDS = 5.0
 MINIMUM_READINESS_STALE_SECONDS = 15.0
 
+# How long the standby's replication stream may be silent before its answers
+# stop counting as current. Bounds the *stream*, not replay lag -- see
+# ReplicaProbe.
+DEFAULT_REPLICA_MAX_LAG_SECONDS = 60.0
+
+# Observed replay lag, published on every replica-backed response. Advisory:
+# the enforced bound is the heartbeat age, for the reason ReplicaProbe explains.
+REPLICA_LAG_HEADER = "X-Prism-Replica-Lag-Seconds"
+
+# require: refuse replica-backed routes unless the backing server is a standby
+# whose replication stream is live within the bound. off: serve whatever the
+# DSN names, which is the behaviour of the extraction before a standby existed.
+# off is the default so that merging this does not 503 a deployment that has
+# not provisioned one yet; the shipped compose sets require.
+REPLICA_MODE_REQUIRE = "require"
+REPLICA_MODE_OFF = "off"
+REPLICA_MODES = (REPLICA_MODE_REQUIRE, REPLICA_MODE_OFF)
+
 HEALTH_SCHEMA = "qbit.prism.public-read-health.v1"
 
 
@@ -143,6 +161,7 @@ class ServiceMetrics:
         self._responses_by_status: dict[int, int] = {}
         self._cache_by_state: dict[str, int] = {"hit": 0, "miss": 0, "bypass": 0}
         self._staleness_refusals = 0
+        self._replica_refusals = 0
 
     def record_request(self) -> None:
         with self._lock:
@@ -164,12 +183,23 @@ class ServiceMetrics:
         with self._lock:
             self._staleness_refusals += 1
 
-    def render(self, *, ready: bool, readiness_age_seconds: float) -> str:
+    def record_replica_refusal(self) -> None:
+        with self._lock:
+            self._replica_refusals += 1
+
+    def render(
+        self,
+        *,
+        ready: bool,
+        readiness_age_seconds: float,
+        replica: dict[str, object] | None = None,
+    ) -> str:
         with self._lock:
             requests_total = self._requests_total
             responses = dict(self._responses_by_status)
             cache_states = dict(self._cache_by_state)
             refusals = self._staleness_refusals
+            replica_refusals = self._replica_refusals
         lines = [
             "# HELP qbit_prism_public_requests_total Public read requests accepted.",
             "# TYPE qbit_prism_public_requests_total counter",
@@ -202,9 +232,194 @@ class ServiceMetrics:
                 "# HELP qbit_prism_public_ledger_probe_age_seconds Age of the last readiness probe, or -1 before the first.",
                 "# TYPE qbit_prism_public_ledger_probe_age_seconds gauge",
                 f"qbit_prism_public_ledger_probe_age_seconds {readiness_age_seconds:.3f}",
+                "# HELP qbit_prism_public_replica_refusals_total Responses refused for failing the replica freshness contract.",
+                "# TYPE qbit_prism_public_replica_refusals_total counter",
+                f"qbit_prism_public_replica_refusals_total {replica_refusals}",
             ]
         )
+        if replica is not None:
+            # -1 rather than omission for the unknowns: a missing series and a
+            # series reading zero are the same alert, and neither is true.
+            lines.extend(
+                [
+                    "# HELP qbit_prism_public_replica_in_recovery Whether the backing server is a standby.",
+                    "# TYPE qbit_prism_public_replica_in_recovery gauge",
+                    f"qbit_prism_public_replica_in_recovery {1 if replica.get('in_recovery') else 0}",
+                    "# HELP qbit_prism_public_replica_heartbeat_age_seconds Age of the newest walreceiver message, or -1 when disconnected. This is the enforced bound.",
+                    "# TYPE qbit_prism_public_replica_heartbeat_age_seconds gauge",
+                    f"qbit_prism_public_replica_heartbeat_age_seconds {_metric_number(replica.get('receiver_heartbeat_age_seconds'))}",
+                    "# HELP qbit_prism_public_replica_replay_lag_seconds Wall clock behind the newest replayed commit, or -1. Advisory: grows on an idle primary.",
+                    "# TYPE qbit_prism_public_replica_replay_lag_seconds gauge",
+                    f"qbit_prism_public_replica_replay_lag_seconds {_metric_number(replica.get('replay_lag_seconds'))}",
+                    "# HELP qbit_prism_public_replica_apply_backlog_bytes WAL received but not yet replayed, or -1.",
+                    "# TYPE qbit_prism_public_replica_apply_backlog_bytes gauge",
+                    f"qbit_prism_public_replica_apply_backlog_bytes {_metric_number(replica.get('apply_backlog_bytes'))}",
+                    "# HELP qbit_prism_public_replica_max_lag_seconds The configured replication-stream silence bound.",
+                    "# TYPE qbit_prism_public_replica_max_lag_seconds gauge",
+                    f"qbit_prism_public_replica_max_lag_seconds {_metric_number(replica.get('max_lag_seconds'))}",
+                ]
+            )
         return "\n".join(lines) + "\n"
+
+
+class ReplicaProbe:
+    """Is the standby this tier reads through still a standby, and still fed?
+
+    Two refusals and one number, from one query per interval:
+
+    * **Not in recovery.** The public tier exists to keep public read volume
+      off the primary the coordinator lands blocks through. A DSN that
+      resolves to a writable server silently undoes that, and the failure is
+      invisible in the responses -- they are correct, just served from the
+      wrong place. So it is refused rather than served.
+    * **A silent replication stream.** The liveness proof is the walreceiver
+      heartbeat age, *not* the transactional replay lag. Heartbeats flow every
+      ``wal_receiver_status_interval`` (10s by default) whether or not the
+      primary has anything to send, whereas replay lag grows with wall clock
+      on an idle primary -- so bounding replay lag would 503 a perfectly
+      healthy replica of a quiet pool every time the pool went quiet, which is
+      exactly when the dashboard is least likely to be wrong.
+
+    Replay lag and apply backlog are still measured and published (header,
+    /healthz, /metrics); they are the number an operator wants, just not the
+    number a gate can be built on.
+
+    Freshness ages locally, which is what makes this fail *closed*. The bound
+    is checked against the heartbeat age the last successful probe reported
+    **plus how long ago that probe ran**, so a probe that starts failing --
+    or a standby that stops answering entirely -- ages its own last good
+    answer out of the bound instead of pinning it there forever.
+
+    Runs as ReadinessProbe's probe callable rather than owning a thread:
+    readiness and replica freshness are the same question, and one probe means
+    one round trip per interval instead of two.
+    """
+
+    def __init__(
+        self,
+        status_probe: Callable[[], dict[str, object]],
+        *,
+        max_lag_seconds: float = DEFAULT_REPLICA_MAX_LAG_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._status_probe = status_probe
+        self._max_lag_seconds = float(max_lag_seconds)
+        self._monotonic = monotonic
+        self._lock = threading.Lock()
+        self._status: dict[str, object] | None = None
+        self._probed_at: float | None = None
+        self._last_error: str | None = None
+
+    @property
+    def max_lag_seconds(self) -> float:
+        return self._max_lag_seconds
+
+    def check(self) -> bool:
+        """One probe. True when the backing server is a live standby.
+
+        Failure is recorded and re-raised so ReadinessProbe reports the real
+        error text rather than a bare "returned false"; the recorded snapshot
+        is deliberately left in place, to age out through freshness_error()
+        rather than vanish and read as warm-up.
+        """
+        try:
+            status = self._status_probe()
+        except Exception as exc:  # noqa: BLE001 - recorded, then re-raised
+            with self._lock:
+                self._last_error = f"{type(exc).__name__}: {exc}"
+            raise
+        with self._lock:
+            self._status = dict(status)
+            self._probed_at = self._monotonic()
+            self._last_error = None
+        return bool(status.get("in_recovery"))
+
+    def view(self) -> dict[str, object]:
+        """What /healthz and /metrics report, including the aged numbers."""
+
+        with self._lock:
+            status = dict(self._status) if self._status is not None else None
+            probed_at = self._probed_at
+            last_error = self._last_error
+        payload: dict[str, object] = {
+            "probed": status is not None,
+            "max_lag_seconds": self._max_lag_seconds,
+        }
+        if last_error is not None:
+            payload["last_error"] = last_error
+        if status is None or probed_at is None:
+            return payload
+        snapshot_age = max(0.0, self._monotonic() - probed_at)
+        payload["probe_age_seconds"] = round(snapshot_age, 3)
+        payload["in_recovery"] = bool(status.get("in_recovery"))
+        heartbeat = _coerce_float(status.get("receiver_heartbeat_age_seconds"))
+        payload["receiver_heartbeat_age_seconds"] = (
+            None if heartbeat is None else round(heartbeat + snapshot_age, 3)
+        )
+        replay_lag = _coerce_float(status.get("replay_lag_seconds"))
+        payload["replay_lag_seconds"] = (
+            None if replay_lag is None else round(replay_lag + snapshot_age, 3)
+        )
+        backlog = _coerce_float(status.get("apply_backlog_bytes"))
+        payload["apply_backlog_bytes"] = None if backlog is None else int(backlog)
+        return payload
+
+    def replay_lag_seconds(self) -> float | None:
+        """Observed replay lag for the response header, aged locally."""
+
+        value = self.view().get("replay_lag_seconds")
+        return None if value is None else float(value)
+
+    def freshness_error(self) -> tuple[str, str] | None:
+        """(code, message) for the 503 a replica-backed route owes, or None."""
+
+        with self._lock:
+            status = dict(self._status) if self._status is not None else None
+            probed_at = self._probed_at
+            last_error = self._last_error
+        if status is None or probed_at is None:
+            message = "public read service is warming up"
+            if last_error is not None:
+                message = f"{message}: replica probe failed: {last_error}"
+            return "replica_unavailable", message
+        if not status.get("in_recovery"):
+            return (
+                "replica_unavailable",
+                "public read service refuses to serve from a server that is "
+                "not in recovery; point PRISM_PUBLIC_DATABASE_URL at the read "
+                "replica, or set PRISM_PUBLIC_REPLICA_MODE=off to serve from "
+                "the primary deliberately",
+            )
+        heartbeat = _coerce_float(status.get("receiver_heartbeat_age_seconds"))
+        if heartbeat is None:
+            return (
+                "replica_unavailable",
+                "read replica replication stream is not connected; the "
+                "walreceiver heartbeat is absent",
+            )
+        silent_for = heartbeat + max(0.0, self._monotonic() - probed_at)
+        if silent_for > self._max_lag_seconds:
+            detail = ""
+            if last_error is not None:
+                detail = f" (last probe failed: {last_error})"
+            return (
+                "replica_unavailable",
+                f"read replica replication stream has been silent for "
+                f"{silent_for:.1f}s, beyond the configured bound "
+                f"{self._max_lag_seconds:.1f}s{detail}",
+            )
+        return None
+
+
+def _coerce_float(value: object) -> float | None:
+    """Postgres json numbers arrive as int/float/str depending on the driver."""
+
+    if value is None:
+        return None
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
 
 
 class ReadinessProbe:
@@ -308,6 +523,29 @@ class ReadinessProbe:
         return (200 if payload["ok"] else 503), payload
 
 
+def path_reads_replica(path: str) -> bool:
+    """Does this route's answer come out of the replicated database?
+
+    Derived from the endpoint registry rather than a hand-kept path list, so a
+    route added there is classified once. Two kinds of route are exempt:
+
+    * those that touch no read slot at all -- today only
+      /public/v1/mining-configuration, assembled from environment;
+    * content-addressed ones, which declare ``immutable_content``. A body that
+      hashes to the requested sha256 is correct at any age, which is why the
+      registry gives them no staleness budget either; refusing one for
+      replication lag would contradict the unbounded budget already published
+      on it.
+
+    An unclassified path is not replica-backed here because dispatch() 404s it
+    before it can read anything.
+    """
+    endpoint = endpoint_registry.endpoint_for_request_path(path)
+    if endpoint is None or endpoint.immutable_content:
+        return False
+    return endpoint_registry.LedgerAccess.READ_SLOT in endpoint.access
+
+
 def staleness_budget_for_path(path: str) -> float | None:
     """The budget for one concrete request path, or None when it has none.
 
@@ -376,6 +614,7 @@ class PublicReadService:
         response_cache: public_api.PublicResponseCache | None = None,
         metrics: ServiceMetrics | None = None,
         readiness: ReadinessProbe | None = None,
+        replica: ReplicaProbe | None = None,
     ) -> None:
         self.coordinator = coordinator
         self.cache = (
@@ -383,6 +622,9 @@ class PublicReadService:
         )
         self.metrics = ServiceMetrics() if metrics is None else metrics
         self.readiness = readiness
+        # None when PRISM_PUBLIC_REPLICA_MODE=off: no replica contract is
+        # enforced and no replica facts are published, because there are none.
+        self.replica = replica
 
 
 def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
@@ -398,6 +640,7 @@ def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
     cache = service.cache
     service_metrics = service.metrics
     readiness = service.readiness
+    replica = service.replica
 
     class PublicReadHandler(BaseHTTPRequestHandler):
         server_version = "PrismPublicRead/1"
@@ -439,6 +682,24 @@ def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
                 )
 
         def handle_public(self, path: str, query: dict[str, list[str]]) -> None:
+            # Before the cache, not after. A replica outage does not make
+            # cached entries expire, so a post-cache check would keep answering
+            # 200 from the last good snapshot for as long as traffic kept the
+            # entry warm -- the precise failure this gate exists to prevent.
+            if replica is not None and path_reads_replica(path):
+                refusal = replica.freshness_error()
+                if refusal is not None:
+                    code, message = refusal
+                    service_metrics.record_replica_refusal()
+                    headers = self.with_replica_lag(
+                        public_api.public_error_headers()
+                    )
+                    self.write_json(
+                        503,
+                        public_api.error_payload(code, message),
+                        headers=self.with_budget(path, headers),
+                    )
+                    return
             cache_policy = public_api.public_cache_policy(path)
             status, payload, cache_state, age_seconds = cache.get_or_compute(
                 key=public_api.public_cache_key(path, query),
@@ -460,7 +721,7 @@ def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
                         budget_seconds=budget_seconds,
                         age_seconds=age_seconds,
                     ),
-                    headers=headers,
+                    headers=self.with_replica_lag(headers),
                 )
                 return
             headers = public_api.public_cache_headers(
@@ -468,7 +729,23 @@ def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
                 cache_state=cache_state,
                 age_seconds=age_seconds,
             )
+            headers = self.with_replica_lag(headers)
             self.write_json(status, payload, headers=self.with_budget(path, headers))
+
+        def with_replica_lag(self, headers: dict[str, str]) -> dict[str, str]:
+            """Publish observed replay lag beside the enforced heartbeat bound.
+
+            Advisory, and deliberately so: this is the number that answers "how
+            far behind is the data I just got", which the enforced bound does
+            not. Omitted rather than guessed when nothing has replayed yet.
+            """
+
+            if replica is None:
+                return headers
+            lag_seconds = replica.replay_lag_seconds()
+            if lag_seconds is not None:
+                headers[REPLICA_LAG_HEADER] = f"{lag_seconds:.3f}"
+            return headers
 
         def with_budget(self, path: str, headers: dict[str, str]) -> dict[str, str]:
             """Attach the route's budget so callers can see it on every response."""
@@ -480,9 +757,26 @@ def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
 
         def handle_healthz(self) -> None:
             if readiness is None:
-                self.write_json(200, {"ok": True, "schema": HEALTH_SCHEMA})
-                return
-            status, payload = readiness.snapshot()
+                payload: dict[str, object] = {"ok": True, "schema": HEALTH_SCHEMA}
+                status = 200
+            else:
+                status, payload = readiness.snapshot()
+            if replica is not None:
+                # The replication facts are why a 503 here says what it says,
+                # so they travel with it rather than only in /metrics.
+                payload["replica"] = replica.view()
+                refusal = replica.freshness_error()
+                if refusal is not None:
+                    payload["ok"] = False
+                    payload["state"] = "unready"
+                    # Overwrite rather than defer to the readiness probe's
+                    # text: in require mode the replica check *is* the
+                    # readiness probe, so a failed contract shows up there as
+                    # the useless "readiness probe returned false". The
+                    # probe's own exception, when there was one, is in the
+                    # replica block beside this.
+                    payload["error"] = refusal[1]
+                    status = 503
             self.write_json(status, payload)
 
         def handle_metrics(self) -> None:
@@ -495,6 +789,7 @@ def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
             body = service_metrics.render(
                 ready=ready,
                 readiness_age_seconds=age_seconds,
+                replica=None if replica is None else replica.view(),
             ).encode()
             service_metrics.record_response(200)
             try:
@@ -546,6 +841,17 @@ def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
             return
 
     return PublicReadHandler
+
+
+def _metric_number(value: object) -> str:
+    """Render a possibly-absent replica number as a gauge value.
+
+    -1 stands in for "not known", matching how the readiness probe age already
+    reports its own pre-first-probe state.
+    """
+
+    number = _coerce_float(value)
+    return "-1" if number is None else f"{number:.3f}"
 
 
 def _format_budget(budget_seconds: float) -> str:
@@ -696,10 +1002,48 @@ def _env_flag(raw: str | None) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def resolve_replica_mode(environ: dict[str, str] | None = None) -> str:
+    """Read PRISM_PUBLIC_REPLICA_MODE, refusing anything it does not mean.
+
+    An unrecognised value is a configuration error, not a reason to pick a
+    default: the two modes differ in whether this process will serve from the
+    coordinator's primary, so guessing gets that wrong silently in one
+    direction or the other.
+    """
+    source = os.environ if environ is None else environ
+    raw = (source.get("PRISM_PUBLIC_REPLICA_MODE") or "").strip().lower()
+    if not raw:
+        return REPLICA_MODE_OFF
+    if raw not in REPLICA_MODES:
+        raise PublicReadConfigurationError(
+            "PRISM_PUBLIC_REPLICA_MODE must be one of "
+            f"{', '.join(REPLICA_MODES)} (got {raw!r})"
+        )
+    return raw
+
+
+def build_replica_probe(
+    ledger: Any,
+    environ: dict[str, str] | None = None,
+) -> ReplicaProbe | None:
+    """The replica contract, or None when this deployment has no standby yet."""
+
+    if resolve_replica_mode(environ) != REPLICA_MODE_REQUIRE:
+        return None
+    return ReplicaProbe(
+        ledger.read_replica_status,
+        max_lag_seconds=env_positive_float(
+            "PRISM_PUBLIC_REPLICA_MAX_LAG_SECONDS",
+            DEFAULT_REPLICA_MAX_LAG_SECONDS,
+        ),
+    )
+
+
 def build_service(environ: dict[str, str] | None = None) -> tuple[
     PublicReadCoordinator,
     ReadinessProbe,
     ServiceMetrics,
+    ReplicaProbe | None,
 ]:
     """Validate configuration and assemble the process's collaborators.
 
@@ -710,14 +1054,19 @@ def build_service(environ: dict[str, str] | None = None) -> tuple[
     ledger = build_ledger_from_env(environ)
     rpc = build_rpc_from_env(environ)
     coordinator = PublicReadCoordinator(ledger=ledger, rpc=rpc)
+    replica = build_replica_probe(ledger, environ)
     readiness = ReadinessProbe(
-        ledger.dashboard_readiness_probe,
+        # In require mode the replication probe *is* the readiness probe: it
+        # round-trips to the same database and additionally proves the server
+        # is the standby this tier is supposed to be reading. Running both
+        # would be two round trips to answer one question.
+        ledger.dashboard_readiness_probe if replica is None else replica.check,
         interval_seconds=env_positive_float(
             "PRISM_PUBLIC_READINESS_PROBE_INTERVAL_SECONDS",
             DEFAULT_READINESS_PROBE_INTERVAL_SECONDS,
         ),
     )
-    return coordinator, readiness, ServiceMetrics()
+    return coordinator, readiness, ServiceMetrics(), replica
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -725,14 +1074,19 @@ def main(argv: list[str] | None = None) -> int:
     bind = os.environ.get("PRISM_PUBLIC_API_BIND") or DEFAULT_PUBLIC_API_BIND
     port = env_int("PRISM_PUBLIC_API_PORT", DEFAULT_PUBLIC_API_PORT)
     try:
-        coordinator, readiness, metrics = build_service()
+        coordinator, readiness, metrics, replica = build_service()
     except PublicReadConfigurationError as exc:
         print(f"prism-public-read: {exc}", file=sys.stderr, flush=True)
         return 2
 
     readiness.start()
     handler = make_handler(
-        PublicReadService(coordinator, metrics=metrics, readiness=readiness)
+        PublicReadService(
+            coordinator,
+            metrics=metrics,
+            readiness=readiness,
+            replica=replica,
+        )
     )
     server = ThreadingHTTPServer((bind, port), handler)
     server.daemon_threads = True
@@ -746,8 +1100,17 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, request_shutdown)
     signal.signal(signal.SIGINT, request_shutdown)
 
+    backing = (
+        "any server the DSN names (replica mode off)"
+        if replica is None
+        else (
+            "a standby with a replication stream no more than "
+            f"{replica.max_lag_seconds:g}s silent"
+        )
+    )
     print(
-        f"prism-public-read: serving /public/v1 on {bind}:{port}",
+        f"prism-public-read: serving /public/v1 on {bind}:{port}, reading from "
+        f"{backing}",
         file=sys.stderr,
         flush=True,
     )

@@ -417,6 +417,12 @@ services:
     profiles: ["prism"]
     image: ${PRISM_POSTGRES_IMAGE:-postgres:16-alpine}
     restart: unless-stopped
+    # The image's own command is `postgres`; repeating it keeps the entrypoint's
+    # first-boot initdb path intact and only adds the hba file that carries the
+    # replication rules prism-postgres-replica connects through. Postgres 16
+    # already defaults to wal_level=replica with 10 senders and 10 slots, which
+    # is enough for one standby, so no other server flags are needed.
+    command: ["postgres", "-c", "hba_file=/etc/postgresql/pg_hba.conf"]
     environment:
       POSTGRES_DB: ${PRISM_POSTGRES_DB:-qbit}
       POSTGRES_USER: ${PRISM_POSTGRES_USER:-qbit}
@@ -425,6 +431,7 @@ services:
     volumes:
       - ${PRISM_POSTGRES_DATA_SOURCE:-prism-postgres-data}:/var/lib/postgresql/data
       - ${PRISM_POSTGRES_WAL_SOURCE:-prism-postgres-wal}:/var/lib/postgresql/wal
+      - ./config/prism-postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
     healthcheck:
       # A socket-only pg_isready is racy: the image's initdb-time temporary
       # server accepts unix-socket connections (with listen_addresses='')
@@ -441,6 +448,60 @@ services:
           -c 'SELECT 1' >/dev/null
       interval: 5s
       timeout: 5s
+      retries: 30
+
+  prism-postgres-replica:
+    profiles: ["prism"]
+    image: ${PRISM_POSTGRES_IMAGE:-postgres:16-alpine}
+    restart: unless-stopped
+    depends_on:
+      prism-postgres:
+        condition: service_healthy
+    # Bootstrap by pg_basebackup instead of initdb, then hand off to the stock
+    # image entrypoint; see config/prism-postgres/replica-entrypoint.sh and
+    # docs/prism-postgres-replica.md.
+    entrypoint: ["/usr/local/bin/prism-replica-entrypoint.sh"]
+    environment:
+      # The data directory is cloned from the primary, so none of these drive
+      # initdb. They give the bootstrap its replication connection and the
+      # healthcheck its psql credentials, using the primary's defaults.
+      POSTGRES_DB: ${PRISM_POSTGRES_DB:-qbit}
+      POSTGRES_USER: ${PRISM_POSTGRES_USER:-qbit}
+      POSTGRES_PASSWORD: ${PRISM_POSTGRES_PASSWORD:-change-this}
+      PGPASSWORD: ${PRISM_POSTGRES_PASSWORD:-change-this}
+      PRISM_POSTGRES_DB: ${PRISM_POSTGRES_DB:-qbit}
+      PRISM_POSTGRES_USER: ${PRISM_POSTGRES_USER:-qbit}
+      PRISM_POSTGRES_PASSWORD: ${PRISM_POSTGRES_PASSWORD:-change-this}
+      PRISM_POSTGRES_REPLICATION_SLOT: ${PRISM_POSTGRES_REPLICATION_SLOT:-prism_public_replica}
+    volumes:
+      - ${PRISM_POSTGRES_REPLICA_DATA_SOURCE:-prism-postgres-replica-data}:/var/lib/postgresql/data
+      - ./config/prism-postgres/replica-entrypoint.sh:/usr/local/bin/prism-replica-entrypoint.sh:ro
+    healthcheck:
+      # Same socket-race lesson as the primary: gate on the real server's TCP
+      # listener, then confirm with a real query. The third clause additionally
+      # requires the server to still be in recovery, so an out-of-band promotion
+      # cannot leave the public read tier pointed at a second writable cluster
+      # while reporting healthy. $$ keeps the variables for the container shell.
+      #
+      # pg_isready names the role explicitly, unlike the primary's check: the
+      # standby's pg_hba.conf is the one initdb wrote on the primary, which
+      # trusts loopback, so an unauthenticated probe reaches the role lookup and
+      # logs `FATAL: role "root" does not exist` on every interval.
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -h 127.0.0.1 -p 5432 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+          && PGPASSWORD="$$POSTGRES_PASSWORD"
+          psql -h 127.0.0.1 -p 5432 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+          -c 'SELECT 1' >/dev/null
+          && [ "$$(PGPASSWORD="$$POSTGRES_PASSWORD"
+          psql -h 127.0.0.1 -p 5432 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+          -tAc 'SELECT pg_is_in_recovery()')" = 't' ]
+      interval: 5s
+      timeout: 5s
+      # The first start streams a full base backup before the server exists at
+      # all, so failures inside the grace window must not burn the retry budget.
+      start_period: 60s
       retries: 30
 
   prism-coordinator:
@@ -670,9 +731,10 @@ services:
     command: ["python3", "-m", "lab.prism.public_read_service"]
     # Deliberately NOT depends_on prism-coordinator. The public tier must
     # survive coordinator restarts -- that independence is a large part of why
-    # the surface was extracted -- so it waits only on the database it reads.
+    # the surface was extracted -- so it waits only on the database it reads,
+    # which is the standby, not the primary the coordinator commits through.
     depends_on:
-      prism-postgres:
+      prism-postgres-replica:
         condition: service_healthy
     volumes:
       # Read-only: published evidence is served from the artifact files, and
@@ -689,7 +751,17 @@ services:
       PRISM_POSTGRES_DB: ${PRISM_POSTGRES_DB:-qbit}
       PRISM_POSTGRES_USER: ${PRISM_POSTGRES_USER:-qbit}
       PRISM_POSTGRES_PASSWORD: ${PRISM_POSTGRES_PASSWORD:-change-this}
-      PRISM_DATABASE_URL: ${PRISM_DATABASE_URL:-postgresql://${PRISM_POSTGRES_USER:-qbit}:${PRISM_POSTGRES_PASSWORD:-change-this}@prism-postgres:5432/${PRISM_POSTGRES_DB:-qbit}}
+      # The standby, under its own operator knob. Reusing PRISM_DATABASE_URL
+      # here would let a .env that names the primary -- which the coordinator's
+      # entry legitimately does -- silently point the public tier back at it,
+      # which is exactly what PRISM_PUBLIC_REPLICA_MODE=require then refuses.
+      PRISM_DATABASE_URL: ${PRISM_PUBLIC_DATABASE_URL:-postgresql://${PRISM_POSTGRES_USER:-qbit}:${PRISM_POSTGRES_PASSWORD:-change-this}@prism-postgres-replica:5432/${PRISM_POSTGRES_DB:-qbit}}
+      # Enforce the replica contract: refuse to serve replica-backed routes
+      # from a writable primary, or past a silent replication stream. `off`
+      # is the code default so an existing deployment that has not provisioned
+      # a standby keeps the merged primary-backed behaviour until it cuts over.
+      PRISM_PUBLIC_REPLICA_MODE: ${PRISM_PUBLIC_REPLICA_MODE:-require}
+      PRISM_PUBLIC_REPLICA_MAX_LAG_SECONDS: ${PRISM_PUBLIC_REPLICA_MAX_LAG_SECONDS:-60}
       PRISM_POSTGRES_PSQL_COMMAND: ${PRISM_POSTGRES_PSQL_COMMAND:-}
       PRISM_POSTGRES_READ_CONCURRENCY: ${PRISM_POSTGRES_READ_CONCURRENCY:-4}
       PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS: ${PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS:-15}
@@ -759,3 +831,4 @@ volumes:
   prism-audit-data:
   prism-postgres-data:
   prism-postgres-wal:
+  prism-postgres-replica-data:
