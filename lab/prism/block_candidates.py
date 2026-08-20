@@ -23,7 +23,7 @@ import traceback
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field, replace as dataclass_replace
 from types import SimpleNamespace
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Protocol
 
 from lab.prism import direct_stratum
 from lab.prism.coordinator_config import (
@@ -239,6 +239,29 @@ class BlockCandidateRunResult:
     refresh_client: Any | None = None
 
 
+class BlockCandidateSubmitPort(Protocol):
+    """Land one candidate through the coordinator's submit entrypoint.
+
+    The landing tail has two forms and only the coordinator can tell them
+    apart: embedders and tests replace the bound ``submit_block_candidate``
+    to stand in for the node submission, and that replacement is installed on
+    the instance *after* this service is constructed. The port therefore
+    carries the whole landing call shape -- an already-created
+    ``node_submission`` when the caller made one, and whether the caller
+    already owns the same-hash disposition -- and lets the coordinator resolve
+    the entrypoint per call, instead of the service inspecting it through the
+    runtime seam.
+    """
+
+    def __call__(
+        self,
+        candidate: PrismBlockCandidate,
+        *,
+        node_submission: _BlockCandidateNodeSubmission | None = None,
+        disposition_held: bool = False,
+    ) -> bool: ...
+
+
 @dataclass(frozen=True)
 class BlockCandidatePorts:
     """Callback seams back into the coordinator, resolved at use time.
@@ -254,7 +277,7 @@ class BlockCandidatePorts:
     ledger: Callable[[], Any]
     stop_event: Callable[[], threading.Event]
     writer_operation: Callable[[str], AbstractContextManager[object]]
-    submit_candidate: Callable[[PrismBlockCandidate], bool]
+    submit_candidate: BlockCandidateSubmitPort
     reject_terminal_prepared: Callable[[PrismBlockCandidate], None]
     begin_preview: Callable[[str, int], None]
     clear_preview: Callable[[str, bool], None]
@@ -319,7 +342,9 @@ def block_candidate_intent(candidate: PrismBlockCandidate) -> dict[str, Any]:
             "height": int(context.template["height"]),
             "coinbasevalue": int(context.template["coinbasevalue"]),
         },
-        "shares_json": context.shares_json,
+        # Materialized to a plain list: a daemon-mirror share sequence parses
+        # its dicts lazily, and the durable JSON boundary needs real objects.
+        "shares_json": list(context.shares_json),
         "prior_balances": context.prior_balances,
         "found_block": context.found_block,
         "prospective_prior_balances": (
@@ -2068,17 +2093,15 @@ class BlockCandidateService:
                 node_submission = coordinator._node_submission_for_candidate_or_retained(candidate)
                 coordinator._mark_block_candidate_attempted(block_hash)
                 with coordinator._block_landing_ledger_statement_timeout_scope(block_hash):
-                    production_submit = coordinator._is_production_block_submit()
-                    if production_submit:
-                        block_landed = coordinator._submit_block_candidate_serialized(
-                            candidate,
-                            node_submission=node_submission,
-                        )
-                    else:
-                        block_landed = coordinator._account_block_candidate_after_node_submit(
-                            candidate,
-                            node_submission,
-                        )
+                    # The same-hash disposition is already held here, so the
+                    # coordinator may run its serialized inner tail rather
+                    # than the public entrypoint that would take that guard
+                    # again. Which of the two applies is its call to make.
+                    block_landed = self.ports.submit_candidate(
+                        candidate,
+                        node_submission=node_submission,
+                        disposition_held=True,
+                    )
             except BaseException:
                 coordinator._retain_block_candidate_for_retry(candidate)
                 raise
@@ -2938,20 +2961,15 @@ class BlockCandidateService:
         try:
             coordinator._record_block_submitter_phase("accounting")
             with coordinator._block_landing_ledger_statement_timeout_scope(block_hash):
-                production_submit = coordinator._is_production_block_submit()
-                if disposition_held and production_submit:
-                    assert node_submission is not None
-                    accepted = coordinator._submit_block_candidate_serialized(
-                        candidate,
-                        node_submission=node_submission,
-                    )
-                elif node_submission is None:
-                    accepted = bool(coordinator.submit_block_candidate(candidate))
-                else:
-                    accepted = coordinator._account_block_candidate_after_node_submit(
-                        candidate,
-                        node_submission,
-                    )
+                # ``disposition_held`` states that the serialized inner tail
+                # is available; a ``node_submission`` of None still selects
+                # the historical bare entrypoint call. Both distinctions are
+                # carried to the port rather than decided from here.
+                accepted = self.ports.submit_candidate(
+                    candidate,
+                    node_submission=node_submission,
+                    disposition_held=disposition_held,
+                )
         except Exception:
             error = "candidate submission raised an exception"
             print(

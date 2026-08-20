@@ -36,6 +36,7 @@ from typing import Any, Callable, Protocol
 
 from lab.prism import direct_stratum
 from lab.prism.bundle_compiler import _ShareWindowSerialization
+from lab.prism.share_ledger import DaemonShareJsonSequence
 from lab.prism.coordinator_config import (
     DEFAULT_PRISM_JOB_BUILD_CANCEL_GRACE_SECONDS,
     DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS,
@@ -3062,7 +3063,18 @@ class JobBundleService:
                 raise JobBuildSuperseded(
                     "precomputed payout artifact does not match payout generation"
                 )
-            shares = list(payout_artifact.shares_json)
+            # A daemon-mirror sequence is kept as-is rather than copied into
+            # a list: it parses its dicts lazily, and the routine build path
+            # must not materialize dicts it never consumes. The rare
+            # consumers that need real dicts (the durable candidate intent,
+            # the canonical audit build) coerce at their own call sites.
+            # Every other artifact sequence keeps the historical list copy.
+            artifact_shares_json = payout_artifact.shares_json
+            shares = (
+                artifact_shares_json
+                if isinstance(artifact_shares_json, DaemonShareJsonSequence)
+                else list(artifact_shares_json)
+            )
             # The artifact binds the key above; the balances actually used may
             # still be an accepted parent's prospective carry state.
             prior_balances = runtime._prior_balances_for_job_parent(
@@ -3270,6 +3282,11 @@ class JobBundleService:
                     ),
                     cancellation=cancellation,
                     share_serialization=share_serialization,
+                    append_invalidation_epoch=(
+                        payout_artifact.append_invalidation_epoch
+                        if payout_artifact is not None
+                        else None
+                    ),
                 )
                 collection_only = False
             else:

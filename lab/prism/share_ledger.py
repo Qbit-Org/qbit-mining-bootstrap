@@ -448,6 +448,11 @@ class IncrementalShareWindow:
     def records(self) -> tuple[AcceptedShareRecord, ...]:
         return tuple(record for page in self.pages for record in page.records)
 
+    @property
+    def record_count(self) -> int:
+        """Retained record total; shared surface with DaemonShareWindowMirror."""
+        return sum(len(page.records) for page in self.pages)
+
     def json_records(self) -> IncrementalShareJsonSequence:
         return IncrementalShareJsonSequence(
             pages=self.pages,
@@ -572,6 +577,322 @@ class IncrementalShareWindow:
             added_rows=len(delta),
             expired_rows=expired_rows,
             touched_pages=len(touched_existing_pages),
+        )
+
+
+class DaemonWindowMirrorDivergence(RuntimeError):
+    """The coordinator's byte mirror disagrees with what the daemon reported.
+
+    Every mirror construction re-hashes the canonical items it holds against
+    the digest the daemon reported AND counts the records those bytes
+    actually contain against the count it reported, so a divergence between
+    the two implementations -- or a bug in the byte surgery itself -- becomes
+    a detected full-rescan instead of a silently wrong payout artifact.
+    Both checks are eager: nothing downstream may hold a mirror whose bytes
+    and metadata have not already been reconciled.
+    """
+
+
+def _canonical_items_layout(fragment: bytes) -> tuple[int, bool]:
+    """Record count and trailing-separator flag for one canonical items span.
+
+    Walks the span with ``raw_decode``, which reports where each record's
+    JSON ends without re-encoding anything, so the count comes from the
+    bytes themselves rather than from a number the daemon declared. A span
+    that is not a run of complete records separated by ``,`` -- a truncated
+    record, a doubled or leading separator, junk between records -- is a
+    divergence, not a parse the caller may retry.
+
+    The trailing flag distinguishes ``a,b`` from ``a,b,``: a dropped prefix
+    legitimately ends on a separator when records remain behind it, and a
+    complete stream never does.
+    """
+    if not fragment:
+        return 0, False
+    try:
+        text = fragment.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise DaemonWindowMirrorDivergence(
+            "daemon window mirror items are not valid UTF-8"
+        ) from exc
+    decoder = json.JSONDecoder()
+    count = 0
+    position = 0
+    length = len(text)
+    while True:
+        if text[position] != "{":
+            raise DaemonWindowMirrorDivergence(
+                "daemon window mirror items hold "
+                f"{text[position]!r} where a record was expected"
+            )
+        try:
+            _, end = decoder.raw_decode(text, position)
+        except ValueError as exc:
+            raise DaemonWindowMirrorDivergence(
+                f"daemon window mirror items hold a malformed record: {exc}"
+            ) from exc
+        count += 1
+        if end >= length:
+            return count, False
+        if text[end] != ",":
+            raise DaemonWindowMirrorDivergence(
+                "daemon window mirror items hold "
+                f"{text[end]!r} where a record separator was expected"
+            )
+        position = end + 1
+        if position >= length:
+            return count, True
+
+
+def _canonical_items_record_count(fragment: bytes) -> int:
+    """Record count of one complete canonical items stream."""
+    count, trailing = _canonical_items_layout(fragment)
+    if trailing:
+        raise DaemonWindowMirrorDivergence(
+            "daemon window mirror items end on a record separator"
+        )
+    return count
+
+
+class DaemonShareJsonSequence(Sequence):
+    """Lazy, byte-backed twin of :class:`IncrementalShareJsonSequence`.
+
+    When the daemon owns the payout-window fold, the coordinator holds only
+    the canonical items stream (every record's canonical JSON encoding joined
+    with ``,``) rather than materialized dicts. The routine build path needs
+    only the length, the digest, and this object's identity; the rare
+    consumers that genuinely need dicts (the found-block audit build, the
+    durable candidate intent, the one-shot builder fallback) force one
+    ``json.loads`` here, paying the parse exactly where the bytes are used.
+    Iteration order and the canonical digest are byte-identical to the paged
+    sequence by construction: both stream the same fragments in the same
+    order, and the digest framing is invariant to page layout.
+
+    The count check below is a floor, not the contract: a sequence handed
+    out by :class:`DaemonShareWindowMirror` had its count reconciled with
+    its bytes at construction, so no consumer of a mirror can be the first
+    to learn of a divergence.
+    """
+
+    __slots__ = ("canonical_items", "record_count", "_parse_lock", "_parsed")
+
+    def __init__(self, canonical_items: bytes, record_count: int) -> None:
+        self.canonical_items = bytes(canonical_items)
+        self.record_count = int(record_count)
+        self._parse_lock = Lock()
+        self._parsed: tuple[dict[str, object], ...] | None = None
+
+    def __len__(self) -> int:
+        return self.record_count
+
+    def _records(self) -> tuple[dict[str, object], ...]:
+        with self._parse_lock:
+            if self._parsed is None:
+                parsed = json.loads(b"[" + self.canonical_items + b"]")
+                if len(parsed) != self.record_count:
+                    raise DaemonWindowMirrorDivergence(
+                        "daemon window mirror parsed "
+                        f"{len(parsed)} records where {self.record_count}"
+                        " were declared"
+                    )
+                self._parsed = tuple(parsed)
+            return self._parsed
+
+    def __iter__(self) -> Iterator[dict[str, object]]:
+        return iter(self._records())
+
+    def __getitem__(
+        self,
+        index: int | slice,
+    ) -> dict[str, object] | tuple[dict[str, object], ...]:
+        return self._records()[index]
+
+    def canonical_json_sha256(self) -> str:
+        digest = hashlib.sha256()
+        digest.update(b"[")
+        digest.update(self.canonical_items)
+        digest.update(b"]")
+        return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class DaemonShareWindowMirror:
+    """Coordinator-held opaque mirror of one daemon-prepared payout window.
+
+    Exposes the same identity surface as :class:`IncrementalShareWindow`
+    (anchor, weight, page size, ``record_count``) so the payout-state cache
+    policy code reads either interchangeably, while the window contents stay
+    pre-encoded bytes the daemon produced. Advancing applies the daemon's
+    reported byte surgery -- drop a prefix, append a suffix -- and every
+    construction verifies the resulting stream hashes to the daemon's digest
+    before anything downstream may consume it.
+    """
+
+    anchor_job_issued_at_ms: int
+    window_weight: int
+    page_size: int
+    record_count: int
+    canonical_items: bytes = field(repr=False)
+    share_snapshot_sha256: str
+
+    @staticmethod
+    def _verified_items_digest(canonical_items: bytes, declared_digest: str) -> None:
+        digest = hashlib.sha256()
+        digest.update(b"[")
+        digest.update(canonical_items)
+        digest.update(b"]")
+        if digest.hexdigest() != declared_digest:
+            raise DaemonWindowMirrorDivergence(
+                "daemon window mirror bytes do not hash to the daemon's digest"
+            )
+
+    @staticmethod
+    def _verified_record_count(counted: int, declared_count: int) -> None:
+        """Pin the declared count to one counted from the mirror's own bytes.
+
+        The digest above pins the bytes but says nothing about the count the
+        daemon reported alongside them, and the count is the one divergence
+        that would otherwise surface only when some consumer first parsed the
+        stream -- arbitrarily far from the materialization that produced it,
+        and after a partial request may already be on the daemon's stdin.
+        Counting eagerly here puts it beside the digest check, where every
+        construction pays it once and no consumer can be surprised.
+        """
+        if counted != int(declared_count):
+            raise DaemonWindowMirrorDivergence(
+                f"daemon window mirror holds {counted} records where "
+                f"{int(declared_count)} were declared"
+            )
+
+    @classmethod
+    def from_full_items(
+        cls,
+        *,
+        anchor_job_issued_at_ms: int,
+        window_weight: int,
+        page_size: int,
+        record_count: int,
+        canonical_items: bytes,
+        share_snapshot_sha256: str,
+    ) -> DaemonShareWindowMirror:
+        cls._verified_items_digest(canonical_items, share_snapshot_sha256)
+        cls._verified_record_count(
+            _canonical_items_record_count(canonical_items),
+            record_count,
+        )
+        return cls(
+            anchor_job_issued_at_ms=int(anchor_job_issued_at_ms),
+            window_weight=int(window_weight),
+            page_size=int(page_size),
+            record_count=int(record_count),
+            canonical_items=bytes(canonical_items),
+            share_snapshot_sha256=share_snapshot_sha256,
+        )
+
+    def _advanced_record_count(
+        self,
+        retained_drop_bytes: int,
+        appended_items: bytes,
+    ) -> int:
+        """Count an advance's records from the surgery, not the whole stream.
+
+        Only the dropped prefix and the appended suffix are walked, so this
+        costs what the byte surgery itself costs rather than what a rescan of
+        the retained window would. The already-verified count of this mirror
+        supplies the retained middle, and the separator placement at both
+        seams is checked: a drop or an append landing inside a record would
+        otherwise let a miscount masquerade as an aligned edit.
+        """
+        dropped, dropped_trailing = _canonical_items_layout(
+            self.canonical_items[:retained_drop_bytes]
+        )
+        retained_items = self.canonical_items[retained_drop_bytes:]
+        if retained_items:
+            if dropped and not dropped_trailing:
+                raise DaemonWindowMirrorDivergence(
+                    "daemon window advance dropped a partial record"
+                )
+        elif dropped_trailing:
+            raise DaemonWindowMirrorDivergence(
+                "daemon window advance dropped every record but kept a"
+                " separator"
+            )
+        retained = int(self.record_count) - dropped
+        if retained < 0:
+            raise DaemonWindowMirrorDivergence(
+                "daemon window advance dropped more records than the mirror"
+                " holds"
+            )
+        if not appended_items:
+            return retained
+        if retained_items:
+            # The retained span already ends on a record, so the suffix must
+            # carry the separator that rejoins the two.
+            if appended_items[:1] != b",":
+                raise DaemonWindowMirrorDivergence(
+                    "daemon window advance appended items without a record"
+                    " separator"
+                )
+            appended = _canonical_items_record_count(appended_items[1:])
+        else:
+            appended = _canonical_items_record_count(appended_items)
+        if not appended:
+            # A suffix that carried only a separator would leave the stream
+            # ending on one, which no complete window ever does.
+            raise DaemonWindowMirrorDivergence(
+                "daemon window advance appended a separator with no record"
+            )
+        return retained + appended
+
+    def advanced(
+        self,
+        *,
+        anchor_job_issued_at_ms: int,
+        record_count: int,
+        retained_drop_bytes: int,
+        appended_items: bytes,
+        share_snapshot_sha256: str,
+    ) -> DaemonShareWindowMirror:
+        retained_drop_bytes = int(retained_drop_bytes)
+        if retained_drop_bytes < 0 or retained_drop_bytes > len(self.canonical_items):
+            raise DaemonWindowMirrorDivergence(
+                "daemon window advance dropped more bytes than the mirror holds"
+            )
+        if retained_drop_bytes == 0 and not appended_items:
+            # Anchor-only advance: the stream is byte-identical, so a digest
+            # string comparison replaces the copy and the re-hash, and the
+            # count must be unchanged for the same reason.
+            canonical_items = self.canonical_items
+            if share_snapshot_sha256 != self.share_snapshot_sha256:
+                raise DaemonWindowMirrorDivergence(
+                    "daemon window advance changed the digest without bytes"
+                )
+            self._verified_record_count(self.record_count, record_count)
+        else:
+            canonical_items = (
+                self.canonical_items[retained_drop_bytes:] + bytes(appended_items)
+            )
+            self._verified_items_digest(canonical_items, share_snapshot_sha256)
+            self._verified_record_count(
+                self._advanced_record_count(
+                    retained_drop_bytes,
+                    bytes(appended_items),
+                ),
+                record_count,
+            )
+        return DaemonShareWindowMirror(
+            anchor_job_issued_at_ms=int(anchor_job_issued_at_ms),
+            window_weight=self.window_weight,
+            page_size=self.page_size,
+            record_count=int(record_count),
+            canonical_items=canonical_items,
+            share_snapshot_sha256=share_snapshot_sha256,
+        )
+
+    def json_records(self) -> DaemonShareJsonSequence:
+        return DaemonShareJsonSequence(
+            canonical_items=self.canonical_items,
+            record_count=self.record_count,
         )
 
 

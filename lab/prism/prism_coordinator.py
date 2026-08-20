@@ -377,6 +377,7 @@ from lab.prism.share_ledger import (
     DEFAULT_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS,
     DEFAULT_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS,
     DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,  # noqa: F401 - compatibility re-export
+    DaemonWindowMirrorDivergence,
     PendingShare,
     PsqlShareLedger,
     SingleWriterShareLedger,
@@ -2017,8 +2018,14 @@ class PrismCoordinator:
                     ledger=lambda: self.ledger,
                     stop_event=lambda: self.stop_event,
                     writer_operation=lambda component: self._writer_operation(component),
-                    submit_candidate=lambda candidate: self.submit_block_candidate(
-                        candidate
+                    submit_candidate=(
+                        lambda candidate, *, node_submission=None, disposition_held=False: (
+                            self._land_block_candidate_submission(
+                                candidate,
+                                node_submission=node_submission,
+                                disposition_held=disposition_held,
+                            )
+                        )
                     ),
                     reject_terminal_prepared=(
                         lambda candidate: self._reject_terminal_prepared_block_candidate(
@@ -4046,9 +4053,9 @@ class PrismCoordinator:
         """Whether a ledger snapshot exposes the append-only window contract."""
         return PayoutStateService._incremental_window_records_supported(records)
 
-    def _full_payout_window_materialization(self, *, snapshot_anchor_ms: int, snapshot_window_weight: int, reason: str, observed_monotonic: float, append_invalidation_epoch: int) -> _PayoutWindowMaterialization:
+    def _full_payout_window_materialization(self, *, snapshot_anchor_ms: int, snapshot_window_weight: int, reason: str, observed_monotonic: float, append_invalidation_epoch: int, bypass_build_interval: bool=False) -> _PayoutWindowMaterialization:
         """Run the exact ledger oracle and atomically replace cached pages."""
-        return self._ensure_payout_state_service()._full_payout_window_materialization(snapshot_anchor_ms=snapshot_anchor_ms, snapshot_window_weight=snapshot_window_weight, reason=reason, observed_monotonic=observed_monotonic, append_invalidation_epoch=append_invalidation_epoch)
+        return self._ensure_payout_state_service()._full_payout_window_materialization(snapshot_anchor_ms=snapshot_anchor_ms, snapshot_window_weight=snapshot_window_weight, reason=reason, observed_monotonic=observed_monotonic, append_invalidation_epoch=append_invalidation_epoch, bypass_build_interval=bypass_build_interval)
 
     def _incremental_payout_window_materialization(self, *, snapshot_anchor_ms: int, snapshot_window_weight: int, force_full_rescan: bool, bypass_build_interval: bool, append_invalidation_epoch: int, reused_prior_balances_sha256: str | None=None) -> _PayoutWindowMaterialization:
         """Return an exact window using debounce, delta folding, or the oracle."""
@@ -4103,6 +4110,10 @@ class PrismCoordinator:
 
     def _record_payout_artifact_event(self, event: str) -> None:
         return self._ensure_payout_state_service()._record_payout_artifact_event(event)
+
+    def _note_window_mirror_divergence(self) -> None:
+        """Invalidate a refuted daemon window mirror and count the event."""
+        return self._ensure_payout_state_service()._note_window_mirror_divergence()
 
     def _usable_payout_ledger_artifact(self, payout_state_generation: int, network_difficulty: int, *, rearm_on_fence_failure: bool=True) -> PayoutLedgerArtifact | None:
         """Return the armed artifact when reuse is valid for NEW work."""
@@ -7783,6 +7794,7 @@ class PrismCoordinator:
         ctv_settlement: dict[str, object] | None = None,
         cancellation: _JobBuildCancellation | None = None,
         share_serialization: _ShareWindowSerialization | None = None,
+        append_invalidation_epoch: int | None = None,
     ) -> dict[str, Any]:
         return self._ensure_bundle_compiler().build_audit_bundle(
             shares=shares,
@@ -7799,6 +7811,31 @@ class PrismCoordinator:
             ctv_settlement=ctv_settlement,
             cancellation=cancellation,
             share_serialization=share_serialization,
+            append_invalidation_epoch=append_invalidation_epoch,
+        )
+
+    def prepare_payout_window(
+        self,
+        *,
+        mode: str,
+        records_json: list[dict[str, object]],
+        anchor_job_issued_at_ms: int,
+        append_invalidation_epoch: int,
+        window_weight: int | None = None,
+        page_size: int | None = None,
+        base_digest: str | None = None,
+        wait_for_daemon: bool = True,
+    ) -> Any:
+        """Fold/advance one payout window through the persistent builder."""
+        return self._ensure_bundle_compiler().prepare_payout_window(
+            mode=mode,
+            records_json=records_json,
+            anchor_job_issued_at_ms=anchor_job_issued_at_ms,
+            append_invalidation_epoch=append_invalidation_epoch,
+            window_weight=window_weight,
+            page_size=page_size,
+            base_digest=base_digest,
+            wait_for_daemon=wait_for_daemon,
         )
 
     def coinbase_script_sig_suffix_hex(self, extranonce1_hex: str, extranonce2_hex: str) -> str:
@@ -7894,10 +7931,21 @@ class PrismCoordinator:
             )
         return False
 
-    @staticmethod
-    def block_candidate_intent(candidate: PrismBlockCandidate) -> dict[str, Any]:
-        """Return the immutable JSON needed to resume a candidate after restart."""
-        return encode_block_candidate_intent(candidate)
+    def block_candidate_intent(self, candidate: PrismBlockCandidate) -> dict[str, Any]:
+        """Return the immutable JSON needed to resume a candidate after restart.
+
+        The durable JSON boundary is where a daemon-mirror share sequence is
+        forced to real dicts, so it is also where a refuted mirror would
+        first be seen on the landing path. Route it before it propagates:
+        the candidate cannot be persisted from a window the coordinator no
+        longer trusts, and the next build must not resume from that window
+        either.
+        """
+        try:
+            return encode_block_candidate_intent(candidate)
+        except DaemonWindowMirrorDivergence:
+            self._note_window_mirror_divergence()
+            raise
 
     def block_candidate_from_intent(
         self,
@@ -9055,18 +9103,46 @@ class PrismCoordinator:
             revalidated_append_epoch=revalidated_append_epoch,
         )
 
-    def _is_production_block_submit(self) -> bool:
-        """Report whether ``submit_block_candidate`` is still the production entrypoint.
+    def _land_block_candidate_submission(
+        self,
+        candidate: PrismBlockCandidate,
+        *,
+        node_submission: _BlockCandidateNodeSubmission | None = None,
+        disposition_held: bool = False,
+    ) -> bool:
+        """Run one candidate's landing tail behind the named submit port.
 
-        Embeddings and tests replace the bound method to stand in for the node
-        submission. The block-candidate owner must know which of the two
-        landing tails to run, and only the coordinator can answer that without
-        reaching back into this module. Resolved per call because the
-        replacement is installed on the instance after construction.
+        Embeddings and tests replace the bound ``submit_block_candidate`` to
+        stand in for the node submission, so which of the two landing tails
+        applies is a fact about this coordinator rather than about the
+        block-candidate owner. Deciding it here keeps that owner from reaching
+        back through the runtime seam to inspect the entrypoint, and keeps the
+        decision per call: the replacement is installed on the instance after
+        the block-candidate service is constructed.
+
+        ``node_submission`` is an already-created offer result when the caller
+        made one, and None when none was created -- which keeps the historical
+        bare entrypoint call. ``disposition_held`` states that the caller
+        already owns the same-hash disposition, which is what makes the
+        serialized inner tail, rather than the public entrypoint that would
+        take that guard again, the correct production call.
         """
-        return (
-            getattr(self.submit_block_candidate, "__func__", None)
+        submit = self.submit_block_candidate
+        production_submit = (
+            getattr(submit, "__func__", None)
             is PrismCoordinator.submit_block_candidate
+        )
+        if disposition_held and production_submit:
+            assert node_submission is not None
+            return self._submit_block_candidate_serialized(
+                candidate,
+                node_submission=node_submission,
+            )
+        if node_submission is None:
+            return bool(submit(candidate))
+        return self._account_block_candidate_after_node_submit(
+            candidate,
+            node_submission,
         )
 
     @ledger_writer_operation("accepted_block_handling")

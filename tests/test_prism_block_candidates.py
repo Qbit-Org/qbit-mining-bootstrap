@@ -1760,6 +1760,228 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
 
         self.assertIs(service.ports.stop_event(), replacement)
 
+    def test_b1_landing_tail_routes_through_the_named_submit_port(self) -> None:
+        # #127: both landing consumers hand the whole call shape to the named
+        # submit port instead of asking the runtime seam which tail is live.
+        server, state, _ledger = submit_coordinator()
+        service = server._ensure_block_candidate_service()
+        self.assertFalse(hasattr(server, "_is_production_block_submit"))
+        calls: list[tuple[str, object, bool]] = []
+
+        def recording_port(
+            landing: PrismBlockCandidate,
+            *,
+            node_submission: object = None,
+            disposition_held: bool = False,
+        ) -> bool:
+            calls.append(
+                (
+                    str(landing.submission.block_hash_hex),
+                    node_submission,
+                    disposition_held,
+                )
+            )
+            return True
+
+        service.ports = dataclasses.replace(
+            service.ports,
+            submit_candidate=recording_port,
+        )
+        queued = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex="d1" * 32,
+                block_hex="00",
+                share_pass=True,
+                block_pass=True,
+            ),
+        )
+        server.enqueue_block_candidate(queued)
+        self.assertTrue(server.submit_next_block_candidate())
+
+        synchronous = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex="d2" * 32,
+                block_hex="00",
+                share_pass=True,
+                block_pass=True,
+            ),
+        )
+        self.assertTrue(server._submit_synchronous_block_candidate(synchronous))
+
+        self.assertEqual([call[0] for call in calls], ["d1" * 32, "d2" * 32])
+        # Both consumers already own the same-hash disposition, and both pass
+        # the node submission they created rather than leaving it to the port.
+        self.assertEqual([call[2] for call in calls], [True, True])
+        for _block_hash, node_submission, _held in calls:
+            self.assertIsInstance(node_submission, _BlockCandidateNodeSubmission)
+
+    def test_b1_submit_port_honours_replacement_installed_after_construction(
+        self,
+    ) -> None:
+        # The service is built before the double is installed, so the named
+        # port must resolve the coordinator's callable at call time.
+        server, state, _ledger = submit_coordinator()
+        service = server._ensure_block_candidate_service()
+        landed: list[str] = []
+
+        def double(landing: PrismBlockCandidate) -> bool:
+            landed.append(str(landing.submission.block_hash_hex))
+            return True
+
+        server.submit_block_candidate = double  # type: ignore[method-assign]
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex="d3" * 32,
+                block_hex="00",
+                share_pass=True,
+                block_pass=True,
+            ),
+        )
+        server.enqueue_block_candidate(candidate)
+        self.assertTrue(server.submit_next_block_candidate())
+
+        self.assertEqual(landed, ["d3" * 32])
+        self.assertIs(service, server._ensure_block_candidate_service())
+
+    def test_b1_submit_port_preserves_every_former_landing_call_shape(self) -> None:
+        server, state, _ledger = submit_coordinator()
+        port = server._ensure_block_candidate_service().ports.submit_candidate
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex="d4" * 32,
+                block_hex="00",
+                share_pass=True,
+                block_pass=True,
+            ),
+        )
+        node_submission = _BlockCandidateNodeSubmission(attempted=False)
+
+        # Shape 1: production entrypoint plus a held disposition runs the
+        # serialized inner tail, not the public entrypoint that would take
+        # that same-hash guard a second time.
+        serialized: list[object] = []
+        server._submit_block_candidate_serialized = (  # type: ignore[method-assign]
+            lambda _landing, *, node_submission: (
+                serialized.append(node_submission) or True
+            )
+        )
+        self.assertTrue(
+            port(candidate, node_submission=node_submission, disposition_held=True)
+        )
+        self.assertEqual(serialized, [node_submission])
+
+        shapes: list[tuple[str, object]] = []
+
+        def bare_double(_landing: PrismBlockCandidate) -> bool:
+            shapes.append(("bare", None))
+            return True
+
+        # Shape 2: no node submission was created, so the historical bare
+        # entrypoint call stands -- including when the disposition is held,
+        # which is the writer path's middle arm.
+        server.submit_block_candidate = bare_double  # type: ignore[method-assign]
+        self.assertTrue(port(candidate))
+        self.assertTrue(
+            port(candidate, node_submission=None, disposition_held=True)
+        )
+
+        def sniffed_double(
+            _landing: PrismBlockCandidate,
+            *,
+            node_submission: object = None,
+        ) -> bool:
+            shapes.append(("node-submission", node_submission))
+            return True
+
+        # Shape 3: an already-created node submission is passed through to a
+        # replacement whose signature can accept it.
+        server.submit_block_candidate = sniffed_double  # type: ignore[method-assign]
+        self.assertTrue(
+            port(candidate, node_submission=node_submission, disposition_held=True)
+        )
+        self.assertTrue(port(candidate, node_submission=node_submission))
+
+        self.assertEqual(
+            shapes,
+            [
+                ("bare", None),
+                ("bare", None),
+                ("node-submission", node_submission),
+                ("node-submission", node_submission),
+            ],
+        )
+
+    def test_b1_production_landing_still_reaches_the_serialized_tail(self) -> None:
+        # #127 is structural hygiene: submit-double tests still do not run
+        # _submit_block_candidate_serialized. This pins the other side -- with
+        # no double installed, ordinary production operation still does.
+        old_tip = "00" * 32
+        new_tip = "11" * 32
+        block_hash = "cd" * 32
+        server, state, _recording = submit_coordinator(tip=old_tip)
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        pending = self._pending_append("production-serialized-tail").pending_share
+        candidate = block_candidate(
+            server,
+            state,
+            SimpleNamespace(
+                coinbase_tx_hex="00",
+                block_hash_hex=block_hash,
+                block_hex="00",
+                share_pass=True,
+                block_pass=True,
+            ),
+            pending_share=pending,
+        )
+        ledger.append_batch([(pending, server.block_candidate_intent(candidate))])
+        submitted: list[str] = []
+        original_submitted = ledger.mark_block_candidate_submitted
+
+        def mark_submitted(*, block_hash: str) -> bool:
+            submitted.append(block_hash)
+            return original_submitted(block_hash=block_hash)
+
+        ledger.mark_block_candidate_submitted = mark_submitted  # type: ignore[method-assign]
+        server._begin_accepted_block_payout_preview(block_hash, block_height=10)
+        server._mark_accepted_block_payout_landed(block_hash, block_height=10)
+        with server.lock:
+            server._accounted_accepted_block_hashes.add(block_hash)
+        server.rpc = TipRpc(new_tip)
+        serialized: list[object] = []
+        real_serialized = server._submit_block_candidate_serialized
+
+        def recording_serialized(
+            landing: PrismBlockCandidate,
+            *,
+            node_submission: object,
+        ) -> bool:
+            serialized.append(node_submission)
+            return real_serialized(landing, node_submission=node_submission)
+
+        server._submit_block_candidate_serialized = (  # type: ignore[method-assign]
+            recording_serialized
+        )
+        server.enqueue_block_candidate(candidate)
+
+        self.assertTrue(server.submit_next_block_candidate())
+
+        self.assertEqual(submitted, [block_hash])
+        self.assertEqual(len(serialized), 1)
+        self.assertIsInstance(serialized[0], _BlockCandidateNodeSubmission)
+
     def test_failed_replay_adoption_does_not_abort_remaining_rows(self) -> None:
         server, state, _recording = submit_coordinator()
         ledger = SingleWriterShareLedger()
