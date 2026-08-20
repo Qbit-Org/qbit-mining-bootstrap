@@ -1352,6 +1352,242 @@ fn build_audit_bundle_serve_mode_caches_parsed_windows() {
 }
 
 #[test]
+fn prepare_window_declares_out_of_range_values_and_survives_them() {
+    // serde refuses an integer above its declared width with the same parse
+    // error a corrupt line gets. Answered as "malformed serve request", the
+    // coordinator read it as an anomaly and SIGKILLed a healthy daemon once
+    // per materialization for as long as the window held the value. The
+    // daemon now classifies such a request as out_of_range -- naming the
+    // field, its literal and the width -- keeps its state, and goes on
+    // serving; a genuinely malformed line is still malformed, and the two
+    // rejection shapes carry their stable category beside the message.
+    use std::io::{BufRead, BufReader as StdBufReader, Read as IoRead, Write as IoWrite};
+    use std::process::Stdio;
+
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_qbit-prism-build-audit-bundle"))
+        .arg("--serve")
+        .arg("--signing-key-seed-hex")
+        .arg("42".repeat(32))
+        .arg("--ledger-signing-key-seed-hex")
+        .arg("43".repeat(32))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = daemon.stdin.take().unwrap();
+    let mut stdout = StdBufReader::new(daemon.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()["event"],
+        "handshake"
+    );
+
+    // Literals above u128/u32 cannot be built with json!, so the request is
+    // written as text -- exactly as the coordinator's json.dumps sends it.
+    fn share_text(seq: u64, difficulty: &str, ntime: &str, ms: i64) -> String {
+        format!(
+            concat!(
+                "{{\"share_seq\":{seq},\"share_id\":\"share-{seq}\",\"miner_id\":\"miner-{m}\",",
+                "\"order_key\":\"{m:02}:miner\",\"p2mr_program_hex\":\"{hex}\",",
+                "\"share_difficulty\":{difficulty},\"network_difficulty\":1000,",
+                "\"template_height\":100,\"job_id\":\"job-{seq}\",",
+                "\"job_issued_at_ms\":{ms},\"accepted_at_ms\":{ms},\"ntime\":{ntime}}}"
+            ),
+            seq = seq,
+            m = seq % 3,
+            hex = format!("{:02x}", seq % 256).repeat(32),
+            difficulty = difficulty,
+            ms = ms,
+            ntime = ntime,
+        )
+    }
+    let prepare = |records: &[String], window_weight: &str| {
+        format!(
+            "{{\"request\":\"prepare_window\",\"mode\":\"full\",\"append_invalidation_epoch\":1,\
+             \"anchor_job_issued_at_ms\":1000003,\"window_weight\":{window_weight},\"records\":[{}]}}",
+            records.join(",")
+        )
+    };
+    fn answer(
+        stdin: &mut std::process::ChildStdin,
+        stdout: &mut StdBufReader<std::process::ChildStdout>,
+        request: &str,
+    ) -> serde_json::Value {
+        writeln!(stdin, "{request}").unwrap();
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap_or_else(|error| panic!("{error}: {line}"))
+    }
+
+    // share_difficulty one above u128 on the second record.
+    let beyond_u128 = answer(
+        &mut stdin,
+        &mut stdout,
+        &prepare(
+            &[
+                share_text(1, "1", "1700000000", 1_000_001),
+                share_text(
+                    2,
+                    "340282366920938463463374607431768211456",
+                    "1700000000",
+                    1_000_001,
+                ),
+            ],
+            "1000",
+        ),
+    );
+    assert_eq!(beyond_u128["ok"], false, "{beyond_u128}");
+    assert_eq!(beyond_u128["request"], "prepare_window");
+    assert_eq!(beyond_u128["out_of_range"], true);
+    assert_eq!(beyond_u128["field"], "records[1].share_difficulty");
+    assert_eq!(beyond_u128["width"], "u128");
+    assert!(beyond_u128.get("needs_window").is_none());
+    assert!(beyond_u128["error"]
+        .as_str()
+        .unwrap()
+        .contains("340282366920938463463374607431768211456"));
+
+    // ntime one above u32, and a window_weight one above u128.
+    let beyond_u32 = answer(
+        &mut stdin,
+        &mut stdout,
+        &prepare(&[share_text(1, "1", "4294967296", 1_000_001)], "1000"),
+    );
+    assert_eq!(beyond_u32["out_of_range"], true, "{beyond_u32}");
+    assert_eq!(beyond_u32["field"], "records[0].ntime");
+    assert_eq!(beyond_u32["width"], "u32");
+    let beyond_weight = answer(
+        &mut stdin,
+        &mut stdout,
+        &prepare(
+            &[share_text(1, "1", "1700000000", 1_000_001)],
+            "340282366920938463463374607431768211456",
+        ),
+    );
+    assert_eq!(beyond_weight["out_of_range"], true, "{beyond_weight}");
+    assert_eq!(beyond_weight["field"], "window_weight");
+
+    // Every input at its width, but the retained total leaves u128: the
+    // accumulator is declined, never saturated.
+    let overflow = answer(
+        &mut stdin,
+        &mut stdout,
+        &prepare(
+            &[
+                share_text(
+                    1,
+                    "170141183460469231731687303715884105728",
+                    "1700000000",
+                    1_000_001,
+                ),
+                share_text(
+                    2,
+                    "170141183460469231731687303715884105728",
+                    "1700000000",
+                    1_000_001,
+                ),
+            ],
+            "340282366920938463463374607431768211455",
+        ),
+    );
+    assert_eq!(overflow["out_of_range"], true, "{overflow}");
+    assert_eq!(overflow["field"], "total_difficulty");
+    assert_eq!(overflow["width"], "u128");
+
+    // A genuinely malformed line is still a malformed request.
+    let malformed = answer(&mut stdin, &mut stdout, "{\"request\":\"prepare_window\",\"mode\":\"full\",\"records\":[{\"share_difficulty\":1.5}]");
+    assert_eq!(malformed["ok"], false);
+    assert!(malformed["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("malformed serve request"));
+    assert!(malformed.get("out_of_range").is_none());
+
+    // Rejections name their condition in a stable category.
+    let duplicate = answer(
+        &mut stdin,
+        &mut stdout,
+        &prepare(
+            &[
+                share_text(1, "1", "1700000000", 1_000_001),
+                share_text(1, "2", "1700000000", 1_000_001),
+            ],
+            "1000",
+        ),
+    );
+    assert_eq!(duplicate["fold_invalid"], true, "{duplicate}");
+    assert_eq!(duplicate["rejection"], "duplicate_share_seq");
+    assert_eq!(
+        duplicate["error"],
+        "full payout window contains duplicate share_seq"
+    );
+
+    // The same process, afterwards, prepares and advances a window at the
+    // declared edges exactly: u64::MAX share_seq, u128::MAX window_weight,
+    // u32::MAX ntime, and difficulties whose retained total is exactly
+    // u128::MAX.
+    let edge = answer(
+        &mut stdin,
+        &mut stdout,
+        &prepare(
+            &[
+                share_text(
+                    1,
+                    "340282366920938463463374607431768211454",
+                    "4294967295",
+                    1_000_001,
+                ),
+                share_text(18446744073709551615, "1", "4294967295", 1_000_001),
+            ],
+            "340282366920938463463374607431768211455",
+        ),
+    );
+    assert_eq!(edge["ok"], true, "{edge}");
+    assert_eq!(edge["record_count"], 2);
+    let base_digest = edge["share_snapshot_sha256"].as_str().unwrap().to_string();
+    let items_len = edge["window_items_len"].as_u64().unwrap() as usize;
+    let mut raw = vec![0u8; items_len + 1];
+    stdout.read_exact(&mut raw).unwrap();
+    assert_eq!(raw[items_len], b'\n');
+    let items = String::from_utf8(raw[..items_len].to_vec()).unwrap();
+    assert!(items.contains("\"share_difficulty\":340282366920938463463374607431768211454"));
+    assert!(items.contains("\"share_seq\":18446744073709551615"));
+    assert!(items.contains("\"ntime\":4294967295"));
+
+    let advance = answer(
+        &mut stdin,
+        &mut stdout,
+        &format!(
+        "{{\"request\":\"prepare_window\",\"mode\":\"advance\",\"append_invalidation_epoch\":1,\
+         \"anchor_job_issued_at_ms\":1000004,\"base_digest\":\"{base_digest}\",\"records\":[]}}"
+    ),
+    );
+    assert_eq!(advance["ok"], true, "{advance}");
+    assert_eq!(advance["record_count"], 2);
+    let appended_len = advance["appended_items_len"].as_u64().unwrap() as usize;
+    let mut raw = vec![0u8; appended_len + 1];
+    stdout.read_exact(&mut raw).unwrap();
+
+    let not_append = answer(
+        &mut stdin,
+        &mut stdout,
+        &format!(
+        "{{\"request\":\"prepare_window\",\"mode\":\"advance\",\"append_invalidation_epoch\":1,\
+         \"anchor_job_issued_at_ms\":1000005,\"base_digest\":\"{base_digest}\",\"records\":[{}]}}",
+        share_text(3, "1", "1700000000", 1_000_005)
+    ),
+    );
+    assert_eq!(not_append["fallback"], true, "{not_append}");
+    assert_eq!(not_append["rejection"], "delta_not_append");
+
+    drop(stdin);
+    let status = daemon.wait().unwrap();
+    assert!(status.success());
+}
+
+#[test]
 fn prepare_window_advance_ignores_the_append_invalidation_epoch_tag() {
     // The coordinator's late-append policy is finer than any tag this daemon
     // could apply: it clears the incremental cache only when the late row

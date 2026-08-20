@@ -1,5 +1,8 @@
 use qbit_pool_builder::{ManifestSigningKey, SignedPayoutManifest};
-use qbit_prism::window::{PayoutWindow, DEFAULT_WINDOW_PAGE_SIZE};
+use qbit_prism::window::{
+    prepare_window_out_of_range, OutOfRangeField, PayoutWindow, DEFAULT_WINDOW_PAGE_SIZE,
+    DIFFICULTY_OVERFLOW_MESSAGE,
+};
 use qbit_prism::{
     build_audit_bundle_with_coinbase_options, build_audit_bundle_with_ctv_settlement_options,
     profile_audit_build, AcceptedShare, AuditBundle, CarryForwardBalance, FanoutFeeRatePolicy,
@@ -17,7 +20,13 @@ const PHASE_METRICS_PREFIX: &str = "qbit-prism-build-phase-metrics ";
 /// version and falls back to one-shot builds instead. Version 2 adds the
 /// prepare_window request (payout-window fold, canonical digest, and
 /// incremental advance daemon-side) and unifies its window state with the
-/// build cache.
+/// build cache. Its non-success prepare_window envelopes carry structure,
+/// never just prose: `fold_invalid` and `fallback` name the refused
+/// condition in a stable `rejection` category (the parity oracle's
+/// vocabulary) beside the human-readable `error`, and `out_of_range` --
+/// distinct from a malformed request -- declares an integer outside the
+/// daemon's declared widths (`field`, `width`, `error`) so the coordinator
+/// folds that window in-process and keeps the daemon.
 const SERVE_PROTOCOL_VERSION: u64 = 2;
 /// Parsed share windows retained by the --serve daemon. Windows rotate with
 /// payout/artifact generations, so two entries cover the current generation
@@ -419,7 +428,23 @@ fn serve_requests(
         let request: ServeRequest = match serde_json::from_str(&line) {
             Ok(request) => request,
             Err(error) => {
-                respond_error(&stdout, &format!("malformed serve request: {error}"), false)?;
+                // serde refuses an integer above its declared width with
+                // the same parse error a corrupt line gets, but the two are
+                // different outcomes: a prepare_window request carrying
+                // such a value is ordinary control flow (the daemon
+                // declines the window, the coordinator folds it
+                // in-process), never a daemon anomaly. Only the failure
+                // path pays for the second, exact-digit parse.
+                if let Some(out_of_range) = prepare_window_out_of_range_line(&line) {
+                    respond_prepare_out_of_range(
+                        &stdout,
+                        &out_of_range.field,
+                        out_of_range.width.name(),
+                        &out_of_range.to_string(),
+                    )?;
+                } else {
+                    respond_error(&stdout, &format!("malformed serve request: {error}"), false)?;
+                }
                 continue;
             }
         };
@@ -595,15 +620,31 @@ fn serve_requests(
     Ok(())
 }
 
+/// Classify a line the strict parse refused: a syntactically valid
+/// prepare_window request whose first out-of-width integer is returned, or
+/// None when the line is malformed (or is not a prepare_window request, whose
+/// width problems the build path does not declare).
+fn prepare_window_out_of_range_line(line: &str) -> Option<OutOfRangeField> {
+    let document: serde_json::Value = serde_json::from_str(line).ok()?;
+    if document.get("request").and_then(serde_json::Value::as_str) != Some("prepare_window") {
+        return None;
+    }
+    prepare_window_out_of_range(&document)
+}
+
 /// Handle one prepare_window request against the unified window cache.
 ///
 /// Success responses append a raw canonical-items section after the JSON
 /// envelope line: the full items stream for `full` mode, or the appended
 /// suffix for `advance` mode (whose envelope also carries the byte count to
-/// drop from the front of the previous stream). The two distinguishable
-/// non-success outcomes -- `needs_full` (state not held) and `fallback`
-/// (an advance invariant failed) -- are ordinary control flow for the
-/// coordinator, never daemon anomalies.
+/// drop from the front of the previous stream). The distinguishable
+/// non-success outcomes -- `needs_full` (state not held), `fallback` (an
+/// advance invariant failed), `fold_invalid` (the snapshot violates the
+/// fold's invariants) and `out_of_range` (an integer, or the difficulty
+/// total, outside the declared widths) -- are ordinary control flow for the
+/// coordinator, never daemon anomalies. The two rejection shapes carry the
+/// parity oracle's category in `rejection` so clients never match on the
+/// message text.
 fn serve_prepare_window(
     stdout: &io::Stdout,
     request: ServeRequest,
@@ -640,6 +681,19 @@ fn serve_prepare_window(
             ) {
                 Ok(window) => window,
                 Err(error) => {
+                    let Some(rejection) = error.rejection_category() else {
+                        // Valid snapshot, but its retained difficulty total
+                        // leaves the declared u128 domain: decline it so
+                        // the coordinator folds in-process, exactly as for
+                        // an out-of-width input.
+                        respond_prepare_out_of_range(
+                            stdout,
+                            "total_difficulty",
+                            "u128",
+                            DIFFICULTY_OVERFLOW_MESSAGE,
+                        )?;
+                        return Ok(());
+                    };
                     // The snapshot itself violates the fold's invariants
                     // (duplicate share_seq/share_id, non-positive
                     // difficulty). The coordinator's in-process oracle
@@ -652,6 +706,7 @@ fn serve_prepare_window(
                             "ok": false,
                             "request": "prepare_window",
                             "fold_invalid": true,
+                            "rejection": rejection,
                             "error": error.to_string(),
                         }),
                     )?;
@@ -739,6 +794,17 @@ fn serve_prepare_window(
             let (advanced, stats, byte_delta) = match advance_result {
                 Ok(result) => result,
                 Err(error) => {
+                    let Some(rejection) = error.rejection_category() else {
+                        // The base stays held and untouched; the
+                        // coordinator rebuilds this window in-process.
+                        respond_prepare_out_of_range(
+                            stdout,
+                            "total_difficulty",
+                            "u128",
+                            DIFFICULTY_OVERFLOW_MESSAGE,
+                        )?;
+                        return Ok(());
+                    };
                     // An advance invariant failed: the coordinator must take
                     // exactly its IncrementalWindowFallback path (clear the
                     // cache, full-rescan) rather than retiring the daemon.
@@ -749,6 +815,7 @@ fn serve_prepare_window(
                             "ok": false,
                             "request": "prepare_window",
                             "fallback": true,
+                            "rejection": rejection,
                             "error": error.to_string(),
                         }),
                     )?;
@@ -824,6 +891,33 @@ fn serve_prepare_window(
             respond_error(stdout, "prepare_window carries no mode", false)?;
         }
     }
+    Ok(())
+}
+
+/// Decline a prepare_window request whose integers (or difficulty total)
+/// lie outside the declared widths. Shaped as a prepare_window outcome, not
+/// a malformed-request error, because the coordinator retires the daemon on
+/// the latter and merely folds in-process on the former.
+fn respond_prepare_out_of_range(
+    stdout: &io::Stdout,
+    field: &str,
+    width: &str,
+    error: &str,
+) -> Result<(), Box<dyn Error>> {
+    let mut out = stdout.lock();
+    serde_json::to_writer(
+        &mut out,
+        &serde_json::json!({
+            "ok": false,
+            "request": "prepare_window",
+            "out_of_range": true,
+            "field": field,
+            "width": width,
+            "error": error,
+        }),
+    )?;
+    writeln!(out)?;
+    out.flush()?;
     Ok(())
 }
 

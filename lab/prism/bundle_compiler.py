@@ -351,10 +351,24 @@ class PreparedWindowOutcome:
     - ``"fold_invalid"`` -- the full snapshot itself violates the fold's
       invariants; the in-process oracle raises the same rejection, so the
       caller falls through to it for the authoritative error.
+    - ``"out_of_range"`` -- the request carries an integer outside the
+      daemon's declared widths (``share_seq`` u64, ``share_difficulty`` and
+      ``network_difficulty`` u128, ``template_height`` u64, ``ntime`` u32,
+      millisecond stamps i64, ``window_weight`` u128) or a difficulty total
+      that leaves u128. The daemon is healthy, keeps its state and stays
+      registered; this materialization degrades to the in-process pipeline,
+      whose unbounded integers fold the window exactly. Ordinary control
+      flow, never a daemon anomaly -- distinct from a malformed request,
+      which does retire the daemon.
     - ``"busy"`` -- another build owns the daemon and it could not be had
       within this preparation's budget. The daemon is healthy and stays
       registered; this materialization degrades to the in-process pipeline.
       Ordinary control flow, never a daemon anomaly.
+
+    ``rejection`` is populated for ``fallback`` and ``fold_invalid``: the
+    daemon's stable, machine-readable category for the refused condition
+    (the parity oracle's vocabulary), never to be inferred from ``error``,
+    whose text is diagnostic and free to drift.
     """
 
     status: str
@@ -367,6 +381,7 @@ class PreparedWindowOutcome:
     retained_drop_bytes: int = 0
     appended_items: bytes = field(default=b"", repr=False)
     error: str | None = None
+    rejection: str | None = None
 
 
 @dataclass
@@ -472,6 +487,7 @@ class BundleCompiler:
             "window_uploads": 0,
             "window_prepares": 0,
             "window_prepare_contended": 0,
+            "window_prepare_out_of_range": 0,
         }
         # Guarded by _serve_builder_metrics_lock.
         self.serve_builder_window_cache_counts = {"hits": 0, "misses": 0}
@@ -1244,8 +1260,11 @@ class BundleCompiler:
         never per build. Any daemon anomaly -- spawn failure, handshake or
         protocol mismatch, crash, timeout, malformed response -- retires the
         daemon and returns None so the caller's in-process pipeline runs
-        unchanged. The ``needs_full``/``fallback``/``fold_invalid`` outcomes
-        are ordinary control flow and never retire the daemon.
+        unchanged. The ``needs_full``/``fallback``/``fold_invalid``/
+        ``out_of_range`` outcomes are ordinary control flow and never retire
+        the daemon; ``out_of_range`` in particular used to arrive as a
+        malformed-request error and retire a healthy daemon once per
+        materialization for as long as the window held the value.
 
         ``wait_for_daemon=False`` refuses to queue at all: urgent
         materializations (the accepted-block preview) must never wait behind
@@ -1351,6 +1370,9 @@ class BundleCompiler:
                         " prepare_window response"
                     )
                 if envelope.get("ok") is not True:
+                    rejection = envelope.get("rejection")
+                    if not isinstance(rejection, str):
+                        rejection = None
                     if bool(envelope.get("needs_full")):
                         outcome = PreparedWindowOutcome(
                             status="needs_full",
@@ -1360,10 +1382,31 @@ class BundleCompiler:
                         outcome = PreparedWindowOutcome(
                             status="fallback",
                             error=str(envelope.get("error", "")),
+                            rejection=rejection,
                         )
                     elif bool(envelope.get("fold_invalid")):
                         outcome = PreparedWindowOutcome(
                             status="fold_invalid",
+                            error=str(envelope.get("error", "")),
+                            rejection=rejection,
+                        )
+                    elif bool(envelope.get("out_of_range")):
+                        # The daemon declined a value outside its declared
+                        # widths. It is healthy and keeps its state; count
+                        # the decline so the degraded materializations are
+                        # visible, and let the in-process fold take over.
+                        with self._serve_builder_metrics_lock:
+                            self.serve_builder_counts[
+                                "window_prepare_out_of_range"
+                            ] = (
+                                self.serve_builder_counts.get(
+                                    "window_prepare_out_of_range",
+                                    0,
+                                )
+                                + 1
+                            )
+                        outcome = PreparedWindowOutcome(
+                            status="out_of_range",
                             error=str(envelope.get("error", "")),
                         )
                     else:

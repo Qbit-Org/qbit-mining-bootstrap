@@ -16,6 +16,42 @@
 //! (`ensure_ascii` escapes included, non-BMP as surrogate pairs) because the
 //! coordinator's cache keys, audit digests, and spool payloads are all
 //! derived from those exact bytes.
+//!
+//! # Declared integer widths
+//!
+//! Python carries every integer exactly; this fold carries them in fixed
+//! machine widths, and that is a deliberate, narrower domain rather than a
+//! divergence. The widths, which are the `AcceptedShare` field types:
+//!
+//! | field                              | width  |
+//! |------------------------------------|--------|
+//! | `share_seq`                        | `u64`  |
+//! | `share_difficulty`                 | `u128` |
+//! | `network_difficulty`               | `u128` |
+//! | `template_height`                  | `u64`  |
+//! | `ntime`                            | `u32`  |
+//! | `job_issued_at_ms`, `accepted_at_ms`, and every anchor | `i64` |
+//! | `window_weight`                    | `u128` |
+//! | `page_size`                        | `usize` (`u64` on the daemon's targets) |
+//!
+//! and the fold's difficulty accumulators are `u128` as well: a window whose
+//! retained total would not fit is declined, never saturated. Why `u128` is
+//! the real contract even though the ledger column is `numeric(78,0)`:
+//! `share_difficulty` is `(pow_limit_target * 10^6) // target`, so at a
+//! Bitcoin-mainnet-scale target one share is roughly 2^98 and a 16x window
+//! totals roughly 2^102 -- a factor of about 6 * 10^7 short of 2^128,
+//! unreachable on any chain this code will see. `numeric(78,0)` is a generic
+//! wide-numeric column choice, not a considered statement that difficulties
+//! exceed 2^128, and widening this fold to arbitrary precision would put
+//! bignum arithmetic on the exact path the migration exists to make faster.
+//!
+//! A prepare_window request carrying an integer outside these widths is
+//! answered by the daemon as `out_of_range` -- distinct from a malformed
+//! request -- and the coordinator folds that window in-process, where
+//! Python's unbounded integers produce the right answer; the daemon keeps
+//! its state and is never retired for it. [`prepare_window_out_of_range`]
+//! is the classifier, and the parity oracle (`tests/window_pipeline_parity.py`)
+//! mirrors the same table as the `rust-daemon` adapter's declared domain.
 
 use crate::AcceptedShare;
 use sha2::{Digest, Sha256};
@@ -25,8 +61,16 @@ use std::rc::Rc;
 /// Mirrors `DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE`.
 pub const DEFAULT_WINDOW_PAGE_SIZE: usize = 512;
 
-/// Full-snapshot rejections; mirrors the `ValueError`s raised by
-/// `IncrementalShareWindow.from_full_snapshot`.
+/// Why a full-snapshot fold did not produce a window.
+///
+/// The first five variants are rejections and mirror the `ValueError`s
+/// raised by `IncrementalShareWindow.from_full_snapshot`; each carries a
+/// stable machine-readable category ([`WindowFoldError::rejection_category`])
+/// that the daemon puts on the wire beside the human-readable message, so a
+/// client never has to match on the message text. `DifficultyOverflow` is
+/// not a rejection: the snapshot is valid, but its retained difficulty total
+/// leaves the declared `u128` domain (see the module docs), which the daemon
+/// reports as `out_of_range`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WindowFoldError {
     NonPositiveWindowWeight,
@@ -34,6 +78,23 @@ pub enum WindowFoldError {
     DuplicateShareSeq,
     DuplicateShareId,
     NonPositiveDifficulty,
+    DifficultyOverflow,
+}
+
+impl WindowFoldError {
+    /// The implementation-neutral rejection category, from the parity
+    /// oracle's `FULL_SNAPSHOT_REJECTIONS` vocabulary; `None` for the
+    /// out-of-domain outcome, which is not a rejection.
+    pub fn rejection_category(&self) -> Option<&'static str> {
+        Some(match self {
+            WindowFoldError::NonPositiveWindowWeight => "non_positive_window_weight",
+            WindowFoldError::NonPositivePageSize => "non_positive_page_size",
+            WindowFoldError::DuplicateShareSeq => "duplicate_share_seq",
+            WindowFoldError::DuplicateShareId => "duplicate_share_id",
+            WindowFoldError::NonPositiveDifficulty => "non_positive_difficulty",
+            WindowFoldError::DifficultyOverflow => return None,
+        })
+    }
 }
 
 impl fmt::Display for WindowFoldError {
@@ -48,13 +109,19 @@ impl fmt::Display for WindowFoldError {
             WindowFoldError::NonPositiveDifficulty => {
                 "full payout window contains non-positive difficulty"
             }
+            WindowFoldError::DifficultyOverflow => DIFFICULTY_OVERFLOW_MESSAGE,
         };
         formatter.write_str(message)
     }
 }
 
-/// Advance rejections; mirrors `IncrementalWindowFallback`, whose message
-/// strings the coordinator logs when it falls back to a full rescan.
+/// Why an advance did not produce a window.
+///
+/// The first six variants are rejections and mirror `IncrementalWindowFallback`,
+/// whose message strings the coordinator logs when it falls back to a full
+/// rescan; each carries a stable category ([`WindowAdvanceError::rejection_category`]).
+/// `DifficultyOverflow` is the out-of-domain outcome: the delta is valid but
+/// the accumulated difficulty leaves `u128`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WindowAdvanceError {
     AnchorMovedBackwards,
@@ -63,6 +130,24 @@ pub enum WindowAdvanceError {
     RepeatsPreviouslyEligible,
     NotAnAppend,
     DeltaOrderNotIncreasing,
+    DifficultyOverflow,
+}
+
+impl WindowAdvanceError {
+    /// The implementation-neutral rejection category, from the parity
+    /// oracle's `ADVANCE_REJECTIONS` vocabulary; `None` for the
+    /// out-of-domain outcome, which is not a rejection.
+    pub fn rejection_category(&self) -> Option<&'static str> {
+        Some(match self {
+            WindowAdvanceError::AnchorMovedBackwards => "anchor_regression",
+            WindowAdvanceError::NonPositiveDifficulty => "delta_non_positive_difficulty",
+            WindowAdvanceError::IneligibleAtNewAnchor => "delta_ineligible_at_anchor",
+            WindowAdvanceError::RepeatsPreviouslyEligible => "delta_repeats_eligible_share",
+            WindowAdvanceError::NotAnAppend => "delta_not_append",
+            WindowAdvanceError::DeltaOrderNotIncreasing => "delta_order_not_increasing",
+            WindowAdvanceError::DifficultyOverflow => return None,
+        })
+    }
 }
 
 impl fmt::Display for WindowAdvanceError {
@@ -82,9 +167,149 @@ impl fmt::Display for WindowAdvanceError {
             WindowAdvanceError::DeltaOrderNotIncreasing => {
                 "delta share_seq order is not increasing"
             }
+            WindowAdvanceError::DifficultyOverflow => DIFFICULTY_OVERFLOW_MESSAGE,
         };
         formatter.write_str(message)
     }
+}
+
+/// Human-readable text for the accumulator leaving the declared domain; the
+/// daemon reports it under `out_of_range` with `field` `"total_difficulty"`.
+pub const DIFFICULTY_OVERFLOW_MESSAGE: &str = "window difficulty total exceeds u128";
+
+/// The fixed widths this pipeline declares for its integer inputs (see the
+/// module docs). Wire literals are checked against these exactly, digit by
+/// digit, so a value one above a width is classified as out of range and a
+/// value at the width is admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclaredWidth {
+    U32,
+    U64,
+    U128,
+    I64,
+}
+
+impl DeclaredWidth {
+    pub fn name(self) -> &'static str {
+        match self {
+            DeclaredWidth::U32 => "u32",
+            DeclaredWidth::U64 => "u64",
+            DeclaredWidth::U128 => "u128",
+            DeclaredWidth::I64 => "i64",
+        }
+    }
+
+    /// Whether an integer literal (optional leading `-`, then digits) is
+    /// representable at this width.
+    pub fn admits(self, literal: &str) -> bool {
+        match self {
+            DeclaredWidth::U32 => literal.parse::<u32>().is_ok(),
+            DeclaredWidth::U64 => literal.parse::<u64>().is_ok(),
+            DeclaredWidth::U128 => literal.parse::<u128>().is_ok(),
+            DeclaredWidth::I64 => literal.parse::<i64>().is_ok(),
+        }
+    }
+}
+
+/// Declared width of every integer an `AcceptedShare` carries, by its wire
+/// (serde) field name; the same table, in the same order, as the parity
+/// oracle's record fields.
+pub const ACCEPTED_SHARE_WIDTHS: [(&str, DeclaredWidth); 7] = [
+    ("share_seq", DeclaredWidth::U64),
+    ("share_difficulty", DeclaredWidth::U128),
+    ("network_difficulty", DeclaredWidth::U128),
+    ("template_height", DeclaredWidth::U64),
+    ("job_issued_at_ms", DeclaredWidth::I64),
+    ("accepted_at_ms", DeclaredWidth::I64),
+    ("ntime", DeclaredWidth::U32),
+];
+
+/// Declared width of every top-level integer a prepare_window request
+/// carries. `page_size` is `usize` in the fold; the daemon's targets are
+/// 64-bit, so the wire contract states `u64`.
+pub const PREPARE_WINDOW_REQUEST_WIDTHS: [(&str, DeclaredWidth); 4] = [
+    ("window_weight", DeclaredWidth::U128),
+    ("page_size", DeclaredWidth::U64),
+    ("anchor_job_issued_at_ms", DeclaredWidth::I64),
+    ("append_invalidation_epoch", DeclaredWidth::U64),
+];
+
+/// One prepare_window integer outside its declared width: the JSON path of
+/// the field, the literal exactly as it arrived, and the width it missed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutOfRangeField {
+    pub field: String,
+    pub literal: String,
+    pub width: DeclaredWidth,
+}
+
+impl fmt::Display for OutOfRangeField {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "prepare_window {} {} is outside the declared {}",
+            self.field,
+            self.literal,
+            self.width.name()
+        )
+    }
+}
+
+fn is_integer_literal(literal: &str) -> bool {
+    let digits = literal.strip_prefix('-').unwrap_or(literal);
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn out_of_range_field(
+    value: Option<&serde_json::Value>,
+    field: impl FnOnce() -> String,
+    width: DeclaredWidth,
+) -> Option<OutOfRangeField> {
+    let serde_json::Value::Number(number) = value? else {
+        return None;
+    };
+    // `arbitrary_precision` keeps the literal's digits verbatim, so the
+    // check is exact at every magnitude; a non-integer literal is not a
+    // width question and is left for the strict parse to call malformed.
+    let literal = number.as_str();
+    if is_integer_literal(literal) && !width.admits(literal) {
+        return Some(OutOfRangeField {
+            field: field(),
+            literal: literal.to_string(),
+            width,
+        });
+    }
+    None
+}
+
+/// Locate the first integer in a (syntactically valid) prepare_window
+/// request document that lies outside its declared width, walking the
+/// top-level fields in [`PREPARE_WINDOW_REQUEST_WIDTHS`] order and then each
+/// record's fields in [`ACCEPTED_SHARE_WIDTHS`] order. `None` means every
+/// integer present is representable -- so a strict parse failure on this
+/// document is a genuinely malformed request, not a width problem. Only
+/// inspects the request; it never folds anything.
+pub fn prepare_window_out_of_range(request: &serde_json::Value) -> Option<OutOfRangeField> {
+    for (field, width) in PREPARE_WINDOW_REQUEST_WIDTHS {
+        if let Some(found) = out_of_range_field(request.get(field), || field.to_string(), width) {
+            return Some(found);
+        }
+    }
+    let records = request
+        .get("records")
+        .and_then(serde_json::Value::as_array)?;
+    for (index, record) in records.iter().enumerate() {
+        for (field, width) in ACCEPTED_SHARE_WIDTHS {
+            if let Some(found) = out_of_range_field(
+                record.get(field),
+                || format!("records[{index}].{field}"),
+                width,
+            ) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 /// Mirrors `IncrementalWindowAdvanceStats`, `touched_pages` definition
@@ -195,6 +420,10 @@ pub struct WindowPage {
 }
 
 impl WindowPage {
+    // Page totals sum a subset of a window total that `from_full_snapshot`
+    // and `advance` have already checked against u128, so the saturating
+    // fold below never actually saturates; it only keeps the constructors
+    // infallible.
     fn from_records(records: Vec<AcceptedShare>) -> Self {
         let fragments: Vec<Vec<u8>> = records.iter().map(canonical_share_fragment).collect();
         let total_difficulty = records
@@ -277,14 +506,19 @@ impl PayoutWindow {
         drop(share_ids);
 
         // Walk newest-to-oldest accumulating weight; the final whole share
-        // crossing window_weight is deliberately retained.
+        // crossing window_weight is deliberately retained. The accumulator
+        // is checked, not saturating: a total that leaves u128 is outside
+        // the declared domain and must be declined, because a saturated
+        // total would silently change later expiry decisions.
         let mut start = eligible.len();
         let mut retained_weight: u128 = 0;
         for index in (0..eligible.len()).rev() {
             if retained_weight >= window_weight {
                 break;
             }
-            retained_weight = retained_weight.saturating_add(eligible[index].share_difficulty);
+            retained_weight = retained_weight
+                .checked_add(eligible[index].share_difficulty)
+                .ok_or(WindowFoldError::DifficultyOverflow)?;
             start = index;
         }
         let retained: Vec<AcceptedShare> = eligible.split_off(start);
@@ -437,14 +671,23 @@ impl PayoutWindow {
             prior_delta_seq = Some(record.share_seq);
         }
 
+        // Both totals are checked before any page is built: a delta or a
+        // combined total that leaves u128 is outside the declared domain,
+        // and every page total below is a subset of the combined total.
+        let delta_difficulty = delta
+            .iter()
+            .map(|record| record.share_difficulty)
+            .try_fold(0u128, u128::checked_add)
+            .ok_or(WindowAdvanceError::DifficultyOverflow)?;
+        let mut total_difficulty = self
+            .total_difficulty
+            .checked_add(delta_difficulty)
+            .ok_or(WindowAdvanceError::DifficultyOverflow)?;
+
         let old_fragment_lengths = self.fragment_lengths();
         let old_count = old_fragment_lengths.len();
         let added_rows = delta.len();
         let delta_fragments: Vec<Vec<u8>> = delta.iter().map(canonical_share_fragment).collect();
-        let delta_difficulty = delta
-            .iter()
-            .map(|record| record.share_difficulty)
-            .fold(0u128, u128::saturating_add);
 
         // Copy page references, never their retained contents. `touched` is
         // pre-existing retained boundary pages only, exactly as in Python.
@@ -487,7 +730,6 @@ impl PayoutWindow {
             delta_encoded = tail_fragments;
         }
 
-        let mut total_difficulty = self.total_difficulty.saturating_add(delta_difficulty);
         let mut expired_rows: usize = 0;
         let mut first_retained_page: usize = 0;
         while first_retained_page < pages.len()
@@ -785,6 +1027,158 @@ mod tests {
         );
         assert_eq!(byte_delta.retained_drop_bytes, 0);
         assert!(byte_delta.appended_items.is_empty());
+    }
+
+    #[test]
+    fn rejection_categories_mirror_the_parity_vocabulary() {
+        // The eleven categories the parity oracle freezes, in its order:
+        // five full-snapshot conditions, then six advance conditions. Both
+        // sides must agree on every one, and the out-of-domain outcome is
+        // deliberately not a category.
+        let fold = [
+            WindowFoldError::DuplicateShareSeq,
+            WindowFoldError::DuplicateShareId,
+            WindowFoldError::NonPositiveDifficulty,
+            WindowFoldError::NonPositiveWindowWeight,
+            WindowFoldError::NonPositivePageSize,
+        ];
+        let advance = [
+            WindowAdvanceError::AnchorMovedBackwards,
+            WindowAdvanceError::NonPositiveDifficulty,
+            WindowAdvanceError::IneligibleAtNewAnchor,
+            WindowAdvanceError::RepeatsPreviouslyEligible,
+            WindowAdvanceError::NotAnAppend,
+            WindowAdvanceError::DeltaOrderNotIncreasing,
+        ];
+        let categories: Vec<&str> = fold
+            .iter()
+            .map(|error| error.rejection_category().expect("rejection"))
+            .chain(
+                advance
+                    .iter()
+                    .map(|error| error.rejection_category().expect("rejection")),
+            )
+            .collect();
+        assert_eq!(
+            categories,
+            [
+                "duplicate_share_seq",
+                "duplicate_share_id",
+                "non_positive_difficulty",
+                "non_positive_window_weight",
+                "non_positive_page_size",
+                "anchor_regression",
+                "delta_non_positive_difficulty",
+                "delta_ineligible_at_anchor",
+                "delta_repeats_eligible_share",
+                "delta_not_append",
+                "delta_order_not_increasing",
+            ]
+        );
+        assert_eq!(
+            WindowFoldError::DifficultyOverflow.rejection_category(),
+            None
+        );
+        assert_eq!(
+            WindowAdvanceError::DifficultyOverflow.rejection_category(),
+            None
+        );
+    }
+
+    #[test]
+    fn declared_widths_admit_the_edge_and_refuse_one_past_it() {
+        assert!(DeclaredWidth::U32.admits("4294967295"));
+        assert!(!DeclaredWidth::U32.admits("4294967296"));
+        assert!(DeclaredWidth::U64.admits("18446744073709551615"));
+        assert!(!DeclaredWidth::U64.admits("18446744073709551616"));
+        assert!(DeclaredWidth::U128.admits("340282366920938463463374607431768211455"));
+        assert!(!DeclaredWidth::U128.admits("340282366920938463463374607431768211456"));
+        assert!(DeclaredWidth::I64.admits("-9223372036854775808"));
+        assert!(!DeclaredWidth::I64.admits("9223372036854775808"));
+        assert!(!DeclaredWidth::U128.admits("-1"));
+    }
+
+    #[test]
+    fn out_of_range_probe_names_the_first_offending_field_exactly() {
+        let request: serde_json::Value = serde_json::from_str(
+            r#"{"request":"prepare_window","mode":"full","window_weight":340282366920938463463374607431768211455,
+                "anchor_job_issued_at_ms":1755000000000,
+                "records":[
+                  {"share_seq":18446744073709551615,"share_difficulty":170141183460469231731687303715884105731,"ntime":4294967295},
+                  {"share_seq":1,"share_difficulty":340282366920938463463374607431768211457,"ntime":4294967296}
+                ]}"#,
+        )
+        .expect("valid json");
+        let found = prepare_window_out_of_range(&request).expect("out of range");
+        assert_eq!(found.field, "records[1].share_difficulty");
+        assert_eq!(found.literal, "340282366920938463463374607431768211457");
+        assert_eq!(found.width, DeclaredWidth::U128);
+        assert_eq!(
+            found.to_string(),
+            "prepare_window records[1].share_difficulty 340282366920938463463374607431768211457 is outside the declared u128"
+        );
+
+        // Top-level fields are checked before records, and a window_weight one
+        // above u128 is caught there.
+        let request: serde_json::Value = serde_json::from_str(
+            r#"{"request":"prepare_window","window_weight":340282366920938463463374607431768211456,"records":[{"ntime":4294967296}]}"#,
+        )
+        .expect("valid json");
+        let found = prepare_window_out_of_range(&request).expect("out of range");
+        assert_eq!(found.field, "window_weight");
+
+        // Everything at its width, a negative i64, and a non-integer literal
+        // (the strict parse's business, not a width question) are all None.
+        let request: serde_json::Value = serde_json::from_str(
+            r#"{"request":"prepare_window","window_weight":340282366920938463463374607431768211455,
+                "anchor_job_issued_at_ms":-9223372036854775808,"page_size":18446744073709551615,
+                "records":[{"share_seq":18446744073709551615,"share_difficulty":340282366920938463463374607431768211455,
+                            "network_difficulty":340282366920938463463374607431768211455,"template_height":18446744073709551615,
+                            "job_issued_at_ms":9223372036854775807,"accepted_at_ms":-1,"ntime":4294967295,"share_id":"x"},
+                           {"share_difficulty":1.5}]}"#,
+        )
+        .expect("valid json");
+        assert_eq!(prepare_window_out_of_range(&request), None);
+    }
+
+    #[test]
+    fn difficulty_totals_that_leave_u128_are_declined_not_saturated() {
+        // Every input fits u128, but the retained total (the crossing row on
+        // top of a near-maximal weight) does not.
+        let records = vec![
+            share(1, u128::MAX / 2 + 1, 5, 5),
+            share(2, u128::MAX / 2 + 1, 6, 6),
+        ];
+        assert_eq!(
+            PayoutWindow::from_full_snapshot(records, 10, u128::MAX, 512).unwrap_err(),
+            WindowFoldError::DifficultyOverflow
+        );
+        // The advance side: the held total plus the delta's leaves u128.
+        let window = PayoutWindow::from_full_snapshot(
+            vec![share(1, u128::MAX / 2 + 1, 5, 5)],
+            10,
+            u128::MAX,
+            512,
+        )
+        .expect("fold");
+        assert_eq!(
+            window
+                .advance(vec![share(2, u128::MAX / 2 + 1, 11, 11)], 11)
+                .unwrap_err(),
+            WindowAdvanceError::DifficultyOverflow
+        );
+        assert_eq!(
+            window
+                .advance(
+                    vec![
+                        share(2, u128::MAX / 2 + 1, 11, 11),
+                        share(3, u128::MAX / 2 + 1, 11, 11)
+                    ],
+                    11
+                )
+                .unwrap_err(),
+            WindowAdvanceError::DifficultyOverflow
+        );
     }
 
     #[test]

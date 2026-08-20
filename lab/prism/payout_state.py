@@ -845,10 +845,12 @@ class PayoutStateService:
                 return materialized
             # Any daemon outcome that cannot produce a window here -- an
             # anomaly (already retired), the transport disabled, a daemon
-            # another build owns, or a snapshot the fold must reject --
-            # degrades to the in-process pipeline below for this
-            # materialization, which is also where an invalid snapshot
-            # raises its authoritative error.
+            # another build owns, a snapshot the fold must reject, or a
+            # value outside the daemon's declared integer widths (the
+            # daemon declines it and stays healthy) -- degrades to the
+            # in-process pipeline below for this materialization, which is
+            # also where an invalid snapshot raises its authoritative error
+            # and where unbounded integers fold the out-of-range window.
 
         window = IncrementalShareWindow.from_full_snapshot(
             records,
@@ -911,8 +913,10 @@ class PayoutStateService:
         consume them. Every non-prepared outcome -- a daemon anomaly (already
         retired by the transport), a daemon another build owns, the fold
         rejecting the snapshot (the in-process oracle must raise the
-        authoritative error), or a refuted byte mirror -- degrades to the
-        in-process pipeline for this materialization.
+        authoritative error), an integer outside the daemon's declared
+        widths (``out_of_range``: the daemon is kept, the window is folded
+        here), or a refuted byte mirror -- degrades to the in-process
+        pipeline for this materialization.
         """
         runtime = self._runtime
         prepare = getattr(runtime, "prepare_payout_window", None)
@@ -988,6 +992,11 @@ class PayoutStateService:
         healthy daemon another build owns: it rebuilds too, because opaque
         mirror bytes cannot advance in-process, but it keeps its own reason
         so a contended daemon is never mistaken for an unavailable one.
+        ``out_of_range`` is a healthy daemon declining a delta outside its
+        declared integer widths: the rebuild goes through the full path,
+        where the daemon declines the snapshot the same way and the
+        in-process fold takes the window -- reasoned
+        ``window_value_out_of_range``, the daemon untouched.
         """
         runtime = self._runtime
         prepare = getattr(runtime, "prepare_payout_window", None)
@@ -1031,6 +1040,15 @@ class PayoutStateService:
         if outcome.status == "fallback":
             raise IncrementalWindowFallback(
                 outcome.error or "daemon advance invariant failed"
+            )
+        if outcome.status == "out_of_range":
+            # The mirror is opaque daemon bytes and the daemon has just
+            # declared it cannot hold this window, so the cache is useless
+            # here; the full path re-asks once (declined again) and folds
+            # in-process. Not an anomaly: the daemon stays registered.
+            raise _DaemonWindowRebuildRequired(
+                "window_value_out_of_range",
+                clear_cache=True,
             )
         if outcome.status != "prepared":
             raise _DaemonWindowRebuildRequired(

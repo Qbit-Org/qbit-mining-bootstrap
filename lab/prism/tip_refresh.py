@@ -1335,6 +1335,7 @@ class TipRefreshService:
                         "window_uploads",
                         "window_prepares",
                         "window_prepare_contended",
+                        "window_prepare_out_of_range",
                     )
                 ],
                 "# HELP qbit_prism_payout_artifact_events_total Payout-ledger-artifact lifecycle outcomes (build, install, reuse pacing).",

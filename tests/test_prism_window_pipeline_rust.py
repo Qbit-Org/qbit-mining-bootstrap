@@ -8,10 +8,11 @@ the contract -- that the ``PRISM_WINDOW_PIPELINE_RUST`` switch defaults to
 Python and fails closed, that the daemon path preserves the append-epoch and
 scan-anchor fences, and that every non-success shape (daemon death,
 ``needs_full`` after a respawn, an ``advance`` invariant failure, a protocol
-mismatch) degrades exactly like its in-process counterpart instead of
-inventing a new failure mode. The daemon here is the fake serve builder,
-which serves prepare_window with the real Python fold so mirror digests
-verify byte-exactly without a Rust build.
+mismatch, a value outside the daemon's declared integer widths) degrades
+exactly like its in-process counterpart instead of inventing a new failure
+mode. The daemon here is the fake serve builder, which serves prepare_window
+with the real Python fold so mirror digests verify byte-exactly without a
+Rust build, and which declares the real daemon's integer widths.
 """
 # ruff: noqa: F403, F405
 
@@ -1023,6 +1024,217 @@ class DaemonWindowRecordCountTests(DaemonWindowPipelineTestCase):
         with server._payout_artifact_executor_lock:
             events = dict(server.payout_artifact_event_counts)
         self.assertEqual(events.get("window_mirror_divergence"), 1)
+
+
+class DaemonWindowIntegerDomainTests(DaemonWindowPipelineTestCase):
+    """A value outside the daemon's declared widths degrades to Python; the daemon lives.
+
+    The daemon carries ``share_difficulty`` in u128 (and the other integers
+    in u64/u32/i64); Python carries them unbounded. A window holding a value
+    above those widths used to come back as a malformed-request error, which
+    the coordinator read as an anomaly: it SIGKILLed a healthy daemon,
+    degraded once, and respawned on the next materialization only to kill
+    it again -- a spawn-and-kill loop, once per materialization, for as long
+    as the window held the value. The daemon now declines such a request as
+    ``out_of_range`` and keeps its state; the coordinator folds the window
+    in-process and never touches the daemon.
+    """
+
+    def _append_wide_share(
+        self,
+        ledger: SingleWriterShareLedger,
+        *,
+        share_seq: int,
+        accepted_at_ms: int,
+    ) -> None:
+        """A share whose difficulty is one above u128: inside Python, outside the daemon."""
+        ledger.append(
+            PendingShare(
+                share_id=f"wide-{share_seq}",
+                miner_id=f"miner-{share_seq % 3}",
+                order_key=f"miner-{share_seq % 3}",
+                p2mr_program_hex=f"{share_seq % 256:02x}" * 32,
+                share_difficulty=2**128 + 1,
+                network_difficulty=1,
+                template_height=9,
+                job_id=f"job-{share_seq}",
+                job_issued_at_ms=accepted_at_ms - 1,
+                accepted_at_ms=accepted_at_ms,
+                ntime=1_700_000_000 + share_seq,
+            )
+        )
+
+    def _worker_counts(self, server: PrismCoordinator) -> dict[str, int]:
+        with server._job_build_scheduler_lock:
+            return dict(server.job_build_worker_counts)
+
+    def test_out_of_range_snapshot_folds_in_python_and_keeps_the_daemon(self) -> None:
+        server, ledger, artifacts = self._server()
+        self._append_wide_share(ledger, share_seq=4, accepted_at_ms=999_930)
+        clock_ms = [1_000_000]
+        with self._rust_env(), self._fake_daemon_command(), patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            artifact = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert artifact is not None
+            self.assertEqual(artifact.window_build_mode, "full_rescan")
+            # Declined by the daemon, folded in-process: a Python window is
+            # cached, byte-exact against the oracle, with the wide digits.
+            cached = server._incremental_payout_artifact_window
+            assert cached is not None
+            self.assertIsInstance(cached.window, IncrementalShareWindow)
+            oracle = _python_window_for(
+                ledger,
+                anchor_ms=int(artifact.snapshot_anchor_ms or 0),
+                network_difficulty=int(artifacts.network_difficulty),
+            )
+            self.assertEqual(
+                artifact.share_snapshot_sha256,
+                oracle.json_records().canonical_json_sha256(),
+            )
+            self.assertTrue(
+                any(
+                    int(record["share_difficulty"]) == 2**128 + 1
+                    for record in artifact.shares_json
+                )
+            )
+            self.assertTrue(server._install_payout_ledger_artifact(artifact))
+            # The daemon was never retired: same live process, registered.
+            daemon = server._serve_builder
+            assert daemon is not None
+            self.assertIsNone(daemon.process.poll())
+
+            # The next materialization still holds the value. Before the fix
+            # this is where the loop turned: a fresh spawn, declined again,
+            # killed again. Now the degraded Python cache advances in
+            # process and the daemon is left alone.
+            append_incremental_share(ledger, share_seq=5, accepted_at_ms=1_000_010)
+            server.payout_artifact_min_build_interval_seconds = 0.0
+            clock_ms[0] = 1_000_020
+            advanced = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert advanced is not None
+            self.assertEqual(advanced.window_build_mode, "incremental")
+            self.assertIs(server._serve_builder, daemon)
+            self.assertIsNone(daemon.process.poll())
+            advanced_oracle = _python_window_for(
+                ledger,
+                anchor_ms=int(advanced.snapshot_anchor_ms or 0),
+                network_difficulty=int(artifacts.network_difficulty),
+            )
+            self.assertEqual(
+                advanced.share_snapshot_sha256,
+                advanced_oracle.json_records().canonical_json_sha256(),
+            )
+        counts = self._serve_counts(server)
+        self.assertEqual(counts["spawns"], 1)
+        self.assertEqual(counts["fallbacks"], 0)
+        # window_prepares counts completed round trips, declined ones
+        # included: one, and it was the decline. The Python-advancing
+        # second materialization never asked the daemon at all.
+        self.assertEqual(counts["window_prepares"], 1)
+        self.assertEqual(counts["window_prepare_out_of_range"], 1)
+        self.assertEqual(self._worker_counts(server)["terminations"], 0)
+
+    def test_out_of_range_delta_rebuilds_in_python_and_keeps_the_daemon(self) -> None:
+        server, ledger, artifacts = self._server()
+        clock_ms = [1_000_000]
+        with self._rust_env(), self._fake_daemon_command(), patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert initial is not None
+            cached = server._incremental_payout_artifact_window
+            assert cached is not None
+            self.assertIsInstance(cached.window, DaemonShareWindowMirror)
+            daemon = server._serve_builder
+            assert daemon is not None
+
+            # The wide share arrives as a delta against a daemon-held mirror:
+            # the daemon declines the advance, the full re-preparation is
+            # declined the same way, and the in-process fold takes over.
+            self._append_wide_share(ledger, share_seq=4, accepted_at_ms=1_000_010)
+            server.payout_artifact_min_build_interval_seconds = 0.0
+            clock_ms[0] = 1_000_020
+            rebuilt = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert rebuilt is not None
+            self.assertEqual(rebuilt.window_build_mode, "full_rescan")
+            self.assertEqual(
+                rebuilt.window_full_rescan_reason,
+                "window_value_out_of_range",
+            )
+            cached = server._incremental_payout_artifact_window
+            assert cached is not None
+            self.assertIsInstance(cached.window, IncrementalShareWindow)
+            oracle = _python_window_for(
+                ledger,
+                anchor_ms=int(rebuilt.snapshot_anchor_ms or 0),
+                network_difficulty=int(artifacts.network_difficulty),
+            )
+            self.assertEqual(
+                rebuilt.share_snapshot_sha256,
+                oracle.json_records().canonical_json_sha256(),
+            )
+            self.assertIs(server._serve_builder, daemon)
+            self.assertIsNone(daemon.process.poll())
+        counts = self._serve_counts(server)
+        self.assertEqual(counts["spawns"], 1)
+        self.assertEqual(counts["fallbacks"], 0)
+        # Three completed round trips: the initial full preparation
+        # succeeded, then the advance and the full re-preparation were
+        # both declined.
+        self.assertEqual(counts["window_prepares"], 3)
+        self.assertEqual(counts["window_prepare_out_of_range"], 2)
+        self.assertEqual(self._worker_counts(server)["terminations"], 0)
+        self.assertEqual(ledger.full_snapshot_calls, 2)
+
+    def test_rejection_envelopes_carry_the_category_not_just_the_message(self) -> None:
+        # The fold_invalid/fallback outcomes name their condition in a stable
+        # category beside the diagnostic message, so the coordinator (and the
+        # parity adapter) never have to match on prose that may drift.
+        server, ledger, artifacts = self._server()
+        clock_ms = [1_000_000]
+        with self._rust_env(mode="prepare-fallback"), (
+            self._fake_daemon_command()
+        ), patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert initial is not None
+            outcome = server.prepare_payout_window(
+                mode="advance",
+                records_json=[],
+                anchor_job_issued_at_ms=1_000_010,
+                append_invalidation_epoch=0,
+                base_digest=initial.share_snapshot_sha256,
+            )
+            assert outcome is not None
+            self.assertEqual(outcome.status, "fallback")
+            self.assertEqual(outcome.rejection, "delta_not_append")
+            duplicate = dict(initial.shares_json[0])
+            declined = server.prepare_payout_window(
+                mode="full",
+                records_json=[duplicate, duplicate],
+                anchor_job_issued_at_ms=1_000_000,
+                append_invalidation_epoch=0,
+                window_weight=1_000,
+                page_size=512,
+            )
+            assert declined is not None
+            self.assertEqual(declined.status, "fold_invalid")
+            self.assertEqual(declined.rejection, "duplicate_share_seq")
 
 
 class DaemonWindowRetagTests(DaemonWindowPipelineTestCase):

@@ -11,7 +11,12 @@ prepare_window requests are served by the real Python fold
 (``IncrementalShareWindow``), so mirror digests verify exactly and the
 window-pipeline tests exercise the coordinator against byte-faithful daemon
 behavior without a Rust build; the Rust implementation itself is proven by
-the parity oracle's ``rust-daemon`` adapter. Additional modes fault-inject
+the parity oracle's ``rust-daemon`` adapter. Two more real-daemon contracts
+are mirrored so the coordinator sees them without a Rust build: the
+declared integer widths (a prepare request carrying a value outside
+``RUST_INTEGER_DOMAIN`` is answered ``out_of_range``, never folded and
+never treated as malformed), and the stable ``rejection`` category beside
+every ``fold_invalid``/``fallback`` error. Additional modes fault-inject
 the prepare protocol: ``prepare-forget-windows`` answers every advance with
 ``needs_full``, ``prepare-fallback`` answers every advance with ``fallback``,
 ``prepare-error`` answers prepare requests with a generic error,
@@ -49,6 +54,76 @@ def _fold_windows():
     return AcceptedShareRecord, IncrementalShareWindow, IncrementalWindowFallback
 
 
+def _declared_domain():
+    """The real daemon's declared widths and rejection vocabulary, lazily.
+
+    Taken from the parity oracle so the fake's ``out_of_range`` and
+    ``rejection`` answers are classified by the same tables the harness
+    holds the Rust daemon to, rather than by a third copy.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from tests.window_pipeline_parity import (  # noqa: PLC0415 - script-local import
+        RUST_INTEGER_DOMAIN,
+        rejection_category_for_message,
+    )
+
+    return RUST_INTEGER_DOMAIN, rejection_category_for_message
+
+
+def _out_of_range(request: dict, domain) -> tuple[str, str] | None:
+    """The first prepare_window integer outside the declared widths.
+
+    Mirrors the real daemon's classifier: the top-level fields first, then
+    each record's integer fields in declaration order; returns the field
+    path and the width it missed.
+    """
+    checks = [
+        ("window_weight", request.get("window_weight"), domain.window_weight),
+        ("page_size", request.get("page_size"), domain.page_size),
+        (
+            "anchor_job_issued_at_ms",
+            request.get("anchor_job_issued_at_ms"),
+            domain.timestamps_ms,
+        ),
+    ]
+    for index, record in enumerate(request.get("records", [])):
+        for name in (
+            "share_seq",
+            "share_difficulty",
+            "network_difficulty",
+            "template_height",
+            "job_issued_at_ms",
+            "accepted_at_ms",
+            "ntime",
+        ):
+            checks.append(
+                (
+                    f"records[{index}].{name}",
+                    record.get(name),
+                    domain.record_field_width(name),
+                )
+            )
+    for field, value, width in checks:
+        if isinstance(value, int) and not width.admits(value):
+            return field, width.name
+    return None
+
+
+def _write_out_of_range(field: str, width: str) -> None:
+    _write_response(
+        {
+            "ok": False,
+            "request": "prepare_window",
+            "out_of_range": True,
+            "field": field,
+            "width": width,
+            "error": f"prepare_window {field} is outside the declared {width}",
+        }
+    )
+
+
 def _write_response(payload: dict, raw_section: bytes | None = None) -> None:
     sys.stdout.write(json.dumps(payload) + "\n")
     sys.stdout.flush()
@@ -82,6 +157,13 @@ def _handle_prepare_window(request: dict, prepared: dict, mode: str) -> None:
         )
         return
     miscount = 1 if mode == "prepare-miscount" else 0
+    domain, category_for_message = _declared_domain()
+    out_of_range = _out_of_range(request, domain)
+    if out_of_range is not None:
+        # Like the real daemon: declined before anything is folded, state
+        # untouched, and the coordinator folds this window in-process.
+        _write_out_of_range(*out_of_range)
+        return
     record_type, window_type, fallback_type = _fold_windows()
     records = [
         record_type(
@@ -97,12 +179,24 @@ def _handle_prepare_window(request: dict, prepared: dict, mode: str) -> None:
     anchor = int(request["anchor_job_issued_at_ms"])
     prepare_mode = request.get("mode")
     if prepare_mode == "full":
-        window = window_type.from_full_snapshot(
-            records,
-            anchor_job_issued_at_ms=anchor,
-            window_weight=int(request["window_weight"]),
-            page_size=int(request.get("page_size", 512)),
-        )
+        try:
+            window = window_type.from_full_snapshot(
+                records,
+                anchor_job_issued_at_ms=anchor,
+                window_weight=int(request["window_weight"]),
+                page_size=int(request.get("page_size", 512)),
+            )
+        except ValueError as error:
+            _write_response(
+                {
+                    "ok": False,
+                    "request": "prepare_window",
+                    "fold_invalid": True,
+                    "rejection": category_for_message(str(error)),
+                    "error": str(error),
+                }
+            )
+            return
         digest = window.json_records().canonical_json_sha256()
         items = _canonical_items(window)
         prepared.clear()
@@ -151,6 +245,7 @@ def _handle_prepare_window(request: dict, prepared: dict, mode: str) -> None:
                 "ok": False,
                 "request": "prepare_window",
                 "fallback": True,
+                "rejection": "delta_not_append",
                 "error": "injected advance invariant failure",
             }
         )
@@ -168,6 +263,7 @@ def _handle_prepare_window(request: dict, prepared: dict, mode: str) -> None:
                 "ok": False,
                 "request": "prepare_window",
                 "fallback": True,
+                "rejection": category_for_message(str(error)),
                 "error": str(error),
             }
         )
