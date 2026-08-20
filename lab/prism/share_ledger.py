@@ -2125,23 +2125,37 @@ class LeaseGuardPort(Protocol):
 
 @dataclass(frozen=True)
 class PostgresSessionGuards:
-    """Session-level GUCs that let the server disown a vanished coordinator.
+    """Session-level GUCs this ledger sets on every connection it opens.
 
-    A coordinator client that disappears without an RST — network partition,
-    SIGSTOP, VM pause — can leave its backend idle in transaction, still
-    holding every row lock the transaction took. The writer-lease landing CTE
-    row-locks the qbit_ledger_writer_lease singleton, so one such orphan
-    blocks a successor's startup lease upsert until the kernel's TCP
-    keepalive teardown (hours at OS defaults). These GUCs make the *server*
-    resolve that on its own: idle_in_transaction_session_timeout aborts the
-    orphaned transaction and releases its locks, and the server-side
-    tcp_keepalives_* settings (all PGC_USERSET, settable per session) bound
-    how long the server keeps a dead socket alive for backends the
-    idle-in-transaction timer cannot cover.
+    Two guarantees ride the one libpq ``options`` carrier, because a setting
+    delivered at connect time covers every statement the session can run —
+    including the autocommit ones — rather than being re-asserted per
+    transaction by code that a future caller might bypass.
+
+    The first is orphan reaping. A coordinator client that disappears without
+    an RST — network partition, SIGSTOP, VM pause — can leave its backend idle
+    in transaction, still holding every row lock the transaction took. The
+    writer-lease landing CTE row-locks the qbit_ledger_writer_lease singleton,
+    so one such orphan blocks a successor's startup lease upsert until the
+    kernel's TCP keepalive teardown (hours at OS defaults). These GUCs make the
+    *server* resolve that on its own: idle_in_transaction_session_timeout
+    aborts the orphaned transaction and releases its locks, and the
+    server-side tcp_keepalives_* settings (all PGC_USERSET, settable per
+    session) bound how long the server keeps a dead socket alive for backends
+    the idle-in-transaction timer cannot cover.
+
+    The second is read-only enforcement. ``read_only`` adds
+    default_transaction_read_only=on, so PostgreSQL refuses the write itself
+    for a ledger built with ``read_only=True``. The refusing writer gate is
+    the in-process half of that promise and remains defense in depth, but it
+    only covers paths that take the gate; the GUC covers every statement the
+    session can issue, wherever the ledger points. Without it the guarantee
+    came from the deployment topology — a hot standby refusing writes — which
+    is absent whenever the read tier is aimed at a writable primary.
 
     Constructed once in PsqlShareLedger.__init__ and shared by all three
     connection paths — the pooled native client, the dedicated lease-guard
-    session, and the psql subprocess backend. The coverage is real but
+    session, and the psql subprocess backend. The orphan coverage is real but
     bounded: the tcp_keepalives_* settings are silently ignored on
     Unix-socket connections and on platforms that do not implement them, so
     idle_in_transaction_session_timeout is the guard that always applies;
@@ -2155,16 +2169,25 @@ class PostgresSessionGuards:
     tcp_keepalives_idle_seconds: int
     tcp_keepalives_interval_seconds: int
     tcp_keepalives_count: int
+    read_only: bool = False
 
     def options_fragment(self) -> str:
-        """Render the guards as libpq ``options`` / PGOPTIONS ``-c`` flags."""
+        """Render the guards as libpq ``options`` / PGOPTIONS ``-c`` flags.
+
+        The read-only setting goes last so that it wins over any earlier
+        duplicate, the same way the whole fragment is placed after an
+        operator's DSN-level options by _merged_session_options.
+        """
         idle_ms = max(1, int(self.idle_in_transaction_timeout_seconds * 1000))
-        return (
+        fragment = (
             f"-c idle_in_transaction_session_timeout={idle_ms}ms "
             f"-c tcp_keepalives_idle={self.tcp_keepalives_idle_seconds} "
             f"-c tcp_keepalives_interval={self.tcp_keepalives_interval_seconds} "
             f"-c tcp_keepalives_count={self.tcp_keepalives_count}"
         )
+        if self.read_only:
+            fragment += " -c default_transaction_read_only=on"
+        return fragment
 
 
 def _merged_session_options(
@@ -2716,6 +2739,12 @@ class PsqlShareLedger:
             tcp_keepalives_idle_seconds=postgres_tcp_keepalives_idle_seconds,
             tcp_keepalives_interval_seconds=postgres_tcp_keepalives_interval_seconds,
             tcp_keepalives_count=postgres_tcp_keepalives_count,
+            # Fail closed at connect time rather than transaction by
+            # transaction: a read-only ledger tells the server it is read-only
+            # once, and every connection it can create -- pool slots, read
+            # slots, the psql subprocess, autocommit statements included --
+            # inherits the refusal.
+            read_only=read_only,
         )
         self._operation_timeout_local = local()
         self._statement_timeout_local = local()

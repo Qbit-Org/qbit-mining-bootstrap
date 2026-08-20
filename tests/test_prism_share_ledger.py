@@ -6514,6 +6514,207 @@ class PostgresSessionGuardTests(unittest.TestCase):
         self.assertNotIn("timeout", kwargs)
 
 
+class ReadOnlySessionEnforcementTests(unittest.TestCase):
+    """``read_only=True`` must be a promise PostgreSQL keeps, not a gate.
+
+    The refusing writer gate only covers paths that take the gate. Any
+    statement issued outside it — the lease upsert, a one-shot psql release —
+    reaches SQL exactly as it would on a read-write ledger, and until #157
+    pointed the public tier at a hot standby, nothing but the deployment
+    topology stopped it. These tests pin the connect-time GUC that makes the
+    server refuse instead, on every connection the instance can create.
+    """
+
+    READ_ONLY_GUC = "-c default_transaction_read_only=on"
+
+    def test_read_only_ledger_builds_read_only_session_guards(self) -> None:
+        ledger = PsqlShareLedger(
+            psql_command="psql postgresql://example.invalid/qbit",
+            native_client_mode="0",
+            read_only=True,
+        )
+        self.addCleanup(ledger.close)
+
+        self.assertTrue(ledger._session_guards.read_only)
+        fragment = ledger._session_guards.options_fragment()
+        self.assertIn(self.READ_ONLY_GUC, fragment)
+        # The orphan-reaping guards #137 established are preserved, not
+        # displaced: one options carrier, both guarantees.
+        self.assertIn("-c idle_in_transaction_session_timeout=15000ms", fragment)
+        self.assertIn("-c tcp_keepalives_idle=30", fragment)
+
+    def test_writable_ledger_keeps_a_writable_session(self) -> None:
+        # The coordinator's own ledger must be untouched by this: it commits
+        # every share, block and settlement the pool has.
+        ledger = FakeLeasePsqlShareLedger(
+            [acquired_lease()],
+            writer_id="writer-a",
+            writer_epoch=1,
+        )
+        self.addCleanup(ledger.close)
+
+        self.assertFalse(ledger._session_guards.read_only)
+        self.assertNotIn(
+            "default_transaction_read_only",
+            ledger._session_guards.options_fragment(),
+        )
+
+    def test_read_only_native_pool_connections_are_read_only(self) -> None:
+        connect_kwargs: list[dict[str, Any]] = []
+
+        class FakeConninfo:
+            @staticmethod
+            def conninfo_to_dict(conninfo: str) -> dict[str, Any]:
+                return {"dbname": "qbit"}
+
+        class FakePsycopg:
+            conninfo = FakeConninfo
+
+            @staticmethod
+            def connect(conninfo: str, **kwargs: Any) -> object:
+                connect_kwargs.append(kwargs)
+                return object()
+
+        client = _NativePostgresClient.__new__(_NativePostgresClient)
+        client._psycopg = FakePsycopg
+        client._conninfo = "postgresql://example.invalid/qbit"
+        client._application_name = "qbit-prism-public-read"
+        client._session_guards = make_session_guards(read_only=True)
+
+        client._connect()
+
+        options = connect_kwargs[0]["options"]
+        self.assertIn(self.READ_ONLY_GUC, options)
+        self.assertIn("-c idle_in_transaction_session_timeout=15000ms", options)
+
+    def test_read_only_native_options_preserve_operator_conninfo_options(self) -> None:
+        connect_kwargs: list[dict[str, Any]] = []
+        operator_options = "-c geqo=off -c default_transaction_read_only=off"
+
+        class FakeConninfo:
+            @staticmethod
+            def conninfo_to_dict(conninfo: str) -> dict[str, Any]:
+                return {"dbname": "qbit", "options": operator_options}
+
+        class FakePsycopg:
+            conninfo = FakeConninfo
+
+            @staticmethod
+            def connect(conninfo: str, **kwargs: Any) -> object:
+                connect_kwargs.append(kwargs)
+                return object()
+
+        client = _NativePostgresClient.__new__(_NativePostgresClient)
+        client._psycopg = FakePsycopg
+        client._conninfo = "postgresql://example.invalid/qbit"
+        client._application_name = None
+        client._session_guards = make_session_guards(read_only=True)
+
+        client._connect()
+
+        options = connect_kwargs[0]["options"]
+        # The operator's own options survive, but libpq applies -c settings
+        # left to right with the last duplicate winning, so a DSN that tries
+        # to turn the session writable again cannot.
+        self.assertIn("-c geqo=off", options)
+        self.assertLess(
+            options.index("-c default_transaction_read_only=off"),
+            options.index(self.READ_ONLY_GUC),
+        )
+        self.assertTrue(options.endswith(self.READ_ONLY_GUC))
+
+    def test_read_only_lease_guard_session_is_read_only(self) -> None:
+        connect_calls: list[dict[str, Any]] = []
+
+        class FakeGuardConnection:
+            closed = False
+
+            def close(self) -> None:
+                pass
+
+        fake_psycopg = types.ModuleType("psycopg")
+        fake_psycopg.connect = lambda conninfo, **kwargs: (  # type: ignore[attr-defined]
+            connect_calls.append(kwargs) or FakeGuardConnection()
+        )
+        fake_psycopg.conninfo = types.SimpleNamespace(  # type: ignore[attr-defined]
+            conninfo_to_dict=lambda conninfo: {"dbname": "qbit"}
+        )
+
+        with unittest.mock.patch.dict(sys.modules, {"psycopg": fake_psycopg}):
+            _NativePostgresLeaseGuard(
+                "postgresql://example.invalid/qbit",
+                1234,
+                session_guards=make_session_guards(read_only=True),
+            )
+
+        options = connect_calls[0]["options"]
+        # A read-only ledger never builds a lease guard, but the guarantee is
+        # a property of the carrier rather than of which paths happen to use
+        # it, so the dedicated session carries it too.
+        self.assertIn(self.READ_ONLY_GUC, options)
+        self.assertIn("-c statement_timeout=500", options)
+
+    def test_read_only_subprocess_backend_is_read_only(self) -> None:
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._command = ["psql"]
+        ledger._native = None
+        ledger._operation_timeout_local = threading.local()
+        ledger._statement_timeout_local = threading.local()
+        ledger._session_guards = make_session_guards(read_only=True)
+        completed = unittest.mock.Mock(returncode=0, stdout="{}\n", stderr="")
+
+        with unittest.mock.patch.dict(
+            "os.environ",
+            {"PGOPTIONS": "-c geqo=off"},
+        ), unittest.mock.patch(
+            "lab.prism.share_ledger.subprocess.run",
+            return_value=completed,
+        ) as run:
+            ledger._run_sql("SELECT '{}'::json;")
+
+        pgoptions = run.call_args.kwargs["env"]["PGOPTIONS"]
+        self.assertIn(self.READ_ONLY_GUC, pgoptions)
+        self.assertTrue(pgoptions.startswith("-c geqo=off"))
+
+    def test_read_only_covers_a_write_method_that_never_takes_the_gate(self) -> None:
+        # release_writer_lease_fresh_connection issues an UPDATE through a
+        # one-shot psql connection, deliberately touching neither the writer
+        # gate nor the pool. It is the shape #163 is about: the gate cannot
+        # refuse it, so the session it opens must be the thing that does.
+        ledger = PsqlShareLedger(
+            psql_command="psql postgresql://example.invalid/qbit",
+            native_client_mode="0",
+            read_only=True,
+        )
+        self.addCleanup(ledger.close)
+        completed = unittest.mock.Mock(returncode=0, stdout='{"released": 0}\n', stderr="")
+
+        with unittest.mock.patch(
+            "lab.prism.share_ledger.subprocess.run",
+            return_value=completed,
+        ) as run:
+            ledger.release_writer_lease_fresh_connection()
+
+        self.assertIn("UPDATE qbit_ledger_writer_lease", run.call_args.kwargs["input"])
+        self.assertIn(
+            self.READ_ONLY_GUC,
+            run.call_args.kwargs["env"]["PGOPTIONS"],
+        )
+
+    def test_read_only_ledger_still_refuses_the_writer_gate(self) -> None:
+        # The server-side refusal is added to the in-process gate, not
+        # substituted for it.
+        ledger = PsqlShareLedger(
+            psql_command="psql postgresql://example.invalid/qbit",
+            native_client_mode="0",
+            read_only=True,
+        )
+        self.addCleanup(ledger.close)
+
+        with self.assertRaises(share_ledger_module.ReadOnlyLedgerError):
+            ledger.append(pending_share(0))
+
+
 class BoundedLeaseAcquisitionTests(unittest.TestCase):
     class DeadlineRecordingLeaseLedger(FakeLeasePsqlShareLedger):
         def __init__(self, lease_results: list[dict[str, object]], **kwargs: Any):
