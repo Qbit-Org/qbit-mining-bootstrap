@@ -1059,12 +1059,9 @@ _OUTBOX_ERROR_RE = re.compile(r"last_error = (NULL|'(?:[^']|'')*')")
 _OUTBOX_SHA_RE = re.compile(r"candidate_sha256 <> '([0-9a-f]+)'")
 
 
-#: Keys the acquire statement's terminal arm may name that this model knows
-#: how to answer when no lease row is visible to it. ``acquired`` is false by
-#: construction on that arm; the holder and lease columns have nothing to
-#: report because no row is visible; and a ``retry`` flag is what the arm
-#: exists to raise. Any other key is a shape this model has not been taught,
-#: and is refused loudly rather than guessed at.
+#: Terminal-arm keys that name a lease column. Nothing is visible to report a
+#: holder from -- the arm exists precisely for that case -- so they answer
+#: null.
 _ACQUIRE_TERMINAL_NULL_KEYS = frozenset(
     {
         "writer_id",
@@ -1076,6 +1073,71 @@ _ACQUIRE_TERMINAL_NULL_KEYS = frozenset(
         "lease_wait_seconds",
     }
 )
+
+#: Terminal-arm keys whose value is a SQL literal, taken from the statement
+#: rather than restated here. ``acquired`` is false on this arm;
+#: ``lease_snapshot_retry`` is the flag ``_try_acquire_writer_lease`` retries
+#: on; ``lease`` and ``retry_reason`` carry the operator-facing subject and
+#: explanation that replace the old "postgres query returned no JSON".
+#:
+#: Reading the value out of the SQL matters more than it looks. An earlier
+#: draft keyed on the *name* -- anything containing "retry" answered true --
+#: which got ``lease_snapshot_retry`` right by luck and would have answered
+#: ``retry_reason`` with a boolean where production emits a sentence. The
+#: model now answers what the statement says, so it cannot drift from the
+#: wording the ledger PR chose.
+_ACQUIRE_TERMINAL_LITERAL_KEYS = frozenset(
+    {
+        "acquired",
+        "lease_snapshot_retry",
+        "lease",
+        "retry_reason",
+    }
+)
+
+
+def _split_sql_arguments(body: str) -> list[str]:
+    """Split a call's argument text on its top-level commas.
+
+    Parenthesised sub-expressions and single-quoted literals are held
+    together, because both occur in this statement: the holder arm nests
+    ``GREATEST(0, EXTRACT(...))``, and the terminal arm's retry reason is a
+    sentence that must survive as one argument.
+    """
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    quoted = False
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if quoted:
+            current.append(char)
+            if char == "'":
+                if index + 1 < len(body) and body[index + 1] == "'":
+                    current.append("'")
+                    index += 1
+                else:
+                    quoted = False
+        elif char == "'":
+            quoted = True
+            current.append(char)
+        elif char in "([":
+            depth += 1
+            current.append(char)
+        elif char in ")]":
+            depth -= 1
+            current.append(char)
+        elif char == "," and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+        index += 1
+    remainder = "".join(current).strip()
+    if remainder:
+        parts.append(remainder)
+    return parts
 
 
 def _balanced_call_body(text: str, open_index: int) -> str:
@@ -1131,15 +1193,40 @@ def acquire_result_arms(sql: str) -> int:
     return arms
 
 
-def acquire_terminal_arm_keys(sql: str) -> tuple[str, ...]:
-    """Return the keys named by the last ``json_build_object`` arm."""
+def acquire_terminal_arm_fields(sql: str) -> tuple[tuple[str, str], ...]:
+    """Return ``(key, raw value text)`` for the last ``json_build_object`` arm.
+
+    ``json_build_object`` takes alternating key and value arguments, so the
+    pairing is the call's own structure rather than a convention this model
+    imposes.
+    """
     _head, _separator, tail = sql.partition("SELECT COALESCE(")
     marker = "json_build_object("
     index = tail.rfind(marker)
     if index < 0:
         raise UnsupportedStatement("acquire statement's terminal arm builds no JSON object")
     body = _balanced_call_body(tail, index + len(marker) - 1)
-    return tuple(re.findall(r"'([a-z_]+)'\s*,", body))
+    arguments = _split_sql_arguments(body)
+    if len(arguments) % 2:
+        raise UnsupportedStatement(
+            "the acquire statement's terminal arm names an odd number of "
+            f"json_build_object arguments ({len(arguments)}); it cannot be read "
+            "as key/value pairs"
+        )
+    fields: list[tuple[str, str]] = []
+    for key_text, value_text in zip(arguments[::2], arguments[1::2], strict=True):
+        if len(key_text) < 2 or not key_text.startswith("'") or not key_text.endswith("'"):
+            raise UnsupportedStatement(
+                f"the acquire statement's terminal arm names {key_text!r} where a "
+                "quoted key was expected"
+            )
+        fields.append((_unquote(key_text[1:-1]), value_text))
+    return tuple(fields)
+
+
+def acquire_terminal_arm_keys(sql: str) -> tuple[str, ...]:
+    """Return the keys named by the last ``json_build_object`` arm."""
+    return tuple(key for key, _value in acquire_terminal_arm_fields(sql))
 
 
 def classify(sql: str) -> Statement:
@@ -1793,27 +1880,50 @@ class FakePostgres:
         if acquire_result_arms(statement.sql) == 2:
             return None
         payload: dict[str, Any] = {}
-        for key in acquire_terminal_arm_keys(statement.sql):
-            if key == "acquired":
-                payload[key] = False
-            elif key in _ACQUIRE_TERMINAL_NULL_KEYS:
-                # Nothing is visible to report a holder from; the arm exists
-                # precisely for that case.
-                payload[key] = None
-            elif "retry" in key:
-                payload[key] = True
-            else:
-                raise UnsupportedStatement(
-                    f"the acquire statement's terminal arm names {key!r}, which "
-                    "this model does not know how to answer. Teach it that key "
-                    "rather than letting a scenario assert against a guess."
-                )
+        for key, value_text in acquire_terminal_arm_fields(statement.sql):
+            payload[key] = self._terminal_arm_value(key, value_text)
         if "acquired" not in payload:
             raise UnsupportedStatement(
                 "the acquire statement's terminal arm does not name 'acquired'; "
                 "the lease evaluator cannot report an outcome from it"
             )
         return payload
+
+    @staticmethod
+    def _terminal_arm_value(key: str, value_text: str) -> Any:
+        """Answer one terminal-arm key from what the statement says it emits.
+
+        The key set stays an allowlist -- an unknown key is refused even when
+        its value is a perfectly readable literal, because a key this model
+        has never seen is a shape nobody has reasoned about. What is *not*
+        guessed is the value: for the literal keys it is parsed out of the
+        SQL, so the model reports the wording the ledger PR chose rather than
+        a restatement of it that can drift.
+        """
+        text = value_text.strip()
+        if key in _ACQUIRE_TERMINAL_LITERAL_KEYS:
+            lowered = text.lower()
+            if lowered == "true":
+                return True
+            if lowered == "false":
+                return False
+            if lowered == "null":
+                return None
+            if len(text) >= 2 and text.startswith("'") and text.endswith("'"):
+                return _unquote(text[1:-1])
+            raise UnsupportedStatement(
+                f"the acquire statement's terminal arm gives {key!r} the "
+                f"non-literal value {text!r}; this model can only report a "
+                "value the statement states outright"
+            )
+        if key in _ACQUIRE_TERMINAL_NULL_KEYS:
+            # A lease column with no visible row behind it.
+            return None
+        raise UnsupportedStatement(
+            f"the acquire statement's terminal arm names {key!r}, which this "
+            "model does not know how to answer. Teach it that key rather than "
+            "letting a scenario assert against a guess."
+        )
 
     @staticmethod
     def _adopt_matches(statement: Statement, row: LeaseRow) -> bool:
@@ -3083,6 +3193,7 @@ __all__ = [
     "UnsupportedStatement",
     "VirtualClock",
     "acquire_result_arms",
+    "acquire_terminal_arm_fields",
     "acquire_terminal_arm_keys",
     "advisory_lock_pair",
     "assert_deterministic",

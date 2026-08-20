@@ -25,8 +25,11 @@ defect. These tests pin the three properties the lease scenarios depend on.
 from __future__ import annotations
 
 import inspect
+import re
+import subprocess
 import threading
 import unittest
+from pathlib import Path
 from typing import Any
 
 from lab.prism import share_ledger as share_ledger_module
@@ -49,6 +52,89 @@ from tests.prism_concurrency_harness import (
     assert_deterministic,
     classify,
 )
+
+
+#: The signed ledger branch that adds the explicit not-acquired/retry arm
+#: (#140). The integration self-test below reads the acquire statement out of
+#: this object read-only; nothing from it is vendored into this tree.
+LEDGER_RETRY_COMMIT = "869bb7e635e4c55491903035d979a06de3fe65f5"
+
+#: The terminal arm exactly as that commit renders it. Kept as a literal so
+#: the synthetic tests still run when the object is not present locally, and
+#: cross-checked against the real statement by
+#: ``test_the_shipped_retry_arm_is_modelled_exactly``.
+LEDGER_RETRY_TERMINAL_ARM = """,
+    json_build_object(
+        'acquired', false,
+        'lease_snapshot_retry', true,
+        'lease', 'qbit ledger writer lease',
+        'retry_reason',
+        'the qbit ledger writer lease row was committed by a concurrent first acquisition after this statement snapshot'
+    )
+);"""
+
+#: What the model must report for that arm. Written out here rather than
+#: derived from the SQL under test: deriving both sides from one parse would
+#: make the assertion agree with itself no matter what the parse did.
+LEDGER_RETRY_TERMINAL_OBJECT = {
+    "acquired": False,
+    "lease_snapshot_retry": True,
+    "lease": "qbit ledger writer lease",
+    "retry_reason": (
+        "the qbit ledger writer lease row was committed by a concurrent "
+        "first acquisition after this statement snapshot"
+    ),
+}
+
+
+def _git(*args: str) -> subprocess.CompletedProcess[str]:
+    root = Path(__file__).resolve().parents[1]
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+
+def _share_ledger_source_at(commit: str) -> str | None:
+    """Read ``share_ledger.py`` out of a commit object, read-only.
+
+    Fetches the object once if it is not present. Returns None when it cannot
+    be obtained, so a clone without network access skips the integration
+    check instead of failing for a reason that is not about this tree.
+    """
+    path = f"{commit}:lab/prism/share_ledger.py"
+    result = _git("show", path)
+    if result.returncode == 0:
+        return result.stdout
+    _git("fetch", "origin", commit)
+    result = _git("show", path)
+    return result.stdout if result.returncode == 0 else None
+
+
+def _acquire_coalesce_tail(source: str) -> str:
+    """Render the acquire statement's final COALESCE from ledger source.
+
+    Only the tail is needed and only the tail is taken: the arms above it are
+    unchanged, and the upsert above *them* interpolates runtime values this
+    test has no business reconstructing. The two retry constants are read from
+    the same source, so a rename there changes this test's input rather than
+    silently invalidating it.
+    """
+    constants = dict(
+        re.findall(
+            r'^(WRITER_LEASE_ACQUIRE_RETRY_(?:KEY|SUBJECT))\s*=\s*"([^"]*)"',
+            source,
+            re.MULTILINE,
+        )
+    )
+    after = source[source.index("def _try_acquire_writer_lease"):]
+    opener = 'sql = f"""'
+    begin = after.index(opener) + len(opener)
+    template = after[begin : after.index('"""', begin)]
+    tail = template[template.rindex("SELECT COALESCE("):]
+    return tail[: tail.index(");") + 2].format(**constants)
 
 
 def _source_of(member: Any) -> str:
@@ -635,24 +721,21 @@ class SchedulerTests(unittest.TestCase):
             # Append a terminal arm to the statement production emits today,
             # so the only difference from the baseline is the thing under test.
             self.assertTrue(shipped.rstrip().endswith(");"))
-            terminal = shipped.rstrip()[:-2] + (
-                ",\n    (\n        SELECT json_build_object(\n"
-                "            'acquired', false,\n"
-                "            'retry', true\n"
-                "        )\n    )\n);"
-            )
+            terminal = shipped.rstrip()[:-2] + LEDGER_RETRY_TERMINAL_ARM
             self.assertEqual(acquire_result_arms(terminal), 3)
-            self.assertEqual(acquire_terminal_arm_keys(terminal), ("acquired", "retry"))
+            self.assertEqual(
+                acquire_terminal_arm_keys(terminal),
+                ("acquired", "lease_snapshot_retry", "lease", "retry_reason"),
+            )
 
             statement = classify(terminal)
             answered = server._unobserved_not_acquired(statement)
 
         # The whole point: this shape cannot evaluate to SQL NULL, so the
-        # ports can no longer raise "postgres query returned no JSON".
-        self.assertIsNotNone(answered)
-        assert answered is not None
-        self.assertIs(answered["acquired"], False)
-        self.assertIs(answered["retry"], True)
+        # ports can no longer raise "postgres query returned no JSON". The
+        # values are the statement's own literals, including the sentence --
+        # a boolean here would mean the model was answering the key's name.
+        self.assertEqual(answered, LEDGER_RETRY_TERMINAL_OBJECT)
 
         # And the baseline shape still must, or the switch is not switching.
         with LeaseHarness() as harness:
@@ -661,6 +744,110 @@ class SchedulerTests(unittest.TestCase):
             harness.run_until(alpha, "done:startup")
             baseline = classify(harness.server.statements[0].sql)
             self.assertIsNone(harness.server._unobserved_not_acquired(baseline))
+
+    def test_the_shipped_retry_arm_is_modelled_exactly(self) -> None:
+        """Integration: read the real acquire statement and answer it exactly.
+
+        The synthetic tests above prove the branch works against an arm this
+        file wrote. That is not the same as proving it works against the arm
+        the ledger PR actually ships, and the difference is exactly where the
+        first attempt was wrong: a name-keyed value policy answered
+        ``retry_reason`` with ``True`` because the key contains "retry", and
+        refused ``lease`` outright. Both would have passed a self-authored
+        fixture chosen to match the policy.
+
+        So this reads ``share_ledger.py`` out of the signed ledger commit,
+        renders its final COALESCE with that commit's own retry constants,
+        splices it onto the statement production emits here, and requires the
+        model to return the exact terminal object -- not NULL, and not a
+        plausible-looking substitute.
+        """
+        source = _share_ledger_source_at(LEDGER_RETRY_COMMIT)
+        if source is None:
+            self.skipTest(
+                "ledger commit unavailable; fetch it with "
+                f"'git fetch origin {LEDGER_RETRY_COMMIT}'"
+            )
+        tail = _acquire_coalesce_tail(source)
+
+        # The literal the synthetic tests run against must be the real arm,
+        # or those tests are exercising a shape nobody ships.
+        self.assertIn(LEDGER_RETRY_TERMINAL_ARM.rstrip(");").strip(), tail)
+
+        with LeaseHarness() as harness:
+            alpha = harness.coordinator("alpha")
+            alpha.start()
+            harness.run_until(alpha, "done:startup")
+            server = harness.server
+            shipped = server.statements[0].sql
+
+            head, separator, _baseline_tail = shipped.partition("SELECT COALESCE(")
+            self.assertTrue(separator)
+            integrated = head + tail
+
+            self.assertEqual(acquire_result_arms(integrated), 3)
+            statement = classify(integrated)
+            self.assertEqual(statement.kind, LeaseOp.ACQUIRE)
+            answered = server._unobserved_not_acquired(statement)
+
+            # And the same rig on the same baseline still returns SQL NULL,
+            # so this is a difference the statement makes, not the harness.
+            self.assertIsNone(
+                server._unobserved_not_acquired(classify(shipped))
+            )
+
+        self.assertEqual(answered, LEDGER_RETRY_TERMINAL_OBJECT)
+        # Spelled out separately: a boolean here is the exact defect the
+        # first policy had, and dict equality alone reads as a typo check.
+        assert answered is not None
+        self.assertIsInstance(answered["retry_reason"], str)
+        self.assertIs(answered["lease_snapshot_retry"], True)
+        self.assertIs(answered["acquired"], False)
+
+    def test_a_terminal_literal_survives_commas_and_quotes(self) -> None:
+        """Punctuation inside a reason string must not become an argument break.
+
+        The sentence this arm ships today happens to contain no comma, so
+        nothing else in this suite exercises the splitter's quoting. That is
+        a thin place to leave under a model whose whole job is to report the
+        wording production chose: the first comma added to that sentence
+        would otherwise silently re-pair every key and value after it, and
+        the failure would look like a renamed key rather than a parser bug.
+        """
+        reason = (
+            "the lease row was committed by a concurrent acquisition, "
+            "after this statement''s snapshot"
+        )
+        arm = (
+            ",\n    json_build_object(\n"
+            "        'acquired', false,\n"
+            "        'lease_snapshot_retry', true,\n"
+            "        'lease', 'qbit ledger writer lease',\n"
+            "        'retry_reason',\n"
+            f"        '{reason}'\n"
+            "    )\n);"
+        )
+        with LeaseHarness() as harness:
+            alpha = harness.coordinator("alpha")
+            alpha.start()
+            harness.run_until(alpha, "done:startup")
+            server = harness.server
+            terminal = server.statements[0].sql.rstrip()[:-2] + arm
+
+            self.assertEqual(acquire_result_arms(terminal), 3)
+            self.assertEqual(
+                acquire_terminal_arm_keys(terminal),
+                ("acquired", "lease_snapshot_retry", "lease", "retry_reason"),
+            )
+            answered = server._unobserved_not_acquired(classify(terminal))
+
+        assert answered is not None
+        self.assertEqual(
+            answered["retry_reason"],
+            "the lease row was committed by a concurrent acquisition, "
+            "after this statement's snapshot",
+        )
+        self.assertEqual(answered["lease"], "qbit ledger writer lease")
 
     def test_an_unteachable_terminal_arm_key_stays_loud(self) -> None:
         """A key this model cannot answer must fail, not be invented.
