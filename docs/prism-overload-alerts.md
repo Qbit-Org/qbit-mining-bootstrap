@@ -44,36 +44,34 @@ remains unscrapable by construction.
 
 ## Signal inventory
 
-All names and export sites below were verified against the source at
-commit `99f5e00`. Every series is a single time series per target; none
-carries labels beyond the target's own `job`/`instance`. Two rows describe
-the state *after* the parallel #188 gauge task lands — the new cap gauge,
-and the corrected semantics of the unresolved-transitions count — and are
-marked as such in the Status column; their `Exported at` references point
-at the surrounding export block.
+All names and export sites below were verified against the source. Every
+series is a single time series per target; none carries labels beyond the
+target's own `job`/`instance`. Two rows include the accompanying #188 gauge
+change: the new cap gauge and the corrected semantics of the
+unresolved-transitions count.
 
 | Metric | Type | Exported at | Status |
 | --- | --- | --- | --- |
-| `qbit_prism_accepted_parent_preview_wait_timeouts_total` | counter | `lab/prism/metrics.py:788` | already present |
-| `qbit_prism_accepted_parent_unresolved_transitions` | gauge, exact admission-fence depth | `lab/prism/metrics.py:782` | present, **semantics corrected by the parallel #188 gauge task** |
-| `qbit_prism_accepted_parent_unresolved_depth_max` | gauge | landing-observability block | **added by the parallel #188 gauge task** |
-| `qbit_prism_accepted_parent_unresolved_oldest_seconds` | gauge, oldest over timestamped transitions, `-1` when none | `lab/prism/metrics.py:785` | already present |
-| `qbit_prism_block_candidates_pending` | gauge, `-1` if unavailable | `lab/prism/metrics.py:721` | already present |
-| `qbit_prism_block_candidate_oldest_pending_seconds` | gauge, `-1` if unavailable | `lab/prism/metrics.py:724` | already present |
-| `qbit_prism_stratum_semantic_current_work_ratio` | gauge, `1.0` when no clients | `lab/prism/metrics.py:340` | already present |
-| `qbit_prism_stratum_authorized_connections` | gauge | `lab/prism/metrics.py:303` | already present |
-| `qbit_prism_refresh_pending` | gauge, 0/1 | `lab/prism/progress_health.py:645` | already present |
-| `qbit_prism_refresh_pending_age_seconds` | gauge, `0` when not pending | `lab/prism/progress_health.py:648` | already present |
-| `qbit_prism_metrics_snapshot_available` | gauge, 0/1; startup coverage only — stays `1` after warm-up even when the refresh is stale | `lab/prism/observability.py:575` | already present |
-| `qbit_prism_metrics_snapshot_stale` | gauge, 0/1 | `lab/prism/observability.py:578` | already present |
-| `qbit_prism_metrics_snapshot_age_seconds` | gauge, `-1` before first success | `lab/prism/observability.py:581` | already present |
+| `qbit_prism_accepted_parent_preview_wait_timeouts_total` | counter | `lab/prism/metrics.py` | already present |
+| `qbit_prism_accepted_parent_unresolved_transitions` | gauge, exact admission-fence depth | `lab/prism/metrics.py` | present, **semantics corrected by the accompanying #188 gauge change** |
+| `qbit_prism_accepted_parent_unresolved_depth_max` | gauge | `lab/prism/metrics.py` | **added by the accompanying #188 gauge change** |
+| `qbit_prism_accepted_parent_unresolved_oldest_seconds` | gauge, oldest over timestamped transitions, `-1` when none | `lab/prism/metrics.py` | already present |
+| `qbit_prism_block_candidates_pending` | gauge, `-1` if unavailable | `lab/prism/metrics.py` | already present |
+| `qbit_prism_block_candidate_oldest_pending_seconds` | gauge, `-1` if unavailable | `lab/prism/metrics.py` | already present |
+| `qbit_prism_stratum_semantic_current_work_ratio` | gauge, `1.0` when no clients | `lab/prism/metrics.py` | already present |
+| `qbit_prism_stratum_authorized_connections` | gauge | `lab/prism/metrics.py` | already present |
+| `qbit_prism_refresh_pending` | gauge, 0/1 | `lab/prism/progress_health.py` | already present |
+| `qbit_prism_refresh_pending_age_seconds` | gauge, `0` when not pending | `lab/prism/progress_health.py` | already present |
+| `qbit_prism_metrics_snapshot_available` | gauge, 0/1; startup coverage only — stays `1` after warm-up even when the refresh is stale | `lab/prism/observability.py` | already present |
+| `qbit_prism_metrics_snapshot_stale` | gauge, 0/1 | `lab/prism/observability.py` | already present |
+| `qbit_prism_metrics_snapshot_age_seconds` | gauge, `-1` before first success | `lab/prism/observability.py` | already present |
 | `up` | gauge, 0/1 | synthesised by Prometheus | not a PRISM series |
 
 What the gauge task adds and corrects:
 
 **Adds the cap.** Before it, the configured unresolved-depth cap
-(`PRISM_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX`, default 8, at
-`lab/prism/coordinator_config.py:295`) was readable only from process
+(`PRISM_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX`, default 8, in
+`lab/prism/coordinator_config.py`) was readable only from process
 configuration, so no rule could express "at or near the cap" without
 hard-coding a deployment-specific constant. Exporting the cap as
 `qbit_prism_accepted_parent_unresolved_depth_max` makes the
@@ -85,9 +83,10 @@ now reports the **exact depth used by the admission fence** — every landed
 transition whose durable bookkeeping is unresolved, including landed
 transitions that carry no timestamp. It was previously derived from the
 timestamped-ages list and so could under-report relative to the depth that
-actually gates job issuance (`lab/prism/payout_state.py:3088`). With the
-correction, rule 2 compares like with like: the gauge and the fence agree
-exactly, so the at-cap alert fires precisely when issuance stops.
+actually gates job issuance (`_await_pending_parent_payout_preview` in
+`lab/prism/payout_state.py`). With the correction, rule 2 compares like
+with like: the gauge and the fence agree exactly, so the at-cap alert fires
+precisely when issuance stops.
 
 `qbit_prism_accepted_parent_unresolved_oldest_seconds` is deliberately
 **not** changed to match that population. It remains the maximum age over
@@ -114,22 +113,23 @@ Thresholds fall into two honestly distinct classes.
 read from the code's own safety contract and stay valid at any cadence:
 
 - the accepted-parent preview wait budget, 5.0 s
-  (`DEFAULT_ACCEPTED_BLOCK_PAYOUT_PREVIEW_WAIT_SECONDS`,
-  `lab/prism/payout_state.py:64`);
+  (`DEFAULT_ACCEPTED_BLOCK_PAYOUT_PREVIEW_WAIT_SECONDS` in
+  `lab/prism/payout_state.py`);
 - the unresolved-depth cap, default 8
-  (`lab/prism/coordinator_config.py:295`), compared as a ratio via the
-  exported gauge rather than as a literal;
+  (`DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX` in
+  `lab/prism/coordinator_config.py`), compared as a ratio via the exported
+  gauge rather than as a literal;
 - the pending-refresh health deadline, 15.0 s
-  (`DEFAULT_PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS`,
-  `lab/prism/coordinator_config.py:117`);
+  (`DEFAULT_PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS` in
+  `lab/prism/coordinator_config.py`);
 - the degraded-coverage line, 0.95, borrowed from the in-process health
   evaluator, which treats a sustained loss of five percent of *current-tip*
-  job coverage as degraded (`lab/prism/observability.py:251`); the
+  job coverage as degraded in `lab/prism/observability.py`; the
   semantic ratio is the stricter sibling of that coverage ratio and is not
   itself thresholded in-process, so 0.95 is applied here by analogy rather
   than read from an existing rule;
-- the snapshot staleness floor, 15.0 s (`MINIMUM_HEALTH_STALE_SECONDS`,
-  `lab/prism/observability.py:13`); the effective budget is
+- the snapshot staleness floor, 15.0 s (`MINIMUM_HEALTH_STALE_SECONDS` in
+  `lab/prism/observability.py`); the effective budget is
   `max(3 × refresh interval, 15 s)`.
 
 **Capture-derived (testnet-cadence-dependent, must be re-baselined).**
@@ -180,7 +180,8 @@ Severity convention: `warning` means investigate within the working day;
 - **Purpose:** landed accepted-block transitions whose durable bookkeeping
   is unresolved stack prospective balance chains on unfinished work. At
   the cap, job issuance stops entirely
-  (`lab/prism/payout_state.py:3088`).
+  (`_await_pending_parent_payout_preview` in
+  `lab/prism/payout_state.py`).
 - **Condition (warning, nonzero and sustained):**
   `qbit_prism_accepted_parent_unresolved_transitions > 0`
 - **Condition (warning, near cap):**
@@ -376,7 +377,8 @@ the healthy-looking `-1` would otherwise hide a lost candidate store.
 **The zero-client ratio reads 1.0, not 0.**
 `qbit_prism_stratum_semantic_current_work_ratio` is computed as
 `semantic_current / authorized if authorized else 1.0`
-(`lab/prism/observability.py:238`). With no authorized connections it
+(`_mining_delivery_snapshot_serialized` in
+`lab/prism/observability.py`). With no authorized connections it
 reports *perfect* coverage. The
 `qbit_prism_stratum_authorized_connections > 0` guard therefore does not
 prevent a false positive — the ratio cannot false-positive at zero
