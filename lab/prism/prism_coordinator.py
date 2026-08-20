@@ -7783,6 +7783,7 @@ class PrismCoordinator:
         ctv_settlement: dict[str, object] | None = None,
         cancellation: _JobBuildCancellation | None = None,
         share_serialization: _ShareWindowSerialization | None = None,
+        append_invalidation_epoch: int | None = None,
     ) -> dict[str, Any]:
         return self._ensure_bundle_compiler().build_audit_bundle(
             shares=shares,
@@ -7799,6 +7800,29 @@ class PrismCoordinator:
             ctv_settlement=ctv_settlement,
             cancellation=cancellation,
             share_serialization=share_serialization,
+            append_invalidation_epoch=append_invalidation_epoch,
+        )
+
+    def prepare_payout_window(
+        self,
+        *,
+        mode: str,
+        records_json: list[dict[str, object]],
+        anchor_job_issued_at_ms: int,
+        append_invalidation_epoch: int,
+        window_weight: int | None = None,
+        page_size: int | None = None,
+        base_digest: str | None = None,
+    ) -> Any:
+        """Fold/advance one payout window through the persistent builder."""
+        return self._ensure_bundle_compiler().prepare_payout_window(
+            mode=mode,
+            records_json=records_json,
+            anchor_job_issued_at_ms=anchor_job_issued_at_ms,
+            append_invalidation_epoch=append_invalidation_epoch,
+            window_weight=window_weight,
+            page_size=page_size,
+            base_digest=base_digest,
         )
 
     def coinbase_script_sig_suffix_hex(self, extranonce1_hex: str, extranonce2_hex: str) -> str:

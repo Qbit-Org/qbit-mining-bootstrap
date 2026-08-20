@@ -118,12 +118,17 @@ import io
 import json
 import os
 import random
+import subprocess
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Protocol
 
-from lab.prism.bundle_compiler import _ShareWindowSerialization
+from lab.prism.bundle_compiler import (
+    PRISM_SERVE_BUILDER_PROTOCOL_VERSION,
+    _ShareWindowSerialization,
+)
+from lab.prism.prism_tools import prism_tool_command
 from lab.prism.share_ledger import (
     DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
     AcceptedShareRecord,
@@ -542,8 +547,147 @@ class PythonWindowPipelineAdapter:
         return run_python_pipeline(case)
 
 
+def _split_record_fragments(items: bytes) -> tuple[bytes, ...]:
+    """Split one canonical items stream into its per-record byte spans.
+
+    The spans come straight from the backend's bytes (``raw_decode`` only
+    reports where each JSON object ends), so a backend encoding divergence is
+    still visible in the returned fragments rather than being papered over by
+    a re-encode.
+    """
+    if not items:
+        return ()
+    text = items.decode("ascii")
+    decoder = json.JSONDecoder()
+    fragments: list[bytes] = []
+    position = 0
+    while position < len(text):
+        _, end = decoder.raw_decode(text, position)
+        fragments.append(text[position:end].encode("ascii"))
+        if end < len(text) and text[end] != ",":
+            raise ValueError(
+                f"canonical items stream has {text[end]!r} where a record"
+                " separator was expected"
+            )
+        position = end + 1
+    return tuple(fragments)
+
+
+@dataclass(frozen=True)
+class RustDaemonWindowPipelineAdapter:
+    """The Rust --serve daemon's prepare_window pipeline as a backend.
+
+    Drives the real daemon binary over its JSONL protocol: one ``full``
+    preparation for the snapshot, then one ``advance`` per delta step, holding
+    the canonical items stream exactly the way the coordinator's opaque
+    mirror does (drop the reported prefix, append the returned suffix). The
+    three byte outputs are taken from the daemon's bytes; only the spool tail
+    runs the shipped Python serialization over the lazily parsed records,
+    which is precisely the production fallback path under the Rust switch.
+
+    Selected with ``QBIT_WINDOW_PIPELINE_PARITY_ADAPTER=rust-daemon``; the
+    daemon binary resolves through ``prism_tool_command`` (``cargo run``
+    unless ``PRISM_TOOL_BIN_DIR`` provides a prebuilt binary).
+    """
+
+    name: str = "rust-daemon"
+
+    @staticmethod
+    def _wire_record(record: AcceptedShareRecord) -> dict[str, object]:
+        return record_input_json(record)
+
+    def run(self, case: WindowPipelineCase) -> WindowPipelineOutputs:
+        command = prism_tool_command("qbit-prism-build-audit-bundle") + [
+            "--serve",
+            "--signing-key-seed-hex",
+            "42" * 32,
+            "--ledger-signing-key-seed-hex",
+            "43" * 32,
+        ]
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        )
+        try:
+            assert process.stdin is not None and process.stdout is not None
+            handshake = json.loads(process.stdout.readline())
+            if handshake.get("protocol") != PRISM_SERVE_BUILDER_PROTOCOL_VERSION:
+                raise RuntimeError(
+                    f"daemon announced protocol {handshake.get('protocol')!r},"
+                    f" expected {PRISM_SERVE_BUILDER_PROTOCOL_VERSION}"
+                )
+
+            def exchange(request: dict[str, object]) -> tuple[dict[str, object], bytes]:
+                assert process.stdin is not None and process.stdout is not None
+                process.stdin.write(
+                    json.dumps(request, separators=(",", ":")).encode("ascii") + b"\n"
+                )
+                process.stdin.flush()
+                envelope = json.loads(process.stdout.readline())
+                if envelope.get("ok") is not True:
+                    raise RuntimeError(f"prepare_window failed: {envelope}")
+                length_key = (
+                    "window_items_len"
+                    if "window_items_len" in envelope
+                    else "appended_items_len"
+                )
+                payload = process.stdout.read(int(envelope[length_key]))
+                process.stdout.read(1)  # the terminating newline
+                return envelope, payload
+
+            envelope, items = exchange(
+                {
+                    "request": "prepare_window",
+                    "mode": "full",
+                    "append_invalidation_epoch": 0,
+                    "anchor_job_issued_at_ms": case.anchor_job_issued_at_ms,
+                    "window_weight": case.window_weight,
+                    "page_size": case.page_size,
+                    "records": [
+                        self._wire_record(record) for record in case.snapshot_records
+                    ],
+                }
+            )
+            for step in case.advances:
+                envelope, appended = exchange(
+                    {
+                        "request": "prepare_window",
+                        "mode": "advance",
+                        "append_invalidation_epoch": 0,
+                        "anchor_job_issued_at_ms": step.anchor_job_issued_at_ms,
+                        "base_digest": envelope["share_snapshot_sha256"],
+                        "records": [
+                            self._wire_record(record) for record in step.delta_records
+                        ],
+                    }
+                )
+                items = items[int(envelope["retained_drop_bytes"]) :] + appended
+        finally:
+            if process.stdin is not None:
+                process.stdin.close()
+            process.wait(timeout=30.0)
+            if process.stdout is not None:
+                process.stdout.close()
+
+        record_jsons = _split_record_fragments(items)
+        if len(record_jsons) != int(envelope["record_count"]):
+            raise RuntimeError(
+                f"daemon reported {envelope['record_count']} records but the"
+                f" items stream holds {len(record_jsons)}"
+            )
+        shares = [json.loads(fragment) for fragment in record_jsons]
+        return WindowPipelineOutputs(
+            record_jsons=record_jsons,
+            canonical_bytes=b"[" + items + b"]",
+            canonical_digest=str(envelope["share_snapshot_sha256"]),
+            spool_tail=spool_tail_bytes(shares),
+        )
+
+
 _ADAPTER_FACTORIES: dict[str, Callable[[], WindowPipelineAdapter]] = {
     DEFAULT_ADAPTER_NAME: PythonWindowPipelineAdapter,
+    "rust-daemon": RustDaemonWindowPipelineAdapter,
 }
 
 

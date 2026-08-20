@@ -1333,6 +1333,7 @@ class TipRefreshService:
                         "fallbacks",
                         "spawns",
                         "window_uploads",
+                        "window_prepares",
                     )
                 ],
                 "# HELP qbit_prism_payout_artifact_events_total Payout-ledger-artifact lifecycle outcomes (build, install, reuse pacing).",
@@ -1359,6 +1360,7 @@ class TipRefreshService:
                         "served_reuse",
                         "probe_rejected_ceiling",
                         "probe_past_floor",
+                        "window_mirror_divergence",
                     )
                 ],
                 "# HELP qbit_prism_serve_builder_window_cache_total Daemon parsed share-window cache outcomes.",

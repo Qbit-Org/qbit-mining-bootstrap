@@ -68,6 +68,12 @@ DEFAULT_PRISM_PAYOUT_ARTIFACT_MIN_BUILD_INTERVAL_SECONDS = 60.0
 # A full oracle pass periodically checks the append-only delta assumption.
 # Reorg/carry mutations and invariant failures force this path immediately.
 DEFAULT_PRISM_PAYOUT_ARTIFACT_FULL_RESCAN_SECONDS = 3_600.0
+# Route the payout-window fold, canonical digest, and incremental advance
+# through the persistent --serve audit builder instead of in-process Python.
+# Defaults to Python: the Rust path is adopted deliberately, per #131's
+# per-component-switch method, and any daemon anomaly still degrades to the
+# in-process pipeline for that materialization without flipping this.
+DEFAULT_PRISM_WINDOW_PIPELINE_RUST = False
 
 
 def validate_payout_artifact_age_bounds(
@@ -405,6 +411,42 @@ def env_decimal(name: str, default: str, *, environ: Env | None = None) -> Decim
 
 def env_bool(name: str, default: str, *, environ: Env | None = None) -> bool:
     return env(name, default, environ=environ).lower() in {"1", "true", "yes", "on"}
+
+
+_STRICT_BOOL_TRUE = frozenset({"1", "true", "yes", "on"})
+_STRICT_BOOL_FALSE = frozenset({"0", "false", "no", "off"})
+
+
+def env_strict_bool(name: str, default: bool, *, environ: Env | None = None) -> bool:
+    """Boolean that fails closed: anything non-boolean refuses startup.
+
+    ``env_bool`` silently reads unrecognized values as false, which is the
+    wrong failure mode for a pipeline-routing switch -- a typo must be a
+    visible startup error, never a silent flip to either side.
+    """
+    raw = _current_environ(environ).get(name)
+    if raw is None or raw == "":
+        return default
+    normalized = raw.lower()
+    if normalized in _STRICT_BOOL_TRUE:
+        return True
+    if normalized in _STRICT_BOOL_FALSE:
+        return False
+    raise SystemExit(f"{name} must be a boolean (0/1/true/false/yes/no/on/off)")
+
+
+def env_window_pipeline_rust(*, environ: Env | None = None) -> bool:
+    """Whether the payout-window pipeline routes through the Rust daemon.
+
+    Independent of PRISM_BUILDER_SERVE: with the daemon transport disabled
+    this switch is inert (the materialization path checks the transport
+    itself), not an error.
+    """
+    return env_strict_bool(
+        "PRISM_WINDOW_PIPELINE_RUST",
+        DEFAULT_PRISM_WINDOW_PIPELINE_RUST,
+        environ=environ,
+    )
 
 
 def env_optional_bool(name: str, *, environ: Env | None = None) -> bool | None:
@@ -947,6 +989,11 @@ class JobPipelineConfig:
     pool_fee_recipient_id: str | None
     pool_fee_order_key: str | None
     template_max_age_raw: str | None
+    # Appended with a default so existing positional constructions keep
+    # working. The loader passes the strict env read, so a non-boolean
+    # PRISM_WINDOW_PIPELINE_RUST refuses startup rather than starting on
+    # either side of the switch.
+    window_pipeline_rust_enabled: bool = DEFAULT_PRISM_WINDOW_PIPELINE_RUST
 
 
 @dataclass(frozen=True)
@@ -1348,6 +1395,7 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
         payout_artifact_reuse_enabled=env_bool(
             "PRISM_PAYOUT_ARTIFACT_REUSE", "1", environ=source
         ),
+        window_pipeline_rust_enabled=env_window_pipeline_rust(environ=source),
         payout_artifact_reanchor_seconds=payout_artifact_reanchor_seconds,
         payout_artifact_min_build_interval_seconds=(
             payout_artifact_min_build_interval_seconds

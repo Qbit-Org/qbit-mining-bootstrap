@@ -43,11 +43,16 @@ from lab.prism.coordinator_config import (
     DEFAULT_PRISM_PAYOUT_ARTIFACT_MAX_ANCHOR_AGE_SECONDS,
     DEFAULT_PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS,
     DEFAULT_PRISM_PAYOUT_ARTIFACT_REARM_MIN_SECONDS,
+    env_bool,
+    env_window_pipeline_rust,
 )
 from lab.prism.coordinator_shutdown import (
     BLOCK_SUBMITTER_WAIT_HEARTBEAT_SLICE_SECONDS,
 )
 from lab.prism.share_ledger import (
+    DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+    DaemonShareWindowMirror,
+    DaemonWindowMirrorDivergence,
     IncrementalShareJsonSequence,  # noqa: F401 - annotation/compatibility export
     IncrementalShareWindow,
     IncrementalWindowAdvanceStats,
@@ -276,6 +281,23 @@ class _IncrementalPayoutArtifactWindow:
     full_rescan_monotonic: float
     full_rescan_attempt_monotonic: float
     append_invalidation_epoch: int = 0
+
+
+class _DaemonWindowRebuildRequired(Exception):
+    """The daemon path cannot advance; rebuild from the full oracle.
+
+    Raised only inside the payout-window materialization: ``reason`` becomes
+    the full-rescan reason routed through the existing invalidation
+    machinery, and ``clear_cache`` distinguishes a refuted local state (the
+    mirror diverged, or the daemon transport vanished under a mirror-typed
+    cache) from a daemon that merely lost its own copy while the coordinator
+    mirror stays valid.
+    """
+
+    def __init__(self, reason: str, *, clear_cache: bool) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.clear_cache = clear_cache
 
 
 @dataclass(frozen=True)
@@ -808,6 +830,23 @@ class PayoutStateService:
                 full_rescan_reason=reason,
             )
 
+        if self._window_pipeline_rust_enabled():
+            materialized = self._daemon_full_window_materialization(
+                records=records,
+                snapshot_anchor_ms=snapshot_anchor_ms,
+                snapshot_window_weight=snapshot_window_weight,
+                reason=reason,
+                observed_monotonic=observed_monotonic,
+                append_invalidation_epoch=append_invalidation_epoch,
+            )
+            if materialized is not None:
+                return materialized
+            # Any daemon outcome that cannot produce a window here -- an
+            # anomaly (already retired), the transport disabled, or a
+            # snapshot the fold must reject -- degrades to the in-process
+            # pipeline below for this materialization, which is also where
+            # an invalid snapshot raises its authoritative error.
+
         window = IncrementalShareWindow.from_full_snapshot(
             records,
             anchor_job_issued_at_ms=snapshot_anchor_ms,
@@ -834,6 +873,166 @@ class PayoutStateService:
             record_count=len(shares_json),
             stats=zero_stats,
             full_rescan_reason=reason,
+        )
+
+    def _window_pipeline_rust_enabled(self) -> bool:
+        """Whether window materialization routes through the --serve daemon.
+
+        Fail-closed at the env layer (a non-boolean PRISM_WINDOW_PIPELINE_RUST
+        refuses startup via SystemExit); inert -- not an error -- when the
+        daemon transport itself is disabled or when the runtime exposes no
+        prepare port (embedders and slim test coordinators).
+        """
+        if not env_window_pipeline_rust():
+            return False
+        if not env_bool("PRISM_BUILDER_SERVE", "1"):
+            return False
+        return callable(getattr(self._runtime, "prepare_payout_window", None))
+
+    def _daemon_full_window_materialization(
+        self,
+        *,
+        records: Sequence[Any],
+        snapshot_anchor_ms: int,
+        snapshot_window_weight: int,
+        reason: str,
+        observed_monotonic: float,
+        append_invalidation_epoch: int,
+    ) -> _PayoutWindowMaterialization | None:
+        """Fold one full snapshot through the daemon; None means fold here.
+
+        The daemon returns the canonical digest plus the full canonical
+        items stream; the mirror construction re-hashes those bytes against
+        the digest before anything downstream may consume them. Every
+        non-prepared outcome -- a daemon anomaly (already retired by the
+        transport), the fold rejecting the snapshot (the in-process oracle
+        must raise the authoritative error), or a refuted byte mirror --
+        degrades to the in-process pipeline for this materialization.
+        """
+        runtime = self._runtime
+        prepare = getattr(runtime, "prepare_payout_window", None)
+        if not callable(prepare):
+            return None
+        outcome = prepare(
+            mode="full",
+            records_json=[record.to_prism_json() for record in records],
+            anchor_job_issued_at_ms=int(snapshot_anchor_ms),
+            append_invalidation_epoch=int(append_invalidation_epoch),
+            window_weight=int(snapshot_window_weight),
+            page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+        )
+        if outcome is None or outcome.status != "prepared":
+            return None
+        try:
+            mirror = DaemonShareWindowMirror.from_full_items(
+                anchor_job_issued_at_ms=int(snapshot_anchor_ms),
+                window_weight=int(snapshot_window_weight),
+                page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+                record_count=int(outcome.record_count),
+                canonical_items=outcome.window_items or b"",
+                share_snapshot_sha256=outcome.share_snapshot_sha256 or "",
+            )
+        except DaemonWindowMirrorDivergence:
+            runtime._record_payout_artifact_event("window_mirror_divergence")
+            return None
+        shares_json = mirror.json_records()
+        runtime._incremental_payout_artifact_window = (
+            _IncrementalPayoutArtifactWindow(
+                window=mirror,
+                shares_json=shares_json,
+                share_snapshot_sha256=mirror.share_snapshot_sha256,
+                refreshed_monotonic=observed_monotonic,
+                full_rescan_monotonic=observed_monotonic,
+                full_rescan_attempt_monotonic=observed_monotonic,
+                append_invalidation_epoch=append_invalidation_epoch,
+            )
+        )
+        return _PayoutWindowMaterialization(
+            shares_json=shares_json,
+            share_snapshot_sha256=mirror.share_snapshot_sha256,
+            snapshot_anchor_ms=int(snapshot_anchor_ms),
+            mode="full_rescan",
+            record_count=mirror.record_count,
+            stats=IncrementalWindowAdvanceStats(
+                added_rows=0,
+                expired_rows=0,
+                touched_pages=0,
+            ),
+            full_rescan_reason=reason,
+        )
+
+    def _daemon_advance_window(
+        self,
+        mirror: DaemonShareWindowMirror,
+        delta_records: Sequence[Any],
+        *,
+        snapshot_anchor_ms: int,
+        append_invalidation_epoch: int,
+    ) -> tuple[DaemonShareWindowMirror, IncrementalWindowAdvanceStats]:
+        """Advance the daemon-prepared window by one append-only delta.
+
+        Outcome mapping, mirroring the in-process contract exactly:
+        ``fallback`` raises IncrementalWindowFallback (same handler, same
+        ``incremental_invariant_failed`` full rescan, daemon not retired);
+        ``needs_full`` and every anomaly raise _DaemonWindowRebuildRequired
+        so the caller rebuilds through the full oracle path.
+        """
+        runtime = self._runtime
+        prepare = getattr(runtime, "prepare_payout_window", None)
+        if not callable(prepare) or not self._window_pipeline_rust_enabled():
+            # The switch or transport flipped between the cache-mode check
+            # and this advance; opaque bytes cannot advance in-process.
+            raise _DaemonWindowRebuildRequired(
+                "window_pipeline_mode_changed",
+                clear_cache=True,
+            )
+        outcome = prepare(
+            mode="advance",
+            records_json=[record.to_prism_json() for record in delta_records],
+            anchor_job_issued_at_ms=int(snapshot_anchor_ms),
+            append_invalidation_epoch=int(append_invalidation_epoch),
+            base_digest=mirror.share_snapshot_sha256,
+        )
+        if outcome is None:
+            raise _DaemonWindowRebuildRequired(
+                "window_daemon_unavailable",
+                clear_cache=True,
+            )
+        if outcome.status == "needs_full":
+            # Respawn or eviction: the daemon no longer holds the base
+            # window. The coordinator mirror is still digest-verified, so
+            # only the daemon needs re-seeding via the full path.
+            raise _DaemonWindowRebuildRequired(
+                "window_daemon_state_lost",
+                clear_cache=False,
+            )
+        if outcome.status == "fallback":
+            raise IncrementalWindowFallback(
+                outcome.error or "daemon advance invariant failed"
+            )
+        if outcome.status != "prepared":
+            raise _DaemonWindowRebuildRequired(
+                "window_daemon_unavailable",
+                clear_cache=True,
+            )
+        try:
+            advanced = mirror.advanced(
+                anchor_job_issued_at_ms=int(snapshot_anchor_ms),
+                record_count=int(outcome.record_count),
+                retained_drop_bytes=int(outcome.retained_drop_bytes),
+                appended_items=outcome.appended_items,
+                share_snapshot_sha256=outcome.share_snapshot_sha256 or "",
+            )
+        except DaemonWindowMirrorDivergence:
+            runtime._record_payout_artifact_event("window_mirror_divergence")
+            raise _DaemonWindowRebuildRequired(
+                "window_mirror_divergence",
+                clear_cache=True,
+            ) from None
+        return advanced, IncrementalWindowAdvanceStats(
+            added_rows=int(outcome.added_rows),
+            expired_rows=int(outcome.expired_rows),
+            touched_pages=int(outcome.touched_pages),
         )
 
     def _incremental_payout_window_materialization(
@@ -875,6 +1074,19 @@ class PayoutStateService:
             runtime._incremental_payout_artifact_window = None
             cached = None
             full_reason = "late_visible_append"
+        elif isinstance(
+            cached.window, DaemonShareWindowMirror
+        ) and not self._window_pipeline_rust_enabled():
+            # The Rust switch went off while a daemon mirror was cached; the
+            # in-process pipeline cannot advance opaque bytes, so rebuild
+            # from the oracle. The converse (a Python window cached while
+            # the switch is on) deliberately keeps advancing in Python --
+            # that is the degraded state while the daemon is unavailable --
+            # and the periodic runtime-check converts it back.
+            runtime._incremental_payout_artifact_window = None
+            runtime._incremental_payout_artifact_window_invalidation_reason = None
+            cached = None
+            full_reason = "window_pipeline_mode_changed"
         elif cached.window.window_weight != int(snapshot_window_weight):
             runtime._incremental_payout_artifact_window = None
             runtime._incremental_payout_artifact_window_invalidation_reason = None
@@ -927,9 +1139,7 @@ class PayoutStateService:
                 share_snapshot_sha256=cached.share_snapshot_sha256,
                 snapshot_anchor_ms=cached.window.anchor_job_issued_at_ms,
                 mode="debounced",
-                record_count=sum(
-                    len(page.records) for page in cached.window.pages
-                ),
+                record_count=cached.window.record_count,
                 stats=IncrementalWindowAdvanceStats(0, 0, 0),
             )
 
@@ -950,9 +1160,30 @@ class PayoutStateService:
                     snapshot_anchor_ms,
                 )
             )
-            advanced_window, stats = cached.window.advance(
-                delta_records,
-                anchor_job_issued_at_ms=snapshot_anchor_ms,
+            if isinstance(cached.window, DaemonShareWindowMirror):
+                advanced_window, stats = self._daemon_advance_window(
+                    cached.window,
+                    delta_records,
+                    snapshot_anchor_ms=snapshot_anchor_ms,
+                    append_invalidation_epoch=append_invalidation_epoch,
+                )
+            else:
+                advanced_window, stats = cached.window.advance(
+                    delta_records,
+                    anchor_job_issued_at_ms=snapshot_anchor_ms,
+                )
+        except _DaemonWindowRebuildRequired as rebuild:
+            # Daemon window loss (respawn/eviction), a daemon anomaly, or a
+            # refuted byte mirror. The cached mirror stays valid when only
+            # the daemon lost state; the oracle rebuild below re-prepares it.
+            if rebuild.clear_cache:
+                runtime._incremental_payout_artifact_window = None
+            return runtime._full_payout_window_materialization(
+                snapshot_anchor_ms=snapshot_anchor_ms,
+                snapshot_window_weight=snapshot_window_weight,
+                reason=rebuild.reason,
+                observed_monotonic=observed,
+                append_invalidation_epoch=append_invalidation_epoch,
             )
         except (IncrementalWindowFallback, ValueError):
             runtime._incremental_payout_artifact_window = None
@@ -1003,10 +1234,15 @@ class PayoutStateService:
                     anchor_job_issued_at_ms=snapshot_anchor_ms,
                     window_weight=snapshot_window_weight,
                 )
-                full_retained = full_window.records()
-                matched = full_retained == advanced_window.records()
                 shares_json = full_window.json_records()
                 digest = self._canonical_json_sha256(shares_json)
+                if isinstance(advanced_window, DaemonShareWindowMirror):
+                    # The mirror holds canonical bytes, not records; digest
+                    # equality is the same comparison, since the canonical
+                    # digest is a function of exactly the retained records.
+                    matched = digest == advanced_window.share_snapshot_sha256
+                else:
+                    matched = full_window.records() == advanced_window.records()
             except Exception:
                 # The already-validated delta remains usable. Space failed
                 # oracle attempts by the configured runtime-check interval so a
@@ -1019,8 +1255,34 @@ class PayoutStateService:
                 mode = "incremental_self_check_failed"
                 check_reason = "periodic_self_check_failed"
             else:
+                oracle_window: (
+                    IncrementalShareWindow | DaemonShareWindowMirror
+                ) = full_window
+                if self._window_pipeline_rust_enabled():
+                    # Keep the cache in mirror form so the next delta build
+                    # advances through the daemon rather than mode-cycling;
+                    # this is also how a Python-advancing cache (the degraded
+                    # state after a daemon outage) converts back. The bytes
+                    # come from the oracle's own pages (already encoded); on
+                    # a match the daemon holds this same digest, and on a
+                    # mismatch (or after an outage) its next advance answers
+                    # needs_full and re-prepares from the oracle's window.
+                    oracle_window = DaemonShareWindowMirror(
+                        anchor_job_issued_at_ms=(
+                            full_window.anchor_job_issued_at_ms
+                        ),
+                        window_weight=full_window.window_weight,
+                        page_size=full_window.page_size,
+                        record_count=len(shares_json),
+                        canonical_items=b",".join(
+                            page.canonical_json_items
+                            for page in full_window.pages
+                            if page.canonical_json_items
+                        ),
+                        share_snapshot_sha256=digest,
+                    )
                 advanced = _IncrementalPayoutArtifactWindow(
-                    window=full_window,
+                    window=oracle_window,
                     shares_json=shares_json,
                     share_snapshot_sha256=digest,
                     refreshed_monotonic=observed,
@@ -1082,7 +1344,7 @@ class PayoutStateService:
             share_snapshot_sha256=advanced.share_snapshot_sha256,
             snapshot_anchor_ms=advanced.window.anchor_job_issued_at_ms,
             mode=mode,
-            record_count=sum(len(page.records) for page in advanced.window.pages),
+            record_count=advanced.window.record_count,
             stats=stats,
             full_rescan_reason=check_reason,
             balance_check_prior_balances=balance_check_prior_balances,

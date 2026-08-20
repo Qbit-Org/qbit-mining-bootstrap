@@ -1,4 +1,5 @@
 use qbit_pool_builder::{ManifestSigningKey, SignedPayoutManifest};
+use qbit_prism::window::{PayoutWindow, DEFAULT_WINDOW_PAGE_SIZE};
 use qbit_prism::{
     build_audit_bundle_with_coinbase_options, build_audit_bundle_with_ctv_settlement_options,
     profile_audit_build, AcceptedShare, AuditBundle, CarryForwardBalance, FanoutFeeRatePolicy,
@@ -13,8 +14,11 @@ use std::{env, error::Error, fs, process};
 const PHASE_METRICS_PREFIX: &str = "qbit-prism-build-phase-metrics ";
 /// Version of the --serve JSONL protocol announced in the startup handshake.
 /// The coordinator refuses to speak to a daemon announcing a different
-/// version and falls back to one-shot builds instead.
-const SERVE_PROTOCOL_VERSION: u64 = 1;
+/// version and falls back to one-shot builds instead. Version 2 adds the
+/// prepare_window request (payout-window fold, canonical digest, and
+/// incremental advance daemon-side) and unifies its window state with the
+/// build cache.
+const SERVE_PROTOCOL_VERSION: u64 = 2;
 /// Parsed share windows retained by the --serve daemon. Windows rotate with
 /// payout/artifact generations, so two entries cover the current generation
 /// plus the previous one still finishing in-flight builds.
@@ -60,16 +64,25 @@ struct ServeWindowKey {
     share_snapshot_sha256: String,
 }
 
+/// One serve-mode request line, build and prepare_window shapes combined so
+/// dispatch needs a single parse of megabyte-scale lines. `request` is absent
+/// on build requests (the historical shape) and `"prepare_window"` on window
+/// preparations; required fields are validated per shape after dispatch so a
+/// malformed request answers with an error instead of killing the daemon.
 #[derive(Debug, Deserialize)]
 struct ServeRequest {
+    #[serde(default)]
+    request: Option<String>,
     /// Identity of the parsed share window this build wants. Requests may
-    /// omit the inline window once a prior request uploaded it.
-    window_key: ServeWindowKey,
+    /// omit the inline window once a prior request uploaded or prepared it.
+    #[serde(default)]
+    window_key: Option<ServeWindowKey>,
     #[serde(default)]
     compact_share_identities: Vec<CompactShareIdentity>,
     #[serde(default)]
     compact_shares: Vec<CompactAcceptedShare>,
-    found_block: FoundBlock,
+    #[serde(default)]
+    found_block: Option<FoundBlock>,
     #[serde(default)]
     prior_balances: Vec<CarryForwardBalance>,
     #[serde(default)]
@@ -80,6 +93,35 @@ struct ServeRequest {
     witness_merkle_leaves_hex: Vec<String>,
     #[serde(default)]
     ctv_settlement: Option<CtvSettlementInput>,
+    /// Coordinator append-invalidation epoch. Prepared window state is
+    /// tagged with the epoch that produced it; any request carrying a newer
+    /// epoch drops older prepared state, so a daemon that missed an
+    /// invalidation while respawning self-corrects on the next request.
+    #[serde(default)]
+    append_invalidation_epoch: Option<u64>,
+    // prepare_window fields.
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    records: Vec<AcceptedShare>,
+    #[serde(default)]
+    base_digest: Option<String>,
+    #[serde(default)]
+    anchor_job_issued_at_ms: Option<i64>,
+    #[serde(default)]
+    window_weight: Option<u128>,
+    #[serde(default)]
+    page_size: Option<usize>,
+}
+
+/// One unified window-cache entry: either a raw upload from the build path
+/// (compact records, loaned to builds exactly as before) or a prepared
+/// window that owns the fold state needed to advance incrementally. Prepared
+/// windows are never loaned: builds clone their records so the advance
+/// lineage survives every build outcome.
+enum WindowState {
+    Uploaded(Vec<AcceptedShare>),
+    Prepared { window: PayoutWindow, epoch: u64 },
 }
 
 #[derive(Serialize)]
@@ -352,7 +394,7 @@ fn serve_requests(
         out.flush()?;
     }
 
-    let mut window_cache: Vec<(String, Vec<AcceptedShare>)> = Vec::new();
+    let mut window_cache: Vec<(String, WindowState)> = Vec::new();
     let mut cache_hits: u64 = 0;
     let mut cache_misses: u64 = 0;
 
@@ -374,7 +416,41 @@ fn serve_requests(
         // expansion, exactly where one-shot mode samples the same metric, so
         // transport comparisons measure identical work.
         let input_deserialization_seconds = input_started.elapsed().as_secs_f64();
-        let window_sha = request.window_key.share_snapshot_sha256.clone();
+        // A newer coordinator epoch invalidates every prepared window from
+        // an older one: the fold inputs those windows were built from are
+        // known-incomplete. Tag-matching here (instead of explicit
+        // invalidate messages) means a daemon that was mid-respawn during
+        // the epoch bump still converges on the next request.
+        if let Some(request_epoch) = request.append_invalidation_epoch {
+            window_cache.retain(|(_, state)| match state {
+                WindowState::Prepared { epoch, .. } => *epoch >= request_epoch,
+                WindowState::Uploaded(_) => true,
+            });
+        }
+        match request.request.as_deref() {
+            None => {}
+            Some("prepare_window") => {
+                serve_prepare_window(&stdout, request, &mut window_cache)?;
+                continue;
+            }
+            Some(other) => {
+                respond_error(
+                    &stdout,
+                    &format!("unsupported serve request type: {other}"),
+                    false,
+                )?;
+                continue;
+            }
+        }
+        let Some(window_key) = request.window_key else {
+            respond_error(&stdout, "build request carries no window_key", false)?;
+            continue;
+        };
+        let Some(found_block) = request.found_block else {
+            respond_error(&stdout, "build request carries no found_block", false)?;
+            continue;
+        };
+        let window_sha = window_key.share_snapshot_sha256;
         let uploaded_window = !request.compact_shares.is_empty();
         if !uploaded_window && !request.compact_share_identities.is_empty() {
             respond_error(
@@ -384,29 +460,57 @@ fn serve_requests(
             )?;
             continue;
         }
-        // The window vector is loaned to the build rather than cloned: both
+        // Uploaded windows are loaned to the build rather than cloned: both
         // audit build entry points only borrow the shares for derivation and
-        // move the vector unmodified into AuditBundle.shares, so it is
-        // reclaimed from the finished bundle below. A failed build drops the
-        // loaned window; the coordinator's needs_window bounce re-uploads it.
+        // move the vector unmodified into AuditBundle.shares, so a loan is
+        // reclaimed from the finished bundle below. Prepared windows are
+        // never loaned -- the build gets a clone and the entry stays intact,
+        // because the fold state must survive a failed build to keep
+        // serving advances. A failed build drops a loaned upload; the
+        // coordinator's needs_window bounce re-uploads it.
+        let cached_position = window_cache.iter().position(|(key, _)| key == &window_sha);
+        let prepared_hit = matches!(
+            cached_position.map(|position| &window_cache[position].1),
+            Some(WindowState::Prepared { .. })
+        );
         let shares: Vec<AcceptedShare> = if uploaded_window {
-            match expand_compact_shares(&request.compact_share_identities, request.compact_shares) {
-                Ok(expanded) => {
-                    cache_misses += 1;
-                    window_cache.retain(|(key, _)| key != &window_sha);
-                    expanded
+            cache_misses += 1;
+            if prepared_hit {
+                // The prepared state is the same content-addressed window at
+                // full fidelity; keep it (and its advance lineage) and serve
+                // the build from it, ignoring the redundant upload bytes.
+                let position = cached_position.expect("prepared_hit implies a position");
+                match &window_cache[position].1 {
+                    WindowState::Prepared { window, .. } => window.shares_for_build(),
+                    WindowState::Uploaded(_) => unreachable!("prepared_hit checked the variant"),
                 }
-                Err(error) => {
-                    respond_error(&stdout, &format!("invalid window upload: {error}"), false)?;
-                    continue;
+            } else {
+                match expand_compact_shares(
+                    &request.compact_share_identities,
+                    request.compact_shares,
+                ) {
+                    Ok(expanded) => {
+                        window_cache.retain(|(key, _)| key != &window_sha);
+                        expanded
+                    }
+                    Err(error) => {
+                        respond_error(&stdout, &format!("invalid window upload: {error}"), false)?;
+                        continue;
+                    }
                 }
             }
-        } else if let Some(position) = window_cache
-            .iter()
-            .position(|(key, _)| key == &window_sha)
-        {
+        } else if let Some(position) = cached_position {
             cache_hits += 1;
-            window_cache.remove(position).1
+            match &window_cache[position].1 {
+                WindowState::Prepared { window, .. } => window.shares_for_build(),
+                WindowState::Uploaded(_) => {
+                    let (_, state) = window_cache.remove(position);
+                    match state {
+                        WindowState::Uploaded(shares) => shares,
+                        WindowState::Prepared { .. } => unreachable!("variant checked above"),
+                    }
+                }
+            }
         } else {
             // Not counted as a miss: the coordinator's follow-up upload of
             // this same window is the miss that gets counted.
@@ -425,7 +529,7 @@ fn serve_requests(
             .unwrap_or_else(PayoutPolicy::day_one_default);
         let (bundle_result, phases_seconds) = run_profiled_build(
             shares,
-            request.found_block,
+            found_block,
             request.prior_balances,
             payout_policy,
             request.ctv_settlement,
@@ -453,10 +557,15 @@ fn serve_requests(
         })?;
         let output_serialization_seconds = output_started.elapsed().as_secs_f64();
         let summary_raw = serde_json::value::RawValue::from_string(summary_json)?;
-        // Reclaim the loaned window from the finished bundle before
-        // reporting cache occupancy: no bytes were copied on the way in or
-        // out, and the entry keeps most-recent position.
-        window_cache.insert(0, (window_sha, bundle.shares));
+        // Reclaim a loaned upload from the finished bundle (no bytes were
+        // copied on the way in or out); a prepared entry only moves to
+        // most-recent position, its clone in bundle.shares is dropped.
+        if let Some(position) = window_cache.iter().position(|(key, _)| key == &window_sha) {
+            let entry = window_cache.remove(position);
+            window_cache.insert(0, entry);
+        } else {
+            window_cache.insert(0, (window_sha, WindowState::Uploaded(bundle.shares)));
+        }
         window_cache.truncate(SERVE_WINDOW_CACHE_MAX_ENTRIES);
         let response = ServeResponse {
             ok: true,
@@ -477,6 +586,224 @@ fn serve_requests(
         serde_json::to_writer(&mut out, &response)?;
         writeln!(out)?;
         out.flush()?;
+    }
+    Ok(())
+}
+
+/// Handle one prepare_window request against the unified window cache.
+///
+/// Success responses append a raw canonical-items section after the JSON
+/// envelope line: the full items stream for `full` mode, or the appended
+/// suffix for `advance` mode (whose envelope also carries the byte count to
+/// drop from the front of the previous stream). The two distinguishable
+/// non-success outcomes -- `needs_full` (state not held) and `fallback`
+/// (an advance invariant failed) -- are ordinary control flow for the
+/// coordinator, never daemon anomalies.
+fn serve_prepare_window(
+    stdout: &io::Stdout,
+    request: ServeRequest,
+    window_cache: &mut Vec<(String, WindowState)>,
+) -> Result<(), Box<dyn Error>> {
+    let Some(request_epoch) = request.append_invalidation_epoch else {
+        respond_error(
+            stdout,
+            "prepare_window carries no append_invalidation_epoch",
+            false,
+        )?;
+        return Ok(());
+    };
+    let Some(anchor_job_issued_at_ms) = request.anchor_job_issued_at_ms else {
+        respond_error(
+            stdout,
+            "prepare_window carries no anchor_job_issued_at_ms",
+            false,
+        )?;
+        return Ok(());
+    };
+    match request.mode.as_deref() {
+        Some("full") => {
+            let Some(window_weight) = request.window_weight else {
+                respond_error(stdout, "prepare_window full carries no window_weight", false)?;
+                return Ok(());
+            };
+            let page_size = request.page_size.unwrap_or(DEFAULT_WINDOW_PAGE_SIZE);
+            let window = match PayoutWindow::from_full_snapshot(
+                request.records,
+                anchor_job_issued_at_ms,
+                window_weight,
+                page_size,
+            ) {
+                Ok(window) => window,
+                Err(error) => {
+                    // The snapshot itself violates the fold's invariants
+                    // (duplicate share_seq/share_id, non-positive
+                    // difficulty). The coordinator's in-process oracle
+                    // raises the same rejection, so answer with a
+                    // distinguishable outcome instead of a daemon anomaly.
+                    let mut out = stdout.lock();
+                    serde_json::to_writer(
+                        &mut out,
+                        &serde_json::json!({
+                            "ok": false,
+                            "request": "prepare_window",
+                            "fold_invalid": true,
+                            "error": error.to_string(),
+                        }),
+                    )?;
+                    writeln!(out)?;
+                    out.flush()?;
+                    return Ok(());
+                }
+            };
+            let digest = window.canonical_digest_hex();
+            let items = window.canonical_items_bytes();
+            let record_count = window.record_count();
+            window_cache.retain(|(key, _)| key != &digest);
+            window_cache.insert(
+                0,
+                (
+                    digest.clone(),
+                    WindowState::Prepared {
+                        window,
+                        epoch: request_epoch,
+                    },
+                ),
+            );
+            window_cache.truncate(SERVE_WINDOW_CACHE_MAX_ENTRIES);
+            let mut out = stdout.lock();
+            serde_json::to_writer(
+                &mut out,
+                &serde_json::json!({
+                    "ok": true,
+                    "request": "prepare_window",
+                    "share_snapshot_sha256": digest,
+                    "record_count": record_count,
+                    "added_rows": 0,
+                    "expired_rows": 0,
+                    "touched_pages": 0,
+                    "window_items_len": items.len(),
+                }),
+            )?;
+            writeln!(out)?;
+            out.write_all(&items)?;
+            writeln!(out)?;
+            out.flush()?;
+        }
+        Some("advance") => {
+            let Some(base_digest) = request.base_digest else {
+                respond_error(stdout, "prepare_window advance carries no base_digest", false)?;
+                return Ok(());
+            };
+            let position = window_cache.iter().position(|(key, state)| {
+                key == &base_digest
+                    && matches!(state, WindowState::Prepared { epoch, .. } if *epoch == request_epoch)
+            });
+            let Some(position) = position else {
+                // Respawn, eviction, or an epoch change dropped the base
+                // window; the coordinator re-sends a full preparation.
+                let mut out = stdout.lock();
+                serde_json::to_writer(
+                    &mut out,
+                    &serde_json::json!({
+                        "ok": false,
+                        "request": "prepare_window",
+                        "needs_full": true,
+                        "error": format!("prepared window {base_digest} is not held"),
+                    }),
+                )?;
+                writeln!(out)?;
+                out.flush()?;
+                return Ok(());
+            };
+            let advance_result = match &window_cache[position].1 {
+                WindowState::Prepared { window, .. } => {
+                    window.advance(request.records, anchor_job_issued_at_ms)
+                }
+                WindowState::Uploaded(_) => unreachable!("position matched a prepared entry"),
+            };
+            let (advanced, stats, byte_delta) = match advance_result {
+                Ok(result) => result,
+                Err(error) => {
+                    // An advance invariant failed: the coordinator must take
+                    // exactly its IncrementalWindowFallback path (clear the
+                    // cache, full-rescan) rather than retiring the daemon.
+                    let mut out = stdout.lock();
+                    serde_json::to_writer(
+                        &mut out,
+                        &serde_json::json!({
+                            "ok": false,
+                            "request": "prepare_window",
+                            "fallback": true,
+                            "error": error.to_string(),
+                        }),
+                    )?;
+                    writeln!(out)?;
+                    out.flush()?;
+                    return Ok(());
+                }
+            };
+            let digest = advanced.canonical_digest_hex();
+            let record_count = advanced.record_count();
+            if digest == base_digest {
+                // Anchor-only advance: replace the entry in place so the
+                // stored anchor tracks the coordinator's, and promote it.
+                let (key, _) = window_cache.remove(position);
+                window_cache.insert(
+                    0,
+                    (
+                        key,
+                        WindowState::Prepared {
+                            window: advanced,
+                            epoch: request_epoch,
+                        },
+                    ),
+                );
+            } else {
+                // The base entry stays for in-flight builds of the previous
+                // generation; the bounded cache evicts it naturally.
+                window_cache.retain(|(key, _)| key != &digest);
+                window_cache.insert(
+                    0,
+                    (
+                        digest.clone(),
+                        WindowState::Prepared {
+                            window: advanced,
+                            epoch: request_epoch,
+                        },
+                    ),
+                );
+                window_cache.truncate(SERVE_WINDOW_CACHE_MAX_ENTRIES);
+            }
+            let mut out = stdout.lock();
+            serde_json::to_writer(
+                &mut out,
+                &serde_json::json!({
+                    "ok": true,
+                    "request": "prepare_window",
+                    "share_snapshot_sha256": digest,
+                    "record_count": record_count,
+                    "added_rows": stats.added_rows,
+                    "expired_rows": stats.expired_rows,
+                    "touched_pages": stats.touched_pages,
+                    "retained_drop_bytes": byte_delta.retained_drop_bytes,
+                    "appended_items_len": byte_delta.appended_items.len(),
+                }),
+            )?;
+            writeln!(out)?;
+            out.write_all(&byte_delta.appended_items)?;
+            writeln!(out)?;
+            out.flush()?;
+        }
+        Some(other) => {
+            respond_error(
+                stdout,
+                &format!("unsupported prepare_window mode: {other}"),
+                false,
+            )?;
+        }
+        None => {
+            respond_error(stdout, "prepare_window carries no mode", false)?;
+        }
     }
     Ok(())
 }

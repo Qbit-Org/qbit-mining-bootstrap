@@ -81,6 +81,10 @@ mod audit_body_ref;
 pub use audit_body_ref::*;
 
 mod settlement;
+
+/// Payout-window fold, canonical digest, and incremental advance for the
+/// --serve daemon's prepare_window request (#131 window-pipeline slice).
+pub mod window;
 pub use settlement::*;
 
 pub const PRISM_WINDOW_MULTIPLIER: u128 = 8;
