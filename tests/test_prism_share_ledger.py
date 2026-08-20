@@ -37,6 +37,9 @@ from lab.prism.share_ledger import (
     AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA,
     DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
     SingleWriterShareLedger,
+    WRITER_LEASE_ACQUIRE_RETRY_ATTEMPTS,
+    WRITER_LEASE_ACQUIRE_RETRY_KEY,
+    WRITER_LEASE_ACQUIRE_RETRY_SUBJECT,
     WRITER_LEASE_HEARTBEAT_SESSION_PREFIX,
     _NativePostgresClient,
     _NativePostgresLeaseGuard,
@@ -163,6 +166,24 @@ def held_lease(
     if age_seconds is not None:
         result["lease_age_seconds"] = age_seconds
     return result
+
+
+def snapshot_retry_lease() -> dict[str, object]:
+    """The acquisition statement's third arm, as PostgreSQL renders it.
+
+    Built from the same constants the statement interpolates, so a change to
+    either the key or the subject shows up as a failure in the retry tests
+    rather than as a sentinel the ledger silently stops recognising.
+    """
+    return {
+        "acquired": False,
+        WRITER_LEASE_ACQUIRE_RETRY_KEY: True,
+        "lease": WRITER_LEASE_ACQUIRE_RETRY_SUBJECT,
+        "retry_reason": (
+            f"the {WRITER_LEASE_ACQUIRE_RETRY_SUBJECT} row was committed by a "
+            "concurrent first acquisition after this statement snapshot"
+        ),
+    }
 
 
 class FakeMonotonicClock:
@@ -5282,6 +5303,158 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertEqual(ledger.sleeps, [])
         self.assertEqual(len(ledger.lease_queries), 1)
         self.assertEqual(stdout.getvalue(), "")
+
+
+class FirstAcquireWriterLeaseRaceTests(unittest.TestCase):
+    """The first-ever concurrent acquisition, from the loser's side.
+
+    Under READ COMMITTED the loser's ``ON CONFLICT DO UPDATE`` re-reads only
+    the conflicting tuple after its lock wait, so the upsert affects zero rows
+    while the holder ``SELECT`` still reads the pre-wait snapshot and finds
+    nothing. Both arms empty used to make the whole statement SQL NULL and kill
+    startup with a driver-level ``postgres query returned no JSON``. These
+    tests drive that interleaving through canned statement results, so they
+    pin the loser's experience without a live server.
+    """
+
+    def test_statement_carries_a_named_retry_arm_for_the_empty_snapshot(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [acquired_lease()],
+            writer_id="writer-a",
+            writer_epoch=1,
+        )
+
+        acquire_sql = ledger.lease_queries[0]
+        # A third COALESCE arm makes the statement total: it is a constant, so
+        # the expression cannot evaluate to SQL NULL however the first two arms
+        # resolve.
+        self.assertIn(f"'{WRITER_LEASE_ACQUIRE_RETRY_KEY}', true", acquire_sql)
+        self.assertIn(f"'lease', '{WRITER_LEASE_ACQUIRE_RETRY_SUBJECT}'", acquire_sql)
+        self.assertIn("'acquired', false", acquire_sql)
+
+    def test_first_acquire_loser_retries_into_the_named_lease_refusal(self) -> None:
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            with self.assertRaises(RuntimeError) as caught:
+                FakeLeasePsqlShareLedger(
+                    [
+                        snapshot_retry_lease(),
+                        held_lease(writer_id="writer-b", wait_seconds=10.0),
+                    ],
+                    writer_id="writer-a",
+                    writer_epoch=1,
+                )
+
+        message = str(caught.exception)
+        # The operator-facing difference this change exists for: the loser now
+        # names the lease and its holder instead of a driver-level parse error.
+        self.assertIn(
+            "qbit ledger writer lease is held by writer-b epoch=1",
+            message,
+        )
+        self.assertNotIn("postgres query returned no JSON", message)
+
+    def test_first_acquire_loser_can_retry_into_an_ordinary_acquisition(self) -> None:
+        # The winner's row is visible on the fresh snapshot and has already
+        # expired, so the second statement takes the lease through the ordinary
+        # expiry CAS. Startup completes without operator action.
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            ledger = FakeLeasePsqlShareLedger(
+                [snapshot_retry_lease(), acquired_lease()],
+                writer_id="writer-a",
+                writer_epoch=1,
+            )
+
+        self.assertEqual(len(ledger.lease_queries), 2)
+        self.assertEqual(ledger.sleeps, [])
+        self.assertIn("fresh statement snapshot", stdout.getvalue())
+
+    def test_retry_result_never_reaches_the_wait_or_adopt_decisions(self) -> None:
+        # The sentinel carries no holder identity, so letting it out of the
+        # acquisition path would be read as a holder of None. It is consumed
+        # where the remedy is -- a fresh statement snapshot -- and the caller
+        # only ever sees an ordinary arm.
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._writer_id = "writer-a"
+        ledger._writer_epoch = 1
+        ledger._writer_session_token = (
+            f"{WRITER_LEASE_HEARTBEAT_SESSION_PREFIX}session-a"
+        )
+        retry = snapshot_retry_lease()
+
+        self.assertFalse(PsqlShareLedger._can_wait_for_writer_lease(ledger, retry))
+        self.assertIsNone(
+            PsqlShareLedger._writer_lease_adoption_wait_seconds(ledger, retry)
+        )
+        self.assertFalse(retry["acquired"])
+
+    def test_unconverging_snapshot_retry_fails_naming_the_lease(self) -> None:
+        # A caller whose transaction pinned one snapshot for its whole life
+        # cannot advance it by re-running. The bound turns that into a visible
+        # failure that still names the lease, never a raw parser error and
+        # never an unbounded loop.
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            with self.assertRaises(RuntimeError) as caught:
+                FakeLeasePsqlShareLedger(
+                    [snapshot_retry_lease()] * WRITER_LEASE_ACQUIRE_RETRY_ATTEMPTS,
+                    writer_id="writer-a",
+                    writer_epoch=1,
+                )
+
+        message = str(caught.exception)
+        self.assertIn(WRITER_LEASE_ACQUIRE_RETRY_SUBJECT, message)
+        self.assertNotIn("postgres query returned no JSON", message)
+
+    def test_unrelated_empty_json_statement_still_raises_the_parser_error(self) -> None:
+        # The lease statement is what became total; the parser is unchanged, so
+        # any other statement returning SQL NULL still fails loudly rather than
+        # being reinterpreted as a retry.
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "postgres query returned no JSON",
+        ):
+            parse_single_json_value(None)
+
+        class FakeCursor:
+            @staticmethod
+            def fetchone() -> tuple[object]:
+                return (None,)
+
+        class FakeConnection:
+            closed = False
+
+            @staticmethod
+            def execute(sql: str) -> FakeCursor:
+                return FakeCursor()
+
+            def close(self) -> None:
+                pass
+
+        class FakeOperationalError(Exception):
+            pass
+
+        fake_psycopg = types.ModuleType("psycopg")
+        fake_psycopg.connect = lambda conninfo, **kwargs: FakeConnection()  # type: ignore[attr-defined]
+        fake_psycopg.conninfo = types.SimpleNamespace(  # type: ignore[attr-defined]
+            conninfo_to_dict=lambda conninfo: {"dbname": "qbit"}
+        )
+        fake_psycopg.OperationalError = FakeOperationalError  # type: ignore[attr-defined]
+
+        with unittest.mock.patch.dict(sys.modules, {"psycopg": fake_psycopg}):
+            client = _NativePostgresClient(
+                "postgresql://example.invalid/qbit",
+                pool_size=1,
+            )
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "postgres query returned no JSON",
+            ):
+                client.run_json("SELECT to_json(NULL);")
 
 
 class CannedQueryPsqlShareLedger(PsqlShareLedger):

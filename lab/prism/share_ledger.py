@@ -80,6 +80,22 @@ DEFAULT_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS = 10
 # psql-only deployments retain ordinary TTL fencing and are never treated as
 # fast-adoptable merely because they share an identity with a replacement.
 WRITER_LEASE_HEARTBEAT_SESSION_PREFIX = "heartbeat-v1:"
+# The third arm of _try_acquire_writer_lease's COALESCE. Both of the first two
+# arms are empty at once in exactly one reachable case: the first-ever
+# concurrent acquisition against an empty lease table, where the loser's
+# ON CONFLICT DO UPDATE affects no rows and the holder SELECT still reads the
+# statement snapshot it took before the winner committed. That is a retry
+# signal local to this one statement -- a fresh statement snapshot sees the
+# committed row -- so the statement names it instead of evaluating to SQL NULL
+# and reaching the generic no-JSON parser error.
+WRITER_LEASE_ACQUIRE_RETRY_KEY = "lease_snapshot_retry"
+WRITER_LEASE_ACQUIRE_RETRY_SUBJECT = "qbit ledger writer lease"
+# Attempts spent taking a fresh statement snapshot before the race is treated
+# as something other than the transient it is. Two attempts suffice under
+# READ COMMITTED (the second statement's snapshot postdates the winner's
+# commit); the third covers a re-raced row and bounds a caller that pinned an
+# older snapshot for the whole transaction, which no retry can advance.
+WRITER_LEASE_ACQUIRE_RETRY_ATTEMPTS = 3
 
 
 class WriterLeaseRenewalDeferred(RuntimeError):
@@ -7805,6 +7821,23 @@ END;
         ) from cause
 
     def _try_acquire_writer_lease(self) -> dict[str, Any]:
+        """Claim, renew, or observe the writer lease in one statement.
+
+        The statement is total: every outcome is a JSON object, so nothing
+        here can reach ``parse_single_json_value``'s NULL branch and surface a
+        raw driver error out of ``PsqlShareLedger.__init__``. Two arms are the
+        ordinary ones -- this identity took the lease, or someone else holds
+        it -- and the third exists because both can be empty at once during
+        the first-ever concurrent acquisition (see
+        WRITER_LEASE_ACQUIRE_RETRY_KEY).
+
+        That third arm is handled here rather than by the caller because the
+        remedy is local to this statement: it carries no holder to wait on or
+        adopt, and only re-running gets the fresh READ COMMITTED snapshot in
+        which the winner's committed row is visible. The retry therefore
+        converges to one of the two ordinary arms, and ``_ensure_writer_lease``
+        never sees the sentinel.
+        """
         payload = {
             "writer_id": self._writer_id,
             "writer_epoch": self._writer_epoch,
@@ -7872,13 +7905,37 @@ SELECT COALESCE(
         )
         FROM qbit_ledger_writer_lease
         WHERE singleton
+    ),
+    json_build_object(
+        'acquired', false,
+        '{WRITER_LEASE_ACQUIRE_RETRY_KEY}', true,
+        'lease', '{WRITER_LEASE_ACQUIRE_RETRY_SUBJECT}',
+        'retry_reason',
+        'the {WRITER_LEASE_ACQUIRE_RETRY_SUBJECT} row was committed by a concurrent first acquisition after this statement snapshot'
     )
 );
 """
-        result = self._run_lease_acquisition_json(sql, "writer lease acquisition")
-        if not isinstance(result, dict):
-            raise RuntimeError("psql writer lease query returned non-object JSON")
-        return result
+        for attempt in range(1, WRITER_LEASE_ACQUIRE_RETRY_ATTEMPTS + 1):
+            result = self._run_lease_acquisition_json(
+                sql,
+                "writer lease acquisition",
+            )
+            if not isinstance(result, dict):
+                raise RuntimeError("psql writer lease query returned non-object JSON")
+            if not result.get(WRITER_LEASE_ACQUIRE_RETRY_KEY):
+                return result
+            print(
+                "prism ledger writer lease acquisition raced a concurrent first "
+                f"acquisition (attempt {attempt}/{WRITER_LEASE_ACQUIRE_RETRY_ATTEMPTS}); "
+                "retrying on a fresh statement snapshot",
+                flush=True,
+            )
+        raise RuntimeError(
+            f"{WRITER_LEASE_ACQUIRE_RETRY_SUBJECT} acquisition still could not see "
+            "the lease row committed by a concurrent first acquisition after "
+            f"{WRITER_LEASE_ACQUIRE_RETRY_ATTEMPTS} fresh statement snapshots; "
+            "the coordinator is exiting rather than starting without the lease"
+        )
 
     def _can_adopt_writer_lease(self, result: dict[str, Any]) -> bool:
         wait_seconds = self._writer_lease_adoption_wait_seconds(result)
