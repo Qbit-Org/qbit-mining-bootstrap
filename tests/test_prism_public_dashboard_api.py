@@ -599,9 +599,8 @@ class CanonicalArtifactPublicLedger(FakePublicLedger):
             "found_block": {"block_height": 123450},
             "accepted_shares": [{"share_seq": 1}],
         }
-        # Audit bundles are hashed over Rust struct-declaration-order bytes;
-        # a compact non-sorted dump reproduces that contract closely enough
-        # that neither served serialization can match the advertised hash.
+        # Audit bundles are hashed over these exact canonical bytes. Production
+        # persists the same sequence beside the compact external-body pointer.
         self.audit_bundle_sha256 = hashlib.sha256(
             json.dumps(self.audit_bundle, separators=(",", ":")).encode()
         ).hexdigest()
@@ -620,6 +619,8 @@ class CanonicalArtifactPublicLedger(FakePublicLedger):
         if payload is None:
             return None
         canonical_json = None
+        if sha256 == self.audit_bundle_sha256:
+            canonical_json = json.dumps(self.audit_bundle, separators=(",", ":"))
         if sha256 == self.manifest_set_sha256:
             canonical_json = canonical_json_text(self.manifest_set)
         if sha256 == self.manifest_sha256:
@@ -2220,12 +2221,7 @@ class PublicArtifactByteExactnessTests(unittest.TestCase):
         self.assertEqual(body, json.dumps(ledger.manifest, sort_keys=True).encode() + b"\n")
         self.assertEqual(json.loads(body), ledger.manifest)
 
-    @unittest.expectedFailure
     def test_audit_bundle_artifact_bytes_hash_to_advertised_sha256(self) -> None:
-        # Audit bundles are hashed over Rust struct-declaration-order bytes
-        # that are not persisted, so their responses still cannot verify.
-        # Remove this marker when the audit-bundle canonical bytes are stored
-        # and served raw like the manifest kinds.
         ledger = CanonicalArtifactPublicLedger()
         base_url = self.serve(ledger)
 

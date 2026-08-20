@@ -4460,7 +4460,7 @@ class PrismShareLedgerTests(unittest.TestCase):
 
             self.assertEqual(ledger.dashboard_public_artifact(sha256=body_sha), bundle)
             query = ledger.lease_queries[-1]
-            self.assertIn("SELECT audit_bundle, audit_bundle_sha256, body_uri", query)
+            self.assertIn("SELECT block_hash, audit_bundle, audit_bundle_sha256, body_uri", query)
 
     def test_psql_public_artifact_exists_uses_metadata_only(self) -> None:
         ledger = FakeLeasePsqlShareLedger(
@@ -4503,13 +4503,122 @@ class PrismShareLedgerTests(unittest.TestCase):
         # The payload and its canonical text come from the same statement so a
         # request touches each artifact table at most once.
         query = ledger.lease_queries[-1]
-        self.assertIn("SELECT audit_bundle, audit_bundle_sha256, body_uri", query)
+        self.assertIn("SELECT block_hash, audit_bundle, audit_bundle_sha256, body_uri", query)
         self.assertIn("SELECT manifest_set, manifest_set_json", query)
         self.assertIn("FROM qbit_ctv_fanout_sets", query)
         self.assertIn("SELECT manifest, manifest_json", query)
         self.assertIn("FROM qbit_ctv_fanout_artifacts", query)
         self.assertEqual(query.count("FROM qbit_ctv_fanout_sets"), 1)
         self.assertEqual(query.count("FROM qbit_ctv_fanout_artifacts"), 1)
+
+    def test_psql_public_artifact_document_prefers_stored_canonical_bundle(self) -> None:
+        canonical_bytes = b'{"schema":"qbit.prism.audit-bundle.v1","accepted_shares":[]}'
+        digest = hashlib.sha256(canonical_bytes).hexdigest()
+        block_hash = "ab" * 32
+        calls: list[tuple[str, str]] = []
+
+        def read_canonical(requested_block: str, requested_digest: str) -> bytes:
+            calls.append((requested_block, requested_digest))
+            return canonical_bytes
+
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {
+                    "has_audit_row": True,
+                    "block_hash": block_hash,
+                    "audit_bundle": {"schema": "legacy-reconstructed"},
+                    "audit_bundle_sha256": digest,
+                    "body_uri": None,
+                    "fallback": None,
+                },
+            ],
+            audit_artifact_store=types.SimpleNamespace(
+                read_canonical_audit_bundle=read_canonical,
+            ),
+        )
+
+        document = ledger.dashboard_public_artifact_document(sha256=digest)
+
+        self.assertEqual(
+            document,
+            {
+                "payload": json.loads(canonical_bytes),
+                "canonical_json": canonical_bytes.decode(),
+            },
+        )
+        self.assertEqual(calls, [(block_hash, digest)])
+
+    def test_psql_public_artifact_visible_row_missing_file_uses_legacy_body(self) -> None:
+        legacy = {"schema": "qbit.prism.audit-bundle.v1", "legacy": True}
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {
+                    "has_audit_row": True,
+                    "block_hash": "ab" * 32,
+                    "audit_bundle": legacy,
+                    "audit_bundle_sha256": "cd" * 32,
+                    "body_uri": None,
+                    "fallback": None,
+                },
+            ],
+            audit_artifact_store=types.SimpleNamespace(
+                read_canonical_audit_bundle=lambda _block, _digest: None,
+            ),
+        )
+
+        self.assertEqual(
+            ledger.dashboard_public_artifact_document(sha256="cd" * 32),
+            {"payload": legacy, "canonical_json": None},
+        )
+
+    def test_psql_public_artifact_file_before_replica_row_is_not_visible(self) -> None:
+        def unexpected_read(_block: str, _digest: str) -> bytes:
+            self.fail("canonical storage must not bypass replica row visibility")
+
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {
+                    "has_audit_row": False,
+                    "block_hash": None,
+                    "audit_bundle": None,
+                    "audit_bundle_sha256": None,
+                    "body_uri": None,
+                    "fallback": None,
+                    "fallback_canonical": None,
+                },
+            ],
+            audit_artifact_store=types.SimpleNamespace(
+                read_canonical_audit_bundle=unexpected_read,
+            ),
+        )
+
+        self.assertIsNone(ledger.dashboard_public_artifact_document(sha256="ef" * 32))
+
+    def test_psql_public_artifact_exists_accepts_verified_canonical_file(self) -> None:
+        canonical_bytes = b'{"schema":"qbit.prism.audit-bundle.v1"}'
+        digest = hashlib.sha256(canonical_bytes).hexdigest()
+        block_hash = "ab" * 32
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {
+                    "has_audit_row": True,
+                    "block_hash": block_hash,
+                    "audit_bundle_sha256": digest,
+                    "audit_bundle_inline": False,
+                    "body_uri": "/missing/legacy-body.json",
+                    "fallback_exists": False,
+                },
+            ],
+            audit_artifact_store=types.SimpleNamespace(
+                read_canonical_audit_bundle=lambda _block, _digest: canonical_bytes,
+            ),
+        )
+
+        self.assertTrue(ledger.dashboard_public_artifact_exists(sha256=digest))
 
     def test_psql_public_artifact_document_returns_none_when_unmatched(self) -> None:
         ledger = FakeLeasePsqlShareLedger(

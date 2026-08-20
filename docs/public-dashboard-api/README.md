@@ -219,14 +219,22 @@ as PRISM audit bundles and CTV manifest JSON, are linked by URL and SHA-256 so
 they can be mirrored or downloaded without making dashboard clients depend on
 internal audit routes.
 
-`GET /public/v1/artifacts/{sha256}` is content-addressed: for CTV fanout
-manifests and manifest sets the response body is the exact canonical byte
-sequence the artifact hash was computed over, so
+`GET /public/v1/artifacts/{sha256}` is content-addressed: for audit bundles,
+CTV fanout manifests, and manifest sets the response body is the exact canonical
+byte sequence the artifact hash was computed over, so
 `sha256(response body) == {sha256}` verifies the download with no
-re-serialization step. Audit bundle responses do not yet carry that guarantee;
-their advertised hash covers the compact struct-declaration-order
-canonicalization (`qbit-prism-audit-canonicalize`), which verifiers must apply
-to the served document until the canonical bundle bytes are served directly.
+re-serialization step. Audit bundles written before canonical-byte persistence
+was introduced retain the legacy reconstructed response until the verified
+backfill publishes their canonical artifact.
+
+On a read-replica deployment, the ledger row remains the visibility authority.
+If the row has replayed but the canonical file is absent, the service uses the
+legacy reconstructed response. If shared storage receives the file before the
+replica replays its row, the artifact returns a non-cacheable `404` until replay
+catches up; the file alone never exposes an uncommitted artifact. This immutable
+route remains exempt from the ordinary freshness refusal. Replica readiness is
+bounded by the existing WAL-receiver heartbeat contract, not by replay-lag
+position.
 
 Direct-coinbase blocks return the same settlement-artifacts wrapper with
 `settlement_mode: direct_coinbase` and `fanouts: []`. A `404` means no public

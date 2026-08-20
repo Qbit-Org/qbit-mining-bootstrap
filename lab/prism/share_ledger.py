@@ -5764,20 +5764,25 @@ SELECT json_build_object(
         return document.get("payload")
 
     def dashboard_public_artifact_document(self, *, sha256: str) -> dict[str, object] | None:
-        """Artifact payload plus, for manifest kinds, its canonical text.
+        """Artifact payload plus its stored canonical text when available.
 
         canonical_json is the manifest_set_json/manifest_json text persisted
         at record time next to the JSONB copies — the exact byte sequence the
-        artifact's sha256 was computed over. Audit bundles have no stored
-        canonical serialization (their hash covers Rust struct-order bytes),
-        so their canonical_json is None. One statement serves both reads so a
-        request touches each artifact table at most once.
+        artifact's sha256 was computed over. Audit bundles use the immutable
+        compressed canonical artifact beside the external body. One statement
+        serves both database reads so a request touches each artifact table at
+        most once.
+
+        Replica ordering is intentionally simple. A visible row plus a missing
+        canonical file is legacy history and falls back to the JSONB/external
+        body. A file that reached shared storage before this replica replays its
+        row remains invisible and returns no match until replay catches up.
         """
         sha256 = str(sha256).lower()
         lit = self._text_literal(sha256)
         sql = f"""
 WITH audit AS (
-    SELECT audit_bundle, audit_bundle_sha256, body_uri
+    SELECT block_hash, audit_bundle, audit_bundle_sha256, body_uri
     FROM qbit_pool_audit_bundles
     WHERE audit_bundle_sha256 = {lit}
     ORDER BY created_at DESC
@@ -5798,6 +5803,7 @@ artifact_row AS (
     LIMIT 1
 )
 SELECT json_build_object(
+    'block_hash', (SELECT block_hash FROM audit),
     'audit_bundle', (SELECT audit_bundle FROM audit),
     'audit_bundle_sha256', (SELECT audit_bundle_sha256 FROM audit),
     'body_uri', (SELECT body_uri FROM audit),
@@ -5816,6 +5822,27 @@ SELECT json_build_object(
         if not isinstance(row, dict):
             return None
         if row.get("has_audit_row"):
+            block_hash = row.get("block_hash")
+            if isinstance(block_hash, str):
+                canonical_bytes = self._stored_canonical_audit_bundle_bytes(
+                    block_hash,
+                    sha256,
+                )
+                if canonical_bytes is not None:
+                    try:
+                        canonical_payload = json.loads(canonical_bytes)
+                        canonical_json = canonical_bytes.decode("utf-8")
+                    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+                        # The store already verifies compression and digest.
+                        # Invalid JSON is nevertheless unusable as a public
+                        # document, so retain the legacy reconstruction path.
+                        pass
+                    else:
+                        if isinstance(canonical_payload, dict):
+                            return {
+                                "payload": canonical_payload,
+                                "canonical_json": canonical_json,
+                            }
             body = row.get("audit_bundle")
             if body is None:
                 body = self._read_external_body(row.get("body_uri"), expected_sha256=sha256)
@@ -5835,7 +5862,7 @@ SELECT json_build_object(
         lit = self._text_literal(sha256)
         sql = f"""
 WITH audit AS (
-    SELECT audit_bundle, body_uri
+    SELECT block_hash, audit_bundle, audit_bundle_sha256, body_uri
     FROM qbit_pool_audit_bundles
     WHERE audit_bundle_sha256 = {lit}
     ORDER BY created_at DESC
@@ -5843,6 +5870,8 @@ WITH audit AS (
 )
 SELECT json_build_object(
     'has_audit_row', (SELECT count(*) FROM audit) > 0,
+    'block_hash', (SELECT block_hash FROM audit),
+    'audit_bundle_sha256', (SELECT audit_bundle_sha256 FROM audit),
     'audit_bundle_inline', (SELECT audit_bundle IS NOT NULL FROM audit),
     'body_uri', (SELECT body_uri FROM audit),
     'fallback_exists',
@@ -5862,6 +5891,13 @@ SELECT json_build_object(
         if not isinstance(row, dict):
             return False
         if row.get("has_audit_row"):
+            block_hash = row.get("block_hash")
+            if (
+                isinstance(block_hash, str)
+                and self._stored_canonical_audit_bundle_bytes(block_hash, sha256)
+                is not None
+            ):
+                return True
             if row.get("audit_bundle_inline"):
                 return True
             body_uri = row.get("body_uri")
@@ -6713,6 +6749,28 @@ FROM bucketed;
         if store is None:
             raise RuntimeError("audit body store is not configured")
         return store
+
+    def _stored_canonical_audit_bundle_bytes(
+        self,
+        block_hash: str,
+        audit_bundle_sha256: str,
+    ) -> bytes | None:
+        """Return a verified stored canonical bundle, or permit legacy fallback.
+
+        Missing artifacts are expected for history predating issue #158.
+        Integrity/read failures also fall back to the independently persisted
+        JSONB or external-body representation; the artifact store keeps a clean
+        miss distinguishable from corruption for callers that need diagnostics.
+        """
+        store = getattr(self, "_audit_artifact_store", None)
+        reader = getattr(store, "read_canonical_audit_bundle", None)
+        if not callable(reader):
+            return None
+        try:
+            canonical_bytes = reader(block_hash, audit_bundle_sha256)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+        return canonical_bytes if isinstance(canonical_bytes, bytes) else None
 
     def _audit_reader(self, body_uri: object) -> AuditArtifactStore:
         del body_uri

@@ -1094,11 +1094,12 @@ def build_audit_artifact_store(
 ) -> AuditArtifactStore | None:
     """Open the audit artifact root read-only, for artifact and settlement reads.
 
-    /public/v1/artifacts/{sha256} and the direct-coinbase settlement read both
-    resolve externalized bodies from body_uri on disk, sha256-verified. The
-    compose service mounts that volume :ro precisely so this process cannot
-    write to it, which also means it cannot create the publication lock file a
-    normal store opens O_RDWR at construction -- hence read_only.
+    /public/v1/artifacts/{sha256} reads immutable compressed canonical bundles
+    first and falls back to legacy externalized bodies from body_uri; both paths
+    are sha256-verified. The compose service mounts that volume :ro precisely so
+    this process cannot write to it, which also means it cannot create the
+    publication lock file a normal store opens O_RDWR at construction -- hence
+    read_only.
     """
     source = os.environ if environ is None else environ
     audit_dir = (source.get("PRISM_AUDIT_DIR") or "").strip()

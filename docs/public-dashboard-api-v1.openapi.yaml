@@ -278,14 +278,13 @@ paths:
         Serves exact canonical public artifacts such as audit bundles, CTV
         manifest sets, per-fanout manifests, or raw fanout transaction data.
         These artifacts are verified by their path SHA-256 and may use their own
-        `qbit.prism.*` schemas. For CTV fanout manifests and manifest sets the
-        response body is the exact canonical byte sequence the hash was
-        computed over, so `sha256(response body)` equals the path SHA-256.
-        Audit bundle hashes cover the compact struct-declaration-order
-        canonicalization, which verifiers must apply to the served document
-        until the canonical bundle bytes are served directly. Dashboard-facing
-        wrapper responses link here rather than inlining large canonical
-        artifacts.
+        `qbit.prism.*` schemas. For audit bundles, CTV fanout manifests, and
+        manifest sets the response body is the exact canonical byte sequence
+        the hash was computed over, so `sha256(response body)` equals the path
+        SHA-256. Audit bundles written before canonical-byte persistence retain
+        the legacy reconstructed response until verified backfill.
+        Dashboard-facing wrapper responses link here rather than inlining large
+        canonical artifacts.
       parameters:
         - name: sha256
           in: path
