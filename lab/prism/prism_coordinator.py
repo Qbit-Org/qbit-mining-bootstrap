@@ -64,6 +64,7 @@ from lab.prism.coordinator_shutdown import (
 from lab.prism.coordinator_config import (
     BLOCK_LANDING_DB_TIMEOUT_WATCHDOG_FRACTION,  # noqa: F401
     CoordinatorConfig,
+    apply_python_switch_interval,
     DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX,  # noqa: F401
     DEFAULT_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS,  # noqa: F401
     DEFAULT_BLOCK_LANDING_DB_TIMEOUT_SECONDS,  # noqa: F401
@@ -9806,6 +9807,18 @@ def main() -> int:
     # all-thread dump for live triage without disturbing the process.
     faulthandler.enable(all_threads=True)
     faulthandler.register(signal.SIGUSR2, all_threads=True)
+    # Before the coordinator, because constructing it starts threads and the
+    # switch interval is process-global: applied afterwards, already-running
+    # threads would observe the change at an arbitrary point in their own
+    # scheduling. Silent when unset -- an unconfigured pool must not log a
+    # value it did not choose.
+    switch_interval = apply_python_switch_interval()
+    if switch_interval is not None:
+        print(
+            "prism interpreter switch interval set to "
+            f"{switch_interval:g}s (default is 5ms)",
+            flush=True,
+        )
     coordinator = PrismCoordinator()
 
     def _request_shutdown(signum: int, _frame: Any) -> None:
