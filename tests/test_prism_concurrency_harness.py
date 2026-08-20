@@ -30,9 +30,15 @@ import unittest
 from typing import Any
 
 from lab.prism import share_ledger as share_ledger_module
-from lab.prism.share_ledger import DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS
+from lab.prism.share_ledger import (
+    DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS,
+    PendingShare,
+)
 from tests.prism_concurrency_harness import (
     HarnessError,
+    acquire_result_arms,
+    acquire_terminal_arm_keys,
+    LandingOp,
     LeaseHarness,
     LeaseOp,
     NotRunnable,
@@ -43,6 +49,51 @@ from tests.prism_concurrency_harness import (
     assert_deterministic,
     classify,
 )
+
+
+#: The explicit not-acquired/retry terminal arm, captured verbatim from the
+#: signed ledger change that introduces it (PR #168, commit 869bb7e). That
+#: reference is documentation of where these bytes came from and nothing more:
+#: this suite never reads that commit, and must not. A test that shells out to
+#: git is a test that fails for reasons which have nothing to do with the tree
+#: under test -- a shallow clone, a pruned object, an offline runner -- and one
+#: that can fetch on demand makes the suite's result depend on the network.
+#: The fixture is checked in so the model is pinned against a fixed input.
+#:
+#: Re-capture by hand if the ledger change re-words the arm; the constants it
+#: interpolates are WRITER_LEASE_ACQUIRE_RETRY_KEY and
+#: WRITER_LEASE_ACQUIRE_RETRY_SUBJECT.
+LEDGER_RETRY_TERMINAL_ARM = """,
+    json_build_object(
+        'acquired', false,
+        'lease_snapshot_retry', true,
+        'lease', 'qbit ledger writer lease',
+        'retry_reason',
+        'the qbit ledger writer lease row was committed by a concurrent first acquisition after this statement snapshot'
+    )
+);"""
+
+#: What the model must report for that arm. Written out independently of the
+#: fixture above rather than derived from parsing it: deriving both sides from
+#: one parse would make the assertion agree with itself no matter what the
+#: parse did.
+LEDGER_RETRY_TERMINAL_OBJECT = {
+    "acquired": False,
+    "lease_snapshot_retry": True,
+    "lease": "qbit ledger writer lease",
+    "retry_reason": (
+        "the qbit ledger writer lease row was committed by a concurrent "
+        "first acquisition after this statement snapshot"
+    ),
+}
+
+
+def _source_of(member: Any) -> str:
+    """Return a member's source, or an empty string when it has none."""
+    try:
+        return inspect.getsource(member)
+    except (OSError, TypeError):
+        return ""
 
 
 class StatementClassificationTests(unittest.TestCase):
@@ -145,6 +196,124 @@ class StatementClassificationTests(unittest.TestCase):
             classify("UPDATE qbit_block_candidate_outbox SET quarantined = true")
         self.assertIn("does not model this statement", str(caught.exception))
         self.assertIn("_LANDING_SIGNATURES", str(caught.exception))
+
+    def test_shipped_share_append_is_not_read_as_the_outbox_state_machine(
+        self,
+    ) -> None:
+        """A share append must not be misnamed as the outbox state machine.
+
+        ``_append_batch_with_replay_outcomes`` opens the very same
+        ``INSERT INTO qbit_block_candidate_outbox (`` and raises the very same
+        ``'block candidate payload mismatch'`` as
+        ``persist_block_candidate_intent``. Those two fragments alone therefore
+        match a share submission, and the classifier answered one with the
+        outbox evaluator: the statement was reported against the wrong state
+        machine, so the failure argued for an outbox bug that did not exist and
+        hid the deferral that did. This drives the shipped ``append_batch`` and
+        requires the captured statement to reach ``_DEFERRED_SIGNATURES``.
+        """
+        share = PendingShare(
+            share_id="miner-a:1",
+            miner_id="miner-a",
+            order_key="miner-a",
+            p2mr_program_hex="22" * 32,
+            share_difficulty=1,
+            network_difficulty=1,
+            template_height=9,
+            job_id="job-1",
+            job_issued_at_ms=1,
+            accepted_at_ms=2,
+            ntime=1_700_000_000,
+        )
+        candidate = {"block_hash_hex": "ab" * 32}
+
+        captured: list[str] = []
+        with LeaseHarness() as harness:
+            alpha = harness.coordinator("alpha")
+            alpha.start()
+            harness.run_until(alpha, "done:startup")
+
+            # Capture at the port. The classifier rejects this statement, so it
+            # never reaches server.statements; the raw SQL has to be taken on
+            # the way in rather than read back out of the recognised trace.
+            executed = harness.server.execute
+
+            def capturing_execute(backend: Any, sql: str, **kwargs: Any) -> Any:
+                captured.append(sql)
+                return executed(backend, sql, **kwargs)
+
+            harness.server.execute = capturing_execute  # type: ignore[method-assign]
+
+            with self.assertRaises(UnsupportedStatement) as caught:
+                alpha.call(
+                    lambda: alpha.ledger.append_batch([(share, candidate)]),
+                    label="append",
+                )
+
+        # The statement really is ambiguous under the two original fragments;
+        # if production stops emitting both, this test is no longer guarding
+        # anything and should fail rather than quietly pass.
+        self.assertEqual(len(captured), 1)
+        sql = captured[0]
+        self.assertIn("INSERT INTO qbit_block_candidate_outbox (", sql)
+        self.assertIn("'block candidate payload mismatch'", sql)
+        self.assertIn("INSERT INTO qbit_share_ledger", sql)
+
+        # The discriminator: a share append claims a colliding outbox row,
+        # it does not leave it alone.
+        self.assertIn("ON CONFLICT (block_hash) DO UPDATE", sql)
+        self.assertNotIn("ON CONFLICT (block_hash) DO NOTHING", sql)
+
+        # Both the in-flight rejection and a direct classification of the
+        # captured statement have to name the same state machine.
+        with self.assertRaises(UnsupportedStatement) as direct:
+            classify(sql)
+        for message in (str(caught.exception), str(direct.exception)):
+            self.assertIn("share submission and dedupe", message)
+            self.assertIn("#128", message)
+            self.assertNotIn(LandingOp.OUTBOX_RECORD.value, message)
+
+    def test_block_candidate_intent_still_classifies_as_the_outbox_record(
+        self,
+    ) -> None:
+        """The discriminator must not cost the outbox its own classification.
+
+        Narrowing ``OUTBOX_RECORD`` is only correct if the statement it exists
+        for still matches, so this pins the other direction of the same change.
+        """
+        with LeaseHarness() as harness:
+            alpha = harness.coordinator("alpha")
+            alpha.start()
+            harness.run_until(alpha, "done:startup")
+            alpha.call(
+                lambda: alpha.ledger.persist_block_candidate_intent(
+                    {"block_hash_hex": "ab" * 32}
+                ),
+                label="intent",
+            )
+            statement = harness.server.statements[-1]
+            self.assertEqual(statement.kind, LandingOp.OUTBOX_RECORD)
+            self.assertEqual(statement.payload["block_hash"], "ab" * 32)
+            self.assertIn("ON CONFLICT (block_hash) DO NOTHING", statement.sql)
+
+    def test_the_outbox_discriminator_is_unique_to_the_intent_writer(
+        self,
+    ) -> None:
+        """Pin the fragment's uniqueness to production, not to this test.
+
+        ``OUTBOX_RECORD`` is now identified by a conflict action. That is only
+        a valid identity while exactly one ledger method emits it, so if a
+        second writer starts inserting the candidate with ``DO NOTHING`` the
+        classifier is ambiguous again and this fails at that moment rather
+        than at the next confusing scenario failure.
+        """
+        discriminator = "ON CONFLICT (block_hash) DO NOTHING"
+        emitters = sorted(
+            name
+            for name, member in vars(share_ledger_module.PsqlShareLedger).items()
+            if discriminator in _source_of(member)
+        )
+        self.assertEqual(emitters, ["persist_block_candidate_intent"])
 
     def test_classifier_extracts_the_configured_ttl(self) -> None:
         with LeaseHarness(lease_ttl_seconds=17.5) as harness:
@@ -356,6 +525,7 @@ class SchedulerTests(unittest.TestCase):
                 "kinds": harness.statement_kinds(),
                 "alpha_failed": alpha.actor.calls[0].error is not None,
                 "beta_error": None if beta_error is None else str(beta_error),
+                "acquire_arms": acquire_result_arms(harness.server.statements[0].sql),
             }
 
         run = assert_deterministic(self, scenario, repeats=25)
@@ -365,31 +535,49 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(run.outcome["holder"], "heartbeat-v1:alpha-1")
         self.assertEqual(run.outcome["kinds"], ["acquire", "acquire"])
         self.assertFalse(run.outcome["alpha_failed"])
-        # The loser does not get a clean refusal. Its DO UPDATE matches
-        # nothing, and the COALESCE fallback reads a snapshot taken before the
-        # winner's row existed, so the whole statement evaluates to SQL NULL.
-        # See test_first_acquire_race_loser_gets_an_unhelpful_error.
-        self.assertEqual(
-            run.outcome["beta_error"],
-            "postgres query returned no JSON",
-        )
+        # What the loser gets is a property of the shipped statement, so it is
+        # asserted against the statement rather than pinned to a constant. On
+        # the two-arm shape its DO UPDATE matches nothing and the COALESCE
+        # fallback reads a snapshot taken before the winner's row existed, so
+        # the whole statement evaluates to SQL NULL. Issue #140's terminal arm
+        # retires that outcome. See
+        # test_first_acquire_race_loser_matches_the_shipped_acquire_shape.
+        if run.outcome["acquire_arms"] == 2:
+            self.assertEqual(
+                run.outcome["beta_error"],
+                "postgres query returned no JSON",
+            )
+        else:
+            self.assertNotIn(
+                "returned no JSON",
+                str(run.outcome["beta_error"]),
+            )
 
-    def test_first_acquire_race_loser_gets_an_unhelpful_error(self) -> None:
-        """Two coordinators racing the first-ever acquire: the loser dies badly.
+    def test_first_acquire_race_loser_matches_the_shipped_acquire_shape(self) -> None:
+        """Two coordinators racing the first-ever acquire.
 
-        The losing ``INSERT ... ON CONFLICT DO UPDATE`` affects zero rows, and
-        the ``COALESCE`` arm that would report the holder reads this
-        statement's own snapshot — taken before the winner's row was
-        committed — so it finds nothing and the statement returns SQL NULL.
+        What the loser gets is decided by the shipped statement, so this test
+        reads the statement and asserts what that shape can produce, instead
+        of pinning whichever outcome was current when it was written.
+
+        **Two-arm shape (this baseline).** The losing
+        ``INSERT ... ON CONFLICT DO UPDATE`` affects zero rows, and the
+        ``COALESCE`` arm that would report the holder reads this statement's
+        own snapshot -- taken before the winner's row was committed -- so it
+        finds nothing and the statement returns SQL NULL.
         ``parse_single_json_value`` turns that into ``postgres query returned
         no JSON``, which ``_ensure_writer_lease`` does not catch, so
         ``PsqlShareLedger.__init__`` dies with an error naming nothing about
-        leases or about the coordinator that holds it.
+        leases or about the coordinator that holds it. That is a real
+        production outcome that reads like a driver fault, which is why it was
+        pinned rather than left implicit.
 
-        Pinned here rather than left implicit because it is a real production
-        outcome that reads like a driver fault, and because it is the shape a
-        fix would have to change: the operator-facing message is the whole
-        difference between this and the ordinary "lease is held by" refusal.
+        **Terminal-arm shape (issue #140).** The arm exists precisely so that
+        race reports a lease outcome, so the generic no-JSON diagnostic must
+        no longer be reachable. This asserts its retirement rather than a
+        message this branch has never seen: the operator-facing text is the
+        ledger PR's to choose, but "not the driver fault" is the whole point
+        of the change and is safe to require here.
         """
         with LeaseHarness() as harness:
             alpha = harness.coordinator("alpha", writer_epoch=1)
@@ -401,14 +589,20 @@ class SchedulerTests(unittest.TestCase):
             harness.drain([alpha, beta])
 
             alpha.actor.calls[0].value()
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "postgres query returned no JSON",
-            ):
-                beta.actor.calls[0].value()
+            arms = acquire_result_arms(harness.server.statements[0].sql)
+            if arms == 2:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "postgres query returned no JSON",
+                ):
+                    beta.actor.calls[0].value()
+            else:
+                error = beta.actor.calls[0].error
+                self.assertNotIn("returned no JSON", str(error))
 
-            # Contrast: once the winner's row is visible in the loser's
-            # snapshot, the same race produces the ordinary refusal.
+            # Contrast, and unchanged by either shape: once the winner's row
+            # is visible in the loser's snapshot, the same race produces the
+            # ordinary refusal.
             gamma = harness.coordinator("gamma", writer_epoch=3)
             gamma.start()
             harness.run_until(gamma, "done:startup")
@@ -417,6 +611,172 @@ class SchedulerTests(unittest.TestCase):
                 "qbit ledger writer lease is held by",
             ):
                 gamma.actor.calls[0].value()
+
+    def test_acquire_arm_count_is_read_from_the_shipped_statement(self) -> None:
+        """The compatibility switch is computed, never declared.
+
+        If this read a constant or a version flag, the whole arrangement would
+        be a guess about production that drifts silently. It reads the
+        statement ``PsqlShareLedger`` actually emitted, and pins what that
+        statement is at this baseline so a shape change cannot pass unnoticed.
+        """
+        with LeaseHarness() as harness:
+            alpha = harness.coordinator("alpha")
+            alpha.start()
+            harness.run_until(alpha, "done:startup")
+            statement = harness.server.statements[0]
+            self.assertEqual(statement.kind, LeaseOp.ACQUIRE)
+            sql = statement.sql
+
+        # The baseline shape: exactly the acquired and holder arms, and the
+        # holder arm is the one that reports identity. Asserting the keys as
+        # well as the count is what stops a renamed-but-still-two-arm
+        # statement from being read as unchanged.
+        self.assertEqual(acquire_result_arms(sql), 2)
+        self.assertEqual(
+            acquire_terminal_arm_keys(sql),
+            (
+                "acquired",
+                "writer_id",
+                "writer_epoch",
+                "writer_session_token",
+                "lease_expires_at",
+                "lease_updated_at",
+                "lease_age_seconds",
+                "lease_wait_seconds",
+            ),
+        )
+
+        # A shape neither this model nor #140 describes stays loud.
+        with self.assertRaises(UnsupportedStatement) as caught:
+            acquire_result_arms("SELECT 1;")
+        self.assertIn("SELECT COALESCE", str(caught.exception))
+
+    def test_the_explicit_not_acquired_arm_is_modelled_when_present(self) -> None:
+        """Exercise the #140 branch now, so it is not dormant until integration.
+
+        This is what keeps the shape switch from being vacuous. A test that
+        only said "if the new shape appears, assert the new thing" would never
+        execute that assertion on this baseline, and a mistake in the branch
+        would surface for the first time in the ledger PR -- as a harness
+        failure blamed on that PR. So the terminal-arm statement is built here
+        from the shipped one, and the model is required to answer it.
+
+        The arm is the captured fixture and the expected object is written out
+        separately, so this holds the model against a fixed input without
+        reading anything outside this tree.
+        """
+        with LeaseHarness() as harness:
+            alpha = harness.coordinator("alpha")
+            alpha.start()
+            harness.run_until(alpha, "done:startup")
+            server = harness.server
+            shipped = server.statements[0].sql
+
+            # Append a terminal arm to the statement production emits today,
+            # so the only difference from the baseline is the thing under test.
+            self.assertTrue(shipped.rstrip().endswith(");"))
+            terminal = shipped.rstrip()[:-2] + LEDGER_RETRY_TERMINAL_ARM
+            self.assertEqual(acquire_result_arms(terminal), 3)
+            self.assertEqual(
+                acquire_terminal_arm_keys(terminal),
+                ("acquired", "lease_snapshot_retry", "lease", "retry_reason"),
+            )
+
+            statement = classify(terminal)
+            answered = server._unobserved_not_acquired(statement)
+
+        # The whole point: this shape cannot evaluate to SQL NULL, so the
+        # ports can no longer raise "postgres query returned no JSON". The
+        # values are the statement's own literals, including the sentence --
+        # a boolean here would mean the model was answering the key's name.
+        self.assertEqual(answered, LEDGER_RETRY_TERMINAL_OBJECT)
+        # Spelled out separately: answering the key's *name* is the exact
+        # defect the first policy had, and it would put a boolean here. Dict
+        # equality alone reads as a typo check and would not say that.
+        assert answered is not None
+        self.assertIsInstance(answered["retry_reason"], str)
+        self.assertIs(answered["lease_snapshot_retry"], True)
+        self.assertIs(answered["acquired"], False)
+
+        # And the baseline shape still must, or the switch is not switching.
+        with LeaseHarness() as harness:
+            alpha = harness.coordinator("alpha")
+            alpha.start()
+            harness.run_until(alpha, "done:startup")
+            baseline = classify(harness.server.statements[0].sql)
+            self.assertIsNone(harness.server._unobserved_not_acquired(baseline))
+
+    def test_a_terminal_literal_survives_commas_and_quotes(self) -> None:
+        """Punctuation inside a reason string must not become an argument break.
+
+        The sentence this arm ships today happens to contain no comma, so
+        nothing else in this suite exercises the splitter's quoting. That is
+        a thin place to leave under a model whose whole job is to report the
+        wording production chose: the first comma added to that sentence
+        would otherwise silently re-pair every key and value after it, and
+        the failure would look like a renamed key rather than a parser bug.
+        """
+        reason = (
+            "the lease row was committed by a concurrent acquisition, "
+            "after this statement''s snapshot"
+        )
+        arm = (
+            ",\n    json_build_object(\n"
+            "        'acquired', false,\n"
+            "        'lease_snapshot_retry', true,\n"
+            "        'lease', 'qbit ledger writer lease',\n"
+            "        'retry_reason',\n"
+            f"        '{reason}'\n"
+            "    )\n);"
+        )
+        with LeaseHarness() as harness:
+            alpha = harness.coordinator("alpha")
+            alpha.start()
+            harness.run_until(alpha, "done:startup")
+            server = harness.server
+            terminal = server.statements[0].sql.rstrip()[:-2] + arm
+
+            self.assertEqual(acquire_result_arms(terminal), 3)
+            self.assertEqual(
+                acquire_terminal_arm_keys(terminal),
+                ("acquired", "lease_snapshot_retry", "lease", "retry_reason"),
+            )
+            answered = server._unobserved_not_acquired(classify(terminal))
+
+        assert answered is not None
+        self.assertEqual(
+            answered["retry_reason"],
+            "the lease row was committed by a concurrent acquisition, "
+            "after this statement's snapshot",
+        )
+        self.assertEqual(answered["lease"], "qbit ledger writer lease")
+
+    def test_an_unteachable_terminal_arm_key_stays_loud(self) -> None:
+        """A key this model cannot answer must fail, not be invented.
+
+        The value policy for the terminal arm is deliberately narrow:
+        ``acquired`` is false, the holder and lease columns are null because
+        nothing is visible, and a retry flag is true. Anything else is a shape
+        nobody has taught this model, and guessing at it would be exactly the
+        harness lie the suite's docstring warns about.
+        """
+        with LeaseHarness() as harness:
+            alpha = harness.coordinator("alpha")
+            alpha.start()
+            harness.run_until(alpha, "done:startup")
+            server = harness.server
+            shipped = server.statements[0].sql
+            terminal = shipped.rstrip()[:-2] + (
+                ",\n    (\n        SELECT json_build_object(\n"
+                "            'acquired', false,\n"
+                "            'backoff_hint_seconds', 3\n"
+                "        )\n    )\n);"
+            )
+            statement = classify(terminal)
+            with self.assertRaises(UnsupportedStatement) as caught:
+                server._unobserved_not_acquired(statement)
+        self.assertIn("backoff_hint_seconds", str(caught.exception))
 
     def test_trace_names_the_actor_and_the_stop(self) -> None:
         with LeaseHarness() as harness:
