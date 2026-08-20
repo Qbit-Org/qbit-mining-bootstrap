@@ -152,6 +152,13 @@ DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS = 4
 DEFAULT_PRISM_JOB_BUILD_TIMEOUT_SECONDS = 60.0
 DEFAULT_PRISM_JOB_BUILD_CANCEL_GRACE_SECONDS = 0.25
 DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS = 2
+# Upper bound for PRISM_PYTHON_SWITCH_INTERVAL_SECONDS. The interpreter default
+# is 5 ms, so anything approaching a second is a misplaced decimal point rather
+# than a tuning intent -- and the failure it would cause is the one hardest to
+# read back from a running pool: threads holding the GIL for whole seconds,
+# presenting as ack-latency and lock-convoy symptoms with no obvious cause.
+# Reject at startup instead.
+MAX_PRISM_PYTHON_SWITCH_INTERVAL_SECONDS = 1.0
 DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS = 15.0
 # Reconnect difficulty retention: a reconnecting worker (same listener +
 # exact username) resumes at its last converged difficulty instead of the
@@ -380,6 +387,21 @@ def env_optional_positive_int(name: str, *, environ: Env | None = None) -> int |
         value = int(raw)
     except ValueError as exc:
         raise SystemExit(f"{name} must be an integer") from exc
+    if value <= 0:
+        raise SystemExit(f"{name} must be positive")
+    return value
+
+
+def env_optional_positive_float(name: str, *, environ: Env | None = None) -> float | None:
+    raw = env_optional(name, environ=environ)
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be a number") from exc
+    if not math.isfinite(value):
+        raise SystemExit(f"{name} must be finite")
     if value <= 0:
         raise SystemExit(f"{name} must be positive")
     return value
@@ -697,6 +719,54 @@ def validate_job_build_executor_workers(workers: int) -> int:
             f"{DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS}"
         )
     return workers
+
+
+def resolve_python_switch_interval_seconds(
+    *, environ: Env | None = None
+) -> float | None:
+    """Return the configured interpreter switch interval, or None to leave it.
+
+    Unset means the interpreter keeps whatever CPython defaults to (5 ms on
+    every version this pool has run), which is the deployed behaviour today.
+    Absent is therefore not "use 5 ms" but "do not call
+    ``sys.setswitchinterval`` at all" -- the two differ if a future
+    interpreter changes its own default, and this knob should not pin a value
+    the tree never chose.
+    """
+    interval = env_optional_positive_float(
+        "PRISM_PYTHON_SWITCH_INTERVAL_SECONDS", environ=environ
+    )
+    if interval is None:
+        return None
+    if interval > MAX_PRISM_PYTHON_SWITCH_INTERVAL_SECONDS:
+        raise SystemExit(
+            "PRISM_PYTHON_SWITCH_INTERVAL_SECONDS cannot exceed "
+            f"{MAX_PRISM_PYTHON_SWITCH_INTERVAL_SECONDS}"
+        )
+    return interval
+
+
+def apply_python_switch_interval(*, environ: Env | None = None) -> float | None:
+    """Apply the configured switch interval; return what was applied, if any.
+
+    Must run before any thread starts. The interval decides how long a
+    CPU-bound thread may hold the GIL before the interpreter forces a switch,
+    so it is process-global state that existing threads observe unevenly if it
+    changes underneath them.
+
+    #143's gate evidence measured this as a real lever rather than a
+    micro-optimisation: a sweep moved throughput 15% and CPU-per-share 13%,
+    and the 5 ms default had the worst ack tail of the three settings tested.
+    The right value is host-specific -- it trades share-ack tail latency
+    against interpreter overhead, and the balance shifts with core count and
+    per-core speed -- so this ships as a knob with no default rather than as a
+    value picked on one machine and inherited everywhere.
+    """
+    interval = resolve_python_switch_interval_seconds(environ=environ)
+    if interval is None:
+        return None
+    sys.setswitchinterval(interval)
+    return interval
 
 
 def load_prism_vardiff_config(

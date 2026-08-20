@@ -4,12 +4,112 @@
 
 from __future__ import annotations
 
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from lab.prism.coordinator_config import env_decimal, load_coordinator_config
+from lab.prism.coordinator_config import (
+    MAX_PRISM_PYTHON_SWITCH_INTERVAL_SECONDS,
+    apply_python_switch_interval,
+    env_decimal,
+    load_coordinator_config,
+    resolve_python_switch_interval_seconds,
+)
 from tests.prism_vardiff_test_support import *
+
+
+class PrismPythonSwitchIntervalTests(unittest.TestCase):
+    """#143: the interpreter switch interval is a tunable, validated at startup."""
+
+    def setUp(self) -> None:
+        # setswitchinterval is process-global, so a test that applies one must
+        # put it back or every later test in this process inherits it.
+        original = sys.getswitchinterval()
+        self.addCleanup(sys.setswitchinterval, original)
+
+    def test_unset_leaves_the_interpreter_default_untouched(self) -> None:
+        before = sys.getswitchinterval()
+
+        self.assertIsNone(resolve_python_switch_interval_seconds(environ={}))
+        self.assertIsNone(apply_python_switch_interval(environ={}))
+
+        # Absent means "do not call setswitchinterval", not "call it with 5ms".
+        self.assertEqual(sys.getswitchinterval(), before)
+
+    def test_empty_value_behaves_as_unset(self) -> None:
+        # compose.yaml passes ${PRISM_PYTHON_SWITCH_INTERVAL_SECONDS:-}, which
+        # reaches the container as an empty string rather than as an absent
+        # variable. If that ever stopped reading as unset, every default
+        # deployment would refuse to start.
+        before = sys.getswitchinterval()
+
+        self.assertIsNone(
+            apply_python_switch_interval(
+                environ={"PRISM_PYTHON_SWITCH_INTERVAL_SECONDS": ""}
+            )
+        )
+
+        self.assertEqual(sys.getswitchinterval(), before)
+
+    def test_configured_value_is_applied_and_returned(self) -> None:
+        applied = apply_python_switch_interval(
+            environ={"PRISM_PYTHON_SWITCH_INTERVAL_SECONDS": "0.001"}
+        )
+
+        self.assertEqual(applied, 0.001)
+        self.assertAlmostEqual(sys.getswitchinterval(), 0.001)
+
+    def test_non_numeric_value_refuses_startup(self) -> None:
+        with self.assertRaisesRegex(
+            SystemExit, "PRISM_PYTHON_SWITCH_INTERVAL_SECONDS must be a number"
+        ):
+            resolve_python_switch_interval_seconds(
+                environ={"PRISM_PYTHON_SWITCH_INTERVAL_SECONDS": "fast"}
+            )
+
+    def test_non_positive_and_non_finite_values_refuse_startup(self) -> None:
+        for raw, message in (
+            ("0", "must be positive"),
+            ("-0.005", "must be positive"),
+            ("nan", "must be finite"),
+            ("inf", "must be finite"),
+        ):
+            with self.subTest(raw=raw), self.assertRaisesRegex(SystemExit, message):
+                resolve_python_switch_interval_seconds(
+                    environ={"PRISM_PYTHON_SWITCH_INTERVAL_SECONDS": raw}
+                )
+
+    def test_value_above_the_ceiling_refuses_startup(self) -> None:
+        # A misplaced decimal point ("5" meaning 5ms) would otherwise let a
+        # thread hold the GIL for whole seconds, which reads as unexplained
+        # ack-latency rather than as a configuration error.
+        with self.assertRaisesRegex(
+            SystemExit, "PRISM_PYTHON_SWITCH_INTERVAL_SECONDS cannot exceed"
+        ):
+            resolve_python_switch_interval_seconds(
+                environ={"PRISM_PYTHON_SWITCH_INTERVAL_SECONDS": "5"}
+            )
+
+    def test_the_ceiling_itself_is_accepted(self) -> None:
+        ceiling = MAX_PRISM_PYTHON_SWITCH_INTERVAL_SECONDS
+
+        self.assertEqual(
+            resolve_python_switch_interval_seconds(
+                environ={"PRISM_PYTHON_SWITCH_INTERVAL_SECONDS": str(ceiling)}
+            ),
+            ceiling,
+        )
+
+    def test_rejected_values_never_reach_the_interpreter(self) -> None:
+        before = sys.getswitchinterval()
+
+        with self.assertRaises(SystemExit):
+            apply_python_switch_interval(
+                environ={"PRISM_PYTHON_SWITCH_INTERVAL_SECONDS": "5"}
+            )
+
+        self.assertEqual(sys.getswitchinterval(), before)
 
 
 class PrismCoordinatorVardiffTests(unittest.TestCase):

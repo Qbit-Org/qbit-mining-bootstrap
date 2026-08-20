@@ -624,6 +624,10 @@ services:
       # backward-compatible implicit cap of min(4, pending bound).
       PRISM_INITIAL_JOB_MAX_WORKERS: ${PRISM_INITIAL_JOB_MAX_WORKERS:-}
       PRISM_JOB_BUILD_EXECUTOR_WORKERS: ${PRISM_JOB_BUILD_EXECUTOR_WORKERS:-2}
+      # No interpolation default on purpose: empty must reach the coordinator
+      # as unset so it leaves sys.setswitchinterval() uncalled, rather than
+      # pinning CPython's current 5ms default as though the tree had chosen it.
+      PRISM_PYTHON_SWITCH_INTERVAL_SECONDS: ${PRISM_PYTHON_SWITCH_INTERVAL_SECONDS:-}
       PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS: ${PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS:-1}
       PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES: ${PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES:-4096}
       PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS: ${PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS:-3600}
