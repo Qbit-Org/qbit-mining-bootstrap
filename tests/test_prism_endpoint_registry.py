@@ -24,6 +24,7 @@ from lab.prism.endpoint_registry import (
     ENDPOINTS,
     LedgerAccess,
 )
+from lab.prism.observability import METRICS_STATE_FRESH, MetricsSnapshotResponse
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -82,8 +83,13 @@ class _RoutingPort:
     def cached_health_payload(self) -> tuple[int, dict[str, object]]:
         return 200, {"ok": True}
 
-    def cached_metrics_payload(self) -> tuple[int, str]:
-        return 200, "fixture 1\n"
+    def cached_metrics_payload(self) -> MetricsSnapshotResponse:
+        return MetricsSnapshotResponse(
+            status=200,
+            body="fixture 1\n",
+            state=METRICS_STATE_FRESH,
+            age_seconds=0,
+        )
 
     def latest_evidence_payload(self) -> dict[str, object] | None:
         return {"schema": "fixture"}

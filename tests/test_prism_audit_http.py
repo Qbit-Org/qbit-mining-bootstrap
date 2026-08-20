@@ -8,12 +8,21 @@ import threading
 import time
 import unittest
 from unittest.mock import patch
+import urllib.error
 import urllib.request
 
 from lab.prism.audit_http import (
     AuditHttpConfig,
     AuditHttpFacade,
     _BoundedThreadingHttpServer,
+)
+from lab.prism.observability import (
+    METRICS_STALE_WARNING,
+    METRICS_STATE_FRESH,
+    METRICS_STATE_HEADER,
+    METRICS_STATE_STALE,
+    METRICS_STATE_UNAVAILABLE,
+    MetricsSnapshotResponse,
 )
 
 
@@ -23,6 +32,12 @@ class FakeAuditHttpPort:
         self.health_release: threading.Event | None = None
         self.health_calls = 0
         self.metrics_calls = 0
+        self.metrics_response = MetricsSnapshotResponse(
+            status=200,
+            body="qbit_prism_cached_fixture 1\n",
+            state=METRICS_STATE_FRESH,
+            age_seconds=0,
+        )
 
     def cached_health_payload(self) -> tuple[int, dict[str, object]]:
         self.health_calls += 1
@@ -32,9 +47,9 @@ class FakeAuditHttpPort:
             self.health_release.wait(2.0)
         return 200, {"ok": True, "schema": "health-fixture"}
 
-    def cached_metrics_payload(self) -> tuple[int, str]:
+    def cached_metrics_payload(self) -> MetricsSnapshotResponse:
         self.metrics_calls += 1
-        return 200, "qbit_prism_cached_fixture 1\n"
+        return self.metrics_response
 
     def latest_evidence_payload(self) -> dict[str, object] | None:
         return None
@@ -206,6 +221,73 @@ class AuditHttpFacadeTests(unittest.TestCase):
         self.assertEqual(stopped.lifecycle, "stopped")
         self.assertFalse(stopped.thread_alive)
         self.assertIsNone(stopped.bound_address)
+
+    def test_metrics_publishes_freshness_in_response_metadata(self) -> None:
+        """A scraper must tell fresh from stale from unavailable (issue #184).
+
+        None of these assertions parse the Prometheus body: the whole point of
+        the response metadata is that a consumer does not have to.
+        """
+
+        port = FakeAuditHttpPort()
+        facade = AuditHttpFacade(
+            port,  # type: ignore[arg-type]
+            AuditHttpConfig(bind="127.0.0.1", port=0),
+        )
+        self.addCleanup(facade.stop)
+        state = facade.start()
+        assert state.bound_address is not None
+        url = f"http://127.0.0.1:{state.bound_address[1]}/metrics"
+
+        with urllib.request.urlopen(url, timeout=2) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers[METRICS_STATE_HEADER], "fresh")
+            self.assertEqual(response.headers["Age"], "0")
+            self.assertIsNone(response.headers["Warning"])
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+            self.assertEqual(response.read(), b"qbit_prism_cached_fixture 1\n")
+
+        # A stale complete payload is served, not refused: 200 is what keeps
+        # Prometheus from discarding the last document that still exists.
+        port.metrics_response = MetricsSnapshotResponse(
+            status=200,
+            body="qbit_prism_cached_fixture 1\n",
+            state=METRICS_STATE_STALE,
+            age_seconds=42,
+        )
+        with urllib.request.urlopen(url, timeout=2) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers[METRICS_STATE_HEADER], "stale")
+            self.assertEqual(response.headers["Age"], "42")
+            self.assertEqual(response.headers["Warning"], METRICS_STALE_WARNING)
+            self.assertEqual(
+                response.headers["Content-Type"],
+                "text/plain; version=0.0.4",
+            )
+            # The prior complete document, unchanged.
+            self.assertEqual(response.read(), b"qbit_prism_cached_fixture 1\n")
+
+        # Warm-up still refuses, and says so out of band. No Age and no stale
+        # warning: there is no served payload for either to describe.
+        port.metrics_response = MetricsSnapshotResponse(
+            status=503,
+            body="qbit_prism_metrics_snapshot_available 0\n",
+            state=METRICS_STATE_UNAVAILABLE,
+            age_seconds=None,
+        )
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(url, timeout=2)
+        refusal = raised.exception
+        self.addCleanup(refusal.close)
+        self.assertEqual(refusal.status, 503)
+        self.assertEqual(refusal.headers[METRICS_STATE_HEADER], "unavailable")
+        self.assertIsNone(refusal.headers["Age"])
+        self.assertIsNone(refusal.headers["Warning"])
+        self.assertEqual(
+            refusal.read(),
+            b"qbit_prism_metrics_snapshot_available 0\n",
+        )
+        self.assertEqual(port.metrics_calls, 3)
 
     def test_unexpected_serve_exit_closes_listener_before_restart(self) -> None:
         class ExitServer:

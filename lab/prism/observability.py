@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import threading
-from typing import Callable, Mapping, Protocol
+from typing import Callable, Iterator, Mapping, Protocol
 
 from lab.prism.progress_health import overlay_progress_health
 
@@ -12,6 +12,30 @@ from lab.prism.progress_health import overlay_progress_health
 HEALTH_SCHEMA = "qbit.prism.audit-health.v1"
 MINIMUM_HEALTH_STALE_SECONDS = 15.0
 METRICS_FAILURE_CLASSES = ("exception", "invalid_payload")
+
+# What /metrics says about the payload it just returned, so a consumer can tell
+# fresh from stale from unavailable without parsing the Prometheus body (issue
+# #184). Same shape as #164's database-state header: one bounded value an
+# operator greps and a dashboard frontend switches a banner on, rather than a
+# warn-code line to parse or a gauge to scrape out of the body it qualifies.
+METRICS_STATE_HEADER = "X-Prism-Metrics-State"
+METRICS_STATE_FRESH = "fresh"
+METRICS_STATE_STALE = "stale"
+METRICS_STATE_UNAVAILABLE = "unavailable"
+METRICS_STATES = (
+    METRICS_STATE_FRESH,
+    METRICS_STATE_STALE,
+    METRICS_STATE_UNAVAILABLE,
+)
+
+# Warning 110 is the registered "Response is Stale" warn-code (RFC 7234 5.5.1),
+# with this service named as the agent that added it, exactly as #164 says it
+# on a cached public response. Said only on a stale payload this endpoint
+# actually served: the warm-up refusal has no cached body to qualify.
+METRICS_STALE_WARNING_HEADER = "Warning"
+METRICS_STALE_WARNING = (
+    '110 qbit-prism "metrics snapshot is stale; serving last complete payload"'
+)
 
 
 @dataclass(frozen=True)
@@ -105,6 +129,40 @@ class MetricsObservabilityState:
     metrics_failure_exception_count: int
     metrics_failure_invalid_payload_count: int
     metrics_last_failure_class: str | None
+
+
+@dataclass(frozen=True)
+class MetricsSnapshotResponse:
+    """One /metrics answer: the bytes to send, and what they are (issue #184).
+
+    Iterable as the ``(status, body)`` pair this read used to return, so the
+    callers that only ever needed those two keep working unchanged while the
+    HTTP layer gets the freshness facts it must publish out of band.
+    """
+
+    status: int
+    body: str
+    state: str
+    age_seconds: int | None
+
+    def __iter__(self) -> Iterator[object]:
+        yield self.status
+        yield self.body
+
+    def response_headers(self) -> dict[str, str]:
+        """State this answer's freshness where no body parsing is needed."""
+
+        headers = {
+            # A scrape answer is never re-servable: an intermediary holding a
+            # stale body would republish it under this response's own Age.
+            "Cache-Control": "no-store",
+            METRICS_STATE_HEADER: self.state,
+        }
+        if self.age_seconds is not None:
+            headers["Age"] = str(self.age_seconds)
+        if self.state == METRICS_STATE_STALE:
+            headers[METRICS_STALE_WARNING_HEADER] = METRICS_STALE_WARNING
+        return headers
 
 
 class _InvalidMetricsPayload(ValueError):
@@ -554,7 +612,7 @@ class ObservabilityService:
         *,
         now: float,
         refresh_seconds: float,
-    ) -> tuple[int, str]:
+    ) -> MetricsSnapshotResponse:
         with self._metrics_lock:
             snapshot = self._metrics_snapshot
             snapshot_monotonic = self._metrics_snapshot_monotonic
@@ -596,10 +654,37 @@ class ObservabilityService:
             f"qbit_prism_metrics_snapshot_generation {generation}",
         ]
         prefix = "" if snapshot is None else snapshot
-        return (503 if stale else 200), prefix + "\n".join(diagnostic_lines) + "\n"
+        body = prefix + "\n".join(diagnostic_lines) + "\n"
+        if snapshot is None:
+            # Nothing complete has ever been published, so there is no payload
+            # to serve and no truthful age to publish beside it. Refuse, and
+            # say so out of band too: this body is diagnostics only, and a
+            # scraper that stored it would be storing a metrics document that
+            # is missing every metric the process actually reports.
+            return MetricsSnapshotResponse(
+                status=503,
+                body=body,
+                state=METRICS_STATE_UNAVAILABLE,
+                age_seconds=None,
+            )
+        # A complete payload exists, so it is served -- stale or not (#184).
+        # Prometheus discards the body of a non-200, so answering 503 here threw
+        # the last known-good document away at exactly the moment it was the
+        # only thing left to look at, and took the diagnostic gauges above with
+        # it. The staleness is not hidden: it travels in the response metadata
+        # and in snapshot_stale/snapshot_age_seconds. Nothing is rendered or
+        # collected on this thread either way -- the published generation is
+        # returned as it stands, so a collector wedged on the GIL or on the
+        # renderer lock cannot delay or re-enter this path.
+        return MetricsSnapshotResponse(
+            status=200,
+            body=body,
+            state=METRICS_STATE_STALE if stale else METRICS_STATE_FRESH,
+            age_seconds=int(age_seconds),
+        )
 
-    def cached_metrics_payload(self) -> tuple[int, str]:
-        """Return cached text using only monotonic time and metrics state."""
+    def cached_metrics_payload(self) -> MetricsSnapshotResponse:
+        """Return the cached answer using only monotonic time and metrics state."""
 
         now = self.port.monotonic()
         refresh_seconds = self.port.metrics_refresh_seconds()
@@ -634,7 +719,15 @@ __all__ = [
     "HEALTH_SCHEMA",
     "MINIMUM_HEALTH_STALE_SECONDS",
     "METRICS_FAILURE_CLASSES",
+    "METRICS_STALE_WARNING",
+    "METRICS_STALE_WARNING_HEADER",
+    "METRICS_STATES",
+    "METRICS_STATE_FRESH",
+    "METRICS_STATE_HEADER",
+    "METRICS_STATE_STALE",
+    "METRICS_STATE_UNAVAILABLE",
     "MetricsObservabilityState",
+    "MetricsSnapshotResponse",
     "MiningDeliveryInputs",
     "ObservabilityPort",
     "ObservabilityService",

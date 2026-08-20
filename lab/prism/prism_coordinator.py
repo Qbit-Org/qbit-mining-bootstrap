@@ -170,6 +170,9 @@ from lab.prism.audit_http import (
     AuditHttpPort,
 )
 from lab.prism.observability import (
+    METRICS_STATE_FRESH,
+    METRICS_STATE_UNAVAILABLE,
+    MetricsSnapshotResponse,
     MiningDeliveryInputs,
     ObservabilityPort,
     ObservabilityService,
@@ -1169,15 +1172,51 @@ class _CoordinatorAuditHttp(AuditHttpPort):
             return 200, self.coordinator.health_payload()
         raise RuntimeError("cached health is unavailable")
 
-    def cached_metrics_payload(self) -> tuple[int, str]:
+    def cached_metrics_payload(self) -> MetricsSnapshotResponse:
         cached = getattr(self.coordinator, "cached_metrics_payload", None)
         if callable(cached):
-            status, payload = cached()
-            if status != 503 or not self.allow_uncached_compatibility:
-                return status, payload
+            response = self._as_metrics_response(cached())
+            if response.status != 503 or not self.allow_uncached_compatibility:
+                # Carried through whole rather than unpacked: the freshness
+                # state and age this read decided are what /metrics publishes
+                # out of band (issue #184), and rebuilding them here from the
+                # status alone would lose the fresh/stale distinction that
+                # both now answer 200.
+                return response
         if self.allow_uncached_compatibility:
-            return 200, self.coordinator.metrics_payload()
+            # Legacy make_audit_handler path only: no refresher owns the
+            # snapshot, so this renders inline and the result is by definition
+            # freshly collected.
+            return MetricsSnapshotResponse(
+                status=200,
+                body=self.coordinator.metrics_payload(),
+                state=METRICS_STATE_FRESH,
+                age_seconds=0,
+            )
         raise RuntimeError("cached metrics are unavailable")
+
+    @staticmethod
+    def _as_metrics_response(cached: object) -> MetricsSnapshotResponse:
+        """Accept the response type, or adapt a legacy ``(status, body)`` pair.
+
+        Coordinator doubles predating the #184 response type still answer with
+        the bare pair. A pair carries no freshness beyond its status, so the
+        state is derived from exactly that and nothing is invented.
+        """
+
+        if isinstance(cached, MetricsSnapshotResponse):
+            return cached
+        status, body = cached  # type: ignore[misc]
+        return MetricsSnapshotResponse(
+            status=int(status),
+            body=str(body),
+            state=(
+                METRICS_STATE_UNAVAILABLE
+                if int(status) == 503
+                else METRICS_STATE_FRESH
+            ),
+            age_seconds=None if int(status) == 503 else 0,
+        )
 
     def latest_evidence_payload(self) -> Mapping[str, object] | None:
         return self.coordinator.latest_evidence_payload()
@@ -9523,7 +9562,7 @@ class PrismCoordinator:
     def refresh_metrics_snapshot(self) -> str:
         return self._ensure_observability_service().refresh_metrics_snapshot()
 
-    def cached_metrics_payload(self) -> tuple[int, str]:
+    def cached_metrics_payload(self) -> MetricsSnapshotResponse:
         return self._ensure_observability_service().cached_metrics_payload()
 
     def metrics_snapshot_loop(self) -> None:

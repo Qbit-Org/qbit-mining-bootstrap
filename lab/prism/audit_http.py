@@ -17,12 +17,29 @@ from typing import Mapping, Protocol
 import urllib.parse
 
 
+class MetricsResponse(Protocol):
+    """What ``/metrics`` needs from a cached metrics read (issue #184).
+
+    Structural on purpose: this module stays free of the observability policy
+    that decides the state and names the headers, and only writes what it is
+    handed.
+    """
+
+    @property
+    def status(self) -> int: ...
+
+    @property
+    def body(self) -> str: ...
+
+    def response_headers(self) -> Mapping[str, str]: ...
+
+
 class AuditHttpPort(Protocol):
     """Purpose-specific application reads exposed to the HTTP facade."""
 
     def cached_health_payload(self) -> tuple[int, Mapping[str, object]]: ...
 
-    def cached_metrics_payload(self) -> tuple[int, str]: ...
+    def cached_metrics_payload(self) -> MetricsResponse: ...
 
     def latest_evidence_payload(self) -> Mapping[str, object] | None: ...
 
@@ -342,11 +359,16 @@ class AuditHttpFacade:
                         self.write_json(status, payload)
                         return
                     if path == "/metrics":
-                        status, payload = facade.port.cached_metrics_payload()
+                        metrics = facade.port.cached_metrics_payload()
                         self.write_text(
-                            status,
-                            payload,
+                            metrics.status,
+                            metrics.body,
                             "text/plain; version=0.0.4",
+                            # Freshness is stated in the response metadata as
+                            # well as the body, so a scraper or an operator can
+                            # tell a stale payload from a current one without
+                            # parsing Prometheus text (issue #184).
+                            headers=metrics.response_headers(),
                         )
                         return
                     if path == "/audit/latest":
@@ -635,12 +657,15 @@ class AuditHttpFacade:
                 status: int,
                 payload: str,
                 content_type: str,
+                headers: Mapping[str, str] | None = None,
             ) -> None:
                 body = payload.encode()
                 try:
                     self.send_response(status)
                     self.send_header("Content-Type", content_type)
                     self.send_header("Content-Length", str(len(body)))
+                    for key, value in (headers or {}).items():
+                        self.send_header(key, value)
                     self.end_headers()
                     self.wfile.write(body)
                 except (BrokenPipeError, ConnectionResetError):
@@ -677,4 +702,5 @@ __all__ = [
     "AuditHttpFacade",
     "AuditHttpPort",
     "AuditHttpState",
+    "MetricsResponse",
 ]
