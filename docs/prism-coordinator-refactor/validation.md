@@ -15,8 +15,14 @@ git diff --check
 
 Inspect the complete slice diff and confirm no leaf module imports
 `lab.prism.prism_coordinator`, including lazily inside a function. A leaf that
-needs a fact about the coordinator asks the injected coordinator reference for
-it; `PrismCoordinator._is_production_block_submit` is the pattern to copy.
+needs coordinator-owned behaviour reaches it through an injected seam that
+carries the full call shape, rather than asking the coordinator for a fact and
+re-deriving the decision itself. `BlockCandidatePorts.submit_candidate`, whose
+production implementation is
+`PrismCoordinator._land_block_candidate_submission`, is the pattern to copy:
+the leaf states what it has (an already-created node submission, an
+already-held disposition) and the coordinator resolves the entrypoint per
+call.
 
 The invariant covers runtime modules under `lab/prism/`. `job_build_benchmark.py`
 is a standalone benchmark entrypoint rather than a leaf owner and still imports

@@ -2006,8 +2006,14 @@ class PrismCoordinator:
                     ledger=lambda: self.ledger,
                     stop_event=lambda: self.stop_event,
                     writer_operation=lambda component: self._writer_operation(component),
-                    submit_candidate=lambda candidate: self.submit_block_candidate(
-                        candidate
+                    submit_candidate=(
+                        lambda candidate, *, node_submission=None, disposition_held=False: (
+                            self._land_block_candidate_submission(
+                                candidate,
+                                node_submission=node_submission,
+                                disposition_held=disposition_held,
+                            )
+                        )
                     ),
                     reject_terminal_prepared=(
                         lambda candidate: self._reject_terminal_prepared_block_candidate(
@@ -9061,18 +9067,46 @@ class PrismCoordinator:
             revalidated_append_epoch=revalidated_append_epoch,
         )
 
-    def _is_production_block_submit(self) -> bool:
-        """Report whether ``submit_block_candidate`` is still the production entrypoint.
+    def _land_block_candidate_submission(
+        self,
+        candidate: PrismBlockCandidate,
+        *,
+        node_submission: _BlockCandidateNodeSubmission | None = None,
+        disposition_held: bool = False,
+    ) -> bool:
+        """Run one candidate's landing tail behind the named submit port.
 
-        Embeddings and tests replace the bound method to stand in for the node
-        submission. The block-candidate owner must know which of the two
-        landing tails to run, and only the coordinator can answer that without
-        reaching back into this module. Resolved per call because the
-        replacement is installed on the instance after construction.
+        Embeddings and tests replace the bound ``submit_block_candidate`` to
+        stand in for the node submission, so which of the two landing tails
+        applies is a fact about this coordinator rather than about the
+        block-candidate owner. Deciding it here keeps that owner from reaching
+        back through the runtime seam to inspect the entrypoint, and keeps the
+        decision per call: the replacement is installed on the instance after
+        the block-candidate service is constructed.
+
+        ``node_submission`` is an already-created offer result when the caller
+        made one, and None when none was created -- which keeps the historical
+        bare entrypoint call. ``disposition_held`` states that the caller
+        already owns the same-hash disposition, which is what makes the
+        serialized inner tail, rather than the public entrypoint that would
+        take that guard again, the correct production call.
         """
-        return (
-            getattr(self.submit_block_candidate, "__func__", None)
+        submit = self.submit_block_candidate
+        production_submit = (
+            getattr(submit, "__func__", None)
             is PrismCoordinator.submit_block_candidate
+        )
+        if disposition_held and production_submit:
+            assert node_submission is not None
+            return self._submit_block_candidate_serialized(
+                candidate,
+                node_submission=node_submission,
+            )
+        if node_submission is None:
+            return bool(submit(candidate))
+        return self._account_block_candidate_after_node_submit(
+            candidate,
+            node_submission,
         )
 
     @ledger_writer_operation("accepted_block_handling")
