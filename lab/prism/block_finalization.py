@@ -56,6 +56,23 @@ FINALIZATION_PHASES = (
 )
 
 
+def _declared_anchor_ms(context: Any) -> int | None:
+    """The payout window anchor this candidate's job declared, if any.
+
+    ``found_block`` records the window the issued job was built from, and its
+    anchor is what scopes an append-invalidation question to this candidate
+    rather than to whatever else moved the global epoch. A candidate that
+    carries no anchor -- a reconstruction whose intent predates the field --
+    cannot scope the question at all, and every fence that asks reads ``None``
+    as invalidated.
+    """
+    found_block = getattr(context, "found_block", None)
+    if not isinstance(found_block, dict):
+        return None
+    anchor_ms = found_block.get("anchor_job_issued_at_ms")
+    return None if anchor_ms is None else int(anchor_ms)
+
+
 @dataclass(frozen=True)
 class FinalizationAdmission:
     """Immutable result of candidate admission and active-chain classification.
@@ -151,6 +168,14 @@ class BlockFinalizationPort(Protocol):
     ) -> list[dict[str, object]]: ...
 
     def _accepted_block_payout_transition_landed(self, block_hash: str) -> bool: ...
+
+    def _append_epoch_invalidated_declared_anchor(
+        self,
+        *,
+        baseline_epoch: int,
+        live_epoch: int,
+        declared_anchor_ms: int | None,
+    ) -> bool: ...
 
     def _audit_publication_identity(
         self,
@@ -739,6 +764,17 @@ class BlockFinalizationService:
             # from here both kinds of candidate share one epoch fence. A
             # reconstructed candidate on a backend that cannot revalidate
             # carries no epoch and the fence stands down.
+            #
+            # The question is asked per anchor, not per counter. The epoch is
+            # global, so a bare inequality also fires for an append that only
+            # invalidated some newer live window -- and on this lane, where
+            # nothing has been offered, that abandoned a block before qbitd
+            # ever saw it (issue #126). The predicate forgives a moved epoch
+            # only when every bump between this candidate's baseline and the
+            # live value was caused by a row that provably does not predate
+            # this candidate's own declared anchor, and fails closed
+            # otherwise -- including when the anchor is unknown, which is
+            # what the bare comparison did for every candidate.
             context_append_epoch = int(
                 getattr(context, "payout_append_invalidation_epoch", 0)
             )
@@ -747,6 +783,7 @@ class BlockFinalizationService:
                 if context_append_epoch >= 0
                 else revalidated_append_epoch
             )
+            declared_anchor_ms = _declared_anchor_ms(context)
             with self.runtime._job_cache_lock:
                 live_append_epoch = int(
                     self.runtime._payout_ledger_append_invalidation_epoch
@@ -756,7 +793,11 @@ class BlockFinalizationService:
                 and not getattr(context, "collection_only", False)
                 and not node_submission.attempted
                 and effective_append_epoch is not None
-                and effective_append_epoch != live_append_epoch
+                and self.runtime._append_epoch_invalidated_declared_anchor(
+                    baseline_epoch=effective_append_epoch,
+                    live_epoch=live_append_epoch,
+                    declared_anchor_ms=declared_anchor_ms,
+                )
             ):
                 # Fail closed only while nothing has been offered: a
                 # fast-lane candidate already reached qbitd, so a moved
@@ -886,7 +927,31 @@ class BlockFinalizationService:
                                 live_append_epoch = int(
                                     self.runtime._payout_ledger_append_invalidation_epoch
                                 )
-                            if live_append_epoch != effective_append_epoch:
+                            # Anchor-scoped, exactly as the advisory read
+                            # above: a bump that commits inside this window
+                            # is terminal only if the row that caused it
+                            # predates this candidate's declared anchor.
+                            # Two guarantees make reading recorded bumps
+                            # sufficient. The fence lock makes the answer
+                            # authoritative: the bump takes the same lock,
+                            # so none can commit between this comparison
+                            # and the RPC below. And every append that
+                            # predates this candidate's window has a bump
+                            # to read: the landing's own anchor is exposed
+                            # for the landing's duration, and the anchor-
+                            # set maximum never decreases while any job is
+                            # landable (an armed artifact's anchor is
+                            # folded into the never-retired published-
+                            # window watermark before the slot can drop
+                            # it), so a predating row always finds an
+                            # anchor to predate and stamps the epoch it
+                            # advances -- never a silent commit this read
+                            # would mistake for harmless history.
+                            if self.runtime._append_epoch_invalidated_declared_anchor(
+                                baseline_epoch=effective_append_epoch,
+                                live_epoch=live_append_epoch,
+                                declared_anchor_ms=declared_anchor_ms,
+                            ):
                                 append_epoch_raced = True
                             else:
                                 _verify_lease_before_submitblock()
@@ -1646,12 +1711,7 @@ class BlockFinalizationService:
         revalidated_append_epoch: int | None = None
         landing_anchor_token: int | None = None
         if not admission.already_active and not collection_only:
-            found_block = getattr(context, "found_block", None)
-            declared_anchor_ms = (
-                found_block.get("anchor_job_issued_at_ms")
-                if isinstance(found_block, dict)
-                else None
-            )
+            declared_anchor_ms = _declared_anchor_ms(context)
             if declared_anchor_ms is not None:
                 # With no armed artifact and no in-flight walk (an outbox
                 # replay at startup, or a landing after the artifact was

@@ -7999,6 +7999,14 @@ class PrismCoordinator:
         """Advance the append-invalidation epoch for a newly durable row."""
         return self._ensure_payout_state_service()._record_late_visible_payout_append(pending_share, landing_fence_owned=landing_fence_owned)
 
+    def _append_epoch_invalidated_declared_anchor(self, *, baseline_epoch: int, live_epoch: int, declared_anchor_ms: int | None) -> bool:
+        """Whether an append between two epochs invalidated this declared anchor."""
+        return self._ensure_payout_state_service()._append_epoch_invalidated_declared_anchor(
+            baseline_epoch=baseline_epoch,
+            live_epoch=live_epoch,
+            declared_anchor_ms=declared_anchor_ms,
+        )
+
     def _invalidate_incremental_payout_window_for_append(self, pending_share: PendingShare) -> None:
         """Disarm payout work that predates a newly visible eligible row."""
         return self._ensure_payout_state_service()._invalidate_incremental_payout_window_for_append(pending_share)
