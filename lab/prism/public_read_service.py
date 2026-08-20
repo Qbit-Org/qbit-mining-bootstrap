@@ -45,6 +45,15 @@ An honest staleness contract
     ``lab/prism/observability.py``, where the cached ``/metrics`` endpoint
     already returns 503 rather than serve an unbounded-stale snapshot.
 
+    The same contract is what a database outage is answered with (#164). While
+    the readiness probe says Postgres is unreachable, a database-backed route
+    serves its warm cache entry if it has one inside that budget -- labelled as
+    degraded, so the client is told the difference between "30s old because
+    that is the poll interval" and "30s old because this is the last answer
+    that exists" -- and refuses with 503 otherwise. It never calls the database
+    to refill and never extends the entry it serves, so the budget stays the
+    real bound: ordinary traffic cannot keep a stale dashboard alive past it.
+
 Entry point: ``python3 -m lab.prism.public_read_service``.
 """
 
@@ -92,6 +101,22 @@ STALENESS_BUDGET_HEADER = "X-Prism-Staleness-Budget-Seconds"
 # What that header says for /public/v1/artifacts/{sha256}, the one route with no
 # budget. A number would be a lie in either direction; this names the contract.
 UNBOUNDED_STALENESS_BUDGET = "unbounded"
+
+# Said on every response served, or refused, while the readiness probe reports
+# the database unreachable. Age and STALENESS_BUDGET_HEADER already carry the
+# numbers; these two carry the fact, which the numbers alone cannot. Without
+# them an ordinary 30-second-old poll response and the last answer that still
+# exists are the same response.
+#
+# Warning 110 is the registered "Response is Stale" warn-code (RFC 7234 5.5.1,
+# retained by clients that still parse the header), with this service named as
+# the agent that added it. The X- header is what an operator greps and what a
+# dashboard frontend switches an outage banner on, because it is a single value
+# rather than a warn-code line to parse.
+DEGRADED_WARNING_HEADER = "Warning"
+DEGRADED_WARNING = '110 qbit-prism "database unavailable; serving cached response"'
+DATABASE_STATE_HEADER = "X-Prism-Database-State"
+DATABASE_STATE_UNAVAILABLE = "unavailable"
 
 # How often the background prober re-checks Postgres, and the age at which its
 # answer stops counting. Same shape as observability.py's health staleness:
@@ -162,6 +187,8 @@ class ServiceMetrics:
         self._cache_by_state: dict[str, int] = {"hit": 0, "miss": 0, "bypass": 0}
         self._staleness_refusals = 0
         self._replica_refusals = 0
+        self._degraded_responses = 0
+        self._database_outage_refusals = 0
 
     def record_request(self) -> None:
         with self._lock:
@@ -187,6 +214,14 @@ class ServiceMetrics:
         with self._lock:
             self._replica_refusals += 1
 
+    def record_degraded_response(self) -> None:
+        with self._lock:
+            self._degraded_responses += 1
+
+    def record_database_outage_refusal(self) -> None:
+        with self._lock:
+            self._database_outage_refusals += 1
+
     def render(
         self,
         *,
@@ -200,6 +235,8 @@ class ServiceMetrics:
             cache_states = dict(self._cache_by_state)
             refusals = self._staleness_refusals
             replica_refusals = self._replica_refusals
+            degraded_responses = self._degraded_responses
+            database_outage_refusals = self._database_outage_refusals
         lines = [
             "# HELP qbit_prism_public_requests_total Public read requests accepted.",
             "# TYPE qbit_prism_public_requests_total counter",
@@ -235,6 +272,12 @@ class ServiceMetrics:
                 "# HELP qbit_prism_public_replica_refusals_total Responses refused for failing the replica freshness contract.",
                 "# TYPE qbit_prism_public_replica_refusals_total counter",
                 f"qbit_prism_public_replica_refusals_total {replica_refusals}",
+                "# HELP qbit_prism_public_degraded_responses_total Cached responses served while the database was unreachable.",
+                "# TYPE qbit_prism_public_degraded_responses_total counter",
+                f"qbit_prism_public_degraded_responses_total {degraded_responses}",
+                "# HELP qbit_prism_public_database_outage_refusals_total Responses refused because the database was unreachable and no warm entry existed.",
+                "# TYPE qbit_prism_public_database_outage_refusals_total counter",
+                f"qbit_prism_public_database_outage_refusals_total {database_outage_refusals}",
             ]
         )
         if replica is not None:
@@ -523,21 +566,28 @@ class ReadinessProbe:
         return (200 if payload["ok"] else 503), payload
 
 
-def path_reads_replica(path: str) -> bool:
-    """Does this route's answer come out of the replicated database?
+def path_reads_database(path: str) -> bool:
+    """Does this route's answer come out of the database?
+
+    One predicate, two gates. The replica contract asks it to decide which
+    routes a silent standby may not answer; the outage gate asks it to decide
+    which routes a dead database may not answer. The exempt set is the same
+    both times, and for the same reasons, so it is derived once here rather
+    than stated twice.
 
     Derived from the endpoint registry rather than a hand-kept path list, so a
     route added there is classified once. Two kinds of route are exempt:
 
     * those that touch no read slot at all -- today only
-      /public/v1/mining-configuration, assembled from environment;
+      /public/v1/mining-configuration, assembled from environment. It has no
+      database answer to lose;
     * content-addressed ones, which declare ``immutable_content``. A body that
       hashes to the requested sha256 is correct at any age, which is why the
       registry gives them no staleness budget either; refusing one for
-      replication lag would contradict the unbounded budget already published
-      on it.
+      replication lag, or for an outage, would contradict the unbounded budget
+      already published on it.
 
-    An unclassified path is not replica-backed here because dispatch() 404s it
+    An unclassified path is not database-backed here because dispatch() 404s it
     before it can read anything.
     """
     endpoint = endpoint_registry.endpoint_for_request_path(path)
@@ -578,6 +628,36 @@ def staleness_budget_header_value(path: str) -> str | None:
     if endpoint.max_staleness_seconds is None:
         return None
     return _format_budget(endpoint.max_staleness_seconds)
+
+
+# The refusal body, built once so the handler can recognise it by identity.
+#
+# Reported under ``stale_read_model`` because ``public_api`` owns the public
+# error enum and that is the entry whose meaning this is: no answer for this
+# route exists inside the age it publishes. It is the same documented wire code
+# (``upstream_unavailable``) the replica refusal already resolves to -- from a
+# client's side the conditions are one condition -- and inventing an
+# undocumented code instead would silently ship a 503 that says "internal
+# error", because error_payload() rewrites codes it does not know.
+DATABASE_UNAVAILABLE_PAYLOAD = public_api.error_payload(
+    "stale_read_model",
+    "public read service cannot reach the database and has no cached response "
+    "for this request inside its staleness budget",
+)
+
+
+def database_unavailable_response() -> tuple[int, dict[str, object]]:
+    """The 503 a database-backed route owes while the database is unreachable.
+
+    Shaped as a ``compute`` for ``PublicResponseCache.get_or_compute`` because
+    that is how the warm/cold distinction gets made without a second cache API:
+    the cache answers a warm key from its entry and never calls this, and on a
+    cold, bypassed or expired key it calls this and stores nothing, because the
+    cache only stores 2xx. So the same call expresses "serve what you have" and
+    "refuse, and do not go and ask".
+    """
+
+    return 503, DATABASE_UNAVAILABLE_PAYLOAD
 
 
 def staleness_error_payload(*, budget_seconds: float, age_seconds: int) -> dict[str, object]:
@@ -682,11 +762,12 @@ def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
                 )
 
         def handle_public(self, path: str, query: dict[str, list[str]]) -> None:
+            reads_database = path_reads_database(path)
             # Before the cache, not after. A replica outage does not make
             # cached entries expire, so a post-cache check would keep answering
             # 200 from the last good snapshot for as long as traffic kept the
             # entry warm -- the precise failure this gate exists to prevent.
-            if replica is not None and path_reads_replica(path):
+            if replica is not None and reads_database:
                 refusal = replica.freshness_error()
                 if refusal is not None:
                     code, message = refusal
@@ -700,13 +781,44 @@ def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
                         headers=self.with_budget(path, headers),
                     )
                     return
+            # Also before the cache, and before any origin computation: while
+            # readiness says the database is unreachable, a database-backed
+            # route may still answer from what it already has, but it may not
+            # go and ask. Handing the cache a non-cacheable 503 instead of
+            # dispatch() is exactly that instruction -- a warm key returns its
+            # entry and never reaches this, a cold, bypassed or expired one
+            # gets the refusal and stores nothing.
+            degraded = (
+                readiness is not None
+                and reads_database
+                and readiness.snapshot()[0] != 200
+            )
             cache_policy = public_api.public_cache_policy(path)
             status, payload, cache_state, age_seconds = cache.get_or_compute(
                 key=public_api.public_cache_key(path, query),
                 ttl_seconds=cache_policy.ttl_seconds,
-                compute=lambda: public_api.dispatch(coordinator, path, query),
+                compute=(
+                    database_unavailable_response
+                    if degraded
+                    else lambda: public_api.dispatch(coordinator, path, query)
+                ),
             )
             service_metrics.record_cache_state(cache_state)
+            if payload is DATABASE_UNAVAILABLE_PAYLOAD:
+                # Nothing warm to serve. Recognised by identity rather than
+                # from this request's own `degraded`, because get_or_compute
+                # coalesces: a request that arrived while another was computing
+                # gets that one's result whatever its own view of readiness
+                # was. Keying on the request would ship this 503 with ordinary
+                # shared-cache headers to a waiter whose probe had recovered in
+                # between, and a CDN would then hold the refusal.
+                service_metrics.record_database_outage_refusal()
+                headers = self.with_replica_lag(public_api.public_error_headers())
+                headers[DATABASE_STATE_HEADER] = DATABASE_STATE_UNAVAILABLE
+                self.write_json(
+                    status, payload, headers=self.with_budget(path, headers)
+                )
+                return
             budget_seconds = staleness_budget_for_path(path)
             if budget_seconds is not None and age_seconds > budget_seconds:
                 # Refuse rather than serve past the budget. A silently stale
@@ -715,6 +827,13 @@ def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
                 headers = public_api.public_error_headers()
                 headers[STALENESS_BUDGET_HEADER] = _format_budget(budget_seconds)
                 headers["Age"] = str(max(0, age_seconds))
+                if degraded:
+                    # Stated, but deliberately not counted as an outage
+                    # refusal: the budget check is unconditional, so this entry
+                    # would have been refused with a healthy database too. The
+                    # outage is why no fresher one replaced it, which is worth
+                    # saying and is not the same claim.
+                    headers[DATABASE_STATE_HEADER] = DATABASE_STATE_UNAVAILABLE
                 self.write_json(
                     503,
                     staleness_error_payload(
@@ -730,6 +849,21 @@ def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
                 age_seconds=age_seconds,
             )
             headers = self.with_replica_lag(headers)
+            if degraded and cache_state == "HIT":
+                # A cached body, inside the budget the same response publishes,
+                # served with the outage stated rather than implied. The
+                # shared-cache headers are deliberately left as they were: the
+                # CDN TTL is the route's own, which the registry derives at a
+                # third of the budget or less, so a downstream cache cannot
+                # carry this body past the bound stated on it.
+                #
+                # Conditioned on the hit, not on `degraded` alone: a coalescing
+                # waiter can receive an origin result computed by a request
+                # that still saw a healthy database, and labelling that fresh
+                # body "serving cached response" would be untrue.
+                service_metrics.record_degraded_response()
+                headers[DEGRADED_WARNING_HEADER] = DEGRADED_WARNING
+                headers[DATABASE_STATE_HEADER] = DATABASE_STATE_UNAVAILABLE
             self.write_json(status, payload, headers=self.with_budget(path, headers))
 
         def with_replica_lag(self, headers: dict[str, str]) -> dict[str, str]:
