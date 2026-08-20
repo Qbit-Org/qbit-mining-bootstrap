@@ -227,20 +227,43 @@ re-serialization step. Audit bundles written before canonical-byte persistence
 was introduced retain the legacy reconstructed response until the verified
 backfill publishes their canonical artifact.
 
-Operators can verify the historical range first with
-`python3 -m lab.prism.backfill_audit_bundle_canonical --dry-run`, then rerun
-without `--dry-run` to publish. The command pages in stable block-hash order
+Operators can verify the historical range while the coordinator is live:
+
+```sh
+python3 -m lab.prism.backfill_audit_bundle_canonical --dry-run
+```
+
+Before publishing, stop the coordinator and confirm it no longer owns the
+PostgreSQL writer lease. Publish mode requires exclusive lease ownership and
+fails instead of waiting behind a live same-identity coordinator. Schema repair
+is unrelated to this filesystem-only rollout, so the recommended publish
+command disables it explicitly:
+
+```sh
+python3 -m lab.prism.backfill_audit_bundle_canonical --no-init-schema
+```
+
+The command releases its exact writer lease and closes its database and
+artifact-store resources on success or failure, so the coordinator can restart
+without waiting for the backfill lease TTL. It pages in stable block-hash order
 and reports `last_checkpoint`; pass that value to `--start-after` to resume a
-bounded rollout.
+bounded rollout. The checkpoint advances over failed rows. Their block hashes,
+advertised digests, failure kinds, and reasons remain in the JSON
+`failed_rows` array, but resuming after the checkpoint will skip them. After
+correcting a failure, retry from before its block hash or rerun from the
+beginning; already published rows are idempotent no-ops.
 
 On a read-replica deployment, the ledger row remains the visibility authority.
 If the row has replayed but the canonical file is absent, the service uses the
-legacy reconstructed response. If shared storage receives the file before the
-replica replays its row, the artifact returns a non-cacheable `404` until replay
-catches up; the file alone never exposes an uncommitted artifact. This immutable
-route remains exempt from the ordinary freshness refusal. Replica readiness is
-bounded by the existing WAL-receiver heartbeat contract, not by replay-lag
-position.
+legacy reconstructed response with `Cache-Control: no-store` and
+`X-Prism-Artifact-Canonical-State: missing`; it is never admitted to the origin
+cache or an immutable CDN cache. A corrupt canonical file fails closed rather
+than being disguised as legacy history. If shared storage receives the file
+before the replica replays its row, the artifact returns a non-cacheable `404`
+until replay catches up; the file alone never exposes an uncommitted artifact.
+This immutable route remains exempt from the ordinary freshness refusal.
+Replica readiness is bounded by the existing WAL-receiver heartbeat contract,
+not by replay-lag position.
 
 Direct-coinbase blocks return the same settlement-artifacts wrapper with
 `settlement_mode: direct_coinbase` and `fanouts: []`. A `404` means no public

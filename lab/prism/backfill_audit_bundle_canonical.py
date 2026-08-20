@@ -29,7 +29,16 @@ cannot publish.
 The run is idempotent and resumable.  Rows are paged by ``block_hash`` (the
 primary key), the last visited hash is reported as ``last_checkpoint``, and
 ``--start-after`` resumes from it.  Revisiting an already published row is
-safe: its canonical artifact is recognized and skipped.
+safe: its canonical artifact is recognized and skipped.  Failed row identities
+and reasons are retained in the machine-readable ``failed_rows`` summary.  A
+checkpoint advances past failures, so retry them by starting before the first
+failed hash (or by rerunning the idempotent scan from the beginning).
+
+Publish mode owns the coordinator writer lease exclusively.  Operators must
+stop the coordinator before publishing; the command refuses lease waits rather
+than sitting behind a live same-identity owner.  Once the run finishes or
+raises, it releases the exact lease and closes both ledger and artifact-store
+resources before returning.
 """
 
 from __future__ import annotations
@@ -132,6 +141,10 @@ class LedgerPreflightRefused(RuntimeError):
 
 class MissingCanonicalCapability(RuntimeError):
     """A required phase-2 method is not present on the injected object."""
+
+
+class BackfillWriterLeaseUnavailable(RuntimeError):
+    """Publish mode could not take exclusive ownership of the writer lease."""
 
 
 def _sha256_hex(payload: bytes) -> str:
@@ -509,6 +522,7 @@ class CanonicalBundleBackfill:
         self._stderr = sys.stderr if stderr is None else stderr
         self._counters = BackfillCounters()
         self._checkpoint = start_after
+        self._failed_rows: list[dict[str, str | None]] = []
 
     def run(self) -> dict[str, Any]:
         for row in self._iter_rows():
@@ -532,6 +546,7 @@ class CanonicalBundleBackfill:
             "limit": self._limit,
             "dry_run_mode": self._dry_run,
             "exit_code": self.exit_code(),
+            "failed_rows": [dict(failure) for failure in self._failed_rows],
             "interface": {
                 "artifacts": self._artifacts.resolved_interface(),
                 "ledger": self._ledger.resolved_interface(),
@@ -573,6 +588,14 @@ class CanonicalBundleBackfill:
                 return
 
     def _report(self, kind: str, row: AuditBundleRow, reason: str) -> None:
+        self._failed_rows.append(
+            {
+                "kind": kind,
+                "block_hash": row.block_hash or None,
+                "audit_bundle_sha256": row.audit_bundle_sha256 or None,
+                "reason": reason,
+            }
+        )
         print(
             f"prism canonical audit bundle backfill {kind} "
             f"block={row.block_hash or '<missing>'} "
@@ -960,6 +983,9 @@ def ledger_from_args(
         writer_id=args.writer_id,
         writer_epoch=args.writer_epoch,
         writer_session_token=args.writer_session_token,
+        lease_retry_sleep=(
+            None if args.dry_run else _refuse_publish_writer_lease_wait
+        ),
         initialize_schema=not args.no_init_schema and not args.dry_run,
         read_only=args.dry_run,
         lease_ttl_seconds=args.lease_ttl_seconds,
@@ -978,6 +1004,52 @@ def ledger_from_args(
     )
 
 
+def _refuse_publish_writer_lease_wait(wait_seconds: float) -> None:
+    """Refuse to wait behind a live same-identity coordinator lease."""
+
+    raise BackfillWriterLeaseUnavailable(
+        "publish-mode canonical audit-bundle backfill requires exclusive "
+        "writer-lease ownership; stop the coordinator before publishing "
+        f"(lease acquisition requested a {float(wait_seconds):g}s wait)"
+    )
+
+
+def _cleanup_backfill_resources(
+    *,
+    ledger: PsqlShareLedger | None,
+    store: AuditArtifactStore | None,
+    publish_mode: bool,
+) -> list[str]:
+    """Release the lease, then close every constructed resource."""
+
+    failures: list[str] = []
+    if ledger is not None:
+        if publish_mode:
+            try:
+                released = ledger.release_writer_lease()
+                if released is False:
+                    raise RuntimeError(
+                        "the exact backfill writer lease was no longer held"
+                    )
+            except Exception as exc:  # noqa: BLE001 - close must still run
+                failures.append(
+                    "writer lease release failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        try:
+            ledger.close()
+        except Exception as exc:  # noqa: BLE001 - store close must still run
+            failures.append(f"ledger close failed: {type(exc).__name__}: {exc}")
+    if store is not None:
+        try:
+            store.close()
+        except Exception as exc:  # noqa: BLE001 - report after all cleanup
+            failures.append(
+                f"audit artifact store close failed: {type(exc).__name__}: {exc}"
+            )
+    return failures
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.limit is not None and args.limit <= 0:
@@ -993,21 +1065,50 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         raise SystemExit(f"--start-after is invalid: {exc}") from exc
 
-    store = build_audit_store_from_env(read_only=args.dry_run)
-    # Bind the canonical artifact API before opening the database: a phase-2
-    # signature that has not landed here should fail without first taking a
-    # writer lease.
-    artifacts = CanonicalArtifactAdapter(store)
-    ledger = ledger_from_args(args, store)
-    backfill = CanonicalBundleBackfill(
-        artifacts=artifacts,
-        ledger=AuditBundleLedgerAdapter(ledger),
-        dry_run=args.dry_run,
-        batch_size=args.batch_size,
-        limit=args.limit,
-        start_after=start_after,
-    )
-    summary = backfill.run()
+    store: AuditArtifactStore | None = None
+    ledger: PsqlShareLedger | None = None
+    summary: dict[str, Any] | None = None
+    primary_error: BaseException | None = None
+    cleanup_failures: list[str] = []
+    try:
+        store = build_audit_store_from_env(read_only=args.dry_run)
+        # Bind the canonical artifact API before opening the database: a
+        # missing phase-2 capability fails without first taking a writer lease.
+        artifacts = CanonicalArtifactAdapter(store)
+        try:
+            ledger = ledger_from_args(args, store)
+        except Exception as exc:
+            if args.dry_run:
+                raise
+            raise SystemExit(
+                "publish-mode canonical audit-bundle backfill could not acquire "
+                "exclusive writer-lease ownership; stop the coordinator before "
+                f"publishing and retry: {exc}"
+            ) from exc
+        backfill = CanonicalBundleBackfill(
+            artifacts=artifacts,
+            ledger=AuditBundleLedgerAdapter(ledger),
+            dry_run=args.dry_run,
+            batch_size=args.batch_size,
+            limit=args.limit,
+            start_after=start_after,
+        )
+        summary = backfill.run()
+    except BaseException as exc:
+        primary_error = exc
+    finally:
+        cleanup_failures = _cleanup_backfill_resources(
+            ledger=ledger,
+            store=store,
+            publish_mode=not args.dry_run,
+        )
+    if primary_error is not None:
+        for failure in cleanup_failures:
+            primary_error.add_note(f"backfill cleanup: {failure}")
+        raise primary_error
+    if cleanup_failures:
+        raise RuntimeError("; ".join(cleanup_failures))
+    assert summary is not None
     print(json.dumps(summary, indent=2, sort_keys=True))
     return int(summary["exit_code"])
 

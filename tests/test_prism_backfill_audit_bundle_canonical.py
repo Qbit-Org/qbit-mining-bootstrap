@@ -16,6 +16,7 @@ from lab.prism.audit_artifacts import AuditArtifactConfig, AuditArtifactStore
 from lab.prism.backfill_audit_bundle_canonical import (
     LEDGER_PREFLIGHT_CANDIDATES,
     AuditBundleLedgerAdapter,
+    BackfillWriterLeaseUnavailable,
     CanonicalArtifactAdapter,
     CanonicalBundleBackfill,
     DEFAULT_BATCH_SIZE,
@@ -24,6 +25,7 @@ from lab.prism.backfill_audit_bundle_canonical import (
     build_audit_store_from_env,
     build_parser,
     ledger_from_args,
+    main,
 )
 from lab.prism.share_ledger import PsqlShareLedger
 
@@ -597,6 +599,16 @@ class CanonicalBundleBackfillTest(unittest.TestCase):
         self.assertNotIn(("write_canonical", bad["block_hash"], digest_of(bad["audit_bundle"])), harness.journal)
         # The bad row still advances the checkpoint so a resume makes progress.
         self.assertEqual(summary["last_checkpoint"], bad["block_hash"])
+        self.assertEqual(len(summary["failed_rows"]), 1)
+        self.assertEqual(
+            summary["failed_rows"][0]["block_hash"],
+            bad["block_hash"],
+        )
+        self.assertEqual(
+            summary["failed_rows"][0]["audit_bundle_sha256"],
+            bad["audit_bundle_sha256"],
+        )
+        self.assertEqual(summary["failed_rows"][0]["kind"], "mismatch")
 
     def test_existing_canonical_artifact_with_wrong_bytes_is_reported(self) -> None:
         row = inline_row(41)
@@ -855,6 +867,7 @@ class CanonicalBundleBackfillTest(unittest.TestCase):
             "errors",
             "last_checkpoint",
             "exit_code",
+            "failed_rows",
         ):
             self.assertIn(key, summary)
         self.assertEqual(
@@ -1054,6 +1067,117 @@ class ConstructionTest(unittest.TestCase):
 
         self.assertTrue(constructor.call_args.kwargs["read_only"])
         self.assertFalse(constructor.call_args.kwargs["initialize_schema"])
+
+    def test_publish_ledger_refuses_same_identity_lease_waits(self) -> None:
+        args = build_parser().parse_args(
+            ["--psql-command", "psql postgresql://example.invalid/qbit"]
+        )
+        with mock.patch(
+            "lab.prism.backfill_audit_bundle_canonical.PsqlShareLedger"
+        ) as constructor:
+            ledger_from_args(args, mock.sentinel.store)
+
+        refuse_wait = constructor.call_args.kwargs["lease_retry_sleep"]
+        with self.assertRaisesRegex(
+            BackfillWriterLeaseUnavailable,
+            "stop the coordinator",
+        ):
+            refuse_wait(60)
+
+
+class CommandLifecycleTest(unittest.TestCase):
+    @staticmethod
+    def resources(journal: list[str]) -> tuple[mock.Mock, mock.Mock]:
+        store = mock.Mock()
+        ledger = mock.Mock()
+        ledger.release_writer_lease.side_effect = lambda: (
+            journal.append("release_writer_lease") or True
+        )
+        ledger.close.side_effect = lambda: journal.append("ledger_close")
+        store.close.side_effect = lambda: journal.append("store_close")
+        return store, ledger
+
+    def run_main(
+        self,
+        *,
+        store: mock.Mock,
+        ledger: mock.Mock,
+        backfill: mock.Mock,
+    ) -> int:
+        with (
+            mock.patch(
+                "lab.prism.backfill_audit_bundle_canonical.build_audit_store_from_env",
+                return_value=store,
+            ),
+            mock.patch(
+                "lab.prism.backfill_audit_bundle_canonical.CanonicalArtifactAdapter",
+                return_value=mock.sentinel.artifacts,
+            ),
+            mock.patch(
+                "lab.prism.backfill_audit_bundle_canonical.ledger_from_args",
+                return_value=ledger,
+            ),
+            mock.patch(
+                "lab.prism.backfill_audit_bundle_canonical.AuditBundleLedgerAdapter",
+                return_value=mock.sentinel.ledger_adapter,
+            ),
+            mock.patch(
+                "lab.prism.backfill_audit_bundle_canonical.CanonicalBundleBackfill",
+                return_value=backfill,
+            ),
+            mock.patch("sys.stdout", new=io.StringIO()),
+        ):
+            return main([])
+
+    def test_success_releases_lease_then_closes_ledger_and_store(self) -> None:
+        journal: list[str] = []
+        store, ledger = self.resources(journal)
+        backfill = mock.Mock()
+        backfill.run.return_value = {"exit_code": 0}
+
+        self.assertEqual(
+            self.run_main(store=store, ledger=ledger, backfill=backfill),
+            0,
+        )
+        self.assertEqual(
+            journal,
+            ["release_writer_lease", "ledger_close", "store_close"],
+        )
+
+    def test_failure_releases_lease_then_closes_ledger_and_store(self) -> None:
+        journal: list[str] = []
+        store, ledger = self.resources(journal)
+        backfill = mock.Mock()
+        backfill.run.side_effect = RuntimeError("backfill failed")
+
+        with self.assertRaisesRegex(RuntimeError, "backfill failed"):
+            self.run_main(store=store, ledger=ledger, backfill=backfill)
+        self.assertEqual(
+            journal,
+            ["release_writer_lease", "ledger_close", "store_close"],
+        )
+
+    def test_conflicting_writer_lease_fails_clearly_and_closes_store(self) -> None:
+        journal: list[str] = []
+        store, _ledger = self.resources(journal)
+        with (
+            mock.patch(
+                "lab.prism.backfill_audit_bundle_canonical.build_audit_store_from_env",
+                return_value=store,
+            ),
+            mock.patch(
+                "lab.prism.backfill_audit_bundle_canonical.CanonicalArtifactAdapter",
+                return_value=mock.sentinel.artifacts,
+            ),
+            mock.patch(
+                "lab.prism.backfill_audit_bundle_canonical.ledger_from_args",
+                side_effect=RuntimeError("lease held by prism-coordinator"),
+            ),
+        ):
+            with self.assertRaisesRegex(SystemExit, "stop the coordinator"):
+                main([])
+
+        self.assertEqual(journal, ["store_close"])
 
 
 class CommandLineTest(unittest.TestCase):

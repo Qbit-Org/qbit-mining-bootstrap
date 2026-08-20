@@ -25,7 +25,11 @@ from typing import Any
 from lab.prism.backfill_ctv_fanouts import backfill_input_from_path, backfill_input_from_payload, infer_block_hash_from_path
 from lab.prism import public_api
 from lab.prism import share_ledger as share_ledger_module
-from lab.prism.audit_artifacts import AuditArtifactConfig, AuditArtifactStore
+from lab.prism.audit_artifacts import (
+    AuditArtifactConfig,
+    AuditArtifactStore,
+    CanonicalAuditBundleCorrupt,
+)
 from lab.prism.share_ledger import (
     database_url_from_psql_command,
     parse_single_json_value,
@@ -4614,10 +4618,67 @@ class PrismShareLedgerTests(unittest.TestCase):
             ),
         )
 
+        with self.assertLogs("lab.prism.share_ledger", level="WARNING") as logs:
+            document = ledger.dashboard_public_artifact_document(sha256="cd" * 32)
+
         self.assertEqual(
-            ledger.dashboard_public_artifact_document(sha256="cd" * 32),
-            {"payload": legacy, "canonical_json": None},
+            document,
+            {
+                "payload": legacy,
+                "canonical_json": None,
+                "canonical_fallback_reason": "missing",
+            },
         )
+        self.assertIn("reason=missing", "\n".join(logs.output))
+
+    def test_psql_public_artifact_corrupt_file_fails_closed(self) -> None:
+        canonical_bytes = b'{"schema":"qbit.prism.audit-bundle.v1"}'
+        digest = hashlib.sha256(canonical_bytes).hexdigest()
+        block_hash = "ab" * 32
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = AuditArtifactStore(
+                AuditArtifactConfig(
+                    root=root,
+                    evidence_path=root / "evidence.json",
+                )
+            )
+            try:
+                path = store.write_canonical_audit_bundle(
+                    block_hash,
+                    digest,
+                    canonical_bytes,
+                )
+                path.chmod(0o600)
+                path.write_bytes(b"not a gzip stream")
+                ledger = FakeLeasePsqlShareLedger(
+                    [
+                        acquired_lease(),
+                        {
+                            "has_audit_row": True,
+                            "block_hash": block_hash,
+                            "audit_bundle": {"schema": "legacy-reconstructed"},
+                            "audit_bundle_sha256": digest,
+                            "body_uri": None,
+                            "fallback": None,
+                        },
+                    ],
+                    audit_artifact_store=store,
+                )
+
+                with self.assertLogs(
+                    "lab.prism.share_ledger",
+                    level="ERROR",
+                ) as logs:
+                    with self.assertRaises(CanonicalAuditBundleCorrupt):
+                        ledger.dashboard_public_artifact_document(sha256=digest)
+
+                output = "\n".join(logs.output)
+                self.assertIn("reason=corrupt", output)
+                self.assertIn(block_hash, output)
+                self.assertIn(digest, output)
+            finally:
+                store.close()
 
     def test_psql_public_artifact_file_before_replica_row_is_not_visible(self) -> None:
         def unexpected_read(_block: str, _digest: str) -> bytes:

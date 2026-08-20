@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import copy
 import hashlib
+import logging
 import os
 import math
 import shlex
@@ -25,8 +26,12 @@ from typing import Any, Callable, Iterator, Protocol, runtime_checkable
 from lab.prism.audit_artifacts import (
     AuditArtifactConfig,
     AuditArtifactStore,
+    CanonicalAuditBundleCorrupt,
     canonical_audit_bundle_bytes,
 )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _default_bundle_canonicalizer() -> Callable[[dict[str, Any]], bytes]:
@@ -6153,22 +6158,39 @@ SELECT json_build_object(
                     try:
                         canonical_payload = json.loads(canonical_bytes)
                         canonical_json = canonical_bytes.decode("utf-8")
-                    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
-                        # The store already verifies compression and digest.
-                        # Invalid JSON is nevertheless unusable as a public
-                        # document, so retain the legacy reconstruction path.
-                        pass
-                    else:
-                        if isinstance(canonical_payload, dict):
-                            return {
-                                "payload": canonical_payload,
-                                "canonical_json": canonical_json,
-                            }
+                    except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+                        LOGGER.error(
+                            "canonical audit bundle unavailable reason=corrupt "
+                            "block_hash=%s audit_bundle_sha256=%s",
+                            block_hash,
+                            sha256,
+                        )
+                        raise CanonicalAuditBundleCorrupt(
+                            "canonical audit bundle is not valid UTF-8 JSON"
+                        ) from exc
+                    if not isinstance(canonical_payload, dict):
+                        LOGGER.error(
+                            "canonical audit bundle unavailable reason=corrupt "
+                            "block_hash=%s audit_bundle_sha256=%s",
+                            block_hash,
+                            sha256,
+                        )
+                        raise CanonicalAuditBundleCorrupt(
+                            "canonical audit bundle JSON is not an object"
+                        )
+                    return {
+                        "payload": canonical_payload,
+                        "canonical_json": canonical_json,
+                    }
             body = row.get("audit_bundle")
             if body is None:
                 body = self._read_external_body(row.get("body_uri"), expected_sha256=sha256)
             if body is not None:
-                return {"payload": body, "canonical_json": None}
+                return {
+                    "payload": body,
+                    "canonical_json": None,
+                    "canonical_fallback_reason": "missing",
+                }
         fallback = row.get("fallback")
         if not isinstance(fallback, dict):
             return None
@@ -7076,22 +7098,57 @@ FROM bucketed;
         block_hash: str,
         audit_bundle_sha256: str,
     ) -> bytes | None:
-        """Return a verified stored canonical bundle, or permit legacy fallback.
+        """Return a verified stored canonical bundle, or permit missing fallback.
 
         Missing artifacts are expected for history predating issue #158.
-        Integrity/read failures also fall back to the independently persisted
-        JSONB or external-body representation; the artifact store keeps a clean
-        miss distinguishable from corruption for callers that need diagnostics.
+        Present-but-corrupt or unreadable artifacts fail closed instead of
+        silently serving a non-byte-exact legacy reconstruction.
         """
         store = getattr(self, "_audit_artifact_store", None)
         reader = getattr(store, "read_canonical_audit_bundle", None)
         if not callable(reader):
+            LOGGER.warning(
+                "canonical audit bundle unavailable reason=missing "
+                "block_hash=%s audit_bundle_sha256=%s",
+                block_hash,
+                audit_bundle_sha256,
+            )
             return None
         try:
             canonical_bytes = reader(block_hash, audit_bundle_sha256)
+        except CanonicalAuditBundleCorrupt:
+            LOGGER.error(
+                "canonical audit bundle unavailable reason=corrupt "
+                "block_hash=%s audit_bundle_sha256=%s",
+                block_hash,
+                audit_bundle_sha256,
+            )
+            raise
         except (OSError, RuntimeError, TypeError, ValueError):
+            LOGGER.exception(
+                "canonical audit bundle unavailable reason=read_error "
+                "block_hash=%s audit_bundle_sha256=%s",
+                block_hash,
+                audit_bundle_sha256,
+            )
+            raise
+        if canonical_bytes is None:
+            LOGGER.warning(
+                "canonical audit bundle unavailable reason=missing "
+                "block_hash=%s audit_bundle_sha256=%s",
+                block_hash,
+                audit_bundle_sha256,
+            )
             return None
-        return canonical_bytes if isinstance(canonical_bytes, bytes) else None
+        if not isinstance(canonical_bytes, bytes):
+            LOGGER.error(
+                "canonical audit bundle unavailable reason=read_error "
+                "block_hash=%s audit_bundle_sha256=%s",
+                block_hash,
+                audit_bundle_sha256,
+            )
+            raise TypeError("canonical audit bundle reader returned non-bytes")
+        return canonical_bytes
 
     def _audit_reader(self, body_uri: object) -> AuditArtifactStore:
         del body_uri

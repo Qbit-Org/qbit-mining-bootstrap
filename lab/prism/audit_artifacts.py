@@ -182,8 +182,8 @@ def gunzip_canonical_bundle_bytes(payload: bytes) -> bytes:
 class CanonicalAuditBundleCorrupt(RuntimeError):
     """A canonical bundle artifact is present but unusable.
 
-    Distinct from a clean miss so callers can log the damage before falling
-    back to reconstruction instead of silently treating it as absent.
+    Distinct from a clean miss so public readers can report the damage and fail
+    closed instead of silently serving a non-byte-exact reconstruction.
     """
 
 

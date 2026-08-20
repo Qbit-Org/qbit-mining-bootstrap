@@ -637,6 +637,22 @@ class TamperedCanonicalArtifactPublicLedger(CanonicalArtifactPublicLedger):
         return {**document, "canonical_json": str(document["canonical_json"]) + " "}
 
 
+class MissingCanonicalArtifactPublicLedger(CanonicalArtifactPublicLedger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.audit_document_calls = 0
+
+    def dashboard_public_artifact_document(self, *, sha256: str) -> dict[str, object] | None:
+        if sha256 != self.audit_bundle_sha256:
+            return super().dashboard_public_artifact_document(sha256=sha256)
+        self.audit_document_calls += 1
+        return {
+            "payload": self.audit_bundle,
+            "canonical_json": None,
+            "canonical_fallback_reason": "missing",
+        }
+
+
 class DirectCoinbasePublicLedger(FakePublicLedger):
     block_hash = "00000000000026e9383a5aeae5fe5c3297f24884f29c4cf1585f71829491f0d9"
     block_height = 23342
@@ -2228,6 +2244,26 @@ class PublicArtifactByteExactnessTests(unittest.TestCase):
         body, _headers = self.fetch_artifact(base_url, ledger.audit_bundle_sha256)
 
         self.assertEqual(hashlib.sha256(body).hexdigest(), ledger.audit_bundle_sha256)
+
+    def test_missing_canonical_audit_bundle_fallback_is_never_cached(self) -> None:
+        ledger = MissingCanonicalArtifactPublicLedger()
+        base_url = self.serve(ledger)
+
+        first, first_headers = self.fetch_artifact(base_url, ledger.audit_bundle_sha256)
+        second, second_headers = self.fetch_artifact(base_url, ledger.audit_bundle_sha256)
+
+        self.assertEqual(json.loads(first), ledger.audit_bundle)
+        self.assertEqual(second, first)
+        self.assertEqual(ledger.audit_document_calls, 2)
+        for headers in (first_headers, second_headers):
+            self.assertEqual(headers.get("Cache-Control"), "no-store")
+            self.assertEqual(
+                headers.get("X-Prism-Artifact-Canonical-State"),
+                "missing",
+            )
+            self.assertNotIn("CDN-Cache-Control", headers)
+            self.assertNotIn("Vercel-CDN-Cache-Control", headers)
+            self.assertNotIn("Age", headers)
 
 
 class PrismPublicDashboardMemoryLedgerTests(unittest.TestCase):
