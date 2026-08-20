@@ -227,6 +227,12 @@ re-serialization step. Audit bundles written before canonical-byte persistence
 was introduced retain the legacy reconstructed response until the verified
 backfill publishes their canonical artifact.
 
+Operators can verify the historical range first with
+`python3 -m lab.prism.backfill_audit_bundle_canonical --dry-run`, then rerun
+without `--dry-run` to publish. The command pages in stable block-hash order
+and reports `last_checkpoint`; pass that value to `--start-after` to resume a
+bounded rollout.
+
 On a read-replica deployment, the ledger row remains the visibility authority.
 If the row has replayed but the canonical file is absent, the service uses the
 legacy reconstructed response. If shared storage receives the file before the
