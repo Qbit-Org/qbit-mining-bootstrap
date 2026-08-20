@@ -1,0 +1,1640 @@
+#!/usr/bin/env python3
+"""Differential parity oracle for the PRISM payout-window pipeline.
+
+Why this exists: the window pipeline -- accepted-share records in, folded
+window plus canonical digest plus audit-builder spool fragments out -- is
+slated to gain a second implementation that must be proven byte-identical to
+the shipped Python one before it can take traffic (issue #131's method: run
+both against the same inputs and assert byte-identical outputs). That proof
+needs three things to exist *before* the second implementation does: a corpus
+derived from the fold's own invariants, frozen byte-exact reference outputs
+produced by the shipped pipeline at a known revision, and a runner that can
+drive more than one backend over the same corpus. This module provides all
+three, composing the two house precedents: the seeded-corpus discipline of
+``tests.test_prism_incremental_payout_window`` and the frozen-reference
+discipline of the metrics render-parity fixture.
+
+What is pinned per corpus case, all inside the migration's scope:
+
+1. ``record_jsons`` -- the folded window as the ordered
+   ``AcceptedShareRecord.to_prism_json()`` sequence, one canonical JSON
+   encoding per record (sorted keys, ``(",", ":")`` separators, ASCII
+   escapes), exactly the encoding each window page pre-computes.
+2. ``canonical_bytes`` / ``canonical_digest`` -- the canonical JSON array
+   exactly as ``IncrementalShareJsonSequence.canonical_json_sha256`` streams
+   it (non-empty page fragments joined with ``,`` inside ``[``/``]``) and its
+   SHA-256 hex digest. The digest is *not* a hash of a monolithic re-encode;
+   an implementation with wrong framing produces a different digest, so the
+   framed bytes are pinned alongside the digest.
+3. ``spool_tail`` -- the audit-builder spool payload tail written by
+   ``_ShareWindowSerialization.acquire_spooled_tail``, byte-for-byte,
+   including the ``,"compact_share_identities":`` / ``,"compact_shares":`` /
+   ``}`` framing, because that framing is the wire contract.
+4. ``advance_stats`` -- one ``IncrementalWindowAdvanceStats`` triple
+   (``added_rows``, ``expired_rows``, ``touched_pages``) per advance step, in
+   order. These are not wire bytes, but the coordinator exports them to
+   metrics on every incremental materialization, so a backend that owns
+   ``advance()`` reports them and they must agree. ``touched_pages`` has a
+   definition (see :class:`WindowPipelineAdvanceStats`) that is easy to
+   re-derive wrongly from the retained result instead of from the work done.
+5. A rejection, when the shipped pipeline refuses the case. ``from_full_
+   snapshot`` refuses five shapes and ``advance()`` six; a backend that
+   accepts an input the shipped pipeline rejects, or rejects one it accepts,
+   ships a different payout window. A rejected case freezes only the
+   implementation-neutral reason category (``REJECTION_REASONS``), never a
+   Python exception class or message, and ``diverging_outputs`` treats
+   rejected-vs-outputs in either direction as a divergence and
+   rejected-vs-rejected with different categories as one too.
+
+The oracle pins the *pipeline's rejection*, not the coordinator's recovery
+from it. In production ``payout_state`` catches the advance fallback, drops
+its cached window and re-materializes from a full rescan; that recovery is
+coordinator behaviour and is tested there (``tests.test_prism_payout_state``).
+Pinning recovery bytes here would let a backend that silently recovers inside
+itself -- returning the rescan's bytes where the shipped pipeline refuses --
+pass as parity, which is exactly the divergence class the rejection cases
+exist to catch.
+
+Integer width. The ledger schema is the only written contract for what the
+pipeline may legally see: ``share_difficulty`` and ``network_difficulty`` are
+``numeric(78,0)`` (sized for 256-bit values), ``share_seq``,
+``template_height`` and ``ntime`` are ``bigint``, and the millisecond fields
+are epoch milliseconds above 2^40; production's ``window_weight`` is already
+within a factor of five of 2^53. Python carries all of these exactly and
+renders every digit, so the corpus holds a backend to the same: the
+``wide-integers`` case carries every integer field above 2^32, difficulties
+above 2^53/2^63/2^64 with one above 2^127, and a ``window_weight`` whose
+retention cutoff depends on exact arithmetic above 2^64. Decision, made
+explicitly here: the corpus *also* carries values at and above 2^128
+(``difficulty-beyond-u128``: ``share_difficulty`` 2^128+1 as the retained
+crossing row, ``network_difficulty`` at 2^128-1, 2^128 and numeric(78,0)'s
+maximum, ``window_weight`` above 2^128). With it the oracle refuses a backend
+that carries difficulties in a 128-bit integer, including one that
+accumulates with saturating arithmetic; without it the oracle would bless
+saturation silently. The schema's width is the contract because nothing
+narrower is written down anywhere, and the mandated ``wide-integers`` values
+already hold a backend to the schema rather than to any existing narrower
+type (``ntime`` 2^63-1 is ``bigint``, not the 32-bit header field;
+``network_difficulty`` 10^77 is numeric(78,0), not u128). If the project
+decides 128 bits is the real contract, that belongs in the schema (a CHECK
+constraint) plus a visible edit to those cases -- not in an oracle that
+never asked. The consequence is deliberate and localized: a backend that
+keeps only the accumulated field and ``window_weight`` in 128 bits passes
+``wide-integers`` and is refused by ``difficulty-beyond-u128`` alone; one
+that also parses ``network_difficulty`` into 128 bits is refused by
+``wide-integers``' 10^77 as well. Either way the refusal names the width.
+
+Adapter contract (the seam a future backend implements): inputs in, outputs
+or a rejection out. Inputs are one :class:`WindowPipelineCase`, available as
+an implementation-neutral JSON document via :func:`case_input_document` --
+the snapshot records with every durable field explicit (``credit_policy`` is
+null when absent), the snapshot anchor, ``window_weight``, ``page_size``, and
+zero or more append-only advance steps that the backend must fold through
+its incremental path. The backend returns :class:`WindowPipelineOutputs` or
+:class:`WindowPipelineRejection`. Register it with :func:`register_adapter`
+and select it by setting ``QBIT_WINDOW_PIPELINE_PARITY_ADAPTER``; selection
+defaults to the shipped Python pipeline. There is deliberately no production
+feature switch here -- the per-component switch belongs to the migration
+slice, not to the oracle.
+
+The corpus owns its record factory (:func:`corpus_record`) rather than
+importing the sibling golden test's, so an edit there cannot move this
+corpus; and literal-pinned cases freeze the input document itself alongside
+the outputs, so when the fixture is regenerated the diff shows whether
+inputs moved, outputs moved, or both. Without that, any input-only change
+fails the suite with "regenerate" and the resulting diff cannot tell the
+two apart.
+
+Regenerating the frozen reference is reproducible and a no-op on an
+unchanged tree:
+
+    python3 -m tests.window_pipeline_parity regenerate
+"""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import os
+import random
+import sys
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Callable, Protocol
+
+from lab.prism.bundle_compiler import _ShareWindowSerialization
+from lab.prism.share_ledger import (
+    DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+    AcceptedShareRecord,
+    IncrementalShareWindow,
+    IncrementalWindowAdvanceStats,
+    IncrementalWindowFallback,
+)
+
+
+# Distinct from the sibling test's RANDOM_MASTER_SEED so the two corpora can
+# never silently alias; derived per-case seeds use fixed documented offsets.
+PARITY_RANDOM_MASTER_SEED = 0xB17E_5EED
+
+REFERENCE_SCHEMA = "qbit-prism-window-pipeline-parity-reference/v2"
+CASE_INPUT_SCHEMA = "qbit-prism-window-pipeline-parity-input/v1"
+REGENERATE_COMMAND = "python3 -m tests.window_pipeline_parity regenerate"
+REFERENCE_FIXTURE_RELPATH = "tests/fixtures/window_pipeline_parity/reference.json"
+REFERENCE_FIXTURE_PATH = (
+    Path(__file__).resolve().parent / "fixtures" / "window_pipeline_parity" / "reference.json"
+)
+
+# Cases whose canonical document fits under this bound additionally pin the
+# literal bytes in the fixture, so a divergence shows *what* diverged, not
+# just that something did; cases whose canonical *input* document fits under
+# it pin that document too, so an input-only change is visible as such in the
+# fixture diff. Larger cases are pinned by length + SHA-256, which is still
+# byte-exact; every framing and encoding rule those cases exercise is also
+# covered by a literal-pinned case.
+LITERAL_PIN_MAX_CANONICAL_BYTES = 16_384
+
+ADAPTER_ENV_VAR = "QBIT_WINDOW_PIPELINE_PARITY_ADAPTER"
+DEFAULT_ADAPTER_NAME = "python"
+
+# The durable/public share identity, in declaration order. Deliberately
+# excludes ``newly_inserted`` and ``candidate_outbox_state``: both are
+# process-local append metadata (compare=False on the dataclass) and are
+# outside the pipeline's byte contract.
+_RECORD_INPUT_FIELDS = (
+    "share_seq",
+    "share_id",
+    "miner_id",
+    "order_key",
+    "p2mr_program_hex",
+    "share_difficulty",
+    "network_difficulty",
+    "template_height",
+    "job_id",
+    "job_issued_at_ms",
+    "accepted_at_ms",
+    "ntime",
+    "credit_policy",
+)
+
+# The implementation-neutral rejection vocabulary, one category per condition
+# the shipped pipeline refuses. Categories name the *condition*, never the
+# Python exception or its message: a backend in another language reports the
+# same category from its own error type. The two groups mirror the two entry
+# points so a reader can tell which phase refused without knowing the case.
+FULL_SNAPSHOT_REJECTIONS = (
+    "duplicate_share_seq",
+    "duplicate_share_id",
+    "non_positive_difficulty",
+    "non_positive_window_weight",
+    "non_positive_page_size",
+)
+ADVANCE_REJECTIONS = (
+    "anchor_regression",
+    "delta_non_positive_difficulty",
+    "delta_ineligible_at_anchor",
+    "delta_repeats_eligible_share",
+    "delta_not_append",
+    "delta_order_not_increasing",
+)
+REJECTION_REASONS = FULL_SNAPSHOT_REJECTIONS + ADVANCE_REJECTIONS
+
+# How the shipped pipeline's rejections map onto the vocabulary. The shipped
+# fold signals each condition only through an exception message, so the
+# Python adapter classifies by exact message; a message not in this table is
+# re-raised rather than guessed, so a new or reworded rejection path surfaces
+# as a harness error instead of being quietly filed under a wrong category.
+_REJECTION_MESSAGE_CATEGORIES = {
+    "full payout window contains duplicate share_seq": "duplicate_share_seq",
+    "full payout window contains duplicate share_id": "duplicate_share_id",
+    "full payout window contains non-positive difficulty": "non_positive_difficulty",
+    "window_weight must be positive": "non_positive_window_weight",
+    "page_size must be positive": "non_positive_page_size",
+    "snapshot anchor moved backwards": "anchor_regression",
+    "delta contains non-positive share difficulty": "delta_non_positive_difficulty",
+    "delta contains a share ineligible at the new anchor": "delta_ineligible_at_anchor",
+    "delta repeats a share eligible at the previous anchor": "delta_repeats_eligible_share",
+    "newly eligible share is not an append": "delta_not_append",
+    "delta share_seq order is not increasing": "delta_order_not_increasing",
+}
+assert set(_REJECTION_MESSAGE_CATEGORIES.values()) == set(REJECTION_REASONS)
+
+
+def corpus_record(
+    share_seq: int,
+    *,
+    share_difficulty: int,
+    job_issued_at_ms: int,
+    accepted_at_ms: int,
+    credit_policy: str | None = None,
+) -> AcceptedShareRecord:
+    """The corpus's own deterministic record factory.
+
+    Owned here rather than imported from the sibling golden test so that an
+    edit to that module's factory can never move this corpus: the frozen
+    reference is only as stable as the inputs that produced it, and the
+    fixture stores those inputs' hash (and, for small cases, the document).
+    The derivations deliberately match the sibling factory as of the first
+    freeze, so the reference needed no regeneration when ownership moved.
+    """
+    return AcceptedShareRecord(
+        share_seq=share_seq,
+        share_id=f"share-{share_seq}",
+        miner_id=f"miner-{share_seq % 11}",
+        order_key=f"{share_seq % 11:02d}:miner-{share_seq % 11}",
+        p2mr_program_hex=f"{share_seq % 256:02x}" * 32,
+        share_difficulty=share_difficulty,
+        network_difficulty=1_000_000 + (share_seq % 17),
+        template_height=800_000 + (share_seq // 32),
+        job_id=f"job-{share_seq}",
+        job_issued_at_ms=job_issued_at_ms,
+        accepted_at_ms=accepted_at_ms,
+        ntime=1_700_000_000 + share_seq,
+        credit_policy=credit_policy,
+    )
+
+
+@dataclass(frozen=True)
+class WindowPipelineAdvance:
+    """One append-only delta step folded through the incremental path."""
+
+    anchor_job_issued_at_ms: int
+    delta_records: tuple[AcceptedShareRecord, ...]
+
+
+@dataclass(frozen=True)
+class WindowPipelineCase:
+    """One corpus case: a full snapshot plus optional incremental advances.
+
+    ``expected_rejection`` is the category the case was *built* to trigger
+    (None for a case the pipeline accepts). It is not input -- the reference
+    freezes what the shipped pipeline actually reports -- but the structural
+    test holds the two equal so a rejection case cannot quietly start passing
+    for a different reason, or none.
+    """
+
+    name: str
+    why: str
+    anchor_job_issued_at_ms: int
+    window_weight: int
+    page_size: int
+    snapshot_records: tuple[AcceptedShareRecord, ...]
+    advances: tuple[WindowPipelineAdvance, ...] = ()
+    expected_rejection: str | None = None
+
+
+@dataclass(frozen=True)
+class WindowPipelineAdvanceStats:
+    """The bounded-work triple one advance step reports, seam-owned.
+
+    Mirrors ``IncrementalWindowAdvanceStats`` without importing its type into
+    the contract. ``touched_pages`` counts pre-existing pages whose records
+    the advance inspected or rewrote: the last pre-existing page when the
+    delta was appended into it, and the pre-existing page that was partially
+    expired, deduplicated -- so a page both appended into and partially
+    expired counts once, a page appended into and then expired wholesale in
+    the same advance still counts (its records were rewritten), a freshly
+    allocated append page never counts even when partial expiry lands in it,
+    and pages expired wholesale without being appended into never count.
+    That is the shipped definition; it is derived from the work performed,
+    not from the retained result, which is why a re-implementation that
+    computes it from survivors gets the expired-append page wrong.
+    """
+
+    added_rows: int
+    expired_rows: int
+    touched_pages: int
+
+    @classmethod
+    def from_shipped(cls, stats: IncrementalWindowAdvanceStats) -> WindowPipelineAdvanceStats:
+        return cls(
+            added_rows=int(stats.added_rows),
+            expired_rows=int(stats.expired_rows),
+            touched_pages=int(stats.touched_pages),
+        )
+
+    def as_document(self) -> dict[str, int]:
+        return {
+            "added_rows": self.added_rows,
+            "expired_rows": self.expired_rows,
+            "touched_pages": self.touched_pages,
+        }
+
+
+@dataclass(frozen=True)
+class WindowPipelineOutputs:
+    """The pipeline's outputs for one accepted corpus case.
+
+    ``advance_stats`` carries one entry per advance step the case folded, in
+    order; it is empty for snapshot-only cases.
+    """
+
+    record_jsons: tuple[bytes, ...]
+    canonical_bytes: bytes
+    canonical_digest: str
+    spool_tail: bytes
+    advance_stats: tuple[WindowPipelineAdvanceStats, ...] = ()
+
+
+@dataclass(frozen=True)
+class WindowPipelineRejection:
+    """The pipeline refused the case, for one of ``REJECTION_REASONS``."""
+
+    reason: str
+
+    def __post_init__(self) -> None:
+        if self.reason not in REJECTION_REASONS:
+            raise ValueError(
+                f"unknown window-pipeline rejection reason {self.reason!r};"
+                f" the vocabulary is {list(REJECTION_REASONS)}"
+            )
+
+
+WindowPipelineResult = WindowPipelineOutputs | WindowPipelineRejection
+
+
+class WindowPipelineAdapter(Protocol):
+    """One backend driven over the corpus: inputs in, outputs or rejection out."""
+
+    name: str
+
+    def run(self, case: WindowPipelineCase) -> WindowPipelineResult: ...
+
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def canonical_json_bytes(value: object) -> bytes:
+    """The pipeline's canonical encoder, byte-identical to the window pages."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
+
+
+def record_input_json(record: AcceptedShareRecord) -> dict[str, object]:
+    """One record as implementation-neutral input data, every field explicit."""
+    return {name: getattr(record, name) for name in _RECORD_INPUT_FIELDS}
+
+
+def case_input_document(case: WindowPipelineCase) -> dict[str, object]:
+    """The full case as the JSON document a non-Python backend consumes.
+
+    Record order is preserved verbatim: unsorted snapshot input is part of
+    what several cases exercise, so normalizing here would erase it.
+    """
+    return {
+        "schema": CASE_INPUT_SCHEMA,
+        "name": case.name,
+        "window_weight": case.window_weight,
+        "page_size": case.page_size,
+        "snapshot": {
+            "anchor_job_issued_at_ms": case.anchor_job_issued_at_ms,
+            "records": [record_input_json(record) for record in case.snapshot_records],
+        },
+        "advances": [
+            {
+                "anchor_job_issued_at_ms": step.anchor_job_issued_at_ms,
+                "records": [record_input_json(record) for record in step.delta_records],
+            }
+            for step in case.advances
+        ],
+    }
+
+
+def case_input_bytes(case: WindowPipelineCase) -> bytes:
+    return canonical_json_bytes(case_input_document(case))
+
+
+def case_input_sha256(case: WindowPipelineCase) -> str:
+    return sha256_hex(case_input_bytes(case))
+
+
+def final_anchor_job_issued_at_ms(case: WindowPipelineCase) -> int:
+    if case.advances:
+        return case.advances[-1].anchor_job_issued_at_ms
+    return case.anchor_job_issued_at_ms
+
+
+def union_rebuild_case(case: WindowPipelineCase) -> WindowPipelineCase:
+    """The snapshot-only case whose bytes an incremental fold must land on."""
+    union_records = case.snapshot_records + tuple(
+        record for step in case.advances for record in step.delta_records
+    )
+    return WindowPipelineCase(
+        name=f"{case.name}-union-rebuild",
+        why=(
+            "from_full_snapshot over the union of the snapshot and every"
+            " advance delta, at the final anchor; the incremental path must"
+            " land on these exact bytes"
+        ),
+        anchor_job_issued_at_ms=final_anchor_job_issued_at_ms(case),
+        window_weight=case.window_weight,
+        page_size=case.page_size,
+        snapshot_records=union_records,
+    )
+
+
+def fold_case_with_stats(
+    case: WindowPipelineCase,
+) -> tuple[IncrementalShareWindow, tuple[WindowPipelineAdvanceStats, ...]]:
+    """Drive the shipped fold: full snapshot, then each advance in order.
+
+    Raises exactly what the shipped pipeline raises; :func:`run_python_pipeline`
+    is the seam-facing wrapper that classifies those into rejections.
+    """
+    window = IncrementalShareWindow.from_full_snapshot(
+        list(case.snapshot_records),
+        anchor_job_issued_at_ms=case.anchor_job_issued_at_ms,
+        window_weight=case.window_weight,
+        page_size=case.page_size,
+    )
+    stats: list[WindowPipelineAdvanceStats] = []
+    for step in case.advances:
+        window, step_stats = window.advance(
+            list(step.delta_records),
+            anchor_job_issued_at_ms=step.anchor_job_issued_at_ms,
+        )
+        stats.append(WindowPipelineAdvanceStats.from_shipped(step_stats))
+    return window, tuple(stats)
+
+
+def fold_case(case: WindowPipelineCase) -> IncrementalShareWindow:
+    """The folded window of a case the shipped pipeline accepts."""
+    return fold_case_with_stats(case)[0]
+
+
+def spool_tail_bytes(shares: list[dict[str, object]]) -> bytes:
+    """The exact spool payload tail the shipped serialization writes.
+
+    Drives the real ``acquire_spooled_tail`` against an in-memory spool file
+    so the pinned bytes are the shipped write path's output, framing
+    included, not a reconstruction of it.
+    """
+    serialization = _ShareWindowSerialization(
+        key=("window-pipeline-parity", len(shares), 0),
+        share_count=len(shares),
+        share_snapshot_sha256="window-pipeline-parity",
+        _spool_factory=io.BytesIO,
+    )
+    leased = serialization.acquire_spooled_tail(shares)
+    if leased is None:
+        raise RuntimeError("in-memory spool lease unexpectedly unavailable")
+    spool, size = leased
+    spool.seek(0)
+    tail = spool.read()
+    if len(tail) != size:
+        raise RuntimeError(f"spool reported {size} bytes but holds {len(tail)}")
+    serialization.release_spooled_tail()
+    serialization.retire_spool()
+    return tail
+
+
+def outputs_from_window(
+    window: IncrementalShareWindow,
+    advance_stats: tuple[WindowPipelineAdvanceStats, ...] = (),
+) -> WindowPipelineOutputs:
+    """Capture the byte outputs from one folded window."""
+    json_records = window.json_records()
+    record_jsons = tuple(canonical_json_bytes(record) for record in json_records)
+    fragments = [
+        page.canonical_json_items
+        for page in json_records.pages
+        if page.canonical_json_items
+    ]
+    canonical_bytes = b"[" + b",".join(fragments) + b"]"
+    return WindowPipelineOutputs(
+        record_jsons=record_jsons,
+        canonical_bytes=canonical_bytes,
+        canonical_digest=json_records.canonical_json_sha256(),
+        spool_tail=spool_tail_bytes(list(json_records)),
+        advance_stats=advance_stats,
+    )
+
+
+def run_python_pipeline(case: WindowPipelineCase) -> WindowPipelineResult:
+    """The shipped pipeline over one case: outputs, or its rejection classified.
+
+    Only the fold is guarded: a failure while capturing outputs (spool, JSON)
+    is a harness fault and propagates, never a rejection.
+    """
+    try:
+        window, advance_stats = fold_case_with_stats(case)
+    except (ValueError, IncrementalWindowFallback) as exc:
+        category = _REJECTION_MESSAGE_CATEGORIES.get(str(exc))
+        if category is None:
+            raise
+        return WindowPipelineRejection(category)
+    return outputs_from_window(window, advance_stats)
+
+
+def record_stream_bytes(record_jsons: tuple[bytes, ...]) -> bytes:
+    # Injective: canonical encodings ASCII-escape every control character, so
+    # a raw newline can never occur inside one record's bytes.
+    return b"\n".join(record_jsons)
+
+
+@dataclass(frozen=True)
+class PythonWindowPipelineAdapter:
+    """The shipped Python pipeline, registered as the default backend."""
+
+    name: str = "python"
+
+    def run(self, case: WindowPipelineCase) -> WindowPipelineResult:
+        return run_python_pipeline(case)
+
+
+_ADAPTER_FACTORIES: dict[str, Callable[[], WindowPipelineAdapter]] = {
+    DEFAULT_ADAPTER_NAME: PythonWindowPipelineAdapter,
+}
+
+
+def register_adapter(name: str, factory: Callable[[], WindowPipelineAdapter]) -> None:
+    if name in _ADAPTER_FACTORIES:
+        raise ValueError(f"window-pipeline parity adapter {name!r} is already registered")
+    _ADAPTER_FACTORIES[name] = factory
+
+
+def resolve_adapter(name: str | None = None) -> WindowPipelineAdapter:
+    """Resolve one backend; defaults to the shipped Python pipeline."""
+    resolved = name or os.environ.get(ADAPTER_ENV_VAR) or DEFAULT_ADAPTER_NAME
+    factory = _ADAPTER_FACTORIES.get(resolved)
+    if factory is None:
+        raise ValueError(
+            f"unknown window-pipeline parity adapter {resolved!r};"
+            f" registered adapters: {sorted(_ADAPTER_FACTORIES)}"
+        )
+    return factory()
+
+
+# --- corpus -----------------------------------------------------------------
+#
+# Every case is derived from an invariant of ``from_full_snapshot``/``advance``
+# or of the byte encodings, and says which. Seeded and deterministic: the
+# builders below always produce the same records, so the frozen reference is
+# reproducible from an unchanged tree.
+
+
+def _empty_window_case() -> WindowPipelineCase:
+    return WindowPipelineCase(
+        name="empty-window",
+        why="zero eligible records: [] framing, digest of [], empty compact arrays",
+        anchor_job_issued_at_ms=1_000,
+        window_weight=10,
+        page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+        snapshot_records=(),
+    )
+
+
+def _single_record_case() -> WindowPipelineCase:
+    record = corpus_record(
+        1,
+        share_difficulty=5,
+        job_issued_at_ms=1_999,
+        accepted_at_ms=2_000,
+    )
+    return WindowPipelineCase(
+        name="single-record",
+        why=(
+            "one record with credit_policy None: to_prism_json omits the key"
+            " while the compact share tuple carries an explicit null -- the"
+            " null-vs-absent divergence surface"
+        ),
+        anchor_job_issued_at_ms=2_000,
+        window_weight=10,
+        page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+        snapshot_records=(record,),
+    )
+
+
+def _crossing_row_retained_case() -> WindowPipelineCase:
+    anchor_ms = 10_000
+    records = (
+        corpus_record(1, share_difficulty=2, job_issued_at_ms=anchor_ms - 4, accepted_at_ms=anchor_ms - 3),
+        corpus_record(
+            2,
+            share_difficulty=3,
+            job_issued_at_ms=anchor_ms - 2,
+            accepted_at_ms=anchor_ms - 1,
+            credit_policy="stale-grace",
+        ),
+        corpus_record(3, share_difficulty=8, job_issued_at_ms=anchor_ms, accepted_at_ms=anchor_ms),
+    )
+    return WindowPipelineCase(
+        name="crossing-row-retained",
+        why=(
+            "difficulties (2,3,8) at weight 10: the final whole share crossing"
+            " window_weight (seq 2) is deliberately retained, total 11 > 10;"
+            " an implementation that drops it diverges here"
+        ),
+        anchor_job_issued_at_ms=anchor_ms,
+        window_weight=10,
+        page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+        snapshot_records=records,
+    )
+
+
+def _crossing_row_exact_fit_case() -> WindowPipelineCase:
+    anchor_ms = 10_000
+    records = (
+        corpus_record(1, share_difficulty=2, job_issued_at_ms=anchor_ms - 4, accepted_at_ms=anchor_ms - 3),
+        corpus_record(2, share_difficulty=3, job_issued_at_ms=anchor_ms - 2, accepted_at_ms=anchor_ms - 1),
+        corpus_record(3, share_difficulty=7, job_issued_at_ms=anchor_ms, accepted_at_ms=anchor_ms),
+    )
+    return WindowPipelineCase(
+        name="crossing-row-exact-fit",
+        why=(
+            "difficulties (2,3,7) at weight 10: cumulative weight lands"
+            " exactly on window_weight, so seq 1 is dropped and there is no"
+            " crossing row; the pair with crossing-row-retained separates the"
+            " >= cutoff from a wrong > cutoff"
+        ),
+        anchor_job_issued_at_ms=anchor_ms,
+        window_weight=10,
+        page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+        snapshot_records=records,
+    )
+
+
+def _eligibility_filtering_case() -> WindowPipelineCase:
+    anchor_ms = 30_000
+    records = (
+        corpus_record(1, share_difficulty=4, job_issued_at_ms=anchor_ms - 2, accepted_at_ms=anchor_ms - 1),
+        corpus_record(2, share_difficulty=5, job_issued_at_ms=anchor_ms + 1, accepted_at_ms=anchor_ms - 1),
+        corpus_record(3, share_difficulty=6, job_issued_at_ms=anchor_ms - 1, accepted_at_ms=anchor_ms + 1),
+        corpus_record(4, share_difficulty=7, job_issued_at_ms=anchor_ms + 2, accepted_at_ms=anchor_ms + 3),
+        corpus_record(5, share_difficulty=8, job_issued_at_ms=anchor_ms, accepted_at_ms=anchor_ms),
+    )
+    return WindowPipelineCase(
+        name="eligibility-filtering",
+        why=(
+            "one record excluded by job_issued_at_ms alone, one by"
+            " accepted_at_ms alone, one by both; seq 5 sits exactly on the"
+            " anchor, pinning the inclusive <= comparisons"
+        ),
+        anchor_job_issued_at_ms=anchor_ms,
+        window_weight=100,
+        page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+        snapshot_records=records,
+    )
+
+
+def _unsorted_input_case() -> WindowPipelineCase:
+    rng = random.Random(PARITY_RANDOM_MASTER_SEED + 1)
+    anchor_ms = 40_000
+    share_seqs = rng.sample(range(1, 100), 9)
+    records = [
+        corpus_record(
+            share_seq,
+            share_difficulty=rng.choice((1, 2, 3, 7, 19)),
+            job_issued_at_ms=anchor_ms - rng.randint(0, 30),
+            accepted_at_ms=anchor_ms - rng.randint(0, 30),
+            credit_policy="stale-grace" if rng.randrange(4) == 0 else None,
+        )
+        for share_seq in share_seqs
+    ]
+    return WindowPipelineCase(
+        name="unsorted-input",
+        why=(
+            "snapshot input arrives in non-ascending share_seq order with"
+            " non-contiguous seqs; the fold's sorted() is load-bearing and the"
+            " output ordering is pinned"
+        ),
+        anchor_job_issued_at_ms=anchor_ms,
+        window_weight=1_000_000,
+        page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+        snapshot_records=tuple(records),
+    )
+
+
+def _identity_reuse_case() -> WindowPipelineCase:
+    anchor_ms = 50_000
+    base = [
+        corpus_record(
+            share_seq,
+            share_difficulty=share_seq,
+            job_issued_at_ms=anchor_ms - share_seq,
+            accepted_at_ms=anchor_ms - share_seq,
+            credit_policy="stale-grace" if share_seq in (2, 5) else None,
+        )
+        for share_seq in range(1, 7)
+    ]
+    # Force full (miner_id, order_key, p2mr_program_hex) identity collisions:
+    # the factory varies p2mr with share_seq, so collisions must be explicit.
+    base[3] = replace(
+        base[3],
+        miner_id=base[0].miner_id,
+        order_key=base[0].order_key,
+        p2mr_program_hex=base[0].p2mr_program_hex,
+    )
+    base[5] = replace(
+        base[5],
+        miner_id=base[1].miner_id,
+        order_key=base[1].order_key,
+        p2mr_program_hex=base[1].p2mr_program_hex,
+    )
+    return WindowPipelineCase(
+        name="credit-policy-identity-reuse",
+        why=(
+            "duplicate (miner_id, order_key, p2mr_program_hex) triples pin"
+            " identity deduplication and identity_index reuse in the compact"
+            " spool fragments, alongside mixed credit_policy values"
+        ),
+        anchor_job_issued_at_ms=anchor_ms,
+        window_weight=1_000_000,
+        page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+        snapshot_records=tuple(base),
+    )
+
+
+def _non_ascii_strings_case() -> WindowPipelineCase:
+    # share_id embeds the raw Stratum username, which survives payout-address
+    # fallback un-sanitized, and the ledger validates none of the string
+    # fields, so non-ASCII (including non-BMP), quotes, backslashes and
+    # control characters can all reach the durable record. json.dumps here
+    # runs with ensure_ascii=True, so every such character is \\u-escaped
+    # (non-BMP as surrogate pairs) -- a default a different JSON encoder is
+    # likely to get wrong. The fourth record widens the alphabet to the
+    # characters that separate Python's encoder from a "below 0x20 plus quote
+    # and backslash" re-encoder: DEL (0x7f, escaped by Python, raw in
+    # serde_json and most hand-rolled encoders), solidus (raw in Python,
+    # escaped by some encoders), the short escapes \\r \\b \\f, U+001F (the
+    # last short-less control), U+2028/U+2029 (escaped by Python, raw in
+    # encoders that only escape JavaScript-unsafe text), and space and
+    # uppercase, which must pass through untouched. They sit in the identity
+    # fields too so the spool's compact identities carry the same escapes.
+    anchor_ms = 60_000
+    records = (
+        replace(
+            corpus_record(1, share_difficulty=3, job_issued_at_ms=anchor_ms - 3, accepted_at_ms=anchor_ms - 2),
+            share_id="minér-é.workér:0a1b",
+            miner_id="minér-é",
+            order_key="00:minér-é",
+        ),
+        replace(
+            corpus_record(
+                2,
+                share_difficulty=4,
+                job_issued_at_ms=anchor_ms - 2,
+                accepted_at_ms=anchor_ms - 1,
+                credit_policy="stale-grace",
+            ),
+            share_id='\U0001f680-share-"quoted"\\back\\slash',
+            job_id="job-\t\n\x01",
+        ),
+        corpus_record(3, share_difficulty=5, job_issued_at_ms=anchor_ms - 1, accepted_at_ms=anchor_ms),
+        replace(
+            corpus_record(4, share_difficulty=6, job_issued_at_ms=anchor_ms - 1, accepted_at_ms=anchor_ms),
+            share_id="MINER-A/worker 1:\x7f\r\b\x0c\x1f\u2028\u2029",
+            miner_id="MINER-A/worker 1\x7f",
+            order_key="04:MINER-A/worker 1\x7f",
+        ),
+    )
+    return WindowPipelineCase(
+        name="non-ascii-strings",
+        why=(
+            "string fields carrying non-ASCII, a non-BMP code point, quotes,"
+            " backslashes, control characters, DEL, solidus, CR/BS/FF, U+001F,"
+            " U+2028/U+2029, space and uppercase: pins the ensure_ascii escape"
+            " rules -- surrogate pairs, \\u007f for DEL, raw solidus, short"
+            " escapes, and pass-through of printable ASCII"
+        ),
+        anchor_job_issued_at_ms=anchor_ms,
+        window_weight=1_000_000,
+        page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+        snapshot_records=records,
+    )
+
+
+def _page_boundary_case(retained_count: int, seed_offset: int) -> WindowPipelineCase:
+    rng = random.Random(PARITY_RANDOM_MASTER_SEED + seed_offset)
+    anchor_ms = 70_000 + retained_count
+    records = tuple(
+        corpus_record(
+            share_seq,
+            share_difficulty=rng.choice((1, 2, 3, 7, 19)),
+            job_issued_at_ms=anchor_ms - rng.randint(0, 30),
+            accepted_at_ms=anchor_ms - rng.randint(0, 30),
+            credit_policy="stale-grace" if rng.randrange(4) == 0 else None,
+        )
+        for share_seq in range(1, retained_count + 1)
+    )
+    return WindowPipelineCase(
+        name=f"page-boundary-{retained_count}",
+        why=(
+            f"exactly {retained_count} retained records around the default"
+            f" page size {DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE}: pins"
+            " page splitting and the digest's page-fragment framing at the"
+            " boundary"
+        ),
+        anchor_job_issued_at_ms=anchor_ms,
+        window_weight=10**9,
+        page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+        snapshot_records=records,
+    )
+
+
+def _multi_page_case() -> WindowPipelineCase:
+    rng = random.Random(PARITY_RANDOM_MASTER_SEED + 11)
+    anchor_ms = 90_000
+    record_count = 1_800
+    records = [
+        corpus_record(
+            share_seq,
+            share_difficulty=rng.choice((1, 2, 3, 7, 19)),
+            job_issued_at_ms=anchor_ms - rng.randint(0, 30),
+            accepted_at_ms=anchor_ms - rng.randint(0, 30),
+            credit_policy="stale-grace" if rng.randrange(4) == 0 else None,
+        )
+        for share_seq in range(1, record_count + 1)
+    ]
+    # Weight chosen so the newest 1699 shares miss the weight by one and the
+    # 1700th (by seq: 101) is the retained crossing row, landing the cutoff in
+    # a page interior across four pages.
+    window_weight = sum(record.share_difficulty for record in records[101:]) + 1
+    shuffled = list(records)
+    rng.shuffle(shuffled)
+    return WindowPipelineCase(
+        name="multi-page-interior-cutoff",
+        why=(
+            "1800 unsorted input records with the retention cutoff landing"
+            " inside a page interior: pins multi-page fragment concatenation"
+            " and a crossing row far from page edges"
+        ),
+        anchor_job_issued_at_ms=anchor_ms,
+        window_weight=window_weight,
+        page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+        snapshot_records=tuple(shuffled),
+    )
+
+
+def _incremental_small_case() -> WindowPipelineCase:
+    anchor_ms = 80_000
+    difficulties = {1: 5, 2: 1, 3: 1, 4: 2, 5: 1, 6: 3, 7: 1}
+    snapshot = [
+        corpus_record(
+            share_seq,
+            share_difficulty=difficulty,
+            job_issued_at_ms=anchor_ms - share_seq,
+            accepted_at_ms=anchor_ms - share_seq,
+            credit_policy="stale-grace" if share_seq == 6 else None,
+        )
+        for share_seq, difficulty in difficulties.items()
+    ]
+    # Never eligible at any anchor this case reaches: the incremental path
+    # never sees it in a delta, and the union rebuild must exclude it too.
+    snapshot.append(
+        corpus_record(8, share_difficulty=100, job_issued_at_ms=10**9, accepted_at_ms=10**9)
+    )
+    first_advance = WindowPipelineAdvance(
+        anchor_job_issued_at_ms=anchor_ms + 1,
+        delta_records=(
+            corpus_record(9, share_difficulty=2, job_issued_at_ms=anchor_ms + 1, accepted_at_ms=anchor_ms - 1),
+            corpus_record(10, share_difficulty=4, job_issued_at_ms=anchor_ms - 10, accepted_at_ms=anchor_ms + 1),
+        ),
+    )
+    second_advance = WindowPipelineAdvance(
+        anchor_job_issued_at_ms=anchor_ms + 10,
+        delta_records=(
+            corpus_record(11, share_difficulty=1, job_issued_at_ms=anchor_ms + 5, accepted_at_ms=anchor_ms + 2),
+            corpus_record(
+                12,
+                share_difficulty=1,
+                job_issued_at_ms=anchor_ms + 10,
+                accepted_at_ms=anchor_ms - 5,
+                credit_policy="stale-grace",
+            ),
+            corpus_record(13, share_difficulty=1, job_issued_at_ms=anchor_ms, accepted_at_ms=anchor_ms + 10),
+            corpus_record(
+                14,
+                share_difficulty=1,
+                job_issued_at_ms=anchor_ms + 9,
+                accepted_at_ms=anchor_ms + 9,
+                credit_policy="stale-grace",
+            ),
+        ),
+    )
+    return WindowPipelineCase(
+        name="incremental-two-advances",
+        why=(
+            "two advance() steps over a page_size-3 window: append into a"
+            " partially filled page, spill into new pages, expire a whole head"
+            " page and partially expire the next; the folded bytes must equal"
+            " a full rebuild over the union"
+        ),
+        anchor_job_issued_at_ms=anchor_ms,
+        window_weight=9,
+        page_size=3,
+        snapshot_records=tuple(snapshot),
+        advances=(first_advance, second_advance),
+    )
+
+
+def _bulk_seeded_case() -> WindowPipelineCase:
+    rng = random.Random(PARITY_RANDOM_MASTER_SEED + 12)
+    anchor_ms = 1_000_000
+    advance_anchor_ms = anchor_ms + 10
+    snapshot: list[AcceptedShareRecord] = []
+    for share_seq in range(1, 4_001):
+        if rng.random() < 0.1:
+            # Ineligible at the snapshot anchor and at every later anchor in
+            # this case, since the incremental path never re-delivers it.
+            lateness = rng.choice(("job", "accepted", "both"))
+            job_ms = (
+                anchor_ms + rng.randint(11, 500)
+                if lateness in ("job", "both")
+                else anchor_ms - rng.randint(0, 30)
+            )
+            accepted_ms = (
+                anchor_ms + rng.randint(11, 500)
+                if lateness in ("accepted", "both")
+                else anchor_ms - rng.randint(0, 30)
+            )
+        else:
+            job_ms = anchor_ms - rng.randint(0, 30)
+            accepted_ms = anchor_ms - rng.randint(0, 30)
+        snapshot.append(
+            corpus_record(
+                share_seq,
+                share_difficulty=rng.choice((1, 2, 3, 7, 19, 101, 1_000)),
+                job_issued_at_ms=job_ms,
+                accepted_at_ms=accepted_ms,
+                credit_policy="stale-grace" if rng.randrange(5) == 0 else None,
+            )
+        )
+    rng.shuffle(snapshot)
+    delta: list[AcceptedShareRecord] = []
+    for share_seq in range(4_001, 4_701):
+        if rng.randrange(2):
+            job_ms = rng.randint(anchor_ms + 1, advance_anchor_ms)
+            accepted_ms = advance_anchor_ms - rng.randint(0, 40)
+        else:
+            job_ms = advance_anchor_ms - rng.randint(0, 40)
+            accepted_ms = rng.randint(anchor_ms + 1, advance_anchor_ms)
+        delta.append(
+            corpus_record(
+                share_seq,
+                share_difficulty=rng.choice((1, 2, 3, 7, 19, 101, 1_000)),
+                job_issued_at_ms=job_ms,
+                accepted_at_ms=accepted_ms,
+                credit_policy="stale-grace" if rng.randrange(5) == 0 else None,
+            )
+        )
+    return WindowPipelineCase(
+        name="bulk-seeded",
+        why=(
+            "4000 seeded snapshot records (roughly a tenth ineligible) plus a"
+            " 700-record advance: representative page-fragment concatenation,"
+            " identity deduplication at natural factory collisions, and head"
+            " expiry at scale"
+        ),
+        anchor_job_issued_at_ms=anchor_ms,
+        window_weight=450_000,
+        page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+        snapshot_records=tuple(snapshot),
+        advances=(
+            WindowPipelineAdvance(
+                anchor_job_issued_at_ms=advance_anchor_ms,
+                delta_records=tuple(delta),
+            ),
+        ),
+    )
+
+
+# A realistic production anchor: epoch milliseconds in 2025, above 2^40. The
+# previous cases all sit below 2^31, which is exactly why a 32-bit backend
+# could pass them; every width case below runs at this scale.
+_REALISTIC_ANCHOR_MS = 1_755_000_000_000
+
+
+def _wide_integers_case() -> WindowPipelineCase:
+    anchor_ms = _REALISTIC_ANCHOR_MS
+    # Retention runs newest-first until the accumulated weight reaches
+    # window_weight. The three newest (2^53+1, 2^63, 2^64+1) sum to
+    # 2^64+2^63+2^53+2, below window_weight only because of its 2^127 term,
+    # so the oldest (2^127+3) is the retained crossing row and all four
+    # survive: a backend that wraps or saturates at 64 bits (or truncates
+    # window_weight to 64 bits) stops after three, and one that clamps the
+    # inputs renders different digits even where it keeps the count.
+    records = (
+        replace(
+            corpus_record(1, share_difficulty=2**127 + 3, job_issued_at_ms=anchor_ms - 3, accepted_at_ms=anchor_ms - 2),
+            network_difficulty=10**77,
+            template_height=2**62,
+            ntime=2**63 - 1,
+        ),
+        replace(
+            corpus_record(2**31, share_difficulty=2**64 + 1, job_issued_at_ms=anchor_ms - 2, accepted_at_ms=anchor_ms - 1),
+            network_difficulty=2**64 + 1,
+            template_height=2**31 + 1,
+            ntime=2**32 - 1,
+        ),
+        replace(
+            corpus_record(2**32 + 5, share_difficulty=2**63, job_issued_at_ms=anchor_ms - 1, accepted_at_ms=anchor_ms - 1),
+            network_difficulty=2**64 - 1,
+            template_height=0,
+            ntime=0,
+        ),
+        replace(
+            corpus_record(2**63 - 1, share_difficulty=2**53 + 1, job_issued_at_ms=anchor_ms, accepted_at_ms=anchor_ms),
+            network_difficulty=2**53 + 1,
+        ),
+        # Excluded by a one-millisecond margin at 2^40 scale: a backend
+        # comparing truncated or float-rounded timestamps includes it.
+        corpus_record(7, share_difficulty=1, job_issued_at_ms=anchor_ms + 1, accepted_at_ms=anchor_ms),
+    )
+    return WindowPipelineCase(
+        name="wide-integers",
+        why=(
+            "every integer field above 2^32 at a realistic epoch-ms anchor:"
+            " share_difficulty across 2^53+1, 2^63, 2^64+1 and 2^127+3,"
+            " network_difficulty up to 10^77, template_height 2^31+1 and"
+            " 2^62, ntime 2^32-1 and 2^63-1, share_seq up to 2^63-1, a zero"
+            " template_height/ntime, and window_weight 2^127+2^64+2^63+4 so"
+            " the retention cutoff depends on exact arithmetic above 2^64;"
+            " pins full-digit rendering and non-wrapping, non-saturating,"
+            " non-float accumulation"
+        ),
+        anchor_job_issued_at_ms=anchor_ms,
+        window_weight=2**127 + 2**64 + 2**63 + 4,
+        page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+        snapshot_records=records,
+    )
+
+
+def _difficulty_beyond_u128_case() -> WindowPipelineCase:
+    anchor_ms = _REALISTIC_ANCHOR_MS
+    # Newest-first: 2^63, then 2^64-1, then 2^128+1 crosses window_weight and
+    # is retained; the oldest (2^127) is dropped. The retained total is above
+    # 2^128 and so is window_weight itself, so neither the inputs nor the
+    # accumulator fit a 128-bit integer: a backend that clamps at u128::MAX
+    # renders different digits for the crossing row and for the numeric(78,0)
+    # maximum network_difficulty even though its retained count agrees.
+    records = (
+        replace(
+            corpus_record(1, share_difficulty=2**127, job_issued_at_ms=anchor_ms - 3, accepted_at_ms=anchor_ms - 3),
+            network_difficulty=2**128 - 1,
+        ),
+        replace(
+            corpus_record(2, share_difficulty=2**128 + 1, job_issued_at_ms=anchor_ms - 2, accepted_at_ms=anchor_ms - 2),
+            network_difficulty=10**78 - 1,
+        ),
+        replace(
+            corpus_record(3, share_difficulty=2**64 - 1, job_issued_at_ms=anchor_ms - 1, accepted_at_ms=anchor_ms - 1),
+            network_difficulty=2**128,
+        ),
+        replace(
+            corpus_record(4, share_difficulty=2**63, job_issued_at_ms=anchor_ms, accepted_at_ms=anchor_ms),
+            network_difficulty=2**128 - 1,
+        ),
+    )
+    return WindowPipelineCase(
+        name="difficulty-beyond-u128",
+        why=(
+            "numeric(78,0) width taken literally: share_difficulty 2^128+1 as"
+            " the retained crossing row, network_difficulty at 2^128-1, 2^128"
+            " and 10^78-1, window_weight and the retained total above 2^128;"
+            " refuses any backend carrying difficulties in 128 bits, saturating"
+            " or not -- see the module docstring for why the schema's width,"
+            " not an existing narrower type, is the contract"
+        ),
+        anchor_job_issued_at_ms=anchor_ms,
+        window_weight=2**128 + 2**64,
+        page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+        snapshot_records=records,
+    )
+
+
+def _advance_exact_fit_expiry_case() -> WindowPipelineCase:
+    anchor_ms = 100_000
+    snapshot = tuple(
+        corpus_record(share_seq, share_difficulty=4, job_issued_at_ms=anchor_ms - share_seq, accepted_at_ms=anchor_ms - share_seq)
+        for share_seq in (1, 2, 3)
+    )
+    return WindowPipelineCase(
+        name="advance-exact-fit-expiry",
+        why=(
+            "three records of difficulty 4 at weight 10 (all retained, total"
+            " 12) plus one delta of difficulty 2: 14-4 = 10 >= 10 expires the"
+            " head row exactly at the weight, retaining seqs 2..4 at total 10;"
+            " an advance-side expiry using > instead of >= retains all four."
+            " The crossing-row-exact-fit sibling pins the snapshot-side twin"
+            " of this comparison; the advance loops are separate code in any"
+            " re-implementation"
+        ),
+        anchor_job_issued_at_ms=anchor_ms,
+        window_weight=10,
+        page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+        snapshot_records=snapshot,
+        advances=(
+            WindowPipelineAdvance(
+                anchor_job_issued_at_ms=anchor_ms + 1,
+                delta_records=(
+                    corpus_record(4, share_difficulty=2, job_issued_at_ms=anchor_ms + 1, accepted_at_ms=anchor_ms + 1),
+                ),
+            ),
+        ),
+    )
+
+
+def _advance_delta_exceeds_window_case() -> WindowPipelineCase:
+    anchor_ms = 110_000
+    snapshot = tuple(
+        corpus_record(share_seq, share_difficulty=3, job_issued_at_ms=anchor_ms - share_seq, accepted_at_ms=anchor_ms - share_seq)
+        for share_seq in (1, 2, 3)
+    )
+    delta = tuple(
+        corpus_record(share_seq, share_difficulty=5, job_issued_at_ms=anchor_ms + 1, accepted_at_ms=anchor_ms + 1)
+        for share_seq in (4, 5, 6, 7, 8)
+    )
+    return WindowPipelineCase(
+        name="advance-delta-exceeds-window",
+        why=(
+            "weight 8, page_size 2, three retained records of difficulty 3 in"
+            " pages [1,2],[3], then one advance of five records of difficulty"
+            " 5 (25 alone outweighs the window): the delta fills page [3,4]"
+            " and allocates [5,6],[7,8]; expiry must run across the appended"
+            " pages too, expiring every old page and three of the five new"
+            " rows to retain [7,8] at total 10. A backend that expires only"
+            " among pre-existing pages -- the natural shape of a drop-prefix /"
+            " append-suffix protocol -- retains four. touched_pages is 1: the"
+            " page appended into counts although this same advance then"
+            " expires it wholesale"
+        ),
+        anchor_job_issued_at_ms=anchor_ms,
+        window_weight=8,
+        page_size=2,
+        snapshot_records=snapshot,
+        advances=(WindowPipelineAdvance(anchor_job_issued_at_ms=anchor_ms + 1, delta_records=delta),),
+    )
+
+
+def _advance_partial_expiry_in_appended_page_case() -> WindowPipelineCase:
+    anchor_ms = 120_000
+    snapshot = tuple(
+        corpus_record(share_seq, share_difficulty=3, job_issued_at_ms=anchor_ms - share_seq, accepted_at_ms=anchor_ms - share_seq)
+        for share_seq in (1, 2, 3)
+    )
+    delta = tuple(
+        corpus_record(share_seq, share_difficulty=difficulty, job_issued_at_ms=anchor_ms + 1, accepted_at_ms=anchor_ms + 1)
+        for share_seq, difficulty in zip((4, 5, 6, 7, 8), (5, 5, 5, 2, 9))
+    )
+    return WindowPipelineCase(
+        name="advance-partial-expiry-in-appended-page",
+        why=(
+            "as advance-delta-exceeds-window but with delta difficulties"
+            " (5,5,5,2,9): whole-page expiry stops at the freshly allocated"
+            " page [7,8] (total 11) and the partial loop then expires seq 7"
+            " inside it, retaining [8] at total 9; touched_pages stays 1"
+            " because a freshly allocated append page never counts even when"
+            " partial expiry lands in it"
+        ),
+        anchor_job_issued_at_ms=anchor_ms,
+        window_weight=8,
+        page_size=2,
+        snapshot_records=snapshot,
+        advances=(WindowPipelineAdvance(anchor_job_issued_at_ms=anchor_ms + 1, delta_records=delta),),
+    )
+
+
+def _advance_from_empty_window_case() -> WindowPipelineCase:
+    anchor_ms = 130_000
+    return WindowPipelineCase(
+        name="advance-from-empty-window",
+        why=(
+            "an empty window (no pages, no last page to append into) advanced"
+            " with a one-record delta: the record lands in a freshly allocated"
+            " page, nothing expires, touched_pages is 0; a backend that"
+            " unwraps the last page fails here"
+        ),
+        anchor_job_issued_at_ms=anchor_ms,
+        window_weight=10,
+        page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+        snapshot_records=(),
+        advances=(
+            WindowPipelineAdvance(
+                anchor_job_issued_at_ms=anchor_ms + 1,
+                delta_records=(
+                    corpus_record(1, share_difficulty=5, job_issued_at_ms=anchor_ms + 1, accepted_at_ms=anchor_ms + 1),
+                ),
+            ),
+        ),
+    )
+
+
+def _advance_empty_delta_case() -> WindowPipelineCase:
+    anchor_ms = 140_000
+    return WindowPipelineCase(
+        name="advance-empty-delta",
+        why=(
+            "one retained record advanced to a later anchor with an empty"
+            " delta: bytes identical to the snapshot, stats all zero; a backend"
+            " that allocates an empty page and frames a trailing separator, or"
+            " re-runs expiry with a stale total, diverges"
+        ),
+        anchor_job_issued_at_ms=anchor_ms,
+        window_weight=10,
+        page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+        snapshot_records=(
+            corpus_record(1, share_difficulty=5, job_issued_at_ms=anchor_ms, accepted_at_ms=anchor_ms),
+        ),
+        advances=(WindowPipelineAdvance(anchor_job_issued_at_ms=anchor_ms + 1, delta_records=()),),
+    )
+
+
+def _advance_equal_anchor_case() -> WindowPipelineCase:
+    anchor_ms = 150_000
+    return WindowPipelineCase(
+        name="advance-equal-anchor",
+        why=(
+            "an advance at the same anchor as the snapshot: the regression"
+            " check is strictly <, so this is accepted (only an empty delta"
+            " can be, since no record is both newly eligible and eligible at"
+            " the same anchor); a backend rejecting on <= diverges"
+        ),
+        anchor_job_issued_at_ms=anchor_ms,
+        window_weight=10,
+        page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+        snapshot_records=(
+            corpus_record(1, share_difficulty=5, job_issued_at_ms=anchor_ms, accepted_at_ms=anchor_ms),
+        ),
+        advances=(WindowPipelineAdvance(anchor_job_issued_at_ms=anchor_ms, delta_records=()),),
+    )
+
+
+# --- rejection cases --------------------------------------------------------
+#
+# One case per condition the shipped pipeline refuses, each built to trigger
+# exactly that condition and nothing earlier in the check order. The three
+# from_full_snapshot duplicate/non-positive shapes are unreachable from the
+# database (PK, UNIQUE, CHECK), but the in-memory ledger and the daemon
+# protocol are not the database, so they are pinned too. What is pinned is
+# the rejection itself, not the coordinator's recovery from it.
+
+_REJECTION_ANCHOR_MS = 200_000
+
+
+def _rejection_case(
+    name: str,
+    category: str,
+    why: str,
+    *,
+    snapshot_records: tuple[AcceptedShareRecord, ...],
+    window_weight: int = 100,
+    page_size: int = DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+    advances: tuple[WindowPipelineAdvance, ...] = (),
+) -> WindowPipelineCase:
+    return WindowPipelineCase(
+        name=name,
+        why=why,
+        anchor_job_issued_at_ms=_REJECTION_ANCHOR_MS,
+        window_weight=window_weight,
+        page_size=page_size,
+        snapshot_records=snapshot_records,
+        advances=advances,
+        expected_rejection=category,
+    )
+
+
+def _eligible(share_seq: int, *, share_difficulty: int = 1, share_id: str | None = None) -> AcceptedShareRecord:
+    """A record eligible at the rejection anchor, at one ms per seq of age."""
+    record = corpus_record(
+        share_seq,
+        share_difficulty=share_difficulty,
+        job_issued_at_ms=_REJECTION_ANCHOR_MS - share_seq,
+        accepted_at_ms=_REJECTION_ANCHOR_MS - share_seq,
+    )
+    return record if share_id is None else replace(record, share_id=share_id)
+
+
+def _newly_eligible(share_seq: int, *, share_difficulty: int = 1, job_offset_ms: int = 1, accepted_offset_ms: int = 1) -> AcceptedShareRecord:
+    """A delta record first eligible at anchor+1 (both stamps above the old anchor)."""
+    return corpus_record(
+        share_seq,
+        share_difficulty=share_difficulty,
+        job_issued_at_ms=_REJECTION_ANCHOR_MS + job_offset_ms,
+        accepted_at_ms=_REJECTION_ANCHOR_MS + accepted_offset_ms,
+    )
+
+
+def _full_snapshot_rejection_cases() -> tuple[WindowPipelineCase, ...]:
+    return (
+        _rejection_case(
+            "reject-duplicate-share-seq",
+            "duplicate_share_seq",
+            "two eligible records share share_seq 1 under distinct share_ids;"
+            " the sorted-order duplicate check fires before the share_id one",
+            snapshot_records=(_eligible(1), _eligible(1, share_difficulty=2, share_id="share-1-again")),
+        ),
+        _rejection_case(
+            "reject-duplicate-share-id",
+            "duplicate_share_id",
+            "seqs 1 and 2 carry the same share_id; distinct seqs so only the"
+            " share_id check can fire",
+            snapshot_records=(_eligible(1), _eligible(2, share_id="share-1")),
+        ),
+        _rejection_case(
+            "reject-non-positive-difficulty",
+            "non_positive_difficulty",
+            "one eligible record with share_difficulty 0 (the check runs on"
+            " eligible records only, so it must be eligible to be refused)",
+            snapshot_records=(_eligible(1, share_difficulty=0),),
+        ),
+        _rejection_case(
+            "reject-non-positive-window-weight",
+            "non_positive_window_weight",
+            "window_weight 0 with one ordinary eligible record; refused before"
+            " any record is examined",
+            snapshot_records=(_eligible(1),),
+            window_weight=0,
+        ),
+        _rejection_case(
+            "reject-non-positive-page-size",
+            "non_positive_page_size",
+            "page_size 0 with one ordinary eligible record; refused before any"
+            " record is examined",
+            snapshot_records=(_eligible(1),),
+            page_size=0,
+        ),
+    )
+
+
+def _advance_rejection_cases() -> tuple[WindowPipelineCase, ...]:
+    # Seqs 1 and 3 retained at the anchor; seq 2 is the gap a late-visible
+    # row would fill.
+    retained = (_eligible(1), _eligible(3))
+
+    def advance(*delta: AcceptedShareRecord, anchor_offset_ms: int = 1) -> tuple[WindowPipelineAdvance, ...]:
+        return (
+            WindowPipelineAdvance(
+                anchor_job_issued_at_ms=_REJECTION_ANCHOR_MS + anchor_offset_ms,
+                delta_records=delta,
+            ),
+        )
+
+    return (
+        _rejection_case(
+            "reject-anchor-regression",
+            "anchor_regression",
+            "an advance whose anchor is one ms earlier than the window's, with"
+            " an empty delta: the anchor check fires before any record check",
+            snapshot_records=retained,
+            advances=advance(anchor_offset_ms=-1),
+        ),
+        _rejection_case(
+            "reject-delta-non-positive-difficulty",
+            "delta_non_positive_difficulty",
+            "a newly eligible delta record of difficulty 0; the difficulty"
+            " check is the first per-record check",
+            snapshot_records=retained,
+            advances=advance(_newly_eligible(4, share_difficulty=0)),
+        ),
+        _rejection_case(
+            "reject-delta-ineligible-job-only",
+            "delta_ineligible_at_anchor",
+            "a delta record whose job_issued_at_ms is one ms past the new"
+            " anchor while accepted_at_ms is on it: ineligible by job alone",
+            snapshot_records=retained,
+            advances=advance(_newly_eligible(4, job_offset_ms=2, accepted_offset_ms=1)),
+        ),
+        _rejection_case(
+            "reject-delta-ineligible-accepted-only",
+            "delta_ineligible_at_anchor",
+            "a delta record whose accepted_at_ms is one ms past the new anchor"
+            " while job_issued_at_ms is on it: ineligible by accepted alone",
+            snapshot_records=retained,
+            advances=advance(_newly_eligible(4, job_offset_ms=1, accepted_offset_ms=2)),
+        ),
+        _rejection_case(
+            "reject-delta-repeats-retained-share",
+            "delta_repeats_eligible_share",
+            "the delta re-delivers seq 3, a share eligible at the previous"
+            " anchor and still inside the window: refused as a repeat before"
+            " the append-order check could see its seq",
+            snapshot_records=retained,
+            advances=advance(_eligible(3)),
+        ),
+        _rejection_case(
+            "reject-delta-not-append",
+            "delta_not_append",
+            "a newly eligible record with seq 2, below the window's last seq"
+            " 3: the late-visible row that cannot be folded as an append and"
+            " in production forces the full rescan",
+            snapshot_records=retained,
+            advances=advance(_newly_eligible(2)),
+        ),
+        _rejection_case(
+            "reject-delta-order-not-increasing",
+            "delta_order_not_increasing",
+            "two newly eligible records delivered as seqs 5 then 4, both"
+            " above the window's last seq so only the intra-delta order check"
+            " can fire",
+            snapshot_records=retained,
+            advances=advance(_newly_eligible(5), _newly_eligible(4)),
+        ),
+    )
+
+
+def build_corpus() -> tuple[WindowPipelineCase, ...]:
+    """Every corpus case, deterministic and in a stable order."""
+    return (
+        _empty_window_case(),
+        _single_record_case(),
+        _crossing_row_retained_case(),
+        _crossing_row_exact_fit_case(),
+        _eligibility_filtering_case(),
+        _unsorted_input_case(),
+        _identity_reuse_case(),
+        _non_ascii_strings_case(),
+        _page_boundary_case(DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE - 1, seed_offset=8),
+        _page_boundary_case(DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE, seed_offset=9),
+        _page_boundary_case(DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE + 1, seed_offset=10),
+        _multi_page_case(),
+        _incremental_small_case(),
+        _bulk_seeded_case(),
+        _wide_integers_case(),
+        _difficulty_beyond_u128_case(),
+        _advance_exact_fit_expiry_case(),
+        _advance_delta_exceeds_window_case(),
+        _advance_partial_expiry_in_appended_page_case(),
+        _advance_from_empty_window_case(),
+        _advance_empty_delta_case(),
+        _advance_equal_anchor_case(),
+        *_full_snapshot_rejection_cases(),
+        *_advance_rejection_cases(),
+    )
+
+
+# --- frozen reference -------------------------------------------------------
+
+
+def reference_case_entry(case: WindowPipelineCase, result: WindowPipelineResult) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "why": case.why,
+        "input_sha256": case_input_sha256(case),
+    }
+    literals: dict[str, object] = {}
+    if len(case_input_bytes(case)) <= LITERAL_PIN_MAX_CANONICAL_BYTES:
+        literals["input"] = case_input_document(case)
+    if isinstance(result, WindowPipelineRejection):
+        entry["rejected"] = result.reason
+    else:
+        outputs = result
+        stream = record_stream_bytes(outputs.record_jsons)
+        if outputs.canonical_digest != sha256_hex(outputs.canonical_bytes):
+            raise RuntimeError(
+                f"case {case.name}: canonical digest does not hash the framed"
+                " canonical bytes; the streaming model no longer matches the"
+                " shipped pipeline"
+            )
+        entry.update(
+            {
+                "record_count": len(outputs.record_jsons),
+                "record_stream_len": len(stream),
+                "record_stream_sha256": sha256_hex(stream),
+                "canonical_bytes_len": len(outputs.canonical_bytes),
+                "canonical_bytes_sha256": sha256_hex(outputs.canonical_bytes),
+                "canonical_digest": outputs.canonical_digest,
+                "spool_tail_len": len(outputs.spool_tail),
+                "spool_tail_sha256": sha256_hex(outputs.spool_tail),
+                "advance_stats": [stats.as_document() for stats in outputs.advance_stats],
+            }
+        )
+        if len(outputs.canonical_bytes) <= LITERAL_PIN_MAX_CANONICAL_BYTES:
+            literals.update(
+                {
+                    "record_jsons": [record.decode("ascii") for record in outputs.record_jsons],
+                    "canonical_bytes": outputs.canonical_bytes.decode("ascii"),
+                    "spool_tail": outputs.spool_tail.decode("ascii"),
+                }
+            )
+    if literals:
+        entry["pinned_literals"] = literals
+    return entry
+
+
+def reference_document() -> dict[str, object]:
+    """The frozen-reference document, regenerated from the shipped pipeline."""
+    adapter = PythonWindowPipelineAdapter()
+    return {
+        "schema": REFERENCE_SCHEMA,
+        "regenerate_with": REGENERATE_COMMAND,
+        "master_seed": f"0x{PARITY_RANDOM_MASTER_SEED:08x}",
+        "default_page_size": DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+        "cases": {case.name: reference_case_entry(case, adapter.run(case)) for case in build_corpus()},
+    }
+
+
+def encode_reference_document(document: dict[str, object]) -> bytes:
+    # sort_keys plus the default ensure_ascii keeps the fixture byte-stable,
+    # so regeneration on an unchanged tree is a no-op.
+    return json.dumps(document, indent=2, sort_keys=True).encode("ascii") + b"\n"
+
+
+def load_reference_document() -> dict[str, object]:
+    try:
+        raw = REFERENCE_FIXTURE_PATH.read_bytes()
+    except FileNotFoundError:
+        raise AssertionError(
+            f"frozen reference {REFERENCE_FIXTURE_RELPATH} is missing;"
+            f" regenerate it with: {REGENERATE_COMMAND}"
+        ) from None
+    document = json.loads(raw)
+    if document.get("schema") != REFERENCE_SCHEMA:
+        raise AssertionError(
+            f"frozen reference {REFERENCE_FIXTURE_RELPATH} has schema"
+            f" {document.get('schema')!r}, expected {REFERENCE_SCHEMA!r};"
+            f" regenerate it with: {REGENERATE_COMMAND}"
+        )
+    return document
+
+
+def diverging_outputs(
+    reference_case: dict[str, object],
+    result: WindowPipelineResult,
+) -> list[str]:
+    """Every way one backend's result diverges from one frozen case.
+
+    An empty list is parity. A rejection matches only a frozen rejection of
+    the same category; outputs match only a frozen outputs entry, where
+    length and SHA-256 comparisons hold for every case, literal comparisons
+    additionally localize the first divergence when the case pins literals,
+    and the per-advance stats must agree exactly.
+    """
+    expected_rejection = reference_case.get("rejected")
+    if isinstance(result, WindowPipelineRejection):
+        if expected_rejection is None:
+            return [
+                f"rejected: backend rejected as {result.reason!r} but the"
+                " frozen reference has outputs"
+            ]
+        if result.reason != expected_rejection:
+            return [f"rejected: {result.reason!r} != frozen {expected_rejection!r}"]
+        return []
+    outputs = result
+    if expected_rejection is not None:
+        return [
+            f"rejected: backend produced outputs but the frozen reference is"
+            f" rejected as {expected_rejection!r}"
+        ]
+
+    problems: list[str] = []
+
+    def check_stream(label: str, actual: bytes, literal: str | None) -> None:
+        expected_len = reference_case[f"{label}_len"]
+        expected_sha = reference_case[f"{label}_sha256"]
+        if len(actual) != expected_len:
+            problems.append(f"{label}: {len(actual)} bytes != frozen {expected_len}")
+        if sha256_hex(actual) != expected_sha:
+            problems.append(f"{label}: sha256 diverges from the frozen reference")
+        if literal is not None and literal.encode("ascii") != actual:
+            problems.append(f"{label}: bytes diverge from the frozen literal")
+
+    literals = reference_case.get("pinned_literals") or {}
+    literal_records = literals.get("record_jsons")
+    if len(outputs.record_jsons) != reference_case["record_count"]:
+        problems.append(
+            f"record_count: {len(outputs.record_jsons)} != frozen {reference_case['record_count']}"
+        )
+    check_stream(
+        "record_stream",
+        record_stream_bytes(outputs.record_jsons),
+        "\n".join(literal_records) if literal_records is not None else None,
+    )
+    if literal_records is not None:
+        expected_records = [text.encode("ascii") for text in literal_records]
+        for index, (expected, actual) in enumerate(zip(expected_records, outputs.record_jsons)):
+            if expected != actual:
+                problems.append(
+                    f"record_jsons[{index}]: {actual!r} != frozen {expected!r}"
+                )
+                break
+    check_stream("canonical_bytes", outputs.canonical_bytes, literals.get("canonical_bytes"))
+    if outputs.canonical_digest != reference_case["canonical_digest"]:
+        problems.append(
+            f"canonical_digest: {outputs.canonical_digest} != frozen"
+            f" {reference_case['canonical_digest']}"
+        )
+    check_stream("spool_tail", outputs.spool_tail, literals.get("spool_tail"))
+    actual_stats = [stats.as_document() for stats in outputs.advance_stats]
+    if actual_stats != reference_case["advance_stats"]:
+        problems.append(
+            f"advance_stats: {actual_stats} != frozen {reference_case['advance_stats']}"
+        )
+    return problems
+
+
+def _main(argv: list[str]) -> int:
+    if argv != ["regenerate"]:
+        print(f"usage: {REGENERATE_COMMAND}", file=sys.stderr)
+        return 2
+    payload = encode_reference_document(reference_document())
+    REFERENCE_FIXTURE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if REFERENCE_FIXTURE_PATH.exists() and REFERENCE_FIXTURE_PATH.read_bytes() == payload:
+        print(f"unchanged: {REFERENCE_FIXTURE_RELPATH}")
+        return 0
+    REFERENCE_FIXTURE_PATH.write_bytes(payload)
+    print(f"wrote {len(payload)} bytes: {REFERENCE_FIXTURE_RELPATH}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv[1:]))
