@@ -37,6 +37,9 @@ from lab.prism.share_ledger import (
     AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA,
     DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
     SingleWriterShareLedger,
+    WRITER_LEASE_ACQUIRE_RETRY_ATTEMPTS,
+    WRITER_LEASE_ACQUIRE_RETRY_KEY,
+    WRITER_LEASE_ACQUIRE_RETRY_SUBJECT,
     WRITER_LEASE_HEARTBEAT_SESSION_PREFIX,
     _NativePostgresClient,
     _NativePostgresLeaseGuard,
@@ -163,6 +166,24 @@ def held_lease(
     if age_seconds is not None:
         result["lease_age_seconds"] = age_seconds
     return result
+
+
+def snapshot_retry_lease() -> dict[str, object]:
+    """The acquisition statement's third arm, as PostgreSQL renders it.
+
+    Built from the same constants the statement interpolates, so a change to
+    either the key or the subject shows up as a failure in the retry tests
+    rather than as a sentinel the ledger silently stops recognising.
+    """
+    return {
+        "acquired": False,
+        WRITER_LEASE_ACQUIRE_RETRY_KEY: True,
+        "lease": WRITER_LEASE_ACQUIRE_RETRY_SUBJECT,
+        "retry_reason": (
+            f"the {WRITER_LEASE_ACQUIRE_RETRY_SUBJECT} row was committed by a "
+            "concurrent first acquisition after this statement snapshot"
+        ),
+    }
 
 
 class FakeMonotonicClock:
@@ -5284,6 +5305,158 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
 
 
+class FirstAcquireWriterLeaseRaceTests(unittest.TestCase):
+    """The first-ever concurrent acquisition, from the loser's side.
+
+    Under READ COMMITTED the loser's ``ON CONFLICT DO UPDATE`` re-reads only
+    the conflicting tuple after its lock wait, so the upsert affects zero rows
+    while the holder ``SELECT`` still reads the pre-wait snapshot and finds
+    nothing. Both arms empty used to make the whole statement SQL NULL and kill
+    startup with a driver-level ``postgres query returned no JSON``. These
+    tests drive that interleaving through canned statement results, so they
+    pin the loser's experience without a live server.
+    """
+
+    def test_statement_carries_a_named_retry_arm_for_the_empty_snapshot(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [acquired_lease()],
+            writer_id="writer-a",
+            writer_epoch=1,
+        )
+
+        acquire_sql = ledger.lease_queries[0]
+        # A third COALESCE arm makes the statement total: it is a constant, so
+        # the expression cannot evaluate to SQL NULL however the first two arms
+        # resolve.
+        self.assertIn(f"'{WRITER_LEASE_ACQUIRE_RETRY_KEY}', true", acquire_sql)
+        self.assertIn(f"'lease', '{WRITER_LEASE_ACQUIRE_RETRY_SUBJECT}'", acquire_sql)
+        self.assertIn("'acquired', false", acquire_sql)
+
+    def test_first_acquire_loser_retries_into_the_named_lease_refusal(self) -> None:
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            with self.assertRaises(RuntimeError) as caught:
+                FakeLeasePsqlShareLedger(
+                    [
+                        snapshot_retry_lease(),
+                        held_lease(writer_id="writer-b", wait_seconds=10.0),
+                    ],
+                    writer_id="writer-a",
+                    writer_epoch=1,
+                )
+
+        message = str(caught.exception)
+        # The operator-facing difference this change exists for: the loser now
+        # names the lease and its holder instead of a driver-level parse error.
+        self.assertIn(
+            "qbit ledger writer lease is held by writer-b epoch=1",
+            message,
+        )
+        self.assertNotIn("postgres query returned no JSON", message)
+
+    def test_first_acquire_loser_can_retry_into_an_ordinary_acquisition(self) -> None:
+        # The winner's row is visible on the fresh snapshot and has already
+        # expired, so the second statement takes the lease through the ordinary
+        # expiry CAS. Startup completes without operator action.
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            ledger = FakeLeasePsqlShareLedger(
+                [snapshot_retry_lease(), acquired_lease()],
+                writer_id="writer-a",
+                writer_epoch=1,
+            )
+
+        self.assertEqual(len(ledger.lease_queries), 2)
+        self.assertEqual(ledger.sleeps, [])
+        self.assertIn("fresh statement snapshot", stdout.getvalue())
+
+    def test_retry_result_never_reaches_the_wait_or_adopt_decisions(self) -> None:
+        # The sentinel carries no holder identity, so letting it out of the
+        # acquisition path would be read as a holder of None. It is consumed
+        # where the remedy is -- a fresh statement snapshot -- and the caller
+        # only ever sees an ordinary arm.
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._writer_id = "writer-a"
+        ledger._writer_epoch = 1
+        ledger._writer_session_token = (
+            f"{WRITER_LEASE_HEARTBEAT_SESSION_PREFIX}session-a"
+        )
+        retry = snapshot_retry_lease()
+
+        self.assertFalse(PsqlShareLedger._can_wait_for_writer_lease(ledger, retry))
+        self.assertIsNone(
+            PsqlShareLedger._writer_lease_adoption_wait_seconds(ledger, retry)
+        )
+        self.assertFalse(retry["acquired"])
+
+    def test_unconverging_snapshot_retry_fails_naming_the_lease(self) -> None:
+        # A caller whose transaction pinned one snapshot for its whole life
+        # cannot advance it by re-running. The bound turns that into a visible
+        # failure that still names the lease, never a raw parser error and
+        # never an unbounded loop.
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            with self.assertRaises(RuntimeError) as caught:
+                FakeLeasePsqlShareLedger(
+                    [snapshot_retry_lease()] * WRITER_LEASE_ACQUIRE_RETRY_ATTEMPTS,
+                    writer_id="writer-a",
+                    writer_epoch=1,
+                )
+
+        message = str(caught.exception)
+        self.assertIn(WRITER_LEASE_ACQUIRE_RETRY_SUBJECT, message)
+        self.assertNotIn("postgres query returned no JSON", message)
+
+    def test_unrelated_empty_json_statement_still_raises_the_parser_error(self) -> None:
+        # The lease statement is what became total; the parser is unchanged, so
+        # any other statement returning SQL NULL still fails loudly rather than
+        # being reinterpreted as a retry.
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "postgres query returned no JSON",
+        ):
+            parse_single_json_value(None)
+
+        class FakeCursor:
+            @staticmethod
+            def fetchone() -> tuple[object]:
+                return (None,)
+
+        class FakeConnection:
+            closed = False
+
+            @staticmethod
+            def execute(sql: str) -> FakeCursor:
+                return FakeCursor()
+
+            def close(self) -> None:
+                pass
+
+        class FakeOperationalError(Exception):
+            pass
+
+        fake_psycopg = types.ModuleType("psycopg")
+        fake_psycopg.connect = lambda conninfo, **kwargs: FakeConnection()  # type: ignore[attr-defined]
+        fake_psycopg.conninfo = types.SimpleNamespace(  # type: ignore[attr-defined]
+            conninfo_to_dict=lambda conninfo: {"dbname": "qbit"}
+        )
+        fake_psycopg.OperationalError = FakeOperationalError  # type: ignore[attr-defined]
+
+        with unittest.mock.patch.dict(sys.modules, {"psycopg": fake_psycopg}):
+            client = _NativePostgresClient(
+                "postgresql://example.invalid/qbit",
+                pool_size=1,
+            )
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "postgres query returned no JSON",
+            ):
+                client.run_json("SELECT to_json(NULL);")
+
+
 class CannedQueryPsqlShareLedger(PsqlShareLedger):
     """Subprocess-mode ledger whose _run_json pops canned results.
 
@@ -6339,6 +6512,207 @@ class PostgresSessionGuardTests(unittest.TestCase):
         self.assertNotIn("statement_timeout", pgoptions)
         self.assertNotIn("lock_timeout", pgoptions)
         self.assertNotIn("timeout", kwargs)
+
+
+class ReadOnlySessionEnforcementTests(unittest.TestCase):
+    """``read_only=True`` must be a promise PostgreSQL keeps, not a gate.
+
+    The refusing writer gate only covers paths that take the gate. Any
+    statement issued outside it — the lease upsert, a one-shot psql release —
+    reaches SQL exactly as it would on a read-write ledger, and until #157
+    pointed the public tier at a hot standby, nothing but the deployment
+    topology stopped it. These tests pin the connect-time GUC that makes the
+    server refuse instead, on every connection the instance can create.
+    """
+
+    READ_ONLY_GUC = "-c default_transaction_read_only=on"
+
+    def test_read_only_ledger_builds_read_only_session_guards(self) -> None:
+        ledger = PsqlShareLedger(
+            psql_command="psql postgresql://example.invalid/qbit",
+            native_client_mode="0",
+            read_only=True,
+        )
+        self.addCleanup(ledger.close)
+
+        self.assertTrue(ledger._session_guards.read_only)
+        fragment = ledger._session_guards.options_fragment()
+        self.assertIn(self.READ_ONLY_GUC, fragment)
+        # The orphan-reaping guards #137 established are preserved, not
+        # displaced: one options carrier, both guarantees.
+        self.assertIn("-c idle_in_transaction_session_timeout=15000ms", fragment)
+        self.assertIn("-c tcp_keepalives_idle=30", fragment)
+
+    def test_writable_ledger_keeps_a_writable_session(self) -> None:
+        # The coordinator's own ledger must be untouched by this: it commits
+        # every share, block and settlement the pool has.
+        ledger = FakeLeasePsqlShareLedger(
+            [acquired_lease()],
+            writer_id="writer-a",
+            writer_epoch=1,
+        )
+        self.addCleanup(ledger.close)
+
+        self.assertFalse(ledger._session_guards.read_only)
+        self.assertNotIn(
+            "default_transaction_read_only",
+            ledger._session_guards.options_fragment(),
+        )
+
+    def test_read_only_native_pool_connections_are_read_only(self) -> None:
+        connect_kwargs: list[dict[str, Any]] = []
+
+        class FakeConninfo:
+            @staticmethod
+            def conninfo_to_dict(conninfo: str) -> dict[str, Any]:
+                return {"dbname": "qbit"}
+
+        class FakePsycopg:
+            conninfo = FakeConninfo
+
+            @staticmethod
+            def connect(conninfo: str, **kwargs: Any) -> object:
+                connect_kwargs.append(kwargs)
+                return object()
+
+        client = _NativePostgresClient.__new__(_NativePostgresClient)
+        client._psycopg = FakePsycopg
+        client._conninfo = "postgresql://example.invalid/qbit"
+        client._application_name = "qbit-prism-public-read"
+        client._session_guards = make_session_guards(read_only=True)
+
+        client._connect()
+
+        options = connect_kwargs[0]["options"]
+        self.assertIn(self.READ_ONLY_GUC, options)
+        self.assertIn("-c idle_in_transaction_session_timeout=15000ms", options)
+
+    def test_read_only_native_options_preserve_operator_conninfo_options(self) -> None:
+        connect_kwargs: list[dict[str, Any]] = []
+        operator_options = "-c geqo=off -c default_transaction_read_only=off"
+
+        class FakeConninfo:
+            @staticmethod
+            def conninfo_to_dict(conninfo: str) -> dict[str, Any]:
+                return {"dbname": "qbit", "options": operator_options}
+
+        class FakePsycopg:
+            conninfo = FakeConninfo
+
+            @staticmethod
+            def connect(conninfo: str, **kwargs: Any) -> object:
+                connect_kwargs.append(kwargs)
+                return object()
+
+        client = _NativePostgresClient.__new__(_NativePostgresClient)
+        client._psycopg = FakePsycopg
+        client._conninfo = "postgresql://example.invalid/qbit"
+        client._application_name = None
+        client._session_guards = make_session_guards(read_only=True)
+
+        client._connect()
+
+        options = connect_kwargs[0]["options"]
+        # The operator's own options survive, but libpq applies -c settings
+        # left to right with the last duplicate winning, so a DSN that tries
+        # to turn the session writable again cannot.
+        self.assertIn("-c geqo=off", options)
+        self.assertLess(
+            options.index("-c default_transaction_read_only=off"),
+            options.index(self.READ_ONLY_GUC),
+        )
+        self.assertTrue(options.endswith(self.READ_ONLY_GUC))
+
+    def test_read_only_lease_guard_session_is_read_only(self) -> None:
+        connect_calls: list[dict[str, Any]] = []
+
+        class FakeGuardConnection:
+            closed = False
+
+            def close(self) -> None:
+                pass
+
+        fake_psycopg = types.ModuleType("psycopg")
+        fake_psycopg.connect = lambda conninfo, **kwargs: (  # type: ignore[attr-defined]
+            connect_calls.append(kwargs) or FakeGuardConnection()
+        )
+        fake_psycopg.conninfo = types.SimpleNamespace(  # type: ignore[attr-defined]
+            conninfo_to_dict=lambda conninfo: {"dbname": "qbit"}
+        )
+
+        with unittest.mock.patch.dict(sys.modules, {"psycopg": fake_psycopg}):
+            _NativePostgresLeaseGuard(
+                "postgresql://example.invalid/qbit",
+                1234,
+                session_guards=make_session_guards(read_only=True),
+            )
+
+        options = connect_calls[0]["options"]
+        # A read-only ledger never builds a lease guard, but the guarantee is
+        # a property of the carrier rather than of which paths happen to use
+        # it, so the dedicated session carries it too.
+        self.assertIn(self.READ_ONLY_GUC, options)
+        self.assertIn("-c statement_timeout=500", options)
+
+    def test_read_only_subprocess_backend_is_read_only(self) -> None:
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._command = ["psql"]
+        ledger._native = None
+        ledger._operation_timeout_local = threading.local()
+        ledger._statement_timeout_local = threading.local()
+        ledger._session_guards = make_session_guards(read_only=True)
+        completed = unittest.mock.Mock(returncode=0, stdout="{}\n", stderr="")
+
+        with unittest.mock.patch.dict(
+            "os.environ",
+            {"PGOPTIONS": "-c geqo=off"},
+        ), unittest.mock.patch(
+            "lab.prism.share_ledger.subprocess.run",
+            return_value=completed,
+        ) as run:
+            ledger._run_sql("SELECT '{}'::json;")
+
+        pgoptions = run.call_args.kwargs["env"]["PGOPTIONS"]
+        self.assertIn(self.READ_ONLY_GUC, pgoptions)
+        self.assertTrue(pgoptions.startswith("-c geqo=off"))
+
+    def test_read_only_covers_a_write_method_that_never_takes_the_gate(self) -> None:
+        # release_writer_lease_fresh_connection issues an UPDATE through a
+        # one-shot psql connection, deliberately touching neither the writer
+        # gate nor the pool. It is the shape #163 is about: the gate cannot
+        # refuse it, so the session it opens must be the thing that does.
+        ledger = PsqlShareLedger(
+            psql_command="psql postgresql://example.invalid/qbit",
+            native_client_mode="0",
+            read_only=True,
+        )
+        self.addCleanup(ledger.close)
+        completed = unittest.mock.Mock(returncode=0, stdout='{"released": 0}\n', stderr="")
+
+        with unittest.mock.patch(
+            "lab.prism.share_ledger.subprocess.run",
+            return_value=completed,
+        ) as run:
+            ledger.release_writer_lease_fresh_connection()
+
+        self.assertIn("UPDATE qbit_ledger_writer_lease", run.call_args.kwargs["input"])
+        self.assertIn(
+            self.READ_ONLY_GUC,
+            run.call_args.kwargs["env"]["PGOPTIONS"],
+        )
+
+    def test_read_only_ledger_still_refuses_the_writer_gate(self) -> None:
+        # The server-side refusal is added to the in-process gate, not
+        # substituted for it.
+        ledger = PsqlShareLedger(
+            psql_command="psql postgresql://example.invalid/qbit",
+            native_client_mode="0",
+            read_only=True,
+        )
+        self.addCleanup(ledger.close)
+
+        with self.assertRaises(share_ledger_module.ReadOnlyLedgerError):
+            ledger.append(pending_share(0))
 
 
 class BoundedLeaseAcquisitionTests(unittest.TestCase):

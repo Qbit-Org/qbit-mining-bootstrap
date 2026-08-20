@@ -64,6 +64,18 @@ else
   PSQL_COMMAND="docker exec -i ${POSTGRES_CONTAINER} psql -U qbit -d qbit"
 fi
 
+# Every PsqlShareLedger session GUC rides PGOPTIONS on the psql path, and
+# "docker exec" does not forward the caller's environment, so the container
+# form silently drops them. The read-only session assertion at the end needs
+# PGOPTIONS to actually arrive, so it runs through a command that asks docker
+# to pass the variable through. An external psql inherits the environment
+# already and needs no help.
+if [[ -n "${EXTERNAL_PSQL}" ]]; then
+  PSQL_COMMAND_WITH_ENV="${PSQL_COMMAND}"
+else
+  PSQL_COMMAND_WITH_ENV="docker exec -i -e PGOPTIONS ${POSTGRES_CONTAINER} psql -U qbit -d qbit"
+fi
+
 if [[ -n "${EXTERNAL_PSQL}" ]]; then
   GATE_IMAGE="external-postgres"
   GATE_IMAGE_DIGEST="not-applicable"
@@ -75,6 +87,7 @@ fi
 (
   cd "${ROOT_DIR}"
   PRISM_PSQL_COMMAND="${PSQL_COMMAND}" \
+  PRISM_PSQL_COMMAND_WITH_ENV="${PSQL_COMMAND_WITH_ENV}" \
     python3 <<'PY'
 from __future__ import annotations
 
@@ -173,6 +186,7 @@ SET updated_at = clock_timestamp() - interval '6 minutes',
 
 
 psql = os.environ["PRISM_PSQL_COMMAND"]
+psql_with_env = os.environ["PRISM_PSQL_COMMAND_WITH_ENV"]
 ledger = PsqlShareLedger(
     psql_command=psql,
     writer_id="writer-a",
@@ -1857,7 +1871,55 @@ for network_difficulty, expected_len in [(512, 4096), (1024, 8192), (1025, 8200)
         f"multi-page audit window crossing row at network difficulty {network_difficulty}",
     )
 
-print("prism postgres ledger PASS shares=14 lease=replay startup-retry persist-fence sql-window maturity=reorg carry-replay integrity multipage-window=9000")
+# A read-only ledger against this writable primary. Everything above proved
+# the database accepts writes, which is exactly what makes it the right target:
+# a standby would refuse these writes whoever asked, so it can never show that
+# read_only=True is what refused them.
+read_only_ledger = PsqlShareLedger(
+    psql_command=psql_with_env,
+    writer_id="public-read",
+    writer_epoch=1,
+    read_only=True,
+)
+
+# release_writer_lease_fresh_connection issues an UPDATE over a one-shot psql
+# connection, taking neither the writer gate nor the pool. The in-process gate
+# cannot refuse it, so the server must.
+try:
+    read_only_ledger.release_writer_lease_fresh_connection()
+except RuntimeError as exc:
+    if "read-only transaction" not in str(exc):
+        raise
+else:
+    raise SystemExit("read-only ledger wrote to a writable primary")
+
+# The read tier still reads: the session is read-only, not unusable. This goes
+# through a read slot, which is the gate every public route takes; all_shares()
+# and the other O(n) reads take the writer gate and are refused in-process,
+# which is the pre-existing half of the promise.
+assert_equal(
+    read_only_ledger.accepted_share_stats()["accepted_share_count"] > 0,
+    True,
+    "read-only ledger still serves reads",
+)
+read_only_ledger.close()
+
+# The same statement, the same identity, the same database, differing only in
+# read_only: it lands. So the refusal above is the read-only session and not
+# the statement, the schema, or the state of the lease row.
+control_writer = PsqlShareLedger(
+    psql_command=psql_with_env,
+    writer_id="public-read",
+    writer_epoch=1,
+)
+assert_equal(
+    control_writer.release_writer_lease_fresh_connection(),
+    True,
+    "writable ledger of the same identity still releases its own lease",
+)
+control_writer.close()
+
+print("prism postgres ledger PASS shares=14 lease=replay startup-retry persist-fence sql-window maturity=reorg carry-replay integrity multipage-window=9000 read-only-session")
 PY
 
   PRISM_PSQL_COMMAND="${PSQL_COMMAND}" \

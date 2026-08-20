@@ -82,6 +82,7 @@ done
   cd "${ROOT_DIR}"
   PRISM_TEST_DATABASE_URL="${DATABASE_URL}" \
   PRISM_TEST_PSQL_COMMAND="docker exec -i ${POSTGRES_CONTAINER} psql -U qbit -d qbit" \
+  PRISM_TEST_PSQL_COMMAND_WITH_ENV="docker exec -i -e PGOPTIONS ${POSTGRES_CONTAINER} psql -U qbit -d qbit" \
     python3 <<'PY'
 from __future__ import annotations
 
@@ -119,6 +120,10 @@ def assert_equal(actual: object, expected: object, message: str) -> None:
 
 database_url = os.environ["PRISM_TEST_DATABASE_URL"]
 psql_command = os.environ["PRISM_TEST_PSQL_COMMAND"]
+# Session GUCs reach a psql subprocess through PGOPTIONS, and "docker exec"
+# does not forward the caller's environment, so the read-only assertions below
+# use a command that asks docker to pass the variable through.
+psql_command_with_env = os.environ["PRISM_TEST_PSQL_COMMAND_WITH_ENV"]
 
 ledger = PsqlShareLedger(
     psql_command=psql_command,
@@ -269,7 +274,76 @@ assert_equal(
 fallback.release_writer_lease()
 fallback.close()
 
-print("prism postgres native ledger: OK")
+# A read-only ledger against this writable primary. The database has accepted
+# every write above, which is what makes it the right target: a standby would
+# refuse these writes whoever asked, so it could never show that read_only=True
+# is what refused them.
+read_only_ledger = PsqlShareLedger(
+    psql_command=psql_command_with_env,
+    database_url=database_url,
+    native_client_mode="1",
+    writer_id="public-read",
+    writer_epoch=1,
+    read_only=True,
+)
+assert_equal(
+    read_only_ledger.execution_backend,
+    "psycopg-pool",
+    "read-only ledger uses the pooled native client",
+)
+
+# One instance, two kinds of connection. The pooled psycopg session runs the
+# writer-lease upsert -- production's own gate-free write, reached here
+# directly because a read-only ledger deliberately never runs it at startup.
+try:
+    read_only_ledger._try_acquire_writer_lease()
+except Exception as exc:
+    if "read-only transaction" not in str(exc):
+        raise
+else:
+    raise SystemExit("read-only pooled session wrote to a writable primary")
+
+# ...and the one-shot psql connection runs the lease release, which takes
+# neither the writer gate nor the pool, so nothing in-process can refuse it.
+try:
+    read_only_ledger.release_writer_lease_fresh_connection()
+except RuntimeError as exc:
+    if "read-only transaction" not in str(exc):
+        raise
+else:
+    raise SystemExit("read-only psql connection wrote to a writable primary")
+
+# Reads still work: the session is read-only, not unusable. A read slot is the
+# gate every public route takes; the O(n) reads take the writer gate and are
+# refused in-process, which is the pre-existing half of the promise.
+assert_equal(
+    read_only_ledger.accepted_share_stats()["accepted_share_count"],
+    share_count,
+    "read-only ledger still serves reads over the pool",
+)
+read_only_ledger.close()
+
+# The same two statements, the same identity, differing only in read_only.
+control_writer = PsqlShareLedger(
+    psql_command=psql_command_with_env,
+    database_url=database_url,
+    native_client_mode="1",
+    writer_id="public-read",
+    writer_epoch=1,
+)
+assert_equal(
+    control_writer._try_acquire_writer_lease()["acquired"],
+    True,
+    "writable pooled session still acquires the lease",
+)
+assert_equal(
+    control_writer.release_writer_lease_fresh_connection(),
+    True,
+    "writable psql connection still releases the lease",
+)
+control_writer.close()
+
+print("prism postgres native ledger: OK read-only-session")
 PY
 )
 
