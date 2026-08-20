@@ -1059,6 +1059,89 @@ _OUTBOX_ERROR_RE = re.compile(r"last_error = (NULL|'(?:[^']|'')*')")
 _OUTBOX_SHA_RE = re.compile(r"candidate_sha256 <> '([0-9a-f]+)'")
 
 
+#: Keys the acquire statement's terminal arm may name that this model knows
+#: how to answer when no lease row is visible to it. ``acquired`` is false by
+#: construction on that arm; the holder and lease columns have nothing to
+#: report because no row is visible; and a ``retry`` flag is what the arm
+#: exists to raise. Any other key is a shape this model has not been taught,
+#: and is refused loudly rather than guessed at.
+_ACQUIRE_TERMINAL_NULL_KEYS = frozenset(
+    {
+        "writer_id",
+        "writer_epoch",
+        "writer_session_token",
+        "lease_expires_at",
+        "lease_updated_at",
+        "lease_age_seconds",
+        "lease_wait_seconds",
+    }
+)
+
+
+def _balanced_call_body(text: str, open_index: int) -> str:
+    """Return the argument text of a call whose ``(`` is at ``open_index``."""
+    depth = 0
+    for index in range(open_index, len(text)):
+        char = text[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_index + 1 : index]
+    raise UnsupportedStatement("acquire statement has unbalanced parentheses")
+
+
+def acquire_result_arms(sql: str) -> int:
+    """Count the result arms of the acquire statement's final COALESCE.
+
+    The acquire statement ends in ``SELECT COALESCE(<arm>, <arm>, ...)``. At
+    this baseline there are exactly two: the ``RETURNING`` row of the upsert
+    (acquired) and the committed holder row (not acquired). Both can be empty
+    at once -- two coordinators racing the very first acquire -- and the
+    statement then evaluates to SQL NULL, which the ports turn into
+    production's "postgres query returned no JSON".
+
+    Issue #140 adds an explicit not-acquired/retry arm so that race reports a
+    lease outcome instead of what reads as a driver fault. That is a change to
+    the shipped statement, so this model keys off the statement rather than
+    off a version flag or a local constant: a statement carrying a terminal
+    arm cannot evaluate to NULL, and continuing to model it as if it could
+    would let a scenario assert an outcome the server can no longer produce --
+    the exact class of harness lie this suite exists to prevent.
+
+    Counting arms rather than matching a chosen literal is deliberate: the arm
+    has to exist for the fix to work, whatever its author names its keys.
+    """
+    _head, separator, tail = sql.partition("SELECT COALESCE(")
+    if not separator:
+        raise UnsupportedStatement(
+            "acquire statement does not end in the SELECT COALESCE this model "
+            "recognises; its result shape changed and the lease evaluator has "
+            "to be re-read against it rather than assumed:\n" + sql.strip()[:400]
+        )
+    arms = tail.count("'acquired',")
+    if arms < 2:
+        raise UnsupportedStatement(
+            f"acquire statement's COALESCE names {arms} result arm(s); this "
+            "model knows the two-arm shape (acquired / holder) and the "
+            "three-or-more-arm shape issue #140 adds. Fewer than two is a "
+            "shape it has never seen."
+        )
+    return arms
+
+
+def acquire_terminal_arm_keys(sql: str) -> tuple[str, ...]:
+    """Return the keys named by the last ``json_build_object`` arm."""
+    _head, _separator, tail = sql.partition("SELECT COALESCE(")
+    marker = "json_build_object("
+    index = tail.rfind(marker)
+    if index < 0:
+        raise UnsupportedStatement("acquire statement's terminal arm builds no JSON object")
+    body = _balanced_call_body(tail, index + len(marker) - 1)
+    return tuple(re.findall(r"'([a-z_]+)'\s*,", body))
+
+
 def classify(sql: str) -> Statement:
     """Map one production statement onto the operation it performs."""
     for op, fragments in _SIGNATURES:
@@ -1696,8 +1779,41 @@ class FakePostgres:
             claim()
             return acquired
         if snapshot is None:
-            return None
+            return self._unobserved_not_acquired(statement)
         return self._observed(snapshot, acquired=False)
+
+    def _unobserved_not_acquired(self, statement: Statement) -> dict[str, Any] | None:
+        """Answer a race whose loser can see neither the upsert nor a holder.
+
+        Which answer is correct is a property of the shipped statement, not of
+        this harness, so it is read off the statement every time. The two-arm
+        shape evaluates to SQL NULL here; the shape issue #140 adds carries a
+        terminal arm and therefore cannot.
+        """
+        if acquire_result_arms(statement.sql) == 2:
+            return None
+        payload: dict[str, Any] = {}
+        for key in acquire_terminal_arm_keys(statement.sql):
+            if key == "acquired":
+                payload[key] = False
+            elif key in _ACQUIRE_TERMINAL_NULL_KEYS:
+                # Nothing is visible to report a holder from; the arm exists
+                # precisely for that case.
+                payload[key] = None
+            elif "retry" in key:
+                payload[key] = True
+            else:
+                raise UnsupportedStatement(
+                    f"the acquire statement's terminal arm names {key!r}, which "
+                    "this model does not know how to answer. Teach it that key "
+                    "rather than letting a scenario assert against a guess."
+                )
+        if "acquired" not in payload:
+            raise UnsupportedStatement(
+                "the acquire statement's terminal arm does not name 'acquired'; "
+                "the lease evaluator cannot report an outcome from it"
+            )
+        return payload
 
     @staticmethod
     def _adopt_matches(statement: Statement, row: LeaseRow) -> bool:
@@ -2966,6 +3082,8 @@ __all__ = [
     "Transaction",
     "UnsupportedStatement",
     "VirtualClock",
+    "acquire_result_arms",
+    "acquire_terminal_arm_keys",
     "advisory_lock_pair",
     "assert_deterministic",
     "classify",
