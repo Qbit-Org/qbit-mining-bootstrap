@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from lab.prism.coordinator_config import (
+    DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX,
     DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS,
     DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS,
 )
@@ -34,6 +35,7 @@ from lab.prism.job_delivery import (
     PRISM_EVICTED_JOB_SUBMIT_OUTCOMES,
 )
 from lab.prism.metrics import MetricsRenderer
+from lab.prism.payout_state import AcceptedBlockPayoutTransition
 from lab.prism.prism_coordinator import PRISM_REJECTION_REASON_IDS
 from lab.prism.reorg_reconciler import (
     PRISM_REORG_RECONCILE_LOOKUP_PATHS,
@@ -187,6 +189,8 @@ def reference_landing_observability_metrics_lines(server) -> list[str]:
                 f'qbit_prism_block_ledger_call_max_duration_seconds{{call_class="{label}"}} {float(stats["max_duration_seconds"]):.6f}',
             ]
         )
+    unresolved_depth = server._accepted_parent_unresolved_depth()
+    unresolved_depth_cap = server._accepted_parent_unresolved_depth_cap()
     unresolved_ages = server.accepted_parent_unresolved_ages_seconds()
     oldest_unresolved = max(unresolved_ages) if unresolved_ages else -1.0
     with server.lock:
@@ -197,7 +201,10 @@ def reference_landing_observability_metrics_lines(server) -> list[str]:
         [
             "# HELP qbit_prism_accepted_parent_unresolved_transitions Landed accepted-block transitions whose durable bookkeeping is unresolved.",
             "# TYPE qbit_prism_accepted_parent_unresolved_transitions gauge",
-            f"qbit_prism_accepted_parent_unresolved_transitions {len(unresolved_ages)}",
+            f"qbit_prism_accepted_parent_unresolved_transitions {unresolved_depth}",
+            "# HELP qbit_prism_accepted_parent_unresolved_depth_max Configured unresolved accepted-parent depth at which job admission fails closed.",
+            "# TYPE qbit_prism_accepted_parent_unresolved_depth_max gauge",
+            f"qbit_prism_accepted_parent_unresolved_depth_max {unresolved_depth_cap}",
             "# HELP qbit_prism_accepted_parent_unresolved_oldest_seconds Age of the oldest unresolved accepted-parent transition, or -1 when none.",
             "# TYPE qbit_prism_accepted_parent_unresolved_oldest_seconds gauge",
             f"qbit_prism_accepted_parent_unresolved_oldest_seconds {oldest_unresolved:.6f}",
@@ -1469,6 +1476,94 @@ class MetricsRendererTests(unittest.TestCase):
                 f'{histograms[result]["count"]}',
                 lines,
             )
+
+
+class AcceptedParentUnresolvedDepthGaugeTests(unittest.TestCase):
+    """The depth gauge must read exactly what the admission fence counts."""
+
+    def _coordinator(self):
+        server = support.coordinator()
+        server._ensure_job_cache_state()
+        return server
+
+    def _landing_lines(self, server) -> list[str]:
+        return MetricsRenderer(server).landing_observability_metrics_lines()
+
+    def _arm_landed_without_timestamp(self, server, block_hash: str) -> None:
+        """Reproduce the landed transitions that carry no monotonic stamp.
+
+        Both the degraded preview-publication fallback and the durable
+        candidate replay reconstruct a transition from the dataclass default,
+        so ``landed`` is armed while ``landed_monotonic`` stays ``None``.
+        """
+        with server._accepted_block_payout_preview_condition:
+            server._accepted_block_payout_previews[block_hash] = (
+                AcceptedBlockPayoutTransition(block_height=11, landed=True)
+            )
+
+    def test_depth_gauge_counts_a_landed_transition_with_no_timestamp(self) -> None:
+        server = self._coordinator()
+        self._arm_landed_without_timestamp(server, "cd" * 32)
+        # The age list cannot see this transition, so a gauge derived from it
+        # would report zero while the fence already counts depth one.
+        self.assertEqual(server.accepted_parent_unresolved_ages_seconds(), [])
+        self.assertEqual(server._accepted_parent_unresolved_depth(), 1)
+        lines = self._landing_lines(server)
+        self.assertIn("qbit_prism_accepted_parent_unresolved_transitions 1", lines)
+        # No timestamp means no age to invent: the oldest gauge reports -1
+        # rather than fabricating an age for the transition depth just counted.
+        self.assertIn(
+            "qbit_prism_accepted_parent_unresolved_oldest_seconds -1.000000",
+            lines,
+        )
+
+    def test_depth_gauge_matches_the_fence_across_mixed_transitions(self) -> None:
+        server = self._coordinator()
+        timestamped = "ce" * 32
+        server._begin_accepted_block_payout_preview(timestamped, block_height=10)
+        server._mark_accepted_block_payout_landed(timestamped, block_height=10)
+        self._arm_landed_without_timestamp(server, "cf" * 32)
+        # A pending (not yet landed) transition stays out of both signals.
+        server._begin_accepted_block_payout_preview("d0" * 32, block_height=12)
+        self.assertEqual(len(server.accepted_parent_unresolved_ages_seconds()), 1)
+        self.assertEqual(server._accepted_parent_unresolved_depth(), 2)
+        lines = self._landing_lines(server)
+        self.assertIn("qbit_prism_accepted_parent_unresolved_transitions 2", lines)
+        self.assertNotIn(
+            "qbit_prism_accepted_parent_unresolved_oldest_seconds -1.000000",
+            lines,
+        )
+
+    def test_depth_gauge_is_zero_without_landed_transitions(self) -> None:
+        server = self._coordinator()
+        lines = self._landing_lines(server)
+        self.assertIn("qbit_prism_accepted_parent_unresolved_transitions 0", lines)
+        self.assertIn(
+            "qbit_prism_accepted_parent_unresolved_oldest_seconds -1.000000",
+            lines,
+        )
+
+    def test_exported_cap_is_the_runtime_configured_cap(self) -> None:
+        server = self._coordinator()
+        # The unconfigured runtime falls back to the shipped default.
+        self.assertEqual(
+            server._accepted_parent_unresolved_depth_cap(),
+            DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX,
+        )
+        self.assertIn(
+            "qbit_prism_accepted_parent_unresolved_depth_max "
+            f"{DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX}",
+            self._landing_lines(server),
+        )
+        # A non-default configured cap must reach the exposition too, so an
+        # alert can compare the depth against the limit actually enforced.
+        non_default = DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX + 3
+        server.accepted_parent_unresolved_depth_max = non_default
+        self.assertEqual(server._accepted_parent_unresolved_depth_cap(), non_default)
+        self.assertIn(
+            f"qbit_prism_accepted_parent_unresolved_depth_max {non_default}",
+            self._landing_lines(server),
+        )
 
 
 if __name__ == "__main__":
