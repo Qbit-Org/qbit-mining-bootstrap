@@ -102,7 +102,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
             connection_id=state.connection_id,
             difficulty_generation=0,
         )
-        server.pending_initial_jobs[state] = request
+        server.pending_initial_jobs = {state: request}
         results: list[bool | None] = []
 
         with vardiff_lock:
@@ -155,7 +155,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
             connection_id=state.connection_id,
             difficulty_generation=0,
         )
-        server.pending_initial_jobs[state] = request
+        server.pending_initial_jobs = {state: request}
         results: list[bool | None] = []
 
         with vardiff_lock:
@@ -211,7 +211,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
             connection_id=state.connection_id,
             difficulty_generation=0,
         )
-        server.pending_initial_jobs[state] = request
+        server.pending_initial_jobs = {state: request}
         results: list[bool | None] = []
 
         with vardiff_lock:
@@ -326,7 +326,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
             connection_id=state.connection_id,
             difficulty_generation=0,
         )
-        server.pending_initial_jobs[state] = request
+        server.pending_initial_jobs = {state: request}
         artifacts = server.current_template_artifacts()
         waits: list[float] = []
         request.cancelled.wait = (  # type: ignore[method-assign]
@@ -377,7 +377,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
             connection_id=state.connection_id,
             difficulty_generation=0,
         )
-        server.pending_initial_jobs[state] = request
+        server.pending_initial_jobs = {state: request}
         artifacts = server.current_template_artifacts()
         waits: list[float] = []
         request.cancelled.wait = (  # type: ignore[method-assign]

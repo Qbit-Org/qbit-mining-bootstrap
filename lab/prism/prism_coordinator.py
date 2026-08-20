@@ -891,8 +891,17 @@ class _CoordinatorObservability(ObservabilityPort):
 
     def mining_delivery_inputs(self, now: float) -> MiningDeliveryInputs:
         coordinator = self.coordinator
+        coordinator._ensure_initial_job_state()
+        # The first-job admission domain is owned by its own lock in the S2
+        # service. Copy it once, before the coordinator lock is taken, so this
+        # refresh never holds both locks and never reads a half-committed
+        # replacement (#159).
+        admission = (
+            coordinator._ensure_job_delivery_service()
+            .initial_job_admission_snapshot()
+        )
+        pending_jobs = admission.pending
         with coordinator.lock:
-            coordinator._ensure_initial_job_state()
             active = len(coordinator.clients)
             current_tip = coordinator._current_published_tip_hash_locked()
             published_snapshot = getattr(coordinator, "tip_template_snapshot", None)
@@ -940,7 +949,7 @@ class _CoordinatorObservability(ObservabilityPort):
             clients_with_no_active_job = sum(
                 1 for client in authorized_clients if client.active_job is None
             )
-            pending_requests = list(coordinator.pending_initial_jobs.values())
+            pending_requests = list(pending_jobs.values())
             pending = len(pending_requests)
             oldest_age = max(
                 (
@@ -960,8 +969,8 @@ class _CoordinatorObservability(ObservabilityPort):
                 for started in (
                     client.authorized_monotonic,
                     (
-                        coordinator.pending_initial_jobs[client].requested_monotonic
-                        if client in coordinator.pending_initial_jobs
+                        pending_jobs[client].requested_monotonic
+                        if client in pending_jobs
                         else None
                     ),
                 )
@@ -980,20 +989,22 @@ class _CoordinatorObservability(ObservabilityPort):
             )
             pending_limit = int(coordinator.stratum_max_pending_initial_jobs)
             timeout = float(coordinator.stratum_initial_job_timeout_seconds)
-            timeout_disconnects = coordinator.initial_job_timeout_count
-            queue_rejections = coordinator.initial_job_queue_rejection_count
-            cancelled = coordinator.initial_job_cancelled_count
-            coalesced = coordinator.initial_job_coalesced_count
-            queue_capacity_reclaimed = (
-                coordinator.initial_job_queue_capacity_reclaimed_count
-            )
+            timeout_disconnects = admission.timeout_disconnects
+            queue_rejections = admission.queue_rejections
+            cancelled = admission.cancelled
+            coalesced = admission.coalesced
+            queue_capacity_reclaimed = admission.queue_capacity_reclaimed
             peak = coordinator.peak_active_connection_count
             handlers = coordinator.handler_thread_count
-            last_delivery = getattr(
-                coordinator,
-                "last_initial_job_delivery_monotonic",
-                None,
-            )
+            last_delivery = admission.last_delivery_monotonic
+
+        # This census is the fleet's only current-tip coverage scan: job
+        # delivery used to repeat it per delivered job under the coordinator
+        # lock, which made every reconnect herd O(N^2) inside the lock the herd
+        # was already queued on (#159). Restored coverage resets the delivery
+        # failure here, after the snapshot and outside the lock.
+        if authorized == 0 or current / authorized >= 0.95:
+            coordinator._ensure_observability_service().reset_delivery_failure()
 
         coordinator._ensure_job_cache_state()
         with coordinator._job_cache_lock:
@@ -5390,23 +5401,6 @@ class PrismCoordinator:
         return self._ensure_job_delivery_service()._client_has_current_tip_job_locked(
             client,
         )
-
-    def _reset_delivery_failure_if_coverage_restored_locked(self) -> None:
-        authorized_clients = [
-            client
-            for client in self.clients
-            if client.subscribed and client.authorized and client.worker is not None
-        ]
-        if not authorized_clients:
-            self._ensure_observability_service().reset_delivery_failure()
-            return
-        current = sum(
-            1
-            for client in authorized_clients
-            if self._client_has_current_tip_job_locked(client)
-        )
-        if current / len(authorized_clients) >= 0.95:
-            self._ensure_observability_service().reset_delivery_failure()
 
     def note_initial_job_delivered(
         self,
