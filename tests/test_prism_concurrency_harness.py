@@ -30,9 +30,13 @@ import unittest
 from typing import Any
 
 from lab.prism import share_ledger as share_ledger_module
-from lab.prism.share_ledger import DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS
+from lab.prism.share_ledger import (
+    DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS,
+    PendingShare,
+)
 from tests.prism_concurrency_harness import (
     HarnessError,
+    LandingOp,
     LeaseHarness,
     LeaseOp,
     NotRunnable,
@@ -43,6 +47,14 @@ from tests.prism_concurrency_harness import (
     assert_deterministic,
     classify,
 )
+
+
+def _source_of(member: Any) -> str:
+    """Return a member's source, or an empty string when it has none."""
+    try:
+        return inspect.getsource(member)
+    except (OSError, TypeError):
+        return ""
 
 
 class StatementClassificationTests(unittest.TestCase):
@@ -145,6 +157,124 @@ class StatementClassificationTests(unittest.TestCase):
             classify("UPDATE qbit_block_candidate_outbox SET quarantined = true")
         self.assertIn("does not model this statement", str(caught.exception))
         self.assertIn("_LANDING_SIGNATURES", str(caught.exception))
+
+    def test_shipped_share_append_is_not_read_as_the_outbox_state_machine(
+        self,
+    ) -> None:
+        """A share append must not be misnamed as the outbox state machine.
+
+        ``_append_batch_with_replay_outcomes`` opens the very same
+        ``INSERT INTO qbit_block_candidate_outbox (`` and raises the very same
+        ``'block candidate payload mismatch'`` as
+        ``persist_block_candidate_intent``. Those two fragments alone therefore
+        match a share submission, and the classifier answered one with the
+        outbox evaluator: the statement was reported against the wrong state
+        machine, so the failure argued for an outbox bug that did not exist and
+        hid the deferral that did. This drives the shipped ``append_batch`` and
+        requires the captured statement to reach ``_DEFERRED_SIGNATURES``.
+        """
+        share = PendingShare(
+            share_id="miner-a:1",
+            miner_id="miner-a",
+            order_key="miner-a",
+            p2mr_program_hex="22" * 32,
+            share_difficulty=1,
+            network_difficulty=1,
+            template_height=9,
+            job_id="job-1",
+            job_issued_at_ms=1,
+            accepted_at_ms=2,
+            ntime=1_700_000_000,
+        )
+        candidate = {"block_hash_hex": "ab" * 32}
+
+        captured: list[str] = []
+        with LeaseHarness() as harness:
+            alpha = harness.coordinator("alpha")
+            alpha.start()
+            harness.run_until(alpha, "done:startup")
+
+            # Capture at the port. The classifier rejects this statement, so it
+            # never reaches server.statements; the raw SQL has to be taken on
+            # the way in rather than read back out of the recognised trace.
+            executed = harness.server.execute
+
+            def capturing_execute(backend: Any, sql: str, **kwargs: Any) -> Any:
+                captured.append(sql)
+                return executed(backend, sql, **kwargs)
+
+            harness.server.execute = capturing_execute  # type: ignore[method-assign]
+
+            with self.assertRaises(UnsupportedStatement) as caught:
+                alpha.call(
+                    lambda: alpha.ledger.append_batch([(share, candidate)]),
+                    label="append",
+                )
+
+        # The statement really is ambiguous under the two original fragments;
+        # if production stops emitting both, this test is no longer guarding
+        # anything and should fail rather than quietly pass.
+        self.assertEqual(len(captured), 1)
+        sql = captured[0]
+        self.assertIn("INSERT INTO qbit_block_candidate_outbox (", sql)
+        self.assertIn("'block candidate payload mismatch'", sql)
+        self.assertIn("INSERT INTO qbit_share_ledger", sql)
+
+        # The discriminator: a share append claims a colliding outbox row,
+        # it does not leave it alone.
+        self.assertIn("ON CONFLICT (block_hash) DO UPDATE", sql)
+        self.assertNotIn("ON CONFLICT (block_hash) DO NOTHING", sql)
+
+        # Both the in-flight rejection and a direct classification of the
+        # captured statement have to name the same state machine.
+        with self.assertRaises(UnsupportedStatement) as direct:
+            classify(sql)
+        for message in (str(caught.exception), str(direct.exception)):
+            self.assertIn("share submission and dedupe", message)
+            self.assertIn("#128", message)
+            self.assertNotIn(LandingOp.OUTBOX_RECORD.value, message)
+
+    def test_block_candidate_intent_still_classifies_as_the_outbox_record(
+        self,
+    ) -> None:
+        """The discriminator must not cost the outbox its own classification.
+
+        Narrowing ``OUTBOX_RECORD`` is only correct if the statement it exists
+        for still matches, so this pins the other direction of the same change.
+        """
+        with LeaseHarness() as harness:
+            alpha = harness.coordinator("alpha")
+            alpha.start()
+            harness.run_until(alpha, "done:startup")
+            alpha.call(
+                lambda: alpha.ledger.persist_block_candidate_intent(
+                    {"block_hash_hex": "ab" * 32}
+                ),
+                label="intent",
+            )
+            statement = harness.server.statements[-1]
+            self.assertEqual(statement.kind, LandingOp.OUTBOX_RECORD)
+            self.assertEqual(statement.payload["block_hash"], "ab" * 32)
+            self.assertIn("ON CONFLICT (block_hash) DO NOTHING", statement.sql)
+
+    def test_the_outbox_discriminator_is_unique_to_the_intent_writer(
+        self,
+    ) -> None:
+        """Pin the fragment's uniqueness to production, not to this test.
+
+        ``OUTBOX_RECORD`` is now identified by a conflict action. That is only
+        a valid identity while exactly one ledger method emits it, so if a
+        second writer starts inserting the candidate with ``DO NOTHING`` the
+        classifier is ambiguous again and this fails at that moment rather
+        than at the next confusing scenario failure.
+        """
+        discriminator = "ON CONFLICT (block_hash) DO NOTHING"
+        emitters = sorted(
+            name
+            for name, member in vars(share_ledger_module.PsqlShareLedger).items()
+            if discriminator in _source_of(member)
+        )
+        self.assertEqual(emitters, ["persist_block_candidate_intent"])
 
     def test_classifier_extracts_the_configured_ttl(self) -> None:
         with LeaseHarness(lease_ttl_seconds=17.5) as harness:

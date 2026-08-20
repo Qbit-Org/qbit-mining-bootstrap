@@ -969,6 +969,17 @@ _LANDING_SIGNATURES: tuple[tuple[LandingOp, tuple[str, ...]], ...] = (
         (
             "INSERT INTO qbit_block_candidate_outbox (",
             "'block candidate payload mismatch'",
+            # Both fragments above also occur in the share-submission append,
+            # which opens the same outbox insert and raises the same mismatch
+            # error, so on their own they name a share append as the outbox
+            # state machine. Only `persist_block_candidate_intent` inserts the
+            # candidate with no share to attach it to and therefore leaves a
+            # colliding row alone; the share append claims that row with
+            # `ON CONFLICT (block_hash) DO UPDATE`. That difference in conflict
+            # action is the discriminator, and it is load-bearing rather than
+            # incidental: it is the SQL-level statement of which caller owns
+            # the row.
+            "ON CONFLICT (block_hash) DO NOTHING",
         ),
     ),
     (
