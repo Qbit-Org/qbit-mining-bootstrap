@@ -8,6 +8,8 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from lab.prism.job_delivery import JobBuildFailed
+from lab.prism.payout_state import AcceptedParentPayoutPreviewPending
 from tests import prism_coordinator_test_support as _job_support
 from tests import prism_vardiff_test_support as _vardiff_support
 
@@ -1754,6 +1756,204 @@ class PrismCoordinatorVardiffTests(_VardiffSupportTestCase):
         self.assertIsNone(
             getattr(server, "template_refresh_failure_started_monotonic", None)
         )
+        server.stop_event.clear()
+        server.watchdog_enabled = False
+        server.watchdog_interval_seconds = 0.001
+        with (
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                return_value=clock["now"],
+            ),
+            patch(
+                "lab.prism.prism_coordinator.os._exit",
+                side_effect=SystemExit(1),
+            ) as exit_process,
+            patch("builtins.print"),
+            self.assertRaises(SystemExit),
+        ):
+            server.watchdog_loop()
+
+        exit_process.assert_called_once_with(1)
+
+
+class AcceptedParentPreviewDeliveryBoundaryTests(_VardiffSupportTestCase):
+    """#182: the three job_delivery TemplateRefreshBlocked boundaries.
+
+    The typed preview-pending exception must coalesce onto the ordinary
+    coordination retry at each boundary while staying outside
+    ``job_build_failure_count`` and the ordinary template-refresh failure
+    budget.
+    """
+
+    def _delivery_client(self, server: PrismCoordinator) -> ClientState:
+        state = client()
+        state.username = "miner-a"
+        state.worker = worker_identity()
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+        return state
+
+    @staticmethod
+    def _preview_pending() -> AcceptedParentPayoutPreviewPending:
+        return AcceptedParentPayoutPreviewPending(
+            "accepted parent payout preview is not ready yet",
+            parent_hash="cc" * 32,
+            waited_seconds=0.25,
+            timeout_count=3,
+        )
+
+    def test_reorg_boundary_propagates_preview_pending_unrelabelled(self) -> None:
+        # Boundary 2: the pre-build reorg-reconciliation guard. The generic
+        # clause below it converts failures into a plain TemplateRefreshBlocked
+        # (which is budgeted); the typed backpressure must pass through it
+        # unchanged instead.
+        server = coordinator()
+        state = self._delivery_client(server)
+        server.job_build_failure_count = 0
+        raised = self._preview_pending()
+
+        def blocked_reconcile() -> bool:
+            raise raised
+
+        server.ensure_reorg_reconciled_for_current_tip = blocked_reconcile  # type: ignore[method-assign]
+        server.build_job_for_client = lambda *_a, **_k: (  # type: ignore[method-assign]
+            self.fail("build must not run once the reorg guard blocks")
+        )
+
+        with (
+            patch("builtins.print"),
+            self.assertRaises(AcceptedParentPayoutPreviewPending) as caught,
+        ):
+            server.maybe_send_job(state, clean_jobs=True)
+
+        self.assertIs(caught.exception, raised)
+        self.assertEqual(server.job_build_failure_count, 0)
+        self.assertIsNone(
+            getattr(server, "template_refresh_failure_started_monotonic", None)
+        )
+
+    def test_build_boundary_retries_preview_pending_without_counting_it(
+        self,
+    ) -> None:
+        # Boundary 3: the client job-build boundary. Non-raising callers skip
+        # the job and retry; raising callers get the typed exception rather
+        # than the generic JobBuildFailed, and neither arms the failure count.
+        server = coordinator()
+        state = self._delivery_client(server)
+        server.job_build_failure_count = 0
+        retries: list[int] = []
+        server._schedule_tip_refresh_retry = lambda: retries.append(1)  # type: ignore[method-assign]
+        server.ensure_reorg_reconciled_for_current_tip = lambda: True  # type: ignore[method-assign]
+        raised = self._preview_pending()
+
+        def blocked_build(*_args: object, **_kwargs: object) -> object:
+            raise raised
+
+        server.build_job_for_client = blocked_build  # type: ignore[method-assign]
+
+        with patch("builtins.print") as logged:
+            self.assertFalse(server.maybe_send_job(state, clean_jobs=True))
+
+        self.assertEqual(server.job_build_failure_count, 0)
+        self.assertEqual(len(retries), 1)
+        # An explicit retry reason is logged instead of a build-failure
+        # traceback.
+        self.assertTrue(
+            any(
+                "accepted_parent_preview_pending" in str(call.args[0])
+                for call in logged.call_args_list
+                if call.args
+            )
+        )
+
+        # raise_on_build_failure must surface the typed backpressure, not the
+        # generic JobBuildFailed wrapper reserved for real build failures.
+        with (
+            patch("builtins.print"),
+            self.assertRaises(AcceptedParentPayoutPreviewPending) as caught,
+        ):
+            server.maybe_send_job(
+                state,
+                clean_jobs=True,
+                raise_on_build_failure=True,
+            )
+
+        self.assertIs(caught.exception, raised)
+        self.assertEqual(server.job_build_failure_count, 0)
+        self.assertEqual(len(retries), 2)
+
+    def test_build_boundary_still_counts_plain_build_failures(self) -> None:
+        # Negative control for boundary 3: an ordinary build failure keeps the
+        # generic accounting and the JobBuildFailed wrapper.
+        server = coordinator()
+        state = self._delivery_client(server)
+        server.job_build_failure_count = 0
+        server.ensure_reorg_reconciled_for_current_tip = lambda: True  # type: ignore[method-assign]
+
+        def failing_build(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("template build unavailable")
+
+        server.build_job_for_client = failing_build  # type: ignore[method-assign]
+
+        with (
+            patch("builtins.print"),
+            patch("lab.prism.job_delivery.traceback.print_exc"),
+        ):
+            self.assertFalse(server.maybe_send_job(state, clean_jobs=True))
+        self.assertEqual(server.job_build_failure_count, 1)
+
+        with (
+            patch("builtins.print"),
+            patch("lab.prism.job_delivery.traceback.print_exc"),
+            self.assertRaises(JobBuildFailed),
+        ):
+            server.maybe_send_job(
+                state,
+                clean_jobs=True,
+                raise_on_build_failure=True,
+            )
+        self.assertEqual(server.job_build_failure_count, 2)
+
+    def test_sustained_preview_pending_exits_via_coordination_budget(self) -> None:
+        # The escalation that keeps this from retrying silently forever: the
+        # ordinary template-refresh budget stays disarmed, while the separate
+        # coordination-blocked streak expires and the watchdog exits.
+        server = coordinator()
+        server.blockpoll_seconds = 0
+        server.template_refresh_failure_exit_seconds = 10.0
+        server.coordination_blocked_exit_seconds = 10.0
+        server._record_heartbeat = lambda _name: None  # type: ignore[method-assign]
+        server.rpc = TipRpc("11" * 32)
+        clock = {"now": 100.0}
+        blocked_polls = 0
+
+        def blocked_fetch() -> QbitTipTemplateSnapshot:
+            nonlocal blocked_polls
+            blocked_polls += 1
+            clock["now"] += 6.0
+            if blocked_polls >= 4:
+                server.stop_event.set()
+            raise AcceptedParentPayoutPreviewPending(
+                "accepted parent payout preview is not ready yet"
+            )
+
+        server.fetch_qbit_tip_template_snapshot = blocked_fetch  # type: ignore[method-assign]
+        with (
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                side_effect=lambda: clock["now"],
+            ),
+            patch("lab.prism.prism_coordinator.traceback.print_exc"),
+            patch("builtins.print"),
+        ):
+            server.blockpoll_loop()
+
+        self.assertEqual(blocked_polls, 4)
+        self.assertIsNone(
+            getattr(server, "template_refresh_failure_started_monotonic", None)
+        )
+        self.assertTrue(server.coordination_blocked_streak_expired(clock["now"]))
+
         server.stop_event.clear()
         server.watchdog_enabled = False
         server.watchdog_interval_seconds = 0.001

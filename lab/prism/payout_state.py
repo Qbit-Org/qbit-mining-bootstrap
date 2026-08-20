@@ -141,6 +141,46 @@ class PayoutStatePublicationBlocked(TemplateRefreshBlocked):
     """Job construction is waiting for a prepared payout publication."""
 
 
+class AcceptedParentPayoutPreviewPending(PayoutStatePublicationBlocked):
+    """A child build's bounded wait expired with its parent's preview unpublished.
+
+    Raised only for the one benign backpressure condition: an armed,
+    un-withdrawn accepted-parent transition whose prospective balances have
+    not published within ``accepted_block_payout_preview_wait_seconds``.  The
+    parent is still landing normally, so nothing has failed -- the child is
+    simply early.
+
+    Subclassing PayoutStatePublicationBlocked keeps this inside the
+    coordination-blocked family: the retry coalesces with the scheduled tip
+    refresh, it never arms ``job_build_failure_count`` or the ordinary
+    template-refresh failure budget, and a sustained continuous streak still
+    exits through the coordination-blocked watchdog rather than retrying
+    silently forever.  Callers that catch either parent keep working
+    unchanged.
+
+    Deliberately *not* used for any other block: RPC/build/trust failures,
+    withdrawn previews, unknown replay-enumeration state, unresolved-depth
+    caps, and invariant violations keep their existing types so their
+    persistence still takes the ordinary budgeted restart path.
+    """
+
+    #: Stable machine-readable reason for retry logs and delivery telemetry.
+    retry_reason = "accepted_parent_preview_pending"
+
+    def __init__(
+        self,
+        message: str = "accepted parent payout preview is not ready yet",
+        *,
+        parent_hash: str | None = None,
+        waited_seconds: float | None = None,
+        timeout_count: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.parent_hash = parent_hash
+        self.waited_seconds = waited_seconds
+        self.timeout_count = timeout_count
+
+
 @dataclass(frozen=True)
 class PayoutStateArtifact:
     """Immutable ledger-backed inputs published with one payout generation."""
@@ -3139,13 +3179,25 @@ class PayoutStateService:
             )
         if timed_out:
             with runtime.lock:
-                runtime._accepted_parent_preview_wait_timeouts = (
+                timeout_count = (
                     int(getattr(runtime, "_accepted_parent_preview_wait_timeouts", 0))
                     + 1
                 )
+                runtime._accepted_parent_preview_wait_timeouts = timeout_count
             runtime._schedule_tip_refresh_retry()
-            raise TemplateRefreshBlocked(
+            # Typed backpressure, not a failure: the transition is armed and
+            # un-withdrawn, so the parent's preview is merely late. The typed
+            # raise keeps this out of the ordinary template-refresh failure
+            # budget while the counter above (and the coordination-blocked
+            # streak the delivery boundaries feed) keeps sustained pendency
+            # visible and still escalating.
+            raise AcceptedParentPayoutPreviewPending(
                 "accepted parent payout preview is not ready yet"
+                f" (parent={selected_key} waited={wait_seconds:.3f}s"
+                f" timeouts={timeout_count})",
+                parent_hash=selected_key,
+                waited_seconds=wait_seconds,
+                timeout_count=timeout_count,
             )
         # The transition reached a terminal durable state while waiting; the
         # caller's confirmed fallback now includes the parent.
@@ -4801,6 +4853,7 @@ class PayoutStateService:
 
 __all__ = [
     "AcceptedBlockPayoutTransition",
+    "AcceptedParentPayoutPreviewPending",
     "DEFAULT_ACCEPTED_BLOCK_PAYOUT_PREVIEW_WAIT_SECONDS",
     "DEFAULT_PRISM_PAYOUT_RECONCILE_SUPERSESSION_RETRIES",
     "PRISM_PAYOUT_ARTIFACT_REARM_BACKOFF_CAP",

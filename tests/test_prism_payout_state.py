@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import unittest
+
+from lab.prism.payout_state import AcceptedParentPayoutPreviewPending
 from tests.prism_coordinator_test_support import *
 
 
@@ -4458,6 +4460,214 @@ class UnfencedAppendDrainTests(unittest.TestCase):
         server._block_submitter_thread_ident = threading.get_ident()
         server._await_unfenced_appends_predating_anchor(1000)
         self.assertEqual(stamps, [])
+
+
+class AcceptedParentPreviewBackpressureTests(unittest.TestCase):
+    """#182: the bounded accepted-parent preview wait is typed backpressure."""
+
+    def test_bounded_wait_timeout_raises_typed_preview_pending(self) -> None:
+        server, _rpc = coordinator()
+        server.accepted_block_payout_preview_wait_seconds = 0.0
+        block_hash = "b1" * 32
+        server._begin_accepted_block_payout_preview(block_hash, block_height=10)
+        server._mark_accepted_block_payout_landed(block_hash, block_height=10)
+        before = int(getattr(server, "_accepted_parent_preview_wait_timeouts", 0))
+
+        with self.assertRaises(AcceptedParentPayoutPreviewPending) as caught:
+            server._await_pending_parent_payout_preview(block_hash)
+
+        exc = caught.exception
+        # Compatibility: every caller that catches either parent still catches
+        # this, so no existing handler changes behavior.
+        self.assertIsInstance(exc, _PayoutStatePublicationBlocked)
+        self.assertIsInstance(exc, TemplateRefreshBlocked)
+        # An explicit, machine-readable retry/log reason.
+        self.assertEqual(exc.retry_reason, "accepted_parent_preview_pending")
+        self.assertEqual(exc.parent_hash, block_hash)
+        self.assertEqual(exc.waited_seconds, 0.0)
+        self.assertIn("not ready yet", str(exc))
+        # The existing timeout counter stays meaningful and is carried on the
+        # exception so a retry log can report it without a second read.
+        self.assertEqual(exc.timeout_count, before + 1)
+        self.assertEqual(
+            server._accepted_parent_preview_wait_timeouts, before + 1
+        )
+        server._clear_accepted_block_payout_preview(block_hash)
+
+    def test_published_preview_and_terminal_transition_do_not_raise(self) -> None:
+        server, _rpc = coordinator()
+        server.accepted_block_payout_preview_wait_seconds = 0.0
+        block_hash = "b2" * 32
+        preview = [
+            {
+                "recipient_id": "miner-a",
+                "order_key": "miner-a",
+                "p2mr_program_hex": "11" * 32,
+                "balance_sats": 25,
+            }
+        ]
+        server._begin_accepted_block_payout_preview(block_hash, block_height=10)
+        server._mark_accepted_block_payout_landed(block_hash, block_height=10)
+        with patch("builtins.print"):
+            server._publish_accepted_block_payout_preview(block_hash, preview)
+
+        # A published preview is the success path: no backpressure, no timeout.
+        self.assertEqual(
+            server._await_pending_parent_payout_preview(block_hash), preview
+        )
+        self.assertEqual(
+            int(getattr(server, "_accepted_parent_preview_wait_timeouts", 0)), 0
+        )
+        # A parent with no governing transition returns None untouched.
+        server._clear_accepted_block_payout_preview(block_hash)
+        self.assertIsNone(server._await_pending_parent_payout_preview(block_hash))
+        self.assertEqual(
+            int(getattr(server, "_accepted_parent_preview_wait_timeouts", 0)), 0
+        )
+
+    def test_withdrawn_preview_keeps_its_existing_type(self) -> None:
+        server, _rpc = coordinator()
+        server.accepted_block_payout_preview_wait_seconds = 0.0
+        block_hash = "b3" * 32
+        server._begin_accepted_block_payout_preview(block_hash, block_height=10)
+        server._mark_accepted_block_payout_landed(block_hash, block_height=10)
+        server._clear_accepted_block_payout_preview(
+            block_hash,
+            invalidate_published=True,
+        )
+
+        with self.assertRaisesRegex(
+            TemplateRefreshBlocked, "was withdrawn"
+        ) as caught:
+            server._await_pending_parent_payout_preview(block_hash)
+
+        self.assertNotIsInstance(
+            caught.exception, AcceptedParentPayoutPreviewPending
+        )
+        # A withdrawal is not a bounded-wait expiry, so it never touches the
+        # preview-wait timeout counter.
+        self.assertEqual(
+            int(getattr(server, "_accepted_parent_preview_wait_timeouts", 0)), 0
+        )
+
+    def test_unresolved_depth_cap_keeps_its_existing_type(self) -> None:
+        server, _rpc = coordinator()
+        server.accepted_parent_unresolved_depth_max = 1
+        server.accepted_block_payout_preview_wait_seconds = 0.0
+        hashes = ["b4" * 32, "b5" * 32]
+        for height, block_hash in enumerate(hashes, start=10):
+            server._begin_accepted_block_payout_preview(
+                block_hash, block_height=height
+            )
+            server._mark_accepted_block_payout_landed(
+                block_hash, block_height=height
+            )
+
+        with self.assertRaisesRegex(
+            TemplateRefreshBlocked, "exceeds cap"
+        ) as caught:
+            server._await_pending_parent_payout_preview(hashes[0])
+
+        self.assertNotIsInstance(
+            caught.exception, AcceptedParentPayoutPreviewPending
+        )
+        self.assertEqual(
+            int(getattr(server, "_accepted_parent_preview_wait_timeouts", 0)), 0
+        )
+        for block_hash in hashes:
+            server._clear_accepted_block_payout_preview(block_hash)
+
+    def test_owed_replay_enumeration_keeps_its_existing_type(self) -> None:
+        server, _rpc = coordinator()
+
+        class EnumLedger(FakeLedger):
+            def pending_block_candidate_rows(
+                self, *, limit: int = 32
+            ) -> list[dict[str, object]]:
+                return []
+
+        server.ledger = EnumLedger()
+        server._note_block_replay_enumeration_owed()
+
+        with self.assertRaisesRegex(
+            TemplateRefreshBlocked, "has not enumerated"
+        ) as caught:
+            server._await_pending_parent_payout_preview("b6" * 32)
+
+        self.assertNotIsInstance(
+            caught.exception, AcceptedParentPayoutPreviewPending
+        )
+
+    def test_preview_pending_uses_the_coordination_blocked_budget(self) -> None:
+        """The typed raise reaches the refresh poller as coordination churn.
+
+        Sustained pendency accrues the separate coordination-blocked streak
+        (which the publication-progress watchdog enforces) instead of arming
+        the ordinary template-refresh failure budget, so it neither retries
+        silently forever nor exits on the wrong clock.
+        """
+        server, _rpc = coordinator()
+        server.reorg_reconciler_enabled = True
+        server.accepted_block_payout_preview_wait_seconds = 0.0
+        block_hash = "b7" * 32
+        server._begin_accepted_block_payout_preview(block_hash, block_height=10)
+        server._mark_accepted_block_payout_landed(block_hash, block_height=10)
+        server.fetch_qbit_tip_template_snapshot = (  # type: ignore[method-assign]
+            lambda: (_ for _ in ()).throw(
+                AcceptedParentPayoutPreviewPending(
+                    "accepted parent payout preview is not ready yet"
+                )
+            )
+        )
+
+        with (
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                return_value=100.0,
+            ),
+            self.assertRaises(AcceptedParentPayoutPreviewPending),
+        ):
+            server.poll_qbit_tip_template_once()
+
+        self.assertIsNone(
+            getattr(server, "template_refresh_failure_started_monotonic", None)
+        )
+        self.assertFalse(server.template_refresh_failure_expired(10_000.0))
+        # The long-lived coordination escalation still runs on its own clock.
+        self.assertEqual(
+            server.coordination_blocked_streak_age_seconds(105.0), 5.0
+        )
+        server._clear_accepted_block_payout_preview(block_hash)
+
+    def test_plain_template_refresh_blocked_still_uses_generic_budget(self) -> None:
+        """Negative control: only the typed subclass is exempt."""
+        server, _rpc = coordinator()
+        server.reorg_reconciler_enabled = True
+        server.template_refresh_failure_exit_seconds = 10.0
+        server.fetch_qbit_tip_template_snapshot = (  # type: ignore[method-assign]
+            lambda: (_ for _ in ()).throw(
+                TemplateRefreshBlocked(
+                    "unable to derive exact artifacts for observed qbit template"
+                )
+            )
+        )
+
+        with (
+            patch(
+                "lab.prism.prism_coordinator.time.monotonic",
+                return_value=100.0,
+            ),
+            self.assertRaises(TemplateRefreshBlocked),
+        ):
+            server.poll_qbit_tip_template_once()
+
+        self.assertEqual(
+            server.template_refresh_failure_started_monotonic, 100.0
+        )
+        self.assertTrue(server.template_refresh_failure_expired(110.0))
+        self.assertEqual(
+            server.coordination_blocked_streak_age_seconds(110.0), 0.0
+        )
 
 
 if __name__ == "__main__":

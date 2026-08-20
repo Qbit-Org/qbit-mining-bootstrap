@@ -6,7 +6,9 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
+from lab.prism.payout_state import AcceptedParentPayoutPreviewPending
 from lab.prism.prism_coordinator import (
     PendingInitialJob,
     PRISM_JOB_EXTRANONCE1_PLACEHOLDER_HEX,
@@ -296,6 +298,62 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         self.assertEqual(
             server.progress_health_snapshot()["eligible_clients_requiring_refresh"],
             0,
+        )
+
+    def test_initial_delivery_retries_preview_pending_without_counting_it(
+        self,
+    ) -> None:
+        # Boundary 1 (#182): the initial-job loop coalesces accepted-parent
+        # preview backpressure onto its ordinary bounded retry. The client
+        # stays connected, the job still lands, and the benign wait never
+        # reaches the generic job_build_failure_count accounting reserved for
+        # real build failures.
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.prewarm_current_tip_ready_bundle()
+        state = client(1)
+        state.authorization_generation = 1
+        state.authorized_monotonic = time.monotonic()
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+
+        bundle_attempts = 0
+        original_shared_job_bundle = server.shared_job_bundle
+
+        def blocked_then_ready(*args: object, **kwargs: object) -> object:
+            nonlocal bundle_attempts
+            bundle_attempts += 1
+            if bundle_attempts == 1:
+                raise AcceptedParentPayoutPreviewPending(
+                    "accepted parent payout preview is not ready yet",
+                    parent_hash="cc" * 32,
+                    waited_seconds=0.25,
+                    timeout_count=1,
+                )
+            return original_shared_job_bundle(*args, **kwargs)  # type: ignore[operator]
+
+        server.shared_job_bundle = blocked_then_ready  # type: ignore[method-assign]
+
+        with patch("builtins.print") as logged:
+            try:
+                server.request_initial_job_delivery(state)
+                wait_until(lambda: state.active_job is not None)
+            finally:
+                server.shutdown_tip_refresh_executor()
+            log_lines = [
+                str(call.args[0]) for call in logged.call_args_list if call.args
+            ]
+
+        self.assertEqual(bundle_attempts, 2)
+        # Retried, not counted: the benign wait stays out of the generic
+        # build-failure budget.
+        self.assertEqual(server.job_build_failure_count, 0)
+        self.assertIn(state, server.clients)
+        self.assertIsNotNone(state.active_job)
+        # The retry carries an explicit reason instead of a failure traceback.
+        self.assertTrue(
+            any("accepted_parent_preview_pending" in line for line in log_lines),
+            log_lines,
         )
 
     def test_initial_delivery_backs_off_after_superseded_work(self) -> None:
