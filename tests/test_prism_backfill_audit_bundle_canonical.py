@@ -10,6 +10,7 @@ import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from lab.prism.audit_artifacts import AuditArtifactConfig, AuditArtifactStore
 from lab.prism.backfill_audit_bundle_canonical import (
@@ -20,7 +21,9 @@ from lab.prism.backfill_audit_bundle_canonical import (
     DEFAULT_BATCH_SIZE,
     MissingCanonicalCapability,
     audit_bundle_page_sql,
+    build_audit_store_from_env,
     build_parser,
+    ledger_from_args,
 )
 from lab.prism.share_ledger import PsqlShareLedger
 
@@ -1013,6 +1016,44 @@ class ConstructionTest(unittest.TestCase):
     def test_limit_must_be_positive_when_given(self) -> None:
         with self.assertRaises(ValueError):
             self._backfill(limit=0)
+
+    def test_dry_run_store_has_no_publication_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = build_audit_store_from_env(
+                {
+                    "PRISM_AUDIT_DIR": str(root),
+                    "PRISM_EVIDENCE_PATH": str(root / "evidence.json"),
+                },
+                read_only=True,
+            )
+            try:
+                self.assertFalse((root / ".prism-audit-publication.lock").exists())
+                payload = b'{"schema":"qbit.prism.audit-bundle.v1"}'
+                with self.assertRaisesRegex(RuntimeError, "read-only"):
+                    store.write_canonical_audit_bundle(
+                        "ab" * 32,
+                        sha256_hex(payload),
+                        payload,
+                    )
+            finally:
+                store.close()
+
+    def test_dry_run_ledger_uses_read_only_database_sessions(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--dry-run",
+                "--psql-command",
+                "psql postgresql://example.invalid/qbit",
+            ]
+        )
+        with mock.patch(
+            "lab.prism.backfill_audit_bundle_canonical.PsqlShareLedger"
+        ) as constructor:
+            ledger_from_args(args, mock.sentinel.store)
+
+        self.assertTrue(constructor.call_args.kwargs["read_only"])
+        self.assertFalse(constructor.call_args.kwargs["initialize_schema"])
 
 
 class CommandLineTest(unittest.TestCase):

@@ -3320,6 +3320,10 @@ class AuditArtifactStore:
                 )
 
     def _write_immutable_bytes(self, path: Path, payload: bytes) -> None:
+        if getattr(self, "_read_only", False):
+            raise RuntimeError(
+                "audit artifact store is read-only: publication is not available"
+            )
         path = Path(path).absolute()
         if (
             path.parent.resolve(strict=True) != self._root

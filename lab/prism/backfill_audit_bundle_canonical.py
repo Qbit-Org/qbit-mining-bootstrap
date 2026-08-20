@@ -813,6 +813,8 @@ def _expected_segment_digest(extra: Mapping[str, Any]) -> str | None:
 
 def build_audit_store_from_env(
     environ: Mapping[str, str] | None = None,
+    *,
+    read_only: bool = False,
 ) -> AuditArtifactStore:
     """Open the audit artifact root the way every PRISM entry point does."""
 
@@ -832,6 +834,7 @@ def build_audit_store_from_env(
             ),
         ),
         canonicalizer=canonical_bundle_bytes,
+        read_only=read_only,
     )
 
 
@@ -957,7 +960,8 @@ def ledger_from_args(
         writer_id=args.writer_id,
         writer_epoch=args.writer_epoch,
         writer_session_token=args.writer_session_token,
-        initialize_schema=not args.no_init_schema,
+        initialize_schema=not args.no_init_schema and not args.dry_run,
+        read_only=args.dry_run,
         lease_ttl_seconds=args.lease_ttl_seconds,
         lease_acquire_lock_timeout_seconds=args.lease_acquire_lock_timeout_seconds,
         lease_acquire_attempts=args.lease_acquire_attempts,
@@ -989,7 +993,7 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         raise SystemExit(f"--start-after is invalid: {exc}") from exc
 
-    store = build_audit_store_from_env()
+    store = build_audit_store_from_env(read_only=args.dry_run)
     # Bind the canonical artifact API before opening the database: a phase-2
     # signature that has not landed here should fail without first taking a
     # writer lease.
