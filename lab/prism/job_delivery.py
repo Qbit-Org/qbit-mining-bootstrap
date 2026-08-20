@@ -21,8 +21,9 @@ does.
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Mapping
 from concurrent.futures import Future
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace as dataclass_replace
 from decimal import Decimal
 import json
@@ -142,6 +143,113 @@ class PendingInitialJob:
     predecessor: Future[bool] | None = None
 
 
+@dataclass(frozen=True)
+class InitialJobAdmissionSnapshot:
+    """One internally consistent copy of the first-job admission domain.
+
+    Metrics and health readers take this instead of reaching into the live
+    admission state, so an observability refresh never has to hold the
+    coordinator lock and the admission lock at the same time (#159).
+    """
+
+    pending: dict[Any, PendingInitialJob]
+    queue_rejections: int
+    timeout_disconnects: int
+    cancelled: int
+    coalesced: int
+    queue_capacity_reclaimed: int
+    last_delivery_monotonic: float | None
+
+
+class PendingInitialJobsView(Mapping):
+    """Read-only, lock-protected view of the first-job admission map.
+
+    The mutable mapping is private to :class:`JobDeliveryService` and is only
+    ever read or written under the admission lock.  Every compatibility reader
+    -- the session owner's reauthorization capacity pre-check, health and
+    metrics, focused tests -- reaches the queue through this view, so an
+    external ``len()``, ``in``, lookup, or iteration is itself taken under the
+    owning lock.  Such a read can therefore never observe a replacement or a
+    cancellation half applied, and can never mutate the queue.
+
+    ``len`` and ``in`` stay O(1) under the lock rather than copying the map:
+    the reauthorization pre-check runs once per re-authorize, and a snapshot
+    copy there would put O(N) work back inside a lock a reconnect herd
+    contends on -- the exact shape #159 exists to remove.  Bulk materialization
+    (``copy``, ``items``, ``values``, ``keys``, iteration) takes one locked
+    copy, so it cannot tear against concurrent admission.
+
+    These reads are exact at the instant they are taken, but they are not a
+    reservation: the authoritative capacity decision is always re-taken under
+    the same lock in :meth:`JobDeliveryService.schedule_initial_job`.
+
+    The view is strictly immutable: it exposes no ``__setitem__``,
+    ``__delitem__``, ``pop``, ``clear``, ``update``, or ``setdefault``, so no
+    caller outside this service can reach admission state to write it.
+    Embedders and focused tests that need to install a request seed the whole
+    mapping through the ``pending_initial_jobs`` setter, which adopts its
+    contents under the admission lock.
+    """
+
+    __slots__ = ("_service",)
+
+    def __init__(self, service: "JobDeliveryService") -> None:
+        self._service = service
+
+    def copy(self) -> dict[Any, PendingInitialJob]:
+        """Return one locked, internally consistent copy of the queue."""
+        service = self._service
+        with service._initial_job_admission_lock:
+            return dict(service._pending_initial_jobs)
+
+    def __getitem__(self, key: Any) -> PendingInitialJob:
+        service = self._service
+        with service._initial_job_admission_lock:
+            return service._pending_initial_jobs[key]
+
+    def __contains__(self, key: object) -> bool:
+        service = self._service
+        with service._initial_job_admission_lock:
+            return key in service._pending_initial_jobs
+
+    def __len__(self) -> int:
+        service = self._service
+        with service._initial_job_admission_lock:
+            return len(service._pending_initial_jobs)
+
+    def get(
+        self,
+        key: Any,
+        default: Any = None,
+    ) -> PendingInitialJob | None:
+        service = self._service
+        with service._initial_job_admission_lock:
+            return service._pending_initial_jobs.get(key, default)
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self.copy())
+
+    def keys(self) -> Any:
+        return self.copy().keys()
+
+    def values(self) -> Any:
+        return self.copy().values()
+
+    def items(self) -> Any:
+        return self.copy().items()
+
+    def __eq__(self, other: object) -> bool:
+        return self.copy() == other
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self.copy()!r})"
+
+
 class JobBuildFailed(RuntimeError):
     """Internal signal used to distinguish a skipped build from a no-op."""
 
@@ -224,8 +332,6 @@ class JobDeliveryRuntime(Protocol):
 
     def _record_startup_phase_once(self, *args: Any, **kwargs: Any) -> Any: ...
 
-    def _reset_delivery_failure_if_coverage_restored_locked(self, *args: Any, **kwargs: Any) -> Any: ...
-
     def _submit_delivery_task(self, *args: Any, **kwargs: Any) -> Any: ...
 
     def bury_evicted_job(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -273,7 +379,25 @@ class JobDeliveryService:
         self._stratum_error = stratum_error
         self.jobs: dict[str, PrismJobContext] = {}
         self.job_counter = 0
-        self.pending_initial_jobs: dict[Any, PendingInitialJob] = {}
+        # Private: every read and write of this mapping happens under the
+        # admission lock below.  Callers outside this service reach it only
+        # through the read-only ``pending_initial_jobs`` view.
+        self._pending_initial_jobs: dict[Any, PendingInitialJob] = {}
+        # Sole owner of the first-job admission domain: the admission map
+        # itself, its exact capacity decision, request replacement/coalescing/
+        # cancellation, and every admission counter and timestamp below.
+        #
+        # It is the innermost lock in the process.  Nothing acquires another
+        # lock while holding it, and it is never held across a socket write, a
+        # disconnect, a job build, an executor shutdown wait, or a future
+        # cancellation (``Future.cancel`` runs done-callbacks inline, and this
+        # module's callback re-enters admission).  Cancellation callbacks are
+        # therefore always invoked after the admission state is committed and
+        # the lock is released.  Splitting this domain out of ``runtime.lock``
+        # is what stops a reconnect herd's queue bookkeeping from convoying
+        # behind fleet-wide coordinator work (#159).
+        self._initial_job_admission_lock = threading.Lock()
+        self._pending_initial_jobs_view = PendingInitialJobsView(self)
         self._initial_job_executor_lock = threading.Lock()
         self._initial_job_executor: _BoundedPriorityExecutor | None = None
         self._initial_job_executor_shutdown = False
@@ -312,6 +436,30 @@ class JobDeliveryService:
         self._disconnected_evicted_job_ids: OrderedDict[str, None] = OrderedDict()
 
     # -- state adoption ----------------------------------------------------
+
+    @property
+    def pending_initial_jobs(self) -> PendingInitialJobsView:
+        """Read-only compatibility surface over the admission map.
+
+        The legacy attribute name is coordinator-visible (and reaches the
+        session owner's reauthorization capacity pre-check through the
+        coordinator descriptor), so it must not hand out the mutable mapping:
+        that is what left a capacity read outside the lock that owns it.
+        """
+        return self._pending_initial_jobs_view
+
+    @pending_initial_jobs.setter
+    def pending_initial_jobs(self, value: Any) -> None:
+        """Adopt a mapping assigned through the legacy name.
+
+        Construction and focused tests assign through this name; adopt the
+        contents into the private map instead of retaining the caller's
+        mutable object, which would put admission state back outside the lock.
+        """
+        with self._initial_job_admission_lock:
+            self._pending_initial_jobs.clear()
+            if value:
+                self._pending_initial_jobs.update(value)
 
     def ensure_evicted_job_state(self) -> None:
         """Ensure/adopt the retained-job index, converting legacy seeded state."""
@@ -482,15 +630,21 @@ class JobDeliveryService:
     def shutdown_initial_job_executor(self) -> None:
         runtime = self._runtime
         runtime._ensure_initial_job_state()
-        with runtime.lock:
-            for request in tuple(self.pending_initial_jobs.values()):
-                if self.pending_initial_jobs.get(request.client) is not request:
-                    continue
-                self.pending_initial_jobs.pop(request.client, None)
+        # Reclaim the whole admission domain in one constant-shape critical
+        # section, then cancel the futures outside it: every cancellation runs
+        # this module's done-callback inline, and that callback re-enters
+        # admission.
+        with self._initial_job_admission_lock:
+            reclaimed = tuple(self._pending_initial_jobs.values())
+            self._pending_initial_jobs.clear()
+            futures = []
+            for request in reclaimed:
                 request.cancelled.set()
                 if request.future is not None:
-                    runtime._cancel_initial_job_future(request.future)
+                    futures.append(request.future)
                 self.initial_job_cancelled_count += 1
+        for future in futures:
+            runtime._cancel_initial_job_future(future)
         with self._initial_job_executor_lock:
             executor = self._initial_job_executor
             self._initial_job_executor = None
@@ -500,9 +654,28 @@ class JobDeliveryService:
             # returns; queued reconnect work is cancelled without starting.
             executor.shutdown(wait=True, cancel_futures=True)
 
+    def initial_job_admission_snapshot(self) -> InitialJobAdmissionSnapshot:
+        """Return one internally consistent copy of the admission domain.
+
+        Health and metrics readers call this instead of walking the live
+        admission state under the coordinator lock, so a refresh never holds
+        two locks at once and never observes a half-committed replacement.
+        """
+        with self._initial_job_admission_lock:
+            return InitialJobAdmissionSnapshot(
+                pending=dict(self._pending_initial_jobs),
+                queue_rejections=self.initial_job_queue_rejection_count,
+                timeout_disconnects=self.initial_job_timeout_count,
+                cancelled=self.initial_job_cancelled_count,
+                coalesced=self.initial_job_coalesced_count,
+                queue_capacity_reclaimed=(
+                    self.initial_job_queue_capacity_reclaimed_count
+                ),
+                last_delivery_monotonic=self.last_initial_job_delivery_monotonic,
+            )
+
     def _cancel_initial_job_future(self, future: Future[bool]) -> bool:
         """Cancel one initial-job future and account physical queue removal."""
-        runtime = self._runtime
         executor = getattr(self, "_initial_job_executor", None)
         reclaimed = bool(
             executor is not None
@@ -511,17 +684,29 @@ class JobDeliveryService:
         if executor is None:
             future.cancel()
         if reclaimed:
-            with runtime.lock:
-                runtime._ensure_initial_job_state()
+            # Admission accounting only; the cancellation callbacks that
+            # ``executor.cancel`` ran inline above have already completed, so
+            # taking the admission lock here cannot re-enter it.
+            with self._initial_job_admission_lock:
                 self.initial_job_queue_capacity_reclaimed_count += 1
         return reclaimed
 
     def _initial_request_current_locked(self, request: PendingInitialJob) -> bool:
+        """Coordinator-domain currency for one first-job request.
+
+        Called with ``runtime.lock`` held (session membership and the
+        published-tip identity are read here).  The pending-slot term is read
+        under the admission lock -- taken and released before the rest of the
+        predicate, and innermost as always -- so it cannot observe a
+        replacement or cancellation half applied.
+        """
         runtime = self._runtime
         client = request.client
         deadline = request.deadline_monotonic
+        with self._initial_job_admission_lock:
+            owns_pending_slot = self._pending_initial_jobs.get(client) is request
         return (
-            self.pending_initial_jobs.get(client) is request
+            owns_pending_slot
             and client in runtime.clients
             and not getattr(client, "closing", False)
             and (
@@ -556,16 +741,26 @@ class JobDeliveryService:
         *,
         count: bool,
     ) -> PendingInitialJob | None:
+        """Release this client's pending first-job slot, if it owns one.
+
+        The historical ``_locked`` name records that the disconnect path calls
+        this with ``runtime.lock`` held; the admission state it mutates is now
+        owned by the admission lock, which is taken (and released) inside.  The
+        future is cancelled after the slot is committed so the inline
+        done-callback observes the released slot and cannot deadlock.
+        """
         runtime = self._runtime
         runtime._ensure_initial_job_state()
-        request = self.pending_initial_jobs.pop(client, None)
-        if request is None:
-            return None
-        request.cancelled.set()
-        if request.future is not None:
-            runtime._cancel_initial_job_future(request.future)
-        if count:
-            self.initial_job_cancelled_count += 1
+        with self._initial_job_admission_lock:
+            request = self._pending_initial_jobs.pop(client, None)
+            if request is None:
+                return None
+            request.cancelled.set()
+            future = request.future
+            if count:
+                self.initial_job_cancelled_count += 1
+        if future is not None:
+            runtime._cancel_initial_job_future(future)
         return request
 
     def _client_has_current_tip_job_locked(self, client: ClientState) -> bool:
@@ -612,15 +807,21 @@ class JobDeliveryService:
         validated_current: bool = False,
     ) -> None:
         runtime = self._runtime
-        with runtime.lock:
-            runtime._ensure_initial_job_state()
-            if not validated_current and not runtime._client_has_current_tip_job_locked(client):
-                return
-            request = self.pending_initial_jobs.pop(client, None)
+        runtime._ensure_initial_job_state()
+        if not validated_current:
+            # Coordinator-domain question (published tip identity, payout
+            # generation): a short constant-time read, taken and released
+            # before any admission state is touched.
+            with runtime.lock:
+                if not runtime._client_has_current_tip_job_locked(client):
+                    return
+        future: Future[bool] | None = None
+        completed = False
+        with self._initial_job_admission_lock:
+            request = self._pending_initial_jobs.pop(client, None)
             if request is not None:
                 request.cancelled.set()
-                if request.future is not None:
-                    runtime._cancel_initial_job_future(request.future)
+                future = request.future
                 delivered = time.monotonic()
                 self.initial_job_sent_count += 1
                 self.initial_job_delivery_latency_seconds_sum += max(
@@ -628,7 +829,11 @@ class JobDeliveryService:
                 )
                 self.initial_job_delivery_latency_count += 1
                 self.last_initial_job_delivery_monotonic = delivered
-                runtime._record_startup_phase_once("first_job_delivered")
+                completed = True
+        if future is not None:
+            runtime._cancel_initial_job_future(future)
+        if completed:
+            runtime._record_startup_phase_once("first_job_delivered")
 
     def schedule_initial_job(self, client: ClientState) -> bool:
         """Coalesce and enqueue one first-job request without blocking its handler."""
@@ -640,30 +845,62 @@ class JobDeliveryService:
             return bool(runtime.maybe_send_job(client, clean_jobs=True))
 
         now = time.monotonic()
+        runtime._ensure_initial_job_state()
+        if (
+            not client.subscribed
+            or not client.authorized
+            or client.worker is None
+            or getattr(client, "closing", False)
+        ):
+            return True
+        generation = int(getattr(client, "authorization_generation", 0))
+        difficulty_generation = int(getattr(client, "difficulty_generation", 0))
+        worker = client.worker
+        connection_id = client.connection_id
+
+        def represents_this_authorization(candidate: PendingInitialJob) -> bool:
+            return (
+                candidate.connection_id == connection_id
+                and candidate.authorization_generation == generation
+                and candidate.difficulty_generation == difficulty_generation
+                and candidate.worker == worker
+            )
+
+        # Pure queue bookkeeping: a live request already represents exactly
+        # this authorization.  A reconnect herd's repeat requests settle here
+        # without ever reaching the coordinator lock.
+        with self._initial_job_admission_lock:
+            existing = self._pending_initial_jobs.get(client)
+            if existing is not None and represents_this_authorization(existing):
+                self.initial_job_coalesced_count += 1
+                return True
+
+        # Coordinator-domain snapshot: whether this connection already holds
+        # current published-tip work is global tip identity, so it stays under
+        # runtime.lock -- taken alone, for a constant-time read, and released
+        # before the admission commit below.
+        with runtime.lock:
+            has_current_tip_job = runtime._client_has_current_tip_job_locked(client)
+
+        # Configuration is read outside the admission lock so nothing but
+        # local state is touched inside it.
+        capacity = int(runtime.stratum_max_pending_initial_jobs)
+        timeout = float(runtime.stratum_initial_job_timeout_seconds)
+
         reject = False
         deferred = False
         superseded_future: Future[bool] | None = None
-        with runtime.lock:
-            runtime._ensure_initial_job_state()
-            if (
-                not client.subscribed
-                or not client.authorized
-                or client.worker is None
-                or getattr(client, "closing", False)
-            ):
+        request: PendingInitialJob | None = None
+        with self._initial_job_admission_lock:
+            if getattr(client, "closing", False):
+                # Re-read under the admission lock: retirement and the timeout
+                # sweep both commit ``closing`` before releasing this client's
+                # slot, so an installation that observed a stale False here
+                # would strand a request behind a session already being torn
+                # down.
                 return True
-            generation = int(getattr(client, "authorization_generation", 0))
-            difficulty_generation = int(
-                getattr(client, "difficulty_generation", 0)
-            )
-            existing = self.pending_initial_jobs.get(client)
-            if (
-                existing is not None
-                and existing.connection_id == client.connection_id
-                and existing.authorization_generation == generation
-                and existing.difficulty_generation == difficulty_generation
-                and existing.worker == client.worker
-            ):
+            existing = self._pending_initial_jobs.get(client)
+            if existing is not None and represents_this_authorization(existing):
                 self.initial_job_coalesced_count += 1
                 return True
             if existing is not None:
@@ -671,45 +908,46 @@ class JobDeliveryService:
                 superseded_future = existing.future
                 self.initial_job_cancelled_count += 1
                 self.initial_job_superseded_count += 1
-            if runtime._client_has_current_tip_job_locked(client):
-                if existing is not None:
-                    self.pending_initial_jobs.pop(client, None)
-                    if superseded_future is not None:
-                        runtime._cancel_initial_job_future(superseded_future)
-                return True
-            if (
-                existing is None
-                and len(self.pending_initial_jobs)
-                >= runtime.stratum_max_pending_initial_jobs
-            ):
-                self.initial_job_queue_rejection_count += 1
-                reject = True
-                request = None
-            else:
-                timeout = float(runtime.stratum_initial_job_timeout_seconds)
-                predecessor = None
-                if existing is not None:
-                    for candidate in (existing.future, existing.predecessor):
-                        if candidate is not None and not candidate.done():
-                            predecessor = candidate
-                            break
-                request = PendingInitialJob(
-                    client=client,
-                    connection_id=client.connection_id,
-                    authorization_generation=generation,
-                    difficulty_generation=difficulty_generation,
-                    worker=client.worker,
-                    requested_monotonic=now,
-                    deadline_monotonic=now + timeout if timeout > 0 else None,
-                    predecessor=predecessor,
-                )
-                self.pending_initial_jobs[client] = request
-                deferred = predecessor is not None
+                if has_current_tip_job:
+                    self._pending_initial_jobs.pop(client, None)
+            if not has_current_tip_job:
+                if (
+                    existing is None
+                    and len(self._pending_initial_jobs) >= capacity
+                ):
+                    self.initial_job_queue_rejection_count += 1
+                    reject = True
+                else:
+                    predecessor = None
+                    if existing is not None:
+                        for candidate in (existing.future, existing.predecessor):
+                            if candidate is not None and not candidate.done():
+                                predecessor = candidate
+                                break
+                    request = PendingInitialJob(
+                        client=client,
+                        connection_id=connection_id,
+                        authorization_generation=generation,
+                        difficulty_generation=difficulty_generation,
+                        worker=worker,
+                        requested_monotonic=now,
+                        deadline_monotonic=now + timeout if timeout > 0 else None,
+                        predecessor=predecessor,
+                    )
+                    # Install the replacement before releasing the lock: the
+                    # superseded future's cancellation callback runs inline
+                    # below and must observe the replacement already holding
+                    # the client slot.
+                    self._pending_initial_jobs[client] = request
+                    deferred = predecessor is not None
         if superseded_future is not None:
-            # Install the replacement before cancellation callbacks can run;
-            # the predecessor callback then hands off exactly one client slot
+            # Cancellation callbacks run inline here, with the admission state
+            # already committed and the admission lock released; the
+            # predecessor callback then hands off exactly one client slot
             # instead of mistaking the obsolete request for a terminal failure.
             runtime._cancel_initial_job_future(superseded_future)
+        if has_current_tip_job:
+            return True
         if reject or request is None:
             runtime.disconnect_client(client)
             return False
@@ -725,9 +963,8 @@ class JobDeliveryService:
 
     def cancel_initial_job_delivery(self, client: ClientState) -> None:
         runtime = self._runtime
-        with runtime.lock:
-            runtime._ensure_initial_job_state()
-            runtime._cancel_pending_initial_job_locked(client, count=True)
+        runtime._ensure_initial_job_state()
+        runtime._cancel_pending_initial_job_locked(client, count=True)
 
     def _submit_initial_job_request(self, request: PendingInitialJob) -> bool:
         runtime = self._runtime
@@ -741,9 +978,9 @@ class JobDeliveryService:
             )
         except (_DeliveryQueueFull, RuntimeError):
             disconnect = False
-            with runtime.lock:
-                if self.pending_initial_jobs.get(client) is request:
-                    self.pending_initial_jobs.pop(client, None)
+            with self._initial_job_admission_lock:
+                if self._pending_initial_jobs.get(client) is request:
+                    self._pending_initial_jobs.pop(client, None)
                     request.cancelled.set()
                     self.initial_job_queue_rejection_count += 1
                     disconnect = True
@@ -753,11 +990,17 @@ class JobDeliveryService:
             # It owns neither the client slot nor the right to retire the live
             # session when admission fails.
             return not disconnect
-        with runtime.lock:
-            if self.pending_initial_jobs.get(client) is request:
+        orphan: Future[bool] | None = None
+        with self._initial_job_admission_lock:
+            if self._pending_initial_jobs.get(client) is request:
                 request.future = future
             else:
-                runtime._cancel_initial_job_future(future)
+                orphan = future
+        if orphan is not None:
+            # A replacement already owns the client slot. Reclaim the queue
+            # entry outside the admission lock; the done-callback installed
+            # just below then fires immediately and hands the slot on.
+            runtime._cancel_initial_job_future(orphan)
         future.add_done_callback(
             lambda completed: runtime._initial_job_future_finished(request, completed)
         )
@@ -786,11 +1029,22 @@ class JobDeliveryService:
                 )
                 traceback.print_exc()
 
+        # Coordinator-domain question, asked only on the delivered path and
+        # only for as long as the constant-time read takes.
+        proven_delivered = False
+        if delivered:
+            with runtime.lock:
+                runtime._ensure_initial_job_state()
+                proven_delivered = bool(
+                    runtime._initial_request_current_locked(request)
+                    and runtime._client_has_current_tip_job_locked(request.client)
+                )
+
         disconnect = False
+        first_delivery = False
         replacement: PendingInitialJob | None = None
-        with runtime.lock:
-            runtime._ensure_initial_job_state()
-            current = self.pending_initial_jobs.get(request.client)
+        with self._initial_job_admission_lock:
+            current = self._pending_initial_jobs.get(request.client)
             if current is not request:
                 if (
                     current is not None
@@ -799,28 +1053,30 @@ class JobDeliveryService:
                 ):
                     current.predecessor = None
                     replacement = current
-            elif (
-                delivered
-                and runtime._initial_request_current_locked(request)
-                and runtime._client_has_current_tip_job_locked(request.client)
-            ):
-                self.pending_initial_jobs.pop(request.client, None)
+            elif proven_delivered:
+                self._pending_initial_jobs.pop(request.client, None)
                 request.cancelled.set()
                 self.last_initial_job_delivery_monotonic = time.monotonic()
-                runtime._record_startup_phase_once("first_job_delivered")
-            elif current is request:
-                self.pending_initial_jobs.pop(request.client, None)
+                first_delivery = True
+            else:
+                self._pending_initial_jobs.pop(request.client, None)
                 request.cancelled.set()
                 if (
                     request.deadline_monotonic is not None
                     and request.deadline_monotonic <= time.monotonic()
                 ):
+                    # Commit teardown while this request still owns the pending
+                    # slot: a concurrent reauthorization re-reads ``closing``
+                    # under this lock and cannot install a replacement between
+                    # expiry and disconnect.
                     request.client.closing = True
                     self.initial_job_timeout_count += 1
                     self.initial_job_cancelled_count += 1
                 else:
                     self.initial_job_failed_count += 1
                 disconnect = True
+        if first_delivery:
+            runtime._record_startup_phase_once("first_job_delivered")
         if replacement is not None:
             runtime._submit_initial_job_request(replacement)
         if disconnect:
@@ -1032,10 +1288,12 @@ class JobDeliveryService:
                                 # complete a request that newer current-tip work
                                 # satisfies instead.
                                 runtime.note_initial_job_delivered(client)
-                                if (
-                                    self.pending_initial_jobs.get(client)
-                                    is not request
-                                ):
+                                with self._initial_job_admission_lock:
+                                    still_owns_slot = (
+                                        self._pending_initial_jobs.get(client)
+                                        is request
+                                    )
+                                if not still_owns_slot:
                                     return False
                                 return None
                             client.active_job = context
@@ -1074,30 +1332,34 @@ class JobDeliveryService:
 
     def sweep_initial_job_timeouts(self, *, now: float | None = None) -> int:
         runtime = self._runtime
+        runtime._ensure_initial_job_state()
         now = time.monotonic() if now is None else now
         timed_out: list[PendingInitialJob] = []
-        with runtime.lock:
-            runtime._ensure_initial_job_state()
+        futures: list[Future[bool]] = []
+        with self._initial_job_admission_lock:
             expired = [
                 request
-                for request in self.pending_initial_jobs.values()
+                for request in self._pending_initial_jobs.values()
                 if request.deadline_monotonic is not None
                 and request.deadline_monotonic <= now
             ]
             for request in expired:
-                if self.pending_initial_jobs.get(request.client) is not request:
-                    continue
-                self.pending_initial_jobs.pop(request.client, None)
+                self._pending_initial_jobs.pop(request.client, None)
                 request.cancelled.set()
                 if request.future is not None:
-                    runtime._cancel_initial_job_future(request.future)
+                    futures.append(request.future)
                 # Commit teardown while this request still owns the pending
-                # slot. A concurrent reauthorization will observe closing and
-                # cannot install a replacement between expiry and disconnect.
+                # slot. A concurrent reauthorization re-reads closing under
+                # this lock and cannot install a replacement between expiry
+                # and disconnect.
                 request.client.closing = True
                 self.initial_job_timeout_count += 1
                 self.initial_job_cancelled_count += 1
                 timed_out.append(request)
+        # Queue reclamation runs cancellation callbacks inline; both it and
+        # the disconnects below stay outside the admission lock.
+        for future in futures:
+            runtime._cancel_initial_job_future(future)
         for request in timed_out:
             runtime.disconnect_client(request.client)
         return len(timed_out)
@@ -1375,15 +1637,26 @@ class JobDeliveryService:
         First delivery wins per tip: same-tip template refreshes must not slide
         the connection's stale-grace anchor forward.
         """
-        runtime = self._runtime
         now = time.monotonic()
-        with runtime.lock:
+        # Per-connection state only. The coordinator lock is deliberately
+        # absent: a delivery to one connection must never wait on fleet-wide
+        # control-plane work, and the O(N) current-tip coverage census that
+        # used to run here now runs once per observability refresh instead of
+        # once per delivery (#159).
+        #
+        # Anchoring is serialized by this connection's job-update lock. Every
+        # production delivery path already holds it across send-then-anchor, so
+        # re-entering it costs nothing and extends the same serialization to
+        # the direct compatibility callers. Lightweight embedders and focused
+        # doubles may supply a minimal lock exposing only the timed
+        # acquire/release pair the delivery path uses; those callers hold it
+        # already, so anchor without re-entering rather than failing on the
+        # missing protocol.
+        lock = getattr(client, "job_update_lock", None)
+        with lock if hasattr(lock, "__enter__") else nullcontext():
             delivered = client.tip_work_delivered
             if delivered is None or delivered[0] != job_parent_hash:
                 client.tip_work_delivered = (job_parent_hash, now)
-            runtime._ensure_initial_job_state()
-            if job_parent_hash == runtime._current_published_tip_hash_locked():
-                runtime._reset_delivery_failure_if_coverage_restored_locked()
 
     def _evicted_job_class_locked(self, entry: EvictedJobEntry) -> str:
         runtime = self._runtime
@@ -2279,9 +2552,11 @@ class JobDeliveryService:
                 # hands the client slot to current work instead of disconnecting.
                 runtime.request_initial_job_delivery(client)
             return False
-        with runtime.lock:
-            runtime._ensure_initial_job_state()
-            initial_pending = client in self.pending_initial_jobs
+        runtime._ensure_initial_job_state()
+        # Lock-protected membership read; the replacement decision itself is
+        # re-taken exactly under the same lock in schedule_initial_job.
+        with self._initial_job_admission_lock:
+            initial_pending = client in self._pending_initial_jobs
         if initial_pending:
             runtime.request_initial_job_delivery(client)
             return False

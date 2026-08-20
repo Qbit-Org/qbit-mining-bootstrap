@@ -935,7 +935,7 @@ class TipRefreshEpochTests(unittest.TestCase):
             connection_id=state.connection_id,
             difficulty_generation=0,
         )
-        server.pending_initial_jobs[state] = request
+        server.pending_initial_jobs = {state: request}
 
         self.assertIs(
             server._deliver_initial_bundle(request, artifacts, bundle),
