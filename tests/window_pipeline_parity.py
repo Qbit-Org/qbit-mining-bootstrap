@@ -832,6 +832,17 @@ class RustDaemonWindowPipelineAdapter:
     integer_domain: WindowPipelineIntegerDomain = RUST_INTEGER_DOMAIN
 
     @staticmethod
+    def daemon_command() -> list[str]:
+        """Return the real deployment tool invocation used by this adapter."""
+        return prism_tool_command("qbit-prism-build-audit-bundle") + [
+            "--serve",
+            "--signing-key-seed-hex",
+            "42" * 32,
+            "--ledger-signing-key-seed-hex",
+            "43" * 32,
+        ]
+
+    @staticmethod
     def _wire_record(record: AcceptedShareRecord) -> dict[str, object]:
         return record_input_json(record)
 
@@ -856,15 +867,8 @@ class RustDaemonWindowPipelineAdapter:
         raise RuntimeError(f"prepare_window failed: {envelope}")
 
     def run(self, case: WindowPipelineCase) -> WindowPipelineResult:
-        command = prism_tool_command("qbit-prism-build-audit-bundle") + [
-            "--serve",
-            "--signing-key-seed-hex",
-            "42" * 32,
-            "--ledger-signing-key-seed-hex",
-            "43" * 32,
-        ]
         process = subprocess.Popen(
-            command,
+            self.daemon_command(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
         )
@@ -872,10 +876,18 @@ class RustDaemonWindowPipelineAdapter:
         try:
             assert process.stdin is not None and process.stdout is not None
             handshake = json.loads(process.stdout.readline())
-            if handshake.get("protocol") != PRISM_SERVE_BUILDER_PROTOCOL_VERSION:
+            expected_handshake = {
+                "event": "handshake",
+                "tool": "qbit-prism-build-audit-bundle",
+                "protocol": PRISM_SERVE_BUILDER_PROTOCOL_VERSION,
+            }
+            announced_handshake = {
+                key: handshake.get(key) for key in expected_handshake
+            }
+            if announced_handshake != expected_handshake:
                 raise RuntimeError(
-                    f"daemon announced protocol {handshake.get('protocol')!r},"
-                    f" expected {PRISM_SERVE_BUILDER_PROTOCOL_VERSION}"
+                    f"daemon announced handshake {announced_handshake!r},"
+                    f" expected {expected_handshake!r}"
                 )
 
             def exchange(request: dict[str, object]) -> tuple[dict[str, object], bytes | None]:
