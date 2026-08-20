@@ -1,0 +1,260 @@
+{
+  "cases": {
+    "bulk-seeded": {
+      "canonical_bytes_len": 939133,
+      "canonical_bytes_sha256": "2c4aeccace2af085e7463f59cf2f9dc67c5e66a3b0a1d9dcb355e504cb581daa",
+      "canonical_digest": "2c4aeccace2af085e7463f59cf2f9dc67c5e66a3b0a1d9dcb355e504cb581daa",
+      "input_sha256": "f436c4580c2735ee9bbd21f12d1684a3bcb4cfd3cb3282481a72828913070dd4",
+      "record_count": 2709,
+      "record_stream_len": 939131,
+      "record_stream_sha256": "fac69fead46482a2343f3db7bc30b3d449b628cf98b10af0606993e89f6264b5",
+      "spool_tail_len": 373230,
+      "spool_tail_sha256": "7a1afc09c5895dbe71bd49f1be6a6cdf1ba46b95ca53da5db5393572fa85863e",
+      "why": "4000 seeded snapshot records (roughly a tenth ineligible) plus a 700-record advance: representative page-fragment concatenation, identity deduplication at natural factory collisions, and head expiry at scale"
+    },
+    "credit-policy-identity-reuse": {
+      "canonical_bytes_len": 2029,
+      "canonical_bytes_sha256": "7e5624d438a160d8e94f4d4eef63fd543de01fa9c3f1317c8a653f55aa2e2aa2",
+      "canonical_digest": "7e5624d438a160d8e94f4d4eef63fd543de01fa9c3f1317c8a653f55aa2e2aa2",
+      "input_sha256": "65e8ff26cc1b1fa565ce047d035c4b89dc359d651a00f6bba1eee75c061cc1ee",
+      "pinned_literals": {
+        "canonical_bytes": "[{\"accepted_at_ms\":49999,\"job_id\":\"job-1\",\"job_issued_at_ms\":49999,\"miner_id\":\"miner-1\",\"network_difficulty\":1000001,\"ntime\":1700000001,\"order_key\":\"01:miner-1\",\"p2mr_program_hex\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"share_difficulty\":1,\"share_id\":\"share-1\",\"share_seq\":1,\"template_height\":800000},{\"accepted_at_ms\":49998,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-2\",\"job_issued_at_ms\":49998,\"miner_id\":\"miner-2\",\"network_difficulty\":1000002,\"ntime\":1700000002,\"order_key\":\"02:miner-2\",\"p2mr_program_hex\":\"0202020202020202020202020202020202020202020202020202020202020202\",\"share_difficulty\":2,\"share_id\":\"share-2\",\"share_seq\":2,\"template_height\":800000},{\"accepted_at_ms\":49997,\"job_id\":\"job-3\",\"job_issued_at_ms\":49997,\"miner_id\":\"miner-3\",\"network_difficulty\":1000003,\"ntime\":1700000003,\"order_key\":\"03:miner-3\",\"p2mr_program_hex\":\"0303030303030303030303030303030303030303030303030303030303030303\",\"share_difficulty\":3,\"share_id\":\"share-3\",\"share_seq\":3,\"template_height\":800000},{\"accepted_at_ms\":49996,\"job_id\":\"job-4\",\"job_issued_at_ms\":49996,\"miner_id\":\"miner-1\",\"network_difficulty\":1000004,\"ntime\":1700000004,\"order_key\":\"01:miner-1\",\"p2mr_program_hex\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"share_difficulty\":4,\"share_id\":\"share-4\",\"share_seq\":4,\"template_height\":800000},{\"accepted_at_ms\":49995,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-5\",\"job_issued_at_ms\":49995,\"miner_id\":\"miner-5\",\"network_difficulty\":1000005,\"ntime\":1700000005,\"order_key\":\"05:miner-5\",\"p2mr_program_hex\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"share_difficulty\":5,\"share_id\":\"share-5\",\"share_seq\":5,\"template_height\":800000},{\"accepted_at_ms\":49994,\"job_id\":\"job-6\",\"job_issued_at_ms\":49994,\"miner_id\":\"miner-2\",\"network_difficulty\":1000006,\"ntime\":1700000006,\"order_key\":\"02:miner-2\",\"p2mr_program_hex\":\"0202020202020202020202020202020202020202020202020202020202020202\",\"share_difficulty\":6,\"share_id\":\"share-6\",\"share_seq\":6,\"template_height\":800000}]",
+        "record_jsons": [
+          "{\"accepted_at_ms\":49999,\"job_id\":\"job-1\",\"job_issued_at_ms\":49999,\"miner_id\":\"miner-1\",\"network_difficulty\":1000001,\"ntime\":1700000001,\"order_key\":\"01:miner-1\",\"p2mr_program_hex\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"share_difficulty\":1,\"share_id\":\"share-1\",\"share_seq\":1,\"template_height\":800000}",
+          "{\"accepted_at_ms\":49998,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-2\",\"job_issued_at_ms\":49998,\"miner_id\":\"miner-2\",\"network_difficulty\":1000002,\"ntime\":1700000002,\"order_key\":\"02:miner-2\",\"p2mr_program_hex\":\"0202020202020202020202020202020202020202020202020202020202020202\",\"share_difficulty\":2,\"share_id\":\"share-2\",\"share_seq\":2,\"template_height\":800000}",
+          "{\"accepted_at_ms\":49997,\"job_id\":\"job-3\",\"job_issued_at_ms\":49997,\"miner_id\":\"miner-3\",\"network_difficulty\":1000003,\"ntime\":1700000003,\"order_key\":\"03:miner-3\",\"p2mr_program_hex\":\"0303030303030303030303030303030303030303030303030303030303030303\",\"share_difficulty\":3,\"share_id\":\"share-3\",\"share_seq\":3,\"template_height\":800000}",
+          "{\"accepted_at_ms\":49996,\"job_id\":\"job-4\",\"job_issued_at_ms\":49996,\"miner_id\":\"miner-1\",\"network_difficulty\":1000004,\"ntime\":1700000004,\"order_key\":\"01:miner-1\",\"p2mr_program_hex\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"share_difficulty\":4,\"share_id\":\"share-4\",\"share_seq\":4,\"template_height\":800000}",
+          "{\"accepted_at_ms\":49995,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-5\",\"job_issued_at_ms\":49995,\"miner_id\":\"miner-5\",\"network_difficulty\":1000005,\"ntime\":1700000005,\"order_key\":\"05:miner-5\",\"p2mr_program_hex\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"share_difficulty\":5,\"share_id\":\"share-5\",\"share_seq\":5,\"template_height\":800000}",
+          "{\"accepted_at_ms\":49994,\"job_id\":\"job-6\",\"job_issued_at_ms\":49994,\"miner_id\":\"miner-2\",\"network_difficulty\":1000006,\"ntime\":1700000006,\"order_key\":\"02:miner-2\",\"p2mr_program_hex\":\"0202020202020202020202020202020202020202020202020202020202020202\",\"share_difficulty\":6,\"share_id\":\"share-6\",\"share_seq\":6,\"template_height\":800000}"
+        ],
+        "spool_tail": ",\"compact_share_identities\":[[\"miner-1\",\"01:miner-1\",\"0101010101010101010101010101010101010101010101010101010101010101\"],[\"miner-2\",\"02:miner-2\",\"0202020202020202020202020202020202020202020202020202020202020202\"],[\"miner-3\",\"03:miner-3\",\"0303030303030303030303030303030303030303030303030303030303030303\"],[\"miner-5\",\"05:miner-5\",\"0505050505050505050505050505050505050505050505050505050505050505\"]],\"compact_shares\":[[1,\"share-1\",0,1,49999,49999,null],[2,\"share-2\",1,2,49998,49998,\"stale-grace\"],[3,\"share-3\",2,3,49997,49997,null],[4,\"share-4\",0,4,49996,49996,null],[5,\"share-5\",3,5,49995,49995,\"stale-grace\"],[6,\"share-6\",1,6,49994,49994,null]]}"
+      },
+      "record_count": 6,
+      "record_stream_len": 2027,
+      "record_stream_sha256": "709ebd145614ea5e0c475c6374f7f9f95ca62fc461e22277b963bb28dbe4ed2f",
+      "spool_tail_len": 645,
+      "spool_tail_sha256": "4fcf4416fbf9a0ae882427db6ddc46f1b98275e8504aee4d13f7003fb880cdcb",
+      "why": "duplicate (miner_id, order_key, p2mr_program_hex) triples pin identity deduplication and identity_index reuse in the compact spool fragments, alongside mixed credit_policy values"
+    },
+    "crossing-row-exact-fit": {
+      "canonical_bytes_len": 655,
+      "canonical_bytes_sha256": "0d423ee61de555cd1c231958351531f4902b29320817f010ea2ac5bd5b2baf05",
+      "canonical_digest": "0d423ee61de555cd1c231958351531f4902b29320817f010ea2ac5bd5b2baf05",
+      "input_sha256": "44b5c58495f43d8ad51331e162bd5b45f95ae2798dee5c4c359d9ebbb4e34e69",
+      "pinned_literals": {
+        "canonical_bytes": "[{\"accepted_at_ms\":9999,\"job_id\":\"job-2\",\"job_issued_at_ms\":9998,\"miner_id\":\"miner-2\",\"network_difficulty\":1000002,\"ntime\":1700000002,\"order_key\":\"02:miner-2\",\"p2mr_program_hex\":\"0202020202020202020202020202020202020202020202020202020202020202\",\"share_difficulty\":3,\"share_id\":\"share-2\",\"share_seq\":2,\"template_height\":800000},{\"accepted_at_ms\":10000,\"job_id\":\"job-3\",\"job_issued_at_ms\":10000,\"miner_id\":\"miner-3\",\"network_difficulty\":1000003,\"ntime\":1700000003,\"order_key\":\"03:miner-3\",\"p2mr_program_hex\":\"0303030303030303030303030303030303030303030303030303030303030303\",\"share_difficulty\":7,\"share_id\":\"share-3\",\"share_seq\":3,\"template_height\":800000}]",
+        "record_jsons": [
+          "{\"accepted_at_ms\":9999,\"job_id\":\"job-2\",\"job_issued_at_ms\":9998,\"miner_id\":\"miner-2\",\"network_difficulty\":1000002,\"ntime\":1700000002,\"order_key\":\"02:miner-2\",\"p2mr_program_hex\":\"0202020202020202020202020202020202020202020202020202020202020202\",\"share_difficulty\":3,\"share_id\":\"share-2\",\"share_seq\":2,\"template_height\":800000}",
+          "{\"accepted_at_ms\":10000,\"job_id\":\"job-3\",\"job_issued_at_ms\":10000,\"miner_id\":\"miner-3\",\"network_difficulty\":1000003,\"ntime\":1700000003,\"order_key\":\"03:miner-3\",\"p2mr_program_hex\":\"0303030303030303030303030303030303030303030303030303030303030303\",\"share_difficulty\":7,\"share_id\":\"share-3\",\"share_seq\":3,\"template_height\":800000}"
+        ],
+        "spool_tail": ",\"compact_share_identities\":[[\"miner-2\",\"02:miner-2\",\"0202020202020202020202020202020202020202020202020202020202020202\"],[\"miner-3\",\"03:miner-3\",\"0303030303030303030303030303030303030303030303030303030303030303\"]],\"compact_shares\":[[2,\"share-2\",0,3,9998,9999,null],[3,\"share-3\",1,7,10000,10000,null]]}"
+      },
+      "record_count": 2,
+      "record_stream_len": 653,
+      "record_stream_sha256": "3fafb775c16d25984e47b0e560e4c7078f56efd1c56267789d46eef58477c0c1",
+      "spool_tail_len": 301,
+      "spool_tail_sha256": "c9b02e86e6d19e03a08394fbcff7232bf4d217b5771bd1eab933c87dd11c73d3",
+      "why": "difficulties (2,3,7) at weight 10: cumulative weight lands exactly on window_weight, so seq 1 is dropped and there is no crossing row; the pair with crossing-row-retained separates the >= cutoff from a wrong > cutoff"
+    },
+    "crossing-row-retained": {
+      "canonical_bytes_len": 685,
+      "canonical_bytes_sha256": "17881e4d4e7775184971a94384e10dd071d409a5ba80f52dfdcfb6311e89fa4c",
+      "canonical_digest": "17881e4d4e7775184971a94384e10dd071d409a5ba80f52dfdcfb6311e89fa4c",
+      "input_sha256": "392a73c5aa97bf5c9442bbc7b49327c90fd4ec5cb8d92bc7839ac66d8eca0542",
+      "pinned_literals": {
+        "canonical_bytes": "[{\"accepted_at_ms\":9999,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-2\",\"job_issued_at_ms\":9998,\"miner_id\":\"miner-2\",\"network_difficulty\":1000002,\"ntime\":1700000002,\"order_key\":\"02:miner-2\",\"p2mr_program_hex\":\"0202020202020202020202020202020202020202020202020202020202020202\",\"share_difficulty\":3,\"share_id\":\"share-2\",\"share_seq\":2,\"template_height\":800000},{\"accepted_at_ms\":10000,\"job_id\":\"job-3\",\"job_issued_at_ms\":10000,\"miner_id\":\"miner-3\",\"network_difficulty\":1000003,\"ntime\":1700000003,\"order_key\":\"03:miner-3\",\"p2mr_program_hex\":\"0303030303030303030303030303030303030303030303030303030303030303\",\"share_difficulty\":8,\"share_id\":\"share-3\",\"share_seq\":3,\"template_height\":800000}]",
+        "record_jsons": [
+          "{\"accepted_at_ms\":9999,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-2\",\"job_issued_at_ms\":9998,\"miner_id\":\"miner-2\",\"network_difficulty\":1000002,\"ntime\":1700000002,\"order_key\":\"02:miner-2\",\"p2mr_program_hex\":\"0202020202020202020202020202020202020202020202020202020202020202\",\"share_difficulty\":3,\"share_id\":\"share-2\",\"share_seq\":2,\"template_height\":800000}",
+          "{\"accepted_at_ms\":10000,\"job_id\":\"job-3\",\"job_issued_at_ms\":10000,\"miner_id\":\"miner-3\",\"network_difficulty\":1000003,\"ntime\":1700000003,\"order_key\":\"03:miner-3\",\"p2mr_program_hex\":\"0303030303030303030303030303030303030303030303030303030303030303\",\"share_difficulty\":8,\"share_id\":\"share-3\",\"share_seq\":3,\"template_height\":800000}"
+        ],
+        "spool_tail": ",\"compact_share_identities\":[[\"miner-2\",\"02:miner-2\",\"0202020202020202020202020202020202020202020202020202020202020202\"],[\"miner-3\",\"03:miner-3\",\"0303030303030303030303030303030303030303030303030303030303030303\"]],\"compact_shares\":[[2,\"share-2\",0,3,9998,9999,\"stale-grace\"],[3,\"share-3\",1,8,10000,10000,null]]}"
+      },
+      "record_count": 2,
+      "record_stream_len": 683,
+      "record_stream_sha256": "6552baf143848e555111c3c2292ca58f7440233d15266965b04578e098786d02",
+      "spool_tail_len": 310,
+      "spool_tail_sha256": "114620560516025d5d0b95a889fe5da45812e0d9fbe64a606e441e733d1c92ca",
+      "why": "difficulties (2,3,8) at weight 10: the final whole share crossing window_weight (seq 2) is deliberately retained, total 11 > 10; an implementation that drops it diverges here"
+    },
+    "eligibility-filtering": {
+      "canonical_bytes_len": 657,
+      "canonical_bytes_sha256": "40fc09d08bc2a883bff421b8b81694558cdc95d2814b03dab42f85d032391cf6",
+      "canonical_digest": "40fc09d08bc2a883bff421b8b81694558cdc95d2814b03dab42f85d032391cf6",
+      "input_sha256": "232dd3419eb6543d104a7e2a7752ee4dd854545ebc11abe2346d767c41b6276c",
+      "pinned_literals": {
+        "canonical_bytes": "[{\"accepted_at_ms\":29999,\"job_id\":\"job-1\",\"job_issued_at_ms\":29998,\"miner_id\":\"miner-1\",\"network_difficulty\":1000001,\"ntime\":1700000001,\"order_key\":\"01:miner-1\",\"p2mr_program_hex\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"share_difficulty\":4,\"share_id\":\"share-1\",\"share_seq\":1,\"template_height\":800000},{\"accepted_at_ms\":30000,\"job_id\":\"job-5\",\"job_issued_at_ms\":30000,\"miner_id\":\"miner-5\",\"network_difficulty\":1000005,\"ntime\":1700000005,\"order_key\":\"05:miner-5\",\"p2mr_program_hex\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"share_difficulty\":8,\"share_id\":\"share-5\",\"share_seq\":5,\"template_height\":800000}]",
+        "record_jsons": [
+          "{\"accepted_at_ms\":29999,\"job_id\":\"job-1\",\"job_issued_at_ms\":29998,\"miner_id\":\"miner-1\",\"network_difficulty\":1000001,\"ntime\":1700000001,\"order_key\":\"01:miner-1\",\"p2mr_program_hex\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"share_difficulty\":4,\"share_id\":\"share-1\",\"share_seq\":1,\"template_height\":800000}",
+          "{\"accepted_at_ms\":30000,\"job_id\":\"job-5\",\"job_issued_at_ms\":30000,\"miner_id\":\"miner-5\",\"network_difficulty\":1000005,\"ntime\":1700000005,\"order_key\":\"05:miner-5\",\"p2mr_program_hex\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"share_difficulty\":8,\"share_id\":\"share-5\",\"share_seq\":5,\"template_height\":800000}"
+        ],
+        "spool_tail": ",\"compact_share_identities\":[[\"miner-1\",\"01:miner-1\",\"0101010101010101010101010101010101010101010101010101010101010101\"],[\"miner-5\",\"05:miner-5\",\"0505050505050505050505050505050505050505050505050505050505050505\"]],\"compact_shares\":[[1,\"share-1\",0,4,29998,29999,null],[5,\"share-5\",1,8,30000,30000,null]]}"
+      },
+      "record_count": 2,
+      "record_stream_len": 655,
+      "record_stream_sha256": "5b48e3140c8cb56e843859395108e1af18deadf4c2b337ff046f1250b8e1b404",
+      "spool_tail_len": 303,
+      "spool_tail_sha256": "6dba2c368162d4562aed7e66ef0e0e23cedb3134b8d77c36ca7243190baea561",
+      "why": "one record excluded by job_issued_at_ms alone, one by accepted_at_ms alone, one by both; seq 5 sits exactly on the anchor, pinning the inclusive <= comparisons"
+    },
+    "empty-window": {
+      "canonical_bytes_len": 2,
+      "canonical_bytes_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "canonical_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "input_sha256": "3783bf5efe7c0a3cde10ef43cbc331d1263f807e073d19c08752c4607ef59580",
+      "pinned_literals": {
+        "canonical_bytes": "[]",
+        "record_jsons": [],
+        "spool_tail": ",\"compact_share_identities\":[],\"compact_shares\":[]}"
+      },
+      "record_count": 0,
+      "record_stream_len": 0,
+      "record_stream_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "spool_tail_len": 51,
+      "spool_tail_sha256": "0a724963f1ff7d7033eefd78473cb2132190352e0443e14db01ff3d89ae01bcf",
+      "why": "zero eligible records: [] framing, digest of [], empty compact arrays"
+    },
+    "incremental-two-advances": {
+      "canonical_bytes_len": 2046,
+      "canonical_bytes_sha256": "2e05cae0e6203ecda5384cbb91768cd0812f0cd79e812ccecfe77775442dc151",
+      "canonical_digest": "2e05cae0e6203ecda5384cbb91768cd0812f0cd79e812ccecfe77775442dc151",
+      "input_sha256": "d7f951bbdc28813c5c5eacfe8aa2669db04ab173183a6f655a51f47ce42d145f",
+      "pinned_literals": {
+        "canonical_bytes": "[{\"accepted_at_ms\":79999,\"job_id\":\"job-9\",\"job_issued_at_ms\":80001,\"miner_id\":\"miner-9\",\"network_difficulty\":1000009,\"ntime\":1700000009,\"order_key\":\"09:miner-9\",\"p2mr_program_hex\":\"0909090909090909090909090909090909090909090909090909090909090909\",\"share_difficulty\":2,\"share_id\":\"share-9\",\"share_seq\":9,\"template_height\":800000},{\"accepted_at_ms\":80001,\"job_id\":\"job-10\",\"job_issued_at_ms\":79990,\"miner_id\":\"miner-10\",\"network_difficulty\":1000010,\"ntime\":1700000010,\"order_key\":\"10:miner-10\",\"p2mr_program_hex\":\"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\",\"share_difficulty\":4,\"share_id\":\"share-10\",\"share_seq\":10,\"template_height\":800000},{\"accepted_at_ms\":80002,\"job_id\":\"job-11\",\"job_issued_at_ms\":80005,\"miner_id\":\"miner-0\",\"network_difficulty\":1000011,\"ntime\":1700000011,\"order_key\":\"00:miner-0\",\"p2mr_program_hex\":\"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b\",\"share_difficulty\":1,\"share_id\":\"share-11\",\"share_seq\":11,\"template_height\":800000},{\"accepted_at_ms\":79995,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-12\",\"job_issued_at_ms\":80010,\"miner_id\":\"miner-1\",\"network_difficulty\":1000012,\"ntime\":1700000012,\"order_key\":\"01:miner-1\",\"p2mr_program_hex\":\"0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c\",\"share_difficulty\":1,\"share_id\":\"share-12\",\"share_seq\":12,\"template_height\":800000},{\"accepted_at_ms\":80010,\"job_id\":\"job-13\",\"job_issued_at_ms\":80000,\"miner_id\":\"miner-2\",\"network_difficulty\":1000013,\"ntime\":1700000013,\"order_key\":\"02:miner-2\",\"p2mr_program_hex\":\"0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d\",\"share_difficulty\":1,\"share_id\":\"share-13\",\"share_seq\":13,\"template_height\":800000},{\"accepted_at_ms\":80009,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-14\",\"job_issued_at_ms\":80009,\"miner_id\":\"miner-3\",\"network_difficulty\":1000014,\"ntime\":1700000014,\"order_key\":\"03:miner-3\",\"p2mr_program_hex\":\"0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e\",\"share_difficulty\":1,\"share_id\":\"share-14\",\"share_seq\":14,\"template_height\":800000}]",
+        "record_jsons": [
+          "{\"accepted_at_ms\":79999,\"job_id\":\"job-9\",\"job_issued_at_ms\":80001,\"miner_id\":\"miner-9\",\"network_difficulty\":1000009,\"ntime\":1700000009,\"order_key\":\"09:miner-9\",\"p2mr_program_hex\":\"0909090909090909090909090909090909090909090909090909090909090909\",\"share_difficulty\":2,\"share_id\":\"share-9\",\"share_seq\":9,\"template_height\":800000}",
+          "{\"accepted_at_ms\":80001,\"job_id\":\"job-10\",\"job_issued_at_ms\":79990,\"miner_id\":\"miner-10\",\"network_difficulty\":1000010,\"ntime\":1700000010,\"order_key\":\"10:miner-10\",\"p2mr_program_hex\":\"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\",\"share_difficulty\":4,\"share_id\":\"share-10\",\"share_seq\":10,\"template_height\":800000}",
+          "{\"accepted_at_ms\":80002,\"job_id\":\"job-11\",\"job_issued_at_ms\":80005,\"miner_id\":\"miner-0\",\"network_difficulty\":1000011,\"ntime\":1700000011,\"order_key\":\"00:miner-0\",\"p2mr_program_hex\":\"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b\",\"share_difficulty\":1,\"share_id\":\"share-11\",\"share_seq\":11,\"template_height\":800000}",
+          "{\"accepted_at_ms\":79995,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-12\",\"job_issued_at_ms\":80010,\"miner_id\":\"miner-1\",\"network_difficulty\":1000012,\"ntime\":1700000012,\"order_key\":\"01:miner-1\",\"p2mr_program_hex\":\"0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c\",\"share_difficulty\":1,\"share_id\":\"share-12\",\"share_seq\":12,\"template_height\":800000}",
+          "{\"accepted_at_ms\":80010,\"job_id\":\"job-13\",\"job_issued_at_ms\":80000,\"miner_id\":\"miner-2\",\"network_difficulty\":1000013,\"ntime\":1700000013,\"order_key\":\"02:miner-2\",\"p2mr_program_hex\":\"0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d\",\"share_difficulty\":1,\"share_id\":\"share-13\",\"share_seq\":13,\"template_height\":800000}",
+          "{\"accepted_at_ms\":80009,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-14\",\"job_issued_at_ms\":80009,\"miner_id\":\"miner-3\",\"network_difficulty\":1000014,\"ntime\":1700000014,\"order_key\":\"03:miner-3\",\"p2mr_program_hex\":\"0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e\",\"share_difficulty\":1,\"share_id\":\"share-14\",\"share_seq\":14,\"template_height\":800000}"
+        ],
+        "spool_tail": ",\"compact_share_identities\":[[\"miner-9\",\"09:miner-9\",\"0909090909090909090909090909090909090909090909090909090909090909\"],[\"miner-10\",\"10:miner-10\",\"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\"],[\"miner-0\",\"00:miner-0\",\"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b\"],[\"miner-1\",\"01:miner-1\",\"0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c\"],[\"miner-2\",\"02:miner-2\",\"0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d\"],[\"miner-3\",\"03:miner-3\",\"0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e\"]],\"compact_shares\":[[9,\"share-9\",0,2,80001,79999,null],[10,\"share-10\",1,4,79990,80001,null],[11,\"share-11\",2,1,80005,80002,null],[12,\"share-12\",3,1,80010,79995,\"stale-grace\"],[13,\"share-13\",4,1,80000,80010,null],[14,\"share-14\",5,1,80009,80009,\"stale-grace\"]]}"
+      },
+      "record_count": 6,
+      "record_stream_len": 2044,
+      "record_stream_sha256": "1aa361b6c09e4dbfcd2c766feef74fd601eec7b1cd6704d92f6412314cbf931f",
+      "spool_tail_len": 841,
+      "spool_tail_sha256": "fa839327371ffe159490e7e0792afde689722061068c67a6c76efcdf729d5a4f",
+      "why": "two advance() steps over a page_size-3 window: append into a partially filled page, spill into new pages, expire a whole head page and partially expire the next; the folded bytes must equal a full rebuild over the union"
+    },
+    "multi-page-interior-cutoff": {
+      "canonical_bytes_len": 584180,
+      "canonical_bytes_sha256": "60792c716201a7035ed376c7742ee51349228bb4bac3d048188183c05aa94703",
+      "canonical_digest": "60792c716201a7035ed376c7742ee51349228bb4bac3d048188183c05aa94703",
+      "input_sha256": "7c5587ca344cabfa4898152e10878aa0888e1b1a690d5bd9335a06fc9cba46fa",
+      "record_count": 1700,
+      "record_stream_len": 584178,
+      "record_stream_sha256": "7d7c4eddd8245ce6620c8d101cc46878eb31bd9628080a39085a9dfebd839a47",
+      "spool_tail_len": 232993,
+      "spool_tail_sha256": "b262f2eb2f5444fe1bfa548555954b858b1c6dff9228aa13a00cc0cfb73aefa7",
+      "why": "1800 unsorted input records with the retention cutoff landing inside a page interior: pins multi-page fragment concatenation and a crossing row far from page edges"
+    },
+    "non-ascii-strings": {
+      "canonical_bytes_len": 1106,
+      "canonical_bytes_sha256": "482c3b00daed9c01344fd51e1f08144bcfc5f2355b34793cf3795430d205b5b0",
+      "canonical_digest": "482c3b00daed9c01344fd51e1f08144bcfc5f2355b34793cf3795430d205b5b0",
+      "input_sha256": "988100d0504ff1ef6123b017806bb62c9c73c5c87762e6b8be85637aa6928f05",
+      "pinned_literals": {
+        "canonical_bytes": "[{\"accepted_at_ms\":59998,\"job_id\":\"job-1\",\"job_issued_at_ms\":59997,\"miner_id\":\"min\\u00e9r-\\u00e9\",\"network_difficulty\":1000001,\"ntime\":1700000001,\"order_key\":\"00:min\\u00e9r-\\u00e9\",\"p2mr_program_hex\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"share_difficulty\":3,\"share_id\":\"min\\u00e9r-\\u00e9.work\\u00e9r:0a1b\",\"share_seq\":1,\"template_height\":800000},{\"accepted_at_ms\":59999,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-\\t\\n\\u0001\",\"job_issued_at_ms\":59998,\"miner_id\":\"miner-2\",\"network_difficulty\":1000002,\"ntime\":1700000002,\"order_key\":\"02:miner-2\",\"p2mr_program_hex\":\"0202020202020202020202020202020202020202020202020202020202020202\",\"share_difficulty\":4,\"share_id\":\"\\ud83d\\ude80-share-\\\"quoted\\\"\\\\back\\\\slash\",\"share_seq\":2,\"template_height\":800000},{\"accepted_at_ms\":60000,\"job_id\":\"job-3\",\"job_issued_at_ms\":59999,\"miner_id\":\"miner-3\",\"network_difficulty\":1000003,\"ntime\":1700000003,\"order_key\":\"03:miner-3\",\"p2mr_program_hex\":\"0303030303030303030303030303030303030303030303030303030303030303\",\"share_difficulty\":5,\"share_id\":\"share-3\",\"share_seq\":3,\"template_height\":800000}]",
+        "record_jsons": [
+          "{\"accepted_at_ms\":59998,\"job_id\":\"job-1\",\"job_issued_at_ms\":59997,\"miner_id\":\"min\\u00e9r-\\u00e9\",\"network_difficulty\":1000001,\"ntime\":1700000001,\"order_key\":\"00:min\\u00e9r-\\u00e9\",\"p2mr_program_hex\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"share_difficulty\":3,\"share_id\":\"min\\u00e9r-\\u00e9.work\\u00e9r:0a1b\",\"share_seq\":1,\"template_height\":800000}",
+          "{\"accepted_at_ms\":59999,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-\\t\\n\\u0001\",\"job_issued_at_ms\":59998,\"miner_id\":\"miner-2\",\"network_difficulty\":1000002,\"ntime\":1700000002,\"order_key\":\"02:miner-2\",\"p2mr_program_hex\":\"0202020202020202020202020202020202020202020202020202020202020202\",\"share_difficulty\":4,\"share_id\":\"\\ud83d\\ude80-share-\\\"quoted\\\"\\\\back\\\\slash\",\"share_seq\":2,\"template_height\":800000}",
+          "{\"accepted_at_ms\":60000,\"job_id\":\"job-3\",\"job_issued_at_ms\":59999,\"miner_id\":\"miner-3\",\"network_difficulty\":1000003,\"ntime\":1700000003,\"order_key\":\"03:miner-3\",\"p2mr_program_hex\":\"0303030303030303030303030303030303030303030303030303030303030303\",\"share_difficulty\":5,\"share_id\":\"share-3\",\"share_seq\":3,\"template_height\":800000}"
+        ],
+        "spool_tail": ",\"compact_share_identities\":[[\"min\\u00e9r-\\u00e9\",\"00:min\\u00e9r-\\u00e9\",\"0101010101010101010101010101010101010101010101010101010101010101\"],[\"miner-2\",\"02:miner-2\",\"0202020202020202020202020202020202020202020202020202020202020202\"],[\"miner-3\",\"03:miner-3\",\"0303030303030303030303030303030303030303030303030303030303030303\"]],\"compact_shares\":[[1,\"min\\u00e9r-\\u00e9.work\\u00e9r:0a1b\",0,3,59997,59998,null],[2,\"\\ud83d\\ude80-share-\\\"quoted\\\"\\\\back\\\\slash\",1,4,59998,59999,\"stale-grace\"],[3,\"share-3\",2,5,59999,60000,null]]}"
+      },
+      "record_count": 3,
+      "record_stream_len": 1104,
+      "record_stream_sha256": "2aca0d3d387cc86b44b0edfb82f4da3c82ee36c7ac612d9274da054ba363c570",
+      "spool_tail_len": 521,
+      "spool_tail_sha256": "5fca3a67dbb25f72371eaadf7f1650b85ef4ee46a667687fef643a460ab4492e",
+      "why": "string fields carrying non-ASCII, a non-BMP code point, quotes, backslashes and control characters: pins the ensure_ascii escape rules, surrogate-pair escaping included"
+    },
+    "page-boundary-511": {
+      "canonical_bytes_len": 174438,
+      "canonical_bytes_sha256": "58feda454b217b56f517e1d3a45656097c808691f5d36b8be709a1b8bc0c91e6",
+      "canonical_digest": "58feda454b217b56f517e1d3a45656097c808691f5d36b8be709a1b8bc0c91e6",
+      "input_sha256": "2a0911a1571970273d508db9f099064a92a3f750af949375d30df2e45e1c0810",
+      "record_count": 511,
+      "record_stream_len": 174436,
+      "record_stream_sha256": "9d8c3a86d59206d39acede0996dcf2bc188f5c289a2b92b91a232326fd5350a8",
+      "spool_tail_len": 69043,
+      "spool_tail_sha256": "94a123b56f8cbf7be963e8cac75a2a5ccf0d7f5dcc4189b95968ae17e6e537d6",
+      "why": "exactly 511 retained records around the default page size 512: pins page splitting and the digest's page-fragment framing at the boundary"
+    },
+    "page-boundary-512": {
+      "canonical_bytes_len": 174535,
+      "canonical_bytes_sha256": "a6a006c0226496981bfc70cbbae5238d07f270c719a1a0a1987224c60c644f0d",
+      "canonical_digest": "a6a006c0226496981bfc70cbbae5238d07f270c719a1a0a1987224c60c644f0d",
+      "input_sha256": "bee70ffe8279e9b3b22fb39a101fb296600b17520855623c2e490d9e123d9387",
+      "record_count": 512,
+      "record_stream_len": 174533,
+      "record_stream_sha256": "f3e63c2bd2e64e6d783596dbf9041cd811cad2782ff35e88d20b6032ceda50f2",
+      "spool_tail_len": 69107,
+      "spool_tail_sha256": "4b7581d08b9356ec17b2d0a877529a95412ad60a130f722548eb4a9e190cf70e",
+      "why": "exactly 512 retained records around the default page size 512: pins page splitting and the digest's page-fragment framing at the boundary"
+    },
+    "page-boundary-513": {
+      "canonical_bytes_len": 175164,
+      "canonical_bytes_sha256": "dfb7169f9f41dff0e8bb04e146f7c276ad385e3d5129b5a64994c132f1507d78",
+      "canonical_digest": "dfb7169f9f41dff0e8bb04e146f7c276ad385e3d5129b5a64994c132f1507d78",
+      "input_sha256": "66a66e502b4ffe31be1abbf6aa42d59dfd2cd0e492d4afd4cc7fb98f72fc500d",
+      "record_count": 513,
+      "record_stream_len": 175162,
+      "record_stream_sha256": "101ee825632e35a14dcccf24250193ee7fb7906b9c817c52ec3250ec99a7765b",
+      "spool_tail_len": 69346,
+      "spool_tail_sha256": "691beb8a990c68061b35b0dfdb3f0add802440a4cd7014d0429099b89a225d57",
+      "why": "exactly 513 retained records around the default page size 512: pins page splitting and the digest's page-fragment framing at the boundary"
+    },
+    "single-record": {
+      "canonical_bytes_len": 327,
+      "canonical_bytes_sha256": "0c0f79989d847dff32c1ec70990ed03c73fb567155eb6fda1576809587116d31",
+      "canonical_digest": "0c0f79989d847dff32c1ec70990ed03c73fb567155eb6fda1576809587116d31",
+      "input_sha256": "f58f51dae8af68af210445807e536d84376c0b3a11b47695893913d69c8cf320",
+      "pinned_literals": {
+        "canonical_bytes": "[{\"accepted_at_ms\":2000,\"job_id\":\"job-1\",\"job_issued_at_ms\":1999,\"miner_id\":\"miner-1\",\"network_difficulty\":1000001,\"ntime\":1700000001,\"order_key\":\"01:miner-1\",\"p2mr_program_hex\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"share_difficulty\":5,\"share_id\":\"share-1\",\"share_seq\":1,\"template_height\":800000}]",
+        "record_jsons": [
+          "{\"accepted_at_ms\":2000,\"job_id\":\"job-1\",\"job_issued_at_ms\":1999,\"miner_id\":\"miner-1\",\"network_difficulty\":1000001,\"ntime\":1700000001,\"order_key\":\"01:miner-1\",\"p2mr_program_hex\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"share_difficulty\":5,\"share_id\":\"share-1\",\"share_seq\":1,\"template_height\":800000}"
+        ],
+        "spool_tail": ",\"compact_share_identities\":[[\"miner-1\",\"01:miner-1\",\"0101010101010101010101010101010101010101010101010101010101010101\"]],\"compact_shares\":[[1,\"share-1\",0,5,1999,2000,null]]}"
+      },
+      "record_count": 1,
+      "record_stream_len": 325,
+      "record_stream_sha256": "b25c06b504068a2ba0ad150679c26e1648f9dcd0869a3294a20a50196e71145f",
+      "spool_tail_len": 174,
+      "spool_tail_sha256": "69673fe5321dfefc026ccedcd8f4ebbd38c562dadf1412dbe872db6225e75601",
+      "why": "one record with credit_policy None: to_prism_json omits the key while the compact share tuple carries an explicit null -- the null-vs-absent divergence surface"
+    },
+    "unsorted-input": {
+      "canonical_bytes_len": 3098,
+      "canonical_bytes_sha256": "e4fbb63bef1cf2d8ab54afc77b766af863bdf2e8c56baaf21f82ab50443b3eb9",
+      "canonical_digest": "e4fbb63bef1cf2d8ab54afc77b766af863bdf2e8c56baaf21f82ab50443b3eb9",
+      "input_sha256": "27a0c45f9c641dafec411ba5a5df29f42957a34b43ce1355b3cb0300f3b6b19f",
+      "pinned_literals": {
+        "canonical_bytes": "[{\"accepted_at_ms\":39988,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-9\",\"job_issued_at_ms\":39975,\"miner_id\":\"miner-9\",\"network_difficulty\":1000009,\"ntime\":1700000009,\"order_key\":\"09:miner-9\",\"p2mr_program_hex\":\"0909090909090909090909090909090909090909090909090909090909090909\",\"share_difficulty\":19,\"share_id\":\"share-9\",\"share_seq\":9,\"template_height\":800000},{\"accepted_at_ms\":39984,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-19\",\"job_issued_at_ms\":39989,\"miner_id\":\"miner-8\",\"network_difficulty\":1000002,\"ntime\":1700000019,\"order_key\":\"08:miner-8\",\"p2mr_program_hex\":\"1313131313131313131313131313131313131313131313131313131313131313\",\"share_difficulty\":1,\"share_id\":\"share-19\",\"share_seq\":19,\"template_height\":800000},{\"accepted_at_ms\":39987,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-20\",\"job_issued_at_ms\":39981,\"miner_id\":\"miner-9\",\"network_difficulty\":1000003,\"ntime\":1700000020,\"order_key\":\"09:miner-9\",\"p2mr_program_hex\":\"1414141414141414141414141414141414141414141414141414141414141414\",\"share_difficulty\":2,\"share_id\":\"share-20\",\"share_seq\":20,\"template_height\":800000},{\"accepted_at_ms\":39971,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-24\",\"job_issued_at_ms\":39986,\"miner_id\":\"miner-2\",\"network_difficulty\":1000007,\"ntime\":1700000024,\"order_key\":\"02:miner-2\",\"p2mr_program_hex\":\"1818181818181818181818181818181818181818181818181818181818181818\",\"share_difficulty\":3,\"share_id\":\"share-24\",\"share_seq\":24,\"template_height\":800000},{\"accepted_at_ms\":39976,\"job_id\":\"job-28\",\"job_issued_at_ms\":40000,\"miner_id\":\"miner-6\",\"network_difficulty\":1000011,\"ntime\":1700000028,\"order_key\":\"06:miner-6\",\"p2mr_program_hex\":\"1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c\",\"share_difficulty\":1,\"share_id\":\"share-28\",\"share_seq\":28,\"template_height\":800000},{\"accepted_at_ms\":39992,\"job_id\":\"job-84\",\"job_issued_at_ms\":39971,\"miner_id\":\"miner-7\",\"network_difficulty\":1000016,\"ntime\":1700000084,\"order_key\":\"07:miner-7\",\"p2mr_program_hex\":\"5454545454545454545454545454545454545454545454545454545454545454\",\"share_difficulty\":1,\"share_id\":\"share-84\",\"share_seq\":84,\"template_height\":800002},{\"accepted_at_ms\":39980,\"job_id\":\"job-88\",\"job_issued_at_ms\":39978,\"miner_id\":\"miner-0\",\"network_difficulty\":1000003,\"ntime\":1700000088,\"order_key\":\"00:miner-0\",\"p2mr_program_hex\":\"5858585858585858585858585858585858585858585858585858585858585858\",\"share_difficulty\":7,\"share_id\":\"share-88\",\"share_seq\":88,\"template_height\":800002},{\"accepted_at_ms\":39984,\"job_id\":\"job-92\",\"job_issued_at_ms\":39974,\"miner_id\":\"miner-4\",\"network_difficulty\":1000007,\"ntime\":1700000092,\"order_key\":\"04:miner-4\",\"p2mr_program_hex\":\"5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c\",\"share_difficulty\":3,\"share_id\":\"share-92\",\"share_seq\":92,\"template_height\":800002},{\"accepted_at_ms\":39988,\"job_id\":\"job-94\",\"job_issued_at_ms\":40000,\"miner_id\":\"miner-6\",\"network_difficulty\":1000009,\"ntime\":1700000094,\"order_key\":\"06:miner-6\",\"p2mr_program_hex\":\"5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e\",\"share_difficulty\":1,\"share_id\":\"share-94\",\"share_seq\":94,\"template_height\":800002}]",
+        "record_jsons": [
+          "{\"accepted_at_ms\":39988,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-9\",\"job_issued_at_ms\":39975,\"miner_id\":\"miner-9\",\"network_difficulty\":1000009,\"ntime\":1700000009,\"order_key\":\"09:miner-9\",\"p2mr_program_hex\":\"0909090909090909090909090909090909090909090909090909090909090909\",\"share_difficulty\":19,\"share_id\":\"share-9\",\"share_seq\":9,\"template_height\":800000}",
+          "{\"accepted_at_ms\":39984,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-19\",\"job_issued_at_ms\":39989,\"miner_id\":\"miner-8\",\"network_difficulty\":1000002,\"ntime\":1700000019,\"order_key\":\"08:miner-8\",\"p2mr_program_hex\":\"1313131313131313131313131313131313131313131313131313131313131313\",\"share_difficulty\":1,\"share_id\":\"share-19\",\"share_seq\":19,\"template_height\":800000}",
+          "{\"accepted_at_ms\":39987,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-20\",\"job_issued_at_ms\":39981,\"miner_id\":\"miner-9\",\"network_difficulty\":1000003,\"ntime\":1700000020,\"order_key\":\"09:miner-9\",\"p2mr_program_hex\":\"1414141414141414141414141414141414141414141414141414141414141414\",\"share_difficulty\":2,\"share_id\":\"share-20\",\"share_seq\":20,\"template_height\":800000}",
+          "{\"accepted_at_ms\":39971,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-24\",\"job_issued_at_ms\":39986,\"miner_id\":\"miner-2\",\"network_difficulty\":1000007,\"ntime\":1700000024,\"order_key\":\"02:miner-2\",\"p2mr_program_hex\":\"1818181818181818181818181818181818181818181818181818181818181818\",\"share_difficulty\":3,\"share_id\":\"share-24\",\"share_seq\":24,\"template_height\":800000}",
+          "{\"accepted_at_ms\":39976,\"job_id\":\"job-28\",\"job_issued_at_ms\":40000,\"miner_id\":\"miner-6\",\"network_difficulty\":1000011,\"ntime\":1700000028,\"order_key\":\"06:miner-6\",\"p2mr_program_hex\":\"1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c\",\"share_difficulty\":1,\"share_id\":\"share-28\",\"share_seq\":28,\"template_height\":800000}",
+          "{\"accepted_at_ms\":39992,\"job_id\":\"job-84\",\"job_issued_at_ms\":39971,\"miner_id\":\"miner-7\",\"network_difficulty\":1000016,\"ntime\":1700000084,\"order_key\":\"07:miner-7\",\"p2mr_program_hex\":\"5454545454545454545454545454545454545454545454545454545454545454\",\"share_difficulty\":1,\"share_id\":\"share-84\",\"share_seq\":84,\"template_height\":800002}",
+          "{\"accepted_at_ms\":39980,\"job_id\":\"job-88\",\"job_issued_at_ms\":39978,\"miner_id\":\"miner-0\",\"network_difficulty\":1000003,\"ntime\":1700000088,\"order_key\":\"00:miner-0\",\"p2mr_program_hex\":\"5858585858585858585858585858585858585858585858585858585858585858\",\"share_difficulty\":7,\"share_id\":\"share-88\",\"share_seq\":88,\"template_height\":800002}",
+          "{\"accepted_at_ms\":39984,\"job_id\":\"job-92\",\"job_issued_at_ms\":39974,\"miner_id\":\"miner-4\",\"network_difficulty\":1000007,\"ntime\":1700000092,\"order_key\":\"04:miner-4\",\"p2mr_program_hex\":\"5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c\",\"share_difficulty\":3,\"share_id\":\"share-92\",\"share_seq\":92,\"template_height\":800002}",
+          "{\"accepted_at_ms\":39988,\"job_id\":\"job-94\",\"job_issued_at_ms\":40000,\"miner_id\":\"miner-6\",\"network_difficulty\":1000009,\"ntime\":1700000094,\"order_key\":\"06:miner-6\",\"p2mr_program_hex\":\"5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e\",\"share_difficulty\":1,\"share_id\":\"share-94\",\"share_seq\":94,\"template_height\":800002}"
+        ],
+        "spool_tail": ",\"compact_share_identities\":[[\"miner-9\",\"09:miner-9\",\"0909090909090909090909090909090909090909090909090909090909090909\"],[\"miner-8\",\"08:miner-8\",\"1313131313131313131313131313131313131313131313131313131313131313\"],[\"miner-9\",\"09:miner-9\",\"1414141414141414141414141414141414141414141414141414141414141414\"],[\"miner-2\",\"02:miner-2\",\"1818181818181818181818181818181818181818181818181818181818181818\"],[\"miner-6\",\"06:miner-6\",\"1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c\"],[\"miner-7\",\"07:miner-7\",\"5454545454545454545454545454545454545454545454545454545454545454\"],[\"miner-0\",\"00:miner-0\",\"5858585858585858585858585858585858585858585858585858585858585858\"],[\"miner-4\",\"04:miner-4\",\"5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c\"],[\"miner-6\",\"06:miner-6\",\"5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e\"]],\"compact_shares\":[[9,\"share-9\",0,19,39975,39988,\"stale-grace\"],[19,\"share-19\",1,1,39989,39984,\"stale-grace\"],[20,\"share-20\",2,2,39981,39987,\"stale-grace\"],[24,\"share-24\",3,3,39986,39971,\"stale-grace\"],[28,\"share-28\",4,1,40000,39976,null],[84,\"share-84\",5,1,39971,39992,null],[88,\"share-88\",6,7,39978,39980,null],[92,\"share-92\",7,3,39974,39984,null],[94,\"share-94\",8,1,40000,39988,null]]}"
+      },
+      "record_count": 9,
+      "record_stream_len": 3096,
+      "record_stream_sha256": "ed085c4435070aab77acb77c5bddc5839c9ecae4c31d2a5fad10e7878062d4e1",
+      "spool_tail_len": 1245,
+      "spool_tail_sha256": "05651dc0dd4b4e151dec5ea8c5f1fa1c499ce513538b812ccdeff6b5e6f9e653",
+      "why": "snapshot input arrives in non-ascending share_seq order with non-contiguous seqs; the fold's sorted() is load-bearing and the output ordering is pinned"
+    }
+  },
+  "default_page_size": 512,
+  "master_seed": "0xb17e5eed",
+  "regenerate_with": "python3 -m tests.window_pipeline_parity regenerate",
+  "schema": "qbit-prism-window-pipeline-parity-reference/v1"
+}
