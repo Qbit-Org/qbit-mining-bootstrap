@@ -4151,6 +4151,29 @@ class CanonicalAuditBundleTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), first)
             self.assertEqual((before.st_dev, before.st_ino), (after.st_dev, after.st_ino))
 
+    def test_republication_accepts_equivalent_gzip_from_another_compressor(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_store(root)
+            bundle = self.bundle()
+            payload = self.canonical(bundle)
+            digest = self.digest(bundle)
+            path = store.write_canonical_audit_bundle(BLOCK_A, digest, payload)
+
+            alternative = gzip.compress(payload, compresslevel=1, mtime=0)
+            self.assertNotEqual(alternative, path.read_bytes())
+            self.assertEqual(gzip.decompress(alternative), payload)
+            path.write_bytes(alternative)
+            before = path.stat()
+
+            repeat = store.write_canonical_audit_bundle(BLOCK_A, digest, payload)
+
+            after = repeat.stat()
+            self.assertEqual(repeat.read_bytes(), alternative)
+            self.assertEqual((before.st_dev, before.st_ino), (after.st_dev, after.st_ino))
+
     def test_conflicting_or_corrupt_artifact_fails_loudly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

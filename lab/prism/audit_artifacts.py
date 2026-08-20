@@ -52,7 +52,8 @@ LEGACY_VERIFICATION_UNAVAILABLE_SCHEMA = (
 )
 # The canonical bundle is stored compressed, but its public identity stays
 # the SHA-256 of the *uncompressed* canonical JSON.  Level 9 with mtime=0
-# keeps stdlib gzip byte-for-byte reproducible so republication is a no-op.
+# keeps stdlib gzip reproducible for a given compressor; republication checks
+# the uncompressed payload so a compressor change cannot redefine identity.
 CANONICAL_BUNDLE_GZIP_LEVEL = 9
 
 _HEX_64 = r"[0-9a-f]{64}"
@@ -159,7 +160,8 @@ def gzip_canonical_bundle_bytes(payload: bytes) -> bytes:
     """Compress canonical bundle bytes reproducibly.
 
     A BytesIO sink carries no name, so gzip emits no FNAME field; with mtime=0
-    the header is a constant and equal inputs always produce equal artifacts.
+    the header is constant and equal inputs are reproducible for a given
+    compressor implementation.
     """
 
     sink = io.BytesIO()
@@ -3531,24 +3533,46 @@ class AuditArtifactStore:
                 f"audit bundle sha256 mismatch: expected {digest}, got {actual}"
             )
         path = self.canonical_bundle_path(block_hash, digest)
-        # The immutable writer is the publication boundary: it links atomically,
-        # treats byte-identical republication as a durability repair, and
-        # refuses to overwrite an artifact that does not match.
-        self._write_immutable_bytes(path, gzip_canonical_bundle_bytes(payload))
-        # `_write_immutable_bytes` already fsyncs the directory; restating the
-        # durability boundary here keeps it explicit for this artifact kind.
-        self._fsync_directory(path.parent)
-        published = self.read_canonical_audit_bundle(block_hash, digest)
-        if published is None:
-            raise RuntimeError(
-                f"canonical audit bundle is absent after publication at {path}"
-            )
-        if not hmac.compare_digest(published, payload):
-            raise CanonicalAuditBundleCorrupt(
-                f"canonical audit bundle bytes changed during publication at {path}"
-            )
-        self._validate_root_identity()
-        return path
+        with self._lock:
+            try:
+                existing_payload = self.read_canonical_audit_bundle(
+                    block_hash,
+                    digest,
+                )
+            except CanonicalAuditBundleCorrupt:
+                # Preserve the immutable writer's existing conflict behavior
+                # for damaged files.  It will refuse to replace their bytes.
+                existing_payload = None
+            if existing_payload is not None and hmac.compare_digest(
+                existing_payload,
+                payload,
+            ):
+                # The public identity covers the uncompressed canonical bytes,
+                # not a particular zlib encoding.  A retry after a compressor
+                # upgrade is therefore the same durability-repair boundary as
+                # a byte-identical gzip republication.
+                self._fsync_directory(path.parent)
+                self._validate_root_identity()
+                return path
+
+            # The immutable writer is the publication boundary: it links
+            # atomically and refuses to overwrite an artifact that does not
+            # represent this canonical payload.
+            self._write_immutable_bytes(path, gzip_canonical_bundle_bytes(payload))
+            # `_write_immutable_bytes` already fsyncs the directory; restating
+            # the durability boundary here keeps it explicit for this artifact.
+            self._fsync_directory(path.parent)
+            published = self.read_canonical_audit_bundle(block_hash, digest)
+            if published is None:
+                raise RuntimeError(
+                    f"canonical audit bundle is absent after publication at {path}"
+                )
+            if not hmac.compare_digest(published, payload):
+                raise CanonicalAuditBundleCorrupt(
+                    f"canonical audit bundle bytes changed during publication at {path}"
+                )
+            self._validate_root_identity()
+            return path
 
     def read_canonical_audit_bundle(
         self,
