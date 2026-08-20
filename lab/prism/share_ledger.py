@@ -6980,6 +6980,143 @@ END;
             return None
         return str(self._audit_body_path(payload["block_hash"], payload["audit_bundle_sha256"]))
 
+    def preflight_canonical_bundle_publication(
+        self,
+        *,
+        block_hash: str,
+        audit_bundle_sha256: str,
+    ) -> dict[str, object]:
+        """Refresh the writer lease and confirm one block/digest row identity.
+
+        The standalone canonical-bundle backfill calls this immediately before
+        each publication. It is the same fence `_external_audit_body_write_plan`
+        applies to the live path: a writer whose lease has lapsed must not keep
+        creating artifacts under the audit root, and the digest it is about to
+        publish must be the one the ledger row already advertises. Reads the
+        audit tables only; the sole mutation is the writer's own lease
+        heartbeat, so no schema changes.
+
+        Returns the row's `body_uri` (None for legacy inline rows) and whether
+        an inline body is still present, which is what the backfill needs to
+        choose its byte source. Raises when the lease is not active or the
+        block/digest identity does not match.
+        """
+
+        block_hash = canonical_hex(str(block_hash), name="block_hash", expected_bytes=32)
+        digest = canonical_hex(
+            str(audit_bundle_sha256),
+            name="audit_bundle_sha256",
+            expected_bytes=32,
+        )
+        payload = {
+            "block_hash": block_hash,
+            "audit_bundle_sha256": digest,
+            "writer_id": self._writer_id,
+            "writer_epoch": self._writer_epoch,
+            "writer_session_token": self._writer_session_token,
+        }
+        sql = f"""
+WITH payload AS (
+    SELECT {self._jsonb_literal(payload)} AS data
+),
+lease AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    FROM payload
+    WHERE qbit_ledger_writer_lease.singleton
+      AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+      AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+      AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
+    RETURNING qbit_ledger_writer_lease.writer_id
+),
+bundle AS (
+    SELECT
+        block_hash,
+        audit_bundle_sha256,
+        body_uri,
+        audit_bundle IS NOT NULL AS has_inline_bundle
+    FROM qbit_pool_audit_bundles
+    WHERE block_hash = (SELECT data->>'block_hash' FROM payload)
+),
+matching_bundle AS (
+    SELECT bundle.*
+    FROM bundle, payload
+    WHERE bundle.audit_bundle_sha256 = data->>'audit_bundle_sha256'
+)
+SELECT CASE
+    WHEN (SELECT count(*) FROM lease) = 0 THEN
+        json_build_object('error', 'writer lease is not active')
+    WHEN (SELECT count(*) FROM bundle) = 0 THEN
+        json_build_object('error', 'audit bundle row does not exist')
+    WHEN (SELECT count(*) FROM matching_bundle) = 0 THEN
+        json_build_object('error', 'audit bundle digest does not match the stored row')
+    ELSE
+        json_build_object(
+            'block_hash', (SELECT block_hash FROM matching_bundle LIMIT 1),
+            'audit_bundle_sha256', (SELECT audit_bundle_sha256 FROM matching_bundle LIMIT 1),
+            'body_uri', (SELECT body_uri FROM matching_bundle LIMIT 1),
+            'has_inline_bundle', (SELECT has_inline_bundle FROM matching_bundle LIMIT 1)
+        )
+END;
+"""
+        result = self._run_fenced_json(sql)
+        if not isinstance(result, dict):
+            raise RuntimeError("canonical bundle preflight returned no row")
+        if "error" in result:
+            raise RuntimeError(str(result["error"]))
+        body_uri = result.get("body_uri")
+        return {
+            "block_hash": block_hash,
+            "audit_bundle_sha256": digest,
+            "body_uri": str(body_uri) if body_uri else None,
+            "has_inline_bundle": bool(result.get("has_inline_bundle")),
+        }
+
+    def canonical_bundle_bytes_for_backfill(
+        self,
+        *,
+        block_hash: str,
+        audit_bundle_sha256: str,
+        body_uri: object,
+    ) -> bytes:
+        """Recover verified canonical bytes for an already published body.
+
+        Binds the ledger's append-only share loader to the store helper so the
+        standalone backfill can repair share segments that have left the disk
+        without reaching into ledger internals. Every recovered range is checked
+        against the digest the body already commits to, and the assembled bundle
+        against the advertised bundle digest.
+        """
+
+        return self._audit_store().canonical_bundle_bytes_from_external_body(
+            block_hash=block_hash,
+            audit_bundle_sha256=audit_bundle_sha256,
+            body_uri=body_uri,
+            load_missing_range=self._load_audit_share_ledger_range,
+        )
+
+    def publish_canonical_bundle_bytes(
+        self,
+        *,
+        block_hash: str,
+        audit_bundle_sha256: str,
+        canonical_bytes: bytes,
+    ) -> str:
+        """Publish canonical bytes under the store's ownership checks.
+
+        Callers must run `preflight_canonical_bundle_publication` immediately
+        before this so the writer lease is current when the artifact lands.
+        """
+
+        return str(
+            self._audit_store().write_canonical_audit_bundle(
+                block_hash,
+                audit_bundle_sha256,
+                canonical_bytes,
+            )
+        )
+
     def _audit_body_byte_len(self, body_uri: object | None, final_bundle: dict[str, Any], canonical_bundle_path: Path | None = None) -> int:
         if self._audit_artifact_store is None:
             return len(self._canonical_audit_bundle_bytes(final_bundle))

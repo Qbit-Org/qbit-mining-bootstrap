@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import gzip
 import hashlib
 import io
 import json
@@ -4956,6 +4957,10 @@ class PrismShareLedgerTests(unittest.TestCase):
                     audit_report=report,
                 )
             self.assertEqual(list(Path(tmp).glob("prism-audit-bundle-body-*.json")), [])
+            self.assertEqual(
+                list(Path(tmp).glob("prism-audit-bundle-canonical-*.json.gz")),
+                [],
+            )
 
     def test_psql_persist_requires_lease_preflight_before_external_body_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4988,6 +4993,220 @@ class PrismShareLedgerTests(unittest.TestCase):
                 )
             self.assertEqual(list(Path(tmp).glob("prism-audit-bundle-body-*.json")), [])
             self.assertEqual(list(Path(tmp).glob("prism-audit-share-segment-*.json")), [])
+            # The canonical copy is a filesystem side effect like any other and
+            # must stay behind the same lease fence.
+            self.assertEqual(
+                list(Path(tmp).glob("prism-audit-bundle-canonical-*.json.gz")),
+                [],
+            )
+
+    def test_psql_persist_publishes_the_canonical_bundle_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = {
+                "schema": "qbit.prism.audit-bundle.v1",
+                "shares": [
+                    {"share_seq": 1, "share_id": "s1"},
+                    {"share_seq": 2, "share_id": "s2"},
+                ],
+                "signed_coinbase_manifest": {"manifest": {"payout_count": 0}},
+                "payout_policy_manifest": {"accounts": []},
+            }
+            digest = fake_audit_bundle_sha256(bundle)
+            report = {
+                "coinbase_txid": "ee" * 32,
+                "coinbase_manifest_sha256_hex": "11" * 32,
+                "audit_bundle_sha256_hex": digest,
+                "coinbase_tx_hex": "00",
+            }
+            insert_result = {
+                "backend": "postgres-psql",
+                "share_count": 0,
+                "block_count": 1,
+                "bundle_count": 1,
+                "payout_entry_count": 0,
+                "carry_forward_count": 0,
+                "onchain_output_count": 0,
+            }
+            ledger = FakeLeasePsqlShareLedger(
+                [
+                    acquired_lease(),
+                    {"existing_block": False, "existing_body_uri": None},
+                    insert_result,
+                ],
+                audit_body_dir=tmp,
+                audit_bundle_canonicalizer=fake_audit_bundle_bytes,
+                audit_share_segment_size=2,
+            )
+            ledger.persist_accepted_block(
+                block_hash="aa" * 32,
+                block_height=10,
+                parent_hash="bb" * 32,
+                final_bundle=bundle,
+                audit_report=report,
+            )
+            canonical_files = sorted(
+                Path(tmp).glob("prism-audit-bundle-canonical-*.json.gz")
+            )
+            self.assertEqual(len(canonical_files), 1)
+            self.assertEqual(
+                canonical_files[0].name,
+                f"prism-audit-bundle-canonical-{'aa' * 32}-{digest}.json.gz",
+            )
+            # The compact body stays the pointer the row references; the
+            # canonical copy carries the exact bytes the digest is taken over.
+            compressed = canonical_files[0].read_bytes()
+            self.assertEqual(gzip.decompress(compressed), fake_audit_bundle_bytes(bundle))
+            body_files = sorted(Path(tmp).glob("prism-audit-bundle-body-*.json"))
+            self.assertEqual(len(body_files), 1)
+            self.assertNotEqual(body_files[0].read_bytes(), fake_audit_bundle_bytes(bundle))
+            self.assertEqual(
+                ledger._audit_store().read_canonical_audit_bundle("aa" * 32, digest),
+                fake_audit_bundle_bytes(bundle),
+            )
+
+            # Re-persisting the same block republishes byte-for-byte.
+            ledger.lease_results.extend(
+                [{"existing_block": True, "existing_body_uri": str(body_files[0])}, insert_result]
+            )
+            ledger.persist_accepted_block(
+                block_hash="aa" * 32,
+                block_height=10,
+                parent_hash="bb" * 32,
+                final_bundle=bundle,
+                audit_report=report,
+            )
+            self.assertEqual(canonical_files[0].read_bytes(), compressed)
+            self.assertEqual(
+                sorted(Path(tmp).glob("prism-audit-bundle-canonical-*.json.gz")),
+                canonical_files,
+            )
+
+    def test_backfill_seams_bind_the_ledger_loader_and_the_owned_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = {
+                "schema": "qbit.prism.audit-bundle.v1",
+                "shares": [
+                    {"share_seq": 1, "share_id": "s1"},
+                    {"share_seq": 2, "share_id": "s2"},
+                ],
+                "signed_coinbase_manifest": {"manifest": {"payout_count": 0}},
+                "payout_policy_manifest": {"accounts": []},
+            }
+            digest = fake_audit_bundle_sha256(bundle)
+            ledger = FakeLeasePsqlShareLedger(
+                [acquired_lease(), {"existing_block": False, "existing_body_uri": None}],
+                audit_body_dir=tmp,
+                audit_bundle_canonicalizer=fake_audit_bundle_bytes,
+                audit_share_segment_size=2,
+            )
+            body_uri = ledger._prepare_external_audit_body(
+                {"block_hash": "aa" * 32, "audit_bundle_sha256": digest},
+                bundle,
+            )
+            assert body_uri is not None
+            canonical_path = Path(
+                ledger.publish_canonical_bundle_bytes(
+                    block_hash="aa" * 32,
+                    audit_bundle_sha256=digest,
+                    canonical_bytes=fake_audit_bundle_bytes(bundle),
+                )
+            )
+            self.assertTrue(canonical_path.exists())
+
+            # Drop the segments; the seam must repair them from the ledger.
+            for segment in Path(tmp).glob("prism-audit-share-segment-*"):
+                segment.unlink()
+            loaded: list[tuple[int, int]] = []
+
+            def load_range(*, first_share_seq: int, last_share_seq: int) -> list[Any]:
+                loaded.append((first_share_seq, last_share_seq))
+                return [
+                    {"share_seq": share_seq, "share_id": f"s{share_seq}"}
+                    for share_seq in range(first_share_seq, last_share_seq + 1)
+                ]
+
+            with unittest.mock.patch.object(
+                ledger,
+                "_load_audit_share_ledger_range",
+                side_effect=load_range,
+            ):
+                recovered = ledger.canonical_bundle_bytes_for_backfill(
+                    block_hash="aa" * 32,
+                    audit_bundle_sha256=digest,
+                    body_uri=body_uri,
+                )
+            self.assertEqual(recovered, fake_audit_bundle_bytes(bundle))
+            self.assertEqual(loaded, [(1, 2)])
+
+    def test_preflight_canonical_bundle_publication_fences_each_backfill_write(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {
+                    "block_hash": "aa" * 32,
+                    "audit_bundle_sha256": "22" * 32,
+                    "body_uri": "prism-audit-bundle-body-x.json",
+                    "has_inline_bundle": False,
+                },
+            ]
+        )
+        result = ledger.preflight_canonical_bundle_publication(
+            block_hash="aa" * 32,
+            audit_bundle_sha256="22" * 32,
+        )
+        self.assertEqual(
+            result,
+            {
+                "block_hash": "aa" * 32,
+                "audit_bundle_sha256": "22" * 32,
+                "body_uri": "prism-audit-bundle-body-x.json",
+                "has_inline_bundle": False,
+            },
+        )
+        query = ledger.lease_queries[-1]
+        # Refreshes the lease this writer already holds, and reads the audit
+        # row it is about to answer for. No schema change, no row rewrite.
+        self.assertIn("UPDATE qbit_ledger_writer_lease", query)
+        self.assertIn("lease_expires_at = clock_timestamp() + make_interval", query)
+        self.assertIn("qbit_ledger_writer_lease.writer_session_token = data->>", query)
+        self.assertIn("FROM qbit_pool_audit_bundles", query)
+        self.assertIn("'writer lease is not active'", query)
+        self.assertIn("'audit bundle digest does not match the stored row'", query)
+        for forbidden in (
+            "ALTER TABLE",
+            "CREATE ",
+            "INSERT INTO",
+            "DELETE FROM",
+            "UPDATE qbit_pool_audit_bundles",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, query)
+
+    def test_preflight_canonical_bundle_publication_fails_closed(self) -> None:
+        for failure, expected in (
+            ({"error": "writer lease is not active"}, "writer lease is not active"),
+            ({"error": "audit bundle row does not exist"}, "row does not exist"),
+            (
+                {"error": "audit bundle digest does not match the stored row"},
+                "digest does not match",
+            ),
+            (None, "returned no row"),
+        ):
+            with self.subTest(failure=failure):
+                ledger = FakeLeasePsqlShareLedger([acquired_lease(), failure])
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    ledger.preflight_canonical_bundle_publication(
+                        block_hash="aa" * 32,
+                        audit_bundle_sha256="22" * 32,
+                    )
+        ledger = FakeLeasePsqlShareLedger([acquired_lease()])
+        for block_hash, digest in (("aa" * 31, "22" * 32), ("aa" * 32, "zz" * 32)):
+            with self.subTest(block_hash=block_hash, digest=digest):
+                with self.assertRaises(ValueError):
+                    ledger.preflight_canonical_bundle_publication(
+                        block_hash=block_hash,
+                        audit_bundle_sha256=digest,
+                    )
 
     def test_psql_external_body_path_must_stay_under_store(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
