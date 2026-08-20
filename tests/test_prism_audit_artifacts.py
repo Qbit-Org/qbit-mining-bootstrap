@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import gzip
 import hashlib
 import json
 import os
@@ -12,18 +13,21 @@ import tempfile
 import threading
 import time
 import unittest
+from typing import Any
 from unittest import mock
 
 from lab.prism.audit_artifacts import (
     AuditArtifactConfig,
     AuditArtifactStore,
     AuditPublicationIdentity,
+    CanonicalAuditBundleCorrupt,
     LIVE_ENVELOPE_SCHEMA,
     LIVE_EVIDENCE_SCHEMA,
     OwnedCandidateArtifact,
     _AuditShareSegmentConflict,
     _FileIdentity,
     canonical_audit_bundle_bytes,
+    gzip_canonical_bundle_bytes,
 )
 from lab.prism.bundle_compiler import canonical_bundle_bytes
 from lab.prism.share_ledger import SingleWriterShareLedger
@@ -3017,7 +3021,7 @@ with store.publication_order_guard():
         with tempfile.TemporaryDirectory() as tmp:
             store = self.make_store(Path(tmp))
             target = store.root / "operator-selected.json"
-            with self.assertRaisesRegex(RuntimeError, "owned body or segment"):
+            with self.assertRaisesRegex(RuntimeError, "is not an owned body"):
                 store._write_immutable_bytes(target, b"payload")
             self.assertFalse(target.exists())
 
@@ -4038,6 +4042,516 @@ class AuditShareSegmentRecoveryTests(unittest.TestCase):
             assert parts is not None
             self.assertEqual(parts[0]["kind"], "segment_range")
             self.assertEqual(parts[0]["first_share_seq"], 4)
+
+
+class CanonicalAuditBundleTests(unittest.TestCase):
+    """Phase 2: the exact bytes behind a published digest stay retrievable."""
+
+    def make_store(
+        self,
+        root: Path,
+        *,
+        share_segment_size: int = 2,
+        counter: list[int] | None = None,
+        **kwargs: object,
+    ) -> AuditArtifactStore:
+        def canonicalizer(bundle: dict[str, object]) -> bytes:
+            if counter is not None:
+                counter.append(1)
+            return json.dumps(bundle, separators=(",", ":")).encode("utf-8")
+
+        return AuditArtifactStore(
+            AuditArtifactConfig(
+                root=root,
+                evidence_path=root / "evidence.json",
+                share_segment_size=share_segment_size,
+                **kwargs,  # type: ignore[arg-type]
+            ),
+            canonicalizer=canonicalizer,
+        )
+
+    @staticmethod
+    def bundle(share_count: int = 4) -> dict[str, object]:
+        return {
+            "schema": "example",
+            "shares": [
+                {"share_seq": share_seq, "worker": f"miner-{share_seq}"}
+                for share_seq in range(1, share_count + 1)
+            ],
+        }
+
+    @staticmethod
+    def canonical(bundle: dict[str, object]) -> bytes:
+        return json.dumps(bundle, separators=(",", ":")).encode("utf-8")
+
+    def digest(self, bundle: dict[str, object]) -> str:
+        return hashlib.sha256(self.canonical(bundle)).hexdigest()
+
+    def publish(
+        self,
+        store: AuditArtifactStore,
+        bundle: dict[str, object],
+        *,
+        block_hash: str = BLOCK_A,
+    ) -> tuple[str, str]:
+        digest = self.digest(bundle)
+        body_uri = str(store.body_path(block_hash, digest))
+        published = store.prepare_external_audit_body(
+            {"block_hash": block_hash, "audit_bundle_sha256": digest},
+            bundle,
+            body_uri=body_uri,
+        )
+        assert published is not None
+        return published, digest
+
+    def test_publication_verifies_the_digest_before_any_store_side_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_store(root)
+            bundle = self.bundle()
+            wrong = "cc" * 32
+            with self.assertRaisesRegex(RuntimeError, "sha256 mismatch"):
+                store.write_canonical_audit_bundle(
+                    BLOCK_A,
+                    wrong,
+                    self.canonical(bundle),
+                )
+            self.assertEqual(
+                list(root.glob("prism-audit-bundle-canonical-*")),
+                [],
+            )
+
+    def test_publication_is_deterministic_reproducible_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_store(root)
+            bundle = self.bundle()
+            digest = self.digest(bundle)
+            path = store.write_canonical_audit_bundle(
+                BLOCK_A,
+                digest,
+                self.canonical(bundle),
+            )
+            self.assertEqual(
+                path.name,
+                f"prism-audit-bundle-canonical-{BLOCK_A}-{digest}.json.gz",
+            )
+            first = path.read_bytes()
+            # mtime=0 and no FNAME field keep the header a constant.
+            self.assertEqual(first[:10].hex(), "1f8b08000000000002ff")
+            self.assertEqual(gzip.decompress(first), self.canonical(bundle))
+            self.assertEqual(first, gzip_canonical_bundle_bytes(self.canonical(bundle)))
+            before = path.stat()
+            repeat = store.write_canonical_audit_bundle(
+                BLOCK_A,
+                digest,
+                self.canonical(bundle),
+            )
+            after = repeat.stat()
+            self.assertEqual(path.read_bytes(), first)
+            self.assertEqual((before.st_dev, before.st_ino), (after.st_dev, after.st_ino))
+
+    def test_republication_accepts_equivalent_gzip_from_another_compressor(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_store(root)
+            bundle = self.bundle()
+            payload = self.canonical(bundle)
+            digest = self.digest(bundle)
+            path = store.write_canonical_audit_bundle(BLOCK_A, digest, payload)
+
+            alternative = gzip.compress(payload, compresslevel=1, mtime=0)
+            self.assertNotEqual(alternative, path.read_bytes())
+            self.assertEqual(gzip.decompress(alternative), payload)
+            path.write_bytes(alternative)
+            before = path.stat()
+
+            repeat = store.write_canonical_audit_bundle(BLOCK_A, digest, payload)
+
+            after = repeat.stat()
+            self.assertEqual(repeat.read_bytes(), alternative)
+            self.assertEqual((before.st_dev, before.st_ino), (after.st_dev, after.st_ino))
+
+    def test_conflicting_or_corrupt_artifact_fails_loudly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_store(root)
+            bundle = self.bundle()
+            digest = self.digest(bundle)
+            path = store.canonical_bundle_path(BLOCK_A, digest)
+            path.write_bytes(gzip_canonical_bundle_bytes(b"{}"))
+            with self.assertRaisesRegex(RuntimeError, "does not match payload"):
+                store.write_canonical_audit_bundle(
+                    BLOCK_A,
+                    digest,
+                    self.canonical(bundle),
+                )
+            path.write_bytes(b"not gzip at all")
+            with self.assertRaisesRegex(RuntimeError, "does not match payload"):
+                store.write_canonical_audit_bundle(
+                    BLOCK_A,
+                    digest,
+                    self.canonical(bundle),
+                )
+
+    def test_post_publication_verification_catches_a_bad_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_store(root)
+            bundle = self.bundle()
+            digest = self.digest(bundle)
+            path = store.canonical_bundle_path(BLOCK_A, digest)
+
+            def publish_other_bytes(target: Path, _payload: bytes) -> None:
+                Path(target).write_bytes(gzip_canonical_bundle_bytes(b'{"other":1}'))
+
+            with mock.patch.object(
+                store,
+                "_write_immutable_bytes",
+                side_effect=publish_other_bytes,
+            ):
+                with self.assertRaises(CanonicalAuditBundleCorrupt):
+                    store.write_canonical_audit_bundle(
+                        BLOCK_A,
+                        digest,
+                        self.canonical(bundle),
+                    )
+            path.unlink()
+            with mock.patch.object(store, "_write_immutable_bytes"):
+                with self.assertRaisesRegex(RuntimeError, "absent after publication"):
+                    store.write_canonical_audit_bundle(
+                        BLOCK_A,
+                        digest,
+                        self.canonical(bundle),
+                    )
+
+    def test_corruption_is_distinguishable_from_a_clean_miss(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_store(root)
+            bundle = self.bundle()
+            digest = self.digest(bundle)
+            self.assertIsNone(store.read_canonical_audit_bundle(BLOCK_A, digest))
+            path = store.write_canonical_audit_bundle(
+                BLOCK_A,
+                digest,
+                self.canonical(bundle),
+            )
+            self.assertEqual(
+                store.read_canonical_audit_bundle(BLOCK_A, digest),
+                self.canonical(bundle),
+            )
+            # A miss for a different block stays a miss, not a failure.
+            self.assertIsNone(store.read_canonical_audit_bundle(BLOCK_B, digest))
+
+            path.write_bytes(path.read_bytes()[:12])
+            with self.assertRaisesRegex(
+                CanonicalAuditBundleCorrupt,
+                "does not decompress",
+            ):
+                store.read_canonical_audit_bundle(BLOCK_A, digest)
+
+            path.write_bytes(gzip_canonical_bundle_bytes(b'{"schema":"other"}'))
+            with self.assertRaisesRegex(CanonicalAuditBundleCorrupt, "hash mismatch"):
+                store.read_canonical_audit_bundle(BLOCK_A, digest)
+
+            path.unlink()
+            outside = root / "outside.gz"
+            outside.write_bytes(gzip_canonical_bundle_bytes(self.canonical(bundle)))
+            path.symlink_to(outside)
+            with self.assertRaisesRegex(
+                CanonicalAuditBundleCorrupt,
+                "not retrievable",
+            ):
+                store.read_canonical_audit_bundle(BLOCK_A, digest)
+
+    def test_root_replacement_revokes_canonical_publication_and_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "audit"
+            root.mkdir()
+            store = self.make_store(root)
+            bundle = self.bundle()
+            digest = self.digest(bundle)
+            store.write_canonical_audit_bundle(
+                BLOCK_A,
+                digest,
+                self.canonical(bundle),
+            )
+
+            pinned = base / "audit-pinned"
+            root.rename(pinned)
+            root.mkdir()
+            for operation in (
+                lambda: store.canonical_bundle_path(BLOCK_A, digest),
+                lambda: store.write_canonical_audit_bundle(
+                    BLOCK_A,
+                    digest,
+                    self.canonical(bundle),
+                ),
+                lambda: store.read_canonical_audit_bundle(BLOCK_A, digest),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "root identity"):
+                    operation()
+            self.assertEqual(list(root.iterdir()), [])
+
+            replacement = base / "audit-replacement"
+            root.rename(replacement)
+            pinned.rename(root)
+            self.assertEqual(
+                store.read_canonical_audit_bundle(BLOCK_A, digest),
+                self.canonical(bundle),
+            )
+
+    def test_kind_metrics_and_pruning_preserve_canonical_bundles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_store(
+                root,
+                live_bundle_retention=0,
+                candidate_retention_seconds=0,
+            )
+            bundle = self.bundle()
+            digest = self.digest(bundle)
+            name = f"prism-audit-bundle-canonical-{BLOCK_A}-{digest}.json.gz"
+            self.assertEqual(AuditArtifactStore.artifact_kind(name), "canonical_bundle")
+            for invalid in (
+                f"prism-audit-bundle-canonical-{BLOCK_A}-{digest}.json",
+                f"prism-audit-bundle-canonical-{BLOCK_A}.json.gz",
+                f"prism-audit-bundle-canonical-{BLOCK_A}-{digest.upper()}.json.gz",
+            ):
+                with self.subTest(invalid=invalid):
+                    self.assertEqual(AuditArtifactStore.artifact_kind(invalid), "other")
+
+            path = store.write_canonical_audit_bundle(
+                BLOCK_A,
+                digest,
+                self.canonical(bundle),
+            )
+            metrics = store.metrics_snapshot()
+            self.assertEqual(
+                metrics["canonical_bundle"],
+                {"files": 1, "bytes": path.stat().st_size},
+            )
+
+            # Retention only ever unlinks the two expendable kinds, and a
+            # canonical bundle is classified as neither.
+            self.assertNotIn(
+                AuditArtifactStore.artifact_kind(path.name),
+                {"live_bundle", "candidate"},
+            )
+            stale = store.issue_candidate(block_hash=BLOCK_B)
+            stale.path.write_bytes(b"stale")
+            store.release_candidate(stale)
+            os.utime(stale.path, ns=(1, 1))
+            result = store.prune_best_effort()
+            self.assertEqual(result.errors, 0)
+            self.assertEqual(result.candidate_removed, 1)
+            self.assertFalse(stale.path.exists())
+            self.assertTrue(path.exists())
+            self.assertEqual(
+                store.read_canonical_audit_bundle(BLOCK_A, digest),
+                self.canonical(bundle),
+            )
+
+    def test_write_path_persists_the_canonical_bytes_it_already_holds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls: list[int] = []
+            store = self.make_store(root, counter=calls)
+            bundle = self.bundle()
+            body_uri, digest = self.publish(store, bundle)
+            self.assertEqual(
+                store.read_canonical_audit_bundle(BLOCK_A, digest),
+                self.canonical(bundle),
+            )
+            # One serialization for the digest check, reused for publication;
+            # the canonical copy is never re-derived.
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(Path(body_uri).exists())
+
+            # Re-persisting the same block is a no-op on both artifacts.
+            body_bytes = Path(body_uri).read_bytes()
+            canonical_path = store.canonical_bundle_path(BLOCK_A, digest)
+            canonical_bytes = canonical_path.read_bytes()
+            self.publish(store, bundle)
+            self.assertEqual(Path(body_uri).read_bytes(), body_bytes)
+            self.assertEqual(canonical_path.read_bytes(), canonical_bytes)
+
+    def test_write_path_reuses_a_verified_canonical_candidate_verbatim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls: list[int] = []
+            store = self.make_store(root, counter=calls)
+            bundle = self.bundle()
+            digest = self.digest(bundle)
+            candidate = root / "candidate.json"
+            candidate.write_bytes(self.canonical(bundle))
+            calls.clear()
+            store.prepare_external_audit_body(
+                {"block_hash": BLOCK_A, "audit_bundle_sha256": digest},
+                bundle,
+                body_uri=str(store.body_path(BLOCK_A, digest)),
+                canonical_bundle_path=candidate,
+            )
+            # The candidate bytes are taken as-is: nothing is reserialized.
+            self.assertEqual(calls, [])
+            self.assertEqual(
+                store.read_canonical_audit_bundle(BLOCK_A, digest),
+                self.canonical(bundle),
+            )
+
+    def test_backfill_helper_repairs_missing_segments_under_the_body_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_store(root)
+            bundle = self.bundle()
+            body_uri, digest = self.publish(store, bundle)
+            for segment in root.glob("prism-audit-share-segment-*"):
+                segment.unlink()
+            requested: list[tuple[int, int]] = []
+
+            def loader(
+                *,
+                first_share_seq: int,
+                last_share_seq: int,
+            ) -> list[dict[str, object]]:
+                requested.append((first_share_seq, last_share_seq))
+                return [
+                    {"share_seq": share_seq, "worker": f"miner-{share_seq}"}
+                    for share_seq in range(first_share_seq, last_share_seq + 1)
+                ]
+
+            recovered = store.canonical_bundle_bytes_from_external_body(
+                block_hash=BLOCK_A,
+                audit_bundle_sha256=digest,
+                body_uri=body_uri,
+                load_missing_range=loader,
+            )
+            self.assertEqual(recovered, self.canonical(bundle))
+            self.assertEqual(requested, [(1, 2), (3, 4)])
+
+            # Without a callback the loss is loud rather than silently patched.
+            with self.assertRaisesRegex(RuntimeError, "not retrievable"):
+                store.canonical_bundle_bytes_from_external_body(
+                    block_hash=BLOCK_A,
+                    audit_bundle_sha256=digest,
+                    body_uri=body_uri,
+                )
+
+    def test_backfill_helper_rejects_unverified_database_fallback_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_store(root)
+            bundle = self.bundle()
+            body_uri, digest = self.publish(store, bundle)
+            for segment in root.glob("prism-audit-share-segment-*"):
+                segment.unlink()
+
+            def tampered(
+                *,
+                first_share_seq: int,
+                last_share_seq: int,
+            ) -> list[dict[str, object]]:
+                return [
+                    {"share_seq": share_seq, "worker": "attacker"}
+                    for share_seq in range(first_share_seq, last_share_seq + 1)
+                ]
+
+            def short(
+                *,
+                first_share_seq: int,
+                last_share_seq: int,
+            ) -> list[dict[str, object]]:
+                return [{"share_seq": first_share_seq, "worker": f"miner-{first_share_seq}"}]
+
+            def failing(*, first_share_seq: int, last_share_seq: int) -> list[Any]:
+                raise RuntimeError("ledger unavailable")
+
+            for loader, expected in (
+                (tampered, "hash mismatch"),
+                (short, "not exactly contiguous"),
+                (failing, "could not be recovered"),
+            ):
+                with self.subTest(loader=loader.__name__):
+                    with self.assertRaisesRegex(RuntimeError, expected):
+                        store.canonical_bundle_bytes_from_external_body(
+                            block_hash=BLOCK_A,
+                            audit_bundle_sha256=digest,
+                            body_uri=body_uri,
+                            load_missing_range=loader,
+                        )
+            self.assertEqual(
+                list(root.glob("prism-audit-share-segment-*")),
+                [],
+            )
+
+    def test_backfill_helper_binds_the_body_uri_to_the_advertised_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_store(root)
+            bundle = self.bundle()
+            body_uri, digest = self.publish(store, bundle)
+            for block_hash, expected_digest, message in (
+                (BLOCK_B, digest, "block hash does not match"),
+                (BLOCK_A, "cc" * 32, "digest does not match"),
+            ):
+                with self.subTest(block_hash=block_hash, digest=expected_digest):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        store.canonical_bundle_bytes_from_external_body(
+                            block_hash=block_hash,
+                            audit_bundle_sha256=expected_digest,
+                            body_uri=body_uri,
+                        )
+
+    def test_pre_v2_literal_body_is_taken_without_reserialization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls: list[int] = []
+            store = self.make_store(root, share_segment_size=0, counter=calls)
+            bundle = self.bundle()
+            body_uri, digest = self.publish(store, bundle)
+            # A pre-v2 body stores the canonical bundle verbatim.
+            self.assertEqual(Path(body_uri).read_bytes(), self.canonical(bundle))
+
+            calls.clear()
+            self.assertEqual(
+                store.literal_canonical_bundle_bytes(
+                    body_uri,
+                    expected_sha256=digest,
+                ),
+                self.canonical(bundle),
+            )
+            self.assertEqual(
+                store.canonical_bundle_bytes_from_external_body(
+                    block_hash=BLOCK_A,
+                    audit_bundle_sha256=digest,
+                    body_uri=body_uri,
+                ),
+                self.canonical(bundle),
+            )
+            # Neither call parsed and reserialized the bundle.
+            self.assertEqual(calls, [])
+
+    def test_literal_helper_declines_a_compact_body(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_store(root)
+            bundle = self.bundle()
+            body_uri, digest = self.publish(store, bundle)
+            self.assertIsNone(
+                store.literal_canonical_bundle_bytes(
+                    body_uri,
+                    expected_sha256=digest,
+                )
+            )
+            with self.assertRaisesRegex(RuntimeError, "digest does not match"):
+                store.literal_canonical_bundle_bytes(
+                    body_uri,
+                    expected_sha256="cc" * 32,
+                )
 
 
 if __name__ == "__main__":

@@ -12,8 +12,10 @@ from __future__ import annotations
 import copy
 from contextlib import contextmanager, nullcontext
 import fcntl
+import gzip
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
@@ -24,6 +26,7 @@ import subprocess
 import threading
 import time
 import uuid
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
@@ -47,6 +50,11 @@ VERIFICATION_IDENTITY_SCHEMA = "qbit.prism.audit-verification-identity.v1"
 LEGACY_VERIFICATION_UNAVAILABLE_SCHEMA = (
     "qbit.prism.legacy-verification-unavailable.v1"
 )
+# The canonical bundle is stored compressed, but its public identity stays
+# the SHA-256 of the *uncompressed* canonical JSON.  Level 9 with mtime=0
+# keeps stdlib gzip reproducible for a given compressor; republication checks
+# the uncompressed payload so a compressor change cannot redefine identity.
+CANONICAL_BUNDLE_GZIP_LEVEL = 9
 
 _HEX_64 = r"[0-9a-f]{64}"
 _TOKEN_32 = r"[0-9a-f]{32}"
@@ -60,6 +68,10 @@ _SHARE_CONTENT_RE = re.compile(
 _SHARE_SLOT_RE = re.compile(
     r"\Aprism-audit-share-segment-slot-(?P<first>[1-9][0-9]*)-"
     r"(?P<last>[1-9][0-9]*)\.json\Z"
+)
+_CANONICAL_BUNDLE_RE = re.compile(
+    rf"\Aprism-audit-bundle-canonical-(?P<block>{_HEX_64})-"
+    rf"(?P<digest>{_HEX_64})\.json\.gz\Z"
 )
 _LIVE_RE = re.compile(
     rf"\Aprism-live-audit-bundle-(?P<height>0|[1-9][0-9]*)-"
@@ -142,6 +154,37 @@ def canonical_audit_bundle_bytes(
         raise RuntimeError("J1 canonical bundle capability is required")
     canonical = canonicalizer(final_bundle)
     return canonical.encode() if isinstance(canonical, str) else bytes(canonical)
+
+
+def gzip_canonical_bundle_bytes(payload: bytes) -> bytes:
+    """Compress canonical bundle bytes reproducibly.
+
+    A BytesIO sink carries no name, so gzip emits no FNAME field; with mtime=0
+    the header is constant and equal inputs are reproducible for a given
+    compressor implementation.
+    """
+
+    sink = io.BytesIO()
+    with gzip.GzipFile(
+        fileobj=sink,
+        mode="wb",
+        compresslevel=CANONICAL_BUNDLE_GZIP_LEVEL,
+        mtime=0,
+    ) as handle:
+        handle.write(payload)
+    return sink.getvalue()
+
+
+def gunzip_canonical_bundle_bytes(payload: bytes) -> bytes:
+    return gzip.decompress(payload)
+
+
+class CanonicalAuditBundleCorrupt(RuntimeError):
+    """A canonical bundle artifact is present but unusable.
+
+    Distinct from a clean miss so public readers can report the damage and fail
+    closed instead of silently serving a non-byte-exact reconstruction.
+    """
 
 
 class _AuditShareSegmentConflict(RuntimeError):
@@ -1220,6 +1263,10 @@ class AuditArtifactStore:
                 if int(segment.group("first")) <= int(segment.group("last"))
                 else "other"
             )
+        if _CANONICAL_BUNDLE_RE.fullmatch(name):
+            # Classified as its own kind so retention never treats a canonical
+            # bundle as a live envelope or an expendable candidate.
+            return "canonical_bundle"
         if (
             _CANDIDATE_RE.fullmatch(name)
             or _LEGACY_CANDIDATE_RE.fullmatch(name)
@@ -1236,6 +1283,7 @@ class AuditArtifactStore:
             for kind in (
                 "body",
                 "share_segment",
+                "canonical_bundle",
                 "live_bundle",
                 "candidate",
                 "other",
@@ -1908,6 +1956,28 @@ class AuditArtifactStore:
             name="audit_bundle_sha256",
         )
         return self._root / f"prism-audit-bundle-body-{block_hash}-{digest}.json"
+
+    def canonical_bundle_path(
+        self,
+        block_hash: str,
+        audit_bundle_sha256: str,
+    ) -> Path:
+        """Owned path for the compressed canonical bundle of one publication.
+
+        The digest in the name is the public SHA-256 over the *uncompressed*
+        canonical JSON, so the artifact is content-addressed by the identity
+        readers already advertise.
+        """
+
+        block_hash = _canonical_hex(block_hash, name="block_hash")
+        digest = _canonical_hex(
+            audit_bundle_sha256,
+            name="audit_bundle_sha256",
+        )
+        self._validate_root_identity()
+        return self._root / (
+            f"prism-audit-bundle-canonical-{block_hash}-{digest}.json.gz"
+        )
 
     def resolve_owned_path(self, body_uri: object) -> Path:
         self._validate_root_identity()
@@ -3252,12 +3322,20 @@ class AuditArtifactStore:
                 )
 
     def _write_immutable_bytes(self, path: Path, payload: bytes) -> None:
+        if getattr(self, "_read_only", False):
+            raise RuntimeError(
+                "audit artifact store is read-only: publication is not available"
+            )
         path = Path(path).absolute()
         if (
             path.parent.resolve(strict=True) != self._root
-            or self.artifact_kind(path.name) not in {"body", "share_segment"}
+            or self.artifact_kind(path.name)
+            not in {"body", "share_segment", "canonical_bundle"}
         ):
-            raise RuntimeError("immutable audit target is not an owned body or segment")
+            raise RuntimeError(
+                "immutable audit target is not an owned body, segment, or "
+                "canonical bundle"
+            )
         with self._lock:
             self._validate_root_identity()
             try:
@@ -3424,6 +3502,315 @@ class AuditArtifactStore:
                 f"audit bundle sha256 mismatch: expected {expected}, got {actual}"
             )
         return body
+
+    # Canonical bundle persistence.  The public digest of a publication is the
+    # SHA-256 of these uncompressed bytes; keeping them on disk means a reader
+    # never has to trust a reconstruction to answer for that identity.
+
+    def write_canonical_audit_bundle(
+        self,
+        block_hash: str,
+        audit_bundle_sha256: str,
+        canonical_bytes: bytes,
+    ) -> Path:
+        """Publish the exact canonical bundle bytes behind an advertised digest.
+
+        Verifies the uncompressed digest before anything reaches the store,
+        compresses reproducibly, publishes immutably, then reopens the
+        published artifact and verifies it again.  Republishing identical
+        bytes is a durable no-op; a conflicting artifact fails loudly.
+        """
+
+        block_hash = _canonical_hex(block_hash, name="block_hash")
+        digest = _canonical_hex(
+            audit_bundle_sha256,
+            name="audit_bundle_sha256",
+        )
+        payload = bytes(canonical_bytes)
+        actual = _sha256_bytes(payload)
+        if not hmac.compare_digest(actual, digest):
+            raise RuntimeError(
+                f"audit bundle sha256 mismatch: expected {digest}, got {actual}"
+            )
+        path = self.canonical_bundle_path(block_hash, digest)
+        with self._lock:
+            try:
+                existing_payload = self.read_canonical_audit_bundle(
+                    block_hash,
+                    digest,
+                )
+            except CanonicalAuditBundleCorrupt:
+                # Preserve the immutable writer's existing conflict behavior
+                # for damaged files.  It will refuse to replace their bytes.
+                existing_payload = None
+            if existing_payload is not None and hmac.compare_digest(
+                existing_payload,
+                payload,
+            ):
+                # The public identity covers the uncompressed canonical bytes,
+                # not a particular zlib encoding.  A retry after a compressor
+                # upgrade is therefore the same durability-repair boundary as
+                # a byte-identical gzip republication.
+                self._fsync_directory(path.parent)
+                self._validate_root_identity()
+                return path
+
+            # The immutable writer is the publication boundary: it links
+            # atomically and refuses to overwrite an artifact that does not
+            # represent this canonical payload.
+            self._write_immutable_bytes(path, gzip_canonical_bundle_bytes(payload))
+            # `_write_immutable_bytes` already fsyncs the directory; restating
+            # the durability boundary here keeps it explicit for this artifact.
+            self._fsync_directory(path.parent)
+            published = self.read_canonical_audit_bundle(block_hash, digest)
+            if published is None:
+                raise RuntimeError(
+                    f"canonical audit bundle is absent after publication at {path}"
+                )
+            if not hmac.compare_digest(published, payload):
+                raise CanonicalAuditBundleCorrupt(
+                    f"canonical audit bundle bytes changed during publication at {path}"
+                )
+            self._validate_root_identity()
+            return path
+
+    def read_canonical_audit_bundle(
+        self,
+        block_hash: str,
+        audit_bundle_sha256: str,
+    ) -> bytes | None:
+        """Return the stored canonical bytes, or None when none were stored.
+
+        Damage raises `CanonicalAuditBundleCorrupt` rather than reporting a
+        miss, so a caller that falls back to reconstruction can log the loss
+        instead of silently absorbing it.
+        """
+
+        block_hash = _canonical_hex(block_hash, name="block_hash")
+        digest = _canonical_hex(
+            audit_bundle_sha256,
+            name="audit_bundle_sha256",
+        )
+        path = self.canonical_bundle_path(block_hash, digest)
+        try:
+            compressed, _value = self._read_owned_regular_bytes(path)
+        except FileNotFoundError:
+            self._validate_root_identity()
+            return None
+        except OSError as exc:
+            # A symlink refused by O_NOFOLLOW, a non-regular file, or a file
+            # mutated mid-read is damage, not absence.
+            raise CanonicalAuditBundleCorrupt(
+                f"canonical audit bundle is not retrievable at {path}: {exc}"
+            ) from exc
+        try:
+            payload = gunzip_canonical_bundle_bytes(compressed)
+        except (OSError, EOFError, zlib.error) as exc:
+            raise CanonicalAuditBundleCorrupt(
+                f"canonical audit bundle does not decompress at {path}: {exc}"
+            ) from exc
+        actual = _sha256_bytes(payload)
+        if not hmac.compare_digest(actual, digest):
+            raise CanonicalAuditBundleCorrupt(
+                f"canonical audit bundle hash mismatch at {path}: "
+                f"expected {digest}, got {actual}"
+            )
+        self._validate_root_identity()
+        return payload
+
+    def _owned_external_body_bytes(
+        self,
+        body_uri: object,
+        *,
+        expected_sha256: str,
+        block_hash: str | None = None,
+    ) -> tuple[Path, bytes]:
+        """Resolve and read an owned external body, binding its filename identity."""
+
+        path = self.resolve_owned_path(body_uri)
+        match = _BODY_RE.fullmatch(path.name)
+        if match is None:
+            raise RuntimeError("body URI is not an owned canonical body")
+        if match.group("digest") != expected_sha256:
+            raise RuntimeError("body URI digest does not match expected digest")
+        if block_hash is not None and match.group("block") != block_hash:
+            raise RuntimeError("body URI block hash does not match expected block")
+        payload, _value = self._read_owned_regular_bytes(path)
+        return path, payload
+
+    def literal_canonical_bundle_bytes(
+        self,
+        body_uri: object,
+        *,
+        expected_sha256: object,
+    ) -> bytes | None:
+        """Return a pre-v2 external body that already *is* the canonical bundle.
+
+        Bodies written before the compact layouts stored the canonical JSON
+        verbatim.  When the file digests to the advertised identity it is the
+        artifact we want, so take it directly instead of parsing and
+        reserializing a bundle that would only have to hash back to the same
+        bytes.  Returns None when the body is a compact reference instead.
+        """
+
+        expected = _canonical_hex(
+            expected_sha256,
+            name="audit_bundle_sha256",
+        )
+        _path, payload = self._owned_external_body_bytes(
+            body_uri,
+            expected_sha256=expected,
+        )
+        if not hmac.compare_digest(_sha256_bytes(payload), expected):
+            return None
+        self._validate_root_identity()
+        return payload
+
+    def canonical_bundle_bytes_from_external_body(
+        self,
+        *,
+        block_hash: str,
+        audit_bundle_sha256: str,
+        body_uri: object,
+        load_missing_range: Callable[..., list[Any]] | None = None,
+    ) -> bytes:
+        """Recover the canonical bytes for an already published body.
+
+        Built for the historical backfill: it takes the pre-v2 literal-body
+        shortcut when it applies, and otherwise reconstructs the logical bundle
+        from the compact reference, repairing share segments that have since
+        left the disk through `load_missing_range`.  Recovered shares are
+        canonicalized and checked against the digest the body itself already
+        commits to, and the assembled bundle is checked against the advertised
+        bundle digest, so database fallback bytes are never trusted on their
+        own.
+        """
+
+        block_hash = _canonical_hex(block_hash, name="block_hash")
+        expected = _canonical_hex(
+            audit_bundle_sha256,
+            name="audit_bundle_sha256",
+        )
+        path, body_bytes = self._owned_external_body_bytes(
+            body_uri,
+            expected_sha256=expected,
+            block_hash=block_hash,
+        )
+        if hmac.compare_digest(_sha256_bytes(body_bytes), expected):
+            self._validate_root_identity()
+            return body_bytes
+        try:
+            body = json.loads(body_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"audit bundle body is not valid JSON at {path}: {exc}"
+            ) from exc
+        schema = body.get("schema") if isinstance(body, dict) else None
+        if schema == AUDIT_BODY_REF_SCHEMA:
+            bundle = self.resolve_audit_body_ref(
+                body,
+                expected_sha256=expected,
+                body_uri=str(path),
+                load_missing_range=load_missing_range,
+            )
+        elif schema == AUDIT_BUNDLE_V2_SCHEMA:
+            bundle = self.resolve_audit_bundle_v2(
+                body,
+                expected_sha256=expected,
+                body_uri=str(path),
+                load_missing_range=load_missing_range,
+            )
+        else:
+            raise RuntimeError(
+                f"audit bundle body is not a canonical bundle source at {path}"
+            )
+        canonical = self.canonical_audit_bundle_bytes(bundle)
+        actual = _sha256_bytes(canonical)
+        if not hmac.compare_digest(actual, expected):
+            raise RuntimeError(
+                f"audit bundle body hash mismatch at {path}: "
+                f"expected {expected}, got {actual}"
+            )
+        self._validate_root_identity()
+        return canonical
+
+    def _read_share_part_with_recovery(
+        self,
+        part: Mapping[str, Any],
+        *,
+        parent_body_uri: object,
+        load_missing_range: Callable[..., list[Any]] | None,
+    ) -> list[Any]:
+        """Read one share part, repairing a segment that has left the disk.
+
+        The digest the compact body already commits to is the only authority
+        for a recovered range, so a callback result is accepted solely because
+        it canonicalizes back to that digest.
+        """
+
+        try:
+            return self.read_audit_share_segment(
+                part,
+                parent_body_uri=parent_body_uri,
+            )
+        except (OSError, RuntimeError) as exc:
+            if load_missing_range is None:
+                raise
+            unavailable = exc
+        kind = str(part.get("kind") or "")
+        digest_key = {
+            "segment": "sha256",
+            "segment_range": "range_sha256",
+            "segment_prefix": "prefix_sha256",
+        }.get(kind)
+        if digest_key is None:
+            raise unavailable
+        try:
+            expected = _canonical_hex(part.get(digest_key), name="share segment digest")
+            first_share_seq = int(part.get("first_share_seq") or 0)
+            last_share_seq = int(part.get("last_share_seq") or 0)
+            share_count = int(part.get("share_count") or 0)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"audit bundle body is not valid JSON at {parent_body_uri}: "
+                f"invalid share part: {exc}"
+            ) from unavailable
+        try:
+            recovered = list(
+                load_missing_range(
+                    first_share_seq=first_share_seq,
+                    last_share_seq=last_share_seq,
+                )
+            )
+        except _AuditShareSegmentConflict:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"audit bundle body is not retrievable at {parent_body_uri}: "
+                f"share segment {part.get('body_uri')} could not be recovered: {exc}"
+            ) from unavailable
+        self._validate_share_range(first_share_seq, last_share_seq, recovered)
+        if len(recovered) != share_count:
+            raise RuntimeError(
+                f"audit bundle body is not valid JSON at {parent_body_uri}: "
+                f"recovered share segment {part.get('body_uri')} share count mismatch"
+            )
+        actual = _sha256_bytes(
+            self.storage_json_bytes(
+                self.audit_share_segment_payload(
+                    first_share_seq=first_share_seq,
+                    last_share_seq=last_share_seq,
+                    shares=recovered,
+                )
+            )
+        )
+        if not hmac.compare_digest(actual, expected):
+            raise RuntimeError(
+                f"audit bundle body hash mismatch at {parent_body_uri}: "
+                f"recovered share segment {part.get('body_uri')} "
+                f"expected {expected}, got {actual}"
+            )
+        return recovered
 
     @staticmethod
     def storage_json_bytes(payload: Mapping[str, Any]) -> bytes:
@@ -4025,8 +4412,18 @@ class AuditArtifactStore:
                 raise RuntimeError(
                     "canonical audit candidate does not match logical bundle"
                 )
+            canonical_bytes = literal
         else:
-            self.canonical_audit_body_bytes_for_sha(final_bundle, expected)
+            canonical_bytes = self.canonical_audit_body_bytes_for_sha(
+                final_bundle,
+                expected,
+            )
+        # Persist the exact bytes the public digest is taken over, reusing the
+        # ones already in hand.  This runs before the compact body so every
+        # path through this call publishes it, including the ones that return
+        # early on an existing body.  The caller's lease preflight has already
+        # completed, so this is still a fenced write.
+        self.write_canonical_audit_bundle(block_hash, expected, canonical_bytes)
         storage = self.audit_bundle_v2(
             block_hash=block_hash,
             audit_bundle_sha256=expected,
@@ -4295,6 +4692,7 @@ class AuditArtifactStore:
         expected_sha256: object | None,
         body_uri: object,
         verify_digest: bool = True,
+        load_missing_range: Callable[..., list[Any]] | None = None,
     ) -> dict[str, object]:
         expected = (
             _canonical_hex(expected_sha256, name="audit_bundle_sha256")
@@ -4325,9 +4723,10 @@ class AuditArtifactStore:
                 )
             kind = part.get("kind")
             if kind in {"segment", "segment_range", "segment_prefix"}:
-                part_shares = self.read_audit_share_segment(
+                part_shares = self._read_share_part_with_recovery(
                     part,
                     parent_body_uri=body_uri,
+                    load_missing_range=load_missing_range,
                 )
             elif kind == "inline" and isinstance(part.get("shares"), list):
                 inline = part["shares"]
@@ -4380,6 +4779,7 @@ class AuditArtifactStore:
         expected_sha256: object | None,
         body_uri: object,
         verify_digest: bool = True,
+        load_missing_range: Callable[..., list[Any]] | None = None,
     ) -> dict[str, object]:
         expected = (
             _canonical_hex(expected_sha256, name="audit_bundle_sha256")
@@ -4428,7 +4828,13 @@ class AuditArtifactStore:
                 raise RuntimeError(
                     f"audit bundle body is not valid JSON at {body_uri}: invalid share part"
                 )
-            shares.extend(self.read_audit_share_segment(part, parent_body_uri=body_uri))
+            shares.extend(
+                self._read_share_part_with_recovery(
+                    part,
+                    parent_body_uri=body_uri,
+                    load_missing_range=load_missing_range,
+                )
+            )
         if len(shares) != int(proof.get("share_count") or 0):
             raise RuntimeError(
                 f"audit bundle body is not valid JSON at {body_uri}: share count mismatch"

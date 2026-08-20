@@ -76,6 +76,14 @@ class RawJsonBody:
     body: bytes
 
 
+@dataclass(frozen=True)
+class UncacheableJsonBody:
+    """JSON payload whose degraded provenance must not enter shared caches."""
+
+    payload: object
+    reason: str
+
+
 @dataclass
 class _PublicCacheEntry:
     status: int
@@ -300,6 +308,8 @@ def public_cache_max_entries() -> int:
 def cacheable_payload_size(payload: object) -> bool:
     max_bytes = env_nonnegative_int("PRISM_PUBLIC_CACHE_MAX_RESPONSE_BYTES", 1_048_576)
     if max_bytes <= 0:
+        return False
+    if isinstance(payload, UncacheableJsonBody):
         return False
     if isinstance(payload, RawJsonBody):
         return len(payload.body) <= max_bytes
@@ -1003,6 +1013,9 @@ def artifact(coordinator: Any, *, sha256: str) -> object:
         payload = row.get("payload")
         if payload is None:
             raise PublicApiError(404, "not_found", "unknown public PRISM artifact")
+        fallback_reason = row.get("canonical_fallback_reason")
+        if isinstance(fallback_reason, str) and fallback_reason:
+            return UncacheableJsonBody(payload=payload, reason=fallback_reason)
         return payload
     getter = getattr(coordinator.ledger, "dashboard_public_artifact", None)
     if not callable(getter):

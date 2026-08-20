@@ -599,9 +599,8 @@ class CanonicalArtifactPublicLedger(FakePublicLedger):
             "found_block": {"block_height": 123450},
             "accepted_shares": [{"share_seq": 1}],
         }
-        # Audit bundles are hashed over Rust struct-declaration-order bytes;
-        # a compact non-sorted dump reproduces that contract closely enough
-        # that neither served serialization can match the advertised hash.
+        # Audit bundles are hashed over these exact canonical bytes. Production
+        # persists the same sequence beside the compact external-body pointer.
         self.audit_bundle_sha256 = hashlib.sha256(
             json.dumps(self.audit_bundle, separators=(",", ":")).encode()
         ).hexdigest()
@@ -620,6 +619,8 @@ class CanonicalArtifactPublicLedger(FakePublicLedger):
         if payload is None:
             return None
         canonical_json = None
+        if sha256 == self.audit_bundle_sha256:
+            canonical_json = json.dumps(self.audit_bundle, separators=(",", ":"))
         if sha256 == self.manifest_set_sha256:
             canonical_json = canonical_json_text(self.manifest_set)
         if sha256 == self.manifest_sha256:
@@ -634,6 +635,22 @@ class TamperedCanonicalArtifactPublicLedger(CanonicalArtifactPublicLedger):
             return document
         # Same document, different bytes: must never be served raw.
         return {**document, "canonical_json": str(document["canonical_json"]) + " "}
+
+
+class MissingCanonicalArtifactPublicLedger(CanonicalArtifactPublicLedger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.audit_document_calls = 0
+
+    def dashboard_public_artifact_document(self, *, sha256: str) -> dict[str, object] | None:
+        if sha256 != self.audit_bundle_sha256:
+            return super().dashboard_public_artifact_document(sha256=sha256)
+        self.audit_document_calls += 1
+        return {
+            "payload": self.audit_bundle,
+            "canonical_json": None,
+            "canonical_fallback_reason": "missing",
+        }
 
 
 class DirectCoinbasePublicLedger(FakePublicLedger):
@@ -2220,18 +2237,33 @@ class PublicArtifactByteExactnessTests(unittest.TestCase):
         self.assertEqual(body, json.dumps(ledger.manifest, sort_keys=True).encode() + b"\n")
         self.assertEqual(json.loads(body), ledger.manifest)
 
-    @unittest.expectedFailure
     def test_audit_bundle_artifact_bytes_hash_to_advertised_sha256(self) -> None:
-        # Audit bundles are hashed over Rust struct-declaration-order bytes
-        # that are not persisted, so their responses still cannot verify.
-        # Remove this marker when the audit-bundle canonical bytes are stored
-        # and served raw like the manifest kinds.
         ledger = CanonicalArtifactPublicLedger()
         base_url = self.serve(ledger)
 
         body, _headers = self.fetch_artifact(base_url, ledger.audit_bundle_sha256)
 
         self.assertEqual(hashlib.sha256(body).hexdigest(), ledger.audit_bundle_sha256)
+
+    def test_missing_canonical_audit_bundle_fallback_is_never_cached(self) -> None:
+        ledger = MissingCanonicalArtifactPublicLedger()
+        base_url = self.serve(ledger)
+
+        first, first_headers = self.fetch_artifact(base_url, ledger.audit_bundle_sha256)
+        second, second_headers = self.fetch_artifact(base_url, ledger.audit_bundle_sha256)
+
+        self.assertEqual(json.loads(first), ledger.audit_bundle)
+        self.assertEqual(second, first)
+        self.assertEqual(ledger.audit_document_calls, 2)
+        for headers in (first_headers, second_headers):
+            self.assertEqual(headers.get("Cache-Control"), "no-store")
+            self.assertEqual(
+                headers.get("X-Prism-Artifact-Canonical-State"),
+                "missing",
+            )
+            self.assertNotIn("CDN-Cache-Control", headers)
+            self.assertNotIn("Vercel-CDN-Cache-Control", headers)
+            self.assertNotIn("Age", headers)
 
 
 class PrismPublicDashboardMemoryLedgerTests(unittest.TestCase):

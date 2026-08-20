@@ -117,6 +117,7 @@ DEGRADED_WARNING_HEADER = "Warning"
 DEGRADED_WARNING = '110 qbit-prism "database unavailable; serving cached response"'
 DATABASE_STATE_HEADER = "X-Prism-Database-State"
 DATABASE_STATE_UNAVAILABLE = "unavailable"
+ARTIFACT_CANONICAL_STATE_HEADER = "X-Prism-Artifact-Canonical-State"
 
 # How often the background prober re-checks Postgres, and the age at which its
 # answer stops counting. Same shape as observability.py's health staleness:
@@ -819,6 +820,18 @@ def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
                     status, payload, headers=self.with_budget(path, headers)
                 )
                 return
+            if isinstance(payload, public_api.UncacheableJsonBody):
+                # Legacy audit rows can predate canonical artifact storage.
+                # Their reconstructed JSON remains available for continuity,
+                # but it must never be cached under an immutable content URL.
+                headers = self.with_replica_lag(public_api.public_error_headers())
+                headers[ARTIFACT_CANONICAL_STATE_HEADER] = payload.reason
+                self.write_json(
+                    status,
+                    payload.payload,
+                    headers=self.with_budget(path, headers),
+                )
+                return
             budget_seconds = staleness_budget_for_path(path)
             if budget_seconds is not None and age_seconds > budget_seconds:
                 # Refuse rather than serve past the budget. A silently stale
@@ -1094,11 +1107,11 @@ def build_audit_artifact_store(
 ) -> AuditArtifactStore | None:
     """Open the audit artifact root read-only, for artifact and settlement reads.
 
-    /public/v1/artifacts/{sha256} and the direct-coinbase settlement read both
-    resolve externalized bodies from body_uri on disk, sha256-verified. The
-    compose service mounts that volume :ro precisely so this process cannot
-    write to it, which also means it cannot create the publication lock file a
-    normal store opens O_RDWR at construction -- hence read_only.
+    /public/v1/artifacts/{sha256} reads immutable compressed canonical bundles
+    first. A clean miss can use a labelled, non-cacheable legacy body; damage
+    fails closed. The compose service mounts that volume :ro precisely so this
+    process cannot write to it, which also means it cannot create the publication
+    lock file a normal store opens O_RDWR at construction -- hence read_only.
     """
     source = os.environ if environ is None else environ
     audit_dir = (source.get("PRISM_AUDIT_DIR") or "").strip()

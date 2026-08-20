@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import copy
 import hashlib
+import logging
 import os
 import math
 import shlex
@@ -25,8 +26,12 @@ from typing import Any, Callable, Iterator, Protocol, runtime_checkable
 from lab.prism.audit_artifacts import (
     AuditArtifactConfig,
     AuditArtifactStore,
+    CanonicalAuditBundleCorrupt,
     canonical_audit_bundle_bytes,
 )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _default_bundle_canonicalizer() -> Callable[[dict[str, Any]], bytes]:
@@ -6085,20 +6090,25 @@ SELECT json_build_object(
         return document.get("payload")
 
     def dashboard_public_artifact_document(self, *, sha256: str) -> dict[str, object] | None:
-        """Artifact payload plus, for manifest kinds, its canonical text.
+        """Artifact payload plus its stored canonical text when available.
 
         canonical_json is the manifest_set_json/manifest_json text persisted
         at record time next to the JSONB copies — the exact byte sequence the
-        artifact's sha256 was computed over. Audit bundles have no stored
-        canonical serialization (their hash covers Rust struct-order bytes),
-        so their canonical_json is None. One statement serves both reads so a
-        request touches each artifact table at most once.
+        artifact's sha256 was computed over. Audit bundles use the immutable
+        compressed canonical artifact beside the external body. One statement
+        serves both database reads so a request touches each artifact table at
+        most once.
+
+        Replica ordering is intentionally simple. A visible row plus a missing
+        canonical file is legacy history and falls back to the JSONB/external
+        body. A file that reached shared storage before this replica replays its
+        row remains invisible and returns no match until replay catches up.
         """
         sha256 = str(sha256).lower()
         lit = self._text_literal(sha256)
         sql = f"""
 WITH audit AS (
-    SELECT audit_bundle, audit_bundle_sha256, body_uri
+    SELECT block_hash, audit_bundle, audit_bundle_sha256, body_uri
     FROM qbit_pool_audit_bundles
     WHERE audit_bundle_sha256 = {lit}
     ORDER BY created_at DESC
@@ -6119,6 +6129,7 @@ artifact_row AS (
     LIMIT 1
 )
 SELECT json_build_object(
+    'block_hash', (SELECT block_hash FROM audit),
     'audit_bundle', (SELECT audit_bundle FROM audit),
     'audit_bundle_sha256', (SELECT audit_bundle_sha256 FROM audit),
     'body_uri', (SELECT body_uri FROM audit),
@@ -6137,11 +6148,49 @@ SELECT json_build_object(
         if not isinstance(row, dict):
             return None
         if row.get("has_audit_row"):
+            block_hash = row.get("block_hash")
+            if isinstance(block_hash, str):
+                canonical_bytes = self._stored_canonical_audit_bundle_bytes(
+                    block_hash,
+                    sha256,
+                )
+                if canonical_bytes is not None:
+                    try:
+                        canonical_payload = json.loads(canonical_bytes)
+                        canonical_json = canonical_bytes.decode("utf-8")
+                    except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+                        LOGGER.error(
+                            "canonical audit bundle unavailable reason=corrupt "
+                            "block_hash=%s audit_bundle_sha256=%s",
+                            block_hash,
+                            sha256,
+                        )
+                        raise CanonicalAuditBundleCorrupt(
+                            "canonical audit bundle is not valid UTF-8 JSON"
+                        ) from exc
+                    if not isinstance(canonical_payload, dict):
+                        LOGGER.error(
+                            "canonical audit bundle unavailable reason=corrupt "
+                            "block_hash=%s audit_bundle_sha256=%s",
+                            block_hash,
+                            sha256,
+                        )
+                        raise CanonicalAuditBundleCorrupt(
+                            "canonical audit bundle JSON is not an object"
+                        )
+                    return {
+                        "payload": canonical_payload,
+                        "canonical_json": canonical_json,
+                    }
             body = row.get("audit_bundle")
             if body is None:
                 body = self._read_external_body(row.get("body_uri"), expected_sha256=sha256)
             if body is not None:
-                return {"payload": body, "canonical_json": None}
+                return {
+                    "payload": body,
+                    "canonical_json": None,
+                    "canonical_fallback_reason": "missing",
+                }
         fallback = row.get("fallback")
         if not isinstance(fallback, dict):
             return None
@@ -6156,7 +6205,7 @@ SELECT json_build_object(
         lit = self._text_literal(sha256)
         sql = f"""
 WITH audit AS (
-    SELECT audit_bundle, body_uri
+    SELECT block_hash, audit_bundle, audit_bundle_sha256, body_uri
     FROM qbit_pool_audit_bundles
     WHERE audit_bundle_sha256 = {lit}
     ORDER BY created_at DESC
@@ -6164,6 +6213,8 @@ WITH audit AS (
 )
 SELECT json_build_object(
     'has_audit_row', (SELECT count(*) FROM audit) > 0,
+    'block_hash', (SELECT block_hash FROM audit),
+    'audit_bundle_sha256', (SELECT audit_bundle_sha256 FROM audit),
     'audit_bundle_inline', (SELECT audit_bundle IS NOT NULL FROM audit),
     'body_uri', (SELECT body_uri FROM audit),
     'fallback_exists',
@@ -6183,6 +6234,13 @@ SELECT json_build_object(
         if not isinstance(row, dict):
             return False
         if row.get("has_audit_row"):
+            block_hash = row.get("block_hash")
+            if (
+                isinstance(block_hash, str)
+                and self._stored_canonical_audit_bundle_bytes(block_hash, sha256)
+                is not None
+            ):
+                return True
             if row.get("audit_bundle_inline"):
                 return True
             body_uri = row.get("body_uri")
@@ -7035,6 +7093,63 @@ FROM bucketed;
             raise RuntimeError("audit body store is not configured")
         return store
 
+    def _stored_canonical_audit_bundle_bytes(
+        self,
+        block_hash: str,
+        audit_bundle_sha256: str,
+    ) -> bytes | None:
+        """Return a verified stored canonical bundle, or permit missing fallback.
+
+        Missing artifacts are expected for history predating issue #158.
+        Present-but-corrupt or unreadable artifacts fail closed instead of
+        silently serving a non-byte-exact legacy reconstruction.
+        """
+        store = getattr(self, "_audit_artifact_store", None)
+        reader = getattr(store, "read_canonical_audit_bundle", None)
+        if not callable(reader):
+            LOGGER.warning(
+                "canonical audit bundle unavailable reason=missing "
+                "block_hash=%s audit_bundle_sha256=%s",
+                block_hash,
+                audit_bundle_sha256,
+            )
+            return None
+        try:
+            canonical_bytes = reader(block_hash, audit_bundle_sha256)
+        except CanonicalAuditBundleCorrupt:
+            LOGGER.error(
+                "canonical audit bundle unavailable reason=corrupt "
+                "block_hash=%s audit_bundle_sha256=%s",
+                block_hash,
+                audit_bundle_sha256,
+            )
+            raise
+        except (OSError, RuntimeError, TypeError, ValueError):
+            LOGGER.exception(
+                "canonical audit bundle unavailable reason=read_error "
+                "block_hash=%s audit_bundle_sha256=%s",
+                block_hash,
+                audit_bundle_sha256,
+            )
+            raise
+        if canonical_bytes is None:
+            LOGGER.warning(
+                "canonical audit bundle unavailable reason=missing "
+                "block_hash=%s audit_bundle_sha256=%s",
+                block_hash,
+                audit_bundle_sha256,
+            )
+            return None
+        if not isinstance(canonical_bytes, bytes):
+            LOGGER.error(
+                "canonical audit bundle unavailable reason=read_error "
+                "block_hash=%s audit_bundle_sha256=%s",
+                block_hash,
+                audit_bundle_sha256,
+            )
+            raise TypeError("canonical audit bundle reader returned non-bytes")
+        return canonical_bytes
+
     def _audit_reader(self, body_uri: object) -> AuditArtifactStore:
         del body_uri
         store = getattr(self, "_audit_artifact_store", None)
@@ -7242,6 +7357,143 @@ END;
         if result.get("existing_block"):
             return None
         return str(self._audit_body_path(payload["block_hash"], payload["audit_bundle_sha256"]))
+
+    def preflight_canonical_bundle_publication(
+        self,
+        *,
+        block_hash: str,
+        audit_bundle_sha256: str,
+    ) -> dict[str, object]:
+        """Refresh the writer lease and confirm one block/digest row identity.
+
+        The standalone canonical-bundle backfill calls this immediately before
+        each publication. It is the same fence `_external_audit_body_write_plan`
+        applies to the live path: a writer whose lease has lapsed must not keep
+        creating artifacts under the audit root, and the digest it is about to
+        publish must be the one the ledger row already advertises. Reads the
+        audit tables only; the sole mutation is the writer's own lease
+        heartbeat, so no schema changes.
+
+        Returns the row's `body_uri` (None for legacy inline rows) and whether
+        an inline body is still present, which is what the backfill needs to
+        choose its byte source. Raises when the lease is not active or the
+        block/digest identity does not match.
+        """
+
+        block_hash = canonical_hex(str(block_hash), name="block_hash", expected_bytes=32)
+        digest = canonical_hex(
+            str(audit_bundle_sha256),
+            name="audit_bundle_sha256",
+            expected_bytes=32,
+        )
+        payload = {
+            "block_hash": block_hash,
+            "audit_bundle_sha256": digest,
+            "writer_id": self._writer_id,
+            "writer_epoch": self._writer_epoch,
+            "writer_session_token": self._writer_session_token,
+        }
+        sql = f"""
+WITH payload AS (
+    SELECT {self._jsonb_literal(payload)} AS data
+),
+lease AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    FROM payload
+    WHERE qbit_ledger_writer_lease.singleton
+      AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+      AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+      AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
+    RETURNING qbit_ledger_writer_lease.writer_id
+),
+bundle AS (
+    SELECT
+        block_hash,
+        audit_bundle_sha256,
+        body_uri,
+        audit_bundle IS NOT NULL AS has_inline_bundle
+    FROM qbit_pool_audit_bundles
+    WHERE block_hash = (SELECT data->>'block_hash' FROM payload)
+),
+matching_bundle AS (
+    SELECT bundle.*
+    FROM bundle, payload
+    WHERE bundle.audit_bundle_sha256 = data->>'audit_bundle_sha256'
+)
+SELECT CASE
+    WHEN (SELECT count(*) FROM lease) = 0 THEN
+        json_build_object('error', 'writer lease is not active')
+    WHEN (SELECT count(*) FROM bundle) = 0 THEN
+        json_build_object('error', 'audit bundle row does not exist')
+    WHEN (SELECT count(*) FROM matching_bundle) = 0 THEN
+        json_build_object('error', 'audit bundle digest does not match the stored row')
+    ELSE
+        json_build_object(
+            'block_hash', (SELECT block_hash FROM matching_bundle LIMIT 1),
+            'audit_bundle_sha256', (SELECT audit_bundle_sha256 FROM matching_bundle LIMIT 1),
+            'body_uri', (SELECT body_uri FROM matching_bundle LIMIT 1),
+            'has_inline_bundle', (SELECT has_inline_bundle FROM matching_bundle LIMIT 1)
+        )
+END;
+"""
+        result = self._run_fenced_json(sql)
+        if not isinstance(result, dict):
+            raise RuntimeError("canonical bundle preflight returned no row")
+        if "error" in result:
+            raise RuntimeError(str(result["error"]))
+        body_uri = result.get("body_uri")
+        return {
+            "block_hash": block_hash,
+            "audit_bundle_sha256": digest,
+            "body_uri": str(body_uri) if body_uri else None,
+            "has_inline_bundle": bool(result.get("has_inline_bundle")),
+        }
+
+    def canonical_bundle_bytes_for_backfill(
+        self,
+        *,
+        block_hash: str,
+        audit_bundle_sha256: str,
+        body_uri: object,
+    ) -> bytes:
+        """Recover verified canonical bytes for an already published body.
+
+        Binds the ledger's append-only share loader to the store helper so the
+        standalone backfill can repair share segments that have left the disk
+        without reaching into ledger internals. Every recovered range is checked
+        against the digest the body already commits to, and the assembled bundle
+        against the advertised bundle digest.
+        """
+
+        return self._audit_store().canonical_bundle_bytes_from_external_body(
+            block_hash=block_hash,
+            audit_bundle_sha256=audit_bundle_sha256,
+            body_uri=body_uri,
+            load_missing_range=self._load_audit_share_ledger_range,
+        )
+
+    def publish_canonical_bundle_bytes(
+        self,
+        *,
+        block_hash: str,
+        audit_bundle_sha256: str,
+        canonical_bytes: bytes,
+    ) -> str:
+        """Publish canonical bytes under the store's ownership checks.
+
+        Callers must run `preflight_canonical_bundle_publication` immediately
+        before this so the writer lease is current when the artifact lands.
+        """
+
+        return str(
+            self._audit_store().write_canonical_audit_bundle(
+                block_hash,
+                audit_bundle_sha256,
+                canonical_bytes,
+            )
+        )
 
     def _audit_body_byte_len(self, body_uri: object | None, final_bundle: dict[str, Any], canonical_bundle_path: Path | None = None) -> int:
         if self._audit_artifact_store is None:
