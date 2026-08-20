@@ -5,10 +5,13 @@ import hashlib
 import io
 import json
 import re
+import tempfile
 import unittest
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+from lab.prism.audit_artifacts import AuditArtifactConfig, AuditArtifactStore
 from lab.prism.backfill_audit_bundle_canonical import (
     LEDGER_PREFLIGHT_CANDIDATES,
     AuditBundleLedgerAdapter,
@@ -19,6 +22,7 @@ from lab.prism.backfill_audit_bundle_canonical import (
     audit_bundle_page_sql,
     build_parser,
 )
+from lab.prism.share_ledger import PsqlShareLedger
 
 
 AUDIT_SHARE_SEGMENT_SCHEMA = "qbit.prism.audit-share-segment.v1"
@@ -277,6 +281,44 @@ class BackfillHarness:
 
 
 class CanonicalBundleBackfillTest(unittest.TestCase):
+    def test_inline_history_publishes_through_the_real_phase_2_store(self) -> None:
+        row = inline_row(1)
+        journal: list[tuple[Any, ...]] = []
+        ledger = FakeLedger(journal, [row])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = AuditArtifactStore(
+                AuditArtifactConfig(
+                    root=root,
+                    evidence_path=root / "evidence.json",
+                ),
+                canonicalizer=canonical_bytes,
+            )
+            try:
+                result = CanonicalBundleBackfill(
+                    artifacts=CanonicalArtifactAdapter(store),
+                    ledger=AuditBundleLedgerAdapter(ledger),
+                ).run()
+
+                self.assertEqual(result["written"], 1)
+                self.assertEqual(
+                    store.read_canonical_audit_bundle(
+                        str(row["block_hash"]),
+                        str(row["audit_bundle_sha256"]),
+                    ),
+                    canonical_bytes(row["audit_bundle"]),
+                )
+                self.assertEqual(
+                    journal[-1],
+                    (
+                        "preflight",
+                        row["block_hash"],
+                        row["audit_bundle_sha256"],
+                    ),
+                )
+            finally:
+                store.close()
+
     def test_first_run_publishes_every_shape_and_rerun_is_idempotent(self) -> None:
         inline = inline_row(1)
 
@@ -846,6 +888,42 @@ class WithoutAttributes:
 
 
 class AdapterBindingTest(unittest.TestCase):
+    def test_phase_2_production_interfaces_bind_and_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = AuditArtifactStore(
+                AuditArtifactConfig(
+                    root=root,
+                    evidence_path=root / "evidence.json",
+                ),
+                canonicalizer=canonical_bytes,
+            )
+            try:
+                artifacts = CanonicalArtifactAdapter(store)
+                block = "ab" * 32
+                payload = b'{"schema":"qbit.prism.audit-bundle.v1"}'
+                digest = sha256_hex(payload)
+
+                artifacts.write_canonical(block, digest, payload)
+
+                self.assertEqual(artifacts.read_canonical(block, digest), payload)
+                self.assertEqual(
+                    artifacts.resolved_interface()["literal_body_reader"],
+                    "literal_canonical_bundle_bytes",
+                )
+                self.assertEqual(
+                    artifacts.resolved_interface()["external_body_reconstruction"],
+                    "canonical_bundle_bytes_from_external_body",
+                )
+            finally:
+                store.close()
+
+        ledger = AuditBundleLedgerAdapter(PsqlShareLedger.__new__(PsqlShareLedger))
+        self.assertEqual(
+            ledger.resolved_interface()["publication_preflight"],
+            "preflight_canonical_bundle_publication",
+        )
+
     def test_missing_canonical_capability_is_named(self) -> None:
         journal: list[tuple[Any, ...]] = []
         store = WithoutAttributes(
@@ -884,7 +962,12 @@ class AdapterBindingTest(unittest.TestCase):
         # handed one; binding still succeeds and the row simply cannot recover
         # an absent segment.
         self.assertIsNone(
-            adapter.reconstruct_external_body("body", "aa" * 32, lambda **_: [])
+            adapter.canonical_bytes_from_external_body(
+                "bb" * 32,
+                "body",
+                "aa" * 32,
+                lambda **_: [],
+            )
         )
 
 

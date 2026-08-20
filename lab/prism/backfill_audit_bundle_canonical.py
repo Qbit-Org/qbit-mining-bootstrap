@@ -80,16 +80,19 @@ DEFAULT_BATCH_SIZE = 100
 READ_CANONICAL_CANDIDATES = ("read_canonical_audit_bundle",)
 WRITE_CANONICAL_CANDIDATES = ("write_canonical_audit_bundle",)
 LITERAL_BODY_CANDIDATES = (
+    "literal_canonical_bundle_bytes",
     "read_literal_audit_body",
     "read_verified_literal_audit_body",
     "read_pre_v2_audit_body",
     "read_literal_external_audit_body",
 )
 RECONSTRUCT_CANDIDATES = (
+    "canonical_bundle_bytes_from_external_body",
     "reconstruct_external_audit_body",
     "read_external_body",
 )
 LEDGER_PREFLIGHT_CANDIDATES = (
+    "preflight_canonical_bundle_publication",
     "preflight_audit_bundle_publication",
     "confirm_audit_bundle_publication",
     "refresh_lease_and_confirm_audit_bundle",
@@ -304,12 +307,21 @@ class CanonicalArtifactAdapter:
             payload = self._literal(body_uri)
         return None if payload is None else bytes(payload)
 
-    def reconstruct_external_body(
+    def canonical_bytes_from_external_body(
         self,
+        block_hash: str,
         body_uri: object,
         digest: str,
         load_missing_range: Callable[..., list[Any]],
-    ) -> dict[str, Any] | None:
+    ) -> bytes | None:
+        if self._reconstruct_name == "canonical_bundle_bytes_from_external_body":
+            payload = self._reconstruct(
+                block_hash=block_hash,
+                audit_bundle_sha256=digest,
+                body_uri=body_uri,
+                load_missing_range=load_missing_range,
+            )
+            return None if payload is None else bytes(payload)
         kwargs: dict[str, Any] = {}
         if self._reconstruct_takes_digest:
             kwargs["expected_sha256"] = digest
@@ -322,7 +334,7 @@ class CanonicalArtifactAdapter:
             raise CanonicalBackfillUnrecoverable(
                 "external audit body reconstruction did not return a bundle object"
             )
-        return bundle
+        return self.canonical_bytes(bundle)
 
     def canonical_bytes(self, bundle: Mapping[str, Any]) -> bytes:
         return bytes(self._canonicalize(dict(bundle)))
@@ -661,9 +673,8 @@ class CanonicalBundleBackfill:
             literal = self._recover_literal(row, digest, reasons)
             if literal is not None:
                 return literal
-            bundle = self._reconstruct(row, digest, reasons)
-            if bundle is not None:
-                canonical = self._artifacts.canonical_bytes(bundle)
+            canonical = self._reconstruct(row, digest, reasons)
+            if canonical is not None:
                 actual = _sha256_hex(canonical)
                 if not hmac.compare_digest(actual, digest):
                     raise CanonicalBackfillMismatch(
@@ -718,9 +729,10 @@ class CanonicalBundleBackfill:
         row: AuditBundleRow,
         digest: str,
         reasons: list[str],
-    ) -> dict[str, Any] | None:
+    ) -> bytes | None:
         try:
-            return self._artifacts.reconstruct_external_body(
+            return self._artifacts.canonical_bytes_from_external_body(
+                row.block_hash,
                 row.body_uri,
                 digest,
                 self._load_missing_range,

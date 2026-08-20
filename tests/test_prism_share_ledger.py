@@ -25,6 +25,7 @@ from typing import Any
 from lab.prism.backfill_ctv_fanouts import backfill_input_from_path, backfill_input_from_payload, infer_block_hash_from_path
 from lab.prism import public_api
 from lab.prism import share_ledger as share_ledger_module
+from lab.prism.audit_artifacts import AuditArtifactConfig, AuditArtifactStore
 from lab.prism.share_ledger import (
     database_url_from_psql_command,
     parse_single_json_value,
@@ -4549,6 +4550,50 @@ class PrismShareLedgerTests(unittest.TestCase):
             },
         )
         self.assertEqual(calls, [(block_hash, digest)])
+
+    def test_psql_public_artifact_serves_real_stored_bytes_without_reserialization(self) -> None:
+        canonical_bytes = b'{"schema":"qbit.prism.audit-bundle.v1","z":0,"a":1}'
+        digest = hashlib.sha256(canonical_bytes).hexdigest()
+        block_hash = "ab" * 32
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = AuditArtifactStore(
+                AuditArtifactConfig(
+                    root=root,
+                    evidence_path=root / "evidence.json",
+                )
+            )
+            try:
+                store.write_canonical_audit_bundle(
+                    block_hash,
+                    digest,
+                    canonical_bytes,
+                )
+                ledger = FakeLeasePsqlShareLedger(
+                    [
+                        acquired_lease(),
+                        {
+                            "has_audit_row": True,
+                            "block_hash": block_hash,
+                            "audit_bundle": {"schema": "legacy-reconstructed"},
+                            "audit_bundle_sha256": digest,
+                            "body_uri": None,
+                            "fallback": None,
+                        },
+                    ],
+                    audit_artifact_store=store,
+                )
+
+                response = public_api.artifact(
+                    types.SimpleNamespace(ledger=ledger),
+                    sha256=digest,
+                )
+
+                self.assertIsInstance(response, public_api.RawJsonBody)
+                self.assertEqual(response.body, canonical_bytes)  # type: ignore[union-attr]
+                self.assertEqual(hashlib.sha256(response.body).hexdigest(), digest)  # type: ignore[union-attr]
+            finally:
+                store.close()
 
     def test_psql_public_artifact_visible_row_missing_file_uses_legacy_body(self) -> None:
         legacy = {"schema": "qbit.prism.audit-bundle.v1", "legacy": True}
