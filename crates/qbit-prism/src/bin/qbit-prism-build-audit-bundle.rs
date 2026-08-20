@@ -93,10 +93,10 @@ struct ServeRequest {
     witness_merkle_leaves_hex: Vec<String>,
     #[serde(default)]
     ctv_settlement: Option<CtvSettlementInput>,
-    /// Coordinator append-invalidation epoch. Prepared window state is
-    /// tagged with the epoch that produced it; any request carrying a newer
-    /// epoch drops older prepared state, so a daemon that missed an
-    /// invalidation while respawning self-corrects on the next request.
+    /// Coordinator append-invalidation epoch. Recorded against prepared
+    /// window state and echoed back on advance for diagnostics; it never
+    /// decides which window this daemon will serve. See `WindowState` for
+    /// why the coordinator's own policy is the only one that can be right.
     #[serde(default)]
     append_invalidation_epoch: Option<u64>,
     // prepare_window fields.
@@ -119,6 +119,17 @@ struct ServeRequest {
 /// window that owns the fold state needed to advance incrementally. Prepared
 /// windows are never loaned: builds clone their records so the advance
 /// lineage survives every build outcome.
+///
+/// The recorded `epoch` is diagnostic only. This daemon never chooses a
+/// window: every entry is addressed by the content digest the coordinator
+/// asks for, builds are validated by the install fence and the job-bundle
+/// epoch checks, and an `advance` base is the coordinator's own
+/// digest-verified mirror -- which the coordinator keeps only while its own
+/// (finer) append-invalidation policy says it may. Refusing an older-tagged
+/// base could therefore never catch anything the coordinator had not
+/// already decided; it could only turn the coordinator's deliberate retag,
+/// the one that preserves an unaffected window across a late append, into a
+/// full DB walk, fold and upload on every replay burst.
 enum WindowState {
     Uploaded(Vec<AcceptedShare>),
     Prepared { window: PayoutWindow, epoch: u64 },
@@ -416,17 +427,11 @@ fn serve_requests(
         // expansion, exactly where one-shot mode samples the same metric, so
         // transport comparisons measure identical work.
         let input_deserialization_seconds = input_started.elapsed().as_secs_f64();
-        // A newer coordinator epoch invalidates every prepared window from
-        // an older one: the fold inputs those windows were built from are
-        // known-incomplete. Tag-matching here (instead of explicit
-        // invalidate messages) means a daemon that was mid-respawn during
-        // the epoch bump still converges on the next request.
-        if let Some(request_epoch) = request.append_invalidation_epoch {
-            window_cache.retain(|(_, state)| match state {
-                WindowState::Prepared { epoch, .. } => *epoch >= request_epoch,
-                WindowState::Uploaded(_) => true,
-            });
-        }
+        // No epoch-driven eviction here: see `WindowState`. A window the
+        // coordinator no longer considers valid is one it never asks for
+        // again, and the entry it does ask for is one it has already
+        // cleared under its own policy. Evicting on the tag would only
+        // discard windows the coordinator still wants.
         match request.request.as_deref() {
             None => {}
             Some("prepare_window") => {
@@ -695,12 +700,11 @@ fn serve_prepare_window(
                 return Ok(());
             };
             let position = window_cache.iter().position(|(key, state)| {
-                key == &base_digest
-                    && matches!(state, WindowState::Prepared { epoch, .. } if *epoch == request_epoch)
+                key == &base_digest && matches!(state, WindowState::Prepared { .. })
             });
             let Some(position) = position else {
-                // Respawn, eviction, or an epoch change dropped the base
-                // window; the coordinator re-sends a full preparation.
+                // Respawn or eviction dropped the base window; the
+                // coordinator re-sends a full preparation.
                 let mut out = stdout.lock();
                 serde_json::to_writer(
                     &mut out,
@@ -715,11 +719,22 @@ fn serve_prepare_window(
                 out.flush()?;
                 return Ok(());
             };
-            let advance_result = match &window_cache[position].1 {
-                WindowState::Prepared { window, .. } => {
-                    window.advance(request.records, anchor_job_issued_at_ms)
+            let (advance_result, base_epoch) = match &window_cache[position].1 {
+                WindowState::Prepared { window, epoch } => (
+                    window.advance(request.records, anchor_job_issued_at_ms),
+                    *epoch,
+                ),
+                WindowState::Uploaded(_) => {
+                    // Only prepared entries can match the predicate above,
+                    // so this arm is dead -- answered rather than panicked
+                    // because the position came from request-derived data.
+                    respond_error(
+                        stdout,
+                        "prepare_window advance matched a non-prepared window",
+                        false,
+                    )?;
+                    return Ok(());
                 }
-                WindowState::Uploaded(_) => unreachable!("position matched a prepared entry"),
             };
             let (advanced, stats, byte_delta) = match advance_result {
                 Ok(result) => result,
@@ -787,6 +802,10 @@ fn serve_prepare_window(
                     "touched_pages": stats.touched_pages,
                     "retained_drop_bytes": byte_delta.retained_drop_bytes,
                     "appended_items_len": byte_delta.appended_items.len(),
+                    // Diagnostics: which epoch the base was prepared under,
+                    // next to the epoch this request carried. Never acted on.
+                    "base_append_invalidation_epoch": base_epoch,
+                    "append_invalidation_epoch": request_epoch,
                 }),
             )?;
             writeln!(out)?;

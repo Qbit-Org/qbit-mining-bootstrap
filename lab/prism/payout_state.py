@@ -799,6 +799,7 @@ class PayoutStateService:
         reason: str,
         observed_monotonic: float,
         append_invalidation_epoch: int,
+        bypass_build_interval: bool = False,
     ) -> _PayoutWindowMaterialization:
         """Run the exact ledger oracle and atomically replace cached pages."""
         runtime = self._runtime
@@ -838,14 +839,16 @@ class PayoutStateService:
                 reason=reason,
                 observed_monotonic=observed_monotonic,
                 append_invalidation_epoch=append_invalidation_epoch,
+                bypass_build_interval=bypass_build_interval,
             )
             if materialized is not None:
                 return materialized
             # Any daemon outcome that cannot produce a window here -- an
-            # anomaly (already retired), the transport disabled, or a
-            # snapshot the fold must reject -- degrades to the in-process
-            # pipeline below for this materialization, which is also where
-            # an invalid snapshot raises its authoritative error.
+            # anomaly (already retired), the transport disabled, a daemon
+            # another build owns, or a snapshot the fold must reject --
+            # degrades to the in-process pipeline below for this
+            # materialization, which is also where an invalid snapshot
+            # raises its authoritative error.
 
         window = IncrementalShareWindow.from_full_snapshot(
             records,
@@ -898,16 +901,18 @@ class PayoutStateService:
         reason: str,
         observed_monotonic: float,
         append_invalidation_epoch: int,
+        bypass_build_interval: bool = False,
     ) -> _PayoutWindowMaterialization | None:
         """Fold one full snapshot through the daemon; None means fold here.
 
         The daemon returns the canonical digest plus the full canonical
-        items stream; the mirror construction re-hashes those bytes against
-        the digest before anything downstream may consume them. Every
-        non-prepared outcome -- a daemon anomaly (already retired by the
-        transport), the fold rejecting the snapshot (the in-process oracle
-        must raise the authoritative error), or a refuted byte mirror --
-        degrades to the in-process pipeline for this materialization.
+        items stream; the mirror construction reconciles those bytes with
+        both the digest and the record count before anything downstream may
+        consume them. Every non-prepared outcome -- a daemon anomaly (already
+        retired by the transport), a daemon another build owns, the fold
+        rejecting the snapshot (the in-process oracle must raise the
+        authoritative error), or a refuted byte mirror -- degrades to the
+        in-process pipeline for this materialization.
         """
         runtime = self._runtime
         prepare = getattr(runtime, "prepare_payout_window", None)
@@ -920,6 +925,9 @@ class PayoutStateService:
             append_invalidation_epoch=int(append_invalidation_epoch),
             window_weight=int(snapshot_window_weight),
             page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+            # An accepted-block preview publishes on the critical path; it
+            # folds in-process rather than queueing behind another build.
+            wait_for_daemon=not bypass_build_interval,
         )
         if outcome is None or outcome.status != "prepared":
             return None
@@ -933,7 +941,7 @@ class PayoutStateService:
                 share_snapshot_sha256=outcome.share_snapshot_sha256 or "",
             )
         except DaemonWindowMirrorDivergence:
-            runtime._record_payout_artifact_event("window_mirror_divergence")
+            runtime._note_window_mirror_divergence()
             return None
         shares_json = mirror.json_records()
         runtime._incremental_payout_artifact_window = (
@@ -968,6 +976,7 @@ class PayoutStateService:
         *,
         snapshot_anchor_ms: int,
         append_invalidation_epoch: int,
+        bypass_build_interval: bool = False,
     ) -> tuple[DaemonShareWindowMirror, IncrementalWindowAdvanceStats]:
         """Advance the daemon-prepared window by one append-only delta.
 
@@ -975,7 +984,10 @@ class PayoutStateService:
         ``fallback`` raises IncrementalWindowFallback (same handler, same
         ``incremental_invariant_failed`` full rescan, daemon not retired);
         ``needs_full`` and every anomaly raise _DaemonWindowRebuildRequired
-        so the caller rebuilds through the full oracle path.
+        so the caller rebuilds through the full oracle path. ``busy`` is a
+        healthy daemon another build owns: it rebuilds too, because opaque
+        mirror bytes cannot advance in-process, but it keeps its own reason
+        so a contended daemon is never mistaken for an unavailable one.
         """
         runtime = self._runtime
         prepare = getattr(runtime, "prepare_payout_window", None)
@@ -992,11 +1004,21 @@ class PayoutStateService:
             anchor_job_issued_at_ms=int(snapshot_anchor_ms),
             append_invalidation_epoch=int(append_invalidation_epoch),
             base_digest=mirror.share_snapshot_sha256,
+            wait_for_daemon=not bypass_build_interval,
         )
         if outcome is None:
             raise _DaemonWindowRebuildRequired(
                 "window_daemon_unavailable",
                 clear_cache=True,
+            )
+        if outcome.status == "busy":
+            # Contention, not sickness: the daemon is untouched and still
+            # holds this base, so the oracle rebuild below re-prepares it
+            # without the cache being thrown away on a healthy daemon's
+            # behalf.
+            raise _DaemonWindowRebuildRequired(
+                "window_daemon_busy",
+                clear_cache=False,
             )
         if outcome.status == "needs_full":
             # Respawn or eviction: the daemon no longer holds the base
@@ -1024,7 +1046,7 @@ class PayoutStateService:
                 share_snapshot_sha256=outcome.share_snapshot_sha256 or "",
             )
         except DaemonWindowMirrorDivergence:
-            runtime._record_payout_artifact_event("window_mirror_divergence")
+            runtime._note_window_mirror_divergence()
             raise _DaemonWindowRebuildRequired(
                 "window_mirror_divergence",
                 clear_cache=True,
@@ -1105,6 +1127,7 @@ class PayoutStateService:
                 reason=full_reason or "cache_invalidated",
                 observed_monotonic=observed,
                 append_invalidation_epoch=append_invalidation_epoch,
+                bypass_build_interval=bypass_build_interval,
             )
             runtime._incremental_payout_artifact_window_invalidation_reason = None
             return materialized
@@ -1151,6 +1174,7 @@ class PayoutStateService:
                 reason="delta_api_unavailable",
                 observed_monotonic=observed,
                 append_invalidation_epoch=append_invalidation_epoch,
+                bypass_build_interval=bypass_build_interval,
             )
 
         try:
@@ -1166,6 +1190,7 @@ class PayoutStateService:
                     delta_records,
                     snapshot_anchor_ms=snapshot_anchor_ms,
                     append_invalidation_epoch=append_invalidation_epoch,
+                    bypass_build_interval=bypass_build_interval,
                 )
             else:
                 advanced_window, stats = cached.window.advance(
@@ -1173,9 +1198,10 @@ class PayoutStateService:
                     anchor_job_issued_at_ms=snapshot_anchor_ms,
                 )
         except _DaemonWindowRebuildRequired as rebuild:
-            # Daemon window loss (respawn/eviction), a daemon anomaly, or a
-            # refuted byte mirror. The cached mirror stays valid when only
-            # the daemon lost state; the oracle rebuild below re-prepares it.
+            # Daemon window loss (respawn/eviction), a daemon anomaly, a
+            # daemon another build owns, or a refuted byte mirror. The cached
+            # mirror stays valid when the daemon merely lost state or was
+            # busy; the oracle rebuild below re-prepares it.
             if rebuild.clear_cache:
                 runtime._incremental_payout_artifact_window = None
             return runtime._full_payout_window_materialization(
@@ -1184,6 +1210,7 @@ class PayoutStateService:
                 reason=rebuild.reason,
                 observed_monotonic=observed,
                 append_invalidation_epoch=append_invalidation_epoch,
+                bypass_build_interval=bypass_build_interval,
             )
         except (IncrementalWindowFallback, ValueError):
             runtime._incremental_payout_artifact_window = None
@@ -1193,6 +1220,7 @@ class PayoutStateService:
                 reason="incremental_invariant_failed",
                 observed_monotonic=observed,
                 append_invalidation_epoch=append_invalidation_epoch,
+                bypass_build_interval=bypass_build_interval,
             )
 
         if delta_records or stats.expired_rows:
@@ -2005,6 +2033,29 @@ class PayoutStateService:
         with runtime._payout_artifact_executor_lock:
             counts = runtime.payout_artifact_event_counts
             counts[event] = int(counts.get(event, 0)) + 1
+
+    def _note_window_mirror_divergence(self) -> None:
+        """Record a refuted mirror and make sure it cannot be advanced again.
+
+        Mirror construction reconciles bytes, digest and record count
+        eagerly, so a divergence reaching a consumer means an assumption
+        this code makes about the daemon's output is wrong. Whatever raised
+        it is already failing its own operation; the job here is to make
+        sure the artifact window that produced the doubt is not carried into
+        the NEXT build, and that the event is visible in metrics rather than
+        only in whatever traceback the caller prints.
+
+        Deliberately does not take _payout_state_prepare_lock: callers reach
+        this from build and landing paths that must not queue behind an
+        oracle rebuild, and the cost of racing a concurrent materialization
+        is one extra full rescan, never an unsound window.
+        """
+        runtime = self._runtime
+        runtime._record_payout_artifact_event("window_mirror_divergence")
+        runtime._incremental_payout_artifact_window = None
+        runtime._incremental_payout_artifact_window_invalidation_reason = (
+            "window_mirror_divergence"
+        )
 
     def _usable_payout_ledger_artifact(
         self,
@@ -4579,11 +4630,18 @@ class PayoutStateService:
             anchor_job_issued_at_ms=int(anchor_ms),
             network_difficulty=int(network_difficulty),
         )
-        recorded_share_ids = {
-            str(row.get("share_id"))
-            for row in context.shares_json
-            if isinstance(row, dict)
-        }
+        try:
+            recorded_share_ids = {
+                str(row.get("share_id"))
+                for row in context.shares_json
+                if isinstance(row, dict)
+            }
+        except DaemonWindowMirrorDivergence:
+            # Fail closed, exactly like a candidate whose window cannot be
+            # replayed at all: a recorded window the coordinator can no
+            # longer read cannot prove the coinbase pays it.
+            self._note_window_mirror_divergence()
+            return False
         return all(
             str(row.get("share_id")) in recorded_share_ids
             for row in durable_rows

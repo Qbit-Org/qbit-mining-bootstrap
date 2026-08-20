@@ -14,13 +14,18 @@ behavior without a Rust build; the Rust implementation itself is proven by
 the parity oracle's ``rust-daemon`` adapter. Additional modes fault-inject
 the prepare protocol: ``prepare-forget-windows`` answers every advance with
 ``needs_full``, ``prepare-fallback`` answers every advance with ``fallback``,
-``prepare-error`` answers prepare requests with a generic error, and
-``crash-during-prepare`` dies on the first prepare request.
+``prepare-error`` answers prepare requests with a generic error,
+``crash-during-prepare`` dies on the first prepare request, and
+``prepare-slow`` sleeps FAKE_SERVE_BUILDER_PREPARE_DELAY_SECONDS before every
+prepare response, so a test can make the daemon exchange itself outlast a
+budget that was consumed waiting for the daemon's lock. ``prepare-miscount``
+answers with byte-exact windows whose declared record_count is one too many.
 """
 
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 
@@ -63,6 +68,10 @@ def _canonical_items(window) -> bytes:
 def _handle_prepare_window(request: dict, prepared: dict, mode: str) -> None:
     if mode == "crash-during-prepare":
         sys.exit(1)
+    if mode == "prepare-slow":
+        time.sleep(
+            float(os.environ.get("FAKE_SERVE_BUILDER_PREPARE_DELAY_SECONDS", "0"))
+        )
     if mode == "prepare-error":
         _write_response(
             {
@@ -72,6 +81,7 @@ def _handle_prepare_window(request: dict, prepared: dict, mode: str) -> None:
             }
         )
         return
+    miscount = 1 if mode == "prepare-miscount" else 0
     record_type, window_type, fallback_type = _fold_windows()
     records = [
         record_type(
@@ -102,7 +112,7 @@ def _handle_prepare_window(request: dict, prepared: dict, mode: str) -> None:
                 "ok": True,
                 "request": "prepare_window",
                 "share_snapshot_sha256": digest,
-                "record_count": window.record_count,
+                "record_count": window.record_count + miscount,
                 "added_rows": 0,
                 "expired_rows": 0,
                 "touched_pages": 0,
@@ -122,11 +132,10 @@ def _handle_prepare_window(request: dict, prepared: dict, mode: str) -> None:
         return
     base_digest = str(request.get("base_digest", ""))
     held = prepared.get(base_digest)
-    if (
-        mode == "prepare-forget-windows"
-        or held is None
-        or held[1] != epoch
-    ):
+    # Addressed by digest alone, like the real daemon: the epoch recorded
+    # beside the window is diagnostic, never an eviction rule, so a base the
+    # coordinator retagged still advances in place.
+    if mode == "prepare-forget-windows" or held is None:
         _write_response(
             {
                 "ok": False,
@@ -163,6 +172,7 @@ def _handle_prepare_window(request: dict, prepared: dict, mode: str) -> None:
             }
         )
         return
+    base_epoch = held[1]
     digest = advanced.json_records().canonical_json_sha256()
     new_items = _canonical_items(advanced)
     # Byte surgery from the old stream to the new: expiry only drops a
@@ -183,12 +193,14 @@ def _handle_prepare_window(request: dict, prepared: dict, mode: str) -> None:
             "ok": True,
             "request": "prepare_window",
             "share_snapshot_sha256": digest,
-            "record_count": advanced.record_count,
+            "record_count": advanced.record_count + miscount,
             "added_rows": stats.added_rows,
             "expired_rows": stats.expired_rows,
             "touched_pages": stats.touched_pages,
             "retained_drop_bytes": drop,
             "appended_items_len": len(appended),
+            "base_append_invalidation_epoch": base_epoch,
+            "append_invalidation_epoch": epoch,
         },
         appended,
     )

@@ -1350,3 +1350,146 @@ fn build_audit_bundle_serve_mode_caches_parsed_windows() {
     let status = daemon.wait().unwrap();
     assert!(status.success());
 }
+
+#[test]
+fn prepare_window_advance_ignores_the_append_invalidation_epoch_tag() {
+    // The coordinator's late-append policy is finer than any tag this daemon
+    // could apply: it clears the incremental cache only when the late row
+    // predates the cached anchor, and otherwise RETAGS the window so the next
+    // delta build advances it in place. A daemon that demanded an exact tag
+    // match turned every such retag into a needs_full -- a full DB walk, fold
+    // and upload -- while catching nothing the coordinator had not already
+    // decided. The tag rides along for diagnostics and nothing else.
+    use std::io::{BufRead, BufReader as StdBufReader, Read as IoRead, Write as IoWrite};
+    use std::process::Stdio;
+
+    fn share(seq: u64) -> serde_json::Value {
+        serde_json::json!({
+            "share_seq": seq,
+            "share_id": format!("share-{seq}"),
+            "miner_id": format!("miner-{}", seq % 3),
+            "order_key": format!("{:02}:miner", seq % 3),
+            "p2mr_program_hex": format!("{:02x}", seq).repeat(32),
+            "share_difficulty": 1,
+            "network_difficulty": 1000,
+            "template_height": 100,
+            "job_id": format!("job-{seq}"),
+            "job_issued_at_ms": 1_000_000 + seq as i64,
+            "accepted_at_ms": 1_000_000 + seq as i64,
+            "ntime": 1_700_000_000u32,
+        })
+    }
+
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_qbit-prism-build-audit-bundle"))
+        .arg("--serve")
+        .arg("--signing-key-seed-hex")
+        .arg("42".repeat(32))
+        .arg("--ledger-signing-key-seed-hex")
+        .arg("43".repeat(32))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = daemon.stdin.take().unwrap();
+    let mut stdout = StdBufReader::new(daemon.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()["event"],
+        "handshake"
+    );
+
+    // A section reader that consumes the raw canonical-items payload plus its
+    // terminating newline, so the next envelope line starts clean.
+    let drain_section = |stdout: &mut StdBufReader<std::process::ChildStdout>, len: usize| {
+        let mut raw = vec![0u8; len + 1];
+        stdout.read_exact(&mut raw).unwrap();
+        assert_eq!(raw[len], b'\n');
+        raw.truncate(len);
+        raw
+    };
+
+    let prepared = serde_json::json!({
+        "request": "prepare_window",
+        "mode": "full",
+        "append_invalidation_epoch": 7,
+        "anchor_job_issued_at_ms": 1_000_003i64,
+        "window_weight": 1_000,
+        "records": [share(1), share(2), share(3)],
+    });
+    writeln!(stdin, "{}", serde_json::to_string(&prepared).unwrap()).unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let full: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(full["ok"], true, "full response: {line}");
+    assert_eq!(full["record_count"], 3);
+    let base_digest = full["share_snapshot_sha256"].as_str().unwrap().to_string();
+    drain_section(&mut stdout, full["window_items_len"].as_u64().unwrap() as usize);
+
+    // A build at a newer epoch must not evict the prepared window either.
+    let build = serde_json::json!({
+        "window_key": {"share_snapshot_sha256": base_digest},
+        "append_invalidation_epoch": 8,
+        "found_block": {
+            "block_height": 101,
+            "coinbase_value_sats": 5_000_000_000u64,
+            "network_difficulty": 1000,
+            "anchor_job_issued_at_ms": 1_000_003i64,
+        },
+        "prior_balances": [],
+    });
+    writeln!(stdin, "{}", serde_json::to_string(&build).unwrap()).unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let served: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(served["ok"], true, "build response: {line}");
+    assert_eq!(served["window_cache"]["hit"], true);
+
+    // The retag case: the base was prepared at epoch 7, the advance arrives
+    // at epoch 9, and it advances in place instead of answering needs_full.
+    let advance = serde_json::json!({
+        "request": "prepare_window",
+        "mode": "advance",
+        "append_invalidation_epoch": 9,
+        "anchor_job_issued_at_ms": 1_000_004i64,
+        "base_digest": base_digest,
+        "records": [share(4)],
+    });
+    writeln!(stdin, "{}", serde_json::to_string(&advance).unwrap()).unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let advanced: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(advanced["ok"], true, "advance response: {line}");
+    assert!(advanced.get("needs_full").is_none());
+    assert_eq!(advanced["record_count"], 4);
+    assert_eq!(advanced["added_rows"], 1);
+    // The tags are reported, never acted on.
+    assert_eq!(advanced["base_append_invalidation_epoch"], 7);
+    assert_eq!(advanced["append_invalidation_epoch"], 9);
+    let appended = drain_section(
+        &mut stdout,
+        advanced["appended_items_len"].as_u64().unwrap() as usize,
+    );
+    assert!(!appended.is_empty());
+
+    // An unheld digest is still the one thing that answers needs_full.
+    let unknown = serde_json::json!({
+        "request": "prepare_window",
+        "mode": "advance",
+        "append_invalidation_epoch": 9,
+        "anchor_job_issued_at_ms": 1_000_005i64,
+        "base_digest": "0".repeat(64),
+        "records": [],
+    });
+    writeln!(stdin, "{}", serde_json::to_string(&unknown).unwrap()).unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let missing: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(missing["ok"], false);
+    assert_eq!(missing["needs_full"], true);
+
+    drop(stdin);
+    let status = daemon.wait().unwrap();
+    assert!(status.success());
+}

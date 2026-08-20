@@ -15,7 +15,7 @@ are injected at construction exactly like the historical layer's
 from __future__ import annotations
 
 from collections import OrderedDict
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 import json
 import os
@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 import uuid
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterator, Protocol
 
 from lab.prism.coordinator_config import (
     DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS,
@@ -34,6 +34,7 @@ from lab.prism.coordinator_config import (
     env_bool,
 )
 from lab.prism.prism_tools import prism_tool_command
+from lab.prism.share_ledger import DaemonWindowMirrorDivergence
 
 
 PRISM_BUILDER_PHASE_METRICS_PREFIX = "qbit-prism-build-phase-metrics "
@@ -120,6 +121,8 @@ class BundleCompilerRuntime(Protocol):
     def _register_job_bundle_process(self, control: Any, process: Any) -> None: ...
 
     def _unregister_job_bundle_process(self, control: Any, process: Any) -> None: ...
+
+    def _note_window_mirror_divergence(self) -> None: ...
 
 
 def _compact_share_payload(
@@ -348,6 +351,10 @@ class PreparedWindowOutcome:
     - ``"fold_invalid"`` -- the full snapshot itself violates the fold's
       invariants; the in-process oracle raises the same rejection, so the
       caller falls through to it for the authoritative error.
+    - ``"busy"`` -- another build owns the daemon and it could not be had
+      within this preparation's budget. The daemon is healthy and stays
+      registered; this materialization degrades to the in-process pipeline.
+      Ordinary control flow, never a daemon anomaly.
     """
 
     status: str
@@ -368,6 +375,11 @@ class _ServeBuilderClient:
 
     process: subprocess.Popen[bytes]
     stdout_buffer: bytearray = field(default_factory=bytearray, repr=False)
+    # True from the first byte of a request until its terminating newline.
+    # A request that escapes half-written leaves the daemon's stdin holding
+    # an unterminated line, and the NEXT request would concatenate onto it,
+    # so the daemon must be retired rather than reused.
+    request_incomplete: bool = False
     # Mirrors the daemon's bounded LRU so requests can predict whether the
     # window must ride along. Divergence is repaired by the daemon's
     # needs_window response, never trusted blindly.
@@ -459,9 +471,33 @@ class BundleCompiler:
             "spawns": 0,
             "window_uploads": 0,
             "window_prepares": 0,
+            "window_prepare_contended": 0,
         }
         # Guarded by _serve_builder_metrics_lock.
         self.serve_builder_window_cache_counts = {"hits": 0, "misses": 0}
+
+    @contextmanager
+    def _routed_window_mirror_divergence(self) -> Iterator[None]:
+        """Report a refuted daemon window mirror, then let the error stand.
+
+        A mirror reconciles its bytes, digest and record count when it is
+        built, so nothing here should ever fire; if it does, the build that
+        touched the mirror is not the place the problem started, and it must
+        not be the only place the problem is visible either. Invalidating
+        the cached window keeps the NEXT build off the same bytes, and the
+        counted event turns a lone traceback into something a scrape sees.
+        """
+        try:
+            yield
+        except DaemonWindowMirrorDivergence:
+            note = getattr(
+                self._runtime,
+                "_note_window_mirror_divergence",
+                None,
+            )
+            if callable(note):
+                note()
+            raise
 
     def shutdown_serve_builder(self) -> None:
         """Retire the persistent audit builder; builds revert to one-shot."""
@@ -898,6 +934,7 @@ class BundleCompiler:
         def send_request(upload_window: bool) -> None:
             nonlocal input_bytes, input_serialization_elapsed
             serialization_started = time.monotonic()
+            client.request_incomplete = True
             try:
                 if not upload_window:
                     input_bytes += self._serve_builder_write(
@@ -907,6 +944,7 @@ class BundleCompiler:
                         cancellation,
                         build_control,
                     )
+                    client.request_incomplete = False
                     return
                 input_bytes += self._serve_builder_write(
                     client,
@@ -915,11 +953,12 @@ class BundleCompiler:
                     cancellation,
                     build_control,
                 )
-                lease = (
-                    share_serialization.acquire_spooled_tail(shares)
-                    if hasattr(os, "splice")
-                    else None
-                )
+                with self._routed_window_mirror_divergence():
+                    lease = (
+                        share_serialization.acquire_spooled_tail(shares)
+                        if hasattr(os, "splice")
+                        else None
+                    )
                 if lease is not None:
                     try:
                         spool_file, spool_size = lease
@@ -957,6 +996,7 @@ class BundleCompiler:
                     cancellation,
                     build_control,
                 )
+                client.request_incomplete = False
             finally:
                 elapsed = time.monotonic() - serialization_started
                 phases["input_serialization"] = (
@@ -1095,6 +1135,7 @@ class BundleCompiler:
             )
             if not isinstance(build_control, self._build_control_type):
                 build_control = None
+            client: _ServeBuilderClient | None = None
             try:
                 client = self._serve_builder
                 if client is not None and client.process.poll() is not None:
@@ -1163,6 +1204,21 @@ class BundleCompiler:
                 with self._serve_builder_metrics_lock:
                     self.serve_builder_counts["fallbacks"] += 1
                 return None
+            except BaseException:
+                # Anything else -- a payload the serializer refused, a
+                # divergence raised while composing the window fragments --
+                # is not a daemon anomaly, so it propagates. But if it
+                # escaped a half-written request, the daemon's stdin now
+                # holds an unterminated line and the next request would
+                # concatenate onto it, so the daemon goes with the error
+                # rather than answering "malformed serve request" to some
+                # innocent later build.
+                if client is not None and client.request_incomplete:
+                    self._record_live_serve_builder_termination(client)
+                    self._retire_serve_builder_locked()
+                    with self._serve_builder_metrics_lock:
+                        self.serve_builder_counts["fallbacks"] += 1
+                raise
             else:
                 with self._serve_builder_metrics_lock:
                     self.serve_builder_counts["requests"] += 1
@@ -1180,6 +1236,7 @@ class BundleCompiler:
         window_weight: int | None = None,
         page_size: int | None = None,
         base_digest: str | None = None,
+        wait_for_daemon: bool = True,
     ) -> PreparedWindowOutcome | None:
         """One prepare_window round trip; None means use in-process Python.
 
@@ -1189,6 +1246,12 @@ class BundleCompiler:
         daemon and returns None so the caller's in-process pipeline runs
         unchanged. The ``needs_full``/``fallback``/``fold_invalid`` outcomes
         are ordinary control flow and never retire the daemon.
+
+        ``wait_for_daemon=False`` refuses to queue at all: urgent
+        materializations (the accepted-block preview) must never wait behind
+        another build's round trip, so a contended daemon answers ``busy``
+        immediately. Either way, losing the race for the daemon is not a
+        daemon fault and is never recorded as one.
         """
         runtime = self._runtime
         if not env_bool("PRISM_BUILDER_SERVE", "1"):
@@ -1213,17 +1276,38 @@ class BundleCompiler:
             request_fields["page_size"] = int(page_size)
         if base_digest is not None:
             request_fields["base_digest"] = base_digest
-        deadline = time.monotonic() + float(
+        budget = float(
             getattr(
                 runtime,
                 "bundle_build_timeout_seconds",
                 DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS,
             )
         )
-        # Unlike builds (which prefer one-shot over queueing), a window
-        # preparation has no cheaper transport to defect to, so it waits for
-        # the daemon; the deadline above still bounds the whole exchange.
-        self._serve_builder_lock.acquire()
+        # Unlike builds (which prefer one-shot over queueing), a routine
+        # window preparation has no cheaper transport to defect to, so it
+        # will wait for the daemon -- but only for its own budget, and the
+        # exchange's deadline is stamped AFTER the wait. Charging a build's
+        # runtime against this preparation's budget would make the first
+        # write inside the lock read as a daemon timeout, and the anomaly
+        # handler would SIGKILL a daemon that had done nothing wrong.
+        if wait_for_daemon:
+            acquired = self._serve_builder_lock.acquire(timeout=budget)
+        else:
+            acquired = self._serve_builder_lock.acquire(blocking=False)
+        if not acquired:
+            with self._serve_builder_metrics_lock:
+                self.serve_builder_counts["window_prepare_contended"] = (
+                    self.serve_builder_counts.get(
+                        "window_prepare_contended",
+                        0,
+                    )
+                    + 1
+                )
+            return PreparedWindowOutcome(
+                status="busy",
+                error="audit-builder daemon is owned by another build",
+            )
+        deadline = time.monotonic() + budget
         try:
             if self._serve_builder_shutdown:
                 return None
@@ -1419,11 +1503,13 @@ class BundleCompiler:
                 serialization = share_serialization
 
                 def precompose() -> tuple[str, str]:
-                    return serialization.compact_fragments(shares)
+                    with self._routed_window_mirror_divergence():
+                        return serialization.compact_fragments(shares)
 
                 precomposed = precompose
             else:
-                identities, compact_shares = _compact_share_payload(shares)
+                with self._routed_window_mirror_divergence():
+                    identities, compact_shares = _compact_share_payload(shares)
                 payload["compact_share_identities"] = identities
                 payload["compact_shares"] = compact_shares
             if record_phase_metrics:
@@ -1435,9 +1521,10 @@ class BundleCompiler:
             # Canonical builds serialize the full share window inline; a
             # daemon-mirror sequence materializes its dicts here, on the
             # rare found-block path that actually consumes them.
-            payload["shares"] = (
-                shares if isinstance(shares, list) else list(shares)
-            )
+            with self._routed_window_mirror_divergence():
+                payload["shares"] = (
+                    shares if isinstance(shares, list) else list(shares)
+                )
         if ctv_settlement is None and payout_policy is None:
             ctv_settlement = runtime.prism_ctv_settlement_config(
                 block_height=int(found_block["block_height"]),
