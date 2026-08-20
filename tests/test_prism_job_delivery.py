@@ -76,9 +76,32 @@ class S2DescriptorRoutingTests(unittest.TestCase):
         server.jobs = jobs_replacement
         self.assertIs(service.jobs, jobs_replacement)
 
-        pending_replacement: dict[object, PendingInitialJob] = {}
+        # The admission map is private to the owner and every access to it is
+        # taken under the admission lock, so assigning through the legacy name
+        # adopts the mapping's contents rather than retaining (and exposing)
+        # the caller's mutable object (#159).
+        state = client()
+        request = PendingInitialJob(
+            client=state,
+            authorization_generation=1,
+            worker=state.worker,
+            requested_monotonic=time.monotonic(),
+            deadline_monotonic=None,
+            connection_id=state.connection_id,
+            difficulty_generation=0,
+        )
+        pending_replacement: dict[object, PendingInitialJob] = {state: request}
         server.pending_initial_jobs = pending_replacement
-        self.assertIs(service.pending_initial_jobs, pending_replacement)
+
+        self.assertIsNot(service.pending_initial_jobs, pending_replacement)
+        self.assertIs(service.pending_initial_jobs[state], request)
+        self.assertEqual(len(server.pending_initial_jobs), 1)
+        # Adoption is a copy: later admission changes are not written back
+        # into the caller's dict, and the caller cannot mutate admission state
+        # behind the lock by holding on to it.
+        server.cancel_initial_job_delivery(state)
+        self.assertEqual(len(server.pending_initial_jobs), 0)
+        self.assertEqual(pending_replacement, {state: request})
 
 
 class S2NarrowAdapterTests(unittest.TestCase):

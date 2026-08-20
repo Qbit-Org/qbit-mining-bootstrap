@@ -88,6 +88,14 @@ LEDGER_RETRY_TERMINAL_OBJECT = {
 }
 
 
+def _without_ledger_retry_terminal_arm(sql: str) -> str:
+    """Return the historical two-arm acquire shape from current shipped SQL."""
+    stripped = sql.rstrip()
+    if not stripped.endswith(LEDGER_RETRY_TERMINAL_ARM):
+        raise AssertionError("shipped acquire SQL does not carry the pinned terminal arm")
+    return stripped[: -len(LEDGER_RETRY_TERMINAL_ARM)] + "\n);"
+
+
 def _source_of(member: Any) -> str:
     """Return a member's source, or an empty string when it has none."""
     try:
@@ -533,7 +541,10 @@ class SchedulerTests(unittest.TestCase):
         # every run. That reproducibility is the property under test; the
         # identity of the winner is just what this schedule happens to pick.
         self.assertEqual(run.outcome["holder"], "heartbeat-v1:alpha-1")
-        self.assertEqual(run.outcome["kinds"], ["acquire", "acquire"])
+        # The race loser receives the explicit retry sentinel and performs one
+        # fresh-snapshot acquire, so the current three-arm statement executes
+        # three acquire operations in this schedule.
+        self.assertEqual(run.outcome["kinds"], ["acquire", "acquire", "acquire"])
         self.assertFalse(run.outcome["alpha_failed"])
         # What the loser gets is a property of the shipped statement, so it is
         # asserted against the statement rather than pinned to a constant. On
@@ -628,22 +639,17 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(statement.kind, LeaseOp.ACQUIRE)
             sql = statement.sql
 
-        # The baseline shape: exactly the acquired and holder arms, and the
-        # holder arm is the one that reports identity. Asserting the keys as
-        # well as the count is what stops a renamed-but-still-two-arm
-        # statement from being read as unchanged.
-        self.assertEqual(acquire_result_arms(sql), 2)
+        # The shipped shape has the acquired, holder, and explicit retry arms.
+        # Asserting the terminal keys as well as the count stops a renamed arm
+        # from being read as unchanged.
+        self.assertEqual(acquire_result_arms(sql), 3)
         self.assertEqual(
             acquire_terminal_arm_keys(sql),
             (
                 "acquired",
-                "writer_id",
-                "writer_epoch",
-                "writer_session_token",
-                "lease_expires_at",
-                "lease_updated_at",
-                "lease_age_seconds",
-                "lease_wait_seconds",
+                "lease_snapshot_retry",
+                "lease",
+                "retry_reason",
             ),
         )
 
@@ -653,14 +659,11 @@ class SchedulerTests(unittest.TestCase):
         self.assertIn("SELECT COALESCE", str(caught.exception))
 
     def test_the_explicit_not_acquired_arm_is_modelled_when_present(self) -> None:
-        """Exercise the #140 branch now, so it is not dormant until integration.
+        """Exercise the integrated #140 arm and the historical two-arm shape.
 
-        This is what keeps the shape switch from being vacuous. A test that
-        only said "if the new shape appears, assert the new thing" would never
-        execute that assertion on this baseline, and a mistake in the branch
-        would surface for the first time in the ledger PR -- as a harness
-        failure blamed on that PR. So the terminal-arm statement is built here
-        from the shipped one, and the model is required to answer it.
+        The current statement must carry the pinned terminal arm and the model
+        must answer it. Removing only that captured arm recreates the old
+        two-arm statement and proves the compatibility switch still switches.
 
         The arm is the captured fixture and the expected object is written out
         separately, so this holds the model against a fixed input without
@@ -673,10 +676,8 @@ class SchedulerTests(unittest.TestCase):
             server = harness.server
             shipped = server.statements[0].sql
 
-            # Append a terminal arm to the statement production emits today,
-            # so the only difference from the baseline is the thing under test.
-            self.assertTrue(shipped.rstrip().endswith(");"))
-            terminal = shipped.rstrip()[:-2] + LEDGER_RETRY_TERMINAL_ARM
+            terminal = shipped.rstrip()
+            baseline = _without_ledger_retry_terminal_arm(shipped)
             self.assertEqual(acquire_result_arms(terminal), 3)
             self.assertEqual(
                 acquire_terminal_arm_keys(terminal),
@@ -699,13 +700,8 @@ class SchedulerTests(unittest.TestCase):
         self.assertIs(answered["lease_snapshot_retry"], True)
         self.assertIs(answered["acquired"], False)
 
-        # And the baseline shape still must, or the switch is not switching.
-        with LeaseHarness() as harness:
-            alpha = harness.coordinator("alpha")
-            alpha.start()
-            harness.run_until(alpha, "done:startup")
-            baseline = classify(harness.server.statements[0].sql)
-            self.assertIsNone(harness.server._unobserved_not_acquired(baseline))
+        # And the historical shape still must, or the switch is not switching.
+        self.assertIsNone(server._unobserved_not_acquired(classify(baseline)))
 
     def test_a_terminal_literal_survives_commas_and_quotes(self) -> None:
         """Punctuation inside a reason string must not become an argument break.
@@ -735,7 +731,8 @@ class SchedulerTests(unittest.TestCase):
             alpha.start()
             harness.run_until(alpha, "done:startup")
             server = harness.server
-            terminal = server.statements[0].sql.rstrip()[:-2] + arm
+            baseline = _without_ledger_retry_terminal_arm(server.statements[0].sql)
+            terminal = baseline.rstrip()[:-2] + arm
 
             self.assertEqual(acquire_result_arms(terminal), 3)
             self.assertEqual(
