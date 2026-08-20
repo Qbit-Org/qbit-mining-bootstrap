@@ -42,7 +42,6 @@ from unittest.mock import patch
 
 from lab.prism import endpoint_registry, public_api, public_read_service
 from lab.prism.audit_http import AuditHttpConfig, AuditHttpFacade
-from lab.prism.share_ledger import PsqlShareLedger
 from lab.prism.share_ledger import PsqlShareLedger, ReadOnlyLedgerError
 
 # The public fixtures these routes are exercised against already exist, written
@@ -54,7 +53,6 @@ from tests.test_prism_public_dashboard_api import (
     DirectCoinbasePublicLedger,
     FakeCoordinator,
     FakePublicLedger,
-    FakeRpc,
 )
 
 
@@ -904,7 +902,7 @@ class ReplicaContractTests(unittest.TestCase):
         harness = self.harness(probe)
 
         self.assertFalse(
-            public_read_service.path_reads_replica(
+            public_read_service.path_reads_database(
                 f"/public/v1/artifacts/{ARTIFACT_SHA256}"
             )
         )
@@ -932,7 +930,7 @@ class ReplicaContractTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(
                     expected_gated,
-                    public_read_service.path_reads_replica(path),
+                    public_read_service.path_reads_database(path),
                 )
                 served = harness.get(request_path(route))
                 if expected_gated:
@@ -1047,6 +1045,512 @@ class ReplicaModeTests(unittest.TestCase):
                 {"PRISM_PUBLIC_REPLICA_MODE": "yes"}
             )
         self.assertIn("PRISM_PUBLIC_REPLICA_MODE", str(raised.exception))
+
+
+class DatabaseReached(AssertionError):
+    """Raised when a route consulted the database while readiness said it was down."""
+
+
+class ScriptedReadiness:
+    """A readiness probe callable whose answer the test flips.
+
+    Raises rather than returning False, because that is what an unreachable
+    Postgres actually does to ``dashboard_readiness_probe``, and the two take
+    different arms inside ReadinessProbe.check_once().
+    """
+
+    def __init__(self, *, healthy: bool = True) -> None:
+        self.healthy = healthy
+        self.calls = 0
+
+    def __call__(self) -> bool:
+        self.calls += 1
+        if not self.healthy:
+            raise RuntimeError("connection refused")
+        return True
+
+
+def cached_entry(
+    cache: public_api.PublicResponseCache,
+    path: str,
+) -> object | None:
+    """The live cache entry for a path, or None.
+
+    Reaches into PublicResponseCache's storage deliberately. Expiry there is
+    keyed on time.monotonic(), which is not injectable, so the alternatives for
+    driving the expired-entry case are sleeping out a real TTL or replacing the
+    cache with a double -- and a double cannot prove the thing under test,
+    which is that a degraded request leaves the *real* entry's bounds alone.
+    """
+    return cache._entries.get(public_api.public_cache_key(path, {}))
+
+
+class CoalescingCache:
+    """A cache that hands back a result some other request computed.
+
+    This is PublicResponseCache's waiter path: a request that arrives while
+    another is already computing the same key never calls compute() itself and
+    receives the owner's result. Modelled here rather than raced, because the
+    property under test is what the handler does with a result it did not
+    produce, not the cache's own locking.
+    """
+
+    def __init__(self, result: tuple) -> None:
+        self.result = result
+        self.computes = 0
+
+    def get_or_compute(self, *, key: object, ttl_seconds: int, compute) -> tuple:
+        del key, ttl_seconds, compute  # a waiter never runs compute()
+        return self.result
+
+
+class DatabaseOutageTests(unittest.TestCase):
+    """Bounded-stale availability while Postgres is unreachable (#164).
+
+    The endpoint is public and the database is not: an outage that turns every
+    dashboard into an error page is an outage the public sees in full. What the
+    surface owes instead is its own already-published bound -- serve the warm
+    entry if there is one inside the route's staleness budget, say plainly that
+    it is doing so, and refuse otherwise.
+
+    Two properties make that honest rather than a way to hide an outage, and
+    each has a test below: a degraded request never calls the database (so the
+    outage is not amplified by the retry traffic it causes), and it never
+    extends the entry it serves (so ordinary polling cannot walk a stale
+    dashboard past the bound, one hit at a time, for as long as the outage
+    lasts).
+    """
+
+    def setUp(self) -> None:
+        self.ledger = FullReadModelLedger()
+        self.coordinator = FakeCoordinator(ledger=self.ledger)
+        self.cache = public_api.PublicResponseCache()
+        self.probe_source = ScriptedReadiness()
+        self.readiness = public_read_service.ReadinessProbe(
+            self.probe_source,
+            interval_seconds=3600,
+        )
+        self.readiness.check_once()
+        self.metrics = public_read_service.ServiceMetrics()
+        self.reached: list[str] = []
+        self.armed: list[str] = []
+        self.harness = ServiceHarness(
+            self.coordinator,
+            response_cache=self.cache,
+            readiness=self.readiness,
+            metrics=self.metrics,
+        )
+        self.addCleanup(self.harness.close)
+
+    def take_database_down(self, *, arm_landmines: bool = True) -> None:
+        """Readiness starts failing, and every database read becomes a landmine.
+
+        Everything public_api asks a ledger for is a database read, so arming
+        all of them turns "the handler went to the origin anyway" into a
+        recorded method name rather than a subtle difference in a body.
+        """
+        self.probe_source.healthy = False
+        self.readiness.check_once()
+        self.assertEqual(503, self.readiness.snapshot()[0])
+        if not arm_landmines:
+            return
+        names = {name for name in dir(self.ledger) if name.startswith("dashboard_")}
+        names.update(
+            name for name in WRITER_LOCK_LEDGER_METHODS if hasattr(self.ledger, name)
+        )
+        for name in sorted(names):
+            def explode(*_args: object, _name: str = name, **_kwargs: object) -> object:
+                self.reached.append(_name)
+                raise DatabaseReached(f"the origin reached {_name}() during an outage")
+
+            setattr(self.ledger, name, explode)
+            self.armed.append(name)
+
+    def bring_database_up(self) -> None:
+        for name in self.armed:
+            delattr(self.ledger, name)
+        self.armed.clear()
+        self.probe_source.healthy = True
+        self.readiness.check_once()
+        self.assertEqual(200, self.readiness.snapshot()[0])
+
+    def assert_degraded(self, served: ServedResponse) -> None:
+        self.assertEqual(
+            public_read_service.DEGRADED_WARNING,
+            served.headers.get(public_read_service.DEGRADED_WARNING_HEADER),
+        )
+        self.assertEqual(
+            public_read_service.DATABASE_STATE_UNAVAILABLE,
+            served.headers.get(public_read_service.DATABASE_STATE_HEADER),
+        )
+
+    def test_a_warm_entry_is_served_and_says_so(self) -> None:
+        warm = self.harness.get("/public/v1/blocks")
+        self.assertEqual(200, warm.status)
+        self.take_database_down()
+
+        served = self.harness.get("/public/v1/blocks")
+
+        self.assertEqual(200, served.status)
+        self.assertEqual(warm.body, served.body)
+        self.assertEqual([], self.reached)
+        # Pinned literally, not through the constant: this string is the
+        # contract a dashboard frontend parses.
+        self.assertEqual(
+            '110 qbit-prism "database unavailable; serving cached response"',
+            served.headers.get("Warning"),
+        )
+        self.assertEqual(
+            "unavailable", served.headers.get("X-Prism-Database-State")
+        )
+        # The outage fact and the numerical bound travel together: without the
+        # second, "stale" has no size.
+        self.assertEqual("0", served.headers.get("Age"))
+        self.assertEqual(
+            "15",
+            served.headers.get(public_read_service.STALENESS_BUDGET_HEADER),
+        )
+
+    def test_a_cold_cache_refuses_without_calling_the_database(self) -> None:
+        self.take_database_down()
+
+        served = self.harness.get("/public/v1/blocks")
+
+        self.assertEqual(503, served.status)
+        self.assertEqual([], self.reached)
+        self.assertEqual("no-store", served.headers.get("Cache-Control"))
+        self.assertEqual("prism.dashboard.error.v1", served.payload["schema"])
+        # PUBLIC_ERROR_CODES rewrites an undocumented code to internal_error,
+        # so a 503 that only reads right in the message is not enough.
+        self.assertEqual("upstream_unavailable", served.payload["error"]["code"])
+        self.assertIn(
+            "cannot reach the database", served.payload["error"]["message"]
+        )
+        self.assertEqual(
+            "unavailable", served.headers.get("X-Prism-Database-State")
+        )
+        # 110 is "Response is Stale". Nothing was served, stale or otherwise.
+        self.assertIsNone(served.headers.get("Warning"))
+        self.assertEqual(
+            "15",
+            served.headers.get(public_read_service.STALENESS_BUDGET_HEADER),
+        )
+
+    def test_a_refusal_stores_nothing(self) -> None:
+        # Otherwise the first refusal would become a warm entry and the next
+        # request would serve a 503 body as a cached 503 -- or worse, count as
+        # the warm entry the outage path is allowed to serve.
+        self.take_database_down()
+        self.harness.get("/public/v1/blocks")
+
+        self.assertIsNone(cached_entry(self.cache, "/public/v1/blocks"))
+
+    def test_an_expired_entry_refuses_and_traffic_cannot_refill_it(self) -> None:
+        self.harness.get("/public/v1/blocks")
+        entry = cached_entry(self.cache, "/public/v1/blocks")
+        self.assertIsNotNone(entry)
+        self.take_database_down()
+        # Expire it where the cache actually looks, rather than sleeping out a
+        # real TTL.
+        entry.expires_at = 0.0  # type: ignore[union-attr]
+
+        for _ in range(3):
+            self.assertEqual(503, self.harness.get("/public/v1/blocks").status)
+
+        self.assertEqual([], self.reached)
+        self.assertIsNone(cached_entry(self.cache, "/public/v1/blocks"))
+
+    def test_an_entry_past_the_route_budget_refuses_though_it_is_warm(self) -> None:
+        """TTL and budget are separate numbers, and the budget is the promise.
+
+        Nothing stops an operator raising PRISM_PUBLIC_*_CACHE_TTL_SECONDS
+        above the registry budget the same route publishes. When that happens
+        the entry is unexpired and past the bound at once, and the bound wins.
+        """
+        self.harness.get("/public/v1/blocks")
+        entry = cached_entry(self.cache, "/public/v1/blocks")
+        entry.stored_at -= 3600.0  # type: ignore[union-attr]
+        entry.expires_at += 3600.0  # type: ignore[union-attr]
+        self.take_database_down()
+
+        for _ in range(3):
+            served = self.harness.get("/public/v1/blocks")
+            self.assertEqual(503, served.status)
+
+        self.assertEqual([], self.reached)
+        self.assertIn(
+            "exceeds the staleness budget", served.payload["error"]["message"]
+        )
+        self.assertEqual("no-store", served.headers.get("Cache-Control"))
+        self.assertEqual("3600", served.headers.get("Age"))
+        self.assertEqual(
+            "15",
+            served.headers.get(public_read_service.STALENESS_BUDGET_HEADER),
+        )
+        self.assertEqual(
+            "unavailable", served.headers.get("X-Prism-Database-State")
+        )
+        self.assertIsNone(served.headers.get("Warning"))
+
+    def test_degraded_traffic_never_extends_the_entry_it_serves(self) -> None:
+        """The bound has to survive the traffic, or it is not a bound.
+
+        A degraded hit that refreshed stored_at or expires_at would let
+        ordinary polling walk one snapshot forward indefinitely, and the
+        staleness budget on every one of those responses would be a number
+        describing nothing.
+        """
+        self.harness.get("/public/v1/blocks")
+        entry = cached_entry(self.cache, "/public/v1/blocks")
+        assert entry is not None
+        bounds = (entry.stored_at, entry.expires_at)
+        self.take_database_down()
+
+        for _ in range(5):
+            self.assert_degraded(self.harness.get("/public/v1/blocks"))
+
+        self.assertEqual(bounds, (entry.stored_at, entry.expires_at))
+        # And when those bounds are reached, the outage cannot renew them.
+        entry.expires_at = 0.0
+        self.assertEqual(503, self.harness.get("/public/v1/blocks").status)
+
+    def test_recovery_restores_the_origin_and_drops_the_degraded_headers(self) -> None:
+        self.harness.get("/public/v1/blocks")
+        self.take_database_down()
+        self.assert_degraded(self.harness.get("/public/v1/blocks"))
+
+        self.bring_database_up()
+        # Expire the warm entry so the answer has to come from the origin.
+        cached_entry(self.cache, "/public/v1/blocks").expires_at = 0.0  # type: ignore[union-attr]
+        served = self.harness.get("/public/v1/blocks")
+
+        self.assertEqual(200, served.status)
+        self.assertIsNone(served.headers.get("Warning"))
+        self.assertIsNone(served.headers.get("X-Prism-Database-State"))
+        self.assertEqual("0", served.headers.get("Age"))
+        # Refilled, which only the origin path can do.
+        self.assertIsNotNone(cached_entry(self.cache, "/public/v1/blocks"))
+
+    def test_every_database_backed_route_degrades_and_the_rest_do_not(self) -> None:
+        """Exhaustive and registry-derived, so a new route is classified once."""
+
+        for route in EXTRACTED_ROUTES:
+            self.assertEqual(
+                200, self.harness.get(request_path(route)).status, route[0]
+            )
+        self.take_database_down()
+
+        degraded = 0
+        for route in EXTRACTED_ROUTES:
+            path = route[0]
+            endpoint = endpoint_registry.endpoint_for_request_path(path)
+            assert endpoint is not None
+            expected = (
+                not endpoint.immutable_content
+                and endpoint_registry.LedgerAccess.READ_SLOT in endpoint.access
+            )
+            with self.subTest(path=path):
+                self.assertEqual(
+                    expected, public_read_service.path_reads_database(path)
+                )
+                served = self.harness.get(request_path(route))
+                self.assertEqual(200, served.status)
+                if expected:
+                    degraded += 1
+                    self.assert_degraded(served)
+                    self.assertIsNotNone(served.headers.get("Age"))
+                    self.assertIsNotNone(
+                        served.headers.get(
+                            public_read_service.STALENESS_BUDGET_HEADER
+                        )
+                    )
+                else:
+                    self.assertIsNone(served.headers.get("Warning"))
+                    self.assertIsNone(
+                        served.headers.get("X-Prism-Database-State")
+                    )
+        self.assertEqual([], self.reached)
+        self.assertGreater(degraded, 0, "no route exercised the outage gate")
+
+    def test_the_exempt_routes_stay_available_from_a_cold_cache(self) -> None:
+        """Mining configuration and immutable artifacts owe answers regardless.
+
+        The first is assembled from the environment and has no database answer
+        to lose; the second is content-addressed, so its body either hashes to
+        the requested sha256 or it does not, which an outage cannot change.
+        Landmines stay disarmed here precisely because these two are expected
+        to reach their origin.
+        """
+        self.take_database_down(arm_landmines=False)
+
+        refused = 0
+        for route in EXTRACTED_ROUTES:
+            path = route[0]
+            with self.subTest(path=path):
+                served = self.harness.get(request_path(route))
+                if public_read_service.path_reads_database(path):
+                    refused += 1
+                    self.assertEqual(503, served.status)
+                    self.assertEqual(
+                        "upstream_unavailable", served.payload["error"]["code"]
+                    )
+                    self.assertEqual(
+                        "no-store", served.headers.get("Cache-Control")
+                    )
+                else:
+                    self.assertEqual(200, served.status)
+                    self.assertIsNone(served.headers.get("Warning"))
+                    self.assertIsNone(
+                        served.headers.get("X-Prism-Database-State")
+                    )
+        self.assertEqual(len(EXTRACTED_ROUTES) - 2, refused)
+
+    def test_a_bypassed_cache_refuses_rather_than_calling_the_database(self) -> None:
+        # With the response cache off there is no warm entry to serve and no
+        # way to make one, so every request is the cold case.
+        with patch.dict(os.environ, {"PRISM_PUBLIC_CACHE_ENABLED": "false"}):
+            self.harness.get("/public/v1/blocks")
+            self.take_database_down()
+            served = self.harness.get("/public/v1/blocks")
+
+        self.assertEqual(503, served.status)
+        self.assertEqual([], self.reached)
+        self.assertEqual(
+            "unavailable", served.headers.get("X-Prism-Database-State")
+        )
+
+    def test_a_route_that_reads_no_database_is_never_degraded(self) -> None:
+        self.take_database_down()
+
+        served = self.harness.get("/public/v1/mining-configuration")
+
+        self.assertEqual(200, served.status)
+        self.assertIsNone(served.headers.get("Warning"))
+        self.assertIsNone(served.headers.get("X-Prism-Database-State"))
+
+    def test_degraded_responses_and_refusals_are_counted(self) -> None:
+        self.harness.get("/public/v1/blocks")
+        self.take_database_down()
+        self.harness.get("/public/v1/blocks")  # warm: degraded 200
+        self.harness.get("/public/v1/leaderboard")  # cold: refused
+
+        body = self.harness.get("/metrics").body.decode()
+
+        self.assertIn("qbit_prism_public_degraded_responses_total 1", body)
+        self.assertIn("qbit_prism_public_database_outage_refusals_total 1", body)
+
+    def test_a_healthy_readiness_snapshot_changes_nothing(self) -> None:
+        # The gate must be invisible while the database is up, including on the
+        # first, uncached request.
+        served = self.harness.get("/public/v1/blocks")
+
+        self.assertEqual(200, served.status)
+        self.assertIsNone(served.headers.get("Warning"))
+        self.assertIsNone(served.headers.get("X-Prism-Database-State"))
+        body = self.harness.get("/metrics").body.decode()
+        self.assertIn("qbit_prism_public_degraded_responses_total 0", body)
+        self.assertIn("qbit_prism_public_database_outage_refusals_total 0", body)
+
+    def test_a_warming_up_probe_is_treated_as_unavailable(self) -> None:
+        # Before the first probe completes there is no evidence the database is
+        # reachable, and this gate fails closed on absent evidence like every
+        # other freshness check in this service.
+        readiness = public_read_service.ReadinessProbe(
+            ScriptedReadiness(), interval_seconds=3600
+        )
+        harness = ServiceHarness(
+            FakeCoordinator(ledger=FullReadModelLedger()), readiness=readiness
+        )
+        self.addCleanup(harness.close)
+
+        self.assertEqual(503, harness.get("/public/v1/blocks").status)
+        self.assertEqual(200, harness.get("/public/v1/mining-configuration").status)
+
+    def test_a_coalesced_refusal_is_never_shared_cacheable(self) -> None:
+        """A waiter must not turn another request's refusal into a CDN entry.
+
+        get_or_compute() coalesces: a request arriving while another is
+        computing the same key gets that one's result, whatever its own view of
+        readiness was. So a request whose probe had already recovered can
+        receive the outage refusal -- and if the handler decided "is this the
+        refusal" from the request instead of from the response, it would send
+        that 503 out under the ordinary shared-cache headers and a CDN would
+        hold it for the route's TTL.
+        """
+        harness = ServiceHarness(
+            self.coordinator,
+            response_cache=CoalescingCache(
+                (503, public_read_service.DATABASE_UNAVAILABLE_PAYLOAD, "MISS", 0)
+            ),
+            readiness=self.readiness,  # healthy: this request never degraded
+        )
+        self.addCleanup(harness.close)
+
+        served = harness.get("/public/v1/blocks")
+
+        self.assertEqual(503, served.status)
+        self.assertEqual("no-store", served.headers.get("Cache-Control"))
+        self.assertIsNone(served.headers.get("CDN-Cache-Control"))
+        self.assertEqual(
+            "unavailable", served.headers.get("X-Prism-Database-State")
+        )
+
+    def test_a_coalesced_fresh_body_is_not_labelled_stale(self) -> None:
+        """The mirror case: the waiter is the degraded one, the body is fresh.
+
+        Warning 110 and X-Prism-Database-State are claims about the body being
+        served. A response another request just computed from a database that
+        answered it is not a cached response, whatever this request's probe
+        said a moment later.
+        """
+        fresh = {"schema": "prism.dashboard.blocks.v1", "rows": []}
+        self.take_database_down()
+        harness = ServiceHarness(
+            self.coordinator,
+            response_cache=CoalescingCache((200, fresh, "MISS", 0)),
+            readiness=self.readiness,
+        )
+        self.addCleanup(harness.close)
+
+        served = harness.get("/public/v1/blocks")
+
+        self.assertEqual(200, served.status)
+        self.assertEqual(fresh, served.payload)
+        self.assertIsNone(served.headers.get("Warning"))
+        self.assertIsNone(served.headers.get("X-Prism-Database-State"))
+
+    def test_replica_mode_require_keeps_its_stricter_refusal(self) -> None:
+        """A warm entry does not soften the standby contract.
+
+        In require mode the replica probe is the readiness probe, so both gates
+        see the same failure. They do not owe the same answer: reading the
+        coordinator's primary is refused because of *where* the answer would
+        come from, which a cached body from that same wrong place does not fix.
+        """
+        clock = FakeClock()
+        replica = public_read_service.ReplicaProbe(
+            ScriptedReplica(standby(heartbeat=1.0), PRIMARY_STATUS),
+            max_lag_seconds=60.0,
+            monotonic=clock,
+        )
+        readiness = public_read_service.ReadinessProbe(
+            replica.check, interval_seconds=3600, monotonic=clock
+        )
+        readiness.check_once()
+        harness = ServiceHarness(
+            FakeCoordinator(ledger=FullReadModelLedger()),
+            readiness=readiness,
+            replica=replica,
+        )
+        self.addCleanup(harness.close)
+        self.assertEqual(200, harness.get("/public/v1/blocks").status)
+
+        readiness.check_once()
+        served = harness.get("/public/v1/blocks")
+
+        self.assertEqual(503, served.status)
+        self.assertIn("not in recovery", served.payload["error"]["message"])
+        self.assertIsNone(served.headers.get("Warning"))
 
 
 class FailClosedStartupTests(unittest.TestCase):
