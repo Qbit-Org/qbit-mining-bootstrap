@@ -377,6 +377,7 @@ from lab.prism.share_ledger import (
     DEFAULT_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS,
     DEFAULT_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS,
     DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,  # noqa: F401 - compatibility re-export
+    DaemonWindowMirrorDivergence,
     PendingShare,
     PsqlShareLedger,
     SingleWriterShareLedger,
@@ -4052,9 +4053,9 @@ class PrismCoordinator:
         """Whether a ledger snapshot exposes the append-only window contract."""
         return PayoutStateService._incremental_window_records_supported(records)
 
-    def _full_payout_window_materialization(self, *, snapshot_anchor_ms: int, snapshot_window_weight: int, reason: str, observed_monotonic: float, append_invalidation_epoch: int) -> _PayoutWindowMaterialization:
+    def _full_payout_window_materialization(self, *, snapshot_anchor_ms: int, snapshot_window_weight: int, reason: str, observed_monotonic: float, append_invalidation_epoch: int, bypass_build_interval: bool=False) -> _PayoutWindowMaterialization:
         """Run the exact ledger oracle and atomically replace cached pages."""
-        return self._ensure_payout_state_service()._full_payout_window_materialization(snapshot_anchor_ms=snapshot_anchor_ms, snapshot_window_weight=snapshot_window_weight, reason=reason, observed_monotonic=observed_monotonic, append_invalidation_epoch=append_invalidation_epoch)
+        return self._ensure_payout_state_service()._full_payout_window_materialization(snapshot_anchor_ms=snapshot_anchor_ms, snapshot_window_weight=snapshot_window_weight, reason=reason, observed_monotonic=observed_monotonic, append_invalidation_epoch=append_invalidation_epoch, bypass_build_interval=bypass_build_interval)
 
     def _incremental_payout_window_materialization(self, *, snapshot_anchor_ms: int, snapshot_window_weight: int, force_full_rescan: bool, bypass_build_interval: bool, append_invalidation_epoch: int, reused_prior_balances_sha256: str | None=None) -> _PayoutWindowMaterialization:
         """Return an exact window using debounce, delta folding, or the oracle."""
@@ -4109,6 +4110,10 @@ class PrismCoordinator:
 
     def _record_payout_artifact_event(self, event: str) -> None:
         return self._ensure_payout_state_service()._record_payout_artifact_event(event)
+
+    def _note_window_mirror_divergence(self) -> None:
+        """Invalidate a refuted daemon window mirror and count the event."""
+        return self._ensure_payout_state_service()._note_window_mirror_divergence()
 
     def _usable_payout_ledger_artifact(self, payout_state_generation: int, network_difficulty: int, *, rearm_on_fence_failure: bool=True) -> PayoutLedgerArtifact | None:
         """Return the armed artifact when reuse is valid for NEW work."""
@@ -7789,6 +7794,7 @@ class PrismCoordinator:
         ctv_settlement: dict[str, object] | None = None,
         cancellation: _JobBuildCancellation | None = None,
         share_serialization: _ShareWindowSerialization | None = None,
+        append_invalidation_epoch: int | None = None,
     ) -> dict[str, Any]:
         return self._ensure_bundle_compiler().build_audit_bundle(
             shares=shares,
@@ -7805,6 +7811,31 @@ class PrismCoordinator:
             ctv_settlement=ctv_settlement,
             cancellation=cancellation,
             share_serialization=share_serialization,
+            append_invalidation_epoch=append_invalidation_epoch,
+        )
+
+    def prepare_payout_window(
+        self,
+        *,
+        mode: str,
+        records_json: list[dict[str, object]],
+        anchor_job_issued_at_ms: int,
+        append_invalidation_epoch: int,
+        window_weight: int | None = None,
+        page_size: int | None = None,
+        base_digest: str | None = None,
+        wait_for_daemon: bool = True,
+    ) -> Any:
+        """Fold/advance one payout window through the persistent builder."""
+        return self._ensure_bundle_compiler().prepare_payout_window(
+            mode=mode,
+            records_json=records_json,
+            anchor_job_issued_at_ms=anchor_job_issued_at_ms,
+            append_invalidation_epoch=append_invalidation_epoch,
+            window_weight=window_weight,
+            page_size=page_size,
+            base_digest=base_digest,
+            wait_for_daemon=wait_for_daemon,
         )
 
     def coinbase_script_sig_suffix_hex(self, extranonce1_hex: str, extranonce2_hex: str) -> str:
@@ -7900,10 +7931,21 @@ class PrismCoordinator:
             )
         return False
 
-    @staticmethod
-    def block_candidate_intent(candidate: PrismBlockCandidate) -> dict[str, Any]:
-        """Return the immutable JSON needed to resume a candidate after restart."""
-        return encode_block_candidate_intent(candidate)
+    def block_candidate_intent(self, candidate: PrismBlockCandidate) -> dict[str, Any]:
+        """Return the immutable JSON needed to resume a candidate after restart.
+
+        The durable JSON boundary is where a daemon-mirror share sequence is
+        forced to real dicts, so it is also where a refuted mirror would
+        first be seen on the landing path. Route it before it propagates:
+        the candidate cannot be persisted from a window the coordinator no
+        longer trusts, and the next build must not resume from that window
+        either.
+        """
+        try:
+            return encode_block_candidate_intent(candidate)
+        except DaemonWindowMirrorDivergence:
+            self._note_window_mirror_divergence()
+            raise
 
     def block_candidate_from_intent(
         self,

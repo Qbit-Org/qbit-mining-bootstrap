@@ -13,10 +13,14 @@ wrong digest framing, null-instead-of-absent, a dropped crossing row, spool
 whitespace, narrow or saturating integers, a fold that never refuses or
 misfiles its refusals, advance expiry with the wrong comparison or confined
 to pre-existing pages, an equal-anchor rejection, a raw DEL or an escaped
-solidus, and advance stats derived from the wrong thing -- and asserts the
-harness catches each one exactly where it should and nowhere else. Green
-alone is not evidence here: every class from the integer-width one onward
-was green against the original fourteen-case corpus, which could not see it.
+solidus, advance stats derived from the wrong thing, and a backend that
+declares Unsupported inside its own domain or returns wrong bytes outside it
+-- and asserts the harness catches each one exactly where it should and
+nowhere else. Green alone is not evidence here: every class from the
+integer-width one onward was green against the original fourteen-case
+corpus, which could not see it, and the width class is re-checked against
+the retuned ``wide-integers`` case so the declared-domain split could not
+have quietly taken that protection away.
 """
 
 from __future__ import annotations
@@ -97,14 +101,30 @@ class WindowPipelineParityOracleTests(unittest.TestCase):
         cls.corpus = parity.build_corpus()
         cls.cases = {case.name: case for case in cls.corpus}
         cls.reference_cases = parity.load_reference_document()["cases"]
-        adapter = parity.resolve_adapter()
-        cls.results = {case.name: adapter.run(case) for case in cls.corpus}
+        cls.adapter = parity.resolve_adapter()
+        cls.results = {case.name: cls.adapter.run(case) for case in cls.corpus}
 
     def _outputs(self, name: str) -> parity.WindowPipelineOutputs:
         result = self.results[name]
         self.assertIsInstance(result, parity.WindowPipelineOutputs, name)
         assert isinstance(result, parity.WindowPipelineOutputs)
         return result
+
+    def _declared_unsupported(self, name: str) -> bool:
+        """Whether the backend legitimately declined this case.
+
+        True only for an Unsupported result on a case outside the backend's
+        declared domain; the main parity test fails any other Unsupported, so
+        the output-shape tests may skip exactly these cases and no others.
+        """
+        result = self.results[name]
+        if not isinstance(result, parity.WindowPipelineUnsupported):
+            return False
+        self.assertIsNotNone(
+            parity.domain_exclusion(self.adapter, self.cases[name]),
+            f"{name}: Unsupported inside the declared domain",
+        )
+        return True
 
     def test_backend_reproduces_every_frozen_case(self) -> None:
         self.assertEqual(set(self.cases), set(self.reference_cases))
@@ -121,14 +141,38 @@ class WindowPipelineParityOracleTests(unittest.TestCase):
                     # The literal makes input drift legible in the fixture
                     # diff; here it also localizes which field moved.
                     self.assertEqual(parity.case_input_document(case), pinned_input)
-                self.assertEqual(parity.diverging_outputs(entry, self.results[name]), [])
+                self.assertEqual(
+                    parity.diverging_outputs(
+                        entry,
+                        self.results[name],
+                        domain_exclusion=parity.domain_exclusion(self.adapter, case),
+                    ),
+                    [],
+                )
+
+    def test_unsupported_is_declared_only_outside_the_declared_domain(self) -> None:
+        # Every Unsupported the selected backend returned names a case its
+        # declared domain excludes, the reference still holds Python's bytes
+        # for it, and the shipped pipeline itself declines nothing.
+        for name in self.cases:
+            result = self.results[name]
+            if not isinstance(result, parity.WindowPipelineUnsupported):
+                continue
+            with self.subTest(case=name):
+                self.assertTrue(result.reason)
+                self.assertIsNotNone(parity.domain_exclusion(self.adapter, self.cases[name]))
+                self.assertIn("record_count", self.reference_cases[name])
+        if isinstance(self.adapter, parity.PythonWindowPipelineAdapter):
+            self.assertFalse(
+                any(isinstance(result, parity.WindowPipelineUnsupported) for result in self.results.values())
+            )
 
     def test_outputs_are_internally_consistent(self) -> None:
         # The digest must hash exactly the framed canonical bytes, and the
         # page-fragment concatenation must equal the flat per-record encoding
         # -- the identity that makes page layout invisible on the wire.
         for name, case in self.cases.items():
-            if case.expected_rejection is not None:
+            if case.expected_rejection is not None or self._declared_unsupported(name):
                 continue
             with self.subTest(case=name):
                 outputs = self._outputs(name)
@@ -156,6 +200,8 @@ class WindowPipelineParityOracleTests(unittest.TestCase):
         ]
         self.assertGreaterEqual(len(advancing), 8)
         for case in advancing:
+            if self._declared_unsupported(case.name):
+                continue
             with self.subTest(case=case.name):
                 rebuilt = python_adapter.run(parity.union_rebuild_case(case))
                 self.assertEqual(
@@ -284,20 +330,27 @@ class WindowPipelineParityOracleTests(unittest.TestCase):
             list(range(len(identities))),
         )
 
-        # Integer width: the case cannot be quietly shrunk back under any
-        # fixed width, and the retention cutoff genuinely depends on bits
-        # above 2^64 (the three newest rows fall short of the weight only
-        # because of its 2^127 term; truncated to 64 bits they would not).
+        # Integer width: wide-integers cannot be quietly shrunk back under
+        # 32/53/64 bits, must stay inside every declared Rust width (so both
+        # backends are held to its bytes), and its retention cutoff genuinely
+        # depends on bits above 2^64 (the three newest rows fall short of the
+        # weight only because of its 2^127 term; truncated to 64 bits they
+        # would not).
         wide_case = self.cases["wide-integers"]
         wide_inputs = wide_case.snapshot_records
         self.assertTrue(any(record.share_difficulty.bit_length() > 64 for record in wide_inputs))
-        self.assertTrue(any(record.network_difficulty.bit_length() > 128 for record in wide_inputs))
+        self.assertTrue(any(record.network_difficulty.bit_length() > 64 for record in wide_inputs))
+        self.assertTrue(any(record.network_difficulty == 2**128 - 1 for record in wide_inputs))
         self.assertTrue(any(record.share_seq.bit_length() > 32 for record in wide_inputs))
+        self.assertTrue(any(record.share_seq == 2**64 - 1 for record in wide_inputs))
         self.assertTrue(any(record.template_height.bit_length() > 32 for record in wide_inputs))
-        self.assertTrue(any(record.ntime.bit_length() > 32 for record in wide_inputs))
+        # ntime: above i32 (top bit set) and at u32's maximum, never beyond.
+        self.assertTrue(any(record.ntime == 2**32 - 1 for record in wide_inputs))
+        self.assertTrue(any(record.ntime.bit_length() == 32 for record in wide_inputs))
         self.assertTrue(any(record.template_height == 0 and record.ntime == 0 for record in wide_inputs))
         self.assertGreater(wide_case.anchor_job_issued_at_ms.bit_length(), 40)
         self.assertGreater(wide_case.window_weight.bit_length(), 64)
+        self.assertIsNone(parity.RUST_INTEGER_DOMAIN.exclusion(wide_case))
         self.assertEqual(reference["wide-integers"]["record_count"], 4)
         wide = parity.fold_case(wide_case)
         self.assertGreater(wide.total_difficulty, wide_case.window_weight)
@@ -305,14 +358,18 @@ class WindowPipelineParityOracleTests(unittest.TestCase):
         self.assertLess(newest_three, wide_case.window_weight)
         self.assertGreaterEqual(newest_three % 2**64, wide_case.window_weight % 2**64)
         wide_literal = reference["wide-integers"]["pinned_literals"]["canonical_bytes"]
-        for digits in (2**127 + 3, 10**77, 2**63 - 1, 2**53 + 1):
+        for digits in (2**127 + 3, 2**128 - 1, 2**64 - 1, 2**62, 2**32 - 1, 2**53 + 1):
             self.assertIn(str(digits), wide_literal)
 
+        # The genuinely out-of-domain values, one case per width, each
+        # excluded from the Rust domain by exactly the field it exists for,
+        # with Python's bytes frozen.
         beyond_case = self.cases["difficulty-beyond-u128"]
         self.assertTrue(
             any(record.share_difficulty.bit_length() > 128 for record in beyond_case.snapshot_records)
         )
         self.assertGreater(beyond_case.window_weight.bit_length(), 128)
+        self.assertIn("u128", parity.RUST_INTEGER_DOMAIN.exclusion(beyond_case) or "")
         self.assertEqual(reference["difficulty-beyond-u128"]["record_count"], 3)
         beyond = parity.fold_case(beyond_case)
         self.assertGreater(beyond.total_difficulty.bit_length(), 128)
@@ -320,6 +377,28 @@ class WindowPipelineParityOracleTests(unittest.TestCase):
         beyond_literal = reference["difficulty-beyond-u128"]["pinned_literals"]["canonical_bytes"]
         for digits in (2**128 + 1, 2**128, 2**128 - 1, 10**78 - 1):
             self.assertIn(str(digits), beyond_literal)
+
+        ntime_case = self.cases["ntime-beyond-u32"]
+        self.assertTrue(any(record.ntime.bit_length() > 32 for record in ntime_case.snapshot_records))
+        self.assertTrue(any(record.ntime == 2**63 - 1 for record in ntime_case.snapshot_records))
+        self.assertEqual(
+            parity.RUST_INTEGER_DOMAIN.exclusion(ntime_case),
+            "snapshot record[0].ntime 4294967296 is outside u32",
+        )
+        self.assertIsNone(
+            parity.RUST_INTEGER_DOMAIN.exclusion(
+                replace(
+                    ntime_case,
+                    snapshot_records=tuple(
+                        replace(record, ntime=2**32 - 1) for record in ntime_case.snapshot_records
+                    ),
+                )
+            )
+        )
+        self.assertEqual(reference["ntime-beyond-u32"]["record_count"], 3)
+        ntime_literal = reference["ntime-beyond-u32"]["pinned_literals"]["canonical_bytes"]
+        for digits in (2**32, 2**63 - 1):
+            self.assertIn(str(digits), ntime_literal)
 
         # Advance-path shapes and their stats, pinned at the values the
         # shipped fold reports so touched_pages' subtle definition cannot be
@@ -553,10 +632,40 @@ class _WrappingU64Adapter:
         return parity.run_python_pipeline(_map_case_integers(case, lambda value: value % 2**64))
 
 
+class _WrappingU32Adapter:
+    """Carries every integer in a wrapping unsigned 32-bit type."""
+
+    name = "perturbed-u32-wrap"
+
+    def run(self, case: parity.WindowPipelineCase) -> parity.WindowPipelineResult:
+        return parity.run_python_pipeline(_map_case_integers(case, lambda value: value % 2**32))
+
+
+class _SaturatingU64AccumulatorAdapter:
+    """Clamps the difficulties and window_weight at u64::MAX: a saturating u64 accumulator."""
+
+    name = "perturbed-u64-saturating-accumulator"
+
+    def run(self, case: parity.WindowPipelineCase) -> parity.WindowPipelineResult:
+        return parity.run_python_pipeline(
+            _map_case_integers(
+                case,
+                lambda value: min(value, 2**64 - 1),
+                record_fields=("share_difficulty",),
+            )
+        )
+
+
 class _SaturatingU128DifficultyAdapter:
-    """Clamps share_difficulty and window_weight at u128::MAX: a saturating u128 accumulator."""
+    """Clamps share_difficulty and window_weight at u128::MAX: a saturating u128 accumulator.
+
+    Declares the Rust domain, so where it answers the oracle must hold it to
+    the bytes and not excuse it: a declared domain permits Unsupported, never
+    wrong digits.
+    """
 
     name = "perturbed-u128-saturating-difficulty"
+    integer_domain = parity.RUST_INTEGER_DOMAIN
 
     def run(self, case: parity.WindowPipelineCase) -> parity.WindowPipelineResult:
         return parity.run_python_pipeline(
@@ -566,6 +675,53 @@ class _SaturatingU128DifficultyAdapter:
                 record_fields=("share_difficulty",),
             )
         )
+
+
+class _DeclaredDomainDecliningAdapter:
+    """Declares the Rust domain and declines exactly the cases outside it.
+
+    The honest shape of a fixed-width backend: Unsupported with a declared
+    reason where the domain excludes the case, Python's bytes everywhere else.
+    """
+
+    name = "perturbed-declared-domain-declining"
+    integer_domain = parity.RUST_INTEGER_DOMAIN
+
+    def run(self, case: parity.WindowPipelineCase) -> parity.WindowPipelineResult:
+        exclusion = self.integer_domain.exclusion(case)
+        if exclusion is not None:
+            return parity.WindowPipelineUnsupported(exclusion)
+        return parity.run_python_pipeline(case)
+
+
+class _OverDecliningAdapter:
+    """Declares the Rust domain but declines anything above 64 bits.
+
+    A backend whose real width is narrower than the one it declares: it
+    answers Unsupported for wide-integers, which its declared domain includes.
+    """
+
+    name = "perturbed-over-declining"
+    integer_domain = parity.RUST_INTEGER_DOMAIN
+
+    def run(self, case: parity.WindowPipelineCase) -> parity.WindowPipelineResult:
+        records = case.snapshot_records + tuple(
+            record for step in case.advances for record in step.delta_records
+        )
+        if any(record.share_difficulty.bit_length() > 64 for record in records):
+            return parity.WindowPipelineUnsupported("difficulty above u64")
+        return parity.run_python_pipeline(case)
+
+
+class _UndeclaredDecliningAdapter:
+    """Declares no domain at all yet declines the beyond-u128 case."""
+
+    name = "perturbed-undeclared-declining"
+
+    def run(self, case: parity.WindowPipelineCase) -> parity.WindowPipelineResult:
+        if case.name == "difficulty-beyond-u128":
+            return parity.WindowPipelineUnsupported("cannot carry 2^128+1")
+        return parity.run_python_pipeline(case)
 
 
 class _NeverRefusingAdapter:
@@ -828,6 +984,15 @@ class WindowPipelineDivergenceDetectionTests(unittest.TestCase):
         self.assertTrue(problems)
         self.assertTrue(all(problem.startswith("spool_tail") for problem in problems))
 
+    def _diverging_declared(self, adapter: parity.WindowPipelineAdapter, case_name: str) -> list[str]:
+        """As _diverging, but telling the harness the backend's declared domain."""
+        case = self.cases[case_name]
+        return parity.diverging_outputs(
+            self.reference_cases[case_name],
+            adapter.run(case),
+            domain_exclusion=parity.domain_exclusion(adapter, case),
+        )
+
     def test_wrapping_64_bit_integers_are_detected_only_above_64_bits(self) -> None:
         adapter = _WrappingU64Adapter()
         # Truncating window_weight and the difficulties stops retention one
@@ -840,15 +1005,77 @@ class WindowPipelineDivergenceDetectionTests(unittest.TestCase):
         for name in ("single-record", "incremental-two-advances", "bulk-seeded"):
             self.assertEqual(self._diverging(adapter, name), [])
 
+    def test_retuned_wide_integers_still_refuses_every_narrow_backend(self) -> None:
+        # The protection wide-integers was built for, re-checked after the
+        # values were brought inside the declared Rust widths: a u32-wrapping,
+        # a u64-wrapping and a u64-saturating backend each still fail it (the
+        # count itself, not only the digits, for the two that touch the
+        # accumulator), while passing the sub-2^31 corpus exactly as before.
+        # Declaring the Rust domain could not excuse any of them, because the
+        # case lies inside that domain.
+        for adapter in (_WrappingU32Adapter(), _WrappingU64Adapter(), _SaturatingU64AccumulatorAdapter()):
+            with self.subTest(adapter=adapter.name):
+                problems = self._diverging(adapter, "wide-integers")
+                self.assertTrue(problems, adapter.name)
+                if adapter.name != "perturbed-u32-wrap":
+                    self.assertTrue(any(problem.startswith("record_count") for problem in problems))
+                declared = type(adapter.name, (object,), {"name": adapter.name, "integer_domain": parity.RUST_INTEGER_DOMAIN, "run": staticmethod(adapter.run)})()
+                self.assertEqual(self._diverging_declared(declared, "wide-integers"), problems)
+                for name in ("single-record", "incremental-two-advances", "crossing-row-retained"):
+                    self.assertEqual(self._diverging(adapter, name), [])
+        self.assertIsNone(parity.RUST_INTEGER_DOMAIN.exclusion(self.cases["wide-integers"]))
+
     def test_saturating_u128_difficulty_is_refused_by_the_beyond_u128_case_alone(self) -> None:
-        # The documented decision: 128-bit difficulty accumulation passes
-        # wide-integers and is refused only where numeric(78,0) exceeds it,
-        # by the clamped crossing row's digits (retained count still agrees).
+        # 128-bit difficulty accumulation passes wide-integers (inside the
+        # declared domain) and is refused where numeric(78,0) exceeds it, by
+        # the clamped crossing row's digits (retained count still agrees).
+        # The backend declares the Rust domain, and that excuses nothing: it
+        # produced bytes, so it is held to the frozen bytes.
         adapter = _SaturatingU128DifficultyAdapter()
-        self.assertEqual(self._diverging(adapter, "wide-integers"), [])
-        problems = self._diverging(adapter, "difficulty-beyond-u128")
+        self.assertEqual(self._diverging_declared(adapter, "wide-integers"), [])
+        self.assertIsNotNone(parity.domain_exclusion(adapter, self.cases["difficulty-beyond-u128"]))
+        problems = self._diverging_declared(adapter, "difficulty-beyond-u128")
         self.assertTrue(any(problem.startswith("record_jsons[0]") for problem in problems))
         self.assertFalse(any(problem.startswith("record_count") for problem in problems))
+
+    def test_unsupported_is_parity_outside_the_declared_domain_and_divergence_inside(self) -> None:
+        honest = _DeclaredDomainDecliningAdapter()
+        for name in ("difficulty-beyond-u128", "ntime-beyond-u32"):
+            with self.subTest(case=name):
+                # Outside the declared domain: Unsupported is parity, while
+                # the frozen reference keeps Python's bytes for the case.
+                self.assertEqual(self._diverging_declared(honest, name), [])
+                self.assertIn("record_count", self.reference_cases[name])
+                result = honest.run(self.cases[name])
+                self.assertIsInstance(result, parity.WindowPipelineUnsupported)
+        # Inside it, the same backend produces bytes and is held to them.
+        self.assertEqual(self._diverging_declared(honest, "wide-integers"), [])
+        self.assertIsInstance(honest.run(self.cases["wide-integers"]), parity.WindowPipelineOutputs)
+
+        # A backend narrower than it declares: Unsupported inside the declared
+        # domain is a divergence, named as such.
+        over = _OverDecliningAdapter()
+        self.assertEqual(
+            self._diverging_declared(over, "wide-integers"),
+            ["unsupported: backend declared 'difficulty above u64' but the case is inside its declared integer domain"],
+        )
+        self.assertEqual(self._diverging_declared(over, "difficulty-beyond-u128"), [])
+
+        # A backend that declares nothing claims the whole domain, so any
+        # Unsupported it returns is a divergence -- even on the beyond case.
+        undeclared = _UndeclaredDecliningAdapter()
+        self.assertIs(parity.adapter_integer_domain(undeclared), parity.UNBOUNDED_INTEGER_DOMAIN)
+        self.assertEqual(
+            self._diverging_declared(undeclared, "difficulty-beyond-u128"),
+            ["unsupported: backend declared 'cannot carry 2^128+1' but the case is inside its declared integer domain"],
+        )
+        # And the shipped pipeline never declines: the reference cannot even
+        # freeze an Unsupported.
+        with self.assertRaisesRegex(RuntimeError, "declared the case unsupported"):
+            parity.reference_case_entry(
+                self.cases["single-record"],
+                parity.WindowPipelineUnsupported("never"),
+            )
 
     def test_a_backend_that_never_refuses_is_detected_on_every_rejection_case(self) -> None:
         adapter = _NeverRefusingAdapter()

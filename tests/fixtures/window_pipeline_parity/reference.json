@@ -1003,7 +1003,7 @@
       "record_stream_sha256": "cda1575a1a6915da092fda79a5bef3389926a3c593331766fb38490fdf7c1f8c",
       "spool_tail_len": 553,
       "spool_tail_sha256": "ee82fbf5450d73af30b9bbb98da5d25a99ff9e7a24327189a9d683c8453404f7",
-      "why": "numeric(78,0) width taken literally: share_difficulty 2^128+1 as the retained crossing row, network_difficulty at 2^128-1, 2^128 and 10^78-1, window_weight and the retained total above 2^128; refuses any backend carrying difficulties in 128 bits, saturating or not -- see the module docstring for why the schema's width, not an existing narrower type, is the contract"
+      "why": "numeric(78,0) width taken literally: share_difficulty 2^128+1 as the retained crossing row, network_difficulty at 2^128-1, 2^128 and 10^78-1, window_weight and the retained total above 2^128 -- outside the declared u128 widths, so a backend declaring them answers Unsupported here while the frozen bytes stay Python's; one that clamps at u128::MAX, saturating or not, renders different digits and fails -- see the module docstring"
     },
     "eligibility-filtering": {
       "advance_stats": [],
@@ -1518,6 +1518,85 @@
       "spool_tail_len": 718,
       "spool_tail_sha256": "fc574b1010ad468cfe56dd2259a7773cdb56904507ff6dc71cbdd1ca39c46092",
       "why": "string fields carrying non-ASCII, a non-BMP code point, quotes, backslashes, control characters, DEL, solidus, CR/BS/FF, U+001F, U+2028/U+2029, space and uppercase: pins the ensure_ascii escape rules -- surrogate pairs, \\u007f for DEL, raw solidus, short escapes, and pass-through of printable ASCII"
+    },
+    "ntime-beyond-u32": {
+      "advance_stats": [],
+      "canonical_bytes_len": 1072,
+      "canonical_bytes_sha256": "55a52eff2234207345c1fbbbf81d7b33abba263e3810b2a07cecbf4532d5bf4b",
+      "canonical_digest": "55a52eff2234207345c1fbbbf81d7b33abba263e3810b2a07cecbf4532d5bf4b",
+      "input_sha256": "2efc000d6c25b0dc049db474d21e4965095b7160a52debb91347dcf75e54e52f",
+      "pinned_literals": {
+        "canonical_bytes": "[{\"accepted_at_ms\":1754999999999,\"job_id\":\"job-1\",\"job_issued_at_ms\":1754999999998,\"miner_id\":\"miner-1\",\"network_difficulty\":1000001,\"ntime\":4294967296,\"order_key\":\"01:miner-1\",\"p2mr_program_hex\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"share_difficulty\":3,\"share_id\":\"share-1\",\"share_seq\":1,\"template_height\":800000},{\"accepted_at_ms\":1754999999999,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-2\",\"job_issued_at_ms\":1754999999999,\"miner_id\":\"miner-2\",\"network_difficulty\":1000002,\"ntime\":9223372036854775807,\"order_key\":\"02:miner-2\",\"p2mr_program_hex\":\"0202020202020202020202020202020202020202020202020202020202020202\",\"share_difficulty\":4,\"share_id\":\"share-2\",\"share_seq\":2,\"template_height\":800000},{\"accepted_at_ms\":1755000000000,\"job_id\":\"job-3\",\"job_issued_at_ms\":1755000000000,\"miner_id\":\"miner-3\",\"network_difficulty\":1000003,\"ntime\":1700000003,\"order_key\":\"03:miner-3\",\"p2mr_program_hex\":\"0303030303030303030303030303030303030303030303030303030303030303\",\"share_difficulty\":5,\"share_id\":\"share-3\",\"share_seq\":3,\"template_height\":800000}]",
+        "input": {
+          "advances": [],
+          "name": "ntime-beyond-u32",
+          "page_size": 512,
+          "schema": "qbit-prism-window-pipeline-parity-input/v1",
+          "snapshot": {
+            "anchor_job_issued_at_ms": 1755000000000,
+            "records": [
+              {
+                "accepted_at_ms": 1754999999999,
+                "credit_policy": null,
+                "job_id": "job-1",
+                "job_issued_at_ms": 1754999999998,
+                "miner_id": "miner-1",
+                "network_difficulty": 1000001,
+                "ntime": 4294967296,
+                "order_key": "01:miner-1",
+                "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                "share_difficulty": 3,
+                "share_id": "share-1",
+                "share_seq": 1,
+                "template_height": 800000
+              },
+              {
+                "accepted_at_ms": 1754999999999,
+                "credit_policy": "stale-grace",
+                "job_id": "job-2",
+                "job_issued_at_ms": 1754999999999,
+                "miner_id": "miner-2",
+                "network_difficulty": 1000002,
+                "ntime": 9223372036854775807,
+                "order_key": "02:miner-2",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "share_difficulty": 4,
+                "share_id": "share-2",
+                "share_seq": 2,
+                "template_height": 800000
+              },
+              {
+                "accepted_at_ms": 1755000000000,
+                "credit_policy": null,
+                "job_id": "job-3",
+                "job_issued_at_ms": 1755000000000,
+                "miner_id": "miner-3",
+                "network_difficulty": 1000003,
+                "ntime": 1700000003,
+                "order_key": "03:miner-3",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "share_difficulty": 5,
+                "share_id": "share-3",
+                "share_seq": 3,
+                "template_height": 800000
+              }
+            ]
+          },
+          "window_weight": 1000
+        },
+        "record_jsons": [
+          "{\"accepted_at_ms\":1754999999999,\"job_id\":\"job-1\",\"job_issued_at_ms\":1754999999998,\"miner_id\":\"miner-1\",\"network_difficulty\":1000001,\"ntime\":4294967296,\"order_key\":\"01:miner-1\",\"p2mr_program_hex\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"share_difficulty\":3,\"share_id\":\"share-1\",\"share_seq\":1,\"template_height\":800000}",
+          "{\"accepted_at_ms\":1754999999999,\"credit_policy\":\"stale-grace\",\"job_id\":\"job-2\",\"job_issued_at_ms\":1754999999999,\"miner_id\":\"miner-2\",\"network_difficulty\":1000002,\"ntime\":9223372036854775807,\"order_key\":\"02:miner-2\",\"p2mr_program_hex\":\"0202020202020202020202020202020202020202020202020202020202020202\",\"share_difficulty\":4,\"share_id\":\"share-2\",\"share_seq\":2,\"template_height\":800000}",
+          "{\"accepted_at_ms\":1755000000000,\"job_id\":\"job-3\",\"job_issued_at_ms\":1755000000000,\"miner_id\":\"miner-3\",\"network_difficulty\":1000003,\"ntime\":1700000003,\"order_key\":\"03:miner-3\",\"p2mr_program_hex\":\"0303030303030303030303030303030303030303030303030303030303030303\",\"share_difficulty\":5,\"share_id\":\"share-3\",\"share_seq\":3,\"template_height\":800000}"
+        ],
+        "spool_tail": ",\"compact_share_identities\":[[\"miner-1\",\"01:miner-1\",\"0101010101010101010101010101010101010101010101010101010101010101\"],[\"miner-2\",\"02:miner-2\",\"0202020202020202020202020202020202020202020202020202020202020202\"],[\"miner-3\",\"03:miner-3\",\"0303030303030303030303030303030303030303030303030303030303030303\"]],\"compact_shares\":[[1,\"share-1\",0,3,1754999999998,1754999999999,null],[2,\"share-2\",1,4,1754999999999,1754999999999,\"stale-grace\"],[3,\"share-3\",2,5,1755000000000,1755000000000,null]]}"
+      },
+      "record_count": 3,
+      "record_stream_len": 1070,
+      "record_stream_sha256": "51be88f333f400b0c0297a079106b8e18e391e6e09b00dbcff999bbf20e9ed9c",
+      "spool_tail_len": 487,
+      "spool_tail_sha256": "fab4c8c3d72ed0f0dbf06bbf587608bbf81b0f86da24a4abf76d3dccb7e10b04",
+      "why": "ntime at 2^32 and 2^63-1 (bigint's maximum) on otherwise ordinary records at a realistic anchor: outside the declared u32 width alone, so a backend declaring it answers Unsupported here while the frozen bytes stay Python's full-digit rendering; one that truncates ntime to 32 bits renders different digits and fails"
     },
     "page-boundary-511": {
       "advance_stats": [],
@@ -2471,12 +2550,12 @@
     },
     "wide-integers": {
       "advance_stats": [],
-      "canonical_bytes_len": 1714,
-      "canonical_bytes_sha256": "d9462880af8d244c4261cf5a39d21db9f6df575a07600173621face51a69d7cf",
-      "canonical_digest": "d9462880af8d244c4261cf5a39d21db9f6df575a07600173621face51a69d7cf",
-      "input_sha256": "bbbe3b6a70906827e9bf7e0333b4760e707c0ba32642279e4383581dc5fba362",
+      "canonical_bytes_len": 1660,
+      "canonical_bytes_sha256": "50468ec22c9a2b4dff65693602bd128ea4753aa3fb7cf5156b79718a8dea8c69",
+      "canonical_digest": "50468ec22c9a2b4dff65693602bd128ea4753aa3fb7cf5156b79718a8dea8c69",
+      "input_sha256": "d861fbfa3e6df7f245d6565297cca3e6ac14a39b6c2b425960ef845e9466773f",
       "pinned_literals": {
-        "canonical_bytes": "[{\"accepted_at_ms\":1754999999998,\"job_id\":\"job-1\",\"job_issued_at_ms\":1754999999997,\"miner_id\":\"miner-1\",\"network_difficulty\":100000000000000000000000000000000000000000000000000000000000000000000000000000,\"ntime\":9223372036854775807,\"order_key\":\"01:miner-1\",\"p2mr_program_hex\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"share_difficulty\":170141183460469231731687303715884105731,\"share_id\":\"share-1\",\"share_seq\":1,\"template_height\":4611686018427387904},{\"accepted_at_ms\":1754999999999,\"job_id\":\"job-2147483648\",\"job_issued_at_ms\":1754999999998,\"miner_id\":\"miner-2\",\"network_difficulty\":18446744073709551617,\"ntime\":4294967295,\"order_key\":\"02:miner-2\",\"p2mr_program_hex\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"share_difficulty\":18446744073709551617,\"share_id\":\"share-2147483648\",\"share_seq\":2147483648,\"template_height\":2147483649},{\"accepted_at_ms\":1754999999999,\"job_id\":\"job-4294967301\",\"job_issued_at_ms\":1754999999999,\"miner_id\":\"miner-9\",\"network_difficulty\":18446744073709551615,\"ntime\":0,\"order_key\":\"09:miner-9\",\"p2mr_program_hex\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"share_difficulty\":9223372036854775808,\"share_id\":\"share-4294967301\",\"share_seq\":4294967301,\"template_height\":0},{\"accepted_at_ms\":1755000000000,\"job_id\":\"job-9223372036854775807\",\"job_issued_at_ms\":1755000000000,\"miner_id\":\"miner-7\",\"network_difficulty\":9007199254740993,\"ntime\":9223372038554775807,\"order_key\":\"07:miner-7\",\"p2mr_program_hex\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"share_difficulty\":9007199254740993,\"share_id\":\"share-9223372036854775807\",\"share_seq\":9223372036854775807,\"template_height\":288230376152511743}]",
+        "canonical_bytes": "[{\"accepted_at_ms\":1754999999998,\"job_id\":\"job-1\",\"job_issued_at_ms\":1754999999997,\"miner_id\":\"miner-1\",\"network_difficulty\":340282366920938463463374607431768211455,\"ntime\":4294967295,\"order_key\":\"01:miner-1\",\"p2mr_program_hex\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"share_difficulty\":170141183460469231731687303715884105731,\"share_id\":\"share-1\",\"share_seq\":1,\"template_height\":4611686018427387904},{\"accepted_at_ms\":1754999999999,\"job_id\":\"job-2147483648\",\"job_issued_at_ms\":1754999999998,\"miner_id\":\"miner-2\",\"network_difficulty\":18446744073709551617,\"ntime\":2147483648,\"order_key\":\"02:miner-2\",\"p2mr_program_hex\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"share_difficulty\":18446744073709551617,\"share_id\":\"share-2147483648\",\"share_seq\":2147483648,\"template_height\":2147483649},{\"accepted_at_ms\":1754999999999,\"job_id\":\"job-4294967301\",\"job_issued_at_ms\":1754999999999,\"miner_id\":\"miner-9\",\"network_difficulty\":18446744073709551615,\"ntime\":0,\"order_key\":\"09:miner-9\",\"p2mr_program_hex\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"share_difficulty\":9223372036854775808,\"share_id\":\"share-4294967301\",\"share_seq\":4294967301,\"template_height\":0},{\"accepted_at_ms\":1755000000000,\"job_id\":\"job-18446744073709551615\",\"job_issued_at_ms\":1755000000000,\"miner_id\":\"miner-4\",\"network_difficulty\":9007199254740993,\"ntime\":2147483649,\"order_key\":\"04:miner-4\",\"p2mr_program_hex\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"share_difficulty\":9007199254740993,\"share_id\":\"share-18446744073709551615\",\"share_seq\":18446744073709551615,\"template_height\":576460752304223487}]",
         "input": {
           "advances": [],
           "name": "wide-integers",
@@ -2491,8 +2570,8 @@
                 "job_id": "job-1",
                 "job_issued_at_ms": 1754999999997,
                 "miner_id": "miner-1",
-                "network_difficulty": 100000000000000000000000000000000000000000000000000000000000000000000000000000,
-                "ntime": 9223372036854775807,
+                "network_difficulty": 340282366920938463463374607431768211455,
+                "ntime": 4294967295,
                 "order_key": "01:miner-1",
                 "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
                 "share_difficulty": 170141183460469231731687303715884105731,
@@ -2507,7 +2586,7 @@
                 "job_issued_at_ms": 1754999999998,
                 "miner_id": "miner-2",
                 "network_difficulty": 18446744073709551617,
-                "ntime": 4294967295,
+                "ntime": 2147483648,
                 "order_key": "02:miner-2",
                 "p2mr_program_hex": "0000000000000000000000000000000000000000000000000000000000000000",
                 "share_difficulty": 18446744073709551617,
@@ -2533,17 +2612,17 @@
               {
                 "accepted_at_ms": 1755000000000,
                 "credit_policy": null,
-                "job_id": "job-9223372036854775807",
+                "job_id": "job-18446744073709551615",
                 "job_issued_at_ms": 1755000000000,
-                "miner_id": "miner-7",
+                "miner_id": "miner-4",
                 "network_difficulty": 9007199254740993,
-                "ntime": 9223372038554775807,
-                "order_key": "07:miner-7",
+                "ntime": 2147483649,
+                "order_key": "04:miner-4",
                 "p2mr_program_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
                 "share_difficulty": 9007199254740993,
-                "share_id": "share-9223372036854775807",
-                "share_seq": 9223372036854775807,
-                "template_height": 288230376152511743
+                "share_id": "share-18446744073709551615",
+                "share_seq": 18446744073709551615,
+                "template_height": 576460752304223487
               },
               {
                 "accepted_at_ms": 1755000000000,
@@ -2565,19 +2644,19 @@
           "window_weight": 170141183460469231759357419826448433156
         },
         "record_jsons": [
-          "{\"accepted_at_ms\":1754999999998,\"job_id\":\"job-1\",\"job_issued_at_ms\":1754999999997,\"miner_id\":\"miner-1\",\"network_difficulty\":100000000000000000000000000000000000000000000000000000000000000000000000000000,\"ntime\":9223372036854775807,\"order_key\":\"01:miner-1\",\"p2mr_program_hex\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"share_difficulty\":170141183460469231731687303715884105731,\"share_id\":\"share-1\",\"share_seq\":1,\"template_height\":4611686018427387904}",
-          "{\"accepted_at_ms\":1754999999999,\"job_id\":\"job-2147483648\",\"job_issued_at_ms\":1754999999998,\"miner_id\":\"miner-2\",\"network_difficulty\":18446744073709551617,\"ntime\":4294967295,\"order_key\":\"02:miner-2\",\"p2mr_program_hex\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"share_difficulty\":18446744073709551617,\"share_id\":\"share-2147483648\",\"share_seq\":2147483648,\"template_height\":2147483649}",
+          "{\"accepted_at_ms\":1754999999998,\"job_id\":\"job-1\",\"job_issued_at_ms\":1754999999997,\"miner_id\":\"miner-1\",\"network_difficulty\":340282366920938463463374607431768211455,\"ntime\":4294967295,\"order_key\":\"01:miner-1\",\"p2mr_program_hex\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"share_difficulty\":170141183460469231731687303715884105731,\"share_id\":\"share-1\",\"share_seq\":1,\"template_height\":4611686018427387904}",
+          "{\"accepted_at_ms\":1754999999999,\"job_id\":\"job-2147483648\",\"job_issued_at_ms\":1754999999998,\"miner_id\":\"miner-2\",\"network_difficulty\":18446744073709551617,\"ntime\":2147483648,\"order_key\":\"02:miner-2\",\"p2mr_program_hex\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"share_difficulty\":18446744073709551617,\"share_id\":\"share-2147483648\",\"share_seq\":2147483648,\"template_height\":2147483649}",
           "{\"accepted_at_ms\":1754999999999,\"job_id\":\"job-4294967301\",\"job_issued_at_ms\":1754999999999,\"miner_id\":\"miner-9\",\"network_difficulty\":18446744073709551615,\"ntime\":0,\"order_key\":\"09:miner-9\",\"p2mr_program_hex\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"share_difficulty\":9223372036854775808,\"share_id\":\"share-4294967301\",\"share_seq\":4294967301,\"template_height\":0}",
-          "{\"accepted_at_ms\":1755000000000,\"job_id\":\"job-9223372036854775807\",\"job_issued_at_ms\":1755000000000,\"miner_id\":\"miner-7\",\"network_difficulty\":9007199254740993,\"ntime\":9223372038554775807,\"order_key\":\"07:miner-7\",\"p2mr_program_hex\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"share_difficulty\":9007199254740993,\"share_id\":\"share-9223372036854775807\",\"share_seq\":9223372036854775807,\"template_height\":288230376152511743}"
+          "{\"accepted_at_ms\":1755000000000,\"job_id\":\"job-18446744073709551615\",\"job_issued_at_ms\":1755000000000,\"miner_id\":\"miner-4\",\"network_difficulty\":9007199254740993,\"ntime\":2147483649,\"order_key\":\"04:miner-4\",\"p2mr_program_hex\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"share_difficulty\":9007199254740993,\"share_id\":\"share-18446744073709551615\",\"share_seq\":18446744073709551615,\"template_height\":576460752304223487}"
         ],
-        "spool_tail": ",\"compact_share_identities\":[[\"miner-1\",\"01:miner-1\",\"0101010101010101010101010101010101010101010101010101010101010101\"],[\"miner-2\",\"02:miner-2\",\"0000000000000000000000000000000000000000000000000000000000000000\"],[\"miner-9\",\"09:miner-9\",\"0505050505050505050505050505050505050505050505050505050505050505\"],[\"miner-7\",\"07:miner-7\",\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"]],\"compact_shares\":[[1,\"share-1\",0,170141183460469231731687303715884105731,1754999999997,1754999999998,null],[2147483648,\"share-2147483648\",1,18446744073709551617,1754999999998,1754999999999,null],[4294967301,\"share-4294967301\",2,9223372036854775808,1754999999999,1754999999999,null],[9223372036854775807,\"share-9223372036854775807\",3,9007199254740993,1755000000000,1755000000000,null]]}"
+        "spool_tail": ",\"compact_share_identities\":[[\"miner-1\",\"01:miner-1\",\"0101010101010101010101010101010101010101010101010101010101010101\"],[\"miner-2\",\"02:miner-2\",\"0000000000000000000000000000000000000000000000000000000000000000\"],[\"miner-9\",\"09:miner-9\",\"0505050505050505050505050505050505050505050505050505050505050505\"],[\"miner-4\",\"04:miner-4\",\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"]],\"compact_shares\":[[1,\"share-1\",0,170141183460469231731687303715884105731,1754999999997,1754999999998,null],[2147483648,\"share-2147483648\",1,18446744073709551617,1754999999998,1754999999999,null],[4294967301,\"share-4294967301\",2,9223372036854775808,1754999999999,1754999999999,null],[18446744073709551615,\"share-18446744073709551615\",3,9007199254740993,1755000000000,1755000000000,null]]}"
       },
       "record_count": 4,
-      "record_stream_len": 1712,
-      "record_stream_sha256": "bcc5c7e11fd92b8b75af6620498b1d66f477b7aa6efdf974fb3c356ec7949cc7",
-      "spool_tail_len": 783,
-      "spool_tail_sha256": "3631f204632509213bf65a912971acc049b30dc70704503f60cbf2430ace6c52",
-      "why": "every integer field above 2^32 at a realistic epoch-ms anchor: share_difficulty across 2^53+1, 2^63, 2^64+1 and 2^127+3, network_difficulty up to 10^77, template_height 2^31+1 and 2^62, ntime 2^32-1 and 2^63-1, share_seq up to 2^63-1, a zero template_height/ntime, and window_weight 2^127+2^64+2^63+4 so the retention cutoff depends on exact arithmetic above 2^64; pins full-digit rendering and non-wrapping, non-saturating, non-float accumulation"
+      "record_stream_len": 1658,
+      "record_stream_sha256": "609bd0feb644a22cea67903b6ad17e9900b39b06fbb753fd63d65e0eb752b639",
+      "spool_tail_len": 785,
+      "spool_tail_sha256": "450b2e639e7e75125ebaf35575cc45c35774a9ab19eed4bd2aaa6e6fe79c2c54",
+      "why": "every integer field above 2^32 at a realistic epoch-ms anchor, all inside the declared Rust widths: share_difficulty across 2^53+1, 2^63, 2^64+1 and 2^127+3, network_difficulty up to 2^128-1, template_height 2^31+1, 2^62 and near 2^59, ntime 2^31 to 2^32-1, share_seq up to 2^64-1, a zero template_height/ntime, and window_weight 2^127+2^64+2^63+4 so the retention cutoff depends on exact arithmetic above 2^64; pins full-digit rendering and non-wrapping, non-saturating, non-float accumulation, with full parity enforced on every backend"
     }
   },
   "default_page_size": 512,

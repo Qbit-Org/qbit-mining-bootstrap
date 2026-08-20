@@ -342,7 +342,9 @@ def block_candidate_intent(candidate: PrismBlockCandidate) -> dict[str, Any]:
             "height": int(context.template["height"]),
             "coinbasevalue": int(context.template["coinbasevalue"]),
         },
-        "shares_json": context.shares_json,
+        # Materialized to a plain list: a daemon-mirror share sequence parses
+        # its dicts lazily, and the durable JSON boundary needs real objects.
+        "shares_json": list(context.shares_json),
         "prior_balances": context.prior_balances,
         "found_block": context.found_block,
         "prospective_prior_balances": (

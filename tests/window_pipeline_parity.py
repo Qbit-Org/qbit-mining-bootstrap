@@ -55,47 +55,78 @@ itself -- returning the rescan's bytes where the shipped pipeline refuses --
 pass as parity, which is exactly the divergence class the rejection cases
 exist to catch.
 
-Integer width. The ledger schema is the only written contract for what the
-pipeline may legally see: ``share_difficulty`` and ``network_difficulty`` are
-``numeric(78,0)`` (sized for 256-bit values), ``share_seq``,
-``template_height`` and ``ntime`` are ``bigint``, and the millisecond fields
-are epoch milliseconds above 2^40; production's ``window_weight`` is already
-within a factor of five of 2^53. Python carries all of these exactly and
-renders every digit, so the corpus holds a backend to the same: the
-``wide-integers`` case carries every integer field above 2^32, difficulties
-above 2^53/2^63/2^64 with one above 2^127, and a ``window_weight`` whose
-retention cutoff depends on exact arithmetic above 2^64. Decision, made
-explicitly here: the corpus *also* carries values at and above 2^128
-(``difficulty-beyond-u128``: ``share_difficulty`` 2^128+1 as the retained
-crossing row, ``network_difficulty`` at 2^128-1, 2^128 and numeric(78,0)'s
-maximum, ``window_weight`` above 2^128). With it the oracle refuses a backend
-that carries difficulties in a 128-bit integer, including one that
-accumulates with saturating arithmetic; without it the oracle would bless
-saturation silently. The schema's width is the contract because nothing
-narrower is written down anywhere, and the mandated ``wide-integers`` values
-already hold a backend to the schema rather than to any existing narrower
-type (``ntime`` 2^63-1 is ``bigint``, not the 32-bit header field;
-``network_difficulty`` 10^77 is numeric(78,0), not u128). If the project
-decides 128 bits is the real contract, that belongs in the schema (a CHECK
-constraint) plus a visible edit to those cases -- not in an oracle that
-never asked. The consequence is deliberate and localized: a backend that
-keeps only the accumulated field and ``window_weight`` in 128 bits passes
-``wide-integers`` and is refused by ``difficulty-beyond-u128`` alone; one
-that also parses ``network_difficulty`` into 128 bits is refused by
-``wide-integers``' 10^77 as well. Either way the refusal names the width.
+Integer width. The ledger schema is wider than any fixed machine type:
+``share_difficulty`` and ``network_difficulty`` are ``numeric(78,0)``,
+``share_seq``, ``template_height`` and ``ntime`` are ``bigint``, and the
+millisecond fields are epoch milliseconds above 2^40; Python carries all of
+them exactly and renders every digit. The contract the corpus enforces is
+narrower, and the decision is made here explicitly: the pipeline's declared
+integer widths are the Rust widths --
 
-Adapter contract (the seam a future backend implements): inputs in, outputs
-or a rejection out. Inputs are one :class:`WindowPipelineCase`, available as
-an implementation-neutral JSON document via :func:`case_input_document` --
-the snapshot records with every durable field explicit (``credit_policy`` is
+    share_seq                          u64
+    share_difficulty                   u128
+    network_difficulty                 u128
+    template_height                    u64
+    ntime                              u32
+    job_issued_at_ms, accepted_at_ms   i64   (and every anchor)
+    window_weight                      u128
+    page_size                          u64
+
+-- with the fold's difficulty accumulators u128 as well, so a window whose
+difficulty total leaves u128 is outside the domain too. Why u128 and not the
+schema's 78 digits: ``share_difficulty`` is ``(pow_limit_target*1e6)//target``,
+so at a Bitcoin-mainnet-scale target a share is ~2^98 and a 16x window totals
+~2^102 -- a factor of roughly 6*10^7 short of 2^128, unreachable on any chain
+this code will see. ``numeric(78,0)`` is a generic wide-numeric column
+choice, not a considered statement that difficulties exceed 2^128; widening
+the Rust fold to arbitrary precision would put bignum arithmetic on the exact
+path the migration exists to make faster.
+
+A narrower domain is modelled as exactly that, not as a divergence. A
+backend declares its domain (:class:`WindowPipelineIntegerDomain`: the
+shipped Python pipeline declares ``UNBOUNDED_INTEGER_DOMAIN``, the daemon
+``RUST_INTEGER_DOMAIN``, and a backend that declares nothing claims all of
+it) and may answer a case outside that domain with the third adapter
+outcome, :class:`WindowPipelineUnsupported`, carrying a declared reason. The
+frozen reference keeps Python's bytes for such cases; the harness accepts
+``Unsupported`` only where the case really lies outside the backend's
+declared domain (:func:`diverging_outputs` is told so by
+:func:`domain_exclusion`), still fails a backend that returns wrong *bytes*
+there (a saturating u128 accumulator, say), and fails a backend that
+declares ``Unsupported`` for a case inside its declared domain. This is what
+the system really does: the Rust daemon answers ``out_of_range`` instead of
+folding, the coordinator degrades to the in-process fold for that
+materialization without retiring the daemon, and Python's unbounded integers
+produce the right answer.
+
+The width cases are split accordingly. ``wide-integers`` carries every
+integer field far above the 2^31/2^53/2^64 boundaries at which a wrapping or
+saturating 32/53/64-bit backend breaks, yet inside every declared width, so
+both backends produce bytes and full parity is enforced there: the
+protection it was built for (nine narrow-integer backends passed the
+original fourteen-case corpus) survives the domain restriction, and the
+divergence suite re-checks it against u32-wrapping, u64-wrapping and
+u64-saturating backends. The genuinely out-of-domain values live in
+``difficulty-beyond-u128`` (``share_difficulty`` 2^128+1 as the retained
+crossing row, ``network_difficulty`` at 2^128-1, 2^128 and numeric(78,0)'s
+maximum, ``window_weight`` and the retained total above 2^128) and
+``ntime-beyond-u32`` (``ntime`` at 2^32 and bigint's maximum): Python's
+bytes are frozen, a u128/u32 backend answers ``Unsupported``, and one that
+clamps or truncates renders different digits and fails.
+
+Adapter contract (the seam a future backend implements): inputs in, one
+result out. Inputs are one :class:`WindowPipelineCase`, available as an
+implementation-neutral JSON document via :func:`case_input_document` -- the
+snapshot records with every durable field explicit (``credit_policy`` is
 null when absent), the snapshot anchor, ``window_weight``, ``page_size``, and
 zero or more append-only advance steps that the backend must fold through
-its incremental path. The backend returns :class:`WindowPipelineOutputs` or
-:class:`WindowPipelineRejection`. Register it with :func:`register_adapter`
-and select it by setting ``QBIT_WINDOW_PIPELINE_PARITY_ADAPTER``; selection
-defaults to the shipped Python pipeline. There is deliberately no production
-feature switch here -- the per-component switch belongs to the migration
-slice, not to the oracle.
+its incremental path. The backend returns :class:`WindowPipelineOutputs`,
+:class:`WindowPipelineRejection`, or -- only for a case outside its declared
+integer domain -- :class:`WindowPipelineUnsupported`. Register it with
+:func:`register_adapter` and select it by setting
+``QBIT_WINDOW_PIPELINE_PARITY_ADAPTER``; selection defaults to the shipped
+Python pipeline. There is deliberately no production feature switch here --
+the per-component switch belongs to the migration slice, not to the oracle.
 
 The corpus owns its record factory (:func:`corpus_record`) rather than
 importing the sibling golden test's, so an edit there cannot move this
@@ -118,12 +149,17 @@ import io
 import json
 import os
 import random
+import subprocess
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Protocol
 
-from lab.prism.bundle_compiler import _ShareWindowSerialization
+from lab.prism.bundle_compiler import (
+    PRISM_SERVE_BUILDER_PROTOCOL_VERSION,
+    _ShareWindowSerialization,
+)
+from lab.prism.prism_tools import prism_tool_command
 from lab.prism.share_ledger import (
     DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
     AcceptedShareRecord,
@@ -218,6 +254,161 @@ _REJECTION_MESSAGE_CATEGORIES = {
     "delta share_seq order is not increasing": "delta_order_not_increasing",
 }
 assert set(_REJECTION_MESSAGE_CATEGORIES.values()) == set(REJECTION_REASONS)
+
+
+def rejection_category_for_message(message: str) -> str | None:
+    """The vocabulary category for one shipped-pipeline rejection message.
+
+    None for a message the table does not know, which callers must treat as
+    a harness fault rather than guess at. Shared with the fake serve builder
+    so its ``rejection`` field is classified exactly as the Python adapter
+    classifies.
+    """
+    return _REJECTION_MESSAGE_CATEGORIES.get(message)
+
+
+# --- declared integer domains ------------------------------------------------
+#
+# The integer fields a record carries, in declaration order; the strings are
+# outside the width contract.
+_RECORD_INTEGER_FIELDS = (
+    "share_seq",
+    "share_difficulty",
+    "network_difficulty",
+    "template_height",
+    "job_issued_at_ms",
+    "accepted_at_ms",
+    "ntime",
+)
+
+
+@dataclass(frozen=True)
+class IntegerWidth:
+    """One declared integer width: an inclusive range, or unbounded."""
+
+    name: str
+    minimum: int | None
+    maximum: int | None
+
+    def admits(self, value: int) -> bool:
+        return (self.minimum is None or value >= self.minimum) and (
+            self.maximum is None or value <= self.maximum
+        )
+
+
+WIDTH_U32 = IntegerWidth("u32", 0, 2**32 - 1)
+WIDTH_U64 = IntegerWidth("u64", 0, 2**64 - 1)
+WIDTH_U128 = IntegerWidth("u128", 0, 2**128 - 1)
+WIDTH_I64 = IntegerWidth("i64", -(2**63), 2**63 - 1)
+WIDTH_UNBOUNDED = IntegerWidth("unbounded", None, None)
+
+
+@dataclass(frozen=True)
+class WindowPipelineIntegerDomain:
+    """The integer widths one backend declares for the pipeline's inputs.
+
+    Every record integer, the anchors, ``window_weight`` and ``page_size``
+    carry a declared width; ``difficulty_total`` bounds the fold's
+    accumulator -- the sum of ``share_difficulty`` over every record a case
+    feeds the backend (snapshot plus every delta) must fit it, which is a
+    conservative envelope of every partial sum the fold forms. A case with
+    any value outside its width is outside the domain, and only then may the
+    backend answer :class:`WindowPipelineUnsupported`.
+    """
+
+    share_seq: IntegerWidth
+    share_difficulty: IntegerWidth
+    network_difficulty: IntegerWidth
+    template_height: IntegerWidth
+    ntime: IntegerWidth
+    timestamps_ms: IntegerWidth
+    window_weight: IntegerWidth
+    page_size: IntegerWidth
+    difficulty_total: IntegerWidth
+
+    def record_field_width(self, name: str) -> IntegerWidth:
+        if name in ("job_issued_at_ms", "accepted_at_ms"):
+            return self.timestamps_ms
+        if name not in _RECORD_INTEGER_FIELDS:
+            raise KeyError(f"{name!r} is not an integer record field")
+        return getattr(self, name)
+
+    def exclusion(self, case: WindowPipelineCase) -> str | None:
+        """Why the case lies outside this domain, or None when it is inside.
+
+        Walks the inputs in document order -- the top-level fields, the
+        snapshot records, then each advance's anchor and records -- and names
+        the first value outside its width, so the reason is stable and reads
+        as the field that caused it; the accumulator envelope is checked last.
+        """
+
+        def outside(label: str, value: int, width: IntegerWidth) -> str | None:
+            if width.admits(int(value)):
+                return None
+            return f"{label} {int(value)} is outside {width.name}"
+
+        for label, value, width in (
+            ("window_weight", case.window_weight, self.window_weight),
+            ("page_size", case.page_size, self.page_size),
+            ("snapshot anchor_job_issued_at_ms", case.anchor_job_issued_at_ms, self.timestamps_ms),
+        ):
+            problem = outside(label, value, width)
+            if problem is not None:
+                return problem
+        groups: list[tuple[str, int | None, tuple[AcceptedShareRecord, ...]]] = [
+            ("snapshot", None, case.snapshot_records)
+        ]
+        groups.extend(
+            (f"advance[{index}]", step.anchor_job_issued_at_ms, step.delta_records)
+            for index, step in enumerate(case.advances)
+        )
+        total = 0
+        for label, anchor_ms, records in groups:
+            if anchor_ms is not None:
+                problem = outside(f"{label} anchor_job_issued_at_ms", anchor_ms, self.timestamps_ms)
+                if problem is not None:
+                    return problem
+            for index, record in enumerate(records):
+                for name in _RECORD_INTEGER_FIELDS:
+                    problem = outside(
+                        f"{label} record[{index}].{name}",
+                        getattr(record, name),
+                        self.record_field_width(name),
+                    )
+                    if problem is not None:
+                        return problem
+                total += int(record.share_difficulty)
+        return outside("difficulty total over every record", total, self.difficulty_total)
+
+
+# The shipped Python pipeline: arbitrary-precision integers throughout.
+UNBOUNDED_INTEGER_DOMAIN = WindowPipelineIntegerDomain(
+    share_seq=WIDTH_UNBOUNDED,
+    share_difficulty=WIDTH_UNBOUNDED,
+    network_difficulty=WIDTH_UNBOUNDED,
+    template_height=WIDTH_UNBOUNDED,
+    ntime=WIDTH_UNBOUNDED,
+    timestamps_ms=WIDTH_UNBOUNDED,
+    window_weight=WIDTH_UNBOUNDED,
+    page_size=WIDTH_UNBOUNDED,
+    difficulty_total=WIDTH_UNBOUNDED,
+)
+
+# The Rust window pipeline, mirroring the declared-width table in
+# crates/qbit-prism/src/window.rs (the AcceptedShare field types plus the
+# prepare_window request fields and the u128 accumulators). Changing either
+# side without the other is a contract change and must show up here.
+RUST_INTEGER_DOMAIN = WindowPipelineIntegerDomain(
+    share_seq=WIDTH_U64,
+    share_difficulty=WIDTH_U128,
+    network_difficulty=WIDTH_U128,
+    template_height=WIDTH_U64,
+    ntime=WIDTH_U32,
+    timestamps_ms=WIDTH_I64,
+    window_weight=WIDTH_U128,
+    page_size=WIDTH_U64,
+    difficulty_total=WIDTH_U128,
+)
 
 
 def corpus_record(
@@ -350,15 +541,56 @@ class WindowPipelineRejection:
             )
 
 
-WindowPipelineResult = WindowPipelineOutputs | WindowPipelineRejection
+@dataclass(frozen=True)
+class WindowPipelineUnsupported:
+    """The backend's declared integer domain does not include this input.
+
+    Neither a rejection (the pipeline did not refuse the case; this backend
+    cannot represent it) nor a divergence (the frozen reference keeps the
+    shipped pipeline's result): it is the outcome the coordinator really
+    sees when the daemon answers ``out_of_range`` and the window is folded
+    in-process instead. ``reason`` is the backend's declared explanation,
+    carried for the report and never matched on -- whether the outcome is
+    legitimate is decided from the backend's declared domain alone, see
+    :func:`diverging_outputs`.
+    """
+
+    reason: str
+
+
+WindowPipelineResult = (
+    WindowPipelineOutputs | WindowPipelineRejection | WindowPipelineUnsupported
+)
 
 
 class WindowPipelineAdapter(Protocol):
-    """One backend driven over the corpus: inputs in, outputs or rejection out."""
+    """One backend driven over the corpus: inputs in, a result out.
+
+    ``integer_domain`` is the domain the backend declares; a backend without
+    the attribute claims the unbounded domain, so any ``Unsupported`` it
+    returns is a divergence.
+    """
 
     name: str
+    integer_domain: WindowPipelineIntegerDomain
 
     def run(self, case: WindowPipelineCase) -> WindowPipelineResult: ...
+
+
+def adapter_integer_domain(adapter: object) -> WindowPipelineIntegerDomain:
+    """The domain a backend declares; one that declares nothing claims all of it."""
+    domain = getattr(adapter, "integer_domain", UNBOUNDED_INTEGER_DOMAIN)
+    if not isinstance(domain, WindowPipelineIntegerDomain):
+        raise TypeError(
+            f"adapter {getattr(adapter, 'name', adapter)!r} declares an"
+            " integer_domain that is not a WindowPipelineIntegerDomain"
+        )
+    return domain
+
+
+def domain_exclusion(adapter: object, case: WindowPipelineCase) -> str | None:
+    """Why the case is outside the backend's declared domain, or None."""
+    return adapter_integer_domain(adapter).exclusion(case)
 
 
 def sha256_hex(data: bytes) -> str:
@@ -519,7 +751,7 @@ def run_python_pipeline(case: WindowPipelineCase) -> WindowPipelineResult:
     try:
         window, advance_stats = fold_case_with_stats(case)
     except (ValueError, IncrementalWindowFallback) as exc:
-        category = _REJECTION_MESSAGE_CATEGORIES.get(str(exc))
+        category = rejection_category_for_message(str(exc))
         if category is None:
             raise
         return WindowPipelineRejection(category)
@@ -537,13 +769,198 @@ class PythonWindowPipelineAdapter:
     """The shipped Python pipeline, registered as the default backend."""
 
     name: str = "python"
+    integer_domain: WindowPipelineIntegerDomain = UNBOUNDED_INTEGER_DOMAIN
 
     def run(self, case: WindowPipelineCase) -> WindowPipelineResult:
         return run_python_pipeline(case)
 
 
+def _split_record_fragments(items: bytes) -> tuple[bytes, ...]:
+    """Split one canonical items stream into its per-record byte spans.
+
+    The spans come straight from the backend's bytes (``raw_decode`` only
+    reports where each JSON object ends), so a backend encoding divergence is
+    still visible in the returned fragments rather than being papered over by
+    a re-encode.
+    """
+    if not items:
+        return ()
+    text = items.decode("ascii")
+    decoder = json.JSONDecoder()
+    fragments: list[bytes] = []
+    position = 0
+    while position < len(text):
+        _, end = decoder.raw_decode(text, position)
+        fragments.append(text[position:end].encode("ascii"))
+        if end < len(text) and text[end] != ",":
+            raise ValueError(
+                f"canonical items stream has {text[end]!r} where a record"
+                " separator was expected"
+            )
+        position = end + 1
+    return tuple(fragments)
+
+
+@dataclass(frozen=True)
+class RustDaemonWindowPipelineAdapter:
+    """The Rust --serve daemon's prepare_window pipeline as a backend.
+
+    Drives the real daemon binary over its JSONL protocol: one ``full``
+    preparation for the snapshot, then one ``advance`` per delta step, holding
+    the canonical items stream exactly the way the coordinator's opaque
+    mirror does (drop the reported prefix, append the returned suffix) and
+    taking each advance's stats triple from its envelope. The three byte
+    outputs are taken from the daemon's bytes; only the spool tail runs the
+    shipped Python serialization over the lazily parsed records, which is
+    precisely the production fallback path under the Rust switch.
+
+    Non-success envelopes are classified on their structure, never on the
+    diagnostic ``error`` text: ``fold_invalid`` and ``fallback`` carry the
+    daemon's ``rejection`` category, which is the oracle's own vocabulary and
+    is filed as :class:`WindowPipelineRejection` (an unknown category is a
+    harness error, not a guess); ``out_of_range`` -- an integer or difficulty
+    total outside the widths this adapter declares as ``RUST_INTEGER_DOMAIN``
+    -- is :class:`WindowPipelineUnsupported`. Anything else is a harness
+    error, exactly as the coordinator treats it as a daemon anomaly.
+
+    Selected with ``QBIT_WINDOW_PIPELINE_PARITY_ADAPTER=rust-daemon``; the
+    daemon binary resolves through ``prism_tool_command`` (``cargo run``
+    unless ``PRISM_TOOL_BIN_DIR`` provides a prebuilt binary).
+    """
+
+    name: str = "rust-daemon"
+    integer_domain: WindowPipelineIntegerDomain = RUST_INTEGER_DOMAIN
+
+    @staticmethod
+    def _wire_record(record: AcceptedShareRecord) -> dict[str, object]:
+        return record_input_json(record)
+
+    @staticmethod
+    def _declined(envelope: dict[str, object]) -> WindowPipelineRejection | WindowPipelineUnsupported:
+        """Classify one non-``ok`` prepare_window envelope by its structure."""
+        if envelope.get("request") != "prepare_window":
+            raise RuntimeError(f"prepare_window failed: {envelope}")
+        if envelope.get("out_of_range") is True:
+            return WindowPipelineUnsupported(
+                str(envelope.get("error") or "value outside the daemon's declared widths")
+            )
+        if envelope.get("fold_invalid") is True or envelope.get("fallback") is True:
+            category = envelope.get("rejection")
+            if not isinstance(category, str):
+                raise RuntimeError(
+                    f"daemon rejection carries no machine-readable category: {envelope}"
+                )
+            # A category outside the vocabulary raises ValueError here: a
+            # harness error, never a quiet filing under the wrong reason.
+            return WindowPipelineRejection(category)
+        raise RuntimeError(f"prepare_window failed: {envelope}")
+
+    def run(self, case: WindowPipelineCase) -> WindowPipelineResult:
+        command = prism_tool_command("qbit-prism-build-audit-bundle") + [
+            "--serve",
+            "--signing-key-seed-hex",
+            "42" * 32,
+            "--ledger-signing-key-seed-hex",
+            "43" * 32,
+        ]
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        )
+        advance_stats: list[WindowPipelineAdvanceStats] = []
+        try:
+            assert process.stdin is not None and process.stdout is not None
+            handshake = json.loads(process.stdout.readline())
+            if handshake.get("protocol") != PRISM_SERVE_BUILDER_PROTOCOL_VERSION:
+                raise RuntimeError(
+                    f"daemon announced protocol {handshake.get('protocol')!r},"
+                    f" expected {PRISM_SERVE_BUILDER_PROTOCOL_VERSION}"
+                )
+
+            def exchange(request: dict[str, object]) -> tuple[dict[str, object], bytes | None]:
+                """One round trip; the payload is None when the daemon declined."""
+                assert process.stdin is not None and process.stdout is not None
+                process.stdin.write(
+                    json.dumps(request, separators=(",", ":")).encode("ascii") + b"\n"
+                )
+                process.stdin.flush()
+                envelope = json.loads(process.stdout.readline())
+                if envelope.get("ok") is not True:
+                    return envelope, None
+                length_key = (
+                    "window_items_len"
+                    if "window_items_len" in envelope
+                    else "appended_items_len"
+                )
+                payload = process.stdout.read(int(envelope[length_key]))
+                process.stdout.read(1)  # the terminating newline
+                return envelope, payload
+
+            envelope, items = exchange(
+                {
+                    "request": "prepare_window",
+                    "mode": "full",
+                    "append_invalidation_epoch": 0,
+                    "anchor_job_issued_at_ms": case.anchor_job_issued_at_ms,
+                    "window_weight": case.window_weight,
+                    "page_size": case.page_size,
+                    "records": [
+                        self._wire_record(record) for record in case.snapshot_records
+                    ],
+                }
+            )
+            if items is None:
+                return self._declined(envelope)
+            for step in case.advances:
+                envelope, appended = exchange(
+                    {
+                        "request": "prepare_window",
+                        "mode": "advance",
+                        "append_invalidation_epoch": 0,
+                        "anchor_job_issued_at_ms": step.anchor_job_issued_at_ms,
+                        "base_digest": envelope["share_snapshot_sha256"],
+                        "records": [
+                            self._wire_record(record) for record in step.delta_records
+                        ],
+                    }
+                )
+                if appended is None:
+                    return self._declined(envelope)
+                items = items[int(envelope["retained_drop_bytes"]) :] + appended
+                advance_stats.append(
+                    WindowPipelineAdvanceStats(
+                        added_rows=int(envelope["added_rows"]),
+                        expired_rows=int(envelope["expired_rows"]),
+                        touched_pages=int(envelope["touched_pages"]),
+                    )
+                )
+        finally:
+            if process.stdin is not None:
+                process.stdin.close()
+            process.wait(timeout=30.0)
+            if process.stdout is not None:
+                process.stdout.close()
+
+        record_jsons = _split_record_fragments(items)
+        if len(record_jsons) != int(envelope["record_count"]):
+            raise RuntimeError(
+                f"daemon reported {envelope['record_count']} records but the"
+                f" items stream holds {len(record_jsons)}"
+            )
+        shares = [json.loads(fragment) for fragment in record_jsons]
+        return WindowPipelineOutputs(
+            record_jsons=record_jsons,
+            canonical_bytes=b"[" + items + b"]",
+            canonical_digest=str(envelope["share_snapshot_sha256"]),
+            spool_tail=spool_tail_bytes(shares),
+            advance_stats=tuple(advance_stats),
+        )
+
+
 _ADAPTER_FACTORIES: dict[str, Callable[[], WindowPipelineAdapter]] = {
     DEFAULT_ADAPTER_NAME: PythonWindowPipelineAdapter,
+    "rust-daemon": RustDaemonWindowPipelineAdapter,
 }
 
 
@@ -1007,25 +1424,31 @@ _REALISTIC_ANCHOR_MS = 1_755_000_000_000
 
 def _wide_integers_case() -> WindowPipelineCase:
     anchor_ms = _REALISTIC_ANCHOR_MS
-    # Retention runs newest-first until the accumulated weight reaches
-    # window_weight. The three newest (2^53+1, 2^63, 2^64+1) sum to
+    # Every value sits far above the 2^31 / 2^53 / 2^64 boundaries at which a
+    # wrapping or saturating 32/53/64-bit backend breaks, yet inside every
+    # declared Rust width (share_seq and template_height u64, difficulties
+    # and window_weight u128, ntime u32), so both backends must produce these
+    # exact bytes. Retention runs newest-first until the accumulated weight
+    # reaches window_weight. The three newest (2^53+1, 2^63, 2^64+1) sum to
     # 2^64+2^63+2^53+2, below window_weight only because of its 2^127 term,
     # so the oldest (2^127+3) is the retained crossing row and all four
     # survive: a backend that wraps or saturates at 64 bits (or truncates
     # window_weight to 64 bits) stops after three, and one that clamps the
-    # inputs renders different digits even where it keeps the count.
+    # inputs renders different digits even where it keeps the count. The
+    # difficulty total over every record stays below 2^128, inside the u128
+    # accumulator, so the case is inside the declared domain entirely.
     records = (
         replace(
             corpus_record(1, share_difficulty=2**127 + 3, job_issued_at_ms=anchor_ms - 3, accepted_at_ms=anchor_ms - 2),
-            network_difficulty=10**77,
+            network_difficulty=2**128 - 1,
             template_height=2**62,
-            ntime=2**63 - 1,
+            ntime=2**32 - 1,
         ),
         replace(
             corpus_record(2**31, share_difficulty=2**64 + 1, job_issued_at_ms=anchor_ms - 2, accepted_at_ms=anchor_ms - 1),
             network_difficulty=2**64 + 1,
             template_height=2**31 + 1,
-            ntime=2**32 - 1,
+            ntime=2**31,
         ),
         replace(
             corpus_record(2**32 + 5, share_difficulty=2**63, job_issued_at_ms=anchor_ms - 1, accepted_at_ms=anchor_ms - 1),
@@ -1033,9 +1456,13 @@ def _wide_integers_case() -> WindowPipelineCase:
             template_height=0,
             ntime=0,
         ),
+        # share_seq at u64's maximum (the factory's derived template_height
+        # lands near 2^59); ntime must be set explicitly because the
+        # factory's default would add the seq to it.
         replace(
-            corpus_record(2**63 - 1, share_difficulty=2**53 + 1, job_issued_at_ms=anchor_ms, accepted_at_ms=anchor_ms),
+            corpus_record(2**64 - 1, share_difficulty=2**53 + 1, job_issued_at_ms=anchor_ms, accepted_at_ms=anchor_ms),
             network_difficulty=2**53 + 1,
+            ntime=2**31 + 1,
         ),
         # Excluded by a one-millisecond margin at 2^40 scale: a backend
         # comparing truncated or float-rounded timestamps includes it.
@@ -1044,14 +1471,16 @@ def _wide_integers_case() -> WindowPipelineCase:
     return WindowPipelineCase(
         name="wide-integers",
         why=(
-            "every integer field above 2^32 at a realistic epoch-ms anchor:"
-            " share_difficulty across 2^53+1, 2^63, 2^64+1 and 2^127+3,"
-            " network_difficulty up to 10^77, template_height 2^31+1 and"
-            " 2^62, ntime 2^32-1 and 2^63-1, share_seq up to 2^63-1, a zero"
+            "every integer field above 2^32 at a realistic epoch-ms anchor,"
+            " all inside the declared Rust widths: share_difficulty across"
+            " 2^53+1, 2^63, 2^64+1 and 2^127+3, network_difficulty up to"
+            " 2^128-1, template_height 2^31+1, 2^62 and near 2^59, ntime"
+            " 2^31 to 2^32-1, share_seq up to 2^64-1, a zero"
             " template_height/ntime, and window_weight 2^127+2^64+2^63+4 so"
             " the retention cutoff depends on exact arithmetic above 2^64;"
             " pins full-digit rendering and non-wrapping, non-saturating,"
-            " non-float accumulation"
+            " non-float accumulation, with full parity enforced on every"
+            " backend"
         ),
         anchor_job_issued_at_ms=anchor_ms,
         window_weight=2**127 + 2**64 + 2**63 + 4,
@@ -1091,13 +1520,54 @@ def _difficulty_beyond_u128_case() -> WindowPipelineCase:
         why=(
             "numeric(78,0) width taken literally: share_difficulty 2^128+1 as"
             " the retained crossing row, network_difficulty at 2^128-1, 2^128"
-            " and 10^78-1, window_weight and the retained total above 2^128;"
-            " refuses any backend carrying difficulties in 128 bits, saturating"
-            " or not -- see the module docstring for why the schema's width,"
-            " not an existing narrower type, is the contract"
+            " and 10^78-1, window_weight and the retained total above 2^128"
+            " -- outside the declared u128 widths, so a backend declaring"
+            " them answers Unsupported here while the frozen bytes stay"
+            " Python's; one that clamps at u128::MAX, saturating or not,"
+            " renders different digits and fails -- see the module docstring"
         ),
         anchor_job_issued_at_ms=anchor_ms,
         window_weight=2**128 + 2**64,
+        page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+        snapshot_records=records,
+    )
+
+
+def _ntime_beyond_u32_case() -> WindowPipelineCase:
+    anchor_ms = _REALISTIC_ANCHOR_MS
+    # ntime is bigint in the ledger but a 32-bit header field and u32 in the
+    # declared Rust domain: 2^32 (one above the width) and bigint's maximum
+    # both lie outside it while every other field is ordinary, so this is
+    # the one width the case exercises.
+    records = (
+        replace(
+            corpus_record(1, share_difficulty=3, job_issued_at_ms=anchor_ms - 2, accepted_at_ms=anchor_ms - 1),
+            ntime=2**32,
+        ),
+        replace(
+            corpus_record(
+                2,
+                share_difficulty=4,
+                job_issued_at_ms=anchor_ms - 1,
+                accepted_at_ms=anchor_ms - 1,
+                credit_policy="stale-grace",
+            ),
+            ntime=2**63 - 1,
+        ),
+        corpus_record(3, share_difficulty=5, job_issued_at_ms=anchor_ms, accepted_at_ms=anchor_ms),
+    )
+    return WindowPipelineCase(
+        name="ntime-beyond-u32",
+        why=(
+            "ntime at 2^32 and 2^63-1 (bigint's maximum) on otherwise"
+            " ordinary records at a realistic anchor: outside the declared"
+            " u32 width alone, so a backend declaring it answers Unsupported"
+            " here while the frozen bytes stay Python's full-digit rendering;"
+            " one that truncates ntime to 32 bits renders different digits"
+            " and fails"
+        ),
+        anchor_job_issued_at_ms=anchor_ms,
+        window_weight=1_000,
         page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
         snapshot_records=records,
     )
@@ -1452,6 +1922,7 @@ def build_corpus() -> tuple[WindowPipelineCase, ...]:
         _bulk_seeded_case(),
         _wide_integers_case(),
         _difficulty_beyond_u128_case(),
+        _ntime_beyond_u32_case(),
         _advance_exact_fit_expiry_case(),
         _advance_delta_exceeds_window_case(),
         _advance_partial_expiry_in_appended_page_case(),
@@ -1474,6 +1945,12 @@ def reference_case_entry(case: WindowPipelineCase, result: WindowPipelineResult)
     literals: dict[str, object] = {}
     if len(case_input_bytes(case)) <= LITERAL_PIN_MAX_CANONICAL_BYTES:
         literals["input"] = case_input_document(case)
+    if isinstance(result, WindowPipelineUnsupported):
+        raise RuntimeError(
+            f"case {case.name}: the shipped pipeline declared the case"
+            f" unsupported ({result.reason}); the reference freezes only the"
+            " shipped pipeline's outputs or rejections"
+        )
     if isinstance(result, WindowPipelineRejection):
         entry["rejected"] = result.reason
     else:
@@ -1550,6 +2027,8 @@ def load_reference_document() -> dict[str, object]:
 def diverging_outputs(
     reference_case: dict[str, object],
     result: WindowPipelineResult,
+    *,
+    domain_exclusion: str | None = None,
 ) -> list[str]:
     """Every way one backend's result diverges from one frozen case.
 
@@ -1558,8 +2037,24 @@ def diverging_outputs(
     length and SHA-256 comparisons hold for every case, literal comparisons
     additionally localize the first divergence when the case pins literals,
     and the per-advance stats must agree exactly.
+
+    ``domain_exclusion`` is why the case lies outside the backend's declared
+    integer domain (:func:`domain_exclusion`), or None when it lies inside.
+    An ``Unsupported`` result is parity exactly when the case is outside:
+    the frozen reference keeps the shipped pipeline's result and the backend
+    has declared, rather than mis-rendered, the input it cannot carry. A
+    backend that answers ``Unsupported`` for a case inside its declared
+    domain diverges, and a backend that produces bytes for a case outside
+    its domain is held to the frozen bytes like any other.
     """
     expected_rejection = reference_case.get("rejected")
+    if isinstance(result, WindowPipelineUnsupported):
+        if domain_exclusion is None:
+            return [
+                f"unsupported: backend declared {result.reason!r} but the"
+                " case is inside its declared integer domain"
+            ]
+        return []
     if isinstance(result, WindowPipelineRejection):
         if expected_rejection is None:
             return [
