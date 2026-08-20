@@ -159,6 +159,15 @@ DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS = 2
 # presenting as ack-latency and lock-convoy symptoms with no obvious cause.
 # Reject at startup instead.
 MAX_PRISM_PYTHON_SWITCH_INTERVAL_SECONDS = 1.0
+# Lower bound, and it is the interpreter's own resolution rather than a policy
+# choice: CPython stores this interval in whole microseconds, so anything below
+# one truncates to *zero* -- sys.setswitchinterval(9e-07) leaves
+# sys.getswitchinterval() reporting 0.0. A zero interval asks for a switch check
+# at every opportunity, which is the opposite of what someone lowering the value
+# is reaching for and is worst precisely here, in a thread-heavy coordinator.
+# The same truncation applies harmlessly above the bound: a requested 1.5us
+# applies as 1us, so a tuned value may read back slightly lower than it was set.
+MIN_PRISM_PYTHON_SWITCH_INTERVAL_SECONDS = 1e-06
 DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS = 15.0
 # Reconnect difficulty retention: a reconnecting worker (same listener +
 # exact username) resumes at its last converged difficulty instead of the
@@ -738,6 +747,12 @@ def resolve_python_switch_interval_seconds(
     )
     if interval is None:
         return None
+    if interval < MIN_PRISM_PYTHON_SWITCH_INTERVAL_SECONDS:
+        raise SystemExit(
+            "PRISM_PYTHON_SWITCH_INTERVAL_SECONDS cannot be below "
+            f"{MIN_PRISM_PYTHON_SWITCH_INTERVAL_SECONDS} "
+            "(the interpreter would truncate it to zero)"
+        )
     if interval > MAX_PRISM_PYTHON_SWITCH_INTERVAL_SECONDS:
         raise SystemExit(
             "PRISM_PYTHON_SWITCH_INTERVAL_SECONDS cannot exceed "

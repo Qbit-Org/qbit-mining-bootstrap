@@ -11,6 +11,7 @@ from pathlib import Path
 
 from lab.prism.coordinator_config import (
     MAX_PRISM_PYTHON_SWITCH_INTERVAL_SECONDS,
+    MIN_PRISM_PYTHON_SWITCH_INTERVAL_SECONDS,
     apply_python_switch_interval,
     env_decimal,
     load_coordinator_config,
@@ -79,6 +80,38 @@ class PrismPythonSwitchIntervalTests(unittest.TestCase):
                 resolve_python_switch_interval_seconds(
                     environ={"PRISM_PYTHON_SWITCH_INTERVAL_SECONDS": raw}
                 )
+
+    def test_sub_microsecond_value_refuses_startup(self) -> None:
+        # CPython stores the interval in whole microseconds, so anything below
+        # one truncates to zero -- a switch check at every opportunity, which
+        # is the opposite of what lowering the value is reaching for.
+        for raw in ("0.0000009", "1e-07", "1e-09"):
+            with self.subTest(raw=raw), self.assertRaisesRegex(
+                SystemExit, "cannot be below .* truncate it to zero"
+            ):
+                resolve_python_switch_interval_seconds(
+                    environ={"PRISM_PYTHON_SWITCH_INTERVAL_SECONDS": raw}
+                )
+
+    def test_the_floor_is_the_interpreters_actual_resolution(self) -> None:
+        # Pins the bound to the interpreter rather than to a number we chose:
+        # the floor must apply intact, and anything below it must truncate to
+        # zero. If a future CPython changes its resolution, this fails rather
+        # than letting the bound silently drift out of agreement with it.
+        floor = MIN_PRISM_PYTHON_SWITCH_INTERVAL_SECONDS
+
+        applied = apply_python_switch_interval(
+            environ={"PRISM_PYTHON_SWITCH_INTERVAL_SECONDS": repr(floor)}
+        )
+        self.assertEqual(applied, floor)
+        self.assertEqual(sys.getswitchinterval(), floor)
+
+        sys.setswitchinterval(floor / 2)
+        self.assertEqual(
+            sys.getswitchinterval(),
+            0.0,
+            "sub-floor intervals no longer truncate to zero; revisit the bound",
+        )
 
     def test_value_above_the_ceiling_refuses_startup(self) -> None:
         # A misplaced decimal point ("5" meaning 5ms) would otherwise let a
