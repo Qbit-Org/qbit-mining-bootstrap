@@ -150,8 +150,31 @@ jobs:
           docker buildx build \
             --build-context qbit-src=/tmp/qbit-functional-fixture \
             --load \
+            --tag qbit-prism:ci \
             -f lab/prism/Dockerfile \
             .
+
+      - name: Run payout-window parity with Python adapter
+        run: |
+          docker run --rm \
+            --volume "$PWD:/workspace:ro" \
+            --workdir /workspace \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            --env PYTHONPATH=/workspace \
+            --env QBIT_WINDOW_PIPELINE_PARITY_ADAPTER=python \
+            qbit-prism:ci \
+            python3 -m tests.window_pipeline_parity_gate
+
+      - name: Run payout-window parity with real Rust daemon
+        run: |
+          docker run --rm \
+            --volume "$PWD:/workspace:ro" \
+            --workdir /workspace \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            --env PYTHONPATH=/workspace \
+            --env QBIT_WINDOW_PIPELINE_PARITY_ADAPTER=rust-daemon \
+            qbit-prism:ci \
+            python3 -m tests.window_pipeline_parity_gate
 
   qbit-runtime-image:
     name: Build and smoke real qbitd image
