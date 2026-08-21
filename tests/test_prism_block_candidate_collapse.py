@@ -3529,6 +3529,328 @@ class BlockCandidateTerminalOutcomeBoundTests(unittest.TestCase):
             self.assertEqual(service.retries, 1)
 
 
+class BlockCandidateAbandonmentDedupBoundTests(unittest.TestCase):
+    """The counted-abandonment dedup set retires with the fence it guards.
+
+    ``_counted_block_candidate_abandonments`` exists because one hash can
+    reach the terminal accounting path more than once: a collapse whose
+    cleanup failed retries every owed step, and a finalize failure freezes a
+    false finalize-only disposition that replays.  Abandonment metrics count
+    candidates, not attempts, so the key deduplicates them.
+
+    Nothing ever retired those keys.  One key per candidate the process had
+    ever abandoned is the same unbounded history the terminal-outcome
+    registry was just bounded away from, and a collapsed storm writes them
+    3,120 at a time.  The key is now retired inside the eviction pass, in
+    the same ``coordinator.lock`` critical section that has already proved
+    the hash unpinned by every live and cleanup-owing lane, and only for a
+    hash whose fence that pass actually drops.
+
+    Retiring one early is the dangerous half: a lane still owed its
+    accounting would count its candidate a second time and the abandoned
+    series would exceed the candidates it describes.  Both writer orderings
+    have to survive that -- the direct finalize counts before it publishes
+    its terminal outcome, the collapse publishes first and counts during
+    cleanup -- so these tests own the bound and the pins in both.
+    """
+
+    CAP = MAX_BLOCK_CANDIDATE_TERMINAL_OUTCOMES
+    REASON = PRISM_BLOCK_CANDIDATE_COLLAPSE_REASON
+    STALE_CLASS = PRISM_BLOCK_CANDIDATE_COLLAPSE_STALE_JOB_CLASS
+    STORM = 3_120
+    STORMS = 4
+    # Well clear of the fixture's own hashes and of the pressure histories.
+    STORM_START = 1 << 60
+
+    # -- harness -----------------------------------------------------------
+
+    def _count(self, fixture: CollapseFixture, block_hash: str) -> None:
+        """One committed abandonment, with the outcome the collapse builds."""
+        fixture.server._record_committed_block_candidate_abandonment(
+            block_hash,
+            SimpleNamespace(reason=self.REASON, stale_job_class=self.STALE_CLASS),
+        )
+
+    @staticmethod
+    def _fence(fixture: CollapseFixture, block_hash: str) -> None:
+        fixture.server._record_block_candidate_terminal_outcome(
+            block_hash,
+            accepted=False,
+        )
+
+    def _abandon(
+        self,
+        fixture: CollapseFixture,
+        block_hash: str,
+        *,
+        terminal_first: bool,
+    ) -> None:
+        """Drive one terminal abandonment in one of the two shipped orders.
+
+        ``terminal_first`` is the collapse: the fenced write publishes the
+        terminal outcome and the cleanup's accounting step follows it.  The
+        other order is ``finalize``, which counts as soon as the durable
+        outbox mark returns and records the process-local outcome at its
+        tail.
+        """
+        if terminal_first:
+            self._fence(fixture, block_hash)
+            self._count(fixture, block_hash)
+        else:
+            self._count(fixture, block_hash)
+            self._fence(fixture, block_hash)
+
+    @staticmethod
+    def _counted(fixture: CollapseFixture) -> set[str]:
+        with fixture.server.lock:
+            return set(fixture.service._counted_block_candidate_abandonments)
+
+    @staticmethod
+    def _outcomes(fixture: CollapseFixture) -> set[str]:
+        with fixture.server.lock:
+            return set(fixture.service._block_candidate_terminal_outcomes)
+
+    def _pressure(self, fixture: CollapseFixture, *, round_index: int = 0) -> None:
+        """Push the registry past its bound through the shipped writer.
+
+        The history is uncounted, so its own eviction retires nothing; it is
+        here purely to make the pass reach whatever the test is protecting.
+        Each round uses a disjoint range so a second round is real pressure
+        rather than a re-stamp of the first.
+        """
+        offset = round_index * (1 << 18)
+        with fixture.server.lock:
+            outcomes = fixture.service._block_candidate_terminal_outcomes
+            for block_hash in _history_hashes(self.CAP, start=(1 << 20) + offset):
+                outcomes[block_hash] = False
+        for block_hash in _history_hashes(64, start=(1 << 40) + offset):
+            self._fence(fixture, block_hash)
+
+    # -- the bound ---------------------------------------------------------
+
+    def test_repeated_storms_do_not_grow_the_dedup_history(self) -> None:
+        """Storm after storm, the dedup set tracks the fences, not the past."""
+        for terminal_first in (False, True):
+            with self.subTest(terminal_first=terminal_first):
+                fixture = CollapseFixture()
+                sizes: list[int] = []
+                for index in range(self.STORMS):
+                    start = self.STORM_START + index * self.STORM
+                    for block_hash in _history_hashes(self.STORM, start=start):
+                        self._abandon(
+                            fixture,
+                            block_hash,
+                            terminal_first=terminal_first,
+                        )
+                    sizes.append(len(self._counted(fixture)))
+                # It stops growing where the fences do, and holds there
+                # however many further storms arrive.
+                self.assertEqual(sizes[-1], self.CAP)
+                self.assertEqual(sizes[-1], sizes[-2])
+                self.assertLessEqual(max(sizes), self.CAP)
+                self.assertEqual(self._counted(fixture), self._outcomes(fixture))
+                # Bounding it cost no accuracy: every candidate counted once.
+                counts = fixture.server.block_candidate_abandoned_counts
+                self.assertEqual(counts[self.REASON], self.STORM * self.STORMS)
+                self.assertEqual(
+                    fixture.server.stale_job_abandon_counts[self.STALE_CLASS],
+                    self.STORM * self.STORMS,
+                )
+
+    def test_a_collapse_page_retires_its_keys_when_its_fences_age_out(
+        self,
+    ) -> None:
+        """The shipped apply, not a hand-rolled ordering, ends up bounded."""
+        fixture = CollapseFixture()
+        page = [_hash(index) for index in range(1, 5)]
+        fixture.seed(page)
+        self.assertEqual(_selected(fixture), set(page))
+        self.assertEqual(fixture.cleanup_backlog(), {})
+        self.assertEqual(
+            fixture.server.block_candidate_abandoned_counts[self.REASON],
+            len(page),
+        )
+        self.assertEqual(self._counted(fixture), set(page))
+        self._pressure(fixture)
+        for block_hash in page:
+            self.assertIsNone(
+                fixture.server._block_candidate_terminal_outcome(block_hash)
+            )
+        self.assertEqual(self._counted(fixture), set())
+
+    def test_the_key_retires_with_its_fence_and_not_before(self) -> None:
+        """A pass that evicts nothing retires nothing."""
+        fixture = CollapseFixture()
+        target = _hash(1)
+        self._abandon(fixture, target, terminal_first=True)
+        with fixture.server.lock:
+            self.assertEqual(
+                fixture.service._bound_block_candidate_terminal_outcomes(),
+                0,
+            )
+        self.assertEqual(self._counted(fixture), {target})
+        self._pressure(fixture)
+        self.assertIsNone(fixture.server._block_candidate_terminal_outcome(target))
+        self.assertEqual(self._counted(fixture), set())
+
+    # -- the two orderings -------------------------------------------------
+
+    def test_both_writer_orderings_converge_on_the_same_state(self) -> None:
+        """Count-then-fence and fence-then-count are indistinguishable."""
+        states = []
+        for terminal_first in (False, True):
+            fixture = CollapseFixture()
+            history = _history_hashes(self.CAP + 64, start=self.STORM_START)
+            for block_hash in history:
+                self._abandon(fixture, block_hash, terminal_first=terminal_first)
+            states.append(
+                (
+                    self._counted(fixture),
+                    self._outcomes(fixture),
+                    dict(fixture.server.block_candidate_abandoned_counts),
+                    dict(fixture.server.stale_job_abandon_counts),
+                )
+            )
+        self.assertEqual(states[0], states[1])
+        counted, outcomes, counts, stale = states[0]
+        self.assertEqual(counted, outcomes)
+        self.assertEqual(len(counted), self.CAP)
+        self.assertEqual(counts[self.REASON], self.CAP + 64)
+        self.assertEqual(stale[self.STALE_CLASS], self.CAP + 64)
+
+    def test_a_repeated_disposition_is_still_counted_once(self) -> None:
+        """The dedup the key exists for survives in both orderings."""
+        for terminal_first in (False, True):
+            with self.subTest(terminal_first=terminal_first):
+                fixture = CollapseFixture()
+                target = _hash(1)
+                for _attempt in range(3):
+                    self._abandon(fixture, target, terminal_first=terminal_first)
+                self.assertEqual(
+                    fixture.server.block_candidate_abandoned_counts[self.REASON],
+                    1,
+                )
+                self.assertEqual(self._counted(fixture), {target})
+
+    def test_a_false_finalize_failure_stays_counted_before_any_outcome(
+        self,
+    ) -> None:
+        """The ambiguous branch counts with no fence to retire it by.
+
+        ``finalize`` freezes a false finalize-only disposition when the
+        durable abandonment mark raises: it counts the candidate and leaves
+        the hash in ``finalize_retries`` without ever recording a terminal
+        outcome.  There is nothing for the eviction pass to drop, and the
+        registry that pins it is itself bounded, so the key simply waits for
+        the replay that publishes its outcome.
+        """
+        fixture = CollapseFixture()
+        target = _hash(1)
+        self._count(fixture, target)
+        with fixture.server.lock:
+            fixture.service.finalize_retries[target] = (False, "boom")
+        self._pressure(fixture)
+        self.assertIsNone(fixture.server._block_candidate_terminal_outcome(target))
+        self.assertEqual(self._counted(fixture), {target})
+        # The paced finalize-only replay re-enters the same accounting call.
+        self._count(fixture, target)
+        self.assertEqual(
+            fixture.server.block_candidate_abandoned_counts[self.REASON],
+            1,
+        )
+        # Its retry succeeds: the tail clears the registry and publishes the
+        # outcome, and only then can the key age out with it.
+        with fixture.server.lock:
+            fixture.service.finalize_retries.pop(target, None)
+        self._fence(fixture, target)
+        self._pressure(fixture, round_index=1)
+        self.assertIsNone(fixture.server._block_candidate_terminal_outcome(target))
+        self.assertEqual(self._counted(fixture), set())
+
+    # -- the pins ----------------------------------------------------------
+
+    def test_pressure_cannot_forget_a_pinned_hash_and_double_count_it(
+        self,
+    ) -> None:
+        """Every lane that can still run the accounting keeps its key."""
+        target = _hash(1)
+
+        def live_queue(fixture: CollapseFixture, candidate: Any) -> None:
+            fixture.service.candidate_queue.put_nowait(candidate)
+
+        def replay_queue(fixture: CollapseFixture, candidate: Any) -> None:
+            fixture.service._block_replay_candidate_queue.put_nowait(candidate)
+
+        def cleanup_owed(fixture: CollapseFixture, candidate: Any) -> None:
+            fixture.service._defer_collapsed_candidate_cleanup(
+                target,
+                frozenset({"abandonment-accounting"}),
+            )
+
+        def finalize_retry(fixture: CollapseFixture, candidate: Any) -> None:
+            with fixture.server.lock:
+                fixture.service.finalize_retries[target] = (False, "boom")
+
+        def disposition_flight(fixture: CollapseFixture, candidate: Any) -> None:
+            lease = fixture.server._claim_block_candidate_disposition(
+                target,
+                blocking=False,
+            )
+            self.assertIsNotNone(lease)
+            self.addCleanup(
+                fixture.server._release_block_candidate_disposition,
+                lease,
+            )
+
+        def outstanding(fixture: CollapseFixture, candidate: Any) -> None:
+            fixture.server._register_outstanding_block_candidate(target)
+
+        def retry_holder(fixture: CollapseFixture, candidate: Any) -> None:
+            with fixture.server.lock:
+                fixture.service.retry_candidate = candidate
+
+        lanes = {
+            "candidate_queue": live_queue,
+            "_block_replay_candidate_queue": replay_queue,
+            "_block_candidate_collapse_cleanup_retries": cleanup_owed,
+            "finalize_retries": finalize_retry,
+            "_block_candidate_disposition_flights": disposition_flight,
+            "_outstanding_block_candidate_hashes": outstanding,
+            "retry_candidate": retry_holder,
+        }
+        for terminal_first in (False, True):
+            for name, install in lanes.items():
+                with self.subTest(lane=name, terminal_first=terminal_first):
+                    fixture = CollapseFixture()
+                    candidate = fixture.seed([target])[0]
+                    # The outcome is recorded before the lane is populated:
+                    # recording clears the reservation, replay, and waiting
+                    # markers for its own hash by design.
+                    self._abandon(fixture, target, terminal_first=terminal_first)
+                    with redirect_stdout(StringIO()):
+                        install(fixture, candidate)
+                    self._pressure(fixture)
+                    self.assertEqual(
+                        len(fixture.service._block_candidate_terminal_outcomes),
+                        self.CAP,
+                    )
+                    self.assertIs(
+                        fixture.server._block_candidate_terminal_outcome(target),
+                        False,
+                    )
+                    self.assertIn(target, self._counted(fixture))
+                    # The lane now runs the accounting it was still owed.
+                    # The surviving key is the only thing standing between
+                    # that and a second count of one candidate.
+                    self._count(fixture, target)
+                    self.assertEqual(
+                        fixture.server.block_candidate_abandoned_counts[
+                            self.REASON
+                        ],
+                        1,
+                    )
+
+
 class BlockCandidateCollapseEnumerationTests(unittest.TestCase):
     """Both replay enumeration shapes collapse before they adopt."""
 

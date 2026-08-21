@@ -907,7 +907,9 @@ class BlockCandidateService:
         self._tip_observed_accepted_block_hashes: dict[str, float] = {}
         # Durable cleanup can fail after a terminal decision and force the
         # same hash through that decision again; abandonment metrics count
-        # candidates, not cleanup attempts.
+        # candidates, not cleanup attempts. Retired by the terminal-outcome
+        # eviction pass, which is the one place that has already proved a
+        # hash unpinned by every live and cleanup-owing lane.
         self._counted_block_candidate_abandonments: set[str] = set()
         self._block_submit_metrics_lock = threading.Lock()
         if submit_seconds_buckets is None:
@@ -4125,6 +4127,20 @@ class BlockCandidateService:
         arriving for it afterwards is a fresh admission, which re-reads the
         durable outbox row -- terminal there either way -- before it can
         offer anything.
+
+        That same proof retires the hash's counted-abandonment dedup key.
+        The key exists so a re-run terminal disposition -- a collapse whose
+        cleanup failed, a finalize-only replay -- counts its candidate once
+        rather than once per attempt, so it may only be dropped when no
+        copy is left to re-run anything. Both writer orderings are covered
+        by the one rule: the direct finalize path counts before it publishes
+        its terminal outcome, so its key is retired by a later pass over the
+        outcome it goes on to publish, and an ambiguous false finalize
+        failure has no outcome to evict at all while ``finalize_retries``
+        pins it; the collapse publishes the outcome first and counts during
+        cleanup, and holds the hash's disposition lease -- an in-flight pin
+        -- across both. Dropping the key here therefore never lets a lane
+        that is still owed accounting count its candidate twice.
         """
         outcomes = self._block_candidate_terminal_outcomes
         overflow = len(outcomes) - MAX_BLOCK_CANDIDATE_TERMINAL_OUTCOMES
@@ -4147,6 +4163,7 @@ class BlockCandidateService:
                 # a live copy, so nothing is evicted this round.
                 return 0
             held |= live
+        counted = getattr(self, "_counted_block_candidate_abandonments", None)
         window = overflow + BLOCK_CANDIDATE_TERMINAL_OUTCOME_EVICTION_SCAN
         dropped = 0
         for key in list(itertools.islice(outcomes, window)):
@@ -4165,6 +4182,11 @@ class BlockCandidateService:
                 outcomes[key] = outcomes.pop(key)
                 continue
             del outcomes[key]
+            if counted is not None:
+                # Retired under the very proof that let the fence go: a
+                # dedup key outliving its fence is what let this set grow
+                # without bound under a collapsed storm.
+                counted.discard(key)
             dropped += 1
         return dropped
 
@@ -4216,6 +4238,11 @@ class BlockCandidateService:
         after cleanup succeeds or after a false finalize-only disposition is
         installed; direct accounting callers invoke it only after the full
         serialized rejection path returns.
+
+        The dedup key that makes this once-per-candidate is retired by
+        ``_bound_block_candidate_terminal_outcomes`` when that pass evicts
+        the hash's terminal outcome, which is the only place that has proved
+        no lane can re-enter this method for the hash.
         """
         reason = getattr(outcome, "reason", None)
         if not isinstance(reason, str) or not reason:
