@@ -931,6 +931,21 @@ def _block_candidate_cursor_parts(cursor: object) -> tuple[object, str]:
     return created_at, block_hash
 
 
+def _normalized_block_candidate_hash_set(
+    block_hashes: Sequence[str],
+) -> tuple[str, ...]:
+    """Normalize a caller-supplied block-hash set for a batch outbox write.
+
+    Both backends key the outbox on the lowercase hash, so the same
+    lowercasing the single-hash terminal updates apply per call is applied
+    once here to the whole set. Duplicates collapse and the result is sorted
+    so a given input set always produces one identical target set --
+    including the generated SQL text, which a caller must be able to reason
+    about without knowing the caller's iteration order.
+    """
+    return tuple(sorted({str(block_hash).lower() for block_hash in block_hashes}))
+
+
 def _memory_block_candidate_row_key(row: dict[str, Any]) -> tuple[float, str]:
     """Total-order key for one in-memory pending outbox row."""
     return (float(row.get("created_monotonic", 0.0)), str(row["block_hash"]))
@@ -1252,6 +1267,15 @@ class SingleWriterShareLedger:
         stamps collide (``time.monotonic`` here, one transaction's
         ``clock_timestamp`` in Postgres), and a cursor on a colliding stamp
         alone would either replay or skip its peers.
+
+        Each row also carries ``pool_block_exists``: whether a durable
+        ``qbit_pool_blocks`` row exists for that hash, i.e. whether the
+        candidate ever reached ``persist_accepted_block``. It is answered
+        inside this page read -- one bounded existence probe per returned row
+        -- because the alternative is one round trip per row, and a page is
+        read precisely when the backlog is large. The fact is advisory by the
+        time the caller holds it; the terminal batch update re-checks it under
+        the writer fence.
         """
         after = (
             None
@@ -1274,6 +1298,9 @@ class SingleWriterShareLedger:
                         dict(row["candidate"])
                         if isinstance(row["candidate"], dict)
                         else row["candidate"]
+                    ),
+                    "pool_block_exists": (
+                        str(row["block_hash"]) in self._memory_pool_blocks
                     ),
                     "cursor": list(key),
                 }
@@ -1333,6 +1360,46 @@ class SingleWriterShareLedger:
             row["last_error"] = error
             row["candidate"] = None
             return True
+
+    def mark_block_candidates_abandoned(
+        self,
+        *,
+        block_hashes: Sequence[str],
+        error: str,
+    ) -> tuple[str, ...]:
+        """Terminally abandon a caller-supplied page of pending rows at once.
+
+        Mirrors ``mark_block_candidate_abandoned`` for a set: only rows whose
+        current state is exactly ``pending`` transition, and the return value
+        is the normalized hashes this call actually transitioned rather than a
+        count, so the caller can restrict any follow-up cleanup to the rows it
+        won. Already-terminal and missing hashes are neither returned nor
+        mutated, and an empty set is a no-op.
+
+        A hash that owns a durable pool-block row is also left alone: that row
+        only exists for a candidate that was offered and landed, so it is not
+        a superseded sibling regardless of what the caller observed earlier.
+
+        The whole page runs under one lock acquisition so the returned set is
+        the outcome of a single atomic decision, matching the Postgres backend
+        where the same page is one fenced statement.
+        """
+        targets = _normalized_block_candidate_hash_set(block_hashes)
+        if not targets:
+            return ()
+        abandoned: list[str] = []
+        with self._lock:
+            for block_hash in targets:
+                row = self._block_candidate_outbox.get(block_hash)
+                if row is None or row["state"] != "pending":
+                    continue
+                if block_hash in self._memory_pool_blocks:
+                    continue
+                row["state"] = "abandoned"
+                row["last_error"] = error
+                row["candidate"] = None
+                abandoned.append(block_hash)
+        return tuple(abandoned)
 
     def snapshot_at_job_issue(
         self,
@@ -4115,6 +4182,15 @@ END;
         stored resolution is microseconds: a second-precision stamp (the
         format the public API endpoints use) would truncate, and the
         resulting predicate would re-emit or skip whole sub-second groups.
+
+        Each row also carries ``pool_block_exists``: whether a durable
+        ``qbit_pool_blocks`` row exists for that hash, i.e. whether the
+        candidate ever reached ``persist_accepted_block``. It is answered
+        inside this page read -- one bounded existence probe per returned row
+        -- because the alternative is one round trip per row, and a page is
+        read precisely when the backlog is large. The fact is advisory by the
+        time the caller holds it; the terminal batch update re-checks it under
+        the writer fence.
         """
         if limit <= 0:
             return []
@@ -4136,11 +4212,19 @@ END;
 SELECT COALESCE(
     json_agg(
         json_build_object(
-            'block_hash', block_hash,
-            'candidate', candidate,
-            'cursor', json_build_array(cursor_created_at, block_hash)
+            'block_hash', pending.block_hash,
+            'candidate', pending.candidate,
+            'pool_block_exists', EXISTS (
+                SELECT 1
+                FROM qbit_pool_blocks pool
+                WHERE pool.block_hash = pending.block_hash
+            ),
+            'cursor', json_build_array(
+                pending.cursor_created_at,
+                pending.block_hash
+            )
         )
-        ORDER BY created_at, block_hash
+        ORDER BY pending.created_at, pending.block_hash
     ),
     '[]'::json
 )
@@ -4160,7 +4244,18 @@ FROM (
 ) pending;
 """
         with self._operation_gate(self._lock, "writer lock"):
-            return list(self._run_retry_safe_read_json(sql))
+            rows = list(self._run_retry_safe_read_json(sql))
+        # A row whose existence fact did not arrive is not a row with no pool
+        # block: reading a missing key as false would hand a caller a false
+        # negative on the one fact that keeps an offered, landed candidate out
+        # of a terminal set. Fail the page instead.
+        for row in rows:
+            if not isinstance(row, dict) or "pool_block_exists" not in row:
+                raise RuntimeError(
+                    "pending block candidate row is missing pool block existence"
+                )
+            row["pool_block_exists"] = bool(row["pool_block_exists"])
+        return rows
 
     def block_candidate_pending_metrics(self) -> dict[str, int | float]:
         """Return aggregate pending ages using the existing outbox index."""
@@ -4233,6 +4328,85 @@ END;
 
     def mark_block_candidate_abandoned(self, *, block_hash: str, error: str) -> bool:
         return self._finish_block_candidate(block_hash=block_hash, state="abandoned", error=error)
+
+    def mark_block_candidates_abandoned(
+        self,
+        *,
+        block_hashes: Sequence[str],
+        error: str,
+    ) -> tuple[str, ...]:
+        """Abandon a caller-supplied page of pending rows in one fenced write.
+
+        Same writer-id/epoch/session-token fence as the single-hash terminal
+        updates, and the same terminal column set, but the row predicate is
+        set-oriented: one ``block_hash = ANY(...)`` statement for the whole
+        page rather than one statement per hash. At the storm cardinalities
+        this exists for, the per-row form is the cost.
+
+        ``RETURNING`` feeds the result, so the value is the exact set of
+        hashes this fenced statement transitioned -- not a count, and not the
+        requested set. Rows that were already terminal, that another writer
+        won, or that do not exist are silently absent from it, which is what
+        lets the caller confine follow-up cleanup to rows it actually won.
+        An empty request performs no query at all, so no degenerate
+        ``ANY(ARRAY[])`` statement is ever generated.
+
+        The predicate re-checks ``qbit_pool_blocks`` rather than trusting the
+        ``pool_block_exists`` the caller read on a prior page: a candidate can
+        land between that read and this write, and a pool-block row is the
+        durable evidence that it did. Re-asking under the writer fence closes
+        that window inside the statement that does the transition, so a row
+        that acquired one is silently absent from the returned set instead of
+        being abandoned after it was won.
+        """
+        targets = _normalized_block_candidate_hash_set(block_hashes)
+        if not targets:
+            return ()
+        sql = f"""
+WITH lease AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    WHERE singleton
+      AND writer_id = {self._text_literal(self._writer_id)}
+      AND writer_epoch = {int(self._writer_epoch)}
+      AND writer_session_token = {self._text_literal(self._writer_session_token)}
+    RETURNING writer_id
+),
+updated AS (
+    UPDATE qbit_block_candidate_outbox
+    SET state = 'abandoned',
+        last_error = {self._text_literal(error)},
+        updated_at = clock_timestamp(),
+        completed_at = clock_timestamp(),
+        candidate = NULL
+    FROM lease
+    WHERE block_hash = ANY({self._text_array_literal(targets)})
+      AND state = 'pending'
+      AND NOT EXISTS (
+          SELECT 1
+          FROM qbit_pool_blocks pool
+          WHERE pool.block_hash = qbit_block_candidate_outbox.block_hash
+      )
+    RETURNING block_hash
+)
+SELECT CASE
+    WHEN NOT EXISTS (SELECT 1 FROM lease) THEN
+        json_build_object('error', 'writer lease is not active')
+    ELSE
+        json_build_object(
+            'abandoned',
+            COALESCE(
+                (SELECT json_agg(block_hash ORDER BY block_hash) FROM updated),
+                '[]'::json
+            )
+        )
+END;
+"""
+        result = self._run_fenced_json(sql)
+        if "error" in result:
+            raise RuntimeError(str(result["error"]))
+        return tuple(str(value) for value in result.get("abandoned", ()))
 
     def _finish_block_candidate(self, *, block_hash: str, state: str, error: str | None) -> bool:
         if state not in {"submitted", "abandoned"}:
@@ -9270,6 +9444,18 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
     @staticmethod
     def _text_literal(value: str) -> str:
         return "'" + value.replace("'", "''") + "'"
+
+    @classmethod
+    def _text_array_literal(cls, values: Sequence[str]) -> str:
+        """Render a non-empty text set as one array literal for ``= ANY``.
+
+        Each element goes through the same quoting the scalar literals use.
+        The cast is explicit because an empty ``ARRAY[]`` has no inferable
+        element type; callers never build one, and the cast keeps that a
+        parse-time guarantee rather than a convention.
+        """
+        elements = ", ".join(cls._text_literal(value) for value in values)
+        return f"ARRAY[{elements}]::text[]"
 
 
 CTV_FANOUT_STATUSES = {
