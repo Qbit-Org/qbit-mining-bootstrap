@@ -156,6 +156,23 @@ BLOCK_CANDIDATE_COLLAPSE_LOG_FAILURES = 3
 # every poll. The counter still moves per row; the log line is rate limited
 # so a persistently degraded read cannot flood the journal.
 BLOCK_CANDIDATE_COLLAPSE_FAIL_CLOSED_LOG_SECONDS = 60.0
+# PRISM records every network difficulty in scaled integer units: the
+# coordinator stamps a candidate's ``found_block.network_difficulty`` with
+# ``template_artifacts.scaled_network_difficulty(template["bits"])``, which is
+# ``pow_limit_target * 1_000_000 // template_target`` -- roughly the raw
+# Bitcoin-style difficulty multiplied by a million. The collapse selector
+# compares that stored value against the occupying block's work, so the
+# occupant has to be converted into the same units from the same inputs.
+# These restate the scale and the qbit powLimit rather than importing them
+# from ``template_artifacts`` (or ``public_api``): both sit above this module
+# in the import graph, and B1 must not grow an edge to the template/payout
+# layer for two constants. ``_collapse_scaled_difficulty`` reapplies the
+# formula, and a collapse test pins it equal to the production helper.
+COLLAPSE_DIFFICULTY_SCALE = 1_000_000
+COLLAPSE_POW_LIMIT_BITS = "207fffff"
+COLLAPSE_POW_LIMIT_TARGET = direct_stratum.target_from_compact_hex(
+    COLLAPSE_POW_LIMIT_BITS
+)
 
 
 def _pending_rows_accepts_cursor(pending_rows: Callable[..., Any]) -> bool:
@@ -234,30 +251,79 @@ def _collapse_height(value: object) -> int | None:
     return None
 
 
-def _collapse_difficulty(value: object) -> float | None:
-    """Parse one work value, rejecting booleans and non-finite numbers.
+def _collapse_difficulty(value: object) -> int | float | None:
+    """Parse one stored work value, rejecting booleans and non-finite numbers.
 
     A NaN compares false against every threshold, so an unparsed NaN would
     silently answer "not enough work" (safe) or, inverted, "enough work"
     (not safe). Rejecting it outright keeps the clause decidable.
+
+    An integral spelling is kept as an ``int`` rather than widened to
+    ``float``. PRISM stores ``found_block.network_difficulty`` as the scaled
+    *integer* ``scaled_network_difficulty`` returns, and above 2**53 a float
+    conversion rounds it -- often upwards, which would make a candidate look
+    strictly heavier than the identical work the chain reports and defeat
+    exactly the equal-work case clause 4b/5 has to accept. Python compares
+    ``int`` and ``float`` exactly, so a non-integral spelling stays usable
+    without dragging the integral ones through binary floating point.
     """
     if isinstance(value, bool) or value is None:
         return None
-    if isinstance(value, (int, float)):
-        try:
-            number = float(value)
-        except (OverflowError, ValueError):
-            return None
+    number: int | float
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, float):
+        number = value
     elif isinstance(value, str):
+        text = value.strip()
         try:
-            number = float(value.strip())
-        except (OverflowError, ValueError):
-            return None
+            number = int(text, 10)
+        except ValueError:
+            try:
+                number = float(text)
+            except (OverflowError, ValueError):
+                return None
     else:
         return None
-    if not math.isfinite(number) or number <= 0:
+    if isinstance(number, float) and not math.isfinite(number):
+        return None
+    if number <= 0:
         return None
     return number
+
+
+def _collapse_scaled_difficulty(bits: object) -> int | None:
+    """Convert one header's compact ``bits`` to PRISM-scaled difficulty units.
+
+    This is deliberately the same integer formula
+    ``template_artifacts.scaled_network_difficulty`` applies to the
+    template's bits when the coordinator stamps a candidate's
+    ``found_block.network_difficulty`` -- recomputed here from
+    ``direct_stratum`` rather than imported, because this module must not
+    grow an edge to the template/payout layer. Both sides of clause 4b/5
+    therefore land on the identical integer for identical work, with no
+    float rounding at the equality boundary the clause turns on.
+
+    Returns ``None`` for anything that is not an 8-character compact hex
+    string with a positive target, so a header missing ``bits``, or
+    carrying a malformed or zero one, fails its page closed instead of
+    being read as "no work".
+    """
+    if not isinstance(bits, str):
+        return None
+    compact = bits.strip().lower()
+    if len(compact) != 8 or any(char not in "0123456789abcdef" for char in compact):
+        return None
+    try:
+        target = direct_stratum.target_from_compact_hex(compact)
+    except ValueError:
+        return None
+    if target <= 0:
+        return None
+    return max(
+        1,
+        (COLLAPSE_POW_LIMIT_TARGET * COLLAPSE_DIFFICULTY_SCALE) // target,
+    )
 
 
 class _BlockCandidateCollapseFailedClosed(Exception):
@@ -306,7 +372,10 @@ class _SupersededCandidateRow:
     block_hash: str
     parent_hash: str
     height: int
-    network_difficulty: float
+    # PRISM-scaled units (see COLLAPSE_DIFFICULTY_SCALE), as stamped by the
+    # coordinator. Comparable only against a chain-side work value converted
+    # into the same units by ``_collapse_scaled_difficulty``.
+    network_difficulty: int | float
     job_id: str
 
 
@@ -322,7 +391,7 @@ class _BlockCandidateChainView:
     def __init__(self, service: "BlockCandidateService") -> None:
         self._service = service
         self._active: dict[int, str] = {}
-        self._difficulty: dict[str, float] = {}
+        self._difficulty: dict[str, int] = {}
 
     def _call(self, method: str, params: list[object] | None = None) -> object:
         coordinator = self._service._coordinator
@@ -369,12 +438,25 @@ class _BlockCandidateChainView:
         self._active[height] = active
         return active
 
-    def cached_difficulty(self, block_hash: str) -> float | None:
+    def cached_difficulty(self, block_hash: str) -> int | None:
         """The work this pass already read for a hash, without a new call."""
         return self._difficulty.get(block_hash)
 
-    def difficulty_of(self, block_hash: str) -> float:
-        """The header work of one occupying block, read once per hash."""
+    def difficulty_of(self, block_hash: str) -> int:
+        """One occupying block's work, in PRISM-scaled units, once per hash.
+
+        Read from the header's compact ``bits``, not its ``difficulty``
+        field. The candidate row this value is compared against carries
+        ``scaled_network_difficulty(template["bits"])`` -- the raw
+        difficulty times COLLAPSE_DIFFICULTY_SCALE -- while
+        ``getblockheader.difficulty`` is the raw float. Comparing the two
+        directly made an equal-work occupant read as a millionth of the
+        candidate's work, so clause 4b/5 rejected it and a decided height
+        never collapsed. Recomputing from bits with the production formula
+        puts both sides on the same integer scale, and keeping it integral
+        means the equal-work boundary the clause turns on is decided
+        exactly rather than by float comparison.
+        """
         cached = self._difficulty.get(block_hash)
         if cached is not None:
             return cached
@@ -383,10 +465,10 @@ class _BlockCandidateChainView:
             raise _BlockCandidateCollapseFailedClosed(
                 f"header for {block_hash} is not an object"
             )
-        difficulty = _collapse_difficulty(header.get("difficulty"))
+        difficulty = _collapse_scaled_difficulty(header.get("bits"))
         if difficulty is None:
             raise _BlockCandidateCollapseFailedClosed(
-                f"header for {block_hash} carries no usable difficulty"
+                f"header for {block_hash} carries no usable compact bits"
             )
         self._difficulty[block_hash] = difficulty
         return difficulty
@@ -1217,6 +1299,9 @@ class BlockCandidateService:
             raise _BlockCandidateCollapseFailedClosed(
                 "durable candidate intent carries no found-block facts"
             )
+        # PRISM-scaled units; see COLLAPSE_DIFFICULTY_SCALE and
+        # _BlockCandidateChainView.difficulty_of for the chain-side half of
+        # the comparison this feeds.
         network_difficulty = _collapse_difficulty(
             found_block.get("network_difficulty")
         )
@@ -1286,7 +1371,9 @@ class BlockCandidateService:
                 continue
             # Clause 4b/5: a lower-work occupant is not a decision. The
             # per-row path can still reorg a heavier sibling into the chain,
-            # and a terminal batch write would destroy that block.
+            # and a terminal batch write would destroy that block. Both
+            # sides are PRISM-scaled integers: the row as the coordinator
+            # stamped it, the occupant as re-derived from its header bits.
             if chain.difficulty_of(active) < row.network_difficulty:
                 continue
             selected.append(row)
@@ -1326,6 +1413,10 @@ class BlockCandidateService:
             active = fresh.active_at(row.height)
             if active == row.block_hash:
                 continue
+            # Same clause, same units as selection: a cache hit reuses the
+            # scaled integer that pass derived, and a changed occupant is
+            # re-derived from its own header bits rather than compared as a
+            # raw float against the row's scaled value.
             difficulty = chain.cached_difficulty(active)
             if difficulty is None:
                 difficulty = fresh.difficulty_of(active)

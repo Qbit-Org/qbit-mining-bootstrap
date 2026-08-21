@@ -45,6 +45,8 @@ from lab.prism.block_candidates import (  # noqa: E402
     BLOCK_CANDIDATE_COLLAPSE_LOG_FAILURES,
     BLOCK_CANDIDATE_COLLAPSE_LOG_GROUPS,
     BLOCK_CANDIDATE_COLLAPSE_LOG_SAMPLE_HASHES,
+    COLLAPSE_DIFFICULTY_SCALE,
+    COLLAPSE_POW_LIMIT_BITS,
     MAX_BLOCK_REPLAY_ENUMERATION_ROWS,
     MAX_PENDING_BLOCK_CANDIDATES,
     PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES,
@@ -52,12 +54,14 @@ from lab.prism.block_candidates import (  # noqa: E402
     PRISM_BLOCK_CANDIDATE_COLLAPSE_STALE_JOB_CLASS,
     PRISM_STALE_JOB_ABANDON_CLASSES,
     _BlockCandidateNodeSubmission,
+    _collapse_scaled_difficulty,
 )
 from lab.prism.metrics import MetricsRenderer  # noqa: E402
 from lab.prism.share_ledger import (  # noqa: E402
     PendingShare,
     SingleWriterShareLedger,
 )
+from lab.prism.template_artifacts import scaled_network_difficulty  # noqa: E402
 from lab.prism.share_submission import PRISM_REJECTION_STALE_JOB  # noqa: E402
 from tests.prism_candidate_storm import (  # noqa: E402
     PERTURBATIONS,
@@ -75,10 +79,38 @@ STORM_PARENT = STORM_PARENT_HASH
 OTHER_PARENT = "22" * 32
 DECIDED_HEIGHT = 10
 DECIDED_WINNER = "dd" * 32
+# Compact header bits, the only work fact these tests state. A candidate's
+# durable ``found_block.network_difficulty`` is
+# ``scaled_network_difficulty(template["bits"])`` -- the raw difficulty times
+# COLLAPSE_DIFFICULTY_SCALE -- so a chain-side work value is only comparable
+# with it once it is re-derived from the occupant's own bits. Spelling the
+# fixture in bits is what makes "equal work" mean the same integer on both
+# sides instead of two numbers a million apart.
+MIN_WORK_BITS = COLLAPSE_POW_LIMIT_BITS
+# A retargeted header: raw difficulty ~2.1e9, scaled ~2.1e15.
+RETARGETED_BITS = "1d00ffff"
+# Scaled work above 2**53, where widening the stored integer to float rounds
+# it *up* and an equal-work occupant would read as strictly weaker.
+HIGH_WORK_BITS = "1b0404cb"
 
 
 def _hash(index: int) -> str:
     return f"{index:064x}"
+
+
+def _scaled(bits: str) -> int:
+    """The PRISM-scaled difficulty a header with ``bits`` carries."""
+    return scaled_network_difficulty(bits)
+
+
+def _raw(bits: str) -> float:
+    """The raw ``getblockheader.difficulty`` float a node reports for ``bits``.
+
+    A million times smaller than the scaled units every candidate row is
+    stamped in; the fixture reports it alongside ``bits`` exactly so a
+    selector that read it again would fail the equal-work tests.
+    """
+    return _scaled(bits) / COLLAPSE_DIFFICULTY_SCALE
 
 
 class CollapseChainRpc(FakeRpc):
@@ -95,7 +127,7 @@ class CollapseChainRpc(FakeRpc):
         tip: str = DECIDED_WINNER,
         tip_height: int = DECIDED_HEIGHT,
         active: dict[int, str] | None = None,
-        difficulty: dict[str, float] | None = None,
+        bits: dict[str, str] | None = None,
     ) -> None:
         self.tip = tip.lower()
         self.tip_height = int(tip_height)
@@ -103,11 +135,13 @@ class CollapseChainRpc(FakeRpc):
             int(height): str(value).lower()
             for height, value in (active or {DECIDED_HEIGHT: DECIDED_WINNER}).items()
         }
-        self.difficulty = {
-            str(key).lower(): float(value)
-            for key, value in (difficulty or {}).items()
+        # Per-block compact bits; every unlisted block sits at the qbit
+        # powLimit, the weakest header the chain can carry.
+        self.bits = {
+            str(key).lower(): str(value).lower()
+            for key, value in (bits or {}).items()
         }
-        self.default_difficulty = 1.0
+        self.default_bits = MIN_WORK_BITS
         self.failures: set[str] = set()
         self.results: dict[str, object] = {}
         self.calls: list[tuple[str, tuple[object, ...]]] = []
@@ -138,14 +172,16 @@ class CollapseChainRpc(FakeRpc):
                 raise RuntimeError(
                     "qbit RPC getblockheader failed: -5 Block not found"
                 )
+            bits = self.bits.get(block_hash, self.default_bits)
             return {
                 "hash": block_hash,
                 "height": self.tip_height,
                 "confirmations": 1,
-                "difficulty": self.difficulty.get(
-                    block_hash,
-                    self.default_difficulty,
-                ),
+                "bits": bits,
+                # qbitd reports both; ``difficulty`` is the raw float, a
+                # million times smaller than the units the candidate rows
+                # carry, and the selector must not read it.
+                "difficulty": _raw(bits),
             }
         return super().call(method, params)
 
@@ -611,11 +647,12 @@ class BlockCandidateCollapsePredicateTests(unittest.TestCase):
                 tip=DECIDED_WINNER,
                 tip_height=DECIDED_HEIGHT,
                 active={DECIDED_HEIGHT: DECIDED_WINNER},
-                difficulty={DECIDED_WINNER: 1.0},
+                bits={DECIDED_WINNER: MIN_WORK_BITS},
             )
         )
-        fixture.seed([_hash(1)], network_difficulty=8)
-        fixture.seed([_hash(2)], network_difficulty=1)
+        occupant = _scaled(MIN_WORK_BITS)
+        fixture.seed([_hash(1)], network_difficulty=occupant * 8)
+        fixture.seed([_hash(2)], network_difficulty=occupant)
         self.assertEqual(_selected(fixture), {_hash(2)})
 
     def test_equal_work_occupant_still_supersedes(self) -> None:
@@ -624,33 +661,120 @@ class BlockCandidateCollapsePredicateTests(unittest.TestCase):
                 tip=DECIDED_WINNER,
                 tip_height=DECIDED_HEIGHT,
                 active={DECIDED_HEIGHT: DECIDED_WINNER},
-                difficulty={DECIDED_WINNER: 4.0},
+                bits={DECIDED_WINNER: RETARGETED_BITS},
             )
         )
-        fixture.seed([_hash(1)], network_difficulty=4)
+        fixture.seed([_hash(1)], network_difficulty=_scaled(RETARGETED_BITS))
         self.assertEqual(_selected(fixture), {_hash(1)})
 
-    def test_unusable_header_difficulty_fails_the_page_closed(self) -> None:
+    def test_header_work_is_read_in_the_candidates_scaled_units(self) -> None:
+        """Regression: the row is scaled, ``getblockheader.difficulty`` is raw.
+
+        A candidate stamped with ``scaled_network_difficulty`` and an
+        active sibling of exactly equal work must collapse. Reading the
+        header's raw ``difficulty`` float instead of re-deriving from its
+        bits makes the occupant look COLLAPSE_DIFFICULTY_SCALE times
+        weaker, so clause 4b/5 rejects it and a decided height never
+        collapses at all.
+        """
+        for bits in (MIN_WORK_BITS, RETARGETED_BITS, HIGH_WORK_BITS):
+            with self.subTest(bits=bits):
+                fixture = CollapseFixture(
+                    rpc=CollapseChainRpc(
+                        tip=DECIDED_WINNER,
+                        tip_height=DECIDED_HEIGHT,
+                        active={DECIDED_HEIGHT: DECIDED_WINNER},
+                        bits={DECIDED_WINNER: bits},
+                    )
+                )
+                scaled = _scaled(bits)
+                # The stored fact really is COLLAPSE_DIFFICULTY_SCALE times
+                # the float the node reports for the very same header --
+                # only approximately so, which is itself why bits and not
+                # the float are authoritative here.
+                self.assertAlmostEqual(
+                    _raw(bits) * COLLAPSE_DIFFICULTY_SCALE / scaled,
+                    1.0,
+                    places=9,
+                )
+                fixture.seed([_hash(1)], network_difficulty=scaled)
+                self.assertEqual(_selected(fixture), {_hash(1)})
+
+    def test_candidate_heavier_than_the_occupant_is_preserved(self) -> None:
+        """One scaled unit of extra work is still a heavier sibling."""
+        for bits in (RETARGETED_BITS, HIGH_WORK_BITS):
+            with self.subTest(bits=bits):
+                fixture = CollapseFixture(
+                    rpc=CollapseChainRpc(
+                        tip=DECIDED_WINNER,
+                        tip_height=DECIDED_HEIGHT,
+                        active={DECIDED_HEIGHT: DECIDED_WINNER},
+                        bits={DECIDED_WINNER: bits},
+                    )
+                )
+                scaled = _scaled(bits)
+                fixture.seed([_hash(1)], network_difficulty=scaled + 1)
+                fixture.seed([_hash(2)], network_difficulty=scaled)
+                self.assertEqual(_selected(fixture), {_hash(2)})
+                self.assertEqual(fixture.pending(), {_hash(1)})
+
+    def test_collapse_reuses_the_production_scaled_difficulty_formula(self) -> None:
+        """The restated formula must not drift from ``template_artifacts``."""
+        for bits in (
+            MIN_WORK_BITS,
+            RETARGETED_BITS,
+            HIGH_WORK_BITS,
+            "1f00ffff",
+            "1e00ffff",
+            "1c7fffff",
+        ):
+            with self.subTest(bits=bits):
+                self.assertEqual(
+                    _collapse_scaled_difficulty(bits),
+                    scaled_network_difficulty(bits),
+                )
+
+    def test_unusable_header_bits_fails_the_page_closed(self) -> None:
         for value in (
             None,
+            "",
             "n/a",
-            float("nan"),
+            "not-hex!",
+            "1d00ff",
+            "1d00ffff00",
+            "00000000",
+            "00000001",
+            0x1D00FFFF,
             True,
-            float("inf"),
-            0,
-            -1,
-            10**10_000,
+            b"1d00ffff",
         ):
-            with self.subTest(difficulty=value):
+            with self.subTest(bits=value):
                 fixture = CollapseFixture()
                 fixture.seed([_hash(1), _hash(2)])
                 fixture.rpc.results["getblockheader"] = {
                     "hash": DECIDED_WINNER,
-                    "difficulty": value,
+                    "bits": value,
+                    # A usable raw float is present and must not rescue the
+                    # read: the scaled comparison has no raw fallback.
+                    "difficulty": 1.0,
                 }
                 fixture.collapse()
                 self.assertEqual(fixture.pending(), {_hash(1), _hash(2)})
                 self.assertEqual(fixture.counts()["fail_closed"], 2)
+
+    def test_header_without_bits_fails_the_page_closed(self) -> None:
+        fixture = CollapseFixture()
+        fixture.seed([_hash(1), _hash(2)])
+        fixture.rpc.results["getblockheader"] = {
+            "hash": DECIDED_WINNER,
+            "height": DECIDED_HEIGHT,
+            "confirmations": 1,
+            "difficulty": 1.0,
+        }
+        fixture.collapse()
+        self.assertEqual(fixture.pending(), {_hash(1), _hash(2)})
+        self.assertEqual(fixture.counts()["fail_closed"], 2)
+        self.assertEqual(fixture.ledger.abandon_calls, [])
 
     def test_each_chain_read_failure_fails_the_page_closed(self) -> None:
         for method in (
@@ -899,10 +1023,11 @@ class BlockCandidateCollapseApplyTests(unittest.TestCase):
         self.assertEqual(fixture.counts()["revalidation_dropped"], 1)
 
     def test_revalidation_reads_a_changed_occupants_work(self) -> None:
+        """A lighter replacement occupant drops the row, in scaled units."""
         fixture = CollapseFixture()
-        fixture.seed([_hash(1)], network_difficulty=8)
-        fixture.rpc.difficulty[DECIDED_WINNER] = 16.0
-        fixture.rpc.difficulty["ee" * 32] = 1.0
+        fixture.seed([_hash(1)], network_difficulty=_scaled(RETARGETED_BITS))
+        fixture.rpc.bits[DECIDED_WINNER] = RETARGETED_BITS
+        fixture.rpc.bits["ee" * 32] = MIN_WORK_BITS
         state = {"seen": 0}
 
         def move_chain(chain: CollapseChainRpc, method: str, params) -> None:
@@ -920,6 +1045,61 @@ class BlockCandidateCollapseApplyTests(unittest.TestCase):
             params for method, params in fixture.rpc.calls if method == "getblockheader"
         ]
         self.assertEqual(headers, [(DECIDED_WINNER,), ("ee" * 32,)])
+
+    def test_revalidation_keeps_an_equal_work_changed_occupant(self) -> None:
+        """The changed-occupant re-read normalizes exactly as selection does.
+
+        The replacement occupant carries different bits from the one
+        selection read but exactly the candidate's scaled work, so the row
+        still collapses. A revalidation that compared the replacement's raw
+        header float against the row's scaled value would drop it instead.
+        """
+        fixture = CollapseFixture()
+        fixture.seed([_hash(1)], network_difficulty=_scaled(HIGH_WORK_BITS))
+        fixture.rpc.bits[DECIDED_WINNER] = HIGH_WORK_BITS
+        fixture.rpc.bits["ee" * 32] = HIGH_WORK_BITS
+        state = {"seen": 0}
+
+        def move_chain(chain: CollapseChainRpc, method: str, params) -> None:
+            if method != "getbestblockhash":
+                return
+            state["seen"] += 1
+            if state["seen"] == 2:
+                chain.active = {DECIDED_HEIGHT: "ee" * 32}
+
+        fixture.rpc.before_call = move_chain
+        self.assertEqual(_selected(fixture), {_hash(1)})
+        self.assertEqual(fixture.counts()["revalidation_dropped"], 0)
+        headers = [
+            params for method, params in fixture.rpc.calls if method == "getblockheader"
+        ]
+        self.assertEqual(headers, [(DECIDED_WINNER,), ("ee" * 32,)])
+
+    def test_revalidation_of_a_changed_occupant_fails_closed_without_bits(
+        self,
+    ) -> None:
+        """The pre-write header re-read has no raw-difficulty fallback either."""
+        fixture = CollapseFixture()
+        fixture.seed([_hash(1)], network_difficulty=_scaled(RETARGETED_BITS))
+        fixture.rpc.bits[DECIDED_WINNER] = RETARGETED_BITS
+        state = {"seen": 0}
+
+        def move_chain(chain: CollapseChainRpc, method: str, params) -> None:
+            if method != "getbestblockhash":
+                return
+            state["seen"] += 1
+            if state["seen"] == 2:
+                chain.active = {DECIDED_HEIGHT: "ee" * 32}
+                chain.results["getblockheader"] = {
+                    "hash": "ee" * 32,
+                    "difficulty": _raw(RETARGETED_BITS),
+                }
+
+        fixture.rpc.before_call = move_chain
+        fixture.collapse()
+        self.assertEqual(fixture.pending(), {_hash(1)})
+        self.assertEqual(fixture.counts()["fail_closed"], 1)
+        self.assertEqual(fixture.ledger.abandon_calls, [])
 
     def test_revalidation_failure_fails_the_page_closed(self) -> None:
         fixture = CollapseFixture()

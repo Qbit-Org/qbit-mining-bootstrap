@@ -80,6 +80,8 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lab.prism.block_candidates import (  # noqa: E402
+    COLLAPSE_DIFFICULTY_SCALE,
+    COLLAPSE_POW_LIMIT_BITS,
     MAX_BLOCK_REPLAY_ENUMERATION_ROWS,
     MAX_PENDING_BLOCK_CANDIDATES,
     _BlockCandidateNodeSubmission,
@@ -88,6 +90,7 @@ from lab.prism.share_ledger import (  # noqa: E402
     PendingShare,
     SingleWriterShareLedger,
 )
+from lab.prism.template_artifacts import scaled_network_difficulty  # noqa: E402
 from tests.prism_vardiff_test_support import (  # noqa: E402
     FakeRpc,
     block_candidate,
@@ -365,14 +368,21 @@ class DecidedHeightRpc(FakeRpc):
         *,
         winner_hash: str,
         height: int,
-        difficulty: float = 1.0,
+        bits: str = COLLAPSE_POW_LIMIT_BITS,
     ) -> None:
         self.winner_hash = winner_hash.lower()
         self.height = int(height)
-        # The decided block's difficulty as qbitd would report it in
-        # getblockheader; the storm template is built at the same value, so
-        # by default the decided block and every sibling carry equal work.
-        self.difficulty = float(difficulty)
+        # The decided block's compact bits as qbitd would report them in
+        # getblockheader. Work is stated in bits, not in the raw difficulty
+        # float, because a candidate row carries scaled difficulty
+        # (raw * COLLAPSE_DIFFICULTY_SCALE) and only a bits-derived value is
+        # in the same units. The default is the qbit powLimit, at or below
+        # every sibling in the storm, so the decided block never reads as
+        # the weaker chain.
+        self.bits = str(bits).lower()
+        self.difficulty = (
+            scaled_network_difficulty(self.bits) / COLLAPSE_DIFFICULTY_SCALE
+        )
         self.calls: dict[str, int] = {}
         self._lock = threading.Lock()
 
@@ -398,6 +408,7 @@ class DecidedHeightRpc(FakeRpc):
                     "hash": self.winner_hash,
                     "height": self.height,
                     "confirmations": 1,
+                    "bits": self.bits,
                     "difficulty": self.difficulty,
                 }
             raise RuntimeError("qbit RPC getblockheader failed: -5 Block not found")
