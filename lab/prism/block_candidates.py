@@ -1547,6 +1547,55 @@ class BlockCandidateService:
             shares,
         )
 
+    def _publish_collapsed_candidate_terminal_fence(
+        self,
+        abandoned: Iterable[str],
+    ) -> None:
+        """Fence every won hash from node submission before any cleanup runs.
+
+        The fenced batch write is the moment a row becomes durably terminal,
+        and the ``terminal-outcome`` cleanup step is what normally publishes
+        that fact in memory. That step can fail, or a page-level abort can
+        stop the pass before it -- and the failure leaves the hash in the
+        cleanup-retry registry while a same-hash candidate may still be
+        sitting in the live, replay, retry, or waiting lane. Once the apply
+        releases its disposition lease that candidate is dequeued, finds no
+        terminal outcome, and offers a durably abandoned block to the node.
+
+        Publishing the outcome here closes that window with the fence the
+        rest of the submitter already honours. The apply holds every won
+        hash's disposition lease from before the write until after this
+        call, so no same-hash lane can be inside its own guarded region
+        while this runs, and none can enter one afterwards without seeing
+        the fence. It is a lock-guarded assignment into a dict the
+        disposition state already owns: no durable read or write, no queue
+        admission, and nothing that could re-adopt or re-offer a row.
+
+        The full ``terminal-outcome`` step still runs in cleanup for its
+        other side effects -- the fast-lane reservation, the replay-inflight
+        marker, and the parked same-hash retry's own floor holder -- and
+        remains owed, and retried, whenever it fails.
+
+        Contained so it cannot raise: this sits between a won write and the
+        page partition, and an exception escaping here would fail the page
+        open and replay-adopt rows whose durable outbox entries are gone.
+        """
+        try:
+            self._ensure_block_candidate_disposition_state()
+            with self._coordinator.lock:
+                outcomes = self._block_candidate_terminal_outcomes
+                for block_hash in abandoned:
+                    outcomes[block_hash] = False
+        except Exception:
+            # Degrades to the pre-publication behaviour: the cleanup step
+            # still owes the outcome and the retry registry still carries it.
+            print(
+                "prism coordinator: collapsed block candidate terminal fence "
+                "could not be published",
+                flush=True,
+            )
+            traceback.print_exc()
+
     def _clean_up_collapsed_block_candidates(
         self,
         abandoned: tuple[str, ...],
@@ -1563,7 +1612,9 @@ class BlockCandidateService:
         contained failure here and a later page-level abort there would
         report one affected hash twice. Each of those hashes keeps its
         still-owed steps in the cleanup-retry registry, because its durable
-        row is terminal and no enumeration will ever hand it back.
+        row is terminal and no enumeration will ever hand it back. Their
+        terminal fence is already published by the apply, so a step this
+        pass leaves owed can never leave one of them offerable to the node.
         """
         every_step = frozenset(BLOCK_CANDIDATE_COLLAPSE_CLEANUP_STEPS)
         remaining, shares = self._run_collapsed_candidate_cleanup_steps(
@@ -1969,6 +2020,10 @@ class BlockCandidateService:
             if not abandoned:
                 return frozenset()
             self._record_block_candidate_collapse("abandoned", len(abandoned))
+            # Before any cleanup, and while every won hash's lease is still
+            # held: a cleanup that fails or aborts must not leave a durably
+            # terminal row offerable to the node.
+            self._publish_collapsed_candidate_terminal_fence(abandoned)
             try:
                 cleanup_failed = self._clean_up_collapsed_block_candidates(
                     tuple(

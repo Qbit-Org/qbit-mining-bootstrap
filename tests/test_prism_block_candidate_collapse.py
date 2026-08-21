@@ -1584,8 +1584,15 @@ class BlockCandidateCollapseCleanupRetryTests(unittest.TestCase):
         # The abort ran the withdrawal and then stopped: the floor holder
         # and every terminal accounting step are still owed.
         self.assertIn(id(candidate.pending_share), fixture.floor())
+        self.assertIn("terminal-outcome", fixture.cleanup_backlog()[target])
         with server.lock:
-            self.assertEqual(fixture.service._block_candidate_terminal_outcomes, {})
+            # The apply published the terminal fence before cleanup, so the
+            # durably terminal row is already unofferable even though the
+            # step that normally publishes it never ran.
+            self.assertIs(
+                fixture.service._block_candidate_terminal_outcomes[target],
+                False,
+            )
         self.assertEqual(server.block_candidate_abandoned_counts, {})
         fixture.service._collapsed_candidate_floor_holders = scan
         self.assertTrue(fixture.retry_cleanup()[0])
@@ -1749,6 +1756,354 @@ class BlockCandidateCollapseCleanupRetryTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(fixture.cleanup_backlog(), {})
         self.assertEqual(fixture.counts()["cleanup_recovered"], 1)
+
+
+class BlockCandidateCollapseSubmissionFenceTests(unittest.TestCase):
+    """A won row is fenced from the node by the write, not by its cleanup.
+
+    The fenced batch write is the moment a row becomes durably terminal, but
+    the in-memory fence the rest of the submitter honours -- the recorded
+    terminal outcome -- used to be installed only by the ``terminal-outcome``
+    cleanup step.  A cleanup that failed at that step, or a page-level abort
+    that never reached it, therefore left a same-hash candidate in the live,
+    replay, retry, or waiting lane free to be dequeued the moment the apply
+    released its disposition lease: ``submit_next`` found no terminal
+    outcome, consulted nothing else, and offered qbitd a block whose durable
+    row was already abandoned.
+
+    These tests own the invariant that closes it.  The apply publishes the
+    false terminal outcome for the exact returned hash set while every won
+    hash's lease is still held and before any cleanup runs, so the fence is
+    up from the write onwards and no cleanup outcome -- success, contained
+    per-step failure, page-level abort, or a retry that keeps failing -- can
+    make a won row offerable again.
+    """
+
+    _breaker = staticmethod(BlockCandidateCollapseCleanupRetryTests._breaker)
+
+    # -- harness -----------------------------------------------------------
+
+    @staticmethod
+    def _arm_node(fixture: CollapseFixture) -> None:
+        """Let a node offer succeed, so an escape is loud rather than lost.
+
+        With ``submitblock`` erroring, a fence regression could be mistaken
+        for an ordinary transport failure; answering it makes the offer land
+        exactly as it would in production.
+        """
+        fixture.rpc.results["submitblock"] = None
+        fixture.server.block_submit_rpc_timeout_seconds = 0.5
+
+    @staticmethod
+    def _offers(fixture: CollapseFixture) -> int:
+        return sum(1 for method, _ in fixture.rpc.calls if method == "submitblock")
+
+    @staticmethod
+    def _queue(
+        fixture: CollapseFixture,
+        candidate: Any,
+        *,
+        replay: bool = False,
+    ) -> None:
+        service = fixture.service
+        service._ensure_block_replay_state()
+        if replay:
+            service._block_replay_candidate_queue.put_nowait(candidate)
+        else:
+            service.candidate_queue.put_nowait(candidate)
+
+    @staticmethod
+    def _submit(fixture: CollapseFixture, *, defer_accounting: bool = True) -> bool:
+        """Drive the shipped queue-to-node path exactly as the loop does."""
+        with redirect_stdout(StringIO()):
+            return fixture.server.submit_next_block_candidate(
+                defer_accounting=defer_accounting
+            )
+
+    def _seed(self, fixture: CollapseFixture, target: str) -> Any:
+        """One durable row whose credit-bearing candidate owns a floor holder."""
+        candidate = fixture.seed([target], credit_share_on_accept=True)[0]
+        fixture.server._ensure_share_writer_service().adopt_pending_share(
+            candidate.pending_share
+        )
+        self._arm_node(fixture)
+        return candidate
+
+    def _seed_queued(
+        self,
+        fixture: CollapseFixture,
+        target: str,
+        *,
+        replay: bool = False,
+    ) -> Any:
+        candidate = self._seed(fixture, target)
+        self._queue(fixture, candidate, replay=replay)
+        return candidate
+
+    def _assert_unofferable(self, fixture: CollapseFixture, target: str) -> None:
+        """Nothing was offered, nothing was resurrected, nothing re-adopted."""
+        self.assertEqual(self._offers(fixture), 0)
+        self.assertEqual(fixture.pending(), set())
+        self.assertEqual(len(fixture.ledger.abandon_calls), 1)
+        service = fixture.service
+        self.assertTrue(service.candidate_queue.empty())
+        self.assertTrue(service._block_replay_candidate_queue.empty())
+        with fixture.server.lock:
+            self.assertIsNone(service.retry_candidate)
+            self.assertNotIn(target, service._block_replay_inflight_hashes)
+            self.assertNotIn(target, service._block_disposition_waiting_retries)
+
+    # -- the two cleanup outcomes that used to unfence a won row -----------
+
+    def test_a_failed_terminal_outcome_still_fences_the_queued_candidate(
+        self,
+    ) -> None:
+        """The P1: the step that publishes the fence is the step that failed."""
+        fixture = CollapseFixture()
+        target = _hash(1)
+        candidate = self._seed_queued(fixture, target)
+        broken = self._breaker(
+            fixture.server,
+            "_record_block_candidate_terminal_outcome",
+        )
+        with redirect_stdout(StringIO()):
+            fixture.collapse()
+        # Exactly the failure this fence exists for: the durable row is gone
+        # and its terminal cleanup is still owed, with the candidate object
+        # still sitting in the live queue.
+        self.assertEqual(fixture.pending(), set())
+        self.assertEqual(
+            fixture.cleanup_backlog(),
+            {target: frozenset({"terminal-outcome"})},
+        )
+        self.assertFalse(fixture.service.candidate_queue.empty())
+        # The submitter reaches the candidate before the accounting lane
+        # reaches the retry -- the ordering the incident actually produced.
+        self.assertTrue(self._submit(fixture))
+        self._assert_unofferable(fixture, target)
+        # Only now does the retry finish the step that failed.
+        broken["on"] = False
+        self.assertTrue(fixture.retry_cleanup()[0])
+        self.assertEqual(fixture.cleanup_backlog(), {})
+        self.assertEqual(self._offers(fixture), 0)
+        self.assertNotIn(id(candidate.pending_share), fixture.floor())
+        counts = fixture.counts()
+        self.assertEqual(counts["cleanup_failed"], 1)
+        self.assertEqual(counts["cleanup_recovered"], 1)
+
+    def test_an_aborted_cleanup_still_fences_the_queued_candidate(self) -> None:
+        """A page-level abort never reaches the terminal-outcome step at all."""
+        fixture = CollapseFixture()
+        target = _hash(1)
+        candidate = self._seed_queued(fixture, target)
+        scan = fixture.service._collapsed_candidate_floor_holders
+        fixture.service._collapsed_candidate_floor_holders = (
+            lambda abandoned: (_ for _ in ()).throw(RuntimeError("index boom"))
+        )
+        with redirect_stdout(StringIO()):
+            fixture.collapse()
+        self.assertEqual(
+            fixture.cleanup_backlog(),
+            {target: frozenset(BLOCK_CANDIDATE_COLLAPSE_CLEANUP_STEPS)},
+        )
+        # The abort ran nothing past the withdrawal, so the queued object
+        # still owns its identity-keyed floor holder.
+        self.assertIn(id(candidate.pending_share), fixture.floor())
+        self.assertTrue(self._submit(fixture))
+        self._assert_unofferable(fixture, target)
+        # The dropped duplicate released its own holder on the way out, which
+        # is what lets the retry re-scan the drained queues and lose nothing.
+        self.assertNotIn(id(candidate.pending_share), fixture.floor())
+        fixture.service._collapsed_candidate_floor_holders = scan
+        self.assertTrue(fixture.retry_cleanup()[0])
+        self.assertEqual(fixture.cleanup_backlog(), {})
+        self.assertEqual(self._offers(fixture), 0)
+
+    # -- lane ownership ----------------------------------------------------
+
+    def test_the_replay_lane_is_fenced_by_the_same_published_outcome(self) -> None:
+        """Durable replay dequeues through the same guard as a live solve."""
+        fixture = CollapseFixture()
+        target = _hash(1)
+        self._seed_queued(fixture, target, replay=True)
+        service = fixture.service
+        with fixture.server.lock:
+            service._block_replay_inflight_hashes.add(target)
+        broken = self._breaker(
+            fixture.server,
+            "_record_block_candidate_terminal_outcome",
+        )
+        with redirect_stdout(StringIO()):
+            fixture.collapse()
+        self.assertFalse(service._block_replay_candidate_queue.empty())
+        self.assertTrue(self._submit(fixture))
+        self.assertEqual(self._offers(fixture), 0)
+        self.assertTrue(service._block_replay_candidate_queue.empty())
+        self.assertEqual(fixture.pending(), set())
+        # A freshly decoded same-hash replay object is refused admission by
+        # the same published outcome rather than queued behind it.
+        sibling = fixture.seed([target], credit_share_on_accept=True)[0]
+        with redirect_stdout(StringIO()):
+            self.assertFalse(service._enqueue_replayed_block_candidate(sibling))
+        self.assertTrue(service._block_replay_candidate_queue.empty())
+        self.assertEqual(self._offers(fixture), 0)
+        broken["on"] = False
+        self.assertTrue(fixture.retry_cleanup()[0])
+        self.assertEqual(fixture.cleanup_backlog(), {})
+
+    def test_the_waiting_retry_lane_is_fenced_when_the_lease_releases(self) -> None:
+        """A wakeup parked behind the apply's own lease must not be offered."""
+        fixture = CollapseFixture()
+        target = _hash(1)
+        candidate = self._seed(fixture, target)
+        service = fixture.service
+        inner = fixture.ledger.inner.mark_block_candidates_abandoned
+
+        def park_then_write(requested: tuple[str, ...], error: str) -> Any:
+            # A parked wakeup is collapse evidence, so the only ordering that
+            # produces one for a won hash is this: the submitter dequeued the
+            # hash, could not claim the apply's lease, and parked it after the
+            # pre-write revalidation re-read the evidence and before the
+            # fenced write landed.
+            with fixture.server.lock:
+                service._block_disposition_waiting_retries[target] = candidate
+            return inner(block_hashes=requested, error=error)
+
+        fixture.ledger.abandon_hook = park_then_write
+        broken = self._breaker(
+            fixture.server,
+            "_record_block_candidate_terminal_outcome",
+        )
+        with redirect_stdout(StringIO()):
+            fixture.collapse()
+        # The failed step is also the one that drops parked wakeups, so the
+        # candidate is still parked and will be dequeued from there.
+        with fixture.server.lock:
+            self.assertIn(target, service._block_disposition_waiting_retries)
+        self.assertTrue(self._submit(fixture))
+        self._assert_unofferable(fixture, target)
+        broken["on"] = False
+        self.assertTrue(fixture.retry_cleanup()[0])
+        self.assertEqual(fixture.cleanup_backlog(), {})
+
+    # -- the non-queue seams ------------------------------------------------
+
+    def test_the_direct_writer_seam_refuses_a_fenced_hash(self) -> None:
+        """The historical direct entrypoint takes the guard and answers False."""
+        fixture = CollapseFixture()
+        target = _hash(1)
+        candidate = self._seed_queued(fixture, target)
+        fixture.service.candidate_queue.get_nowait()
+        broken = self._breaker(
+            fixture.server,
+            "_record_block_candidate_terminal_outcome",
+        )
+        with redirect_stdout(StringIO()):
+            fixture.collapse()
+        with redirect_stdout(StringIO()):
+            landed = fixture.server._submit_next_block_candidate_writer(candidate)
+        self.assertFalse(landed)
+        self.assertEqual(self._offers(fixture), 0)
+        self.assertEqual(fixture.pending(), set())
+        self.assertEqual(len(fixture.ledger.abandon_calls), 1)
+        broken["on"] = False
+        self.assertTrue(fixture.retry_cleanup()[0])
+
+    def test_the_synchronous_seam_refuses_a_fenced_hash(self) -> None:
+        """The miner-facing resubmit joins the same terminal disposition."""
+        fixture = CollapseFixture()
+        target = _hash(1)
+        candidate = self._seed_queued(fixture, target)
+        fixture.service.candidate_queue.get_nowait()
+        broken = self._breaker(
+            fixture.server,
+            "_record_block_candidate_terminal_outcome",
+        )
+        with redirect_stdout(StringIO()):
+            fixture.collapse()
+        with redirect_stdout(StringIO()):
+            landed = fixture.server._submit_synchronous_block_candidate(candidate)
+        self.assertFalse(landed)
+        self.assertEqual(self._offers(fixture), 0)
+        self.assertEqual(fixture.pending(), set())
+        self.assertNotIn(id(candidate.pending_share), fixture.floor())
+        broken["on"] = False
+        self.assertTrue(fixture.retry_cleanup()[0])
+
+    # -- durability of the fence across the retry series -------------------
+
+    def test_the_fence_survives_every_retry_failure_and_its_discharge(self) -> None:
+        """Repeated failures, then recovery, and never one node offer."""
+        fixture = CollapseFixture()
+        target = _hash(1)
+        candidate = self._seed(fixture, target)
+        fixture.service.retry_initial_seconds = 0.5
+        fixture.service.retry_max_seconds = 2.0
+        broken = self._breaker(
+            fixture.server,
+            "_record_block_candidate_terminal_outcome",
+        )
+        with redirect_stdout(StringIO()):
+            fixture.collapse()
+        for attempt in (1, 2, 3):
+            self.assertTrue(fixture.retry_cleanup(force_due=True)[0])
+            self.assertEqual(fixture.counts()["cleanup_retry_failed"], attempt)
+            self.assertEqual(set(fixture.cleanup_backlog()), {target})
+            # The fence is unaffected by the attempt that just failed: the
+            # same-hash wakeup is dropped, not offered, on every round.
+            self._queue(fixture, candidate)
+            self.assertTrue(self._submit(fixture))
+            self._assert_unofferable(fixture, target)
+        broken["on"] = False
+        self.assertTrue(fixture.retry_cleanup(force_due=True)[0])
+        self.assertEqual(fixture.cleanup_backlog(), {})
+        # Discharging the backlog leaves the ordinary terminal fence behind,
+        # so the durably terminal row is still never re-offered.
+        self._queue(fixture, candidate)
+        self.assertTrue(self._submit(fixture))
+        self._assert_unofferable(fixture, target)
+        with fixture.server.lock:
+            self.assertIs(
+                fixture.service._block_candidate_terminal_outcomes[target],
+                False,
+            )
+        # Accounting stayed bounded by the affected hashes, and the label
+        # space is still the closed outcome set.
+        counts = fixture.counts()
+        self.assertEqual(counts["cleanup_failed"], 1)
+        self.assertEqual(counts["cleanup_recovered"], 1)
+        self.assertEqual(counts["cleanup_retry_failed"], 3)
+        self.assertLessEqual(counts["cleanup_recovered"], counts["cleanup_failed"])
+        self.assertEqual(
+            set(counts),
+            set(PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES),
+        )
+
+    def test_a_clean_collapse_fences_its_queued_candidate_too(self) -> None:
+        """The fence is a property of the write, not of a cleanup failure."""
+        fixture = CollapseFixture()
+        target = _hash(1)
+        self._seed_queued(fixture, target)
+        with redirect_stdout(StringIO()):
+            fixture.collapse()
+        self.assertEqual(fixture.cleanup_backlog(), {})
+        self.assertEqual(fixture.counts()["cleanup_failed"], 0)
+        self.assertTrue(self._submit(fixture))
+        self._assert_unofferable(fixture, target)
+
+    def test_a_preserved_row_is_never_fenced_by_another_pages_win(self) -> None:
+        """Only the exact returned hash set is published, never the request."""
+        fixture = CollapseFixture()
+        won, lost = _hash(1), _hash(2)
+        fixture.seed([won, lost], credit_share_on_accept=True)
+        fixture.ledger.abandon_hook = lambda requested, error: (won,)
+        with redirect_stdout(StringIO()):
+            fixture.collapse()
+        service = fixture.service
+        with fixture.server.lock:
+            outcomes = dict(service._block_candidate_terminal_outcomes)
+        self.assertEqual(outcomes, {won: False})
+        self.assertEqual(fixture.counts()["write_lost"], 1)
 
 
 class BlockCandidateCollapseEnumerationTests(unittest.TestCase):
