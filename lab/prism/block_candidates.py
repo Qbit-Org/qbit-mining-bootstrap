@@ -91,7 +91,11 @@ DEFAULT_BLOCK_ACCOUNTING_CLEANUP_RETRY_WORK_ITEMS = 8
 # entries that no in-memory copy still needs: every lane that can hold a
 # candidate object (or its still-owed terminal work) pins its hash and is
 # never evicted, so a fenced hash cannot become offerable again by being
-# forgotten. The bound sits far above the number of copies the process can
+# forgotten. That includes the instant between lanes -- a candidate the
+# submitter has taken out of a holder or queue but not yet handed to its
+# disposition flight is named by the dequeued-hash pin, moved in and out
+# under the same lock holds that empty and refill the lanes around it. The
+# bound sits far above the number of copies the process can
 # hold at once -- the bounded admission queue
 # (MAX_PENDING_BLOCK_CANDIDATES), one replay enumeration batch
 # (MAX_BLOCK_REPLAY_ENUMERATION_ROWS), and the single-slot retry holders --
@@ -605,6 +609,17 @@ class _BlockCandidateAccountingTask:
     candidate: PrismBlockCandidate
     node_submission: _BlockCandidateNodeSubmission
     disposition_lease: _BlockCandidateDispositionLease
+    # Set by the accounting lane's own exception path once it has retained
+    # this task's candidate for retry while still holding the disposition.
+    # The loop's catch reads it so a candidate the lane retained is not
+    # retained (and counted) a second time, while a failure that fired
+    # before the lane could retain -- a delegate raising ahead of it -- is
+    # still retained there.
+    retained_for_retry: threading.Event = field(
+        default_factory=threading.Event,
+        compare=False,
+        repr=False,
+    )
 
 
 class BlockSubmitterDatabaseTimeout(TimeoutError):
@@ -3842,6 +3857,7 @@ class BlockCandidateService:
             and hasattr(self, "_block_candidate_terminal_outcomes")
             and hasattr(self, "_block_fast_lane_reservations")
             and hasattr(self, "_block_disposition_waiting_retries")
+            and hasattr(self, "_block_candidate_dequeued_hashes")
         ):
             return
         with _STATE_BACKFILL_LOCK:
@@ -3859,6 +3875,11 @@ class BlockCandidateService:
                 self._block_disposition_waiting_retries: dict[
                     str, PrismBlockCandidate
                 ] = {}
+            if not hasattr(self, "_block_candidate_dequeued_hashes"):
+                # hash -> number of dequeued same-hash candidate objects that
+                # are between a lane and their disposition flight (or the
+                # waiting registry). Read and written under coordinator.lock.
+                self._block_candidate_dequeued_hashes: dict[str, int] = {}
 
     def _claim_block_candidate_disposition(
         self,
@@ -3917,6 +3938,50 @@ class BlockCandidateService:
             lease.flight,
         )
 
+    # -- dequeued-hash pin -------------------------------------------------
+
+    def _pin_dequeued_block_candidate_locked(
+        self,
+        candidate: PrismBlockCandidate,
+    ) -> str:
+        """Name a candidate's hash from the instant it leaves its lane.
+
+        Caller holds ``coordinator.lock`` and, in the same critical section,
+        has just taken ``candidate`` out of the retry holder, a candidate
+        queue, or the waiting registry. Until ``submit_next`` hands the hash
+        to its disposition flight or back to the waiting registry -- again
+        under the lock -- the candidate object lives only in that method's
+        local variable, and this pin is the only thing that tells the
+        terminal-outcome eviction a same-hash copy is still in memory. The
+        lanes and the flight each pin the hash in their own right; without
+        this entry a terminal duplicate's fence is the oldest unpinned
+        outcome exactly while the pass that is about to read it holds the
+        candidate in hand.
+
+        Counted rather than set-valued so two dequeued same-hash objects
+        (a second caller of ``submit_next``) cannot unpin each other.
+        Returns the lowercase key the rest of the pass compares on.
+        """
+        block_hash = str(candidate.submission.block_hash_hex).lower()
+        pins = self._block_candidate_dequeued_hashes
+        pins[block_hash] = pins.get(block_hash, 0) + 1
+        return block_hash
+
+    def _unpin_dequeued_block_candidate_locked(self, block_hash: str) -> None:
+        """Drop one dequeue's pin. Caller holds ``coordinator.lock``.
+
+        Called only in the critical section that hands the hash on -- to the
+        flight the claim installed, or to the waiting registry -- or where
+        nothing needs it any more because the candidate object left with an
+        exception and no in-memory copy remains to offer the block.
+        """
+        pins = self._block_candidate_dequeued_hashes
+        remaining = pins.get(block_hash, 0) - 1
+        if remaining > 0:
+            pins[block_hash] = remaining
+        else:
+            pins.pop(block_hash, None)
+
     def _live_block_candidate_hash_registries(self) -> tuple[Any, ...]:
         """Registries whose named hash forbids evicting its terminal outcome.
 
@@ -3925,6 +3990,9 @@ class BlockCandidateService:
         reads the terminal outcome before it may offer the block again.
         Dropping the outcome under one of them is exactly the window
         ``_publish_collapsed_candidate_terminal_fence`` exists to close.
+        The dequeued-hash pin is the lane between lanes: the candidate
+        ``submit_next`` has taken out of a holder, queue, or the waiting
+        registry and not yet handed to its disposition flight.
 
         Read with ``coordinator.lock`` held. Backfilled state is fetched by
         ``getattr`` rather than by an ``_ensure_...`` call, which would take
@@ -3941,6 +4009,7 @@ class BlockCandidateService:
                 getattr(self, "finalize_retries", None),
                 getattr(self, "_block_candidate_retained_node_submissions", None),
                 getattr(self, "_block_candidate_collapse_cleanup_retries", None),
+                getattr(self, "_block_candidate_dequeued_hashes", None),
             )
             if registry
         )
@@ -4048,13 +4117,14 @@ class BlockCandidateService:
         are all still live simply stays large, which is the safe direction.
         The pins are themselves bounded state, so the total stays bounded.
 
-        The pin set is the union of the lane registries, the single-slot
-        retry holders, the candidate objects still queued on the live and
-        replay lanes, and the hashes with a claimed disposition flight. A
-        hash held by none of those has no in-memory copy left that could
-        reach a node offer; anything arriving for it afterwards is a fresh
-        admission, which re-reads the durable outbox row -- terminal there
-        either way -- before it can offer anything.
+        The pin set is the union of the lane registries (including the
+        dequeued-hash pin), the single-slot retry holders, the candidate
+        objects still queued on the live and replay lanes, and the hashes
+        with a claimed disposition flight. A hash held by none of those has
+        no in-memory copy left that could reach a node offer; anything
+        arriving for it afterwards is a fresh admission, which re-reads the
+        durable outbox row -- terminal there either way -- before it can
+        offer anything.
         """
         outcomes = self._block_candidate_terminal_outcomes
         overflow = len(outcomes) - MAX_BLOCK_CANDIDATE_TERMINAL_OUTCOMES
@@ -4397,6 +4467,21 @@ class BlockCandidateService:
                 outcome.refresh_client = None
         except ShutdownInProgress:
             return
+        except Exception:
+            # An unexpected failure leaves the candidate to the retry lane.
+            # Retain it here, while this thread still owns the disposition:
+            # an accounting-owner retain routes into the deferred holder,
+            # which names the hash until the finally below merges it into
+            # the retry slot under coordinator.lock -- after the lease is
+            # released, but with no instant in between where nothing names
+            # it. The loop's catch used to retain only after this finally
+            # had already released the lease, and that instant was exactly
+            # the dequeued-candidate gap in its accounting-lane form: a
+            # terminal-outcome eviction there could unfence the hash the
+            # retried candidate was about to be re-disposed against.
+            self._coordinator._retain_block_candidate_for_retry(candidate)
+            task.retained_for_retry.set()
+            raise
         finally:
             self._coordinator._release_block_candidate_disposition(
                 task.disposition_lease
@@ -4493,7 +4578,16 @@ class BlockCandidateService:
                     flush=True,
                 )
                 traceback.print_exc()
-                self._coordinator._retain_block_candidate_for_retry(task.candidate)
+                retained = getattr(task, "retained_for_retry", None)
+                if retained is None or not retained.is_set():
+                    # The failure fired before _run_block_accounting_task's
+                    # own exception path could retain the candidate -- a
+                    # delegate raising ahead of it -- so it is retained here
+                    # as before. A candidate the lane already retained (and
+                    # merged into the retry slot) is not retained again.
+                    self._coordinator._retain_block_candidate_for_retry(
+                        task.candidate
+                    )
             finally:
                 assert source_queue is not None
                 source_queue.task_done()
@@ -4577,6 +4671,17 @@ class BlockCandidateService:
         """
         coordinator = self._coordinator
         coordinator._record_block_submitter_phase("dequeue-retry")
+        # The disposition state owns the dequeued-hash pin, and its backfill
+        # takes the state-backfill lock, so it runs before any coordinator
+        # lock hold below rather than underneath one.
+        self._ensure_block_candidate_disposition_state()
+        # Every dequeue below leaves its lane and enters the dequeued-hash
+        # pin in one coordinator.lock critical section. The lanes pin a
+        # terminal duplicate's outcome against eviction while it sits in
+        # them and the disposition flight pins it from the claim onward;
+        # between the two the candidate object is only this method's local
+        # variable, and the pin is what keeps the fence it is about to read
+        # from being the oldest unpinned entry in the registry.
         with coordinator.lock:
             candidate = self.retry_candidate
             if candidate is not None and not self._block_candidate_retry_ready_locked(
@@ -4588,6 +4693,7 @@ class BlockCandidateService:
                 candidate = None
             if candidate is not None:
                 self.retry_candidate = None
+                block_hash = self._pin_dequeued_block_candidate_locked(candidate)
         if candidate is None:
             queue_obj = self.candidate_queue
             self._ensure_block_replay_state()
@@ -4601,18 +4707,21 @@ class BlockCandidateService:
             )
             while candidate is None:
                 coordinator._record_block_submitter_phase("dequeue-queue")
-                # Live discoveries always outrank durable restart replay.
-                for candidate_queue in (queue_obj, replay_queue):
-                    if candidate_queue is None:
-                        continue
-                    try:
-                        candidate = candidate_queue.get_nowait()
+                with coordinator.lock:
+                    # Live discoveries always outrank durable restart replay.
+                    # The non-blocking get takes the queue's own mutex under
+                    # coordinator.lock -- the order the eviction's queue read
+                    # already establishes -- so the entry leaves the queue
+                    # and enters the pin without a gap between them.
+                    for candidate_queue in (queue_obj, replay_queue):
+                        if candidate_queue is None:
+                            continue
+                        try:
+                            candidate = candidate_queue.get_nowait()
+                        except queue.Empty:
+                            continue
                         break
-                    except queue.Empty:
-                        pass
-                if candidate is None:
-                    self._ensure_block_candidate_disposition_state()
-                    with coordinator.lock:
+                    if candidate is None:
                         waiting = self._block_disposition_waiting_retries
                         ready_hashes = [
                             key
@@ -4629,6 +4738,10 @@ class BlockCandidateService:
                                 ),
                             )
                             candidate = waiting.pop(waiting_hash)
+                    if candidate is not None:
+                        block_hash = self._pin_dequeued_block_candidate_locked(
+                            candidate
+                        )
                 if candidate is not None:
                     break
                 if deadline is None:
@@ -4641,23 +4754,36 @@ class BlockCandidateService:
                 ):
                     return BlockCandidateRunResult(False)
 
-        block_hash = str(candidate.submission.block_hash_hex).lower()
-        lease = coordinator._claim_block_candidate_disposition(
-            block_hash,
-            blocking=not defer_accounting,
-        )
+        try:
+            lease = coordinator._claim_block_candidate_disposition(
+                block_hash,
+                blocking=not defer_accounting,
+            )
+        except BaseException:
+            # The candidate object leaves with the exception (its durable
+            # outbox row still replays), so no in-memory copy remains that
+            # the pin would be protecting.
+            with coordinator.lock:
+                self._unpin_dequeued_block_candidate_locked(block_hash)
+            raise
         if lease is None:
             # Another same-hash pass already spans node offer through durable
             # finalization. Keep this wakeup outside the global parent retry
             # slot until that lease transfers/releases: consuming it can lose
             # an accounting retry, while repeatedly prioritizing it can starve
-            # unrelated live blocks.
+            # unrelated live blocks. The waiting registry takes over the pin
+            # in the same critical section.
             with coordinator.lock:
                 self._block_disposition_waiting_retries[block_hash] = candidate
+                self._unpin_dequeued_block_candidate_locked(block_hash)
             coordinator._wait_for_block_candidate_retry(
                 float(self.retry_initial_seconds)
             )
             return BlockCandidateRunResult(True)
+        # The claim installed this pass's disposition flight, which the
+        # eviction reads as a pin of its own; hand the hash over to it.
+        with coordinator.lock:
+            self._unpin_dequeued_block_candidate_locked(block_hash)
         transferred = False
         if coordinator._block_candidate_terminal_outcome(block_hash) is not None:
             coordinator._release_block_candidate_disposition(lease)
@@ -4704,9 +4830,12 @@ class BlockCandidateService:
                 elif not coordinator._reserve_block_fast_lane_slot(block_hash):
                     # Capacity is provisionally occupied by another unresolved
                     # node offer. Preserve strict max-block semantics until
-                    # that offer either accounts or terminates.
-                    coordinator._release_block_candidate_disposition(lease)
+                    # that offer either accounts or terminates. Retained
+                    # before the lease goes, as on the exception paths, so
+                    # the retry holder names the hash before the flight
+                    # stops doing so.
                     coordinator._retain_block_candidate_for_retry(candidate)
+                    coordinator._release_block_candidate_disposition(lease)
                     coordinator._wait_for_block_candidate_retry(
                         float(self.retry_initial_seconds)
                     )
@@ -4749,8 +4878,8 @@ class BlockCandidateService:
             if enqueued:
                 transferred = True
                 return BlockCandidateRunResult(True)
-            coordinator._release_block_candidate_disposition(lease)
             coordinator._retain_block_candidate_for_retry(candidate)
+            coordinator._release_block_candidate_disposition(lease)
             coordinator._wait_for_block_candidate_retry(
                 float(self.retry_initial_seconds)
             )
@@ -5808,6 +5937,7 @@ _STATE_FIELD_MAP = {
     "_block_candidate_terminal_outcomes": "_block_candidate_terminal_outcomes",
     "_block_fast_lane_reservations": "_block_fast_lane_reservations",
     "_block_disposition_waiting_retries": "_block_disposition_waiting_retries",
+    "_block_candidate_dequeued_hashes": "_block_candidate_dequeued_hashes",
     "_block_accounting_state_lock": "_block_accounting_state_lock",
     "_block_accounting_queue": "_block_accounting_queue",
     "_block_accounting_overflow_queue": "_block_accounting_overflow_queue",

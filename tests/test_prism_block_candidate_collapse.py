@@ -56,6 +56,7 @@ from lab.prism.block_candidates import (  # noqa: E402
     PRISM_BLOCK_CANDIDATE_COLLAPSE_REASON,
     PRISM_BLOCK_CANDIDATE_COLLAPSE_STALE_JOB_CLASS,
     PRISM_STALE_JOB_ABANDON_CLASSES,
+    _BlockCandidateAccountingTask,
     _BlockCandidateChainView,
     _BlockCandidateNodeSubmission,
     _collapse_scaled_difficulty,
@@ -2951,6 +2952,11 @@ class BlockCandidateTerminalOutcomeBoundTests(unittest.TestCase):
             )
             self.assertIsNotNone(lease)
 
+        def dequeued_pin(fixture: CollapseFixture, candidate: Any) -> None:
+            # The instant between leaving a lane and owning a flight.
+            with fixture.server.lock:
+                fixture.service._pin_dequeued_block_candidate_locked(candidate)
+
         lanes = {
             "_outstanding_block_candidate_hashes": outstanding,
             "_block_replay_inflight_hashes": replay_inflight,
@@ -2965,6 +2971,7 @@ class BlockCandidateTerminalOutcomeBoundTests(unittest.TestCase):
             "candidate_queue": live_queue,
             "_block_replay_candidate_queue": replay_queue,
             "_block_candidate_disposition_flights": disposition_flight,
+            "_block_candidate_dequeued_hashes": dequeued_pin,
         }
         for name, install in lanes.items():
             with self.subTest(lane=name):
@@ -3041,6 +3048,485 @@ class BlockCandidateTerminalOutcomeBoundTests(unittest.TestCase):
         ]
         self.assertEqual(offers, [])
         self.assertTrue(fixture.service.candidate_queue.empty())
+
+    # -- the dequeue-to-disposition pin ------------------------------------
+
+    WAIT_SECONDS = 10.0
+
+    def _park_claim(
+        self,
+        fixture: CollapseFixture,
+        target: str,
+    ) -> tuple[threading.Event, threading.Event]:
+        """Park the submitter inside the old dequeue-to-disposition gap.
+
+        Wraps the disposition claim so the pass that dequeued ``target`` is
+        held after it has left its lane and before any flight exists for
+        it -- exactly where ``submit_next``'s local variable used to be the
+        only thing holding the candidate.  The park is deterministic: only
+        the test releases it, after it has applied eviction pressure and
+        looked at the registry.
+        """
+        service = fixture.service
+        original = service._claim_block_candidate_disposition
+        in_gap = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def park_then_claim(block_hash: str, *, blocking: bool) -> Any:
+            if block_hash == target:
+                in_gap.set()
+                if not release.wait(self.WAIT_SECONDS):
+                    raise AssertionError("the parked claim was never released")
+            return original(block_hash, blocking=blocking)
+
+        service._claim_block_candidate_disposition = park_then_claim
+        return in_gap, release
+
+    @staticmethod
+    def _submit_in_background(
+        fixture: CollapseFixture,
+    ) -> tuple[threading.Thread, list[Any]]:
+        """Run one submitter pass on its own thread; collect its result."""
+        results: list[Any] = []
+
+        def run() -> None:
+            try:
+                results.append(
+                    fixture.server.submit_next_block_candidate(
+                        defer_accounting=True
+                    )
+                )
+            except BaseException as error:  # reported to the test, not raised here
+                results.append(error)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return thread, results
+
+    @staticmethod
+    def _dequeue_lanes_empty(fixture: CollapseFixture, target: str) -> bool:
+        """Whether no dequeue source still holds a copy of ``target``."""
+        service = fixture.service
+        with fixture.server.lock:
+            return (
+                service.retry_candidate is None
+                and service.candidate_queue.empty()
+                and service._block_replay_candidate_queue.empty()
+                and target not in service._block_disposition_waiting_retries
+            )
+
+    def test_a_dequeued_duplicate_keeps_its_fence_across_the_claim_gap(
+        self,
+    ) -> None:
+        """Eviction inside the dequeue-to-disposition gap finds the hash pinned.
+
+        Every lane pins its hash while a candidate sits in it, and the
+        disposition flight pins it from the claim onward.  Between the two
+        the candidate used to be held only by ``submit_next``'s local
+        variable: the retry holder cleared, the queue entry consumed, or
+        the waiting entry popped, and no flight installed yet.  An eviction
+        in that window dropped the oldest unpinned outcome -- this
+        duplicate's fence -- and the pass then found nothing and offered a
+        durably terminal block to the node.
+
+        The dequeue now moves the hash into the dequeued-hash pin under the
+        same lock hold that empties the lane, and hands it to the flight
+        (or back to the waiting registry) under the lock again, so there is
+        no instant at which nothing names it.  The barrier parks the pass
+        in the old gap, applies real eviction pressure from the other side,
+        and proves the fence survives -- for each of the four sources a
+        pass can dequeue from.
+        """
+        target = _hash(1)
+
+        def retry_holder(fixture: CollapseFixture, candidate: Any) -> None:
+            with fixture.server.lock:
+                fixture.service.retry_candidate = candidate
+
+        def live_queue(fixture: CollapseFixture, candidate: Any) -> None:
+            fixture.service.candidate_queue.put_nowait(candidate)
+
+        def replay_queue(fixture: CollapseFixture, candidate: Any) -> None:
+            fixture.service._block_replay_candidate_queue.put_nowait(candidate)
+
+        def waiting_retry(fixture: CollapseFixture, candidate: Any) -> None:
+            with fixture.server.lock:
+                fixture.service._block_disposition_waiting_retries[target] = (
+                    candidate
+                )
+
+        sources = {
+            "retry_candidate": retry_holder,
+            "candidate_queue": live_queue,
+            "_block_replay_candidate_queue": replay_queue,
+            "_block_disposition_waiting_retries": waiting_retry,
+        }
+        for name, install in sources.items():
+            with self.subTest(source=name):
+                fixture = CollapseFixture()
+                service = fixture.service
+                candidate = fixture.seed([target])[0]
+                # A working node offer, so an escape would land as a real
+                # submitblock rather than being lost in a transport error.
+                fixture.rpc.results["submitblock"] = None
+                fixture.server.block_submit_rpc_timeout_seconds = 0.5
+                # Recorded first, exactly as a terminal disposition does;
+                # the duplicate arrives in its lane afterwards.
+                fixture.server._record_block_candidate_terminal_outcome(
+                    target,
+                    accepted=False,
+                )
+                install(fixture, candidate)
+                # The duplicate's fence is now the oldest entry and the
+                # registry sits one over its bound: the next recorded
+                # outcome evicts exactly the oldest unpinned hash.
+                self._fill(fixture, self.CAP)
+                in_gap, release = self._park_claim(fixture, target)
+                with redirect_stdout(StringIO()):
+                    thread, results = self._submit_in_background(fixture)
+                    self.assertTrue(in_gap.wait(self.WAIT_SECONDS))
+                    # This is the old gap: the lane is empty, no flight
+                    # exists, and the candidate object is the submitter's
+                    # local variable.
+                    self.assertTrue(self._dequeue_lanes_empty(fixture, target))
+                    with service._block_candidate_disposition_registry_lock:
+                        self.assertNotIn(
+                            target,
+                            service._block_candidate_disposition_flights,
+                        )
+                    self._record(fixture, 64)
+                    # The fence survived the pressure; history did not.
+                    self.assertIs(
+                        fixture.server._block_candidate_terminal_outcome(target),
+                        False,
+                    )
+                    self.assertEqual(
+                        len(service._block_candidate_terminal_outcomes),
+                        self.CAP,
+                    )
+                    # ...because the dequeue itself is what names the hash.
+                    with fixture.server.lock:
+                        self.assertEqual(
+                            service._block_candidate_dequeued_hashes,
+                            {target: 1},
+                        )
+                    release.set()
+                    thread.join(self.WAIT_SECONDS)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(results, [True])
+                offers = [
+                    method
+                    for method, _ in fixture.rpc.calls
+                    if method == "submitblock"
+                ]
+                self.assertEqual(offers, [])
+                # The duplicate was dropped against its fence: nothing holds
+                # it, no pin outlived the pass, and the fence still stands.
+                self.assertTrue(self._dequeue_lanes_empty(fixture, target))
+                with fixture.server.lock:
+                    self.assertEqual(service._block_candidate_dequeued_hashes, {})
+                with service._block_candidate_disposition_registry_lock:
+                    self.assertEqual(service._block_candidate_disposition_flights, {})
+                self.assertIs(
+                    fixture.server._block_candidate_terminal_outcome(target),
+                    False,
+                )
+
+    def test_the_dequeued_pin_never_outlives_the_claim(self) -> None:
+        """Every way the claim comes back hands the hash on and unpins it.
+
+        A pin that leaked would be a hash the eviction could never reclaim
+        -- unbounded growth by another name -- and a pin dropped early is
+        the window the pin exists to close.  A lease hands the hash to the
+        installed flight (covered above); a miss parks the candidate in the
+        waiting registry in the same critical section; an exception leaves
+        nothing behind because the candidate object leaves with it; and a
+        parked retry that is not yet due is never dequeued, so it is never
+        pinned.
+        """
+        target = _hash(1)
+
+        with self.subTest(outcome="lease-miss"):
+            fixture = CollapseFixture()
+            service = fixture.service
+            candidate = fixture.seed([target])[0]
+            # Another same-hash pass spans the offer-to-finalize region.
+            lease = fixture.server._claim_block_candidate_disposition(
+                target,
+                blocking=False,
+            )
+            self.assertIsNotNone(lease)
+            self.addCleanup(
+                fixture.server._release_block_candidate_disposition,
+                lease,
+            )
+            service.candidate_queue.put_nowait(candidate)
+            with redirect_stdout(StringIO()):
+                self.assertTrue(
+                    fixture.server.submit_next_block_candidate(
+                        defer_accounting=True
+                    )
+                )
+            with fixture.server.lock:
+                self.assertIs(
+                    service._block_disposition_waiting_retries.get(target),
+                    candidate,
+                )
+                self.assertEqual(service._block_candidate_dequeued_hashes, {})
+            self.assertTrue(service.candidate_queue.empty())
+
+        with self.subTest(outcome="claim-raises"):
+            fixture = CollapseFixture()
+            service = fixture.service
+            candidate = fixture.seed([target])[0]
+
+            def explode(block_hash: str, *, blocking: bool) -> Any:
+                raise RuntimeError("claim exploded")
+
+            service._claim_block_candidate_disposition = explode
+            service.candidate_queue.put_nowait(candidate)
+            with redirect_stdout(StringIO()):
+                with self.assertRaises(RuntimeError):
+                    fixture.server.submit_next_block_candidate(
+                        defer_accounting=True
+                    )
+            with fixture.server.lock:
+                self.assertEqual(service._block_candidate_dequeued_hashes, {})
+            with service._block_candidate_disposition_registry_lock:
+                self.assertEqual(service._block_candidate_disposition_flights, {})
+            self.assertTrue(self._dequeue_lanes_empty(fixture, target))
+
+        with self.subTest(outcome="retry-not-due"):
+            fixture = CollapseFixture()
+            service = fixture.service
+            candidate = fixture.seed([target])[0]
+            with fixture.server.lock:
+                service.retry_candidate = candidate
+                service._block_candidate_retry_not_before = {
+                    target: time.monotonic() + 60.0
+                }
+            with redirect_stdout(StringIO()):
+                self.assertFalse(
+                    fixture.server.submit_next_block_candidate(
+                        defer_accounting=True
+                    )
+                )
+            with fixture.server.lock:
+                self.assertIs(service.retry_candidate, candidate)
+                self.assertEqual(service._block_candidate_dequeued_hashes, {})
+
+    # -- the accounting lane's exception handoff ---------------------------
+
+    @staticmethod
+    def _accounting_task(
+        fixture: CollapseFixture,
+        target: str,
+        candidate: Any,
+    ) -> Any:
+        """One queued accounting task owning ``target``'s disposition lease.
+
+        Built exactly as the submitter's deferred handoff leaves it: the
+        node offer is done and the lease travels with the task until the
+        accounting lane releases it.
+        """
+        server = fixture.server
+        lease = server._claim_block_candidate_disposition(target, blocking=False)
+        assert lease is not None
+        task = _BlockCandidateAccountingTask(
+            candidate=candidate,
+            node_submission=_BlockCandidateNodeSubmission(
+                attempted=True,
+                result=None,
+            ),
+            disposition_lease=lease,
+        )
+        assert server._enqueue_block_accounting_task(task)
+        return task
+
+    def _drain_accounting_lane(
+        self,
+        fixture: CollapseFixture,
+        *,
+        before_stop: Any = None,
+    ) -> None:
+        """Run the shipped accounting loop until its queue is drained.
+
+        Bounded: the lane either finishes the queued task quickly or the
+        deadline expires and the assertions that follow report it.
+        """
+        service = fixture.service
+        server = fixture.server
+        service._ensure_block_accounting_state()
+        thread = threading.Thread(target=service.block_accounting_loop, daemon=True)
+        with redirect_stdout(StringIO()):
+            thread.start()
+            try:
+                if before_stop is not None:
+                    before_stop()
+                deadline = time.monotonic() + self.WAIT_SECONDS
+                while (
+                    service._block_accounting_queue.unfinished_tasks
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+            finally:
+                server.stop_event.set()
+                thread.join(self.WAIT_SECONDS)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(service._block_accounting_queue.unfinished_tasks, 0)
+
+    def test_an_accounting_failure_hands_its_candidate_off_without_a_gap(
+        self,
+    ) -> None:
+        """The lane's unexpected-failure retry leaves no unnamed instant.
+
+        ``_run_block_accounting_task`` owns the task's disposition lease and
+        releases it in its ``finally``; ``block_accounting_loop`` used to
+        retain the candidate only afterwards, in its own catch.  Between
+        the release and that retain the candidate was the loop's local
+        variable and nothing named its hash -- the dequeue gap above in its
+        accounting-lane form.  The lane now retains while it still holds
+        the disposition, which routes the candidate into the accounting
+        owner's deferred holder; the ``finally`` then releases the lease
+        and merges that holder into the retry slot under
+        ``coordinator.lock``, exactly as it always did for a writer-side
+        retain.  The loop's catch sees the task already retained and does
+        not retain it again.
+
+        The barrier parks the lane the instant its lease release returns,
+        applies eviction pressure, and proves the fence survives; afterwards
+        the candidate sits in the retry slot exactly once, with one retry
+        counted and its floor holder intact.
+        """
+        target = _hash(1)
+        fixture = CollapseFixture()
+        service, server = fixture.service, fixture.server
+        candidate = fixture.seed([target], credit_share_on_accept=True)[0]
+        server._ensure_share_writer_service().adopt_pending_share(
+            candidate.pending_share
+        )
+        self.assertEqual(len(fixture.floor()), 1)
+        # The fence is the oldest entry and the registry sits one over its
+        # bound: the next recorded outcome evicts the oldest unpinned hash.
+        server._record_block_candidate_terminal_outcome(target, accepted=False)
+        self._fill(fixture, self.CAP)
+        writer_calls = [0]
+
+        def exploding_writer(
+            candidate_arg: Any,
+            *,
+            node_submission: Any,
+            disposition_held: bool,
+        ) -> bool:
+            writer_calls[0] += 1
+            raise RuntimeError("accounting writer exploded")
+
+        server._call_block_candidate_writer = exploding_writer
+        task = self._accounting_task(fixture, target, candidate)
+        # Park the lane the instant its lease release returns.
+        in_gap = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        original_release = service._release_block_candidate_disposition
+
+        def release_then_park(lease: Any) -> None:
+            original_release(lease)
+            if lease.block_hash == target:
+                in_gap.set()
+                if not release.wait(self.WAIT_SECONDS):
+                    raise AssertionError("the parked accounting lane was never released")
+
+        service._release_block_candidate_disposition = release_then_park
+
+        def in_the_gap() -> None:
+            try:
+                self.assertTrue(in_gap.wait(self.WAIT_SECONDS))
+                # The old gap: the lease is gone and the loop's catch has
+                # not run; the candidate is a local variable of the lane.
+                with service._block_candidate_disposition_registry_lock:
+                    self.assertNotIn(
+                        target,
+                        service._block_candidate_disposition_flights,
+                    )
+                self._record(fixture, 64)
+                # The fence survived the pressure; history did not.
+                self.assertIs(
+                    server._block_candidate_terminal_outcome(target),
+                    False,
+                )
+                self.assertEqual(
+                    len(service._block_candidate_terminal_outcomes),
+                    self.CAP,
+                )
+                # ...because the lane retained into the deferred holder
+                # before it let go of the lease.
+                with server.lock:
+                    self.assertIs(
+                        service._block_accounting_deferred_retry_candidate,
+                        candidate,
+                    )
+            finally:
+                # A failed assertion must not leave the lane parked for the
+                # whole ceiling before the test can report it.
+                release.set()
+
+        self._drain_accounting_lane(fixture, before_stop=in_the_gap)
+        self.assertEqual(writer_calls[0], 1)
+        self.assertTrue(task.retained_for_retry.is_set())
+        # Handed off exactly once: in the retry slot, the deferred holder
+        # cleared, one retry counted, one floor holder, nothing offered.
+        with server.lock:
+            self.assertIs(service.retry_candidate, candidate)
+            self.assertIsNone(service._block_accounting_deferred_retry_candidate)
+            self.assertFalse(
+                getattr(service, "_block_accounting_holds_disposition", False)
+            )
+            self.assertEqual(service.retries, 1)
+            self.assertIn(target, service._outstanding_block_candidate_hashes)
+        self.assertEqual(len(fixture.floor()), 1)
+        with service._block_candidate_disposition_registry_lock:
+            self.assertEqual(service._block_candidate_disposition_flights, {})
+        self.assertIs(server._block_candidate_terminal_outcome(target), False)
+        offers = [
+            method for method, _ in fixture.rpc.calls if method == "submitblock"
+        ]
+        self.assertEqual(offers, [])
+
+    def test_a_failure_ahead_of_the_accounting_lane_is_still_retained_once(
+        self,
+    ) -> None:
+        """The loop's catch still retains when the lane itself never ran.
+
+        The lane's own exception path marks the task once it has retained.
+        A failure that fires before the lane can -- here the coordinator
+        delegate raising ahead of it -- leaves the mark unset, and the loop
+        retains the candidate exactly as it always did: once.
+        """
+        target = _hash(1)
+        fixture = CollapseFixture()
+        service, server = fixture.service, fixture.server
+        candidate = fixture.seed([target])[0]
+        task = self._accounting_task(fixture, target, candidate)
+        # The lane never runs, so nothing releases the task's lease; the
+        # test owns it from here.
+        self.addCleanup(
+            server._release_block_candidate_disposition,
+            task.disposition_lease,
+        )
+
+        def delegate_explodes(task_arg: Any) -> None:
+            raise RuntimeError("delegate exploded")
+
+        server._run_block_accounting_task = delegate_explodes
+        self._drain_accounting_lane(fixture)
+        self.assertFalse(task.retained_for_retry.is_set())
+        with server.lock:
+            self.assertIs(service.retry_candidate, candidate)
+            self.assertIsNone(
+                getattr(service, "_block_accounting_deferred_retry_candidate", None)
+            )
+            self.assertEqual(service.retries, 1)
 
 
 class BlockCandidateCollapseEnumerationTests(unittest.TestCase):

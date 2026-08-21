@@ -1868,6 +1868,9 @@ class PrismCoordinator:
     _block_disposition_waiting_retries = BlockCandidateStateField(
         "_block_disposition_waiting_retries"
     )
+    _block_candidate_dequeued_hashes = BlockCandidateStateField(
+        "_block_candidate_dequeued_hashes"
+    )
     _block_accounting_state_lock = BlockCandidateStateField(
         "_block_accounting_state_lock"
     )
