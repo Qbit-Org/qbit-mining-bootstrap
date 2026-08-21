@@ -959,9 +959,12 @@ class CandidateStormRig:
     def _run_block_accounting_tasks(self, server: Any) -> int:
         """Run the shipped accounting lane to quiescence, on this thread.
 
-        Mirrors ``BlockCandidateService.block_accounting_loop``: primary
-        queue first, then the unbounded spillover, then the invalid-intent
-        quarantine, with the loop's own retain-on-failure behaviour.
+        Mirrors ``BlockCandidateService.block_accounting_loop``: the
+        definitive-acceptance lane first while its dispatch quota lasts, then
+        the primary queue, then the unbounded spillover, then the
+        invalid-intent quarantine, with the loop's own retain-on-failure
+        behaviour.  The quota is read from the service rather than assumed so
+        a scenario that pins it also pins what this drain does.
         """
         service = server._ensure_block_candidate_service()
         service._ensure_block_accounting_state()
@@ -970,18 +973,41 @@ class CandidateStormRig:
         # instead of sleeping while the lease and writer admission are held.
         service._block_accounting_thread_ident = threading.get_ident()
         ran = 0
+        accepted_run = 0
         while True:
-            try:
-                _priority, _sequence, task = (
-                    service._block_accounting_queue.get_nowait()
-                )
-                source_queue = service._block_accounting_queue
-            except queue.Empty:
+            source_queue = None
+            if accepted_run < service._block_accounting_accepted_dispatch_quota():
                 try:
                     _priority, _sequence, task = (
-                        service._block_accounting_overflow_queue.get_nowait()
+                        service._block_accounting_accepted_queue.get_nowait()
                     )
-                    source_queue = service._block_accounting_overflow_queue
+                    source_queue = service._block_accounting_accepted_queue
+                    accepted_run += 1
+                except queue.Empty:
+                    pass
+            if source_queue is None:
+                try:
+                    _priority, _sequence, task = (
+                        service._block_accounting_queue.get_nowait()
+                    )
+                    source_queue = service._block_accounting_queue
+                except queue.Empty:
+                    try:
+                        _priority, _sequence, task = (
+                            service._block_accounting_overflow_queue.get_nowait()
+                        )
+                        source_queue = service._block_accounting_overflow_queue
+                    except queue.Empty:
+                        pass
+                if source_queue is not None:
+                    accepted_run = 0
+            if source_queue is None:
+                try:
+                    _priority, _sequence, task = (
+                        service._block_accounting_accepted_queue.get_nowait()
+                    )
+                    source_queue = service._block_accounting_accepted_queue
+                    accepted_run = 0
                 except queue.Empty:
                     while server._run_one_invalid_block_candidate_quarantine():
                         pass
