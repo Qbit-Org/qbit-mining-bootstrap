@@ -143,6 +143,9 @@ _STATE_BACKFILL_LOCK = threading.Lock()
 PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES = (
     # Durable pending rows the selector examined.
     "considered",
+    # Rows preserved because their height was never probed: the walk had
+    # spent MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES distinct heights.
+    "height_deferred",
     # Rows that satisfied every predicate clause.
     "selected",
     # Selected rows whose disposition lease was held elsewhere.
@@ -197,6 +200,28 @@ BLOCK_CANDIDATE_COLLAPSE_LOG_FAILURES = 3
 # every poll. The counter still moves per row; the log line is rate limited
 # so a persistently degraded read cannot flood the journal.
 BLOCK_CANDIDATE_COLLAPSE_FAIL_CLOSED_LOG_SECONDS = 60.0
+# Chain-height probes one replay walk may spend on collapse, counted in
+# *distinct heights* rather than rows.
+#
+# The storm this path exists for is one decided height behind thousands of
+# rows, and it costs a single probe no matter how wide the page is. A page
+# whose rows span many heights is the opposite shape: selection would read
+# ``getblockhash`` (and then the occupant's ``getblockheader``) once per
+# distinct height, sequentially, on the sole block-submitter thread. A page
+# holds up to MAX_BLOCK_REPLAY_ENUMERATION_ROWS rows, so that is up to 1,024
+# heights and ~2,048 round trips; at a production RPC deadline the thread
+# would sit in collapse for hours while a live solve waited behind it for
+# submitblock. The bound makes the chain cost of a walk a constant --
+# at most this many ``getblockhash`` reads and at most one occupant header
+# each -- independent of how many rows or heights the backlog carries.
+#
+# Rows at a height the walk did not probe are simply never selected. They
+# stay durable, keep every piece of evidence they had, and are adopted by
+# the ordinary per-row disposition path, which disposed of them exactly this
+# way before collapse existed; a later walk starts with a fresh budget and
+# may probe their heights. Collapse is an optimisation over that path, so
+# spending less of it is always safe and never terminalizes anything.
+MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES = 8
 # PRISM records every network difficulty in scaled integer units: the
 # coordinator stamps a candidate's ``found_block.network_difficulty`` with
 # ``template_artifacts.scaled_network_difficulty(template["bits"])``, which is
@@ -431,6 +456,36 @@ class _SupersededCandidateRow:
     job_id: str
 
 
+@dataclass
+class _CollapseHeightProbeBudget:
+    """Distinct chain heights a collapse walk may still read.
+
+    One budget is created per replay walk and shared by that walk's pages,
+    so the walk's chain cost is the bound whether the backlog arrives as one
+    page or fifty. A pass handed no budget (a direct call, or the legacy
+    single-page shape) gets a fresh full one, which is the same ceiling
+    applied to a walk of one.
+
+    Only heights are charged. The occupant header a probed height leads to is
+    read at most once per probed height, so charging the height bounds both
+    round trips at once and keeps the accounting to the single number the
+    comment on MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES explains.
+    """
+
+    remaining: int = MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES
+
+    @property
+    def exhausted(self) -> bool:
+        return self.remaining <= 0
+
+    def spend(self) -> bool:
+        """Claim one height probe; False when the walk has none left."""
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
+
+
 class _BlockCandidateChainView:
     """Bounded chain reads for one collapse pass.
 
@@ -438,12 +493,27 @@ class _BlockCandidateChainView:
     height once per distinct candidate height, so a 3,120-row storm at one
     decided height costs a fixed handful of RPCs instead of one round trip
     per row. Every miss or failure is a fail-closed page, never a guess.
+
+    A height-diverse page cannot turn "once per distinct height" into a walk
+    of the node as long as the page: ``probe_budget`` caps the distinct
+    heights this view will ever read, and a height past the cap is reported
+    as unprobed rather than guessed at.
     """
 
-    def __init__(self, service: "BlockCandidateService") -> None:
+    def __init__(
+        self,
+        service: "BlockCandidateService",
+        *,
+        probe_budget: _CollapseHeightProbeBudget | None = None,
+    ) -> None:
         self._service = service
         self._active: dict[int, str] = {}
         self._difficulty: dict[str, int] = {}
+        self._probe_budget = (
+            probe_budget
+            if probe_budget is not None
+            else _CollapseHeightProbeBudget()
+        )
 
     def _call(self, method: str, params: list[object] | None = None) -> object:
         coordinator = self._service._coordinator
@@ -477,11 +547,21 @@ class _BlockCandidateChainView:
             )
         return height
 
-    def active_at(self, height: int) -> str:
-        """The active-chain block occupying ``height``, read once per height."""
+    def active_at(self, height: int) -> str | None:
+        """The active-chain block occupying ``height``, read once per height.
+
+        ``None`` means this walk has spent its height-probe budget and the
+        height was never read. It is not "no occupant" and it is not a
+        fail-closed read: it says only that the chain was never asked, so
+        every caller must preserve the row rather than decide anything about
+        it. A height already in this view's cache is free and stays
+        answerable after the budget is gone.
+        """
         cached = self._active.get(height)
         if cached is not None:
             return cached
+        if not self._probe_budget.spend():
+            return None
         active = _collapse_block_hash(self._call("getblockhash", [int(height)]))
         if active is None:
             raise _BlockCandidateCollapseFailedClosed(
@@ -1424,7 +1504,11 @@ class BlockCandidateService:
         Every clause is conjunctive and every unknown is a rejection. The
         chain view bounds the cost: one best-tip and one tip-height read for
         the page, one active-block and one header read per distinct
-        candidate height.
+        candidate height, and at most
+        MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES distinct heights for the
+        whole walk. A row whose height the walk cannot afford to probe is
+        counted and skipped, which preserves it for the per-row path exactly
+        as any other rejected clause does.
         """
         # Clause 2 is read first, for the whole page, before a single chain
         # round trip: a page that cannot answer it selects nothing at all,
@@ -1449,6 +1533,7 @@ class BlockCandidateService:
         tip_height = chain.tip_height()
         selected: list[_SupersededCandidateRow] = []
         seen: set[str] = set()
+        height_deferred = 0
         for pool_block_exists, durable_row in zip(pool_block_facts, durable_rows):
             row = self._superseded_candidate_row(durable_row)
             if row.block_hash in seen:
@@ -1467,6 +1552,14 @@ class BlockCandidateService:
             if row.height > tip_height:
                 continue
             active = chain.active_at(row.height)
+            if active is None:
+                # The walk has spent its bounded height probes. Nothing is
+                # known about this height, so nothing may be concluded about
+                # this row: it stays durable, keeps its evidence, and reaches
+                # the per-row path this pass and the next walk's collapse
+                # after that.
+                height_deferred += 1
+                continue
             if active == row.block_hash:
                 continue
             # Clause 4b/5: a lower-work occupant is not a decision. The
@@ -1477,6 +1570,7 @@ class BlockCandidateService:
             if chain.difficulty_of(active) < row.network_difficulty:
                 continue
             selected.append(row)
+        self._record_block_candidate_collapse("height_deferred", height_deferred)
         return selected
 
     def _revalidate_superseded_block_candidates(
@@ -1497,7 +1591,17 @@ class BlockCandidateService:
         changed; an unchanged occupant keeps the work value the selection
         pass already read, so the steady case adds no header round trip.
         """
-        fresh = _BlockCandidateChainView(self)
+        # Budgeted for exactly the heights selection already probed and no
+        # more. The leased set is a subset of one bounded selection, so this
+        # can never refuse a re-read the write depends on, and it cannot draw
+        # on the walk's budget either -- the walk's remaining probes are for
+        # pages this apply has not seen.
+        fresh = _BlockCandidateChainView(
+            self,
+            probe_budget=_CollapseHeightProbeBudget(
+                remaining=len({row.height for row in leased}),
+            ),
+        )
         tip = fresh.best_tip()
         leased_hashes = frozenset(row.block_hash for row in leased)
         evidence = self._block_candidate_collapse_evidence(
@@ -1513,7 +1617,10 @@ class BlockCandidateService:
             # An occupied height is by construction at or below the tip, so
             # this read subsumes the height bound as well as clause 4b.
             active = fresh.active_at(row.height)
-            if active == row.block_hash:
+            if active is None or active == row.block_hash:
+                # Unreachable while the budget above matches the leased
+                # heights, and a drop either way: an unprobed height is a row
+                # this write must not carry.
                 continue
             # Same clause, same units as selection: a cache hit reuses the
             # scaled integer that pass derived, and a changed occupant is
@@ -2301,6 +2408,7 @@ class BlockCandidateService:
         *,
         timeout_seconds: float | None,
         call_class: str,
+        probe_budget: _CollapseHeightProbeBudget | None = None,
     ) -> list[Any]:
         """Terminalize this page's decided-height siblings before adoption.
 
@@ -2309,8 +2417,12 @@ class BlockCandidateService:
         fetched payload is a stale copy of an intent whose durable row is
         now terminal, so it must never be replay-adopted or re-arm a payout
         barrier. Anything short of a won row -- a fail-closed read, an
-        unclaimable lease, a revalidation drop, a partial return, a failed
-        write -- preserves the row and leaves it to the per-row path.
+        unclaimable lease, a revalidation drop, an unprobed height, a partial
+        return, a failed write -- preserves the row and leaves it to the
+        per-row path.
+
+        ``probe_budget`` is the enumeration walk's shared chain-height
+        budget; passes given none get a fresh one of their own.
         """
         if not durable_rows:
             return durable_rows
@@ -2326,9 +2438,19 @@ class BlockCandidateService:
             # read, so it neither counts nor spends a chain round trip: the
             # per-row path disposes of every row exactly as before.
             return durable_rows
+        if probe_budget is not None and probe_budget.exhausted:
+            # This walk has spent its chain-height budget on earlier pages.
+            # Selection could not qualify a single row, so the two page-scope
+            # tip reads it opens with would be two more round trips per page
+            # for a pass that is already decided. Every row is preserved.
+            self._record_block_candidate_collapse(
+                "height_deferred",
+                len(durable_rows),
+            )
+            return durable_rows
         self._coordinator._record_block_submitter_phase("replay-collapse-select")
         self._record_block_candidate_collapse("considered", len(durable_rows))
-        chain = _BlockCandidateChainView(self)
+        chain = _BlockCandidateChainView(self, probe_budget=probe_budget)
         try:
             selected = self._select_superseded_block_candidates(
                 durable_rows,
@@ -2372,6 +2494,40 @@ class BlockCandidateService:
             )
             not in abandoned
         ]
+
+    def _block_replay_should_yield_to_live_candidates(
+        self,
+        probe_budget: _CollapseHeightProbeBudget,
+    ) -> bool:
+        """Whether this walk should hand the submitter back before another page.
+
+        The block-submitter thread that walks these pages is the only thread
+        that reaches ``submitblock``, so a backlog it keeps walking is a
+        backlog that delays a live solve. Between pages -- never inside one
+        page's fenced collapse, its write, or its adoption -- the walk gives
+        that thread back as soon as two things hold at once:
+
+        * a live candidate or a retry is waiting, so there is something
+          strictly more valuable than finishing the enumeration; and
+        * the walk has already spent its chain-height probes, so the pages it
+          would go on to fetch can no longer collapse anything anyway and the
+          yield costs no collapse efficacy at all.
+
+        Both halves matter. Yielding on a waiting candidate alone would cut
+        short the same-height storm this path exists for, which walks several
+        pages on a single probe. Yielding on a spent budget alone would leave
+        the enumeration owed -- and job builds blocked -- for a walk that had
+        nothing better to do than finish. The caller re-enumerates from the
+        outbox on its next pass with a fresh budget, and every row this walk
+        fetched was adopted before the yield, so the backlog still shrinks.
+        """
+        if not probe_budget.exhausted:
+            return False
+        with self._coordinator.lock:
+            if self.retry_candidate is not None:
+                return True
+        queue_obj = self.candidate_queue
+        return queue_obj is not None and not queue_obj.empty()
 
     def replay_pending(self) -> int:
         """Queue durable candidate intents not completed by an earlier process."""
@@ -2487,6 +2643,9 @@ class BlockCandidateService:
         queued = 0
         enumeration_truncated = False
         enumeration_paginated = False
+        # One chain-height budget for the whole walk, so a backlog split
+        # across fifty pages costs the node what a single page does.
+        collapse_probe_budget = _CollapseHeightProbeBudget()
         if enumeration_owed and fetch_durable_page is not None:
             # Pagination, not a widening window: the doubling loop below
             # fails closed once one page would have to hold the entire
@@ -2527,6 +2686,7 @@ class BlockCandidateService:
                         durable_rows,
                         timeout_seconds=replay_query_timeout,
                         call_class=replay_query_call_class,
+                        probe_budget=collapse_probe_budget,
                     )
                 )
                 print(
@@ -2538,6 +2698,18 @@ class BlockCandidateService:
                     # A short page proves no pending row followed it at query
                     # time, which is the completeness the job-build gate waits
                     # on.
+                    break
+                if self._block_replay_should_yield_to_live_candidates(
+                    collapse_probe_budget
+                ):
+                    enumeration_truncated = True
+                    print(
+                        "prism coordinator: pending block candidate "
+                        f"enumeration page={page} yielded to a waiting live "
+                        "candidate; job builds stay blocked until a complete "
+                        "enumeration succeeds",
+                        flush=True,
+                    )
                     break
                 next_cursor = (
                     durable_rows[-1].get("cursor")
@@ -2573,9 +2745,22 @@ class BlockCandidateService:
                         durable_rows,
                         timeout_seconds=replay_query_timeout,
                         call_class=replay_query_call_class,
+                        probe_budget=collapse_probe_budget,
                     )
                 )
                 if len(durable_rows) < enumeration_limit or not enumeration_owed:
+                    break
+                if self._block_replay_should_yield_to_live_candidates(
+                    collapse_probe_budget
+                ):
+                    enumeration_truncated = True
+                    print(
+                        "prism coordinator: pending block candidate "
+                        f"enumeration at {enumeration_limit} rows yielded to "
+                        "a waiting live candidate; job builds stay blocked "
+                        "until a complete enumeration succeeds",
+                        flush=True,
+                    )
                     break
                 # A full batch may hide more pending rows, and a hidden row could
                 # be the active parent whose carry a child job must not omit.

@@ -49,6 +49,7 @@ from lab.prism.block_candidates import (  # noqa: E402
     COLLAPSE_DIFFICULTY_SCALE,
     COLLAPSE_POW_LIMIT_BITS,
     DEFAULT_BLOCK_ACCOUNTING_CLEANUP_RETRY_WORK_ITEMS,
+    MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES,
     MAX_BLOCK_CANDIDATE_TERMINAL_OUTCOMES,
     MAX_BLOCK_REPLAY_ENUMERATION_ROWS,
     MAX_PENDING_BLOCK_CANDIDATES,
@@ -84,6 +85,10 @@ STORM_PARENT = STORM_PARENT_HASH
 OTHER_PARENT = "22" * 32
 DECIDED_HEIGHT = 10
 DECIDED_WINNER = "dd" * 32
+# A candidate building on the current best tip: the block waiting to be
+# offered, which predicate S must never select and whose submission must not
+# sit behind a long enumeration walk.
+LIVE_SOLVE_HASH = f"{0xFEED0001:064x}"
 # Compact header bits, the only work fact these tests state. A candidate's
 # durable ``found_block.network_difficulty`` is
 # ``scaled_network_difficulty(template["bits"])`` -- the raw difficulty times
@@ -4184,6 +4189,228 @@ class BlockCandidateCollapseEnumerationTests(unittest.TestCase):
         self.assertIn("enumeration page=2", log)
         self.assertFalse(fixture.server._block_replay_enumeration_owed())
         self.assertEqual(len(fixture.ledger.abandon_calls), 2)
+        self.assertEqual(
+            [len(call[0]) for call in fixture.ledger.abandon_calls],
+            [MAX_BLOCK_REPLAY_ENUMERATION_ROWS, 7],
+        )
+
+
+class BlockCandidateCollapseHeightProbeBoundTests(unittest.TestCase):
+    """A height-diverse backlog must not turn collapse into a page-sized walk.
+
+    Collapse reads the chain once per *distinct candidate height*.  For the
+    same-height storm this path exists for that is a handful of round trips
+    however wide the page is.  For a page whose rows sit at many different
+    heights it was one ``getblockhash`` plus one ``getblockheader`` per
+    height, sequentially, on the sole block-submitter thread: a full
+    1,024-row page of distinct heights is ~2,048 node calls, and at a
+    production RPC deadline that is minutes to hours in which no live solve
+    reaches ``submitblock``.
+
+    MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES caps the distinct heights one
+    enumeration walk reads.  These tests own the three properties that makes
+    it safe: the cap actually binds, an unprobed row is preserved rather than
+    terminalized and collapses on a later walk, and the walk hands the
+    submitter back to a waiting live solve once its budget is gone -- without
+    disturbing the storm, which never spends the budget at all.
+    """
+
+    # -- harness -----------------------------------------------------------
+
+    @staticmethod
+    def _diverse(heights: int) -> tuple[CollapseFixture, list[str]]:
+        """A backlog of one row at each of ``heights`` distinct decided heights.
+
+        Every candidate height is occupied by a different heavier block and
+        the tip sits one height above the highest of them, so predicate S
+        would select every seeded row if the walk could afford to probe every
+        height.  What the walk actually collapses is therefore exactly what
+        the probe budget bought.
+        """
+        top = heights + 1
+        occupied = {
+            height: f"{0xC0DE0000 + height:064x}"
+            for height in range(1, top)
+        }
+        occupied[top] = DECIDED_WINNER
+        fixture = CollapseFixture(
+            rpc=CollapseChainRpc(
+                tip=DECIDED_WINNER,
+                tip_height=top,
+                active=occupied,
+            )
+        )
+        seeded = []
+        for height in range(1, top):
+            block_hash = _hash(height)
+            seeded.append(block_hash)
+            fixture.seed([block_hash], height=height)
+        return fixture, seeded
+
+    @staticmethod
+    def _live_solve(fixture: CollapseFixture, *, height: int) -> Any:
+        """One durable candidate on the best tip, admitted to the live lane.
+
+        Its parent is the tip, so clause 3 rejects it before any height is
+        read: it costs the walk no probe and is never a collapse candidate.
+        It is queued through the shipped admission path so the submitter sees
+        exactly what a fresh solve leaves behind.
+        """
+        candidate = fixture.seed(
+            [LIVE_SOLVE_HASH],
+            parent=DECIDED_WINNER,
+            height=height,
+        )[0]
+        fixture.server.enqueue_block_candidate(candidate)
+        fixture.rpc.results["submitblock"] = None
+        fixture.server.block_submit_rpc_timeout_seconds = 0.5
+        return candidate
+
+    @staticmethod
+    def _offers(fixture: CollapseFixture) -> int:
+        return sum(1 for method, _ in fixture.rpc.calls if method == "submitblock")
+
+    # -- the bound binds ---------------------------------------------------
+
+    def test_a_height_diverse_page_stops_at_the_probe_bound(self) -> None:
+        """The P1: 1,024 rows at 1,024 heights, still a fixed handful of reads."""
+        rows = MAX_BLOCK_REPLAY_ENUMERATION_ROWS
+        bound = MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES
+        fixture, _seeded = self._diverse(rows)
+        page = fixture.page(limit=rows)
+        self.assertEqual(len(page), rows)
+        retained, _log = fixture.collapse(page)
+        probed = {
+            params[0]
+            for method, params in fixture.rpc.calls
+            if method == "getblockhash"
+        }
+        self.assertEqual(len(probed), bound)
+        counts = fixture.rpc.counts()
+        # Selection probes the bound; the pre-write revalidation re-reads
+        # exactly the heights it selected and reuses their cached work, so
+        # the whole pass is a constant regardless of the page's row count.
+        self.assertEqual(counts["getblockhash"], 2 * bound)
+        self.assertEqual(counts["getblockheader"], bound)
+        self.assertEqual(counts["getbestblockhash"], 2)
+        self.assertEqual(counts["getblockcount"], 1)
+        self.assertEqual(fixture.counts()["abandoned"], bound)
+        self.assertEqual(fixture.counts()["height_deferred"], rows - bound)
+        # Every unprobed row is handed back, and handed back durable.
+        self.assertEqual(len(retained), rows - bound)
+        self.assertEqual(
+            {str(row["block_hash"]).lower() for row in retained},
+            fixture.pending(),
+        )
+
+    def test_unprobed_rows_are_retained_and_later_passes_converge(self) -> None:
+        """Deferral is not loss: each pass buys the bound, and they add up."""
+        bound = MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES
+        heights = 3 * bound
+        fixture, seeded = self._diverse(heights)
+        outstanding = set(seeded)
+        self.assertEqual(fixture.pending(), outstanding)
+        collapsed: set[str] = set()
+        passes = 0
+        # Bounded rather than a while-loop: a pass that stopped making
+        # progress must fail this test, not spin in it.
+        for _attempt in range(heights + 1):
+            if not fixture.pending():
+                break
+            before = fixture.pending()
+            retained, _log = fixture.collapse(fixture.page(limit=heights))
+            after = fixture.pending()
+            passes += 1
+            won = before - after
+            self.assertEqual(len(won), bound)
+            self.assertEqual(won & collapsed, set())
+            self.assertEqual(
+                {str(row["block_hash"]).lower() for row in retained},
+                after,
+                "a preserved row must still be the durable row it came from",
+            )
+            collapsed |= won
+        self.assertEqual(collapsed, outstanding)
+        self.assertEqual(fixture.pending(), set())
+        self.assertEqual(passes, heights // bound)
+
+    # -- the walk hands the submitter back --------------------------------
+
+    def test_the_walk_yields_to_a_waiting_live_solve_between_pages(self) -> None:
+        """A diverse backlog cannot hold the only thread that reaches qbitd."""
+        bound = MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES
+        page_rows = MAX_BLOCK_REPLAY_ENUMERATION_ROWS
+        fixture, _seeded = self._diverse(page_rows + 7)
+        # Seeded last, so its durable row sits on the page the walk yields
+        # before ever fetching.
+        self._live_solve(fixture, height=page_rows + 9)
+        queued, log = fixture.replay(enumeration_owed=True)
+        self.assertIn("enumeration page=1", log)
+        self.assertNotIn("enumeration page=2", log)
+        self.assertIn("yielded to a waiting live candidate", log)
+        counts = fixture.rpc.counts()
+        self.assertEqual(counts["getblockhash"], 2 * bound)
+        self.assertEqual(counts["getblockheader"], bound)
+        # An unproven enumeration stays owed: yielding must not be mistaken
+        # for the completeness proof that unblocks job builds.
+        self.assertTrue(fixture.server._block_replay_enumeration_owed())
+        # Nothing was skipped -- the page it did fetch was adopted in full.
+        self.assertEqual(queued, page_rows - bound)
+        service = fixture.service
+        self.assertEqual(service.candidate_queue.qsize(), 1)
+        self.assertEqual(
+            service._block_replay_candidate_queue.qsize(),
+            page_rows - bound,
+        )
+        # The scheduling contract itself: the very next turn of the submitter
+        # loop lands the live solve, ahead of the whole adopted backlog.
+        with redirect_stdout(StringIO()):
+            self.assertTrue(
+                fixture.server.submit_next_block_candidate(defer_accounting=True)
+            )
+        self.assertEqual(self._offers(fixture), 1)
+        self.assertTrue(service.candidate_queue.empty())
+        self.assertEqual(
+            service._block_replay_candidate_queue.qsize(),
+            page_rows - bound,
+        )
+
+    def test_a_walk_with_nothing_waiting_finishes_its_pages(self) -> None:
+        """The yield is conditional; without a live solve the walk completes."""
+        bound = MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES
+        rows = MAX_BLOCK_REPLAY_ENUMERATION_ROWS + 7
+        fixture, _seeded = self._diverse(rows)
+        queued, log = fixture.replay(enumeration_owed=True)
+        self.assertIn("enumeration page=2", log)
+        self.assertNotIn("yielded", log)
+        self.assertFalse(fixture.server._block_replay_enumeration_owed())
+        self.assertEqual(queued, rows - bound)
+        # Page two spends no chain read at all: with the walk's budget gone
+        # it could not qualify a row, so even the two page-scope tip reads
+        # would have been round trips for a decided answer.
+        counts = fixture.rpc.counts()
+        self.assertEqual(counts["getbestblockhash"], 2)
+        self.assertEqual(counts["getblockcount"], 1)
+        self.assertEqual(counts["getblockhash"], 2 * bound)
+        self.assertEqual(fixture.counts()["height_deferred"], rows - bound)
+
+    def test_a_same_height_storm_walk_is_unchanged(self) -> None:
+        """The shape collapse exists for pays one probe per page and never yields."""
+        fixture = CollapseFixture()
+        storm = MAX_BLOCK_REPLAY_ENUMERATION_ROWS + 7
+        fixture.seed([_hash(index) for index in range(1, storm + 1)])
+        self._live_solve(fixture, height=DECIDED_HEIGHT + 1)
+        queued, log = fixture.replay(enumeration_owed=True)
+        # A live solve waits for the whole walk, but one decided height costs
+        # one probe per page, so the budget is never spent and the storm
+        # still collapses inside a single, complete enumeration.
+        self.assertNotIn("yielded", log)
+        self.assertIn("enumeration page=2", log)
+        self.assertFalse(fixture.server._block_replay_enumeration_owed())
+        self.assertEqual(fixture.counts()["abandoned"], storm)
+        self.assertEqual(fixture.counts()["height_deferred"], 0)
+        self.assertEqual(fixture.pending(), {LIVE_SOLVE_HASH})
+        self.assertEqual(queued, 1)
         self.assertEqual(
             [len(call[0]) for call in fixture.ledger.abandon_calls],
             [MAX_BLOCK_REPLAY_ENUMERATION_ROWS, 7],
