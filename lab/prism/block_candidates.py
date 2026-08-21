@@ -67,6 +67,24 @@ DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS = 30.0
 # stays unbounded by design so an already-offered block is never converted
 # back into a raw-submit retry.
 DEFAULT_BLOCK_ACCOUNTING_QUEUE_DEPTH = 8
+# How many definitive-acceptance accounting tasks the lane may dispatch back
+# to back while non-accepted work is waiting. The accepted lane exists so a
+# decided block's accounting never queues behind stale replay (see
+# _enqueue_block_accounting_task), but "never behind" must not become "stale
+# replay never runs": a stale accounting task that is starved leaves its
+# durable outbox row pending, its offer-time accepted-block payout-preview
+# barrier armed, and its disposition lease held, which is a different bug
+# rather than a fixed one. The quota therefore states the fairness bound
+# outright -- a non-accepted task at the head of its lane waits behind at
+# most this many accepted services, whatever the accepted arrival rate.
+#
+# Four, not one: one accepted tip can produce more than one accepted-evidence
+# task (the winner, plus a same-height idempotent replay of it), and a quota
+# of one would interleave a stale task's ~6 RPCs, two ledger writes and a
+# payout-balance mutation into the middle of that acceptance tail -- the very
+# interleaving the lane was added to remove. Four covers a normal tip's tail
+# while still bounding stale delay at four accepted services.
+BLOCK_ACCOUNTING_ACCEPTED_DISPATCH_QUOTA = 4
 # A collapsed row whose post-write cleanup failed has no durable replay
 # source left, so the accounting lane is the only thing that can ever finish
 # it. Draining it purely from that lane's idle branch made it hostage to the
@@ -74,10 +92,10 @@ DEFAULT_BLOCK_ACCOUNTING_QUEUE_DEPTH = 8
 # continuously replenished invalid-candidate quarantine queue, starved the
 # retry for as long as the traffic lasted. The lane therefore also offers
 # one bounded retry after at most this many completed work items, where a
-# work item is one finished accounting task from either handoff queue or one
-# finished quarantine item. The offer runs at most one hash's still-owed
-# steps and the cadence resets on every offer -- including one that finds
-# nothing due -- so neither lane can starve the other.
+# work item is one finished accounting task from any of the handoff queues
+# or one finished quarantine item. The offer runs at most one hash's
+# still-owed steps and the cadence resets on every offer -- including one
+# that finds nothing due -- so neither lane can starve the other.
 DEFAULT_BLOCK_ACCOUNTING_CLEANUP_RETRY_WORK_ITEMS = 8
 # The same-hash disposition guard remembers every terminal outcome so a late
 # duplicate -- queued, replayed, retried, parked, or quarantined -- joins the
@@ -750,6 +768,39 @@ class _BlockCandidateNodeSubmission:
     attempted: bool
     result: object = None
     error: BaseException | None = None
+
+
+def _is_definitive_node_acceptance(
+    node_submission: _BlockCandidateNodeSubmission | None,
+) -> bool:
+    """Report whether an offer is a *definitive* node acceptance.
+
+    qbitd's ``submitblock`` returns JSON ``null`` for a block it accepted and
+    a rejection string ("duplicate", "inconclusive", a validation reason) for
+    anything else, so the only shape that names an accepted block is an
+    attempted offer that returned no result and raised nothing.
+
+    All three clauses are load-bearing, and ``error is None`` is the one that
+    is easy to drop by accident: the transport failure path in
+    :meth:`_submit_block_candidate_to_node` builds
+    ``_BlockCandidateNodeSubmission(attempted=True, error=exc)``, which leaves
+    ``result`` at its ``None`` default. A two-clause test would therefore read
+    a *failed* offer as an acceptance -- the single worst misclassification
+    available here, because every consumer of this predicate treats a true
+    answer as "the node already has this block".
+
+    Consumers must share this one definition rather than re-spelling it:
+    :meth:`_stash_retained_block_candidate_node_submission` decides whether an
+    offer may be replayed from memory, and the accounting handoff decides
+    which lane a task joins. Those two answers must never diverge.
+    """
+    if node_submission is None:
+        return False
+    return (
+        bool(node_submission.attempted)
+        and node_submission.error is None
+        and node_submission.result is None
+    )
 
 
 @dataclass
@@ -3995,19 +4046,11 @@ class BlockCandidateService:
             attempted=True,
             result=result,
         )
-        if (
-            node_submission.attempted
-            and node_submission.error is None
-            and node_submission.result is None
-        ):
-            # The definitive-acceptance discriminator: all three clauses, not
-            # two. The submitblock error path above also builds result=None,
-            # so a two-clause test would stamp a failed offer as an
-            # acceptance. This is the same predicate
-            # _stash_retained_block_candidate_node_submission applies; it is
-            # inlined here only because this change lands ahead of the shared
-            # `_is_definitive_node_acceptance` helper, and this call site
-            # folds into that helper when it arrives.
+        if _is_definitive_node_acceptance(node_submission):
+            # Stamp the start of issue #181's acceptance-to-publication
+            # interval from the same predicate the lane routing and the
+            # retained-offer stash read, so "the node has this block" has
+            # exactly one definition in this module.
             self._note_accepted_block_preview_acceptance(block_hash)
         self._coordinator._arm_block_candidate_after_node_offer(
             candidate,
@@ -4713,6 +4756,16 @@ class BlockCandidateService:
             self._block_accounting_queue = queue.PriorityQueue(maxsize=depth)
         if not hasattr(self, "_block_accounting_overflow_queue"):
             self._block_accounting_overflow_queue = queue.PriorityQueue()
+        if not hasattr(self, "_block_accounting_accepted_queue"):
+            # Deliberately unbounded, for the reason the overflow queue is:
+            # a node offer has already happened and must never be converted
+            # back into a raw-submit retry. A maxsize here would need a spill
+            # target, and any queue-state-dependent spill is exactly the
+            # inversion this lane removes. Max-block admission
+            # (_reserve_block_fast_lane_slot, max_blocks, stop_after_block)
+            # and the physical block-acceptance rate bound how many
+            # unresolved real offers can exist at once.
+            self._block_accounting_accepted_queue = queue.PriorityQueue()
         if not hasattr(self, "_block_accounting_sequence"):
             self._block_accounting_sequence = 0
         if not hasattr(self, "_block_accounting_thread"):
@@ -4744,6 +4797,34 @@ class BlockCandidateService:
             self._block_accounting_sequence += 1
         priority = int(task.candidate.context.template["height"])
         item = (priority, sequence, task)
+        if _is_definitive_node_acceptance(task.node_submission):
+            # Definitive acceptance leaves the primary/overflow population
+            # entirely. It does not get a better key inside it -- a key there
+            # is inert exactly when it matters. Under a burst the spillover
+            # rule below has already engaged, so the accepted task would be
+            # put behind the spill while the stale entries still sitting in
+            # the bounded primary queue -- up to
+            # DEFAULT_BLOCK_ACCOUNTING_QUEUE_DEPTH of them -- are all served
+            # ahead of it, each costing ~6 RPCs, two ledger writes and a
+            # payout-balance mutation. Priority only ever orders one heap; the
+            # primary-then-overflow dequeue discipline is what inverts it.
+            #
+            # Membership is what changes here, not the spillover rule. That
+            # rule is unchanged below, and the property it exists to protect --
+            # once spillover begins, later handoffs join it rather than
+            # repeatedly refilling the bounded primary, so older spill entries
+            # are not starved by newer arrivals -- still governs exactly the
+            # population it was written for: non-definitive accounting work.
+            #
+            # A separate lane makes this class structurally un-spillable: no
+            # queue-state-dependent rule can place it behind stale work,
+            # because it shares no queue with stale work. Fairness for the
+            # stale lanes stops being an emergent property of two heaps and
+            # becomes the explicit dispatch quota
+            # BLOCK_ACCOUNTING_ACCEPTED_DISPATCH_QUOTA, enforced in
+            # block_accounting_loop and bounded there rather than argued for.
+            self._block_accounting_accepted_queue.put_nowait(item)
+            return True
         if not self._block_accounting_overflow_queue.empty():
             # Once spillover begins, keep later handoffs behind it instead of
             # repeatedly refilling the primary queue and starving older spill
@@ -4904,10 +4985,11 @@ class BlockCandidateService:
     def _block_accounting_cleanup_retry_work_items(self) -> int:
         """Completed work items the lane may run between cleanup offers.
 
-        One work item is one finished ordinary accounting task from either
-        handoff queue, or one finished invalid-candidate quarantine item.
-        Bounded below at one so a misconfigured value degrades into offering
-        the retry after every item rather than never offering it at all.
+        One work item is one finished ordinary accounting task from any of
+        the handoff queues, or one finished invalid-candidate quarantine
+        item. Bounded below at one so a misconfigured value degrades into
+        offering the retry after every item rather than never offering it at
+        all.
         """
         return max(
             1,
@@ -4916,6 +4998,24 @@ class BlockCandidateService:
                     self._coordinator,
                     "block_accounting_cleanup_retry_work_items",
                     DEFAULT_BLOCK_ACCOUNTING_CLEANUP_RETRY_WORK_ITEMS,
+                )
+            ),
+        )
+
+    def _block_accounting_accepted_dispatch_quota(self) -> int:
+        """Consecutive accepted dispatches allowed while stale work waits.
+
+        Bounded below at one so a misconfigured value degrades into strict
+        alternation -- one accepted task per stale task -- rather than into
+        an accepted lane that can never dispatch while any stale work exists.
+        """
+        return max(
+            1,
+            int(
+                getattr(
+                    self._coordinator,
+                    "block_accounting_accepted_dispatch_quota",
+                    BLOCK_ACCOUNTING_ACCEPTED_DISPATCH_QUOTA,
                 )
             ),
         )
@@ -4930,39 +5030,92 @@ class BlockCandidateService:
         # items here bounds that wait at one offer per configured cadence
         # whichever lane the traffic is on.
         work_items = 0
+        # Definitive-acceptance tasks dispatched back to back since the last
+        # non-accepted dispatch. Counted separately from work_items on
+        # purpose: work_items paces the deferred-cleanup offer against *all*
+        # completed work, while this counter measures one thing only -- how
+        # long the accepted lane has been holding the stale lanes off. Never
+        # fold the two together.
+        accepted_run = 0
         while not self._coordinator.stop_event.is_set():
             self._coordinator._record_block_submitter_phase("accounting-queue")
             source_queue = None
-            try:
-                _priority, _sequence, task = self._block_accounting_queue.get_nowait()
-                source_queue = self._block_accounting_queue
-            except queue.Empty:
+            task = None
+            # Selection order is the accepted lane's whole contract, and it
+            # is stated as a bound rather than as a preference:
+            #
+            #   whenever non-accepted accounting work is available, at most
+            #   `quota` accepted tasks are dispatched between two consecutive
+            #   dispatches of non-accepted work.
+            #
+            # Equivalently, a non-accepted task at the head of its lane waits
+            # behind at most `quota` accepted services, never behind an
+            # unbounded stream of them, whatever the accepted arrival rate.
+            # Starving it is not an option: a stale accounting task that never
+            # runs leaves its outbox row pending, its offer-time payout-preview
+            # barrier armed and its disposition lease held.
+            if accepted_run < self._block_accounting_accepted_dispatch_quota():
                 try:
                     _priority, _sequence, task = (
-                        self._block_accounting_overflow_queue.get_nowait()
+                        self._block_accounting_accepted_queue.get_nowait()
                     )
-                    source_queue = self._block_accounting_overflow_queue
+                    source_queue = self._block_accounting_accepted_queue
+                    accepted_run += 1
                 except queue.Empty:
-                    if self._coordinator._run_one_invalid_block_candidate_quarantine():
-                        work_items += 1
-                        if (
-                            work_items
-                            >= self._block_accounting_cleanup_retry_work_items()
-                        ):
-                            work_items = 0
-                            self._run_one_collapsed_block_candidate_cleanup_retry()
-                        continue
-                    # A collapsed row's failed cleanup has no durable replay
-                    # source left, so the accounting lane is the only thing
-                    # that will ever finish it. A truly idle lane offers it
-                    # here immediately rather than waiting out a cadence; the
-                    # work-item cadence exists for the busy lanes, which
-                    # never reach this branch at all.
-                    work_items = 0
-                    if self._run_one_collapsed_block_candidate_cleanup_retry():
-                        continue
-                    self._coordinator.stop_event.wait(self._block_work_wait_slice())
+                    pass
+            if source_queue is None:
+                # The stale population, dequeued with exactly the discipline
+                # it has always had: bounded primary first, then the
+                # unbounded spillover behind it.
+                try:
+                    _priority, _sequence, task = (
+                        self._block_accounting_queue.get_nowait()
+                    )
+                    source_queue = self._block_accounting_queue
+                except queue.Empty:
+                    try:
+                        _priority, _sequence, task = (
+                            self._block_accounting_overflow_queue.get_nowait()
+                        )
+                        source_queue = self._block_accounting_overflow_queue
+                    except queue.Empty:
+                        pass
+                if source_queue is not None:
+                    accepted_run = 0
+            if source_queue is None:
+                # No stale work exists, so the quota has nothing to yield to
+                # and is honoured vacuously; anything the quota was holding
+                # back runs now, and the run counter restarts from this
+                # dispatch rather than carrying an exhausted count forward.
+                try:
+                    _priority, _sequence, task = (
+                        self._block_accounting_accepted_queue.get_nowait()
+                    )
+                    source_queue = self._block_accounting_accepted_queue
+                    accepted_run = 0
+                except queue.Empty:
+                    pass
+            if source_queue is None:
+                if self._coordinator._run_one_invalid_block_candidate_quarantine():
+                    work_items += 1
+                    if (
+                        work_items
+                        >= self._block_accounting_cleanup_retry_work_items()
+                    ):
+                        work_items = 0
+                        self._run_one_collapsed_block_candidate_cleanup_retry()
                     continue
+                # A collapsed row's failed cleanup has no durable replay
+                # source left, so the accounting lane is the only thing
+                # that will ever finish it. A truly idle lane offers it
+                # here immediately rather than waiting out a cadence; the
+                # work-item cadence exists for the busy lanes, which
+                # never reach this branch at all.
+                work_items = 0
+                if self._run_one_collapsed_block_candidate_cleanup_retry():
+                    continue
+                self._coordinator.stop_event.wait(self._block_work_wait_slice())
+                continue
             try:
                 self._coordinator._run_block_accounting_task(task)
             except Exception:
@@ -5610,14 +5763,12 @@ class BlockCandidateService:
         reaches a terminal outcome, so repeated retryable failures keep
         reusing the same known acceptance.
         """
-        if node_submission is None or not node_submission.attempted:
-            return
-        if (
-            node_submission.error is not None
-            or node_submission.result is not None
-        ):
+        if not _is_definitive_node_acceptance(node_submission):
             # Only a definitive success is safe to reuse: an ambiguous or
             # rejected offer must be re-offered so the node can resolve it.
+            # The predicate is shared with the accounting handoff's lane
+            # routing so the two readings of "the node has this block" cannot
+            # drift apart.
             return
         with self._coordinator.lock:
             retained = getattr(
@@ -6409,6 +6560,7 @@ _STATE_FIELD_MAP = {
     "_block_accounting_state_lock": "_block_accounting_state_lock",
     "_block_accounting_queue": "_block_accounting_queue",
     "_block_accounting_overflow_queue": "_block_accounting_overflow_queue",
+    "_block_accounting_accepted_queue": "_block_accounting_accepted_queue",
     "_block_accounting_sequence": "_block_accounting_sequence",
     "_block_accounting_thread": "_block_accounting_thread",
     "_block_accounting_thread_ident": "_block_accounting_thread_ident",
