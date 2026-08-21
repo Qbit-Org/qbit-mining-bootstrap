@@ -16,10 +16,13 @@ already been offered this candidate".  Any maintenance selector that treats
 either whole set as active node-offer evidence will exclude the whole storm.
 A wakeup parked in the retry holder is the same kind of marker for the same
 reason: ``_retain_block_candidate_for_retry`` also runs when the fast-lane
-reservation declines, before any submitblock.  The rig therefore reports the
-attested offers (``node_offer_evidence``) apart from the conservative
-must-not-abandon union (``selector_evidence``) that a selector owes the
-#183 contract, so a retry holder is never mistaken for a node call.
+reservation declines, before any submitblock.  So is a claimed disposition
+lease: ``submit_next`` takes it on the dequeued hash *before* the terminal,
+capacity and fast-lane checks, each of which releases it again having
+offered nothing.  The rig therefore reports the attested offers
+(``node_offer_evidence``) apart from the conservative must-not-abandon union
+(``selector_evidence``) that a selector owes the #183 contract, so neither a
+retry holder nor a held lease is ever mistaken for a node call.
 
 This is a component instrument, not a performance threshold.  It uses the
 real coordinator admission, durable codec, pagination, payout barriers, and
@@ -32,7 +35,7 @@ settled: ``decide_height`` makes one candidate the active block at that
 height (``DecidedHeightRpc``), ``ownership`` reads every candidate's
 ownership and node-offer-evidence facts from the shipped state so a
 maintenance selector can be evaluated against the real population,
-``perturb`` installs one node-offer-evidence shape at a time through the
+``perturb`` installs one selector-evidence shape at a time through the
 shipped entry points, and ``drain_per_row`` drives the shipped per-row
 disposition path in the production split -- ``submit_next`` with
 ``defer_accounting=True`` handing every node offer to the real accounting
@@ -122,10 +125,13 @@ class CandidateStormSnapshot:
     # part of it.
     selector_evidence_marked: int = 0
     # How that union splits: rows something actually attests a node offer
-    # for, and rows it covers only because a wakeup is parked in a retry
-    # holder, which by itself is not evidence qbitd was ever called.
+    # for, and the two widenings that attest nothing -- a wakeup parked in a
+    # retry holder, and a claimed disposition lease.  Neither is by itself
+    # evidence qbitd was ever called.  The two can coincide on one row, so
+    # they are counted separately rather than folded into one residue.
     node_offer_evidence_marked: int = 0
     unoffered_retry_marked: int = 0
+    unoffered_lease_marked: int = 0
 
 
 @dataclass(frozen=True)
@@ -137,9 +143,9 @@ class CandidateOwnership:
     instead of a hand-built corpus. ``outstanding`` and ``replay_inflight``
     are process-ownership markers; the fields folded into
     ``node_offer_evidence`` are the ones that mean a node offer happened,
-    is happening, or left acceptance evidence behind. ``retry_held`` is
-    neither: it is a third category, covered by the conservative
-    ``selector_evidence`` union without attesting an offer.
+    is happening, or left acceptance evidence behind. ``retry_held`` and
+    ``disposition_held`` are neither: they are a third category, covered by
+    the conservative ``selector_evidence`` union without attesting an offer.
     """
 
     block_hash: str
@@ -165,17 +171,16 @@ class CandidateOwnership:
     def node_offer_evidence(self) -> bool:
         """Whether anything attests that qbitd was offered this hash.
 
-        Every fact here is written by the offer or downstream of it: the
-        disposition lease covers the in-flight offer, a retained submission
-        records one that already returned, a tip observation and an
-        accounted acceptance are readings of an accepted offer, and a
-        terminal outcome or a pool-block row is what an offer's disposition
-        left behind.  ``retry_held`` is deliberately absent; see
-        :attr:`retry_held_without_offer`.
+        Every fact here is written by the offer or downstream of it: a
+        retained submission records an offer that already returned, a tip
+        observation and an accounted acceptance are readings of an accepted
+        offer, and a terminal outcome or a pool-block row is what an offer's
+        disposition left behind.  ``retry_held`` and ``disposition_held`` are
+        deliberately absent; see :attr:`retry_held_without_offer` and
+        :attr:`lease_held_without_offer`.
         """
         return bool(
-            self.disposition_held
-            or self.node_acceptance_retained
+            self.node_acceptance_retained
             or self.tip_observed
             or self.accounted_accepted
             or self.terminal_outcome is not None
@@ -197,19 +202,48 @@ class CandidateOwnership:
         return bool(self.retry_held) and not self.node_offer_evidence
 
     @property
+    def lease_held_without_offer(self) -> bool:
+        """A claimed disposition lease with no offer attested for it.
+
+        ``submit_next`` claims the lease on the dequeued hash *before* it
+        consults the terminal outcome, before the accounted/capacity close,
+        and before ``_reserve_block_fast_lane_slot``.  Each of those paths
+        releases the lease again without ever reaching submitblock, and the
+        deferred split hands the still-held lease to accounting even when the
+        node submission is ``attempted=False``.  The registry this field is
+        read from is weaker still: ``_claim_block_candidate_disposition``
+        registers a user on the flight *before* it takes the flight's lock,
+        so the key is present for a blocked waiter as well as for the holder.
+        A held lease therefore says only "some pass owns this row's eventual
+        disposition", exactly like ``outstanding`` and ``replay_inflight``,
+        and reading it as an offer would credit the rig with a node call that
+        never happened.
+        """
+        return bool(self.disposition_held) and not self.node_offer_evidence
+
+    @property
     def selector_evidence(self) -> bool:
         """The conservative must-not-abandon union the #183 contract needs.
 
-        This is :attr:`node_offer_evidence` widened by ``retry_held``: a
-        parked wakeup may equally have come from a path that *did* offer and
-        is retrying its tail, and the holder alone cannot tell the two
-        apart, so a selector has to leave the row to the per-row path either
-        way.  Because the widening is deliberately conservative, a true
-        value here is not a claim that qbitd was offered the hash -- read
+        This is :attr:`node_offer_evidence` widened by ``retry_held`` and by
+        ``disposition_held``.  Each widening covers an ambiguity rather than
+        an attestation: a parked wakeup may equally have come from a path
+        that *did* offer and is retrying its tail, and a claimed lease may
+        equally span an offer already in flight.  Neither the holder nor the
+        flight registry can tell the two apart, so a selector has to leave
+        the row to the per-row path either way -- and a row whose lease it
+        cannot claim is not one it could dispose of anyway.  Because the
+        widening is deliberately conservative, a true value here is not a
+        claim that qbitd was offered the hash -- read
         :attr:`node_offer_evidence` for that, and
-        :attr:`retry_held_without_offer` for the rows the widening adds.
+        :attr:`retry_held_without_offer` / :attr:`lease_held_without_offer`
+        for the rows the widenings add.
         """
-        return self.node_offer_evidence or bool(self.retry_held)
+        return (
+            self.node_offer_evidence
+            or bool(self.retry_held)
+            or bool(self.disposition_held)
+        )
 
 
 @dataclass(frozen=True)
@@ -466,6 +500,9 @@ class CandidateStormRig:
             unoffered_retry_marked=sum(
                 1 for record in ownership if record.retry_held_without_offer
             ),
+            unoffered_lease_marked=sum(
+                1 for record in ownership if record.lease_held_without_offer
+            ),
         )
 
     # -- decided-height extension ------------------------------------------
@@ -607,18 +644,20 @@ class CandidateStormRig:
         raise KeyError(f"no queued wakeup for {block_hash}")
 
     def perturb(self, server: Any, kind: str, block_hash: str) -> Any:
-        """Install one node-offer-evidence shape on a seeded candidate.
+        """Install one selector-evidence shape on a seeded candidate.
 
         Each kind reproduces one of the facts ``submit_next`` and
         ``record_abandoned`` consult, through the shipped entry point rather
         than a hand-written marker, and each shows up in :meth:`ownership` as
-        ``selector_evidence``.  ``retry_slot`` is the one kind that shows
-        up there *without* ``node_offer_evidence``: it moves an
-        already-queued, never-offered wakeup into the retry holder, which is
-        exactly what the shipped path does when the fast-lane reservation
-        declines.  Returns a callable that undoes the perturbation where
-        undoing is meaningful (the held disposition lease), otherwise
-        ``None``.
+        ``selector_evidence``.  Two kinds show up there *without*
+        ``node_offer_evidence``, because neither reaches qbitd: ``retry_slot``
+        moves an already-queued, never-offered wakeup into the retry holder,
+        which is exactly what the shipped path does when the fast-lane
+        reservation declines, and ``lease_held`` claims the disposition lease
+        by itself, which is all ``submit_next`` holds while it runs the
+        terminal, capacity and fast-lane checks that precede any submitblock.
+        Returns a callable that undoes the perturbation where undoing is
+        meaningful (the held disposition lease), otherwise ``None``.
         """
         service = server._ensure_block_candidate_service()
         service._ensure_block_replay_state()
