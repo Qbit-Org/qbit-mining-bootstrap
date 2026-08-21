@@ -458,7 +458,7 @@ class _SupersededCandidateRow:
 
 @dataclass
 class _CollapseHeightProbeBudget:
-    """Distinct chain heights a collapse walk may still read.
+    """Distinct chain heights a collapse walk may still read, and what it read.
 
     One budget is created per replay walk and shared by that walk's pages,
     so the walk's chain cost is the bound whether the backlog arrives as one
@@ -470,9 +470,27 @@ class _CollapseHeightProbeBudget:
     read at most once per probed height, so charging the height bounds both
     round trips at once and keeps the accounting to the single number the
     comment on MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES explains.
+
+    The two caches live here, beside the counter, for the same reason the
+    counter does: a walk that has paid for a height must not pay for it
+    again on its next page. Each page builds a fresh
+    ``_BlockCandidateChainView`` over this one budget, and a view that
+    cached its reads only for itself would recharge the walk for the same
+    height on every page -- so the one decided height behind a storm would
+    exhaust the budget after eight pages and defer the entire remainder of
+    the backlog. ``difficulty`` is keyed by block hash, whose work is
+    immutable, so sharing it can only remove round trips. Sharing ``active``
+    widens the window between a selection read and the write it feeds, which
+    is precisely the window the pre-write revalidation exists to close: that
+    pass builds its own budget, so its caches -- and therefore its chain
+    reads -- stay fresh and independent of this walk's.
     """
 
     remaining: int = MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES
+    # Height -> the active-chain block this walk read there.
+    active: dict[int, str] = field(default_factory=dict)
+    # Block hash -> its PRISM-scaled work, re-derived from its header bits.
+    difficulty: dict[str, int] = field(default_factory=dict)
 
     @property
     def exhausted(self) -> bool:
@@ -498,6 +516,14 @@ class _BlockCandidateChainView:
     of the node as long as the page: ``probe_budget`` caps the distinct
     heights this view will ever read, and a height past the cap is reported
     as unprobed rather than guessed at.
+
+    "Once per distinct height" is a property of the *walk*, not of this
+    view. The caches are the budget's, so a page-two view over the same
+    budget already knows every height page one probed: a storm at one
+    decided height costs the walk one ``getblockhash`` and one
+    ``getblockheader`` however many pages it spans. Only the page-scope tip
+    reads are per view, which is what keeps each page's selection running
+    against a freshly read tip.
     """
 
     def __init__(
@@ -507,13 +533,13 @@ class _BlockCandidateChainView:
         probe_budget: _CollapseHeightProbeBudget | None = None,
     ) -> None:
         self._service = service
-        self._active: dict[int, str] = {}
-        self._difficulty: dict[str, int] = {}
         self._probe_budget = (
             probe_budget
             if probe_budget is not None
             else _CollapseHeightProbeBudget()
         )
+        self._active: dict[int, str] = self._probe_budget.active
+        self._difficulty: dict[str, int] = self._probe_budget.difficulty
 
     def _call(self, method: str, params: list[object] | None = None) -> object:
         coordinator = self._service._coordinator
@@ -554,8 +580,9 @@ class _BlockCandidateChainView:
         height was never read. It is not "no occupant" and it is not a
         fail-closed read: it says only that the chain was never asked, so
         every caller must preserve the row rather than decide anything about
-        it. A height already in this view's cache is free and stays
-        answerable after the budget is gone.
+        it. A height this walk has already read is free -- on this page and
+        on every later page of the same walk -- and stays answerable after
+        the budget is gone.
         """
         cached = self._active.get(height)
         if cached is not None:
@@ -571,7 +598,7 @@ class _BlockCandidateChainView:
         return active
 
     def cached_difficulty(self, block_hash: str) -> int | None:
-        """The work this pass already read for a hash, without a new call."""
+        """The work this walk already read for a hash, without a new call."""
         return self._difficulty.get(block_hash)
 
     def difficulty_of(self, block_hash: str) -> int:
@@ -1588,14 +1615,18 @@ class BlockCandidateService:
         is the very next thing that happens.
 
         The occupant's header is re-read only when the occupying hash
-        changed; an unchanged occupant keeps the work value the selection
-        pass already read, so the steady case adds no header round trip.
+        changed; an unchanged occupant keeps the work value this walk
+        already read for that hash, so the steady case adds no header round
+        trip.
         """
         # Budgeted for exactly the heights selection already probed and no
         # more. The leased set is a subset of one bounded selection, so this
         # can never refuse a re-read the write depends on, and it cannot draw
         # on the walk's budget either -- the walk's remaining probes are for
-        # pages this apply has not seen.
+        # pages this apply has not seen. A budget of its own is a cache of
+        # its own as well: the walk's active-height reads, which may have
+        # been made pages ago, are never reused here, so every leased height
+        # is genuinely re-read from the chain under the held leases.
         fresh = _BlockCandidateChainView(
             self,
             probe_budget=_CollapseHeightProbeBudget(
@@ -2422,7 +2453,8 @@ class BlockCandidateService:
         per-row path.
 
         ``probe_budget`` is the enumeration walk's shared chain-height
-        budget; passes given none get a fresh one of their own.
+        budget, carrying both the walk's remaining probes and the reads it
+        has already made; passes given none get a fresh one of their own.
         """
         if not durable_rows:
             return durable_rows
@@ -2643,8 +2675,9 @@ class BlockCandidateService:
         queued = 0
         enumeration_truncated = False
         enumeration_paginated = False
-        # One chain-height budget for the whole walk, so a backlog split
-        # across fifty pages costs the node what a single page does.
+        # One chain-height budget for the whole walk -- both its remaining
+        # probes and the reads they bought -- so a backlog split across fifty
+        # pages costs the node what a single page does.
         collapse_probe_budget = _CollapseHeightProbeBudget()
         if enumeration_owed and fetch_durable_page is not None:
             # Pagination, not a widening window: the doubling loop below

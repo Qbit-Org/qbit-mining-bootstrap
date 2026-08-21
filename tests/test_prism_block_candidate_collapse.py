@@ -4208,11 +4208,12 @@ class BlockCandidateCollapseHeightProbeBoundTests(unittest.TestCase):
     reaches ``submitblock``.
 
     MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES caps the distinct heights one
-    enumeration walk reads.  These tests own the three properties that makes
-    it safe: the cap actually binds, an unprobed row is preserved rather than
-    terminalized and collapses on a later walk, and the walk hands the
-    submitter back to a waiting live solve once its budget is gone -- without
-    disturbing the storm, which never spends the budget at all.
+    enumeration walk reads.  These tests own the four properties that make it
+    safe: the cap actually binds, an unprobed row is preserved rather than
+    terminalized and collapses on a later walk, the walk hands the submitter
+    back to a waiting live solve once its budget is gone, and none of that
+    disturbs the storm, which spends one probe for the whole walk however
+    many pages it spans.
     """
 
     # -- harness -----------------------------------------------------------
@@ -4416,6 +4417,77 @@ class BlockCandidateCollapseHeightProbeBoundTests(unittest.TestCase):
             [MAX_BLOCK_REPLAY_ENUMERATION_ROWS, 7],
         )
 
+    def test_a_storm_deeper_than_the_budget_collapses_in_one_walk(self) -> None:
+        """A storm spanning more pages than the walk has probes still collapses.
+
+        The budget is per walk but the chain reads it pays for were once per
+        *page*: every page rebuilt its view, so one decided height was
+        charged again on every page and the walk ran out after
+        MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES pages.  Past that point
+        collapse did nothing at all.  Each remaining page was preserved
+        whole by the exhausted-budget early return and replay-adopted, or --
+        as here, with a live candidate waiting -- never fetched at all,
+        because a spent budget is half of the yield condition.  Either way a
+        backlog deeper than eight pages collapsed only 8,192 rows per walk,
+        which at the 312,000-row scale this path is sized for defeats it
+        outright.
+
+        This walk is nine pages of one decided height, so the eight-page
+        boundary is genuinely crossed, and the whole storm has to go in one
+        enumeration off a single probe.
+        """
+        bound = MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES
+        page_rows = MAX_BLOCK_REPLAY_ENUMERATION_ROWS
+        # One page past the bound, plus a short final page: nine fetched
+        # pages against eight affordable probes.
+        storm = bound * page_rows + 7
+        fixture = CollapseFixture()
+        fixture.seed([_hash(index) for index in range(1, storm + 1)])
+        # Seeded last, so it sits on the ninth page -- the page a walk that
+        # recharged per page never reaches, having yielded to this very
+        # candidate once its budget was gone.
+        self._live_solve(fixture, height=DECIDED_HEIGHT + 1)
+        queued, log = fixture.replay(enumeration_owed=True)
+        # One complete enumeration: every page fetched, none yielded, and the
+        # completeness proof the job-build gate waits on delivered.
+        self.assertIn(f"enumeration page={bound + 1}", log)
+        self.assertNotIn("yielded", log)
+        self.assertFalse(fixture.server._block_replay_enumeration_owed())
+        # The whole storm collapsed, not the first eight pages of it.
+        self.assertEqual(fixture.counts()["abandoned"], storm)
+        self.assertEqual(fixture.counts()["height_deferred"], 0)
+        self.assertEqual(fixture.pending(), {LIVE_SOLVE_HASH})
+        self.assertEqual(
+            [len(call[0]) for call in fixture.ledger.abandon_calls],
+            [page_rows] * bound + [7],
+        )
+        # Not one collapsed row was replay-adopted: the single adoption is
+        # the live solve, which predicate S rejects on clause 3.
+        self.assertEqual(queued, 1)
+        service = fixture.service
+        self.assertEqual(service._block_replay_candidate_queue.qsize(), 1)
+        adopted = service._block_replay_candidate_queue.get_nowait()
+        self.assertEqual(adopted.submission.block_hash_hex.lower(), LIVE_SOLVE_HASH)
+        # The decided height is charged once for the whole walk. Selection
+        # reads it on page one and every later page answers from the walk's
+        # cache, so the occupant's header is read exactly once; the nine
+        # remaining height reads are the per-page pre-write revalidation,
+        # which keeps a budget -- and therefore a cache -- of its own by
+        # design and re-reads the chain under the held leases.
+        probes = [
+            params[0]
+            for method, params in fixture.rpc.calls
+            if method == "getblockhash"
+        ]
+        self.assertEqual(set(probes), {DECIDED_HEIGHT})
+        self.assertEqual(len(probes), 1 + (bound + 1))
+        counts = fixture.rpc.counts()
+        self.assertEqual(counts["getblockheader"], 1)
+        # Page-scope reads stay per page: one selection tip pair and one
+        # revalidation tip read each.
+        self.assertEqual(counts["getbestblockhash"], 2 * (bound + 1))
+        self.assertEqual(counts["getblockcount"], bound + 1)
+
 
 class BlockCandidateCollapseObservabilityTests(unittest.TestCase):
     """Bounded logs and bounded, hash-free metrics."""
@@ -4604,12 +4676,16 @@ class BlockCandidateCollapseStormTests(unittest.TestCase):
         self.assertEqual(len(selected), 3_119)
         pages = -(-3_120 // MAX_BLOCK_REPLAY_ENUMERATION_ROWS)
         calls = server.rpc.calls
-        # Two tip reads and two active-block reads per page (selection plus
-        # revalidation), one tip-height read and one occupant header per page.
+        # Tip reads are page-scope: two per page (selection plus
+        # revalidation) and one tip-height read each. The decided height and
+        # its occupant are walk-scope: selection reads them once for the
+        # whole walk and every later page answers from the walk's cache, so
+        # the only further active-block reads are the one each page's
+        # pre-write revalidation makes under its own fresh budget.
         self.assertEqual(calls["getbestblockhash"], 2 * pages)
         self.assertEqual(calls["getblockcount"], pages)
-        self.assertEqual(calls["getblockhash"], 2 * pages)
-        self.assertEqual(calls["getblockheader"], pages)
+        self.assertEqual(calls["getblockhash"], 1 + pages)
+        self.assertEqual(calls["getblockheader"], 1)
         self.assertNotIn("submitblock", calls)
 
     def test_no_perturbation_ever_produces_a_selector_only_hash(self) -> None:
