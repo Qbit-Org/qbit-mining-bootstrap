@@ -1345,7 +1345,7 @@ class BlockCandidateService:
     def _clean_up_collapsed_block_candidates(
         self,
         abandoned: tuple[str, ...],
-    ) -> None:
+    ) -> frozenset[str]:
         """Mirror per-row terminal abandonment cleanup for the rows we won.
 
         Driven by the hashes the fenced write returned, never by the hashes
@@ -1355,6 +1355,11 @@ class BlockCandidateService:
 
         Every step is idempotent and independently guarded, so a hash whose
         cleanup raises cannot strand the rest of the page mid-way.
+
+        Returns the hashes whose cleanup did not complete. The apply owns
+        the ``cleanup_failed`` accounting for the whole page: counting a
+        contained failure here and a later page-level abort there would
+        report one affected hash twice.
         """
         coordinator = self._coordinator
         coordinator._record_block_submitter_phase("replay-collapse-cleanup")
@@ -1448,13 +1453,13 @@ class BlockCandidateService:
                     ),
                 )
         if failed:
-            self._record_block_candidate_collapse("cleanup_failed", len(failed))
             print(
                 "prism coordinator: collapsed block candidate cleanup failed "
                 f"rows={len(failed)} of {len(abandoned)}; their durable rows "
                 "are already terminal",
                 flush=True,
             )
+        return frozenset(failed)
 
     def _log_collapsed_block_candidates(
         self,
@@ -1610,13 +1615,37 @@ class BlockCandidateService:
                 return frozenset()
             self._record_block_candidate_collapse("abandoned", len(abandoned))
             try:
-                self._clean_up_collapsed_block_candidates(
+                cleanup_failed = self._clean_up_collapsed_block_candidates(
                     tuple(
                         row.block_hash
                         for row in qualified
                         if row.block_hash in abandoned
                     )
                 )
+            except Exception:
+                # The rows are durably terminal whatever happened here, so
+                # the caller must still partition them out of the page: a
+                # cleanup fault cannot be allowed to replay-adopt a row
+                # whose outbox entry is gone. An abort proves nothing about
+                # the steps it skipped, so the whole won set is affected --
+                # which subsumes any hash a contained step already failed.
+                cleanup_failed = abandoned
+                print(
+                    "prism coordinator: collapsed block candidate cleanup "
+                    f"aborted rows={len(abandoned)}; their durable rows are "
+                    "already terminal",
+                    flush=True,
+                )
+                traceback.print_exc()
+            if cleanup_failed:
+                # Counted once per apply over distinct hashes. Contained
+                # per-step failures and a later abort describe the same
+                # rows, so this series can never exceed the won set.
+                self._record_block_candidate_collapse(
+                    "cleanup_failed",
+                    len(cleanup_failed),
+                )
+            try:
                 self._log_collapsed_block_candidates(
                     qualified,
                     abandoned,
@@ -1626,18 +1655,12 @@ class BlockCandidateService:
                     revalidation_dropped=len(leased) - len(qualified),
                 )
             except Exception:
-                # The rows are durably terminal whatever happened here, so
-                # the caller must still partition them out of the page: a
-                # cleanup fault cannot be allowed to replay-adopt a row
-                # whose outbox entry is gone.
-                self._record_block_candidate_collapse(
-                    "cleanup_failed",
-                    len(abandoned),
-                )
+                # Diagnostics are not cleanup state. Keep a formatter fault
+                # visible without claiming hashes whose terminal cleanup
+                # completed successfully.
                 print(
-                    "prism coordinator: collapsed block candidate cleanup "
-                    f"aborted rows={len(abandoned)}; their durable rows are "
-                    "already terminal",
+                    "prism coordinator: collapsed block candidate logging "
+                    f"failed rows={len(abandoned)}",
                     flush=True,
                 )
                 traceback.print_exc()

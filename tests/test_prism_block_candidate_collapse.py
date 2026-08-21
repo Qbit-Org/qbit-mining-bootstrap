@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import queue
 import sys
+import threading
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
@@ -1189,6 +1190,50 @@ class BlockCandidateCollapseCleanupTests(unittest.TestCase):
         self.assertIn("cleanup aborted rows=2", log)
         self.assertEqual(fixture.counts()["cleanup_failed"], 2)
 
+    def test_a_log_failure_does_not_double_count_cleanup_failures(self) -> None:
+        """cleanup_failed counts affected hashes, not diagnostic failures.
+
+        A contained per-step failure belongs to the one hash it happened to,
+        while a later summary formatter fault does not change any hash's
+        cleanup state. Treating both as cleanup reported four affected hashes
+        for a three-row page even though only one cleanup actually failed.
+        """
+        fixture = CollapseFixture()
+        hashes = [_hash(1), _hash(2), _hash(3)]
+        fixture.seed(hashes)
+        original = fixture.server._clear_block_candidate_retry_state
+
+        def explode(block_hash: str) -> None:
+            if block_hash == _hash(2):
+                raise RuntimeError("cleanup boom")
+            original(block_hash)
+
+        fixture.server._clear_block_candidate_retry_state = explode
+        # The grouped formatter runs only after every cleanup step.
+        fixture.service._log_collapsed_block_candidates = (
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("log boom"))
+        )
+        rows = fixture.page()
+        retained, log = fixture.collapse(rows)
+        counts = fixture.counts()
+        self.assertEqual(counts["abandoned"], 3)
+        self.assertEqual(counts["cleanup_failed"], 1)
+        self.assertLessEqual(counts["cleanup_failed"], counts["abandoned"])
+        # Both faults are visible, every cleanup attempt still ran, and the
+        # terminal rows are still partitioned out of the page.
+        self.assertIn("cleanup failed rows=1 of 3", log)
+        self.assertIn("logging failed rows=3", log)
+        self.assertNotIn("cleanup aborted rows=3", log)
+        self.assertEqual(retained, [])
+        self.assertEqual(fixture.pending(), set())
+        with fixture.server.lock:
+            self.assertEqual(
+                set(fixture.service._block_candidate_terminal_outcomes),
+                set(hashes),
+            )
+        with fixture.service._block_candidate_disposition_registry_lock:
+            self.assertEqual(fixture.service._block_candidate_disposition_flights, {})
+
     def test_a_queued_candidates_floor_holder_is_released(self) -> None:
         fixture = CollapseFixture()
         target = _hash(1)
@@ -1396,6 +1441,130 @@ class BlockCandidateCollapseEnumerationTests(unittest.TestCase):
                 self.assertEqual(fixture.pending(), {_hash(1), _hash(2)})
                 self.assertEqual(self._adopted(fixture), {_hash(1), _hash(2)})
                 self.assertEqual(queued, 2)
+
+    def test_a_timed_out_write_that_lands_late_preserves_then_converges(self) -> None:
+        """The caller's deadline expires while the batch write is still out.
+
+        This drives the real submitter ledger-call seam rather than raising
+        from the ledger hook: the batch write runs on the bounded worker
+        ``_run_block_submitter_ledger_call`` spawns, the coordinator-side
+        wait expires first and raises ``BlockSubmitterDatabaseTimeout``, and
+        the worker completes the write afterwards. The apply learns nothing
+        from a call that never answered it, so the whole page fails closed
+        and stays adoptable, and the write that lands later is still fenced
+        by the durable pool-block fact rather than by what the selector read
+        a page earlier. Whatever that write transitions, no cleanup and no
+        payout authority may follow from a hash the call did not return
+        synchronously.
+        """
+        wait_seconds = 10.0
+        fixture = CollapseFixture()
+        abandoned_late = _hash(1)
+        landed_meanwhile = _hash(2)
+        fixture.seed([abandoned_late, landed_meanwhile], credit_share_on_accept=True)
+        # Short enough to keep the test quick, wide enough that the page
+        # read ahead of it is never the call that expires.
+        fixture.server.block_submit_db_timeout_seconds = 0.25
+        started = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def stall_then_write(hashes: tuple[str, ...], error: str) -> tuple[str, ...]:
+            # Deterministic: the write cannot land before the deadline
+            # because only the test releases it, and it is released only
+            # after the timed-out apply has returned.
+            started.set()
+            if not release.wait(wait_seconds):
+                raise AssertionError("the stalled ledger call was never released")
+            return fixture.ledger.inner.mark_block_candidates_abandoned(
+                block_hashes=hashes,
+                error=error,
+            )
+
+        fixture.ledger.abandon_hook = stall_then_write
+        queued, log = fixture.replay(enumeration_owed=False)
+        self.assertTrue(started.is_set())
+        self.assertIn("ledger phase timed out phase=collapse-superseded", log)
+        # Failed closed: every row is preserved, adopted, and left to the
+        # per-row path exactly as an outright write failure leaves it.
+        self.assertEqual(queued, 2)
+        self.assertEqual(fixture.pending(), {abandoned_late, landed_meanwhile})
+        self.assertEqual(self._adopted(fixture), {abandoned_late, landed_meanwhile})
+        counts = fixture.counts()
+        self.assertEqual(counts["fail_closed"], 2)
+        self.assertEqual(counts["abandoned"], 0)
+        self.assertEqual(counts["write_lost"], 0)
+        self.assertEqual(counts["cleanup_failed"], 0)
+        self.assertEqual(
+            fixture.service.block_ledger_call_class_metrics()["fast"][
+                "timeouts_total"
+            ],
+            1,
+        )
+        with fixture.service._block_candidate_disposition_registry_lock:
+            self.assertEqual(fixture.service._block_candidate_disposition_flights, {})
+        adopted_floor = set(fixture.floor())
+        self.assertEqual(len(adopted_floor), 2)
+        with fixture.service._block_submitter_ledger_calls_lock:
+            stalled = [
+                call
+                for key, call in fixture.service._block_submitter_ledger_calls.items()
+                if key[0] == "collapse-superseded"
+            ]
+        self.assertEqual(len(stalled), 1)
+        # One of the two rows really did land while the call was out. Only
+        # the durable pool-block row proves it, and the fenced write re-asks
+        # for that fact itself.
+        fixture.ledger.inner.persist_accepted_block(
+            block_hash=landed_meanwhile,
+            block_height=DECIDED_HEIGHT,
+            parent_hash=STORM_PARENT,
+            final_bundle={},
+            audit_report={},
+        )
+        release.set()
+        self.assertTrue(stalled[0].done.wait(wait_seconds))
+        self.assertEqual(len(fixture.ledger.abandon_calls), 1)
+        self.assertEqual(
+            set(fixture.ledger.abandon_calls[0][0]),
+            {abandoned_late, landed_meanwhile},
+        )
+        self.assertEqual(set(stalled[0].result), {abandoned_late})
+        self.assertEqual(fixture.pending(), {landed_meanwhile})
+        # Nothing was cleaned up for the hash the call never returned to
+        # anybody: its in-memory state still belongs to the per-row path.
+        server = fixture.server
+        with server.lock:
+            self.assertEqual(fixture.service._block_candidate_terminal_outcomes, {})
+        self.assertEqual(server.block_candidate_abandoned_counts, {})
+        self.assertEqual(set(fixture.floor()), adopted_floor)
+        # A later enumeration is idempotent: the terminal row is gone from
+        # the outbox, the landed one is excluded by its pool-block row, and
+        # no second fenced write is issued.
+        second_queued, _second_log = fixture.replay(enumeration_owed=True)
+        self.assertEqual(second_queued, 0)
+        self.assertEqual(len(fixture.ledger.abandon_calls), 1)
+        self.assertEqual(fixture.pending(), {landed_meanwhile})
+        self.assertEqual(self._adopted(fixture), {abandoned_late, landed_meanwhile})
+        counts = fixture.counts()
+        self.assertEqual(counts["selected"], 2)
+        self.assertEqual(counts["abandoned"], 0)
+        self.assertEqual(counts["cleanup_failed"], 0)
+        # The barrier replay armed is still only a barrier: no landed
+        # transition and no published preview were invented for a row whose
+        # fate the coordinator never observed.
+        with server._accepted_block_payout_preview_condition:
+            previews = dict(server._accepted_block_payout_previews)
+            self.assertEqual(
+                dict(server._invalidated_accepted_block_payout_previews),
+                {},
+            )
+        self.assertEqual(set(previews), {abandoned_late, landed_meanwhile})
+        self.assertFalse(previews[abandoned_late].landed)
+        self.assertIsNone(previews[abandoned_late].preview)
+        self.assertFalse(
+            server._accepted_block_payout_transition_landed(abandoned_late)
+        )
 
     def test_pagination_still_completes_after_a_full_page_collapses(self) -> None:
         """Collapse must not break the short-page completeness proof."""
