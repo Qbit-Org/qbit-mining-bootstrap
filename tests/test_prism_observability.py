@@ -11,6 +11,12 @@ from types import SimpleNamespace
 
 from lab.prism.observability import (
     HEALTH_SCHEMA,
+    METRICS_STALE_WARNING,
+    METRICS_STATES,
+    METRICS_STATE_FRESH,
+    METRICS_STATE_HEADER,
+    METRICS_STATE_STALE,
+    METRICS_STATE_UNAVAILABLE,
     MiningDeliveryInputs,
     ObservabilityService,
 )
@@ -401,20 +407,157 @@ class ObservabilityServiceTests(unittest.TestCase):
         self.assertTrue(cached.startswith("qbit_prism_fixture 1\n"))
 
         port.now += 16.0
-        status, cached = service.cached_metrics_payload()
-        self.assertEqual(status, 503)
-        self.assertIn("qbit_prism_metrics_snapshot_stale 1\n", cached)
+        response = service.cached_metrics_payload()
+
+        # The failed refresh left the last complete generation in place and
+        # #184 keeps serving it. Refusing here discarded that payload along
+        # with the failure counters that explain it, because Prometheus drops
+        # the body of a non-200 response.
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.state, METRICS_STATE_STALE)
+        self.assertTrue(response.body.startswith("qbit_prism_fixture 1\n"))
+        self.assertIn("qbit_prism_metrics_snapshot_stale 1\n", response.body)
+        self.assertIn(
+            'qbit_prism_metrics_collection_failures_total{class="invalid_payload"} 1',
+            response.body,
+        )
 
     def test_metrics_without_snapshot_fails_closed_without_collecting(self) -> None:
         port = FakeObservabilityPort()
         service = ObservabilityService(port)
 
-        status, payload = service.cached_metrics_payload()
+        response = service.cached_metrics_payload()
 
-        self.assertEqual(status, 503)
+        # Warm-up is the one case that still refuses: there is no complete
+        # payload to serve, so the body is diagnostics only and a scraper must
+        # not store it as this process's metrics.
+        self.assertEqual(response.status, 503)
+        self.assertEqual(response.state, METRICS_STATE_UNAVAILABLE)
+        self.assertIsNone(response.age_seconds)
         self.assertEqual(port.metrics_render_count, 0)
-        self.assertIn("qbit_prism_metrics_snapshot_available 0\n", payload)
-        self.assertIn("qbit_prism_metrics_snapshot_age_seconds -1.000\n", payload)
+        self.assertIn("qbit_prism_metrics_snapshot_available 0\n", response.body)
+        self.assertIn(
+            "qbit_prism_metrics_snapshot_age_seconds -1.000\n",
+            response.body,
+        )
+        self.assertNotIn("qbit_prism_fixture", response.body)
+
+    def test_stale_complete_snapshot_is_served_as_200_with_truthful_age(
+        self,
+    ) -> None:
+        port = FakeObservabilityPort()
+        service = ObservabilityService(port)
+        service.refresh_metrics_snapshot()
+
+        port.now += 47.5
+
+        response = service.cached_metrics_payload()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.state, METRICS_STATE_STALE)
+        # Byte-for-byte the generation that was published, with the current
+        # diagnostics appended -- nothing re-rendered on this thread.
+        self.assertTrue(response.body.startswith(port.metrics_payload))
+        self.assertEqual(port.metrics_render_count, 1)
+        self.assertIn("qbit_prism_metrics_snapshot_available 1\n", response.body)
+        self.assertIn("qbit_prism_metrics_snapshot_stale 1\n", response.body)
+        self.assertIn(
+            "qbit_prism_metrics_snapshot_age_seconds 47.500\n",
+            response.body,
+        )
+        # Floored, not rounded: Age must never overstate freshness.
+        self.assertEqual(response.age_seconds, 47)
+
+    def test_blocked_refresh_past_budget_serves_prior_document_promptly(
+        self,
+    ) -> None:
+        port = FakeObservabilityPort()
+        service = ObservabilityService(port)
+        service.refresh_metrics_snapshot()
+        entered = threading.Event()
+        release = threading.Event()
+        render_calls: list[str] = []
+
+        def blocked_render() -> str:
+            render_calls.append("render")
+            entered.set()
+            release.wait(5.0)
+            return "qbit_prism_fixture 2\n"
+
+        port.render_metrics_payload = blocked_render  # type: ignore[method-assign]
+        collector = threading.Thread(target=service.refresh_metrics_snapshot)
+        collector.start()
+        try:
+            self.assertTrue(entered.wait(2.0))
+            # Far past the staleness budget, with the collector still wedged
+            # inside the renderer holding the collection lock.
+            port.now += 600.0
+
+            started = time.monotonic()
+            response = service.cached_metrics_payload()
+            elapsed = time.monotonic() - started
+        finally:
+            release.set()
+            collector.join(5.0)
+
+        # Never waited on the stuck collector, and never re-entered the
+        # renderer itself: the only render is the collector's own.
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(render_calls, ["render"])
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.state, METRICS_STATE_STALE)
+        self.assertTrue(response.body.startswith("qbit_prism_fixture 1\n"))
+        self.assertEqual(response.age_seconds, 600)
+        self.assertFalse(collector.is_alive())
+
+    def test_metrics_response_metadata_is_exact_and_bounded(self) -> None:
+        port = FakeObservabilityPort()
+        service = ObservabilityService(port)
+
+        unavailable = service.cached_metrics_payload()
+        service.refresh_metrics_snapshot()
+        port.now += 2.0
+        fresh = service.cached_metrics_payload()
+        port.now += 20.0
+        stale = service.cached_metrics_payload()
+
+        self.assertEqual(
+            unavailable.response_headers(),
+            {
+                "Cache-Control": "no-store",
+                METRICS_STATE_HEADER: "unavailable",
+            },
+        )
+        self.assertEqual(
+            fresh.response_headers(),
+            {
+                "Cache-Control": "no-store",
+                METRICS_STATE_HEADER: "fresh",
+                "Age": "2",
+            },
+        )
+        self.assertEqual(
+            stale.response_headers(),
+            {
+                "Cache-Control": "no-store",
+                METRICS_STATE_HEADER: "stale",
+                "Age": "22",
+                "Warning": METRICS_STALE_WARNING,
+            },
+        )
+        # Bounded vocabulary, and the warn-code line is the registered 110.
+        self.assertEqual(METRICS_STATES, ("fresh", "stale", "unavailable"))
+        for response in (unavailable, fresh, stale):
+            self.assertIn(response.state, METRICS_STATES)
+        self.assertEqual(
+            METRICS_STALE_WARNING,
+            '110 qbit-prism "metrics snapshot is stale; '
+            'serving last complete payload"',
+        )
+        # Still destructures as the pair every pre-#184 caller unpacks.
+        status, body = fresh
+        self.assertEqual((status, body), (fresh.status, fresh.body))
+        self.assertEqual(fresh.state, METRICS_STATE_FRESH)
 
     def test_metrics_exception_is_bounded_and_recovery_replaces_snapshot(
         self,

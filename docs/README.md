@@ -39,6 +39,10 @@ This is useful for reviewers and operators who need implementation detail:
 
 - [prism-ledger-ops.md](prism-ledger-ops.md): formal ledger invariants,
   writer-lease behavior, compaction contract, and readiness probes.
+- [prism-overload-alerts.md](prism-overload-alerts.md): specification for
+  the PRISM overload and backlog alert rules (issue #188), including signal
+  inventory, thresholds and their provenance, and the ordering dependency on
+  #184. Not live: this repository holds no monitoring configuration.
 - [prism-capacity-readiness.md](prism-capacity-readiness.md): optional
   Stratum-to-Postgres qualification artifact and standalone validator contract.
 - [prism-coordinator-refactor/README.md](prism-coordinator-refactor/README.md):

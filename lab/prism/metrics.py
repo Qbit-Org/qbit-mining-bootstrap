@@ -127,6 +127,8 @@ class MetricsPort(Protocol):
     _job_build_priority_preparations: Any
     _accepted_parent_preview_wait_timeouts: Any
 
+    def _accepted_parent_unresolved_depth(self) -> int: ...
+    def _accepted_parent_unresolved_depth_cap(self) -> int: ...
     def _ensure_connection_capacity_state(self) -> Any: ...
     def _ensure_evicted_job_state(self) -> Any: ...
     def _ensure_initial_job_state(self) -> Any: ...
@@ -769,6 +771,14 @@ class MetricsRenderer:
                     f'qbit_prism_block_ledger_call_max_duration_seconds{{call_class="{label}"}} {float(stats["max_duration_seconds"]):.6f}',
                 ]
             )
+        # The depth gauge must equal what the admission fence counts. The
+        # fence counts every landed transition; the age list can only report
+        # the ones carrying a monotonic landing stamp. A degraded preview
+        # publication and a replayed durable candidate both arm ``landed``
+        # without that stamp, so deriving depth from the ages would read zero
+        # while the fence already refuses admission at depth one.
+        unresolved_depth = self.port._accepted_parent_unresolved_depth()
+        unresolved_depth_cap = self.port._accepted_parent_unresolved_depth_cap()
         unresolved_ages = self.port.accepted_parent_unresolved_ages_seconds()
         oldest_unresolved = max(unresolved_ages) if unresolved_ages else -1.0
         with self.port.lock:
@@ -779,7 +789,10 @@ class MetricsRenderer:
             [
                 "# HELP qbit_prism_accepted_parent_unresolved_transitions Landed accepted-block transitions whose durable bookkeeping is unresolved.",
                 "# TYPE qbit_prism_accepted_parent_unresolved_transitions gauge",
-                f"qbit_prism_accepted_parent_unresolved_transitions {len(unresolved_ages)}",
+                f"qbit_prism_accepted_parent_unresolved_transitions {unresolved_depth}",
+                "# HELP qbit_prism_accepted_parent_unresolved_depth_max Configured unresolved accepted-parent depth at which job admission fails closed.",
+                "# TYPE qbit_prism_accepted_parent_unresolved_depth_max gauge",
+                f"qbit_prism_accepted_parent_unresolved_depth_max {unresolved_depth_cap}",
                 "# HELP qbit_prism_accepted_parent_unresolved_oldest_seconds Age of the oldest unresolved accepted-parent transition, or -1 when none.",
                 "# TYPE qbit_prism_accepted_parent_unresolved_oldest_seconds gauge",
                 f"qbit_prism_accepted_parent_unresolved_oldest_seconds {oldest_unresolved:.6f}",
