@@ -366,16 +366,31 @@ class DecidedCandidateStormTests(unittest.TestCase):
 
         # Close pool capacity through the shipped coordinator tunable the
         # production check reads, then drive one row of the shipped path.
+        # ``max_rounds`` cannot bound this call: it budgets node offers and
+        # this path makes none, so the single row is stepped by withholding
+        # every other one instead.
         server.max_blocks = 0
-        drain = rig.drain_per_row(server, stop_before_hash=winner, max_rounds=1)
+        drain = rig.drain_per_row(
+            server,
+            stop_before_hash=winner,
+            preserve_hashes=[
+                block_hash for block_hash in rig.block_hashes if block_hash != closed
+            ],
+        )
 
         # The rig's own RPC call log is the proof: the row was terminalized
-        # and not one submitblock was made, on this call or ever.
-        self.assertEqual(drain.rounds, 1)
+        # and not one submitblock was made, on this call or ever -- so the
+        # call performed no rounds at all, and the report's offer gauge
+        # agrees with its RPC delta instead of contradicting it.
+        self.assertEqual(drain.rounds, 0)
         self.assertEqual(drain.rpc_calls.get("submitblock", 0), 0)
         self.assertNotIn("submitblock", rig.decided_rpc.calls)
         self.assertEqual(drain.abandoned_hashes, frozenset({closed}))
         self.assertEqual(drain.submitted_hashes, frozenset())
+        self.assertEqual(
+            drain.withheld_hashes,
+            frozenset(rig.block_hashes) - {closed},
+        )
         # The durable row still records an attempt, so attempt_count is no
         # substitute for the missing RPC: submit_writer marks admission to a
         # processing phase before the offer branch it never took.
@@ -577,6 +592,76 @@ class DecidedCandidateStormTests(unittest.TestCase):
             drain.rpc_calls["submitblock"],
             DECIDED_STORM_CANDIDATES - 2,
         )
+
+    def test_max_rounds_budgets_offers_not_wakeups_when_a_lease_is_held(
+        self,
+    ) -> None:
+        """A parked no-offer row must not spend the bounded drain's budget.
+
+        ``submit_next_block_candidate(defer_accounting=True)`` returns True
+        for the head whose disposition lease it could not claim: it only
+        parks the wakeup in ``_block_disposition_waiting_retries`` and
+        returns, having offered qbitd nothing.  A ``max_rounds`` budget spent
+        on that boolean would end a bounded drain with zero submitblock
+        calls, zero accounting tasks and zero terminalizations, while the
+        report still claimed a round -- so the gauge would contradict this
+        report's own RPC, accounting and terminal-set fields, and a caller
+        stepping the oracle one offered row at a time would silently get no
+        row at all.
+        """
+
+        rig = CandidateStormRig(candidates=DECIDED_STORM_CANDIDATES)
+        rig.seed_live()
+        winner = rig.decide_height()
+        server = rig.live_server
+        service = server._ensure_block_candidate_service()
+        # The head of the live lane, so the parked row is the first one the
+        # bounded drain reaches.
+        held = str(
+            list(service.candidate_queue.queue)[0].submission.block_hash_hex
+        ).lower()
+
+        release = rig.perturb(server, "lease_held", held)
+        try:
+            drain = rig.drain_per_row(
+                server,
+                stop_before_hash=winner,
+                max_rounds=1,
+            )
+            # Read while the lease still stands: that is the state the drain
+            # saw and the reason it parked the row.
+            record = {r.block_hash: r for r in rig.ownership(server)}[held]
+        finally:
+            release()
+
+        # The parked row cost no offer, so it cost no round; the drain moved
+        # past it and spent its single round on a row it really offered.
+        self.assertEqual(drain.rounds, 1)
+        self.assertEqual(drain.rpc_calls.get("submitblock", 0), 1)
+        self.assertEqual(drain.accounting_tasks, 1)
+        self.assertEqual(drain.ledger_attempt_marks, 1)
+        # Every cost field agrees with the terminal sets: exactly one row was
+        # terminalized, and it is not the parked one.
+        self.assertEqual(len(drain.abandoned_hashes), 1)
+        self.assertNotIn(held, drain.abandoned_hashes)
+        self.assertEqual(drain.submitted_hashes, frozenset())
+        self.assertEqual(drain.lease_blocked_hashes, frozenset({held}))
+        self.assertEqual(drain.withheld_hashes, frozenset({held}))
+        self.assertIn(held, drain.pending_hashes)
+        self.assertEqual(
+            drain.pending_hashes,
+            frozenset(rig.block_hashes) - drain.abandoned_hashes,
+        )
+
+        # The parked row itself is untouched: no offer, no durable attempt,
+        # no terminal outcome -- only the lease this test holds.
+        self.assertEqual(record.outbox_state, "pending")
+        self.assertEqual(record.attempt_count, 0)
+        self.assertIsNone(record.terminal_outcome)
+        self.assertFalse(record.node_offer_evidence)
+        self.assertTrue(record.disposition_held)
+        self.assertTrue(record.lease_held_without_offer)
+        self.assertTrue(record.selector_evidence)
 
     def test_per_row_drain_preserves_every_offer_evidence_perturbation(
         self,

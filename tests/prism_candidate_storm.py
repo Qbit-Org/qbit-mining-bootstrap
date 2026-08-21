@@ -305,6 +305,19 @@ class PerRowDrainReport:
     counterweight -- rows the drain reached and the shipped path deliberately
     refused to terminalize -- so a selector that claims one of them can be
     caught rather than silently believed.
+
+    ``rounds`` is the number of node offers the call actually performed --
+    the ``submitblock`` delta in the rig's own RPC log -- not the number of
+    wakeups it consumed.  ``submit_next_block_candidate`` returns True on
+    several paths that never reach qbitd: a disposition lease held elsewhere
+    parks the wakeup in ``_block_disposition_waiting_retries``, a same-hash
+    duplicate whose disposition already landed is dropped, a declined
+    fast-lane reservation retains the candidate for retry, and the
+    capacity-closed split hands accounting an ``attempted=False`` submission
+    that terminalizes the durable row without calling qbitd once.  Counting
+    those would make ``rounds`` disagree with this report's own ``rpc_calls``,
+    ``accounting_tasks`` and ``ledger_attempt_marks``, and would let a
+    ``max_rounds`` budget be spent without a single offer being made.
     """
 
     rounds: int
@@ -892,6 +905,29 @@ class CandidateStormRig:
             if wakeup is not None and held is not None:
                 held.append((str(lane), head, wakeup))
 
+    @staticmethod
+    def _node_offers_made(rpc: Any) -> int:
+        """Total ``submitblock`` calls the rig's RPC log has counted so far.
+
+        :class:`DecidedHeightRpc` counts per method under a lock, and the
+        shipped fast lane runs ``submitblock`` on a bounded worker thread
+        whose completion ``submit_next`` waits for, so a delta taken across
+        one ``submit_next`` names exactly the offers that call performed.
+
+        The counter is required rather than optional: a drain that could not
+        read it would report zero offers forever, which would silently make
+        ``max_rounds`` unbounded instead of stopping the drain.  Every drain
+        runs against a decided height, so the counter is always installed.
+        """
+        calls = getattr(rpc, "calls", None)
+        if not isinstance(calls, dict):
+            raise TypeError(
+                "drain_per_row needs the per-method RPC counter installed by "
+                "decide_height; rounds and max_rounds are measured from its "
+                "submitblock count"
+            )
+        return int(calls.get("submitblock", 0))
+
     def _run_block_accounting_tasks(self, server: Any) -> int:
         """Run the shipped accounting lane to quiescence, on this thread.
 
@@ -973,11 +1009,20 @@ class CandidateStormRig:
         a discarded wakeup leaves the row pending with nothing left to
         dispose of it and no later drain able to reach it.
 
-        ``max_rounds`` stops the drain after that many rows have been offered,
-        so a caller can step the oracle one row at a time.  The report then
-        covers only the rows *this* call moved: it is compared against the
-        durable state captured on entry, so a second bounded call never
-        re-reports the first one's abandonment.
+        ``max_rounds`` stops the drain after that many *node offers* -- the
+        ``submitblock`` calls this invocation actually made, measured across
+        each ``submit_next`` from the rig's own RPC log -- so a caller can
+        step the oracle one offered row at a time.  It is deliberately not
+        the count of consumed wakeups: ``submit_next`` also returns True for
+        a row it parked on a lease held elsewhere, a same-hash duplicate it
+        dropped, a fast-lane reservation it declined, and the capacity-closed
+        ``attempted=False`` split that terminalizes a durable row without
+        calling qbitd, and spending the budget on those would stop a bounded
+        drain before it performed the offers it promised.  Boundedness for
+        those rows comes from the withholding above, not from the budget.
+        The report then covers only the rows *this* call moved: it is
+        compared against the durable state captured on entry, so a second
+        bounded call never re-reports the first one's abandonment.
         """
         service = server._ensure_block_candidate_service()
         service._ensure_block_candidate_disposition_state()
@@ -999,6 +1044,9 @@ class CandidateStormRig:
         lease_blocked: set[str] = set()
         deferred: set[str] = set()
         stalls: dict[str, int] = {}
+        # Node offers this call performed.  The rig's RPC log is the only
+        # authoritative source: ``submit_next``'s boolean is True for
+        # no-offer paths too (see PerRowDrainReport).
         rounds = 0
         accounting_tasks = 0
         enumerations = 0
@@ -1030,8 +1078,12 @@ class CandidateStormRig:
                         break
                     with server.lock:
                         terminal_before = len(service._block_candidate_terminal_outcomes)
-                    if server.submit_next_block_candidate(defer_accounting=True):
-                        rounds += 1
+                    offers_before = self._node_offers_made(rpc)
+                    server.submit_next_block_candidate(defer_accounting=True)
+                    # submit_next waits for its own submitblock worker before
+                    # returning, so this delta is complete and is either 0 or
+                    # 1 for the row just driven.
+                    rounds += self._node_offers_made(rpc) - offers_before
                     accounting_tasks += self._run_block_accounting_tasks(server)
                     with server.lock:
                         progressed = (
