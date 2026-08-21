@@ -47,6 +47,7 @@ from lab.prism.block_candidates import (  # noqa: E402
     BLOCK_CANDIDATE_COLLAPSE_LOG_SAMPLE_HASHES,
     COLLAPSE_DIFFICULTY_SCALE,
     COLLAPSE_POW_LIMIT_BITS,
+    DEFAULT_BLOCK_ACCOUNTING_CLEANUP_RETRY_WORK_ITEMS,
     MAX_BLOCK_REPLAY_ENUMERATION_ROWS,
     MAX_PENDING_BLOCK_CANDIDATES,
     PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES,
@@ -1525,6 +1526,131 @@ class BlockCandidateCollapseCleanupTests(unittest.TestCase):
         )
 
 
+def _break_cleanup_step(target: Any, name: str, *, only: str | None = None) -> dict:
+    """Make one cleanup step raise until the returned switch is flipped."""
+    original = getattr(target, name)
+    broken = {"on": True}
+
+    def failing(block_hash: str, *args: Any, **kwargs: Any) -> Any:
+        if broken["on"] and (only is None or block_hash == only):
+            raise RuntimeError(f"{name} boom")
+        return original(block_hash, *args, **kwargs)
+
+    setattr(target, name, failing)
+    return broken
+
+
+class AccountingLaneRig:
+    """Drive the shipped accounting loop against controllable lane traffic.
+
+    Only the two sinks the loop reaches through the coordinator are replaced
+    -- the ordinary accounting task runner and the invalid-candidate
+    quarantine drain -- so the loop body, its cleanup-retry cadence, and the
+    real deferred cleanup all stay exactly as shipped.  ``mode`` chooses
+    which lane is kept permanently busy:
+
+    ``accounting``
+        Each finished task re-arms the primary handoff queue before it
+        returns, so the loop's next queue read can never see an empty lane.
+    ``quarantine``
+        Both handoff queues stay empty and the quarantine drain always
+        reports an item, so the loop never reaches its idle branch either.
+    ``both``
+        The two alternate: each quarantine item re-arms the accounting
+        queue, so one work item of each kind completes per pair.
+    ``idle``
+        No traffic at all, so the loop falls straight through to the idle
+        branch that predates the cadence.
+
+    In every busy mode the idle branch is unreachable by construction, which
+    is what makes these fixtures a starvation test rather than a race.
+    """
+
+    ACCOUNTING = "accounting"
+    QUARANTINE = "quarantine"
+    BOTH = "both"
+    IDLE = "idle"
+
+    def __init__(self, fixture: CollapseFixture, mode: str) -> None:
+        self.fixture = fixture
+        self.server = fixture.server
+        self.service = fixture.service
+        self.mode = mode
+        self.accounting_items = 0
+        self.quarantine_items = 0
+        # (accounting items, quarantine items) completed at each offer.
+        self.offers: list[tuple[int, int]] = []
+        self.attempts = 0
+        self.log = ""
+        self.thread_alive = False
+        self._sequence = 0
+        self.service._ensure_block_accounting_state()
+        self.service._ensure_block_replay_state()
+        self.server._run_block_accounting_task = self._run_task
+        self.server._run_one_invalid_block_candidate_quarantine = self._run_quarantine
+        shipped = self.service._run_one_collapsed_block_candidate_cleanup_retry
+
+        def offer() -> bool:
+            self.offers.append((self.accounting_items, self.quarantine_items))
+            ran = shipped()
+            if ran:
+                self.attempts += 1
+            return ran
+
+        self.service._run_one_collapsed_block_candidate_cleanup_retry = offer
+        if mode in (self.ACCOUNTING, self.BOTH):
+            self._arm_accounting()
+
+    @property
+    def work_items(self) -> int:
+        return self.accounting_items + self.quarantine_items
+
+    def _arm_accounting(self) -> None:
+        self._sequence += 1
+        self.service._block_accounting_queue.put_nowait(
+            (0, self._sequence, SimpleNamespace())
+        )
+
+    def _run_task(self, task: Any) -> None:
+        self.accounting_items += 1
+        if self.mode == self.ACCOUNTING:
+            self._arm_accounting()
+
+    def _run_quarantine(self) -> bool:
+        if self.mode not in (self.QUARANTINE, self.BOTH):
+            return False
+        self.quarantine_items += 1
+        if self.mode == self.BOTH:
+            self._arm_accounting()
+        return True
+
+    def run_until(self, predicate: Any, *, timeout: float = 10.0) -> bool:
+        """Run the lane until ``predicate`` holds or the deadline expires.
+
+        Bounded on purpose: a starved retry must end the test with a report,
+        not with an unbounded wait.  Counters are only read by callers after
+        the loop thread has been stopped and joined, so every assertion sees
+        one consistent snapshot.
+        """
+        thread = threading.Thread(
+            target=self.service.block_accounting_loop,
+            daemon=True,
+        )
+        buffer = StringIO()
+        with redirect_stdout(buffer):
+            thread.start()
+            try:
+                deadline = time.monotonic() + timeout
+                while not predicate() and time.monotonic() < deadline:
+                    time.sleep(0.002)
+            finally:
+                self.server.stop_event.set()
+                thread.join(timeout=timeout)
+        self.log = buffer.getvalue()
+        self.thread_alive = thread.is_alive()
+        return predicate()
+
+
 class BlockCandidateCollapseCleanupRetryTests(unittest.TestCase):
     """A failed cleanup is the only state with no durable replay source.
 
@@ -1541,16 +1667,7 @@ class BlockCandidateCollapseCleanupRetryTests(unittest.TestCase):
     @staticmethod
     def _breaker(target: Any, name: str, *, only: str | None = None) -> dict:
         """Make one cleanup step raise until the returned switch is flipped."""
-        original = getattr(target, name)
-        broken = {"on": True}
-
-        def failing(block_hash: str, *args: Any, **kwargs: Any) -> Any:
-            if broken["on"] and (only is None or block_hash == only):
-                raise RuntimeError(f"{name} boom")
-            return original(block_hash, *args, **kwargs)
-
-        setattr(target, name, failing)
-        return broken
+        return _break_cleanup_step(target, name, only=only)
 
     # -- payout preview and tombstone --------------------------------------
 
@@ -1936,6 +2053,197 @@ class BlockCandidateCollapseCleanupRetryTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(fixture.cleanup_backlog(), {})
         self.assertEqual(fixture.counts()["cleanup_recovered"], 1)
+
+
+class BlockCandidateCollapseCleanupCadenceTests(unittest.TestCase):
+    """The accounting lane must reach a due cleanup while it is busy.
+
+    A collapsed row whose cleanup failed has no durable replay source, so
+    the accounting lane is its only driver.  Driving it purely from that
+    lane's idle branch made the retry hostage to the lane going idle:
+    sustained ordinary accounting traffic, or a continuously replenished
+    invalid-candidate quarantine queue, starved it for as long as the
+    traffic lasted.  These tests own the explicit work-item cadence that
+    closes the gap in both directions -- the cleanup reaches its record
+    within a bounded number of work items, and the cleanup backlog in turn
+    can spend no more than one attempt per cadence, so it cannot starve
+    accounting or quarantine in return.
+    """
+
+    def _deferred(self, fixture: CollapseFixture, hashes: list[str]) -> dict:
+        """Collapse ``hashes`` with one cleanup step broken; return the switch."""
+        fixture.seed(hashes)
+        broken = _break_cleanup_step(
+            fixture.server,
+            "_clear_block_candidate_retry_state",
+        )
+        with redirect_stdout(StringIO()):
+            fixture.collapse()
+        self.assertEqual(set(fixture.cleanup_backlog()), set(hashes))
+        return broken
+
+    def test_the_cadence_bound_is_the_shipped_default(self) -> None:
+        fixture = CollapseFixture()
+        self.assertEqual(
+            fixture.service._block_accounting_cleanup_retry_work_items(),
+            DEFAULT_BLOCK_ACCOUNTING_CLEANUP_RETRY_WORK_ITEMS,
+        )
+        self.assertGreaterEqual(DEFAULT_BLOCK_ACCOUNTING_CLEANUP_RETRY_WORK_ITEMS, 1)
+
+    def test_a_non_positive_cadence_offers_after_every_work_item(self) -> None:
+        """A misconfigured bound degrades to offering more, never never."""
+        fixture = CollapseFixture()
+        fixture.server.block_accounting_cleanup_retry_work_items = 0
+        self.assertEqual(
+            fixture.service._block_accounting_cleanup_retry_work_items(),
+            1,
+        )
+        broken = self._deferred(fixture, [_hash(1)])
+        broken["on"] = False
+        rig = AccountingLaneRig(fixture, AccountingLaneRig.ACCOUNTING)
+        self.assertTrue(rig.run_until(lambda: not fixture.cleanup_backlog()))
+        self.assertLessEqual(rig.offers[0][0], 1)
+
+    # -- starvation by ordinary accounting traffic -------------------------
+
+    def test_a_due_cleanup_runs_while_the_accounting_queues_stay_busy(self) -> None:
+        """The handoff queues never empty, so only the cadence can run it."""
+        fixture = CollapseFixture()
+        target = _hash(1)
+        broken = self._deferred(fixture, [target])
+        broken["on"] = False
+        bound = fixture.service._block_accounting_cleanup_retry_work_items()
+        rig = AccountingLaneRig(fixture, AccountingLaneRig.ACCOUNTING)
+        self.assertTrue(
+            rig.run_until(lambda: not fixture.cleanup_backlog()),
+            f"cleanup starved behind accounting traffic; log={rig.log}",
+        )
+        self.assertFalse(rig.thread_alive)
+        self.assertEqual(fixture.cleanup_backlog(), {})
+        self.assertEqual(fixture.counts()["cleanup_recovered"], 1)
+        # The lane was never idle: every offer came from the cadence, and
+        # the first one landed inside the documented bound.
+        self.assertGreater(rig.accounting_items, 0)
+        self.assertEqual(rig.quarantine_items, 0)
+        self.assertLessEqual(rig.offers[0][0], bound)
+
+    # -- starvation by invalid-candidate quarantine traffic ----------------
+
+    def test_a_due_cleanup_runs_while_quarantine_is_replenished(self) -> None:
+        """Quarantine always reports work, so the idle branch never runs."""
+        fixture = CollapseFixture()
+        target = _hash(1)
+        broken = self._deferred(fixture, [target])
+        broken["on"] = False
+        bound = fixture.service._block_accounting_cleanup_retry_work_items()
+        rig = AccountingLaneRig(fixture, AccountingLaneRig.QUARANTINE)
+        self.assertTrue(
+            rig.run_until(lambda: not fixture.cleanup_backlog()),
+            f"cleanup starved behind quarantine traffic; log={rig.log}",
+        )
+        self.assertFalse(rig.thread_alive)
+        self.assertEqual(fixture.cleanup_backlog(), {})
+        self.assertEqual(fixture.counts()["cleanup_recovered"], 1)
+        self.assertEqual(rig.accounting_items, 0)
+        self.assertGreater(rig.quarantine_items, 0)
+        self.assertLessEqual(rig.offers[0][1], bound)
+
+    # -- the cadence cannot be starved *by* the cleanup --------------------
+
+    def test_a_cleanup_backlog_spends_one_attempt_per_cadence(self) -> None:
+        """A permanently failing backlog must not take the lane over."""
+        fixture = CollapseFixture()
+        hashes = [_hash(index) for index in range(1, 6)]
+        self._deferred(fixture, hashes)
+        # retry_initial_seconds is 0 in this fixture, so the doubled backoff
+        # stays 0 and every record in the backlog is due on every offer.
+        self.assertEqual(fixture.service.retry_initial_seconds, 0.0)
+        bound = fixture.service._block_accounting_cleanup_retry_work_items()
+        rig = AccountingLaneRig(fixture, AccountingLaneRig.BOTH)
+        self.assertTrue(rig.run_until(lambda: rig.work_items >= 20 * bound))
+        self.assertFalse(rig.thread_alive)
+        # One offer per completed cadence, and one attempt per offer at most.
+        self.assertEqual(len(rig.offers), rig.work_items // bound)
+        self.assertLessEqual(rig.attempts, rig.work_items // bound)
+        self.assertEqual(fixture.counts()["cleanup_retry_failed"], rig.attempts)
+        # Both lanes kept draining throughout; neither was taken over.
+        self.assertGreaterEqual(rig.accounting_items, 5 * bound)
+        self.assertGreaterEqual(rig.quarantine_items, 5 * bound)
+        # Round-robin re-registration keeps the whole backlog owed.
+        self.assertEqual(set(fixture.cleanup_backlog()), set(hashes))
+        self.assertEqual(fixture.counts()["cleanup_recovered"], 0)
+
+    # -- the cadence offers, the record's own deadline decides -------------
+
+    def test_a_record_behind_its_backoff_is_offered_but_not_run(self) -> None:
+        fixture = CollapseFixture()
+        target = _hash(1)
+        self._deferred(fixture, [target])
+        registry = fixture.service._block_candidate_collapse_cleanup_retries
+        with fixture.server.lock:
+            registry[target].not_before_monotonic = time.monotonic() + 3600.0
+        bound = fixture.service._block_accounting_cleanup_retry_work_items()
+        rig = AccountingLaneRig(fixture, AccountingLaneRig.ACCOUNTING)
+        self.assertTrue(rig.run_until(lambda: len(rig.offers) >= 3))
+        self.assertFalse(rig.thread_alive)
+        # Offered on cadence...
+        self.assertLessEqual(rig.offers[0][0], bound)
+        # ...and refused by the record's own deadline, not run early.
+        self.assertEqual(rig.attempts, 0)
+        self.assertEqual(registry[target].attempts, 0)
+        self.assertEqual(set(fixture.cleanup_backlog()), {target})
+        counts = fixture.counts()
+        self.assertEqual(counts["cleanup_retry_failed"], 0)
+        self.assertEqual(counts["cleanup_recovered"], 0)
+
+    # -- the pre-existing idle path is unchanged ---------------------------
+
+    def test_a_truly_idle_lane_still_runs_the_cleanup_immediately(self) -> None:
+        """The idle branch must not wait for a cadence's worth of items."""
+        fixture = CollapseFixture()
+        target = _hash(1)
+        broken = self._deferred(fixture, [target])
+        broken["on"] = False
+        rig = AccountingLaneRig(fixture, AccountingLaneRig.IDLE)
+        self.assertTrue(
+            rig.run_until(lambda: not fixture.cleanup_backlog()),
+            f"idle lane did not finish the cleanup; log={rig.log}",
+        )
+        self.assertFalse(rig.thread_alive)
+        self.assertEqual(fixture.cleanup_backlog(), {})
+        self.assertEqual(fixture.counts()["cleanup_recovered"], 1)
+        # No work item of either kind was needed.
+        self.assertEqual(rig.accounting_items, 0)
+        self.assertEqual(rig.quarantine_items, 0)
+        self.assertEqual(rig.offers[0], (0, 0))
+
+    # -- regression proof for the cadence itself ---------------------------
+
+    def test_without_the_cadence_both_lanes_starve_the_cleanup(self) -> None:
+        """Neutralising the cadence must break the two starvation tests.
+
+        Raising the bound out of reach removes every cadence offer, which is
+        exactly what deleting the cadence calls does to the loop: in both
+        busy modes the idle branch is unreachable, so nothing is left to
+        drive the retry.  If this test ever stops starving, the two tests
+        above have stopped proving the cadence.
+        """
+        bound = DEFAULT_BLOCK_ACCOUNTING_CLEANUP_RETRY_WORK_ITEMS
+        for mode in (AccountingLaneRig.ACCOUNTING, AccountingLaneRig.QUARANTINE):
+            with self.subTest(mode=mode):
+                fixture = CollapseFixture()
+                target = _hash(1)
+                broken = self._deferred(fixture, [target])
+                broken["on"] = False
+                fixture.server.block_accounting_cleanup_retry_work_items = 1 << 30
+                rig = AccountingLaneRig(fixture, mode)
+                rig.run_until(lambda: rig.work_items >= 50 * bound)
+                self.assertFalse(rig.thread_alive)
+                self.assertGreaterEqual(rig.work_items, 50 * bound)
+                self.assertEqual(rig.offers, [])
+                self.assertEqual(rig.attempts, 0)
+                self.assertEqual(set(fixture.cleanup_backlog()), {target})
+                self.assertEqual(fixture.counts()["cleanup_recovered"], 0)
 
 
 class BlockCandidateCollapseSubmissionFenceTests(unittest.TestCase):

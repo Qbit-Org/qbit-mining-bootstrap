@@ -66,6 +66,18 @@ DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS = 30.0
 # stays unbounded by design so an already-offered block is never converted
 # back into a raw-submit retry.
 DEFAULT_BLOCK_ACCOUNTING_QUEUE_DEPTH = 8
+# A collapsed row whose post-write cleanup failed has no durable replay
+# source left, so the accounting lane is the only thing that can ever finish
+# it. Draining it purely from that lane's idle branch made it hostage to the
+# lane staying idle: sustained ordinary accounting traffic, or a
+# continuously replenished invalid-candidate quarantine queue, starved the
+# retry for as long as the traffic lasted. The lane therefore also offers
+# one bounded retry after at most this many completed work items, where a
+# work item is one finished accounting task from either handoff queue or one
+# finished quarantine item. The offer runs at most one hash's still-owed
+# steps and the cadence resets on every offer -- including one that finds
+# nothing due -- so neither lane can starve the other.
+DEFAULT_BLOCK_ACCOUNTING_CLEANUP_RETRY_WORK_ITEMS = 8
 BLOCK_SUBMITTER_WAIT_HEARTBEAT_SLICE_SECONDS = 0.25
 MAX_BLOCK_SUBMITTER_STUCK_CALL_WORKERS = 2
 BLOCK_CANDIDATE_RETRY_HEARTBEAT_SLICE_SECONDS = 0.25
@@ -1823,14 +1835,18 @@ class BlockCandidateService:
     def _run_one_collapsed_block_candidate_cleanup_retry(self) -> bool:
         """Retry one deferred collapse cleanup; True when one was attempted.
 
-        Driven from the accounting lane's idle branch beside the quarantine
-        drain, because a terminal hash's cleanup is accounting work and the
-        durable row behind it is already gone. The pass is bounded three
-        ways: at most one hash per call, only that hash's still-owed steps,
-        and only once its own backoff deadline has passed. It never reads or
-        writes the outbox and never enqueues a candidate, so it can only
-        finish tearing state down -- a terminal row can be neither re-adopted
-        nor re-offered from here.
+        Driven from the accounting lane, because a terminal hash's cleanup
+        is accounting work and the durable row behind it is already gone.
+        The lane offers it two ways: immediately whenever the lane is truly
+        idle, and otherwise on an explicit cadence after at most
+        ``_block_accounting_cleanup_retry_work_items()`` completed work
+        items, so neither sustained accounting traffic nor a continuously
+        replenished quarantine queue can starve a due record. The pass is
+        bounded three ways: at most one hash per call, only that hash's
+        still-owed steps, and only once its own backoff deadline has passed.
+        It never reads or writes the outbox and never enqueues a candidate,
+        so it can only finish tearing state down -- a terminal row can be
+        neither re-adopted nor re-offered from here.
         """
         registry = self._collapsed_candidate_cleanup_registry()
         now = time.monotonic()
@@ -4093,9 +4109,35 @@ class BlockCandidateService:
             )
             self._coordinator._record_block_submitter_phase("refresh-jobs:complete")
 
+    def _block_accounting_cleanup_retry_work_items(self) -> int:
+        """Completed work items the lane may run between cleanup offers.
+
+        One work item is one finished ordinary accounting task from either
+        handoff queue, or one finished invalid-candidate quarantine item.
+        Bounded below at one so a misconfigured value degrades into offering
+        the retry after every item rather than never offering it at all.
+        """
+        return max(
+            1,
+            int(
+                getattr(
+                    self._coordinator,
+                    "block_accounting_cleanup_retry_work_items",
+                    DEFAULT_BLOCK_ACCOUNTING_CLEANUP_RETRY_WORK_ITEMS,
+                )
+            ),
+        )
+
     def block_accounting_loop(self) -> None:
         self._block_accounting_thread_ident = threading.get_ident()
         self._ensure_block_accounting_state()
+        # Work items completed since the last deferred-cleanup offer. The
+        # idle branch below cannot be the only driver: either lane running
+        # continuously would hold a due terminal cleanup off for as long as
+        # the traffic lasted, and its durable row is already gone. Counting
+        # items here bounds that wait at one offer per configured cadence
+        # whichever lane the traffic is on.
+        work_items = 0
         while not self._coordinator.stop_event.is_set():
             self._coordinator._record_block_submitter_phase("accounting-queue")
             source_queue = None
@@ -4110,10 +4152,21 @@ class BlockCandidateService:
                     source_queue = self._block_accounting_overflow_queue
                 except queue.Empty:
                     if self._coordinator._run_one_invalid_block_candidate_quarantine():
+                        work_items += 1
+                        if (
+                            work_items
+                            >= self._block_accounting_cleanup_retry_work_items()
+                        ):
+                            work_items = 0
+                            self._run_one_collapsed_block_candidate_cleanup_retry()
                         continue
                     # A collapsed row's failed cleanup has no durable replay
-                    # source left, so this idle branch is the only thing that
-                    # will ever finish it.
+                    # source left, so the accounting lane is the only thing
+                    # that will ever finish it. A truly idle lane offers it
+                    # here immediately rather than waiting out a cadence; the
+                    # work-item cadence exists for the busy lanes, which
+                    # never reach this branch at all.
+                    work_items = 0
                     if self._run_one_collapsed_block_candidate_cleanup_retry():
                         continue
                     self._coordinator.stop_event.wait(self._block_work_wait_slice())
@@ -4131,6 +4184,18 @@ class BlockCandidateService:
             finally:
                 assert source_queue is not None
                 source_queue.task_done()
+            work_items += 1
+            if work_items >= self._block_accounting_cleanup_retry_work_items():
+                # The counter resets on every offer, due record or not: a
+                # cleanup backlog may therefore spend at most one attempt per
+                # cadence, so it can never starve accounting or quarantine in
+                # return. Deliberately left uncontained and outside the task's
+                # try/finally -- the retry pops its record before attempting
+                # it, and only its own failure paths re-register it, so an
+                # outer catch here could swallow the last reference to a
+                # terminal hash's owed steps.
+                work_items = 0
+                self._run_one_collapsed_block_candidate_cleanup_retry()
 
     # -- submitter loop ----------------------------------------------------
 
