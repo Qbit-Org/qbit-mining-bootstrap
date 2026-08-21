@@ -80,7 +80,7 @@ Lint only in Docker:
 docker run --rm \
   -e PYTHONPYCACHEPREFIX=/tmp/pycache \
   -v "$PWD:/work:ro" -w /work \
-  python:3.12-slim \
+  python:3.14-slim-trixie \
   python -m compileall -q docker lab tests examples scripts
 
 docker run --rm \
