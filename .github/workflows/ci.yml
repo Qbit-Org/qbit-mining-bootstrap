@@ -20,7 +20,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -82,7 +82,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Install ckpool build dependencies
         run: |
@@ -106,7 +106,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Install production PostgreSQL client dependency
         run: python -m pip install "psycopg[binary]==3.2.*"
@@ -198,7 +198,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Stage pinned qbit source
         run: |
