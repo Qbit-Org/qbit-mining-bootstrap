@@ -33,7 +33,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Iterable
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -45,15 +45,18 @@ from lab.prism.block_candidates import (  # noqa: E402
     BLOCK_CANDIDATE_COLLAPSE_LOG_FAILURES,
     BLOCK_CANDIDATE_COLLAPSE_LOG_GROUPS,
     BLOCK_CANDIDATE_COLLAPSE_LOG_SAMPLE_HASHES,
+    BLOCK_CANDIDATE_TERMINAL_OUTCOME_EVICTION_SCAN,
     COLLAPSE_DIFFICULTY_SCALE,
     COLLAPSE_POW_LIMIT_BITS,
     DEFAULT_BLOCK_ACCOUNTING_CLEANUP_RETRY_WORK_ITEMS,
+    MAX_BLOCK_CANDIDATE_TERMINAL_OUTCOMES,
     MAX_BLOCK_REPLAY_ENUMERATION_ROWS,
     MAX_PENDING_BLOCK_CANDIDATES,
     PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES,
     PRISM_BLOCK_CANDIDATE_COLLAPSE_REASON,
     PRISM_BLOCK_CANDIDATE_COLLAPSE_STALE_JOB_CLASS,
     PRISM_STALE_JOB_ABANDON_CLASSES,
+    _BlockCandidateChainView,
     _BlockCandidateNodeSubmission,
     _collapse_scaled_difficulty,
 )
@@ -943,9 +946,9 @@ class BlockCandidateCollapseApplyTests(unittest.TestCase):
         seen: list[frozenset[str]] = []
         original = fixture.service._block_candidate_collapse_evidence
 
-        def record(*, ignore_leases=frozenset()):
+        def record(hashes, *, ignore_leases=frozenset()):
             seen.append(frozenset(ignore_leases))
-            return original(ignore_leases=ignore_leases)
+            return original(hashes, ignore_leases=ignore_leases)
 
         fixture.service._block_candidate_collapse_evidence = record
         self.assertEqual(_selected(fixture), {_hash(1), _hash(2)})
@@ -2592,6 +2595,452 @@ class BlockCandidateCollapseSubmissionFenceTests(unittest.TestCase):
             outcomes = dict(service._block_candidate_terminal_outcomes)
         self.assertEqual(outcomes, {won: False})
         self.assertEqual(fixture.counts()["write_lost"], 1)
+
+
+class _CountingRegistry(dict):
+    """A registry that counts membership probes and reports being walked.
+
+    The page-bounded evidence read has to answer from probes alone; a
+    regression that goes back to copying a registry into a set shows up here
+    as a walk (optionally a hard failure) rather than as a wall-clock wobble
+    that a fast enough machine hides.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.probes = 0
+        self.walks = 0
+        self.forbid_walks = False
+
+    def __contains__(self, key: object) -> bool:
+        self.probes += 1
+        return super().__contains__(key)
+
+    def __iter__(self) -> Any:
+        self.walks += 1
+        if self.forbid_walks:
+            raise AssertionError("terminal outcome registry was walked")
+        return super().__iter__()
+
+
+def _history_hashes(count: int, *, start: int = 1 << 20) -> list[str]:
+    """``count`` distinct hashes standing in for already-disposed blocks."""
+    return [f"{index:064x}" for index in range(start, start + count)]
+
+
+class BlockCandidateCollapseEvidenceCostTests(unittest.TestCase):
+    """One evidence probe per hash the caller is deciding, and no more.
+
+    ``_block_candidate_terminal_outcomes`` is the one registry the collapse
+    evidence read touches that grows with every block the process has ever
+    disposed: the 2026-08-20 storm left 312,000 entries behind, and every
+    poll folded all of them into a set while holding ``coordinator.lock``
+    -- about 124 ms per page, linear in history, with every unrelated share
+    ack queued behind the same lock.  The selector never needed the union:
+    it asks one question, "is this page's hash already offered", for at most
+    a page of hashes at a time.
+
+    These tests pin that shape with a registry that counts its probes and
+    refuses to be walked, so the cost claim is a deterministic assertion
+    about work performed rather than a timing measurement.
+    """
+
+    HISTORY = 200_000
+
+    @staticmethod
+    def _install_history(
+        fixture: CollapseFixture,
+        size: int,
+        *,
+        terminal: Iterable[str] = (),
+    ) -> _CountingRegistry:
+        registry = _CountingRegistry(
+            (block_hash, False) for block_hash in _history_hashes(size)
+        )
+        for block_hash in terminal:
+            registry[block_hash] = False
+        with fixture.server.lock:
+            fixture.service._block_candidate_terminal_outcomes = registry
+        registry.probes = 0
+        registry.walks = 0
+        return registry
+
+    def test_evidence_answers_a_page_without_walking_the_history(self) -> None:
+        fixture = CollapseFixture()
+        page = [_hash(1), _hash(2)]
+        fixture.seed(page)
+        registry = self._install_history(
+            fixture,
+            self.HISTORY,
+            terminal=[_hash(2)],
+        )
+        registry.forbid_walks = True
+        evidence = fixture.service._block_candidate_collapse_evidence(page)
+        # Semantics unchanged: the historical terminal outcome still speaks
+        # for its hash, it is simply asked about rather than enumerated.
+        self.assertEqual(evidence, frozenset({_hash(2)}))
+        self.assertEqual(registry.walks, 0)
+        self.assertEqual(registry.probes, len(page))
+
+    def test_selection_work_does_not_grow_with_the_history(self) -> None:
+        """The same page costs the same probes at 1,000 and at 200,000."""
+        page = [_hash(index) for index in range(1, 6)]
+        probes: dict[int, int] = {}
+        for size in (1_000, self.HISTORY):
+            with self.subTest(history=size):
+                fixture = CollapseFixture()
+                fixture.seed(page)
+                rows = fixture.page()
+                registry = self._install_history(fixture, size)
+                registry.forbid_walks = True
+                chain = _BlockCandidateChainView(fixture.service)
+                selected = fixture.service._select_superseded_block_candidates(
+                    rows,
+                    chain,
+                )
+                self.assertEqual(
+                    {row.block_hash for row in selected},
+                    set(page),
+                )
+                self.assertEqual(registry.walks, 0)
+                probes[size] = registry.probes
+        self.assertEqual(probes[1_000], probes[self.HISTORY])
+        self.assertEqual(probes[self.HISTORY], len(page))
+
+    def test_revalidation_probes_only_the_leased_subset(self) -> None:
+        """The pre-write re-read is bounded by the leases, not by the page."""
+        fixture = CollapseFixture()
+        page = [_hash(index) for index in range(1, 6)]
+        fixture.seed(page)
+        chain = _BlockCandidateChainView(fixture.service)
+        selected = fixture.service._select_superseded_block_candidates(
+            fixture.page(),
+            chain,
+        )
+        leased = selected[:2]
+        registry = self._install_history(fixture, 1_000)
+        registry.forbid_walks = True
+        qualified, _tip = fixture.service._revalidate_superseded_block_candidates(
+            leased,
+            chain,
+        )
+        self.assertEqual(
+            {row.block_hash for row in qualified},
+            {row.block_hash for row in leased},
+        )
+        self.assertEqual(registry.walks, 0)
+        self.assertEqual(registry.probes, len(leased))
+
+    def test_a_collapse_over_a_large_history_bounds_it(self) -> None:
+        """The apply still wins its page, and leaves the registry bounded."""
+        fixture = CollapseFixture()
+        page = [_hash(index) for index in range(1, 6)]
+        fixture.seed(page)
+        with fixture.server.lock:
+            fixture.service._block_candidate_terminal_outcomes = {
+                block_hash: False
+                for block_hash in _history_hashes(self.HISTORY)
+            }
+        self.assertEqual(_selected(fixture), set(page))
+        outcomes = fixture.service._block_candidate_terminal_outcomes
+        self.assertEqual(len(outcomes), MAX_BLOCK_CANDIDATE_TERMINAL_OUTCOMES)
+        for block_hash in page:
+            self.assertIs(outcomes[block_hash], False)
+
+
+class BlockCandidateTerminalOutcomeBoundTests(unittest.TestCase):
+    """The terminal-outcome registry is bounded, and never unfences a copy.
+
+    The same-hash disposition guard used to remember every outcome for the
+    life of the process.  That is what made the collapse evidence read
+    expensive, but it is also unbounded memory in its own right, so the
+    registry is trimmed oldest-first once it passes
+    ``MAX_BLOCK_CANDIDATE_TERMINAL_OUTCOMES``.
+
+    Eviction is the dangerous half.  A forgotten outcome reads exactly like
+    an outcome that never happened, so a same-hash candidate still sitting
+    in the live, replay, retry, parked, or quarantine lane would find no
+    fence and offer qbitd a block whose durable row is already terminal --
+    the very escape ``_publish_collapsed_candidate_terminal_fence`` exists
+    to close.  Every lane that can still be holding such a copy therefore
+    pins its hash, and these tests own that pin, lane by lane.
+    """
+
+    CAP = MAX_BLOCK_CANDIDATE_TERMINAL_OUTCOMES
+
+    # -- harness -----------------------------------------------------------
+
+    @staticmethod
+    def _fill(fixture: CollapseFixture, count: int) -> None:
+        """Accumulate historical outcomes behind whatever is already there."""
+        with fixture.server.lock:
+            outcomes = fixture.service._block_candidate_terminal_outcomes
+            for block_hash in _history_hashes(count):
+                outcomes[block_hash] = False
+
+    @staticmethod
+    def _record(fixture: CollapseFixture, count: int) -> None:
+        """Drive ``count`` real terminal outcomes, each one a trim occasion."""
+        for block_hash in _history_hashes(count, start=1 << 40):
+            fixture.server._record_block_candidate_terminal_outcome(
+                block_hash,
+                accepted=False,
+            )
+
+    def _pressure(self, fixture: CollapseFixture) -> None:
+        """Push the registry past its bound through the shipped writer."""
+        self._fill(fixture, self.CAP)
+        self._record(fixture, 64)
+
+    # -- the bound ---------------------------------------------------------
+
+    def test_the_registry_stops_growing_at_its_bound(self) -> None:
+        fixture = CollapseFixture()
+        self._record(fixture, self.CAP + 512)
+        outcomes = fixture.service._block_candidate_terminal_outcomes
+        self.assertEqual(len(outcomes), self.CAP)
+        history = _history_hashes(self.CAP + 512, start=1 << 40)
+        # Oldest-first: the first outcomes are gone, the newest are kept.
+        self.assertIsNone(
+            fixture.server._block_candidate_terminal_outcome(history[0])
+        )
+        self.assertIs(
+            fixture.server._block_candidate_terminal_outcome(history[-1]),
+            False,
+        )
+
+    def test_a_re_recorded_outcome_is_treated_as_the_newest(self) -> None:
+        """Reasserting an outcome must not leave it at the eviction front."""
+        fixture = CollapseFixture()
+        target = _hash(1)
+        fixture.server._record_block_candidate_terminal_outcome(
+            target,
+            accepted=False,
+        )
+        self._fill(fixture, 8)
+        fixture.server._record_block_candidate_terminal_outcome(
+            target,
+            accepted=False,
+        )
+        outcomes = fixture.service._block_candidate_terminal_outcomes
+        self.assertEqual(list(outcomes)[-1], target)
+
+    def test_pinned_entries_do_not_stall_the_trim(self) -> None:
+        """A run of pinned hashes longer than the scan window still drains."""
+        fixture = CollapseFixture()
+        pinned = _history_hashes(
+            BLOCK_CANDIDATE_TERMINAL_OUTCOME_EVICTION_SCAN * 2,
+            start=1 << 30,
+        )
+        for block_hash in pinned:
+            fixture.server._record_block_candidate_terminal_outcome(
+                block_hash,
+                accepted=False,
+            )
+        with fixture.server.lock:
+            fixture.service._block_replay_inflight_hashes.update(pinned)
+        self._pressure(fixture)
+        outcomes = fixture.service._block_candidate_terminal_outcomes
+        self.assertEqual(len(outcomes), self.CAP)
+        for block_hash in pinned:
+            self.assertIn(block_hash, outcomes)
+
+    def test_a_fence_page_larger_than_the_bound_keeps_its_publication(
+        self,
+    ) -> None:
+        """A storm-sized fence never evicts the outcomes it just published."""
+        fixture = CollapseFixture()
+        self._fill(fixture, self.CAP)
+        page = tuple(_history_hashes(self.CAP + 100, start=1 << 50))
+        with redirect_stdout(StringIO()):
+            fixture.service._publish_collapsed_candidate_terminal_fence(page)
+        outcomes = fixture.service._block_candidate_terminal_outcomes
+        for block_hash in page:
+            self.assertIs(outcomes[block_hash], False)
+        # Only history was dropped; the registry stays over its bound
+        # rather than unfencing a row the apply is still cleaning up.
+        self.assertEqual(len(outcomes), len(page))
+
+    def test_the_trim_is_skipped_rather_than_waiting_on_a_lane(self) -> None:
+        """Nothing is evicted against a lane that could not be read."""
+        fixture = CollapseFixture()
+        self._fill(fixture, self.CAP + 16)
+        service = fixture.service
+        with service.candidate_queue.mutex:
+            with fixture.server.lock:
+                self.assertEqual(
+                    service._bound_block_candidate_terminal_outcomes(),
+                    0,
+                )
+        self.assertEqual(
+            len(service._block_candidate_terminal_outcomes),
+            self.CAP + 16,
+        )
+        with fixture.server.lock:
+            self.assertEqual(
+                service._bound_block_candidate_terminal_outcomes(),
+                16,
+            )
+
+    # -- the pins ----------------------------------------------------------
+
+    def test_every_lane_that_holds_a_copy_pins_its_outcome(self) -> None:
+        """Each lane the fence protects keeps its hash out of the eviction."""
+        target = _hash(1)
+
+        def outstanding(fixture: CollapseFixture, candidate: Any) -> None:
+            fixture.server._register_outstanding_block_candidate(target)
+
+        def replay_inflight(fixture: CollapseFixture, candidate: Any) -> None:
+            with fixture.server.lock:
+                fixture.service._block_replay_inflight_hashes.add(target)
+
+        def quarantined(fixture: CollapseFixture, candidate: Any) -> None:
+            with fixture.server.lock:
+                fixture.service._block_quarantine_hashes.add(target)
+
+        def fast_lane(fixture: CollapseFixture, candidate: Any) -> None:
+            with fixture.server.lock:
+                fixture.service._block_fast_lane_reservations.add(target)
+
+        def waiting_retry(fixture: CollapseFixture, candidate: Any) -> None:
+            with fixture.server.lock:
+                fixture.service._block_disposition_waiting_retries[target] = (
+                    candidate
+                )
+
+        def finalize_retry(fixture: CollapseFixture, candidate: Any) -> None:
+            with fixture.server.lock:
+                fixture.service.finalize_retries[target] = (False, "boom")
+
+        def retained_submission(fixture: CollapseFixture, candidate: Any) -> None:
+            fixture.service._stash_retained_block_candidate_node_submission(
+                target,
+                _BlockCandidateNodeSubmission(attempted=True, result=None),
+            )
+
+        def cleanup_retry(fixture: CollapseFixture, candidate: Any) -> None:
+            fixture.service._defer_collapsed_candidate_cleanup(
+                target,
+                frozenset({"terminal-outcome"}),
+            )
+
+        def retry_holder(fixture: CollapseFixture, candidate: Any) -> None:
+            with fixture.server.lock:
+                fixture.service.retry_candidate = candidate
+
+        def deferred_retry_holder(
+            fixture: CollapseFixture,
+            candidate: Any,
+        ) -> None:
+            with fixture.server.lock:
+                fixture.service._block_accounting_deferred_retry_candidate = (
+                    candidate
+                )
+
+        def live_queue(fixture: CollapseFixture, candidate: Any) -> None:
+            fixture.service.candidate_queue.put_nowait(candidate)
+
+        def replay_queue(fixture: CollapseFixture, candidate: Any) -> None:
+            fixture.service._block_replay_candidate_queue.put_nowait(candidate)
+
+        def disposition_flight(fixture: CollapseFixture, candidate: Any) -> None:
+            lease = fixture.server._claim_block_candidate_disposition(
+                target,
+                blocking=False,
+            )
+            self.assertIsNotNone(lease)
+
+        lanes = {
+            "_outstanding_block_candidate_hashes": outstanding,
+            "_block_replay_inflight_hashes": replay_inflight,
+            "_block_quarantine_hashes": quarantined,
+            "_block_fast_lane_reservations": fast_lane,
+            "_block_disposition_waiting_retries": waiting_retry,
+            "finalize_retries": finalize_retry,
+            "_block_candidate_retained_node_submissions": retained_submission,
+            "_block_candidate_collapse_cleanup_retries": cleanup_retry,
+            "retry_candidate": retry_holder,
+            "_block_accounting_deferred_retry_candidate": deferred_retry_holder,
+            "candidate_queue": live_queue,
+            "_block_replay_candidate_queue": replay_queue,
+            "_block_candidate_disposition_flights": disposition_flight,
+        }
+        for name, install in lanes.items():
+            with self.subTest(lane=name):
+                fixture = CollapseFixture()
+                candidate = fixture.seed([target])[0]
+                # The outcome is recorded first, exactly as a terminal
+                # disposition does, and the lane is populated afterwards:
+                # recording clears the reservation, replay, and waiting
+                # markers for its own hash by design.
+                fixture.server._record_block_candidate_terminal_outcome(
+                    target,
+                    accepted=False,
+                )
+                with redirect_stdout(StringIO()):
+                    install(fixture, candidate)
+                self._pressure(fixture)
+                outcomes = fixture.service._block_candidate_terminal_outcomes
+                self.assertEqual(len(outcomes), self.CAP)
+                self.assertIs(
+                    fixture.server._block_candidate_terminal_outcome(target),
+                    False,
+                )
+
+    def test_a_queued_duplicate_keeps_its_fence_under_eviction_pressure(
+        self,
+    ) -> None:
+        """The escape the fence closes must survive the registry's bound.
+
+        A won row's cleanup clears the ownership markers -- outstanding,
+        replay-inflight -- for the hash it just terminalized, so a same-hash
+        candidate still queued behind the apply is named by no registry at
+        all.  Its fence would be the oldest evictable entry in the registry
+        and the dequeue would then find nothing.  The queue itself is read,
+        so it does not.
+        """
+        fixture = CollapseFixture()
+        queued, forgotten = _hash(1), _hash(2)
+        candidate = fixture.seed([queued], credit_share_on_accept=True)[0]
+        fixture.seed([forgotten])
+        fixture.server._ensure_share_writer_service().adopt_pending_share(
+            candidate.pending_share
+        )
+        # A working node offer, so an escape lands as a real submitblock
+        # rather than being lost in a transport error.
+        fixture.rpc.results["submitblock"] = None
+        fixture.server.block_submit_rpc_timeout_seconds = 0.5
+        fixture.service.candidate_queue.put_nowait(candidate)
+        with redirect_stdout(StringIO()):
+            fixture.collapse()
+        self.assertEqual(fixture.pending(), set())
+        self.assertEqual(fixture.cleanup_backlog(), {})
+        with fixture.server.lock:
+            service = fixture.service
+            self.assertNotIn(
+                queued,
+                service._outstanding_block_candidate_hashes,
+            )
+            self.assertNotIn(queued, service._block_replay_inflight_hashes)
+        self._pressure(fixture)
+        # The unheld hash ages out; the queued copy's fence does not.
+        self.assertIsNone(
+            fixture.server._block_candidate_terminal_outcome(forgotten)
+        )
+        self.assertIs(
+            fixture.server._block_candidate_terminal_outcome(queued),
+            False,
+        )
+        with redirect_stdout(StringIO()):
+            self.assertTrue(
+                fixture.server.submit_next_block_candidate(defer_accounting=True)
+            )
+        offers = [
+            method for method, _ in fixture.rpc.calls if method == "submitblock"
+        ]
+        self.assertEqual(offers, [])
+        self.assertTrue(fixture.service.candidate_queue.empty())
 
 
 class BlockCandidateCollapseEnumerationTests(unittest.TestCase):

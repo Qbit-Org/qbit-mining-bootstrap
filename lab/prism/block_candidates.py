@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import itertools
 import json
 import math
 import queue
@@ -78,6 +79,30 @@ DEFAULT_BLOCK_ACCOUNTING_QUEUE_DEPTH = 8
 # steps and the cadence resets on every offer -- including one that finds
 # nothing due -- so neither lane can starve the other.
 DEFAULT_BLOCK_ACCOUNTING_CLEANUP_RETRY_WORK_ITEMS = 8
+# The same-hash disposition guard remembers every terminal outcome so a late
+# duplicate -- queued, replayed, retried, parked, or quarantined -- joins the
+# decision instead of re-offering a block qbitd already answered for. That
+# memory was process-lifetime historical state: one testnet4 storm left
+# 312,000 entries behind, and every decided-height collapse poll copied the
+# whole registry under the global lock (~124 ms at that size, growing with
+# every block the process ever disposed) while unrelated share acks waited.
+#
+# The registry is bounded instead, and eviction is oldest-first over the
+# entries that no in-memory copy still needs: every lane that can hold a
+# candidate object (or its still-owed terminal work) pins its hash and is
+# never evicted, so a fenced hash cannot become offerable again by being
+# forgotten. The bound sits far above the number of copies the process can
+# hold at once -- the bounded admission queue
+# (MAX_PENDING_BLOCK_CANDIDATES), one replay enumeration batch
+# (MAX_BLOCK_REPLAY_ENUMERATION_ROWS), and the single-slot retry holders --
+# so ordinary operation never even reaches an eviction.
+MAX_BLOCK_CANDIDATE_TERMINAL_OUTCOMES = 8192
+# One insert examines at most this many of the oldest entries beyond the
+# overflow it has to clear, so trimming stays O(1) amortized under the global
+# lock even when a run of pinned hashes sits at the front of the registry.
+# A pinned entry the scan passes is moved behind the window rather than
+# dropped, so every pass makes progress against the next one.
+BLOCK_CANDIDATE_TERMINAL_OUTCOME_EVICTION_SCAN = 128
 BLOCK_SUBMITTER_WAIT_HEARTBEAT_SLICE_SECONDS = 0.25
 MAX_BLOCK_SUBMITTER_STUCK_CALL_WORKERS = 2
 BLOCK_CANDIDATE_RETRY_HEARTBEAT_SLICE_SECONDS = 0.25
@@ -239,6 +264,17 @@ def _collapse_block_hash(value: object) -> str | None:
     except ValueError:
         return None
     return key
+
+
+def _block_candidate_hash_of(candidate: object) -> str | None:
+    """The canonical block hash one candidate object carries, if any."""
+    return _collapse_block_hash(
+        getattr(
+            getattr(candidate, "submission", None),
+            "block_hash_hex",
+            None,
+        )
+    )
 
 
 def _collapse_height(value: object) -> int | None:
@@ -1175,10 +1211,22 @@ class BlockCandidateService:
 
     def _block_candidate_collapse_evidence(
         self,
+        hashes: Iterable[object],
         *,
         ignore_leases: frozenset[str] = frozenset(),
-    ) -> set[str]:
-        """Hashes some evidence says were offered to qbitd, or are being.
+    ) -> frozenset[str]:
+        """Which of ``hashes`` some evidence says were offered to qbitd, or are being.
+
+        Answers membership for the hashes the caller is actually deciding --
+        one durable page during selection, the leased subset during
+        revalidation -- instead of materializing the union of every registry.
+        The registries this reads are not all page-sized:
+        ``_block_candidate_terminal_outcomes`` is historical state that grows
+        with every block the process ever disposed (312,000 entries after one
+        testnet4 storm), and copying it per poll cost ~124 ms with
+        ``coordinator.lock`` held against every unrelated share ack. Probing
+        the page's own hashes keeps the cost O(page * registries) and makes
+        it independent of how much disposition history has accumulated.
 
         Deliberately excludes ``_outstanding_block_candidate_hashes`` and
         ``_block_replay_inflight_hashes``. Both mean "this process still owns
@@ -1193,19 +1241,33 @@ class BlockCandidateService:
         ``ignore_leases`` lets the pre-write revalidation re-read this
         evidence without the apply's own disposition leases disqualifying
         the very rows they were claimed for.
+
+        Every registry read here is keyed by the canonical lowercase hash the
+        rest of the submitter compares on -- the same spelling
+        ``_collapse_block_hash`` folds a page row to -- which is what lets a
+        membership probe replace the old lowercasing walk without changing
+        which hashes count as evidence.
         """
         coordinator = self._coordinator
         coordinator._ensure_job_cache_state()
         self._ensure_block_candidate_disposition_state()
+        probes: set[str] = set()
+        for value in hashes:
+            key = _collapse_block_hash(value)
+            if key is not None:
+                probes.add(key)
+        if not probes:
+            return frozenset()
         evidence: set[str] = set()
         with self._block_submitter_lock(
             self._block_candidate_disposition_registry_lock,
             "candidate-disposition-registry",
         ):
+            flights = self._block_candidate_disposition_flights
             evidence.update(
                 key
-                for key in self._block_candidate_disposition_flights
-                if key not in ignore_leases
+                for key in probes
+                if key in flights and key not in ignore_leases
             )
         with coordinator.lock:
             for holder in (
@@ -1221,7 +1283,7 @@ class BlockCandidateService:
                         None,
                     )
                 )
-                if held is not None:
+                if held is not None and held in probes:
                     evidence.add(held)
             for registry in (
                 self._block_disposition_waiting_retries,
@@ -1231,10 +1293,10 @@ class BlockCandidateService:
                 getattr(coordinator, "_accounted_accepted_block_hashes", None),
                 self._block_candidate_terminal_outcomes,
             ):
-                if registry is None:
+                if not registry:
                     continue
-                evidence.update(str(key).lower() for key in registry)
-        return evidence
+                evidence.update(key for key in probes if key in registry)
+        return frozenset(evidence)
 
     def _collapse_pool_block_exists(self, durable_row: object) -> bool:
         """Read one row's durable pool-block fact, or fail the page closed.
@@ -1356,7 +1418,16 @@ class BlockCandidateService:
             self._collapse_pool_block_exists(durable_row)
             for durable_row in durable_rows
         ]
-        evidence = self._block_candidate_collapse_evidence()
+        # Evidence is asked about this page's hashes only. A malformed row
+        # contributes no probe and is failed closed by
+        # ``_superseded_candidate_row`` below regardless; every row that
+        # survives that decode carries the row key probed here, because the
+        # decode refuses an intent whose hash disagrees with it.
+        evidence = self._block_candidate_collapse_evidence(
+            durable_row.get("block_hash")
+            for durable_row in durable_rows
+            if isinstance(durable_row, dict)
+        )
         tip = chain.best_tip()
         tip_height = chain.tip_height()
         selected: list[_SupersededCandidateRow] = []
@@ -1411,8 +1482,10 @@ class BlockCandidateService:
         """
         fresh = _BlockCandidateChainView(self)
         tip = fresh.best_tip()
+        leased_hashes = frozenset(row.block_hash for row in leased)
         evidence = self._block_candidate_collapse_evidence(
-            ignore_leases=frozenset(row.block_hash for row in leased)
+            leased_hashes,
+            ignore_leases=leased_hashes,
         )
         qualified: list[_SupersededCandidateRow] = []
         for row in leased:
@@ -1685,10 +1758,19 @@ class BlockCandidateService:
         """
         try:
             self._ensure_block_candidate_disposition_state()
+            published: set[str] = set()
             with self._coordinator.lock:
                 outcomes = self._block_candidate_terminal_outcomes
                 for block_hash in abandoned:
-                    outcomes[block_hash] = False
+                    self._stamp_block_candidate_terminal_outcome(
+                        outcomes,
+                        block_hash,
+                        False,
+                    )
+                    published.add(block_hash)
+                self._bound_block_candidate_terminal_outcomes(
+                    frozenset(published)
+                )
         except Exception:
             # Degrades to the pre-publication behaviour: the cleanup step
             # still owes the outcome and the retry registry still carries it.
@@ -3835,6 +3917,187 @@ class BlockCandidateService:
             lease.flight,
         )
 
+    def _live_block_candidate_hash_registries(self) -> tuple[Any, ...]:
+        """Registries whose named hash forbids evicting its terminal outcome.
+
+        Each one either holds a candidate object that has not reached the
+        node yet or the still-owed terminal work of one, and every such copy
+        reads the terminal outcome before it may offer the block again.
+        Dropping the outcome under one of them is exactly the window
+        ``_publish_collapsed_candidate_terminal_fence`` exists to close.
+
+        Read with ``coordinator.lock`` held. Backfilled state is fetched by
+        ``getattr`` rather than by an ``_ensure_...`` call, which would take
+        the state-backfill lock underneath the global one.
+        """
+        return tuple(
+            registry
+            for registry in (
+                getattr(self, "_outstanding_block_candidate_hashes", None),
+                getattr(self, "_block_replay_inflight_hashes", None),
+                getattr(self, "_block_quarantine_hashes", None),
+                getattr(self, "_block_fast_lane_reservations", None),
+                getattr(self, "_block_disposition_waiting_retries", None),
+                getattr(self, "finalize_retries", None),
+                getattr(self, "_block_candidate_retained_node_submissions", None),
+                getattr(self, "_block_candidate_collapse_cleanup_retries", None),
+            )
+            if registry
+        )
+
+    def _held_block_candidate_retry_hashes(self) -> frozenset[str]:
+        """The hashes the single-slot retry holders are still carrying."""
+        held: set[str] = set()
+        for holder in (
+            getattr(self, "retry_candidate", None),
+            getattr(self, "_block_accounting_deferred_retry_candidate", None),
+        ):
+            key = _block_candidate_hash_of(holder)
+            if key is not None:
+                held.add(key)
+        return frozenset(held)
+
+    @staticmethod
+    def _queued_block_candidate_hashes(queue_obj: object) -> frozenset[str] | None:
+        """The hashes still sitting in one candidate queue, or None if unread.
+
+        The registries above stop naming a hash the moment its terminal
+        outcome is recorded -- ``_record_block_candidate_terminal_outcome``
+        and the collapse cleanup's ``outstanding-and-tip-observation`` step
+        clear the outstanding and replay-inflight markers by design -- so a
+        *duplicate* copy of that hash still queued behind the pass that
+        finished would be named by nothing. That copy is precisely the one
+        the fence protects, so the queues themselves are read.
+
+        The underlying deque is read under the queue's own mutex, because
+        iterating it while a producer or consumer mutates it is not safe.
+        The acquire is non-blocking: this runs with ``coordinator.lock``
+        held, and waiting there for a queue's leaf lock would convoy the
+        whole coordinator behind an unrelated enqueue. Failing to take it
+        returns None and the caller skips the eviction pass entirely, which
+        only leaves the registry over its bound until the next outcome.
+        """
+        if queue_obj is None:
+            return frozenset()
+        mutex = getattr(queue_obj, "mutex", None)
+        entries = getattr(queue_obj, "queue", None)
+        if mutex is None or entries is None:
+            return frozenset()
+        if not mutex.acquire(blocking=False):
+            return None
+        try:
+            items = list(entries)
+        finally:
+            mutex.release()
+        queued: set[str] = set()
+        for item in items:
+            key = _block_candidate_hash_of(item)
+            if key is not None:
+                queued.add(key)
+        return frozenset(queued)
+
+    def _in_flight_block_candidate_hashes(self) -> frozenset[str] | None:
+        """The hashes with a live same-hash disposition flight, or None.
+
+        A claimed flight means a pass is between its node offer and its
+        durable finalization for that hash. Same non-blocking rule as the
+        queues: the disposition registry lock is taken under
+        ``coordinator.lock`` here, the reverse of the ordinary order, so it
+        is only ever tried, never waited on.
+        """
+        lock = getattr(self, "_block_candidate_disposition_registry_lock", None)
+        flights = getattr(self, "_block_candidate_disposition_flights", None)
+        if lock is None or flights is None:
+            return frozenset()
+        if not lock.acquire(blocking=False):
+            return None
+        try:
+            return frozenset(flights)
+        finally:
+            lock.release()
+
+    @staticmethod
+    def _stamp_block_candidate_terminal_outcome(
+        outcomes: dict[str, bool],
+        block_hash: str,
+        accepted: bool,
+    ) -> None:
+        """Record one outcome as the newest entry of the FIFO registry.
+
+        Re-recording an existing hash would otherwise keep its original
+        insertion position, leaving a freshly reasserted outcome at the
+        front of the eviction scan.
+        """
+        outcomes.pop(block_hash, None)
+        outcomes[block_hash] = accepted
+
+    def _bound_block_candidate_terminal_outcomes(
+        self,
+        protect: frozenset[str] = frozenset(),
+    ) -> int:
+        """Trim the terminal-outcome registry to its bound; return evictions.
+
+        Called by the two writers with ``coordinator.lock`` already held and
+        their own entries already stamped. ``protect`` names the hashes this
+        very call published: a bulk fence page larger than the whole bound
+        must not evict the outcomes it just wrote, so the registry is left
+        temporarily over its bound instead.
+
+        Eviction is oldest-first and skips every pinned hash, so the bound
+        is a target rather than a hard ceiling -- a registry whose entries
+        are all still live simply stays large, which is the safe direction.
+        The pins are themselves bounded state, so the total stays bounded.
+
+        The pin set is the union of the lane registries, the single-slot
+        retry holders, the candidate objects still queued on the live and
+        replay lanes, and the hashes with a claimed disposition flight. A
+        hash held by none of those has no in-memory copy left that could
+        reach a node offer; anything arriving for it afterwards is a fresh
+        admission, which re-reads the durable outbox row -- terminal there
+        either way -- before it can offer anything.
+        """
+        outcomes = self._block_candidate_terminal_outcomes
+        overflow = len(outcomes) - MAX_BLOCK_CANDIDATE_TERMINAL_OUTCOMES
+        if overflow <= 0:
+            return 0
+        pinned = self._live_block_candidate_hash_registries()
+        held = set(self._held_block_candidate_retry_hashes())
+        for live in (
+            self._queued_block_candidate_hashes(
+                getattr(self, "candidate_queue", None)
+            ),
+            self._queued_block_candidate_hashes(
+                getattr(self, "_block_replay_candidate_queue", None)
+            ),
+            self._in_flight_block_candidate_hashes(),
+        ):
+            if live is None:
+                # A lane could not be read without waiting under the global
+                # lock. Evicting against an incomplete pin set could unfence
+                # a live copy, so nothing is evicted this round.
+                return 0
+            held |= live
+        window = overflow + BLOCK_CANDIDATE_TERMINAL_OUTCOME_EVICTION_SCAN
+        dropped = 0
+        for key in list(itertools.islice(outcomes, window)):
+            if dropped >= overflow:
+                break
+            if (
+                key in protect
+                or key in held
+                or any(key in registry for registry in pinned)
+            ):
+                # A live, replayed, retried, parked, quarantined, or
+                # cleanup-owing copy of this hash is still in memory and
+                # will read this outcome before it could offer the block.
+                # Move it behind the scan window so it stops blocking the
+                # next pass instead of dropping it.
+                outcomes[key] = outcomes.pop(key)
+                continue
+            del outcomes[key]
+            dropped += 1
+        return dropped
+
     def _block_candidate_terminal_outcome(self, block_hash: str) -> bool | None:
         self._ensure_block_candidate_disposition_state()
         with self._coordinator.lock:
@@ -3850,7 +4113,12 @@ class BlockCandidateService:
         dropped_waiting: PrismBlockCandidate | None = None
         with self._coordinator.lock:
             key = block_hash.lower()
-            self._block_candidate_terminal_outcomes[key] = accepted
+            self._stamp_block_candidate_terminal_outcome(
+                self._block_candidate_terminal_outcomes,
+                key,
+                accepted,
+            )
+            self._bound_block_candidate_terminal_outcomes(frozenset((key,)))
             self._block_fast_lane_reservations.discard(key)
             replay_hashes = getattr(self, "_block_replay_inflight_hashes", None)
             if replay_hashes is not None:
