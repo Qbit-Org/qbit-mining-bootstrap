@@ -17,8 +17,8 @@ either whole set as active node-offer evidence will exclude the whole storm.
 A wakeup parked in the retry holder is the same kind of marker for the same
 reason: ``_retain_block_candidate_for_retry`` also runs when the fast-lane
 reservation declines, before any submitblock.  The rig therefore reports the
-attested offers (``node_offer_attested``) apart from the conservative
-must-not-abandon union (``node_offer_evidence``) that a selector owes the
+attested offers (``node_offer_evidence``) apart from the conservative
+must-not-abandon union (``selector_evidence``) that a selector owes the
 #183 contract, so a retry holder is never mistaken for a node call.
 
 This is a component instrument, not a performance threshold.  It uses the
@@ -88,7 +88,7 @@ from tests.prism_vardiff_test_support import (  # noqa: E402
 OBSERVED_TESTNET_CANDIDATE_STORM = 3_120
 STORM_PARENT_HASH = "11" * 32
 
-# The node-offer-evidence shapes record_abandoned and submit_next consult,
+# The selector-evidence shapes record_abandoned and submit_next consult,
 # each installable on one seeded candidate through CandidateStormRig.perturb.
 PERTURBATIONS = (
     "lease_held",
@@ -117,14 +117,14 @@ class CandidateStormSnapshot:
     replay_enumeration_owed: bool
     # Candidates the #183 must-not-abandon contract covers, i.e. carrying
     # any evidence that a node offer happened, is in flight, or cannot be
-    # ruled out (see CandidateOwnership.node_offer_evidence). The
+    # ruled out (see CandidateOwnership.selector_evidence). The
     # outstanding and replay-inflight markers above are deliberately NOT
     # part of it.
-    offer_evidence_marked: int = 0
+    selector_evidence_marked: int = 0
     # How that union splits: rows something actually attests a node offer
     # for, and rows it covers only because a wakeup is parked in a retry
     # holder, which by itself is not evidence qbitd was ever called.
-    node_offer_attested_marked: int = 0
+    node_offer_evidence_marked: int = 0
     unoffered_retry_marked: int = 0
 
 
@@ -136,10 +136,10 @@ class CandidateOwnership:
     maintenance selector can be evaluated against the real population
     instead of a hand-built corpus. ``outstanding`` and ``replay_inflight``
     are process-ownership markers; the fields folded into
-    ``node_offer_attested`` are the ones that mean a node offer happened,
+    ``node_offer_evidence`` are the ones that mean a node offer happened,
     is happening, or left acceptance evidence behind. ``retry_held`` is
     neither: it is a third category, covered by the conservative
-    ``node_offer_evidence`` union without attesting an offer.
+    ``selector_evidence`` union without attesting an offer.
     """
 
     block_hash: str
@@ -162,7 +162,7 @@ class CandidateOwnership:
     pool_block_chain_state: str | None
 
     @property
-    def node_offer_attested(self) -> bool:
+    def node_offer_evidence(self) -> bool:
         """Whether anything attests that qbitd was offered this hash.
 
         Every fact here is written by the offer or downstream of it: the
@@ -194,22 +194,22 @@ class CandidateOwnership:
         ``outstanding`` and ``replay_inflight``, and reading it as an offer
         would credit the rig with a node call that never happened.
         """
-        return bool(self.retry_held) and not self.node_offer_attested
+        return bool(self.retry_held) and not self.node_offer_evidence
 
     @property
-    def node_offer_evidence(self) -> bool:
+    def selector_evidence(self) -> bool:
         """The conservative must-not-abandon union the #183 contract needs.
 
-        This is :attr:`node_offer_attested` widened by ``retry_held``: a
+        This is :attr:`node_offer_evidence` widened by ``retry_held``: a
         parked wakeup may equally have come from a path that *did* offer and
         is retrying its tail, and the holder alone cannot tell the two
         apart, so a selector has to leave the row to the per-row path either
         way.  Because the widening is deliberately conservative, a true
         value here is not a claim that qbitd was offered the hash -- read
-        :attr:`node_offer_attested` for that, and
+        :attr:`node_offer_evidence` for that, and
         :attr:`retry_held_without_offer` for the rows the widening adds.
         """
-        return self.node_offer_attested or bool(self.retry_held)
+        return self.node_offer_evidence or bool(self.retry_held)
 
 
 @dataclass(frozen=True)
@@ -457,11 +457,11 @@ class CandidateStormRig:
             replay_inflight_covers_all_durable=durable_hashes <= replay_inflight,
             accepted_parent_previews=len(server._accepted_block_payout_previews),
             replay_enumeration_owed=server._block_replay_enumeration_owed(),
-            offer_evidence_marked=sum(
-                1 for record in ownership if record.node_offer_evidence
+            selector_evidence_marked=sum(
+                1 for record in ownership if record.selector_evidence
             ),
-            node_offer_attested_marked=sum(
-                1 for record in ownership if record.node_offer_attested
+            node_offer_evidence_marked=sum(
+                1 for record in ownership if record.node_offer_evidence
             ),
             unoffered_retry_marked=sum(
                 1 for record in ownership if record.retry_held_without_offer
@@ -612,8 +612,8 @@ class CandidateStormRig:
         Each kind reproduces one of the facts ``submit_next`` and
         ``record_abandoned`` consult, through the shipped entry point rather
         than a hand-written marker, and each shows up in :meth:`ownership` as
-        ``node_offer_evidence``.  ``retry_slot`` is the one kind that shows
-        up there *without* ``node_offer_attested``: it moves an
+        ``selector_evidence``.  ``retry_slot`` is the one kind that shows
+        up there *without* ``node_offer_evidence``: it moves an
         already-queued, never-offered wakeup into the retry holder, which is
         exactly what the shipped path does when the fast-lane reservation
         declines.  Returns a callable that undoes the perturbation where
