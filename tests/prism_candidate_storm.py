@@ -25,12 +25,24 @@ The decided-height extension models the instant after the storm height is
 settled: ``decide_height`` makes one candidate the active block at that
 height (``DecidedHeightRpc``), ``ownership`` reads every candidate's
 ownership and node-offer-evidence facts from the shipped state so a
-maintenance selector can be evaluated against the real population, and
-``drain_per_row`` drives the shipped per-row disposition path the way the
-submitter loop does and reports what it cost (RPC calls by method, ledger
-attempt marks, replay enumerations).  The per-row drain is the oracle any
-set-oriented selector has to agree with; the instrument does not contain a
-selector itself.
+maintenance selector can be evaluated against the real population,
+``perturb`` installs one node-offer-evidence shape at a time through the
+shipped entry points, and ``drain_per_row`` drives the shipped per-row
+disposition path in the production split -- ``submit_next`` with
+``defer_accounting=True`` handing every node offer to the real accounting
+queue and task runner -- reporting the exact hash sets it terminalized and
+what they cost.  The per-row drain is the oracle any set-oriented selector
+has to agree with; the instrument does not contain a selector itself.
+
+Driving both lanes from one thread is what makes the drain deterministic,
+and it costs nothing in fidelity: the two lanes are already serialized per
+hash by the disposition lease, and the drain stamps the accounting-thread
+identity the shipped loop stamps, so retry pacing records a not-before
+deadline exactly as it does on the real accounting thread.  Splitting the
+drive this way also matters for correctness, not just fidelity:
+``submit_next`` claims the disposition lease *blocking* unless accounting
+is deferred, and ``_restore_replayed_candidate_acceptance_evidence`` runs
+only inside the accounting task.
 """
 
 from __future__ import annotations
@@ -46,7 +58,7 @@ from dataclasses import asdict, dataclass
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, ContextManager
+from typing import Any, ContextManager, Iterable
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -54,6 +66,7 @@ if not __package__:
 from lab.prism.block_candidates import (  # noqa: E402
     MAX_BLOCK_REPLAY_ENUMERATION_ROWS,
     MAX_PENDING_BLOCK_CANDIDATES,
+    _BlockCandidateNodeSubmission,
 )
 from lab.prism.share_ledger import (  # noqa: E402
     PendingShare,
@@ -68,6 +81,17 @@ from tests.prism_vardiff_test_support import (  # noqa: E402
 
 OBSERVED_TESTNET_CANDIDATE_STORM = 3_120
 STORM_PARENT_HASH = "11" * 32
+
+# The node-offer-evidence shapes record_abandoned and submit_next consult,
+# each installable on one seeded candidate through CandidateStormRig.perturb.
+PERTURBATIONS = (
+    "lease_held",
+    "retained_success",
+    "tip_observed",
+    "retry_slot",
+    "prepared_pool_block",
+    "terminal",
+)
 
 
 @dataclass(frozen=True)
@@ -138,16 +162,40 @@ class CandidateOwnership:
 
 @dataclass(frozen=True)
 class PerRowDrainReport:
-    """What the shipped per-row disposition path cost to drain a storm."""
+    """What the shipped per-row disposition path did, and cost, over a storm.
+
+    ``abandoned_hashes`` is the oracle a set-oriented selector has to agree
+    with: the exact set of durable rows the shipped path terminalized as
+    abandoned, not a count.  ``deferred_hashes`` and ``lease_blocked_hashes``
+    are its counterweight -- rows the drain reached and the shipped path
+    deliberately refused to terminalize -- so a selector that claims one of
+    them can be caught rather than silently believed.
+    """
 
     rounds: int
+    accounting_tasks: int
     replay_enumerations: int
-    abandoned_rows: int
-    submitted_rows: int
-    pending_rows: int
+    abandoned_hashes: frozenset[str]
+    submitted_hashes: frozenset[str]
+    pending_hashes: frozenset[str]
+    withheld_hashes: frozenset[str]
+    lease_blocked_hashes: frozenset[str]
+    deferred_hashes: frozenset[str]
     rpc_calls: dict[str, int]
     ledger_attempt_marks: int
     wall_seconds: float
+
+    @property
+    def abandoned_rows(self) -> int:
+        return len(self.abandoned_hashes)
+
+    @property
+    def submitted_rows(self) -> int:
+        return len(self.submitted_hashes)
+
+    @property
+    def pending_rows(self) -> int:
+        return len(self.pending_hashes)
 
 
 class DecidedHeightRpc(FakeRpc):
@@ -237,6 +285,11 @@ class CandidateStormRig:
         server.stop_after_block = False
         server.block_candidate_queue = queue.Queue(maxsize=self.queue_depth)
         server.ledger = self.ledger
+        # A shipped tunable, set to zero so a parked or retained retry neither
+        # sleeps on the submitter lane nor parks behind a not-before deadline.
+        # This is a component oracle, not a pacing test: every wakeup must be
+        # re-offerable in the same round it was parked.
+        server.block_candidate_retry_initial_seconds = 0.0
         if self.decided_rpc is not None:
             server.rpc = self.decided_rpc
         return server, state
@@ -469,69 +522,302 @@ class CandidateStormRig:
             )
         return records
 
-    def _next_dequeued_hash(self, server: Any) -> str | None:
-        """Peek the hash ``submit_next`` would take next, in its order."""
+    # -- perturbation -------------------------------------------------------
+
+    def _take_queued_candidate(self, server: Any, block_hash: str) -> Any:
+        """Remove one queued wakeup from whichever lane currently holds it."""
         service = server._ensure_block_candidate_service()
         service._ensure_block_replay_state()
+        for queue_obj in (
+            service.candidate_queue,
+            service._block_replay_candidate_queue,
+        ):
+            for item in list(queue_obj.queue):
+                if str(item.submission.block_hash_hex).lower() == block_hash:
+                    # Single-threaded instrument: removing in place from the
+                    # backing deque keeps both queue order and qsize() exact.
+                    queue_obj.queue.remove(item)
+                    return item
+        raise KeyError(f"no queued wakeup for {block_hash}")
+
+    def perturb(self, server: Any, kind: str, block_hash: str) -> Any:
+        """Install one node-offer-evidence shape on a seeded candidate.
+
+        Each kind reproduces one of the facts ``submit_next`` and
+        ``record_abandoned`` consult, through the shipped entry point rather
+        than a hand-written marker, and each shows up in :meth:`ownership` as
+        ``node_offer_evidence``.  Returns a callable that undoes the
+        perturbation where undoing is meaningful (the held disposition
+        lease), otherwise ``None``.
+        """
+        service = server._ensure_block_candidate_service()
+        service._ensure_block_replay_state()
+        service._ensure_block_candidate_disposition_state()
+        key = str(block_hash).lower()
+        if kind == "lease_held":
+            lease = server._claim_block_candidate_disposition(key, blocking=False)
+            if lease is None:
+                raise RuntimeError(f"disposition lease already held for {key}")
+            return lambda: server._release_block_candidate_disposition(lease)
+        if kind == "retained_success":
+            service._stash_retained_block_candidate_node_submission(
+                key,
+                _BlockCandidateNodeSubmission(attempted=True, result=None),
+            )
+            return None
+        if kind == "tip_observed":
+            # Only an outstanding hash can register a tip observation, and
+            # replay adoption alone never makes one outstanding -- the node
+            # offer does (see test_replay_adoption_alone_drops_a_tip_observation).
+            # Model "offered, then seen as the tip" through both shipped entry
+            # points so the shape holds in the restart view too.
+            server._register_outstanding_block_candidate(key)
+            server._note_tip_observation_for_candidates(key)
+            return None
+        if kind == "retry_slot":
+            candidate = self._take_queued_candidate(server, key)
+            with server.lock:
+                service.retry_candidate = candidate
+            return None
+        if kind == "prepared_pool_block":
+            self.ledger.persist_accepted_block(
+                block_hash=key,
+                block_height=self.storm_height,
+                parent_hash=STORM_PARENT_HASH,
+                final_bundle={},
+                audit_report={},
+            )
+            return None
+        if kind == "terminal":
+            service._record_block_candidate_terminal_outcome(key, accepted=False)
+            return None
+        raise ValueError(f"unknown perturbation: {kind}")
+
+    # -- per-row drain ------------------------------------------------------
+
+    # A head that neither terminalizes a row nor parks on a held lease is
+    # being deferred by the shipped path (acceptance evidence).  Offer it
+    # once more, then withhold it: re-offering forever is what the shipped
+    # loop does behind its backoff, and this drain has no backoff.
+    _DRAIN_STALL_LIMIT = 2
+
+    def _dequeue_head(self, server: Any) -> tuple[str | None, str | None]:
+        """Peek the hash and lane ``submit_next`` would take next, in order."""
+        service = server._ensure_block_candidate_service()
+        service._ensure_block_replay_state()
+        service._ensure_block_candidate_disposition_state()
         with server.lock:
             retry = service.retry_candidate
-        if retry is not None:
-            return str(retry.submission.block_hash_hex).lower()
-        for queue_obj in (service.candidate_queue, service._block_replay_candidate_queue):
+            if retry is not None and service._block_candidate_retry_ready_locked(
+                retry
+            ):
+                return str(retry.submission.block_hash_hex).lower(), "retry"
+        for lane, queue_obj in (
+            ("live", service.candidate_queue),
+            ("replay", service._block_replay_candidate_queue),
+        ):
             items = list(queue_obj.queue)
             if items:
-                return str(items[0].submission.block_hash_hex).lower()
-        return None
+                return str(items[0].submission.block_hash_hex).lower(), lane
+        with server.lock:
+            waiting = service._block_disposition_waiting_retries
+            ready = [
+                key
+                for key in waiting
+                if service._block_candidate_retry_ready_locked(waiting[key])
+            ]
+            if ready:
+                return (
+                    min(
+                        ready,
+                        key=lambda key: int(
+                            waiting[key].context.template["height"]
+                        ),
+                    ),
+                    "waiting",
+                )
+        return None, None
+
+    def _withhold_head(self, server: Any, block_hash: str, lane: str) -> None:
+        """Lift one withheld hash out of the lane that would dequeue it next."""
+        service = server._ensure_block_candidate_service()
+        if lane == "retry":
+            with server.lock:
+                service.retry_candidate = None
+        elif lane == "live":
+            service.candidate_queue.get_nowait()
+        elif lane == "replay":
+            service._block_replay_candidate_queue.get_nowait()
+        elif lane == "waiting":
+            with server.lock:
+                service._block_disposition_waiting_retries.pop(block_hash, None)
+
+    def _next_drainable(
+        self,
+        server: Any,
+        withheld: set[str],
+    ) -> tuple[str | None, str | None]:
+        """Return the next hash to drive, lifting withheld ones out on the way."""
+        while True:
+            head, lane = self._dequeue_head(server)
+            if head is None or head not in withheld:
+                return head, lane
+            self._withhold_head(server, head, str(lane))
+
+    def _run_block_accounting_tasks(self, server: Any) -> int:
+        """Run the shipped accounting lane to quiescence, on this thread.
+
+        Mirrors ``BlockCandidateService.block_accounting_loop``: primary
+        queue first, then the unbounded spillover, then the invalid-intent
+        quarantine, with the loop's own retain-on-failure behaviour.
+        """
+        service = server._ensure_block_candidate_service()
+        service._ensure_block_accounting_state()
+        # block_accounting_loop stamps this on entry, and
+        # _pace_block_candidate_retry reads it to record a not-before deadline
+        # instead of sleeping while the lease and writer admission are held.
+        service._block_accounting_thread_ident = threading.get_ident()
+        ran = 0
+        while True:
+            try:
+                _priority, _sequence, task = (
+                    service._block_accounting_queue.get_nowait()
+                )
+                source_queue = service._block_accounting_queue
+            except queue.Empty:
+                try:
+                    _priority, _sequence, task = (
+                        service._block_accounting_overflow_queue.get_nowait()
+                    )
+                    source_queue = service._block_accounting_overflow_queue
+                except queue.Empty:
+                    while server._run_one_invalid_block_candidate_quarantine():
+                        pass
+                    return ran
+            try:
+                server._run_block_accounting_task(task)
+            except Exception:
+                server._retain_block_candidate_for_retry(task.candidate)
+            finally:
+                source_queue.task_done()
+            ran += 1
 
     def drain_per_row(
         self,
         server: Any,
         *,
         stop_before_hash: str | None = None,
+        preserve_hashes: Iterable[str] | None = None,
         max_rounds: int | None = None,
     ) -> PerRowDrainReport:
-        """Drive the shipped per-row path the way the submitter loop does.
+        """Drive the shipped per-row path in the production submitter split.
 
-        Alternates ``submit_next_block_candidate()`` with the outbox replay
-        query exactly as ``BlockCandidateService.run`` does, so coalesced
-        wakeups are recovered through the real enumeration. Stops before the
-        given hash would be dequeued (the decided winner's own finalization
-        tail is outside this instrument), at ``max_rounds``, or when nothing
-        is left to dequeue and the enumeration restores nothing new.
+        Each round runs ``submit_next_block_candidate(defer_accounting=True)``
+        -- the call ``BlockCandidateService.run`` makes -- and then drains the
+        real accounting queue through ``_run_block_accounting_task``, so the
+        node offer, the fast-lane reservation, the replayed-candidate
+        acceptance-evidence restore and the durable finalization all run on
+        their shipped code paths.  When both lanes are empty the outbox replay
+        query recovers coalesced wakeups, exactly as the loop does.
+
+        ``defer_accounting=True`` is not a detail: with accounting inline
+        ``submit_next`` claims each disposition lease *blocking*, so a single
+        candidate whose lease is held elsewhere stops the drain forever, and
+        ``_restore_replayed_candidate_acceptance_evidence`` -- which is what
+        keeps a replayed candidate with a prepared pool-block row from being
+        abandoned -- never runs at all.
+
+        ``stop_before_hash`` ends the drain when that hash reaches the head
+        (used for the decided winner, whose finalization tail is outside this
+        instrument).  ``preserve_hashes`` instead withholds hashes for the
+        whole drain: they are lifted out of the dequeue order without being
+        offered or disposed, so their durable row and evidence markers stay
+        exactly as the caller arranged them while every other row drains.
+        Any head the shipped path parks on a held lease, or repeatedly
+        declines to terminalize, is withheld the same way and reported, so
+        the drain is bounded no matter what evidence the caller installed.
         """
+        service = server._ensure_block_candidate_service()
+        service._ensure_block_candidate_disposition_state()
         rpc = server.rpc
         calls_before = dict(getattr(rpc, "calls", {}))
         outbox = self.ledger._block_candidate_outbox
         attempts_before = sum(int(row["attempt_count"]) for row in outbox.values())
+        withheld = {str(item).lower() for item in (preserve_hashes or ())}
+        caller_withheld = frozenset(withheld)
+        stop_hash = None if stop_before_hash is None else str(stop_before_hash).lower()
+        lease_blocked: set[str] = set()
+        deferred: set[str] = set()
+        stalls: dict[str, int] = {}
         rounds = 0
+        accounting_tasks = 0
         enumerations = 0
         started = time.monotonic()
         with self._silence():
             while True:
                 if max_rounds is not None and rounds >= max_rounds:
                     break
-                if (
-                    stop_before_hash is not None
-                    and self._next_dequeued_hash(server) == stop_before_hash.lower()
-                ):
-                    break
-                ran = server.submit_next_block_candidate()
-                if ran:
-                    rounds += 1
+                head, _lane = self._next_drainable(server, withheld)
+                if head is None:
+                    enumerations += 1
+                    if server.replay_pending_block_candidates() == 0:
+                        break
+                    if self._next_drainable(server, withheld)[0] is None:
+                        # The enumeration restored only withheld rows; the
+                        # shipped loop would re-adopt and re-park them for as
+                        # long as their evidence stands.
+                        break
                     continue
-                enumerations += 1
-                if server.replay_pending_block_candidates() == 0:
+                if stop_hash is not None and head == stop_hash:
                     break
-        counts = {"pending": 0, "submitted": 0, "abandoned": 0}
-        for row in outbox.values():
-            counts[str(row["state"])] = counts.get(str(row["state"]), 0) + 1
+                with server.lock:
+                    terminal_before = len(service._block_candidate_terminal_outcomes)
+                if server.submit_next_block_candidate(defer_accounting=True):
+                    rounds += 1
+                accounting_tasks += self._run_block_accounting_tasks(server)
+                with server.lock:
+                    progressed = (
+                        len(service._block_candidate_terminal_outcomes)
+                        != terminal_before
+                    )
+                    parked = head in service._block_disposition_waiting_retries
+                if progressed:
+                    stalls.pop(head, None)
+                    continue
+                if parked:
+                    # submit_next could not claim this hash's lease without
+                    # blocking and parked the wakeup, exactly as the shipped
+                    # loop does. Withhold it instead of spinning behind a
+                    # lease this drain does not own.
+                    withheld.add(head)
+                    lease_blocked.add(head)
+                    continue
+                stalls[head] = stalls.get(head, 0) + 1
+                if stalls[head] >= self._DRAIN_STALL_LIMIT:
+                    withheld.add(head)
+                    deferred.add(head)
+        by_state: dict[str, set[str]] = {
+            "pending": set(),
+            "submitted": set(),
+            "abandoned": set(),
+        }
+        for block_hash, row in outbox.items():
+            by_state.setdefault(str(row["state"]), set()).add(str(block_hash).lower())
         calls_after = dict(getattr(rpc, "calls", {}))
         return PerRowDrainReport(
             rounds=rounds,
+            accounting_tasks=accounting_tasks,
             replay_enumerations=enumerations,
-            abandoned_rows=counts["abandoned"],
-            submitted_rows=counts["submitted"],
-            pending_rows=counts["pending"],
+            abandoned_hashes=frozenset(by_state["abandoned"]),
+            submitted_hashes=frozenset(by_state["submitted"]),
+            pending_hashes=frozenset(by_state["pending"]),
+            withheld_hashes=(
+                caller_withheld
+                | frozenset(lease_blocked)
+                | frozenset(deferred)
+            ),
+            lease_blocked_hashes=frozenset(lease_blocked),
+            deferred_hashes=frozenset(deferred),
             rpc_calls={
                 method: calls_after.get(method, 0) - calls_before.get(method, 0)
                 for method in sorted(set(calls_before) | set(calls_after))
@@ -605,7 +891,23 @@ def main() -> int:
                 rig.restarted_server,
                 stop_before_hash=winner,
             )
-            report["decided"]["per_row_drain"] = asdict(drain)
+            # The abandoned/submitted hash sets are the programmatic output
+            # and are storm-sized; only the bounded sets are printed.
+            report["decided"]["per_row_drain"] = {
+                "rounds": drain.rounds,
+                "accounting_tasks": drain.accounting_tasks,
+                "replay_enumerations": drain.replay_enumerations,
+                "abandoned_rows": drain.abandoned_rows,
+                "submitted_rows": drain.submitted_rows,
+                "pending_rows": drain.pending_rows,
+                "pending_hashes": sorted(drain.pending_hashes),
+                "withheld_hashes": sorted(drain.withheld_hashes),
+                "lease_blocked_hashes": sorted(drain.lease_blocked_hashes),
+                "deferred_hashes": sorted(drain.deferred_hashes),
+                "rpc_calls": drain.rpc_calls,
+                "ledger_attempt_marks": drain.ledger_attempt_marks,
+                "wall_seconds": drain.wall_seconds,
+            }
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 
