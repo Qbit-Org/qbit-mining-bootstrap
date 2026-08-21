@@ -108,6 +108,8 @@ PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES = (
     "lease_skipped",
     # Leased rows the immediate pre-write re-read disqualified.
     "revalidation_dropped",
+    # Qualified rows the fenced batch write did not transition.
+    "write_lost",
     # Rows the fenced batch write actually transitioned.
     "abandoned",
     # Rows preserved because a page-scope read or write failed closed.
@@ -1599,6 +1601,10 @@ class BlockCandidateService:
                 # transitioned a row this apply never leased; refuse to run
                 # cleanup for it rather than tear down somebody else's state.
                 if key is not None and key in requested
+            )
+            self._record_block_candidate_collapse(
+                "write_lost",
+                len(requested - abandoned),
             )
             if not abandoned:
                 return frozenset()

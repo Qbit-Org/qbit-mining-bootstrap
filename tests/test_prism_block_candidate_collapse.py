@@ -939,6 +939,7 @@ class BlockCandidateCollapseApplyTests(unittest.TestCase):
         retained, _log = fixture.collapse()
         self.assertEqual(fixture.pending(), {_hash(2)})
         self.assertEqual(fixture.counts()["abandoned"], 2)
+        self.assertEqual(fixture.counts()["write_lost"], 1)
         with fixture.server.lock:
             terminal = dict(service._block_candidate_terminal_outcomes)
         self.assertEqual(set(terminal), {_hash(1), _hash(3)})
@@ -974,6 +975,7 @@ class BlockCandidateCollapseApplyTests(unittest.TestCase):
         retained, _log = fixture.collapse(rows)
         self.assertEqual(len(retained), 2)
         self.assertEqual(fixture.counts()["abandoned"], 0)
+        self.assertEqual(fixture.counts()["write_lost"], 2)
         with fixture.server.lock:
             self.assertEqual(fixture.service._block_candidate_terminal_outcomes, {})
 
