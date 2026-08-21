@@ -1027,6 +1027,7 @@ class CandidateStormRig:
         stop_before_hash: str | None = None,
         preserve_hashes: Iterable[str] | None = None,
         max_rounds: int | None = None,
+        dequeue_skip: bool = False,
     ) -> PerRowDrainReport:
         """Drive the shipped per-row path in the production submitter split.
 
@@ -1077,6 +1078,16 @@ class CandidateStormRig:
         The report then covers only the rows *this* call moved: it is
         compared against the durable state captured on entry, so a second
         bounded call never re-reports the first one's abandonment.
+
+        ``dequeue_skip`` is off by default, and off is what keeps this the
+        per-row oracle.  Issue #181 item 2 added a second set-oriented
+        disposition inside ``submit_next`` itself -- the dequeue-time stale
+        sibling skip -- which would otherwise dispose of rows this drain is
+        meant to measure the per-row path against, exactly as #183's
+        replay-adoption collapse would.  Suppressed the same way and for the
+        same reason.  Turning it on drives the shipped skip instead, so the
+        same report shape (abandoned hashes, per-method RPC counts, attempt
+        marks) can be compared against the oracle the default produces.
         """
         service = server._ensure_block_candidate_service()
         service._ensure_block_candidate_disposition_state()
@@ -1089,6 +1100,13 @@ class CandidateStormRig:
         service._collapse_superseded_block_candidates = (
             lambda durable_rows, **_kwargs: durable_rows
         )
+        if not dequeue_skip:
+            # Issue #181 item 2's dequeue-time skip is a second shipped
+            # disposition inside ``submit_next``.  The oracle is the per-row
+            # path, so it is suppressed exactly as the #183 collapse is.
+            service._skip_superseded_block_candidate_at_dequeue = (
+                lambda _candidate, **_kwargs: False
+            )
         rpc = server.rpc
         calls_before = dict(getattr(rpc, "calls", {}))
         outbox = self.ledger._block_candidate_outbox
@@ -1197,6 +1215,10 @@ class CandidateStormRig:
             finally:
                 service.__dict__.pop(
                     "_collapse_superseded_block_candidates",
+                    None,
+                )
+                service.__dict__.pop(
+                    "_skip_superseded_block_candidate_at_dequeue",
                     None,
                 )
         terminalized: dict[str, set[str]] = {"submitted": set(), "abandoned": set()}
