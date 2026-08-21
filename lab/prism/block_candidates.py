@@ -165,6 +165,51 @@ PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES = (
     # Retry passes that ran but still left at least one step owed.
     "cleanup_retry_failed",
 )
+# Issue #181 item 3: the interval from definitive node acceptance (the
+# submitblock RPC returning None on the submitter thread) to the accepted
+# block's payout preview becoming visible to waiting child work. Both exits
+# of _publish_accepted_block_payout_preview publish -- the atomic generation
+# publication, and issue #188's fenced local-retention branch, which installs
+# the compact preview and notifies waiters without installing a generation --
+# so the label set separates them rather than merging a degraded publication
+# into the healthy one.
+PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_RESULTS = (
+    "published",
+    "degraded",
+)
+# The acceptance criterion is a p95 below the 5 s child wait budget
+# (DEFAULT_ACCEPTED_BLOCK_PAYOUT_PREVIEW_WAIT_SECONDS), so the boundary at
+# exactly 5.0 has to exist and the approach to it has to be resolved. The
+# shared PRISM_JOB_BUILD_SECONDS_BUCKETS tuple is tuned for millisecond job
+# builds and steps 1.0 -> 2.5 -> 5.0 -> 10.0 across the whole decision range;
+# this dedicated tuple keeps that one unwidened while still extending well
+# past the budget so a saturated tail is bucketed instead of folded into
+# +Inf.
+PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_SECONDS_BUCKETS = (
+    0.01,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    5.0,
+    7.5,
+    10.0,
+    20.0,
+    30.0,
+    60.0,
+)
+# Acceptance stamps are keyed by block hash and consumed by the first
+# publication observed for that hash. A hash that never reaches publication
+# -- a terminal accounting failure, a withdrawn acceptance -- would otherwise
+# retain its stamp forever, so the oldest entries are evicted past this cap.
+# Max-block admission and the physical block rate keep the live population
+# far below it; this is a leak bound, not a working set.
+MAX_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_STAMPS = 512
 # The terminal cleanup one won row owes, in the order the apply runs it.
 # A deferred retry replays exactly the steps its own hash still owes, so
 # the step names are a closed set: a retry can never repeat a step that
@@ -1048,6 +1093,34 @@ class BlockCandidateService:
             "sum": 0.0,
             "count": 0,
         }
+        # Issue #181 item 3. Definitive node acceptance is learned on the
+        # submitter thread and the preview is published on the accounting
+        # thread, so the start stamp has to outlive the offer: the hash is
+        # the only identity both sides share. A stamp of None is the
+        # already-observed tombstone -- it keeps a re-offer of the same hash
+        # from restarting an interval that has already been measured -- and
+        # both the stamps and the histograms live under one leaf lock that
+        # never nests, so an observation can be taken while the publication
+        # path still holds the payout-balance mutation lock.
+        self._accepted_block_preview_publication_lock = threading.Lock()
+        self.accepted_block_preview_publication_seconds_histogram: dict[
+            str, dict[str, Any]
+        ] = {
+            result: {
+                "buckets": {
+                    bucket: 0
+                    for bucket in (
+                        PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_SECONDS_BUCKETS
+                    )
+                },
+                "sum": 0.0,
+                "count": 0,
+            }
+            for result in PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_RESULTS
+        }
+        self._accepted_block_preview_acceptance_monotonic: dict[
+            str, float | None
+        ] = {}
         self._block_replay_enumeration_owed_flag = False
         # Fixed-key selector/apply outcome counters for the decided-height
         # collapse. The key set is closed so the rendered series carries no
@@ -2979,6 +3052,22 @@ class BlockCandidateService:
                 int(histogram["count"]),
             )
 
+    def accepted_block_preview_publication_snapshot(
+        self,
+    ) -> dict[str, dict[str, Any]]:
+        """Copied acceptance-to-preview-publication histograms, by result."""
+        with self._accepted_block_preview_publication_lock:
+            return {
+                result: {
+                    "buckets": dict(histogram["buckets"]),
+                    "sum": float(histogram["sum"]),
+                    "count": int(histogram["count"]),
+                }
+                for result, histogram in (
+                    self.accepted_block_preview_publication_seconds_histogram
+                ).items()
+            }
+
     def next_retry_delay(self, block_hash: str) -> float:
         initial = max(0.0, float(self.retry_initial_seconds))
         maximum = max(initial, float(self.retry_max_seconds))
@@ -3906,6 +3995,20 @@ class BlockCandidateService:
             attempted=True,
             result=result,
         )
+        if (
+            node_submission.attempted
+            and node_submission.error is None
+            and node_submission.result is None
+        ):
+            # The definitive-acceptance discriminator: all three clauses, not
+            # two. The submitblock error path above also builds result=None,
+            # so a two-clause test would stamp a failed offer as an
+            # acceptance. This is the same predicate
+            # _stash_retained_block_candidate_node_submission applies; it is
+            # inlined here only because this change lands ahead of the shared
+            # `_is_definitive_node_acceptance` helper, and this call site
+            # folds into that helper when it arrives.
+            self._note_accepted_block_preview_acceptance(block_hash)
         self._coordinator._arm_block_candidate_after_node_offer(
             candidate,
             node_submission,
@@ -6136,6 +6239,80 @@ class BlockCandidateService:
                 if elapsed_seconds <= bucket:
                     buckets[bucket] = int(buckets.get(bucket, 0)) + 1
 
+    def _note_accepted_block_preview_acceptance(self, block_hash: str) -> None:
+        """Stamp the moment definitive node acceptance became known.
+
+        Deliberately not ``AcceptedBlockPayoutTransition.landed_monotonic``:
+        that stamp is armed *before* the RPC (see
+        ``_unmark_accepted_block_payout_landed``, "the next attempt re-arms
+        landed before its own RPC"), so an interval measured from it would
+        include the offer itself and would restart on every retry. This one
+        is taken on the submitter thread at the instant the offer resolved
+        definitively, which is the earliest moment acceptance is knowable
+        without a further chain probe.
+        """
+        key = str(block_hash).lower()
+        stamped = time.monotonic()
+        with self._accepted_block_preview_publication_lock:
+            stamps = self._accepted_block_preview_acceptance_monotonic
+            if key in stamps:
+                # Either an unpublished stamp from an earlier definitive
+                # offer of this hash, or its observed tombstone. Both mean
+                # the interval is already owned; a re-offer must not restart
+                # a measurement that is running or already recorded.
+                return
+            stamps[key] = stamped
+            overflow = len(stamps) - MAX_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_STAMPS
+            if overflow > 0:
+                for stale in list(stamps)[:overflow]:
+                    del stamps[stale]
+
+    def _observe_accepted_block_preview_publication(
+        self,
+        block_hash: str,
+        *,
+        result: str,
+    ) -> None:
+        """Close the acceptance-to-publication interval for one hash.
+
+        Only the first publication of a hash is measured: it is the one that
+        made the preview visible to children already waiting on the
+        transition, which is the latency the 5 s child wait budget is spent
+        against. Later matching republications observe nothing.
+        """
+        key = str(block_hash).lower()
+        published = time.monotonic()
+        with self._accepted_block_preview_publication_lock:
+            stamps = self._accepted_block_preview_acceptance_monotonic
+            if key not in stamps:
+                # No definitive offer of this hash was stamped in this
+                # process: a replayed candidate confirmed by chain probe, or
+                # a preview republished for an acceptance this process never
+                # made. There is no interval to close, and inventing one from
+                # the publication alone would report a zero.
+                return
+            started = stamps[key]
+            if started is None:
+                return
+            histogram = self.accepted_block_preview_publication_seconds_histogram.get(
+                result
+            )
+            if histogram is None:
+                # The label set is closed by
+                # PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_RESULTS. Drop the
+                # observation rather than growing series cardinality, and
+                # leave the stamp for a labelled publication to close.
+                return
+            stamps[key] = None
+            elapsed = max(0.0, published - float(started))
+            histogram["count"] = int(histogram["count"]) + 1
+            histogram["sum"] = float(histogram["sum"]) + elapsed
+            buckets = histogram["buckets"]
+            assert isinstance(buckets, dict)
+            for bucket in tuple(buckets):
+                if elapsed <= bucket:
+                    buckets[bucket] = int(buckets.get(bucket, 0)) + 1
+
 
 class BlockCandidateCompatibilityField:
     """Route temporary coordinator fields to the B1 service owner."""
@@ -6264,6 +6441,15 @@ _STATE_FIELD_MAP = {
     "stale_job_abandon_counts": "stale_job_abandon_counts",
     "_block_submit_metrics_lock": "_block_submit_metrics_lock",
     "block_submit_seconds_histogram": "block_submit_seconds_histogram",
+    "_accepted_block_preview_publication_lock": (
+        "_accepted_block_preview_publication_lock"
+    ),
+    "accepted_block_preview_publication_seconds_histogram": (
+        "accepted_block_preview_publication_seconds_histogram"
+    ),
+    "_accepted_block_preview_acceptance_monotonic": (
+        "_accepted_block_preview_acceptance_monotonic"
+    ),
     "_block_replay_enumeration_owed_flag": "_block_replay_enumeration_owed_flag",
 }
 

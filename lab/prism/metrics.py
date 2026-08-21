@@ -15,6 +15,8 @@ import time
 from typing import Any, Protocol
 
 from lab.prism.block_candidates import (
+    PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_RESULTS,
+    PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_SECONDS_BUCKETS,
     PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES,
     PRISM_STALE_JOB_ABANDON_CLASSES,
 )
@@ -703,6 +705,38 @@ class MetricsRenderer:
             f"qbit_prism_coordinator_lock_wait_seconds_max {float(wait_max):.6f}",
         ]
 
+    @staticmethod
+    def _accepted_block_preview_publication_lines(
+        histograms: dict[str, Any],
+    ) -> list[str]:
+        """Per-result bucket/sum/count lines for the publication histogram."""
+        lines: list[str] = []
+        for result in PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_RESULTS:
+            histogram = histograms[result]
+            buckets = histogram["buckets"]
+            count = int(histogram["count"])
+            lines.extend(
+                f"qbit_prism_accepted_block_preview_publication_seconds_bucket"
+                f'{{result="{result}",le="{bucket:g}"}} '
+                f"{int(buckets.get(bucket, 0))}"
+                for bucket in (
+                    PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_SECONDS_BUCKETS
+                )
+            )
+            lines.append(
+                f"qbit_prism_accepted_block_preview_publication_seconds_bucket"
+                f'{{result="{result}",le="+Inf"}} {count}'
+            )
+            lines.append(
+                f"qbit_prism_accepted_block_preview_publication_seconds_sum"
+                f'{{result="{result}"}} {float(histogram["sum"]):.6f}'
+            )
+            lines.append(
+                f"qbit_prism_accepted_block_preview_publication_seconds_count"
+                f'{{result="{result}"}} {count}'
+            )
+        return lines
+
     def block_submitter_metrics_lines(self) -> list[str]:
         snapshot = self.port.block_submitter_snapshot()
         submit_buckets = snapshot["submit_seconds_buckets"]
@@ -716,6 +750,12 @@ class MetricsRenderer:
         # is fixed by PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES so the series
         # cardinality cannot grow with the candidate population.
         collapse_counts = self.port.block_candidate_collapse_snapshot()
+        # Issue #181 item 3: the label set is closed by
+        # PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_RESULTS, so this series
+        # carries no block hash or height and cannot grow with the candidate
+        # population.
+        preview_publication = snapshot["accepted_preview_publication"]
+        assert isinstance(preview_publication, dict)
         return [
             "# HELP qbit_prism_block_submit_seconds Seconds from a block candidate landing in this process to its submitblock RPC returning.",
             "# TYPE qbit_prism_block_submit_seconds histogram",
@@ -726,6 +766,9 @@ class MetricsRenderer:
             f'qbit_prism_block_submit_seconds_bucket{{le="+Inf"}} {submit_count}',
             f"qbit_prism_block_submit_seconds_sum {submit_sum:.6f}",
             f"qbit_prism_block_submit_seconds_count {submit_count}",
+            "# HELP qbit_prism_accepted_block_preview_publication_seconds Seconds from definitive qbitd acceptance of a block candidate to its payout preview becoming visible to waiting child work, by publication result.",
+            "# TYPE qbit_prism_accepted_block_preview_publication_seconds histogram",
+            *self._accepted_block_preview_publication_lines(preview_publication),
             "# HELP qbit_prism_block_candidates_pending Durable block candidates awaiting a terminal outcome, or -1 if unavailable.",
             "# TYPE qbit_prism_block_candidates_pending gauge",
             f"qbit_prism_block_candidates_pending {int(snapshot['pending_count'])}",

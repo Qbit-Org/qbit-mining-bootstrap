@@ -1966,6 +1966,17 @@ class PrismCoordinator:
     block_submit_seconds_histogram = BlockCandidateStateField(
         "block_submit_seconds_histogram"
     )
+    _accepted_block_preview_publication_lock = BlockCandidateStateField(
+        "_accepted_block_preview_publication_lock"
+    )
+    accepted_block_preview_publication_seconds_histogram = (
+        BlockCandidateStateField(
+            "accepted_block_preview_publication_seconds_histogram"
+        )
+    )
+    _accepted_block_preview_acceptance_monotonic = BlockCandidateStateField(
+        "_accepted_block_preview_acceptance_monotonic"
+    )
     _block_replay_enumeration_owed_flag = BlockCandidateStateField(
         "_block_replay_enumeration_owed_flag"
     )
@@ -9681,12 +9692,27 @@ class PrismCoordinator:
             elapsed_seconds
         )
 
+    def _observe_accepted_block_preview_publication(
+        self,
+        block_hash: str,
+        *,
+        result: str,
+    ) -> None:
+        # Called from the P1 publication boundary; the B1 owner holds the
+        # acceptance stamp taken on the submitter thread.
+        service = self._ensure_block_candidate_service()
+        service._observe_accepted_block_preview_publication(
+            block_hash,
+            result=result,
+        )
+
     def block_submitter_snapshot(self) -> dict[str, object]:
         """Merged durable pending-candidate and B1 owner snapshot.
 
         Combines the ledger's durable pending aggregates with the block-
-        candidate service's copied backoff and submit-histogram snapshots;
-        each owner copies under its own lock, so no locks nest here.
+        candidate service's copied backoff, submit-histogram, and
+        acceptance-to-preview-publication snapshots; each owner copies under
+        its own lock, so no locks nest here.
         """
         pending_metrics: dict[str, object] = {
             "pending_count": -1,
@@ -9708,6 +9734,9 @@ class PrismCoordinator:
         submit_buckets, submit_sum, submit_count = (
             service.block_submit_seconds_snapshot()
         )
+        accepted_preview_publication = (
+            service.accepted_block_preview_publication_snapshot()
+        )
         pending_metrics.update(
             {
                 "backoff_active": backoff_active,
@@ -9716,6 +9745,7 @@ class PrismCoordinator:
                 "submit_seconds_buckets": submit_buckets,
                 "submit_seconds_sum": submit_sum,
                 "submit_seconds_count": submit_count,
+                "accepted_preview_publication": accepted_preview_publication,
             }
         )
         return pending_metrics
