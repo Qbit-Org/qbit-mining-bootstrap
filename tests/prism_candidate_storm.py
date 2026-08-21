@@ -19,10 +19,15 @@ reason: ``_retain_block_candidate_for_retry`` also runs when the fast-lane
 reservation declines, before any submitblock.  So is a claimed disposition
 lease: ``submit_next`` takes it on the dequeued hash *before* the terminal,
 capacity and fast-lane checks, each of which releases it again having
-offered nothing.  The rig therefore reports the attested offers
+offered nothing.  So, less obviously, is a recorded terminal outcome: when
+pool capacity is already closed the deferred split builds a node submission
+with ``attempted=False`` and lets accounting terminalize the durable row
+without calling qbitd once, and the durable ``attempt_count`` is marked on
+that same zero-RPC path.  The rig therefore reports the attested offers
 (``node_offer_evidence``) apart from the conservative must-not-abandon union
 (``selector_evidence``) that a selector owes the #183 contract, so neither a
-retry holder nor a held lease is ever mistaken for a node call.
+retry holder, nor a held lease, nor a terminal seal is ever mistaken for a
+node call.
 
 This is a component instrument, not a performance threshold.  It uses the
 real coordinator admission, durable codec, pagination, payout barriers, and
@@ -125,13 +130,15 @@ class CandidateStormSnapshot:
     # part of it.
     selector_evidence_marked: int = 0
     # How that union splits: rows something actually attests a node offer
-    # for, and the two widenings that attest nothing -- a wakeup parked in a
-    # retry holder, and a claimed disposition lease.  Neither is by itself
-    # evidence qbitd was ever called.  The two can coincide on one row, so
-    # they are counted separately rather than folded into one residue.
+    # for, and the three widenings that attest nothing -- a wakeup parked in
+    # a retry holder, a claimed disposition lease, and a recorded terminal
+    # outcome.  None is by itself evidence qbitd was ever called; production
+    # reaches all three without a submitblock.  They can coincide on one row,
+    # so they are counted separately rather than folded into one residue.
     node_offer_evidence_marked: int = 0
     unoffered_retry_marked: int = 0
     unoffered_lease_marked: int = 0
+    unoffered_terminal_marked: int = 0
 
 
 @dataclass(frozen=True)
@@ -143,9 +150,10 @@ class CandidateOwnership:
     instead of a hand-built corpus. ``outstanding`` and ``replay_inflight``
     are process-ownership markers; the fields folded into
     ``node_offer_evidence`` are the ones that mean a node offer happened,
-    is happening, or left acceptance evidence behind. ``retry_held`` and
-    ``disposition_held`` are neither: they are a third category, covered by
-    the conservative ``selector_evidence`` union without attesting an offer.
+    is happening, or left acceptance evidence behind. ``retry_held``,
+    ``disposition_held`` and ``terminal_outcome`` are none of those: they
+    are a third category, covered by the conservative ``selector_evidence``
+    union without attesting an offer.
     """
 
     block_hash: str
@@ -174,16 +182,16 @@ class CandidateOwnership:
         Every fact here is written by the offer or downstream of it: a
         retained submission records an offer that already returned, a tip
         observation and an accounted acceptance are readings of an accepted
-        offer, and a terminal outcome or a pool-block row is what an offer's
-        disposition left behind.  ``retry_held`` and ``disposition_held`` are
-        deliberately absent; see :attr:`retry_held_without_offer` and
-        :attr:`lease_held_without_offer`.
+        offer, and a pool-block row is what an accepted offer's payout
+        preparation left behind.  ``retry_held``, ``disposition_held`` and
+        ``terminal_outcome`` are deliberately absent; see
+        :attr:`retry_held_without_offer`, :attr:`lease_held_without_offer`
+        and :attr:`terminal_without_offer`.
         """
         return bool(
             self.node_acceptance_retained
             or self.tip_observed
             or self.accounted_accepted
-            or self.terminal_outcome is not None
             or self.pool_block_chain_state is not None
         )
 
@@ -222,27 +230,59 @@ class CandidateOwnership:
         return bool(self.disposition_held) and not self.node_offer_evidence
 
     @property
+    def terminal_without_offer(self) -> bool:
+        """A recorded terminal outcome with no offer attested for it.
+
+        ``_record_block_candidate_terminal_outcome`` means "this process
+        finished deciding this row", not "this process offered it".  The
+        deferred submitter split reaches it having called nothing: when pool
+        capacity is already closed -- ``accepted_block_count`` has reached
+        ``max_blocks``, or ``stop_after_block`` is set and one block landed
+        -- ``submit_next`` builds a ``_BlockCandidateNodeSubmission(
+        attempted=False)`` and hands it straight to accounting, which
+        terminalizes the durable outbox row without a single ``submitblock``
+        (the already-accounted and finalize-only replay paths do the same).
+
+        ``attempt_count`` is no substitute for the missing RPC either:
+        ``submit_writer`` calls ``_mark_block_candidate_attempted`` *before*
+        the offer branch, and the ledger documents the mark as "admission to
+        a real processing phase", so the durable row records an attempt on
+        exactly the same zero-RPC path.
+
+        Excluding the terminal registry from :attr:`node_offer_evidence`
+        costs that gauge no attestation it legitimately had: finalization
+        adds an accepted hash to ``_accounted_accepted_block_hashes`` and
+        persists its pool-block row before the terminal outcome is recorded,
+        so a candidate that really was offered and accepted still attests it
+        in its own right.
+        """
+        return self.terminal_outcome is not None and not self.node_offer_evidence
+
+    @property
     def selector_evidence(self) -> bool:
         """The conservative must-not-abandon union the #183 contract needs.
 
-        This is :attr:`node_offer_evidence` widened by ``retry_held`` and by
-        ``disposition_held``.  Each widening covers an ambiguity rather than
-        an attestation: a parked wakeup may equally have come from a path
-        that *did* offer and is retrying its tail, and a claimed lease may
-        equally span an offer already in flight.  Neither the holder nor the
-        flight registry can tell the two apart, so a selector has to leave
-        the row to the per-row path either way -- and a row whose lease it
-        cannot claim is not one it could dispose of anyway.  Because the
+        This is :attr:`node_offer_evidence` widened by ``retry_held``, by
+        ``disposition_held``, and by a recorded ``terminal_outcome``.  Each
+        widening covers an ambiguity rather than an attestation: a parked
+        wakeup may equally have come from a path that *did* offer and is
+        retrying its tail, a claimed lease may equally span an offer already
+        in flight, and a terminal outcome may equally be the seal on an offer
+        that returned.  Nothing the selector can read tells the two apart, so
+        it has to leave the row to the per-row path either way -- and a row
+        whose lease it cannot claim, or whose disposition this process has
+        already fixed, is not one it could dispose of anyway.  Because the
         widening is deliberately conservative, a true value here is not a
         claim that qbitd was offered the hash -- read
         :attr:`node_offer_evidence` for that, and
-        :attr:`retry_held_without_offer` / :attr:`lease_held_without_offer`
-        for the rows the widenings add.
+        :attr:`retry_held_without_offer` / :attr:`lease_held_without_offer` /
+        :attr:`terminal_without_offer` for the rows the widenings add.
         """
         return (
             self.node_offer_evidence
             or bool(self.retry_held)
             or bool(self.disposition_held)
+            or self.terminal_outcome is not None
         )
 
 
@@ -503,6 +543,9 @@ class CandidateStormRig:
             unoffered_lease_marked=sum(
                 1 for record in ownership if record.lease_held_without_offer
             ),
+            unoffered_terminal_marked=sum(
+                1 for record in ownership if record.terminal_without_offer
+            ),
         )
 
     # -- decided-height extension ------------------------------------------
@@ -649,13 +692,15 @@ class CandidateStormRig:
         Each kind reproduces one of the facts ``submit_next`` and
         ``record_abandoned`` consult, through the shipped entry point rather
         than a hand-written marker, and each shows up in :meth:`ownership` as
-        ``selector_evidence``.  Two kinds show up there *without*
-        ``node_offer_evidence``, because neither reaches qbitd: ``retry_slot``
+        ``selector_evidence``.  Three kinds show up there *without*
+        ``node_offer_evidence``, because none reaches qbitd: ``retry_slot``
         moves an already-queued, never-offered wakeup into the retry holder,
         which is exactly what the shipped path does when the fast-lane
-        reservation declines, and ``lease_held`` claims the disposition lease
+        reservation declines; ``lease_held`` claims the disposition lease
         by itself, which is all ``submit_next`` holds while it runs the
-        terminal, capacity and fast-lane checks that precede any submitblock.
+        terminal, capacity and fast-lane checks that precede any submitblock;
+        and ``terminal`` records the disposition seal that the capacity-closed
+        path installs with ``attempted=False`` and no submitblock at all.
         Returns a callable that undoes the perturbation where undoing is
         meaningful (the held disposition lease), otherwise ``None``.
         """
@@ -747,31 +792,105 @@ class CandidateStormRig:
                 )
         return None, None
 
-    def _withhold_head(self, server: Any, block_hash: str, lane: str) -> None:
-        """Lift one withheld hash out of the lane that would dequeue it next."""
+    def _withhold_head(
+        self,
+        server: Any,
+        block_hash: str,
+        lane: str,
+    ) -> Any | None:
+        """Lift one withheld hash out of the lane that would dequeue it next.
+
+        Returns the exact wakeup object removed, so the drain can put it back
+        before it returns.  Discarding it instead would strand the row for
+        good: replay adoption keeps the hash in
+        ``_block_replay_inflight_hashes`` until a terminal outcome is
+        recorded, and ``_enqueue_replayed_block_candidate`` drops any
+        re-adoption of an in-flight hash as a duplicate, so no later
+        enumeration can rebuild the wakeup this call threw away.
+        """
         service = server._ensure_block_candidate_service()
         if lane == "retry":
             with server.lock:
+                candidate = service.retry_candidate
                 service.retry_candidate = None
-        elif lane == "live":
-            service.candidate_queue.get_nowait()
-        elif lane == "replay":
-            service._block_replay_candidate_queue.get_nowait()
-        elif lane == "waiting":
+            return candidate
+        if lane == "live":
+            return service.candidate_queue.get_nowait()
+        if lane == "replay":
+            return service._block_replay_candidate_queue.get_nowait()
+        if lane == "waiting":
             with server.lock:
-                service._block_disposition_waiting_retries.pop(block_hash, None)
+                return service._block_disposition_waiting_retries.pop(
+                    block_hash,
+                    None,
+                )
+        return None
+
+    def _restore_withheld_wakeup(
+        self,
+        server: Any,
+        block_hash: str,
+        lane: str,
+        wakeup: Any,
+    ) -> bool:
+        """Put one lifted wakeup back where it was lifted from.
+
+        Returns False when an equivalent wakeup already stands for the hash,
+        which makes this object a dropped same-hash duplicate for the caller
+        to release.
+
+        Queue lanes are restored by pushing onto the front of the backing
+        deque rather than through ``put_nowait``.  The wakeup was the head
+        when it was lifted and everything ahead of it has since been
+        consumed, so the front is its exact position; and because
+        ``get_nowait`` never touched ``unfinished_tasks``, putting it back in
+        place leaves that counter matching the item's original ``put``
+        instead of double-counting it.  This is the same in-place idiom
+        :meth:`_take_queued_candidate` uses, for the same reason.
+        """
+        service = server._ensure_block_candidate_service()
+        service._ensure_block_replay_state()
+        service._ensure_block_candidate_disposition_state()
+        if lane in ("retry", "waiting"):
+            with server.lock:
+                if lane == "retry" and service.retry_candidate is None:
+                    service.retry_candidate = wakeup
+                    return True
+                # Either this is a waiting-registry entry, or the single
+                # retry head slot has been taken since. The shipped merge
+                # parks a displaced hash in the waiting registry for exactly
+                # this reason, so park it there rather than drop it.
+                waiting = service._block_disposition_waiting_retries
+                if block_hash in waiting:
+                    return False
+                waiting[block_hash] = wakeup
+                return True
+        queue_obj = (
+            service._block_replay_candidate_queue
+            if lane == "replay"
+            else service.candidate_queue
+        )
+        queue_obj.queue.appendleft(wakeup)
+        return True
 
     def _next_drainable(
         self,
         server: Any,
         withheld: set[str],
+        held: list[tuple[str, str, Any]] | None = None,
     ) -> tuple[str | None, str | None]:
-        """Return the next hash to drive, lifting withheld ones out on the way."""
+        """Return the next hash to drive, lifting withheld ones out on the way.
+
+        Every wakeup lifted out is appended to ``held`` in lift order so the
+        drain can restore it; see :meth:`_restore_withheld_wakeup`.
+        """
         while True:
             head, lane = self._dequeue_head(server)
             if head is None or head not in withheld:
                 return head, lane
-            self._withhold_head(server, head, str(lane))
+            wakeup = self._withhold_head(server, head, str(lane))
+            if wakeup is not None and held is not None:
+                held.append((str(lane), head, wakeup))
 
     def _run_block_accounting_tasks(self, server: Any) -> int:
         """Run the shipped accounting lane to quiescence, on this thread.
@@ -846,6 +965,14 @@ class CandidateStormRig:
         declines to terminalize, is withheld the same way and reported, so
         the drain is bounded no matter what evidence the caller installed.
 
+        Withholding is scoped to the invocation, so every wakeup this call
+        lifted out is put back before it returns, on every exit -- exhausted,
+        ``max_rounds``, ``stop_before_hash``, or an exception.  Restoring is
+        not a courtesy: a withheld row keeps its ownership markers, and a
+        hash marked replay-inflight is one no enumeration will re-adopt, so
+        a discarded wakeup leaves the row pending with nothing left to
+        dispose of it and no later drain able to reach it.
+
         ``max_rounds`` stops the drain after that many rows have been offered,
         so a caller can step the oracle one row at a time.  The report then
         covers only the rows *this* call moved: it is compared against the
@@ -875,50 +1002,80 @@ class CandidateStormRig:
         rounds = 0
         accounting_tasks = 0
         enumerations = 0
+        # Every wakeup withholding lifted out, in lift order, so the finally
+        # below can put each one back exactly where it came from.
+        held_wakeups: list[tuple[str, str, Any]] = []
         started = time.monotonic()
-        with self._silence():
-            while True:
-                if max_rounds is not None and rounds >= max_rounds:
-                    break
-                head, _lane = self._next_drainable(server, withheld)
-                if head is None:
-                    enumerations += 1
-                    if server.replay_pending_block_candidates() == 0:
+        try:
+            with self._silence():
+                while True:
+                    if max_rounds is not None and rounds >= max_rounds:
                         break
-                    if self._next_drainable(server, withheld)[0] is None:
-                        # The enumeration restored only withheld rows; the
-                        # shipped loop would re-adopt and re-park them for as
-                        # long as their evidence stands.
+                    head, _lane = self._next_drainable(server, withheld, held_wakeups)
+                    if head is None:
+                        enumerations += 1
+                        if server.replay_pending_block_candidates() == 0:
+                            break
+                        if self._next_drainable(
+                            server,
+                            withheld,
+                            held_wakeups,
+                        )[0] is None:
+                            # The enumeration restored only withheld rows; the
+                            # shipped loop would re-adopt and re-park them for as
+                            # long as their evidence stands.
+                            break
+                        continue
+                    if stop_hash is not None and head == stop_hash:
                         break
-                    continue
-                if stop_hash is not None and head == stop_hash:
-                    break
-                with server.lock:
-                    terminal_before = len(service._block_candidate_terminal_outcomes)
-                if server.submit_next_block_candidate(defer_accounting=True):
-                    rounds += 1
-                accounting_tasks += self._run_block_accounting_tasks(server)
-                with server.lock:
-                    progressed = (
-                        len(service._block_candidate_terminal_outcomes)
-                        != terminal_before
-                    )
-                    parked = head in service._block_disposition_waiting_retries
-                if progressed:
-                    stalls.pop(head, None)
-                    continue
-                if parked:
-                    # submit_next could not claim this hash's lease without
-                    # blocking and parked the wakeup, exactly as the shipped
-                    # loop does. Withhold it instead of spinning behind a
-                    # lease this drain does not own.
-                    withheld.add(head)
-                    lease_blocked.add(head)
-                    continue
-                stalls[head] = stalls.get(head, 0) + 1
-                if stalls[head] >= self._DRAIN_STALL_LIMIT:
-                    withheld.add(head)
-                    deferred.add(head)
+                    with server.lock:
+                        terminal_before = len(service._block_candidate_terminal_outcomes)
+                    if server.submit_next_block_candidate(defer_accounting=True):
+                        rounds += 1
+                    accounting_tasks += self._run_block_accounting_tasks(server)
+                    with server.lock:
+                        progressed = (
+                            len(service._block_candidate_terminal_outcomes)
+                            != terminal_before
+                        )
+                        parked = head in service._block_disposition_waiting_retries
+                    if progressed:
+                        stalls.pop(head, None)
+                        continue
+                    if parked:
+                        # submit_next could not claim this hash's lease without
+                        # blocking and parked the wakeup, exactly as the shipped
+                        # loop does. Withhold it instead of spinning behind a
+                        # lease this drain does not own.
+                        withheld.add(head)
+                        lease_blocked.add(head)
+                        continue
+                    stalls[head] = stalls.get(head, 0) + 1
+                    if stalls[head] >= self._DRAIN_STALL_LIMIT:
+                        withheld.add(head)
+                        deferred.add(head)
+        finally:
+            with self._silence():
+                # Newest lift first: a mid-drain enumeration can re-adopt a row
+                # this call already lifted, and the re-adopted object is the one
+                # the shipped markers now describe. Restoring newest-first also
+                # rebuilds the original lane order, because each lifted wakeup
+                # goes back to the front of its lane.
+                restored: set[str] = set()
+                for lane, key, wakeup in reversed(held_wakeups):
+                    if key in restored or not self._restore_withheld_wakeup(
+                        server,
+                        key,
+                        lane,
+                        wakeup,
+                    ):
+                        # A wakeup for this hash already stands, so this object
+                        # is a dropped same-hash duplicate and must release the
+                        # credit floor it carries -- exactly what the shipped
+                        # duplicate paths do with the object they discard.
+                        service._release_dropped_duplicate_candidate_floor(wakeup)
+                        continue
+                    restored.add(key)
         terminalized: dict[str, set[str]] = {"submitted": set(), "abandoned": set()}
         still_pending: set[str] = set()
         for block_hash, row in outbox.items():
