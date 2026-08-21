@@ -4386,9 +4386,11 @@ class BlockCandidateCollapseHeightProbeBoundTests(unittest.TestCase):
         self.assertNotIn("yielded", log)
         self.assertFalse(fixture.server._block_replay_enumeration_owed())
         self.assertEqual(queued, rows - bound)
-        # Page two spends no chain read at all: with the walk's budget gone
-        # it could not qualify a row, so even the two page-scope tip reads
-        # would have been round trips for a decided answer.
+        # Page two spends no chain read at all. Every row in this backlog
+        # sits at a height of its own, so page two holds nothing the walk
+        # already read and a spent budget leaves it nothing to qualify --
+        # even the two page-scope tip reads would have been round trips for
+        # a decided answer.
         counts = fixture.rpc.counts()
         self.assertEqual(counts["getbestblockhash"], 2)
         self.assertEqual(counts["getblockcount"], 1)
@@ -4487,6 +4489,117 @@ class BlockCandidateCollapseHeightProbeBoundTests(unittest.TestCase):
         # revalidation tip read each.
         self.assertEqual(counts["getbestblockhash"], 2 * (bound + 1))
         self.assertEqual(counts["getblockcount"], bound + 1)
+
+    def test_cached_heights_keep_collapsing_after_the_budget_is_spent(self) -> None:
+        """A spent budget stops new heights, not the ones already read.
+
+        The counter and the caches are shared by the walk, but the page pass
+        used to return the whole page the moment the counter hit zero.  A
+        first page spread across all eight affordable heights therefore
+        disarmed collapse for the rest of the walk, even for later siblings
+        at exactly those heights -- rows the walk could have decided without
+        one new round trip, because their occupant was already in
+        ``probe_budget.active``.  Every one of them was preserved and
+        replay-adopted instead, which is the same defeat the shared cache was
+        added to prevent, just one page later.
+
+        Nine heights are seeded and only eight are ever affordable, so the
+        walk here has to draw the line in exactly the right place: reuse what
+        it read, refuse what it did not.
+        """
+        bound = MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES
+        page_rows = MAX_BLOCK_REPLAY_ENUMERATION_ROWS
+        per_height = page_rows // bound
+        # The ninth height is the negative control: decided, occupied by a
+        # heavier block, and selected by every clause of S -- so the only
+        # thing that can defer it is the spent budget.
+        control_height = bound + 1
+        top = control_height + 1
+        occupied = {
+            height: f"{0xC0DE0000 + height:064x}"
+            for height in range(1, top)
+        }
+        occupied[top] = DECIDED_WINNER
+        fixture = CollapseFixture(
+            rpc=CollapseChainRpc(
+                tip=DECIDED_WINNER,
+                tip_height=top,
+                active=occupied,
+            )
+        )
+        index = 1
+
+        def seed(height: int, rows: int) -> list[str]:
+            nonlocal index
+            hashes = [_hash(value) for value in range(index, index + rows)]
+            index += rows
+            fixture.seed(hashes, height=height)
+            return hashes
+
+        # Page one: a full page spread across all eight affordable heights,
+        # which spends the walk's budget exactly.
+        for height in range(1, bound + 1):
+            seed(height, per_height)
+        # Page two: siblings at those same eight heights -- free to decide --
+        # and, last on the page, the control rows at the height the walk can
+        # no longer afford to read.
+        for height in range(1, bound + 1):
+            seed(height, per_height - 1)
+        control = set(seed(control_height, bound))
+        # A short third page, still at cached heights, proves the reuse
+        # outlives the page that first ran into the bound and ends the walk.
+        for height in range(1, bound):
+            seed(height, 1)
+        cached_rows = page_rows + (bound * (per_height - 1)) + (bound - 1)
+
+        queued, log = fixture.replay(enumeration_owed=True)
+        # One complete enumeration, all three pages walked.
+        self.assertIn("enumeration page=3", log)
+        self.assertNotIn("yielded", log)
+        self.assertFalse(fixture.server._block_replay_enumeration_owed())
+        # Every sibling at a height this walk had already read collapsed,
+        # including the two pages that ran entirely on a spent counter.
+        self.assertEqual(fixture.counts()["abandoned"], cached_rows)
+        self.assertEqual(
+            [len(call[0]) for call in fixture.ledger.abandon_calls],
+            [page_rows, bound * (per_height - 1), bound - 1],
+        )
+        # The control rows are the only deferral, and they are preserved
+        # durable rather than lost.
+        self.assertEqual(fixture.counts()["height_deferred"], bound)
+        self.assertEqual(fixture.pending(), control)
+        # Nor did the walk leak a collapsed sibling into replay adoption: the
+        # deferred controls are the entire adopted set.
+        self.assertEqual(queued, bound)
+        service = fixture.service
+        self.assertEqual(service._block_replay_candidate_queue.qsize(), bound)
+        adopted = set()
+        while not service._block_replay_candidate_queue.empty():
+            candidate = service._block_replay_candidate_queue.get_nowait()
+            adopted.add(candidate.submission.block_hash_hex.lower())
+        self.assertEqual(adopted, control)
+        # Not one new distinct height was read past the bound. The control
+        # height is never asked about at all -- an unprobed height is not a
+        # cheaper probe, it is no probe.
+        probes = [
+            params[0]
+            for method, params in fixture.rpc.calls
+            if method == "getblockhash"
+        ]
+        self.assertEqual(set(probes), set(range(1, bound + 1)))
+        self.assertNotIn(control_height, probes)
+        # Selection reads the eight heights once for the whole walk; the rest
+        # are the per-page pre-write revalidation, which keeps its own budget
+        # and re-reads each retained height under the held leases.
+        self.assertEqual(len(probes), bound + (bound + bound + (bound - 1)))
+        counts = fixture.rpc.counts()
+        # One header per occupant for the walk: page two and page three both
+        # answer clause 4b from the work this walk already derived.
+        self.assertEqual(counts["getblockheader"], bound)
+        # Page-scope tip reads stay per page and stay fresh, on the pages a
+        # spent budget now lets through as much as on the first.
+        self.assertEqual(counts["getbestblockhash"], 2 * 3)
+        self.assertEqual(counts["getblockcount"], 3)
 
 
 class BlockCandidateCollapseObservabilityTests(unittest.TestCase):

@@ -328,6 +328,24 @@ def _collapse_height(value: object) -> int | None:
     return None
 
 
+def _collapse_row_height(durable_row: object) -> int | None:
+    """The height one durable page row claims, or None when it states none.
+
+    The single place that knows where a fetched row records its height, so
+    the cheap pre-selection peek in ``_collapse_superseded_block_candidates``
+    and the decode in ``_superseded_candidate_row`` can never drift apart on
+    it. This is only a peek: it validates nothing beyond the parse, and every
+    fact it reads is re-read and cross-checked against the row's template by
+    the decode, which is what actually decides the row.
+    """
+    if not isinstance(durable_row, dict):
+        return None
+    intent = durable_row.get("candidate")
+    if not isinstance(intent, dict):
+        return None
+    return _collapse_height(intent.get("expected_height"))
+
+
 def _collapse_difficulty(value: object) -> int | float | None:
     """Parse one stored work value, rejecting booleans and non-finite numbers.
 
@@ -1470,7 +1488,7 @@ class BlockCandidateService:
                 "durable candidate row key does not match its intent"
             )
         parent_hash = _collapse_block_hash(intent.get("parent_hash"))
-        height = _collapse_height(intent.get("expected_height"))
+        height = _collapse_row_height(durable_row)
         if parent_hash is None or height is None or height < 0:
             raise _BlockCandidateCollapseFailedClosed(
                 "durable candidate intent carries no usable parent or height"
@@ -2454,7 +2472,11 @@ class BlockCandidateService:
 
         ``probe_budget`` is the enumeration walk's shared chain-height
         budget, carrying both the walk's remaining probes and the reads it
-        has already made; passes given none get a fresh one of their own.
+        has already made; passes given none get a fresh one of their own. A
+        spent budget ends this page only when the page has nothing at a
+        height the walk already read: the counter bounds new heights, and a
+        cached height costs nothing to answer from however late in the walk
+        it is asked.
         """
         if not durable_rows:
             return durable_rows
@@ -2470,11 +2492,28 @@ class BlockCandidateService:
             # read, so it neither counts nor spends a chain round trip: the
             # per-row path disposes of every row exactly as before.
             return durable_rows
-        if probe_budget is not None and probe_budget.exhausted:
-            # This walk has spent its chain-height budget on earlier pages.
-            # Selection could not qualify a single row, so the two page-scope
-            # tip reads it opens with would be two more round trips per page
-            # for a pass that is already decided. Every row is preserved.
+        if (
+            probe_budget is not None
+            and probe_budget.exhausted
+            and not any(
+                _collapse_row_height(durable_row) in probe_budget.active
+                for durable_row in durable_rows
+            )
+        ):
+            # This walk has spent its chain-height budget on earlier pages
+            # *and* not one row here sits at a height those pages already
+            # read. A spent counter only forbids reading a new height; a
+            # height already in the walk's cache stays answerable for free,
+            # and a page holding such rows still qualifies them below. This
+            # page holds none, so selection could not qualify a single row
+            # and the two page-scope tip reads it opens with would be two
+            # more round trips for a pass that is already decided. Every row
+            # is preserved.
+            #
+            # The peek is deliberately lenient: a row it cannot read a height
+            # from contributes no cached height, which at worst preserves a
+            # page the decode would have failed closed on anyway -- exactly
+            # what the unconditional early return did for every such page.
             self._record_block_candidate_collapse(
                 "height_deferred",
                 len(durable_rows),
@@ -2542,8 +2581,8 @@ class BlockCandidateService:
         * a live candidate or a retry is waiting, so there is something
           strictly more valuable than finishing the enumeration; and
         * the walk has already spent its chain-height probes, so the pages it
-          would go on to fetch can no longer collapse anything anyway and the
-          yield costs no collapse efficacy at all.
+          would go on to fetch can no longer decide a height it has not
+          already read.
 
         Both halves matter. Yielding on a waiting candidate alone would cut
         short the same-height storm this path exists for, which walks several
@@ -2552,6 +2591,13 @@ class BlockCandidateService:
         nothing better to do than finish. The caller re-enumerates from the
         outbox on its next pass with a fresh budget, and every row this walk
         fetched was adopted before the yield, so the backlog still shrinks.
+
+        A spent budget is not the same as nothing left to collapse: the pages
+        past the yield may hold siblings at heights this walk already read,
+        and those would have collapsed for free. What the yield gives up is
+        therefore bounded and recovered -- those rows stay durable and pending,
+        and the next walk re-probes their heights on a fresh budget -- while
+        what it buys is the only thread that reaches ``submitblock``.
         """
         if not probe_budget.exhausted:
             return False
