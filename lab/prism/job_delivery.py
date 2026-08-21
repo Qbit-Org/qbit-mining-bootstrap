@@ -47,6 +47,10 @@ from lab.prism.job_bundle import (
     JobBuildWaiterCancelled,
     PRISM_JOB_BUILD_PHASES,  # noqa: F401 - owner-shared phase registry
 )
+# Imported from its owning module rather than the template_artifacts
+# compatibility surface: this type is new, so it has no historical import
+# path to preserve there.
+from lab.prism.payout_state import AcceptedParentPayoutPreviewPending
 from lab.prism.template_artifacts import (
     CachedTemplateArtifacts,
     QbitTipTemplateSnapshot,
@@ -1082,6 +1086,30 @@ class JobDeliveryService:
         if disconnect:
             runtime.disconnect_client(request.client)
 
+    def _log_accepted_parent_preview_pending(
+        self,
+        exc: AcceptedParentPayoutPreviewPending,
+        *,
+        connection_id: object,
+    ) -> None:
+        """Rate-limited retry note for accepted-parent preview backpressure.
+
+        Kept separate from the generic build-failure log (and its own 5s
+        stamp) so benign backpressure never crowds out, or is mistaken for,
+        a counted job-build failure.
+        """
+        now = time.monotonic()
+        last = getattr(self, "_last_preview_pending_log_monotonic", None)
+        if last is not None and now - last < 5.0:
+            return
+        self._last_preview_pending_log_monotonic = now
+        print(
+            "prism coordinator: job delivery waiting on accepted-parent payout "
+            f"preview reason={exc.retry_reason} connection={connection_id}; "
+            f"retrying: {exc}",
+            flush=True,
+        )
+
     def _run_initial_job(self, request: PendingInitialJob) -> bool:
         """Prepare outside client locks, then atomically stamp and send current work."""
         runtime = self._runtime
@@ -1140,6 +1168,25 @@ class JobDeliveryService:
                 except JobBuildWaiterCancelled:
                     if runtime._initial_request_cancelled(request):
                         return False
+                    if not retry_later():
+                        return False
+                    continue
+                except AcceptedParentPayoutPreviewPending as exc:
+                    # Coordination backpressure, not a build failure: the
+                    # accepted parent's preview has simply not published yet.
+                    # Coalesce onto the same bounded retry as any other
+                    # blocked refresh and stay out of
+                    # ``job_build_failure_count``.  The raise site already
+                    # counted the timeout and scheduled the tip-refresh
+                    # retry, so sustained pendency still escalates through
+                    # the coordination-blocked watchdog instead of retrying
+                    # silently forever.
+                    if runtime._initial_request_cancelled(request):
+                        return False
+                    self._log_accepted_parent_preview_pending(
+                        exc,
+                        connection_id=request.client.connection_id,
+                    )
                     if not retry_later():
                         return False
                     continue
@@ -2092,6 +2139,12 @@ class JobDeliveryService:
                             "qbit chain view became untrusted before client job build"
                         )
                     return False
+            except AcceptedParentPayoutPreviewPending:
+                # Propagated verbatim: a late accepted-parent preview must
+                # never be relabelled into a reorg-reconciliation failure by
+                # the generic clause below, which would arm the ordinary
+                # template-refresh failure budget.
+                raise
             except TemplateRefreshBlocked:
                 raise
             except Exception as exc:
@@ -2131,6 +2184,20 @@ class JobDeliveryService:
                 )
             else:
                 context = runtime.build_job_for_client(client, clean_jobs=clean_jobs)
+        except AcceptedParentPayoutPreviewPending as exc:
+            # Same coalescing retry as any other blocked build, but typed all
+            # the way up: the caller's coordination-blocked handling keeps it
+            # out of ``job_build_failure_count`` and the ordinary
+            # template-refresh failure budget, while its own longer streak
+            # deadline preserves the existing watchdog/health escalation.
+            runtime._schedule_tip_refresh_retry()
+            self._log_accepted_parent_preview_pending(
+                exc,
+                connection_id=client.connection_id,
+            )
+            if guarded_refresh or raise_on_reorg_failure or raise_on_build_failure:
+                raise
+            return False
         except TemplateRefreshBlocked:
             runtime._schedule_tip_refresh_retry()
             if guarded_refresh or raise_on_reorg_failure or raise_on_build_failure:
