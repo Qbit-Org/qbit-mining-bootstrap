@@ -163,14 +163,19 @@ class DecidedCandidateStormTests(unittest.TestCase):
                 len(PERTURBATIONS),
             )
             # The union is conservative, but the rig still says which rows
-            # actually attest a node offer. Only the parked wakeup does not:
-            # the retry holder is reachable without any submitblock.
+            # actually attest a node offer. Two do not: both the retry holder
+            # and the disposition lease are reachable without any submitblock.
             self.assertFalse(by_hash[hashes[3]].node_offer_evidence)
             self.assertTrue(by_hash[hashes[3]].retry_held_without_offer)
-            for index in (0, 1, 2, 4, 5):
+            self.assertFalse(by_hash[hashes[3]].lease_held_without_offer)
+            self.assertFalse(by_hash[hashes[0]].node_offer_evidence)
+            self.assertTrue(by_hash[hashes[0]].lease_held_without_offer)
+            self.assertFalse(by_hash[hashes[0]].retry_held_without_offer)
+            for index in (1, 2, 4, 5):
                 with self.subTest(perturbation=PERTURBATIONS[index]):
                     self.assertTrue(by_hash[hashes[index]].node_offer_evidence)
                     self.assertFalse(by_hash[hashes[index]].retry_held_without_offer)
+                    self.assertFalse(by_hash[hashes[index]].lease_held_without_offer)
             snapshot = rig.snapshot(server)
             self.assertEqual(
                 snapshot.selector_evidence_marked,
@@ -178,9 +183,19 @@ class DecidedCandidateStormTests(unittest.TestCase):
             )
             self.assertEqual(
                 snapshot.node_offer_evidence_marked,
-                len(PERTURBATIONS) - 1,
+                len(PERTURBATIONS) - 2,
             )
             self.assertEqual(snapshot.unoffered_retry_marked, 1)
+            self.assertEqual(snapshot.unoffered_lease_marked, 1)
+            # The published split accounts for the whole union: every row the
+            # conservative contract covers is either an attested offer or one
+            # of the two named widenings, and here the widenings are disjoint.
+            self.assertEqual(
+                snapshot.selector_evidence_marked,
+                snapshot.node_offer_evidence_marked
+                + snapshot.unoffered_retry_marked
+                + snapshot.unoffered_lease_marked,
+            )
         finally:
             for release in undo:
                 if release is not None:
@@ -239,6 +254,77 @@ class DecidedCandidateStormTests(unittest.TestCase):
         self.assertEqual(snapshot.selector_evidence_marked, 1)
         self.assertEqual(snapshot.node_offer_evidence_marked, 0)
         self.assertEqual(snapshot.unoffered_retry_marked, 1)
+
+    def test_lease_retention_alone_is_not_node_offer_evidence(self) -> None:
+        """Holding the disposition lease must not read as an offer.
+
+        ``submit_next`` claims the lease on the dequeued hash *before* it
+        consults the terminal outcome, the accounted/capacity close and
+        ``_reserve_block_fast_lane_slot``; each of those paths releases it
+        again without ever reaching submitblock.  The flight registry this is
+        read from is weaker still -- ``_claim_block_candidate_disposition``
+        registers a user before taking the flight's lock, so a blocked waiter
+        is present too.  A rig that folded the lease into its offer evidence
+        would credit a node call that never happened, and #183's safety
+        comparison is published against exactly that split.  The
+        must-not-abandon union still has to cover the row, because a held
+        lease may equally span an offer already in flight.
+        """
+
+        rig = CandidateStormRig(candidates=DECIDED_STORM_CANDIDATES)
+        rig.seed_live()
+        rig.decide_height()
+        server = rig.live_server
+        leased = rig.block_hashes[0]
+
+        before = {record.block_hash: record for record in rig.ownership(server)}
+        self.assertFalse(before[leased].disposition_held)
+        self.assertFalse(before[leased].selector_evidence)
+        calls_before = dict(rig.decided_rpc.calls)
+
+        # Claim the lease through the shipped entry point, exactly as
+        # submit_next does before it has decided anything about the row.
+        release = rig.perturb(server, "lease_held", leased)
+        try:
+            record = {r.block_hash: r for r in rig.ownership(server)}[leased]
+            self.assertTrue(record.disposition_held)
+
+            # Nothing was offered: no RPC happened, and no fact downstream of
+            # an offer exists for the row.
+            self.assertEqual(rig.decided_rpc.calls, calls_before)
+            self.assertFalse(record.node_offer_evidence)
+            self.assertTrue(record.lease_held_without_offer)
+            self.assertFalse(record.retry_held)
+            self.assertFalse(record.retry_held_without_offer)
+            self.assertFalse(record.node_acceptance_retained)
+            self.assertFalse(record.tip_observed)
+            self.assertFalse(record.accounted_accepted)
+            self.assertIsNone(record.pool_block_chain_state)
+            # Nor is the row disposed: the lease is a claim on the decision,
+            # not the decision, so the durable row is untouched and
+            # unattempted.
+            self.assertIsNone(record.terminal_outcome)
+            self.assertEqual(record.outbox_state, "pending")
+            self.assertEqual(record.attempt_count, 0)
+            # The conservative contract still covers it.
+            self.assertTrue(record.selector_evidence)
+
+            snapshot = rig.snapshot(server)
+            self.assertEqual(snapshot.selector_evidence_marked, 1)
+            self.assertEqual(snapshot.node_offer_evidence_marked, 0)
+            self.assertEqual(snapshot.unoffered_lease_marked, 1)
+            self.assertEqual(snapshot.unoffered_retry_marked, 0)
+        finally:
+            release()
+
+        # Releasing drops the row out of the union again: the widening reads
+        # the live flight registry rather than a sticky marker, so it cannot
+        # accumulate the storm the way outstanding/replay-inflight do.
+        after = {r.block_hash: r for r in rig.ownership(server)}[leased]
+        self.assertFalse(after.disposition_held)
+        self.assertFalse(after.selector_evidence)
+        self.assertEqual(rig.snapshot(server).selector_evidence_marked, 0)
+        self.assertEqual(rig.decided_rpc.calls, calls_before)
 
     def test_replay_adoption_alone_drops_a_tip_observation(self) -> None:
         """Why ``perturb('tip_observed')`` also registers the hash outstanding.
@@ -387,12 +473,14 @@ class DecidedCandidateStormTests(unittest.TestCase):
     ) -> None:
         """What the shipped path does with each evidence shape, in both views.
 
-        Only the two shapes that are *not* live node-offer evidence at
-        disposition time reach a terminal abandonment: a wakeup sitting in
-        the retry slot (dequeued and re-offered like any other), and, in the
-        live view only, a prepared pool-block row (rejected first, then
+        Only two shapes reach a terminal abandonment: a wakeup sitting in the
+        retry slot (dequeued and re-offered like any other), and, in the live
+        view only, a prepared pool-block row (rejected first, then
         abandoned). The same prepared row after restart is preserved, because
-        the accounting task restores its acceptance evidence.
+        the accounting task restores its acceptance evidence. ``lease_held``
+        carries no node-offer evidence either, but it is spared for an
+        unrelated reason: the drain cannot claim its lease, so the shipped
+        path parks that wakeup instead of deciding it.
         """
 
         for view in ("live", "restart"):
