@@ -245,7 +245,13 @@ assert_equal(
         {key: value for key, value in row.items() if key != "cursor"}
         for row in pending_rows
     ],
-    [{"block_hash": "ab" * 32, "candidate": candidate_intent}],
+    [
+        {
+            "block_hash": "ab" * 32,
+            "candidate": candidate_intent,
+            "pool_block_exists": False,
+        }
+    ],
     "pending candidate replay retains authoritative outbox key",
 )
 # Startup enumeration pages this read with a keyset cursor, so the cursor
@@ -313,6 +319,115 @@ assert ledger.mark_block_candidate_abandoned(
     error="invalid durable candidate intent",
 )
 assert_equal(ledger.pending_block_candidates(), [], "poison row quarantined by durable key")
+
+# The bulk terminal update replaces N single-hash abandonments on the storm
+# path, so its fence, its exactly-pending predicate, its pool-block veto and
+# its RETURNING-fed report all have to hold against the real table -- where
+# state, completed_at and candidate are checked together in SQL and a
+# half-applied terminal row would be rejected outright.
+bulk_pending_a = "1a" * 32
+bulk_pending_b = "1b" * 32
+bulk_submitted = "1c" * 32
+bulk_landed = "1d" * 32
+bulk_missing = "99" * 32
+for bulk_hash in (bulk_pending_a, bulk_pending_b, bulk_submitted, bulk_landed):
+    assert ledger.persist_block_candidate_intent(
+        {**candidate_intent, "block_hash_hex": bulk_hash}
+    )
+assert ledger.mark_block_candidate_submitted(block_hash=bulk_submitted)
+ledger._run_sql(
+    "INSERT INTO qbit_pool_blocks "
+    "(block_hash, block_height, parent_hash, coinbase_txid, payout_manifest_sha256) "
+    f"VALUES ('{bulk_landed}', 11, '{'00' * 32}', '{'11' * 32}', '{'22' * 32}');"
+)
+# The page read answers the landed-block question for every row it returns,
+# so the caller never pays one round trip per pending hash.
+assert_equal(
+    {
+        row["block_hash"]: row["pool_block_exists"]
+        for row in ledger.pending_block_candidate_rows(limit=32)
+    },
+    {bulk_pending_a: False, bulk_pending_b: False, bulk_landed: True},
+    "pending page reports authoritative pool-block existence",
+)
+assert_equal(
+    ledger.mark_block_candidates_abandoned(block_hashes=[], error="unused"),
+    (),
+    "empty bulk abandon page is a no-op",
+)
+bulk_abandoned = ledger.mark_block_candidates_abandoned(
+    block_hashes=[
+        bulk_pending_b,
+        bulk_pending_a.upper(),
+        bulk_pending_a,
+        bulk_submitted,
+        bulk_landed,
+        bulk_missing,
+    ],
+    error="superseded by decided height",
+)
+assert_equal(
+    list(bulk_abandoned),
+    [bulk_pending_a, bulk_pending_b],
+    "bulk abandon reports exactly the pending rows it won",
+)
+assert_equal(
+    ledger.pending_block_candidates(),
+    [{**candidate_intent, "block_hash_hex": bulk_landed}],
+    "bulk abandon leaves the landed candidate pending",
+)
+bulk_rows = ledger._run_json(
+    "SELECT json_build_object('rows', COALESCE(json_agg(json_build_object("
+    "'block_hash', block_hash, 'state', state, 'last_error', last_error, "
+    "'candidate_cleared', candidate IS NULL, "
+    "'completed', completed_at IS NOT NULL) ORDER BY block_hash), '[]'::json)) "
+    "FROM qbit_block_candidate_outbox WHERE block_hash = ANY(ARRAY["
+    f"'{bulk_pending_a}', '{bulk_pending_b}', '{bulk_submitted}', '{bulk_landed}'"
+    "]::text[]);"
+)["rows"]
+assert_equal(
+    bulk_rows,
+    [
+        {
+            "block_hash": bulk_pending_a,
+            "state": "abandoned",
+            "last_error": "superseded by decided height",
+            "candidate_cleared": True,
+            "completed": True,
+        },
+        {
+            "block_hash": bulk_pending_b,
+            "state": "abandoned",
+            "last_error": "superseded by decided height",
+            "candidate_cleared": True,
+            "completed": True,
+        },
+        {
+            "block_hash": bulk_submitted,
+            "state": "submitted",
+            "last_error": None,
+            "candidate_cleared": True,
+            "completed": True,
+        },
+        {
+            "block_hash": bulk_landed,
+            "state": "pending",
+            "last_error": None,
+            "candidate_cleared": False,
+            "completed": False,
+        },
+    ],
+    "bulk abandon writes the terminal column set and spares every other row",
+)
+assert_equal(
+    ledger.mark_block_candidates_abandoned(
+        block_hashes=[bulk_pending_a, bulk_pending_b],
+        error="second attempt",
+    ),
+    (),
+    "already-terminal rows are not re-won",
+)
+ledger._run_sql(f"DELETE FROM qbit_pool_blocks WHERE block_hash = '{bulk_landed}';")
 ledger._run_sql(
     """
 DELETE FROM qbit_block_candidate_outbox;
@@ -1919,7 +2034,7 @@ assert_equal(
 )
 control_writer.close()
 
-print("prism postgres ledger PASS shares=14 lease=replay startup-retry persist-fence sql-window maturity=reorg carry-replay integrity multipage-window=9000 read-only-session")
+print("prism postgres ledger PASS shares=14 lease=replay startup-retry persist-fence sql-window bulk-abandon=fenced maturity=reorg carry-replay integrity multipage-window=9000 read-only-session")
 PY
 
   PRISM_PSQL_COMMAND="${PSQL_COMMAND}" \

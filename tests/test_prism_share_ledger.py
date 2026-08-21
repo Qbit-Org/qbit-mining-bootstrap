@@ -210,6 +210,29 @@ class FakeMonotonicClock:
         self.now += seconds
 
 
+# Fixed hashes for the bulk terminal-update cases, named for the role each
+# row plays in a page rather than for its bytes.
+BULK_PENDING_A = "1a" * 32
+BULK_PENDING_B = "1b" * 32
+BULK_SUBMITTED = "1c" * 32
+BULK_MISSING = "99" * 32
+
+
+class CountingLock:
+    """Context-manager lock proxy that counts how often it is entered."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.acquisitions = 0
+
+    def __enter__(self) -> Any:
+        self.acquisitions += 1
+        return self._inner.__enter__()
+
+    def __exit__(self, *exc_info: Any) -> Any:
+        return self._inner.__exit__(*exc_info)
+
+
 class FakeLeasePsqlShareLedger(PsqlShareLedger):
     def __init__(self, lease_results: list[dict[str, object]], **kwargs: Any):
         self.lease_results = list(lease_results)
@@ -728,7 +751,13 @@ class PrismShareLedgerTests(unittest.TestCase):
                 {key: value for key, value in row.items() if key != "cursor"}
                 for row in rows
             ],
-            [{"block_hash": "ab" * 32, "candidate": intent}],
+            [
+                {
+                    "block_hash": "ab" * 32,
+                    "candidate": intent,
+                    "pool_block_exists": False,
+                }
+            ],
         )
         # The pagination cursor is opaque to callers but always keyed on the
         # row it came from.
@@ -779,6 +808,149 @@ class PrismShareLedgerTests(unittest.TestCase):
             ledger._block_candidate_outbox[block_hash]["attempt_count"],
             1,
         )
+
+    def _seeded_bulk_abandon_ledger(self) -> SingleWriterShareLedger:
+        """One pending pair, one already-terminal row, one never persisted."""
+        ledger = SingleWriterShareLedger()
+        for block_hash in (BULK_PENDING_A, BULK_PENDING_B, BULK_SUBMITTED):
+            ledger.persist_block_candidate_intent(
+                {
+                    "schema": "qbit.prism.block-candidate-intent.v1",
+                    "block_hash_hex": block_hash,
+                    "block_hex": "00",
+                }
+            )
+        self.assertTrue(
+            ledger.mark_block_candidate_submitted(block_hash=BULK_SUBMITTED)
+        )
+        return ledger
+
+    def test_bulk_candidate_abandon_reports_only_the_rows_it_transitioned(
+        self,
+    ) -> None:
+        """The report is the caller's cleanup authority, not an echo.
+
+        A page handed to the bulk update is a candidate set, not a decided
+        set: rows can already be terminal, or absent entirely. Returning the
+        rows this call actually moved -- rather than a count or the request
+        -- is what lets the caller confine its follow-up cleanup to rows it
+        won, so it is asserted against a page deliberately containing both
+        kinds of non-transition.
+        """
+        ledger = self._seeded_bulk_abandon_ledger()
+
+        abandoned = ledger.mark_block_candidates_abandoned(
+            block_hashes=[
+                BULK_PENDING_B,
+                BULK_PENDING_A.upper(),
+                BULK_PENDING_A,
+                BULK_SUBMITTED,
+                BULK_MISSING,
+            ],
+            error="superseded by decided height",
+        )
+
+        # Duplicates and case collapse; ordering is the normalized set's, not
+        # the caller's, so one input set always reports one identical result.
+        self.assertEqual(abandoned, (BULK_PENDING_A, BULK_PENDING_B))
+        for block_hash in (BULK_PENDING_A, BULK_PENDING_B):
+            row = ledger._block_candidate_outbox[block_hash]
+            self.assertEqual(row["state"], "abandoned")
+            self.assertEqual(row["last_error"], "superseded by decided height")
+            self.assertIsNone(row["candidate"])
+        # An already-terminal row is neither reported nor rewritten, so its
+        # own terminal reason survives a page that happens to name it.
+        submitted = ledger._block_candidate_outbox[BULK_SUBMITTED]
+        self.assertEqual(submitted["state"], "submitted")
+        self.assertIsNone(submitted["last_error"])
+        self.assertNotIn(BULK_MISSING, ledger._block_candidate_outbox)
+        self.assertEqual(ledger.pending_block_candidates(), [])
+
+        # Re-running the same page wins nothing: the rows are terminal now.
+        self.assertEqual(
+            ledger.mark_block_candidates_abandoned(
+                block_hashes=[BULK_PENDING_A, BULK_PENDING_B],
+                error="second attempt",
+            ),
+            (),
+        )
+        self.assertEqual(
+            ledger._block_candidate_outbox[BULK_PENDING_A]["last_error"],
+            "superseded by decided height",
+        )
+
+    def test_bulk_candidate_abandon_on_an_empty_page_touches_nothing(self) -> None:
+        ledger = self._seeded_bulk_abandon_ledger()
+
+        self.assertEqual(
+            ledger.mark_block_candidates_abandoned(block_hashes=[], error="unused"),
+            (),
+        )
+        self.assertEqual(
+            ledger._block_candidate_outbox[BULK_PENDING_A]["state"],
+            "pending",
+        )
+        self.assertEqual(len(ledger.pending_block_candidates()), 2)
+
+    def test_pending_candidate_page_reports_pool_block_existence(self) -> None:
+        """The page read answers the landed-block question, not a per-row call.
+
+        Both backends carry the fact on the row itself so a caller reading a
+        page never has to ask once per hash. The memory mirror reads the same
+        durable evidence the Postgres ``EXISTS`` does: a pool-block row exists
+        only for a candidate that reached ``persist_accepted_block``.
+        """
+        ledger = self._seeded_bulk_abandon_ledger()
+        ledger._memory_pool_blocks[BULK_PENDING_B] = (10, "prepared", "00" * 32)
+
+        rows = ledger.pending_block_candidate_rows(limit=32)
+
+        self.assertEqual(
+            {row["block_hash"]: row["pool_block_exists"] for row in rows},
+            {BULK_PENDING_A: False, BULK_PENDING_B: True},
+        )
+
+    def test_bulk_candidate_abandon_spares_a_landed_candidate(self) -> None:
+        """A pool-block row vetoes the transition even inside the page.
+
+        The caller's page could have been read before the candidate landed,
+        so the veto has to live in the write itself. A row that acquired one
+        is simply absent from the report, which is exactly how the caller
+        learns not to clean it up.
+        """
+        ledger = self._seeded_bulk_abandon_ledger()
+        ledger._memory_pool_blocks[BULK_PENDING_B] = (10, "prepared", "00" * 32)
+
+        abandoned = ledger.mark_block_candidates_abandoned(
+            block_hashes=[BULK_PENDING_A, BULK_PENDING_B],
+            error="superseded by decided height",
+        )
+
+        self.assertEqual(abandoned, (BULK_PENDING_A,))
+        landed = ledger._block_candidate_outbox[BULK_PENDING_B]
+        self.assertEqual(landed["state"], "pending")
+        self.assertIsNone(landed["last_error"])
+        self.assertIsNotNone(landed["candidate"])
+
+    def test_bulk_candidate_abandon_decides_a_page_under_one_lock_hold(self) -> None:
+        """One page is one atomic decision, matching the Postgres statement.
+
+        The Postgres backend resolves a whole page inside a single fenced
+        statement, so a memory backend that released and re-took the lock per
+        hash would let a concurrent writer split the reported set across two
+        views of the outbox -- a parity gap the returned set would then hide.
+        """
+        ledger = self._seeded_bulk_abandon_ledger()
+        counting = CountingLock(ledger._lock)
+        ledger._lock = counting
+
+        abandoned = ledger.mark_block_candidates_abandoned(
+            block_hashes=[BULK_PENDING_A, BULK_PENDING_B, BULK_MISSING],
+            error="superseded by decided height",
+        )
+
+        self.assertEqual(abandoned, (BULK_PENDING_A, BULK_PENDING_B))
+        self.assertEqual(counting.acquisitions, 1)
 
     def test_pending_candidate_cursor_pages_walk_a_stable_total_order(self) -> None:
         """Startup enumeration must complete for a backlog of any size.
@@ -1034,7 +1206,13 @@ class PrismShareLedgerTests(unittest.TestCase):
                 {key: value for key, value in row.items() if key != "cursor"}
                 for row in ledger.pending_block_candidate_rows()
             ],
-            [{"block_hash": "ef" * 32, "candidate": intent}],
+            [
+                {
+                    "block_hash": "ef" * 32,
+                    "candidate": intent,
+                    "pool_block_exists": False,
+                }
+            ],
         )
         self.assertTrue(ledger.mark_block_candidate_submitted(block_hash="ef" * 32))
         terminal_persist = ledger.persist_block_candidate_intent(retry_intent)
@@ -1638,6 +1816,7 @@ class PrismShareLedgerTests(unittest.TestCase):
                     {
                         "block_hash": "ef" * 32,
                         "candidate": intent,
+                        "pool_block_exists": False,
                         "cursor": cursor,
                     }
                 ],
@@ -1650,17 +1829,18 @@ class PrismShareLedgerTests(unittest.TestCase):
                 {
                     "block_hash": "ef" * 32,
                     "candidate": intent,
+                    "pool_block_exists": False,
                     "cursor": cursor,
                 }
             ],
         )
         query = ledger.lease_queries[-1]
-        self.assertIn("'block_hash', block_hash,", query)
-        self.assertIn("'candidate', candidate,", query)
+        self.assertIn("'block_hash', pending.block_hash,", query)
+        self.assertIn("'candidate', pending.candidate,", query)
         # The cursor is the two ordering columns, and its stamp keeps the
         # microsecond precision the column stores.
         self.assertIn(
-            "'cursor', json_build_array(cursor_created_at, block_hash)",
+            "'cursor', json_build_array(\n                pending.cursor_created_at,\n                pending.block_hash\n            )",
             query,
         )
         self.assertIn(
@@ -1797,6 +1977,236 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertIn("writer_id = 'writer-a'", query)
         self.assertIn("writer_epoch = 7", query)
         self.assertIn("attempt_count = attempt_count + 1", query)
+
+    def _bulk_abandon_query(
+        self,
+        *,
+        block_hashes: list[str],
+        error: str = "superseded by decided height",
+        abandoned: list[str] | None = None,
+    ) -> tuple[FakeLeasePsqlShareLedger, tuple[str, ...], str]:
+        ledger = FakeLeasePsqlShareLedger(
+            [acquired_lease(), {"abandoned": abandoned or []}],
+            writer_id="writer-a",
+            writer_epoch=7,
+        )
+        result = ledger.mark_block_candidates_abandoned(
+            block_hashes=block_hashes,
+            error=error,
+        )
+        return ledger, result, ledger.lease_queries[-1]
+
+    def test_postgres_bulk_candidate_abandon_is_one_fenced_set_statement(
+        self,
+    ) -> None:
+        """One statement per page, carrying the same fence as the per-row path.
+
+        The point of the batch form is that a storm-sized page costs one
+        fenced write rather than one per hash, so the shape assertions are
+        the behaviour: exactly one outbox ``UPDATE``, and a set predicate
+        rather than a disjunction of equalities.
+        """
+        _, _, query = self._bulk_abandon_query(
+            block_hashes=[BULK_PENDING_A, BULK_PENDING_B],
+        )
+
+        self.assertEqual(query.count("UPDATE qbit_block_candidate_outbox"), 1)
+        self.assertIn("qbit_ledger_writer_lease", query)
+        self.assertIn("writer_id = 'writer-a'", query)
+        self.assertIn("writer_epoch = 7", query)
+        self.assertIn("writer_session_token = ", query)
+        self.assertIn(
+            f"block_hash = ANY(ARRAY['{BULK_PENDING_A}', '{BULK_PENDING_B}']::text[])",
+            query,
+        )
+        self.assertIn("AND state = 'pending'", query)
+        self.assertIn("SET state = 'abandoned'", query)
+        self.assertIn("last_error = 'superseded by decided height'", query)
+        self.assertIn("updated_at = clock_timestamp()", query)
+        self.assertIn("completed_at = clock_timestamp()", query)
+        self.assertIn("candidate = NULL", query)
+        self.assertIn("RETURNING block_hash", query)
+        self.assertIn("'writer lease is not active'", query)
+
+    def test_postgres_bulk_candidate_abandon_re_checks_pool_blocks(self) -> None:
+        """The landed-block fact is re-asked inside the write, not trusted.
+
+        ``pool_block_exists`` from a page read is a fact about the moment of
+        that read. A candidate can land between the read and the write, and
+        the pool-block row is what records that it did, so the terminal
+        statement carries its own ``NOT EXISTS`` arm under the writer fence.
+        """
+        _, _, query = self._bulk_abandon_query(block_hashes=[BULK_PENDING_A])
+
+        self.assertIn("AND NOT EXISTS (", query)
+        self.assertIn("FROM qbit_pool_blocks pool", query)
+        self.assertIn(
+            "WHERE pool.block_hash = qbit_block_candidate_outbox.block_hash",
+            query,
+        )
+
+    def test_postgres_bulk_candidate_abandon_returns_the_rows_it_won(self) -> None:
+        """``RETURNING`` decides the report, so the request cannot inflate it."""
+        _, abandoned, _ = self._bulk_abandon_query(
+            block_hashes=[BULK_PENDING_A, BULK_PENDING_B, BULK_SUBMITTED],
+            abandoned=[BULK_PENDING_A],
+        )
+
+        self.assertEqual(abandoned, (BULK_PENDING_A,))
+
+    def test_postgres_bulk_candidate_abandon_reports_an_empty_win(self) -> None:
+        _, abandoned, query = self._bulk_abandon_query(
+            block_hashes=[BULK_PENDING_A],
+            abandoned=[],
+        )
+
+        self.assertEqual(abandoned, ())
+        # The empty case is the aggregate's, not a missing key: an outer
+        # json_agg over zero rows is NULL and would decode as None.
+        self.assertIn("'[]'::json", query)
+
+    def test_postgres_bulk_candidate_abandon_normalizes_the_target_set(
+        self,
+    ) -> None:
+        """Mixed case and duplicates resolve to one deterministic target set.
+
+        Rows are keyed on the lowercase hash, so a page naming the same row
+        twice in two cases must ask for it once. Sorting is what makes the
+        generated statement a function of the set rather than of the caller's
+        iteration order.
+        """
+        _, _, query = self._bulk_abandon_query(
+            block_hashes=[
+                BULK_PENDING_B,
+                BULK_PENDING_A.upper(),
+                BULK_PENDING_A,
+                BULK_PENDING_B.upper(),
+            ],
+        )
+
+        self.assertIn(
+            f"ANY(ARRAY['{BULK_PENDING_A}', '{BULK_PENDING_B}']::text[])",
+            query,
+        )
+        self.assertEqual(query.count(BULK_PENDING_A), 1)
+        self.assertNotIn(BULK_PENDING_A.upper(), query)
+
+    def test_postgres_bulk_candidate_abandon_quotes_the_reason(self) -> None:
+        _, _, query = self._bulk_abandon_query(
+            block_hashes=[BULK_PENDING_A],
+            error="height 'H' decided by another block",
+        )
+
+        self.assertIn(
+            "last_error = 'height ''H'' decided by another block'",
+            query,
+        )
+
+    def test_postgres_bulk_candidate_abandon_on_an_empty_page_issues_no_query(
+        self,
+    ) -> None:
+        """An empty page must not reach the server at all.
+
+        ``ANY(ARRAY[])`` has no inferable element type and would fail to
+        parse, so the guard is not an optimization: the alternative is a
+        malformed statement.
+        """
+        ledger = FakeLeasePsqlShareLedger([acquired_lease()])
+        queries_before = len(ledger.lease_queries)
+
+        self.assertEqual(
+            ledger.mark_block_candidates_abandoned(block_hashes=[], error="unused"),
+            (),
+        )
+
+        self.assertEqual(len(ledger.lease_queries), queries_before)
+
+    def test_postgres_bulk_candidate_abandon_fails_on_inactive_writer_lease(
+        self,
+    ) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [acquired_lease(), {"error": "writer lease is not active"}]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "writer lease is not active"):
+            ledger.mark_block_candidates_abandoned(
+                block_hashes=[BULK_PENDING_A, BULK_PENDING_B],
+                error="superseded by decided height",
+            )
+
+    def test_postgres_pending_candidate_page_carries_pool_block_existence(
+        self,
+    ) -> None:
+        """One page read answers the landed-block question for every row.
+
+        Asking per row is one round trip per row, and the page read exists
+        precisely for backlogs where that is the whole cost. The probe sits
+        outside the limited subquery so it runs at most ``limit`` times
+        rather than once per pending row in the backlog.
+        """
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                [
+                    {
+                        "block_hash": BULK_PENDING_A,
+                        "candidate": {"block_hash_hex": BULK_PENDING_A},
+                        "pool_block_exists": False,
+                        "cursor": ["2026-08-20T00:00:00.000001Z", BULK_PENDING_A],
+                    },
+                    {
+                        "block_hash": BULK_PENDING_B,
+                        "candidate": {"block_hash_hex": BULK_PENDING_B},
+                        "pool_block_exists": True,
+                        "cursor": ["2026-08-20T00:00:00.000002Z", BULK_PENDING_B],
+                    },
+                ],
+            ]
+        )
+
+        rows = ledger.pending_block_candidate_rows(limit=32)
+
+        self.assertEqual(
+            [row["pool_block_exists"] for row in rows],
+            [False, True],
+        )
+        query = ledger.lease_queries[-1]
+        self.assertIn("'pool_block_exists', EXISTS (", query)
+        self.assertIn("FROM qbit_pool_blocks pool", query)
+        self.assertIn("WHERE pool.block_hash = pending.block_hash", query)
+        # Outside the LIMITed subquery: the probe is bounded by the page, not
+        # by the backlog behind it.
+        self.assertLess(
+            query.index("'pool_block_exists', EXISTS ("),
+            query.index("FROM (\n    SELECT"),
+        )
+        self.assertIn("LIMIT 32", query)
+
+    def test_postgres_pending_candidate_page_without_existence_fails_closed(
+        self,
+    ) -> None:
+        """A page that cannot report the fact raises instead of implying false."""
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                [{"block_hash": BULK_PENDING_A, "candidate": {}, "cursor": [1, "a"]}],
+            ]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "pool block existence"):
+            ledger.pending_block_candidate_rows(limit=32)
+
+    def test_postgres_pending_candidate_page_propagates_read_failure(self) -> None:
+        """A failed page read must not read as an empty backlog."""
+
+        class FailingPageLedger(FakeLeasePsqlShareLedger):
+            def _run_retry_safe_read_json(self, sql: str) -> Any:
+                raise RuntimeError("connection reset by peer")
+
+        ledger = FailingPageLedger([acquired_lease()])
+
+        with self.assertRaisesRegex(RuntimeError, "connection reset by peer"):
+            ledger.pending_block_candidate_rows(limit=32)
 
     def test_writer_lease_ttl_defaults_to_sixty_seconds(self) -> None:
         ledger = FakeLeasePsqlShareLedger([acquired_lease()])
