@@ -163,19 +163,27 @@ class DecidedCandidateStormTests(unittest.TestCase):
                 len(PERTURBATIONS),
             )
             # The union is conservative, but the rig still says which rows
-            # actually attest a node offer. Two do not: both the retry holder
-            # and the disposition lease are reachable without any submitblock.
-            self.assertFalse(by_hash[hashes[3]].node_offer_evidence)
-            self.assertTrue(by_hash[hashes[3]].retry_held_without_offer)
-            self.assertFalse(by_hash[hashes[3]].lease_held_without_offer)
-            self.assertFalse(by_hash[hashes[0]].node_offer_evidence)
-            self.assertTrue(by_hash[hashes[0]].lease_held_without_offer)
-            self.assertFalse(by_hash[hashes[0]].retry_held_without_offer)
-            for index in (1, 2, 4, 5):
-                with self.subTest(perturbation=PERTURBATIONS[index]):
+            # actually attest a node offer. Three do not: the retry holder,
+            # the disposition lease and the terminal registry are each
+            # reachable without any submitblock.
+            widenings = {
+                "retry_slot": "retry_held_without_offer",
+                "lease_held": "lease_held_without_offer",
+                "terminal": "terminal_without_offer",
+            }
+            for kind, attested in widenings.items():
+                with self.subTest(perturbation=kind):
+                    record = by_hash[hashes[PERTURBATIONS.index(kind)]]
+                    self.assertFalse(record.node_offer_evidence)
+                    for name in widenings.values():
+                        self.assertEqual(getattr(record, name), name == attested)
+            for index, kind in enumerate(PERTURBATIONS):
+                if kind in widenings:
+                    continue
+                with self.subTest(perturbation=kind):
                     self.assertTrue(by_hash[hashes[index]].node_offer_evidence)
-                    self.assertFalse(by_hash[hashes[index]].retry_held_without_offer)
-                    self.assertFalse(by_hash[hashes[index]].lease_held_without_offer)
+                    for name in widenings.values():
+                        self.assertFalse(getattr(by_hash[hashes[index]], name))
             snapshot = rig.snapshot(server)
             self.assertEqual(
                 snapshot.selector_evidence_marked,
@@ -183,18 +191,21 @@ class DecidedCandidateStormTests(unittest.TestCase):
             )
             self.assertEqual(
                 snapshot.node_offer_evidence_marked,
-                len(PERTURBATIONS) - 2,
+                len(PERTURBATIONS) - len(widenings),
             )
             self.assertEqual(snapshot.unoffered_retry_marked, 1)
             self.assertEqual(snapshot.unoffered_lease_marked, 1)
+            self.assertEqual(snapshot.unoffered_terminal_marked, 1)
             # The published split accounts for the whole union: every row the
             # conservative contract covers is either an attested offer or one
-            # of the two named widenings, and here the widenings are disjoint.
+            # of the three named widenings, and here the widenings are
+            # disjoint.
             self.assertEqual(
                 snapshot.selector_evidence_marked,
                 snapshot.node_offer_evidence_marked
                 + snapshot.unoffered_retry_marked
-                + snapshot.unoffered_lease_marked,
+                + snapshot.unoffered_lease_marked
+                + snapshot.unoffered_terminal_marked,
             )
         finally:
             for release in undo:
@@ -325,6 +336,105 @@ class DecidedCandidateStormTests(unittest.TestCase):
         self.assertFalse(after.selector_evidence)
         self.assertEqual(rig.snapshot(server).selector_evidence_marked, 0)
         self.assertEqual(rig.decided_rpc.calls, calls_before)
+
+    def test_capacity_closed_terminalization_is_not_node_offer_evidence(
+        self,
+    ) -> None:
+        """A terminal outcome reached with zero submitblock is not an offer.
+
+        Whenever pool capacity is already closed, ``submit_next`` builds a
+        ``_BlockCandidateNodeSubmission(attempted=False)`` and hands it
+        straight to the accounting queue, which marks the durable attempt and
+        terminalizes the outbox row without calling qbitd once.  A rig that
+        folded the terminal registry into its offer evidence would publish
+        that row as an attested node offer, and #183's safety comparison is
+        published against exactly that split.  The conservative
+        must-not-abandon union still has to cover the row, because a terminal
+        outcome may equally be the seal on an offer that returned.
+        """
+
+        rig = CandidateStormRig(candidates=DECIDED_STORM_CANDIDATES)
+        rig.seed_live()
+        winner = rig.decide_height()
+        server = rig.live_server
+        closed = rig.block_hashes[0]
+
+        before = {r.block_hash: r for r in rig.ownership(server)}[closed]
+        self.assertIsNone(before.terminal_outcome)
+        self.assertFalse(before.selector_evidence)
+        self.assertNotIn("submitblock", rig.decided_rpc.calls)
+
+        # Close pool capacity through the shipped coordinator tunable the
+        # production check reads, then drive one row of the shipped path.
+        server.max_blocks = 0
+        drain = rig.drain_per_row(server, stop_before_hash=winner, max_rounds=1)
+
+        # The rig's own RPC call log is the proof: the row was terminalized
+        # and not one submitblock was made, on this call or ever.
+        self.assertEqual(drain.rounds, 1)
+        self.assertEqual(drain.rpc_calls.get("submitblock", 0), 0)
+        self.assertNotIn("submitblock", rig.decided_rpc.calls)
+        self.assertEqual(drain.abandoned_hashes, frozenset({closed}))
+        self.assertEqual(drain.submitted_hashes, frozenset())
+        # The durable row still records an attempt, so attempt_count is no
+        # substitute for the missing RPC: submit_writer marks admission to a
+        # processing phase before the offer branch it never took.
+        self.assertEqual(drain.ledger_attempt_marks, 1)
+
+        record = {r.block_hash: r for r in rig.ownership(server)}[closed]
+        self.assertEqual(record.outbox_state, "abandoned")
+        self.assertIs(record.terminal_outcome, False)
+        self.assertEqual(record.attempt_count, 1)
+        self.assertFalse(record.node_offer_evidence)
+        self.assertTrue(record.terminal_without_offer)
+        # Nothing else attests an offer for the row either.
+        self.assertFalse(record.node_acceptance_retained)
+        self.assertFalse(record.tip_observed)
+        self.assertFalse(record.accounted_accepted)
+        self.assertIsNone(record.pool_block_chain_state)
+        self.assertFalse(record.retry_held)
+        self.assertFalse(record.retry_held_without_offer)
+        self.assertFalse(record.disposition_held)
+        self.assertFalse(record.lease_held_without_offer)
+        # The conservative contract still covers it.
+        self.assertTrue(record.selector_evidence)
+
+        snapshot = rig.snapshot(server)
+        self.assertEqual(snapshot.node_offer_evidence_marked, 0)
+        self.assertEqual(snapshot.unoffered_terminal_marked, 1)
+        self.assertEqual(snapshot.unoffered_retry_marked, 0)
+        self.assertEqual(snapshot.unoffered_lease_marked, 0)
+        self.assertEqual(snapshot.selector_evidence_marked, 1)
+
+        # The oracle's exact-set properties are unchanged by the narrowed
+        # gauge: reopening capacity drains every remaining sibling through
+        # the ordinary offer path, and the two calls partition the sibling
+        # set exactly, each reporting only its own transitions.
+        server.max_blocks = DECIDED_STORM_CANDIDATES + 1
+        rest = rig.drain_per_row(server, stop_before_hash=winner)
+        self.assertEqual(
+            rest.rpc_calls["submitblock"],
+            DECIDED_STORM_CANDIDATES - 2,
+        )
+        self.assertTrue(rest.abandoned_hashes.isdisjoint(drain.abandoned_hashes))
+        self.assertEqual(
+            drain.abandoned_hashes | rest.abandoned_hashes,
+            frozenset(rig.block_hashes) - {winner},
+        )
+        self.assertEqual(rest.pending_hashes, frozenset({winner}))
+        self.assertEqual(rest.submitted_hashes, frozenset())
+        self.assertEqual(rest.withheld_hashes, frozenset())
+        # Every abandoned row is now conservatively covered and none of them
+        # is published as an attested offer.
+        after = rig.ownership(server)
+        self.assertEqual(
+            sum(1 for r in after if r.terminal_without_offer),
+            DECIDED_STORM_CANDIDATES - 1,
+        )
+        self.assertEqual(
+            rig.snapshot(server).node_offer_evidence_marked,
+            0,
+        )
 
     def test_replay_adoption_alone_drops_a_tip_observation(self) -> None:
         """Why ``perturb('tip_observed')`` also registers the hash outstanding.
@@ -538,6 +648,122 @@ class DecidedCandidateStormTests(unittest.TestCase):
                 )
                 self.assertEqual(drain.submitted_hashes, frozenset())
                 self.assertIn(winner, drain.pending_hashes)
+
+    def test_preserved_wakeups_survive_the_drain_that_withheld_them(self) -> None:
+        """``preserve_hashes`` is invocation-scoped, so it must not eat wakeups.
+
+        A withheld row is lifted out of the dequeue order without being
+        offered or disposed, which leaves its ownership markers standing.
+        After restart adoption that includes ``_block_replay_inflight_hashes``,
+        and ``_enqueue_replayed_block_candidate`` drops any re-adoption of an
+        in-flight hash as a duplicate -- so a drain that discarded the lifted
+        wakeup would leave the row pending with nothing left to dispose of it
+        and no enumeration able to rebuild it.  Partial and repeated drains
+        re-apply the withholding every call, so the wakeup has to survive each
+        one, and a later unprotected drain has to be able to process the row.
+        """
+
+        for view in ("live", "restart"):
+            with self.subTest(view=view):
+                rig = CandidateStormRig(candidates=DECIDED_STORM_CANDIDATES)
+                rig.seed_live()
+                if view == "restart":
+                    rig.restart_and_enumerate()
+                winner = rig.decide_height()
+                server = rig.restarted_server if view == "restart" else rig.live_server
+                service = server._ensure_block_candidate_service()
+                protected = rig.block_hashes[0]
+
+                def queued_wakeups() -> set[str]:
+                    return {
+                        str(item.submission.block_hash_hex).lower()
+                        for lane in (
+                            service.candidate_queue,
+                            service._block_replay_candidate_queue,
+                        )
+                        for item in list(lane.queue)
+                    }
+
+                self.assertIn(protected, queued_wakeups())
+
+                # Repeated partial drains: each one withholds the row again.
+                steps = [
+                    rig.drain_per_row(
+                        server,
+                        stop_before_hash=winner,
+                        preserve_hashes=[protected],
+                        max_rounds=2,
+                    )
+                    for _ in range(2)
+                ]
+                for index, step in enumerate(steps):
+                    with self.subTest(step=index):
+                        self.assertEqual(step.rounds, 2)
+                        self.assertEqual(step.withheld_hashes, frozenset({protected}))
+                        self.assertNotIn(protected, step.abandoned_hashes)
+                        self.assertIn(protected, step.pending_hashes)
+                        self.assertEqual(len(step.abandoned_hashes), 2)
+                self.assertTrue(
+                    steps[0].abandoned_hashes.isdisjoint(steps[1].abandoned_hashes)
+                )
+                self.assertIn(protected, queued_wakeups())
+
+                # ...then an unbounded preserving drain over the remainder.
+                first = rig.drain_per_row(
+                    server,
+                    stop_before_hash=winner,
+                    preserve_hashes=[protected],
+                )
+                self.assertEqual(first.withheld_hashes, frozenset({protected}))
+                self.assertNotIn(protected, first.abandoned_hashes)
+                self.assertEqual(
+                    first.pending_hashes,
+                    frozenset({protected, winner}),
+                )
+
+                # The protected row still owns exactly one in-memory wakeup,
+                # in a lane a later drain dequeues from...
+                self.assertIn(protected, queued_wakeups())
+                self.assertEqual(
+                    sum(
+                        1
+                        for lane in (
+                            service.candidate_queue,
+                            service._block_replay_candidate_queue,
+                        )
+                        for item in list(lane.queue)
+                        if str(item.submission.block_hash_hex).lower() == protected
+                    ),
+                    1,
+                )
+                record = {r.block_hash: r for r in rig.ownership(server)}[protected]
+                self.assertTrue(record.live_queued or record.replay_queued)
+                # ...and its durable row and evidence are untouched, exactly
+                # as the caller arranged them.
+                self.assertEqual(record.outbox_state, "pending")
+                self.assertEqual(record.attempt_count, 0)
+                self.assertIsNone(record.terminal_outcome)
+                self.assertFalse(record.selector_evidence)
+                self.assertFalse(record.node_offer_evidence)
+
+                # A later unprotected drain reaches it and disposes of it for
+                # real -- one offer, one accounting task, one durable attempt.
+                second = rig.drain_per_row(server, stop_before_hash=winner)
+                self.assertEqual(second.rounds, 1)
+                self.assertEqual(second.accounting_tasks, 1)
+                self.assertEqual(second.ledger_attempt_marks, 1)
+                self.assertEqual(second.rpc_calls["submitblock"], 1)
+                self.assertEqual(second.abandoned_hashes, frozenset({protected}))
+                self.assertEqual(second.withheld_hashes, frozenset())
+                self.assertEqual(second.pending_hashes, frozenset({winner}))
+                # Every call partitions the sibling set; nothing was stranded.
+                self.assertEqual(
+                    steps[0].abandoned_hashes
+                    | steps[1].abandoned_hashes
+                    | first.abandoned_hashes
+                    | second.abandoned_hashes,
+                    frozenset(rig.block_hashes) - {winner},
+                )
 
     def test_bounded_drains_report_only_their_own_transitions(self) -> None:
         """``max_rounds`` reports this call's work, not the rig's history.
