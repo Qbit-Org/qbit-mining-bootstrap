@@ -32,7 +32,9 @@ disposition path in the production split -- ``submit_next`` with
 ``defer_accounting=True`` handing every node offer to the real accounting
 queue and task runner -- reporting the exact hash sets it terminalized and
 what they cost.  The per-row drain is the oracle any set-oriented selector
-has to agree with; the instrument does not contain a selector itself.
+has to agree with; the instrument does not contain a selector itself, and
+suppresses the shipped #183 collapse for the duration of the drain so the
+oracle stays the per-row path even where the drain re-enumerates.
 
 Driving both lanes from one thread is what makes the drain deterministic,
 and it costs nothing in fidelity: the two lanes are already serialized per
@@ -359,9 +361,24 @@ class CandidateStormRig:
         if self.restarted_server is not None:
             raise RuntimeError("storm has already been restarted")
         server, _state = self._coordinator()
+        # The restart view exists to hand a set-oriented selector the full
+        # replay-adopted population, so the shipped #183 collapse is
+        # suppressed for this enumeration exactly as it is for the per-row
+        # drain. Without that, deciding the height before the restart would
+        # let the enumeration dispose of the storm itself and leave the
+        # instrument with nothing to characterize.
+        server._ensure_block_candidate_service()._collapse_superseded_block_candidates = (
+            lambda durable_rows, **_kwargs: durable_rows
+        )
         server._note_block_replay_enumeration_owed()
-        with self._silence():
-            restored = server.replay_pending_block_candidates()
+        try:
+            with self._silence():
+                restored = server.replay_pending_block_candidates()
+        finally:
+            server._ensure_block_candidate_service().__dict__.pop(
+                "_collapse_superseded_block_candidates",
+                None,
+            )
         if restored != self.candidates:
             raise AssertionError(
                 f"restart restored {restored} of {self.candidates} candidates"
@@ -739,6 +756,15 @@ class CandidateStormRig:
         """
         service = server._ensure_block_candidate_service()
         service._ensure_block_candidate_disposition_state()
+        # Issue #183 landed a set-oriented collapse inside ``replay_pending``.
+        # This drain exists to be the *per-row* oracle that selector is
+        # measured against, and it re-enumerates the outbox whenever both
+        # lanes empty, so the collapse is suppressed for its duration:
+        # otherwise the enumeration would dispose of rows itself and the
+        # comparison would be the selector against the selector.
+        service._collapse_superseded_block_candidates = (
+            lambda durable_rows, **_kwargs: durable_rows
+        )
         rpc = server.rpc
         calls_before = dict(getattr(rpc, "calls", {}))
         outbox = self.ledger._block_candidate_outbox
@@ -753,49 +779,55 @@ class CandidateStormRig:
         accounting_tasks = 0
         enumerations = 0
         started = time.monotonic()
-        with self._silence():
-            while True:
-                if max_rounds is not None and rounds >= max_rounds:
-                    break
-                head, _lane = self._next_drainable(server, withheld)
-                if head is None:
-                    enumerations += 1
-                    if server.replay_pending_block_candidates() == 0:
+        try:
+            with self._silence():
+                while True:
+                    if max_rounds is not None and rounds >= max_rounds:
                         break
-                    if self._next_drainable(server, withheld)[0] is None:
-                        # The enumeration restored only withheld rows; the
-                        # shipped loop would re-adopt and re-park them for as
-                        # long as their evidence stands.
+                    head, _lane = self._next_drainable(server, withheld)
+                    if head is None:
+                        enumerations += 1
+                        if server.replay_pending_block_candidates() == 0:
+                            break
+                        if self._next_drainable(server, withheld)[0] is None:
+                            # The enumeration restored only withheld rows; the
+                            # shipped loop would re-adopt and re-park them for as
+                            # long as their evidence stands.
+                            break
+                        continue
+                    if stop_hash is not None and head == stop_hash:
                         break
-                    continue
-                if stop_hash is not None and head == stop_hash:
-                    break
-                with server.lock:
-                    terminal_before = len(service._block_candidate_terminal_outcomes)
-                if server.submit_next_block_candidate(defer_accounting=True):
-                    rounds += 1
-                accounting_tasks += self._run_block_accounting_tasks(server)
-                with server.lock:
-                    progressed = (
-                        len(service._block_candidate_terminal_outcomes)
-                        != terminal_before
-                    )
-                    parked = head in service._block_disposition_waiting_retries
-                if progressed:
-                    stalls.pop(head, None)
-                    continue
-                if parked:
-                    # submit_next could not claim this hash's lease without
-                    # blocking and parked the wakeup, exactly as the shipped
-                    # loop does. Withhold it instead of spinning behind a
-                    # lease this drain does not own.
-                    withheld.add(head)
-                    lease_blocked.add(head)
-                    continue
-                stalls[head] = stalls.get(head, 0) + 1
-                if stalls[head] >= self._DRAIN_STALL_LIMIT:
-                    withheld.add(head)
-                    deferred.add(head)
+                    with server.lock:
+                        terminal_before = len(service._block_candidate_terminal_outcomes)
+                    if server.submit_next_block_candidate(defer_accounting=True):
+                        rounds += 1
+                    accounting_tasks += self._run_block_accounting_tasks(server)
+                    with server.lock:
+                        progressed = (
+                            len(service._block_candidate_terminal_outcomes)
+                            != terminal_before
+                        )
+                        parked = head in service._block_disposition_waiting_retries
+                    if progressed:
+                        stalls.pop(head, None)
+                        continue
+                    if parked:
+                        # submit_next could not claim this hash's lease without
+                        # blocking and parked the wakeup, exactly as the shipped
+                        # loop does. Withhold it instead of spinning behind a
+                        # lease this drain does not own.
+                        withheld.add(head)
+                        lease_blocked.add(head)
+                        continue
+                    stalls[head] = stalls.get(head, 0) + 1
+                    if stalls[head] >= self._DRAIN_STALL_LIMIT:
+                        withheld.add(head)
+                        deferred.add(head)
+        finally:
+            service.__dict__.pop(
+                "_collapse_superseded_block_candidates",
+                None,
+            )
         by_state: dict[str, set[str]] = {
             "pending": set(),
             "submitted": set(),
