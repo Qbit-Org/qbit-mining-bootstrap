@@ -14,6 +14,12 @@ marks every restored row replay-inflight before it is processed.  Those
 markers mean "this process still owns eventual disposition", not "qbitd has
 already been offered this candidate".  Any maintenance selector that treats
 either whole set as active node-offer evidence will exclude the whole storm.
+A wakeup parked in the retry holder is the same kind of marker for the same
+reason: ``_retain_block_candidate_for_retry`` also runs when the fast-lane
+reservation declines, before any submitblock.  The rig therefore reports the
+attested offers (``node_offer_attested``) apart from the conservative
+must-not-abandon union (``node_offer_evidence``) that a selector owes the
+#183 contract, so a retry holder is never mistaken for a node call.
 
 This is a component instrument, not a performance threshold.  It uses the
 real coordinator admission, durable codec, pagination, payout barriers, and
@@ -109,10 +115,17 @@ class CandidateStormSnapshot:
     replay_inflight_covers_all_durable: bool
     accepted_parent_previews: int
     replay_enumeration_owed: bool
-    # Candidates carrying any evidence that a node offer happened or is in
-    # flight (see CandidateOwnership.node_offer_evidence). The outstanding
-    # and replay-inflight markers above are deliberately NOT part of it.
+    # Candidates the #183 must-not-abandon contract covers, i.e. carrying
+    # any evidence that a node offer happened, is in flight, or cannot be
+    # ruled out (see CandidateOwnership.node_offer_evidence). The
+    # outstanding and replay-inflight markers above are deliberately NOT
+    # part of it.
     offer_evidence_marked: int = 0
+    # How that union splits: rows something actually attests a node offer
+    # for, and rows it covers only because a wakeup is parked in a retry
+    # holder, which by itself is not evidence qbitd was ever called.
+    node_offer_attested_marked: int = 0
+    unoffered_retry_marked: int = 0
 
 
 @dataclass(frozen=True)
@@ -123,8 +136,10 @@ class CandidateOwnership:
     maintenance selector can be evaluated against the real population
     instead of a hand-built corpus. ``outstanding`` and ``replay_inflight``
     are process-ownership markers; the fields folded into
-    ``node_offer_evidence`` are the ones that mean a node offer happened,
-    is happening, or left acceptance evidence behind.
+    ``node_offer_attested`` are the ones that mean a node offer happened,
+    is happening, or left acceptance evidence behind. ``retry_held`` is
+    neither: it is a third category, covered by the conservative
+    ``node_offer_evidence`` union without attesting an offer.
     """
 
     block_hash: str
@@ -147,11 +162,19 @@ class CandidateOwnership:
     pool_block_chain_state: str | None
 
     @property
-    def node_offer_evidence(self) -> bool:
-        """Whether anything says this hash was (or is being) offered to qbitd."""
+    def node_offer_attested(self) -> bool:
+        """Whether anything attests that qbitd was offered this hash.
+
+        Every fact here is written by the offer or downstream of it: the
+        disposition lease covers the in-flight offer, a retained submission
+        records one that already returned, a tip observation and an
+        accounted acceptance are readings of an accepted offer, and a
+        terminal outcome or a pool-block row is what an offer's disposition
+        left behind.  ``retry_held`` is deliberately absent; see
+        :attr:`retry_held_without_offer`.
+        """
         return bool(
             self.disposition_held
-            or self.retry_held
             or self.node_acceptance_retained
             or self.tip_observed
             or self.accounted_accepted
@@ -159,17 +182,55 @@ class CandidateOwnership:
             or self.pool_block_chain_state is not None
         )
 
+    @property
+    def retry_held_without_offer(self) -> bool:
+        """A wakeup parked in a retry holder with no offer attested for it.
+
+        ``_retain_block_candidate_for_retry`` also runs on paths that never
+        reached qbitd -- most plainly when ``_reserve_block_fast_lane_slot``
+        declines and ``submit_next`` parks the candidate *before* any
+        submitblock.  Retry retention on its own therefore says only "this
+        process still owes this row a disposition", exactly like
+        ``outstanding`` and ``replay_inflight``, and reading it as an offer
+        would credit the rig with a node call that never happened.
+        """
+        return bool(self.retry_held) and not self.node_offer_attested
+
+    @property
+    def node_offer_evidence(self) -> bool:
+        """The conservative must-not-abandon union the #183 contract needs.
+
+        This is :attr:`node_offer_attested` widened by ``retry_held``: a
+        parked wakeup may equally have come from a path that *did* offer and
+        is retrying its tail, and the holder alone cannot tell the two
+        apart, so a selector has to leave the row to the per-row path either
+        way.  Because the widening is deliberately conservative, a true
+        value here is not a claim that qbitd was offered the hash -- read
+        :attr:`node_offer_attested` for that, and
+        :attr:`retry_held_without_offer` for the rows the widening adds.
+        """
+        return self.node_offer_attested or bool(self.retry_held)
+
 
 @dataclass(frozen=True)
 class PerRowDrainReport:
     """What the shipped per-row disposition path did, and cost, over a storm.
 
+    Every field reports *one* invocation of :meth:`CandidateStormRig.drain_per_row`.
     ``abandoned_hashes`` is the oracle a set-oriented selector has to agree
-    with: the exact set of durable rows the shipped path terminalized as
-    abandoned, not a count.  ``deferred_hashes`` and ``lease_blocked_hashes``
-    are its counterweight -- rows the drain reached and the shipped path
-    deliberately refused to terminalize -- so a selector that claims one of
-    them can be caught rather than silently believed.
+    with: the exact set of durable rows that call terminalized as abandoned,
+    not a count, and not every abandoned row standing in the rig.  It and
+    ``submitted_hashes`` are transitions -- a row already terminal when the
+    call started is left out -- so successive bounded drains (``max_rounds``)
+    partition the work between them instead of each claiming the whole
+    history.  ``pending_hashes`` is the complementary residue: the rows still
+    awaiting disposition when the call returned, which is a state rather than
+    a transition because nothing ever transitions *into* pending.
+
+    ``deferred_hashes`` and ``lease_blocked_hashes`` are the oracle's
+    counterweight -- rows the drain reached and the shipped path deliberately
+    refused to terminalize -- so a selector that claims one of them can be
+    caught rather than silently believed.
     """
 
     rounds: int
@@ -383,6 +444,7 @@ class CandidateStormRig:
         }
         outstanding = set(service._outstanding_block_candidate_hashes)
         replay_inflight = set(service._block_replay_inflight_hashes)
+        ownership = self.ownership(server)
         return CandidateStormSnapshot(
             durable_pending=len(durable_hashes),
             live_queue_capacity=service.candidate_queue.maxsize,
@@ -396,9 +458,13 @@ class CandidateStormRig:
             accepted_parent_previews=len(server._accepted_block_payout_previews),
             replay_enumeration_owed=server._block_replay_enumeration_owed(),
             offer_evidence_marked=sum(
-                1
-                for record in self.ownership(server)
-                if record.node_offer_evidence
+                1 for record in ownership if record.node_offer_evidence
+            ),
+            node_offer_attested_marked=sum(
+                1 for record in ownership if record.node_offer_attested
+            ),
+            unoffered_retry_marked=sum(
+                1 for record in ownership if record.retry_held_without_offer
             ),
         )
 
@@ -546,9 +612,13 @@ class CandidateStormRig:
         Each kind reproduces one of the facts ``submit_next`` and
         ``record_abandoned`` consult, through the shipped entry point rather
         than a hand-written marker, and each shows up in :meth:`ownership` as
-        ``node_offer_evidence``.  Returns a callable that undoes the
-        perturbation where undoing is meaningful (the held disposition
-        lease), otherwise ``None``.
+        ``node_offer_evidence``.  ``retry_slot`` is the one kind that shows
+        up there *without* ``node_offer_attested``: it moves an
+        already-queued, never-offered wakeup into the retry holder, which is
+        exactly what the shipped path does when the fast-lane reservation
+        declines.  Returns a callable that undoes the perturbation where
+        undoing is meaningful (the held disposition lease), otherwise
+        ``None``.
         """
         service = server._ensure_block_candidate_service()
         service._ensure_block_replay_state()
@@ -736,6 +806,12 @@ class CandidateStormRig:
         Any head the shipped path parks on a held lease, or repeatedly
         declines to terminalize, is withheld the same way and reported, so
         the drain is bounded no matter what evidence the caller installed.
+
+        ``max_rounds`` stops the drain after that many rows have been offered,
+        so a caller can step the oracle one row at a time.  The report then
+        covers only the rows *this* call moved: it is compared against the
+        durable state captured on entry, so a second bounded call never
+        re-reports the first one's abandonment.
         """
         service = server._ensure_block_candidate_service()
         service._ensure_block_candidate_disposition_state()
@@ -743,6 +819,14 @@ class CandidateStormRig:
         calls_before = dict(getattr(rpc, "calls", {}))
         outbox = self.ledger._block_candidate_outbox
         attempts_before = sum(int(row["attempt_count"]) for row in outbox.values())
+        # The durable state of every row on entry.  A row is only ever
+        # finished out of "pending" once, so comparing against this is what
+        # makes the report name this call's transitions rather than every
+        # terminal row the rig has accumulated across earlier drains.
+        states_before = {
+            str(block_hash).lower(): str(row["state"])
+            for block_hash, row in outbox.items()
+        }
         withheld = {str(item).lower() for item in (preserve_hashes or ())}
         caller_withheld = frozenset(withheld)
         stop_hash = None if stop_before_hash is None else str(stop_before_hash).lower()
@@ -796,21 +880,23 @@ class CandidateStormRig:
                 if stalls[head] >= self._DRAIN_STALL_LIMIT:
                     withheld.add(head)
                     deferred.add(head)
-        by_state: dict[str, set[str]] = {
-            "pending": set(),
-            "submitted": set(),
-            "abandoned": set(),
-        }
+        terminalized: dict[str, set[str]] = {"submitted": set(), "abandoned": set()}
+        still_pending: set[str] = set()
         for block_hash, row in outbox.items():
-            by_state.setdefault(str(row["state"]), set()).add(str(block_hash).lower())
+            key = str(block_hash).lower()
+            state = str(row["state"])
+            if state == "pending":
+                still_pending.add(key)
+            elif states_before.get(key) != state:
+                terminalized.setdefault(state, set()).add(key)
         calls_after = dict(getattr(rpc, "calls", {}))
         return PerRowDrainReport(
             rounds=rounds,
             accounting_tasks=accounting_tasks,
             replay_enumerations=enumerations,
-            abandoned_hashes=frozenset(by_state["abandoned"]),
-            submitted_hashes=frozenset(by_state["submitted"]),
-            pending_hashes=frozenset(by_state["pending"]),
+            abandoned_hashes=frozenset(terminalized["abandoned"]),
+            submitted_hashes=frozenset(terminalized["submitted"]),
+            pending_hashes=frozenset(still_pending),
             withheld_hashes=(
                 caller_withheld
                 | frozenset(lease_blocked)

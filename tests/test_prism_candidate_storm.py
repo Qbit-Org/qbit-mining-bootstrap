@@ -162,14 +162,80 @@ class DecidedCandidateStormTests(unittest.TestCase):
                 sum(1 for record in by_hash.values() if record.node_offer_evidence),
                 len(PERTURBATIONS),
             )
+            # The union is conservative, but the rig still says which rows
+            # actually attest a node offer. Only the parked wakeup does not:
+            # the retry holder is reachable without any submitblock.
+            self.assertFalse(by_hash[hashes[3]].node_offer_attested)
+            self.assertTrue(by_hash[hashes[3]].retry_held_without_offer)
+            for index in (0, 1, 2, 4, 5):
+                with self.subTest(perturbation=PERTURBATIONS[index]):
+                    self.assertTrue(by_hash[hashes[index]].node_offer_attested)
+                    self.assertFalse(by_hash[hashes[index]].retry_held_without_offer)
+            snapshot = rig.snapshot(server)
+            self.assertEqual(snapshot.offer_evidence_marked, len(PERTURBATIONS))
             self.assertEqual(
-                rig.snapshot(server).offer_evidence_marked,
-                len(PERTURBATIONS),
+                snapshot.node_offer_attested_marked,
+                len(PERTURBATIONS) - 1,
             )
+            self.assertEqual(snapshot.unoffered_retry_marked, 1)
         finally:
             for release in undo:
                 if release is not None:
                     release()
+
+    def test_retry_retention_alone_is_not_node_offer_evidence(self) -> None:
+        """Parking a wakeup in the retry holder must not read as an offer.
+
+        ``_retain_block_candidate_for_retry`` runs on shipped paths that
+        never reached qbitd -- most plainly when
+        ``_reserve_block_fast_lane_slot`` declines and ``submit_next`` parks
+        the candidate *before* any submitblock -- so a rig that folded the
+        holder into its offer evidence would credit a node call that never
+        happened.  The #183 must-not-abandon union still has to cover the
+        row, because the holder cannot distinguish that path from a genuine
+        offer retrying its tail.
+        """
+
+        rig = CandidateStormRig(candidates=DECIDED_STORM_CANDIDATES)
+        rig.seed_live()
+        rig.decide_height()
+        server = rig.live_server
+        parked = rig.block_hashes[0]
+
+        before = {record.block_hash: record for record in rig.ownership(server)}
+        self.assertTrue(before[parked].live_queued)
+        self.assertFalse(before[parked].retry_held)
+        self.assertFalse(before[parked].node_offer_evidence)
+        calls_before = dict(rig.decided_rpc.calls)
+
+        # Move a queued, never-offered wakeup into the retry slot, exactly as
+        # a declined fast-lane reservation does.
+        rig.perturb(server, "retry_slot", parked)
+        record = {r.block_hash: r for r in rig.ownership(server)}[parked]
+        self.assertTrue(record.retry_held)
+
+        # Nothing was offered: no RPC happened, and no fact downstream of an
+        # offer exists for the row.
+        self.assertEqual(rig.decided_rpc.calls, calls_before)
+        self.assertFalse(record.node_offer_attested)
+        self.assertTrue(record.retry_held_without_offer)
+        self.assertFalse(record.disposition_held)
+        self.assertFalse(record.node_acceptance_retained)
+        self.assertFalse(record.tip_observed)
+        self.assertFalse(record.accounted_accepted)
+        self.assertIsNone(record.pool_block_chain_state)
+        # Nor is the row reported terminal: retry retention is not a
+        # disposition, so the durable row is untouched and unattempted.
+        self.assertIsNone(record.terminal_outcome)
+        self.assertEqual(record.outbox_state, "pending")
+        self.assertEqual(record.attempt_count, 0)
+        # The conservative contract still covers it.
+        self.assertTrue(record.node_offer_evidence)
+
+        snapshot = rig.snapshot(server)
+        self.assertEqual(snapshot.offer_evidence_marked, 1)
+        self.assertEqual(snapshot.node_offer_attested_marked, 0)
+        self.assertEqual(snapshot.unoffered_retry_marked, 1)
 
     def test_replay_adoption_alone_drops_a_tip_observation(self) -> None:
         """Why ``perturb('tip_observed')`` also registers the hash outstanding.
@@ -381,6 +447,65 @@ class DecidedCandidateStormTests(unittest.TestCase):
                 )
                 self.assertEqual(drain.submitted_hashes, frozenset())
                 self.assertIn(winner, drain.pending_hashes)
+
+    def test_bounded_drains_report_only_their_own_transitions(self) -> None:
+        """``max_rounds`` reports this call's work, not the rig's history.
+
+        A bounded drain is how a caller steps the oracle one row at a time.
+        If the report named every terminal row standing in the outbox instead
+        of the ones this call moved, the second step would claim the first
+        step's abandonment, and no per-step comparison against a selector
+        would mean anything.
+        """
+
+        steps = 3
+        rig = CandidateStormRig(candidates=DECIDED_STORM_CANDIDATES)
+        rig.seed_live()
+        winner = rig.decide_height()
+        server = rig.live_server
+
+        seen: frozenset[str] = frozenset()
+        for step in range(steps):
+            with self.subTest(step=step):
+                report = rig.drain_per_row(
+                    server,
+                    stop_before_hash=winner,
+                    max_rounds=1,
+                )
+                # One row offered, one accounted, one durable attempt marked.
+                self.assertEqual(report.rounds, 1)
+                self.assertEqual(report.accounting_tasks, 1)
+                self.assertEqual(report.ledger_attempt_marks, 1)
+                self.assertEqual(report.rpc_calls["submitblock"], 1)
+                # The first 32 wakeups are already queued, so no step needs
+                # the recovery enumeration.
+                self.assertEqual(report.replay_enumerations, 0)
+                # ...and exactly one transition, never an earlier step's.
+                self.assertEqual(len(report.abandoned_hashes), 1)
+                self.assertEqual(report.submitted_hashes, frozenset())
+                self.assertEqual(report.withheld_hashes, frozenset())
+                self.assertTrue(report.abandoned_hashes.isdisjoint(seen))
+                seen |= report.abandoned_hashes
+                # pending_hashes is the complementary residue of the same
+                # outbox, so it shrinks by exactly the rows drained so far.
+                self.assertEqual(
+                    report.pending_hashes,
+                    frozenset(rig.block_hashes) - seen,
+                )
+        self.assertEqual(len(seen), steps)
+
+        # The bounded steps and the unbounded remainder partition the sibling
+        # set exactly: no row is reported twice and none is dropped.
+        final = rig.drain_per_row(server, stop_before_hash=winner)
+        self.assertEqual(final.rounds, DECIDED_STORM_CANDIDATES - 1 - steps)
+        self.assertTrue(final.abandoned_hashes.isdisjoint(seen))
+        self.assertEqual(
+            seen | final.abandoned_hashes,
+            frozenset(rig.block_hashes) - {winner},
+        )
+        self.assertEqual(final.submitted_hashes, frozenset())
+        self.assertEqual(final.withheld_hashes, frozenset())
+        self.assertEqual(final.pending_hashes, frozenset({winner}))
 
     def test_per_row_drain_at_the_observed_cardinality(self) -> None:
         """The same facts at the incident's 3,120 rows, live and after restart.
