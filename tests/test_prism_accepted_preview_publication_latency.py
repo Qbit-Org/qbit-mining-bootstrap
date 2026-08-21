@@ -74,6 +74,8 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lab.prism.block_candidates import (  # noqa: E402
+    COLLAPSE_DIFFICULTY_SCALE,
+    COLLAPSE_POW_LIMIT_BITS,
     PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_RESULTS,
     PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_SECONDS_BUCKETS,
 )
@@ -84,6 +86,7 @@ from lab.prism.share_ledger import (  # noqa: E402
     PendingShare,
     SingleWriterShareLedger,
 )
+from lab.prism.template_artifacts import scaled_network_difficulty  # noqa: E402
 from tests.prism_vardiff_test_support import (  # noqa: E402
     FakeRpc,
     block_candidate,
@@ -170,6 +173,16 @@ class CadenceChainRpc(FakeRpc):
     as ``DecidedHeightRpc`` counts them, and every call pays
     ``latency_seconds`` so a node round-trip has the cost that makes lane
     ordering observable in wall clock.
+
+    ``getblockheader`` reports the occupant's compact ``bits`` (and the raw
+    ``difficulty`` float qbitd reports beside it) because #181 item 2's
+    dequeue-time skip reads clause 4b from them. Without ``bits`` the clause
+    has no work value to compare and every evaluation fails closed, so the
+    instrument would silently measure a coordinator whose skip never fires
+    -- and would still report a changed p95, because failing closed is not
+    free. The default is the qbit powLimit, exactly as ``DecidedHeightRpc``
+    defaults, which is at or above the raw ``network_difficulty`` of 1 this
+    rig stamps its candidates with.
     """
 
     def __init__(
@@ -178,9 +191,11 @@ class CadenceChainRpc(FakeRpc):
         parent: str,
         height: int,
         latency_seconds: float = DEFAULT_CADENCE_RPC_LATENCY_SECONDS,
+        bits: str = COLLAPSE_POW_LIMIT_BITS,
     ) -> None:
         self.tip = str(parent).lower()
         self.height = int(height)
+        self.bits = str(bits).lower()
         self.latency_seconds = max(0.0, float(latency_seconds))
         self.active: dict[int, str] = {}
         self.winners: dict[str, int] = {}
@@ -243,6 +258,15 @@ class CadenceChainRpc(FakeRpc):
                 "hash": block_hash,
                 "height": height,
                 "confirmations": top - height + 1,
+                "bits": self.bits,
+                # Reported beside bits, as qbitd does, and a million times
+                # smaller than the scaled units a candidate row carries: a
+                # reader that took this float instead would make an
+                # equal-work occupant read as weaker.
+                "difficulty": (
+                    scaled_network_difficulty(self.bits)
+                    / COLLAPSE_DIFFICULTY_SCALE
+                ),
             }
         return super().call(method, params)
 
