@@ -27,6 +27,7 @@ from __future__ import annotations
 import queue
 import sys
 import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
@@ -38,6 +39,9 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lab.prism.block_candidates import (  # noqa: E402
+    BLOCK_CANDIDATE_COLLAPSE_CLEANUP_FLOOR_STEP,
+    BLOCK_CANDIDATE_COLLAPSE_CLEANUP_PAYOUT_STEP,
+    BLOCK_CANDIDATE_COLLAPSE_CLEANUP_STEPS,
     BLOCK_CANDIDATE_COLLAPSE_LOG_FAILURES,
     BLOCK_CANDIDATE_COLLAPSE_LOG_GROUPS,
     BLOCK_CANDIDATE_COLLAPSE_LOG_SAMPLE_HASHES,
@@ -361,7 +365,29 @@ class CollapseFixture:
             queued = self.server.replay_pending_block_candidates()
         return queued, buffer.getvalue()
 
+    def retry_cleanup(self, *, force_due: bool = False) -> tuple[bool, str]:
+        """Run one deferred cleanup retry pass on the accounting lane's runner.
+
+        ``force_due`` clears the per-hash backoff deadline so a second and
+        later attempt can be driven without sleeping; a freshly deferred
+        hash is due immediately and needs it not at all.
+        """
+        service = self.service
+        if force_due:
+            with self.server.lock:
+                for record in (
+                    service._block_candidate_collapse_cleanup_retries.values()
+                ):
+                    record.not_before_monotonic = 0.0
+        buffer = StringIO()
+        with redirect_stdout(buffer):
+            ran = service._run_one_collapsed_block_candidate_cleanup_retry()
+        return ran, buffer.getvalue()
+
     # -- observation -------------------------------------------------------
+
+    def cleanup_backlog(self) -> dict[str, frozenset[str]]:
+        return self.service.collapsed_candidate_cleanup_backlog()
 
     def pending(self) -> set[str]:
         return {
@@ -1317,6 +1343,412 @@ class BlockCandidateCollapseCleanupTests(unittest.TestCase):
             PRISM_BLOCK_CANDIDATE_COLLAPSE_STALE_JOB_CLASS,
             PRISM_STALE_JOB_ABANDON_CLASSES,
         )
+
+
+class BlockCandidateCollapseCleanupRetryTests(unittest.TestCase):
+    """A failed cleanup is the only state with no durable replay source.
+
+    Once the fenced batch write returns a hash, that row is terminal: it is
+    partitioned out of the replay page and no later enumeration can hand it
+    back.  A cleanup step that failed therefore has nothing left to retry
+    it, and whatever it did not tear down -- a payout preview or its
+    tombstone, a pending-share floor holder, an outstanding-hash marker --
+    would stay installed for the process lifetime.  These tests own the
+    bounded, idempotent retry that closes that gap, and the accounting of
+    it: the affected-hash series still counts hashes, never attempts.
+    """
+
+    @staticmethod
+    def _breaker(target: Any, name: str, *, only: str | None = None) -> dict:
+        """Make one cleanup step raise until the returned switch is flipped."""
+        original = getattr(target, name)
+        broken = {"on": True}
+
+        def failing(block_hash: str, *args: Any, **kwargs: Any) -> Any:
+            if broken["on"] and (only is None or block_hash == only):
+                raise RuntimeError(f"{name} boom")
+            return original(block_hash, *args, **kwargs)
+
+        setattr(target, name, failing)
+        return broken
+
+    # -- payout preview and tombstone --------------------------------------
+
+    def test_a_failed_payout_withdrawal_is_retried_until_it_recovers(self) -> None:
+        """The wait storm the collapse exists to end must not be re-armed."""
+        fixture = CollapseFixture()
+        target = _hash(1)
+        fixture.seed([target])
+        server = fixture.server
+        server._begin_accepted_block_payout_preview(
+            target,
+            block_height=DECIDED_HEIGHT,
+        )
+        server._mark_accepted_block_payout_landed(
+            target,
+            block_height=DECIDED_HEIGHT,
+        )
+        broken = self._breaker(server, "_clear_accepted_block_payout_preview")
+        with redirect_stdout(StringIO()):
+            fixture.collapse()
+        # The durable row is terminal and gone from every replay source
+        # while the landed barrier it armed is still installed: descendants
+        # keep waiting on a transition nothing else will ever clear.
+        self.assertEqual(fixture.pending(), set())
+        self.assertTrue(server._accepted_block_payout_transition_landed(target))
+        self.assertEqual(fixture.counts()["cleanup_failed"], 1)
+        self.assertEqual(
+            fixture.cleanup_backlog(),
+            {target: frozenset({BLOCK_CANDIDATE_COLLAPSE_CLEANUP_PAYOUT_STEP})},
+        )
+        broken["on"] = False
+        ran, log = fixture.retry_cleanup()
+        self.assertTrue(ran)
+        with server._accepted_block_payout_preview_condition:
+            self.assertNotIn(target, server._accepted_block_payout_previews)
+            self.assertNotIn(
+                target,
+                server._invalidated_accepted_block_payout_previews,
+            )
+        self.assertEqual(fixture.cleanup_backlog(), {})
+        self.assertIn("cleanup recovered", log)
+        counts = fixture.counts()
+        self.assertEqual(counts["cleanup_recovered"], 1)
+        # The affected-hash series counts the hash once, whatever it took.
+        self.assertEqual(counts["cleanup_failed"], 1)
+
+    def test_a_failed_tombstone_drop_is_retried(self) -> None:
+        """A retained tombstone fails descendants closed just as hard."""
+        fixture = CollapseFixture()
+        target = _hash(1)
+        fixture.seed([target])
+        server = fixture.server
+        server._begin_accepted_block_payout_preview(
+            target,
+            block_height=DECIDED_HEIGHT,
+        )
+        server._mark_accepted_block_payout_landed(
+            target,
+            block_height=DECIDED_HEIGHT,
+        )
+        original = server._clear_accepted_block_payout_preview
+        broken = {"on": True}
+
+        def clear(block_hash: str, *, invalidate_published: bool = False) -> None:
+            # The withdrawal lands and installs the tombstone; only the
+            # second half -- the drop -- fails.
+            if broken["on"] and not invalidate_published:
+                raise RuntimeError("tombstone drop boom")
+            original(block_hash, invalidate_published=invalidate_published)
+
+        server._clear_accepted_block_payout_preview = clear
+        with redirect_stdout(StringIO()):
+            fixture.collapse()
+        with server._accepted_block_payout_preview_condition:
+            self.assertIn(
+                target,
+                server._invalidated_accepted_block_payout_previews,
+            )
+        broken["on"] = False
+        self.assertTrue(fixture.retry_cleanup()[0])
+        with server._accepted_block_payout_preview_condition:
+            self.assertEqual(server._invalidated_accepted_block_payout_previews, {})
+        self.assertEqual(fixture.cleanup_backlog(), {})
+
+    # -- pending-share floor -----------------------------------------------
+
+    def test_a_failed_floor_release_survives_the_queue_it_was_read_from(self) -> None:
+        """The floor keys holders by identity, so the retry must carry them."""
+        fixture = CollapseFixture()
+        target = _hash(1)
+        candidate = fixture.seed([target], credit_share_on_accept=True)[0]
+        server = fixture.server
+        server._ensure_share_writer_service().adopt_pending_share(
+            candidate.pending_share
+        )
+        fixture.service.candidate_queue.put_nowait(candidate)
+        original = server._finish_pending_share_commit
+        broken = {"on": True}
+
+        def finish(pending_share: Any) -> None:
+            if broken["on"]:
+                raise RuntimeError("floor release boom")
+            original(pending_share)
+
+        server._finish_pending_share_commit = finish
+        with redirect_stdout(StringIO()):
+            fixture.collapse()
+        self.assertIn(id(candidate.pending_share), fixture.floor())
+        self.assertEqual(
+            fixture.cleanup_backlog(),
+            {target: frozenset({BLOCK_CANDIDATE_COLLAPSE_CLEANUP_FLOOR_STEP})},
+        )
+        # The queue the holder was indexed from drains before the retry
+        # runs, so a fresh scan would find nothing to release.
+        self.assertIs(fixture.service.candidate_queue.get_nowait(), candidate)
+        self.assertEqual(
+            fixture.service._collapsed_candidate_floor_holders((target,)),
+            {},
+        )
+        broken["on"] = False
+        self.assertTrue(fixture.retry_cleanup()[0])
+        self.assertNotIn(id(candidate.pending_share), fixture.floor())
+        self.assertEqual(fixture.cleanup_backlog(), {})
+        self.assertEqual(fixture.counts()["cleanup_recovered"], 1)
+
+    def test_another_candidates_floor_holder_is_never_released_by_a_retry(
+        self,
+    ) -> None:
+        fixture = CollapseFixture()
+        collapsed = fixture.seed([_hash(1)], credit_share_on_accept=True)[0]
+        untouched = fixture.seed(
+            [_hash(2)],
+            parent=OTHER_PARENT,
+            credit_share_on_accept=True,
+        )[0]
+        server = fixture.server
+        writer = server._ensure_share_writer_service()
+        for candidate in (collapsed, untouched):
+            writer.adopt_pending_share(candidate.pending_share)
+        fixture.service.candidate_queue.put_nowait(collapsed)
+        fixture.rpc.tip = OTHER_PARENT
+        original = server._finish_pending_share_commit
+        broken = {"on": True}
+
+        def finish(pending_share: Any) -> None:
+            if broken["on"]:
+                raise RuntimeError("floor release boom")
+            original(pending_share)
+
+        server._finish_pending_share_commit = finish
+        with redirect_stdout(StringIO()):
+            fixture.collapse()
+        broken["on"] = False
+        self.assertTrue(fixture.retry_cleanup()[0])
+        floor = fixture.floor()
+        self.assertNotIn(id(collapsed.pending_share), floor)
+        self.assertIn(id(untouched.pending_share), floor)
+
+    # -- what a retry repeats ----------------------------------------------
+
+    def test_a_retry_repeats_only_the_steps_that_are_still_owed(self) -> None:
+        fixture = CollapseFixture()
+        target = _hash(1)
+        fixture.seed([target])
+        server = fixture.server
+        discarded: list[str] = []
+        original_discard = server._discard_outstanding_block_candidate
+
+        def discard(block_hash: str) -> None:
+            discarded.append(block_hash)
+            original_discard(block_hash)
+
+        server._discard_outstanding_block_candidate = discard
+        broken = self._breaker(server, "_clear_block_candidate_retry_state")
+        with redirect_stdout(StringIO()):
+            fixture.collapse()
+        self.assertEqual(discarded, [target])
+        self.assertEqual(
+            fixture.cleanup_backlog(),
+            {target: frozenset({"retry-state"})},
+        )
+        broken["on"] = False
+        self.assertTrue(fixture.retry_cleanup()[0])
+        # A step that already completed is never run a second time.
+        self.assertEqual(discarded, [target])
+        self.assertEqual(fixture.cleanup_backlog(), {})
+
+    def test_an_aborted_cleanup_is_deferred_and_retried_in_full(self) -> None:
+        """An abort proves nothing, so every won hash owes every step again."""
+        fixture = CollapseFixture()
+        target = _hash(1)
+        candidate = fixture.seed([target], credit_share_on_accept=True)[0]
+        server = fixture.server
+        server._ensure_share_writer_service().adopt_pending_share(
+            candidate.pending_share
+        )
+        fixture.service.candidate_queue.put_nowait(candidate)
+        scan = fixture.service._collapsed_candidate_floor_holders
+        fixture.service._collapsed_candidate_floor_holders = (
+            lambda abandoned: (_ for _ in ()).throw(RuntimeError("index boom"))
+        )
+        retained, log = fixture.collapse()
+        self.assertEqual(retained, [])
+        self.assertEqual(fixture.pending(), set())
+        self.assertIn("cleanup aborted rows=1", log)
+        self.assertEqual(fixture.counts()["cleanup_failed"], 1)
+        self.assertEqual(
+            fixture.cleanup_backlog(),
+            {target: frozenset(BLOCK_CANDIDATE_COLLAPSE_CLEANUP_STEPS)},
+        )
+        # The abort ran the withdrawal and then stopped: the floor holder
+        # and every terminal accounting step are still owed.
+        self.assertIn(id(candidate.pending_share), fixture.floor())
+        with server.lock:
+            self.assertEqual(fixture.service._block_candidate_terminal_outcomes, {})
+        self.assertEqual(server.block_candidate_abandoned_counts, {})
+        fixture.service._collapsed_candidate_floor_holders = scan
+        self.assertTrue(fixture.retry_cleanup()[0])
+        # The retry re-indexes the holders the abort never got to read.
+        self.assertNotIn(id(candidate.pending_share), fixture.floor())
+        with server.lock:
+            self.assertIs(
+                fixture.service._block_candidate_terminal_outcomes[target],
+                False,
+            )
+            self.assertNotIn(
+                target,
+                fixture.service._outstanding_block_candidate_hashes,
+            )
+        self.assertEqual(
+            server.block_candidate_abandoned_counts,
+            {PRISM_BLOCK_CANDIDATE_COLLAPSE_REASON: 1},
+        )
+        self.assertEqual(fixture.cleanup_backlog(), {})
+        self.assertEqual(fixture.counts()["cleanup_recovered"], 1)
+
+    def test_a_cleanup_retry_never_re_adopts_or_re_offers_the_row(self) -> None:
+        fixture = CollapseFixture()
+        target = _hash(1)
+        fixture.seed([target])
+        server = fixture.server
+        broken = self._breaker(server, "_record_block_candidate_terminal_outcome")
+        with redirect_stdout(StringIO()):
+            fixture.collapse()
+        abandon_calls = len(fixture.ledger.abandon_calls)
+        rpc_calls = len(fixture.rpc.calls)
+        broken["on"] = False
+        self.assertTrue(fixture.retry_cleanup()[0])
+        # No durable read or write, no node offer, no queued candidate.
+        self.assertEqual(fixture.pending(), set())
+        self.assertEqual(len(fixture.ledger.abandon_calls), abandon_calls)
+        self.assertEqual(len(fixture.rpc.calls), rpc_calls)
+        self.assertTrue(fixture.service.candidate_queue.empty())
+        self.assertTrue(fixture.service._block_replay_candidate_queue.empty())
+        with server.lock:
+            self.assertEqual(fixture.service._block_replay_inflight_hashes, set())
+            self.assertIsNone(fixture.service.retry_candidate)
+            self.assertIs(
+                fixture.service._block_candidate_terminal_outcomes[target],
+                False,
+            )
+
+    # -- bounds, pacing, and accounting ------------------------------------
+
+    def test_the_backlog_is_bounded_by_the_affected_terminal_hashes(self) -> None:
+        fixture = CollapseFixture()
+        hashes = [_hash(1), _hash(2), _hash(3)]
+        fixture.seed(hashes)
+        server = fixture.server
+        original = server._clear_block_candidate_retry_state
+        broken = {"on": True}
+
+        def retry_state(block_hash: str) -> None:
+            if broken["on"] and block_hash != _hash(3):
+                raise RuntimeError("retry state boom")
+            original(block_hash)
+
+        server._clear_block_candidate_retry_state = retry_state
+        with redirect_stdout(StringIO()):
+            fixture.collapse()
+        # Only the hashes whose cleanup actually failed are retained.
+        self.assertEqual(set(fixture.cleanup_backlog()), {_hash(1), _hash(2)})
+        broken["on"] = False
+        # One hash per pass, and the lane idles once the backlog drains.
+        self.assertTrue(fixture.retry_cleanup()[0])
+        self.assertEqual(len(fixture.cleanup_backlog()), 1)
+        self.assertTrue(fixture.retry_cleanup()[0])
+        self.assertEqual(fixture.cleanup_backlog(), {})
+        self.assertFalse(fixture.retry_cleanup()[0])
+        counts = fixture.counts()
+        self.assertEqual(counts["cleanup_recovered"], 2)
+        self.assertEqual(counts["cleanup_failed"], 2)
+        self.assertLessEqual(counts["cleanup_recovered"], counts["cleanup_failed"])
+
+    def test_a_persistently_failing_retry_backs_off_without_recounting(self) -> None:
+        fixture = CollapseFixture()
+        target = _hash(1)
+        fixture.seed([target])
+        fixture.service.retry_initial_seconds = 0.5
+        fixture.service.retry_max_seconds = 2.0
+        fixture.server._clear_block_candidate_retry_state = (
+            lambda block_hash: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+        with redirect_stdout(StringIO()):
+            fixture.collapse()
+        self.assertEqual(fixture.counts()["cleanup_failed"], 1)
+        for attempt, delay in ((1, 1.0), (2, 2.0), (3, 2.0)):
+            self.assertTrue(fixture.retry_cleanup(force_due=True)[0])
+            self.assertEqual(fixture.counts()["cleanup_retry_failed"], attempt)
+            record = fixture.service._block_candidate_collapse_cleanup_retries[
+                target
+            ]
+            self.assertEqual(record.attempts, attempt)
+            self.assertEqual(record.delay_seconds, delay)
+        # Attempts never inflate the affected-hash series.
+        counts = fixture.counts()
+        self.assertEqual(counts["cleanup_failed"], 1)
+        self.assertEqual(counts["cleanup_recovered"], 0)
+        self.assertEqual(set(fixture.cleanup_backlog()), {target})
+        # A record parked behind its own backoff is not due.
+        self.assertFalse(fixture.retry_cleanup()[0])
+
+    def test_the_backlog_only_ever_holds_fixed_step_labels(self) -> None:
+        fixture = CollapseFixture()
+        hashes = [_hash(1), _hash(2)]
+        fixture.seed(hashes)
+        fixture.service._collapsed_candidate_floor_holders = (
+            lambda abandoned: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+        with redirect_stdout(StringIO()):
+            fixture.collapse()
+        backlog = fixture.cleanup_backlog()
+        self.assertEqual(set(backlog), set(hashes))
+        for steps in backlog.values():
+            self.assertLessEqual(
+                steps,
+                frozenset(BLOCK_CANDIDATE_COLLAPSE_CLEANUP_STEPS),
+            )
+        # A step name outside the closed set is refused, not stored.
+        with redirect_stdout(StringIO()):
+            fixture.service._defer_collapsed_candidate_cleanup(
+                _hash(9),
+                ("not-a-cleanup-step",),
+            )
+        self.assertNotIn(_hash(9), fixture.cleanup_backlog())
+        self.assertEqual(
+            set(fixture.counts()),
+            set(PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES),
+        )
+
+    def test_the_accounting_lane_drives_the_deferred_cleanup(self) -> None:
+        """The retry must reach a shipped loop, not just a direct call."""
+        fixture = CollapseFixture()
+        target = _hash(1)
+        fixture.seed([target])
+        server = fixture.server
+        broken = self._breaker(server, "_clear_block_candidate_retry_state")
+        with redirect_stdout(StringIO()):
+            fixture.collapse()
+        self.assertEqual(set(fixture.cleanup_backlog()), {target})
+        broken["on"] = False
+        service = fixture.service
+        service._ensure_block_accounting_state()
+        thread = threading.Thread(target=service.block_accounting_loop, daemon=True)
+        with redirect_stdout(StringIO()):
+            thread.start()
+            try:
+                # Bounded: the lane either drains the backlog quickly or the
+                # deadline expires and the assertions below report it.
+                deadline = time.monotonic() + 5.0
+                while fixture.cleanup_backlog() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            finally:
+                server.stop_event.set()
+                thread.join(timeout=5.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(fixture.cleanup_backlog(), {})
+        self.assertEqual(fixture.counts()["cleanup_recovered"], 1)
 
 
 class BlockCandidateCollapseEnumerationTests(unittest.TestCase):

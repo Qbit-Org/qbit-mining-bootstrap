@@ -116,6 +116,25 @@ PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES = (
     "fail_closed",
     # Won rows whose post-write cleanup raised.
     "cleanup_failed",
+    # Deferred cleanups a later bounded retry pass finished in full.
+    "cleanup_recovered",
+    # Retry passes that ran but still left at least one step owed.
+    "cleanup_retry_failed",
+)
+# The terminal cleanup one won row owes, in the order the apply runs it.
+# A deferred retry replays exactly the steps its own hash still owes, so
+# the step names are a closed set: a retry can never repeat a step that
+# already completed, and never invent one the apply does not run.
+BLOCK_CANDIDATE_COLLAPSE_CLEANUP_PAYOUT_STEP = "payout-preview-withdrawal"
+BLOCK_CANDIDATE_COLLAPSE_CLEANUP_FLOOR_STEP = "pending-share-floor"
+BLOCK_CANDIDATE_COLLAPSE_CLEANUP_STEPS = (
+    BLOCK_CANDIDATE_COLLAPSE_CLEANUP_PAYOUT_STEP,
+    "finalize-retry",
+    "retry-state",
+    "outstanding-and-tip-observation",
+    "terminal-outcome",
+    "abandonment-accounting",
+    BLOCK_CANDIDATE_COLLAPSE_CLEANUP_FLOOR_STEP,
 )
 # The per-row path abandons a candidate whose height was decided by another
 # block as a tip-moved stale job; the bulk path must land in the same
@@ -248,6 +267,36 @@ class _BlockCandidateCollapseFailedClosed(Exception):
     page selects nothing and every one of its rows is preserved for the
     ordinary per-row path.
     """
+
+
+@dataclass
+class _CollapsedCandidateCleanup:
+    """One terminal hash's outstanding cleanup, kept for a later retry.
+
+    After the fenced batch write the durable row is terminal, so the row is
+    partitioned out of the replay page and no later enumeration will ever
+    return it: a cleanup step that failed has no durable replay source and
+    would otherwise leave its in-memory state -- a payout preview or its
+    tombstone, a pending-share floor holder, an outstanding-hash marker --
+    installed for the process lifetime. This record is that replay source.
+
+    It holds no candidate object, no durable row, and no node submission,
+    so a deferred cleanup can only finish tearing state down; there is
+    nothing here to re-adopt or re-offer with. ``shares`` carries the exact
+    pending-share floor holders the apply resolved, because the floor keys
+    holders by object identity and the queues they were read from are
+    drained long before a retry runs. ``shares_resolved`` is false only
+    when the apply aborted before it could index them, in which case the
+    retry re-runs the (bounded, in-memory) scan itself.
+    """
+
+    block_hash: str
+    steps: frozenset[str]
+    shares: tuple[PendingShare, ...] = ()
+    shares_resolved: bool = True
+    attempts: int = 0
+    delay_seconds: float = 0.0
+    not_before_monotonic: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -737,6 +786,13 @@ class BlockCandidateService:
         self._block_candidate_collapse_fail_closed_logged_monotonic: (
             float | None
         ) = None
+        # Terminal hashes whose collapse cleanup did not complete, keyed by
+        # hash so the backlog is bounded by the affected rows themselves and
+        # a repeated failure re-registers rather than accumulating.
+        self._block_candidate_collapse_cleanup_retries: dict[
+            str,
+            _CollapsedCandidateCleanup,
+        ] = {}
 
     # -- twelve historical field aliases -----------------------------------
 
@@ -975,8 +1031,11 @@ class BlockCandidateService:
     # -- decided-height collapse (#183) ------------------------------------
 
     def _ensure_block_candidate_collapse_state(self) -> None:
-        """Backfill the fixed-key collapse counters for lightweight embedders."""
-        if hasattr(self, "_block_candidate_collapse_counts"):
+        """Backfill the collapse counters and cleanup-retry registry."""
+        if hasattr(self, "_block_candidate_collapse_counts") and hasattr(
+            self,
+            "_block_candidate_collapse_cleanup_retries",
+        ):
             return
         with _STATE_BACKFILL_LOCK:
             if not hasattr(self, "_block_candidate_collapse_counts"):
@@ -984,6 +1043,11 @@ class BlockCandidateService:
                     outcome: 0
                     for outcome in PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES
                 }
+            if not hasattr(self, "_block_candidate_collapse_cleanup_retries"):
+                self._block_candidate_collapse_cleanup_retries: dict[
+                    str,
+                    _CollapsedCandidateCleanup,
+                ] = {}
 
     def _record_block_candidate_collapse(
         self,
@@ -1342,34 +1406,34 @@ class BlockCandidateService:
                     holders.setdefault(key, []).append(item)
         return holders
 
-    def _clean_up_collapsed_block_candidates(
+    def _run_collapsed_candidate_cleanup_steps(
         self,
         abandoned: tuple[str, ...],
-    ) -> frozenset[str]:
-        """Mirror per-row terminal abandonment cleanup for the rows we won.
-
-        Driven by the hashes the fenced write returned, never by the hashes
-        it was asked about: a requested-but-absent row was won by somebody
-        else (or already terminal), and running this cleanup for it would
-        discard state its real owner still needs.
+        *,
+        owed: dict[str, frozenset[str]],
+        shares: dict[str, tuple[PendingShare, ...]] | None = None,
+    ) -> tuple[dict[str, frozenset[str]], dict[str, tuple[PendingShare, ...]]]:
+        """Run each hash's owed cleanup steps and report what it still owes.
 
         Every step is idempotent and independently guarded, so a hash whose
-        cleanup raises cannot strand the rest of the page mid-way.
+        step raises cannot strand the rest of the page mid-way, and a step
+        the caller does not list is simply not run -- which is what lets a
+        deferred retry replay only the remainder.
 
-        Returns the hashes whose cleanup did not complete. The apply owns
-        the ``cleanup_failed`` accounting for the whole page: counting a
-        contained failure here and a later page-level abort there would
-        report one affected hash twice.
+        Returns the still-owed steps per hash (absent means fully clean) and
+        the floor holders this pass resolved, so a caller that has to defer
+        the remainder keeps the exact holder objects it would otherwise lose
+        when the queues drain.
         """
         coordinator = self._coordinator
         coordinator._record_block_submitter_phase("replay-collapse-cleanup")
-        failed: set[str] = set()
+        remaining: dict[str, set[str]] = {}
         detailed_failures = 0
 
         def note_failure(block_hash: str, step: str) -> None:
             nonlocal detailed_failures
             detailed = detailed_failures < BLOCK_CANDIDATE_COLLAPSE_LOG_FAILURES
-            failed.add(block_hash)
+            remaining.setdefault(block_hash, set()).add(step)
             if not detailed:
                 return
             detailed_failures += 1
@@ -1389,6 +1453,11 @@ class BlockCandidateService:
             "payout-balance-mutation",
         ):
             for block_hash in abandoned:
+                if (
+                    BLOCK_CANDIDATE_COLLAPSE_CLEANUP_PAYOUT_STEP
+                    not in owed.get(block_hash, frozenset())
+                ):
+                    continue
                 try:
                     # Withdraw with published invalidation, then drop the
                     # tombstone: the durable row is already terminal, so no
@@ -1401,14 +1470,32 @@ class BlockCandidateService:
                     )
                     coordinator._clear_accepted_block_payout_preview(block_hash)
                 except Exception:
-                    note_failure(block_hash, "payout-preview-withdrawal")
+                    note_failure(
+                        block_hash,
+                        BLOCK_CANDIDATE_COLLAPSE_CLEANUP_PAYOUT_STEP,
+                    )
         outcome = SimpleNamespace(
             reason=PRISM_BLOCK_CANDIDATE_COLLAPSE_REASON,
             stale_job_class=PRISM_BLOCK_CANDIDATE_COLLAPSE_STALE_JOB_CLASS,
         )
-        floor_holders = self._collapsed_candidate_floor_holders(abandoned)
+        if shares is None:
+            # Unguarded on purpose: a page-scope indexing fault proves
+            # nothing about any hash's remaining steps, so the caller must
+            # see it as an abort and defer the whole won set.
+            shares = {
+                block_hash: tuple(
+                    candidate.pending_share for candidate in candidates
+                )
+                for block_hash, candidates in (
+                    self._collapsed_candidate_floor_holders(abandoned).items()
+                )
+            }
         for block_hash in abandoned:
+            steps = owed.get(block_hash, frozenset())
+
             def run_step(step: str, action: Callable[[], None]) -> None:
+                if step not in steps:
+                    return
                 try:
                     action()
                 except Exception:
@@ -1445,21 +1532,289 @@ class BlockCandidateService:
                     outcome,
                 ),
             )
-            for candidate in floor_holders.get(block_hash, ()):
+            for pending_share in shares.get(block_hash, ()):
                 run_step(
-                    "pending-share-floor",
-                    lambda candidate=candidate: coordinator._finish_pending_share_commit(
-                        candidate.pending_share
+                    BLOCK_CANDIDATE_COLLAPSE_CLEANUP_FLOOR_STEP,
+                    lambda pending_share=pending_share: (
+                        coordinator._finish_pending_share_commit(pending_share)
                     ),
                 )
-        if failed:
+        return (
+            {
+                block_hash: frozenset(steps)
+                for block_hash, steps in remaining.items()
+            },
+            shares,
+        )
+
+    def _clean_up_collapsed_block_candidates(
+        self,
+        abandoned: tuple[str, ...],
+    ) -> frozenset[str]:
+        """Mirror per-row terminal abandonment cleanup for the rows we won.
+
+        Driven by the hashes the fenced write returned, never by the hashes
+        it was asked about: a requested-but-absent row was won by somebody
+        else (or already terminal), and running this cleanup for it would
+        discard state its real owner still needs.
+
+        Returns the hashes whose cleanup did not complete. The apply owns
+        the ``cleanup_failed`` accounting for the whole page: counting a
+        contained failure here and a later page-level abort there would
+        report one affected hash twice. Each of those hashes keeps its
+        still-owed steps in the cleanup-retry registry, because its durable
+        row is terminal and no enumeration will ever hand it back.
+        """
+        every_step = frozenset(BLOCK_CANDIDATE_COLLAPSE_CLEANUP_STEPS)
+        remaining, shares = self._run_collapsed_candidate_cleanup_steps(
+            abandoned,
+            owed={block_hash: every_step for block_hash in abandoned},
+        )
+        for block_hash in abandoned:
+            owed = remaining.get(block_hash)
+            if owed:
+                self._defer_collapsed_candidate_cleanup(
+                    block_hash,
+                    owed,
+                    shares=shares.get(block_hash, ()),
+                )
+            else:
+                # A hash the fenced write can only win once, but a direct
+                # caller may repeat the cleanup; a completed pass discharges
+                # whatever an earlier one left owed.
+                self._discharge_collapsed_candidate_cleanup(block_hash)
+        if remaining:
             print(
                 "prism coordinator: collapsed block candidate cleanup failed "
-                f"rows={len(failed)} of {len(abandoned)}; their durable rows "
-                "are already terminal",
+                f"rows={len(remaining)} of {len(abandoned)}; their durable rows "
+                "are already terminal and their cleanup is retried",
                 flush=True,
             )
-        return frozenset(failed)
+        return frozenset(remaining)
+
+    # -- deferred cleanup retry --------------------------------------------
+
+    def _collapsed_candidate_cleanup_registry(
+        self,
+    ) -> dict[str, _CollapsedCandidateCleanup]:
+        self._ensure_block_candidate_collapse_state()
+        return self._block_candidate_collapse_cleanup_retries
+
+    def _defer_collapsed_candidate_cleanup(
+        self,
+        block_hash: str,
+        steps: Iterable[str],
+        *,
+        shares: Iterable[PendingShare] = (),
+        shares_resolved: bool = True,
+    ) -> None:
+        """Keep one terminal hash's owed cleanup steps for a later retry.
+
+        Contained so it cannot raise: the apply's abort path calls this on
+        its way to returning the won set, and an exception escaping there
+        would fail the whole page closed and replay-adopt rows whose durable
+        outbox entries are already gone.
+        """
+        try:
+            owed = frozenset(steps).intersection(
+                BLOCK_CANDIDATE_COLLAPSE_CLEANUP_STEPS
+            )
+            if not owed:
+                return
+            registry = self._collapsed_candidate_cleanup_registry()
+            now = time.monotonic()
+            with self._coordinator.lock:
+                record = registry.pop(block_hash, None)
+                if record is None:
+                    record = _CollapsedCandidateCleanup(
+                        block_hash=block_hash,
+                        steps=owed,
+                        shares=tuple(shares),
+                        shares_resolved=bool(shares_resolved),
+                        delay_seconds=max(0.0, float(self.retry_initial_seconds)),
+                        # The first attempt is due immediately; only a failed
+                        # attempt starts the backoff.
+                        not_before_monotonic=now,
+                    )
+                else:
+                    # The floor keys holders by object identity, so merge by
+                    # identity rather than by value: two reconstructed shares
+                    # for one hash are two distinct holders.
+                    by_identity = {id(share): share for share in record.shares}
+                    for share in shares:
+                        by_identity.setdefault(id(share), share)
+                    record.steps = record.steps | owed
+                    record.shares = tuple(by_identity.values())
+                    record.shares_resolved = record.shares_resolved and bool(
+                        shares_resolved
+                    )
+                    record.not_before_monotonic = min(
+                        record.not_before_monotonic,
+                        now,
+                    )
+                # Re-inserted at the tail so a storm-sized backlog is retried
+                # round-robin instead of starving behind its oldest entry.
+                registry[block_hash] = record
+        except Exception:
+            print(
+                "prism coordinator: collapsed block candidate cleanup could "
+                f"not be deferred hash={block_hash}",
+                flush=True,
+            )
+            traceback.print_exc()
+
+    def _discharge_collapsed_candidate_cleanup(self, block_hash: str) -> bool:
+        """Drop one hash's retry record; True when one was still owed."""
+        registry = self._collapsed_candidate_cleanup_registry()
+        with self._coordinator.lock:
+            return registry.pop(block_hash, None) is not None
+
+    def collapsed_candidate_cleanup_backlog(self) -> dict[str, frozenset[str]]:
+        """The cleanup steps each terminal hash still owes (diagnostics)."""
+        registry = self._collapsed_candidate_cleanup_registry()
+        with self._coordinator.lock:
+            return {
+                block_hash: record.steps
+                for block_hash, record in registry.items()
+            }
+
+    def _run_one_collapsed_block_candidate_cleanup_retry(self) -> bool:
+        """Retry one deferred collapse cleanup; True when one was attempted.
+
+        Driven from the accounting lane's idle branch beside the quarantine
+        drain, because a terminal hash's cleanup is accounting work and the
+        durable row behind it is already gone. The pass is bounded three
+        ways: at most one hash per call, only that hash's still-owed steps,
+        and only once its own backoff deadline has passed. It never reads or
+        writes the outbox and never enqueues a candidate, so it can only
+        finish tearing state down -- a terminal row can be neither re-adopted
+        nor re-offered from here.
+        """
+        registry = self._collapsed_candidate_cleanup_registry()
+        now = time.monotonic()
+        with self._coordinator.lock:
+            due: _CollapsedCandidateCleanup | None = None
+            for record in registry.values():
+                if record.not_before_monotonic <= now:
+                    due = record
+                    break
+            if due is None:
+                return False
+            # Taken out of the registry for the duration of the attempt so a
+            # second lane cannot run the same hash's steps concurrently;
+            # whatever it still owes afterwards is re-registered below.
+            registry.pop(due.block_hash, None)
+            due.attempts += 1
+        self._coordinator._record_block_submitter_phase(
+            "replay-collapse-cleanup-retry"
+        )
+        block_hash = due.block_hash
+        owed = due.steps
+        shares = due.shares
+        shares_resolved = due.shares_resolved
+        if (
+            BLOCK_CANDIDATE_COLLAPSE_CLEANUP_FLOOR_STEP in owed
+            and not shares_resolved
+        ):
+            # The apply aborted before it could index the floor holders. The
+            # scan reads only the in-memory queues, so repeating it is cheap
+            # and safe; a candidate already dropped from them released its
+            # own holder on the way out.
+            try:
+                holders = self._collapsed_candidate_floor_holders((block_hash,))
+            except Exception:
+                print(
+                    "prism coordinator: collapsed block candidate cleanup "
+                    f"retry could not index floor holders hash={block_hash}",
+                    flush=True,
+                )
+                traceback.print_exc()
+                self._record_block_candidate_collapse("cleanup_retry_failed")
+                self._reschedule_collapsed_candidate_cleanup(
+                    due,
+                    owed,
+                    shares=shares,
+                    shares_resolved=False,
+                )
+                return True
+            by_identity = {id(share): share for share in shares}
+            for candidate in holders.get(block_hash, ()):
+                by_identity.setdefault(
+                    id(candidate.pending_share),
+                    candidate.pending_share,
+                )
+            shares = tuple(by_identity.values())
+            shares_resolved = True
+        try:
+            remaining, _shares = self._run_collapsed_candidate_cleanup_steps(
+                (block_hash,),
+                owed={block_hash: owed},
+                shares={block_hash: shares},
+            )
+            still_owed = remaining.get(block_hash, frozenset())
+        except Exception:
+            # Same reasoning as the apply's abort: a pass that died proves
+            # nothing about the steps it skipped, so the hash owes them all
+            # again.
+            print(
+                "prism coordinator: collapsed block candidate cleanup retry "
+                f"aborted hash={block_hash}",
+                flush=True,
+            )
+            traceback.print_exc()
+            still_owed = owed
+        if still_owed:
+            self._record_block_candidate_collapse("cleanup_retry_failed")
+            self._reschedule_collapsed_candidate_cleanup(
+                due,
+                still_owed,
+                shares=shares,
+                shares_resolved=shares_resolved,
+            )
+            return True
+        # Counted once per hash: the record is gone, so no later pass can
+        # report the same recovery twice, and the series can never exceed
+        # the cleanup_failed set that created these records.
+        self._record_block_candidate_collapse("cleanup_recovered")
+        print(
+            "prism coordinator: collapsed block candidate cleanup recovered "
+            f"hash={block_hash} attempts={due.attempts}",
+            flush=True,
+        )
+        return True
+
+    def _reschedule_collapsed_candidate_cleanup(
+        self,
+        record: _CollapsedCandidateCleanup,
+        steps: Iterable[str],
+        *,
+        shares: Iterable[PendingShare],
+        shares_resolved: bool,
+    ) -> None:
+        """Re-register a retried hash behind its own doubled backoff.
+
+        The pacing mirrors ``next_retry_delay``: the configured candidate
+        retry backoff, doubled per attempt and capped, so a systemically
+        broken cleanup cannot spin the accounting lane while a transient one
+        still recovers on its next tick.
+        """
+        initial = max(0.0, float(self.retry_initial_seconds))
+        maximum = max(initial, float(self.retry_max_seconds))
+        delay = min(maximum, max(initial, float(record.delay_seconds) * 2))
+        self._defer_collapsed_candidate_cleanup(
+            record.block_hash,
+            steps,
+            shares=shares,
+            shares_resolved=shares_resolved,
+        )
+        registry = self._collapsed_candidate_cleanup_registry()
+        with self._coordinator.lock:
+            rescheduled = registry.get(record.block_hash)
+            if rescheduled is None:
+                return
+            rescheduled.attempts = max(rescheduled.attempts, record.attempts)
+            rescheduled.delay_seconds = delay
+            rescheduled.not_before_monotonic = time.monotonic() + delay
 
     def _log_collapsed_block_candidates(
         self,
@@ -1630,10 +1985,20 @@ class BlockCandidateService:
                 # the steps it skipped, so the whole won set is affected --
                 # which subsumes any hash a contained step already failed.
                 cleanup_failed = abandoned
+                # Every won hash owes every step again, and the floor
+                # holders were never indexed, so the retry re-runs that scan
+                # too. Deferral is contained, so this stays on the path that
+                # returns the won set.
+                for block_hash in abandoned:
+                    self._defer_collapsed_candidate_cleanup(
+                        block_hash,
+                        BLOCK_CANDIDATE_COLLAPSE_CLEANUP_STEPS,
+                        shares_resolved=False,
+                    )
                 print(
                     "prism coordinator: collapsed block candidate cleanup "
                     f"aborted rows={len(abandoned)}; their durable rows are "
-                    "already terminal",
+                    "already terminal and their cleanup is retried",
                     flush=True,
                 )
                 traceback.print_exc()
@@ -3599,6 +3964,11 @@ class BlockCandidateService:
                     source_queue = self._block_accounting_overflow_queue
                 except queue.Empty:
                     if self._coordinator._run_one_invalid_block_candidate_quarantine():
+                        continue
+                    # A collapsed row's failed cleanup has no durable replay
+                    # source left, so this idle branch is the only thing that
+                    # will ever finish it.
+                    if self._run_one_collapsed_block_candidate_cleanup_retry():
                         continue
                     self._coordinator.stop_event.wait(self._block_work_wait_slice())
                     continue
