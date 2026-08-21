@@ -3071,6 +3071,37 @@ class BlockCandidateService:
             started_monotonic=min(active_starts),
         )
 
+    def _retire_finished_block_submitter_ledger_call(
+        self,
+        key: tuple[object, ...],
+        call: _BlockSubmitterLedgerCall,
+    ) -> None:
+        """Take one finished call out of the registry, by identity.
+
+        A finished call has no live need: it is registered only so that a
+        same-key caller arriving while the worker is *still out* joins that
+        one call instead of starting a second one, and a worker that has
+        published ``done`` is not out any more. Leaving it behind would wait
+        on an invocation that may never come -- the exact key can be a whole
+        enumeration page of block hashes, and the late write itself is what
+        empties that page out of the outbox -- so the registry would keep
+        the completed call, and its hash tuple, for the life of the process.
+
+        Both the worker and a waiter that observed the completion call this,
+        whichever gets there first; the identity check is what keeps either
+        of them from dropping a *different* call that has since taken the
+        key, and the ``done`` check is what keeps them from ever dropping a
+        worker that is still out. Waiters hold the call directly, so a
+        removal never costs anybody the result or error it is owed: it only
+        settles that the next caller for that key replays the idempotent
+        operation on a fresh call.
+        """
+        with self._block_submitter_ledger_calls_lock:
+            if not call.done.is_set():
+                return
+            if self._block_submitter_ledger_calls.get(key) is call:
+                del self._block_submitter_ledger_calls[key]
+
     @contextmanager
     def _block_submitter_ledger_timeout_scope(
         self,
@@ -3203,11 +3234,20 @@ class BlockCandidateService:
     ) -> Any:
         """Run one direct outbox call without letting its driver wedge us.
 
-        A timed-out call remains registered and is reused by the next paced
-        retry. This bounds the coordinator-side wait without spawning an
-        unbounded pile of threads when a fake/misbehaving driver ignores the
-        real PostgreSQL statement deadline. Candidate outbox mutations are
+        A timed-out call stays registered for as long as its worker is
+        still out, and the next paced retry joins that same call. This
+        bounds the coordinator-side wait without spawning an unbounded pile
+        of threads when a fake/misbehaving driver ignores the real
+        PostgreSQL statement deadline. Candidate outbox mutations are
         idempotent, so a late completion converges with replay.
+
+        The registry therefore holds in-flight calls and nothing else: the
+        worker retires its own entry the moment it publishes ``done`` (see
+        _retire_finished_block_submitter_ledger_call), so a key whose retry
+        never comes back cannot pin a completed call and its page of block
+        hashes for the life of the process. Waiters already parked on the
+        call hold it directly and still get its result or error; a caller
+        arriving after the removal simply replays the operation.
 
         call_class labels the per-class latency/timeout metrics and must
         match the budget in use: a call given the landing deadline records
@@ -3253,7 +3293,14 @@ class BlockCandidateService:
                         call.error = exc
                     finally:
                         call.done.set()
+                        # The slot goes back before the removal: a caller
+                        # that arrives to find this key already retired must
+                        # not then be told the bounded pool is exhausted.
                         self._block_submitter_ledger_worker_slots.release()
+                        self._retire_finished_block_submitter_ledger_call(
+                            key,
+                            call,
+                        )
 
                 threading.Thread(
                     target=run,
@@ -3303,9 +3350,7 @@ class BlockCandidateService:
             duration_seconds=max(0.0, time.monotonic() - call.started_monotonic),
             timed_out=isinstance(call.error, TimeoutError),
         )
-        with self._block_submitter_ledger_calls_lock:
-            if self._block_submitter_ledger_calls.get(key) is call:
-                self._block_submitter_ledger_calls.pop(key, None)
+        self._retire_finished_block_submitter_ledger_call(key, call)
         if call.error is not None:
             raise call.error
         return call.result

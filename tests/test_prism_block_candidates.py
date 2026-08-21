@@ -17,10 +17,12 @@ from lab.prism.audit_artifacts import (
 )
 from lab.prism.block_candidates import (
     MAX_BLOCK_REPLAY_ENUMERATION_ROWS,
+    MAX_BLOCK_SUBMITTER_STUCK_CALL_WORKERS,
     MAX_PENDING_BLOCK_CANDIDATES,
     BlockCandidateAttemptResult,
     BlockCandidateRunResult,
     _BlockCandidateNodeSubmission,
+    _BlockSubmitterLedgerCall,
     block_candidate_from_intent,
     block_candidate_intent,
 )
@@ -10340,6 +10342,283 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
             self.assertTrue(server._fatal_exit_requested)
         finally:
             release.set()
+
+    def _ledger_worker_thread(self, phase: str) -> threading.Thread:
+        """The bounded worker still running one stalled ledger call."""
+        name = f"prism-block-ledger-{phase}"
+        for thread in threading.enumerate():
+            if thread.name == name:
+                return thread
+        raise AssertionError(f"no bounded ledger worker named {name}")
+
+    def _assert_ledger_registry_drained(self, server: PrismCoordinator) -> None:
+        """Neither an entry nor a worker slot outlives a finished call."""
+        with server._block_submitter_ledger_calls_lock:
+            self.assertEqual(dict(server._block_submitter_ledger_calls), {})
+        acquired = [
+            server._block_submitter_ledger_worker_slots.acquire(blocking=False)
+            for _ in range(MAX_BLOCK_SUBMITTER_STUCK_CALL_WORKERS)
+        ]
+        for _ in [slot for slot in acquired if slot]:
+            server._block_submitter_ledger_worker_slots.release()
+        self.assertEqual(acquired, [True] * MAX_BLOCK_SUBMITTER_STUCK_CALL_WORKERS)
+
+    def _drive_late_ledger_call(
+        self,
+        server: PrismCoordinator,
+        key: tuple[object, ...],
+        phase: str,
+        result: object = None,
+        error: BaseException | None = None,
+    ) -> _BlockSubmitterLedgerCall:
+        """Expire the coordinator-side wait, then let the worker land late.
+
+        Returns the call the registry held, once its worker has fully
+        exited, so a caller can assert on the registry without racing the
+        removal the worker performs on its way out.
+        """
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def stall() -> object:
+            if not release.wait(5):
+                raise AssertionError("the stalled ledger call was never released")
+            if error is not None:
+                raise error
+            return result
+
+        with self.assertRaises(TimeoutError):
+            server._run_block_submitter_ledger_call(key, phase, stall)
+        with server._block_submitter_ledger_calls_lock:
+            call = server._block_submitter_ledger_calls[key]
+        worker = self._ledger_worker_thread(phase)
+        release.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        return call
+
+    def _overlapping_ledger_callers(
+        self,
+        server: PrismCoordinator,
+        key: tuple[object, ...],
+        phase: str,
+        result: object = None,
+        error: BaseException | None = None,
+        count: int = 3,
+    ) -> tuple[list[object], list[BaseException], list[str]]:
+        """Park ``count`` callers on one in-flight call, then let it land."""
+        started = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        runs: list[str] = []
+
+        def operation() -> object:
+            runs.append("run")
+            started.set()
+            if not release.wait(5):
+                raise AssertionError("the shared ledger call was never released")
+            if error is not None:
+                raise error
+            return result
+
+        waiting: set[int] = set()
+        waiting_lock = threading.Lock()
+        original_record_wait = server._record_block_submitter_wait
+
+        def observed_record_wait(observed: str) -> None:
+            original_record_wait(observed)
+            if observed == phase:
+                with waiting_lock:
+                    waiting.add(threading.get_ident())
+
+        server._record_block_submitter_wait = observed_record_wait  # type: ignore[method-assign]
+
+        results: list[object] = []
+        failures: list[BaseException] = []
+
+        def caller() -> None:
+            try:
+                results.append(
+                    server._run_block_submitter_ledger_call(key, phase, operation)
+                )
+            except BaseException as exc:  # pragma: no cover - failure detail
+                failures.append(exc)
+
+        callers = [threading.Thread(target=caller) for _ in range(count)]
+        callers[0].start()
+        self.assertTrue(started.wait(5))
+        for thread in callers[1:]:
+            thread.start()
+        # Every late arrival has to be parked on the one in-flight call
+        # before it lands, or nothing here is a statement about overlap.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with waiting_lock:
+                if len(waiting) == count:
+                    break
+            time.sleep(0.005)
+        with waiting_lock:
+            self.assertEqual(len(waiting), count)
+        release.set()
+        for thread in callers:
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+        return results, failures, runs
+
+    def test_late_ledger_completions_return_the_registry_to_empty(self) -> None:
+        """Unique keys that time out and then land late must not pile up.
+
+        The shipped collapse write is keyed by the exact page of block
+        hashes it abandons, so a write that finally lands after the caller's
+        deadline is the very thing that empties that page out of the outbox:
+        no later invocation of that key exists to observe the completion and
+        drop the entry. The registry has to come back to empty by itself, or
+        every timed-out page leaks a completed call object and its whole
+        hash tuple for the life of the process.
+        """
+        server, _state, _recording = submit_coordinator()
+        server.block_submit_db_timeout_seconds = 0.01
+        rounds = 6
+        sizes: list[int] = []
+        for index in range(rounds):
+            call = self._drive_late_ledger_call(
+                server,
+                ("late", index),
+                f"late-{index}",
+                result=index,
+            )
+            # The worker really did finish its operation before retiring it.
+            self.assertEqual(call.result, index)
+            with server._block_submitter_ledger_calls_lock:
+                sizes.append(len(server._block_submitter_ledger_calls))
+
+        self.assertEqual(sizes, [0] * rounds)
+        # Nothing was retired while it still owed a bounded worker slot.
+        self._assert_ledger_registry_drained(server)
+
+    def test_a_late_ledger_success_is_retired_and_then_replayed(self) -> None:
+        """A late success answered nobody, so it leaves nothing behind."""
+        server, _state, _recording = submit_coordinator()
+        server.block_submit_db_timeout_seconds = 0.01
+        runs: list[str] = []
+
+        def fresh() -> str:
+            runs.append("fresh")
+            return "fresh-result"
+
+        call = self._drive_late_ledger_call(
+            server,
+            ("late-success",),
+            "late-success",
+            result="late-result",
+        )
+        self.assertEqual(call.result, "late-result")
+        self._assert_ledger_registry_drained(server)
+        # The key is free again, so the next caller replays the idempotent
+        # operation instead of being answered by a call it never made.
+        server.block_submit_db_timeout_seconds = 5.0
+        self.assertEqual(
+            server._run_block_submitter_ledger_call(
+                ("late-success",),
+                "late-success",
+                fresh,
+            ),
+            "fresh-result",
+        )
+        self.assertEqual(runs, ["fresh"])
+        self._assert_ledger_registry_drained(server)
+
+    def test_a_late_ledger_error_is_retired_and_then_replayed(self) -> None:
+        """A late failure is not owed to a caller that never waited on it."""
+        server, _state, _recording = submit_coordinator()
+        server.block_submit_db_timeout_seconds = 0.01
+        failure = RuntimeError("late ledger failure")
+        runs: list[str] = []
+
+        def fresh() -> str:
+            runs.append("fresh")
+            return "fresh-result"
+
+        call = self._drive_late_ledger_call(
+            server,
+            ("late-error",),
+            "late-error",
+            error=failure,
+        )
+        self.assertIs(call.error, failure)
+        self._assert_ledger_registry_drained(server)
+        server.block_submit_db_timeout_seconds = 5.0
+        self.assertEqual(
+            server._run_block_submitter_ledger_call(
+                ("late-error",),
+                "late-error",
+                fresh,
+            ),
+            "fresh-result",
+        )
+        self.assertEqual(runs, ["fresh"])
+        self._assert_ledger_registry_drained(server)
+
+    def test_retirement_never_drops_an_unfinished_or_replaced_call(self) -> None:
+        """The two guards single flight and slot accounting rest on."""
+        server, _state, _recording = submit_coordinator()
+        service = server._ensure_block_candidate_service()
+        service._ensure_block_submitter_ledger_call_state()
+        running = _BlockSubmitterLedgerCall()
+        successor = _BlockSubmitterLedgerCall()
+        stale = _BlockSubmitterLedgerCall()
+        stale.done.set()
+        finished = _BlockSubmitterLedgerCall()
+        finished.done.set()
+        with server._block_submitter_ledger_calls_lock:
+            server._block_submitter_ledger_calls[("running",)] = running
+            server._block_submitter_ledger_calls[("replaced",)] = successor
+            server._block_submitter_ledger_calls[("finished",)] = finished
+
+        # A worker that is still out is what same-key single flight and the
+        # bounded pool are counted from; it is never dropped.
+        service._retire_finished_block_submitter_ledger_call(("running",), running)
+        # A finished call cannot drop the fresh call that has taken its key.
+        service._retire_finished_block_submitter_ledger_call(("replaced",), stale)
+        # Its own finished entry does go.
+        service._retire_finished_block_submitter_ledger_call(("finished",), finished)
+
+        with server._block_submitter_ledger_calls_lock:
+            self.assertEqual(
+                dict(server._block_submitter_ledger_calls),
+                {("running",): running, ("replaced",): successor},
+            )
+
+    def test_overlapping_same_key_waiters_share_one_bounded_worker(self) -> None:
+        """Single flight is unchanged: one operation, one slot, one answer."""
+        server, _state, _recording = submit_coordinator()
+        server.block_submit_db_timeout_seconds = 5.0
+        results, failures, runs = self._overlapping_ledger_callers(
+            server,
+            ("shared",),
+            "shared",
+            result="shared-result",
+        )
+        self.assertEqual(failures, [])
+        self.assertEqual(runs, ["run"])
+        self.assertEqual(results, ["shared-result"] * 3)
+        self._assert_ledger_registry_drained(server)
+
+    def test_overlapping_same_key_waiters_all_receive_the_failure(self) -> None:
+        """Retiring the entry cannot cost a parked waiter what it is owed."""
+        server, _state, _recording = submit_coordinator()
+        server.block_submit_db_timeout_seconds = 5.0
+        failure = RuntimeError("shared ledger failure")
+        results, failures, runs = self._overlapping_ledger_callers(
+            server,
+            ("shared-error",),
+            "shared-error",
+            error=failure,
+        )
+        self.assertEqual(results, [])
+        self.assertEqual(runs, ["run"])
+        self.assertEqual(failures, [failure] * 3)
+        self._assert_ledger_registry_drained(server)
 
     def test_parent_retry_displacement_preserves_durable_descendant(self) -> None:
         server, state, _recording = submit_coordinator()

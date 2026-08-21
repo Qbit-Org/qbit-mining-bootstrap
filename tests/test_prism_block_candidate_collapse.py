@@ -2841,6 +2841,81 @@ class BlockCandidateCollapseEnumerationTests(unittest.TestCase):
             server._accepted_block_payout_transition_landed(abandoned_late)
         )
 
+    def test_repeated_late_collapse_writes_leave_no_ledger_calls(self) -> None:
+        """A page key that never recurs must still leave the registry.
+
+        Each fenced write is keyed by the exact page of hashes it abandons,
+        so the write that lands after the caller's deadline is the very
+        thing that empties that page out of the outbox: nothing invokes that
+        key again to observe the completion and drop the entry. Several such
+        pages in a row must leave the registry back at empty, not one
+        completed call per page each pinning its whole hash tuple for the
+        life of the process.
+        """
+        fixture = CollapseFixture()
+        # Wide enough that the page read ahead of the write is never the
+        # call that expires, short enough to keep the test quick.
+        fixture.server.block_submit_db_timeout_seconds = 0.25
+        rounds = 4
+        page_keys: list[tuple[object, ...]] = []
+        for round_index in range(rounds):
+            fixture.seed(
+                [_hash(2 * round_index + 1), _hash(2 * round_index + 2)]
+            )
+            release = threading.Event()
+            self.addCleanup(release.set)
+
+            def stall_then_write(
+                hashes: tuple[str, ...],
+                error: str,
+                release: threading.Event = release,
+            ) -> tuple[str, ...]:
+                if not release.wait(10):
+                    raise AssertionError(
+                        "the stalled ledger call was never released"
+                    )
+                return fixture.ledger.inner.mark_block_candidates_abandoned(
+                    block_hashes=hashes,
+                    error=error,
+                )
+
+            fixture.ledger.abandon_hook = stall_then_write
+            _retained, log = fixture.collapse()
+            self.assertIn(
+                "ledger phase timed out phase=collapse-superseded",
+                log,
+            )
+            with fixture.service._block_submitter_ledger_calls_lock:
+                stalled = [
+                    key
+                    for key, call in (
+                        fixture.service._block_submitter_ledger_calls.items()
+                    )
+                    if not call.done.is_set()
+                ]
+            self.assertEqual(len(stalled), 1)
+            page_keys.append(stalled[0])
+            worker = next(
+                thread
+                for thread in threading.enumerate()
+                if thread.name == "prism-block-ledger-collapse-superseded"
+            )
+            release.set()
+            worker.join(10)
+            self.assertFalse(worker.is_alive())
+            # The write committed on the worker, and took its entry with it.
+            with fixture.service._block_submitter_ledger_calls_lock:
+                self.assertEqual(
+                    dict(fixture.service._block_submitter_ledger_calls),
+                    {},
+                )
+
+        # Every page really was a distinct key, and every delayed write
+        # really did commit.
+        self.assertEqual(len(fixture.ledger.abandon_calls), rounds)
+        self.assertEqual(len(set(page_keys)), rounds)
+        self.assertEqual(fixture.pending(), set())
+
     def test_pagination_still_completes_after_a_full_page_collapses(self) -> None:
         """Collapse must not break the short-page completeness proof."""
         fixture = CollapseFixture()
