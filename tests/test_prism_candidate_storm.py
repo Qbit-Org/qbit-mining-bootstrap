@@ -105,7 +105,7 @@ class DecidedCandidateStormTests(unittest.TestCase):
 
         live = rig.snapshot(rig.live_server)
         self.assertEqual(live.outstanding_marked, DECIDED_STORM_CANDIDATES)
-        self.assertEqual(live.offer_evidence_marked, 0)
+        self.assertEqual(live.selector_evidence_marked, 0)
         ownership = rig.ownership(rig.live_server)
         self.assertEqual(len(ownership), DECIDED_STORM_CANDIDATES)
         decided_header = rig.decided_rpc.call("getblockheader", [winner])
@@ -118,7 +118,7 @@ class DecidedCandidateStormTests(unittest.TestCase):
             # the same difficulty, so height occupancy is decisive here.
             self.assertEqual(record.network_difficulty, decided_header["difficulty"])
             self.assertTrue(record.outstanding)
-            self.assertFalse(record.node_offer_evidence)
+            self.assertFalse(record.selector_evidence)
         self.assertEqual(
             sum(1 for record in ownership if record.live_queued),
             MAX_PENDING_BLOCK_CANDIDATES,
@@ -130,13 +130,13 @@ class DecidedCandidateStormTests(unittest.TestCase):
         restarted = rig.restart_and_enumerate()
         self.assertEqual(restarted.replay_inflight_marked, DECIDED_STORM_CANDIDATES)
         self.assertEqual(restarted.accepted_parent_previews, DECIDED_STORM_CANDIDATES)
-        self.assertEqual(restarted.offer_evidence_marked, 0)
+        self.assertEqual(restarted.selector_evidence_marked, 0)
         self.assertIs(rig.restarted_server.rpc, rig.decided_rpc)
         self.assertTrue(
             all(record.replay_queued for record in rig.ownership(rig.restarted_server))
         )
 
-    def test_offer_evidence_gauge_counts_each_evidence_kind_once(self) -> None:
+    def test_selector_evidence_gauge_counts_each_evidence_kind_once(self) -> None:
         rig = CandidateStormRig(candidates=DECIDED_STORM_CANDIDATES)
         rig.seed_live()
         rig.decide_height()
@@ -155,26 +155,29 @@ class DecidedCandidateStormTests(unittest.TestCase):
             self.assertEqual(by_hash[hashes[4]].pool_block_chain_state, "prepared")
             self.assertIs(by_hash[hashes[5]].terminal_outcome, False)
             for block_hash in hashes[:len(PERTURBATIONS)]:
-                self.assertTrue(by_hash[block_hash].node_offer_evidence)
+                self.assertTrue(by_hash[block_hash].selector_evidence)
                 # Process ownership is unchanged by evidence: still outstanding.
                 self.assertTrue(by_hash[block_hash].outstanding)
             self.assertEqual(
-                sum(1 for record in by_hash.values() if record.node_offer_evidence),
+                sum(1 for record in by_hash.values() if record.selector_evidence),
                 len(PERTURBATIONS),
             )
             # The union is conservative, but the rig still says which rows
             # actually attest a node offer. Only the parked wakeup does not:
             # the retry holder is reachable without any submitblock.
-            self.assertFalse(by_hash[hashes[3]].node_offer_attested)
+            self.assertFalse(by_hash[hashes[3]].node_offer_evidence)
             self.assertTrue(by_hash[hashes[3]].retry_held_without_offer)
             for index in (0, 1, 2, 4, 5):
                 with self.subTest(perturbation=PERTURBATIONS[index]):
-                    self.assertTrue(by_hash[hashes[index]].node_offer_attested)
+                    self.assertTrue(by_hash[hashes[index]].node_offer_evidence)
                     self.assertFalse(by_hash[hashes[index]].retry_held_without_offer)
             snapshot = rig.snapshot(server)
-            self.assertEqual(snapshot.offer_evidence_marked, len(PERTURBATIONS))
             self.assertEqual(
-                snapshot.node_offer_attested_marked,
+                snapshot.selector_evidence_marked,
+                len(PERTURBATIONS),
+            )
+            self.assertEqual(
+                snapshot.node_offer_evidence_marked,
                 len(PERTURBATIONS) - 1,
             )
             self.assertEqual(snapshot.unoffered_retry_marked, 1)
@@ -205,7 +208,7 @@ class DecidedCandidateStormTests(unittest.TestCase):
         before = {record.block_hash: record for record in rig.ownership(server)}
         self.assertTrue(before[parked].live_queued)
         self.assertFalse(before[parked].retry_held)
-        self.assertFalse(before[parked].node_offer_evidence)
+        self.assertFalse(before[parked].selector_evidence)
         calls_before = dict(rig.decided_rpc.calls)
 
         # Move a queued, never-offered wakeup into the retry slot, exactly as
@@ -217,7 +220,7 @@ class DecidedCandidateStormTests(unittest.TestCase):
         # Nothing was offered: no RPC happened, and no fact downstream of an
         # offer exists for the row.
         self.assertEqual(rig.decided_rpc.calls, calls_before)
-        self.assertFalse(record.node_offer_attested)
+        self.assertFalse(record.node_offer_evidence)
         self.assertTrue(record.retry_held_without_offer)
         self.assertFalse(record.disposition_held)
         self.assertFalse(record.node_acceptance_retained)
@@ -230,11 +233,11 @@ class DecidedCandidateStormTests(unittest.TestCase):
         self.assertEqual(record.outbox_state, "pending")
         self.assertEqual(record.attempt_count, 0)
         # The conservative contract still covers it.
-        self.assertTrue(record.node_offer_evidence)
+        self.assertTrue(record.selector_evidence)
 
         snapshot = rig.snapshot(server)
-        self.assertEqual(snapshot.offer_evidence_marked, 1)
-        self.assertEqual(snapshot.node_offer_attested_marked, 0)
+        self.assertEqual(snapshot.selector_evidence_marked, 1)
+        self.assertEqual(snapshot.node_offer_evidence_marked, 0)
         self.assertEqual(snapshot.unoffered_retry_marked, 1)
 
     def test_replay_adoption_alone_drops_a_tip_observation(self) -> None:
@@ -259,13 +262,13 @@ class DecidedCandidateStormTests(unittest.TestCase):
         server._note_tip_observation_for_candidates(replayed)
         by_hash = {record.block_hash: record for record in rig.ownership(server)}
         self.assertFalse(by_hash[replayed].tip_observed)
-        self.assertFalse(by_hash[replayed].node_offer_evidence)
-        self.assertEqual(rig.snapshot(server).offer_evidence_marked, 0)
+        self.assertFalse(by_hash[replayed].selector_evidence)
+        self.assertEqual(rig.snapshot(server).selector_evidence_marked, 0)
 
         rig.perturb(server, "tip_observed", replayed)
         by_hash = {record.block_hash: record for record in rig.ownership(server)}
         self.assertTrue(by_hash[replayed].tip_observed)
-        self.assertEqual(rig.snapshot(server).offer_evidence_marked, 1)
+        self.assertEqual(rig.snapshot(server).selector_evidence_marked, 1)
 
     def test_per_row_drain_cost_is_linear_in_siblings_live_and_after_restart(
         self,
@@ -303,7 +306,7 @@ class DecidedCandidateStormTests(unittest.TestCase):
         self.assertEqual(drain.replay_enumerations, 3)
         after = {record.block_hash: record for record in live_rig.ownership(live_rig.live_server)}
         self.assertEqual(after[winner].outbox_state, "pending")
-        self.assertFalse(after[winner].node_offer_evidence)
+        self.assertFalse(after[winner].selector_evidence)
         self.assertTrue(
             all(
                 record.outbox_state == "abandoned" and record.terminal_outcome is False
@@ -406,7 +409,7 @@ class DecidedCandidateStormTests(unittest.TestCase):
                     for kind, block_hash in hashes.items()
                 ]
                 self.assertEqual(
-                    rig.snapshot(server).offer_evidence_marked,
+                    rig.snapshot(server).selector_evidence_marked,
                     len(PERTURBATIONS),
                 )
                 try:
