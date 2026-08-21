@@ -1868,6 +1868,9 @@ class PrismCoordinator:
     _block_disposition_waiting_retries = BlockCandidateStateField(
         "_block_disposition_waiting_retries"
     )
+    _block_candidate_dequeued_hashes = BlockCandidateStateField(
+        "_block_candidate_dequeued_hashes"
+    )
     _block_accounting_state_lock = BlockCandidateStateField(
         "_block_accounting_state_lock"
     )
@@ -8505,6 +8508,9 @@ class PrismCoordinator:
 
     def block_ledger_call_class_metrics(self) -> dict[str, dict[str, float | int]]:
         return self._ensure_block_candidate_service().block_ledger_call_class_metrics()
+
+    def block_candidate_collapse_snapshot(self) -> dict[str, int]:
+        return self._ensure_block_candidate_service().block_candidate_collapse_snapshot()
 
     def _block_submitter_stuck_call_exit_timeout(self) -> float:
         return self._ensure_block_candidate_service()._block_submitter_stuck_call_exit_timeout()

@@ -192,6 +192,14 @@ jobs:
       - name: Set up Blacksmith Docker builder
         uses: useblacksmith/setup-docker-builder@v1
 
+      # The runtime smoke derives its header-bits assertion from PRISM's own
+      # difficulty helpers, so this job needs the same interpreter the unit
+      # tests run under rather than whatever the runner image happens to ship.
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
       - name: Stage pinned qbit source
         run: |
           set -euo pipefail

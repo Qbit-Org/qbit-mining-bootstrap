@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import itertools
 import json
+import math
 import queue
 import threading
 import time
@@ -23,7 +25,7 @@ import traceback
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field, replace as dataclass_replace
 from types import SimpleNamespace
-from typing import Any, Callable, Iterator, Protocol
+from typing import Any, Callable, Iterable, Iterator, Protocol
 
 from lab.prism import direct_stratum
 from lab.prism.coordinator_config import (
@@ -65,6 +67,46 @@ DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS = 30.0
 # stays unbounded by design so an already-offered block is never converted
 # back into a raw-submit retry.
 DEFAULT_BLOCK_ACCOUNTING_QUEUE_DEPTH = 8
+# A collapsed row whose post-write cleanup failed has no durable replay
+# source left, so the accounting lane is the only thing that can ever finish
+# it. Draining it purely from that lane's idle branch made it hostage to the
+# lane staying idle: sustained ordinary accounting traffic, or a
+# continuously replenished invalid-candidate quarantine queue, starved the
+# retry for as long as the traffic lasted. The lane therefore also offers
+# one bounded retry after at most this many completed work items, where a
+# work item is one finished accounting task from either handoff queue or one
+# finished quarantine item. The offer runs at most one hash's still-owed
+# steps and the cadence resets on every offer -- including one that finds
+# nothing due -- so neither lane can starve the other.
+DEFAULT_BLOCK_ACCOUNTING_CLEANUP_RETRY_WORK_ITEMS = 8
+# The same-hash disposition guard remembers every terminal outcome so a late
+# duplicate -- queued, replayed, retried, parked, or quarantined -- joins the
+# decision instead of re-offering a block qbitd already answered for. That
+# memory was process-lifetime historical state: one testnet4 storm left
+# 312,000 entries behind, and every decided-height collapse poll copied the
+# whole registry under the global lock (~124 ms at that size, growing with
+# every block the process ever disposed) while unrelated share acks waited.
+#
+# The registry is bounded instead, and eviction is oldest-first over the
+# entries that no in-memory copy still needs: every lane that can hold a
+# candidate object (or its still-owed terminal work) pins its hash and is
+# never evicted, so a fenced hash cannot become offerable again by being
+# forgotten. That includes the instant between lanes -- a candidate the
+# submitter has taken out of a holder or queue but not yet handed to its
+# disposition flight is named by the dequeued-hash pin, moved in and out
+# under the same lock holds that empty and refill the lanes around it. The
+# bound sits far above the number of copies the process can
+# hold at once -- the bounded admission queue
+# (MAX_PENDING_BLOCK_CANDIDATES), one replay enumeration batch
+# (MAX_BLOCK_REPLAY_ENUMERATION_ROWS), and the single-slot retry holders --
+# so ordinary operation never even reaches an eviction.
+MAX_BLOCK_CANDIDATE_TERMINAL_OUTCOMES = 8192
+# One insert examines at most this many of the oldest entries beyond the
+# overflow it has to clear, so trimming stays O(1) amortized under the global
+# lock even when a run of pinned hashes sits at the front of the registry.
+# A pinned entry the scan passes is moved behind the window rather than
+# dropped, so every pass makes progress against the next one.
+BLOCK_CANDIDATE_TERMINAL_OUTCOME_EVICTION_SCAN = 128
 BLOCK_SUBMITTER_WAIT_HEARTBEAT_SLICE_SECONDS = 0.25
 MAX_BLOCK_SUBMITTER_STUCK_CALL_WORKERS = 2
 BLOCK_CANDIDATE_RETRY_HEARTBEAT_SLICE_SECONDS = 0.25
@@ -93,6 +135,110 @@ PRISM_REJECTION_LEDGER_CONFIRMATION_SUPERSEDED = "ledger-confirmation-superseded
 # first-touch callers from ever publishing different containers for the same
 # state.
 _STATE_BACKFILL_LOCK = threading.Lock()
+
+# -- decided-height candidate collapse (#183) --------------------------
+# Bounded, fixed-label outcome keys for the collapse selector/apply. They
+# are the whole metric label space: no block hash, parent hash, or job ID
+# ever becomes a Prometheus label.
+PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES = (
+    # Durable pending rows the selector examined.
+    "considered",
+    # Rows preserved because their height was never probed: the walk had
+    # spent MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES distinct heights.
+    "height_deferred",
+    # Rows that satisfied every predicate clause.
+    "selected",
+    # Selected rows whose disposition lease was held elsewhere.
+    "lease_skipped",
+    # Leased rows the immediate pre-write re-read disqualified.
+    "revalidation_dropped",
+    # Qualified rows the fenced batch write did not transition.
+    "write_lost",
+    # Rows the fenced batch write actually transitioned.
+    "abandoned",
+    # Rows preserved because a page-scope read or write failed closed.
+    "fail_closed",
+    # Won rows whose post-write cleanup raised.
+    "cleanup_failed",
+    # Deferred cleanups a later bounded retry pass finished in full.
+    "cleanup_recovered",
+    # Retry passes that ran but still left at least one step owed.
+    "cleanup_retry_failed",
+)
+# The terminal cleanup one won row owes, in the order the apply runs it.
+# A deferred retry replays exactly the steps its own hash still owes, so
+# the step names are a closed set: a retry can never repeat a step that
+# already completed, and never invent one the apply does not run.
+BLOCK_CANDIDATE_COLLAPSE_CLEANUP_PAYOUT_STEP = "payout-preview-withdrawal"
+BLOCK_CANDIDATE_COLLAPSE_CLEANUP_FLOOR_STEP = "pending-share-floor"
+BLOCK_CANDIDATE_COLLAPSE_CLEANUP_STEPS = (
+    BLOCK_CANDIDATE_COLLAPSE_CLEANUP_PAYOUT_STEP,
+    "finalize-retry",
+    "retry-state",
+    "outstanding-and-tip-observation",
+    "terminal-outcome",
+    "abandonment-accounting",
+    BLOCK_CANDIDATE_COLLAPSE_CLEANUP_FLOOR_STEP,
+)
+# The per-row path abandons a candidate whose height was decided by another
+# block as a tip-moved stale job; the bulk path must land in the same
+# bounded reason/class buckets or the abandonment series splits in two.
+# ``share_submission`` imports this module, so its PRISM_REJECTION_STALE_JOB
+# is restated here rather than imported; a collapse test pins them equal.
+PRISM_BLOCK_CANDIDATE_COLLAPSE_REASON = "stale-job"
+PRISM_BLOCK_CANDIDATE_COLLAPSE_STALE_JOB_CLASS = "tip_moved"
+# A storm collapses thousands of rows in one apply. Logs stay bounded: at
+# most this many parent/job/reason groups are printed, each with at most
+# this many sample hashes, plus one remainder line.
+BLOCK_CANDIDATE_COLLAPSE_LOG_GROUPS = 8
+BLOCK_CANDIDATE_COLLAPSE_LOG_SAMPLE_HASHES = 3
+# A systemic cleanup fault would otherwise print one line and one
+# traceback per row of a storm-sized page; only the first few are
+# detailed and the rest are summarized by count.
+BLOCK_CANDIDATE_COLLAPSE_LOG_FAILURES = 3
+# A ledger or node that cannot answer the page-scope reads fails closed on
+# every poll. The counter still moves per row; the log line is rate limited
+# so a persistently degraded read cannot flood the journal.
+BLOCK_CANDIDATE_COLLAPSE_FAIL_CLOSED_LOG_SECONDS = 60.0
+# Chain-height probes one replay walk may spend on collapse, counted in
+# *distinct heights* rather than rows.
+#
+# The storm this path exists for is one decided height behind thousands of
+# rows, and it costs a single probe no matter how wide the page is. A page
+# whose rows span many heights is the opposite shape: selection would read
+# ``getblockhash`` (and then the occupant's ``getblockheader``) once per
+# distinct height, sequentially, on the sole block-submitter thread. A page
+# holds up to MAX_BLOCK_REPLAY_ENUMERATION_ROWS rows, so that is up to 1,024
+# heights and ~2,048 round trips; at a production RPC deadline the thread
+# would sit in collapse for hours while a live solve waited behind it for
+# submitblock. The bound makes the chain cost of a walk a constant --
+# at most this many ``getblockhash`` reads and at most one occupant header
+# each -- independent of how many rows or heights the backlog carries.
+#
+# Rows at a height the walk did not probe are simply never selected. They
+# stay durable, keep every piece of evidence they had, and are adopted by
+# the ordinary per-row disposition path, which disposed of them exactly this
+# way before collapse existed; a later walk starts with a fresh budget and
+# may probe their heights. Collapse is an optimisation over that path, so
+# spending less of it is always safe and never terminalizes anything.
+MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES = 8
+# PRISM records every network difficulty in scaled integer units: the
+# coordinator stamps a candidate's ``found_block.network_difficulty`` with
+# ``template_artifacts.scaled_network_difficulty(template["bits"])``, which is
+# ``pow_limit_target * 1_000_000 // template_target`` -- roughly the raw
+# Bitcoin-style difficulty multiplied by a million. The collapse selector
+# compares that stored value against the occupying block's work, so the
+# occupant has to be converted into the same units from the same inputs.
+# These restate the scale and the qbit powLimit rather than importing them
+# from ``template_artifacts`` (or ``public_api``): both sit above this module
+# in the import graph, and B1 must not grow an edge to the template/payout
+# layer for two constants. ``_collapse_scaled_difficulty`` reapplies the
+# formula, and a collapse test pins it equal to the production helper.
+COLLAPSE_DIFFICULTY_SCALE = 1_000_000
+COLLAPSE_POW_LIMIT_BITS = "207fffff"
+COLLAPSE_POW_LIMIT_TARGET = direct_stratum.target_from_compact_hex(
+    COLLAPSE_POW_LIMIT_BITS
+)
 
 
 def _pending_rows_accepts_cursor(pending_rows: Callable[..., Any]) -> bool:
@@ -126,6 +272,383 @@ def _block_replay_cursor_key(after_cursor: object | None) -> str | None:
     if after_cursor is None:
         return None
     return json.dumps(after_cursor, separators=(",", ":"), default=repr)
+
+
+def _collapse_block_hash(value: object) -> str | None:
+    """Normalize one block hash, or report it unusable.
+
+    Every collapse comparison is between hashes from three unrelated
+    sources -- a durable intent, a durable row key, and a qbitd RPC -- so
+    they are folded to one canonical spelling here. Anything that is not a
+    64-character hex string is unusable rather than merely differently
+    spelled, and its row is never selected.
+    """
+    if not isinstance(value, str):
+        return None
+    key = value.strip().lower()
+    if len(key) != 64:
+        return None
+    try:
+        int(key, 16)
+    except ValueError:
+        return None
+    return key
+
+
+def _block_candidate_hash_of(candidate: object) -> str | None:
+    """The canonical block hash one candidate object carries, if any."""
+    return _collapse_block_hash(
+        getattr(
+            getattr(candidate, "submission", None),
+            "block_hash_hex",
+            None,
+        )
+    )
+
+
+def _collapse_height(value: object) -> int | None:
+    """Parse one block height, rejecting booleans and inexact numbers.
+
+    ``bool`` is an ``int`` subclass, so a stray ``True`` would otherwise
+    parse as height 1 and compare against a real tip height.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        if not math.isfinite(value) or value != int(value):
+            return None
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip(), 10)
+        except ValueError:
+            return None
+    return None
+
+
+def _collapse_row_height(durable_row: object) -> int | None:
+    """The height one durable page row claims, or None when it states none.
+
+    The single place that knows where a fetched row records its height, so
+    the cheap pre-selection peek in ``_collapse_superseded_block_candidates``
+    and the decode in ``_superseded_candidate_row`` can never drift apart on
+    it. This is only a peek: it validates nothing beyond the parse, and every
+    fact it reads is re-read and cross-checked against the row's template by
+    the decode, which is what actually decides the row.
+    """
+    if not isinstance(durable_row, dict):
+        return None
+    intent = durable_row.get("candidate")
+    if not isinstance(intent, dict):
+        return None
+    return _collapse_height(intent.get("expected_height"))
+
+
+def _collapse_difficulty(value: object) -> int | float | None:
+    """Parse one stored work value, rejecting booleans and non-finite numbers.
+
+    A NaN compares false against every threshold, so an unparsed NaN would
+    silently answer "not enough work" (safe) or, inverted, "enough work"
+    (not safe). Rejecting it outright keeps the clause decidable.
+
+    An integral spelling is kept as an ``int`` rather than widened to
+    ``float``. PRISM stores ``found_block.network_difficulty`` as the scaled
+    *integer* ``scaled_network_difficulty`` returns, and above 2**53 a float
+    conversion rounds it -- often upwards, which would make a candidate look
+    strictly heavier than the identical work the chain reports and defeat
+    exactly the equal-work case clause 4b/5 has to accept. Python compares
+    ``int`` and ``float`` exactly, so a non-integral spelling stays usable
+    without dragging the integral ones through binary floating point.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    number: int | float
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, float):
+        number = value
+    elif isinstance(value, str):
+        text = value.strip()
+        try:
+            number = int(text, 10)
+        except ValueError:
+            try:
+                number = float(text)
+            except (OverflowError, ValueError):
+                return None
+    else:
+        return None
+    if isinstance(number, float) and not math.isfinite(number):
+        return None
+    if number <= 0:
+        return None
+    return number
+
+
+def _collapse_scaled_difficulty(bits: object) -> int | None:
+    """Convert one header's compact ``bits`` to PRISM-scaled difficulty units.
+
+    This is deliberately the same integer formula
+    ``template_artifacts.scaled_network_difficulty`` applies to the
+    template's bits when the coordinator stamps a candidate's
+    ``found_block.network_difficulty`` -- recomputed here from
+    ``direct_stratum`` rather than imported, because this module must not
+    grow an edge to the template/payout layer. Both sides of clause 4b/5
+    therefore land on the identical integer for identical work, with no
+    float rounding at the equality boundary the clause turns on.
+
+    Returns ``None`` for anything that is not an 8-character compact hex
+    string with a positive target, so a header missing ``bits``, or
+    carrying a malformed or zero one, fails its page closed instead of
+    being read as "no work".
+    """
+    if not isinstance(bits, str):
+        return None
+    compact = bits.strip().lower()
+    if len(compact) != 8 or any(char not in "0123456789abcdef" for char in compact):
+        return None
+    try:
+        target = direct_stratum.target_from_compact_hex(compact)
+    except ValueError:
+        return None
+    if target <= 0:
+        return None
+    return max(
+        1,
+        (COLLAPSE_POW_LIMIT_TARGET * COLLAPSE_DIFFICULTY_SCALE) // target,
+    )
+
+
+class _BlockCandidateCollapseFailedClosed(Exception):
+    """A page-scope chain read was unavailable or proved nothing.
+
+    Raised, not returned, because every caller's answer is the same: this
+    page selects nothing and every one of its rows is preserved for the
+    ordinary per-row path.
+    """
+
+
+@dataclass
+class _CollapsedCandidateCleanup:
+    """One terminal hash's outstanding cleanup, kept for a later retry.
+
+    After the fenced batch write the durable row is terminal, so the row is
+    partitioned out of the replay page and no later enumeration will ever
+    return it: a cleanup step that failed has no durable replay source and
+    would otherwise leave its in-memory state -- a payout preview or its
+    tombstone, a pending-share floor holder, an outstanding-hash marker --
+    installed for the process lifetime. This record is that replay source.
+
+    It holds no candidate object, no durable row, and no node submission,
+    so a deferred cleanup can only finish tearing state down; there is
+    nothing here to re-adopt or re-offer with. ``shares`` carries the exact
+    pending-share floor holders the apply resolved, because the floor keys
+    holders by object identity and the queues they were read from are
+    drained long before a retry runs. ``shares_resolved`` is false only
+    when the apply aborted before it could index them, in which case the
+    retry re-runs the (bounded, in-memory) scan itself.
+    """
+
+    block_hash: str
+    steps: frozenset[str]
+    shares: tuple[PendingShare, ...] = ()
+    shares_resolved: bool = True
+    attempts: int = 0
+    delay_seconds: float = 0.0
+    not_before_monotonic: float = 0.0
+
+
+@dataclass(frozen=True)
+class _SupersededCandidateRow:
+    """One durable pending row reduced to the facts predicate S reads."""
+
+    block_hash: str
+    parent_hash: str
+    height: int
+    # PRISM-scaled units (see COLLAPSE_DIFFICULTY_SCALE), as stamped by the
+    # coordinator. Comparable only against a chain-side work value converted
+    # into the same units by ``_collapse_scaled_difficulty``.
+    network_difficulty: int | float
+    job_id: str
+
+
+@dataclass
+class _CollapseHeightProbeBudget:
+    """Distinct chain heights a collapse walk may still read, and what it read.
+
+    One budget is created per replay walk and shared by that walk's pages,
+    so the walk's chain cost is the bound whether the backlog arrives as one
+    page or fifty. A pass handed no budget (a direct call, or the legacy
+    single-page shape) gets a fresh full one, which is the same ceiling
+    applied to a walk of one.
+
+    Only heights are charged. The occupant header a probed height leads to is
+    read at most once per probed height, so charging the height bounds both
+    round trips at once and keeps the accounting to the single number the
+    comment on MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES explains.
+
+    The two caches live here, beside the counter, for the same reason the
+    counter does: a walk that has paid for a height must not pay for it
+    again on its next page. Each page builds a fresh
+    ``_BlockCandidateChainView`` over this one budget, and a view that
+    cached its reads only for itself would recharge the walk for the same
+    height on every page -- so the one decided height behind a storm would
+    exhaust the budget after eight pages and defer the entire remainder of
+    the backlog. ``difficulty`` is keyed by block hash, whose work is
+    immutable, so sharing it can only remove round trips. Sharing ``active``
+    widens the window between a selection read and the write it feeds, which
+    is precisely the window the pre-write revalidation exists to close: that
+    pass builds its own budget, so its caches -- and therefore its chain
+    reads -- stay fresh and independent of this walk's.
+    """
+
+    remaining: int = MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES
+    # Height -> the active-chain block this walk read there.
+    active: dict[int, str] = field(default_factory=dict)
+    # Block hash -> its PRISM-scaled work, re-derived from its header bits.
+    difficulty: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def exhausted(self) -> bool:
+        return self.remaining <= 0
+
+    def spend(self) -> bool:
+        """Claim one height probe; False when the walk has none left."""
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
+
+
+class _BlockCandidateChainView:
+    """Bounded chain reads for one collapse pass.
+
+    The best tip is read once for the whole page and the active block at a
+    height once per distinct candidate height, so a 3,120-row storm at one
+    decided height costs a fixed handful of RPCs instead of one round trip
+    per row. Every miss or failure is a fail-closed page, never a guess.
+
+    A height-diverse page cannot turn "once per distinct height" into a walk
+    of the node as long as the page: ``probe_budget`` caps the distinct
+    heights this view will ever read, and a height past the cap is reported
+    as unprobed rather than guessed at.
+
+    "Once per distinct height" is a property of the *walk*, not of this
+    view. The caches are the budget's, so a page-two view over the same
+    budget already knows every height page one probed: a storm at one
+    decided height costs the walk one ``getblockhash`` and one
+    ``getblockheader`` however many pages it spans. Only the page-scope tip
+    reads are per view, which is what keeps each page's selection running
+    against a freshly read tip.
+    """
+
+    def __init__(
+        self,
+        service: "BlockCandidateService",
+        *,
+        probe_budget: _CollapseHeightProbeBudget | None = None,
+    ) -> None:
+        self._service = service
+        self._probe_budget = (
+            probe_budget
+            if probe_budget is not None
+            else _CollapseHeightProbeBudget()
+        )
+        self._active: dict[int, str] = self._probe_budget.active
+        self._difficulty: dict[str, int] = self._probe_budget.difficulty
+
+    def _call(self, method: str, params: list[object] | None = None) -> object:
+        coordinator = self._service._coordinator
+        coordinator._record_block_submitter_phase(f"replay-collapse-{method}")
+        try:
+            if params is None:
+                return coordinator.rpc.call(method)
+            return coordinator.rpc.call(method, params)
+        except Exception as exc:
+            raise _BlockCandidateCollapseFailedClosed(
+                f"{method} failed during candidate collapse: {exc}"
+            ) from exc
+        finally:
+            coordinator._record_block_submitter_phase(
+                f"replay-collapse-{method}:complete"
+            )
+
+    def best_tip(self) -> str:
+        tip = _collapse_block_hash(self._call("getbestblockhash"))
+        if tip is None:
+            raise _BlockCandidateCollapseFailedClosed(
+                "best tip hash is not a block hash"
+            )
+        return tip
+
+    def tip_height(self) -> int:
+        height = _collapse_height(self._call("getblockcount"))
+        if height is None or height < 0:
+            raise _BlockCandidateCollapseFailedClosed(
+                "best tip height is not an integer"
+            )
+        return height
+
+    def active_at(self, height: int) -> str | None:
+        """The active-chain block occupying ``height``, read once per height.
+
+        ``None`` means this walk has spent its height-probe budget and the
+        height was never read. It is not "no occupant" and it is not a
+        fail-closed read: it says only that the chain was never asked, so
+        every caller must preserve the row rather than decide anything about
+        it. A height this walk has already read is free -- on this page and
+        on every later page of the same walk -- and stays answerable after
+        the budget is gone.
+        """
+        cached = self._active.get(height)
+        if cached is not None:
+            return cached
+        if not self._probe_budget.spend():
+            return None
+        active = _collapse_block_hash(self._call("getblockhash", [int(height)]))
+        if active is None:
+            raise _BlockCandidateCollapseFailedClosed(
+                f"active block at height {height} is not a block hash"
+            )
+        self._active[height] = active
+        return active
+
+    def cached_difficulty(self, block_hash: str) -> int | None:
+        """The work this walk already read for a hash, without a new call."""
+        return self._difficulty.get(block_hash)
+
+    def difficulty_of(self, block_hash: str) -> int:
+        """One occupying block's work, in PRISM-scaled units, once per hash.
+
+        Read from the header's compact ``bits``, not its ``difficulty``
+        field. The candidate row this value is compared against carries
+        ``scaled_network_difficulty(template["bits"])`` -- the raw
+        difficulty times COLLAPSE_DIFFICULTY_SCALE -- while
+        ``getblockheader.difficulty`` is the raw float. Comparing the two
+        directly made an equal-work occupant read as a millionth of the
+        candidate's work, so clause 4b/5 rejected it and a decided height
+        never collapsed. Recomputing from bits with the production formula
+        puts both sides on the same integer scale, and keeping it integral
+        means the equal-work boundary the clause turns on is decided
+        exactly rather than by float comparison.
+        """
+        cached = self._difficulty.get(block_hash)
+        if cached is not None:
+            return cached
+        header = self._call("getblockheader", [block_hash])
+        if not isinstance(header, dict):
+            raise _BlockCandidateCollapseFailedClosed(
+                f"header for {block_hash} is not an object"
+            )
+        difficulty = _collapse_scaled_difficulty(header.get("bits"))
+        if difficulty is None:
+            raise _BlockCandidateCollapseFailedClosed(
+                f"header for {block_hash} carries no usable compact bits"
+            )
+        self._difficulty[block_hash] = difficulty
+        return difficulty
 
 
 @dataclass(frozen=True)
@@ -211,6 +734,17 @@ class _BlockCandidateAccountingTask:
     candidate: PrismBlockCandidate
     node_submission: _BlockCandidateNodeSubmission
     disposition_lease: _BlockCandidateDispositionLease
+    # Set by the accounting lane's own exception path once it has retained
+    # this task's candidate for retry while still holding the disposition.
+    # The loop's catch reads it so a candidate the lane retained is not
+    # retained (and counted) a second time, while a failure that fired
+    # before the lane could retain -- a delegate raising ahead of it -- is
+    # still retained there.
+    retained_for_retry: threading.Event = field(
+        default_factory=threading.Event,
+        compare=False,
+        repr=False,
+    )
 
 
 class BlockSubmitterDatabaseTimeout(TimeoutError):
@@ -498,7 +1032,9 @@ class BlockCandidateService:
         self._tip_observed_accepted_block_hashes: dict[str, float] = {}
         # Durable cleanup can fail after a terminal decision and force the
         # same hash through that decision again; abandonment metrics count
-        # candidates, not cleanup attempts.
+        # candidates, not cleanup attempts. Retired by the terminal-outcome
+        # eviction pass, which is the one place that has already proved a
+        # hash unpinned by every live and cleanup-owing lane.
         self._counted_block_candidate_abandonments: set[str] = set()
         self._block_submit_metrics_lock = threading.Lock()
         if submit_seconds_buckets is None:
@@ -513,6 +1049,22 @@ class BlockCandidateService:
             "count": 0,
         }
         self._block_replay_enumeration_owed_flag = False
+        # Fixed-key selector/apply outcome counters for the decided-height
+        # collapse. The key set is closed so the rendered series carries no
+        # block hash, parent hash, or job ID in a label.
+        self._block_candidate_collapse_counts: dict[str, int] = {
+            outcome: 0 for outcome in PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES
+        }
+        self._block_candidate_collapse_fail_closed_logged_monotonic: (
+            float | None
+        ) = None
+        # Terminal hashes whose collapse cleanup did not complete, keyed by
+        # hash so the backlog is bounded by the affected rows themselves and
+        # a repeated failure re-registers rather than accumulating.
+        self._block_candidate_collapse_cleanup_retries: dict[
+            str,
+            _CollapsedCandidateCleanup,
+        ] = {}
 
     # -- twelve historical field aliases -----------------------------------
 
@@ -748,6 +1300,1313 @@ class BlockCandidateService:
                 )
         return queued
 
+    # -- decided-height collapse (#183) ------------------------------------
+
+    def _ensure_block_candidate_collapse_state(self) -> None:
+        """Backfill the collapse counters and cleanup-retry registry."""
+        if hasattr(self, "_block_candidate_collapse_counts") and hasattr(
+            self,
+            "_block_candidate_collapse_cleanup_retries",
+        ):
+            return
+        with _STATE_BACKFILL_LOCK:
+            if not hasattr(self, "_block_candidate_collapse_counts"):
+                self._block_candidate_collapse_counts: dict[str, int] = {
+                    outcome: 0
+                    for outcome in PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES
+                }
+            if not hasattr(self, "_block_candidate_collapse_cleanup_retries"):
+                self._block_candidate_collapse_cleanup_retries: dict[
+                    str,
+                    _CollapsedCandidateCleanup,
+                ] = {}
+
+    def _record_block_candidate_collapse(
+        self,
+        outcome: str,
+        count: int = 1,
+    ) -> None:
+        if outcome not in PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES:
+            raise ValueError(
+                f"unknown block candidate collapse outcome: {outcome}"
+            )
+        if count <= 0:
+            return
+        self._ensure_block_candidate_collapse_state()
+        with self._coordinator.lock:
+            counts = self._block_candidate_collapse_counts
+            counts[outcome] = int(counts.get(outcome, 0)) + int(count)
+
+    def block_candidate_collapse_snapshot(self) -> dict[str, int]:
+        """Copied fixed-key collapse counters for metrics rendering.
+
+        The key set is closed and carries no hash, parent, or job ID, so the
+        renderer can label by outcome without any unbounded label space.
+        """
+        self._ensure_block_candidate_collapse_state()
+        with self._coordinator.lock:
+            counts = dict(self._block_candidate_collapse_counts)
+        return {
+            outcome: int(counts.get(outcome, 0))
+            for outcome in PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES
+        }
+
+    def _block_candidate_collapse_evidence(
+        self,
+        hashes: Iterable[object],
+        *,
+        ignore_leases: frozenset[str] = frozenset(),
+    ) -> frozenset[str]:
+        """Which of ``hashes`` some evidence says were offered to qbitd, or are being.
+
+        Answers membership for the hashes the caller is actually deciding --
+        one durable page during selection, the leased subset during
+        revalidation -- instead of materializing the union of every registry.
+        The registries this reads are not all page-sized:
+        ``_block_candidate_terminal_outcomes`` is historical state that grows
+        with every block the process ever disposed (312,000 entries after one
+        testnet4 storm), and copying it per poll cost ~124 ms with
+        ``coordinator.lock`` held against every unrelated share ack. Probing
+        the page's own hashes keeps the cost O(page * registries) and makes
+        it independent of how much disposition history has accumulated.
+
+        Deliberately excludes ``_outstanding_block_candidate_hashes`` and
+        ``_block_replay_inflight_hashes``. Both mean "this process still owns
+        eventual disposition", not "a node offer happened": live admission
+        marks a candidate outstanding before it even reaches the bounded
+        queue, and replay adoption marks every restored row inflight, so
+        folding either one in excludes an entire storm and makes the whole
+        selector a safe no-op. ``attempt_count`` is excluded for the mirror
+        reason: it is stamped only *after* the node offer, so at the instant
+        that matters it proves nothing.
+
+        ``ignore_leases`` lets the pre-write revalidation re-read this
+        evidence without the apply's own disposition leases disqualifying
+        the very rows they were claimed for.
+
+        Every registry read here is keyed by the canonical lowercase hash the
+        rest of the submitter compares on -- the same spelling
+        ``_collapse_block_hash`` folds a page row to -- which is what lets a
+        membership probe replace the old lowercasing walk without changing
+        which hashes count as evidence.
+        """
+        coordinator = self._coordinator
+        coordinator._ensure_job_cache_state()
+        self._ensure_block_candidate_disposition_state()
+        probes: set[str] = set()
+        for value in hashes:
+            key = _collapse_block_hash(value)
+            if key is not None:
+                probes.add(key)
+        if not probes:
+            return frozenset()
+        evidence: set[str] = set()
+        with self._block_submitter_lock(
+            self._block_candidate_disposition_registry_lock,
+            "candidate-disposition-registry",
+        ):
+            flights = self._block_candidate_disposition_flights
+            evidence.update(
+                key
+                for key in probes
+                if key in flights and key not in ignore_leases
+            )
+        with coordinator.lock:
+            for holder in (
+                self.retry_candidate,
+                getattr(self, "_block_accounting_deferred_retry_candidate", None),
+            ):
+                if holder is None:
+                    continue
+                held = _collapse_block_hash(
+                    getattr(
+                        getattr(holder, "submission", None),
+                        "block_hash_hex",
+                        None,
+                    )
+                )
+                if held is not None and held in probes:
+                    evidence.add(held)
+            for registry in (
+                self._block_disposition_waiting_retries,
+                self.finalize_retries,
+                getattr(self, "_block_candidate_retained_node_submissions", None),
+                self._tip_observed_accepted_block_hashes,
+                getattr(coordinator, "_accounted_accepted_block_hashes", None),
+                self._block_candidate_terminal_outcomes,
+            ):
+                if not registry:
+                    continue
+                evidence.update(key for key in probes if key in registry)
+        return frozenset(evidence)
+
+    def _collapse_pool_block_exists(self, durable_row: object) -> bool:
+        """Read one row's durable pool-block fact, or fail the page closed.
+
+        A missing key is not "no pool block": it is a page that cannot
+        answer the one fact keeping an offered, landed candidate out of a
+        terminal set. Reading it as false would abandon exactly the rows
+        that must never be abandoned, so the whole page fails closed. The
+        fenced batch write re-asks under the writer fence regardless.
+        """
+        if (
+            not isinstance(durable_row, dict)
+            or "pool_block_exists" not in durable_row
+        ):
+            raise _BlockCandidateCollapseFailedClosed(
+                "durable page row carries no pool block existence fact"
+            )
+        exists = durable_row["pool_block_exists"]
+        if not isinstance(exists, bool):
+            raise _BlockCandidateCollapseFailedClosed(
+                "durable page row pool block existence is not a boolean"
+            )
+        return exists
+
+    def _superseded_candidate_row(
+        self,
+        durable_row: object,
+    ) -> _SupersededCandidateRow:
+        """Reduce one page row to S's inputs, or fail its page closed.
+
+        The preserved page still reaches ordinary decode/quarantine, but no
+        sibling may be terminalized from a snapshot containing a malformed
+        candidate fact.
+        """
+        if not isinstance(durable_row, dict):
+            raise _BlockCandidateCollapseFailedClosed(
+                "durable candidate row is not an object"
+            )
+        block_hash = _collapse_block_hash(durable_row.get("block_hash"))
+        intent = durable_row.get("candidate")
+        if block_hash is None or not isinstance(intent, dict):
+            raise _BlockCandidateCollapseFailedClosed(
+                "durable candidate row carries no usable hash or intent"
+            )
+        if _collapse_block_hash(intent.get("block_hash_hex")) != block_hash:
+            raise _BlockCandidateCollapseFailedClosed(
+                "durable candidate row key does not match its intent"
+            )
+        parent_hash = _collapse_block_hash(intent.get("parent_hash"))
+        height = _collapse_row_height(durable_row)
+        if parent_hash is None or height is None or height < 0:
+            raise _BlockCandidateCollapseFailedClosed(
+                "durable candidate intent carries no usable parent or height"
+            )
+        template = intent.get("template")
+        if not isinstance(template, dict):
+            raise _BlockCandidateCollapseFailedClosed(
+                "durable candidate intent carries no template"
+            )
+        # The decode path refuses an intent whose template disagrees with
+        # its own parent/height fields. Reading either half of a
+        # disagreeing pair here would compare the chain against a fact the
+        # candidate does not actually carry.
+        if _collapse_block_hash(template.get("previousblockhash")) != parent_hash:
+            raise _BlockCandidateCollapseFailedClosed(
+                "durable candidate template parent disagrees with its intent"
+            )
+        if _collapse_height(template.get("height")) != height:
+            raise _BlockCandidateCollapseFailedClosed(
+                "durable candidate template height disagrees with its intent"
+            )
+        found_block = intent.get("found_block")
+        if not isinstance(found_block, dict):
+            raise _BlockCandidateCollapseFailedClosed(
+                "durable candidate intent carries no found-block facts"
+            )
+        # PRISM-scaled units; see COLLAPSE_DIFFICULTY_SCALE and
+        # _BlockCandidateChainView.difficulty_of for the chain-side half of
+        # the comparison this feeds.
+        network_difficulty = _collapse_difficulty(
+            found_block.get("network_difficulty")
+        )
+        if network_difficulty is None:
+            raise _BlockCandidateCollapseFailedClosed(
+                "durable candidate intent carries no usable network difficulty"
+            )
+        pending_share = intent.get("pending_share")
+        job_id = (
+            str(pending_share.get("job_id", ""))
+            if isinstance(pending_share, dict)
+            else ""
+        )
+        return _SupersededCandidateRow(
+            block_hash=block_hash,
+            parent_hash=parent_hash,
+            height=height,
+            network_difficulty=network_difficulty,
+            job_id=job_id,
+        )
+
+    def _select_superseded_block_candidates(
+        self,
+        durable_rows: list[Any],
+        chain: _BlockCandidateChainView,
+    ) -> list[_SupersededCandidateRow]:
+        """Apply predicate S to one fetched page of durable pending rows.
+
+        Every clause is conjunctive and every unknown is a rejection. The
+        chain view bounds the cost: one best-tip and one tip-height read for
+        the page, one active-block and one header read per distinct
+        candidate height, and at most
+        MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES distinct heights for the
+        whole walk. A row whose height the walk cannot afford to probe is
+        counted and skipped, which preserves it for the per-row path exactly
+        as any other rejected clause does.
+        """
+        # Clause 2 is read first, for the whole page, before a single chain
+        # round trip: a page that cannot answer it selects nothing at all,
+        # and a ledger whose page reader never carries the fact (a
+        # compatibility intent-only reader) must not spend a tip read per
+        # poll to discover that again. The list is page-bounded.
+        pool_block_facts = [
+            self._collapse_pool_block_exists(durable_row)
+            for durable_row in durable_rows
+        ]
+        # Evidence is asked about this page's hashes only. A malformed row
+        # contributes no probe and is failed closed by
+        # ``_superseded_candidate_row`` below regardless; every row that
+        # survives that decode carries the row key probed here, because the
+        # decode refuses an intent whose hash disagrees with it.
+        evidence = self._block_candidate_collapse_evidence(
+            durable_row.get("block_hash")
+            for durable_row in durable_rows
+            if isinstance(durable_row, dict)
+        )
+        tip = chain.best_tip()
+        tip_height = chain.tip_height()
+        selected: list[_SupersededCandidateRow] = []
+        seen: set[str] = set()
+        height_deferred = 0
+        for pool_block_exists, durable_row in zip(pool_block_facts, durable_rows):
+            row = self._superseded_candidate_row(durable_row)
+            if row.block_hash in seen:
+                continue
+            seen.add(row.block_hash)
+            if pool_block_exists:
+                continue
+            if row.block_hash in evidence:
+                continue
+            # Clause 3: a candidate building on the current best tip is the
+            # next block, not a superseded sibling.
+            if row.parent_hash == tip:
+                continue
+            # Clause 4: only a height the chain has already decided, decided
+            # by somebody else.
+            if row.height > tip_height:
+                continue
+            active = chain.active_at(row.height)
+            if active is None:
+                # The walk has spent its bounded height probes. Nothing is
+                # known about this height, so nothing may be concluded about
+                # this row: it stays durable, keeps its evidence, and reaches
+                # the per-row path this pass and the next walk's collapse
+                # after that.
+                height_deferred += 1
+                continue
+            if active == row.block_hash:
+                continue
+            # Clause 4b/5: a lower-work occupant is not a decision. The
+            # per-row path can still reorg a heavier sibling into the chain,
+            # and a terminal batch write would destroy that block. Both
+            # sides are PRISM-scaled integers: the row as the coordinator
+            # stamped it, the occupant as re-derived from its header bits.
+            if chain.difficulty_of(active) < row.network_difficulty:
+                continue
+            selected.append(row)
+        self._record_block_candidate_collapse("height_deferred", height_deferred)
+        return selected
+
+    def _revalidate_superseded_block_candidates(
+        self,
+        leased: list[_SupersededCandidateRow],
+        chain: _BlockCandidateChainView,
+    ) -> tuple[list[_SupersededCandidateRow], str]:
+        """Re-read the chain under the held leases, immediately before the write.
+
+        Selection ran before any lease existed, so a selected candidate
+        could have been offered, accepted, and become the active block in
+        the gap. Re-reading the best tip and each retained height's occupant
+        with the leases held closes it: nothing else can drive this hash
+        through a node offer while the lease is ours, and the fenced write
+        is the very next thing that happens.
+
+        The occupant's header is re-read only when the occupying hash
+        changed; an unchanged occupant keeps the work value this walk
+        already read for that hash, so the steady case adds no header round
+        trip.
+        """
+        # Budgeted for exactly the heights selection already probed and no
+        # more. The leased set is a subset of one bounded selection, so this
+        # can never refuse a re-read the write depends on, and it cannot draw
+        # on the walk's budget either -- the walk's remaining probes are for
+        # pages this apply has not seen. A budget of its own is a cache of
+        # its own as well: the walk's active-height reads, which may have
+        # been made pages ago, are never reused here, so every leased height
+        # is genuinely re-read from the chain under the held leases.
+        fresh = _BlockCandidateChainView(
+            self,
+            probe_budget=_CollapseHeightProbeBudget(
+                remaining=len({row.height for row in leased}),
+            ),
+        )
+        tip = fresh.best_tip()
+        leased_hashes = frozenset(row.block_hash for row in leased)
+        evidence = self._block_candidate_collapse_evidence(
+            leased_hashes,
+            ignore_leases=leased_hashes,
+        )
+        qualified: list[_SupersededCandidateRow] = []
+        for row in leased:
+            if row.block_hash in evidence:
+                continue
+            if row.parent_hash == tip or row.block_hash == tip:
+                continue
+            # An occupied height is by construction at or below the tip, so
+            # this read subsumes the height bound as well as clause 4b.
+            active = fresh.active_at(row.height)
+            if active is None or active == row.block_hash:
+                # Unreachable while the budget above matches the leased
+                # heights, and a drop either way: an unprobed height is a row
+                # this write must not carry.
+                continue
+            # Same clause, same units as selection: a cache hit reuses the
+            # scaled integer that pass derived, and a changed occupant is
+            # re-derived from its own header bits rather than compared as a
+            # raw float against the row's scaled value.
+            difficulty = chain.cached_difficulty(active)
+            if difficulty is None:
+                difficulty = fresh.difficulty_of(active)
+            if difficulty < row.network_difficulty:
+                continue
+            qualified.append(row)
+        return qualified, tip
+
+    def _note_block_candidate_collapse_fail_closed(
+        self,
+        rows: int,
+        detail: object,
+    ) -> bool:
+        """Count a fail-closed page and log it at a bounded rate.
+
+        Returns whether this occasion logged, so a caller holding an
+        exception can attach its traceback under the same rate limit
+        instead of flooding a persistently degraded read.
+        """
+        self._record_block_candidate_collapse("fail_closed", rows)
+        now = time.monotonic()
+        with self._coordinator.lock:
+            last = getattr(
+                self,
+                "_block_candidate_collapse_fail_closed_logged_monotonic",
+                None,
+            )
+            due = (
+                last is None
+                or (now - float(last))
+                >= BLOCK_CANDIDATE_COLLAPSE_FAIL_CLOSED_LOG_SECONDS
+            )
+            if due:
+                self._block_candidate_collapse_fail_closed_logged_monotonic = now
+        if due:
+            print(
+                "prism coordinator: superseded block candidate collapse failed "
+                f"closed rows={rows}: {detail}; every row keeps the per-row "
+                "path",
+                flush=True,
+            )
+        return due
+
+    def _collapsed_candidate_floor_holders(
+        self,
+        abandoned: Iterable[str],
+    ) -> dict[str, list[PrismBlockCandidate]]:
+        """Index the in-memory candidate objects owning each collapsed hash.
+
+        The pending-share floor keys holders by object identity, so only the
+        exact object a lane is holding may be released and never a same-hash
+        sibling's. A durable row that was never adopted owns no object and
+        no holder, and none is invented for it: decoding one just to release
+        it would adopt a fresh floor holder in order to drop it.
+        """
+        wanted = frozenset(abandoned)
+        holders: dict[str, list[PrismBlockCandidate]] = {}
+        if not wanted:
+            return holders
+        self._ensure_block_replay_state()
+        for queue_obj in (
+            self.candidate_queue,
+            self._block_replay_candidate_queue,
+        ):
+            if queue_obj is None:
+                continue
+            with queue_obj.mutex:
+                queued = list(queue_obj.queue)
+            for item in queued:
+                key = _collapse_block_hash(
+                    getattr(
+                        getattr(item, "submission", None),
+                        "block_hash_hex",
+                        None,
+                    )
+                )
+                if key in wanted:
+                    holders.setdefault(key, []).append(item)
+        return holders
+
+    def _run_collapsed_candidate_cleanup_steps(
+        self,
+        abandoned: tuple[str, ...],
+        *,
+        owed: dict[str, frozenset[str]],
+        shares: dict[str, tuple[PendingShare, ...]] | None = None,
+    ) -> tuple[dict[str, frozenset[str]], dict[str, tuple[PendingShare, ...]]]:
+        """Run each hash's owed cleanup steps and report what it still owes.
+
+        Every step is idempotent and independently guarded, so a hash whose
+        step raises cannot strand the rest of the page mid-way, and a step
+        the caller does not list is simply not run -- which is what lets a
+        deferred retry replay only the remainder.
+
+        Returns the still-owed steps per hash (absent means fully clean) and
+        the floor holders this pass resolved, so a caller that has to defer
+        the remainder keeps the exact holder objects it would otherwise lose
+        when the queues drain.
+        """
+        coordinator = self._coordinator
+        coordinator._record_block_submitter_phase("replay-collapse-cleanup")
+        remaining: dict[str, set[str]] = {}
+        detailed_failures = 0
+
+        def note_failure(block_hash: str, step: str) -> None:
+            nonlocal detailed_failures
+            detailed = detailed_failures < BLOCK_CANDIDATE_COLLAPSE_LOG_FAILURES
+            remaining.setdefault(block_hash, set()).add(step)
+            if not detailed:
+                return
+            detailed_failures += 1
+            print(
+                "prism coordinator: collapsed block candidate cleanup failed "
+                f"step={step} hash={block_hash}",
+                flush=True,
+            )
+            traceback.print_exc()
+
+        # One outer acquisition for the whole page. Each withdrawal takes
+        # this lock anyway (it is re-entrant); acquiring it per hash would
+        # hand a storm-sized page thousands of chances to interleave with
+        # descendant payout work between two halves of one hash's cleanup.
+        with self._block_submitter_lock(
+            coordinator._payout_balance_mutation_lock,
+            "payout-balance-mutation",
+        ):
+            for block_hash in abandoned:
+                if (
+                    BLOCK_CANDIDATE_COLLAPSE_CLEANUP_PAYOUT_STEP
+                    not in owed.get(block_hash, frozenset())
+                ):
+                    continue
+                try:
+                    # Withdraw with published invalidation, then drop the
+                    # tombstone: the durable row is already terminal, so no
+                    # replay source is left for the tombstone to fence, and
+                    # a retained one is exactly the preview wait storm this
+                    # collapse exists to end.
+                    coordinator._clear_accepted_block_payout_preview(
+                        block_hash,
+                        invalidate_published=True,
+                    )
+                    coordinator._clear_accepted_block_payout_preview(block_hash)
+                except Exception:
+                    note_failure(
+                        block_hash,
+                        BLOCK_CANDIDATE_COLLAPSE_CLEANUP_PAYOUT_STEP,
+                    )
+        outcome = SimpleNamespace(
+            reason=PRISM_BLOCK_CANDIDATE_COLLAPSE_REASON,
+            stale_job_class=PRISM_BLOCK_CANDIDATE_COLLAPSE_STALE_JOB_CLASS,
+        )
+        if shares is None:
+            # Unguarded on purpose: a page-scope indexing fault proves
+            # nothing about any hash's remaining steps, so the caller must
+            # see it as an abort and defer the whole won set.
+            shares = {
+                block_hash: tuple(
+                    candidate.pending_share for candidate in candidates
+                )
+                for block_hash, candidates in (
+                    self._collapsed_candidate_floor_holders(abandoned).items()
+                )
+            }
+        for block_hash in abandoned:
+            steps = owed.get(block_hash, frozenset())
+
+            def run_step(step: str, action: Callable[[], None]) -> None:
+                if step not in steps:
+                    return
+                try:
+                    action()
+                except Exception:
+                    note_failure(block_hash, step)
+
+            def clear_finalize_retry() -> None:
+                with coordinator.lock:
+                    self.finalize_retries.pop(block_hash, None)
+
+            run_step("finalize-retry", clear_finalize_retry)
+            run_step(
+                "retry-state",
+                lambda: coordinator._clear_block_candidate_retry_state(block_hash),
+            )
+            # Stops matching tip observations and drops the tip observation
+            # stamp in the same critical section.
+            run_step(
+                "outstanding-and-tip-observation",
+                lambda: coordinator._discard_outstanding_block_candidate(block_hash),
+            )
+            # Also drops the fast-lane reservation, replay-inflight marker,
+            # and any parked same-hash retry object's own floor holder.
+            run_step(
+                "terminal-outcome",
+                lambda: coordinator._record_block_candidate_terminal_outcome(
+                    block_hash,
+                    accepted=False,
+                ),
+            )
+            run_step(
+                "abandonment-accounting",
+                lambda: coordinator._record_committed_block_candidate_abandonment(
+                    block_hash,
+                    outcome,
+                ),
+            )
+            for pending_share in shares.get(block_hash, ()):
+                run_step(
+                    BLOCK_CANDIDATE_COLLAPSE_CLEANUP_FLOOR_STEP,
+                    lambda pending_share=pending_share: (
+                        coordinator._finish_pending_share_commit(pending_share)
+                    ),
+                )
+        return (
+            {
+                block_hash: frozenset(steps)
+                for block_hash, steps in remaining.items()
+            },
+            shares,
+        )
+
+    def _publish_collapsed_candidate_terminal_fence(
+        self,
+        abandoned: Iterable[str],
+    ) -> None:
+        """Fence every won hash from node submission before any cleanup runs.
+
+        The fenced batch write is the moment a row becomes durably terminal,
+        and the ``terminal-outcome`` cleanup step is what normally publishes
+        that fact in memory. That step can fail, or a page-level abort can
+        stop the pass before it -- and the failure leaves the hash in the
+        cleanup-retry registry while a same-hash candidate may still be
+        sitting in the live, replay, retry, or waiting lane. Once the apply
+        releases its disposition lease that candidate is dequeued, finds no
+        terminal outcome, and offers a durably abandoned block to the node.
+
+        Publishing the outcome here closes that window with the fence the
+        rest of the submitter already honours. The apply holds every won
+        hash's disposition lease from before the write until after this
+        call, so no same-hash lane can be inside its own guarded region
+        while this runs, and none can enter one afterwards without seeing
+        the fence. It is a lock-guarded assignment into a dict the
+        disposition state already owns: no durable read or write, no queue
+        admission, and nothing that could re-adopt or re-offer a row.
+
+        The full ``terminal-outcome`` step still runs in cleanup for its
+        other side effects -- the fast-lane reservation, the replay-inflight
+        marker, and the parked same-hash retry's own floor holder -- and
+        remains owed, and retried, whenever it fails.
+
+        Contained so it cannot raise: this sits between a won write and the
+        page partition, and an exception escaping here would fail the page
+        open and replay-adopt rows whose durable outbox entries are gone.
+        """
+        try:
+            self._ensure_block_candidate_disposition_state()
+            published: set[str] = set()
+            with self._coordinator.lock:
+                outcomes = self._block_candidate_terminal_outcomes
+                for block_hash in abandoned:
+                    self._stamp_block_candidate_terminal_outcome(
+                        outcomes,
+                        block_hash,
+                        False,
+                    )
+                    published.add(block_hash)
+                self._bound_block_candidate_terminal_outcomes(
+                    frozenset(published)
+                )
+        except Exception:
+            # Degrades to the pre-publication behaviour: the cleanup step
+            # still owes the outcome and the retry registry still carries it.
+            print(
+                "prism coordinator: collapsed block candidate terminal fence "
+                "could not be published",
+                flush=True,
+            )
+            traceback.print_exc()
+
+    def _clean_up_collapsed_block_candidates(
+        self,
+        abandoned: tuple[str, ...],
+    ) -> frozenset[str]:
+        """Mirror per-row terminal abandonment cleanup for the rows we won.
+
+        Driven by the hashes the fenced write returned, never by the hashes
+        it was asked about: a requested-but-absent row was won by somebody
+        else (or already terminal), and running this cleanup for it would
+        discard state its real owner still needs.
+
+        Returns the hashes whose cleanup did not complete. The apply owns
+        the ``cleanup_failed`` accounting for the whole page: counting a
+        contained failure here and a later page-level abort there would
+        report one affected hash twice. Each of those hashes keeps its
+        still-owed steps in the cleanup-retry registry, because its durable
+        row is terminal and no enumeration will ever hand it back. Their
+        terminal fence is already published by the apply, so a step this
+        pass leaves owed can never leave one of them offerable to the node.
+        """
+        every_step = frozenset(BLOCK_CANDIDATE_COLLAPSE_CLEANUP_STEPS)
+        remaining, shares = self._run_collapsed_candidate_cleanup_steps(
+            abandoned,
+            owed={block_hash: every_step for block_hash in abandoned},
+        )
+        for block_hash in abandoned:
+            owed = remaining.get(block_hash)
+            if owed:
+                self._defer_collapsed_candidate_cleanup(
+                    block_hash,
+                    owed,
+                    shares=shares.get(block_hash, ()),
+                )
+            else:
+                # A hash the fenced write can only win once, but a direct
+                # caller may repeat the cleanup; a completed pass discharges
+                # whatever an earlier one left owed.
+                self._discharge_collapsed_candidate_cleanup(block_hash)
+        if remaining:
+            print(
+                "prism coordinator: collapsed block candidate cleanup failed "
+                f"rows={len(remaining)} of {len(abandoned)}; their durable rows "
+                "are already terminal and their cleanup is retried",
+                flush=True,
+            )
+        return frozenset(remaining)
+
+    # -- deferred cleanup retry --------------------------------------------
+
+    def _collapsed_candidate_cleanup_registry(
+        self,
+    ) -> dict[str, _CollapsedCandidateCleanup]:
+        self._ensure_block_candidate_collapse_state()
+        return self._block_candidate_collapse_cleanup_retries
+
+    def _defer_collapsed_candidate_cleanup(
+        self,
+        block_hash: str,
+        steps: Iterable[str],
+        *,
+        shares: Iterable[PendingShare] = (),
+        shares_resolved: bool = True,
+    ) -> None:
+        """Keep one terminal hash's owed cleanup steps for a later retry.
+
+        Contained so it cannot raise: the apply's abort path calls this on
+        its way to returning the won set, and an exception escaping there
+        would fail the whole page closed and replay-adopt rows whose durable
+        outbox entries are already gone.
+        """
+        try:
+            owed = frozenset(steps).intersection(
+                BLOCK_CANDIDATE_COLLAPSE_CLEANUP_STEPS
+            )
+            if not owed:
+                return
+            registry = self._collapsed_candidate_cleanup_registry()
+            now = time.monotonic()
+            with self._coordinator.lock:
+                record = registry.pop(block_hash, None)
+                if record is None:
+                    record = _CollapsedCandidateCleanup(
+                        block_hash=block_hash,
+                        steps=owed,
+                        shares=tuple(shares),
+                        shares_resolved=bool(shares_resolved),
+                        delay_seconds=max(0.0, float(self.retry_initial_seconds)),
+                        # The first attempt is due immediately; only a failed
+                        # attempt starts the backoff.
+                        not_before_monotonic=now,
+                    )
+                else:
+                    # The floor keys holders by object identity, so merge by
+                    # identity rather than by value: two reconstructed shares
+                    # for one hash are two distinct holders.
+                    by_identity = {id(share): share for share in record.shares}
+                    for share in shares:
+                        by_identity.setdefault(id(share), share)
+                    record.steps = record.steps | owed
+                    record.shares = tuple(by_identity.values())
+                    record.shares_resolved = record.shares_resolved and bool(
+                        shares_resolved
+                    )
+                    record.not_before_monotonic = min(
+                        record.not_before_monotonic,
+                        now,
+                    )
+                # Re-inserted at the tail so a storm-sized backlog is retried
+                # round-robin instead of starving behind its oldest entry.
+                registry[block_hash] = record
+        except Exception:
+            print(
+                "prism coordinator: collapsed block candidate cleanup could "
+                f"not be deferred hash={block_hash}",
+                flush=True,
+            )
+            traceback.print_exc()
+
+    def _discharge_collapsed_candidate_cleanup(self, block_hash: str) -> bool:
+        """Drop one hash's retry record; True when one was still owed."""
+        registry = self._collapsed_candidate_cleanup_registry()
+        with self._coordinator.lock:
+            return registry.pop(block_hash, None) is not None
+
+    def collapsed_candidate_cleanup_backlog(self) -> dict[str, frozenset[str]]:
+        """The cleanup steps each terminal hash still owes (diagnostics)."""
+        registry = self._collapsed_candidate_cleanup_registry()
+        with self._coordinator.lock:
+            return {
+                block_hash: record.steps
+                for block_hash, record in registry.items()
+            }
+
+    def _run_one_collapsed_block_candidate_cleanup_retry(self) -> bool:
+        """Retry one deferred collapse cleanup; True when one was attempted.
+
+        Driven from the accounting lane, because a terminal hash's cleanup
+        is accounting work and the durable row behind it is already gone.
+        The lane offers it two ways: immediately whenever the lane is truly
+        idle, and otherwise on an explicit cadence after at most
+        ``_block_accounting_cleanup_retry_work_items()`` completed work
+        items, so neither sustained accounting traffic nor a continuously
+        replenished quarantine queue can starve a due record. The pass is
+        bounded three ways: at most one hash per call, only that hash's
+        still-owed steps, and only once its own backoff deadline has passed.
+        It never reads or writes the outbox and never enqueues a candidate,
+        so it can only finish tearing state down -- a terminal row can be
+        neither re-adopted nor re-offered from here.
+        """
+        registry = self._collapsed_candidate_cleanup_registry()
+        now = time.monotonic()
+        with self._coordinator.lock:
+            due: _CollapsedCandidateCleanup | None = None
+            for record in registry.values():
+                if record.not_before_monotonic <= now:
+                    due = record
+                    break
+            if due is None:
+                return False
+            # Taken out of the registry for the duration of the attempt so a
+            # second lane cannot run the same hash's steps concurrently;
+            # whatever it still owes afterwards is re-registered below.
+            registry.pop(due.block_hash, None)
+            due.attempts += 1
+        self._coordinator._record_block_submitter_phase(
+            "replay-collapse-cleanup-retry"
+        )
+        block_hash = due.block_hash
+        owed = due.steps
+        shares = due.shares
+        shares_resolved = due.shares_resolved
+        if (
+            BLOCK_CANDIDATE_COLLAPSE_CLEANUP_FLOOR_STEP in owed
+            and not shares_resolved
+        ):
+            # The apply aborted before it could index the floor holders. The
+            # scan reads only the in-memory queues, so repeating it is cheap
+            # and safe; a candidate already dropped from them released its
+            # own holder on the way out.
+            try:
+                holders = self._collapsed_candidate_floor_holders((block_hash,))
+            except Exception:
+                print(
+                    "prism coordinator: collapsed block candidate cleanup "
+                    f"retry could not index floor holders hash={block_hash}",
+                    flush=True,
+                )
+                traceback.print_exc()
+                self._record_block_candidate_collapse("cleanup_retry_failed")
+                self._reschedule_collapsed_candidate_cleanup(
+                    due,
+                    owed,
+                    shares=shares,
+                    shares_resolved=False,
+                )
+                return True
+            by_identity = {id(share): share for share in shares}
+            for candidate in holders.get(block_hash, ()):
+                by_identity.setdefault(
+                    id(candidate.pending_share),
+                    candidate.pending_share,
+                )
+            shares = tuple(by_identity.values())
+            shares_resolved = True
+        try:
+            remaining, _shares = self._run_collapsed_candidate_cleanup_steps(
+                (block_hash,),
+                owed={block_hash: owed},
+                shares={block_hash: shares},
+            )
+            still_owed = remaining.get(block_hash, frozenset())
+        except Exception:
+            # Same reasoning as the apply's abort: a pass that died proves
+            # nothing about the steps it skipped, so the hash owes them all
+            # again.
+            print(
+                "prism coordinator: collapsed block candidate cleanup retry "
+                f"aborted hash={block_hash}",
+                flush=True,
+            )
+            traceback.print_exc()
+            still_owed = owed
+        if still_owed:
+            self._record_block_candidate_collapse("cleanup_retry_failed")
+            self._reschedule_collapsed_candidate_cleanup(
+                due,
+                still_owed,
+                shares=shares,
+                shares_resolved=shares_resolved,
+            )
+            return True
+        # Counted once per hash: the record is gone, so no later pass can
+        # report the same recovery twice, and the series can never exceed
+        # the cleanup_failed set that created these records.
+        self._record_block_candidate_collapse("cleanup_recovered")
+        print(
+            "prism coordinator: collapsed block candidate cleanup recovered "
+            f"hash={block_hash} attempts={due.attempts}",
+            flush=True,
+        )
+        return True
+
+    def _reschedule_collapsed_candidate_cleanup(
+        self,
+        record: _CollapsedCandidateCleanup,
+        steps: Iterable[str],
+        *,
+        shares: Iterable[PendingShare],
+        shares_resolved: bool,
+    ) -> None:
+        """Re-register a retried hash behind its own doubled backoff.
+
+        The pacing mirrors ``next_retry_delay``: the configured candidate
+        retry backoff, doubled per attempt and capped, so a systemically
+        broken cleanup cannot spin the accounting lane while a transient one
+        still recovers on its next tick.
+        """
+        initial = max(0.0, float(self.retry_initial_seconds))
+        maximum = max(initial, float(self.retry_max_seconds))
+        delay = min(maximum, max(initial, float(record.delay_seconds) * 2))
+        self._defer_collapsed_candidate_cleanup(
+            record.block_hash,
+            steps,
+            shares=shares,
+            shares_resolved=shares_resolved,
+        )
+        registry = self._collapsed_candidate_cleanup_registry()
+        with self._coordinator.lock:
+            rescheduled = registry.get(record.block_hash)
+            if rescheduled is None:
+                return
+            rescheduled.attempts = max(rescheduled.attempts, record.attempts)
+            rescheduled.delay_seconds = delay
+            rescheduled.not_before_monotonic = time.monotonic() + delay
+
+    def _log_collapsed_block_candidates(
+        self,
+        qualified: list[_SupersededCandidateRow],
+        abandoned: frozenset[str],
+        *,
+        considered: int,
+        selected: int,
+        lease_skipped: int,
+        revalidation_dropped: int,
+    ) -> None:
+        """Emit one bounded summary instead of one line per candidate."""
+        groups: dict[tuple[str, str], list[str]] = {}
+        for row in qualified:
+            if row.block_hash not in abandoned:
+                continue
+            groups.setdefault((row.parent_hash, row.job_id[:64]), []).append(
+                row.block_hash
+            )
+        print(
+            "prism coordinator: collapsed superseded block candidates "
+            f"considered={considered} selected={selected} "
+            f"lease_skipped={lease_skipped} "
+            f"revalidation_dropped={revalidation_dropped} "
+            f"abandoned={len(abandoned)} "
+            f"reason={PRISM_BLOCK_CANDIDATE_COLLAPSE_REASON} "
+            f"stale_job_class={PRISM_BLOCK_CANDIDATE_COLLAPSE_STALE_JOB_CLASS} "
+            f"groups={len(groups)}",
+            flush=True,
+        )
+        ordered = sorted(groups.items(), key=lambda item: (-len(item[1]), item[0]))
+        for (parent_hash, job_id), hashes in (
+            ordered[:BLOCK_CANDIDATE_COLLAPSE_LOG_GROUPS]
+        ):
+            sample = ",".join(
+                sorted(hashes)[:BLOCK_CANDIDATE_COLLAPSE_LOG_SAMPLE_HASHES]
+            )
+            print(
+                "prism coordinator: collapsed candidate group "
+                f"parent={parent_hash} job={job_id} "
+                f"reason={PRISM_BLOCK_CANDIDATE_COLLAPSE_REASON} "
+                f"count={len(hashes)} sample={sample}",
+                flush=True,
+            )
+        remainder = len(ordered) - BLOCK_CANDIDATE_COLLAPSE_LOG_GROUPS
+        if remainder > 0:
+            print(
+                "prism coordinator: collapsed candidate groups not shown "
+                f"count={remainder}",
+                flush=True,
+            )
+
+    def _apply_superseded_block_candidate_collapse(
+        self,
+        selected: list[_SupersededCandidateRow],
+        chain: _BlockCandidateChainView,
+        *,
+        page_rows: int,
+        timeout_seconds: float | None,
+        call_class: str,
+    ) -> frozenset[str]:
+        """Lease, revalidate, write once, then clean up exactly what we won."""
+        coordinator = self._coordinator
+        coordinator._record_block_submitter_phase("replay-collapse-lease")
+        leases: dict[str, _BlockCandidateDispositionLease] = {}
+        try:
+            for row in selected:
+                # Never block: a synchronous submit that has persisted its
+                # intent but not yet claimed its own lease must not queue
+                # behind a page of maintenance work.
+                lease = coordinator._claim_block_candidate_disposition(
+                    row.block_hash,
+                    blocking=False,
+                )
+                if lease is not None:
+                    leases[row.block_hash] = lease
+            self._record_block_candidate_collapse(
+                "lease_skipped",
+                len(selected) - len(leases),
+            )
+            leased = [row for row in selected if row.block_hash in leases]
+            if not leased:
+                return frozenset()
+            coordinator._record_block_submitter_phase("replay-collapse-revalidate")
+            try:
+                qualified, tip = self._revalidate_superseded_block_candidates(
+                    leased,
+                    chain,
+                )
+            except Exception as exc:
+                logged = self._note_block_candidate_collapse_fail_closed(
+                    page_rows,
+                    exc,
+                )
+                if logged and not isinstance(
+                    exc,
+                    _BlockCandidateCollapseFailedClosed,
+                ):
+                    traceback.print_exc()
+                return frozenset()
+            self._record_block_candidate_collapse(
+                "revalidation_dropped",
+                len(leased) - len(qualified),
+            )
+            if not qualified:
+                return frozenset()
+            hashes = tuple(row.block_hash for row in qualified)
+            error = f"tip moved before submit: {tip}"
+            coordinator._record_block_submitter_phase("replay-collapse-write")
+            try:
+                mark = coordinator.ledger.mark_block_candidates_abandoned
+                returned = coordinator._run_block_submitter_ledger_call(
+                    ("collapse-superseded", hashes),
+                    "collapse-superseded",
+                    lambda: mark(block_hashes=hashes, error=error),
+                    timeout_seconds=timeout_seconds,
+                    call_class=call_class,
+                )
+            except Exception as exc:
+                # The rows stay pending, so nothing is lost: the whole page
+                # is preserved and the per-row path disposes of it. A
+                # timed-out call may still land on its bounded worker; the
+                # rows it transitions simply replay as terminal, which is
+                # the same convergence every other outbox mutation has.
+                if self._note_block_candidate_collapse_fail_closed(page_rows, exc):
+                    traceback.print_exc()
+                return frozenset()
+            if not isinstance(returned, (list, tuple, set, frozenset)):
+                # The contract is a hash set, not a count or a boolean. A
+                # ledger that answers with something else has told us
+                # nothing about which rows it won.
+                self._note_block_candidate_collapse_fail_closed(
+                    page_rows,
+                    "fenced batch abandonment did not return a hash set",
+                )
+                return frozenset()
+            requested = frozenset(hashes)
+            abandoned = frozenset(
+                key
+                for key in (
+                    _collapse_block_hash(value) for value in (returned or ())
+                )
+                # A returned hash outside the request would mean the ledger
+                # transitioned a row this apply never leased; refuse to run
+                # cleanup for it rather than tear down somebody else's state.
+                if key is not None and key in requested
+            )
+            self._record_block_candidate_collapse(
+                "write_lost",
+                len(requested - abandoned),
+            )
+            if not abandoned:
+                return frozenset()
+            self._record_block_candidate_collapse("abandoned", len(abandoned))
+            # Before any cleanup, and while every won hash's lease is still
+            # held: a cleanup that fails or aborts must not leave a durably
+            # terminal row offerable to the node.
+            self._publish_collapsed_candidate_terminal_fence(abandoned)
+            try:
+                cleanup_failed = self._clean_up_collapsed_block_candidates(
+                    tuple(
+                        row.block_hash
+                        for row in qualified
+                        if row.block_hash in abandoned
+                    )
+                )
+            except Exception:
+                # The rows are durably terminal whatever happened here, so
+                # the caller must still partition them out of the page: a
+                # cleanup fault cannot be allowed to replay-adopt a row
+                # whose outbox entry is gone. An abort proves nothing about
+                # the steps it skipped, so the whole won set is affected --
+                # which subsumes any hash a contained step already failed.
+                cleanup_failed = abandoned
+                # Every won hash owes every step again, and the floor
+                # holders were never indexed, so the retry re-runs that scan
+                # too. Deferral is contained, so this stays on the path that
+                # returns the won set.
+                for block_hash in abandoned:
+                    self._defer_collapsed_candidate_cleanup(
+                        block_hash,
+                        BLOCK_CANDIDATE_COLLAPSE_CLEANUP_STEPS,
+                        shares_resolved=False,
+                    )
+                print(
+                    "prism coordinator: collapsed block candidate cleanup "
+                    f"aborted rows={len(abandoned)}; their durable rows are "
+                    "already terminal and their cleanup is retried",
+                    flush=True,
+                )
+                traceback.print_exc()
+            if cleanup_failed:
+                # Counted once per apply over distinct hashes. Contained
+                # per-step failures and a later abort describe the same
+                # rows, so this series can never exceed the won set.
+                self._record_block_candidate_collapse(
+                    "cleanup_failed",
+                    len(cleanup_failed),
+                )
+            try:
+                self._log_collapsed_block_candidates(
+                    qualified,
+                    abandoned,
+                    considered=page_rows,
+                    selected=len(selected),
+                    lease_skipped=len(selected) - len(leases),
+                    revalidation_dropped=len(leased) - len(qualified),
+                )
+            except Exception:
+                # Diagnostics are not cleanup state. Keep a formatter fault
+                # visible without claiming hashes whose terminal cleanup
+                # completed successfully.
+                print(
+                    "prism coordinator: collapsed block candidate logging "
+                    f"failed rows={len(abandoned)}",
+                    flush=True,
+                )
+                traceback.print_exc()
+            return abandoned
+        finally:
+            for lease in leases.values():
+                coordinator._release_block_candidate_disposition(lease)
+
+    def _collapse_superseded_block_candidates(
+        self,
+        durable_rows: list[Any],
+        *,
+        timeout_seconds: float | None,
+        call_class: str,
+        probe_budget: _CollapseHeightProbeBudget | None = None,
+    ) -> list[Any]:
+        """Terminalize this page's decided-height siblings before adoption.
+
+        Returns the rows that still have to be adopted: exactly the page
+        minus the hashes the fenced write actually transitioned. A won row's
+        fetched payload is a stale copy of an intent whose durable row is
+        now terminal, so it must never be replay-adopted or re-arm a payout
+        barrier. Anything short of a won row -- a fail-closed read, an
+        unclaimable lease, a revalidation drop, an unprobed height, a partial
+        return, a failed write -- preserves the row and leaves it to the
+        per-row path.
+
+        ``probe_budget`` is the enumeration walk's shared chain-height
+        budget, carrying both the walk's remaining probes and the reads it
+        has already made; passes given none get a fresh one of their own. A
+        spent budget ends this page only when the page has nothing at a
+        height the walk already read: the counter bounds new heights, and a
+        cached height costs nothing to answer from however late in the walk
+        it is asked.
+        """
+        if not durable_rows:
+            return durable_rows
+        if not callable(
+            getattr(
+                self._coordinator.ledger,
+                "mark_block_candidates_abandoned",
+                None,
+            )
+        ):
+            # A ledger with no fenced batch abandonment has no safe bulk
+            # form at all. That is a structural absence, not a fail-closed
+            # read, so it neither counts nor spends a chain round trip: the
+            # per-row path disposes of every row exactly as before.
+            return durable_rows
+        if (
+            probe_budget is not None
+            and probe_budget.exhausted
+            and not any(
+                _collapse_row_height(durable_row) in probe_budget.active
+                for durable_row in durable_rows
+            )
+        ):
+            # This walk has spent its chain-height budget on earlier pages
+            # *and* not one row here sits at a height those pages already
+            # read. A spent counter only forbids reading a new height; a
+            # height already in the walk's cache stays answerable for free,
+            # and a page holding such rows still qualifies them below. This
+            # page holds none, so selection could not qualify a single row
+            # and the two page-scope tip reads it opens with would be two
+            # more round trips for a pass that is already decided. Every row
+            # is preserved.
+            #
+            # The peek is deliberately lenient: a row it cannot read a height
+            # from contributes no cached height, which at worst preserves a
+            # page the decode would have failed closed on anyway -- exactly
+            # what the unconditional early return did for every such page.
+            self._record_block_candidate_collapse(
+                "height_deferred",
+                len(durable_rows),
+            )
+            return durable_rows
+        self._coordinator._record_block_submitter_phase("replay-collapse-select")
+        self._record_block_candidate_collapse("considered", len(durable_rows))
+        chain = _BlockCandidateChainView(self, probe_budget=probe_budget)
+        try:
+            selected = self._select_superseded_block_candidates(
+                durable_rows,
+                chain,
+            )
+        except Exception as exc:
+            logged = self._note_block_candidate_collapse_fail_closed(
+                len(durable_rows),
+                exc,
+            )
+            if logged and not isinstance(exc, _BlockCandidateCollapseFailedClosed):
+                traceback.print_exc()
+            return durable_rows
+        if not selected:
+            return durable_rows
+        self._record_block_candidate_collapse("selected", len(selected))
+        try:
+            abandoned = self._apply_superseded_block_candidate_collapse(
+                selected,
+                chain,
+                page_rows=len(durable_rows),
+                timeout_seconds=timeout_seconds,
+                call_class=call_class,
+            )
+        except Exception as exc:
+            if self._note_block_candidate_collapse_fail_closed(
+                len(durable_rows),
+                exc,
+            ):
+                traceback.print_exc()
+            return durable_rows
+        if not abandoned:
+            return durable_rows
+        return [
+            durable_row
+            for durable_row in durable_rows
+            if _collapse_block_hash(
+                durable_row.get("block_hash")
+                if isinstance(durable_row, dict)
+                else None
+            )
+            not in abandoned
+        ]
+
+    def _block_replay_should_yield_to_live_candidates(
+        self,
+        probe_budget: _CollapseHeightProbeBudget,
+    ) -> bool:
+        """Whether this walk should hand the submitter back before another page.
+
+        The block-submitter thread that walks these pages is the only thread
+        that reaches ``submitblock``, so a backlog it keeps walking is a
+        backlog that delays a live solve. Between pages -- never inside one
+        page's fenced collapse, its write, or its adoption -- the walk gives
+        that thread back as soon as two things hold at once:
+
+        * a live candidate or a retry is waiting, so there is something
+          strictly more valuable than finishing the enumeration; and
+        * the walk has already spent its chain-height probes, so the pages it
+          would go on to fetch can no longer decide a height it has not
+          already read.
+
+        Both halves matter. Yielding on a waiting candidate alone would cut
+        short the same-height storm this path exists for, which walks several
+        pages on a single probe. Yielding on a spent budget alone would leave
+        the enumeration owed -- and job builds blocked -- for a walk that had
+        nothing better to do than finish. The caller re-enumerates from the
+        outbox on its next pass with a fresh budget, and every row this walk
+        fetched was adopted before the yield, so the backlog still shrinks.
+
+        A spent budget is not the same as nothing left to collapse: the pages
+        past the yield may hold siblings at heights this walk already read,
+        and those would have collapsed for free. What the yield gives up is
+        therefore bounded and recovered -- those rows stay durable and pending,
+        and the next walk re-probes their heights on a fresh budget -- while
+        what it buys is the only thread that reaches ``submitblock``.
+        """
+        if not probe_budget.exhausted:
+            return False
+        with self._coordinator.lock:
+            if self.retry_candidate is not None:
+                return True
+        queue_obj = self.candidate_queue
+        return queue_obj is not None and not queue_obj.empty()
+
     def replay_pending(self) -> int:
         """Queue durable candidate intents not completed by an earlier process."""
         self._coordinator._record_block_submitter_phase("replay-check-memory")
@@ -862,6 +2721,10 @@ class BlockCandidateService:
         queued = 0
         enumeration_truncated = False
         enumeration_paginated = False
+        # One chain-height budget for the whole walk -- both its remaining
+        # probes and the reads they bought -- so a backlog split across fifty
+        # pages costs the node what a single page does.
+        collapse_probe_budget = _CollapseHeightProbeBudget()
         if enumeration_owed and fetch_durable_page is not None:
             # Pagination, not a widening window: the doubling loop below
             # fails closed once one page would have to hold the entire
@@ -891,7 +2754,20 @@ class BlockCandidateService:
                     # windowed semantics, fail-closed truncation included.
                     break
                 enumeration_paginated = True
-                queued += self._adopt_durable_block_candidate_rows(durable_rows)
+                # Collapse this page's decided-height siblings before any of
+                # it is adopted, so a row this apply terminalizes is never
+                # queued and never re-arms a payout barrier. The cursor and
+                # short-page proof stay bound to the *fetched* page: what the
+                # collapse removes was removed from the outbox too, so the
+                # enumeration is still complete.
+                queued += self._adopt_durable_block_candidate_rows(
+                    self._collapse_superseded_block_candidates(
+                        durable_rows,
+                        timeout_seconds=replay_query_timeout,
+                        call_class=replay_query_call_class,
+                        probe_budget=collapse_probe_budget,
+                    )
+                )
                 print(
                     "prism coordinator: pending block candidate enumeration "
                     f"page={page} rows={len(durable_rows)}",
@@ -901,6 +2777,18 @@ class BlockCandidateService:
                     # A short page proves no pending row followed it at query
                     # time, which is the completeness the job-build gate waits
                     # on.
+                    break
+                if self._block_replay_should_yield_to_live_candidates(
+                    collapse_probe_budget
+                ):
+                    enumeration_truncated = True
+                    print(
+                        "prism coordinator: pending block candidate "
+                        f"enumeration page={page} yielded to a waiting live "
+                        "candidate; job builds stay blocked until a complete "
+                        "enumeration succeeds",
+                        flush=True,
+                    )
                     break
                 next_cursor = (
                     durable_rows[-1].get("cursor")
@@ -928,8 +2816,30 @@ class BlockCandidateService:
             enumeration_limit = MAX_PENDING_BLOCK_CANDIDATES
             while True:
                 durable_rows = fetch_durable_rows(enumeration_limit)
-                queued += self._adopt_durable_block_candidate_rows(durable_rows)
+                # Same collapse-then-adopt order on the legacy widening
+                # window; the truncation proof below still measures the
+                # fetched window, not the surviving remainder.
+                queued += self._adopt_durable_block_candidate_rows(
+                    self._collapse_superseded_block_candidates(
+                        durable_rows,
+                        timeout_seconds=replay_query_timeout,
+                        call_class=replay_query_call_class,
+                        probe_budget=collapse_probe_budget,
+                    )
+                )
                 if len(durable_rows) < enumeration_limit or not enumeration_owed:
+                    break
+                if self._block_replay_should_yield_to_live_candidates(
+                    collapse_probe_budget
+                ):
+                    enumeration_truncated = True
+                    print(
+                        "prism coordinator: pending block candidate "
+                        f"enumeration at {enumeration_limit} rows yielded to "
+                        "a waiting live candidate; job builds stay blocked "
+                        "until a complete enumeration succeeds",
+                        flush=True,
+                    )
                     break
                 # A full batch may hide more pending rows, and a hidden row could
                 # be the active parent whose carry a child job must not omit.
@@ -1524,6 +3434,37 @@ class BlockCandidateService:
             started_monotonic=min(active_starts),
         )
 
+    def _retire_finished_block_submitter_ledger_call(
+        self,
+        key: tuple[object, ...],
+        call: _BlockSubmitterLedgerCall,
+    ) -> None:
+        """Take one finished call out of the registry, by identity.
+
+        A finished call has no live need: it is registered only so that a
+        same-key caller arriving while the worker is *still out* joins that
+        one call instead of starting a second one, and a worker that has
+        published ``done`` is not out any more. Leaving it behind would wait
+        on an invocation that may never come -- the exact key can be a whole
+        enumeration page of block hashes, and the late write itself is what
+        empties that page out of the outbox -- so the registry would keep
+        the completed call, and its hash tuple, for the life of the process.
+
+        Both the worker and a waiter that observed the completion call this,
+        whichever gets there first; the identity check is what keeps either
+        of them from dropping a *different* call that has since taken the
+        key, and the ``done`` check is what keeps them from ever dropping a
+        worker that is still out. Waiters hold the call directly, so a
+        removal never costs anybody the result or error it is owed: it only
+        settles that the next caller for that key replays the idempotent
+        operation on a fresh call.
+        """
+        with self._block_submitter_ledger_calls_lock:
+            if not call.done.is_set():
+                return
+            if self._block_submitter_ledger_calls.get(key) is call:
+                del self._block_submitter_ledger_calls[key]
+
     @contextmanager
     def _block_submitter_ledger_timeout_scope(
         self,
@@ -1656,11 +3597,20 @@ class BlockCandidateService:
     ) -> Any:
         """Run one direct outbox call without letting its driver wedge us.
 
-        A timed-out call remains registered and is reused by the next paced
-        retry. This bounds the coordinator-side wait without spawning an
-        unbounded pile of threads when a fake/misbehaving driver ignores the
-        real PostgreSQL statement deadline. Candidate outbox mutations are
+        A timed-out call stays registered for as long as its worker is
+        still out, and the next paced retry joins that same call. This
+        bounds the coordinator-side wait without spawning an unbounded pile
+        of threads when a fake/misbehaving driver ignores the real
+        PostgreSQL statement deadline. Candidate outbox mutations are
         idempotent, so a late completion converges with replay.
+
+        The registry therefore holds in-flight calls and nothing else: the
+        worker retires its own entry the moment it publishes ``done`` (see
+        _retire_finished_block_submitter_ledger_call), so a key whose retry
+        never comes back cannot pin a completed call and its page of block
+        hashes for the life of the process. Waiters already parked on the
+        call hold it directly and still get its result or error; a caller
+        arriving after the removal simply replays the operation.
 
         call_class labels the per-class latency/timeout metrics and must
         match the budget in use: a call given the landing deadline records
@@ -1706,7 +3656,14 @@ class BlockCandidateService:
                         call.error = exc
                     finally:
                         call.done.set()
+                        # The slot goes back before the removal: a caller
+                        # that arrives to find this key already retired must
+                        # not then be told the bounded pool is exhausted.
                         self._block_submitter_ledger_worker_slots.release()
+                        self._retire_finished_block_submitter_ledger_call(
+                            key,
+                            call,
+                        )
 
                 threading.Thread(
                     target=run,
@@ -1756,9 +3713,7 @@ class BlockCandidateService:
             duration_seconds=max(0.0, time.monotonic() - call.started_monotonic),
             timed_out=isinstance(call.error, TimeoutError),
         )
-        with self._block_submitter_ledger_calls_lock:
-            if self._block_submitter_ledger_calls.get(key) is call:
-                self._block_submitter_ledger_calls.pop(key, None)
+        self._retire_finished_block_submitter_ledger_call(key, call)
         if call.error is not None:
             raise call.error
         return call.result
@@ -2168,6 +4123,7 @@ class BlockCandidateService:
             and hasattr(self, "_block_candidate_terminal_outcomes")
             and hasattr(self, "_block_fast_lane_reservations")
             and hasattr(self, "_block_disposition_waiting_retries")
+            and hasattr(self, "_block_candidate_dequeued_hashes")
         ):
             return
         with _STATE_BACKFILL_LOCK:
@@ -2185,6 +4141,11 @@ class BlockCandidateService:
                 self._block_disposition_waiting_retries: dict[
                     str, PrismBlockCandidate
                 ] = {}
+            if not hasattr(self, "_block_candidate_dequeued_hashes"):
+                # hash -> number of dequeued same-hash candidate objects that
+                # are between a lane and their disposition flight (or the
+                # waiting registry). Read and written under coordinator.lock.
+                self._block_candidate_dequeued_hashes: dict[str, int] = {}
 
     def _claim_block_candidate_disposition(
         self,
@@ -2243,6 +4204,256 @@ class BlockCandidateService:
             lease.flight,
         )
 
+    # -- dequeued-hash pin -------------------------------------------------
+
+    def _pin_dequeued_block_candidate_locked(
+        self,
+        candidate: PrismBlockCandidate,
+    ) -> str:
+        """Name a candidate's hash from the instant it leaves its lane.
+
+        Caller holds ``coordinator.lock`` and, in the same critical section,
+        has just taken ``candidate`` out of the retry holder, a candidate
+        queue, or the waiting registry. Until ``submit_next`` hands the hash
+        to its disposition flight or back to the waiting registry -- again
+        under the lock -- the candidate object lives only in that method's
+        local variable, and this pin is the only thing that tells the
+        terminal-outcome eviction a same-hash copy is still in memory. The
+        lanes and the flight each pin the hash in their own right; without
+        this entry a terminal duplicate's fence is the oldest unpinned
+        outcome exactly while the pass that is about to read it holds the
+        candidate in hand.
+
+        Counted rather than set-valued so two dequeued same-hash objects
+        (a second caller of ``submit_next``) cannot unpin each other.
+        Returns the lowercase key the rest of the pass compares on.
+        """
+        block_hash = str(candidate.submission.block_hash_hex).lower()
+        pins = self._block_candidate_dequeued_hashes
+        pins[block_hash] = pins.get(block_hash, 0) + 1
+        return block_hash
+
+    def _unpin_dequeued_block_candidate_locked(self, block_hash: str) -> None:
+        """Drop one dequeue's pin. Caller holds ``coordinator.lock``.
+
+        Called only in the critical section that hands the hash on -- to the
+        flight the claim installed, or to the waiting registry -- or where
+        nothing needs it any more because the candidate object left with an
+        exception and no in-memory copy remains to offer the block.
+        """
+        pins = self._block_candidate_dequeued_hashes
+        remaining = pins.get(block_hash, 0) - 1
+        if remaining > 0:
+            pins[block_hash] = remaining
+        else:
+            pins.pop(block_hash, None)
+
+    def _live_block_candidate_hash_registries(self) -> tuple[Any, ...]:
+        """Registries whose named hash forbids evicting its terminal outcome.
+
+        Each one either holds a candidate object that has not reached the
+        node yet or the still-owed terminal work of one, and every such copy
+        reads the terminal outcome before it may offer the block again.
+        Dropping the outcome under one of them is exactly the window
+        ``_publish_collapsed_candidate_terminal_fence`` exists to close.
+        The dequeued-hash pin is the lane between lanes: the candidate
+        ``submit_next`` has taken out of a holder, queue, or the waiting
+        registry and not yet handed to its disposition flight.
+
+        Read with ``coordinator.lock`` held. Backfilled state is fetched by
+        ``getattr`` rather than by an ``_ensure_...`` call, which would take
+        the state-backfill lock underneath the global one.
+        """
+        return tuple(
+            registry
+            for registry in (
+                getattr(self, "_outstanding_block_candidate_hashes", None),
+                getattr(self, "_block_replay_inflight_hashes", None),
+                getattr(self, "_block_quarantine_hashes", None),
+                getattr(self, "_block_fast_lane_reservations", None),
+                getattr(self, "_block_disposition_waiting_retries", None),
+                getattr(self, "finalize_retries", None),
+                getattr(self, "_block_candidate_retained_node_submissions", None),
+                getattr(self, "_block_candidate_collapse_cleanup_retries", None),
+                getattr(self, "_block_candidate_dequeued_hashes", None),
+            )
+            if registry
+        )
+
+    def _held_block_candidate_retry_hashes(self) -> frozenset[str]:
+        """The hashes the single-slot retry holders are still carrying."""
+        held: set[str] = set()
+        for holder in (
+            getattr(self, "retry_candidate", None),
+            getattr(self, "_block_accounting_deferred_retry_candidate", None),
+        ):
+            key = _block_candidate_hash_of(holder)
+            if key is not None:
+                held.add(key)
+        return frozenset(held)
+
+    @staticmethod
+    def _queued_block_candidate_hashes(queue_obj: object) -> frozenset[str] | None:
+        """The hashes still sitting in one candidate queue, or None if unread.
+
+        The registries above stop naming a hash the moment its terminal
+        outcome is recorded -- ``_record_block_candidate_terminal_outcome``
+        and the collapse cleanup's ``outstanding-and-tip-observation`` step
+        clear the outstanding and replay-inflight markers by design -- so a
+        *duplicate* copy of that hash still queued behind the pass that
+        finished would be named by nothing. That copy is precisely the one
+        the fence protects, so the queues themselves are read.
+
+        The underlying deque is read under the queue's own mutex, because
+        iterating it while a producer or consumer mutates it is not safe.
+        The acquire is non-blocking: this runs with ``coordinator.lock``
+        held, and waiting there for a queue's leaf lock would convoy the
+        whole coordinator behind an unrelated enqueue. Failing to take it
+        returns None and the caller skips the eviction pass entirely, which
+        only leaves the registry over its bound until the next outcome.
+        """
+        if queue_obj is None:
+            return frozenset()
+        mutex = getattr(queue_obj, "mutex", None)
+        entries = getattr(queue_obj, "queue", None)
+        if mutex is None or entries is None:
+            return frozenset()
+        if not mutex.acquire(blocking=False):
+            return None
+        try:
+            items = list(entries)
+        finally:
+            mutex.release()
+        queued: set[str] = set()
+        for item in items:
+            key = _block_candidate_hash_of(item)
+            if key is not None:
+                queued.add(key)
+        return frozenset(queued)
+
+    def _in_flight_block_candidate_hashes(self) -> frozenset[str] | None:
+        """The hashes with a live same-hash disposition flight, or None.
+
+        A claimed flight means a pass is between its node offer and its
+        durable finalization for that hash. Same non-blocking rule as the
+        queues: the disposition registry lock is taken under
+        ``coordinator.lock`` here, the reverse of the ordinary order, so it
+        is only ever tried, never waited on.
+        """
+        lock = getattr(self, "_block_candidate_disposition_registry_lock", None)
+        flights = getattr(self, "_block_candidate_disposition_flights", None)
+        if lock is None or flights is None:
+            return frozenset()
+        if not lock.acquire(blocking=False):
+            return None
+        try:
+            return frozenset(flights)
+        finally:
+            lock.release()
+
+    @staticmethod
+    def _stamp_block_candidate_terminal_outcome(
+        outcomes: dict[str, bool],
+        block_hash: str,
+        accepted: bool,
+    ) -> None:
+        """Record one outcome as the newest entry of the FIFO registry.
+
+        Re-recording an existing hash would otherwise keep its original
+        insertion position, leaving a freshly reasserted outcome at the
+        front of the eviction scan.
+        """
+        outcomes.pop(block_hash, None)
+        outcomes[block_hash] = accepted
+
+    def _bound_block_candidate_terminal_outcomes(
+        self,
+        protect: frozenset[str] = frozenset(),
+    ) -> int:
+        """Trim the terminal-outcome registry to its bound; return evictions.
+
+        Called by the two writers with ``coordinator.lock`` already held and
+        their own entries already stamped. ``protect`` names the hashes this
+        very call published: a bulk fence page larger than the whole bound
+        must not evict the outcomes it just wrote, so the registry is left
+        temporarily over its bound instead.
+
+        Eviction is oldest-first and skips every pinned hash, so the bound
+        is a target rather than a hard ceiling -- a registry whose entries
+        are all still live simply stays large, which is the safe direction.
+        The pins are themselves bounded state, so the total stays bounded.
+
+        The pin set is the union of the lane registries (including the
+        dequeued-hash pin), the single-slot retry holders, the candidate
+        objects still queued on the live and replay lanes, and the hashes
+        with a claimed disposition flight. A hash held by none of those has
+        no in-memory copy left that could reach a node offer; anything
+        arriving for it afterwards is a fresh admission, which re-reads the
+        durable outbox row -- terminal there either way -- before it can
+        offer anything.
+
+        That same proof retires the hash's counted-abandonment dedup key.
+        The key exists so a re-run terminal disposition -- a collapse whose
+        cleanup failed, a finalize-only replay -- counts its candidate once
+        rather than once per attempt, so it may only be dropped when no
+        copy is left to re-run anything. Both writer orderings are covered
+        by the one rule: the direct finalize path counts before it publishes
+        its terminal outcome, so its key is retired by a later pass over the
+        outcome it goes on to publish, and an ambiguous false finalize
+        failure has no outcome to evict at all while ``finalize_retries``
+        pins it; the collapse publishes the outcome first and counts during
+        cleanup, and holds the hash's disposition lease -- an in-flight pin
+        -- across both. Dropping the key here therefore never lets a lane
+        that is still owed accounting count its candidate twice.
+        """
+        outcomes = self._block_candidate_terminal_outcomes
+        overflow = len(outcomes) - MAX_BLOCK_CANDIDATE_TERMINAL_OUTCOMES
+        if overflow <= 0:
+            return 0
+        pinned = self._live_block_candidate_hash_registries()
+        held = set(self._held_block_candidate_retry_hashes())
+        for live in (
+            self._queued_block_candidate_hashes(
+                getattr(self, "candidate_queue", None)
+            ),
+            self._queued_block_candidate_hashes(
+                getattr(self, "_block_replay_candidate_queue", None)
+            ),
+            self._in_flight_block_candidate_hashes(),
+        ):
+            if live is None:
+                # A lane could not be read without waiting under the global
+                # lock. Evicting against an incomplete pin set could unfence
+                # a live copy, so nothing is evicted this round.
+                return 0
+            held |= live
+        counted = getattr(self, "_counted_block_candidate_abandonments", None)
+        window = overflow + BLOCK_CANDIDATE_TERMINAL_OUTCOME_EVICTION_SCAN
+        dropped = 0
+        for key in list(itertools.islice(outcomes, window)):
+            if dropped >= overflow:
+                break
+            if (
+                key in protect
+                or key in held
+                or any(key in registry for registry in pinned)
+            ):
+                # A live, replayed, retried, parked, quarantined, or
+                # cleanup-owing copy of this hash is still in memory and
+                # will read this outcome before it could offer the block.
+                # Move it behind the scan window so it stops blocking the
+                # next pass instead of dropping it.
+                outcomes[key] = outcomes.pop(key)
+                continue
+            del outcomes[key]
+            if counted is not None:
+                # Retired under the very proof that let the fence go: a
+                # dedup key outliving its fence is what let this set grow
+                # without bound under a collapsed storm.
+                counted.discard(key)
+            dropped += 1
+        return dropped
+
     def _block_candidate_terminal_outcome(self, block_hash: str) -> bool | None:
         self._ensure_block_candidate_disposition_state()
         with self._coordinator.lock:
@@ -2258,7 +4469,12 @@ class BlockCandidateService:
         dropped_waiting: PrismBlockCandidate | None = None
         with self._coordinator.lock:
             key = block_hash.lower()
-            self._block_candidate_terminal_outcomes[key] = accepted
+            self._stamp_block_candidate_terminal_outcome(
+                self._block_candidate_terminal_outcomes,
+                key,
+                accepted,
+            )
+            self._bound_block_candidate_terminal_outcomes(frozenset((key,)))
             self._block_fast_lane_reservations.discard(key)
             replay_hashes = getattr(self, "_block_replay_inflight_hashes", None)
             if replay_hashes is not None:
@@ -2286,6 +4502,11 @@ class BlockCandidateService:
         after cleanup succeeds or after a false finalize-only disposition is
         installed; direct accounting callers invoke it only after the full
         serialized rejection path returns.
+
+        The dedup key that makes this once-per-candidate is retired by
+        ``_bound_block_candidate_terminal_outcomes`` when that pass evicts
+        the hash's terminal outcome, which is the only place that has proved
+        no lane can re-enter this method for the hash.
         """
         reason = getattr(outcome, "reason", None)
         if not isinstance(reason, str) or not reason:
@@ -2537,6 +4758,21 @@ class BlockCandidateService:
                 outcome.refresh_client = None
         except ShutdownInProgress:
             return
+        except Exception:
+            # An unexpected failure leaves the candidate to the retry lane.
+            # Retain it here, while this thread still owns the disposition:
+            # an accounting-owner retain routes into the deferred holder,
+            # which names the hash until the finally below merges it into
+            # the retry slot under coordinator.lock -- after the lease is
+            # released, but with no instant in between where nothing names
+            # it. The loop's catch used to retain only after this finally
+            # had already released the lease, and that instant was exactly
+            # the dequeued-candidate gap in its accounting-lane form: a
+            # terminal-outcome eviction there could unfence the hash the
+            # retried candidate was about to be re-disposed against.
+            self._coordinator._retain_block_candidate_for_retry(candidate)
+            task.retained_for_retry.set()
+            raise
         finally:
             self._coordinator._release_block_candidate_disposition(
                 task.disposition_lease
@@ -2562,9 +4798,35 @@ class BlockCandidateService:
             )
             self._coordinator._record_block_submitter_phase("refresh-jobs:complete")
 
+    def _block_accounting_cleanup_retry_work_items(self) -> int:
+        """Completed work items the lane may run between cleanup offers.
+
+        One work item is one finished ordinary accounting task from either
+        handoff queue, or one finished invalid-candidate quarantine item.
+        Bounded below at one so a misconfigured value degrades into offering
+        the retry after every item rather than never offering it at all.
+        """
+        return max(
+            1,
+            int(
+                getattr(
+                    self._coordinator,
+                    "block_accounting_cleanup_retry_work_items",
+                    DEFAULT_BLOCK_ACCOUNTING_CLEANUP_RETRY_WORK_ITEMS,
+                )
+            ),
+        )
+
     def block_accounting_loop(self) -> None:
         self._block_accounting_thread_ident = threading.get_ident()
         self._ensure_block_accounting_state()
+        # Work items completed since the last deferred-cleanup offer. The
+        # idle branch below cannot be the only driver: either lane running
+        # continuously would hold a due terminal cleanup off for as long as
+        # the traffic lasted, and its durable row is already gone. Counting
+        # items here bounds that wait at one offer per configured cadence
+        # whichever lane the traffic is on.
+        work_items = 0
         while not self._coordinator.stop_event.is_set():
             self._coordinator._record_block_submitter_phase("accounting-queue")
             source_queue = None
@@ -2579,6 +4841,22 @@ class BlockCandidateService:
                     source_queue = self._block_accounting_overflow_queue
                 except queue.Empty:
                     if self._coordinator._run_one_invalid_block_candidate_quarantine():
+                        work_items += 1
+                        if (
+                            work_items
+                            >= self._block_accounting_cleanup_retry_work_items()
+                        ):
+                            work_items = 0
+                            self._run_one_collapsed_block_candidate_cleanup_retry()
+                        continue
+                    # A collapsed row's failed cleanup has no durable replay
+                    # source left, so the accounting lane is the only thing
+                    # that will ever finish it. A truly idle lane offers it
+                    # here immediately rather than waiting out a cadence; the
+                    # work-item cadence exists for the busy lanes, which
+                    # never reach this branch at all.
+                    work_items = 0
+                    if self._run_one_collapsed_block_candidate_cleanup_retry():
                         continue
                     self._coordinator.stop_event.wait(self._block_work_wait_slice())
                     continue
@@ -2591,10 +4869,31 @@ class BlockCandidateService:
                     flush=True,
                 )
                 traceback.print_exc()
-                self._coordinator._retain_block_candidate_for_retry(task.candidate)
+                retained = getattr(task, "retained_for_retry", None)
+                if retained is None or not retained.is_set():
+                    # The failure fired before _run_block_accounting_task's
+                    # own exception path could retain the candidate -- a
+                    # delegate raising ahead of it -- so it is retained here
+                    # as before. A candidate the lane already retained (and
+                    # merged into the retry slot) is not retained again.
+                    self._coordinator._retain_block_candidate_for_retry(
+                        task.candidate
+                    )
             finally:
                 assert source_queue is not None
                 source_queue.task_done()
+            work_items += 1
+            if work_items >= self._block_accounting_cleanup_retry_work_items():
+                # The counter resets on every offer, due record or not: a
+                # cleanup backlog may therefore spend at most one attempt per
+                # cadence, so it can never starve accounting or quarantine in
+                # return. Deliberately left uncontained and outside the task's
+                # try/finally -- the retry pops its record before attempting
+                # it, and only its own failure paths re-register it, so an
+                # outer catch here could swallow the last reference to a
+                # terminal hash's owed steps.
+                work_items = 0
+                self._run_one_collapsed_block_candidate_cleanup_retry()
 
     # -- submitter loop ----------------------------------------------------
 
@@ -2663,6 +4962,17 @@ class BlockCandidateService:
         """
         coordinator = self._coordinator
         coordinator._record_block_submitter_phase("dequeue-retry")
+        # The disposition state owns the dequeued-hash pin, and its backfill
+        # takes the state-backfill lock, so it runs before any coordinator
+        # lock hold below rather than underneath one.
+        self._ensure_block_candidate_disposition_state()
+        # Every dequeue below leaves its lane and enters the dequeued-hash
+        # pin in one coordinator.lock critical section. The lanes pin a
+        # terminal duplicate's outcome against eviction while it sits in
+        # them and the disposition flight pins it from the claim onward;
+        # between the two the candidate object is only this method's local
+        # variable, and the pin is what keeps the fence it is about to read
+        # from being the oldest unpinned entry in the registry.
         with coordinator.lock:
             candidate = self.retry_candidate
             if candidate is not None and not self._block_candidate_retry_ready_locked(
@@ -2674,6 +4984,7 @@ class BlockCandidateService:
                 candidate = None
             if candidate is not None:
                 self.retry_candidate = None
+                block_hash = self._pin_dequeued_block_candidate_locked(candidate)
         if candidate is None:
             queue_obj = self.candidate_queue
             self._ensure_block_replay_state()
@@ -2687,18 +4998,21 @@ class BlockCandidateService:
             )
             while candidate is None:
                 coordinator._record_block_submitter_phase("dequeue-queue")
-                # Live discoveries always outrank durable restart replay.
-                for candidate_queue in (queue_obj, replay_queue):
-                    if candidate_queue is None:
-                        continue
-                    try:
-                        candidate = candidate_queue.get_nowait()
+                with coordinator.lock:
+                    # Live discoveries always outrank durable restart replay.
+                    # The non-blocking get takes the queue's own mutex under
+                    # coordinator.lock -- the order the eviction's queue read
+                    # already establishes -- so the entry leaves the queue
+                    # and enters the pin without a gap between them.
+                    for candidate_queue in (queue_obj, replay_queue):
+                        if candidate_queue is None:
+                            continue
+                        try:
+                            candidate = candidate_queue.get_nowait()
+                        except queue.Empty:
+                            continue
                         break
-                    except queue.Empty:
-                        pass
-                if candidate is None:
-                    self._ensure_block_candidate_disposition_state()
-                    with coordinator.lock:
+                    if candidate is None:
                         waiting = self._block_disposition_waiting_retries
                         ready_hashes = [
                             key
@@ -2715,6 +5029,10 @@ class BlockCandidateService:
                                 ),
                             )
                             candidate = waiting.pop(waiting_hash)
+                    if candidate is not None:
+                        block_hash = self._pin_dequeued_block_candidate_locked(
+                            candidate
+                        )
                 if candidate is not None:
                     break
                 if deadline is None:
@@ -2727,23 +5045,36 @@ class BlockCandidateService:
                 ):
                     return BlockCandidateRunResult(False)
 
-        block_hash = str(candidate.submission.block_hash_hex).lower()
-        lease = coordinator._claim_block_candidate_disposition(
-            block_hash,
-            blocking=not defer_accounting,
-        )
+        try:
+            lease = coordinator._claim_block_candidate_disposition(
+                block_hash,
+                blocking=not defer_accounting,
+            )
+        except BaseException:
+            # The candidate object leaves with the exception (its durable
+            # outbox row still replays), so no in-memory copy remains that
+            # the pin would be protecting.
+            with coordinator.lock:
+                self._unpin_dequeued_block_candidate_locked(block_hash)
+            raise
         if lease is None:
             # Another same-hash pass already spans node offer through durable
             # finalization. Keep this wakeup outside the global parent retry
             # slot until that lease transfers/releases: consuming it can lose
             # an accounting retry, while repeatedly prioritizing it can starve
-            # unrelated live blocks.
+            # unrelated live blocks. The waiting registry takes over the pin
+            # in the same critical section.
             with coordinator.lock:
                 self._block_disposition_waiting_retries[block_hash] = candidate
+                self._unpin_dequeued_block_candidate_locked(block_hash)
             coordinator._wait_for_block_candidate_retry(
                 float(self.retry_initial_seconds)
             )
             return BlockCandidateRunResult(True)
+        # The claim installed this pass's disposition flight, which the
+        # eviction reads as a pin of its own; hand the hash over to it.
+        with coordinator.lock:
+            self._unpin_dequeued_block_candidate_locked(block_hash)
         transferred = False
         if coordinator._block_candidate_terminal_outcome(block_hash) is not None:
             coordinator._release_block_candidate_disposition(lease)
@@ -2790,9 +5121,12 @@ class BlockCandidateService:
                 elif not coordinator._reserve_block_fast_lane_slot(block_hash):
                     # Capacity is provisionally occupied by another unresolved
                     # node offer. Preserve strict max-block semantics until
-                    # that offer either accounts or terminates.
-                    coordinator._release_block_candidate_disposition(lease)
+                    # that offer either accounts or terminates. Retained
+                    # before the lease goes, as on the exception paths, so
+                    # the retry holder names the hash before the flight
+                    # stops doing so.
                     coordinator._retain_block_candidate_for_retry(candidate)
+                    coordinator._release_block_candidate_disposition(lease)
                     coordinator._wait_for_block_candidate_retry(
                         float(self.retry_initial_seconds)
                     )
@@ -2835,8 +5169,8 @@ class BlockCandidateService:
             if enqueued:
                 transferred = True
                 return BlockCandidateRunResult(True)
-            coordinator._release_block_candidate_disposition(lease)
             coordinator._retain_block_candidate_for_retry(candidate)
+            coordinator._release_block_candidate_disposition(lease)
             coordinator._wait_for_block_candidate_retry(
                 float(self.retry_initial_seconds)
             )
@@ -3894,6 +6228,7 @@ _STATE_FIELD_MAP = {
     "_block_candidate_terminal_outcomes": "_block_candidate_terminal_outcomes",
     "_block_fast_lane_reservations": "_block_fast_lane_reservations",
     "_block_disposition_waiting_retries": "_block_disposition_waiting_retries",
+    "_block_candidate_dequeued_hashes": "_block_candidate_dequeued_hashes",
     "_block_accounting_state_lock": "_block_accounting_state_lock",
     "_block_accounting_queue": "_block_accounting_queue",
     "_block_accounting_overflow_queue": "_block_accounting_overflow_queue",

@@ -46,7 +46,9 @@ disposition path in the production split -- ``submit_next`` with
 ``defer_accounting=True`` handing every node offer to the real accounting
 queue and task runner -- reporting the exact hash sets it terminalized and
 what they cost.  The per-row drain is the oracle any set-oriented selector
-has to agree with; the instrument does not contain a selector itself.
+has to agree with; the instrument does not contain a selector itself, and
+suppresses the shipped #183 collapse for the duration of the drain so the
+oracle stays the per-row path even where the drain re-enumerates.
 
 Driving both lanes from one thread is what makes the drain deterministic,
 and it costs nothing in fidelity: the two lanes are already serialized per
@@ -78,6 +80,8 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lab.prism.block_candidates import (  # noqa: E402
+    COLLAPSE_DIFFICULTY_SCALE,
+    COLLAPSE_POW_LIMIT_BITS,
     MAX_BLOCK_REPLAY_ENUMERATION_ROWS,
     MAX_PENDING_BLOCK_CANDIDATES,
     _BlockCandidateNodeSubmission,
@@ -86,6 +90,7 @@ from lab.prism.share_ledger import (  # noqa: E402
     PendingShare,
     SingleWriterShareLedger,
 )
+from lab.prism.template_artifacts import scaled_network_difficulty  # noqa: E402
 from tests.prism_vardiff_test_support import (  # noqa: E402
     FakeRpc,
     block_candidate,
@@ -363,14 +368,21 @@ class DecidedHeightRpc(FakeRpc):
         *,
         winner_hash: str,
         height: int,
-        difficulty: float = 1.0,
+        bits: str = COLLAPSE_POW_LIMIT_BITS,
     ) -> None:
         self.winner_hash = winner_hash.lower()
         self.height = int(height)
-        # The decided block's difficulty as qbitd would report it in
-        # getblockheader; the storm template is built at the same value, so
-        # by default the decided block and every sibling carry equal work.
-        self.difficulty = float(difficulty)
+        # The decided block's compact bits as qbitd would report them in
+        # getblockheader. Work is stated in bits, not in the raw difficulty
+        # float, because a candidate row carries scaled difficulty
+        # (raw * COLLAPSE_DIFFICULTY_SCALE) and only a bits-derived value is
+        # in the same units. The default is the qbit powLimit, at or below
+        # every sibling in the storm, so the decided block never reads as
+        # the weaker chain.
+        self.bits = str(bits).lower()
+        self.difficulty = (
+            scaled_network_difficulty(self.bits) / COLLAPSE_DIFFICULTY_SCALE
+        )
         self.calls: dict[str, int] = {}
         self._lock = threading.Lock()
 
@@ -396,6 +408,7 @@ class DecidedHeightRpc(FakeRpc):
                     "hash": self.winner_hash,
                     "height": self.height,
                     "confirmations": 1,
+                    "bits": self.bits,
                     "difficulty": self.difficulty,
                 }
             raise RuntimeError("qbit RPC getblockheader failed: -5 Block not found")
@@ -507,9 +520,24 @@ class CandidateStormRig:
         if self.restarted_server is not None:
             raise RuntimeError("storm has already been restarted")
         server, _state = self._coordinator()
+        # The restart view exists to hand a set-oriented selector the full
+        # replay-adopted population, so the shipped #183 collapse is
+        # suppressed for this enumeration exactly as it is for the per-row
+        # drain. Without that, deciding the height before the restart would
+        # let the enumeration dispose of the storm itself and leave the
+        # instrument with nothing to characterize.
+        server._ensure_block_candidate_service()._collapse_superseded_block_candidates = (
+            lambda durable_rows, **_kwargs: durable_rows
+        )
         server._note_block_replay_enumeration_owed()
-        with self._silence():
-            restored = server.replay_pending_block_candidates()
+        try:
+            with self._silence():
+                restored = server.replay_pending_block_candidates()
+        finally:
+            server._ensure_block_candidate_service().__dict__.pop(
+                "_collapse_superseded_block_candidates",
+                None,
+            )
         if restored != self.candidates:
             raise AssertionError(
                 f"restart restored {restored} of {self.candidates} candidates"
@@ -1026,6 +1054,15 @@ class CandidateStormRig:
         """
         service = server._ensure_block_candidate_service()
         service._ensure_block_candidate_disposition_state()
+        # Issue #183 landed a set-oriented collapse inside ``replay_pending``.
+        # This drain exists to be the *per-row* oracle that selector is
+        # measured against, and it re-enumerates the outbox whenever both
+        # lanes empty, so the collapse is suppressed for its duration:
+        # otherwise the enumeration would dispose of rows itself and the
+        # comparison would be the selector against the selector.
+        service._collapse_superseded_block_candidates = (
+            lambda durable_rows, **_kwargs: durable_rows
+        )
         rpc = server.rpc
         calls_before = dict(getattr(rpc, "calls", {}))
         outbox = self.ledger._block_candidate_outbox
@@ -1107,27 +1144,35 @@ class CandidateStormRig:
                         withheld.add(head)
                         deferred.add(head)
         finally:
-            with self._silence():
-                # Newest lift first: a mid-drain enumeration can re-adopt a row
-                # this call already lifted, and the re-adopted object is the one
-                # the shipped markers now describe. Restoring newest-first also
-                # rebuilds the original lane order, because each lifted wakeup
-                # goes back to the front of its lane.
-                restored: set[str] = set()
-                for lane, key, wakeup in reversed(held_wakeups):
-                    if key in restored or not self._restore_withheld_wakeup(
-                        server,
-                        key,
-                        lane,
-                        wakeup,
-                    ):
-                        # A wakeup for this hash already stands, so this object
-                        # is a dropped same-hash duplicate and must release the
-                        # credit floor it carries -- exactly what the shipped
-                        # duplicate paths do with the object they discard.
-                        service._release_dropped_duplicate_candidate_floor(wakeup)
-                        continue
-                    restored.add(key)
+            try:
+                with self._silence():
+                    # Newest lift first: a mid-drain enumeration can re-adopt a
+                    # row this call already lifted, and the re-adopted object is
+                    # the one the shipped markers now describe. Restoring
+                    # newest-first also rebuilds the original lane order,
+                    # because each lifted wakeup goes back to its lane's front.
+                    restored: set[str] = set()
+                    for lane, key, wakeup in reversed(held_wakeups):
+                        if key in restored or not self._restore_withheld_wakeup(
+                            server,
+                            key,
+                            lane,
+                            wakeup,
+                        ):
+                            # A wakeup for this hash already stands, so this
+                            # object is a dropped same-hash duplicate and must
+                            # release the credit floor it carries -- exactly
+                            # what the shipped duplicate paths do.
+                            service._release_dropped_duplicate_candidate_floor(
+                                wakeup
+                            )
+                            continue
+                        restored.add(key)
+            finally:
+                service.__dict__.pop(
+                    "_collapse_superseded_block_candidates",
+                    None,
+                )
         terminalized: dict[str, set[str]] = {"submitted": set(), "abandoned": set()}
         still_pending: set[str] = set()
         for block_hash, row in outbox.items():

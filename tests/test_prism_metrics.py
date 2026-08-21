@@ -23,7 +23,10 @@ from lab.prism.coordinator_config import (
     DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS,
     DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS,
 )
-from lab.prism.block_candidates import PRISM_STALE_JOB_ABANDON_CLASSES
+from lab.prism.block_candidates import (
+    PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES,
+    PRISM_STALE_JOB_ABANDON_CLASSES,
+)
 from lab.prism.job_bundle import (
     PRISM_JOB_BUILD_PHASES,
     PRISM_JOB_BUILD_SECONDS_BUCKETS,
@@ -132,6 +135,7 @@ def reference_block_submitter_metrics_lines(server) -> list[str]:
     submit_buckets, submit_sum, submit_count = (
         service.block_submit_seconds_snapshot()
     )
+    collapse_counts = service.block_candidate_collapse_snapshot()
     return [
         "# HELP qbit_prism_block_submit_seconds Seconds from a block candidate landing in this process to its submitblock RPC returning.",
         "# TYPE qbit_prism_block_submit_seconds histogram",
@@ -160,6 +164,12 @@ def reference_block_submitter_metrics_lines(server) -> list[str]:
         "# HELP qbit_prism_block_submitter_retry_backoff_seconds Current intentional submitter retry delay.",
         "# TYPE qbit_prism_block_submitter_retry_backoff_seconds gauge",
         f"qbit_prism_block_submitter_retry_backoff_seconds {backoff_delay:.6f}",
+        "# HELP qbit_prism_block_candidate_collapse_total Durable pending block candidates handled by the decided-height collapse, by bounded outcome. The outcome label set is closed: no block hash, parent hash, or job ID is ever a label.",
+        "# TYPE qbit_prism_block_candidate_collapse_total counter",
+        *[
+            f'qbit_prism_block_candidate_collapse_total{{outcome="{outcome}"}} {int(collapse_counts.get(outcome, 0))}'
+            for outcome in PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES
+        ],
     ]
 
 
@@ -1443,7 +1453,12 @@ class MetricsRendererTests(unittest.TestCase):
                 "submit_seconds_count": 1,
             }
 
-        port = SimpleNamespace(block_submitter_snapshot=snapshot)
+        port = SimpleNamespace(
+            block_submitter_snapshot=snapshot,
+            block_candidate_collapse_snapshot=lambda: {
+                outcome: 0 for outcome in PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES
+            },
+        )
         lines = MetricsRenderer(port).block_submitter_metrics_lines()  # type: ignore[arg-type]
 
         self.assertEqual(snapshot_calls, 1)

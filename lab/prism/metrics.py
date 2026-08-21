@@ -14,7 +14,10 @@ from __future__ import annotations
 import time
 from typing import Any, Protocol
 
-from lab.prism.block_candidates import PRISM_STALE_JOB_ABANDON_CLASSES
+from lab.prism.block_candidates import (
+    PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES,
+    PRISM_STALE_JOB_ABANDON_CLASSES,
+)
 from lab.prism.coordinator_config import (
     DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS,
     DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS,
@@ -140,6 +143,7 @@ class MetricsPort(Protocol):
     def accepted_share_stats(self) -> Any: ...
     def accepted_parent_unresolved_ages_seconds(self) -> list[float]: ...
     def audit_artifact_metrics(self) -> Any: ...
+    def block_candidate_collapse_snapshot(self) -> dict[str, int]: ...
     def block_finalization_metrics_lines(self) -> Any: ...
     def block_ledger_call_class_metrics(self) -> Any: ...
     def block_submitter_snapshot(self) -> dict[str, object]: ...
@@ -708,6 +712,10 @@ class MetricsRenderer:
         backoff_active = bool(snapshot["backoff_active"])
         backoff_remaining = float(snapshot["backoff_remaining_seconds"])
         backoff_delay = float(snapshot["backoff_delay_seconds"])
+        # The B1 owner copies these under the coordinator lock; the key set
+        # is fixed by PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES so the series
+        # cardinality cannot grow with the candidate population.
+        collapse_counts = self.port.block_candidate_collapse_snapshot()
         return [
             "# HELP qbit_prism_block_submit_seconds Seconds from a block candidate landing in this process to its submitblock RPC returning.",
             "# TYPE qbit_prism_block_submit_seconds histogram",
@@ -736,6 +744,12 @@ class MetricsRenderer:
             "# HELP qbit_prism_block_submitter_retry_backoff_seconds Current intentional submitter retry delay.",
             "# TYPE qbit_prism_block_submitter_retry_backoff_seconds gauge",
             f"qbit_prism_block_submitter_retry_backoff_seconds {backoff_delay:.6f}",
+            "# HELP qbit_prism_block_candidate_collapse_total Durable pending block candidates handled by the decided-height collapse, by bounded outcome. The outcome label set is closed: no block hash, parent hash, or job ID is ever a label.",
+            "# TYPE qbit_prism_block_candidate_collapse_total counter",
+            *[
+                f'qbit_prism_block_candidate_collapse_total{{outcome="{outcome}"}} {int(collapse_counts.get(outcome, 0))}'
+                for outcome in PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES
+            ],
         ]
 
     def landing_observability_metrics_lines(self) -> list[str]:
