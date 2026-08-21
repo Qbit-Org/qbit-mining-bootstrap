@@ -2966,6 +2966,18 @@ class PayoutStateService:
             return None
 
         active_ancestors: list[tuple[int, str, bool]] = []
+        # One probe per distinct height, not per candidate. Every offered or
+        # replay-adopted block candidate arms a preview barrier, and siblings
+        # of one solved block all share a height -- so a candidate storm makes
+        # this loop issue thousands of identical getblockhash calls for a
+        # single answer, twice per built bundle, on the path every child build
+        # takes before it can wait for a preview.
+        #
+        # Scoped to this scan deliberately, and not memoized across calls: the
+        # active block at a height changes under reorgs, and a longer-lived
+        # cache would answer with a chain that no longer exists. Within one
+        # scan a single view is what the comparison below already assumes.
+        active_hash_by_height: dict[int, str] = {}
         try:
             for (
                 candidate_hash,
@@ -2973,9 +2985,12 @@ class PayoutStateService:
                 candidate_invalidated,
             ) in ancestor_candidates:
                 assert candidate_height is not None
-                active_hash = str(
-                    runtime.rpc.call("getblockhash", [candidate_height])
-                ).lower()
+                active_hash = active_hash_by_height.get(candidate_height)
+                if active_hash is None:
+                    active_hash = str(
+                        runtime.rpc.call("getblockhash", [candidate_height])
+                    ).lower()
+                    active_hash_by_height[candidate_height] = active_hash
                 if active_hash == candidate_hash:
                     active_ancestors.append(
                         (

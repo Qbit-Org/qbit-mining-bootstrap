@@ -183,6 +183,73 @@ class JobBundleCacheTests(unittest.TestCase):
         self.assertFalse(server._payout_state_publication_fenced())
         self.assertFalse(server._payout_state_delivery_gate._delivery_blocked)
 
+    def test_ancestor_scan_probes_each_height_once(self) -> None:
+        # Every offered or replay-adopted candidate arms a preview barrier, and
+        # siblings of one solved block share a height -- so without dedupe this
+        # scan issues one getblockhash per barrier for a single answer. The
+        # 2026-08-20 load test reached 3,120 barriers at one height.
+        server, rpc = coordinator()
+        original_rpc_call = rpc.call
+        heights_probed: list[int] = []
+
+        def counting_call(
+            method: str,
+            params: list[object] | None = None,
+        ) -> object:
+            if method == "getblockhash":
+                assert params is not None
+                heights_probed.append(int(params[0]))
+                return "ff" * 32
+            return original_rpc_call(method, params)
+
+        rpc.call = counting_call  # type: ignore[method-assign]
+        for index in range(50):
+            server._begin_accepted_block_payout_preview(
+                f"{index:064x}",
+                block_height=10,
+            )
+        for index in range(50, 60):
+            server._begin_accepted_block_payout_preview(
+                f"{index:064x}",
+                block_height=11,
+            )
+
+        server._accepted_block_payout_transition_for_parent(
+            "ab" * 32,
+            parent_height=12,
+        )
+
+        # Two distinct heights, sixty barriers: two probes, not sixty.
+        self.assertEqual(sorted(heights_probed), [10, 11])
+
+    def test_ancestor_scan_dedupe_is_scoped_to_one_scan(self) -> None:
+        # The active block at a height changes under reorgs, so the memo must
+        # not outlive the scan that built it.
+        server, rpc = coordinator()
+        original_rpc_call = rpc.call
+        probe_count = 0
+
+        def counting_call(
+            method: str,
+            params: list[object] | None = None,
+        ) -> object:
+            nonlocal probe_count
+            if method == "getblockhash":
+                probe_count += 1
+                return "ff" * 32
+            return original_rpc_call(method, params)
+
+        rpc.call = counting_call  # type: ignore[method-assign]
+        server._begin_accepted_block_payout_preview("cd" * 32, block_height=10)
+
+        for _ in range(3):
+            server._accepted_block_payout_transition_for_parent(
+                "ab" * 32,
+                parent_height=12,
+            )
+
+        self.assertEqual(probe_count, 3)
+
     def test_withdrawn_landed_transition_blocks_active_descendant_fallback(
         self,
     ) -> None:
