@@ -3242,6 +3242,7 @@ class BlockCandidateService:
         exhausted = False
         attempts = 0
         streak = 0
+        self._ensure_block_replay_state()
         with self._coordinator.lock:
             # Re-inserted (not updated in place) so insertion order tracks
             # recency and the eviction above stays oldest-first.
@@ -3251,7 +3252,16 @@ class BlockCandidateService:
             if record is None:
                 record = _AncestorRedriveRecord()
             self._ancestor_redrive_records[ancestor] = record
-            if not record.armed and not record.exhausted:
+            # A replay-lane copy of the ancestor means in-process resolution
+            # is already underway -- an earlier re-drive's adoption, or
+            # ordinary replay. Deferrals during that window prove nothing a
+            # new pass could act on (it would no-op on the adopted check),
+            # so they must not bank toward attempts: burning the cap against
+            # a mechanism that is mid-fix would exhaust it before slow-but-
+            # working finalization completes, standing the re-drive down for
+            # an ancestor it had already reached.
+            ancestor_inflight = ancestor in self._block_replay_inflight_hashes
+            if not record.armed and not record.exhausted and not ancestor_inflight:
                 record.streak += 1
                 streak = record.streak
                 if record.streak >= threshold:

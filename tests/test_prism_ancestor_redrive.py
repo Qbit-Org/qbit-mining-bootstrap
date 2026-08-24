@@ -424,9 +424,12 @@ class AncestorRedriveSweepTests(unittest.TestCase):
         )
         service = server._ensure_block_candidate_service()
         service._ensure_block_replay_state()
+        # Armed first, then adopted: deferrals against an already-inflight
+        # ancestor bank nothing (covered in the bookkeeping suite), so the
+        # adopted short-circuit is reached by arming before adoption.
+        self._defer_once(server)
         with server.lock:
             server._block_replay_inflight_hashes.add(ANCESTOR_HASH)
-        self._defer_once(server)
         with patch("builtins.print"):
             self.assertEqual(server.replay_pending_block_candidates(), 0)
         # An inflight hash means ordinary replay finalization still owns the
@@ -602,6 +605,33 @@ class AncestorRedriveBookkeepingTests(unittest.TestCase):
         self.assertEqual(int(server.accepted_parent_redrive_resolved_count), 0)
         self.assertEqual(service._ancestor_redrive_records, {})
         self.assertEqual(service._ancestor_redrive_last_blocking, {})
+
+    def test_deferrals_while_the_ancestor_is_inflight_bank_nothing(self) -> None:
+        """An adopted ancestor is mid-resolution; a new pass would no-op.
+
+        Burning armed attempts against an adoption already in progress
+        would exhaust the cap before slow-but-working replay finalization
+        completes; the streak must resume only once the flight ends.
+        """
+        server, service = self._tracker(threshold=1, cap=3)
+        service._ensure_block_replay_state()
+        with server.lock:
+            server._block_replay_inflight_hashes.add(ANCESTOR_HASH)
+        with patch("builtins.print"):
+            for _cycle in range(3):
+                service.note_pending_parent_transition_deferral(
+                    CHILD_HASH, ANCESTOR_HASH
+                )
+        self.assertFalse(service._ancestor_redrive_owed())
+        self.assertEqual(int(server.accepted_parent_redrive_attempt_count), 0)
+        with server.lock:
+            server._block_replay_inflight_hashes.discard(ANCESTOR_HASH)
+        with patch("builtins.print"):
+            service.note_pending_parent_transition_deferral(
+                CHILD_HASH, ANCESTOR_HASH
+            )
+        self.assertTrue(service._ancestor_redrive_owed())
+        self.assertEqual(int(server.accepted_parent_redrive_attempt_count), 1)
 
     def test_child_entry_eviction_never_cancels_an_ancestor_record(self) -> None:
         """The two registries are different hash spaces; trimming one must
