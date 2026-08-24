@@ -592,6 +592,12 @@ class PayoutStateRuntime(Protocol):
 
     def _record_progress_payout_generation(self, *args: Any, **kwargs: Any) -> Any: ...
 
+    def _observe_accepted_block_preview_publication(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any: ...
+
     def _writer_operation(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
@@ -2636,6 +2642,15 @@ class PayoutStateService:
                         existing is not None
                         and existing.published_generation is not None
                     ):
+                        # A matching preview that already carries a published
+                        # generation is visible to waiting children, so this
+                        # call is the publication for issue #181's interval
+                        # when it is the first one seen for the hash; the
+                        # observer drops it otherwise.
+                        runtime._observe_accepted_block_preview_publication(
+                            key,
+                            result="published",
+                        )
                         return runtime._materialize_prior_balance_preview(
                             existing_preview
                         )
@@ -2729,6 +2744,16 @@ class PayoutStateService:
                         published_generation=None,
                     )
                     runtime._accepted_block_payout_preview_condition.notify_all()
+        # Both exits above make the preview observable to children already
+        # waiting on the transition -- the generation publication through the
+        # atomic pointer swap, the fenced retention branch through the
+        # compact preview plus notify_all -- so both close issue #181's
+        # acceptance-to-publication interval. They are labelled apart because
+        # only one of them installed a generation.
+        runtime._observe_accepted_block_preview_publication(
+            key,
+            result="published" if published is not None else "degraded",
+        )
         return runtime._materialize_prior_balance_preview(serialized)
 
     def _accepted_block_preview_candidate(

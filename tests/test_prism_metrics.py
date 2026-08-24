@@ -24,6 +24,8 @@ from lab.prism.coordinator_config import (
     DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS,
 )
 from lab.prism.block_candidates import (
+    PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_RESULTS,
+    PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_SECONDS_BUCKETS,
     PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES,
     PRISM_STALE_JOB_ABANDON_CLASSES,
 )
@@ -136,6 +138,29 @@ def reference_block_submitter_metrics_lines(server) -> list[str]:
         service.block_submit_seconds_snapshot()
     )
     collapse_counts = service.block_candidate_collapse_snapshot()
+    preview_publication = service.accepted_block_preview_publication_snapshot()
+    preview_publication_lines: list[str] = []
+    for result in PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_RESULTS:
+        histogram = preview_publication[result]
+        buckets = histogram["buckets"]
+        count = int(histogram["count"])
+        preview_publication_lines.extend(
+            f"qbit_prism_accepted_block_preview_publication_seconds_bucket"
+            f'{{result="{result}",le="{bucket:g}"}} {int(buckets.get(bucket, 0))}'
+            for bucket in PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_SECONDS_BUCKETS
+        )
+        preview_publication_lines.append(
+            f"qbit_prism_accepted_block_preview_publication_seconds_bucket"
+            f'{{result="{result}",le="+Inf"}} {count}'
+        )
+        preview_publication_lines.append(
+            f"qbit_prism_accepted_block_preview_publication_seconds_sum"
+            f'{{result="{result}"}} {float(histogram["sum"]):.6f}'
+        )
+        preview_publication_lines.append(
+            f"qbit_prism_accepted_block_preview_publication_seconds_count"
+            f'{{result="{result}"}} {count}'
+        )
     return [
         "# HELP qbit_prism_block_submit_seconds Seconds from a block candidate landing in this process to its submitblock RPC returning.",
         "# TYPE qbit_prism_block_submit_seconds histogram",
@@ -146,6 +171,9 @@ def reference_block_submitter_metrics_lines(server) -> list[str]:
         f'qbit_prism_block_submit_seconds_bucket{{le="+Inf"}} {submit_count}',
         f"qbit_prism_block_submit_seconds_sum {submit_sum:.6f}",
         f"qbit_prism_block_submit_seconds_count {submit_count}",
+        "# HELP qbit_prism_accepted_block_preview_publication_seconds Seconds from definitive qbitd acceptance of a block candidate to its payout preview becoming visible to waiting child work, by publication result.",
+        "# TYPE qbit_prism_accepted_block_preview_publication_seconds histogram",
+        *preview_publication_lines,
         "# HELP qbit_prism_block_candidates_pending Durable block candidates awaiting a terminal outcome, or -1 if unavailable.",
         "# TYPE qbit_prism_block_candidates_pending gauge",
         f"qbit_prism_block_candidates_pending {int(pending_metrics['pending_count'])}",
@@ -1144,6 +1172,17 @@ class MetricsRenderParityTests(unittest.TestCase):
         }
         server.block_solves_dropped_counts = {"stale_grace": 2}
         server._observe_block_submit_seconds(0.5)
+        # Acceptance-to-preview-publication needs both halves of the interval:
+        # the submitter-thread acceptance stamp and the publication that
+        # closes it. Seeding through the shipped B1 entry points keeps the
+        # parity document exercising the real observer, not a hand-built
+        # histogram.
+        service = server._ensure_block_candidate_service()
+        service._note_accepted_block_preview_acceptance("ab" * 32)
+        server._observe_accepted_block_preview_publication(
+            "ab" * 32,
+            result="published",
+        )
         server._record_block_ledger_call(
             call_class="landing",
             budget_seconds=30.0,
@@ -1228,6 +1267,7 @@ class MetricsRenderParityTests(unittest.TestCase):
             "qbit_prism_block_candidate_accept_pending_defers_total 1",
             'qbit_prism_share_ack_seconds_count{result="accepted"} 1',
             "qbit_prism_block_submit_seconds_count 1",
+            'qbit_prism_accepted_block_preview_publication_seconds_count{result="published"} 1',
             'qbit_prism_reorg_reconcile_lookups_total{path="job_build",source="memo_hit"} 1',
             'qbit_prism_block_solves_dropped_total{reason="stale_grace"} 2',
             'qbit_prism_stale_job_abandons_total{class="',
@@ -1451,6 +1491,28 @@ class MetricsRendererTests(unittest.TestCase):
                 "submit_seconds_buckets": {0.05: 1},
                 "submit_seconds_sum": 0.04,
                 "submit_seconds_count": 1,
+                "accepted_preview_publication": {
+                    "published": {
+                        "buckets": {
+                            bucket: (1 if bucket >= 0.5 else 0)
+                            for bucket in (
+                                PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_SECONDS_BUCKETS
+                            )
+                        },
+                        "sum": 0.4,
+                        "count": 1,
+                    },
+                    "degraded": {
+                        "buckets": {
+                            bucket: 0
+                            for bucket in (
+                                PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_SECONDS_BUCKETS
+                            )
+                        },
+                        "sum": 0.0,
+                        "count": 0,
+                    },
+                },
             }
 
         port = SimpleNamespace(
@@ -1467,6 +1529,29 @@ class MetricsRendererTests(unittest.TestCase):
         self.assertIn("qbit_prism_block_submit_seconds_count 1", lines)
         self.assertIn(
             'qbit_prism_block_submit_seconds_bucket{le="0.05"} 1',
+            lines,
+        )
+        self.assertIn(
+            "qbit_prism_accepted_block_preview_publication_seconds_bucket"
+            '{result="published",le="0.5"} 1',
+            lines,
+        )
+        # The 5 s child wait budget must be an exact bucket boundary: the
+        # acceptance criterion is a p95 below it, which a Prometheus
+        # histogram can only answer at a boundary it carries.
+        self.assertIn(
+            "qbit_prism_accepted_block_preview_publication_seconds_bucket"
+            '{result="published",le="5"} 1',
+            lines,
+        )
+        self.assertIn(
+            "qbit_prism_accepted_block_preview_publication_seconds_count"
+            '{result="published"} 1',
+            lines,
+        )
+        self.assertIn(
+            "qbit_prism_accepted_block_preview_publication_seconds_count"
+            '{result="degraded"} 0',
             lines,
         )
 
