@@ -1878,6 +1878,9 @@ class PrismCoordinator:
     _block_accounting_overflow_queue = BlockCandidateStateField(
         "_block_accounting_overflow_queue"
     )
+    _block_accounting_accepted_queue = BlockCandidateStateField(
+        "_block_accounting_accepted_queue"
+    )
     _block_accounting_sequence = BlockCandidateStateField(
         "_block_accounting_sequence"
     )
@@ -2580,6 +2583,12 @@ class PrismCoordinator:
             tuple[int, int, _BlockCandidateAccountingTask]
         ] = queue.PriorityQueue()
         self._block_accounting_overflow_queue: queue.PriorityQueue[
+            tuple[int, int, _BlockCandidateAccountingTask]
+        ] = queue.PriorityQueue()
+        # Definitive node acceptances only, and unbounded for the same reason
+        # the overflow queue is: the offer already happened, so it may never
+        # be converted back into a raw-submit retry.
+        self._block_accounting_accepted_queue: queue.PriorityQueue[
             tuple[int, int, _BlockCandidateAccountingTask]
         ] = queue.PriorityQueue()
         self._block_accounting_sequence = 0

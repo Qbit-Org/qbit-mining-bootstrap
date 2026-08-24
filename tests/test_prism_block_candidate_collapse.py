@@ -3355,14 +3355,26 @@ class BlockCandidateTerminalOutcomeBoundTests(unittest.TestCase):
         *,
         before_stop: Any = None,
     ) -> None:
-        """Run the shipped accounting loop until its queue is drained.
+        """Run the shipped accounting loop until its queues are drained.
 
         Bounded: the lane either finishes the queued task quickly or the
-        deadline expires and the assertions that follow report it.
+        deadline expires and the assertions that follow report it.  All three
+        handoff lanes are watched, because a task built with definitive node
+        acceptance is routed to the accepted lane rather than the primary
+        queue and a wait that only watched the primary would stop the loop
+        before that task ever ran.
         """
         service = fixture.service
         server = fixture.server
         service._ensure_block_accounting_state()
+
+        def unfinished() -> int:
+            return (
+                service._block_accounting_accepted_queue.unfinished_tasks
+                + service._block_accounting_queue.unfinished_tasks
+                + service._block_accounting_overflow_queue.unfinished_tasks
+            )
+
         thread = threading.Thread(target=service.block_accounting_loop, daemon=True)
         with redirect_stdout(StringIO()):
             thread.start()
@@ -3370,16 +3382,13 @@ class BlockCandidateTerminalOutcomeBoundTests(unittest.TestCase):
                 if before_stop is not None:
                     before_stop()
                 deadline = time.monotonic() + self.WAIT_SECONDS
-                while (
-                    service._block_accounting_queue.unfinished_tasks
-                    and time.monotonic() < deadline
-                ):
+                while unfinished() and time.monotonic() < deadline:
                     time.sleep(0.01)
             finally:
                 server.stop_event.set()
                 thread.join(self.WAIT_SECONDS)
         self.assertFalse(thread.is_alive())
-        self.assertEqual(service._block_accounting_queue.unfinished_tasks, 0)
+        self.assertEqual(unfinished(), 0)
 
     def test_an_accounting_failure_hands_its_candidate_off_without_a_gap(
         self,
