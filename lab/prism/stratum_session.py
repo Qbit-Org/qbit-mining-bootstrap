@@ -112,6 +112,32 @@ class ClientState:
     # unchanged difficulty may refresh its TTL; a session that resumed a
     # retained value and submitted nothing must let that value keep ageing.
     vardiff_accepted_any: bool = False
+    # Most recent accepted-share evidence. Durable reconnect retention uses
+    # the exact stamped difficulty plus its wall-clock evidence time so a
+    # later explicit difficulty request cannot accidentally be persisted as
+    # safe merely because this connection accepted an older, easier share.
+    vardiff_last_accepted_difficulty: Decimal | None = None
+    vardiff_last_accepted_wall_ms: int | None = None
+    # Fast-arrival initial convergence. True until this connection's first
+    # share-driven retarget actually commits; while set, an accepted share
+    # may trigger a retarget before the configured interval and that
+    # retarget may take the larger initial step bound. Cleared exactly once,
+    # at the paired-send commit point, so a build/send failure cannot spend
+    # the relaxation without the miner ever seeing the new difficulty, and
+    # so every later retarget is back on the ordinary configured bound.
+    vardiff_initial_convergence_pending: bool = True
+    # The statistical gate is evaluated once at the first sample that meets
+    # both its share-count and elapsed-time floors. A failed delivery may
+    # re-arm it, but an ordinary on-cadence window is never tested after every
+    # subsequent share (which would compound the false-positive probability).
+    vardiff_initial_convergence_evaluated: bool = False
+    # Connection-scoped arrival evidence for the bounded high-difficulty
+    # arrival histograms: when this session's vardiff accounting began, how
+    # many accepted shares it has produced since, and whether its one
+    # crossing of the high-diff threshold has already been observed.
+    vardiff_session_started_monotonic: float = field(default_factory=time.monotonic)
+    vardiff_session_accepted: int = 0
+    vardiff_high_diff_arrival_recorded: bool = False
     # Owns all per-client difficulty policy, estimates, and Vardiff windows.
     # Share handlers release it before acquiring job_update_lock or the
     # coordinator lock; job delivery may acquire it while job_update_lock is

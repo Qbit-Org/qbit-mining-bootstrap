@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 
 from lab.prism.coordinator_config import (
+    DEFAULT_PRISM_VARDIFF_INITIAL_MAX_STEP_UP,
     MAX_PRISM_PYTHON_SWITCH_INTERVAL_SECONDS,
     MIN_PRISM_PYTHON_SWITCH_INTERVAL_SECONDS,
     apply_python_switch_interval,
@@ -1557,6 +1558,178 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             fake_ledger.call_args.kwargs["writer_session_token"].startswith(
                 WRITER_LEASE_HEARTBEAT_SESSION_PREFIX
             )
+        )
+
+
+class PrismVardiffInitialConvergenceKillSwitchTests(unittest.TestCase):
+    """PRISM_STRATUM_VARDIFF_INITIAL_CONVERGENCE=0 must fully disengage.
+
+    The switch is documented as restoring the pre-#132 behavior exactly, so
+    turning it off has to stop the initial-convergence settings from having
+    any say in whether the coordinator starts. VardiffConfig enforces its
+    invariants on every instance, so the loader is what has to keep an inert
+    setting from reaching them as a startup failure.
+    """
+
+    START = Decimal("0.000000001")
+
+    # Each entry is one initial-convergence setting that is invalid only
+    # relative to the relaxation, plus the message the enabled loader rejects
+    # it with. Raising MAX_STEP_UP past the initial bound is the reproducer
+    # that motivated this: it is an ordinary tuning change that becomes
+    # unrelated to anything once the relaxation is off.
+    DISABLED_SHOULD_TOLERATE = (
+        (
+            {"PRISM_STRATUM_VARDIFF_MAX_STEP_UP": "128"},
+            "PRISM_STRATUM_VARDIFF_INITIAL_MAX_STEP_UP is below",
+        ),
+        (
+            {"PRISM_STRATUM_VARDIFF_INITIAL_MAX_STEP_UP": "2"},
+            "PRISM_STRATUM_VARDIFF_INITIAL_MAX_STEP_UP is below",
+        ),
+        (
+            {"PRISM_STRATUM_VARDIFF_INITIAL_MIN_SHARES": "0"},
+            "PRISM_STRATUM_VARDIFF_INITIAL_MIN_SHARES must be at least 1",
+        ),
+        (
+            {"PRISM_STRATUM_VARDIFF_INITIAL_MIN_STEP_UP": "0.5"},
+            "PRISM_STRATUM_VARDIFF_INITIAL_MIN_STEP_UP must be at least 1",
+        ),
+        (
+            {"PRISM_STRATUM_VARDIFF_INITIAL_MIN_SECONDS": "0"},
+            "PRISM_STRATUM_VARDIFF_INITIAL_MIN_SECONDS must be positive",
+        ),
+    )
+
+    def test_disabled_initial_settings_never_fail_startup(self) -> None:
+        for overrides, _message in self.DISABLED_SHOULD_TOLERATE:
+            with self.subTest(overrides=overrides):
+                config = load_prism_vardiff_config(
+                    self.START,
+                    environ={
+                        "PRISM_STRATUM_VARDIFF_INITIAL_CONVERGENCE": "0",
+                        **overrides,
+                    },
+                )
+
+                self.assertFalse(config.initial_convergence_enabled)
+                # Whatever the loader had to do to the inert values, the
+                # config it returns must satisfy the invariants rather than
+                # having escaped them.
+                self.assertGreaterEqual(
+                    config.initial_max_step_factor, config.max_step_factor
+                )
+                self.assertGreaterEqual(config.initial_min_step_factor, 1)
+                self.assertGreaterEqual(config.initial_min_accepted_shares, 1)
+                self.assertGreater(config.initial_min_elapsed_seconds, 0)
+
+    def test_disabled_initial_settings_are_not_parsed(self) -> None:
+        config = load_prism_vardiff_config(
+            self.START,
+            environ={
+                "PRISM_STRATUM_VARDIFF_INITIAL_CONVERGENCE": "0",
+                "PRISM_STRATUM_VARDIFF_INITIAL_MAX_STEP_UP": "not-a-decimal",
+                "PRISM_STRATUM_VARDIFF_INITIAL_MIN_SHARES": "not-an-integer",
+                "PRISM_STRATUM_VARDIFF_INITIAL_MIN_STEP_UP": "NaN",
+                "PRISM_STRATUM_VARDIFF_INITIAL_MIN_SECONDS": "-1",
+            },
+        )
+
+        self.assertFalse(config.initial_convergence_enabled)
+        self.assertEqual(
+            config.initial_max_step_factor,
+            DEFAULT_PRISM_VARDIFF_INITIAL_MAX_STEP_UP,
+        )
+
+    def test_enabled_validation_is_unchanged(self) -> None:
+        for overrides, message in self.DISABLED_SHOULD_TOLERATE:
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(SystemExit) as raised:
+                    load_prism_vardiff_config(self.START, environ=dict(overrides))
+
+                self.assertIn(message, str(raised.exception))
+
+    def test_enabled_still_accepts_a_valid_custom_relaxation(self) -> None:
+        config = load_prism_vardiff_config(
+            self.START,
+            environ={
+                "PRISM_STRATUM_VARDIFF_MAX_STEP_UP": "8",
+                "PRISM_STRATUM_VARDIFF_INITIAL_MAX_STEP_UP": "128",
+                "PRISM_STRATUM_VARDIFF_INITIAL_MIN_SHARES": "4",
+                "PRISM_STRATUM_VARDIFF_INITIAL_MIN_STEP_UP": "2",
+            },
+        )
+
+        self.assertTrue(config.initial_convergence_enabled)
+        # Operator values reach the config untouched while the switch is on.
+        self.assertEqual(config.max_step_factor, Decimal("8"))
+        self.assertEqual(config.initial_max_step_factor, Decimal("128"))
+        self.assertEqual(config.initial_min_accepted_shares, 4)
+        self.assertEqual(config.initial_min_step_factor, Decimal("2"))
+
+    def test_validation_unrelated_to_the_relaxation_still_applies_when_off(
+        self,
+    ) -> None:
+        # The switch relaxes the initial-convergence settings only. The
+        # observation-only arrival threshold and the ordinary step bound are
+        # read regardless of it, so they keep failing closed.
+        for overrides, message in (
+            (
+                {"PRISM_STRATUM_VARDIFF_HIGH_DIFF_ARRIVAL_DIFF": "0"},
+                "PRISM_STRATUM_VARDIFF_HIGH_DIFF_ARRIVAL_DIFF must be positive",
+            ),
+            (
+                {"PRISM_STRATUM_VARDIFF_MAX_STEP_UP": "not-a-number"},
+                "PRISM_STRATUM_VARDIFF_MAX_STEP_UP must be a decimal number",
+            ),
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(SystemExit) as raised:
+                    load_prism_vardiff_config(
+                        self.START,
+                        environ={
+                            "PRISM_STRATUM_VARDIFF_INITIAL_CONVERGENCE": "0",
+                            **overrides,
+                        },
+                    )
+
+                self.assertIn(message, str(raised.exception))
+
+    def test_tolerated_settings_stay_inert(self) -> None:
+        # The whole justification for accepting these configurations is that
+        # the relaxation is off, so pin that: neither the early trigger nor
+        # the wider step bound may act on a config the loader had to adjust.
+        config = load_prism_vardiff_config(
+            self.START,
+            environ={
+                "PRISM_STRATUM_VARDIFF_INITIAL_CONVERGENCE": "0",
+                "PRISM_STRATUM_VARDIFF_MAX_STEP_UP": "128",
+                "PRISM_STRATUM_VARDIFF_MAX_DIFF": "1000000000",
+            },
+        )
+        current = Decimal("100")
+
+        self.assertFalse(
+            vardiff.initial_convergence_ready(
+                current_difficulty=current,
+                accepted_shares=1000,
+                accepted_difficulty=Decimal("1000000"),
+                elapsed_seconds=Decimal("60"),
+                config=config,
+            )
+        )
+        # Even asked for the relaxation directly, the step stays on the
+        # ordinary bound: 128x, not the coerced initial factor.
+        self.assertEqual(
+            vardiff.calculate_next_difficulty(
+                current_difficulty=current,
+                accepted_shares=1000,
+                elapsed_seconds=Decimal("60"),
+                config=config,
+                accepted_difficulty=Decimal("100000000"),
+                initial_convergence=True,
+            ),
+            current * config.max_step_factor,
         )
 
 

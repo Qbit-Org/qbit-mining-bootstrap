@@ -40,7 +40,14 @@ paths:
     get:
       tags: [dashboard]
       operationId: getHashrateSeries
-      summary: Get chart-ready pool or miner hashrate time series.
+      summary: Get chart-ready pool or miner credited hashrate time series.
+      description: >
+        Every rate is credited hashrate, derived from the accepted share
+        difficulty the pool credited to the subject in each bucket. It is not
+        physical router telemetry: while the assigned share target and the
+        router's own share filtering disagree, neither the raw nor the smoothed
+        series reproduces what the router reports. Buckets with no credited
+        shares are omitted; consumers synthesize gaps.
       parameters:
         - name: subject
           in: query
@@ -64,9 +71,27 @@ paths:
             allOf:
               - $ref: "#/components/schemas/HashrateBucket"
             default: auto
+        - name: view
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [both]
+          description: >
+            Omit for the `prism.dashboard.hashrate-series.v1` response, whose
+            `hashrate_ths` is the smoothed credited rate. `both` returns
+            `prism.dashboard.hashrate-series.v2` carrying the raw and the
+            smoothed credited rate for every bucket. Any other non-empty value
+            is rejected with `400 bad_request`. The view is part of the cache
+            key, so the two responses never share a cache entry. `bucket=auto`
+            resolves to 1h for 1w/1m and 1d for 6m/all; with the default 30m
+            smoothing window those coarse series have `method=none`. Request
+            `bucket=5m` to compare raw buckets with the 30m trailing rate.
       responses:
         "200":
-          description: Hashrate series.
+          description: >
+            Hashrate series. `prism.dashboard.hashrate-series.v1` without
+            `view`; `prism.dashboard.hashrate-series.v2` for `view=both`.
           headers:
             Cache-Control:
               $ref: "#/components/headers/BrowserCacheControl"
@@ -79,7 +104,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HashrateSeriesResponse"
+                oneOf:
+                  - $ref: "#/components/schemas/HashrateSeriesResponse"
+                  - $ref: "#/components/schemas/HashrateSeriesDualRateResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "503":
@@ -788,7 +815,11 @@ components:
         timestamp:
           $ref: "#/components/schemas/IsoTimestamp"
         hashrate_ths:
-          $ref: "#/components/schemas/DecimalString"
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: >
+            Trailing-smoothed credited hashrate estimated from accepted share
+            difficulty. This is not router-side physical telemetry.
         accepted_share_count:
           type: integer
           minimum: 0
@@ -817,6 +848,105 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/HashratePoint"
+    HashrateSmoothing:
+      type: object
+      additionalProperties: false
+      required: [method, window_seconds]
+      description: >
+        How `smoothed_hashrate_ths` was produced. `trailing` averages credited
+        difficulty over the trailing `window_seconds` ending at each bucket,
+        with buckets missing from the series counting as zero. `none` means
+        smoothing is disabled or configured shorter than two buckets: the
+        window is then the bucket itself and the smoothed rate equals the raw
+        rate.
+      properties:
+        method:
+          type: string
+          enum: [trailing, none]
+        window_seconds:
+          type: integer
+          minimum: 1
+    DualRateHashratePoint:
+      type: object
+      additionalProperties: false
+      required:
+        - timestamp
+        - raw_hashrate_ths
+        - smoothed_hashrate_ths
+        - accepted_share_count
+        - accepted_share_difficulty
+        - complete
+      properties:
+        timestamp:
+          $ref: "#/components/schemas/IsoTimestamp"
+        raw_hashrate_ths:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: >
+            Credited difficulty in this bucket divided by the full
+            `bucket_seconds`, even when the bucket is not yet complete. This
+            is a credited-work estimate, not router telemetry; sparse
+            high-difficulty shares can make an individual bucket over-read the
+            delivered physical rate.
+        smoothed_hashrate_ths:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: >
+            Trailing-window credited rate, the same estimate v1 serves as
+            `hashrate_ths`. Equals `raw_hashrate_ths` when the smoothing
+            method is `none`.
+        accepted_share_count:
+          type: integer
+          minimum: 0
+        accepted_share_difficulty:
+          $ref: "#/components/schemas/DecimalString"
+        complete:
+          type: boolean
+          description: >
+            False when `generated_at` falls before the bucket's end; the
+            bucket is still accumulating credit and its raw rate under-reads.
+    HashrateSeriesDualRateResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - schema
+        - generated_at
+        - subject
+        - range
+        - bucket
+        - bucket_seconds
+        - unit
+        - rate_basis
+        - smoothing
+        - points
+      properties:
+        schema:
+          type: string
+          const: prism.dashboard.hashrate-series.v2
+        generated_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        subject:
+          $ref: "#/components/schemas/HashrateSubject"
+        range:
+          $ref: "#/components/schemas/HashrateRange"
+        bucket:
+          $ref: "#/components/schemas/HashrateBucket"
+        bucket_seconds:
+          type: integer
+          enum: [300, 3600, 86400]
+          description: Duration of every bucket, and the divisor behind each raw rate.
+        unit:
+          type: string
+          const: ths
+        rate_basis:
+          type: string
+          const: accepted_share_difficulty
+        smoothing:
+          $ref: "#/components/schemas/HashrateSmoothing"
+        points:
+          type: array
+          items:
+            $ref: "#/components/schemas/DualRateHashratePoint"
     WindowInfo:
       type: object
       additionalProperties: false
@@ -838,7 +968,12 @@ components:
         - participant_count
       properties:
         pool_hashrate_ths:
-          $ref: "#/components/schemas/DecimalString"
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: >
+            Pool credited hashrate over the fixed 3h leaderboard window,
+            estimated from accepted share difficulty rather than router
+            telemetry.
         pool_accepted_share_difficulty:
           $ref: "#/components/schemas/DecimalString"
         participant_count:
@@ -865,7 +1000,12 @@ components:
         display_name:
           $ref: "#/components/schemas/NullableString"
         hashrate_ths_3h:
-          $ref: "#/components/schemas/DecimalString"
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: >
+            Recipient credited hashrate over the fixed 3h leaderboard window,
+            estimated from accepted share difficulty rather than router
+            telemetry.
         share_percent:
           oneOf:
             - $ref: "#/components/schemas/DecimalString"
