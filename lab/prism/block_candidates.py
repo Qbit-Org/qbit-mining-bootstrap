@@ -182,6 +182,24 @@ PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES = (
     "cleanup_recovered",
     # Retry passes that ran but still left at least one step owed.
     "cleanup_retry_failed",
+    # -- issue #181 item 2: the dequeue-time stale sibling skip -------------
+    # These three name the *population* the skip judged, one dequeued
+    # candidate at a time, and partition it exactly:
+    # dequeue_considered = dequeue_skipped + dequeue_preserved. The outcomes
+    # above stay shared with the replay-adoption page path, because they
+    # describe the same machinery (one selection, one lease set, one fenced
+    # write, one cleanup) whichever caller drove it.
+    #
+    # Dequeued candidates predicate S was actually asked about: the ledger
+    # can answer a fenced batch abandonment and a pool-block probe, and the
+    # candidate carries a readable hash and parent.
+    "dequeue_considered",
+    # Dequeued candidates terminalized before any node offer.
+    "dequeue_skipped",
+    # Dequeued candidates handed to the ordinary offer path, for any reason
+    # at all -- current work, offer evidence, an unprobed height, a lighter
+    # occupant, a lost fenced write, or a read that failed closed.
+    "dequeue_preserved",
 )
 # Issue #181 item 3: the interval from definitive node acceptance (the
 # submitblock RPC returning None on the submitter thread) to the accepted
@@ -621,6 +639,18 @@ class _BlockCandidateChainView:
         )
         self._active: dict[int, str] = self._probe_budget.active
         self._difficulty: dict[str, int] = self._probe_budget.difficulty
+        # Per view, never on the budget: the tip is the one fact a view must
+        # not inherit from an earlier page, and keeping the memo here is what
+        # preserves "each page's selection runs against a freshly read tip"
+        # while letting one page read it once. Both reads were already made
+        # at most once per view by the page selector and the pre-write
+        # revalidation, so memoizing changes no existing caller's round
+        # trips; it exists so a caller that needs the tip *before* handing
+        # this view to selection -- the dequeue-time skip, which gates on
+        # clause 3 before it spends a durable read -- does not pay for a
+        # second one.
+        self._tip: str | None = None
+        self._tip_height: int | None = None
 
     def _call(self, method: str, params: list[object] | None = None) -> object:
         coordinator = self._service._coordinator
@@ -639,19 +669,27 @@ class _BlockCandidateChainView:
             )
 
     def best_tip(self) -> str:
+        """The chain's best tip, read once for the life of this view."""
+        if self._tip is not None:
+            return self._tip
         tip = _collapse_block_hash(self._call("getbestblockhash"))
         if tip is None:
             raise _BlockCandidateCollapseFailedClosed(
                 "best tip hash is not a block hash"
             )
+        self._tip = tip
         return tip
 
     def tip_height(self) -> int:
+        """The best tip's height, read once for the life of this view."""
+        if self._tip_height is not None:
+            return self._tip_height
         height = _collapse_height(self._call("getblockcount"))
         if height is None or height < 0:
             raise _BlockCandidateCollapseFailedClosed(
                 "best tip height is not an integer"
             )
+        self._tip_height = height
         return height
 
     def active_at(self, height: int) -> str | None:
@@ -1003,6 +1041,54 @@ def block_candidate_intent(candidate: PrismBlockCandidate) -> dict[str, Any]:
     # introduces a value that cannot survive the durable JSON boundary.
     json.dumps(intent, separators=(",", ":"), sort_keys=True)
     return intent
+
+
+def _dequeued_candidate_collapse_row(
+    candidate: PrismBlockCandidate,
+    *,
+    pool_block_exists: bool,
+) -> dict[str, Any]:
+    """Shape one dequeued candidate as the durable page row predicate S reads.
+
+    The dequeue-time skip (issue #181 item 2) judges an in-memory candidate,
+    not a fetched outbox row, so it has to present one. It deliberately does
+    *not* call :func:`block_candidate_intent` to do that: that function
+    re-serializes the whole block, recomputes every witness merkle leaf, and
+    round-trips the result through ``json.dumps`` to validate it -- work
+    proportional to the block, paid per dequeued sibling, to read four
+    scalars. This builds only the fields ``_superseded_candidate_row``
+    actually decodes.
+
+    Every value here is copied from the same place the durable intent copies
+    it from, so the row this returns and the row the outbox holds for the
+    same candidate carry identical facts; a regression pins that field by
+    field rather than trusting the restatement. No predicate input is
+    coerced or defaulted: a candidate whose context cannot answer one of
+    them raises, and the caller fails that candidate closed onto the
+    ordinary offer path. ``job_id`` is the one exception, because it is not
+    a predicate input at all -- it only groups the collapse log line.
+    """
+    context = candidate.context
+    template = context.template
+    return {
+        "block_hash": str(candidate.submission.block_hash_hex).lower(),
+        "candidate": {
+            "block_hash_hex": str(candidate.submission.block_hash_hex).lower(),
+            "parent_hash": str(template["previousblockhash"]).lower(),
+            "expected_height": int(template["height"]),
+            "template": {
+                "previousblockhash": template["previousblockhash"],
+                "height": int(template["height"]),
+            },
+            "found_block": context.found_block,
+            "pending_share": {
+                "job_id": getattr(candidate.pending_share, "job_id", ""),
+            },
+        },
+        # Read durably by the caller, never assumed: clause 2 is the fact
+        # that keeps an offered, landed candidate out of a terminal set.
+        "pool_block_exists": bool(pool_block_exists),
+    }
 
 
 def block_candidate_from_intent(intent: dict[str, Any]) -> PrismBlockCandidate:
@@ -1667,6 +1753,8 @@ class BlockCandidateService:
         self,
         durable_rows: list[Any],
         chain: _BlockCandidateChainView,
+        *,
+        ignore_leases: frozenset[str] = frozenset(),
     ) -> list[_SupersededCandidateRow]:
         """Apply predicate S to one fetched page of durable pending rows.
 
@@ -1678,6 +1766,17 @@ class BlockCandidateService:
         whole walk. A row whose height the walk cannot afford to probe is
         counted and skipped, which preserves it for the per-row path exactly
         as any other rejected clause does.
+
+        ``ignore_leases`` names disposition flights the *caller itself*
+        holds, exactly as it does for the pre-write revalidation: those
+        flights are not treated as offer evidence, and every other member of
+        the evidence set still rejects. The replay-adoption page path passes
+        nothing and is unchanged; the dequeue-time skip (issue #181 item 2)
+        passes the single hash whose lease ``submit_next`` claimed before it
+        called here, because that flight is this pass and this pass has
+        made no node offer. See
+        ``_skip_superseded_block_candidate_at_dequeue`` for why no other
+        flight can hide behind it.
         """
         # Clause 2 is read first, for the whole page, before a single chain
         # round trip: a page that cannot answer it selects nothing at all,
@@ -1694,9 +1793,12 @@ class BlockCandidateService:
         # survives that decode carries the row key probed here, because the
         # decode refuses an intent whose hash disagrees with it.
         evidence = self._block_candidate_collapse_evidence(
-            durable_row.get("block_hash")
-            for durable_row in durable_rows
-            if isinstance(durable_row, dict)
+            (
+                durable_row.get("block_hash")
+                for durable_row in durable_rows
+                if isinstance(durable_row, dict)
+            ),
+            ignore_leases=ignore_leases,
         )
         tip = chain.best_tip()
         tip_height = chain.tip_height()
@@ -2412,13 +2514,26 @@ class BlockCandidateService:
         page_rows: int,
         timeout_seconds: float | None,
         call_class: str,
+        held_leases: frozenset[str] = frozenset(),
     ) -> frozenset[str]:
-        """Lease, revalidate, write once, then clean up exactly what we won."""
+        """Lease, revalidate, write once, then clean up exactly what we won.
+
+        ``held_leases`` names hashes whose disposition lease the caller
+        already holds and will release itself. They are neither claimed nor
+        released here, and they count as leased for every step that follows
+        -- including the pre-write revalidation's own self-exemption, which
+        already ignores the leases this apply is operating under. The
+        replay-adoption page path passes nothing and behaves exactly as
+        before; the dequeue-time skip passes the one hash ``submit_next``
+        leased before it dequeued anything.
+        """
         coordinator = self._coordinator
         coordinator._record_block_submitter_phase("replay-collapse-lease")
         leases: dict[str, _BlockCandidateDispositionLease] = {}
         try:
             for row in selected:
+                if row.block_hash in held_leases:
+                    continue
                 # Never block: a synchronous submit that has persisted its
                 # intent but not yet claimed its own lease must not queue
                 # behind a page of maintenance work.
@@ -2428,11 +2543,15 @@ class BlockCandidateService:
                 )
                 if lease is not None:
                     leases[row.block_hash] = lease
+            leased = [
+                row
+                for row in selected
+                if row.block_hash in leases or row.block_hash in held_leases
+            ]
             self._record_block_candidate_collapse(
                 "lease_skipped",
-                len(selected) - len(leases),
+                len(selected) - len(leased),
             )
-            leased = [row for row in selected if row.block_hash in leases]
             if not leased:
                 return frozenset()
             coordinator._record_block_submitter_phase("replay-collapse-revalidate")
@@ -2557,7 +2676,7 @@ class BlockCandidateService:
                     abandoned,
                     considered=page_rows,
                     selected=len(selected),
-                    lease_skipped=len(selected) - len(leases),
+                    lease_skipped=len(selected) - len(leased),
                     revalidation_dropped=len(leased) - len(qualified),
                 )
             except Exception:
@@ -2689,6 +2808,247 @@ class BlockCandidateService:
             )
             not in abandoned
         ]
+
+    # -- dequeue-time stale sibling skip (issue #181 item 2) ----------------
+
+    def _block_candidate_dequeue_chain(self) -> _BlockCandidateChainView:
+        """A chain view over the submitter's own tip-epoch height cache.
+
+        The replay walk shares one ``_CollapseHeightProbeBudget`` across its
+        pages so a storm at one decided height costs the walk one
+        ``getblockhash`` and one ``getblockheader`` however many pages it
+        spans. A dequeue burst has exactly that shape -- hundreds of
+        siblings of one decided height, arriving one candidate at a time --
+        so it shares a budget the same way, and for the same reason: without
+        it every sibling would re-read the occupant and its header.
+
+        The cache is retired by :meth:`_retire_block_candidate_dequeue_chain`
+        the moment the best tip changes, so its lifetime is exactly one tip
+        epoch. Only the height caches are shared: the tip itself is memoized
+        per view, so every candidate's selection still runs against a
+        freshly read best tip, and the pre-write revalidation builds its own
+        budget and re-reads the occupant under the held lease regardless.
+
+        Submitter-thread state, like the replay walk's budget: ``submit_next``
+        is the only caller and the block-submitter thread is the only thread
+        that reaches it.
+        """
+        budget = getattr(self, "_block_candidate_dequeue_probe_budget", None)
+        if budget is None:
+            budget = _CollapseHeightProbeBudget()
+            self._block_candidate_dequeue_probe_budget = budget
+            self._block_candidate_dequeue_probe_tip: str | None = None
+        return _BlockCandidateChainView(self, probe_budget=budget)
+
+    def _retire_block_candidate_dequeue_chain(self, tip: str) -> None:
+        """Drop every height this cache read under an earlier best tip.
+
+        The best tip names the whole active chain beneath it: a block at any
+        height can only change by changing every descendant, so while the
+        tip hash is unchanged every ``getblockhash(H)`` below it answers
+        identically. Retiring exactly on a tip change therefore makes the
+        cache valid for precisely as long as it is kept, and returns the
+        bounded probe allowance so a long-lived submitter never stops
+        probing new heights.
+
+        That is a stronger statement than the walk's cross-page sharing
+        needs, and the pre-write revalidation is unaffected either way: it
+        builds its own budget and re-reads the occupant from the chain under
+        the held lease before anything terminal happens.
+        """
+        if getattr(self, "_block_candidate_dequeue_probe_tip", None) == tip:
+            return
+        budget = self._block_candidate_dequeue_probe_budget
+        budget.active.clear()
+        budget.difficulty.clear()
+        budget.remaining = MAX_BLOCK_CANDIDATE_COLLAPSE_HEIGHT_PROBES
+        self._block_candidate_dequeue_probe_tip = tip
+
+    def _skip_superseded_block_candidate_at_dequeue(
+        self,
+        candidate: PrismBlockCandidate,
+        *,
+        timeout_seconds: float | None = None,
+        call_class: str = "fast",
+    ) -> bool:
+        """Terminalize one provably-stale dequeued candidate before any offer.
+
+        Returns True when the durable row was abandoned and every piece of
+        this candidate's in-memory state was torn down, so ``submit_next``
+        must release its lease and consume the wakeup without offering
+        anything. False means "offer it", for any reason at all: this is an
+        optimisation over the per-row path and declining it is always safe.
+
+        Why this exists (issue #181, the 2026-08-20 spike): a candidate
+        whose parent is no longer the best tip and that carries no offer
+        evidence is provably stale *before* the offer, and the per-row path
+        spends one ``submitblock``, ~6 chain reads and two ledger writes
+        discovering that -- plus an accounting task, a fast-lane
+        reservation, and an accepted-block payout-preview barrier armed and
+        withdrawn -- for each one. Those are the individual
+        ``block candidate abandoned reason=stale-job: tip moved before
+        submit`` bursts the 2026-08-21 validation still showed for
+        live/fast-path siblings after #196 removed the replay population.
+
+        The predicate is #196's, unchanged: same evidence set, same
+        clauses, same fencing, same cleanup, same terminal write. This is a
+        second *caller*, not a second notion of staleness. The one
+        divergence is the self-exemption below.
+
+        **The self-exemption, and why nothing else can hide behind it.**
+        ``submit_next`` claims this hash's disposition lease before it gets
+        here, so the hash is in ``_block_candidate_disposition_flights`` --
+        a member of #196's evidence set E -- and #196's selector would
+        reject the row on clause 1 forever. Exactly one flight is exempted:
+        the one this pass holds the lock of, named by this candidate's own
+        hash and passed as ``ignore_leases``/``held_leases``. No other
+        flight can be exempted, because no other hash is ever in that set;
+        and no other *holder* of this flight can hide behind the exemption,
+        because a flight's registry entry is shared by its holder and its
+        waiters while its lock has exactly one owner -- this pass. A pass
+        merely waiting on the lock has offered nothing, and once the fenced
+        write lands, ``_publish_collapsed_candidate_terminal_fence`` stamps
+        the terminal outcome while the lease is still ours, so the waiter
+        wakes into the fence rather than into an offer. Every other member
+        of E still rejects this hash: retry holders, the deferred accounting
+        retry, ``_block_disposition_waiting_retries``, ``finalize_retries``,
+        ``_block_candidate_retained_node_submissions``,
+        ``_tip_observed_accepted_block_hashes``,
+        ``_accounted_accepted_block_hashes``,
+        ``_block_candidate_terminal_outcomes``, and a ``qbit_pool_blocks``
+        row in any state.
+
+        **Chain, not observation set.** Replay adoption does not register a
+        hash outstanding, so a blockwait observation of a replayed hash is
+        dropped until dequeue and the in-memory tip view says nothing about
+        it. Clause 3 is therefore decided against a freshly read
+        ``getbestblockhash``, never against the coordinator's published tip.
+
+        **Fail closed.** Any unreadable fact -- a chain read, the pool-block
+        probe, an intent this candidate cannot answer, a fenced write that
+        did not return this hash -- preserves the candidate for the offer
+        path. Nothing is ever abandoned on an unknown.
+
+        One diagnostic note: because this reuses #196's selection and apply
+        verbatim, the submitter phase stamps those emit still read
+        ``replay-collapse-*``. They name the machinery, which is shared, not
+        the caller. The ``dequeue_considered``/``dequeue_skipped``/
+        ``dequeue_preserved`` counters are what separate this caller's
+        population from the replay walk's, and the one phase this method
+        stamps itself -- ``dequeue-collapse-pool-block`` -- names the only
+        durable read it adds.
+        """
+        coordinator = self._coordinator
+        ledger = coordinator.ledger
+        if not callable(getattr(ledger, "mark_block_candidates_abandoned", None)):
+            # A ledger with no fenced batch abandonment has no safe bulk form
+            # at all; a structural absence, so it neither counts nor spends a
+            # round trip. Same reasoning as the page-level driver.
+            return False
+        pool_block_reader = getattr(ledger, "pool_block_state", None)
+        if not callable(pool_block_reader):
+            # Clause 2 has no durable answer here. Reading it as false would
+            # abandon exactly the rows that must never be abandoned.
+            return False
+        block_hash = _block_candidate_hash_of(candidate)
+        if block_hash is None:
+            return False
+        held = frozenset((block_hash,))
+        self._record_block_candidate_collapse("dequeue_considered")
+        try:
+            if self._block_candidate_collapse_evidence(held, ignore_leases=held):
+                # Clause 1 first, because it is the only clause that costs
+                # nothing: the selector re-asks it below, but asking here
+                # keeps both the chain round trip and the durable pool-block
+                # probe off every candidate some evidence already excludes.
+                self._record_block_candidate_collapse("dequeue_preserved")
+                return False
+            parent_hash = _collapse_block_hash(
+                candidate.context.template["previousblockhash"]
+            )
+            if parent_hash is None:
+                raise _BlockCandidateCollapseFailedClosed(
+                    "dequeued candidate carries no usable parent hash"
+                )
+            chain = self._block_candidate_dequeue_chain()
+            tip = chain.best_tip()
+            self._retire_block_candidate_dequeue_chain(tip)
+            if parent_hash == tip:
+                # Clause 3, short-circuited before any durable read: this is
+                # the block waiting to be offered, not a superseded sibling.
+                # Keeping it first is what holds the acceptance path's added
+                # cost to a single getbestblockhash.
+                #
+                # That read is not replaceable by the coordinator's published
+                # tip (``_current_published_tip_hash_locked``), tempting as a
+                # free in-memory gate is. Published work is what a *blocked*
+                # refresh stops updating, and a blocked refresh is #181's
+                # symptom: during the incident the published tip sits at the
+                # very parent every stale sibling names, so a gate on it
+                # would decline to skip exactly the population this exists
+                # for. The chain is asked instead, which is also what D5
+                # requires for replay-adopted rows.
+                self._record_block_candidate_collapse("dequeue_preserved")
+                return False
+            pool_block_exists = (
+                coordinator._run_block_submitter_ledger_call(
+                    ("dequeue-collapse-pool-block", block_hash),
+                    "dequeue-collapse-pool-block",
+                    lambda: pool_block_reader(block_hash=block_hash),
+                    timeout_seconds=timeout_seconds,
+                    call_class=call_class,
+                )
+                is not None
+            )
+            selected = self._select_superseded_block_candidates(
+                [
+                    _dequeued_candidate_collapse_row(
+                        candidate,
+                        pool_block_exists=pool_block_exists,
+                    )
+                ],
+                chain,
+                ignore_leases=held,
+            )
+        except Exception as exc:
+            logged = self._note_block_candidate_collapse_fail_closed(1, exc)
+            if logged and not isinstance(exc, _BlockCandidateCollapseFailedClosed):
+                traceback.print_exc()
+            self._record_block_candidate_collapse("dequeue_preserved")
+            return False
+        if not selected:
+            self._record_block_candidate_collapse("dequeue_preserved")
+            return False
+        self._record_block_candidate_collapse("selected", len(selected))
+        try:
+            abandoned = self._apply_superseded_block_candidate_collapse(
+                selected,
+                chain,
+                page_rows=1,
+                timeout_seconds=timeout_seconds,
+                call_class=call_class,
+                held_leases=held,
+            )
+        except Exception as exc:
+            if self._note_block_candidate_collapse_fail_closed(1, exc):
+                traceback.print_exc()
+            self._record_block_candidate_collapse("dequeue_preserved")
+            return False
+        if block_hash not in abandoned:
+            # Anything short of a won row -- an unclaimable lease, a
+            # revalidation drop, a lost fenced write -- is preserved.
+            self._record_block_candidate_collapse("dequeue_preserved")
+            return False
+        # The floor holder is bound to the *queued object's* identity, and
+        # this object has already left its lane, so the apply's own
+        # pending-share step -- which indexes holders by scanning the live
+        # and replay queues -- cannot see it. Release it here, through the
+        # same seam ``submit_next`` uses for a dropped duplicate. Correct
+        # whether the apply's cleanup completed or was deferred: a deferred
+        # retry has no queue left to find this object in either.
+        self._release_dropped_duplicate_candidate_floor(candidate)
+        self._record_block_candidate_collapse("dequeue_skipped")
+        return True
 
     def _block_replay_should_yield_to_live_candidates(
         self,
@@ -5346,6 +5706,41 @@ class BlockCandidateService:
         with coordinator.lock:
             pending_finalize = self.finalize_retries.get(block_hash)
         if pending_finalize is None:
+            # Issue #181 item 2. A candidate whose parent is no longer the
+            # best tip, whose height the chain has decided in favour of a
+            # block of at least its work, and which carries no offer
+            # evidence, is provably stale before any offer: skip it here
+            # rather than pay a submitblock, ~6 chain reads, two ledger
+            # writes, an accounting task and a payout-preview barrier to
+            # learn the same thing per row.
+            #
+            # Placed after the lease claim and the terminal-outcome fence --
+            # both of which this depends on -- and before the fast-lane
+            # reservation, so a sibling on its way to being abandoned never
+            # consumes max-block capacity. The skip terminalizes the durable
+            # row itself (it does not drop the wakeup): the lease it holds
+            # is already in #196's evidence set, so a dropped row would be
+            # rejected by that selector forever, and the dequeued object's
+            # pending-share floor holder can only be released by draining
+            # this object.
+            #
+            # Guarded exactly as the node offer below is: the skip contains
+            # its own failures and answers False for every one of them, but
+            # an escape here would leave this hash's lease held forever and
+            # drop the only object that can release its floor holder.
+            try:
+                stale = self._skip_superseded_block_candidate_at_dequeue(
+                    candidate
+                )
+            except BaseException:
+                try:
+                    coordinator._retain_block_candidate_for_retry(candidate)
+                finally:
+                    coordinator._release_block_candidate_disposition(lease)
+                raise
+            if stale:
+                coordinator._release_block_candidate_disposition(lease)
+                return BlockCandidateRunResult(True)
             permanently_closed = False
             already_accounted = False
             if defer_accounting:
