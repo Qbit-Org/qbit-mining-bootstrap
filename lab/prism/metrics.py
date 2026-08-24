@@ -131,6 +131,9 @@ class MetricsPort(Protocol):
     _job_build_retiring: Any
     _job_build_priority_preparations: Any
     _accepted_parent_preview_wait_timeouts: Any
+    accepted_parent_redrive_attempt_count: Any
+    accepted_parent_redrive_resolved_count: Any
+    accepted_parent_redrive_exhausted_count: Any
 
     def _accepted_parent_unresolved_depth(self) -> int: ...
     def _accepted_parent_unresolved_depth_cap(self) -> int: ...
@@ -856,6 +859,18 @@ class MetricsRenderer:
                 "# HELP qbit_prism_accepted_parent_preview_wait_timeouts_total Child job builds that timed out waiting for an accepted-parent payout preview.",
                 "# TYPE qbit_prism_accepted_parent_preview_wait_timeouts_total counter",
                 f"qbit_prism_accepted_parent_preview_wait_timeouts_total {preview_wait_timeouts}",
+                "# HELP qbit_prism_accepted_parent_redrive_attempts_total In-process ancestor re-drives armed after repeated finalization deferrals on one pending accepted-parent transition.",
+                "# TYPE qbit_prism_accepted_parent_redrive_attempts_total counter",
+                "qbit_prism_accepted_parent_redrive_attempts_total "
+                f"{int(getattr(self.port, 'accepted_parent_redrive_attempt_count', 0))}",
+                "# HELP qbit_prism_accepted_parent_redrive_resolved_total Pending accepted-parent transitions that resolved after at least one in-process re-drive attempt.",
+                "# TYPE qbit_prism_accepted_parent_redrive_resolved_total counter",
+                "qbit_prism_accepted_parent_redrive_resolved_total "
+                f"{int(getattr(self.port, 'accepted_parent_redrive_resolved_count', 0))}",
+                "# HELP qbit_prism_accepted_parent_redrive_exhausted_total Ancestors whose re-drive attempt cap was exhausted with the transition still pending; the publication-progress watchdog remains the backstop.",
+                "# TYPE qbit_prism_accepted_parent_redrive_exhausted_total counter",
+                "qbit_prism_accepted_parent_redrive_exhausted_total "
+                f"{int(getattr(self.port, 'accepted_parent_redrive_exhausted_count', 0))}",
             ]
         )
         prior_stats_fn = getattr(self.port.ledger, "prior_balances_read_stats", None)

@@ -30,6 +30,8 @@ from typing import Any, Callable, Iterable, Iterator, Protocol
 from lab.prism import direct_stratum
 from lab.prism.coordinator_config import (
     BLOCK_LANDING_DB_TIMEOUT_WATCHDOG_FRACTION,
+    DEFAULT_ACCEPTED_PARENT_REDRIVE_ATTEMPT_MAX,
+    DEFAULT_ACCEPTED_PARENT_REDRIVE_DEFER_THRESHOLD,
     DEFAULT_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS,
     DEFAULT_BLOCK_LANDING_DB_TIMEOUT_SECONDS,
     DEFAULT_BLOCK_SUBMIT_DB_TIMEOUT_SECONDS,
@@ -60,6 +62,13 @@ MAX_PENDING_BLOCK_CANDIDATES = 32
 # gate simply stays closed while the queued batch drains, and the submitter
 # loop re-enumerates the shrinking remainder.
 MAX_BLOCK_REPLAY_ENUMERATION_ROWS = 1024
+# Ancestor re-drive bookkeeping (issue #190) is keyed by block hash and
+# dropped the moment the blocking transition resolves; this bound only
+# guards against a pathological stream of distinct never-resolving
+# ancestors leaking entries forever. Eviction is oldest-first, which for a
+# wedge means the still-blocking ancestor (re-recorded every deferral) is
+# the last thing evicted.
+MAX_ANCESTOR_REDRIVE_TRACKED_HASHES = 64
 DEFAULT_BLOCK_CANDIDATE_RETRY_INITIAL_SECONDS = 0.25
 DEFAULT_BLOCK_CANDIDATE_RETRY_MAX_SECONDS = 30.0
 # The primary accounting handoff queue must be bounded or the documented
@@ -1259,6 +1268,20 @@ class BlockCandidateService:
             str, float | None
         ] = {}
         self._block_replay_enumeration_owed_flag = False
+        # Targeted ancestor re-drive state (issue #190), all under
+        # coordinator.lock. A found block whose finalization keeps deferring
+        # on the same unresolved accepted-ancestor payout transition arms a
+        # forced durable-replay pass for that ancestor after a configured
+        # deferral streak; the counters feed the qbit_prism_accepted_parent_
+        # redrive_* metrics.
+        self._ancestor_redrive_streaks: dict[str, int] = {}
+        self._ancestor_redrive_attempts: dict[str, int] = {}
+        self._ancestor_redrive_requests: dict[str, None] = {}
+        self._ancestor_redrive_exhausted: set[str] = set()
+        self._ancestor_redrive_last_blocking: dict[str, str] = {}
+        self.accepted_parent_redrive_attempt_count = 0
+        self.accepted_parent_redrive_resolved_count = 0
+        self.accepted_parent_redrive_exhausted_count = 0
         # Fixed-key selector/apply outcome counters for the decided-height
         # collapse. The key set is closed so the rendered series carries no
         # block hash, parent hash, or job ID in a label.
@@ -3091,6 +3114,279 @@ class BlockCandidateService:
         queue_obj = self.candidate_queue
         return queue_obj is not None and not queue_obj.empty()
 
+    # -- targeted ancestor re-drive (issue #190) ---------------------------
+
+    def _ancestor_redrive_defer_threshold(self) -> int:
+        return max(
+            1,
+            int(
+                getattr(
+                    self._coordinator,
+                    "accepted_parent_redrive_defer_threshold",
+                    DEFAULT_ACCEPTED_PARENT_REDRIVE_DEFER_THRESHOLD,
+                )
+            ),
+        )
+
+    def _ancestor_redrive_attempt_cap(self) -> int:
+        """Re-drives one ancestor may trigger; zero disables the mechanism."""
+        return max(
+            0,
+            int(
+                getattr(
+                    self._coordinator,
+                    "accepted_parent_redrive_attempt_max",
+                    DEFAULT_ACCEPTED_PARENT_REDRIVE_ATTEMPT_MAX,
+                )
+            ),
+        )
+
+    def _evict_stale_redrive_entries_locked(self) -> None:
+        """Bound per-hash re-drive bookkeeping. Caller holds the runtime lock.
+
+        Entries are dropped on resolution, so eviction only engages under a
+        pathological stream of distinct never-resolving ancestors. The
+        deferral path re-inserts its ancestor on every deferral, so an
+        actively blocking hash sits at the back of every registry and is the
+        last thing an oldest-first eviction touches.
+        """
+        for registry in (
+            self._ancestor_redrive_streaks,
+            self._ancestor_redrive_attempts,
+            self._ancestor_redrive_last_blocking,
+        ):
+            while len(registry) > MAX_ANCESTOR_REDRIVE_TRACKED_HASHES:
+                evicted = next(iter(registry))
+                registry.pop(evicted, None)
+                self._ancestor_redrive_requests.pop(evicted, None)
+                self._ancestor_redrive_exhausted.discard(evicted)
+
+    def note_pending_parent_transition_deferral(
+        self,
+        block_hash: str,
+        ancestor_hash: str,
+    ) -> None:
+        """Track one finalization deferral against its blocking ancestor.
+
+        Called by the coordinator's pending-parent fence each time a
+        candidate's finalization defers because ``ancestor_hash``'s accepted
+        payout transition is unresolved. The deferral itself only re-checks
+        the transition, so a streak of them proves the retry loop cannot
+        resolve the ancestor on its own; on crossing the configured
+        threshold a targeted durable-replay pass is armed for the submitter
+        loop. Bounded per ancestor by the attempt cap, past which deferrals
+        fall back to exactly the pre-#190 behavior with the
+        publication-progress watchdog as the backstop.
+        """
+        child = str(block_hash).lower()
+        ancestor = str(ancestor_hash).lower()
+        threshold = self._ancestor_redrive_defer_threshold()
+        cap = self._ancestor_redrive_attempt_cap()
+        requested = False
+        exhausted = False
+        attempts = 0
+        streak = 0
+        with self._coordinator.lock:
+            # Re-inserted (not updated in place) so insertion order tracks
+            # recency and the eviction above stays oldest-first.
+            self._ancestor_redrive_last_blocking.pop(child, None)
+            self._ancestor_redrive_last_blocking[child] = ancestor
+            streak = int(self._ancestor_redrive_streaks.pop(ancestor, 0)) + 1
+            self._ancestor_redrive_streaks[ancestor] = streak
+            attempts = int(self._ancestor_redrive_attempts.get(ancestor, 0))
+            if (
+                streak >= threshold
+                and ancestor not in self._ancestor_redrive_requests
+            ):
+                if attempts < cap:
+                    attempts += 1
+                    self._ancestor_redrive_attempts.pop(ancestor, None)
+                    self._ancestor_redrive_attempts[ancestor] = attempts
+                    self._ancestor_redrive_requests[ancestor] = None
+                    self._ancestor_redrive_streaks[ancestor] = 0
+                    self.accepted_parent_redrive_attempt_count = (
+                        int(self.accepted_parent_redrive_attempt_count) + 1
+                    )
+                    requested = True
+                elif ancestor not in self._ancestor_redrive_exhausted:
+                    self._ancestor_redrive_exhausted.add(ancestor)
+                    self.accepted_parent_redrive_exhausted_count = (
+                        int(self.accepted_parent_redrive_exhausted_count) + 1
+                    )
+                    exhausted = True
+            self._evict_stale_redrive_entries_locked()
+        if requested:
+            print(
+                "prism coordinator: arming in-process ancestor re-drive "
+                f"ancestor={ancestor} child={child} deferral_streak={streak} "
+                f"attempt={attempts}/{cap}",
+                flush=True,
+            )
+        if exhausted:
+            print(
+                "prism coordinator: ancestor re-drive attempts exhausted "
+                f"ancestor={ancestor} child={child} attempts={attempts}; "
+                "deferrals continue and the publication-progress watchdog "
+                "remains the backstop",
+                flush=True,
+            )
+
+    def note_pending_parent_transition_resolved(self, block_hash: str) -> None:
+        """Drop re-drive bookkeeping once a child's ancestor fence passes."""
+        child = str(block_hash).lower()
+        resolved_ancestor: str | None = None
+        with self._coordinator.lock:
+            ancestor = self._ancestor_redrive_last_blocking.pop(child, None)
+            if ancestor is None:
+                return
+            attempts = int(self._ancestor_redrive_attempts.pop(ancestor, 0))
+            self._ancestor_redrive_streaks.pop(ancestor, None)
+            self._ancestor_redrive_requests.pop(ancestor, None)
+            self._ancestor_redrive_exhausted.discard(ancestor)
+            for key in [
+                key
+                for key, value in self._ancestor_redrive_last_blocking.items()
+                if value == ancestor
+            ]:
+                self._ancestor_redrive_last_blocking.pop(key, None)
+            if attempts > 0:
+                self.accepted_parent_redrive_resolved_count = (
+                    int(self.accepted_parent_redrive_resolved_count) + 1
+                )
+                resolved_ancestor = ancestor
+        if resolved_ancestor is not None:
+            print(
+                "prism coordinator: pending ancestor payout transition "
+                "resolved after in-process re-drive "
+                f"ancestor={resolved_ancestor} child={child}",
+                flush=True,
+            )
+
+    def _ancestor_redrive_owed(self) -> bool:
+        """Whether a forced durable-replay pass is armed for any ancestor."""
+        with self._coordinator.lock:
+            return bool(self._ancestor_redrive_requests)
+
+    def _consume_ancestor_redrive_requests(self) -> tuple[str, ...]:
+        """Take (and clear) every armed re-drive; one forced pass serves all.
+
+        Consumed up front deliberately: a pass whose enumeration fails burns
+        the attempt rather than re-running unbounded, the deferral streak
+        re-arms the next attempt, and the per-ancestor cap bounds the total.
+        """
+        with self._coordinator.lock:
+            if not self._ancestor_redrive_requests:
+                return ()
+            consumed = tuple(self._ancestor_redrive_requests)
+            self._ancestor_redrive_requests.clear()
+            return consumed
+
+    def _block_candidate_owned_in_process(self, block_hash: str) -> bool | None:
+        """Whether any live lane still names this hash, or None if unreadable.
+
+        Reuses exactly the pin set the terminal-outcome eviction trusts: the
+        lane registries, the single-slot retry holders, the live and replay
+        queues, and the claimed disposition flights. None means a leaf lane
+        could not be read without waiting under the global lock; callers
+        treat that as owned, which is the safe direction.
+        """
+        key = str(block_hash).lower()
+        self._ensure_block_candidate_disposition_state()
+        self._ensure_block_replay_state()
+        with self._coordinator.lock:
+            if any(
+                key in registry
+                for registry in self._live_block_candidate_hash_registries()
+            ):
+                return True
+            if key in self._held_block_candidate_retry_hashes():
+                return True
+            for live in (
+                self._queued_block_candidate_hashes(
+                    getattr(self, "candidate_queue", None)
+                ),
+                self._queued_block_candidate_hashes(
+                    getattr(self, "_block_replay_candidate_queue", None)
+                ),
+                self._in_flight_block_candidate_hashes(),
+            ):
+                if live is None:
+                    return None
+                if key in live:
+                    return True
+        return False
+
+    def _resolve_unreplayable_ancestor_transition(self, block_hash: str) -> None:
+        """Converge a stuck transition with durable state when replay cannot.
+
+        A forced enumeration that adopts the ancestor's pending outbox row is
+        the ordinary re-drive; this handles the remaining wedge shape, where
+        the armed transition has no pending durable row left -- the state a
+        process restart resolves simply by not rebuilding the transition. It
+        is cleared here only under the same proof a fresh startup replay
+        would compute: the completed enumeration found no pending row for
+        the hash, no in-process lane still owns a copy that could finish (or
+        withdraw) the transition itself, and the durable pool-block row
+        reports the block confirmed and not reversed -- the exact predicate
+        the landing's already-confirmed branch clears the preview under.
+        Anything short of that proof leaves the transition alone and the
+        watchdog remains the backstop.
+        """
+        coordinator = self._coordinator
+        coordinator._ensure_job_cache_state()
+        key = str(block_hash).lower()
+        with coordinator._accepted_block_payout_preview_condition:
+            transition = coordinator._accepted_block_payout_previews.get(key)
+        if transition is None:
+            return
+        if self._block_candidate_owned_in_process(key) is not False:
+            print(
+                "prism coordinator: ancestor re-drive left the transition to "
+                f"its in-process owner hash={key}",
+                flush=True,
+            )
+            return
+        block_state_reader = getattr(coordinator.ledger, "pool_block_state", None)
+        if not callable(block_state_reader):
+            return
+        try:
+            block_state = coordinator._run_block_submitter_ledger_call(
+                ("redrive-pool-block-state", key),
+                "redrive-pool-block-state",
+                lambda: block_state_reader(block_hash=key),
+            )
+        except Exception:
+            print(
+                "prism coordinator: ancestor re-drive pool-block state read "
+                f"failed hash={key}",
+                flush=True,
+            )
+            traceback.print_exc()
+            return
+        confirmed = (
+            isinstance(block_state, dict)
+            and str(block_state.get("chain_state", "")) == "confirmed"
+            and str(block_state.get("maturity_state", "")) != "reversed"
+        )
+        if not confirmed:
+            print(
+                "prism coordinator: ancestor re-drive could not resolve the "
+                f"transition hash={key} (no pending outbox row, pool block "
+                "not durably confirmed); watchdog remains the backstop",
+                flush=True,
+            )
+            return
+        # Durable state already includes this block's payout carry, so
+        # removing the in-memory override changes no logical payout state --
+        # the same clear the landing performs for an already-confirmed
+        # exact-idempotent replay.
+        coordinator._clear_accepted_block_payout_preview(key)
+        print(
+            "prism coordinator: ancestor re-drive cleared a stale transition "
+            f"for durably confirmed block hash={key}",
+            flush=True,
+        )
+
     def replay_pending(self) -> int:
         """Queue durable candidate intents not completed by an earlier process."""
         self._coordinator._record_block_submitter_phase("replay-check-memory")
@@ -3099,17 +3395,36 @@ class BlockCandidateService:
         # blocked until pending candidates are known, and only a successful
         # enumeration can unblock them.
         enumeration_owed = self._coordinator._block_replay_enumeration_owed()
+        # A targeted ancestor re-drive (issue #190) must reach the outbox
+        # query even while a retained retry or queued live work exists --
+        # those short-circuits are exactly what starved this path during the
+        # observed wedge -- so an armed request bypasses each of them below.
+        redrive_hashes = self._consume_ancestor_redrive_requests()
+        redrive_owed = bool(redrive_hashes)
         with self._coordinator.lock:
-            if not enumeration_owed and self.retry_candidate is not None:
+            if (
+                not enumeration_owed
+                and not redrive_owed
+                and self.retry_candidate is not None
+            ):
                 return 0
         # A live wakeup is already the lowest-latency route to qbitd. Never
         # park it behind the outbox query that exists only to recover missing
         # wakeups after queue pressure or restart.
         queue_obj = self.candidate_queue
-        if not enumeration_owed and queue_obj is not None and not queue_obj.empty():
+        if (
+            not enumeration_owed
+            and not redrive_owed
+            and queue_obj is not None
+            and not queue_obj.empty()
+        ):
             return 0
         self._ensure_block_replay_state()
-        if not enumeration_owed and not self._block_replay_candidate_queue.empty():
+        if (
+            not enumeration_owed
+            and not redrive_owed
+            and not self._block_replay_candidate_queue.empty()
+        ):
             return 0
         # The startup enumeration gates job issuance, so it runs with the
         # landing-class budget instead of the poll budget (issue #188 fix 4);
@@ -3311,7 +3626,12 @@ class BlockCandidateService:
                         probe_budget=collapse_probe_budget,
                     )
                 )
-                if len(durable_rows) < enumeration_limit or not enumeration_owed:
+                if len(durable_rows) < enumeration_limit or not (
+                    enumeration_owed or redrive_owed
+                ):
+                    # A short page proves no further pending row existed at
+                    # query time -- the completeness the re-drive's
+                    # stale-transition sweep below also relies on.
                     break
                 if self._block_replay_should_yield_to_live_candidates(
                     collapse_probe_budget
@@ -3349,6 +3669,29 @@ class BlockCandidateService:
             # and the submitter loop re-enumerates the remainder.
             self._coordinator._clear_block_replay_enumeration_owed()
             self._coordinator._record_startup_phase_once("block_replay_enumerated")
+        if redrive_hashes and enumeration_truncated:
+            print(
+                "prism coordinator: ancestor re-drive enumeration was "
+                "truncated; leaving pending transitions for the next "
+                "attempt or the watchdog",
+                flush=True,
+            )
+        elif redrive_hashes:
+            for redrive_hash in redrive_hashes:
+                key = str(redrive_hash).lower()
+                with self._coordinator.lock:
+                    adopted = key in self._block_replay_inflight_hashes
+                if adopted:
+                    # The pending outbox row was (re-)adopted -- by this pass
+                    # or an earlier one -- so ordinary replay finalization now
+                    # owns resolving the transition.
+                    print(
+                        "prism coordinator: ancestor re-drive enumerated a "
+                        f"pending candidate hash={key}",
+                        flush=True,
+                    )
+                    continue
+                self._resolve_unreplayable_ancestor_transition(key)
         if queued:
             print(
                 f"prism coordinator: replayed {queued} pending block candidate(s)",
@@ -5542,7 +5885,13 @@ class BlockCandidateService:
                 ) and self._coordinator.submit_next_block_candidate(
                     defer_accounting=True
                 ):
-                    continue
+                    if not self._ancestor_redrive_owed():
+                        continue
+                    # An armed ancestor re-drive (issue #190) falls through
+                    # to the replay entrypoint even though immediate work
+                    # succeeded: sustained live traffic taking this
+                    # `continue` every pass is exactly how the wedge starved
+                    # the one path that resolves a stuck ancestor.
                 self.ports.replay_entrypoint()
                 self._coordinator.submit_next_block_candidate(
                     timeout=1.0,
@@ -6985,6 +7334,9 @@ _STATE_FIELD_MAP = {
     "_outstanding_block_candidate_hashes": "_outstanding_block_candidate_hashes",
     "_tip_observed_accepted_block_hashes": "_tip_observed_accepted_block_hashes",
     "block_candidate_accept_pending_defer_count": "block_candidate_accept_pending_defer_count",
+    "accepted_parent_redrive_attempt_count": "accepted_parent_redrive_attempt_count",
+    "accepted_parent_redrive_resolved_count": "accepted_parent_redrive_resolved_count",
+    "accepted_parent_redrive_exhausted_count": "accepted_parent_redrive_exhausted_count",
     "stale_job_abandon_counts": "stale_job_abandon_counts",
     "_block_submit_metrics_lock": "_block_submit_metrics_lock",
     "block_submit_seconds_histogram": "block_submit_seconds_histogram",

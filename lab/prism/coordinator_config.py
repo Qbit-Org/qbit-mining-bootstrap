@@ -293,6 +293,20 @@ DEFAULT_PRISM_OBSERVED_TIP_ACCEPT_WINDOW_SECONDS = 300.0
 # builds block instead of stacking further prospective balance chains. The
 # durable outbox (MAX_PENDING_BLOCK_CANDIDATES) remains the wider bound.
 DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX = 8
+# In-process targeted ancestor re-drive (issue #190). A found block whose
+# finalization keeps deferring on the same unresolved accepted-ancestor
+# payout transition can only be resolved by re-driving that ancestor through
+# the durable-replay path -- the deferral itself merely re-checks the
+# transition. After this many consecutive deferrals on one ancestor the
+# submitter forces a durable-outbox enumeration (the same code startup
+# replay runs) so the stuck ancestor is re-adopted and finalized in-process
+# instead of waiting out the publication-progress watchdog restart.
+DEFAULT_ACCEPTED_PARENT_REDRIVE_DEFER_THRESHOLD = 3
+# How many re-drives one ancestor may trigger before the mechanism stands
+# down for that hash. On exhaustion deferrals continue exactly as before
+# the fix and the watchdog restart remains the backstop, so the re-drive
+# itself can never livelock the submitter.
+DEFAULT_ACCEPTED_PARENT_REDRIVE_ATTEMPT_MAX = 3
 DEFAULT_HIGHDIFF_DIFFICULTY = "500000"
 DEFAULT_HIGHDIFF_MAX_DIFFICULTY = "4294967296"
 # Coinbase output ordering policies accepted by PRISM_COINBASE_OUTPUT_POLICY.
@@ -1091,6 +1105,13 @@ class BlockConfig:
     submit_stuck_call_exit_seconds: float
     observed_tip_accept_window_seconds: float
     accepted_parent_unresolved_depth_max: int
+    # Defaulted so existing positional constructions keep working.
+    accepted_parent_redrive_defer_threshold: int = (
+        DEFAULT_ACCEPTED_PARENT_REDRIVE_DEFER_THRESHOLD
+    )
+    accepted_parent_redrive_attempt_max: int = (
+        DEFAULT_ACCEPTED_PARENT_REDRIVE_ATTEMPT_MAX
+    )
 
 
 @dataclass(frozen=True)
@@ -1560,6 +1581,16 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
         accepted_parent_unresolved_depth_max=env_positive_int(
             "PRISM_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX",
             DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX,
+            environ=source,
+        ),
+        accepted_parent_redrive_defer_threshold=env_positive_int(
+            "PRISM_ACCEPTED_PARENT_REDRIVE_DEFER_THRESHOLD",
+            DEFAULT_ACCEPTED_PARENT_REDRIVE_DEFER_THRESHOLD,
+            environ=source,
+        ),
+        accepted_parent_redrive_attempt_max=env_nonnegative_int(
+            "PRISM_ACCEPTED_PARENT_REDRIVE_ATTEMPT_MAX",
+            DEFAULT_ACCEPTED_PARENT_REDRIVE_ATTEMPT_MAX,
             environ=source,
         ),
     )
