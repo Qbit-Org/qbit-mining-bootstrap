@@ -89,6 +89,64 @@ PRISM_PAYOUT_APPEND_INVALIDATION_STAMP_HISTORY = 256
 # leaf module never imports upward.
 PRISM_REWARD_WINDOW_MULTIPLIER = 8
 PRISM_SNAPSHOT_WINDOW_MARGIN = 2
+
+# qbit retargets every block (ASERT), so the snapshot weight -- margin times
+# the 8 x difficulty reward window -- drifts a fraction of a percent with
+# every tip change. Treating any weight delta as a cache invalidation
+# therefore forced the full oracle rescan (a multi-second ledger read under
+# the postgres writer lock) on effectively every block, which is exactly the
+# hold that starves the block submitter's landing-window reads and delays
+# accepted-block preview publication (mainnet alert #236, 2026-08-25).
+#
+# The snapshot deliberately retains PRISM_SNAPSHOT_WINDOW_MARGIN times the
+# reward window, and every consumer re-derives the exact 8 x difficulty
+# cutoff from its own live network_difficulty (_prism_window_shares and the
+# fold's requested_window_weight); the cached superset therefore stays
+# payout-correct while it still covers the live reward window. Hold the
+# cached weight inside a band instead of demanding equality: rescan only
+# when the cached weight falls below 5/8 of the live snapshot weight (the
+# 8 x reward window plus 25% headroom out of the 2 x margin) or exceeds
+# twice it (bounding how oversized a stale superset may grow). Forced
+# rescans -- landing reconcile invalidation, cold start, invariant
+# failures, daemon rebuilds -- still re-center the weight at the live
+# difficulty, and the periodic runtime-check validates the pipeline at the
+# cached weight so its match verdict stays like-for-like.
+PRISM_SNAPSHOT_WINDOW_WEIGHT_BAND_FLOOR_NUM = 5
+PRISM_SNAPSHOT_WINDOW_WEIGHT_BAND_FLOOR_DEN = 8
+PRISM_SNAPSHOT_WINDOW_WEIGHT_BAND_CEILING = 2
+
+# Payout coverage depends on the floor retaining at least the whole reward
+# window out of the margined snapshot: FLOOR_NUM/FLOOR_DEN >= 1/MARGIN.
+# The fold has no error path for an under-covering superset -- it would
+# silently truncate the window tail and misdistribute the coinbase -- so a
+# margin retune that breaks the relationship must fail at import, not at
+# payout time. Not an `assert`: python -O would strip it.
+if (
+    PRISM_SNAPSHOT_WINDOW_WEIGHT_BAND_FLOOR_NUM * PRISM_SNAPSHOT_WINDOW_MARGIN
+    < PRISM_SNAPSHOT_WINDOW_WEIGHT_BAND_FLOOR_DEN
+):
+    raise AssertionError(
+        "snapshot window weight band floor no longer covers the reward "
+        "window at the configured snapshot margin"
+    )
+
+
+def _snapshot_window_weight_within_band(
+    cached_weight: int, live_weight: int
+) -> bool:
+    """Whether a cached snapshot weight still serves the live reward window."""
+    if cached_weight <= 0 or live_weight <= 0:
+        return False
+    if cached_weight == live_weight:
+        return True
+    if (
+        cached_weight * PRISM_SNAPSHOT_WINDOW_WEIGHT_BAND_FLOOR_DEN
+        < live_weight * PRISM_SNAPSHOT_WINDOW_WEIGHT_BAND_FLOOR_NUM
+    ):
+        return False
+    return cached_weight <= live_weight * PRISM_SNAPSHOT_WINDOW_WEIGHT_BAND_CEILING
+
+
 PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS = 0.05
 # Payout preparation/publication/first-delivery latency buckets; value-equal
 # to the tip-refresh owner's seconds buckets so exposition is unchanged.
@@ -1173,11 +1231,13 @@ class PayoutStateService:
             runtime._incremental_payout_artifact_window_invalidation_reason = None
             cached = None
             full_reason = "window_pipeline_mode_changed"
-        elif cached.window.window_weight != int(snapshot_window_weight):
+        elif not _snapshot_window_weight_within_band(
+            int(cached.window.window_weight), int(snapshot_window_weight)
+        ):
             runtime._incremental_payout_artifact_window = None
             runtime._incremental_payout_artifact_window_invalidation_reason = None
             cached = None
-            full_reason = "network_difficulty_changed"
+            full_reason = "snapshot_window_weight_out_of_band"
         elif snapshot_anchor_ms < cached.window.anchor_job_issued_at_ms:
             runtime._incremental_payout_artifact_window = None
             runtime._incremental_payout_artifact_window_invalidation_reason = None
@@ -1315,26 +1375,70 @@ class PayoutStateService:
         balance_check_mismatch = False
         if not bypass_build_interval and self_check_overdue:
             try:
+                # Within the tolerance band the cached and live snapshot
+                # weights legitimately differ. The match verdict must
+                # compare like-for-like at the cached weight (a live-weight
+                # comparison would turn ordinary difficulty drift into
+                # systematic false self_check_mismatch), and on ordinary
+                # drift the adopted window must ALSO keep the cached weight:
+                # adopting a digest the daemon never prepared would answer
+                # needs_full on the next advance and pay a second full
+                # oracle read under the writer lock at every runtime-check.
+                # Re-centering is therefore one-sided and thresholded --
+                # only when the cached weight sits more than 25% above the
+                # live snapshot weight, the oversize direction nothing else
+                # bounds (a falling difficulty could otherwise pin an
+                # up-to-2x oversized oracle scan); the undersize direction
+                # is safety-bounded by the band floor and re-centered by
+                # every forced rescan. The oversize case makes the cached
+                # weight the larger one, so the single oracle read at the
+                # cached weight covers both exact cutoffs.
+                cached_window_weight = int(advanced_window.window_weight)
+                live_window_weight = int(snapshot_window_weight)
+                recenter_oversized = (
+                    cached_window_weight * 4 > live_window_weight * 5
+                )
                 full_records = list(
                     runtime.ledger.snapshot_at_job_issue(
                         snapshot_anchor_ms,
-                        window_weight=snapshot_window_weight,
+                        window_weight=cached_window_weight,
                     )
                 )
-                full_window = IncrementalShareWindow.from_full_snapshot(
+                comparison_window = IncrementalShareWindow.from_full_snapshot(
                     full_records,
                     anchor_job_issued_at_ms=snapshot_anchor_ms,
-                    window_weight=snapshot_window_weight,
+                    window_weight=cached_window_weight,
                 )
+                if recenter_oversized:
+                    full_window = IncrementalShareWindow.from_full_snapshot(
+                        full_records,
+                        anchor_job_issued_at_ms=snapshot_anchor_ms,
+                        window_weight=live_window_weight,
+                    )
+                else:
+                    full_window = comparison_window
                 shares_json = full_window.json_records()
                 digest = self._canonical_json_sha256(shares_json)
                 if isinstance(advanced_window, DaemonShareWindowMirror):
                     # The mirror holds canonical bytes, not records; digest
                     # equality is the same comparison, since the canonical
                     # digest is a function of exactly the retained records.
-                    matched = digest == advanced_window.share_snapshot_sha256
+                    comparison_digest = (
+                        digest
+                        if full_window is comparison_window
+                        else self._canonical_json_sha256(
+                            comparison_window.json_records()
+                        )
+                    )
+                    matched = (
+                        comparison_digest
+                        == advanced_window.share_snapshot_sha256
+                    )
                 else:
-                    matched = full_window.records() == advanced_window.records()
+                    matched = (
+                        comparison_window.records()
+                        == advanced_window.records()
+                    )
             except Exception:
                 # The already-validated delta remains usable. Space failed
                 # oracle attempts by the configured runtime-check interval so a

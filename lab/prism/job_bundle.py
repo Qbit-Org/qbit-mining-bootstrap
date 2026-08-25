@@ -2876,19 +2876,14 @@ class JobBundleService:
     ) -> _ShareWindowSerialization:
         """Cached digest and builder fragments for the artifact's share window.
 
-        Single-slot cache keyed by the canonical content digest, share count,
-        and window weight. A debounced payout generation can retag an
+        Single-slot cache keyed by the canonical content digest and share
+        count. A debounced payout generation can retag an
         unchanged window, so generation identity would unnecessarily rebuild
         and re-spool the same multi-megabyte compact payload. The compute
         deliberately takes no cancellation checkpoints -- the result outlives
         any one requester and is served to whichever build wins next.
         """
         self._runtime._ensure_job_cache_state()
-        window_weight = (
-            PRISM_REWARD_WINDOW_MULTIPLIER
-            * PRISM_SNAPSHOT_WINDOW_MARGIN
-            * int(payout_artifact.network_difficulty)
-        )
         # The digest is computed under the slot lock on purpose: the two
         # bounded build flights can request the same window concurrently, and
         # letting both walk the share tree would duplicate exactly the
@@ -2902,14 +2897,19 @@ class JobBundleService:
                 and cached is not None
                 and cached._source_artifact is payout_artifact
                 and cached.share_count == len(shares)
-                and cached.key[2] == window_weight
             ):
                 return cached
             share_snapshot_sha256 = (
                 payout_artifact.share_snapshot_sha256
                 or self._canonical_json_sha256(shares)
             )
-            key = (share_snapshot_sha256, len(shares), window_weight)
+            # The compact payload is a pure function of the shares (see the
+            # class docstring), so the digest and count fully identify it.
+            # The live-difficulty window weight was deliberately dropped
+            # from this key: ASERT retargets every block, so a weight
+            # component rotated the key -- and re-spooled an identical
+            # multi-megabyte payload -- per block.
+            key = (share_snapshot_sha256, len(shares))
             if (
                 cached is not None
                 and cached.key == key
