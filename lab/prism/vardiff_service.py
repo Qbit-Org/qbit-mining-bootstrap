@@ -146,39 +146,155 @@ class _PendingDurableWrite:
     difficulty: Decimal
     evidence_at_ms: int | None
     now_ms: int
+    # A coalesced evidence write may also carry the minimum correction that
+    # must run if the store rejects that evidence as stale. Keeping this
+    # branch separate is load-bearing: folding it into ``difficulty`` loses
+    # the correction when a newer row already stands in the store.
+    stale_downward_difficulty: Decimal | None = None
+    stale_downward_now_ms: int | None = None
+
+    @property
+    def has_downward_correction(self) -> bool:
+        return self.downward_only or self.stale_downward_difficulty is not None
+
+    def _stale_downward(self) -> tuple[Decimal, int] | None:
+        if self.downward_only:
+            return (self.difficulty, self.now_ms)
+        if self.stale_downward_difficulty is None:
+            return None
+        return (
+            self.stale_downward_difficulty,
+            int(
+                self.now_ms
+                if self.stale_downward_now_ms is None
+                else self.stale_downward_now_ms
+            ),
+        )
+
+    @staticmethod
+    def _minimum_downward(
+        earlier: tuple[Decimal, int] | None,
+        later: tuple[Decimal, int] | None,
+    ) -> tuple[Decimal, int] | None:
+        """Collapse lower-only writes without inventing an update timestamp.
+
+        The first occurrence of the minimum wins: a later equal or higher
+        correction is a no-op after the earlier minimum has landed.
+        """
+        if earlier is None:
+            return later
+        if later is None or earlier[0] <= later[0]:
+            return earlier
+        return later
+
+    @classmethod
+    def _evidence_write(
+        cls,
+        source: "_PendingDurableWrite",
+        *,
+        difficulty: Decimal | None = None,
+        now_ms: int | None = None,
+        stale_downward: tuple[Decimal, int] | None = None,
+    ) -> "_PendingDurableWrite":
+        return cls(
+            key=source.key,
+            downward_only=False,
+            difficulty=source.difficulty if difficulty is None else difficulty,
+            evidence_at_ms=source.evidence_at_ms,
+            now_ms=source.now_ms if now_ms is None else now_ms,
+            stale_downward_difficulty=(
+                None if stale_downward is None else stale_downward[0]
+            ),
+            stale_downward_now_ms=(
+                None if stale_downward is None else stale_downward[1]
+            ),
+        )
 
     def merged_with(self, later: "_PendingDurableWrite") -> "_PendingDurableWrite":
         """Collapse this entry and a later one for the same worker.
 
-        The result is exactly what applying both in order would leave behind:
-
-        * a later evidence-carrying write supersedes anything queued for the
-          key -- it names the difficulty the session actually ended up at, and
-          its evidence is what the store arbitrates on;
-        * a later downward correction cannot discard a queued evidence-carrying
-          write, so it clamps that write's difficulty instead. ``lower`` sets
-          the row only when the stored value is greater, so upsert-then-lower
-          and a single upsert at the minimum leave the same difficulty and the
-          same ``evidence_at``;
-        * two downward corrections collapse to the smaller: ``lower`` is
-          idempotent under minimum.
+        Evidence order, not queue order, selects the upsert that can stand.
+        Lower-only corrections are retained as a stale-upsert fallback when
+        an evidence write follows them, because a newer row already in the
+        store can reject every queued upsert while still needing the lower.
+        This is a compact representation of both possible store branches:
+        evidence accepted, or all queued evidence rejected as stale.
         """
-        if not later.downward_only:
-            return later
-        if self.downward_only:
-            return _PendingDurableWrite(
-                key=self.key,
-                downward_only=True,
-                difficulty=min(self.difficulty, later.difficulty),
-                evidence_at_ms=None,
-                now_ms=max(self.now_ms, later.now_ms),
+        if self.key != later.key:
+            raise ValueError("durable writes for different workers cannot merge")
+
+        if later.downward_only:
+            if self.downward_only:
+                minimum = self._minimum_downward(
+                    self._stale_downward(),
+                    later._stale_downward(),
+                )
+                assert minimum is not None
+                return _PendingDurableWrite(
+                    key=self.key,
+                    downward_only=True,
+                    difficulty=minimum[0],
+                    evidence_at_ms=None,
+                    now_ms=minimum[1],
+                )
+            stale_downward = self._minimum_downward(
+                self._stale_downward(),
+                later._stale_downward(),
             )
-        return _PendingDurableWrite(
-            key=self.key,
-            downward_only=False,
-            difficulty=min(self.difficulty, later.difficulty),
-            evidence_at_ms=self.evidence_at_ms,
-            now_ms=max(self.now_ms, later.now_ms),
+            difficulty = self.difficulty
+            now_ms = self.now_ms
+            if later.difficulty < difficulty:
+                difficulty = later.difficulty
+                now_ms = later.now_ms
+            return self._evidence_write(
+                self,
+                difficulty=difficulty,
+                now_ms=now_ms,
+                stale_downward=stale_downward,
+            )
+
+        if self.downward_only:
+            stale_downward = self._minimum_downward(
+                self._stale_downward(),
+                later._stale_downward(),
+            )
+            return self._evidence_write(
+                later,
+                stale_downward=stale_downward,
+            )
+
+        self_evidence = int(self.evidence_at_ms or 0)
+        later_evidence = int(later.evidence_at_ms or 0)
+        if later_evidence >= self_evidence:
+            stale_downward = self._minimum_downward(
+                self._stale_downward(),
+                later._stale_downward(),
+            )
+            return self._evidence_write(
+                later,
+                stale_downward=stale_downward,
+            )
+
+        # ``later`` carries older evidence and is rejected whenever ``self``
+        # applies. If ``later`` already represents a coalesced sequence, only
+        # its stale-upsert lower branch remains observable after ``self``.
+        later_stale_downward = later._stale_downward()
+        stale_downward = self._minimum_downward(
+            self._stale_downward(),
+            later_stale_downward,
+        )
+        difficulty = self.difficulty
+        now_ms = self.now_ms
+        if (
+            later_stale_downward is not None
+            and later_stale_downward[0] < difficulty
+        ):
+            difficulty, now_ms = later_stale_downward
+        return self._evidence_write(
+            self,
+            difficulty=difficulty,
+            now_ms=now_ms,
+            stale_downward=stale_downward,
         )
 
 
@@ -1075,7 +1191,7 @@ class VardiffService:
                 # leaves a restart resuming an abandoned difficulty -- so it
                 # is applied on this thread instead, bounded by the store's
                 # own per-statement operation deadline.
-                if pending.downward_only:
+                if pending.has_downward_correction:
                     apply_inline = True
                 else:
                     lost = pending
@@ -1099,7 +1215,7 @@ class VardiffService:
             self._apply_durable_write(pending)
             return
         if lost is not None:
-            if lost.downward_only:
+            if lost.has_downward_correction:
                 self._count_downward_drop(lost)
             else:
                 self._count_durable_write("dropped")
@@ -1120,10 +1236,10 @@ class VardiffService:
         if len(self._vardiff_durable_pending) < MAX_PENDING_VARDIFF_DURABLE_WRITES:
             return None
         for key, queued in self._vardiff_durable_pending.items():
-            if not queued.downward_only:
+            if not queued.has_downward_correction:
                 del self._vardiff_durable_pending[key]
                 return queued
-        if not incoming.downward_only:
+        if not incoming.has_downward_correction:
             return incoming
         oldest_key = next(iter(self._vardiff_durable_pending))
         return self._vardiff_durable_pending.pop(oldest_key)
@@ -1138,10 +1254,12 @@ class VardiffService:
         self._count_durable_write("dropped")
         with self._vardiff_convergence_lock:
             self.vardiff_durable_downward_dropped += 1
+        downward = pending._stale_downward()
+        assert downward is not None
         print(
             "prism coordinator: durable vardiff step-down dropped "
             f"listener={pending.key[0]} worker={pending.key[1]} "
-            f"difficulty={pending.difficulty} "
+            f"difficulty={downward[0]} "
             "(reconnect may resume a higher difficulty until its TTL expires)",
             flush=True,
         )
@@ -1187,7 +1305,7 @@ class VardiffService:
         """
         chosen_key: tuple[str, str] | None = None
         for key, queued in self._vardiff_durable_pending.items():
-            if queued.downward_only:
+            if queued.has_downward_correction:
                 chosen_key = key
                 break
         if chosen_key is None:
@@ -1231,14 +1349,14 @@ class VardiffService:
             abandoned = list(self._vardiff_durable_pending.values())
             self._vardiff_durable_pending.clear()
         for pending in abandoned:
-            if pending.downward_only:
+            if pending.has_downward_correction:
                 self._count_downward_drop(pending)
             else:
                 self._count_durable_write("dropped")
 
     def _apply_durable_write(self, pending: _PendingDurableWrite) -> None:
-        try:
-            if pending.downward_only:
+        if pending.downward_only:
+            try:
                 lowered = self.worker_difficulty_store.apply_downward(
                     listener=pending.key[0],
                     worker_username=pending.key[1],
@@ -1246,15 +1364,34 @@ class VardiffService:
                     now_ms=pending.now_ms,
                 )
                 outcome = "lowered" if lowered.applied else "unchanged"
-            else:
-                result = self.worker_difficulty_store.upsert(
-                    listener=pending.key[0],
-                    worker_username=pending.key[1],
-                    difficulty=pending.difficulty,
-                    evidence_at_ms=int(pending.evidence_at_ms or 0),
-                    now_ms=pending.now_ms,
-                )
-                outcome = "applied" if result.applied else "stale"
+            except Exception:
+                outcome = "failed"
+            self._count_durable_write(outcome)
+            return
+
+        try:
+            result = self.worker_difficulty_store.upsert(
+                listener=pending.key[0],
+                worker_username=pending.key[1],
+                difficulty=pending.difficulty,
+                evidence_at_ms=int(pending.evidence_at_ms or 0),
+                now_ms=pending.now_ms,
+            )
+        except Exception:
+            self._count_durable_write("failed")
+            return
+        self._count_durable_write("applied" if result.applied else "stale")
+        stale_downward = pending._stale_downward()
+        if result.applied or stale_downward is None:
+            return
+        try:
+            lowered = self.worker_difficulty_store.apply_downward(
+                listener=pending.key[0],
+                worker_username=pending.key[1],
+                difficulty=stale_downward[0],
+                now_ms=stale_downward[1],
+            )
+            outcome = "lowered" if lowered.applied else "unchanged"
         except Exception:
             outcome = "failed"
         self._count_durable_write(outcome)

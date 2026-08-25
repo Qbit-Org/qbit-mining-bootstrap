@@ -481,6 +481,13 @@ class PostgresStoreSqlTests(unittest.TestCase):
         )
         self.assertIn("ORDER BY evidence_at ASC, listener, worker_username", bounded)
         self.assertIn("LIMIT 2", bounded)
+        # The candidate scan and DELETE share one statement, but a concurrent
+        # upsert can refresh a selected row while DELETE waits on its lock.
+        # Recheck eligibility on the tuple DELETE actually reaches.
+        self.assertIn(
+            f"target.evidence_at <= to_timestamp(({BASE_MS}::double precision / 1000.0))",
+            bounded,
+        )
 
     def test_statements_touch_only_the_worker_difficulty_table(self) -> None:
         store = QueryCaptureStore(

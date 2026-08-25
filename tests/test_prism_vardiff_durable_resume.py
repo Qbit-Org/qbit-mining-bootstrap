@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 import inspect
+from itertools import product
 from types import SimpleNamespace
 import threading
 import time
@@ -433,8 +434,20 @@ class DurableVardiffResumeTests(unittest.TestCase):
                     )
                 )
             self.assertEqual(service.durable_pending_depth(), capacity)
-            # Every slot is now an optional resume hint. Step-downs must still
-            # get in, by evicting hints rather than themselves.
+            # Turn one hint into a composite whose correction matters if its
+            # evidence is stale. It must receive the same queue priority as a
+            # pure step-down even though its primary operation is an upsert.
+            service._enqueue_durable_write(
+                _PendingDurableWrite(
+                    key=("default", "hint-0"),
+                    downward_only=True,
+                    difficulty=Decimal("1024"),
+                    evidence_at_ms=None,
+                    now_ms=1_000_100,
+                )
+            )
+            # New step-downs must still get in by evicting the remaining pure
+            # hints rather than any safety-critical correction.
             for index in range(8):
                 service._enqueue_durable_write(
                     _PendingDurableWrite(
@@ -450,6 +463,10 @@ class DurableVardiffResumeTests(unittest.TestCase):
                 queued = list(service._vardiff_durable_pending.values())
 
         self.assertEqual(sum(1 for entry in queued if entry.downward_only), 8)
+        self.assertEqual(
+            sum(1 for entry in queued if entry.has_downward_correction),
+            9,
+        )
         self.assertEqual(service.vardiff_durable_downward_dropped, 0)
         self.assertEqual(
             service.vardiff_durable_write_outcome_counts["dropped"],
@@ -531,8 +548,155 @@ class DurableVardiffResumeTests(unittest.TestCase):
         self.assertFalse(merged.downward_only)
         self.assertEqual(merged.difficulty, Decimal("65536"))
         self.assertEqual(merged.evidence_at_ms, 1_000_000)
-        # A later evidence write supersedes a queued step-down outright.
-        self.assertEqual(lower.merged_with(upsert), upsert)
+        # A later evidence write supersedes the step-down if it applies, but
+        # must retain the correction for the branch where the store already
+        # has still-newer evidence and rejects the queued upsert.
+        lower_then_upsert = lower.merged_with(upsert)
+        self.assertEqual(lower_then_upsert.difficulty, upsert.difficulty)
+        self.assertEqual(
+            lower_then_upsert.stale_downward_difficulty,
+            lower.difficulty,
+        )
+
+    def test_coalescing_keeps_newer_evidence_when_it_was_queued_first(self) -> None:
+        newer = _PendingDurableWrite(
+            key=("default", "miner-a.rig-1"),
+            downward_only=False,
+            difficulty=Decimal("1048576"),
+            evidence_at_ms=1_000_100,
+            now_ms=1_000_100,
+        )
+        older = _PendingDurableWrite(
+            key=newer.key,
+            downward_only=False,
+            difficulty=Decimal("65536"),
+            evidence_at_ms=1_000_000,
+            now_ms=1_000_200,
+        )
+
+        merged = newer.merged_with(older)
+
+        # Applying newer then older leaves the newer row standing because the
+        # store rejects the second write as stale. Coalescing must preserve the
+        # same evidence and difficulty.
+        self.assertEqual(merged.evidence_at_ms, newer.evidence_at_ms)
+        self.assertEqual(merged.difficulty, newer.difficulty)
+        self.assertEqual(merged.now_ms, newer.now_ms)
+
+    def test_coalesced_step_down_still_applies_when_upsert_is_stale(self) -> None:
+        durable = MemoryWorkerDifficultyStore()
+        service = self.service(runtime(durable))
+        durable.upsert(
+            listener="default",
+            worker_username="miner-a.rig-1",
+            difficulty=Decimal("1048576"),
+            evidence_at_ms=1_000_200,
+            now_ms=1_000_200,
+        )
+        stale_upsert = _PendingDurableWrite(
+            key=("default", "miner-a.rig-1"),
+            downward_only=False,
+            difficulty=Decimal("262144"),
+            evidence_at_ms=1_000_100,
+            now_ms=1_000_300,
+        )
+        lower = _PendingDurableWrite(
+            key=stale_upsert.key,
+            downward_only=True,
+            difficulty=Decimal("65536"),
+            evidence_at_ms=None,
+            now_ms=1_000_400,
+        )
+
+        service._apply_durable_write(stale_upsert.merged_with(lower))
+
+        stored = durable._entries[stale_upsert.key]
+        self.assertEqual(stored.difficulty, Decimal("65536"))
+        self.assertEqual(stored.evidence_at_ms, 1_000_200)
+        self.assertEqual(stored.updated_at_ms, 1_000_400)
+        self.assertEqual(service.vardiff_durable_write_outcome_counts["stale"], 1)
+        self.assertEqual(service.vardiff_durable_write_outcome_counts["lowered"], 1)
+
+    def test_coalescing_is_order_equivalent_for_upserts_and_step_downs(self) -> None:
+        key = ("default", "miner-a.rig-1")
+        operation_specs = (
+            (False, Decimal("16"), 1_000_000),
+            (False, Decimal("64"), 1_000_100),
+            (False, Decimal("8"), 1_000_100),
+            (True, Decimal("8"), None),
+            (True, Decimal("32"), None),
+            (True, Decimal("128"), None),
+        )
+        seeds = (
+            None,
+            (999_900, Decimal("4")),
+            (999_900, Decimal("256")),
+            (1_000_050, Decimal("32")),
+            (1_000_200, Decimal("256")),
+        )
+
+        def apply(store, pending: _PendingDurableWrite) -> None:
+            if pending.downward_only:
+                store.apply_downward(
+                    listener=key[0],
+                    worker_username=key[1],
+                    difficulty=pending.difficulty,
+                    now_ms=pending.now_ms,
+                )
+                return
+            result = store.upsert(
+                listener=key[0],
+                worker_username=key[1],
+                difficulty=pending.difficulty,
+                evidence_at_ms=int(pending.evidence_at_ms or 0),
+                now_ms=pending.now_ms,
+            )
+            stale_downward = pending._stale_downward()
+            if not result.applied and stale_downward is not None:
+                store.apply_downward(
+                    listener=key[0],
+                    worker_username=key[1],
+                    difficulty=stale_downward[0],
+                    now_ms=stale_downward[1],
+                )
+
+        for length in range(1, 5):
+            for specs in product(operation_specs, repeat=length):
+                operations = [
+                    _PendingDurableWrite(
+                        key=key,
+                        downward_only=downward_only,
+                        difficulty=difficulty,
+                        evidence_at_ms=evidence_at_ms,
+                        now_ms=1_001_000 + index,
+                    )
+                    for index, (downward_only, difficulty, evidence_at_ms) in enumerate(
+                        specs
+                    )
+                ]
+                merged = operations[0]
+                for operation in operations[1:]:
+                    merged = merged.merged_with(operation)
+                for seed in seeds:
+                    sequential = MemoryWorkerDifficultyStore()
+                    coalesced = MemoryWorkerDifficultyStore()
+                    if seed is not None:
+                        for store in (sequential, coalesced):
+                            store.upsert(
+                                listener=key[0],
+                                worker_username=key[1],
+                                difficulty=seed[1],
+                                evidence_at_ms=seed[0],
+                                now_ms=999_000,
+                            )
+                    for operation in operations:
+                        apply(sequential, operation)
+                    apply(coalesced, merged)
+                    self.assertEqual(
+                        coalesced._entries,
+                        sequential._entries,
+                        (specs, seed, merged),
+                    )
 
     def test_shutdown_drains_step_downs_instead_of_cancelling_them(self) -> None:
         durable = MemoryWorkerDifficultyStore()

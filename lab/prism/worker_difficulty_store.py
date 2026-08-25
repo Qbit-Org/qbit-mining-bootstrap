@@ -641,6 +641,7 @@ deleted AS (
     USING doomed
     WHERE target.listener = doomed.listener
       AND target.worker_username = doomed.worker_username
+      AND target.evidence_at <= {cutoff_literal}
     RETURNING 1
 )
 SELECT json_build_object('deleted', (SELECT count(*) FROM deleted));
