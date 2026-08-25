@@ -863,13 +863,40 @@ class DurableVardiffResumeTests(unittest.TestCase):
         self.assertEqual(len(durable), 0)
         self.assertEqual(service.vardiff_durable_pruned_records, 3)
 
-    def test_idle_sweep_arms_the_periodic_prune(self) -> None:
-        service = self.service(runtime(MemoryWorkerDifficultyStore()))
-        service._vardiff_durable_next_prune_monotonic = time.monotonic() - 1.0
-        source = inspect.getsource(VardiffService.idle_sweep_once)
+    def test_periodic_prune_runs_when_idle_sweeps_are_disabled(self) -> None:
+        pruned = threading.Event()
 
-        self.assertIn("request_durable_prune_if_due", source)
-        self.assertTrue(service.request_durable_prune_if_due())
+        class RecordingStore(MemoryWorkerDifficultyStore):
+            def prune(self, **kwargs: object) -> int:  # type: ignore[override]
+                deleted = super().prune(**kwargs)  # type: ignore[arg-type]
+                pruned.set()
+                return deleted
+
+        durable = RecordingStore()
+        service = self.service(runtime(durable, ttl_seconds=1.0))
+        pruned.clear()  # Ignore the service's empty startup-prune call.
+        durable.upsert(
+            listener="default",
+            worker_username="expired",
+            difficulty=Decimal("16384"),
+            evidence_at_ms=1_000,
+            now_ms=1_000,
+        )
+        service._vardiff_durable_next_prune_monotonic = time.monotonic() - 1.0
+
+        # No idle-sweep runtime fields or thread are involved: the durable
+        # lane's scheduler must wake and prune on its own.
+        service.start_durable_prune_scheduler()
+        service._vardiff_durable_wake.set()
+
+        self.assertTrue(pruned.wait(5.0))
+        self.assertEqual(len(durable), 0)
+
+    def test_serve_starts_durable_pruning_before_accepting(self) -> None:
+        source = inspect.getsource(PrismCoordinator._serve_with_listener_stack)
+        scheduler = source.index("start_durable_prune_scheduler")
+
+        self.assertLess(scheduler, source.index("self.accept_loop"))
 
     def test_prune_metric_is_a_counter_covering_every_prune(self) -> None:
         service = self.service(runtime(MemoryWorkerDifficultyStore()))

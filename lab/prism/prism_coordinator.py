@@ -6563,7 +6563,8 @@ class PrismCoordinator:
         # accepting.  The service performs one bounded startup read and then
         # serves authorizations from its in-memory cache, so a miner's first
         # request never waits on PostgreSQL.
-        self._ensure_vardiff_service()
+        vardiff_service = self._ensure_vardiff_service()
+        vardiff_service.start_durable_prune_scheduler()
         for extra_server, extra_profile in listeners[1:]:
             self._start_secondary_accept_service(extra_server, extra_profile)
         try:

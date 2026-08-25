@@ -815,8 +815,8 @@ class VardiffService:
         self.vardiff_durable_preload_records = store.preload(entries)
         # Retention is an optimization over the safe cold-start path, so a
         # prune failure must not prevent mining or discard the records already
-        # loaded into the process-local map; the periodic prune armed from the
-        # idle sweep retries it on the ordinary interval.
+        # loaded into the process-local map; the durable lane's own scheduler
+        # retries it on the ordinary interval.
         self.vardiff_durable_pruned_records = self._prune_expired_rows(cutoff_ms)
 
     def client_config(self, client: ClientState) -> vardiff.VardiffConfig:
@@ -1278,6 +1278,19 @@ class VardiffService:
         self._vardiff_durable_thread = thread
         thread.start()
 
+    def start_durable_prune_scheduler(self) -> None:
+        """Keep TTL pruning alive even when idle vardiff retargets are off.
+
+        Production calls this once before accepting Stratum connections. The
+        existing durable lane then owns both write traffic and the periodic
+        prune clock, without adding database work to an accept/client thread.
+        Disabled retention still creates no worker.
+        """
+        if not self.session_difficulty_store.enabled:
+            return
+        with self._vardiff_durable_lock:
+            self._ensure_durable_worker_locked()
+
     def _durable_worker_loop(self) -> None:
         while True:
             self._vardiff_durable_wake.wait(
@@ -1286,6 +1299,11 @@ class VardiffService:
             self._vardiff_durable_wake.clear()
             with self._vardiff_durable_lock:
                 stopping = self._vardiff_durable_stopping
+            if not stopping:
+                # The lane owns its own clock. In particular, this must not
+                # depend on vardiff_idle_sweep_seconds: operators may disable
+                # idle retargets without disabling durable-row retention.
+                self.request_durable_prune_if_due()
             self._drain_durable_pending(
                 deadline=None if not stopping else (
                     time.monotonic() + self._vardiff_durable_operation_timeout_seconds
@@ -1399,10 +1417,11 @@ class VardiffService:
     def request_durable_prune_if_due(self) -> bool:
         """Arm a TTL prune when one is due, without doing database work here.
 
-        Called from the idle sweep, so pruning is driven by the clock rather
-        than by successful write traffic: a lane whose writes all fail, or a
-        process that inherits rows and writes none of its own, still prunes.
-        Returns whether a prune was armed.
+        Called from the durable worker's own scheduler, so pruning is driven
+        by the clock rather than by successful write traffic or the optional
+        idle-retarget sweep. A lane whose writes all fail, or a process that
+        inherits rows and writes none of its own, still prunes. Returns
+        whether a prune was armed.
         """
         if not self.session_difficulty_store.enabled:
             return False
@@ -1951,10 +1970,6 @@ class VardiffService:
         sweep_started = time.monotonic()
         now = time.monotonic()
         queued = 0
-        # Arm the durable TTL prune from the clock, not from write traffic:
-        # this only flips a flag and wakes the lane, so no database work
-        # happens on the sweep thread.
-        self.request_durable_prune_if_due()
         try:
             with self.runtime.lock:
                 clients = tuple(self.runtime.clients)
