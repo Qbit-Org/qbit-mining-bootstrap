@@ -249,6 +249,18 @@ def reference_landing_observability_metrics_lines(server) -> list[str]:
             "# HELP qbit_prism_accepted_parent_preview_wait_timeouts_total Child job builds that timed out waiting for an accepted-parent payout preview.",
             "# TYPE qbit_prism_accepted_parent_preview_wait_timeouts_total counter",
             f"qbit_prism_accepted_parent_preview_wait_timeouts_total {preview_wait_timeouts}",
+            "# HELP qbit_prism_accepted_parent_redrive_attempts_total In-process ancestor re-drives armed after repeated finalization deferrals on one pending accepted-parent transition.",
+            "# TYPE qbit_prism_accepted_parent_redrive_attempts_total counter",
+            "qbit_prism_accepted_parent_redrive_attempts_total "
+            f"{int(getattr(server, 'accepted_parent_redrive_attempt_count', 0))}",
+            "# HELP qbit_prism_accepted_parent_redrive_resolved_total Pending accepted-parent transitions that resolved after at least one in-process re-drive attempt.",
+            "# TYPE qbit_prism_accepted_parent_redrive_resolved_total counter",
+            "qbit_prism_accepted_parent_redrive_resolved_total "
+            f"{int(getattr(server, 'accepted_parent_redrive_resolved_count', 0))}",
+            "# HELP qbit_prism_accepted_parent_redrive_exhausted_total Ancestors whose re-drive attempt cap was exhausted with the transition still pending; the publication-progress watchdog remains the backstop.",
+            "# TYPE qbit_prism_accepted_parent_redrive_exhausted_total counter",
+            "qbit_prism_accepted_parent_redrive_exhausted_total "
+            f"{int(getattr(server, 'accepted_parent_redrive_exhausted_count', 0))}",
         ]
     )
     prior_stats_fn = getattr(server.ledger, "prior_balances_read_stats", None)

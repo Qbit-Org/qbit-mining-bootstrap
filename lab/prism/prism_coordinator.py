@@ -1962,6 +1962,15 @@ class PrismCoordinator:
     block_candidate_accept_pending_defer_count = BlockCandidateStateField(
         "block_candidate_accept_pending_defer_count"
     )
+    accepted_parent_redrive_attempt_count = BlockCandidateStateField(
+        "accepted_parent_redrive_attempt_count"
+    )
+    accepted_parent_redrive_resolved_count = BlockCandidateStateField(
+        "accepted_parent_redrive_resolved_count"
+    )
+    accepted_parent_redrive_exhausted_count = BlockCandidateStateField(
+        "accepted_parent_redrive_exhausted_count"
+    )
     stale_job_abandon_counts = BlockCandidateStateField("stale_job_abandon_counts")
     _block_submit_metrics_lock = BlockCandidateStateField(
         "_block_submit_metrics_lock"
@@ -2275,6 +2284,12 @@ class PrismCoordinator:
         )
         self.accepted_parent_unresolved_depth_max = (
             block_config.accepted_parent_unresolved_depth_max
+        )
+        self.accepted_parent_redrive_defer_threshold = (
+            block_config.accepted_parent_redrive_defer_threshold
+        )
+        self.accepted_parent_redrive_attempt_max = (
+            block_config.accepted_parent_redrive_attempt_max
         )
         self.block_submit_lock_wait_log_seconds = (
             block_config.submit_lock_wait_log_seconds
@@ -9041,6 +9056,26 @@ class PrismCoordinator:
     def _count_accept_pending_defer(self) -> None:
         self._ensure_block_candidate_service()._count_accept_pending_defer()
 
+    def _note_pending_parent_payout_transition_deferred(
+        self,
+        block_hash: str,
+        ancestor_hash: str,
+    ) -> None:
+        """Track a finalization deferral against its blocking ancestor (#190)."""
+        self._ensure_block_candidate_service().note_pending_parent_transition_deferral(
+            block_hash,
+            ancestor_hash,
+        )
+
+    def _note_pending_parent_payout_transition_resolved(
+        self,
+        block_hash: str,
+    ) -> None:
+        """Drop ancestor re-drive bookkeeping once the fence passes (#190)."""
+        self._ensure_block_candidate_service().note_pending_parent_transition_resolved(
+            block_hash
+        )
+
     def _abandon_block_candidate(
         self,
         reason: str,
@@ -9124,7 +9159,23 @@ class PrismCoordinator:
             )
             return True
         if pending_parent_transition is None:
+            self._note_pending_parent_payout_transition_resolved(block_hash)
             return False
+        pending_ancestor_hash, pending_ancestor_invalidated = (
+            pending_parent_transition
+        )
+        if not pending_ancestor_invalidated:
+            # Issue #190: the deferral below only re-checks the transition;
+            # it can never resolve the stuck ancestor. Count the deferral so
+            # a streak against one ancestor arms a targeted in-process
+            # re-drive through the durable-replay path. A tombstoned
+            # (invalidated) transition is a withdrawal in progress that the
+            # withdrawal retry publication owns, not a replay-resolvable
+            # pendency, so it stays outside the streak.
+            self._note_pending_parent_payout_transition_deferred(
+                block_hash,
+                pending_ancestor_hash,
+            )
         preserve_active_candidate_barrier()
         self._abandon_block_candidate(
             PRISM_REJECTION_LEDGER_CONFIRMATION_FAILED,
