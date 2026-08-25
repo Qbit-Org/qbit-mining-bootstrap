@@ -77,6 +77,11 @@ Operators can tune the defaults with:
 - `PRISM_PUBLIC_CACHE_MAX_RESPONSE_BYTES`
 - `PRISM_PUBLIC_CACHE_DEBUG_HEADERS`
 
+The v2 dual-rate series is roughly 1.5 times the v1 payload at the same point
+count because it carries two decimal rate strings. Operators serving long 5m
+series with `view=both` should size `PRISM_PUBLIC_CACHE_MAX_RESPONSE_BYTES`
+accordingly or the origin cache will deliberately skip oversized responses.
+
 The public read service also keeps a small in-process origin cache keyed by
 normalized path and query string, and coalesces concurrent misses for the same
 key. Error responses use `Cache-Control: no-store` and are not cached by that
@@ -162,6 +167,62 @@ content-addressed and never refuses for staleness.
   `total_pages`.
 - Optional fields are present as `null` when unavailable, so dashboard layout
   can remain stable.
+
+## Hashrate Series
+
+`GET /public/v1/hashrate-series` reports **credited hashrate**: each bucket's
+rate is derived from the difficulty of the accepted shares the pool credited to
+the subject in that bucket, not from anything a miner or router reports about
+itself. Neither series below is physical router telemetry. While the share
+target the pool assigned and the router's own share filtering disagree, the
+credited rate and the rate the router shows will differ.
+
+Without `view`, the endpoint returns `prism.dashboard.hashrate-series.v1`
+unchanged: `hashrate_ths` is the credited rate smoothed over a trailing window
+(`PRISM_PUBLIC_HASHRATE_SMOOTHING_SECONDS`, default 1800 seconds, `0`
+disables), while `accepted_share_count` and `accepted_share_difficulty` stay
+raw per bucket.
+
+`view=both` returns `prism.dashboard.hashrate-series.v2`. It keeps
+`generated_at`, `subject`, `range`, `bucket`, `unit`, and the bucket cadence,
+and adds:
+
+- `bucket_seconds` — the bucket duration every raw rate is computed over.
+- `rate_basis` — always `accepted_share_difficulty`.
+- `smoothing` — `{ "method": "trailing" | "none", "window_seconds": n }`.
+  `trailing` averages credited difficulty over the trailing `window_seconds`
+  ending at each bucket, with buckets missing from the series counting as
+  zero. When smoothing is disabled or configured shorter than two buckets the
+  method is `none`, `window_seconds` equals `bucket_seconds`, and the smoothed
+  rate equals the raw rate.
+
+Each v2 point carries `timestamp`, `raw_hashrate_ths`, `smoothed_hashrate_ths`,
+`accepted_share_count`, `accepted_share_difficulty`, and `complete`:
+
+- `raw_hashrate_ths` is the bucket's credited difficulty divided by the full
+  bucket duration, so a bucket that is still accumulating shares under-reads.
+  It is a credited-work estimate, not physical router telemetry: with sparse
+  high-difficulty shares, assigning a whole share to its arrival bucket can
+  temporarily over-read the miner's delivered rate (the 539 TH/s raw versus
+  118 TH/s trailing incident is an example).
+- `smoothed_hashrate_ths` is the same trailing-window estimate v1 serves as
+  `hashrate_ths`.
+- `complete` is `false` when `generated_at` falls before the bucket's end.
+  Render such a point provisionally; it changes on the next request.
+
+Buckets with no credited shares are omitted from both views; consumers
+synthesize gaps rather than expecting zero-valued points. Both views fetch one
+smoothing window of pre-range history so the first in-range trailing windows
+average over real data, then trim those context buckets from the response. Any
+other non-empty `view` value is rejected with `400 bad_request`. `view` is part
+of the origin cache key, so the two views never share a cached response.
+`fixtures/hashrate-series.json` mocks the v1 response and
+`fixtures/hashrate-series-dual-rate.json` mocks the v2 response.
+
+`bucket=auto` resolves to 1h for 1w/1m and 1d for 6m/all. With the default 30m
+smoothing window those coarse buckets report `smoothing.method=none`, so raw
+and smoothed are identical. Dashboards that need to expose short bursts and
+their 30m trailing context should explicitly request `bucket=5m`.
 
 ## Reward Leaderboard
 

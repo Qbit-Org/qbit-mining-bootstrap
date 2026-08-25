@@ -13,8 +13,8 @@ import urllib.parse
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
-from typing import Any, Callable
+from decimal import Decimal, InvalidOperation
+from typing import Any, Callable, Iterator
 
 from lab.prism.ctv_broadcaster import COINBASE_MATURITY
 from lab.prism import direct_stratum
@@ -382,7 +382,8 @@ def dispatch(coordinator: Any, path: str, query: dict[str, list[str]]) -> tuple[
         subject = first_query_value(query, "subject") or "pool"
         range_id = first_query_value(query, "range") or "1m"
         bucket = first_query_value(query, "bucket") or "auto"
-        return 200, hashrate_series(coordinator, subject=subject, range_id=range_id, bucket=bucket)
+        view = first_query_value(query, "view")
+        return 200, hashrate_series(coordinator, subject=subject, range_id=range_id, bucket=bucket, view=view)
     if path == "/public/v1/mining-configuration":
         return 200, mining_configuration(coordinator)
     if path.startswith("/public/v1/miners/"):
@@ -534,7 +535,14 @@ def reward_leaderboard(
     }
 
 
-def hashrate_series(coordinator: Any, *, subject: str, range_id: str, bucket: str) -> dict[str, object]:
+def hashrate_series(
+    coordinator: Any,
+    *,
+    subject: str,
+    range_id: str,
+    bucket: str,
+    view: str | None = None,
+) -> dict[str, object]:
     if range_id not in {"1w", "1m", "6m", "all"}:
         raise PublicApiError(400, "invalid_range", "range must be one of 1w, 1m, 6m, all")
     if bucket == "auto":
@@ -549,13 +557,34 @@ def hashrate_series(coordinator: Any, *, subject: str, range_id: str, bucket: st
         subject_id = subject.removeprefix("miner:")
     else:
         raise PublicApiError(400, "invalid_subject", "subject must be pool or miner:{recipient_id}")
-    generated_at = utc_now_iso()
+    # An absent view keeps the v1 response; only `both` opts into the dual-rate
+    # v2 contract. Anything else is rejected rather than silently
+    # served as v1, so a client that mistypes the view cannot mistake the
+    # legacy smoothed rate for the raw one it asked for.
+    if view is not None and view != "both":
+        raise PublicApiError(400, "invalid_view", "view must be both or omitted")
+    dual_rate = view == "both"
+    now = datetime.now(timezone.utc)
+    generated_at = iso_datetime(now)
+    generated_at_epoch = int(now.timestamp())
     bucket_seconds = HASHRATE_SERIES_BUCKET_SECONDS[bucket]
     window_seconds = public_hashrate_smoothing_seconds()
     range_seconds = HASHRATE_SERIES_RANGE_SECONDS[range_id]
     lookback_seconds = 0
     min_epoch: int | None = None
     range_anchor_epoch: int | None = None
+    if range_seconds is not None and (
+        dual_rate or window_seconds // bucket_seconds >= 2
+    ):
+        # V2 raw rates always divide by a full bucket, so trim a leading bucket
+        # that straddles the range boundary even when this coarse bucket has no
+        # trailing smoothing. V1 keeps its frozen no-smoothing behavior.
+        range_anchor_epoch = generated_at_epoch
+        min_epoch = hashrate_series_min_epoch(
+            range_anchor_epoch,
+            range_seconds,
+            bucket_seconds,
+        )
     if window_seconds // bucket_seconds >= 2 and range_seconds is not None:
         # Fetch one full smoothing window of pre-range history so the first
         # in-range points average over real data instead of artificial zeros,
@@ -563,8 +592,12 @@ def hashrate_series(coordinator: Any, *, subject: str, range_id: str, bucket: st
         # its range lower bound on the same epoch min_epoch derives from, so
         # the trim cannot disagree with the fetch under clock skew.
         lookback_seconds = (window_seconds // bucket_seconds) * bucket_seconds
-        range_anchor_epoch = int(datetime.now(timezone.utc).timestamp())
-        min_epoch = hashrate_series_min_epoch(range_anchor_epoch, range_seconds, bucket_seconds)
+        range_anchor_epoch = generated_at_epoch
+        min_epoch = hashrate_series_min_epoch(
+            range_anchor_epoch,
+            range_seconds,
+            bucket_seconds,
+        )
     points = coordinator.ledger.dashboard_hashrate_series(
         subject_type=subject_type,
         subject_id=subject_id,
@@ -573,6 +606,27 @@ def hashrate_series(coordinator: Any, *, subject: str, range_id: str, bucket: st
         lookback_seconds=lookback_seconds,
         range_anchor_epoch=range_anchor_epoch,
     )
+    subject_payload = {"type": subject_type, "id": subject_id}
+    if dual_rate:
+        smoothing = hashrate_series_smoothing(bucket_seconds=bucket_seconds, window_seconds=window_seconds)
+        return {
+            "schema": "prism.dashboard.hashrate-series.v2",
+            "generated_at": generated_at,
+            "subject": subject_payload,
+            "range": range_id,
+            "bucket": bucket,
+            "bucket_seconds": bucket_seconds,
+            "unit": "ths",
+            "rate_basis": "accepted_share_difficulty",
+            "smoothing": smoothing,
+            "points": dual_rate_hashrate_series_points(
+                points,
+                bucket_seconds=bucket_seconds,
+                window_seconds=window_seconds,
+                min_epoch=min_epoch,
+                generated_at_epoch=generated_at_epoch,
+            ),
+        }
     points = smooth_hashrate_series_points(
         points,
         bucket_seconds=bucket_seconds,
@@ -582,7 +636,7 @@ def hashrate_series(coordinator: Any, *, subject: str, range_id: str, bucket: st
     return {
         "schema": "prism.dashboard.hashrate-series.v1",
         "generated_at": generated_at,
-        "subject": {"type": subject_type, "id": subject_id},
+        "subject": subject_payload,
         "range": range_id,
         "bucket": bucket,
         "unit": "ths",
@@ -1298,6 +1352,95 @@ def smooth_hashrate_series_points(
     if (bucket_count < 2 and min_epoch is None) or not points:
         return points
     effective_window_seconds = bucket_count * bucket_seconds
+    parsed_points = _parse_hashrate_series_points(points)
+    if bucket_count < 2:
+        return [point for epoch, _, point in parsed_points if min_epoch is None or epoch >= min_epoch]
+    smoothed: list[dict[str, object]] = []
+    for epoch, _, point, window_total in _trailing_window_totals(parsed_points, effective_window_seconds):
+        if min_epoch is not None and epoch < min_epoch:
+            continue
+        smoothed.append(
+            {
+                **point,
+                "hashrate_ths": hashrate_ths_from_difficulty(window_total, effective_window_seconds),
+            }
+        )
+    return smoothed
+
+
+def hashrate_series_smoothing(*, bucket_seconds: int, window_seconds: int) -> dict[str, object]:
+    """Describe the smoothing a dual-rate series was produced with.
+
+    Mirrors smooth_hashrate_series_points: a window shorter than two buckets
+    (including the smoothing kill switch at 0) leaves rates untouched, so the
+    method is reported as `none` and the effective window is the bucket
+    itself. Otherwise the trailing window is the whole number of buckets that
+    fit in the configured seconds.
+    """
+    bucket_count = window_seconds // bucket_seconds if bucket_seconds > 0 else 0
+    if bucket_count < 2:
+        return {"method": "none", "window_seconds": bucket_seconds}
+    return {"method": "trailing", "window_seconds": bucket_count * bucket_seconds}
+
+
+def dual_rate_hashrate_series_points(
+    points: list[dict[str, object]],
+    *,
+    bucket_seconds: int,
+    window_seconds: int,
+    min_epoch: int | None = None,
+    generated_at_epoch: int,
+) -> list[dict[str, object]]:
+    """Build v2 points carrying both the raw and the trailing-window rate.
+
+    raw_hashrate_ths is the bucket's credited difficulty over the full bucket
+    duration, recomputed here rather than trusting the ledger's per-bucket
+    rate so the documented definition holds for every backend.
+    smoothed_hashrate_ths is the same trailing-window estimate the v1 series
+    serves as hashrate_ths; when smoothing is off or shorter than two buckets
+    it equals the raw rate. A bucket is complete once generated_at has reached
+    its end, so the newest bucket is normally still accumulating credit and
+    its raw rate under-reads the true rate.
+
+    Pre-range lookback context and malformed points are handled exactly as in
+    smooth_hashrate_series_points. Points are returned ascending by timestamp.
+    """
+    smoothing = hashrate_series_smoothing(bucket_seconds=bucket_seconds, window_seconds=window_seconds)
+    trailing = smoothing["method"] == "trailing"
+    effective_window_seconds = int(smoothing["window_seconds"])
+    parsed_points = _parse_hashrate_series_points(points)
+    dual_rate: list[dict[str, object]] = []
+    for epoch, difficulty, point, window_total in _trailing_window_totals(parsed_points, effective_window_seconds):
+        if min_epoch is not None and epoch < min_epoch:
+            continue
+        try:
+            accepted_share_count = int(
+                Decimal(str(point.get("accepted_share_count", 0)))
+            )
+        except (ValueError, InvalidOperation, OverflowError):
+            accepted_share_count = 0
+        raw_hashrate_ths = hashrate_ths_from_difficulty(difficulty, bucket_seconds)
+        dual_rate.append(
+            {
+                "timestamp": point["timestamp"],
+                "raw_hashrate_ths": raw_hashrate_ths,
+                "smoothed_hashrate_ths": (
+                    hashrate_ths_from_difficulty(window_total, effective_window_seconds)
+                    if trailing
+                    else raw_hashrate_ths
+                ),
+                "accepted_share_count": accepted_share_count,
+                "accepted_share_difficulty": str(difficulty),
+                "complete": generated_at_epoch >= epoch + bucket_seconds,
+            }
+        )
+    return dual_rate
+
+
+def _parse_hashrate_series_points(
+    points: list[dict[str, object]],
+) -> list[tuple[int, int, dict[str, object]]]:
+    """Return (epoch, difficulty, point) ascending by epoch, dropping malformed points."""
     parsed_points: list[tuple[int, int, dict[str, object]]] = []
     for point in points:
         try:
@@ -1308,28 +1451,28 @@ def smooth_hashrate_series_points(
             continue
         parsed_points.append((epoch, difficulty, point))
     parsed_points.sort(key=lambda entry: entry[0])
-    smoothed: list[dict[str, object]] = []
+    return parsed_points
+
+
+def _trailing_window_totals(
+    parsed_points: list[tuple[int, int, dict[str, object]]],
+    window_seconds: int,
+) -> Iterator[tuple[int, int, dict[str, object], int]]:
+    """Yield each parsed point with the difficulty total of its trailing window.
+
+    The window covers buckets with epoch in (epoch - window_seconds, epoch];
+    buckets missing from the series contribute nothing, so gaps count as zero
+    difficulty.
+    """
     window: deque[tuple[int, int]] = deque()
     window_total = 0
     for epoch, difficulty, point in parsed_points:
-        if bucket_count < 2:
-            if min_epoch is None or epoch >= min_epoch:
-                smoothed.append(point)
-            continue
         window.append((epoch, difficulty))
         window_total += difficulty
-        while window and window[0][0] <= epoch - effective_window_seconds:
+        while window and window[0][0] <= epoch - window_seconds:
             _, expired_difficulty = window.popleft()
             window_total -= expired_difficulty
-        if min_epoch is not None and epoch < min_epoch:
-            continue
-        smoothed.append(
-            {
-                **point,
-                "hashrate_ths": hashrate_ths_from_difficulty(window_total, effective_window_seconds),
-            }
-        )
-    return smoothed
+        yield epoch, difficulty, point, window_total
 
 
 def pagination(page: int, limit: int, total_count: int) -> dict[str, int]:

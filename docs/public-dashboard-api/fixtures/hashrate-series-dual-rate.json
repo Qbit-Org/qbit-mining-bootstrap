@@ -1,0 +1,75 @@
+{
+  "schema": "prism.dashboard.hashrate-series.v2",
+  "generated_at": "2026-06-26T20:45:00Z",
+  "subject": {
+    "type": "pool",
+    "id": null
+  },
+  "range": "1m",
+  "bucket": "5m",
+  "unit": "ths",
+  "bucket_seconds": 300,
+  "rate_basis": "accepted_share_difficulty",
+  "smoothing": {
+    "method": "trailing",
+    "window_seconds": 1800
+  },
+  "points": [
+    {
+      "timestamp": "2026-06-26T19:50:00Z",
+      "raw_hashrate_ths": "600.00",
+      "smoothed_hashrate_ths": "100.00",
+      "accepted_share_count": 184,
+      "accepted_share_difficulty": "41700000",
+      "complete": true
+    },
+    {
+      "timestamp": "2026-06-26T19:55:00Z",
+      "raw_hashrate_ths": "600.00",
+      "smoothed_hashrate_ths": "200.00",
+      "accepted_share_count": 191,
+      "accepted_share_difficulty": "42800000",
+      "complete": true
+    },
+    {
+      "timestamp": "2026-06-26T20:25:00Z",
+      "raw_hashrate_ths": "169.02",
+      "smoothed_hashrate_ths": "28.17",
+      "accepted_share_count": 52,
+      "accepted_share_difficulty": "11800000",
+      "complete": true
+    },
+    {
+      "timestamp": "2026-06-26T20:30:00Z",
+      "raw_hashrate_ths": "539.40",
+      "smoothed_hashrate_ths": "118.07",
+      "accepted_share_count": 167,
+      "accepted_share_difficulty": "37700000",
+      "complete": true
+    },
+    {
+      "timestamp": "2026-06-26T20:35:00Z",
+      "raw_hashrate_ths": "604.08",
+      "smoothed_hashrate_ths": "218.75",
+      "accepted_share_count": 188,
+      "accepted_share_difficulty": "42200000",
+      "complete": true
+    },
+    {
+      "timestamp": "2026-06-26T20:40:00Z",
+      "raw_hashrate_ths": "618.36",
+      "smoothed_hashrate_ths": "321.81",
+      "accepted_share_count": 193,
+      "accepted_share_difficulty": "43200000",
+      "complete": true
+    },
+    {
+      "timestamp": "2026-06-26T20:45:00Z",
+      "raw_hashrate_ths": "199.98",
+      "smoothed_hashrate_ths": "355.14",
+      "accepted_share_count": 61,
+      "accepted_share_difficulty": "14600000",
+      "complete": false
+    }
+  ]
+}

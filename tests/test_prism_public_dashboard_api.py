@@ -111,6 +111,14 @@ def _bucket_timestamp(epoch: int) -> str:
     return public_api.iso_datetime(datetime.fromtimestamp(epoch, timezone.utc))
 
 
+FIXTURE_DIR = Path(__file__).resolve().parents[1] / "docs" / "public-dashboard-api" / "fixtures"
+
+
+def _load_fixture(name: str) -> dict[str, object]:
+    with (FIXTURE_DIR / name).open(encoding="utf-8") as fixture_file:
+        return json.load(fixture_file)
+
+
 class FakePublicLedger:
     backend_name = "fake-ledger"
     block_hash = "a" * 64
@@ -127,6 +135,7 @@ class FakePublicLedger:
         self.leaderboard_calls = 0
         self.reward_leaderboard_calls: list[dict[str, object]] = []
         self.pool_snapshot_calls = 0
+        self.hashrate_series_calls = 0
 
     def dashboard_pool_snapshot(self, *, current_network_difficulty: object, generated_at: str) -> dict[str, object]:
         self.pool_snapshot_calls += 1
@@ -372,6 +381,7 @@ class FakePublicLedger:
         lookback_seconds: int = 0,
         range_anchor_epoch: int | None = None,
     ) -> list[dict[str, object]]:
+        self.hashrate_series_calls += 1
         self.last_hashrate_series_lookback = lookback_seconds
         self.last_hashrate_series_anchor = range_anchor_epoch
         if bucket == "5m":
@@ -513,17 +523,28 @@ class RangeBoundaryPublicLedger(FakePublicLedger):
         # Derive the boundary from the caller-provided anchor, exactly as the
         # endpoint's min_epoch trim does, so this stub is deterministic.
         anchor_epoch = range_anchor_epoch if range_anchor_epoch is not None else int(time.time())
-        cutoff_epoch = public_api.hashrate_series_min_epoch(anchor_epoch, 7 * 86400, 300)
+        bucket_seconds = public_api.HASHRATE_SERIES_BUCKET_SECONDS[bucket]
+        cutoff_epoch = public_api.hashrate_series_min_epoch(
+            anchor_epoch,
+            7 * 86400,
+            bucket_seconds,
+        )
         return [
             {
-                "timestamp": _bucket_timestamp(cutoff_epoch - 300),
-                "hashrate_ths": public_api.hashrate_ths_from_difficulty(600, 300),
+                "timestamp": _bucket_timestamp(cutoff_epoch - bucket_seconds),
+                "hashrate_ths": public_api.hashrate_ths_from_difficulty(
+                    600,
+                    bucket_seconds,
+                ),
                 "accepted_share_count": 1,
                 "accepted_share_difficulty": "600",
             },
             {
-                "timestamp": _bucket_timestamp(cutoff_epoch + 1200),
-                "hashrate_ths": public_api.hashrate_ths_from_difficulty(1200, 300),
+                "timestamp": _bucket_timestamp(cutoff_epoch + 4 * bucket_seconds),
+                "hashrate_ths": public_api.hashrate_ths_from_difficulty(
+                    1200,
+                    bucket_seconds,
+                ),
                 "accepted_share_count": 1,
                 "accepted_share_difficulty": "1200",
             },
@@ -1071,6 +1092,330 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         )
         self.assertEqual(len(smoothed), 1)
         self.assertEqual(smoothed[0]["timestamp"], _bucket_timestamp(cutoff_epoch))
+
+    V1_SERIES_KEYS = {"schema", "generated_at", "subject", "range", "bucket", "unit", "points"}
+    V1_POINT_KEYS = {"timestamp", "hashrate_ths", "accepted_share_count", "accepted_share_difficulty"}
+    V2_POINT_KEYS = {
+        "timestamp",
+        "raw_hashrate_ths",
+        "smoothed_hashrate_ths",
+        "accepted_share_count",
+        "accepted_share_difficulty",
+        "complete",
+    }
+
+    def test_hashrate_series_default_view_retains_exact_v1_shape(self) -> None:
+        fixture = _load_fixture("hashrate-series.json")
+        for suffix in ("",):
+            with urllib.request.urlopen(
+                f"{self.base_url}/public/v1/hashrate-series?subject=pool&range=1w&bucket=5m{suffix}",
+                timeout=5,
+            ) as response:
+                body = response.read()
+            series = json.loads(body)
+
+            self.assertEqual(series["schema"], "prism.dashboard.hashrate-series.v1")
+            self.assertEqual(set(series), self.V1_SERIES_KEYS)
+            self.assertEqual(set(series), set(fixture))
+            self.assertEqual(len(series["points"]), 2)
+            for point in series["points"]:
+                self.assertEqual(set(point), self.V1_POINT_KEYS)
+                self.assertEqual(set(point), set(fixture["points"][0]))
+            # The legacy body carries none of the dual-rate vocabulary.
+            for token in (b"raw_hashrate_ths", b"smoothed_hashrate_ths", b"bucket_seconds", b"rate_basis", b"smoothing", b"complete"):
+                self.assertNotIn(token, body)
+            # And still serves the trailing-window rate as hashrate_ths.
+            self.assert_hashrate_ths(series["points"][0]["hashrate_ths"], 600, 1800)
+            self.assert_hashrate_ths(series["points"][1]["hashrate_ths"], 1800, 1800)
+
+    def test_hashrate_series_both_view_returns_raw_and_smoothed_rates(self) -> None:
+        fixture = _load_fixture("hashrate-series-dual-rate.json")
+        series = self.get_json("/public/v1/hashrate-series?subject=pool&range=1w&bucket=5m&view=both")
+
+        self.assertEqual(series["schema"], "prism.dashboard.hashrate-series.v2")
+        self.assertEqual(set(series), set(fixture))
+        self.assertEqual(series["subject"], {"type": "pool", "id": None})
+        self.assertEqual(series["range"], "1w")
+        self.assertEqual(series["bucket"], "5m")
+        self.assertEqual(series["bucket_seconds"], 300)
+        self.assertEqual(series["unit"], "ths")
+        self.assertEqual(series["rate_basis"], "accepted_share_difficulty")
+        self.assertEqual(series["smoothing"], {"method": "trailing", "window_seconds": 1800})
+
+        points = series["points"]
+        self.assertEqual(len(points), 2)
+        for point in points:
+            self.assertEqual(set(point), self.V2_POINT_KEYS)
+            self.assertEqual(set(point), set(fixture["points"][0]))
+        self.assertEqual([point["accepted_share_difficulty"] for point in points], ["600", "1200"])
+        self.assertEqual([point["accepted_share_count"] for point in points], [2, 1])
+        # Raw divides the bucket's credit by the full 5m bucket; smoothed is the
+        # 30m trailing estimate v1 serves, so the two differ for the same point.
+        self.assert_hashrate_ths(points[0]["raw_hashrate_ths"], 600, 300)
+        self.assert_hashrate_ths(points[0]["smoothed_hashrate_ths"], 600, 1800)
+        self.assert_hashrate_ths(points[1]["raw_hashrate_ths"], 1200, 300)
+        self.assert_hashrate_ths(points[1]["smoothed_hashrate_ths"], 1800, 1800)
+        for point in points:
+            self.assertNotEqual(Decimal(point["raw_hashrate_ths"]), Decimal(point["smoothed_hashrate_ths"]))
+        # The older bucket ended before generated_at; the current one is still
+        # accumulating credit.
+        self.assertEqual([point["complete"] for point in points], [True, False])
+        generated_at_epoch = int(
+            datetime.strptime(series["generated_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+        )
+        for point in points:
+            point_epoch = int(
+                datetime.strptime(point["timestamp"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+            )
+            self.assertEqual(point["complete"], generated_at_epoch >= point_epoch + 300)
+
+    def test_hashrate_series_both_view_reports_no_smoothing_when_disabled(self) -> None:
+        with patch.dict(os.environ, {"PRISM_PUBLIC_HASHRATE_SMOOTHING_SECONDS": "0"}):
+            series = self.get_json("/public/v1/hashrate-series?subject=pool&range=1w&bucket=5m&view=both")
+
+        self.assertEqual(series["schema"], "prism.dashboard.hashrate-series.v2")
+        self.assertEqual(series["smoothing"], {"method": "none", "window_seconds": 300})
+        points = series["points"]
+        self.assertEqual(len(points), 2)
+        self.assert_hashrate_ths(points[0]["raw_hashrate_ths"], 600, 300)
+        self.assert_hashrate_ths(points[1]["raw_hashrate_ths"], 1200, 300)
+        for point in points:
+            self.assertEqual(point["smoothed_hashrate_ths"], point["raw_hashrate_ths"])
+
+    def test_hashrate_series_both_view_reports_no_smoothing_for_coarse_buckets(self) -> None:
+        # The default 30m window is shorter than two 1h buckets, so the v1
+        # series passes ledger rates through; v2 says so explicitly.
+        ledger = RangeBoundaryPublicLedger()
+        series = public_api.hashrate_series(
+            FakeCoordinator(ledger=ledger),  # type: ignore[arg-type]
+            subject="miner:miner-a",
+            range_id="1w",
+            bucket="auto",
+            view="both",
+        )
+
+        self.assertEqual(series["schema"], "prism.dashboard.hashrate-series.v2")
+        self.assertEqual(series["subject"], {"type": "miner", "id": "miner-a"})
+        self.assertEqual(series["bucket"], "1h")
+        self.assertEqual(series["bucket_seconds"], 3600)
+        self.assertEqual(series["smoothing"], {"method": "none", "window_seconds": 3600})
+        self.assertEqual(len(series["points"]), 1)
+        point = series["points"][0]
+        self.assertEqual(point["accepted_share_count"], 1)
+        self.assertEqual(point["accepted_share_difficulty"], "1200")
+        self.assert_hashrate_ths(point["raw_hashrate_ths"], 1200, 3600)
+        self.assertEqual(point["smoothed_hashrate_ths"], point["raw_hashrate_ths"])
+        self.assertTrue(point["complete"])
+
+    def test_hashrate_series_both_view_trims_partial_leading_coarse_bucket(self) -> None:
+        ledger = RangeBoundaryPublicLedger()
+        series = public_api.hashrate_series(
+            FakeCoordinator(ledger=ledger),  # type: ignore[arg-type]
+            subject="pool",
+            range_id="1w",
+            bucket="auto",
+            view="both",
+        )
+
+        self.assertEqual(series["smoothing"], {"method": "none", "window_seconds": 3600})
+        self.assertEqual(ledger.last_hashrate_series_lookback, 0)
+        self.assertIsNotNone(ledger.last_hashrate_series_anchor)
+        self.assertEqual(len(series["points"]), 1)
+        self.assertEqual(series["points"][0]["accepted_share_difficulty"], "1200")
+        self.assertTrue(series["points"][0]["complete"])
+
+    def test_hashrate_series_both_view_trims_lookback_but_keeps_its_smoothing(self) -> None:
+        ledger = RangeBoundaryPublicLedger()
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = (
+                f"http://127.0.0.1:{server.server_port}/public/v1/hashrate-series"
+                "?subject=pool&range=1w&bucket=5m&view=both"
+            )
+            with urllib.request.urlopen(url, timeout=5) as response:
+                series = json.loads(response.read())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(ledger.last_hashrate_series_lookback, 1800)
+        self.assertIsNotNone(ledger.last_hashrate_series_anchor)
+        points = series["points"]
+        # The pre-range bucket is trimmed from the response, but its credit
+        # still feeds the kept point's trailing window while the raw rate
+        # describes only the kept bucket.
+        self.assertEqual(len(points), 1)
+        self.assertEqual(points[0]["accepted_share_difficulty"], "1200")
+        self.assert_hashrate_ths(points[0]["raw_hashrate_ths"], 1200, 300)
+        self.assert_hashrate_ths(points[0]["smoothed_hashrate_ths"], 1800, 1800)
+        self.assertTrue(points[0]["complete"])
+
+    def test_hashrate_series_rejects_unknown_view(self) -> None:
+        for view in ("raw", "smoothed", "BOTH", "both,raw"):
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                self.get_json(f"/public/v1/hashrate-series?subject=pool&range=1w&bucket=5m&view={view}")
+
+            self.assertEqual(raised.exception.code, 400, view)
+            payload = json.loads(raised.exception.read())
+            raised.exception.close()
+            self.assertEqual(payload["schema"], "prism.dashboard.error.v1")
+            self.assertEqual(
+                payload["error"],
+                {"code": "bad_request", "message": "view must be both or omitted", "request_id": None},
+            )
+
+    def test_origin_cache_separates_hashrate_series_views(self) -> None:
+        path = "/public/v1/hashrate-series"
+        base_query = {"subject": ["pool"], "range": ["1w"], "bucket": ["5m"]}
+        self.assertNotEqual(
+            public_api.public_cache_key(path, base_query),
+            public_api.public_cache_key(path, {**base_query, "view": ["both"]}),
+        )
+
+        ledger = FakePublicLedger()
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch.dict(os.environ, {"PRISM_PUBLIC_AGGREGATE_CACHE_TTL_SECONDS": "30"}, clear=True):
+                schemas = []
+                for suffix in ("", "&view=both", ""):
+                    with urllib.request.urlopen(
+                        f"http://127.0.0.1:{server.server_port}{path}?subject=pool&range=1w&bucket=5m{suffix}",
+                        timeout=5,
+                    ) as response:
+                        schemas.append(json.loads(response.read())["schema"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(
+            schemas,
+            [
+                "prism.dashboard.hashrate-series.v1",
+                "prism.dashboard.hashrate-series.v2",
+                "prism.dashboard.hashrate-series.v1",
+            ],
+        )
+        # One origin computation per view; the repeated v1 request is a hit.
+        self.assertEqual(ledger.hashrate_series_calls, 2)
+
+    def test_hashrate_series_smoothing_descriptor_matches_smoother_threshold(self) -> None:
+        self.assertEqual(
+            public_api.hashrate_series_smoothing(bucket_seconds=300, window_seconds=1800),
+            {"method": "trailing", "window_seconds": 1800},
+        )
+        # Partial buckets are dropped from the effective window.
+        self.assertEqual(
+            public_api.hashrate_series_smoothing(bucket_seconds=300, window_seconds=899),
+            {"method": "trailing", "window_seconds": 600},
+        )
+        for bucket_seconds, window_seconds in ((300, 0), (300, 599), (3600, 1800), (86400, 86400)):
+            self.assertEqual(
+                public_api.hashrate_series_smoothing(bucket_seconds=bucket_seconds, window_seconds=window_seconds),
+                {"method": "none", "window_seconds": bucket_seconds},
+                (bucket_seconds, window_seconds),
+            )
+
+    def test_dual_rate_points_complete_flag_follows_bucket_end(self) -> None:
+        epoch = 1_750_000_000 // 300 * 300
+        point = {
+            "timestamp": _bucket_timestamp(epoch),
+            "hashrate_ths": "0",
+            "accepted_share_count": 4,
+            "accepted_share_difficulty": "900",
+        }
+        for generated_at_epoch, complete in ((epoch, False), (epoch + 299, False), (epoch + 300, True), (epoch + 301, True)):
+            points = public_api.dual_rate_hashrate_series_points(
+                [point],
+                bucket_seconds=300,
+                window_seconds=1800,
+                generated_at_epoch=generated_at_epoch,
+            )
+            self.assertEqual(len(points), 1)
+            self.assertEqual(points[0]["complete"], complete, generated_at_epoch - epoch)
+            self.assertEqual(points[0]["timestamp"], _bucket_timestamp(epoch))
+            self.assertEqual(points[0]["accepted_share_count"], 4)
+            self.assertEqual(points[0]["accepted_share_difficulty"], "900")
+            self.assertEqual(points[0]["raw_hashrate_ths"], public_api.hashrate_ths_from_difficulty(900, 300))
+
+    def test_dual_rate_points_match_v1_smoothing_and_trim_lookback(self) -> None:
+        base_epoch = 1_750_000_000 // 300 * 300
+        series = [
+            (base_epoch, 100),
+            (base_epoch + 300, 250),
+            (base_epoch + 900, 75),
+            (base_epoch + 1500, 500),
+            (base_epoch + 1800, 125),
+            (base_epoch + 3600, 900),
+        ]
+        malformed = {
+            "timestamp": "not-a-timestamp",
+            "hashrate_ths": "2.5",
+            "accepted_share_count": 1,
+            "accepted_share_difficulty": "100",
+        }
+        points = [
+            {
+                "timestamp": _bucket_timestamp(epoch),
+                "hashrate_ths": "0",
+                "accepted_share_count": 1,
+                "accepted_share_difficulty": str(difficulty),
+            }
+            for epoch, difficulty in series
+        ]
+        generated_at_epoch = base_epoch + 3600 + 150
+        smoothed = public_api.smooth_hashrate_series_points(
+            list(points), bucket_seconds=300, window_seconds=1800
+        )
+        dual_rate = public_api.dual_rate_hashrate_series_points(
+            [malformed, *reversed(points)],
+            bucket_seconds=300,
+            window_seconds=1800,
+            generated_at_epoch=generated_at_epoch,
+        )
+        self.assertEqual(len(dual_rate), len(series))
+        for (epoch, difficulty), v1_point, v2_point in zip(series, smoothed, dual_rate):
+            self.assertEqual(v2_point["timestamp"], _bucket_timestamp(epoch))
+            self.assertEqual(v2_point["smoothed_hashrate_ths"], v1_point["hashrate_ths"])
+            self.assertEqual(v2_point["raw_hashrate_ths"], public_api.hashrate_ths_from_difficulty(difficulty, 300))
+            self.assertEqual(v2_point["complete"], epoch != base_epoch + 3600)
+
+        # Trimming keeps the lookback credit inside the first kept window.
+        trimmed = public_api.dual_rate_hashrate_series_points(
+            points,
+            bucket_seconds=300,
+            window_seconds=1800,
+            min_epoch=base_epoch + 900,
+            generated_at_epoch=generated_at_epoch,
+        )
+        self.assertEqual([point["timestamp"] for point in trimmed], [_bucket_timestamp(epoch) for epoch, _ in series[2:]])
+        self.assertEqual(trimmed[0]["raw_hashrate_ths"], public_api.hashrate_ths_from_difficulty(75, 300))
+        self.assertEqual(trimmed[0]["smoothed_hashrate_ths"], public_api.hashrate_ths_from_difficulty(425, 1800))
+
+        # Below the two-bucket threshold the smoothed rate is the raw rate.
+        unsmoothed = public_api.dual_rate_hashrate_series_points(
+            points,
+            bucket_seconds=300,
+            window_seconds=300,
+            generated_at_epoch=generated_at_epoch,
+        )
+        for point in unsmoothed:
+            self.assertEqual(point["smoothed_hashrate_ths"], point["raw_hashrate_ths"])
+
+        count_as_decimal = public_api.dual_rate_hashrate_series_points(
+            [{**points[0], "accepted_share_count": "3.0"}],
+            bucket_seconds=300,
+            window_seconds=1800,
+            generated_at_epoch=generated_at_epoch,
+        )
+        self.assertEqual(count_as_decimal[0]["accepted_share_count"], 3)
 
     def test_omitted_leaderboard_window_retains_exact_legacy_v1_keys(self) -> None:
         payload = self.get_json("/public/v1/leaderboard")

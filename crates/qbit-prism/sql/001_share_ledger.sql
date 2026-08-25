@@ -2528,6 +2528,40 @@ BEGIN
 END;
 $$;
 
+-- Durable retention of the last delivered, safe per-worker vardiff wire
+-- difficulty, keyed by listener lane plus exact Stratum username. Rows are
+-- operational preload hints for reconnecting sessions only: they never join
+-- share accounting or payout artifacts, and pruning them loses no canonical
+-- state. Exact usernames are public identities, not authentication secrets.
+--
+-- difficulty is an unconstrained numeric so the decimal wire value survives
+-- without lossy integer conversion; the CHECK pins it to a positive finite
+-- value (numeric NaN compares greater than every value including zero, and
+-- only the < 'Infinity' comparison excludes it, so both guards are
+-- load-bearing). evidence_at records when share-backed evidence last
+-- validated the value — the writer's upsert keeps it monotonic per key —
+-- while updated_at records the last write of any kind. The single index
+-- serves both the bounded newest-first preload (its column order matches the
+-- preload ORDER BY exactly) and the evidence_at range scan the prune uses.
+-- The key columns collate as "C": preload/prune tie-breaks are byte order,
+-- identical across deployments and to the in-memory store's code-point
+-- ordering, instead of drifting with the database's locale collation.
+-- This DDL block must stay byte-identical to WORKER_DIFFICULTY_SCHEMA_SQL in
+-- lab/prism/worker_difficulty_store.py; a contract test pins the match.
+CREATE TABLE IF NOT EXISTS qbit_worker_difficulty (
+    listener text COLLATE "C" NOT NULL CHECK (listener <> ''),
+    worker_username text COLLATE "C" NOT NULL CHECK (worker_username <> ''),
+    difficulty numeric NOT NULL CHECK (
+        difficulty > 0 AND difficulty < 'Infinity'::numeric
+    ),
+    evidence_at timestamptz NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (listener, worker_username)
+);
+
+CREATE INDEX IF NOT EXISTS qbit_worker_difficulty_evidence_idx
+    ON qbit_worker_difficulty (evidence_at DESC, listener, worker_username);
+
 -- Pairs with the BEGIN at the top of the file: the apply is one transaction
 -- no matter which client performs it.
 COMMIT;

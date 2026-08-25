@@ -22,6 +22,7 @@ FIXTURE_DIR = CONTRACT_DIR / "fixtures"
 EXPECTED_FIXTURES = {
     "pool-summary.json": "prism.dashboard.pool-summary.v1",
     "hashrate-series.json": "prism.dashboard.hashrate-series.v1",
+    "hashrate-series-dual-rate.json": "prism.dashboard.hashrate-series.v2",
     "leaderboard.json": "prism.dashboard.leaderboard.v2",
     "leaderboard-legacy.json": "prism.dashboard.leaderboard.v1",
     "blocks.json": "prism.dashboard.blocks.v1",
@@ -267,13 +268,165 @@ class PublicDashboardApiContractTests(unittest.TestCase):
         )
 
     def test_hashrate_subject_fixture_matches_subject_type(self) -> None:
-        subject = self.load_fixture("hashrate-series.json")["subject"]
-        if subject["type"] == "pool":
-            self.assertIsNone(subject["id"])
+        for fixture_name in ("hashrate-series.json", "hashrate-series-dual-rate.json"):
+            subject = self.load_fixture(fixture_name)["subject"]
+            if subject["type"] == "pool":
+                self.assertIsNone(subject["id"], fixture_name)
+            else:
+                self.assertEqual(subject["type"], "miner", fixture_name)
+                self.assertIsInstance(subject["id"], str, fixture_name)
+                self.assertGreater(len(subject["id"]), 0, fixture_name)
+
+    def test_legacy_hashrate_series_fixture_retains_exact_v1_shape(self) -> None:
+        series = self.load_fixture("hashrate-series.json")
+
+        self.assertEqual(set(series), {"schema", "generated_at", "subject", "range", "bucket", "unit", "points"})
+        self.assertGreater(len(series["points"]), 0)
+        for point in series["points"]:
+            self.assertEqual(
+                set(point),
+                {"timestamp", "hashrate_ths", "accepted_share_count", "accepted_share_difficulty"},
+            )
+
+    def test_dual_rate_hashrate_series_fixture_is_internally_consistent(self) -> None:
+        series = self.load_fixture("hashrate-series-dual-rate.json")
+
+        self.assertEqual(
+            set(series),
+            {
+                "schema",
+                "generated_at",
+                "subject",
+                "range",
+                "bucket",
+                "bucket_seconds",
+                "unit",
+                "rate_basis",
+                "smoothing",
+                "points",
+            },
+        )
+        self.assertEqual(series["unit"], "ths")
+        self.assertEqual(series["rate_basis"], "accepted_share_difficulty")
+        bucket_seconds = series["bucket_seconds"]
+        self.assertEqual(bucket_seconds, public_api.HASHRATE_SERIES_BUCKET_SECONDS[series["bucket"]])
+        smoothing = series["smoothing"]
+        self.assertEqual(set(smoothing), {"method", "window_seconds"})
+        window_seconds = smoothing["window_seconds"]
+        self.assertIsInstance(window_seconds, int)
+        self.assertEqual(window_seconds % bucket_seconds, 0)
+        if smoothing["method"] == "none":
+            self.assertEqual(window_seconds, bucket_seconds)
         else:
-            self.assertEqual(subject["type"], "miner")
-            self.assertIsInstance(subject["id"], str)
-            self.assertGreater(len(subject["id"]), 0)
+            self.assertEqual(smoothing["method"], "trailing")
+            self.assertGreaterEqual(window_seconds // bucket_seconds, 2)
+        self.assertEqual(
+            smoothing,
+            public_api.hashrate_series_smoothing(bucket_seconds=bucket_seconds, window_seconds=window_seconds),
+        )
+
+        generated_at_epoch = self.epoch(series["generated_at"])
+        points = series["points"]
+        self.assertGreater(len(points), 0)
+        epochs = [self.epoch(point["timestamp"]) for point in points]
+        self.assertEqual(epochs, sorted(set(epochs)))
+        for point, epoch in zip(points, epochs):
+            self.assertEqual(
+                set(point),
+                {
+                    "timestamp",
+                    "raw_hashrate_ths",
+                    "smoothed_hashrate_ths",
+                    "accepted_share_count",
+                    "accepted_share_difficulty",
+                    "complete",
+                },
+            )
+            self.assertEqual(epoch % bucket_seconds, 0, point["timestamp"])
+            self.assertIsInstance(point["complete"], bool)
+            self.assertEqual(point["complete"], generated_at_epoch >= epoch + bucket_seconds, point["timestamp"])
+            # Every raw rate is credit over the full bucket, so the trailing
+            # estimate is the window's raw rates summed and re-scaled from
+            # bucket duration to window duration, with missing buckets as zero.
+            window_raw_total = sum(
+                Decimal(other["raw_hashrate_ths"])
+                for other, other_epoch in zip(points, epochs)
+                if epoch - window_seconds < other_epoch <= epoch
+            )
+            # Each public rate is independently rounded by decimal_string, so
+            # their re-scaled totals may differ by the final decimal place.
+            smoothed_total = Decimal(point["smoothed_hashrate_ths"]) * Decimal(
+                window_seconds
+            )
+            raw_total = window_raw_total * Decimal(bucket_seconds)
+            self.assertLessEqual(
+                abs(smoothed_total - raw_total),
+                max(abs(raw_total) * Decimal("1e-30"), Decimal("1e-30")),
+                point["timestamp"],
+            )
+            if smoothing["method"] == "none":
+                self.assertEqual(Decimal(point["smoothed_hashrate_ths"]), Decimal(point["raw_hashrate_ths"]))
+
+    def test_openapi_hashrate_series_declares_dual_rate_view(self) -> None:
+        text = OPENAPI_PATH.read_text(encoding="utf-8")
+        self.assertIn("- name: view\n          in: query", text)
+        self.assertIn("enum: [both]", text)
+        self.assertIn('- $ref: "#/components/schemas/HashrateSeriesResponse"', text)
+        self.assertIn('- $ref: "#/components/schemas/HashrateSeriesDualRateResponse"', text)
+        self.assertIn("HashrateSmoothing:", text)
+        self.assertIn("enum: [trailing, none]", text)
+        self.assertIn("const: accepted_share_difficulty", text)
+        self.assertIn("credited hashrate", text)
+        # The documented required fields are exactly the fixture's keys.
+        self.assertIn(
+            "    DualRateHashratePoint:\n"
+            "      type: object\n"
+            "      additionalProperties: false\n"
+            "      required:\n"
+            "        - timestamp\n"
+            "        - raw_hashrate_ths\n"
+            "        - smoothed_hashrate_ths\n"
+            "        - accepted_share_count\n"
+            "        - accepted_share_difficulty\n"
+            "        - complete\n",
+            text,
+        )
+        self.assertIn(
+            "    HashrateSeriesDualRateResponse:\n"
+            "      type: object\n"
+            "      additionalProperties: false\n"
+            "      required:\n"
+            "        - schema\n"
+            "        - generated_at\n"
+            "        - subject\n"
+            "        - range\n"
+            "        - bucket\n"
+            "        - bucket_seconds\n"
+            "        - unit\n"
+            "        - rate_basis\n"
+            "        - smoothing\n"
+            "        - points\n",
+            text,
+        )
+        # The legacy point schema is untouched.
+        self.assertIn(
+            "    HashratePoint:\n"
+            "      type: object\n"
+            "      additionalProperties: false\n"
+            "      required:\n"
+            "        - timestamp\n"
+            "        - hashrate_ths\n"
+            "        - accepted_share_count\n"
+            "        - accepted_share_difficulty\n",
+            text,
+        )
+
+        readme_text = (CONTRACT_DIR / "README.md").read_text(encoding="utf-8")
+        self.assertIn("credited hashrate", readme_text)
+        self.assertIn("`view=both`", readme_text)
+        self.assertIn("prism.dashboard.hashrate-series.v2", readme_text)
+        self.assertIn("PRISM_PUBLIC_HASHRATE_SMOOTHING_SECONDS", readme_text)
+        self.assertIn("router telemetry", readme_text)
 
     def test_fanout_fixture_status_matches_tip_height(self) -> None:
         tip_height = self.load_fixture("pool-summary.json")["network"]["height"]
@@ -429,6 +582,10 @@ class PublicDashboardApiContractTests(unittest.TestCase):
 
     def is_hex_hash_key(self, key: str) -> bool:
         return key in HEX_HASH_KEYS or key.endswith("_sha256") or key.endswith("_txid")
+
+    def epoch(self, timestamp: str) -> int:
+        self.assertTrue(timestamp.endswith("Z"), timestamp)
+        return int(datetime.fromisoformat(timestamp.removesuffix("Z") + "+00:00").timestamp())
 
     def assert_iso_timestamp(self, value: object, source: str, path: tuple[str, ...]) -> None:
         self.assertIsInstance(value, str, ".".join(path))

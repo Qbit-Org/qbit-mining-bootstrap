@@ -180,6 +180,15 @@ DEFAULT_PRISM_VARDIFF_IDLE_SWEEP_SECONDS = 15.0
 DEFAULT_PRISM_VARDIFF_RESUME_TTL_SECONDS = 900.0
 DEFAULT_PRISM_VARDIFF_RESUME_MAX_ENTRIES = 8192
 DEFAULT_PRISM_VARDIFF_RESUME_MAX_START_FACTOR = Decimal("1024")
+# Fast-arrival initial convergence defaults (#132). 64x in one move is what
+# lets a standard-lane session started at 16384 cross the 500000 a rental
+# router filters at without waiting out several ordinary 4x retargets; 8
+# accepted shares over at least 1 second, showing at least a 4x gap, is the
+# evidence required before that one move is allowed.
+DEFAULT_PRISM_VARDIFF_INITIAL_MAX_STEP_UP = Decimal("64")
+DEFAULT_PRISM_VARDIFF_INITIAL_MIN_SHARES = 8
+DEFAULT_PRISM_VARDIFF_INITIAL_MIN_STEP_UP = Decimal("4")
+DEFAULT_PRISM_VARDIFF_INITIAL_MIN_SECONDS = Decimal("1")
 DEFAULT_PRISM_WORKER_METRICS_LIMIT = 100
 DEFAULT_SHARE_COMMIT_BATCH_SIZE = 64
 DEFAULT_SHARE_COMMIT_LINGER_MILLISECONDS = 5.0
@@ -801,6 +810,67 @@ def apply_python_switch_interval(*, environ: Env | None = None) -> float | None:
 def load_prism_vardiff_config(
     startup_difficulty: Decimal, *, environ: Env | None = None
 ) -> vardiff.VardiffConfig:
+    initial_convergence_enabled = env_bool(
+        "PRISM_STRATUM_VARDIFF_INITIAL_CONVERGENCE",
+        "1",
+        environ=environ,
+    )
+    high_diff_arrival_threshold = env_decimal(
+        "PRISM_STRATUM_VARDIFF_HIGH_DIFF_ARRIVAL_DIFF",
+        DEFAULT_HIGHDIFF_DIFFICULTY,
+        environ=environ,
+    )
+    max_step_factor = env_decimal(
+        "PRISM_STRATUM_VARDIFF_MAX_STEP_UP", "4", environ=environ
+    )
+    if initial_convergence_enabled:
+        initial_min_shares = env_int(
+            "PRISM_STRATUM_VARDIFF_INITIAL_MIN_SHARES",
+            DEFAULT_PRISM_VARDIFF_INITIAL_MIN_SHARES,
+            environ=environ,
+        )
+        if initial_min_shares < 1:
+            raise SystemExit(
+                "PRISM_STRATUM_VARDIFF_INITIAL_MIN_SHARES must be at least 1"
+            )
+        initial_max_step_factor = env_decimal(
+            "PRISM_STRATUM_VARDIFF_INITIAL_MAX_STEP_UP",
+            str(DEFAULT_PRISM_VARDIFF_INITIAL_MAX_STEP_UP),
+            environ=environ,
+        )
+        initial_min_step_factor = env_decimal(
+            "PRISM_STRATUM_VARDIFF_INITIAL_MIN_STEP_UP",
+            str(DEFAULT_PRISM_VARDIFF_INITIAL_MIN_STEP_UP),
+            environ=environ,
+        )
+        if initial_min_step_factor < 1:
+            raise SystemExit(
+                "PRISM_STRATUM_VARDIFF_INITIAL_MIN_STEP_UP must be at least 1"
+            )
+        initial_min_seconds = env_decimal(
+            "PRISM_STRATUM_VARDIFF_INITIAL_MIN_SECONDS",
+            str(DEFAULT_PRISM_VARDIFF_INITIAL_MIN_SECONDS),
+            environ=environ,
+        )
+        if initial_max_step_factor < max_step_factor:
+            raise SystemExit(
+                "PRISM_STRATUM_VARDIFF_INITIAL_MAX_STEP_UP is below "
+                "PRISM_STRATUM_VARDIFF_MAX_STEP_UP"
+            )
+    else:
+        # The relaxation is off, so do not parse its environment settings:
+        # initial_convergence_ready() refuses immediately on
+        # initial_convergence_enabled, and calculate_next_difficulty() keeps
+        # the ordinary max_step_factor. Defaults keep VardiffConfig's
+        # unconditional invariants satisfied without allowing dead settings
+        # (including malformed strings) to prevent startup.
+        initial_min_shares = DEFAULT_PRISM_VARDIFF_INITIAL_MIN_SHARES
+        initial_min_step_factor = DEFAULT_PRISM_VARDIFF_INITIAL_MIN_STEP_UP
+        initial_max_step_factor = max(
+            DEFAULT_PRISM_VARDIFF_INITIAL_MAX_STEP_UP,
+            max_step_factor,
+        )
+        initial_min_seconds = DEFAULT_PRISM_VARDIFF_INITIAL_MIN_SECONDS
     return vardiff.VardiffConfig(
         enabled=env_bool("PRISM_STRATUM_VARDIFF", "1", environ=environ),
         target_share_interval_seconds=env_decimal(
@@ -813,7 +883,7 @@ def load_prism_vardiff_config(
         retarget_interval_seconds=env_decimal(
             "PRISM_STRATUM_VARDIFF_RETARGET_SECONDS", "90", environ=environ
         ),
-        max_step_factor=env_decimal("PRISM_STRATUM_VARDIFF_MAX_STEP_UP", "4", environ=environ),
+        max_step_factor=max_step_factor,
         startup_difficulty=env_decimal(
             "PRISM_STRATUM_VARDIFF_START_DIFF", str(startup_difficulty), environ=environ
         ),
@@ -824,6 +894,12 @@ def load_prism_vardiff_config(
         retarget_tolerance=env_decimal(
             "PRISM_STRATUM_VARDIFF_RETARGET_TOLERANCE", "0.25", environ=environ
         ),
+        initial_convergence_enabled=initial_convergence_enabled,
+        initial_max_step_factor=initial_max_step_factor,
+        initial_min_accepted_shares=initial_min_shares,
+        initial_min_step_factor=initial_min_step_factor,
+        initial_min_elapsed_seconds=initial_min_seconds,
+        high_diff_arrival_threshold=high_diff_arrival_threshold,
     )
 
 

@@ -9,7 +9,7 @@ from decimal import Decimal
 import threading
 import time
 import traceback
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 
 from lab.auxpow import vardiff
 from lab.prism.coordinator_config import (
@@ -25,10 +25,28 @@ from lab.prism.stratum_session import (
     WorkerIdentity,
     client_vardiff_lock,
 )
+from lab.prism.worker_difficulty_store import (
+    MemoryWorkerDifficultyStore,
+    PostgresWorkerDifficultyStore,
+    WorkerDifficultyStorePort,
+)
 
 
 PRISM_VARDIFF_IDLE_RETARGET_MAX_WORKERS = 2
 MAX_PENDING_VARDIFF_IDLE_RETARGETS = 8
+# Hard bound on the durable persistence lane. Entries coalesce by worker
+# identity, so this bounds DISTINCT pending workers, not the event rate.
+MAX_PENDING_VARDIFF_DURABLE_WRITES = 256
+PRISM_VARDIFF_DURABLE_PRUNE_INTERVAL_SECONDS = 300.0
+# TTL pruning deletes in bounded batches rather than one unbounded statement,
+# so a large inherited backlog cannot produce a single delete that outruns the
+# ledger's operation deadline and then never converges. Several batches run per
+# pass; whatever is left waits for the next interval.
+PRISM_VARDIFF_DURABLE_PRUNE_BATCH = 1024
+PRISM_VARDIFF_DURABLE_PRUNE_MAX_BATCHES = 8
+# How long the lane's worker parks between wake-ups. Work arrives by event;
+# this only bounds how long a stop request waits for the loop to notice.
+PRISM_VARDIFF_DURABLE_IDLE_WAKE_SECONDS = 1.0
 # Mirrors the coordinator's PRISM_JOB_BUILD_SECONDS_BUCKETS values; owned
 # here so metric formatting does not import the coordinator module.
 PRISM_VARDIFF_IDLE_SECONDS_BUCKETS = (
@@ -52,6 +70,43 @@ PRISM_VARDIFF_IDLE_SKIP_REASONS = (
     "queue_full",
     "superseded",
 )
+# Bounded outcomes for one retarget taken under the fast-arrival initial
+# convergence policy; also the metric label order for
+# qbit_prism_vardiff_initial_retargets_total. Their sum is the attempt count
+# published alongside them.
+PRISM_VARDIFF_INITIAL_RETARGET_OUTCOMES = (
+    "applied",     # committed together with its paired job
+    "suppressed",  # the computed step landed inside the retarget tolerance
+    "superseded",  # difficulty or job state moved before the paired send
+    "failed",      # the build or send raised; speculative state was restored
+)
+# Seconds and accepted-share buckets for the high-difficulty arrival
+# histograms. Fixed bucket sets, no per-worker labels: the whole point is to
+# see how long a rental-scale session spends below the threshold it should
+# be credited at, fleet-wide.
+PRISM_VARDIFF_HIGH_DIFF_ARRIVAL_SECONDS_BUCKETS = (
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+    30.0,
+    60.0,
+    120.0,
+    300.0,
+    600.0,
+)
+PRISM_VARDIFF_HIGH_DIFF_ARRIVAL_SHARES_BUCKETS = (
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+    512,
+)
 # Bounded outcomes for one reconnect difficulty resume attempt; also the
 # metric label order for qbit_prism_vardiff_resume_total.
 PRISM_VARDIFF_RESUME_OUTCOMES = (
@@ -63,6 +118,184 @@ PRISM_VARDIFF_RESUME_OUTCOMES = (
     "rejected",    # entry present but unusable (non-finite / non-positive)
     "disabled",    # retention off, or vardiff disabled for this client
 )
+# Bounded outcomes for one durable worker-difficulty write. The first two are
+# evidence-carrying upserts; the next two are the lower-only correction, whose
+# "unchanged" means there was no higher stored row left to correct.
+PRISM_VARDIFF_DURABLE_WRITE_OUTCOMES = (
+    "applied",
+    "stale",
+    "lowered",
+    "unchanged",
+    "failed",
+    "dropped",
+)
+
+
+@dataclass(frozen=True)
+class _PendingDurableWrite:
+    """One queued durable worker-difficulty write, keyed by worker identity.
+
+    ``downward_only`` selects the atomic lower-only correction, which carries
+    no evidence timestamp: it reduces an existing row without touching
+    ``evidence_at``, so it can neither refresh the TTL of a value no share
+    proved nor refuse a later share-backed write whose evidence predates it.
+    """
+
+    key: tuple[str, str]
+    downward_only: bool
+    difficulty: Decimal
+    evidence_at_ms: int | None
+    now_ms: int
+    # A coalesced evidence write may also carry the minimum correction that
+    # must run if the store rejects that evidence as stale. Keeping this
+    # branch separate is load-bearing: folding it into ``difficulty`` loses
+    # the correction when a newer row already stands in the store.
+    stale_downward_difficulty: Decimal | None = None
+    stale_downward_now_ms: int | None = None
+
+    @property
+    def has_downward_correction(self) -> bool:
+        return self.downward_only or self.stale_downward_difficulty is not None
+
+    def _stale_downward(self) -> tuple[Decimal, int] | None:
+        if self.downward_only:
+            return (self.difficulty, self.now_ms)
+        if self.stale_downward_difficulty is None:
+            return None
+        return (
+            self.stale_downward_difficulty,
+            int(
+                self.now_ms
+                if self.stale_downward_now_ms is None
+                else self.stale_downward_now_ms
+            ),
+        )
+
+    @staticmethod
+    def _minimum_downward(
+        earlier: tuple[Decimal, int] | None,
+        later: tuple[Decimal, int] | None,
+    ) -> tuple[Decimal, int] | None:
+        """Collapse lower-only writes without inventing an update timestamp.
+
+        The first occurrence of the minimum wins: a later equal or higher
+        correction is a no-op after the earlier minimum has landed.
+        """
+        if earlier is None:
+            return later
+        if later is None or earlier[0] <= later[0]:
+            return earlier
+        return later
+
+    @classmethod
+    def _evidence_write(
+        cls,
+        source: "_PendingDurableWrite",
+        *,
+        difficulty: Decimal | None = None,
+        now_ms: int | None = None,
+        stale_downward: tuple[Decimal, int] | None = None,
+    ) -> "_PendingDurableWrite":
+        return cls(
+            key=source.key,
+            downward_only=False,
+            difficulty=source.difficulty if difficulty is None else difficulty,
+            evidence_at_ms=source.evidence_at_ms,
+            now_ms=source.now_ms if now_ms is None else now_ms,
+            stale_downward_difficulty=(
+                None if stale_downward is None else stale_downward[0]
+            ),
+            stale_downward_now_ms=(
+                None if stale_downward is None else stale_downward[1]
+            ),
+        )
+
+    def merged_with(self, later: "_PendingDurableWrite") -> "_PendingDurableWrite":
+        """Collapse this entry and a later one for the same worker.
+
+        Evidence order, not queue order, selects the upsert that can stand.
+        Lower-only corrections are retained as a stale-upsert fallback when
+        an evidence write follows them, because a newer row already in the
+        store can reject every queued upsert while still needing the lower.
+        This is a compact representation of both possible store branches:
+        evidence accepted, or all queued evidence rejected as stale.
+        """
+        if self.key != later.key:
+            raise ValueError("durable writes for different workers cannot merge")
+
+        if later.downward_only:
+            if self.downward_only:
+                minimum = self._minimum_downward(
+                    self._stale_downward(),
+                    later._stale_downward(),
+                )
+                assert minimum is not None
+                return _PendingDurableWrite(
+                    key=self.key,
+                    downward_only=True,
+                    difficulty=minimum[0],
+                    evidence_at_ms=None,
+                    now_ms=minimum[1],
+                )
+            stale_downward = self._minimum_downward(
+                self._stale_downward(),
+                later._stale_downward(),
+            )
+            difficulty = self.difficulty
+            now_ms = self.now_ms
+            if later.difficulty < difficulty:
+                difficulty = later.difficulty
+                now_ms = later.now_ms
+            return self._evidence_write(
+                self,
+                difficulty=difficulty,
+                now_ms=now_ms,
+                stale_downward=stale_downward,
+            )
+
+        if self.downward_only:
+            stale_downward = self._minimum_downward(
+                self._stale_downward(),
+                later._stale_downward(),
+            )
+            return self._evidence_write(
+                later,
+                stale_downward=stale_downward,
+            )
+
+        self_evidence = int(self.evidence_at_ms or 0)
+        later_evidence = int(later.evidence_at_ms or 0)
+        if later_evidence >= self_evidence:
+            stale_downward = self._minimum_downward(
+                self._stale_downward(),
+                later._stale_downward(),
+            )
+            return self._evidence_write(
+                later,
+                stale_downward=stale_downward,
+            )
+
+        # ``later`` carries older evidence and is rejected whenever ``self``
+        # applies. If ``later`` already represents a coalesced sequence, only
+        # its stale-upsert lower branch remains observable after ``self``.
+        later_stale_downward = later._stale_downward()
+        stale_downward = self._minimum_downward(
+            self._stale_downward(),
+            later_stale_downward,
+        )
+        difficulty = self.difficulty
+        now_ms = self.now_ms
+        if (
+            later_stale_downward is not None
+            and later_stale_downward[0] < difficulty
+        ):
+            difficulty, now_ms = later_stale_downward
+        return self._evidence_write(
+            self,
+            difficulty=difficulty,
+            now_ms=now_ms,
+            stale_downward=stale_downward,
+        )
 
 
 @dataclass(frozen=True)
@@ -190,6 +423,42 @@ class SessionDifficultyStore:
             self._entries.move_to_end(key)
             self.hit_count += 1
             return retained.difficulty, "hit"
+
+    def preload(
+        self,
+        entries: Iterable[
+            tuple[tuple[str, str], Decimal, float]
+        ],
+    ) -> int:
+        """Seed bounded retained values without counting them as live writes.
+
+        ``recorded_monotonic`` is reconstructed by the durable integration
+        layer from each wall-clock evidence timestamp. Callers provide oldest
+        first so the resulting LRU order still has the newest evidence at the
+        end. Invalid rows are ignored defensively; the durable stores already
+        validate them on write and parse.
+        """
+        if not self.enabled:
+            return 0
+        loaded = 0
+        with self._lock:
+            for key, difficulty, recorded_monotonic in entries:
+                if (
+                    not isinstance(difficulty, Decimal)
+                    or not difficulty.is_finite()
+                    or difficulty <= 0
+                ):
+                    continue
+                self._entries[key] = RetainedSessionDifficulty(
+                    difficulty=difficulty,
+                    recorded_monotonic=float(recorded_monotonic),
+                )
+                self._entries.move_to_end(key)
+                loaded += 1
+                while len(self._entries) > self.max_entries:
+                    self._entries.popitem(last=False)
+                    self.evicted_count += 1
+        return loaded
 
     def prune(self, *, now: float) -> int:
         if not self.enabled:
@@ -339,12 +608,83 @@ VARDIFF_COMPATIBILITY_FIELDS = (
 )
 
 
-def _new_histogram() -> dict[str, Any]:
+def _new_bucket_histogram(buckets: tuple[float, ...]) -> dict[str, Any]:
     return {
-        "buckets": {bucket: 0 for bucket in PRISM_VARDIFF_IDLE_SECONDS_BUCKETS},
+        "buckets": {bucket: 0 for bucket in buckets},
         "sum": 0.0,
         "count": 0,
     }
+
+
+def _new_histogram() -> dict[str, Any]:
+    return _new_bucket_histogram(PRISM_VARDIFF_IDLE_SECONDS_BUCKETS)
+
+
+def _observe_bucket_histogram(
+    histogram: dict[str, Any],
+    buckets: tuple[float, ...],
+    value: float,
+) -> None:
+    """Record one observation. Caller holds the histogram's owning lock."""
+    histogram["count"] = int(histogram["count"]) + 1
+    histogram["sum"] = float(histogram["sum"]) + float(value)
+    counts = histogram["buckets"]
+    for bucket in buckets:
+        if value <= bucket:
+            counts[bucket] = int(counts.get(bucket, 0)) + 1
+
+
+def _histogram_lines(
+    metric_name: str,
+    description: str,
+    histogram: dict[str, Any],
+    buckets: tuple[float, ...],
+) -> list[str]:
+    return [
+        f"# HELP {metric_name} {description}",
+        f"# TYPE {metric_name} histogram",
+        *[
+            f'{metric_name}_bucket{{le="{bucket:g}"}} {histogram["buckets"].get(bucket, 0)}'
+            for bucket in buckets
+        ],
+        f'{metric_name}_bucket{{le="+Inf"}} {histogram["count"]}',
+        f'{metric_name}_sum {float(histogram["sum"]):.6f}',
+        f'{metric_name}_count {histogram["count"]}',
+    ]
+
+
+def _worker_difficulty_store(runtime: VardiffRuntime) -> WorkerDifficultyStorePort:
+    """Resolve one process-wide durable-store adapter for the runtime.
+
+    Focused embedders may inject ``worker_difficulty_store`` directly. In
+    production the adapter is attached to the ledger so recreating the
+    vardiff service in-process does not discard the memory reference store,
+    while PostgreSQL remains the cross-process source of truth.
+    """
+    injected = getattr(runtime, "worker_difficulty_store", None)
+    if injected is not None:
+        return injected
+    ledger = getattr(runtime, "ledger", None)
+    owner = ledger if ledger is not None else runtime
+    existing = getattr(owner, "_worker_difficulty_store", None)
+    if existing is not None:
+        return existing
+    if (
+        ledger is not None
+        and getattr(ledger, "backend_name", "") == "postgres-psql"
+    ):
+        store: WorkerDifficultyStorePort = (
+            PostgresWorkerDifficultyStore.from_share_ledger(
+                ledger,
+                timeout_seconds=float(
+                    getattr(runtime, "share_commit_timeout_seconds", 15.0)
+                ),
+            )
+        )
+    else:
+        store = MemoryWorkerDifficultyStore()
+    setattr(owner, "_worker_difficulty_store", store)
+    return store
 
 
 class VardiffService:
@@ -400,6 +740,84 @@ class VardiffService:
             outcome: 0 for outcome in PRISM_VARDIFF_RESUME_OUTCOMES
         }
         self.vardiff_lane_accepted_counts: dict[str, int] = {}
+        self.vardiff_initial_retarget_attempts = 0
+        self.vardiff_initial_retarget_outcome_counts = {
+            outcome: 0 for outcome in PRISM_VARDIFF_INITIAL_RETARGET_OUTCOMES
+        }
+        self.vardiff_high_diff_arrival_seconds_histogram = _new_bucket_histogram(
+            PRISM_VARDIFF_HIGH_DIFF_ARRIVAL_SECONDS_BUCKETS
+        )
+        self.vardiff_high_diff_arrival_shares_histogram = _new_bucket_histogram(
+            PRISM_VARDIFF_HIGH_DIFF_ARRIVAL_SHARES_BUCKETS
+        )
+        self.worker_difficulty_store = _worker_difficulty_store(runtime)
+        self.vardiff_durable_preload_records = 0
+        self.vardiff_durable_preload_failures = 0
+        self.vardiff_durable_prune_failures = 0
+        self.vardiff_durable_pruned_records = 0
+        self.vardiff_durable_coalesced = 0
+        self.vardiff_durable_downward_dropped = 0
+        self.vardiff_durable_write_outcome_counts = {
+            outcome: 0 for outcome in PRISM_VARDIFF_DURABLE_WRITE_OUTCOMES
+        }
+        # Durable writes leave the Stratum/client lock path through this
+        # bounded, coalescing, single-worker lane. Nothing here reads client
+        # state or waits on a client lock: every payload is snapshotted by the
+        # caller, so a slow database can never reach back into share
+        # accounting or job delivery. The queue is capped by DISTINCT worker
+        # identity, and safety-critical downward corrections outrank optional
+        # resume hints for both eviction and shutdown drain order.
+        self._vardiff_durable_lock = threading.Lock()
+        self._vardiff_durable_pending: OrderedDict[
+            tuple[str, str], _PendingDurableWrite
+        ] = OrderedDict()
+        self._vardiff_durable_thread: threading.Thread | None = None
+        self._vardiff_durable_wake = threading.Event()
+        self._vardiff_durable_stopping = False
+        self._vardiff_durable_prune_requested = False
+        self._vardiff_durable_inflight = 0
+        self._vardiff_durable_operation_timeout_seconds = float(
+            getattr(runtime, "share_commit_timeout_seconds", 15.0)
+        )
+        self._vardiff_durable_next_prune_monotonic = (
+            time.monotonic() + PRISM_VARDIFF_DURABLE_PRUNE_INTERVAL_SECONDS
+        )
+        self._preload_worker_difficulties()
+
+    def _preload_worker_difficulties(self) -> None:
+        """Hydrate the authorization-time map with one bounded durable read."""
+        store = self.session_difficulty_store
+        if not store.enabled:
+            return
+        now_ms = max(0, int(time.time() * 1000))
+        ttl_ms = max(0, int(store.ttl_seconds * 1000))
+        cutoff_ms = max(0, now_ms - ttl_ms)
+        try:
+            recent = self.worker_difficulty_store.load_recent(
+                evidence_after_ms=cutoff_ms,
+                limit=store.max_entries,
+            )
+        except Exception:
+            self.vardiff_durable_preload_failures += 1
+            return
+        now_monotonic = time.monotonic()
+        # load_recent is newest-first; preload oldest-first so LRU recency
+        # ends in the same order as evidence freshness.
+        entries = [
+            (
+                (record.listener, record.worker_username),
+                record.difficulty,
+                now_monotonic
+                - max(0.0, (now_ms - record.evidence_at_ms) / 1000.0),
+            )
+            for record in reversed(recent)
+        ]
+        self.vardiff_durable_preload_records = store.preload(entries)
+        # Retention is an optimization over the safe cold-start path, so a
+        # prune failure must not prevent mining or discard the records already
+        # loaded into the process-local map; the durable lane's own scheduler
+        # retries it on the ordinary interval.
+        self.vardiff_durable_pruned_records = self._prune_expired_rows(cutoff_ms)
 
     def client_config(self, client: ClientState) -> vardiff.VardiffConfig:
         """The difficulty policy for one client: its per-client specialization
@@ -489,6 +907,11 @@ class VardiffService:
             # prove the difficulty this session is running at is real, which
             # is what lets disconnect refresh the retained value's TTL.
             client.vardiff_accepted_any = True
+            client.vardiff_last_accepted_difficulty = share_difficulty
+            client.vardiff_last_accepted_wall_ms = max(
+                0,
+                int(time.time() * 1000),
+            )
             config = (
                 client.vardiff_config
                 or client.listener_vardiff_config
@@ -498,29 +921,74 @@ class VardiffService:
                 return
             client.vardiff_window_accepted += 1
             client.vardiff_window_work += share_difficulty
+            client.vardiff_session_accepted = int(
+                getattr(client, "vardiff_session_accepted", 0)
+            ) + 1
             elapsed_seconds = Decimal(
                 str(max(0.001, now - client.vardiff_window_started_monotonic))
             )
-            if elapsed_seconds < config.retarget_interval_seconds:
+            current_difficulty = (
+                client.pending_share_difficulty or client.share_difficulty
+            )
+            # Fast arrival: a session that has not yet had a retarget commit
+            # may cross the ordinary interval early, but only on decisive
+            # evidence. Both the early trigger and the larger step bound come
+            # from the same predicate, so a session can never take the wider
+            # step on evidence that was not good enough to trigger it.
+            initial_evaluation = bool(
+                getattr(client, "vardiff_initial_convergence_pending", True)
+                and not getattr(
+                    client,
+                    "vardiff_initial_convergence_evaluated",
+                    False,
+                )
+                and client.vardiff_window_accepted
+                >= config.initial_min_accepted_shares
+                and elapsed_seconds >= config.initial_min_elapsed_seconds
+            )
+            if initial_evaluation:
+                client.vardiff_initial_convergence_evaluated = True
+            initial_convergence = initial_evaluation and vardiff.initial_convergence_ready(
+                current_difficulty=current_difficulty,
+                accepted_shares=client.vardiff_window_accepted,
+                accepted_difficulty=client.vardiff_window_work,
+                elapsed_seconds=elapsed_seconds,
+                config=config,
+            )
+            if (
+                elapsed_seconds < config.retarget_interval_seconds
+                and not initial_convergence
+            ):
                 return
             accepted_shares = client.vardiff_window_accepted
             submitted_shares = client.vardiff_window_submitted
             accepted_difficulty = client.vardiff_window_work
-            current_difficulty = (
-                client.pending_share_difficulty or client.share_difficulty
-            )
             client.vardiff_window_started_monotonic = now
             client.vardiff_window_accepted = 0
             client.vardiff_window_submitted = 0
             client.vardiff_window_work = Decimal("0")
-        self.runtime.retarget_client(
-            client,
-            current_difficulty=current_difficulty,
-            accepted_shares=accepted_shares,
-            submitted_shares=submitted_shares,
-            accepted_difficulty=accepted_difficulty,
-            elapsed_seconds=elapsed_seconds,
-        )
+        applied = False
+        try:
+            applied = bool(
+                self.runtime.retarget_client(
+                    client,
+                    current_difficulty=current_difficulty,
+                    accepted_shares=accepted_shares,
+                    submitted_shares=submitted_shares,
+                    accepted_difficulty=accepted_difficulty,
+                    elapsed_seconds=elapsed_seconds,
+                    initial_convergence=initial_convergence,
+                )
+            )
+        finally:
+            if initial_convergence and not applied:
+                with client_vardiff_lock(client):
+                    if getattr(
+                        client,
+                        "vardiff_initial_convergence_pending",
+                        True,
+                    ):
+                        client.vardiff_initial_convergence_evaluated = False
 
     def _count_resume_outcome(self, outcome: str) -> None:
         if outcome not in PRISM_VARDIFF_RESUME_OUTCOMES:
@@ -528,12 +996,77 @@ class VardiffService:
         with self._vardiff_convergence_lock:
             self.vardiff_resume_outcome_counts[outcome] += 1
 
+    def _count_initial_retarget_attempt(self) -> None:
+        with self._vardiff_convergence_lock:
+            self.vardiff_initial_retarget_attempts += 1
+
+    def _count_initial_retarget_outcome(self, outcome: str) -> None:
+        if outcome not in PRISM_VARDIFF_INITIAL_RETARGET_OUTCOMES:
+            raise ValueError(f"unknown vardiff initial retarget outcome: {outcome}")
+        with self._vardiff_convergence_lock:
+            self.vardiff_initial_retarget_outcome_counts[outcome] += 1
+
+    def observe_high_diff_arrival(
+        self,
+        client: ClientState,
+        *,
+        config: vardiff.VardiffConfig,
+        previous_difficulty: Decimal,
+        next_difficulty: Decimal,
+    ) -> bool:
+        """Observe this connection's first vardiff crossing of the high-diff
+        threshold, in seconds and in accepted shares.
+
+        Observation only -- the threshold never gates or clamps a retarget.
+        Recorded at most once per connection, and only for a retarget that
+        carried the session from below the threshold to at or above it, so a
+        lane that already starts above it (the high-diff listener) never
+        contributes and a step-down followed by a re-crossing does not
+        double count. Returns whether an observation was recorded.
+
+        The client's vardiff lock is released before the counter lock is
+        taken: this module never nests the two in either direction.
+        """
+        threshold = getattr(
+            config,
+            "high_diff_arrival_threshold",
+            Decimal("0"),
+        )
+        if (
+            not threshold.is_finite()
+            or threshold <= 0
+            or previous_difficulty >= threshold
+            or next_difficulty < threshold
+        ):
+            return False
+        with client_vardiff_lock(client):
+            if getattr(client, "vardiff_high_diff_arrival_recorded", False):
+                return False
+            client.vardiff_high_diff_arrival_recorded = True
+            started = getattr(client, "vardiff_session_started_monotonic", None)
+            accepted = int(getattr(client, "vardiff_session_accepted", 0))
+        with self._vardiff_convergence_lock:
+            if started is not None:
+                _observe_bucket_histogram(
+                    self.vardiff_high_diff_arrival_seconds_histogram,
+                    PRISM_VARDIFF_HIGH_DIFF_ARRIVAL_SECONDS_BUCKETS,
+                    max(0.0, time.monotonic() - float(started)),
+                )
+            _observe_bucket_histogram(
+                self.vardiff_high_diff_arrival_shares_histogram,
+                PRISM_VARDIFF_HIGH_DIFF_ARRIVAL_SHARES_BUCKETS,
+                float(accepted),
+            )
+        return True
+
     def record_session_difficulty(
         self,
         client: ClientState,
         difficulty: Decimal | None = None,
         *,
         share_backed: bool,
+        previous_difficulty: Decimal | None = None,
+        initial_convergence: bool = False,
     ) -> None:
         """Retain a session's converged difficulty for reconnect resume.
 
@@ -546,21 +1079,473 @@ class VardiffService:
         paired send completed records its own value at that commit point.
 
         ``share_backed`` says whether this difficulty is backed by accepted
-        shares; the store uses it to decide whether re-recording an unchanged
-        value may refresh its TTL.
+        shares; the process-local store uses it to decide whether re-recording
+        an unchanged value may refresh its TTL. Durable writes are stricter:
+        a committed retarget may carry forward the share evidence that drove
+        its estimate, while a disconnect is durable only when the last
+        accepted share was stamped at the exact delivered difficulty. This
+        prevents an unproven explicit step-up from surviving a restart.
+
+        A committed retarget that LOWERS the difficulty is durable even with
+        no accepted shares behind it, but it goes out as an atomic lower-only
+        correction rather than a write of new evidence: leaving a stale higher
+        row standing would let a restart resurrect a difficulty the live
+        session had already abandoned, while re-stamping evidence_at would let
+        the correction suppress later genuine share-backed evidence.
         """
         key = session_difficulty_key(client)
         if key is None:
             return
-        if difficulty is None:
-            with client_vardiff_lock(client):
+        if not self.session_difficulty_store.enabled:
+            return
+        committed_retarget = difficulty is not None
+        with client_vardiff_lock(client):
+            if difficulty is None:
                 difficulty = client.share_difficulty
+            evidence_difficulty = getattr(
+                client,
+                "vardiff_last_accepted_difficulty",
+                None,
+            )
+            evidence_at_ms = getattr(
+                client,
+                "vardiff_last_accepted_wall_ms",
+                None,
+            )
         self.session_difficulty_store.record(
             key,
             difficulty,
             now=time.monotonic(),
             share_backed=share_backed,
         )
+        now_ms = max(0, int(time.time() * 1000))
+        downward_commit = bool(
+            committed_retarget
+            and previous_difficulty is not None
+            and difficulty < previous_difficulty
+        )
+        durably_share_backed = bool(
+            share_backed
+            and evidence_at_ms is not None
+            and (
+                (committed_retarget and not initial_convergence)
+                or evidence_difficulty == difficulty
+            )
+        )
+        # A share-backed write already carries this exact difficulty plus the
+        # evidence that proves it, so it subsumes the downward correction; the
+        # lower-only path is for the moves no accepted share backs, above all
+        # the idle step-down.
+        if durably_share_backed:
+            self._enqueue_durable_write(
+                _PendingDurableWrite(
+                    key=key,
+                    downward_only=False,
+                    difficulty=difficulty,
+                    evidence_at_ms=int(evidence_at_ms),
+                    now_ms=now_ms,
+                )
+            )
+        elif downward_commit:
+            self._enqueue_durable_write(
+                _PendingDurableWrite(
+                    key=key,
+                    downward_only=True,
+                    difficulty=difficulty,
+                    evidence_at_ms=None,
+                    now_ms=now_ms,
+                )
+            )
+
+    def _count_durable_write(self, outcome: str) -> None:
+        if outcome not in PRISM_VARDIFF_DURABLE_WRITE_OUTCOMES:
+            raise ValueError(f"unknown vardiff durable write outcome: {outcome}")
+        with self._vardiff_convergence_lock:
+            self.vardiff_durable_write_outcome_counts[outcome] += 1
+
+    # -- bounded coalescing persistence lane -------------------------------
+
+    def _enqueue_durable_write(self, pending: _PendingDurableWrite) -> None:
+        """Hand one durable write to the lane. Never touches a client lock.
+
+        The payload is fully snapshotted by the caller, so nothing here reads
+        client state and nothing waits on ``job_update_lock``: a slow database
+        can never reach back into share accounting or job delivery.
+
+        Entries coalesce by worker identity, which is what keeps the queue
+        bounded by DISTINCT workers rather than by event rate. The merge is
+        order-equivalent to applying both writes in sequence -- see
+        :meth:`_PendingDurableWrite.merged_with`.
+
+        After the lane is closed a step-down is applied on the calling thread
+        rather than queued, because the shutdown drain has already run and a
+        queued entry would simply be stranded.
+        """
+        lost: _PendingDurableWrite | None = None
+        apply_inline = False
+        with self._vardiff_durable_lock:
+            if self._vardiff_durable_stopping:
+                # The lane is closed: its drain has already run, so queueing
+                # here would strand the entry. An optional resume hint is
+                # dropped, but a step-down is safety critical -- losing it
+                # leaves a restart resuming an abandoned difficulty -- so it
+                # is applied on this thread instead, bounded by the store's
+                # own per-statement operation deadline.
+                if pending.has_downward_correction:
+                    apply_inline = True
+                else:
+                    lost = pending
+            else:
+                existing = self._vardiff_durable_pending.get(pending.key)
+                if existing is not None:
+                    self._vardiff_durable_pending[pending.key] = (
+                        existing.merged_with(pending)
+                    )
+                    self.vardiff_durable_coalesced += 1
+                else:
+                    lost = self._evict_for_locked(pending)
+                    # _evict_for_locked returns the incoming entry itself when
+                    # it is the one refused, in which case it must not also be
+                    # queued -- that would push the lane past its bound.
+                    if lost is not pending:
+                        self._vardiff_durable_pending[pending.key] = pending
+                self._ensure_durable_worker_locked()
+        if apply_inline:
+            # Outside the lane lock: _apply_durable_write reaches the store.
+            self._apply_durable_write(pending)
+            return
+        if lost is not None:
+            if lost.has_downward_correction:
+                self._count_downward_drop(lost)
+            else:
+                self._count_durable_write("dropped")
+        self._vardiff_durable_wake.set()
+
+    def _evict_for_locked(
+        self,
+        incoming: _PendingDurableWrite,
+    ) -> _PendingDurableWrite | None:
+        """Make room for ``incoming`` under the hard queue bound.
+
+        Caller holds ``_vardiff_durable_lock``. Optional resume hints are
+        evicted before safety-critical downward corrections, and the incoming
+        entry itself is refused only when every queued entry is already a
+        downward correction -- which needs MAX_PENDING distinct workers
+        stepping down while the database is unavailable.
+        """
+        if len(self._vardiff_durable_pending) < MAX_PENDING_VARDIFF_DURABLE_WRITES:
+            return None
+        for key, queued in self._vardiff_durable_pending.items():
+            if not queued.has_downward_correction:
+                del self._vardiff_durable_pending[key]
+                return queued
+        if not incoming.has_downward_correction:
+            return incoming
+        oldest_key = next(iter(self._vardiff_durable_pending))
+        return self._vardiff_durable_pending.pop(oldest_key)
+
+    def _count_downward_drop(self, pending: _PendingDurableWrite) -> None:
+        """Record -- loudly -- a downward correction the lane could not keep.
+
+        This is the one durable-write loss that can leave a restart resuming a
+        difficulty the live session abandoned, so it gets its own counter and
+        a log line instead of folding into the generic drop count.
+        """
+        self._count_durable_write("dropped")
+        with self._vardiff_convergence_lock:
+            self.vardiff_durable_downward_dropped += 1
+        downward = pending._stale_downward()
+        assert downward is not None
+        print(
+            "prism coordinator: durable vardiff step-down dropped "
+            f"listener={pending.key[0]} worker={pending.key[1]} "
+            f"difficulty={downward[0]} "
+            "(reconnect may resume a higher difficulty until its TTL expires)",
+            flush=True,
+        )
+
+    def _ensure_durable_worker_locked(self) -> None:
+        """Start the lane's single worker thread. Caller holds the lane lock."""
+        if self._vardiff_durable_thread is not None:
+            return
+        if self._vardiff_durable_stopping:
+            return
+        thread = threading.Thread(
+            target=self._durable_worker_loop,
+            name="prism-vardiff-durable",
+            daemon=True,
+        )
+        self._vardiff_durable_thread = thread
+        thread.start()
+
+    def start_durable_prune_scheduler(self) -> None:
+        """Keep TTL pruning alive even when idle vardiff retargets are off.
+
+        Production calls this once before accepting Stratum connections. The
+        existing durable lane then owns both write traffic and the periodic
+        prune clock, without adding database work to an accept/client thread.
+        Disabled retention still creates no worker.
+        """
+        if not self.session_difficulty_store.enabled:
+            return
+        with self._vardiff_durable_lock:
+            self._ensure_durable_worker_locked()
+
+    def _durable_worker_loop(self) -> None:
+        while True:
+            self._vardiff_durable_wake.wait(
+                PRISM_VARDIFF_DURABLE_IDLE_WAKE_SECONDS
+            )
+            self._vardiff_durable_wake.clear()
+            with self._vardiff_durable_lock:
+                stopping = self._vardiff_durable_stopping
+            if not stopping:
+                # The lane owns its own clock. In particular, this must not
+                # depend on vardiff_idle_sweep_seconds: operators may disable
+                # idle retargets without disabling durable-row retention.
+                self.request_durable_prune_if_due()
+            self._drain_durable_pending(
+                deadline=None if not stopping else (
+                    time.monotonic() + self._vardiff_durable_operation_timeout_seconds
+                ),
+                final=stopping,
+            )
+            self._prune_durable_worker_difficulties_if_requested()
+            if stopping:
+                return
+
+    def _next_pending_locked(self) -> _PendingDurableWrite | None:
+        """Pop the next entry, safety-critical corrections first.
+
+        Caller holds ``_vardiff_durable_lock``. Downward-first ordering is
+        what lets a deadline-bounded shutdown drain finish the writes that
+        matter even when optional resume hints are still queued behind them.
+        """
+        chosen_key: tuple[str, str] | None = None
+        for key, queued in self._vardiff_durable_pending.items():
+            if queued.has_downward_correction:
+                chosen_key = key
+                break
+        if chosen_key is None:
+            chosen_key = next(iter(self._vardiff_durable_pending), None)
+        if chosen_key is None:
+            return None
+        return self._vardiff_durable_pending.pop(chosen_key)
+
+    def _drain_durable_pending(
+        self,
+        *,
+        deadline: float | None,
+        final: bool,
+    ) -> None:
+        """Apply queued writes until the queue empties or ``deadline`` passes.
+
+        ``deadline`` bounds the whole drain with the same budget the ledger
+        gives one operation; each individual statement is separately bounded
+        by the store's own operation timeout. On a final drain anything still
+        queued when the budget runs out is accounted for explicitly.
+        """
+        while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            with self._vardiff_durable_lock:
+                pending = self._next_pending_locked()
+                # Counted as in-flight while the lane lock is held, so a
+                # concurrent flush cannot observe an empty queue between the
+                # pop and the write landing.
+                self._vardiff_durable_inflight += 1 if pending is not None else 0
+            if pending is None:
+                return
+            try:
+                self._apply_durable_write(pending)
+            finally:
+                with self._vardiff_durable_lock:
+                    self._vardiff_durable_inflight -= 1
+        if not final:
+            return
+        with self._vardiff_durable_lock:
+            abandoned = list(self._vardiff_durable_pending.values())
+            self._vardiff_durable_pending.clear()
+        for pending in abandoned:
+            if pending.has_downward_correction:
+                self._count_downward_drop(pending)
+            else:
+                self._count_durable_write("dropped")
+
+    def _apply_durable_write(self, pending: _PendingDurableWrite) -> None:
+        if pending.downward_only:
+            try:
+                lowered = self.worker_difficulty_store.apply_downward(
+                    listener=pending.key[0],
+                    worker_username=pending.key[1],
+                    difficulty=pending.difficulty,
+                    now_ms=pending.now_ms,
+                )
+                outcome = "lowered" if lowered.applied else "unchanged"
+            except Exception:
+                outcome = "failed"
+            self._count_durable_write(outcome)
+            return
+
+        try:
+            result = self.worker_difficulty_store.upsert(
+                listener=pending.key[0],
+                worker_username=pending.key[1],
+                difficulty=pending.difficulty,
+                evidence_at_ms=int(pending.evidence_at_ms or 0),
+                now_ms=pending.now_ms,
+            )
+        except Exception:
+            self._count_durable_write("failed")
+            return
+        self._count_durable_write("applied" if result.applied else "stale")
+        stale_downward = pending._stale_downward()
+        if result.applied or stale_downward is None:
+            return
+        try:
+            lowered = self.worker_difficulty_store.apply_downward(
+                listener=pending.key[0],
+                worker_username=pending.key[1],
+                difficulty=stale_downward[0],
+                now_ms=stale_downward[1],
+            )
+            outcome = "lowered" if lowered.applied else "unchanged"
+        except Exception:
+            outcome = "failed"
+        self._count_durable_write(outcome)
+
+    def request_durable_prune_if_due(self) -> bool:
+        """Arm a TTL prune when one is due, without doing database work here.
+
+        Called from the durable worker's own scheduler, so pruning is driven
+        by the clock rather than by successful write traffic or the optional
+        idle-retarget sweep. A lane whose writes all fail, or a process that
+        inherits rows and writes none of its own, still prunes. Returns
+        whether a prune was armed.
+        """
+        if not self.session_difficulty_store.enabled:
+            return False
+        now_monotonic = time.monotonic()
+        with self._vardiff_durable_lock:
+            if now_monotonic < self._vardiff_durable_next_prune_monotonic:
+                return False
+            self._vardiff_durable_next_prune_monotonic = (
+                now_monotonic + PRISM_VARDIFF_DURABLE_PRUNE_INTERVAL_SECONDS
+            )
+            if self._vardiff_durable_stopping:
+                return False
+            self._vardiff_durable_prune_requested = True
+            self._ensure_durable_worker_locked()
+        self._vardiff_durable_wake.set()
+        return True
+
+    def _prune_expired_rows(self, cutoff_ms: int) -> int:
+        """Delete expired rows in bounded batches; never one open-ended DELETE.
+
+        Every statement carries a finite ``limit`` so it stays inside the
+        ledger's operation deadline, and batching continues only while a full
+        batch comes back, so an inherited backlog drains over successive
+        intervals instead of stalling on a delete it can never finish.
+        """
+        pruned = 0
+        for _ in range(PRISM_VARDIFF_DURABLE_PRUNE_MAX_BATCHES):
+            try:
+                deleted = self.worker_difficulty_store.prune(
+                    evidence_cutoff_ms=cutoff_ms,
+                    limit=PRISM_VARDIFF_DURABLE_PRUNE_BATCH,
+                )
+            except Exception:
+                with self._vardiff_convergence_lock:
+                    self.vardiff_durable_prune_failures += 1
+                break
+            pruned += int(deleted)
+            if int(deleted) < PRISM_VARDIFF_DURABLE_PRUNE_BATCH:
+                break
+        return pruned
+
+    def _prune_durable_worker_difficulties_if_requested(self) -> None:
+        with self._vardiff_durable_lock:
+            if not self._vardiff_durable_prune_requested:
+                return
+            self._vardiff_durable_prune_requested = False
+        now_ms = max(0, int(time.time() * 1000))
+        cutoff_ms = max(
+            0,
+            now_ms - int(self.session_difficulty_store.ttl_seconds * 1000),
+        )
+        pruned = self._prune_expired_rows(cutoff_ms)
+        if not pruned:
+            return
+        with self._vardiff_convergence_lock:
+            self.vardiff_durable_pruned_records += pruned
+
+    def durable_pending_depth(self) -> int:
+        with self._vardiff_durable_lock:
+            return len(self._vardiff_durable_pending)
+
+    def durable_coalesced_count(self) -> int:
+        """Coalesced-entry count, read under the lane lock that maintains it."""
+        with self._vardiff_durable_lock:
+            return int(self.vardiff_durable_coalesced)
+
+    def flush_durable_writes(self, *, timeout: float | None = None) -> bool:
+        """Wait until the lane has nothing queued or in flight.
+
+        No production caller needs this -- durable retention is deliberately
+        fire-and-forget so mining never waits on it. It exists so tests and
+        the shutdown drain can observe the lane deterministically. Returns
+        whether the lane went quiet within the budget.
+        """
+        budget = (
+            self._vardiff_durable_operation_timeout_seconds
+            if timeout is None
+            else float(timeout)
+        )
+        deadline = time.monotonic() + max(0.0, budget)
+        self._vardiff_durable_wake.set()
+        while True:
+            with self._vardiff_durable_lock:
+                quiet = (
+                    not self._vardiff_durable_pending
+                    and self._vardiff_durable_inflight == 0
+                )
+                worker_running = self._vardiff_durable_thread is not None
+            if quiet:
+                return True
+            if not worker_running:
+                # Nothing will drain this; do it on the caller's thread rather
+                # than spin until the budget expires.
+                self._drain_durable_pending(deadline=deadline, final=False)
+                continue
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.001)
+
+    def shutdown_durable_executor(self) -> None:
+        """Close the lane, draining safety-critical corrections first.
+
+        Queued work is drained, never cancelled: the whole point of the
+        downward correction is that losing it leaves a restart resuming an
+        abandoned difficulty. The drain is bounded by the ledger's operation
+        timeout so shutdown cannot stall on an unreachable database, and
+        anything the budget cannot cover is counted and logged.
+        """
+        with self._vardiff_durable_lock:
+            already_stopped = self._vardiff_durable_stopping
+            self._vardiff_durable_stopping = True
+            thread = self._vardiff_durable_thread
+            self._vardiff_durable_thread = None
+        if already_stopped and thread is None:
+            return
+        deadline = (
+            time.monotonic() + self._vardiff_durable_operation_timeout_seconds
+        )
+        self._vardiff_durable_wake.set()
+        if thread is not None:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        # The worker owns the drain while it lives; this covers a lane whose
+        # worker never started, already exited, or ran out of budget.
+        self._drain_durable_pending(deadline=deadline, final=True)
 
     def note_resume_overridden(self) -> None:
         """Count a resumed difficulty that an explicit request superseded.
@@ -669,6 +1654,10 @@ class VardiffService:
         with self._vardiff_convergence_lock:
             lane_accepted = dict(self.vardiff_lane_accepted_counts)
             resume_outcomes = dict(self.vardiff_resume_outcome_counts)
+            durable_writes = dict(self.vardiff_durable_write_outcome_counts)
+            durable_pruned = int(self.vardiff_durable_pruned_records)
+            durable_prune_failures = int(self.vardiff_durable_prune_failures)
+            durable_downward_dropped = int(self.vardiff_durable_downward_dropped)
         # Prune first so the retained-sessions gauge counts only entries a
         # reconnect could still adopt.
         self.session_difficulty_store.prune(now=time.monotonic())
@@ -679,6 +1668,16 @@ class VardiffService:
             "resume_outcomes": resume_outcomes,
             "retained_sessions": int(store["entries"]),
             "store": store,
+            "durable_store": {
+                "preloaded": self.vardiff_durable_preload_records,
+                "preload_failures": self.vardiff_durable_preload_failures,
+                "pruned": durable_pruned,
+                "prune_failures": durable_prune_failures,
+                "pending": self.durable_pending_depth(),
+                "coalesced": self.durable_coalesced_count(),
+                "downward_dropped": durable_downward_dropped,
+                "writes": durable_writes,
+            },
         }
 
     def record_idle_skip(self, reason: str) -> None:
@@ -948,6 +1947,7 @@ class VardiffService:
             self._vardiff_idle_executor_shutdown = True
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=True)
+        self.shutdown_durable_executor()
 
     def idle_sweep_loop(self) -> None:
         while not self.runtime.stop_event.wait(
@@ -1084,6 +2084,7 @@ class VardiffService:
         expected_worker: WorkerIdentity | None = None,
         expected_active_job: PrismJobContext | None = None,
         expected_window_started: float | None = None,
+        initial_convergence: bool = False,
     ) -> bool:
         acquired = client.job_update_lock.acquire(blocking=not require_idle)
         if not acquired:
@@ -1106,6 +2107,7 @@ class VardiffService:
                 expected_worker=expected_worker,
                 expected_active_job=expected_active_job,
                 expected_window_started=expected_window_started,
+                initial_convergence=initial_convergence,
             )
         finally:
             client.job_update_lock.release()
@@ -1126,10 +2128,25 @@ class VardiffService:
         expected_active_job: PrismJobContext | None = None,
         expected_window_started: float | None = None,
         prepared_bundle_allow_uncached: bool = False,
+        initial_convergence: bool = False,
     ) -> bool:
         config = self.client_config(client)
         if not config.enabled:
             return False
+        # Idle step-downs carry no accepted shares, so they can never be the
+        # decisive evidence the initial relaxation is granted for.
+        with client_vardiff_lock(client):
+            initial_convergence = bool(
+                initial_convergence
+                and not require_idle
+                and getattr(
+                    client,
+                    "vardiff_initial_convergence_pending",
+                    True,
+                )
+            )
+        if initial_convergence:
+            self._count_initial_retarget_attempt()
         if require_idle:
             if prepared_bundle is None:
                 return False
@@ -1181,46 +2198,59 @@ class VardiffService:
             config=config,
             accepted_difficulty=accepted_difficulty,
             difficulty_estimate=difficulty_estimate,
+            initial_convergence=initial_convergence,
         )
         if not vardiff.should_retarget(
             current_difficulty,
             next_difficulty,
             config.retarget_tolerance,
         ):
+            if initial_convergence:
+                self._count_initial_retarget_outcome("suppressed")
             return False
         idle_window_state: tuple[float, int, int, Decimal] | None = None
         idle_window_reset_at: float | None = None
+        difficulty_superseded = False
+        prior_pending: Decimal | None = None
         with client_vardiff_lock(client), self.runtime.lock:
             previous_difficulty = (
                 client.pending_share_difficulty or client.share_difficulty
             )
             if previous_difficulty != current_difficulty:
-                return False
-            if require_idle and (
-                client not in self.runtime.clients
-                or getattr(client, "closing", False)
-                or not self.runtime.client_can_receive_jobs(client)
-                or client.connection_id != expected_connection_id
-                or client.worker != expected_worker
-                or client.active_job is not expected_active_job
-                or client.vardiff_window_started_monotonic
-                != expected_window_started
-                or client.vardiff_window_accepted != 0
-                or client.vardiff_window_submitted != 0
-            ):
-                # A share landed since the idle snapshot; the accept path owns
-                # this window. Abort the speculative step-down rather than
-                # overriding a client that just resumed submitting.
-                return False
-            if require_idle:
-                idle_window_state = (
-                    client.vardiff_window_started_monotonic,
-                    client.vardiff_window_accepted,
-                    client.vardiff_window_submitted,
-                    client.vardiff_window_work,
-                )
-            prior_pending = client.pending_share_difficulty
-            client.pending_share_difficulty = next_difficulty
+                # An explicit d=/md= request (or another retarget) moved this
+                # client while the step was being computed. It keeps its
+                # precedence: this retarget yields rather than overriding it.
+                difficulty_superseded = True
+            else:
+                if require_idle and (
+                    client not in self.runtime.clients
+                    or getattr(client, "closing", False)
+                    or not self.runtime.client_can_receive_jobs(client)
+                    or client.connection_id != expected_connection_id
+                    or client.worker != expected_worker
+                    or client.active_job is not expected_active_job
+                    or client.vardiff_window_started_monotonic
+                    != expected_window_started
+                    or client.vardiff_window_accepted != 0
+                    or client.vardiff_window_submitted != 0
+                ):
+                    # A share landed since the idle snapshot; the accept path
+                    # owns this window. Abort the speculative step-down rather
+                    # than overriding a client that just resumed submitting.
+                    return False
+                if require_idle:
+                    idle_window_state = (
+                        client.vardiff_window_started_monotonic,
+                        client.vardiff_window_accepted,
+                        client.vardiff_window_submitted,
+                        client.vardiff_window_work,
+                    )
+                prior_pending = client.pending_share_difficulty
+                client.pending_share_difficulty = next_difficulty
+        if difficulty_superseded:
+            if initial_convergence:
+                self._count_initial_retarget_outcome("superseded")
+            return False
         # Advertise the new difficulty only with its corresponding job. Idle
         # retargets stamp an already-cached bundle; normal share-driven
         # retargets retain the existing build path. Either path sends the pair
@@ -1294,6 +2324,22 @@ class VardiffService:
             # immediately afterward, but it cannot make already-delivered work
             # speculative again.
             if sent:
+                if not require_idle:
+                    # Commit point for the fast-arrival relaxation: it is
+                    # spent only once a share-driven retarget has actually
+                    # reached the miner, so a skipped build or a failed send
+                    # cannot consume it silently. Every later retarget on
+                    # this connection is back on the ordinary step bound.
+                    with client_vardiff_lock(client):
+                        client.vardiff_initial_convergence_pending = False
+                if initial_convergence:
+                    self._count_initial_retarget_outcome("applied")
+                self.observe_high_diff_arrival(
+                    client,
+                    config=config,
+                    previous_difficulty=current_difficulty,
+                    next_difficulty=next_difficulty,
+                )
                 # Retain the committed difficulty here, not only on
                 # disconnect, so sessions that die without a clean
                 # disconnect still resume at their converged value. An idle
@@ -1304,6 +2350,8 @@ class VardiffService:
                     client,
                     next_difficulty,
                     share_backed=accepted_shares > 0,
+                    previous_difficulty=current_difficulty,
+                    initial_convergence=initial_convergence,
                 )
                 return True
         except Exception:
@@ -1311,8 +2359,12 @@ class VardiffService:
             # socket errors can surface during the paired send. Both must undo
             # every speculative client mutation before the task reports failure.
             restore_speculative_retarget()
+            if initial_convergence:
+                self._count_initial_retarget_outcome("failed")
             raise
         restore_speculative_retarget()
+        if initial_convergence:
+            self._count_initial_retarget_outcome("superseded")
         return False
 
     @staticmethod
@@ -1358,6 +2410,35 @@ class VardiffService:
             queue_depth = self.vardiff_idle_queue_depth
             inflight = self.vardiff_idle_inflight
             failures = self.vardiff_idle_task_failures
+        with self._vardiff_convergence_lock:
+            initial_attempts = self.vardiff_initial_retarget_attempts
+            initial_outcomes = dict(self.vardiff_initial_retarget_outcome_counts)
+            durable_writes = dict(self.vardiff_durable_write_outcome_counts)
+            durable_pruned = int(self.vardiff_durable_pruned_records)
+            durable_prune_failures = int(self.vardiff_durable_prune_failures)
+            durable_downward_dropped = int(self.vardiff_durable_downward_dropped)
+            durable_backend = (
+                "postgres"
+                if isinstance(
+                    self.worker_difficulty_store,
+                    PostgresWorkerDifficultyStore,
+                )
+                else "memory"
+            )
+            arrival_seconds = {
+                "buckets": dict(
+                    self.vardiff_high_diff_arrival_seconds_histogram["buckets"]
+                ),
+                "sum": float(self.vardiff_high_diff_arrival_seconds_histogram["sum"]),
+                "count": int(self.vardiff_high_diff_arrival_seconds_histogram["count"]),
+            }
+            arrival_shares = {
+                "buckets": dict(
+                    self.vardiff_high_diff_arrival_shares_histogram["buckets"]
+                ),
+                "sum": float(self.vardiff_high_diff_arrival_shares_histogram["sum"]),
+                "count": int(self.vardiff_high_diff_arrival_shares_histogram["count"]),
+            }
 
         lines = [
             "# HELP qbit_prism_vardiff_idle_clients_inspected_total Clients inspected by bounded vardiff idle sweeps.",
@@ -1378,7 +2459,62 @@ class VardiffService:
             "# HELP qbit_prism_vardiff_idle_task_failures_total Idle retarget tasks that failed during cached delivery.",
             "# TYPE qbit_prism_vardiff_idle_task_failures_total counter",
             f"qbit_prism_vardiff_idle_task_failures_total {failures}",
+            "# HELP qbit_prism_vardiff_initial_retarget_attempts_total Retargets attempted under the fast-arrival initial convergence policy: a connection whose first retarget has not yet committed produced enough accepted shares, over enough elapsed time, to show an observed difficulty far above the one it is stamped at. Equals the sum of qbit_prism_vardiff_initial_retargets_total.",
+            "# TYPE qbit_prism_vardiff_initial_retarget_attempts_total counter",
+            f"qbit_prism_vardiff_initial_retarget_attempts_total {int(initial_attempts)}",
+            "# HELP qbit_prism_vardiff_initial_retargets_total Fast-arrival initial retargets by outcome; only applied reached the miner as a paired difficulty and job, and only applied spends the connection's one initial relaxation.",
+            "# TYPE qbit_prism_vardiff_initial_retargets_total counter",
+            *[
+                f'qbit_prism_vardiff_initial_retargets_total{{outcome="{outcome}"}} {int(initial_outcomes.get(outcome, 0))}'
+                for outcome in PRISM_VARDIFF_INITIAL_RETARGET_OUTCOMES
+            ],
+            "# HELP qbit_prism_vardiff_durable_preloaded Worker difficulties restored into the bounded authorization-time cache during service initialization.",
+            "# TYPE qbit_prism_vardiff_durable_preloaded gauge",
+            f"qbit_prism_vardiff_durable_preloaded {self.vardiff_durable_preload_records}",
+            "# HELP qbit_prism_vardiff_durable_preload_failures_total Durable startup preload failures; mining safely falls back to lane startup difficulty.",
+            "# TYPE qbit_prism_vardiff_durable_preload_failures_total counter",
+            f"qbit_prism_vardiff_durable_preload_failures_total {self.vardiff_durable_preload_failures}",
+            "# HELP qbit_prism_vardiff_durable_pruned_total Worker-difficulty rows deleted as expired, across the startup prune and every periodic TTL prune since.",
+            "# TYPE qbit_prism_vardiff_durable_pruned_total counter",
+            f"qbit_prism_vardiff_durable_pruned_total {durable_pruned}",
+            "# HELP qbit_prism_vardiff_durable_prune_failures_total TTL prune attempts that raised; rows stay until the next interval retries.",
+            "# TYPE qbit_prism_vardiff_durable_prune_failures_total counter",
+            f"qbit_prism_vardiff_durable_prune_failures_total {durable_prune_failures}",
+            "# HELP qbit_prism_vardiff_durable_pending Worker-difficulty writes queued on the bounded persistence lane right now.",
+            "# TYPE qbit_prism_vardiff_durable_pending gauge",
+            f"qbit_prism_vardiff_durable_pending {self.durable_pending_depth()}",
+            "# HELP qbit_prism_vardiff_durable_coalesced_total Queued writes absorbed into an existing entry for the same worker; the lane is bounded by distinct workers, not by event rate.",
+            "# TYPE qbit_prism_vardiff_durable_coalesced_total counter",
+            f"qbit_prism_vardiff_durable_coalesced_total {self.durable_coalesced_count()}",
+            "# HELP qbit_prism_vardiff_durable_downward_dropped_total Safe step-down corrections the lane could not persist. Non-zero means a reconnect may resume a difficulty the live session had abandoned, until its TTL expires; alert on it.",
+            "# TYPE qbit_prism_vardiff_durable_downward_dropped_total counter",
+            f"qbit_prism_vardiff_durable_downward_dropped_total {durable_downward_dropped}",
+            "# HELP qbit_prism_vardiff_durable_backend Active worker-difficulty retention backend.",
+            "# TYPE qbit_prism_vardiff_durable_backend gauge",
+            f'qbit_prism_vardiff_durable_backend{{backend="{durable_backend}"}} 1',
+            "# HELP qbit_prism_vardiff_durable_writes_total Share-backed worker-difficulty persistence attempts by bounded outcome.",
+            "# TYPE qbit_prism_vardiff_durable_writes_total counter",
+            *[
+                f'qbit_prism_vardiff_durable_writes_total{{outcome="{outcome}"}} {int(durable_writes.get(outcome, 0))}'
+                for outcome in PRISM_VARDIFF_DURABLE_WRITE_OUTCOMES
+            ],
         ]
+        lines.extend(
+            _histogram_lines(
+                "qbit_prism_vardiff_high_diff_arrival_seconds",
+                "Seconds from the start of a session's vardiff accounting until a retarget first carried it to the configured high-difficulty arrival threshold. Observed once per connection, and only for sessions that started below the threshold, so a lane already starting above it never contributes.",
+                arrival_seconds,
+                PRISM_VARDIFF_HIGH_DIFF_ARRIVAL_SECONDS_BUCKETS,
+            )
+        )
+        lines.extend(
+            _histogram_lines(
+                "qbit_prism_vardiff_high_diff_arrival_shares",
+                "Accepted shares a session produced before a retarget first carried it to the configured high-difficulty arrival threshold. Shares credited at the pre-arrival stamped target are exactly the under-credited ones, so this is the share-denominated cost of the climb.",
+                arrival_shares,
+                PRISM_VARDIFF_HIGH_DIFF_ARRIVAL_SHARES_BUCKETS,
+            )
+        )
         for metric_name, description, histogram in (
             (
                 "qbit_prism_vardiff_idle_sweep_seconds",
@@ -1392,16 +2528,11 @@ class VardiffService:
             ),
         ):
             lines.extend(
-                [
-                    f"# HELP {metric_name} {description}",
-                    f"# TYPE {metric_name} histogram",
-                    *[
-                        f'{metric_name}_bucket{{le="{bucket:g}"}} {histogram["buckets"].get(bucket, 0)}'
-                        for bucket in PRISM_VARDIFF_IDLE_SECONDS_BUCKETS
-                    ],
-                    f'{metric_name}_bucket{{le="+Inf"}} {histogram["count"]}',
-                    f'{metric_name}_sum {float(histogram["sum"]):.6f}',
-                    f'{metric_name}_count {histogram["count"]}',
-                ]
+                _histogram_lines(
+                    metric_name,
+                    description,
+                    histogram,
+                    PRISM_VARDIFF_IDLE_SECONDS_BUCKETS,
+                )
             )
         return lines
