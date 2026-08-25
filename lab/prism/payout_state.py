@@ -115,6 +115,21 @@ PRISM_SNAPSHOT_WINDOW_WEIGHT_BAND_FLOOR_NUM = 5
 PRISM_SNAPSHOT_WINDOW_WEIGHT_BAND_FLOOR_DEN = 8
 PRISM_SNAPSHOT_WINDOW_WEIGHT_BAND_CEILING = 2
 
+# Payout coverage depends on the floor retaining at least the whole reward
+# window out of the margined snapshot: FLOOR_NUM/FLOOR_DEN >= 1/MARGIN.
+# The fold has no error path for an under-covering superset -- it would
+# silently truncate the window tail and misdistribute the coinbase -- so a
+# margin retune that breaks the relationship must fail at import, not at
+# payout time. Not an `assert`: python -O would strip it.
+if (
+    PRISM_SNAPSHOT_WINDOW_WEIGHT_BAND_FLOOR_NUM * PRISM_SNAPSHOT_WINDOW_MARGIN
+    < PRISM_SNAPSHOT_WINDOW_WEIGHT_BAND_FLOOR_DEN
+):
+    raise AssertionError(
+        "snapshot window weight band floor no longer covers the reward "
+        "window at the configured snapshot margin"
+    )
+
 
 def _snapshot_window_weight_within_band(
     cached_weight: int, live_weight: int
@@ -130,6 +145,8 @@ def _snapshot_window_weight_within_band(
     ):
         return False
     return cached_weight <= live_weight * PRISM_SNAPSHOT_WINDOW_WEIGHT_BAND_CEILING
+
+
 PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS = 0.05
 # Payout preparation/publication/first-delivery latency buckets; value-equal
 # to the tip-refresh owner's seconds buckets so exposition is unchanged.
@@ -1220,7 +1237,7 @@ class PayoutStateService:
             runtime._incremental_payout_artifact_window = None
             runtime._incremental_payout_artifact_window_invalidation_reason = None
             cached = None
-            full_reason = "network_difficulty_changed"
+            full_reason = "snapshot_window_weight_out_of_band"
         elif snapshot_anchor_ms < cached.window.anchor_job_issued_at_ms:
             runtime._incremental_payout_artifact_window = None
             runtime._incremental_payout_artifact_window_invalidation_reason = None
@@ -1358,34 +1375,63 @@ class PayoutStateService:
         balance_check_mismatch = False
         if not bypass_build_interval and self_check_overdue:
             try:
-                # Read the oracle at the cached window's weight, not the
-                # live snapshot weight: within the tolerance band the two
-                # legitimately differ, and a live-weight oracle would turn
-                # ordinary difficulty drift into a systematic false
-                # self_check_mismatch. Weight re-centering belongs to the
-                # forced full rescans and the band predicate, not to this
-                # pipeline-validation comparison.
-                self_check_window_weight = int(advanced_window.window_weight)
+                # Within the tolerance band the cached and live snapshot
+                # weights legitimately differ, and this one oracle read has
+                # to serve two purposes without conflating them: the match
+                # verdict must compare like-for-like at the cached weight
+                # (a live-weight comparison would turn ordinary difficulty
+                # drift into systematic false self_check_mismatch), while
+                # the adopted window must carry the live weight so the
+                # periodic runtime-check re-centers the cache -- otherwise
+                # a falling difficulty could pin an up-to-2x oversized
+                # oracle scan until the next forced rescan. Reading at the
+                # larger of the two weights covers both exact cutoffs from
+                # a single ledger pass.
+                cached_window_weight = int(advanced_window.window_weight)
+                live_window_weight = int(snapshot_window_weight)
                 full_records = list(
                     runtime.ledger.snapshot_at_job_issue(
                         snapshot_anchor_ms,
-                        window_weight=self_check_window_weight,
+                        window_weight=max(
+                            cached_window_weight, live_window_weight
+                        ),
                     )
                 )
-                full_window = IncrementalShareWindow.from_full_snapshot(
+                comparison_window = IncrementalShareWindow.from_full_snapshot(
                     full_records,
                     anchor_job_issued_at_ms=snapshot_anchor_ms,
-                    window_weight=self_check_window_weight,
+                    window_weight=cached_window_weight,
                 )
+                if live_window_weight == cached_window_weight:
+                    full_window = comparison_window
+                else:
+                    full_window = IncrementalShareWindow.from_full_snapshot(
+                        full_records,
+                        anchor_job_issued_at_ms=snapshot_anchor_ms,
+                        window_weight=live_window_weight,
+                    )
                 shares_json = full_window.json_records()
                 digest = self._canonical_json_sha256(shares_json)
                 if isinstance(advanced_window, DaemonShareWindowMirror):
                     # The mirror holds canonical bytes, not records; digest
                     # equality is the same comparison, since the canonical
                     # digest is a function of exactly the retained records.
-                    matched = digest == advanced_window.share_snapshot_sha256
+                    comparison_digest = (
+                        digest
+                        if full_window is comparison_window
+                        else self._canonical_json_sha256(
+                            comparison_window.json_records()
+                        )
+                    )
+                    matched = (
+                        comparison_digest
+                        == advanced_window.share_snapshot_sha256
+                    )
                 else:
-                    matched = full_window.records() == advanced_window.records()
+                    matched = (
+                        comparison_window.records()
+                        == advanced_window.records()
+                    )
             except Exception:
                 # The already-validated delta remains usable. Space failed
                 # oracle attempts by the configured runtime-check interval so a

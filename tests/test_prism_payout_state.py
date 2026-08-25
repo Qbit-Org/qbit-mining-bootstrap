@@ -8,6 +8,8 @@ import unittest
 
 from lab.prism.payout_state import AcceptedParentPayoutPreviewPending
 from lab.prism.payout_state import _snapshot_window_weight_within_band
+from lab.prism.payout_state import PRISM_REWARD_WINDOW_MULTIPLIER
+from lab.prism.payout_state import PRISM_SNAPSHOT_WINDOW_MARGIN
 from tests.prism_coordinator_test_support import *
 
 
@@ -2711,7 +2713,7 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
             self.assertEqual(surged.window_build_mode, "full_rescan")
             self.assertEqual(
                 surged.window_full_rescan_reason,
-                "network_difficulty_changed",
+                "snapshot_window_weight_out_of_band",
             )
             self.assertEqual(ledger.full_snapshot_calls, 2)
 
@@ -2740,9 +2742,49 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
             self.assertEqual(collapsed.window_build_mode, "full_rescan")
             self.assertEqual(
                 collapsed.window_full_rescan_reason,
-                "network_difficulty_changed",
+                "snapshot_window_weight_out_of_band",
             )
             self.assertEqual(ledger.full_snapshot_calls, 2)
+
+    def test_self_check_under_band_drift_matches_and_recenters(
+        self,
+    ) -> None:
+        # The periodic runtime-check must compare like-for-like at the
+        # cached weight (in-band ASERT drift is not a pipeline mismatch)
+        # while adopting the oracle window at the live weight so the cache
+        # re-centers at the runtime-check cadence. Reverting the self-check
+        # to the live snapshot weight turns this into self_check_mismatch;
+        # reverting re-centering leaves the stale cached weight installed.
+        server, ledger, artifacts = self.configured_server()
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert initial is not None
+            server.payout_artifact_min_build_interval_seconds = 0.0
+            server.payout_artifact_full_rescan_seconds = 0.0
+            clock_ms[0] = 1_000_020
+            drifted_difficulty = (
+                int(artifacts.network_difficulty) * 101 + 99
+            ) // 100
+            checked = server._build_payout_ledger_artifact(
+                0, 0, drifted_difficulty
+            )
+            assert checked is not None
+            self.assertEqual(checked.window_build_mode, "self_check_match")
+            window = server._incremental_payout_artifact_window
+            assert window is not None
+            self.assertEqual(
+                int(window.window.window_weight),
+                PRISM_REWARD_WINDOW_MULTIPLIER
+                * PRISM_SNAPSHOT_WINDOW_MARGIN
+                * drifted_difficulty,
+            )
+        self.assertEqual(ledger.full_snapshot_calls, 2)
 
     def test_late_visible_replay_append_forces_next_build_to_full_oracle(
         self,
@@ -4836,8 +4878,6 @@ class AcceptedParentPreviewBackpressureTests(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
 class SnapshotWindowWeightBandTests(unittest.TestCase):
     def test_equal_weights_are_within_band(self) -> None:
         self.assertTrue(_snapshot_window_weight_within_band(1_000, 1_000))
@@ -4855,3 +4895,7 @@ class SnapshotWindowWeightBandTests(unittest.TestCase):
         self.assertFalse(_snapshot_window_weight_within_band(0, 1_000))
         self.assertFalse(_snapshot_window_weight_within_band(1_000, 0))
         self.assertFalse(_snapshot_window_weight_within_band(-16, -16))
+
+
+if __name__ == "__main__":
+    unittest.main()
