@@ -2746,15 +2746,15 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
             )
             self.assertEqual(ledger.full_snapshot_calls, 2)
 
-    def test_self_check_under_band_drift_matches_and_recenters(
+    def test_self_check_under_small_drift_matches_and_keeps_weight(
         self,
     ) -> None:
-        # The periodic runtime-check must compare like-for-like at the
-        # cached weight (in-band ASERT drift is not a pipeline mismatch)
-        # while adopting the oracle window at the live weight so the cache
-        # re-centers at the runtime-check cadence. Reverting the self-check
-        # to the live snapshot weight turns this into self_check_mismatch;
-        # reverting re-centering leaves the stale cached weight installed.
+        # The periodic runtime-check compares like-for-like at the cached
+        # weight (in-band ASERT drift is not a pipeline mismatch) and, on
+        # ordinary drift, adopts the oracle window still at the cached
+        # weight: adopting a digest the daemon never prepared would answer
+        # needs_full on the next advance and re-pay the full oracle read
+        # at every runtime-check.
         server, ledger, artifacts = self.configured_server()
         clock_ms = [1_000_000]
         with patch(
@@ -2782,7 +2782,47 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
                 int(window.window.window_weight),
                 PRISM_REWARD_WINDOW_MULTIPLIER
                 * PRISM_SNAPSHOT_WINDOW_MARGIN
-                * drifted_difficulty,
+                * int(artifacts.network_difficulty),
+            )
+        self.assertEqual(ledger.full_snapshot_calls, 2)
+
+    def test_self_check_recenters_only_a_well_oversized_weight(
+        self,
+    ) -> None:
+        # When difficulty falls far enough that the cached weight sits more
+        # than 25% above the live snapshot weight, the runtime-check adopts
+        # the oracle window at the live weight so a falling market cannot
+        # pin an oversized oracle scan; the match verdict still compares at
+        # the cached weight.
+        server, ledger, artifacts = self.configured_server()
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert initial is not None
+            server.payout_artifact_min_build_interval_seconds = 0.0
+            server.payout_artifact_full_rescan_seconds = 0.0
+            clock_ms[0] = 1_000_020
+            # cached/live = 4/3 > 5/4, still inside the 2x band ceiling.
+            collapsed_difficulty = max(
+                1, int(artifacts.network_difficulty) * 3 // 4
+            )
+            checked = server._build_payout_ledger_artifact(
+                0, 0, collapsed_difficulty
+            )
+            assert checked is not None
+            self.assertEqual(checked.window_build_mode, "self_check_match")
+            window = server._incremental_payout_artifact_window
+            assert window is not None
+            self.assertEqual(
+                int(window.window.window_weight),
+                PRISM_REWARD_WINDOW_MULTIPLIER
+                * PRISM_SNAPSHOT_WINDOW_MARGIN
+                * collapsed_difficulty,
             )
         self.assertEqual(ledger.full_snapshot_calls, 2)
 

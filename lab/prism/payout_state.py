@@ -1376,25 +1376,32 @@ class PayoutStateService:
         if not bypass_build_interval and self_check_overdue:
             try:
                 # Within the tolerance band the cached and live snapshot
-                # weights legitimately differ, and this one oracle read has
-                # to serve two purposes without conflating them: the match
-                # verdict must compare like-for-like at the cached weight
-                # (a live-weight comparison would turn ordinary difficulty
-                # drift into systematic false self_check_mismatch), while
-                # the adopted window must carry the live weight so the
-                # periodic runtime-check re-centers the cache -- otherwise
-                # a falling difficulty could pin an up-to-2x oversized
-                # oracle scan until the next forced rescan. Reading at the
-                # larger of the two weights covers both exact cutoffs from
-                # a single ledger pass.
+                # weights legitimately differ. The match verdict must
+                # compare like-for-like at the cached weight (a live-weight
+                # comparison would turn ordinary difficulty drift into
+                # systematic false self_check_mismatch), and on ordinary
+                # drift the adopted window must ALSO keep the cached weight:
+                # adopting a digest the daemon never prepared would answer
+                # needs_full on the next advance and pay a second full
+                # oracle read under the writer lock at every runtime-check.
+                # Re-centering is therefore one-sided and thresholded --
+                # only when the cached weight sits more than 25% above the
+                # live snapshot weight, the oversize direction nothing else
+                # bounds (a falling difficulty could otherwise pin an
+                # up-to-2x oversized oracle scan); the undersize direction
+                # is safety-bounded by the band floor and re-centered by
+                # every forced rescan. The oversize case makes the cached
+                # weight the larger one, so the single oracle read at the
+                # cached weight covers both exact cutoffs.
                 cached_window_weight = int(advanced_window.window_weight)
                 live_window_weight = int(snapshot_window_weight)
+                recenter_oversized = (
+                    cached_window_weight * 4 > live_window_weight * 5
+                )
                 full_records = list(
                     runtime.ledger.snapshot_at_job_issue(
                         snapshot_anchor_ms,
-                        window_weight=max(
-                            cached_window_weight, live_window_weight
-                        ),
+                        window_weight=cached_window_weight,
                     )
                 )
                 comparison_window = IncrementalShareWindow.from_full_snapshot(
@@ -1402,14 +1409,14 @@ class PayoutStateService:
                     anchor_job_issued_at_ms=snapshot_anchor_ms,
                     window_weight=cached_window_weight,
                 )
-                if live_window_weight == cached_window_weight:
-                    full_window = comparison_window
-                else:
+                if recenter_oversized:
                     full_window = IncrementalShareWindow.from_full_snapshot(
                         full_records,
                         anchor_job_issued_at_ms=snapshot_anchor_ms,
                         window_weight=live_window_weight,
                     )
+                else:
+                    full_window = comparison_window
                 shares_json = full_window.json_records()
                 digest = self._canonical_json_sha256(shares_json)
                 if isinstance(advanced_window, DaemonShareWindowMirror):
