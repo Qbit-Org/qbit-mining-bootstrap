@@ -89,6 +89,47 @@ PRISM_PAYOUT_APPEND_INVALIDATION_STAMP_HISTORY = 256
 # leaf module never imports upward.
 PRISM_REWARD_WINDOW_MULTIPLIER = 8
 PRISM_SNAPSHOT_WINDOW_MARGIN = 2
+
+# qbit retargets every block (ASERT), so the snapshot weight -- margin times
+# the 8 x difficulty reward window -- drifts a fraction of a percent with
+# every tip change. Treating any weight delta as a cache invalidation
+# therefore forced the full oracle rescan (a multi-second ledger read under
+# the postgres writer lock) on effectively every block, which is exactly the
+# hold that starves the block submitter's landing-window reads and delays
+# accepted-block preview publication (mainnet alert #236, 2026-08-25).
+#
+# The snapshot deliberately retains PRISM_SNAPSHOT_WINDOW_MARGIN times the
+# reward window, and every consumer re-derives the exact 8 x difficulty
+# cutoff from its own live network_difficulty (_prism_window_shares and the
+# fold's requested_window_weight); the cached superset therefore stays
+# payout-correct while it still covers the live reward window. Hold the
+# cached weight inside a band instead of demanding equality: rescan only
+# when the cached weight falls below 5/8 of the live snapshot weight (the
+# 8 x reward window plus 25% headroom out of the 2 x margin) or exceeds
+# twice it (bounding how oversized a stale superset may grow). Forced
+# rescans -- landing reconcile invalidation, cold start, invariant
+# failures, daemon rebuilds -- still re-center the weight at the live
+# difficulty, and the periodic runtime-check validates the pipeline at the
+# cached weight so its match verdict stays like-for-like.
+PRISM_SNAPSHOT_WINDOW_WEIGHT_BAND_FLOOR_NUM = 5
+PRISM_SNAPSHOT_WINDOW_WEIGHT_BAND_FLOOR_DEN = 8
+PRISM_SNAPSHOT_WINDOW_WEIGHT_BAND_CEILING = 2
+
+
+def _snapshot_window_weight_within_band(
+    cached_weight: int, live_weight: int
+) -> bool:
+    """Whether a cached snapshot weight still serves the live reward window."""
+    if cached_weight <= 0 or live_weight <= 0:
+        return False
+    if cached_weight == live_weight:
+        return True
+    if (
+        cached_weight * PRISM_SNAPSHOT_WINDOW_WEIGHT_BAND_FLOOR_DEN
+        < live_weight * PRISM_SNAPSHOT_WINDOW_WEIGHT_BAND_FLOOR_NUM
+    ):
+        return False
+    return cached_weight <= live_weight * PRISM_SNAPSHOT_WINDOW_WEIGHT_BAND_CEILING
 PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS = 0.05
 # Payout preparation/publication/first-delivery latency buckets; value-equal
 # to the tip-refresh owner's seconds buckets so exposition is unchanged.
@@ -1173,7 +1214,9 @@ class PayoutStateService:
             runtime._incremental_payout_artifact_window_invalidation_reason = None
             cached = None
             full_reason = "window_pipeline_mode_changed"
-        elif cached.window.window_weight != int(snapshot_window_weight):
+        elif not _snapshot_window_weight_within_band(
+            int(cached.window.window_weight), int(snapshot_window_weight)
+        ):
             runtime._incremental_payout_artifact_window = None
             runtime._incremental_payout_artifact_window_invalidation_reason = None
             cached = None
@@ -1315,16 +1358,24 @@ class PayoutStateService:
         balance_check_mismatch = False
         if not bypass_build_interval and self_check_overdue:
             try:
+                # Read the oracle at the cached window's weight, not the
+                # live snapshot weight: within the tolerance band the two
+                # legitimately differ, and a live-weight oracle would turn
+                # ordinary difficulty drift into a systematic false
+                # self_check_mismatch. Weight re-centering belongs to the
+                # forced full rescans and the band predicate, not to this
+                # pipeline-validation comparison.
+                self_check_window_weight = int(advanced_window.window_weight)
                 full_records = list(
                     runtime.ledger.snapshot_at_job_issue(
                         snapshot_anchor_ms,
-                        window_weight=snapshot_window_weight,
+                        window_weight=self_check_window_weight,
                     )
                 )
                 full_window = IncrementalShareWindow.from_full_snapshot(
                     full_records,
                     anchor_job_issued_at_ms=snapshot_anchor_ms,
-                    window_weight=snapshot_window_weight,
+                    window_weight=self_check_window_weight,
                 )
                 shares_json = full_window.json_records()
                 digest = self._canonical_json_sha256(shares_json)

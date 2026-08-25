@@ -7,6 +7,7 @@ from __future__ import annotations
 import unittest
 
 from lab.prism.payout_state import AcceptedParentPayoutPreviewPending
+from lab.prism.payout_state import _snapshot_window_weight_within_band
 from tests.prism_coordinator_test_support import *
 
 
@@ -2645,6 +2646,104 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
             },
         )
 
+    def test_difficulty_drift_within_band_keeps_incremental_window(
+        self,
+    ) -> None:
+        # ASERT retargets every block, so the snapshot weight drifts a
+        # fraction of a percent per tip change. Within the retained margin
+        # that drift must ride the incremental window: the pre-band behavior
+        # ran the full oracle (a multi-second writer-lock hold) on every
+        # block, which starved landing-window ledger reads (mainnet alert
+        # #236).
+        server, ledger, artifacts = self.configured_server()
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert initial is not None
+            self.assertEqual(initial.window_build_mode, "full_rescan")
+            self.assertEqual(ledger.full_snapshot_calls, 1)
+
+            server.payout_artifact_min_build_interval_seconds = 0.0
+            clock_ms[0] = 1_000_020
+            drifted_difficulty = (
+                int(artifacts.network_difficulty) * 101 + 99
+            ) // 100
+            drifted = server._build_payout_ledger_artifact(
+                0, 0, drifted_difficulty
+            )
+            assert drifted is not None
+            self.assertEqual(drifted.window_build_mode, "incremental")
+            self.assertEqual(ledger.full_snapshot_calls, 1)
+            # The artifact still stamps the live difficulty: the exact
+            # 8 x difficulty reward cutoff is re-derived downstream, so the
+            # cached superset only has to cover it.
+            self.assertEqual(
+                drifted.network_difficulty, drifted_difficulty
+            )
+
+    def test_difficulty_drift_beyond_band_floor_forces_full_rescan(
+        self,
+    ) -> None:
+        server, ledger, artifacts = self.configured_server()
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert initial is not None
+            server.payout_artifact_min_build_interval_seconds = 0.0
+            clock_ms[0] = 1_000_020
+            # Cached weight below 5/8 of the live snapshot weight: the
+            # retained superset no longer covers the live reward window
+            # with headroom, so the oracle must re-center.
+            surged = server._build_payout_ledger_artifact(
+                0, 0, int(artifacts.network_difficulty) * 2
+            )
+            assert surged is not None
+            self.assertEqual(surged.window_build_mode, "full_rescan")
+            self.assertEqual(
+                surged.window_full_rescan_reason,
+                "network_difficulty_changed",
+            )
+            self.assertEqual(ledger.full_snapshot_calls, 2)
+
+    def test_difficulty_drop_beyond_band_ceiling_forces_full_rescan(
+        self,
+    ) -> None:
+        server, ledger, artifacts = self.configured_server()
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ):
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert initial is not None
+            server.payout_artifact_min_build_interval_seconds = 0.0
+            clock_ms[0] = 1_000_020
+            # Cached weight more than twice the live snapshot weight: the
+            # stale superset is bounded above, so a difficulty collapse
+            # re-centers rather than serving an oversized window forever.
+            collapsed = server._build_payout_ledger_artifact(
+                0, 0, max(1, int(artifacts.network_difficulty) // 3)
+            )
+            assert collapsed is not None
+            self.assertEqual(collapsed.window_build_mode, "full_rescan")
+            self.assertEqual(
+                collapsed.window_full_rescan_reason,
+                "network_difficulty_changed",
+            )
+            self.assertEqual(ledger.full_snapshot_calls, 2)
+
     def test_late_visible_replay_append_forces_next_build_to_full_oracle(
         self,
     ) -> None:
@@ -4739,3 +4838,20 @@ class AcceptedParentPreviewBackpressureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+class SnapshotWindowWeightBandTests(unittest.TestCase):
+    def test_equal_weights_are_within_band(self) -> None:
+        self.assertTrue(_snapshot_window_weight_within_band(1_000, 1_000))
+
+    def test_floor_boundary_is_exact(self) -> None:
+        # cached * 8 >= live * 5 holds at exactly 5/8 and fails one below.
+        self.assertTrue(_snapshot_window_weight_within_band(625, 1_000))
+        self.assertFalse(_snapshot_window_weight_within_band(624, 1_000))
+
+    def test_ceiling_boundary_is_exact(self) -> None:
+        self.assertTrue(_snapshot_window_weight_within_band(2_000, 1_000))
+        self.assertFalse(_snapshot_window_weight_within_band(2_001, 1_000))
+
+    def test_non_positive_weights_fail_closed(self) -> None:
+        self.assertFalse(_snapshot_window_weight_within_band(0, 1_000))
+        self.assertFalse(_snapshot_window_weight_within_band(1_000, 0))
+        self.assertFalse(_snapshot_window_weight_within_band(-16, -16))
