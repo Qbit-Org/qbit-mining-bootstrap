@@ -4294,10 +4294,14 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                 "chain_state": "confirmed",
                 "maturity_state": "immature",
             }
+            historical_reads: list[dict[str, object]] = []
             ledger.prior_balances_after_pool_block = (  # type: ignore[attr-defined]
-                lambda **_kwargs: []
+                lambda **kwargs: historical_reads.append(dict(kwargs)) or []
             )
             self.assertTrue(server.submit_block_candidate(candidate))
+            # The confirmed-ancestor replay keeps its height-bounded
+            # active-chain view (issue #209 leaves replay behavior intact).
+            self.assertEqual(historical_reads, [{"block_hash": block_hash}])
             latest_evidence = server.latest_evidence
 
         self.assertEqual([row["block_hash"] for row in ledger.persisted], [block_hash] * 2)
@@ -4323,6 +4327,74 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(latest_evidence["accepted_share_count"], 0)
         self.assertEqual(latest_evidence["distinct_miner_count"], 0)
         self.assertNotIn("distinct_miners", latest_evidence)
+
+    def test_fresh_confirmation_never_reads_historical_balances(self) -> None:
+        # Issue #209: a fresh confirmation lands as the ledger's newest
+        # confirmed pool block, so its post-confirm validation reads the
+        # O(recipients) current-balance summary. The O(history) height-bounded
+        # reader -- whose carry-table scan once held payout serialization past
+        # the parent-preview wait during back-to-back blocks -- is replay-only.
+        server, state, ledger = submit_coordinator()
+        server._ensure_job_cache_state()
+        server.max_blocks = 2
+        server.stop_after_block = False
+        ledger.durable_payout_state = True
+        block_hash = "e3" * 32
+        historical_reads: list[dict[str, object]] = []
+        # A poisoned historical view: touching it on the fresh path would
+        # fail the post-confirm comparison and force shutdown.
+        ledger.prior_balances_after_pool_block = (  # type: ignore[attr-defined]
+            lambda **kwargs: historical_reads.append(dict(kwargs))
+            or [
+                {
+                    "recipient_id": "history-miner",
+                    "order_key": "history-miner",
+                    "p2mr_program_hex": "33" * 32,
+                    "balance_sats": 999,
+                }
+            ]
+        )
+        current_reads = 0
+        original_current = ledger.current_prior_balances
+
+        def counting_current_prior_balances() -> list[dict[str, object]]:
+            nonlocal current_reads
+            current_reads += 1
+            return original_current()
+
+        ledger.current_prior_balances = counting_current_prior_balances  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as tempdir:
+            server.audit_dir = Path(tempdir)
+            server.evidence_path = Path(tempdir) / "evidence.json"
+            server.ledger_writer_public_key_hex = "aa" * 32
+            server.rpc = SubmitRpc(
+                tip="00" * 32,
+                block_hash=block_hash,
+                ledger=ledger,
+            )
+            server.build_audit_bundle = (  # type: ignore[method-assign]
+                lambda **_kwargs: verified_block_bundle()
+            )
+            server.verify_bundle = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: verified_audit_report()
+            )
+            submission = SimpleNamespace(
+                coinbase_tx_hex="c0ffee",
+                block_hash_hex=block_hash,
+                block_hex="00",
+            )
+
+            self.assertTrue(
+                server.submit_block_candidate(
+                    block_candidate(server, state, submission)
+                )
+            )
+
+        self.assertEqual(historical_reads, [])
+        self.assertGreaterEqual(current_reads, 1)
+        self.assertEqual(len(ledger.confirmed), 1)
+        self.assertFalse(server.stop_event.is_set())
+        self.assertEqual(server.accepted_block_count, 1)
 
     def test_audit_retention_prunes_only_live_and_candidate_files(self) -> None:
         server = coordinator()

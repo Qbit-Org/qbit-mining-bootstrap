@@ -1375,16 +1375,30 @@ class BlockFinalizationService:
                     return None
 
                 if durable_payout_state:
-                    # Compare the durable active-chain view as of this block,
-                    # not the global latest view: an exact replay may finalize
-                    # ancestor A after later pool block B is already confirmed.
-                    # This also preserves the invariant across restart after a
-                    # prior post-confirm mismatch instead of silently accepting
-                    # the already-confirmed row on the next attempt.
-                    as_of_reader = getattr(
-                        self.runtime.ledger,
-                        "prior_balances_after_pool_block",
-                        None,
+                    # A fresh confirmation just made this block the ledger's
+                    # newest confirmed pool block: the landing holds the
+                    # balance serializer and every younger landing defers on
+                    # this block's unresolved payout transition (re-armed by
+                    # startup replay enumeration after a restart), so the
+                    # transactionally maintained current-balance summary IS
+                    # the active-chain view as of this block. Read that
+                    # O(recipients) summary instead of the O(history) carry
+                    # scan, whose growth past the parent-preview wait stalled
+                    # back-to-back landings (issue #209). Only an exact replay
+                    # of an already-confirmed ancestor can run after a later
+                    # pool block changed global balances; that replay still
+                    # compares against its height-bounded active-chain view,
+                    # which also preserves the invariant across restart after
+                    # a prior post-confirm mismatch instead of silently
+                    # accepting the already-confirmed row on the next attempt.
+                    as_of_reader = (
+                        getattr(
+                            self.runtime.ledger,
+                            "prior_balances_after_pool_block",
+                            None,
+                        )
+                        if already_confirmed
+                        else None
                     )
                     confirmed_balances = self.runtime.normalized_prior_balances(
                         as_of_reader(block_hash=block_hash)

@@ -656,9 +656,10 @@ class LandingStatementClassificationTests(unittest.TestCase):
             harness.drain([harness.client])
             self.assertIsNone(landed.error)
 
-            # The three a successful landing never emits: nothing was
-            # rejected, and neither the share history nor the pool-block state
-            # is read on the happy path.
+            # The four a successful landing never emits: nothing was
+            # rejected, neither the share history nor the pool-block state
+            # is read on the happy path, and the height-bounded as-of balance
+            # read belongs to confirmed-ancestor replay only (issue #209).
             _prepared(harness, BLOCK_B, height=11, parent_hash=BLOCK_A)
             _run(
                 harness,
@@ -675,6 +676,14 @@ class LandingStatementClassificationTests(unittest.TestCase):
                 harness.client,
                 lambda: ledger.pool_block_state(block_hash=BLOCK_A),
                 "state",
+            ).value()
+            _run(
+                harness,
+                harness.client,
+                lambda: ledger.prior_balances_after_pool_block(
+                    block_hash=BLOCK_A,
+                ),
+                "as-of",
             ).value()
 
             observed = {
