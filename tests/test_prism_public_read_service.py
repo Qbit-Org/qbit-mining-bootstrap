@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Pin the extracted PRISM public read tier against the surface it replaced.
 
-The extraction step of issue #145 moved exactly the 13 ``/public/v1`` routes
-out of the coordinator's audit/ops listener into
-``lab/prism/public_read_service.py``. The issue's read-replica back-end is a
+The extraction step of issue #145 moved exactly the 13 original ``/public/v1``
+routes out of the coordinator's audit/ops listener into
+``lab/prism/public_read_service.py``; ``/public/v1/block-markers`` joined the
+extracted surface later, bringing it to 14 routes. The issue's read-replica back-end is a
 separate follow-up -- this service still reads the primary Postgres, through
 bounded read slots rather than the writer path. An extraction is
 only worth doing if it changes nothing a client can observe and everything the
@@ -16,7 +17,7 @@ coordinator can feel, so these tests assert both halves:
   separately and unchanged by ``tests/test_prism_public_dashboard_api.py``,
   whose 70 assertions were written against the coordinator's listener and now
   run against this handler.
-* **The point of the move** -- ``NoWriterLockReadTests`` drives all 13 routes
+* **The point of the move** -- ``NoWriterLockReadTests`` drives all 14 routes
   against a ledger that raises if any writer-lock read is reached. Moving the
   GIL contention while leaving the lock contention would have been motion
   without progress.
@@ -77,6 +78,7 @@ EXTRACTED_ROUTES: tuple[tuple[str, str], ...] = (
     ("/public/v1/blocks", ""),
     ("/public/v1/leaderboard", ""),
     ("/public/v1/hashrate-series", ""),
+    ("/public/v1/block-markers", ""),
     ("/public/v1/mining-configuration", ""),
     (f"/public/v1/miners/{RECIPIENT_ID}", ""),
     (f"/public/v1/miners/{RECIPIENT_ID}/earnings", ""),
@@ -88,7 +90,7 @@ EXTRACTED_ROUTES: tuple[tuple[str, str], ...] = (
     (f"/public/v1/artifacts/{ARTIFACT_SHA256}", ""),
 )
 
-EXTRACTED_ROUTE_COUNT = 13
+EXTRACTED_ROUTE_COUNT = 14
 
 CACHE_HEADERS = ("Cache-Control", "CDN-Cache-Control", "Vercel-CDN-Cache-Control", "Age")
 
@@ -192,7 +194,7 @@ class RegistryAgreementTests(unittest.TestCase):
             covered.add(endpoint.primary_path)
         self.assertEqual(set(endpoint_registry.extracted_paths()), covered)
 
-    def test_the_extracted_surface_is_still_thirteen_routes(self) -> None:
+    def test_the_extracted_surface_is_still_fourteen_routes(self) -> None:
         self.assertEqual(
             EXTRACTED_ROUTE_COUNT,
             len(endpoint_registry.extracted_paths()),

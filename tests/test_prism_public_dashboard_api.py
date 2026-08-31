@@ -124,6 +124,11 @@ def _bucket_timestamp(epoch: int) -> str:
     return public_api.iso_datetime(datetime.fromtimestamp(epoch, timezone.utc))
 
 
+def _epoch_from_timestamp(timestamp: str) -> int:
+    parsed = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
+    return int(parsed.replace(tzinfo=timezone.utc).timestamp())
+
+
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / "docs" / "public-dashboard-api" / "fixtures"
 
 
@@ -150,6 +155,24 @@ class FakePublicLedger:
         self.pool_snapshot_calls = 0
         self.hashrate_series_calls = 0
         self.blocks_calls: list[dict[str, object]] = []
+        self.block_marker_calls = 0
+        self.last_block_markers_anchor: int | None = None
+        # Found blocks across two recent 1h buckets plus one ancient one, as
+        # (height, hash, found_at_epoch, chain_state). The newer bucket holds
+        # four accepted blocks (so the top-3 cap truncates), two of them tied
+        # on found_at (so the height tiebreak is observable), plus a reversed
+        # block that must never appear. The ancient block sits far outside
+        # every bounded range and is only reachable through range=all.
+        base_hour = int(time.time()) // 3600 * 3600
+        self.block_marker_records: list[tuple[int, str, int, str]] = [
+            (67440, "1a" * 32, base_hour - 7200 + 300, "confirmed"),
+            (67441, "1b" * 32, base_hour - 3600 + 60, "confirmed"),
+            (67442, "1c" * 32, base_hour - 3600 + 120, "confirmed"),
+            (67443, "1d" * 32, base_hour - 3600 + 240, "confirmed"),
+            (67444, "1e" * 32, base_hour - 3600 + 240, "confirmed"),
+            (67439, "1f" * 32, base_hour - 3600 + 240, "reversed"),
+            (60000, "2a" * 32, base_hour - 400 * 86400, "confirmed"),
+        ]
 
     def dashboard_pool_snapshot(self, *, current_network_difficulty: object, generated_at: str) -> dict[str, object]:
         self.pool_snapshot_calls += 1
@@ -453,6 +476,56 @@ class FakePublicLedger:
             }
         ]
 
+    def dashboard_block_markers(
+        self,
+        *,
+        range_id: str,
+        bucket: str,
+        range_anchor_epoch: int | None = None,
+    ) -> dict[str, object]:
+        # Mirrors the Postgres read model over the fixture records: reversed
+        # blocks excluded, floor bucketing on the hashrate grid, the
+        # hashrate_series_min_epoch lower bound for bounded ranges, per-bucket
+        # top-3 by found_at DESC then height DESC.
+        self.block_marker_calls += 1
+        self.last_block_markers_anchor = range_anchor_epoch
+        bucket_seconds = public_api.HASHRATE_SERIES_BUCKET_SECONDS[bucket]
+        range_seconds = public_api.HASHRATE_SERIES_RANGE_SECONDS[range_id]
+        min_epoch = None
+        if range_seconds is not None:
+            anchor = range_anchor_epoch if range_anchor_epoch is not None else int(time.time())
+            min_epoch = public_api.hashrate_series_min_epoch(anchor, range_seconds, bucket_seconds)
+        buckets: dict[int, list[tuple[int, str, int]]] = {}
+        total = 0
+        for height, block_hash, found_epoch, chain_state in self.block_marker_records:
+            if chain_state == "reversed":
+                continue
+            if min_epoch is not None and found_epoch < min_epoch:
+                continue
+            bucket_epoch = found_epoch // bucket_seconds * bucket_seconds
+            buckets.setdefault(bucket_epoch, []).append((height, block_hash, found_epoch))
+            total += 1
+        points: list[dict[str, object]] = []
+        for bucket_epoch in sorted(buckets):
+            records = sorted(buckets[bucket_epoch], key=lambda record: (-record[2], -record[0]))
+            points.append(
+                {
+                    "timestamp": _bucket_timestamp(bucket_epoch),
+                    "block_count": len(records),
+                    "blocks": [
+                        {
+                            "height": height,
+                            "hash": block_hash,
+                            "found_at": _bucket_timestamp(found_epoch),
+                        }
+                        for height, block_hash, found_epoch in records[
+                            : public_api.BLOCK_MARKERS_MAX_BLOCKS_PER_BUCKET
+                        ]
+                    ],
+                }
+            )
+        return {"total_blocks": total, "points": points}
+
     def all_shares(self) -> list[object]:
         return [
             SimpleNamespace(
@@ -591,6 +664,41 @@ class RangeBoundaryPublicLedger(FakePublicLedger):
                 "accepted_share_difficulty": "1200",
             },
         ]
+
+
+class RangeBoundaryBlockMarkerLedger(FakePublicLedger):
+    """Serves one block just before the 1w marker cutoff and one just after.
+
+    The records are derived from the caller-provided anchor with the same
+    hashrate_series_min_epoch arithmetic the read models apply, so the test
+    can pin the trim boundary deterministically: the pre-cutoff block sits in
+    the straddling bucket that must be dropped whole, and the post-cutoff
+    block sits in the first fully covered bucket.
+    """
+
+    def dashboard_block_markers(
+        self,
+        *,
+        range_id: str,
+        bucket: str,
+        range_anchor_epoch: int | None = None,
+    ) -> dict[str, object]:
+        anchor_epoch = range_anchor_epoch if range_anchor_epoch is not None else int(time.time())
+        bucket_seconds = public_api.HASHRATE_SERIES_BUCKET_SECONDS[bucket]
+        cutoff_epoch = public_api.hashrate_series_min_epoch(
+            anchor_epoch,
+            7 * 86400,
+            bucket_seconds,
+        )
+        self.block_marker_records = [
+            (100, "aa" * 32, cutoff_epoch - 1, "confirmed"),
+            (101, "bb" * 32, cutoff_epoch + 60, "confirmed"),
+        ]
+        return super().dashboard_block_markers(
+            range_id=range_id,
+            bucket=bucket,
+            range_anchor_epoch=range_anchor_epoch,
+        )
 
 
 class BrokenPublicLedger(FakePublicLedger):
@@ -1165,6 +1273,124 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
                 self.assertIsNone(public_api.network_hashrate_ths(coordinator))
         fractional = FakeCoordinator(rpc=FakeRpc(network_hashps=1_500_000_000_000.5))
         self.assertEqual(public_api.network_hashrate_ths(fractional), "1.5000000000005")
+
+    def test_block_markers_shape_alignment_and_truncation(self) -> None:
+        markers = self.get_json("/public/v1/block-markers?range=1m&bucket=auto")
+
+        self.assertEqual(markers["schema"], "prism.dashboard.block-markers.v1")
+        self.assertEqual(markers["range"], "1m")
+        # auto resolves exactly as it does for hashrate-series: 1h for 1m.
+        self.assertEqual(markers["bucket"], "1h")
+        self.assertEqual(markers["bucket_seconds"], 3600)
+        # The reversed block and the out-of-range ancient block are excluded
+        # from the total; empty buckets are omitted rather than zero-filled.
+        self.assertEqual(markers["total_blocks"], 5)
+        points = markers["points"]
+        self.assertEqual(len(points), 2)
+        epochs = [_epoch_from_timestamp(str(point["timestamp"])) for point in points]
+        self.assertEqual(epochs, sorted(epochs))
+        for point, epoch in zip(points, epochs):
+            # Marker buckets sit on the hashrate chart's grid: the same floor
+            # arithmetic hashrate-series buckets use, so every timestamp is
+            # bucket-aligned and every block floors into its point's bucket.
+            self.assertEqual(epoch % 3600, 0)
+            for block in point["blocks"]:
+                found_epoch = _epoch_from_timestamp(str(block["found_at"]))
+                self.assertEqual(found_epoch // 3600 * 3600, epoch)
+        self.assertEqual(points[0]["block_count"], 1)
+        self.assertFalse(points[0]["truncated"])
+        self.assertEqual(points[0]["blocks"][0]["height"], 67440)
+        # Four accepted blocks in the newer bucket: only the three most recent
+        # survive, ordered found_at DESC with height DESC breaking the tie.
+        self.assertEqual(points[1]["block_count"], 4)
+        self.assertTrue(points[1]["truncated"])
+        self.assertEqual(
+            [block["height"] for block in points[1]["blocks"]],
+            [67444, 67443, 67442],
+        )
+        found_ats = [
+            _epoch_from_timestamp(str(block["found_at"]))
+            for block in points[1]["blocks"]
+        ]
+        self.assertEqual(found_ats, sorted(found_ats, reverse=True))
+        self.assertNotIn("1f" * 32, json.dumps(markers))
+
+    def test_block_markers_all_range_reaches_unbounded_history(self) -> None:
+        markers = self.get_json("/public/v1/block-markers?range=all&bucket=1d")
+
+        self.assertEqual(markers["bucket"], "1d")
+        self.assertEqual(markers["bucket_seconds"], 86400)
+        # `all` has no lower bound, so the ancient block joins the total.
+        self.assertEqual(markers["total_blocks"], 6)
+        points = markers["points"]
+        self.assertEqual(
+            sum(int(point["block_count"]) for point in points),
+            markers["total_blocks"],
+        )
+        self.assertEqual(points[0]["blocks"][0]["hash"], "2a" * 32)
+        for point in points:
+            self.assertEqual(_epoch_from_timestamp(str(point["timestamp"])) % 86400, 0)
+        # An unbounded range carries no anchor: there is no lower bound for
+        # the ledger to derive from it.
+        ledger = FakePublicLedger()
+        ledger.last_block_markers_anchor = -1
+        public_api.block_markers(FakeCoordinator(ledger=ledger), range_id="all", bucket="1d")
+        self.assertIsNone(ledger.last_block_markers_anchor)
+
+    def test_block_markers_pass_range_anchor_and_trim_straddling_bucket(self) -> None:
+        ledger = RangeBoundaryBlockMarkerLedger()
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_port}/public/v1/block-markers?range=1w&bucket=5m"
+            with urllib.request.urlopen(url, timeout=5) as response:
+                markers = json.loads(response.read())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        # The endpoint anchors the range on its own clock and the ledger keeps
+        # only fully covered buckets, so the block in the straddling bucket is
+        # dropped whole while the first in-range bucket survives -- the same
+        # boundary the hashrate series trims against.
+        self.assertIsNotNone(ledger.last_block_markers_anchor)
+        self.assertEqual(markers["total_blocks"], 1)
+        self.assertEqual(len(markers["points"]), 1)
+        self.assertEqual(markers["points"][0]["blocks"][0]["hash"], "bb" * 32)
+        self.assertNotIn("aa" * 32, json.dumps(markers))
+        cutoff_epoch = public_api.hashrate_series_min_epoch(
+            int(ledger.last_block_markers_anchor),
+            7 * 86400,
+            300,
+        )
+        self.assertEqual(
+            _epoch_from_timestamp(str(markers["points"][0]["timestamp"])),
+            cutoff_epoch,
+        )
+
+    def test_block_markers_reject_invalid_range_bucket_and_clamp_combos(self) -> None:
+        for path in (
+            "/public/v1/block-markers?range=2y",
+            "/public/v1/block-markers?range=1w&bucket=7m",
+            # Every clamped combination: finer buckets than the range's chart
+            # renders are rejected rather than served unboundedly long.
+            "/public/v1/block-markers?range=1m&bucket=5m",
+            "/public/v1/block-markers?range=6m&bucket=5m",
+            "/public/v1/block-markers?range=6m&bucket=1h",
+            "/public/v1/block-markers?range=all&bucket=5m",
+            "/public/v1/block-markers?range=all&bucket=1h",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    self.get_json(path)
+                self.assertEqual(raised.exception.code, 400)
+                payload = json.loads(raised.exception.read())
+                raised.exception.close()
+                self.assertEqual(payload["schema"], "prism.dashboard.error.v1")
+                self.assertEqual(payload["error"]["code"], "bad_request")
 
     def assert_hashrate_ths(self, actual: object, difficulty: int, seconds: int) -> None:
         # Hashrate strings are Decimal-context dependent (direct_stratum pins
@@ -3267,6 +3493,30 @@ class PrismPublicDashboardMemoryLedgerTests(unittest.TestCase):
 
         self.assertEqual(snapshot["blocks_reversed_total"], 0)
         self.assertEqual(snapshot["blocks_inactive_total"], 0)
+
+    def test_memory_ledger_block_markers_are_empty_safe(self) -> None:
+        # The in-memory backend records no found_at for its pool blocks, so
+        # the marker series degrades to an empty response rather than 500ing,
+        # the way its other dashboard read models degrade.
+        coordinator = MemoryCoordinator()
+        handler = make_public_handler(coordinator)  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_port}/public/v1/block-markers?range=1m&bucket=1h",
+                timeout=5,
+            ) as response:
+                payload = json.loads(response.read())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(payload["schema"], "prism.dashboard.block-markers.v1")
+        self.assertEqual(payload["total_blocks"], 0)
+        self.assertEqual(payload["points"], [])
 
     def test_memory_ledger_artifact_responses_verify_end_to_end(self) -> None:
         # Full path: the real record path persists the canonical text, and the
