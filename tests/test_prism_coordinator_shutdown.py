@@ -839,6 +839,11 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
                 return {"backend": "recording", "renewed_count": 1}
 
         server = coordinator(BlockingHeartbeatLedger())
+        # A scaled-down but internally coherent policy: the interval stays
+        # below the failure budget and the budget plus the exit envelope
+        # stays inside the adoption silence, so the heartbeat starts and the
+        # stall — not a refused configuration — is what fires the exit.
+        server.ledger_lease_heartbeat_seconds = 0.005
         server.ledger_lease_heartbeat_failure_seconds = 0.03
         server.ledger_lease_heartbeat_monitor_seconds = 0.005
         server.ledger_lease_heartbeat_exit_timeout_seconds = 0.01
@@ -994,7 +999,7 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
         death + interval + budget — past a replacement's CAS eligibility
         when interval + budget reaches the adoption silence. The
         server-proven cap measures from completed round trips, which
-        cannot postdate the death, and must fire first (cap 0.265s here
+        cannot postdate the death, and must fire first (cap 0.26s here
         versus interval + budget = 0.30s).
         """
         first_done = threading.Event()
@@ -1028,6 +1033,11 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
         server.ledger_lease_heartbeat_failure_seconds = 0.25
         server.ledger_lease_heartbeat_monitor_seconds = 0.005
         server.ledger_lease_heartbeat_exit_timeout_seconds = 0.005
+        # The scheduler slack is a term of the safety inequality, so a
+        # scaled-down policy has to scale it too: left at the production
+        # value it would not fit inside this 0.28s silence and the
+        # heartbeat would (correctly) refuse to start.
+        server.ledger_lease_heartbeat_scheduler_slack_seconds = 0.005
         thread: threading.Thread | None = None
 
         try:
@@ -1069,7 +1079,17 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
             if thread is not None:
                 thread.join(0.5)
 
-    def test_heartbeat_warning_honors_private_silence_attribute(self) -> None:
+    def test_heartbeat_rejection_honors_private_silence_attribute(self) -> None:
+        """An operator silence override reaches the safety inequality.
+
+        PsqlShareLedger keeps the adoption silence on a private attribute
+        with no public alias. The policy must read it: a 0.5s silence
+        cannot contain the default 1.25s failure budget plus the exit
+        envelope, so this is a real double-writer hazard, not a tuning
+        preference, and the heartbeat must refuse to start rather than
+        run with a broken exit-before-adoption argument.
+        """
+
         class ShortSilenceLedger(GuardVerifyLeaseLedger):
             _lease_adoption_silence_seconds = 0.5
 
@@ -1077,40 +1097,106 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
         server = coordinator(ledger)
         server.ledger_lease_heartbeat_seconds = 0.01
 
-        with patch("builtins.print") as printed:
-            thread = server._start_ledger_lease_heartbeat()
-            self.assertIsNotNone(thread)
-            self.assertTrue(server._stop_ledger_lease_heartbeat())
-        assert thread is not None
-        thread.join(0.2)
-        warnings = [
-            call.args[0]
-            for call in printed.call_args_list
-            if call.args
-            and "heartbeat timing is misconfigured" in str(call.args[0])
-        ]
-        # The default 0.75s budget leaves no envelope headroom under a
-        # 0.5s operator silence override stored on the ledger's private
-        # attribute; the warning must see it rather than the 1.0s default.
-        self.assertEqual(len(warnings), 1)
+        with patch.object(
+            server,
+            "_ledger_lease_heartbeat_hard_exit",
+        ) as hard_exit:
+            self.assertIsNone(server._start_ledger_lease_heartbeat())
 
-    def test_heartbeat_timing_misconfiguration_warns_at_start(self) -> None:
+        hard_exit.assert_called_once()
+        message = str(hard_exit.call_args.args[0])
+        self.assertIn("refusing to start the ledger lease heartbeat", message)
+        self.assertIn("adoption silence 0.5s", message)
+        # No thread may exist: refusing means refusing to run, not
+        # starting and then complaining.
+        self.assertIsNone(server._ledger_lease_heartbeat_thread)
+        self.assertEqual(ledger.verify_calls, 0)
+
+    def test_heartbeat_unsafe_timing_is_refused_at_start(self) -> None:
+        """A failure budget that overruns the adoption silence is refused.
+
+        The budget the monitor enforces has to fit inside the silence
+        window alongside the exit envelope, or a coordinator that lost its
+        guarded session can still be running when a replacement becomes
+        adoption-eligible. Before issue #212 this printed a warning and
+        started anyway.
+        """
         ledger = GuardVerifyLeaseLedger()
         server = coordinator(ledger)
         server.ledger_lease_heartbeat_seconds = 0.01
-        server.ledger_lease_heartbeat_failure_seconds = 1.5
+        server.ledger_lease_heartbeat_failure_seconds = 2.5
 
-        with patch("builtins.print") as printed:
+        with patch.object(
+            server,
+            "_ledger_lease_heartbeat_hard_exit",
+        ) as hard_exit:
+            self.assertIsNone(server._start_ledger_lease_heartbeat())
+
+        hard_exit.assert_called_once()
+        message = str(hard_exit.call_args.args[0])
+        self.assertIn("refusing to start the ledger lease heartbeat", message)
+        self.assertIn("failure budget 2.5s", message)
+        self.assertIsNone(server._ledger_lease_heartbeat_thread)
+
+    def test_heartbeat_interval_at_or_above_budget_is_refused(self) -> None:
+        """One idle wait must not be able to exhaust the liveness budget."""
+        ledger = GuardVerifyLeaseLedger()
+        server = coordinator(ledger)
+        server.ledger_lease_heartbeat_seconds = 1.25
+        server.ledger_lease_heartbeat_failure_seconds = 1.25
+
+        with patch.object(
+            server,
+            "_ledger_lease_heartbeat_hard_exit",
+        ) as hard_exit:
+            self.assertIsNone(server._start_ledger_lease_heartbeat())
+
+        hard_exit.assert_called_once()
+        self.assertIn(
+            "must exceed the heartbeat interval",
+            str(hard_exit.call_args.args[0]),
+        )
+
+    def test_heartbeat_warns_without_tail_latency_headroom(self) -> None:
+        """Safe but unstable timing warns instead of refusing.
+
+        A silence window that still satisfies the exit-before-adoption
+        inequality but leaves the server-proven cap below the largest gap a
+        healthy coordinator can produce permits no double writer — it just
+        guarantees issue #212's false exits. Labs and tests deliberately
+        run tiny policies, so this stays a warning.
+        """
+
+        class TightSilenceLedger(GuardVerifyLeaseLedger):
+            _lease_adoption_silence_seconds = 0.5
+
+        ledger = TightSilenceLedger()
+        server = coordinator(ledger)
+        server.ledger_lease_heartbeat_seconds = 0.01
+        server.ledger_lease_heartbeat_failure_seconds = 0.2
+        server.ledger_lease_heartbeat_monitor_seconds = 0.005
+        server.ledger_lease_heartbeat_exit_timeout_seconds = 0.01
+        # Scaled with the rest of the policy so this stays the safe-but-tight
+        # case: the guard's own statement timeout is not scaled, so the
+        # staleness cap still lands below the healthy-gap bound and the
+        # advisory fires.
+        server.ledger_lease_heartbeat_scheduler_slack_seconds = 0.005
+
+        with patch("builtins.print") as printed, patch.object(
+            server,
+            "_ledger_lease_heartbeat_hard_exit",
+        ) as hard_exit:
             thread = server._start_ledger_lease_heartbeat()
             self.assertIsNotNone(thread)
             self.assertTrue(server._stop_ledger_lease_heartbeat())
         assert thread is not None
         thread.join(0.2)
+
+        hard_exit.assert_not_called()
         warnings = [
             call.args[0]
             for call in printed.call_args_list
-            if call.args
-            and "heartbeat timing is misconfigured" in str(call.args[0])
+            if call.args and "no tail-latency headroom" in str(call.args[0])
         ]
         self.assertEqual(len(warnings), 1)
 
@@ -1127,6 +1213,10 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
         thread.join(0.2)
         for call in printed.call_args_list:
             if call.args:
+                self.assertNotIn(
+                    "no tail-latency headroom",
+                    str(call.args[0]),
+                )
                 self.assertNotIn(
                     "heartbeat timing is misconfigured",
                     str(call.args[0]),

@@ -243,7 +243,15 @@ class FakeLeasePsqlShareLedger(PsqlShareLedger):
         super().__init__(
             psql_command="psql postgresql://example.invalid/qbit",
             lease_retry_sleep=retry_sleep,
-            lease_retry_max_sleep_seconds=1.0,
+            # One retry sleep must be able to cover a whole adoption silence,
+            # or a scenario that waits out the silence is split into several
+            # capped sleeps and consumes lease observations the fixture never
+            # scripted. Derived from the policy so retuning the silence does
+            # not silently change what these scenarios exercise.
+            lease_retry_max_sleep_seconds=max(
+                1.0,
+                DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
+            ),
             **kwargs,
         )
 
@@ -6043,10 +6051,14 @@ class PrismShareLedgerTests(unittest.TestCase):
                 writer_epoch=1,
             )
 
-        self.assertEqual(ledger.sleeps, [1.0, 0.25])
+        # The first wait is clamped by the fixture's retry ceiling (the
+        # adoption silence), the second by the retry floor.
+        retry_ceiling = max(1.0, DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS)
+        self.assertEqual(ledger.sleeps, [retry_ceiling, 0.25])
         self.assertEqual(len(ledger.lease_queries), 3)
         self.assertIn(
-            "prism ledger writer lease held until 2026-06-26 19:50:22.233718+00; waiting 1s before retry",
+            "prism ledger writer lease held until 2026-06-26 19:50:22.233718+00; "
+            f"waiting {retry_ceiling:.3g}s before retry",
             stdout.getvalue(),
         )
         self.assertIn("holder writer=writer-a epoch=1 session=old-session", stdout.getvalue())
@@ -6285,10 +6297,16 @@ class PrismShareLedgerTests(unittest.TestCase):
                 lease_retry_sleep=stop_after_second_sleep,
             )
 
-        # First wait is floored by the guard-acquisition silence (1.0s); once
-        # that elapsed, the renewing twin's fresh updated_at keeps gating the
-        # CAS through the row-silence edge (0.9s remaining).
-        self.assertEqual(sleeps, [1.0, 0.9])
+        # First wait is floored by the guard-acquisition silence; once that
+        # elapsed, the renewing twin's fresh updated_at keeps gating the CAS
+        # through the row-silence edge (the silence less the row's 0.1s age).
+        self.assertEqual(
+            sleeps,
+            [
+                DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
+                round(DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS - 0.1, 6),
+            ],
+        )
         self.assertEqual(len(ledger.lease_queries), 2)
         self.assertTrue(
             all("observed_writer_session_token" not in query for query in ledger.lease_queries)
@@ -6316,12 +6334,17 @@ class PrismShareLedgerTests(unittest.TestCase):
                     held_lease(
                         session=old_session,
                         updated_at=first_updated_at,
-                        age_seconds=1.1,
+                        age_seconds=(
+                            DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS + 0.1
+                        ),
                     ),
                     held_lease(
                         session=old_session,
                         updated_at=first_updated_at,
-                        age_seconds=2.1,
+                        age_seconds=(
+                            2 * DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS
+                            + 0.1
+                        ),
                     ),
                     held_lease(
                         session=old_session,
@@ -6331,7 +6354,9 @@ class PrismShareLedgerTests(unittest.TestCase):
                     held_lease(
                         session=old_session,
                         updated_at=renewed_updated_at,
-                        age_seconds=1.1,
+                        age_seconds=(
+                            DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS + 0.1
+                        ),
                     ),
                     acquired_lease(session=new_session) | {"adopted": True},
                 ],
@@ -6344,7 +6369,10 @@ class PrismShareLedgerTests(unittest.TestCase):
         # Guard-acquisition silence first, then a lost CAS re-observes the
         # renewed row and requires a fresh full row-silence interval before
         # the second CAS.
-        self.assertEqual(sleeps, [1.0, 1.0])
+        self.assertEqual(
+            sleeps,
+            [DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS] * 2,
+        )
         self.assertEqual(len(ledger.lease_queries), 5)
         self.assertIn("observed_writer_session_token", ledger.lease_queries[2])
         self.assertIn("observed_writer_session_token", ledger.lease_queries[4])

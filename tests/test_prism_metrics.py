@@ -51,6 +51,12 @@ from lab.prism.share_submission import (
     empty_share_ack_histograms,
 )
 from lab.prism.vardiff_service import PRISM_VARDIFF_RESUME_OUTCOMES
+from lab.prism.writer_lease_timing import (
+    LEASE_HEARTBEAT_MODES,
+    LEASE_HEARTBEAT_OUTCOMES,
+    LEASE_HEARTBEAT_PHASES,
+    LEASE_HEARTBEAT_POLICY_TERMS,
+)
 from tests import prism_vardiff_test_support as support
 
 
@@ -380,6 +386,64 @@ def reference_accepted_stats_reconcile_metric_lines(server) -> list[str]:
             ]
         )
     return lines
+
+
+def reference_lease_heartbeat_metrics_lines(server) -> list[str]:
+    snapshot = server._ensure_lease_heartbeat_service().snapshot()
+    attempts = snapshot["attempts"]
+    outcomes = snapshot["outcomes"]
+    last_phases = snapshot["last_phase_seconds"]
+    worst_phases = snapshot["worst_phase_seconds"]
+    policy_seconds = snapshot["policy_seconds"]
+    assert isinstance(attempts, dict)
+    assert isinstance(outcomes, dict)
+    assert isinstance(last_phases, dict)
+    assert isinstance(worst_phases, dict)
+    assert isinstance(policy_seconds, dict)
+    return [
+        "# HELP qbit_prism_lease_heartbeat_running Whether the writer-lease heartbeat thread is alive.",
+        "# TYPE qbit_prism_lease_heartbeat_running gauge",
+        f"qbit_prism_lease_heartbeat_running {int(bool(snapshot['running']))}",
+        "# HELP qbit_prism_lease_heartbeat_attempts_total Guard verifications by mode.",
+        "# TYPE qbit_prism_lease_heartbeat_attempts_total counter",
+        *[
+            f'qbit_prism_lease_heartbeat_attempts_total{{mode="{mode}"}} {int(attempts.get(mode, 0))}'
+            for mode in LEASE_HEARTBEAT_MODES
+        ],
+        "# HELP qbit_prism_lease_heartbeat_outcomes_total Guard verification outcomes.",
+        "# TYPE qbit_prism_lease_heartbeat_outcomes_total counter",
+        *[
+            f'qbit_prism_lease_heartbeat_outcomes_total{{outcome="{outcome}"}} {int(outcomes.get(outcome, 0))}'
+            for outcome in LEASE_HEARTBEAT_OUTCOMES
+        ],
+        "# HELP qbit_prism_lease_heartbeat_phase_seconds Phase breakdown of the latest guard verification.",
+        "# TYPE qbit_prism_lease_heartbeat_phase_seconds gauge",
+        *[
+            f'qbit_prism_lease_heartbeat_phase_seconds{{phase="{phase}"}} {float(last_phases.get(phase, 0.0)):.6f}'
+            for phase in LEASE_HEARTBEAT_PHASES
+        ],
+        "# HELP qbit_prism_lease_heartbeat_worst_phase_seconds Phase breakdown of the slowest guard verification observed.",
+        "# TYPE qbit_prism_lease_heartbeat_worst_phase_seconds gauge",
+        *[
+            f'qbit_prism_lease_heartbeat_worst_phase_seconds{{phase="{phase}"}} {float(worst_phases.get(phase, 0.0)):.6f}'
+            for phase in LEASE_HEARTBEAT_PHASES
+        ],
+        "# HELP qbit_prism_lease_heartbeat_activity_age_seconds Age of the newest monitor-visible heartbeat activity mark.",
+        "# TYPE qbit_prism_lease_heartbeat_activity_age_seconds gauge",
+        f"qbit_prism_lease_heartbeat_activity_age_seconds {float(snapshot['activity_age_seconds']):.6f}",
+        "# HELP qbit_prism_lease_heartbeat_server_proven_age_seconds Age of the newest completed guard round trip.",
+        "# TYPE qbit_prism_lease_heartbeat_server_proven_age_seconds gauge",
+        f"qbit_prism_lease_heartbeat_server_proven_age_seconds {float(snapshot['server_proven_age_seconds']):.6f}",
+        "# HELP qbit_prism_lease_heartbeat_monitor_wake_delay_seconds Worst observed lateness of the heartbeat monitor's own poll.",
+        "# TYPE qbit_prism_lease_heartbeat_monitor_wake_delay_seconds gauge",
+        f"qbit_prism_lease_heartbeat_monitor_wake_delay_seconds {float(snapshot['monitor_wake_delay_seconds']):.6f}",
+        "# HELP qbit_prism_lease_heartbeat_policy_seconds Terms of the validated writer-lease heartbeat timing policy.",
+        "# TYPE qbit_prism_lease_heartbeat_policy_seconds gauge",
+        *[
+            f'qbit_prism_lease_heartbeat_policy_seconds{{term="{term}"}} {float(policy_seconds.get(term, 0.0)):.6f}'
+            for term in LEASE_HEARTBEAT_POLICY_TERMS
+        ],
+    ]
 
 
 def reference_shutdown_metrics_lines(server) -> list[str]:
@@ -1180,6 +1244,7 @@ def reference_render_metrics_payload(server) -> str:
         "# TYPE qbit_prism_audit_artifact_scan_error gauge",
         f"qbit_prism_audit_artifact_scan_error {audit_metrics['scan_error']}",
     ]
+    lines.extend(reference_lease_heartbeat_metrics_lines(server))
     lines.extend(reference_shutdown_metrics_lines(server))
     lines.extend(reference_coordinator_lock_metrics_lines(server))
     lines.extend(reference_block_submitter_metrics_lines(server))
@@ -1383,6 +1448,11 @@ class MetricsRenderParityTests(unittest.TestCase):
             'qbit_prism_vardiff_resume_total{outcome="clamped"}',
             'qbit_prism_vardiff_resume_total{outcome="overridden"} 2',
             'qbit_prism_vardiff_lane_accepted_shares_per_second{lane="default"}',
+            'qbit_prism_lease_heartbeat_attempts_total{mode="proof"}',
+            'qbit_prism_lease_heartbeat_phase_seconds{phase="guard_slot_wait"}',
+            'qbit_prism_lease_heartbeat_policy_seconds{term="scheduler_slack"}',
+            'qbit_prism_lease_heartbeat_policy_seconds{term="exit_envelope"}',
+            'qbit_prism_lease_heartbeat_policy_seconds{term="server_proven_cap"}',
         ):
             self.assertIn(needle, actual)
 
