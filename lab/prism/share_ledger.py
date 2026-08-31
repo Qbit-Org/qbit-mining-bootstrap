@@ -9543,10 +9543,20 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
             if timeout_seconds is None:
                 return native.run_json(sql)
             return native.run_json(sql, timeout_seconds=timeout_seconds)
-        output = self._run_sql(
-            sql,
-            on_statement_start=on_statement_start,
-        ).strip()
+        run_sql = self._run_sql
+        if getattr(run_sql, "__func__", None) is PsqlShareLedger._run_sql:
+            output = run_sql(
+                sql,
+                on_statement_start=on_statement_start,
+            ).strip()
+        else:
+            # The A1 gate and embedders historically override this private
+            # seam with the one-argument signature. Their replacement owns
+            # the full execution boundary, so entry is the only statement-
+            # start signal the base class can expose without breaking them.
+            if on_statement_start is not None:
+                on_statement_start()
+            output = run_sql(sql).strip()
         if not output:
             raise RuntimeError("psql query returned no JSON")
         return json.loads(output.splitlines()[-1])

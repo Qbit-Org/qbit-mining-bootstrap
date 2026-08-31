@@ -2386,6 +2386,29 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertEqual(stats["execute_seconds_total"], 0.0)
         self.assertEqual(ledger._read_semaphore._value, 1)
 
+    def test_run_json_preserves_legacy_run_sql_override_signature(self) -> None:
+        """Private one-argument subprocess seams remain supported."""
+
+        calls: list[str] = []
+        starts: list[str] = []
+
+        class LegacyRunSqlLedger(PsqlShareLedger):
+            def _run_sql(self, sql: str) -> str:
+                calls.append(sql)
+                return '{"ok": true}'
+
+        ledger = LegacyRunSqlLedger.__new__(LegacyRunSqlLedger)
+        ledger._native = None
+
+        result = ledger._run_json(
+            "SELECT json_build_object('ok', true);",
+            on_statement_start=lambda: starts.append("started"),
+        )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(calls, ["SELECT json_build_object('ok', true);"])
+        self.assertEqual(starts, ["started"])
+
     def test_postgres_pending_candidate_page_attributes_an_admission_expiry(
         self,
     ) -> None:
