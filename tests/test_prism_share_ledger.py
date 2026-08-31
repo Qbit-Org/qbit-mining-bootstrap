@@ -4209,10 +4209,15 @@ class PrismShareLedgerTests(unittest.TestCase):
         # chain_state=all drops the filter from the page and the pagination
         # count alike, and surfaces the public state fields.
         self.assertIn("WHERE true", all_query)
-        self.assertNotIn("'reversed'", all_query)
+        self.assertNotIn("WHERE chain_state", all_query)
+        self.assertNotIn("WHERE block.chain_state", all_query)
         self.assertIn("'chain_state', rows.chain_state", all_query)
+        # disconnected_at is a reorg disconnect time: rejected rows carry the
+        # column too (their maturity flip requires it), so the public row
+        # masks it to reversed chain states.
         self.assertIn(
-            "'disconnected_at', to_char(rows.disconnected_at AT TIME ZONE 'UTC'",
+            "'disconnected_at', CASE WHEN rows.chain_state = 'reversed'"
+            " THEN to_char(rows.disconnected_at AT TIME ZONE 'UTC'",
             all_query,
         )
 

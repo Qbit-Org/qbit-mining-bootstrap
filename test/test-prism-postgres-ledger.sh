@@ -1336,6 +1336,20 @@ assert_equal(
     {"chain_state": "rejected", "maturity_state": "reversed"},
     "rejected prepared block state",
 )
+# The reject flip stamps disconnected_at (its maturity_state 'reversed'
+# requires it), but the public contract defines disconnected_at as a reorg
+# disconnect time that is null for every non-reversed row -- a rejected
+# block must not read as a reorg casualty.
+rejected_all_view = replacement.dashboard_blocks(page=1, limit=50, chain_state="all")
+rejected_public_row = next(
+    (row for row in rejected_all_view["rows"] if row["hash"] == "46" * 32),
+    None,
+)
+if rejected_public_row is None:
+    raise SystemExit("chain_state=all did not surface the rejected block")
+assert_equal(rejected_public_row["chain_state"], "rejected", "rejected block reports its chain state")
+if rejected_public_row["disconnected_at"] is not None:
+    raise SystemExit("rejected block must not report a reorg disconnect time")
 assert_equal(
     replacement.confirm_accepted_block(
         block_hash="46" * 32,

@@ -6891,9 +6891,15 @@ SELECT json_build_object(
         page_predicate = state_predicates[chain_state].format(column="block.chain_state")
         include_state = chain_state != "active"
         state_columns = "\n        block.chain_state,\n        block.disconnected_at," if include_state else ""
+        # disconnected_at is a reorg disconnect time in the public contract,
+        # null for every non-reversed row. The ledger also stamps the column
+        # on rejected rows (their maturity_state 'reversed' requires it), so
+        # it is masked to reversed chain states rather than serialized as
+        # recorded.
         state_json_fields = (
             "\n            'chain_state', rows.chain_state,"
-            "\n            'disconnected_at', to_char(rows.disconnected_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),"
+            "\n            'disconnected_at', CASE WHEN rows.chain_state = 'reversed'"
+            " THEN to_char(rows.disconnected_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') END,"
             if include_state
             else ""
         )
