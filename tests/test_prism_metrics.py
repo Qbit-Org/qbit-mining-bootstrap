@@ -1367,6 +1367,8 @@ class MetricsRenderParityTests(unittest.TestCase):
             'qbit_prism_vardiff_lane_accepted_shares_per_second{lane="default"}',
             'qbit_prism_lease_heartbeat_attempts_total{mode="proof"}',
             'qbit_prism_lease_heartbeat_phase_seconds{phase="guard_slot_wait"}',
+            'qbit_prism_lease_heartbeat_policy_seconds{term="scheduler_slack"}',
+            'qbit_prism_lease_heartbeat_policy_seconds{term="exit_envelope"}',
             'qbit_prism_lease_heartbeat_policy_seconds{term="server_proven_cap"}',
         ):
             self.assertIn(needle, actual)

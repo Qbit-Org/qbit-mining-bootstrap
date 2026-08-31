@@ -840,6 +840,11 @@ class LedgerLeaseHeartbeatService:
                 "failure_budget": policy.failure_budget_seconds,
                 "monitor_interval": policy.monitor_interval_seconds,
                 "exit_margin": policy.exit_margin_seconds,
+                "guard_statement_timeout": (
+                    policy.guard_statement_timeout_seconds
+                ),
+                "scheduler_slack": policy.scheduler_slack_seconds,
+                "exit_envelope": policy.exit_envelope_seconds,
                 "server_proven_cap": policy.server_proven_cap_seconds,
                 "max_healthy_server_gap": policy.max_healthy_server_gap_seconds,
                 "stability_surplus": policy.stability_surplus_seconds,

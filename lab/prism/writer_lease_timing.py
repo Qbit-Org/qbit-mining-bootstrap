@@ -185,9 +185,9 @@ WRITER_LEASE_HEARTBEAT_FAILURE_SECONDS = (
     + WRITER_LEASE_HEARTBEAT_SCHEDULER_SLACK_SECONDS
 )
 
-# The smallest adoption silence that satisfies inequality (1) is 1.45s with
-# the budgets above. 2.0s is the next round value and leaves 0.55s of
-# stability surplus above the healthy-gap bound.
+# The smallest adoption silence that satisfies inequality (1) is just above
+# 1.95s with the budgets above. 2.0s is the next round value and leaves 0.05s
+# of stability surplus above the healthy-gap bound.
 DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS = 2.0
 
 # Heartbeat modes, and the phase names the attribution and metrics use.
@@ -216,6 +216,9 @@ LEASE_HEARTBEAT_POLICY_TERMS = (
     "failure_budget",
     "monitor_interval",
     "exit_margin",
+    "guard_statement_timeout",
+    "scheduler_slack",
+    "exit_envelope",
     "server_proven_cap",
     "max_healthy_server_gap",
     "stability_surplus",
@@ -367,7 +370,8 @@ class WriterLeaseHeartbeatPolicy:
                 f"budget {self.failure_budget_seconds:g}s plus the exit "
                 f"envelope {self.exit_envelope_seconds:g}s (exit margin "
                 f"{self.exit_margin_seconds:g}s + 2 x monitor interval "
-                f"{self.monitor_interval_seconds:g}s), or a coordinator that "
+                f"{self.monitor_interval_seconds:g}s + scheduler slack "
+                f"{self.scheduler_slack_seconds:g}s), or a coordinator that "
                 "lost its guarded session may still be live when a "
                 "replacement becomes adoption-eligible"
             )
@@ -410,6 +414,7 @@ class WriterLeaseHeartbeatPolicy:
             f"exit_margin={self.exit_margin_seconds:g}s "
             f"guard_statement_timeout={self.guard_statement_timeout_seconds:g}s "
             f"scheduler_slack={self.scheduler_slack_seconds:g}s "
+            f"exit_envelope={self.exit_envelope_seconds:g}s "
             f"=> server_proven_cap={self.server_proven_cap_seconds:g}s "
             f"healthy_gap={self.max_healthy_server_gap_seconds:g}s "
             f"surplus={self.stability_surplus_seconds:g}s"
