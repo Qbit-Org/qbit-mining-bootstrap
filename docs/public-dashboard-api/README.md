@@ -143,6 +143,7 @@ endpoint. At the documented defaults this yields:
 | Route | Budget |
 | --- | --- |
 | `/public/v1/blocks` | 15s |
+| `/public/v1/block-markers` | 15s |
 | `/public/v1/leaderboard` | 15s |
 | `/public/v1/miners/{recipient_id}/earnings` | 15s |
 | `/public/v1/miners/{recipient_id}/payouts` | 15s |
@@ -306,6 +307,32 @@ non-fatal: if the node cannot answer, the response carries
 `"hashrate_ths": null` and never turns the failure into a 503. Pool-summary
 still returns 503 only when no valid compact bits are available, exactly as
 before.
+
+## Block Markers
+
+`GET /public/v1/block-markers` serves the found-block markers the dashboard
+draws over the hashrate chart, pre-bucketed server-side. Paging
+`GET /public/v1/blocks` cannot place markers on long timeframes — at hundreds
+of found blocks a day the 1m/6m/all views would need hundreds of pages per
+chart render — so this endpoint aggregates the pool's block history into the
+chart's own buckets in one response.
+
+`range` and `bucket` use the hashrate-series vocabulary, and `bucket=auto`
+resolves identically (1h for 1w/1m, 1d for 6m/all). Bucket epochs use the
+identical floor arithmetic the hashrate buckets use, and bounded ranges keep
+only fully covered buckets from the same range anchor, so markers land in the
+same buckets as the hashrate points on every timeframe. Finer buckets than a
+range's chart renders are rejected with `400 bad_request`: 1w allows 5m/1h/1d,
+1m allows 1h/1d, 6m and all allow 1d only.
+
+The response (`prism.dashboard.block-markers.v1`) reports `total_blocks` — all
+non-reversed found blocks in range — and `points` containing only buckets with
+at least one found block, ascending by timestamp. Each point carries the
+bucket's full `block_count`, at most its 3 most recent blocks (`found_at`
+descending, height breaking ties) with `height`, `hash`, and `found_at`, and
+`truncated: true` when more blocks exist than are listed. Reversed blocks are
+excluded throughout, matching `/public/v1/blocks`.
+`fixtures/block-markers.json` mocks the response.
 
 ## Reward Leaderboard
 

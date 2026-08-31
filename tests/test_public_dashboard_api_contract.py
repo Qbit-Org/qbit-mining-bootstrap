@@ -27,6 +27,7 @@ EXPECTED_FIXTURES = {
     "leaderboard-legacy.json": "prism.dashboard.leaderboard.v1",
     "blocks.json": "prism.dashboard.blocks.v1",
     "blocks-chain-states.json": "prism.dashboard.blocks.v2",
+    "block-markers.json": "prism.dashboard.block-markers.v1",
     "settlement-artifacts.json": "prism.dashboard.settlement-artifacts.v1",
     "settlement-artifacts-direct-coinbase.json": "prism.dashboard.settlement-artifacts.v1",
     "pending-fanouts.json": "prism.dashboard.pending-fanouts.v1",
@@ -42,6 +43,7 @@ EXPECTED_FIXTURES = {
 EXPECTED_ROUTES = (
     "/pool-summary:",
     "/hashrate-series:",
+    "/block-markers:",
     "/leaderboard:",
     "/blocks:",
     "/blocks/{block_hash}/settlement-artifacts:",
@@ -368,6 +370,79 @@ class PublicDashboardApiContractTests(unittest.TestCase):
             )
             if smoothing["method"] == "none":
                 self.assertEqual(Decimal(point["smoothed_hashrate_ths"]), Decimal(point["raw_hashrate_ths"]))
+
+    def test_block_markers_fixture_is_internally_consistent(self) -> None:
+        markers = self.load_fixture("block-markers.json")
+
+        self.assertEqual(
+            set(markers),
+            {"schema", "generated_at", "range", "bucket", "bucket_seconds", "total_blocks", "points"},
+        )
+        bucket_seconds = markers["bucket_seconds"]
+        self.assertEqual(bucket_seconds, public_api.HASHRATE_SERIES_BUCKET_SECONDS[markers["bucket"]])
+        self.assertIn(markers["bucket"], public_api.allowed_block_marker_buckets(markers["range"]))
+        points = markers["points"]
+        self.assertGreater(len(points), 0)
+        epochs = [self.epoch(point["timestamp"]) for point in points]
+        self.assertEqual(epochs, sorted(set(epochs)))
+        # total_blocks counts every non-reversed block in range and every such
+        # block lands in some listed bucket, so the two totals must agree.
+        self.assertEqual(
+            markers["total_blocks"],
+            sum(point["block_count"] for point in points),
+        )
+        for point, epoch in zip(points, epochs):
+            self.assertEqual(set(point), {"timestamp", "block_count", "blocks", "truncated"})
+            # Marker buckets sit on the hashrate chart's floor-aligned grid.
+            self.assertEqual(epoch % bucket_seconds, 0, point["timestamp"])
+            self.assertGreater(point["block_count"], 0)
+            blocks = point["blocks"]
+            self.assertEqual(
+                len(blocks),
+                min(point["block_count"], public_api.BLOCK_MARKERS_MAX_BLOCKS_PER_BUCKET),
+            )
+            self.assertEqual(
+                point["truncated"],
+                point["block_count"] > public_api.BLOCK_MARKERS_MAX_BLOCKS_PER_BUCKET,
+            )
+            found_epochs = [self.epoch(block["found_at"]) for block in blocks]
+            self.assertEqual(found_epochs, sorted(found_epochs, reverse=True))
+            for block, found_epoch in zip(blocks, found_epochs):
+                self.assertEqual(set(block), {"height", "hash", "found_at"})
+                self.assertEqual(found_epoch // bucket_seconds * bucket_seconds, epoch, block["hash"])
+
+    def test_block_markers_fixture_shares_the_blocks_fixture_pool(self) -> None:
+        # The newest marker is blocks.json's latest block, so the two fixtures
+        # describe one pool and a dashboard can render them together.
+        markers = self.load_fixture("block-markers.json")
+        latest = self.load_fixture("blocks.json")["rows"][0]
+        newest_marker = markers["points"][-1]["blocks"][0]
+        self.assertEqual(newest_marker["hash"], latest["hash"])
+        self.assertEqual(newest_marker["height"], latest["height"])
+        self.assertEqual(newest_marker["found_at"], latest["found_at"])
+
+    def test_openapi_block_markers_declares_marker_contract(self) -> None:
+        text = OPENAPI_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "    BlockMarkerPoint:\n"
+            "      type: object\n"
+            "      additionalProperties: false\n"
+            "      required: [timestamp, block_count, blocks, truncated]\n",
+            text,
+        )
+        self.assertIn(
+            "    BlockMarkerBlock:\n"
+            "      type: object\n"
+            "      additionalProperties: false\n"
+            "      required: [height, hash, found_at]\n",
+            text,
+        )
+        self.assertIn("const: prism.dashboard.block-markers.v1", text)
+        self.assertIn("maxItems: 3", text)
+
+        readme_text = (CONTRACT_DIR / "README.md").read_text(encoding="utf-8")
+        self.assertIn("/public/v1/block-markers", readme_text)
+        self.assertIn("block-markers.json", readme_text)
 
     def test_openapi_hashrate_series_declares_dual_rate_view(self) -> None:
         text = OPENAPI_PATH.read_text(encoding="utf-8")
