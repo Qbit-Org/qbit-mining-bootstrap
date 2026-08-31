@@ -224,6 +224,59 @@ smoothing window those coarse buckets report `smoothing.method=none`, so raw
 and smoothed are identical. Dashboards that need to expose short bursts and
 their 30m trailing context should explicitly request `bucket=5m`.
 
+## Blocks and Reorg Visibility
+
+Chain reorganizations happen, and hiding them entirely made the pool's block
+history look cleaner than the chain it mines. `GET /public/v1/blocks` therefore
+takes a `chain_state` filter:
+
+- Omitted or `chain_state=active` — exactly the pre-filter behavior and the
+  `prism.dashboard.blocks.v1` schema tag: every recorded pool block except
+  those a reorganization reversed. Existing consumers see a byte-compatible
+  response.
+- `chain_state=all` — every recorded pool block, including reversed ones.
+- `chain_state=reversed` — only blocks the pool once landed that a chain
+  reorganization later disconnected.
+
+Both non-default filters return `prism.dashboard.blocks.v2`, whose rows carry
+the v1 fields plus `chain_state` (`prepared`, `confirmed`, `inactive`,
+`rejected`, or `reversed`) and `disconnected_at`, the reorg disconnect time
+that is `null` for every non-reversed block. Pagination `total_count` and
+`total_pages` always describe the filtered set. Any other `chain_state` value
+is rejected with `400 bad_request`. The filter is part of the origin cache
+key, so the three views never share a cache entry, and the route keeps the
+5-second dynamic-read TTL class. `fixtures/blocks.json` mocks the default
+response and `fixtures/blocks-chain-states.json` mocks the `chain_state=all`
+response with a reversed block.
+
+`GET /public/v1/pool-summary` surfaces the same information in aggregate:
+`pool.blocks_reversed_total` and `pool.blocks_inactive_total` count the
+reversed and currently-inactive pool blocks. `blocks_found_total` is
+unchanged and keeps excluding reversed blocks, so it is not the sum of the
+per-state counters. These are **additive fields on
+`prism.dashboard.pool-summary.v1`** (added in 2.x): pool-summary takes no
+request parameter, so the repo's param-gated versioning precedent does not
+apply cleanly; the schema tag stays `v1` and validators that pin the vendored
+contract pick the fields up when they bump their pin.
+
+## Network Hashrate
+
+`network.hashrate_ths` in `GET /public/v1/pool-summary` is the node's own
+estimate of the network hashrate in TH/s — qbit's `getnetworkhashps` over its
+default 120-block window, restricted to the permissionless lane the pool's
+shares are credited against. Divide a pool `hashrate_ths` window (`h1`/`h3`)
+by it to render "pool is X% of network"; no precomputed percentage is served.
+The ratio is approximate by construction: pool hashrate is credited work from
+accepted shares while the network figure is a chain-derived estimate, so the
+two can disagree over short windows.
+
+Like the reorg counters, this is an additive field on
+`prism.dashboard.pool-summary.v1` (added in 2.x). It is nullable and
+non-fatal: if the node cannot answer, the response carries
+`"hashrate_ths": null` and never turns the failure into a 503. Pool-summary
+still returns 503 only when no valid compact bits are available, exactly as
+before.
+
 ## Reward Leaderboard
 
 `GET /public/v1/leaderboard?window=reward` returns

@@ -176,9 +176,31 @@ paths:
       parameters:
         - $ref: "#/components/parameters/Page"
         - $ref: "#/components/parameters/Limit"
+        - name: chain_state
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [active, all, reversed]
+            default: active
+          description: >
+            Omit or pass `active` for the `prism.dashboard.blocks.v1` response,
+            which hides reorged-out blocks exactly as before this parameter
+            existed. `all` includes every recorded pool block and `reversed`
+            returns only blocks the pool once landed that a chain
+            reorganization later disconnected; both return
+            `prism.dashboard.blocks.v2` rows carrying `chain_state` and
+            `disconnected_at`. Pagination `total_count`/`total_pages` always
+            describe the filtered set. Any other value is rejected with
+            `400 bad_request`. The filter is part of the cache key, so the
+            views never share a cache entry.
       responses:
         "200":
-          description: Recent block rows.
+          description: >
+            Recent block rows. `prism.dashboard.blocks.v1` without
+            `chain_state` (or with `chain_state=active`);
+            `prism.dashboard.blocks.v2` for `chain_state=all` and
+            `chain_state=reversed`.
           headers:
             Cache-Control:
               $ref: "#/components/headers/BrowserCacheControl"
@@ -191,7 +213,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/BlocksResponse"
+                oneOf:
+                  - $ref: "#/components/schemas/BlocksResponse"
+                  - $ref: "#/components/schemas/BlocksChainStateResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "503":
@@ -651,6 +675,7 @@ components:
         - tip_hash
         - bits
         - network_difficulty
+        - hashrate_ths
         - initial_block_download
         - peers
       properties:
@@ -665,6 +690,19 @@ components:
           $ref: "#/components/schemas/CompactBits"
         network_difficulty:
           $ref: "#/components/schemas/DecimalString"
+        hashrate_ths:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalString"
+            - type: "null"
+          description: >
+            Estimated network hashrate in TH/s for the permissionless lane the
+            pool mines, from the node's own recent-blocks estimate. Additive
+            field on `prism.dashboard.pool-summary.v1` (2.x). Divide a pool
+            `hashrate_ths` window (`h1`/`h3`) by this value for an approximate
+            pool share-of-network: pool hashrate is credited work from
+            accepted shares while this is a chain-derived estimate, so the
+            ratio is approximate by construction. `null` when the node cannot
+            answer; that failure never turns into a 503.
         initial_block_download:
           type: boolean
         peers:
@@ -737,6 +775,8 @@ components:
         - participants_3h
         - blocks_found_total
         - prism_blocks_total
+        - blocks_reversed_total
+        - blocks_inactive_total
         - total_mined_bits
         - expected_time_to_block_seconds
         - latest_block
@@ -752,9 +792,28 @@ components:
         blocks_found_total:
           type: integer
           minimum: 0
+          description: >
+            Every pool block not reversed by a chain reorganization. Excludes
+            `reversed` blocks by design; it is not the sum of the per-state
+            counters below.
         prism_blocks_total:
           type: integer
           minimum: 0
+        blocks_reversed_total:
+          type: integer
+          minimum: 0
+          description: >
+            Pool blocks a chain reorganization disconnected from the active
+            chain. Additive field on `prism.dashboard.pool-summary.v1` (2.x);
+            list the affected blocks with
+            `GET /public/v1/blocks?chain_state=reversed`.
+        blocks_inactive_total:
+          type: integer
+          minimum: 0
+          description: >
+            Pool blocks currently off the active chain but not yet resolved as
+            reversed. Additive field on `prism.dashboard.pool-summary.v1`
+            (2.x).
         total_mined_bits:
           $ref: "#/components/schemas/Bits"
         expected_time_to_block_seconds:
@@ -1237,6 +1296,105 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/BlockRow"
+    ChainState:
+      type: string
+      enum:
+        - prepared
+        - confirmed
+        - inactive
+        - rejected
+        - reversed
+      description: >
+        The pool's ledger view of where a found block stands against the
+        active chain. `prepared` blocks are still being landed, `confirmed`
+        blocks are on the active chain, `inactive` blocks are temporarily off
+        it, `rejected` blocks never activated, and `reversed` blocks were
+        disconnected by a chain reorganization after the pool landed them.
+    ChainStateBlockRow:
+      type: object
+      additionalProperties: false
+      required:
+        - height
+        - hash
+        - found_at
+        - network_difficulty
+        - bits
+        - solver_recipient_id
+        - solver_worker_name
+        - solver_share_difficulty
+        - reward_window_weight
+        - coinbase_value_bits
+        - audit_bundle_sha256
+        - payout_manifest_sha256
+        - explorer_url
+        - chain_state
+        - disconnected_at
+      properties:
+        height:
+          type: integer
+          minimum: 0
+        hash:
+          $ref: "#/components/schemas/HexHash"
+        found_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        network_difficulty:
+          $ref: "#/components/schemas/DecimalString"
+        bits:
+          $ref: "#/components/schemas/CompactBits"
+        solver_recipient_id:
+          type: string
+        solver_worker_name:
+          $ref: "#/components/schemas/NullableString"
+        solver_share_difficulty:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalString"
+            - type: "null"
+        reward_window_weight:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalString"
+            - type: "null"
+        coinbase_value_bits:
+          $ref: "#/components/schemas/Bits"
+        audit_bundle_sha256:
+          oneOf:
+            - $ref: "#/components/schemas/HexHash"
+            - type: "null"
+        payout_manifest_sha256:
+          oneOf:
+            - $ref: "#/components/schemas/HexHash"
+            - type: "null"
+        explorer_url:
+          oneOf:
+            - type: string
+              format: uri
+            - type: "null"
+        chain_state:
+          $ref: "#/components/schemas/ChainState"
+        disconnected_at:
+          allOf:
+            - $ref: "#/components/schemas/NullableTimestamp"
+          description: >
+            When a chain reorganization disconnected this block from the
+            active chain; `null` for blocks that have not been reversed.
+    BlocksChainStateResponse:
+      type: object
+      additionalProperties: false
+      required: [schema, generated_at, pagination, rows]
+      description: >
+        The `chain_state=all` / `chain_state=reversed` view of the block
+        history: the v1 rows plus reorg visibility fields.
+      properties:
+        schema:
+          type: string
+          const: prism.dashboard.blocks.v2
+        generated_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChainStateBlockRow"
     SettlementStatus:
       type: string
       enum:

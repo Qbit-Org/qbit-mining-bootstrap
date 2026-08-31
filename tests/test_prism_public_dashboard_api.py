@@ -80,11 +80,16 @@ class FakeRpc:
         template_bits: str | None = "207fffff",
         blockchain_info: dict[str, object] | None = None,
         network_info: dict[str, object] | None = None,
+        network_hashps: object = 2_500_000_000_000_000_000,
     ) -> None:
         self.template_difficulty = template_difficulty
         self.template_bits = template_bits
         self.blockchain_info = blockchain_info or {}
         self.network_info = network_info or {}
+        # H/s, as qbitd's getnetworkhashps reports. Pass an exception instance
+        # to simulate a node whose hashrate estimate is unavailable.
+        self.network_hashps = network_hashps
+        self.network_hashps_calls: list[list[object] | None] = []
 
     def call(self, method: str, params: list[object] | None = None) -> object:
         if method == "getblockchaininfo":
@@ -104,6 +109,11 @@ class FakeRpc:
             return template
         if method == "getnetworkinfo":
             return {"connections": 8, **self.network_info}
+        if method == "getnetworkhashps":
+            self.network_hashps_calls.append(params)
+            if isinstance(self.network_hashps, BaseException):
+                raise self.network_hashps
+            return self.network_hashps
         raise AssertionError(f"unexpected RPC method {method}")
 
 
@@ -136,6 +146,7 @@ class FakePublicLedger:
         self.reward_leaderboard_calls: list[dict[str, object]] = []
         self.pool_snapshot_calls = 0
         self.hashrate_series_calls = 0
+        self.blocks_calls: list[dict[str, object]] = []
 
     def dashboard_pool_snapshot(self, *, current_network_difficulty: object, generated_at: str) -> dict[str, object]:
         self.pool_snapshot_calls += 1
@@ -146,6 +157,8 @@ class FakePublicLedger:
             "participants_3h": 2,
             "blocks_found_total": 3,
             "prism_blocks_total": 3,
+            "blocks_reversed_total": 1,
+            "blocks_inactive_total": 2,
             "total_mined_bits": 600,
             "latest_block": {
                 "height": 123450,
@@ -164,26 +177,52 @@ class FakePublicLedger:
             },
         }
 
-    def dashboard_blocks(self, *, page: int, limit: int) -> dict[str, object]:
+    def dashboard_blocks(self, *, page: int, limit: int, chain_state: str | None = None) -> dict[str, object]:
+        # chain_state=None records that the caller omitted the argument, which
+        # is what the default public /blocks path must do.
+        self.blocks_calls.append({"page": page, "limit": limit, "chain_state": chain_state})
+        active_row = {
+            "height": 123450,
+            "hash": "a" * 64,
+            "found_at": "2026-06-26T19:55:00Z",
+            "network_difficulty": "1000",
+            "bits": "207fffff",
+            "solver_recipient_id": "miner-a",
+            "solver_worker_name": None,
+            "solver_share_difficulty": "99",
+            "reward_window_weight": "792",
+            "coinbase_value_bits": 600,
+            "audit_bundle_sha256": "b" * 64,
+            "payout_manifest_sha256": "c" * 64,
+            "explorer_url": None,
+        }
+        if chain_state in (None, "active"):
+            rows = [active_row]
+        else:
+            reversed_row = {
+                **active_row,
+                "height": 123449,
+                "hash": "f" * 64,
+                "found_at": "2026-06-26T18:55:00Z",
+                "solver_recipient_id": "miner-b",
+                "solver_share_difficulty": None,
+                "audit_bundle_sha256": None,
+                "payout_manifest_sha256": None,
+                "chain_state": "reversed",
+                "disconnected_at": "2026-06-26T19:05:00Z",
+            }
+            if chain_state == "all":
+                rows = [
+                    {**active_row, "chain_state": "confirmed", "disconnected_at": None},
+                    reversed_row,
+                ]
+            elif chain_state == "reversed":
+                rows = [reversed_row]
+            else:
+                raise ValueError("chain_state must be one of active, all, reversed")
         return {
-            "pagination": {"page": page, "limit": limit, "total_count": 1, "total_pages": 1},
-            "rows": [
-                {
-                    "height": 123450,
-                    "hash": "a" * 64,
-                    "found_at": "2026-06-26T19:55:00Z",
-                    "network_difficulty": "1000",
-                    "bits": "207fffff",
-                    "solver_recipient_id": "miner-a",
-                    "solver_worker_name": None,
-                    "solver_share_difficulty": "99",
-                    "reward_window_weight": "792",
-                    "coinbase_value_bits": 600,
-                    "audit_bundle_sha256": "b" * 64,
-                    "payout_manifest_sha256": "c" * 64,
-                    "explorer_url": None,
-                }
-            ],
+            "pagination": {"page": page, "limit": limit, "total_count": len(rows), "total_pages": 1},
+            "rows": rows,
         }
 
     def dashboard_leaderboard(self, *, page: int, limit: int, search: str | None = None) -> dict[str, object]:
@@ -954,6 +993,148 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         # 1h buckets already exceed the default smoothing window, so ledger
         # rates pass through untouched.
         self.assertEqual(series["points"][0]["hashrate_ths"], "2.5")
+
+    BLOCK_ROW_V1_KEYS = {
+        "height",
+        "hash",
+        "found_at",
+        "network_difficulty",
+        "bits",
+        "solver_recipient_id",
+        "solver_worker_name",
+        "solver_share_difficulty",
+        "reward_window_weight",
+        "coinbase_value_bits",
+        "audit_bundle_sha256",
+        "payout_manifest_sha256",
+        "explorer_url",
+    }
+
+    def test_blocks_default_response_keeps_v1_shape_and_omits_state_fields(self) -> None:
+        ledger = FakePublicLedger()
+        coordinator = FakeCoordinator(ledger=ledger)
+
+        for query in ({}, {"chain_state": ["active"]}):
+            with self.subTest(query=query):
+                status, payload = public_api.dispatch(coordinator, "/public/v1/blocks", query)
+
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["schema"], "prism.dashboard.blocks.v1")
+                for row in payload["rows"]:
+                    self.assertEqual(set(row), self.BLOCK_ROW_V1_KEYS)
+        # Both the implicit default and an explicit chain_state=active reach
+        # the read model without any chain_state argument, so a ledger that
+        # predates the filter keeps serving the default contract.
+        self.assertEqual(
+            ledger.blocks_calls,
+            [
+                {"page": 1, "limit": 15, "chain_state": None},
+                {"page": 1, "limit": 15, "chain_state": None},
+            ],
+        )
+
+    def test_blocks_chain_state_filter_returns_v2_rows_and_filtered_pagination(self) -> None:
+        ledger = FakePublicLedger()
+        coordinator = FakeCoordinator(ledger=ledger)
+
+        status, all_payload = public_api.dispatch(
+            coordinator, "/public/v1/blocks", {"chain_state": ["all"]}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(all_payload["schema"], "prism.dashboard.blocks.v2")
+        self.assertEqual(all_payload["pagination"]["total_count"], 2)
+        for row in all_payload["rows"]:
+            self.assertEqual(set(row), self.BLOCK_ROW_V1_KEYS | {"chain_state", "disconnected_at"})
+        self.assertEqual(all_payload["rows"][0]["chain_state"], "confirmed")
+        self.assertIsNone(all_payload["rows"][0]["disconnected_at"])
+        self.assertEqual(all_payload["rows"][1]["chain_state"], "reversed")
+        self.assertEqual(all_payload["rows"][1]["disconnected_at"], "2026-06-26T19:05:00Z")
+
+        status, reversed_payload = public_api.dispatch(
+            coordinator, "/public/v1/blocks", {"chain_state": ["reversed"]}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(reversed_payload["schema"], "prism.dashboard.blocks.v2")
+        self.assertEqual(reversed_payload["pagination"]["total_count"], 1)
+        self.assertEqual(
+            [row["chain_state"] for row in reversed_payload["rows"]],
+            ["reversed"],
+        )
+        self.assertEqual(
+            ledger.blocks_calls,
+            [
+                {"page": 1, "limit": 15, "chain_state": "all"},
+                {"page": 1, "limit": 15, "chain_state": "reversed"},
+            ],
+        )
+
+    def test_blocks_rejects_unknown_chain_state(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self.get_json("/public/v1/blocks?chain_state=orphaned")
+
+        self.assertEqual(raised.exception.code, 400)
+        payload = json.loads(raised.exception.read())
+        raised.exception.close()
+        self.assertEqual(payload["error"]["code"], "bad_request")
+
+    def test_origin_cache_separates_blocks_chain_states(self) -> None:
+        ledger = FakePublicLedger()
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch.dict(os.environ, {"PRISM_PUBLIC_CACHE_TTL_SECONDS": "30"}, clear=True):
+                base = f"http://127.0.0.1:{server.server_port}/public/v1/blocks"
+                for url in (base, base, f"{base}?chain_state=all"):
+                    with urllib.request.urlopen(url, timeout=5) as response:
+                        payload = json.loads(response.read())
+                with urllib.request.urlopen(base, timeout=5) as response:
+                    default_payload = json.loads(response.read())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        # chain_state partitions the origin cache automatically because the
+        # cache key carries the sorted query string: the repeated default
+        # requests share one entry while chain_state=all computes its own.
+        self.assertEqual(payload["schema"], "prism.dashboard.blocks.v2")
+        self.assertEqual(default_payload["schema"], "prism.dashboard.blocks.v1")
+        self.assertEqual(
+            [call["chain_state"] for call in ledger.blocks_calls],
+            [None, "all"],
+        )
+
+    def test_pool_summary_reports_reorg_counts_and_network_hashrate(self) -> None:
+        rpc = FakeRpc(network_hashps=2_500_000_000_000_000_000)
+        payload = public_api.pool_summary(FakeCoordinator(rpc=rpc))
+
+        self.assertEqual(payload["pool"]["blocks_reversed_total"], 1)
+        self.assertEqual(payload["pool"]["blocks_inactive_total"], 2)
+        # 2.5e18 H/s reported by the node is 2,500,000 TH/s, and the lookup
+        # asks for the permissionless lane the pool's shares are credited
+        # against, over the RPC's own default 120-block window at the tip.
+        self.assertEqual(payload["network"]["hashrate_ths"], "2500000")
+        self.assertEqual(rpc.network_hashps_calls, [[120, -1, "permissionless"]])
+
+    def test_pool_summary_network_hashrate_is_null_when_rpc_fails(self) -> None:
+        rpc = FakeRpc(network_hashps=RuntimeError("getnetworkhashps unavailable"))
+        payload = public_api.pool_summary(FakeCoordinator(rpc=rpc))
+
+        # The field is nullable and non-fatal: pool-summary still answers 200
+        # with everything else populated, and only compact-bits loss may 503.
+        self.assertIsNone(payload["network"]["hashrate_ths"])
+        self.assertEqual(payload["schema"], "prism.dashboard.pool-summary.v1")
+        self.assertEqual(payload["pool"]["blocks_found_total"], 3)
+
+    def test_network_hashrate_ths_rejects_non_numeric_estimates(self) -> None:
+        for network_hashps in (float("nan"), float("inf"), -1, True, "not-a-rate", None, {}):
+            with self.subTest(network_hashps=network_hashps):
+                coordinator = FakeCoordinator(rpc=FakeRpc(network_hashps=network_hashps))
+                self.assertIsNone(public_api.network_hashrate_ths(coordinator))
+        fractional = FakeCoordinator(rpc=FakeRpc(network_hashps=1_500_000_000_000.5))
+        self.assertEqual(public_api.network_hashrate_ths(fractional), "1.5000000000005")
 
     def assert_hashrate_ths(self, actual: object, difficulty: int, seconds: int) -> None:
         # Hashrate strings are Decimal-context dependent (direct_stratum pins
@@ -2648,6 +2829,26 @@ class PrismPublicDashboardMemoryLedgerTests(unittest.TestCase):
         self.assertEqual(payload["schema"], "prism.dashboard.leaderboard.v1")
         self.assertEqual(payload["pagination"]["total_count"], 1)
         self.assertEqual(payload["rows"][0]["recipient_id"], "miner-a")
+
+    def test_memory_ledger_supports_blocks_chain_state_filter(self) -> None:
+        ledger = SingleWriterShareLedger()
+
+        for chain_state in ("active", "all", "reversed"):
+            with self.subTest(chain_state=chain_state):
+                payload = ledger.dashboard_blocks(page=1, limit=15, chain_state=chain_state)
+                self.assertEqual(payload["rows"], [])
+                self.assertEqual(payload["pagination"]["total_count"], 0)
+        with self.assertRaises(ValueError):
+            ledger.dashboard_blocks(page=1, limit=15, chain_state="orphaned")
+
+    def test_memory_ledger_pool_snapshot_reports_zero_reorg_counts(self) -> None:
+        snapshot = SingleWriterShareLedger().dashboard_pool_snapshot(
+            current_network_difficulty="1",
+            generated_at=public_api.utc_now_iso(),
+        )
+
+        self.assertEqual(snapshot["blocks_reversed_total"], 0)
+        self.assertEqual(snapshot["blocks_inactive_total"], 0)
 
     def test_memory_ledger_artifact_responses_verify_end_to_end(self) -> None:
         # Full path: the real record path persists the canonical text, and the
