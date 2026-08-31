@@ -117,6 +117,50 @@ def _take_writer_gate(ledger: Any) -> None:
         ledger._lock.release()
 
 
+def _step_to_the_stale_page_window(
+    harness: LandingHarness,
+    ledger: Any,
+    found: Any,
+) -> None:
+    """Step the landing to the window a stale page is acted on in.
+
+    Three conditions, deliberately named instead of a checkpoint: the
+    accepted-block write has committed so a durable ``qbit_pool_blocks`` row
+    exists, the candidate's outbox row is still pending so the terminal
+    write's ordinary state predicate cannot be what refuses it, and the writer
+    gate is free so that write can run at all.
+
+    A checkpoint name would have been the shorter spelling and the wrong one.
+    This scenario originally stopped at ``ledger.begin:prior_balances_as_of``,
+    and issue #210 then routed fresh confirmations through the
+    current-balance summary instead of the height-bounded as-of read -- which
+    deleted that checkpoint from the landing while leaving the window itself
+    exactly where it was. Asking for the state the proof depends on survives
+    that kind of change; asking for the statement that happened to sit next to
+    it did not.
+    """
+    block_hash = found.block_hash
+    for _ in range(200):
+        if not harness.accounting.runnable():
+            raise AssertionError(
+                "the landing stalled before reaching the stale-page window "
+                f"(blocked at {harness.accounting.block_reason!r})"
+            )
+        label = harness.step(harness.accounting)
+        if (
+            harness.pool_block(block_hash) is not None
+            and harness.outbox_state(found) == "pending"
+            and not ledger._lock.locked()
+        ):
+            return
+        if label.startswith("done:"):
+            break
+    raise AssertionError(
+        "the landing never offered a landed-but-pending window with the "
+        "writer gate free"
+    )
+
+
 class EnumerationOutsideTheWriterConvoyTests(unittest.TestCase):
     def _scenario(self, harness: LeaseHarness) -> dict[str, Any]:
         """Enumerate a durable backlog while a fenced write holds the gate."""
@@ -388,8 +432,9 @@ class StalePageAgainstALandingWriteTests(unittest.TestCase):
         # A's write commits. Its pool-block row is now durable while its
         # outbox row is still pending, and the writer gate is free again --
         # the exact window in which a caller holding the stale page acts.
-        harness.run_until(harness.accounting, "ledger.begin:prior_balances_as_of")
+        _step_to_the_stale_page_window(harness, ledger, block_a)
         landed = harness.pool_block(BLOCK_A) is not None
+        still_pending = harness.outbox_state(block_a)
 
         terminal = harness.scheduler.actor("collapse")
         abandon_call = terminal.submit(
@@ -404,6 +449,7 @@ class StalePageAgainstALandingWriteTests(unittest.TestCase):
         harness.drain([harness.accounting, harness.appender, terminal])
         return {
             "gate_held_during_read": gate_held_during_read,
+            "pending_at_the_terminal_write": still_pending,
             "admission_error": type(admission_call.error).__name__,
             "page": [
                 (str(row["block_hash"]), bool(row["pool_block_exists"]))
@@ -446,6 +492,7 @@ class StalePageAgainstALandingWriteTests(unittest.TestCase):
         # pending -- both halves matter, or the row would be excluded by the
         # ordinary state predicate and prove nothing about the re-check.
         self.assertTrue(result["landed_before_the_terminal_write"])
+        self.assertEqual(result["pending_at_the_terminal_write"], "pending")
 
         # The caller asked to abandon both hashes on the strength of a page
         # that said neither had landed. The fenced UPDATE re-asked
