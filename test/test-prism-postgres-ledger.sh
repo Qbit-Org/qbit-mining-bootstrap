@@ -428,6 +428,9 @@ assert_equal(
     "already-terminal rows are not re-won",
 )
 ledger._run_sql(f"DELETE FROM qbit_pool_blocks WHERE block_hash = '{bulk_landed}';")
+# The stale-page case below asserts an exact page and terminal set. Isolate it
+# from the pending row intentionally retained by the bulk-abandon case above.
+ledger._run_sql("DELETE FROM qbit_block_candidate_outbox;")
 
 # Issue #211 removed the writer gate from the page read, which makes the page
 # advisory by construction: a candidate can land between the snapshot and
