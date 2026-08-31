@@ -67,6 +67,12 @@ paths:
         - name: bucket
           in: query
           required: false
+          description: >
+            Each range admits a fixed set of buckets: 1w allows 5m, 1h, and
+            1d; 1m allows 1h and 1d; 6m and all allow only 1d. `auto` always
+            resolves inside the allowed set. A combination outside that
+            vocabulary is rejected with `400 bad_request` naming the allowed
+            buckets.
           schema:
             allOf:
               - $ref: "#/components/schemas/HashrateBucket"
@@ -604,7 +610,9 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
     UpstreamUnavailable:
-      description: Required pool or node data source is unavailable.
+      description: >
+        Required pool or node data source is unavailable, or the read exceeded
+        its statement deadline (error code `read_timeout`).
       content:
         application/json:
           schema:
@@ -1967,6 +1975,7 @@ components:
             - rate_limited
             - internal_error
             - upstream_unavailable
+            - read_timeout
         message:
           type: string
         request_id:

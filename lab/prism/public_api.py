@@ -43,6 +43,21 @@ HASHRATE_SERIES_RANGE_SECONDS = {
     "6m": 180 * 86400,
     "all": None,
 }
+# The bucket vocabulary each range may request. Chart resolution is a product
+# choice, but request cost is not: the ledger scan and the response both grow
+# with range/bucket, and the widest combinations (a 5m bucket over months of
+# history) exceed PRISM_PUBLIC_CACHE_MAX_RESPONSE_BYTES, so every such request
+# bypasses the response cache and re-scans -- an unbounded-cost endpoint any
+# stranger can hit. The static vocabulary closes that: coarse ranges admit only
+# buckets whose point counts stay dashboard-sized, and auto_bucket() always
+# resolves inside these sets, so `bucket=auto` is never rejected. Shared by
+# every bucketed public series endpoint, not just the hashrate series.
+HASHRATE_SERIES_ALLOWED_BUCKETS: dict[str, frozenset[str]] = {
+    "1w": frozenset({"5m", "1h", "1d"}),
+    "1m": frozenset({"1h", "1d"}),
+    "6m": frozenset({"1d"}),
+    "all": frozenset({"1d"}),
+}
 DEFAULT_HASHRATE_SMOOTHING_SECONDS = 30 * 60
 
 PUBLIC_ERROR_CODES = {
@@ -61,6 +76,13 @@ PUBLIC_ERROR_CODES = {
     # stale_read_model for the same reason: from a client's side the two are
     # one condition.
     "replica_unavailable": "upstream_unavailable",
+    # A public origin computation hit its per-request statement deadline
+    # (PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS) before the ledger
+    # answered. Its own wire code rather than upstream_unavailable: the
+    # database is reachable, this particular read was too expensive, and a
+    # retry a moment later can succeed off the cache -- which is not what
+    # upstream_unavailable tells a client.
+    "read_timeout": "read_timeout",
 }
 
 
@@ -127,32 +149,73 @@ class PublicResponseCache:
         key: tuple[str, tuple[tuple[str, tuple[str, ...]], ...]],
         ttl_seconds: int,
         compute: Callable[[], tuple[int, object]],
+        stale_while_revalidate_seconds: int = 0,
     ) -> tuple[int, object, str, int]:
         if ttl_seconds <= 0:
             status, payload = compute()
             return status, payload, "BYPASS", 0
 
         now = time.monotonic()
+        stale_result: tuple[int, object, str, int] | None = None
+        refresh: _PublicInflight | None = None
         with self._lock:
             entry = self._entries.get(key)
             if entry is not None:
                 if entry.expires_at > now:
                     self._entries.move_to_end(key)
                     return entry.status, entry.payload, "HIT", max(0, int(now - entry.stored_at))
-                # Expired: drop the stale slot so it cannot count toward the bound.
-                del self._entries[key]
-            inflight = self._inflight.get(key)
-            if inflight is None:
-                inflight = _PublicInflight(event=threading.Event())
-                self._inflight[key] = inflight
-                owner = True
-            else:
-                owner = False
+                if (
+                    stale_while_revalidate_seconds > 0
+                    and now <= entry.expires_at + stale_while_revalidate_seconds
+                ):
+                    # Inside the stale-while-revalidate window the expired
+                    # entry is served immediately -- with its honest age --
+                    # instead of blocking this requester on a recompute that
+                    # can take seconds. The entry stays in place: it remains
+                    # the answer for the rest of the window, including when
+                    # the refresh below fails. At most one background refresh
+                    # runs per key, deduped through the same inflight map that
+                    # coalesces blocking misses, so a stampede of stale hits
+                    # costs one origin call.
+                    self._entries.move_to_end(key)
+                    stale_result = (
+                        entry.status,
+                        entry.payload,
+                        "STALE",
+                        max(0, int(now - entry.stored_at)),
+                    )
+                    if key not in self._inflight:
+                        refresh = _PublicInflight(event=threading.Event())
+                        self._inflight[key] = refresh
+                else:
+                    # Expired past any revalidation window: drop the stale
+                    # slot so it cannot count toward the bound.
+                    del self._entries[key]
+            if stale_result is None:
+                inflight = self._inflight.get(key)
+                if inflight is None:
+                    inflight = _PublicInflight(event=threading.Event())
+                    self._inflight[key] = inflight
+                    owner = True
+                else:
+                    owner = False
+
+        if stale_result is not None:
+            if refresh is not None:
+                threading.Thread(
+                    target=self._refresh_entry,
+                    args=(key, ttl_seconds, compute, refresh),
+                    name="prism-public-cache-refresh",
+                    daemon=True,
+                ).start()
+            return stale_result
 
         if not owner:
             # Coalesce onto the owner's single origin call. Reuse its result even
             # when it was not cacheable (BYPASS), and re-raise its exception, so
-            # waiters never re-run an expensive or failing compute().
+            # waiters never re-run an expensive or failing compute(). The owner
+            # may be a background refresh whose stale entry has since aged past
+            # the revalidation window; waiting for it is the same bargain.
             inflight.event.wait()
             if inflight.exception is not None:
                 raise inflight.exception
@@ -164,27 +227,7 @@ class PublicResponseCache:
         try:
             status, payload = compute()
             if 200 <= status < 300 and cacheable_payload_size(payload):
-                now = time.monotonic()
-                with self._lock:
-                    self._entries[key] = _PublicCacheEntry(
-                        status=status,
-                        payload=payload,
-                        stored_at=now,
-                        expires_at=now + ttl_seconds,
-                    )
-                    self._entries.move_to_end(key)
-                    max_entries = public_cache_max_entries()
-                    if len(self._entries) > max_entries:
-                        # Reap expired entries before LRU eviction so dead slots
-                        # never push out still-fresh keys.
-                        for stale_key in [
-                            stored_key
-                            for stored_key, stored in self._entries.items()
-                            if stored_key != key and stored.expires_at <= now
-                        ]:
-                            del self._entries[stale_key]
-                    while len(self._entries) > max_entries:
-                        self._entries.popitem(last=False)
+                self._store_entry(key, status=status, payload=payload, ttl_seconds=ttl_seconds)
                 inflight.result = (status, payload, "MISS", 0)
             else:
                 inflight.result = (status, payload, "BYPASS", 0)
@@ -192,6 +235,68 @@ class PublicResponseCache:
         except BaseException as exc:
             inflight.exception = exc
             raise
+        finally:
+            with self._lock:
+                self._inflight.pop(key, None)
+            inflight.event.set()
+
+    def _store_entry(
+        self,
+        key: tuple[str, tuple[tuple[str, tuple[str, ...]], ...]],
+        *,
+        status: int,
+        payload: object,
+        ttl_seconds: int,
+    ) -> None:
+        now = time.monotonic()
+        with self._lock:
+            self._entries[key] = _PublicCacheEntry(
+                status=status,
+                payload=payload,
+                stored_at=now,
+                expires_at=now + ttl_seconds,
+            )
+            self._entries.move_to_end(key)
+            max_entries = public_cache_max_entries()
+            if len(self._entries) > max_entries:
+                # Reap expired entries before LRU eviction so dead slots
+                # never push out still-fresh keys.
+                for stale_key in [
+                    stored_key
+                    for stored_key, stored in self._entries.items()
+                    if stored_key != key and stored.expires_at <= now
+                ]:
+                    del self._entries[stale_key]
+            while len(self._entries) > max_entries:
+                self._entries.popitem(last=False)
+
+    def _refresh_entry(
+        self,
+        key: tuple[str, tuple[tuple[str, tuple[str, ...]], ...]],
+        ttl_seconds: int,
+        compute: Callable[[], tuple[int, object]],
+        inflight: _PublicInflight,
+    ) -> None:
+        """Recompute one stale-served key off the request thread.
+
+        The same compute through the same status/size gates as a blocking
+        miss. Success replaces the entry; a failure or a non-cacheable result
+        leaves the stale entry exactly where it was -- still servable until
+        its revalidation window ends -- and the finally clause frees the
+        inflight slot either way, so a later stale hit can retry. A blocking
+        request that arrives beyond the window while this runs coalesces onto
+        it through the inflight map, exactly as it would onto a foreground
+        owner; the recorded result and exception exist for those waiters.
+        """
+        try:
+            status, payload = compute()
+            if 200 <= status < 300 and cacheable_payload_size(payload):
+                self._store_entry(key, status=status, payload=payload, ttl_seconds=ttl_seconds)
+                inflight.result = (status, payload, "MISS", 0)
+            else:
+                inflight.result = (status, payload, "BYPASS", 0)
+        except BaseException as exc:
+            inflight.exception = exc
         finally:
             with self._lock:
                 self._inflight.pop(key, None)
@@ -578,6 +683,7 @@ def hashrate_series(
         bucket = auto_bucket(range_id)
     if bucket not in {"5m", "1h", "1d"}:
         raise PublicApiError(400, "invalid_bucket", "bucket must be one of auto, 5m, 1h, 1d")
+    allowed_hashrate_bucket(range_id, bucket)
     if subject == "pool":
         subject_type = "pool"
         subject_id = None
@@ -1591,6 +1697,27 @@ def auto_bucket(range_id: str) -> str:
     if range_id == "1m":
         return "1h"
     return "1d"
+
+
+def allowed_hashrate_bucket(range_id: str, bucket: str) -> None:
+    """Reject a bucket outside the range's static vocabulary.
+
+    Called after auto resolution, so ``bucket`` is always concrete; auto
+    resolves inside every allowed set and can never be rejected here. A range
+    absent from HASHRATE_SERIES_ALLOWED_BUCKETS passes -- range validity is
+    the caller's own check, and this helper must stay reusable by every
+    bucketed public series endpoint, so it speaks only of buckets and ranges.
+    """
+    allowed = HASHRATE_SERIES_ALLOWED_BUCKETS.get(range_id)
+    if allowed is None or bucket in allowed:
+        return
+    ordered = sorted(allowed, key=HASHRATE_SERIES_BUCKET_SECONDS.__getitem__)
+    raise PublicApiError(
+        400,
+        "invalid_bucket",
+        f"bucket {bucket} is not allowed for range {range_id}; "
+        f"allowed: {', '.join(ordered)}",
+    )
 
 
 def qbit_gbt_rules(chain: str) -> list[str]:

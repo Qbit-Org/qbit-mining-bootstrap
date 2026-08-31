@@ -84,12 +84,26 @@ accordingly or the origin cache will deliberately skip oversized responses.
 
 The public read service also keeps a small in-process origin cache keyed by
 normalized path and query string, and coalesces concurrent misses for the same
-key. Error responses use `Cache-Control: no-store` and are not cached by that
-origin cache.
+key. The `stale-while-revalidate` window applies in-process too, not only at
+CDNs: an entry that has expired inside the window is served immediately with
+its honest `Age` while a single background refresh recomputes it. Concurrent
+stale hits share that one refresh, and a failed refresh keeps the stale entry
+servable until the window ends. The in-process window is clamped so a
+stale-served `Age` never exceeds the route's staleness budget (below); past
+the window the next request blocks and recomputes as before. Error responses
+use `Cache-Control: no-store` and are not cached by that origin cache.
 Miner pages additionally share one briefly cached pool-wide reward-window
 aggregate (`PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS`, default 30 seconds, 0
 disables), so requests for different miners reuse a single recursive
 reward-window scan instead of each re-running it.
+
+Database-backed origin computations run under a per-request statement deadline
+(`PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS`, default 20 seconds, `0`
+disables). A read that exceeds it is cancelled server-side, frees its bounded
+read slot instead of running to completion for a client that has long since
+hung up, and returns `503` with error code `read_timeout` and `Cache-Control:
+no-store`. The refusal is never cached, so the next request — or a
+stale-while-revalidate refresh — retries the origin.
 
 ## Staleness
 
@@ -223,6 +237,13 @@ of the origin cache key, so the two views never share a cached response.
 smoothing window those coarse buckets report `smoothing.method=none`, so raw
 and smoothed are identical. Dashboards that need to expose short bursts and
 their 30m trailing context should explicitly request `bucket=5m`.
+
+Each range admits a fixed set of buckets: `1w` allows `5m`, `1h`, and `1d`;
+`1m` allows `1h` and `1d`; `6m` and `all` allow only `1d`. `bucket=auto`
+always resolves inside the allowed set. A combination outside that vocabulary
+— an unbounded-cost request such as `range=all&bucket=5m`, whose response
+would outgrow the cache size cap and re-scan the ledger on every request — is
+rejected with `400 bad_request` naming the allowed buckets.
 
 ## Blocks and Reorg Visibility
 
