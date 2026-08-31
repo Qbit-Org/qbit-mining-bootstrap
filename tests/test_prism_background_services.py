@@ -817,5 +817,152 @@ class CoordinatorBackgroundServiceIntegrationTests(unittest.TestCase):
         )
 
 
+class ScriptedStopEvent:
+    """Stop signal whose transitions the test scripts explicitly."""
+
+    def __init__(self) -> None:
+        self.stopped = False
+        self.waits: list[float] = []
+
+    def is_set(self) -> bool:
+        return self.stopped
+
+    def wait(self, timeout: float) -> bool:
+        self.waits.append(timeout)
+        return self.stopped
+
+
+class ScriptedRollupLedger:
+    """Rollup-capable ledger stub yielding one scripted result per pass."""
+
+    def __init__(self, results: list[object], *, on_exhausted=None) -> None:
+        self.results = list(results)
+        self.calls: list[int] = []
+        self.on_exhausted = on_exhausted
+
+    def advance_hashrate_rollups(self, *, batch_limit: int) -> dict[str, object]:
+        self.calls.append(batch_limit)
+        result = self.results.pop(0)
+        if not self.results and self.on_exhausted is not None:
+            self.on_exhausted()
+        if isinstance(result, BaseException):
+            raise result
+        return result  # type: ignore[return-value]
+
+
+class HashrateRollupMaintenanceServiceTests(unittest.TestCase):
+    @staticmethod
+    def rollup_coordinator(ledger: object) -> PrismCoordinator:
+        server = PrismCoordinator.__new__(PrismCoordinator)
+        server.blockwait_enabled = False
+        server.vardiff_idle_sweep_seconds = 0.0
+        server.stratum_initial_job_timeout_seconds = 0.0
+        server.ctv_broadcaster_enabled = False
+        server.watchdog_enabled = False
+        server.audit_bind = None
+        server.audit_port = 0
+        server.ledger = ledger
+        server.hashrate_rollup_enabled = True
+        server.hashrate_rollup_interval_seconds = 15.0
+        server.hashrate_rollup_batch_shares = 50000
+        return server
+
+    def test_rollup_service_registers_only_for_rollup_capable_ledgers(self) -> None:
+        # The capability conditional is the one intentional exception to the
+        # registered-unconditionally rule: a memory ledger never grows
+        # advance_hashrate_rollups at runtime, so the service either exists
+        # for the life of the process or never will.
+        capable = self.rollup_coordinator(ScriptedRollupLedger([]))
+        registry = capable._make_background_service_registry()
+        self.assertIn("hashrate-rollup-maintenance", registry.service_names())
+        service = registry.snapshot("hashrate-rollup-maintenance").specification
+        self.assertEqual(
+            (service.thread_name, service.join_timeout, service.watchdog_monitored),
+            ("prism-hashrate-rollup-maintenance", 1.0, False),
+        )
+
+        memory_backed = self.rollup_coordinator(SimpleNamespace())
+        self.assertNotIn(
+            "hashrate-rollup-maintenance",
+            memory_backed._make_background_service_registry().service_names(),
+        )
+
+    def test_rollup_start_honours_enable_flag_and_ledger_capability(self) -> None:
+        started = self.rollup_coordinator(ScriptedRollupLedger([]))
+        started._heartbeats = {}
+        started._watchdog_pauses = {}
+        started._heartbeats_lock = threading.Lock()
+        started._background_services = BackgroundServiceRegistry(
+            [specification("hashrate-rollup-maintenance")],
+            thread_factory=DormantThread,  # type: ignore[arg-type]
+        )
+        with patch("builtins.print"):
+            started._start_hashrate_rollup_maintenance_if_enabled()
+        self.assertTrue(
+            started._background_services.snapshot("hashrate-rollup-maintenance").started
+        )
+
+        disabled = self.rollup_coordinator(ScriptedRollupLedger([]))
+        disabled.hashrate_rollup_enabled = False
+        disabled._background_services = BackgroundServiceRegistry(
+            [specification("hashrate-rollup-maintenance")],
+            thread_factory=DormantThread,  # type: ignore[arg-type]
+        )
+        disabled._start_hashrate_rollup_maintenance_if_enabled()
+        self.assertFalse(
+            disabled._background_services.snapshot("hashrate-rollup-maintenance").started
+        )
+
+        # A memory-backed coordinator has no registered service to start, so
+        # the guard must return before asking the registry for the name.
+        memory_backed = self.rollup_coordinator(SimpleNamespace())
+        memory_backed._background_services = BackgroundServiceRegistry([])
+        memory_backed._start_hashrate_rollup_maintenance_if_enabled()
+
+    def test_rollup_loop_drains_backlog_then_sleeps_the_interval(self) -> None:
+        # Catch-up looping is the backfill mechanism: while the ledger
+        # reports more history behind the watermark the loop advances again
+        # immediately, and only a caught-up pass reaches the interval wait.
+        stop = ScriptedStopEvent()
+        ledger = ScriptedRollupLedger(
+            [
+                {"scanned": 3, "last_share_seq": 3, "caught_up": False},
+                {"scanned": 3, "last_share_seq": 6, "caught_up": False},
+                {"scanned": 2, "last_share_seq": 8, "caught_up": True},
+            ],
+            on_exhausted=lambda: setattr(stop, "stopped", True),
+        )
+        server = self.rollup_coordinator(ledger)
+        server.stop_event = stop  # type: ignore[assignment]
+        server.hashrate_rollup_batch_shares = 3
+
+        with patch("builtins.print"):
+            server.hashrate_rollup_maintenance_loop()
+
+        self.assertEqual(ledger.calls, [3, 3, 3])
+        self.assertEqual(stop.waits, [15.0])
+
+    def test_rollup_loop_logs_the_error_and_retries_next_interval(self) -> None:
+        stop = ScriptedStopEvent()
+        ledger = ScriptedRollupLedger(
+            [
+                RuntimeError("rollup pass failed"),
+                {"scanned": 0, "last_share_seq": 8, "caught_up": True},
+            ],
+            on_exhausted=lambda: setattr(stop, "stopped", True),
+        )
+        server = self.rollup_coordinator(ledger)
+        server.stop_event = stop  # type: ignore[assignment]
+
+        with patch("builtins.print"), patch("traceback.print_exc") as print_exc:
+            server.hashrate_rollup_maintenance_loop()
+
+        # The failed pass reaches the interval wait instead of hot-looping,
+        # then the next pass succeeds and the scripted stop ends the loop.
+        self.assertEqual(ledger.calls, [50000, 50000])
+        self.assertEqual(stop.waits, [15.0, 15.0])
+        self.assertEqual(print_exc.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
