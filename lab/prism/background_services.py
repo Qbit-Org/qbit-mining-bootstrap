@@ -37,6 +37,23 @@ from lab.prism.share_ledger import (
     WRITER_LEASE_VERIFICATION_MAX_STATEMENTS,
     WriterLeaseRenewalDeferred,
 )
+from lab.prism.writer_lease_timing import (
+    WRITER_LEASE_HEARTBEAT_SCHEDULER_SLACK_SECONDS,
+    LEASE_HEARTBEAT_MODE_FENCE,
+    LEASE_HEARTBEAT_MODE_PROOF,
+    LEASE_HEARTBEAT_MODE_RENEW,
+    LEASE_HEARTBEAT_MODES,
+    LEASE_HEARTBEAT_OUTCOME_DEFERRED,
+    LEASE_HEARTBEAT_OUTCOME_FAILED,
+    LEASE_HEARTBEAT_OUTCOME_PROVEN,
+    LEASE_HEARTBEAT_OUTCOME_RENEWAL_DUE,
+    LEASE_HEARTBEAT_OUTCOME_RENEWED,
+    LEASE_HEARTBEAT_OUTCOMES,
+    UNATTRIBUTED_PHASES,
+    WriterLeaseHeartbeatPolicy,
+    WriterLeaseVerificationAttempt,
+    WriterLeaseVerificationPhases,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -508,6 +525,61 @@ def guard_session_verifier(ledger: object) -> Callable[..., object] | None:
     return getattr(ledger, "renew_writer_lease_heartbeat", None)
 
 
+def guard_session_prover(ledger: object) -> Callable[..., object] | None:
+    """Return the cheap read-only ownership proof for ``ledger``, if any.
+
+    ``prove_writer_lease_guard_session`` answers only "does this backend
+    still hold the advisory guard, and does the committed lease row still
+    name this exact session?" on one non-blocking statement.  It is the
+    frequent half of the issue #212 split: the heartbeat needs ownership
+    several times per adoption-silence window, but the lease TTL only needs
+    a writer-side refresh well before it lapses, and paying for renewal
+    (a ``SKIP LOCKED`` row lock, a ``pg_stat_activity`` locker attribution,
+    and sometimes a second statement) on every beat is what pushed the
+    frequent statement toward the guard's 500ms statement timeout during a
+    rapid-block burst.
+
+    A ledger that does not offer it — an embedder's, or a test fake —
+    simply keeps running the full verification on every beat, which is the
+    behavior that predates the split.
+    """
+    return getattr(ledger, "prove_writer_lease_guard_session", None)
+
+
+def verifier_callbacks(verify: Callable[..., object]) -> frozenset[str]:
+    """Which progress callbacks ``verify`` accepts.
+
+    Resolved once per loop rather than per beat: a ledger's verification
+    signature cannot change under a running heartbeat, and
+    ``inspect.signature`` is far too expensive for a 0.25s cadence.
+    """
+    try:
+        parameters = inspect.signature(verify).parameters
+    except (TypeError, ValueError):
+        return frozenset()
+    return frozenset(
+        name
+        for name in (
+            "on_query_start",
+            "on_statement_progress",
+            "on_statement_end",
+        )
+        if name in parameters
+    )
+
+
+def _default_monotonic() -> float:
+    """Read ``time.monotonic`` at call time, not at class-definition time.
+
+    The lease lifecycle's documented test seam is patching ``monotonic`` on
+    the shared ``time`` module object. A dataclass default captured when this
+    module is imported would keep reading the real clock behind such a patch,
+    which is exactly the kind of silent divergence between test and
+    production that the phase attribution exists to prevent.
+    """
+    return time.monotonic()
+
+
 @dataclass(frozen=True)
 class LedgerLeaseHeartbeatPorts:
     """Call-time-resolved coordinator seams for the lease heartbeat owner.
@@ -531,6 +603,20 @@ class LedgerLeaseHeartbeatPorts:
     watchdog_hard_exit: Callable[..., None]
     heartbeat_loop: Callable[[], None]
     monitor_loop: Callable[[], None]
+    # Every interval this service measures about itself reads this clock, so
+    # a deterministic test can drive the whole envelope — idle waits, phase
+    # attribution, staleness, the monitor's own lateness — by advancing a
+    # virtual clock instead of sleeping and hoping. Production passes
+    # nothing and gets time.monotonic.
+    monotonic: Callable[[], float] = _default_monotonic
+    # The process-side scheduling allowance, resolved like every other
+    # timing term rather than read from a module constant: it appears on
+    # both sides of the safety inequality (the heartbeat's stamping path
+    # and the monitor's own poll), so a deployment or a scaled-down test
+    # that changes it must change what the policy validates.
+    scheduler_slack_seconds: Callable[[], float] = (
+        lambda: WRITER_LEASE_HEARTBEAT_SCHEDULER_SLACK_SECONDS
+    )
 
 
 class LedgerLeaseHeartbeatService:
@@ -559,6 +645,21 @@ class LedgerLeaseHeartbeatService:
         self.exit_thread: threading.Thread | None = None
         self.failure_reason: str | None = None
         self.failure_has_traceback = False
+        # Phase attribution (issue #212). Written by whichever thread ran the
+        # attempt and published as one immutable snapshot, so the monitor can
+        # quote the last attempt in a hard-exit reason without locking.
+        self.last_phases: WriterLeaseVerificationPhases = UNATTRIBUTED_PHASES
+        self.worst_phases: WriterLeaseVerificationPhases = UNATTRIBUTED_PHASES
+        self.attempt_counts: dict[str, int] = {
+            mode: 0 for mode in LEASE_HEARTBEAT_MODES
+        }
+        self.outcome_counts: dict[str, int] = {
+            outcome: 0 for outcome in LEASE_HEARTBEAT_OUTCOMES
+        }
+        # The monitor's own lateness. It decides the hard exit, so a stalled
+        # monitor thread consumes envelope exactly like a stalled heartbeat
+        # thread and must be attributable separately from database latency.
+        self.monitor_wake_delay_seconds = 0.0
 
     def record_success(self, renewal_started_monotonic: float) -> None:
         """Advance the conservative freshness edge without regression."""
@@ -569,6 +670,18 @@ class LedgerLeaseHeartbeatService:
                 or renewal_started_monotonic > last_success
             ):
                 self.last_success_monotonic = renewal_started_monotonic
+
+    def record_phases(self, phases: WriterLeaseVerificationPhases) -> None:
+        """Publish one attempt's phase breakdown for exits and metrics."""
+        self.last_phases = phases
+        if phases.total_seconds >= self.worst_phases.total_seconds:
+            self.worst_phases = phases
+        counts = self.attempt_counts
+        if phases.mode in counts:
+            counts[phases.mode] += 1
+        outcomes = self.outcome_counts
+        if phases.outcome in outcomes:
+            outcomes[phases.outcome] += 1
 
     def record_progress(self) -> None:
         """Stamp mid-verification progress for the staleness monitor only.
@@ -583,9 +696,12 @@ class LedgerLeaseHeartbeatService:
         is not mistaken for a wedged heartbeat while a genuinely stuck
         statement still ages toward the failure budget unimpeded.
         """
-        self.last_progress_monotonic = time.monotonic()
+        self.last_progress_monotonic = self._ports.monotonic()
 
-    def record_server_proven(self) -> None:
+    def record_server_proven(
+        self,
+        proven_monotonic: float | None = None,
+    ) -> None:
         """Stamp a completed server round trip: progress plus the envelope edge.
 
         Client-side progress marks (attempt start, query-slot acquisition)
@@ -597,10 +713,29 @@ class LedgerLeaseHeartbeatService:
         completed statement round trip or a whole verification — proves
         the session was alive approximately now, so only these sites stamp
         the server-proven edge the monitor's envelope cap measures from.
+
+        ``proven_monotonic`` is the *send* edge of the statement whose
+        response just arrived: a response proves the session was alive at
+        some instant between the statement leaving this process and the
+        answer arriving, and the conservative end of that interval is when
+        it left. Stamping receipt time instead would let scheduler delay
+        between the response and this call make the session look fresher
+        than PostgreSQL proved, spending adoption envelope that the exit
+        ordering argument budgets for the monitor's own poll. Omitting the
+        argument keeps the old receipt-time behavior for callers that
+        cannot observe the send edge.
+
+        The stamp never regresses: the heartbeat and a concurrent external
+        fence both publish here, and an older send edge arriving second
+        must not undo a newer proof.
         """
-        now = time.monotonic()
+        now = self._ports.monotonic()
         self.last_progress_monotonic = now
-        self.last_server_proven_monotonic = now
+        proven = now if proven_monotonic is None else float(proven_monotonic)
+        with self.freshness_lock:
+            last_proven = self.last_server_proven_monotonic
+            if last_proven is None or proven > last_proven:
+                self.last_server_proven_monotonic = proven
 
     def adoption_silence_seconds(self) -> float:
         """Resolve the ledger's adoption-silence window for timing checks.
@@ -638,14 +773,78 @@ class LedgerLeaseHeartbeatService:
         last_success = float(
             self.last_success_monotonic
             if self.last_success_monotonic is not None
-            else time.monotonic()
+            else self._ports.monotonic()
         )
         last_progress = float(
             self.last_progress_monotonic
             if self.last_progress_monotonic is not None
             else last_success
         )
-        return max(0.0, time.monotonic() - max(last_success, last_progress))
+        return max(0.0, self._ports.monotonic() - max(last_success, last_progress))
+
+    def server_proven_age_seconds(self) -> float:
+        """Age of the newest completed guard round trip.
+
+        The envelope edge: unlike the client-side activity marks this can
+        never postdate a silent guard-session death, so it is what the
+        monitor's adoption cap measures from.
+        """
+        last_server_proven = float(
+            self.last_server_proven_monotonic
+            if self.last_server_proven_monotonic is not None
+            else self._ports.monotonic()
+        )
+        return max(0.0, self._ports.monotonic() - last_server_proven)
+
+    def policy(self) -> WriterLeaseHeartbeatPolicy:
+        """Resolve the five coupled timings as one validated policy.
+
+        Built from live ports and the ledger's own adoption silence, so an
+        operator override reaches the same inequality the compiled defaults
+        satisfy rather than being compared against a stale constant.
+        """
+        return WriterLeaseHeartbeatPolicy(
+            adoption_silence_seconds=self.adoption_silence_seconds(),
+            heartbeat_interval_seconds=float(self._ports.heartbeat_seconds()),
+            failure_budget_seconds=float(self._ports.failure_seconds()),
+            monitor_interval_seconds=float(self._ports.monitor_seconds()),
+            exit_margin_seconds=float(self._ports.exit_timeout_seconds()),
+            scheduler_slack_seconds=float(
+                self._ports.scheduler_slack_seconds()
+            ),
+        )
+
+    def snapshot(self) -> dict[str, object]:
+        """Read-only heartbeat attribution for the metrics surface.
+
+        Every key is fixed and every nested map has a fixed key set, so the
+        rendered metric cardinality cannot grow with traffic.
+        """
+        policy = self.policy()
+        last = self.last_phases
+        worst = self.worst_phases
+        thread = self.thread
+        return {
+            "running": bool(thread is not None and thread.is_alive()),
+            "activity_age_seconds": self.activity_age_seconds(),
+            "server_proven_age_seconds": self.server_proven_age_seconds(),
+            "monitor_wake_delay_seconds": self.monitor_wake_delay_seconds,
+            "attempts": dict(self.attempt_counts),
+            "outcomes": dict(self.outcome_counts),
+            "last_phase_seconds": last.phase_seconds(),
+            "worst_phase_seconds": worst.phase_seconds(),
+            "last_statement_count": last.statement_count,
+            "policy_seconds": {
+                "adoption_silence": policy.adoption_silence_seconds,
+                "heartbeat_interval": policy.heartbeat_interval_seconds,
+                "failure_budget": policy.failure_budget_seconds,
+                "monitor_interval": policy.monitor_interval_seconds,
+                "exit_margin": policy.exit_margin_seconds,
+                "server_proven_cap": policy.server_proven_cap_seconds,
+                "max_healthy_server_gap": policy.max_healthy_server_gap_seconds,
+                "stability_surplus": policy.stability_surplus_seconds,
+            },
+        }
 
     def start(self) -> threading.Thread | None:
         """Arm both coupled threads and wait for the first liveness proof."""
@@ -683,7 +882,38 @@ class LedgerLeaseHeartbeatService:
                     include_traceback=False,
                 )
             return None
-        armed_started_monotonic = time.monotonic()
+        # One validated policy, resolved before anything is armed. An unsafe
+        # combination is refused outright rather than warned about and run:
+        # the whole content of a violation is "this process may still be
+        # live when a replacement adopts the lease", which is the split-brain
+        # the guard exists to prevent, and running anyway trades a loud
+        # startup failure for a silent double-writer window. Refusing here —
+        # before the threads exist and before serve() admits a writer — is
+        # the fail-closed reading.
+        policy = self.policy()
+        violations = policy.violations()
+        if violations:
+            self._ports.lease_hard_exit(
+                "prism coordinator: refusing to start the ledger lease "
+                "heartbeat; its timing policy cannot guarantee hard exit "
+                "before replacement adoption ("
+                + "; ".join(violations)
+                + f"). Policy: {policy.describe()}",
+                include_traceback=False,
+            )
+            return None
+        for advisory in policy.advisories():
+            # Safe but unstable: no double-writer window, but ordinary
+            # verification tail latency will hard-exit a healthy
+            # coordinator. A lab or test policy is allowed to make that
+            # trade deliberately, so this stays a warning.
+            print(
+                "prism coordinator: ledger lease heartbeat timing has no "
+                f"tail-latency headroom: {advisory}. Policy: "
+                f"{policy.describe()}",
+                flush=True,
+            )
+        armed_started_monotonic = self._ports.monotonic()
         self.last_success_monotonic = armed_started_monotonic
         self.last_server_proven_monotonic = armed_started_monotonic
         self.failed = threading.Event()
@@ -703,33 +933,7 @@ class LedgerLeaseHeartbeatService:
         )
         monitor_thread.start()
         self.monitor_thread = monitor_thread
-        failure_seconds = float(self._ports.failure_seconds())
-        interval_seconds = float(self._ports.heartbeat_seconds())
-        silence_seconds = self.adoption_silence_seconds()
-        monitor_seconds = float(self._ports.monitor_seconds())
-        exit_seconds = float(self._ports.exit_timeout_seconds())
-        if (
-            failure_seconds <= interval_seconds
-            or silence_seconds
-            <= failure_seconds + exit_seconds + 2.0 * monitor_seconds
-        ):
-            # The hard-exit ordering argument needs interval < budget (one
-            # idle wait must not exhaust the budget) and enough headroom
-            # between the budget and the adoption silence for the monitor's
-            # server-proven envelope cap to fit its poll and exit costs
-            # (this process must be gone before a replacement may CAS).
-            # The derived defaults satisfy both; only operator overrides
-            # can break them, so warn rather than refuse.
-            print(
-                "prism coordinator: ledger lease heartbeat timing is "
-                f"misconfigured: failure budget {failure_seconds:g}s must "
-                f"exceed the heartbeat interval {interval_seconds:g}s and "
-                f"leave the adoption silence {silence_seconds:g}s at least "
-                f"{exit_seconds + 2.0 * monitor_seconds:g}s of envelope "
-                "headroom; continuing, but hard-exit is no longer "
-                "guaranteed to precede replacement adoption",
-                flush=True,
-            )
+        failure_seconds = policy.failure_budget_seconds
         # The startup fencing deadline measures silence from the newest
         # monitor-visible activity, not from arming: a first verification
         # that is legally slower than the whole budget end-to-end but
@@ -744,7 +948,8 @@ class LedgerLeaseHeartbeatService:
                 continue
             self._ports.lease_hard_exit(
                 "prism coordinator: initial ledger lease heartbeat did not "
-                "complete before startup fencing deadline",
+                "complete before startup fencing deadline "
+                f"({self.last_phases.summary()})",
                 include_traceback=False,
             )
             return None
@@ -777,6 +982,92 @@ class LedgerLeaseHeartbeatService:
             timeout_seconds=float(self._ports.exit_timeout_seconds()),
         )
 
+    def run_guard_attempt(
+        self,
+        call: Callable[..., object],
+        callbacks: frozenset[str],
+        mode: str,
+    ) -> object:
+        """Run one guarded call, attributing its phases, and publish them.
+
+        Every progress mark this installs feeds the same two clocks the
+        monitor reads, and the attempt object turns the same marks into the
+        phase breakdown an operator needs to see in the exit reason:
+        queue wait for the guard's serialized slot, guard SQL across the
+        round trips, and the residual — Python scheduling and GIL
+        contention — that neither of those explains.
+
+        Progress marks feed only the staleness monitor; authority freshness
+        still moves exclusively on the conservative success edge the caller
+        records. The attempt-start and slot-acquisition marks are
+        client-side and can postdate a silent guard-session death by at
+        most one idle interval, so they carry only the liveness budget. The
+        adoption envelope is enforced separately by the monitor's
+        server-proven cap, which measures from completed round trips at
+        their conservative send edge. During any hang the external-effect
+        fence also queues behind the hung statement and fails closed, so no
+        new external effect authorizes while the monitor ages out.
+
+        Raises whatever the guarded call raises, after publishing the
+        phases of the failed attempt — the exit reason is built from them.
+        """
+        attempt = WriterLeaseVerificationAttempt(
+            mode,
+            monotonic=self._ports.monotonic,
+        )
+
+        def on_query_start() -> None:
+            attempt.slot_acquired()
+            self.record_progress()
+
+        def on_statement_end() -> None:
+            self.record_server_proven(attempt.statement_completed())
+
+        kwargs: dict[str, Callable[[], None]] = {}
+        if "on_query_start" in callbacks:
+            kwargs["on_query_start"] = on_query_start
+        if "on_statement_end" in callbacks:
+            kwargs["on_statement_end"] = on_statement_end
+        elif "on_statement_progress" in callbacks:
+            # The legacy spelling: fires only between a verification's two
+            # statements, which is enough to keep a lawful attribution
+            # recheck from looking wedged but carries no phase timing.
+            kwargs["on_statement_progress"] = self.record_server_proven
+        try:
+            result = call(**kwargs)
+        except BaseException:
+            self.record_phases(attempt.finish(LEASE_HEARTBEAT_OUTCOME_FAILED))
+            raise
+        self.record_phases(attempt.finish(self._attempt_outcome(mode, result)))
+        # Completion is a real server response even when the call reported
+        # no per-statement marks; stamp the conservative edge so a verifier
+        # without callbacks still keeps the envelope fed.
+        self.record_server_proven(attempt.proven_edge_monotonic)
+        return result
+
+    @staticmethod
+    def _attempt_outcome(mode: str, result: object) -> str:
+        """Classify one guarded call for attribution and metrics."""
+        if not isinstance(result, dict):
+            return (
+                LEASE_HEARTBEAT_OUTCOME_PROVEN
+                if mode == LEASE_HEARTBEAT_MODE_PROOF
+                else LEASE_HEARTBEAT_OUTCOME_RENEWED
+            )
+        if mode == LEASE_HEARTBEAT_MODE_PROOF:
+            if result.get("lease_renewal_due"):
+                return LEASE_HEARTBEAT_OUTCOME_RENEWAL_DUE
+            return LEASE_HEARTBEAT_OUTCOME_PROVEN
+        if result.get("renewal_deferred_to_own_write"):
+            return LEASE_HEARTBEAT_OUTCOME_DEFERRED
+        try:
+            renewed = int(result.get("renewed_count", 0))
+        except (TypeError, ValueError):
+            renewed = 0
+        if renewed > 0:
+            return LEASE_HEARTBEAT_OUTCOME_RENEWED
+        return LEASE_HEARTBEAT_OUTCOME_PROVEN
+
     def heartbeat_loop(self) -> None:
         """Keep proving the guarded session live on an isolated DB path.
 
@@ -787,80 +1078,76 @@ class LedgerLeaseHeartbeatService:
         lease TTL whenever that tuple is uncontended, so an idle coordinator
         (no fenced writes, CTV broadcaster disabled) does not let
         ``lease_expires_at`` lapse into different-identity expiry claims.
+
+        Ownership and renewal run at different rates (issue #212). Each beat
+        asks the cheap read-only ownership question — one non-blocking
+        statement, no row lock and no ``pg_stat_activity`` scan — and the
+        full renewing verification runs on the first beat and thereafter
+        only on a beat whose proof reports the committed row inside the
+        own-write authority margin. That escalation happens on the *same*
+        beat, so renewal is never later than it was before the split, and
+        while renewals are actually being skipped (a long own fenced write)
+        every beat runs the same fail-closed verification it always did.
+        A ledger with no proof method keeps running the full verification
+        on every beat.
         """
         ledger = self._ports.ledger()
         verify = guard_session_verifier(ledger)
         if verify is None:
             return
+        prove = guard_session_prover(ledger)
+        verify_callbacks = verifier_callbacks(verify)
+        prove_callbacks = (
+            verifier_callbacks(prove) if prove is not None else frozenset()
+        )
         interval_seconds = float(self._ports.heartbeat_seconds())
         heartbeat_stop = self.stop_event
         if heartbeat_stop is None:
             heartbeat_stop = threading.Event()
             self.stop_event = heartbeat_stop
-        # The verification may lawfully run a second statement (the
-        # attribution recheck) whose duration the monitor's failure budget
-        # cannot absorb — that budget must stay under the adoption silence,
-        # so it is sized for one statement. A verification that reports
-        # per-statement progress lets the monitor count the completed first
-        # round trip instead of hard-exiting a healthy coordinator mid-way
-        # through a lawful recheck.
-        try:
-            verify_parameters = inspect.signature(verify).parameters
-        except (TypeError, ValueError):
-            verify_parameters = {}
-        verify_reports_query_start = "on_query_start" in verify_parameters
-        verify_reports_statement_progress = (
-            "on_statement_progress" in verify_parameters
-        )
+        # The first beat renews: startup readiness must prove the renewing
+        # path works, not merely that the session answers.
+        renew_this_beat = True
         while not heartbeat_stop.is_set():
-            verify_started_monotonic = time.monotonic()
-            # An advancing verification is monitor-visible activity. The
-            # failure budget is sized for one statement round trip, so the
-            # monitor must measure silence between demonstrable steps of a
-            # verification (attempt start, query-slot acquisition, statement
-            # progress, completion), never between success edges: those are
-            # call-start times, so back-to-back verifications that each
-            # lawfully approach the statement budget age the freshest edge
-            # by two call durations plus the idle interval and the monitor
-            # would hard-exit a healthy sole writer. Progress marks feed
-            # only the staleness monitor — authority freshness still moves
-            # exclusively on the conservative success edge below. The
-            # attempt-start and slot-acquisition marks are client-side and
-            # can postdate a silent guard-session death by at most one idle
-            # interval, so they carry only the liveness budget; the
-            # adoption envelope (hard exit before a replacement's silence
-            # window elapses) is enforced separately by the monitor's
-            # server-proven cap, which measures from completed round trips
-            # alone. During any such hang the external-effect fence also
-            # queues behind the hung statement and fails closed, so no new
-            # external effect authorizes while the monitor ages out.
+            beat_started_monotonic = self._ports.monotonic()
+            # An advancing verification is monitor-visible activity, and the
+            # attempt start is its first client-side mark.
             self.record_progress()
-            verify_kwargs: dict[str, Callable[[], None]] = {}
-            if verify_reports_query_start:
-                verify_kwargs["on_query_start"] = self.record_progress
-            if verify_reports_statement_progress:
-                verify_kwargs["on_statement_progress"] = (
-                    self.record_server_proven
-                )
             try:
-                verify(**verify_kwargs)
+                if prove is not None and not renew_this_beat:
+                    proof = self.run_guard_attempt(
+                        prove,
+                        prove_callbacks,
+                        LEASE_HEARTBEAT_MODE_PROOF,
+                    )
+                    renew_this_beat = not isinstance(proof, dict) or bool(
+                        proof.get("lease_renewal_due")
+                    )
+                if renew_this_beat or prove is None:
+                    self.record_progress()
+                    self.run_guard_attempt(
+                        verify,
+                        verify_callbacks,
+                        LEASE_HEARTBEAT_MODE_RENEW,
+                    )
+                    # A landed renewal (or a deferral behind this writer's
+                    # own in-flight write) puts the answer back in the
+                    # committed row: the next beat's proof re-reads it and
+                    # escalates again if renewal is still outstanding.
+                    renew_this_beat = False
             except Exception:
                 self._ports.lease_hard_exit(
                     "prism coordinator: ledger lease heartbeat failed; "
                     "hard-exiting so this process cannot outlive its "
-                    "fast-adoptable session",
+                    "fast-adoptable session "
+                    f"({self.last_phases.summary()})",
                     include_traceback=True,
                 )
                 return
-            # The session was proven live no earlier than call start. Using
-            # that conservative edge prevents a delayed response from making
-            # local freshness look newer than what PostgreSQL actually proved.
-            self.record_success(verify_started_monotonic)
-            # Completion is the newest demonstrable activity and a real
-            # server response; the monitor may observe it even though
-            # authority freshness stays pinned to the call-start edge
-            # recorded above.
-            self.record_server_proven()
+            # The session was proven live no earlier than the beat's start.
+            # Using that conservative edge prevents a delayed response from
+            # making local freshness look newer than what PostgreSQL proved.
+            self.record_success(beat_started_monotonic)
             ready = self.ready
             if ready is not None:
                 ready.set()
@@ -868,59 +1155,85 @@ class LedgerLeaseHeartbeatService:
                 return
 
     def monitor_loop(self) -> None:
-        failure_seconds = float(self._ports.failure_seconds())
-        monitor_seconds = float(self._ports.monitor_seconds())
+        # One resolved policy for the whole loop: the monitor's two bounds
+        # and the exit reason all quote the same inequality.
+        policy = self.policy()
+        failure_seconds = policy.failure_budget_seconds
+        monitor_seconds = policy.monitor_interval_seconds
         heartbeat_stop = self.stop_event
         if heartbeat_stop is None:
             heartbeat_stop = threading.Event()
             self.stop_event = heartbeat_stop
         # The adoption-envelope cap: the client-side progress marks that
         # keep a lawfully slow verification alive can postdate a silent
-        # guard-session death by up to one idle interval, which with the
-        # derived defaults (interval + budget = silence) would let the
-        # hard exit land at or after a replacement's CAS eligibility.
-        # Server-proven marks cannot postdate the death, so a second bound
-        # measured from them — sized to leave room for one monitor poll on
-        # each side plus the hard-exit budget inside the silence window —
-        # restores exit-before-adoption regardless of client marks. It is
-        # floored at the failure budget so a misconfigured (warned) tiny
+        # guard-session death by up to one idle interval, which with a
+        # silence sized at interval + budget would let the hard exit land
+        # at or after a replacement's CAS eligibility. Server-proven marks
+        # cannot postdate the death, so a second bound measured from them
+        # restores exit-before-adoption regardless of client marks. What
+        # the cap must leave free inside the silence is the whole exit
+        # envelope: the hard-exit budget, one poll of granularity, this
+        # thread's own budgeted lateness, and one further poll of strict
+        # reserve (see WriterLeaseHeartbeatPolicy.exit_envelope_seconds).
+        # Reserving only the poll intervals — as this did before the
+        # scheduler-slack term was added — lets a maximally late monitor
+        # begin the exit after the successor is already eligible. The cap
+        # is floored at the failure budget so a deliberately tiny (advised)
         # silence degrades to the plain liveness bound instead of killing
         # lawful single-statement verifications.
-        exit_seconds = float(self._ports.exit_timeout_seconds())
-        server_cap_seconds = max(
-            failure_seconds,
-            self.adoption_silence_seconds()
-            - exit_seconds
-            - 2.0 * monitor_seconds,
-        )
-        while not heartbeat_stop.wait(monitor_seconds):
-            # Mid-verification progress counts: the budget — sized for one
-            # statement so it stays under the adoption silence — cannot
-            # absorb a whole multi-step verification, and each demonstrable
-            # step (attempt start, slot acquisition, statement round trip,
-            # completion) is the advancing-heartbeat evidence this monitor
-            # watches for. A wedged statement records nothing and still
-            # ages out.
-            age_seconds = self.activity_age_seconds()
-            last_server_proven = float(
-                self.last_server_proven_monotonic
-                if self.last_server_proven_monotonic is not None
-                else time.monotonic()
-            )
-            server_age_seconds = max(
+        server_cap_seconds = policy.server_proven_cap_seconds
+        while True:
+            wait_started_monotonic = self._ports.monotonic()
+            if heartbeat_stop.wait(monitor_seconds):
+                return
+            # The monitor decides the hard exit, so its own lateness is
+            # spent envelope exactly like a slow statement is. Attributing
+            # it separately is what lets an operator tell "PostgreSQL was
+            # slow" from "this process could not get scheduled".
+            wake_delay = max(
                 0.0,
-                time.monotonic() - last_server_proven,
+                self._ports.monotonic() - wait_started_monotonic - monitor_seconds,
             )
+            if wake_delay > self.monitor_wake_delay_seconds:
+                self.monitor_wake_delay_seconds = wake_delay
+            # Mid-verification progress counts: the budget — sized for one
+            # statement plus one idle wait plus scheduler slack so it stays
+            # under the adoption silence — cannot absorb a whole multi-step
+            # verification, and each demonstrable step (attempt start, slot
+            # acquisition, statement round trip, completion) is the
+            # advancing-heartbeat evidence this monitor watches for. A
+            # wedged statement records nothing and still ages out.
+            age_seconds = self.activity_age_seconds()
+            server_age_seconds = self.server_proven_age_seconds()
             if (
                 age_seconds < failure_seconds
                 and server_age_seconds < server_cap_seconds
             ):
                 continue
+            # Name the bound that tripped and the phase that consumed it.
+            # Issue #212 was unresolvable in production precisely because
+            # the exit said only how stale the heartbeat was, never where
+            # the time went.
+            if age_seconds >= failure_seconds:
+                tripped = (
+                    f"activity {age_seconds:.3f}s >= failure budget "
+                    f"{failure_seconds:.3f}s"
+                )
+            else:
+                tripped = (
+                    f"server-proven {server_age_seconds:.3f}s >= adoption "
+                    f"envelope cap {server_cap_seconds:.3f}s"
+                )
             self._ports.lease_hard_exit(
                 "prism coordinator: ledger lease heartbeat stopped making "
                 f"progress for {age_seconds:.3f}s "
                 f"(server-proven {server_age_seconds:.3f}s); hard-exiting "
-                "before its session becomes fast-adoptable",
+                "before its session becomes fast-adoptable. "
+                f"Tripped: {tripped}. Last attempt: "
+                f"{self.last_phases.summary()}. Worst attempt: "
+                f"{self.worst_phases.summary()}. Monitor wake delay: "
+                f"{self.monitor_wake_delay_seconds:.3f}s. Policy: "
+                f"{policy.describe()}",
                 include_traceback=False,
             )
             return
@@ -938,7 +1251,7 @@ class LedgerLeaseHeartbeatService:
         exit_thread = self.exit_thread
         if deadline is None:
             deadline = (
-                time.monotonic()
+                self._ports.monotonic()
                 + DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS
             )
         for thread in threads:
@@ -948,7 +1261,7 @@ class LedgerLeaseHeartbeatService:
                 or thread is exit_thread
             ):
                 continue
-            thread.join(max(0.0, deadline - time.monotonic()))
+            thread.join(max(0.0, deadline - self._ports.monotonic()))
         return all(
             thread is None
             or thread is threading.current_thread()
@@ -1026,20 +1339,27 @@ class LedgerLeaseHeartbeatService:
             float(self._ports.failure_seconds()),
         )
         query_started = threading.Event()
-        try:
-            verify_parameters = inspect.signature(verify).parameters
-        except (TypeError, ValueError):
-            verify_parameters = {}
-        verify_reports_query_start = "on_query_start" in verify_parameters
+        callbacks = verifier_callbacks(verify)
+        verify_reports_query_start = "on_query_start" in callbacks
         # This verification holds the guard's serialized slot for its whole
         # statement sequence, so the periodic heartbeat queues behind it
         # and records nothing meanwhile. Its lawful second statement (the
         # attribution recheck) can therefore age the heartbeat's last
-        # success past the monitor's single-statement failure budget — the
-        # same hazard the heartbeat loop's own recheck had — so this
-        # caller must feed the monitor the completed first round trip too.
+        # success past the monitor's failure budget — the same hazard the
+        # heartbeat loop's own recheck had — so this caller must feed the
+        # monitor its completed round trips too.
+        verify_reports_statement_end = "on_statement_end" in callbacks
         verify_reports_statement_progress = (
-            "on_statement_progress" in verify_parameters
+            not verify_reports_statement_end
+            and "on_statement_progress" in callbacks
+        )
+        # The fence is a guard-slot caller like the heartbeat, so its phases
+        # belong in the same attribution: a fence that spent its budget
+        # queueing behind an in-flight renewal reads very differently from
+        # one that spent it inside PostgreSQL.
+        attempt = WriterLeaseVerificationAttempt(
+            LEASE_HEARTBEAT_MODE_FENCE,
+            monotonic=self._ports.monotonic,
         )
         if not verify_reports_query_start:
             # A verification that cannot report when its query slot was
@@ -1049,14 +1369,23 @@ class LedgerLeaseHeartbeatService:
 
         outcome: queue.Queue[BaseException | None] = queue.Queue(maxsize=1)
         verification_result: list[object] = []
-        verification_started_monotonic = time.monotonic()
+        verification_started_monotonic = attempt.started_monotonic
+
+        def on_query_start() -> None:
+            attempt.slot_acquired()
+            query_started.set()
+
+        def on_statement_end() -> None:
+            self.record_server_proven(attempt.statement_completed())
 
         def verify_exact_session() -> None:
             try:
                 verify_kwargs: dict[str, Callable[[], None]] = {}
                 if verify_reports_query_start:
-                    verify_kwargs["on_query_start"] = query_started.set
-                if verify_reports_statement_progress:
+                    verify_kwargs["on_query_start"] = on_query_start
+                if verify_reports_statement_end:
+                    verify_kwargs["on_statement_end"] = on_statement_end
+                elif verify_reports_statement_progress:
                     verify_kwargs["on_statement_progress"] = (
                         self.record_server_proven
                     )
@@ -1084,14 +1413,24 @@ class LedgerLeaseHeartbeatService:
                 f"writer lease guard verification could not start before {component}"
             ) from exc
 
+        def refuse(detail: str) -> str:
+            """Fail closed, naming the phase that consumed the fence budget."""
+            phases = attempt.finish(LEASE_HEARTBEAT_OUTCOME_FAILED)
+            self.record_phases(phases)
+            return (
+                "prism coordinator: refusing external side effect from "
+                f"{component}; {detail} ({phases.summary()})"
+            )
+
         queue_deadline = verification_started_monotonic + queue_timeout_seconds
         while not query_started.is_set() and thread.is_alive():
-            remaining = queue_deadline - time.monotonic()
+            remaining = queue_deadline - self._ports.monotonic()
             if remaining <= 0.0:
                 self._ports.lease_hard_exit(
-                    "prism coordinator: refusing external side effect from "
-                    f"{component}; exact-session verification could not "
-                    f"start within {queue_timeout_seconds:g}s",
+                    refuse(
+                        "exact-session verification could not start within "
+                        f"{queue_timeout_seconds:g}s"
+                    ),
                     include_traceback=False,
                 )
                 raise ShutdownInProgress(
@@ -1101,9 +1440,10 @@ class LedgerLeaseHeartbeatService:
         thread.join(timeout_seconds)
         if thread.is_alive():
             self._ports.lease_hard_exit(
-                "prism coordinator: refusing external side effect from "
-                f"{component}; exact-session verification exceeded "
-                f"{timeout_seconds:g}s",
+                refuse(
+                    "exact-session verification exceeded "
+                    f"{timeout_seconds:g}s"
+                ),
                 include_traceback=False,
             )
             raise ShutdownInProgress(
@@ -1114,8 +1454,7 @@ class LedgerLeaseHeartbeatService:
             error = outcome.get_nowait()
         except queue.Empty as exc:
             self._ports.lease_hard_exit(
-                "prism coordinator: refusing external side effect from "
-                f"{component}; exact-session verification returned no result",
+                refuse("exact-session verification returned no result"),
                 include_traceback=False,
             )
             raise ShutdownInProgress(
@@ -1123,8 +1462,7 @@ class LedgerLeaseHeartbeatService:
             ) from exc
         if error is not None:
             self._ports.lease_hard_exit(
-                "prism coordinator: refusing external side effect from "
-                f"{component}; exact-session verification failed",
+                refuse("exact-session verification failed"),
                 include_traceback=False,
             )
             raise ShutdownInProgress(
@@ -1133,10 +1471,10 @@ class LedgerLeaseHeartbeatService:
 
         # Use the call-start time so scheduler delay never makes this success
         # appear fresher than the database response actually proves. The
-        # response itself is a fresh server round trip, so the monitor's
-        # envelope cap may take it at receipt time.
+        # envelope edge takes the conservative send edge of the newest
+        # completed round trip for the same reason.
         self.record_success(verification_started_monotonic)
-        self.record_server_proven()
+        self.record_server_proven(attempt.proven_edge_monotonic)
 
         # A verification that proved liveness only because the writer's own
         # fenced write holds the expired lease row is not authority for an
@@ -1147,6 +1485,11 @@ class LedgerLeaseHeartbeatService:
         # and the write's commit will land the next renewal; callers retry
         # on their own cadence (broadcast interval, candidate outbox replay).
         result = verification_result[0] if verification_result else None
+        self.record_phases(
+            attempt.finish(
+                self._attempt_outcome(LEASE_HEARTBEAT_MODE_FENCE, result)
+            )
+        )
         if isinstance(result, dict) and result.get(
             "renewal_deferred_to_own_write"
         ):

@@ -45,6 +45,9 @@ from lab.prism.bounded_executor import (
 )
 from lab.prism.prism_tools import prism_tool_command
 # Compatibility re-exports; new callers should import lab.prism.background_services.
+from lab.prism.writer_lease_timing import (
+    WRITER_LEASE_HEARTBEAT_SCHEDULER_SLACK_SECONDS,
+)
 from lab.prism.background_services import (
     BackgroundServiceRegistry,  # noqa: F401 - compatibility re-export
     BackgroundServiceSpec,  # noqa: F401 - compatibility re-export
@@ -53,6 +56,7 @@ from lab.prism.background_services import (
     WatchdogPorts,
     WatchdogService,
     _LeaseHeartbeatStateField,
+    guard_session_prover as _lease_guard_session_prover,
     guard_session_verifier as _lease_guard_session_verifier,
 )
 # Compatibility re-exports; new callers should import lab.prism.coordinator_shutdown.
@@ -5933,6 +5937,13 @@ class PrismCoordinator:
                             )
                         )
                     ),
+                    scheduler_slack_seconds=lambda: float(
+                        getattr(
+                            self,
+                            "ledger_lease_heartbeat_scheduler_slack_seconds",
+                            WRITER_LEASE_HEARTBEAT_SCHEDULER_SLACK_SECONDS,
+                        )
+                    ),
                     heartbeat_loop=lambda: self.ledger_lease_heartbeat_loop(),
                     monitor_loop=lambda: (
                         self.ledger_lease_heartbeat_monitor_loop()
@@ -6004,6 +6015,17 @@ class PrismCoordinator:
     ) -> Callable[..., object] | None:
         """Return the guarded-session liveness check for ``ledger``."""
         return _lease_guard_session_verifier(ledger)
+
+    @staticmethod
+    def _ledger_lease_guard_session_prover(
+        ledger: object,
+    ) -> Callable[..., object] | None:
+        """Return the cheap read-only ownership proof for ``ledger``."""
+        return _lease_guard_session_prover(ledger)
+
+    def _ledger_lease_heartbeat_snapshot(self) -> dict[str, object]:
+        """Phase attribution and policy terms for the metrics surface."""
+        return self._ensure_lease_heartbeat_service().snapshot()
 
     def _start_ledger_lease_heartbeat(self) -> threading.Thread | None:
         return self._ensure_lease_heartbeat_service().start()

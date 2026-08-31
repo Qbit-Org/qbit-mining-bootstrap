@@ -29,6 +29,11 @@ from lab.prism.audit_artifacts import (
     CanonicalAuditBundleCorrupt,
     canonical_audit_bundle_bytes,
 )
+from lab.prism.writer_lease_timing import (  # noqa: F401 - compatibility re-export
+    DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
+    WRITER_LEASE_GUARD_STATEMENT_TIMEOUT_SECONDS,
+    WRITER_LEASE_VERIFICATION_MAX_STATEMENTS,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -120,14 +125,11 @@ class WriterLeaseRenewalDeferred(RuntimeError):
     """
 
 
-# Statements verify_writer_lease_guard_session may lawfully run inside one
-# guarded slot: the verification statement plus its single attribution
-# recheck. Callers that budget the verification's execution wall-clock must
-# cover this many server-side statement timeouts, or a lawful recheck under
-# moderate database latency is killed by the caller's deadline instead of
-# rescuing the coordinator.
-WRITER_LEASE_VERIFICATION_MAX_STATEMENTS = 2
-DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS = 1.0
+# WRITER_LEASE_VERIFICATION_MAX_STATEMENTS and
+# DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS now live in
+# lab.prism.writer_lease_timing, next to the rest of the heartbeat timing
+# policy they are terms of, and are re-exported above so every existing
+# import site keeps working.
 VALID_CREDIT_POLICIES = frozenset({"stale-grace"})
 
 
@@ -2496,8 +2498,9 @@ class LeaseGuardPort(Protocol):
     loses the advisory lock and must fence the owning coordinator, so the
     heartbeat's liveness proof depends on the session's identity surviving.
     A substitute must honour the same contract, including the serialized
-    query slot that `on_query_start` marks and the in-slot `followup`
-    statement the attribution recheck relies on.
+    query slot that `on_query_start` marks, the per-statement round trip
+    `on_statement_end` marks, and the in-slot `followup` statement the
+    attribution recheck relies on.
     """
 
     def try_acquire(self) -> bool: ...
@@ -2510,6 +2513,7 @@ class LeaseGuardPort(Protocol):
         sql: str,
         *,
         on_query_start: Callable[[], None] | None = None,
+        on_statement_end: Callable[[], None] | None = None,
         followup: Callable[[Any], str | None] | None = None,
     ) -> Any: ...
 
@@ -2815,11 +2819,17 @@ class _NativePostgresLeaseGuard:
 
         # The short statement_timeout stays: the guard session must never
         # queue behind a fenced write (see verify_writer_lease_guard_session).
+        # It is also the dominant term in the heartbeat's staleness envelope
+        # (WriterLeaseHeartbeatPolicy.max_healthy_server_gap_seconds), so the
+        # value is taken from the timing policy rather than written twice.
         # The session guards ride the same options string so this dedicated
         # connection carries the same orphan bounds as every pooled one.
         # Merged with any operator DSN-level options, coordinator fragments
         # last so they win.
-        options = "-c statement_timeout=500"
+        statement_timeout_ms = int(
+            round(WRITER_LEASE_GUARD_STATEMENT_TIMEOUT_SECONDS * 1000)
+        )
+        options = f"-c statement_timeout={statement_timeout_ms}"
         if session_guards is not None:
             options = _merged_session_options(
                 psycopg,
@@ -2854,6 +2864,7 @@ class _NativePostgresLeaseGuard:
         sql: str,
         *,
         on_query_start: Callable[[], None] | None = None,
+        on_statement_end: Callable[[], None] | None = None,
         followup: Callable[[Any], str | None] | None = None,
     ) -> Any:
         with self._query_lock:
@@ -2867,6 +2878,12 @@ class _NativePostgresLeaseGuard:
                 raise RuntimeError("postgres writer lease guard is not held")
             row = self._connection.execute(sql).fetchone()
             result = parse_single_json_value(row[0] if row else None)
+            # Every completed round trip is server-proven liveness, and the
+            # boundary the caller's phase attribution charges guard SQL
+            # against. It fires after the result is parsed so a malformed
+            # response is not counted as a healthy round trip.
+            if on_statement_end is not None:
+                on_statement_end()
             # A followup runs inside this same serialized slot: no second
             # queue wait behind other guard callers can be charged to the
             # caller's execution budget. Each execute on this autocommit
@@ -2879,6 +2896,8 @@ class _NativePostgresLeaseGuard:
                     break
                 row = self._connection.execute(next_sql).fetchone()
                 result = parse_single_json_value(row[0] if row else None)
+                if on_statement_end is not None:
+                    on_statement_end()
             return result
 
     def close(self) -> None:
@@ -8877,11 +8896,169 @@ SELECT COALESCE(
         """
         return self._renew_writer_lease_with(self._run_fenced_json)
 
+    def prove_writer_lease_guard_session(
+        self,
+        *,
+        on_query_start: Callable[[], None] | None = None,
+        on_statement_end: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        """Prove ownership on one cheap read-only statement; never renew.
+
+        The frequent half of the split issue #212 asked for.  Ownership and
+        TTL renewal are two different questions asked at two very different
+        rates: the heartbeat must prove *ownership* several times inside one
+        adoption-silence window, but the lease TTL is 60s and only needs a
+        writer-side refresh well before it lapses (every fenced write
+        refreshes it too).  Paying for the renewal question on every beat is
+        what made the frequent statement expensive: ``FOR NO KEY UPDATE SKIP
+        LOCKED`` on the hot lease tuple, a ``pg_stat_activity`` scan to
+        attribute the tuple's locker, and — in the ambiguous case — a second
+        statement.  Under a rapid-block burst that statement approached the
+        guard's 500ms statement timeout, which is exactly how a healthy
+        coordinator ran out of server-proven envelope.
+
+        This statement asks only the ownership question, and asks it with
+        two ``EXISTS`` reads:
+
+        * PostgreSQL still shows *this* backend holding the writer/epoch
+          advisory lock, and
+        * the last committed lease row still names this exact
+          ``(writer_id, writer_epoch, writer_session_token)``.
+
+        Those are the same two conditions
+        :meth:`verify_writer_lease_guard_session` raises on, evaluated the
+        same way, so the exact-session guarantee is unchanged: a guard
+        session that died, or an identity that was fenced out, still raises
+        here and still hard-exits the coordinator.  What is *not* asked is
+        anything that can block or that needs live backend state, so the
+        statement takes no row lock, never queues behind a fenced write, and
+        never needs an attribution recheck — it is one round trip, always.
+
+        The lease-expiry guarantee is preserved by escalation rather than by
+        renewal.  The result reports ``lease_renewal_due`` whenever the
+        committed row's remaining validity has fallen to the own-write
+        authority margin (which ``_resolve_lease_authority_margin_seconds``
+        keeps at or above half the TTL, and strictly below it), and
+        ``lease_expired`` when it has lapsed outright — an expired row is
+        always also renewal-due.  The heartbeat answers either flag by
+        running the full renewing verification immediately, on the same
+        beat.  So the cheap proof short-circuits only while the lease is
+        comfortably valid, which is precisely the window in which the full
+        verification had nothing to decide; the moment renewal actually
+        matters — including for the whole of a long own fenced write that
+        keeps skipping renewals — every beat runs the same fail-closed
+        verification it ran before this split existed.
+
+        Never call this in place of the verification before an external
+        side effect.  A proof is liveness and identity, not authority: it
+        deliberately does not renew, so it cannot distinguish a row this
+        writer's own in-flight write will refresh from one it will roll
+        back.  :meth:`require_fresh_lease_for_external_side_effect` keeps
+        using the full verification for that reason.
+
+        ``on_query_start`` fires once the guarded session's serialized query
+        slot is acquired and ``on_statement_end`` once the round trip
+        returns, so a caller can attribute queue wait and server time
+        separately.
+        """
+        if not self.writer_lease_fast_adoption_capable:
+            raise RuntimeError("writer session is not heartbeat-capable")
+        guard = self._writer_lease_guard
+        if guard is None:
+            raise RuntimeError("postgres writer lease guard is not held")
+        payload = {
+            "writer_id": self._writer_id,
+            "writer_epoch": self._writer_epoch,
+            "writer_session_token": self._writer_session_token,
+        }
+        lock_key = _writer_lease_advisory_lock_key(
+            self._writer_id,
+            self._writer_epoch,
+        )
+        lock_classid = (lock_key >> 32) & 0xFFFFFFFF
+        lock_objid = lock_key & 0xFFFFFFFF
+        sql = f"""
+WITH payload AS (
+    SELECT {self._jsonb_literal(payload)} AS data
+)
+SELECT json_build_object(
+    'backend', 'postgres-psql',
+    'guard_advisory_lock_held', EXISTS (
+        SELECT 1
+        FROM pg_locks
+        WHERE locktype = 'advisory'
+          AND granted
+          AND pid = pg_backend_pid()
+          AND classid = {lock_classid}::oid
+          AND objid = {lock_objid}::oid
+          AND objsubid = 1
+    ),
+    'writer_session_token_current', EXISTS (
+        SELECT 1
+        FROM qbit_ledger_writer_lease, payload
+        WHERE qbit_ledger_writer_lease.singleton
+          AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+          AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+          AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
+    ),
+    'lease_expired', EXISTS (
+        SELECT 1
+        FROM qbit_ledger_writer_lease, payload
+        WHERE qbit_ledger_writer_lease.singleton
+          AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+          AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+          AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
+          AND qbit_ledger_writer_lease.lease_expires_at <= clock_timestamp()
+    ),
+    'lease_renewal_due', EXISTS (
+        SELECT 1
+        FROM qbit_ledger_writer_lease, payload
+        WHERE qbit_ledger_writer_lease.singleton
+          AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+          AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+          AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
+          AND qbit_ledger_writer_lease.lease_expires_at
+              <= clock_timestamp() + {self._lease_authority_margin_sql}
+    )
+);
+"""
+        run_kwargs: dict[str, Callable[[], None]] = {}
+        if on_query_start is not None:
+            run_kwargs["on_query_start"] = on_query_start
+        if on_statement_end is not None:
+            run_kwargs["on_statement_end"] = on_statement_end
+        result = guard.run_json(sql, **run_kwargs)
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                "psql writer lease guard proof returned non-object JSON"
+            )
+        if not result.get("guard_advisory_lock_held"):
+            raise RuntimeError(
+                "postgres writer lease guard advisory lock is no longer held"
+            )
+        if not result.get("writer_session_token_current"):
+            raise RuntimeError("writer lease is not active")
+        # An expired row is renewal-due by construction, but state it
+        # explicitly: a caller must never be able to read a stale committed
+        # row as "proved and nothing to do".
+        renewal_due = bool(
+            result.get("lease_renewal_due") or result.get("lease_expired")
+        )
+        return {
+            "backend": str(result["backend"]),
+            "verified_count": 1,
+            "renewed_count": 0,
+            "proof_only": True,
+            "lease_expired": bool(result.get("lease_expired")),
+            "lease_renewal_due": renewal_due,
+        }
+
     def verify_writer_lease_guard_session(
         self,
         *,
         on_query_start: Callable[[], None] | None = None,
         on_statement_progress: Callable[[], None] | None = None,
+        on_statement_end: Callable[[], None] | None = None,
     ) -> dict[str, int | str]:
         """Prove the guard session live; renew the TTL only without waiting.
 
@@ -8999,6 +9176,12 @@ SELECT COALESCE(
         stamp progress here so a lawful two-statement verification is not
         mistaken for a wedged heartbeat, while a genuinely stuck statement
         still produces no progress at all.
+
+        ``on_statement_end`` is the general form of the same signal: it
+        fires after *every* completed round trip, including the last one,
+        which is what a caller attributing guard SQL time per phase needs.
+        A caller that supplies it does not also need
+        ``on_statement_progress``.
         """
         if not self.writer_lease_fast_adoption_capable:
             raise RuntimeError("writer session is not heartbeat-capable")
@@ -9115,14 +9298,12 @@ SELECT json_build_object(
                 return sql
             return None
 
-        if on_query_start is None:
-            result = guard.run_json(sql, followup=attribution_recheck)
-        else:
-            result = guard.run_json(
-                sql,
-                on_query_start=on_query_start,
-                followup=attribution_recheck,
-            )
+        run_kwargs: dict[str, Any] = {"followup": attribution_recheck}
+        if on_query_start is not None:
+            run_kwargs["on_query_start"] = on_query_start
+        if on_statement_end is not None:
+            run_kwargs["on_statement_end"] = on_statement_end
+        result = guard.run_json(sql, **run_kwargs)
         if not isinstance(result, dict):
             raise RuntimeError(
                 "psql writer lease guard verification returned non-object JSON"

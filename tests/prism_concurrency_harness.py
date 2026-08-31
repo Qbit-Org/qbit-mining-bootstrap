@@ -118,6 +118,9 @@ from lab.prism.share_ledger import (  # noqa: E402
     PsqlShareLedger,
     parse_single_json_value,
 )
+from lab.prism.writer_lease_timing import (  # noqa: E402
+    WRITER_LEASE_GUARD_STATEMENT_TIMEOUT_SECONDS,
+)
 
 # Real seconds the controller will wait for an actor to hand the baton back
 # before declaring the harness itself broken. It is a failure detector, not
@@ -138,8 +141,10 @@ BATON_TIMEOUT_SECONDS = float(
 # updated_at as text.
 CLOCK_ORIGIN = datetime(2026, 6, 26, 19, 49, 22, 233718, tzinfo=timezone.utc)
 
-# The guard session connects with `-c statement_timeout=500`.
-GUARD_STATEMENT_TIMEOUT_SECONDS = 0.5
+# The guard session's server-side statement_timeout, taken from the shipped
+# timing policy rather than repeated, so a change to the bound the heartbeat
+# envelope is sized against also changes what this model enforces.
+GUARD_STATEMENT_TIMEOUT_SECONDS = WRITER_LEASE_GUARD_STATEMENT_TIMEOUT_SECONDS
 
 
 class HarnessError(AssertionError):
@@ -826,6 +831,11 @@ class LeaseOp(str, Enum):
     RENEW = "renew"
     RELEASE = "release"
     VERIFY = "verify"
+    # The cheap read-only ownership proof the heartbeat runs on most beats
+    # (issue #212). Deliberately a distinct trace step from VERIFY: a
+    # scenario asserting the split has to be able to see which question the
+    # coordinator actually asked PostgreSQL on each beat.
+    PROVE = "prove"
 
 
 class LandingOp(str, Enum):
@@ -879,6 +889,14 @@ _OBJID_RE = re.compile(r"objid = (\d+)::oid")
 # the production SQL in lab/prism/share_ledger.py, so a change there breaks
 # classification loudly instead of silently changing what the fake models.
 _SIGNATURES: tuple[tuple[LeaseOp, tuple[str, ...]], ...] = (
+    (
+        LeaseOp.PROVE,
+        (
+            "'guard_advisory_lock_held'",
+            "'writer_session_token_current'",
+            "'lease_renewal_due'",
+        ),
+    ),
     (
         LeaseOp.VERIFY,
         (
@@ -1233,15 +1251,23 @@ def classify(sql: str) -> Statement:
     """Map one production statement onto the operation it performs."""
     for op, fragments in _SIGNATURES:
         if all(fragment in sql for fragment in fragments):
-            return Statement(
-                kind=op,
-                payload=_extract_payload(sql),
-                lease_ttl_seconds=_extract_interval(sql, first=True),
-                authority_margin_seconds=(
+            if op is LeaseOp.PROVE:
+                # The proof renews nothing, so its only interval literal is
+                # the renewal-due (own-write authority) margin.
+                lease_ttl_seconds = None
+                authority_margin_seconds = _extract_interval(sql, first=True)
+            else:
+                lease_ttl_seconds = _extract_interval(sql, first=True)
+                authority_margin_seconds = (
                     _extract_interval(sql, first=False)
                     if op is LeaseOp.VERIFY
                     else None
-                ),
+                )
+            return Statement(
+                kind=op,
+                payload=_extract_payload(sql),
+                lease_ttl_seconds=lease_ttl_seconds,
+                authority_margin_seconds=authority_margin_seconds,
                 advisory_lock=_extract_advisory_lock(sql),
                 sql=sql,
             )
@@ -1477,6 +1503,13 @@ class FakePostgres:
         self.clock = clock
         self.lease: LeaseRow | None = None
         self.statements: list[Statement] = []
+        # Optional per-statement server time, in virtual seconds. Scenarios
+        # that model database latency (the rapid-block tail behind issue
+        # #212) install a callable here; the default None keeps every
+        # existing scenario's statements instantaneous.
+        self.statement_latency_seconds: (
+            Callable[[Statement], float] | None
+        ) = None
         # Landing tables. Insertion-ordered dicts, because the trace and every
         # assertion made against them has to be order-stable across runs.
         self.pool_blocks: dict[str, PoolBlockRow] = {}
@@ -1642,6 +1675,11 @@ class FakePostgres:
             effective_timeout = session_bound
             timeout_kind = "statement"
         try:
+            self._charge_execution_latency(
+                statement,
+                effective_timeout,
+                timeout_kind,
+            )
             result = self._evaluate(
                 statement,
                 transaction,
@@ -1658,6 +1696,41 @@ class FakePostgres:
         if autocommit:
             self._commit(transaction)
         return result
+
+    def _charge_execution_latency(
+        self,
+        statement: Statement,
+        timeout_seconds: float | None,
+        timeout_kind: str,
+    ) -> None:
+        """Spend modelled server time for this statement, honouring its bound.
+
+        Lock waits were already modelled (``_await_lease_lock``); this is the
+        other half — a statement that is simply *slow*, which is what the
+        rapid-block bursts behind issue #212 produce and what the heartbeat's
+        staleness envelope has to absorb. Advancing the virtual clock inside
+        the statement is exact under the baton scheduler: no other actor is
+        running, so the time is charged to this statement alone and every
+        other actor's deadline sees it on its next turn.
+
+        A statement whose modelled cost exceeds the session bound is
+        cancelled at the bound, exactly as PostgreSQL's statement_timeout
+        cancels it — the guard session's 0.5s ceiling is the term the
+        heartbeat policy is sized against, so a scenario must not be able to
+        model a guarded round trip that quietly outlives it.
+        """
+        latency_for = self.statement_latency_seconds
+        if latency_for is None:
+            return
+        latency = float(latency_for(statement) or 0.0)
+        if latency <= 0.0:
+            return
+        if timeout_seconds is not None and latency > timeout_seconds:
+            self.clock.advance(max(0.0, timeout_seconds))
+            raise LockTimeout(
+                f"canceling statement due to {timeout_kind} timeout"
+            )
+        self.clock.advance(latency)
 
     def _evaluate(
         self,
@@ -1677,6 +1750,8 @@ class FakePostgres:
             )
         if statement.kind is LeaseOp.VERIFY:
             return self._evaluate_verify(statement, transaction, tag)
+        if statement.kind is LeaseOp.PROVE:
+            return self._evaluate_prove(statement, transaction)
 
         # READ COMMITTED takes one snapshot per command, *before* any lock
         # wait. This is the distinction that makes a queued statement report
@@ -2022,6 +2097,45 @@ class FakePostgres:
             ),
         )
         return {"released": 1}
+
+    def _evaluate_prove(
+        self,
+        statement: Statement,
+        transaction: Transaction,
+    ) -> dict[str, Any]:
+        """The read-only ownership proof: no row lock, no locker attribution.
+
+        Everything it reads comes from one MVCC snapshot plus this backend's
+        own advisory-lock state, so unlike VERIFY there is no
+        snapshot-versus-live-state window and no interleaving point inside
+        the statement. That is the whole point of the split: the frequent
+        statement cannot queue, cannot misattribute, and cannot need a
+        second round trip.
+        """
+        payload = statement.payload
+        now = self.clock.now()
+        margin = statement.authority_margin_seconds or 0.0
+        snapshot = self._visible_lease(transaction)
+        exact = snapshot is not None and self._is_exact_session(snapshot, payload)
+        guard_backend = transaction.backend
+        advisory_held = (
+            statement.advisory_lock is not None
+            and statement.advisory_lock in guard_backend.advisory_locks
+            and self._advisory_owners.get(statement.advisory_lock) is guard_backend
+            and not guard_backend.closed
+        )
+        return {
+            "backend": "postgres-psql",
+            "guard_advisory_lock_held": bool(advisory_held),
+            "writer_session_token_current": bool(exact),
+            "lease_expired": bool(
+                exact and snapshot.lease_expires_at <= now
+            ),
+            "lease_renewal_due": bool(
+                exact
+                and snapshot.lease_expires_at <= now + timedelta(seconds=margin)
+            ),
+        }
 
     def _evaluate_verify(
         self,
@@ -2657,6 +2771,7 @@ class FakeLeaseGuard:
         sql: str,
         *,
         on_query_start: Callable[[], None] | None = None,
+        on_statement_end: Callable[[], None] | None = None,
         followup: Callable[[Any], str | None] | None = None,
     ) -> Any:
         actor = self.server.scheduler.current()
@@ -2680,6 +2795,8 @@ class FakeLeaseGuard:
                     tag=self.tag,
                 )
             )
+            if on_statement_end is not None:
+                on_statement_end()
             while followup is not None:
                 next_sql = followup(result)
                 if next_sql is None:
@@ -2693,6 +2810,8 @@ class FakeLeaseGuard:
                         tag=self.tag,
                     )
                 )
+                if on_statement_end is not None:
+                    on_statement_end()
             return result
         finally:
             self._slot_owner = None

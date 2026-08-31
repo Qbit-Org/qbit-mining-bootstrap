@@ -27,6 +27,7 @@ from lab.prism.share_ledger import (
     DEFAULT_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS,
     DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
 )
+from lab.prism.writer_lease_timing import DEFAULT_WRITER_LEASE_HEARTBEAT_POLICY
 
 
 DEFAULT_P2MR_SPEND_INPUT_BYTES = 3_680
@@ -205,25 +206,39 @@ DEFAULT_PRISM_WATCHDOG_TIMEOUT_SECONDS = 120.0
 # The release worker is daemonized and the watchdog hard-exits at this total
 # wall-clock deadline whether quiescence or the fresh DB connection completes.
 DEFAULT_PRISM_WATCHDOG_LEASE_RELEASE_TIMEOUT_SECONDS = 5.0
-# A fast-adoptable coordinator proves its guarded session live four times
-# inside the one-second silence proof required by PsqlShareLedger. This runs
-# through a dedicated connection, not the ordinary ledger lock or shared
-# native pool, and must never wait on the lease tuple's row lock: fenced
-# writes hold it for whole transactions (persist_accepted_block can exceed
-# the guard's statement timeout many times over). The lease TTL is renewed
-# only when that tuple is uncontended (SKIP LOCKED), so an idle coordinator
-# still keeps lease_expires_at ahead of different-identity expiry claims.
+# A fast-adoptable coordinator proves its guarded session live several times
+# inside the silence proof required by PsqlShareLedger. This runs through a
+# dedicated connection, not the ordinary ledger lock or shared native pool,
+# and must never wait on the lease tuple's row lock: fenced writes hold it
+# for whole transactions (persist_accepted_block can exceed the guard's
+# statement timeout many times over). The lease TTL is renewed only when
+# that tuple is uncontended (SKIP LOCKED), so an idle coordinator still
+# keeps lease_expires_at ahead of different-identity expiry claims.
+#
+# The five values below are not independent knobs. They are the terms of one
+# inequality — exit before adoption — owned by
+# lab.prism.writer_lease_timing.WriterLeaseHeartbeatPolicy, which derives
+# them from measurable phase budgets (the guard session's statement timeout,
+# the heartbeat interval, and a process scheduler-slack allowance) and
+# validates them at import. They are read from that policy rather than
+# re-derived here, so retuning one term cannot silently break the argument
+# the others depend on. See writer_lease_timing for the derivation and for
+# why the shipped adoption silence is what it is (issue #212).
 DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_SECONDS = (
-    DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS / 4
+    DEFAULT_WRITER_LEASE_HEARTBEAT_POLICY.heartbeat_interval_seconds
 )
 # The monitor kills a coordinator before PostgreSQL can observe the full
 # adoption silence if the heartbeat query itself wedges. Its short release
 # budget keeps the old process gone before a successor is allowed to CAS.
 DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_FAILURE_SECONDS = (
-    DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS * 0.75
+    DEFAULT_WRITER_LEASE_HEARTBEAT_POLICY.failure_budget_seconds
 )
-DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_MONITOR_SECONDS = 0.05
-DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_EXIT_TIMEOUT_SECONDS = 0.1
+DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_MONITOR_SECONDS = (
+    DEFAULT_WRITER_LEASE_HEARTBEAT_POLICY.monitor_interval_seconds
+)
+DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_EXIT_TIMEOUT_SECONDS = (
+    DEFAULT_WRITER_LEASE_HEARTBEAT_POLICY.exit_margin_seconds
+)
 DEFAULT_PRISM_LEDGER_LEASE_EXTERNAL_FENCE_TIMEOUT_SECONDS = 0.5
 # Headroom added on top of the longest guarded RPC deadline when sizing the
 # ledger's own-write deferral margin. It absorbs what the deadline itself

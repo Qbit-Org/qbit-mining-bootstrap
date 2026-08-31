@@ -356,12 +356,20 @@ client (`PRISM_POSTGRES_NATIVE_CLIENT=auto` or `1`). Each coordinator holds a
 dedicated PostgreSQL advisory guard for its writer ID and epoch and
 periodically proves that isolated session live with a non-blocking check (the
 session answers, still holds the advisory lock, and the committed lease row
-still names it). The heartbeat never waits on the lease tuple's row lock:
-fenced writes hold it for entire transactions, and accepted-block persistence
-can legitimately exceed the guard's statement timeout. It renews the lease TTL
-only while that tuple is uncontended (`SKIP LOCKED`), so an idle coordinator —
-no fenced writes and the CTV broadcaster disabled — still keeps its lease from
-expiring under a different writer identity's expiry claim. If the committed row
+still names it). Most beats run only that cheap read-only ownership proof: one
+statement, no row lock and no `pg_stat_activity` scan. The full renewing
+verification runs on the first beat and thereafter on any beat whose proof
+reports the committed lease row inside the own-write authority margin (at or
+above half the lease TTL), escalating on that same beat. So renewal is never
+later than it was before the split, and for the whole of a long own fenced
+write — when renewals are actually being skipped — every beat runs the same
+fail-closed verification as before. The heartbeat never waits on the lease
+tuple's row lock: fenced writes hold it for entire transactions, and
+accepted-block persistence can legitimately exceed the guard's statement
+timeout. It renews the lease TTL only while that tuple is uncontended
+(`SKIP LOCKED`), so an idle coordinator — no fenced writes and the CTV
+broadcaster disabled — still keeps its lease from expiring under a different
+writer identity's expiry claim. If the committed row
 is already expired and the renewal was lock-blocked, verification fails closed:
 the skipped lock may be an in-flight expiry claim, and a stale committed token
 read is not proof of liveness. The one exemption is a lock `pg_stat_activity`
@@ -384,6 +392,77 @@ merely because it is idle. A psql-only deployment cannot retain a session
 guard, logs that fast adoption is disabled, and conservatively falls back to
 the configured lease TTL. Keep generated session tokens in production; fixed
 tokens remain a local test-only facility.
+
+#### Heartbeat timing is one validated policy
+
+The adoption silence, heartbeat interval, failure budget, monitor interval and
+exit margin are terms of a single inequality — the old coordinator must be gone
+before a replacement may compare-and-swap the lease row — owned by
+`lab/prism/writer_lease_timing.py`. The defaults are derived from measurable
+phase budgets rather than tuned individually:
+
+| term | value | where it comes from |
+| --- | --- | --- |
+| guard statement timeout | 0.50s | the guard session's server-side `statement_timeout` |
+| heartbeat interval | 0.25s | idle gap between ownership proofs |
+| scheduler slack | 0.50s | process-side scheduling delay, applied to both the heartbeat's stamping path and the monitor's own poll |
+| failure budget | 1.25s | interval + statement timeout + slack |
+| monitor interval | 0.05s | staleness poll |
+| exit margin | 0.10s | hard-exit budget |
+| exit envelope | 0.70s | exit margin + 2 x monitor interval + scheduler slack |
+| adoption silence | 2.00s | must exceed 1.25 + 0.70 = 1.95s |
+| server-proven cap | 1.30s | adoption silence - exit envelope |
+
+The exit envelope reserves the monitor's *own* lateness, not just its poll
+granularity. The monitor is a Python thread in the same process, behind the
+same GIL, as the heartbeat whose stalls the policy explicitly budgets for, so
+it cannot be assumed to wake on time when the heartbeat does not. At the
+shipped numbers, with a maximally late monitor:
+
+```
+1.30 (cap) + 0.05 (poll) + 0.50 (monitor lateness) + 0.10 (exit) = 1.95 < 2.00
+```
+
+leaving one monitor poll of strict reserve before a successor may
+compare-and-swap.
+
+Genuine writer failover therefore costs 2.0 seconds of adoption silence rather
+than 1.0. That is the price of the guard session's own statement timeout: the
+monitor can only trust completed round trips, so the envelope has to contain
+one whole statement plus one idle interval plus process scheduling — and then,
+separately, room for the monitor itself to be that late in noticing. It
+replaces the temporary downstream 4.0-second pin.
+
+A combination that breaks the safety inequality is now **refused at startup**:
+the coordinator hard-exits with the failing term named instead of printing a
+warning and running with no exit-before-adoption guarantee. A combination that
+is safe but leaves the staleness cap below the largest gap a healthy
+coordinator can produce logs a `no tail-latency headroom` warning and starts —
+that state cannot produce two writers, it only produces avoidable restarts.
+
+#### Reading a heartbeat exit
+
+Every heartbeat hard exit names which bound tripped (`Tripped: activity ... >=
+failure budget` or `... >= adoption envelope cap`), the phase breakdown of the
+last and worst verification attempts (`slot_wait` / `guard_sql` / `scheduler`
+/ `total`), the monitor's own worst wake delay, and every term of the policy
+that produced the decision. Guard-slot queueing, database round trips and
+Python scheduling stalls are attributed separately, so an exit says whether to
+look at PostgreSQL or at the coordinator process.
+
+The same attribution is exported with fixed metric cardinality:
+`qbit_prism_lease_heartbeat_attempts_total{mode}` (`proof`, `renew`, `fence`),
+`qbit_prism_lease_heartbeat_outcomes_total{outcome}`,
+`qbit_prism_lease_heartbeat_phase_seconds{phase}` and its
+`worst_phase_seconds` companion,
+`qbit_prism_lease_heartbeat_activity_age_seconds`,
+`qbit_prism_lease_heartbeat_server_proven_age_seconds`,
+`qbit_prism_lease_heartbeat_monitor_wake_delay_seconds`, and
+`qbit_prism_lease_heartbeat_policy_seconds{term}`. Alert on
+`qbit_prism_lease_heartbeat_server_proven_age_seconds` approaching
+`qbit_prism_lease_heartbeat_policy_seconds{term="server_proven_cap"}`, and on
+`qbit_prism_lease_heartbeat_policy_seconds{term="stability_surplus"}` falling
+to or below zero.
 
 Before each mutating qbitd or wallet RPC, the coordinator performs the same
 bounded non-blocking exact-session verification on that advisory-guard
