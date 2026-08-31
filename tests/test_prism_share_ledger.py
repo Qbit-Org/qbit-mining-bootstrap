@@ -2200,7 +2200,14 @@ class PrismShareLedgerTests(unittest.TestCase):
         """A failed page read must not read as an empty backlog."""
 
         class FailingPageLedger(FakeLeasePsqlShareLedger):
-            def _run_retry_safe_read_json(self, sql: str) -> Any:
+            def _run_retry_safe_read_json(
+                self,
+                sql: str,
+                *,
+                on_statement_start: Any = None,
+            ) -> Any:
+                if on_statement_start is not None:
+                    on_statement_start()
                 raise RuntimeError("connection reset by peer")
 
         ledger = FailingPageLedger([acquired_lease()])
@@ -2284,7 +2291,14 @@ class PrismShareLedgerTests(unittest.TestCase):
         """
 
         class TimingOutPageLedger(FakeLeasePsqlShareLedger):
-            def _run_retry_safe_read_json(self, sql: str) -> Any:
+            def _run_retry_safe_read_json(
+                self,
+                sql: str,
+                *,
+                on_statement_start: Any = None,
+            ) -> Any:
+                if on_statement_start is not None:
+                    on_statement_start()
                 raise LedgerOperationTimeout("postgres operation exceeded 5s")
 
         ledger = TimingOutPageLedger([acquired_lease()])
@@ -2299,6 +2313,40 @@ class PrismShareLedgerTests(unittest.TestCase):
         # The failed read still handed its slot back, or the next enumeration
         # would queue behind a slot nobody holds.
         self.assertEqual(ledger._read_semaphore._value, 4)
+
+    def test_postgres_pending_candidate_page_attributes_pre_send_expiry_locally(
+        self,
+    ) -> None:
+        """A deadline exhausted after admission is still not server time."""
+
+        class NeverRunNative:
+            def run_json(self, sql: str, **kwargs: Any) -> Any:
+                raise AssertionError("deadline-expired read must not reach PostgreSQL")
+
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._read_semaphore = threading.BoundedSemaphore(1)
+        ledger._native = NeverRunNative()
+        deadline_local = threading.local()
+        deadline_local.deadline = 1.0
+        ledger._operation_timeout_local = deadline_local
+        # admission start, deadline check while acquiring, admission end,
+        # deadline check immediately before the native statement
+        clock = iter([0.0, 0.5, 0.75, 1.01])
+        ledger._monotonic = lambda: next(clock)
+
+        with self.assertRaisesRegex(LedgerOperationTimeout, "deadline expired"):
+            ledger._run_attributed_read_json(
+                "SELECT json_build_object('ok', true);",
+                operation="pending_block_candidate_rows",
+            )
+
+        self.assertEqual(list(clock), [])
+        stats = ledger.ledger_read_gate_stats()["pending_block_candidate_rows"]
+        self.assertEqual(stats["calls_total"], 1)
+        self.assertEqual(stats["gate_timeouts_total"], 1)
+        self.assertEqual(stats["execute_timeouts_total"], 0)
+        self.assertEqual(stats["execute_seconds_total"], 0.0)
+        self.assertEqual(ledger._read_semaphore._value, 1)
 
     def test_postgres_pending_candidate_page_attributes_an_admission_expiry(
         self,

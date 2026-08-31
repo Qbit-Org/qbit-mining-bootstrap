@@ -8567,15 +8567,27 @@ END;
             )
             raise
         gate_wait_seconds = max(0.0, self._monotonic() - gate_started)
-        execute_started = self._monotonic()
+        execute_started: float | None = None
+
+        def on_statement_start() -> None:
+            nonlocal execute_started
+            execute_started = self._monotonic()
+
         timed_out = False
         try:
-            return self._run_retry_safe_read_json(sql)
+            return self._run_retry_safe_read_json(
+                sql,
+                on_statement_start=on_statement_start,
+            )
         except BaseException as exc:
             timed_out = isinstance(exc, TimeoutError)
             raise
         finally:
-            execute_seconds = max(0.0, self._monotonic() - execute_started)
+            execute_seconds = (
+                None
+                if execute_started is None
+                else max(0.0, self._monotonic() - execute_started)
+            )
             # Released before the record is taken: a bookkeeping failure must
             # never leak the read slot it was measuring.
             self._read_semaphore.release()
@@ -8665,10 +8677,21 @@ END;
                 for operation, stats in self._ledger_read_timings.items()
             }
 
-    def _run_retry_safe_read_json(self, sql: str) -> Any:
+    def _run_retry_safe_read_json(
+        self,
+        sql: str,
+        *,
+        on_statement_start: Callable[[], None] | None = None,
+    ) -> Any:
         native = getattr(self, "_native", None)
         if native is not None:
+            # Resolve the caller's deadline before marking SQL execution as
+            # started. If admission consumed the final budget, no statement
+            # is sent and attributed callers must charge that expiry to local
+            # admission rather than inventing a PostgreSQL timeout sample.
             timeout_seconds = self._remaining_operation_timeout()
+            if on_statement_start is not None:
+                on_statement_start()
             if timeout_seconds is None:
                 return native.run_json(sql, retry_safe=True)
             return native.run_json(
@@ -8676,6 +8699,8 @@ END;
                 retry_safe=True,
                 timeout_seconds=timeout_seconds,
             )
+        if on_statement_start is not None:
+            on_statement_start()
         return self._run_json(sql)
 
     def _ensure_writer_lease(self) -> None:
