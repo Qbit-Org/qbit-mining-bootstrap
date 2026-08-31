@@ -7184,6 +7184,49 @@ class NativeClientSelectionTests(unittest.TestCase):
         self.assertRegex(executions[1], r"^SET LOCAL lock_timeout = '\d+ms'$")
         self.assertEqual(executions[2], "SELECT json_build_object('ok', true)")
 
+    def test_native_connection_setup_expiry_does_not_start_statement_timing(
+        self,
+    ) -> None:
+        """A budget exhausted while connecting never becomes server time."""
+
+        class OperationalError(Exception):
+            pass
+
+        class FakePsycopg:
+            pass
+
+        FakePsycopg.OperationalError = OperationalError  # type: ignore[attr-defined]
+
+        client = _NativePostgresClient.__new__(_NativePostgresClient)
+        client._psycopg = FakePsycopg
+        starts: list[str] = []
+
+        @contextlib.contextmanager
+        def connection(*, timeout_seconds: float | None = None) -> Any:
+            self.assertGreater(float(timeout_seconds), 0.0)
+            yield unittest.mock.Mock()
+
+        client.connection = connection  # type: ignore[method-assign]
+
+        # Establish deadline, calculate the connection budget, then discover
+        # that connection setup consumed it before SET LOCAL or the query.
+        with unittest.mock.patch.object(
+            share_ledger_module.time,
+            "monotonic",
+            side_effect=[0.0, 0.1, 0.6],
+        ):
+            with self.assertRaisesRegex(
+                LedgerOperationTimeout,
+                "statement deadline expired",
+            ):
+                client.run_json(
+                    "SELECT json_build_object('ok', true)",
+                    timeout_seconds=0.5,
+                    on_statement_start=lambda: starts.append("started"),
+                )
+
+        self.assertEqual(starts, [])
+
     def test_native_server_deadline_raises_operation_timeout(self) -> None:
         class OperationalError(Exception):
             pass

@@ -2722,12 +2722,15 @@ class FakeSqlBackend:
         *,
         retry_safe: bool = False,
         timeout_seconds: float | None = None,
+        on_statement_start: Callable[[], None] | None = None,
     ) -> Any:
         if self.closed:
             raise RuntimeError("connection pool is closed")
         backend = self._acquire(timeout_seconds)
         transaction: Transaction | None = None
         try:
+            if on_statement_start is not None:
+                on_statement_start()
             if timeout_seconds is not None:
                 # `with conn.transaction():` — SET LOCAL statement_timeout and
                 # lock_timeout, run the statement, then send COMMIT.

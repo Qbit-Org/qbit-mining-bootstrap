@@ -2480,6 +2480,7 @@ class LedgerSqlPort(Protocol):
         *,
         retry_safe: bool = False,
         timeout_seconds: float | None = None,
+        on_statement_start: Callable[[], None] | None = None,
     ) -> Any: ...
 
     def run_script(self, sql: str) -> None: ...
@@ -2721,6 +2722,7 @@ class _NativePostgresClient:
         *,
         retry_safe: bool = False,
         timeout_seconds: float | None = None,
+        on_statement_start: Callable[[], None] | None = None,
     ) -> Any:
         """Run one JSON-returning statement.
 
@@ -2751,6 +2753,8 @@ class _NativePostgresClient:
                 )
                 with connection as conn:
                     if deadline is None:
+                        if on_statement_start is not None:
+                            on_statement_start()
                         row = conn.execute(sql).fetchone()
                     else:
                         remaining = deadline - time.monotonic()
@@ -2758,6 +2762,8 @@ class _NativePostgresClient:
                             raise LedgerOperationTimeout(
                                 "postgres statement deadline expired"
                             )
+                        if on_statement_start is not None:
+                            on_statement_start()
                         timeout_ms = max(1, int(remaining * 1000))
                         # SET LOCAL confines both guards to this explicit
                         # transaction, so pooled connections cannot leak a
@@ -8571,7 +8577,12 @@ END;
 
         def on_statement_start() -> None:
             nonlocal execute_started
-            execute_started = self._monotonic()
+            # A retry-safe native read may dispatch more than once after an
+            # ambiguous connection loss. Execution attribution begins at the
+            # first dispatch and includes the retry tail rather than resetting
+            # the clock for each attempt.
+            if execute_started is None:
+                execute_started = self._monotonic()
 
         timed_out = False
         try:
@@ -8685,20 +8696,18 @@ END;
     ) -> Any:
         native = getattr(self, "_native", None)
         if native is not None:
-            # Resolve the caller's deadline before marking SQL execution as
-            # started. If admission consumed the final budget, no statement
-            # is sent and attributed callers must charge that expiry to local
-            # admission rather than inventing a PostgreSQL timeout sample.
             timeout_seconds = self._remaining_operation_timeout()
+            run_kwargs: dict[str, Any] = {"retry_safe": True}
             if on_statement_start is not None:
-                on_statement_start()
+                # The native client borrows or creates its connection before
+                # firing this signal, and rechecks the deadline afterward.
+                # Connection setup expiry is therefore local admission, not
+                # statement execution that never happened.
+                run_kwargs["on_statement_start"] = on_statement_start
             if timeout_seconds is None:
-                return native.run_json(sql, retry_safe=True)
-            return native.run_json(
-                sql,
-                retry_safe=True,
-                timeout_seconds=timeout_seconds,
-            )
+                return native.run_json(sql, **run_kwargs)
+            run_kwargs["timeout_seconds"] = timeout_seconds
+            return native.run_json(sql, **run_kwargs)
         run_json = self._run_json
         if getattr(run_json, "__func__", None) is PsqlShareLedger._run_json:
             return run_json(sql, on_statement_start=on_statement_start)
@@ -9538,11 +9547,13 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
         native = getattr(self, "_native", None)
         if native is not None:
             timeout_seconds = self._remaining_operation_timeout()
+            run_kwargs: dict[str, Any] = {}
             if on_statement_start is not None:
-                on_statement_start()
+                run_kwargs["on_statement_start"] = on_statement_start
             if timeout_seconds is None:
-                return native.run_json(sql)
-            return native.run_json(sql, timeout_seconds=timeout_seconds)
+                return native.run_json(sql, **run_kwargs)
+            run_kwargs["timeout_seconds"] = timeout_seconds
+            return native.run_json(sql, **run_kwargs)
         run_sql = self._run_sql
         if getattr(run_sql, "__func__", None) is PsqlShareLedger._run_sql:
             output = run_sql(
