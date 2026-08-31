@@ -2348,6 +2348,44 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertEqual(stats["execute_seconds_total"], 0.0)
         self.assertEqual(ledger._read_semaphore._value, 1)
 
+    def test_psql_pending_candidate_page_attributes_pre_spawn_expiry_locally(
+        self,
+    ) -> None:
+        """The subprocess backend validates its deadline before execution."""
+
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._read_semaphore = threading.BoundedSemaphore(1)
+        ledger._native = None
+        ledger._command = ["psql"]
+        ledger._session_guards = None
+        deadline_local = threading.local()
+        deadline_local.deadline = 1.0
+        ledger._operation_timeout_local = deadline_local
+        # admission start, deadline check while acquiring, admission end,
+        # deadline check in _run_sql immediately before subprocess setup
+        clock = iter([0.0, 0.5, 0.75, 1.01])
+        ledger._monotonic = lambda: next(clock)
+
+        with unittest.mock.patch.object(
+            share_ledger_module.subprocess,
+            "run",
+            side_effect=AssertionError("deadline-expired read must not spawn psql"),
+        ) as run:
+            with self.assertRaisesRegex(LedgerOperationTimeout, "deadline expired"):
+                ledger._run_attributed_read_json(
+                    "SELECT json_build_object('ok', true);",
+                    operation="pending_block_candidate_rows",
+                )
+
+        run.assert_not_called()
+        self.assertEqual(list(clock), [])
+        stats = ledger.ledger_read_gate_stats()["pending_block_candidate_rows"]
+        self.assertEqual(stats["calls_total"], 1)
+        self.assertEqual(stats["gate_timeouts_total"], 1)
+        self.assertEqual(stats["execute_timeouts_total"], 0)
+        self.assertEqual(stats["execute_seconds_total"], 0.0)
+        self.assertEqual(ledger._read_semaphore._value, 1)
+
     def test_postgres_pending_candidate_page_attributes_an_admission_expiry(
         self,
     ) -> None:

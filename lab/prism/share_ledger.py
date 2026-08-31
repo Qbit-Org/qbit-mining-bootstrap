@@ -8699,9 +8699,16 @@ END;
                 retry_safe=True,
                 timeout_seconds=timeout_seconds,
             )
+        run_json = self._run_json
+        if getattr(run_json, "__func__", None) is PsqlShareLedger._run_json:
+            return run_json(sql, on_statement_start=on_statement_start)
+        # Test and embedding subclasses have historically overridden this
+        # private seam with the one-argument signature. Preserve that
+        # compatibility while treating entry into their replacement as the
+        # only observable statement-start boundary they expose.
         if on_statement_start is not None:
             on_statement_start()
-        return self._run_json(sql)
+        return run_json(sql)
 
     def _ensure_writer_lease(self) -> None:
         while True:
@@ -9522,14 +9529,24 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
             raise RuntimeError("psql query returned no JSON")
         return json.loads(output.splitlines()[-1])
 
-    def _run_json(self, sql: str) -> Any:
+    def _run_json(
+        self,
+        sql: str,
+        *,
+        on_statement_start: Callable[[], None] | None = None,
+    ) -> Any:
         native = getattr(self, "_native", None)
         if native is not None:
             timeout_seconds = self._remaining_operation_timeout()
+            if on_statement_start is not None:
+                on_statement_start()
             if timeout_seconds is None:
                 return native.run_json(sql)
             return native.run_json(sql, timeout_seconds=timeout_seconds)
-        output = self._run_sql(sql).strip()
+        output = self._run_sql(
+            sql,
+            on_statement_start=on_statement_start,
+        ).strip()
         if not output:
             raise RuntimeError("psql query returned no JSON")
         return json.loads(output.splitlines()[-1])
@@ -9541,7 +9558,12 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
             return
         self._run_sql(sql)
 
-    def _run_sql(self, sql: str) -> str:
+    def _run_sql(
+        self,
+        sql: str,
+        *,
+        on_statement_start: Callable[[], None] | None = None,
+    ) -> str:
         cmd = [
             *self._command,
             "--no-psqlrc",
@@ -9600,6 +9622,11 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
                 max(1, math.ceil(timeout_seconds))
             )
             run_kwargs["timeout"] = timeout_seconds
+        # All local deadline validation is complete. Only now does this
+        # invocation count as execution: an expiry raised above never starts
+        # psql and must remain attributed to coordinator-local admission.
+        if on_statement_start is not None:
+            on_statement_start()
         try:
             completed = subprocess.run(
                 cmd,
