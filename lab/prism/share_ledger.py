@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from threading import BoundedSemaphore, Lock, Thread, local
-from typing import Any, Callable, Iterator, Protocol, runtime_checkable
+from typing import Any, Callable, ClassVar, Iterator, Protocol, runtime_checkable
 
 from lab.prism.audit_artifacts import (
     AuditArtifactConfig,
@@ -2925,6 +2925,14 @@ class PsqlShareLedger:
     # of silently reverting every scenario to wall-clock time.
     _monotonic: Callable[[], float] = staticmethod(time.monotonic)
 
+    # Guards the one-time creation of the per-instance read-timing state for
+    # ledgers built through __new__ (several focused tests exercise a single
+    # statement that way). A class attribute, so the check-then-set inside
+    # _ensure_ledger_read_timings cannot let two threads each publish their
+    # own dict and lose one of them; __init__ builds the state directly and
+    # never reaches it.
+    _ledger_read_timings_bootstrap: ClassVar[Lock] = Lock()
+
     @staticmethod
     def _resolve_lease_authority_margin_seconds(
         lease_ttl_seconds: float,
@@ -3200,6 +3208,14 @@ class PsqlShareLedger:
         self._prior_balances_reads_total = 0
         self._prior_balances_read_last_seconds = 0.0
         self._prior_balances_read_max_seconds = 0.0
+        # Attribution for read-slot operations: local admission and server
+        # execution are recorded separately (see _run_attributed_read_json).
+        # Built here so the production path never reaches the __new__
+        # bootstrap in _ensure_ledger_read_timings; the dict is published
+        # before the lock that guards it, so a reader that observes the lock
+        # observes the dict too.
+        self._ledger_read_timings: dict[str, dict[str, float | int]] = {}
+        self._ledger_read_timings_lock = Lock()
         self._native = self._make_native_client(
             native_client_mode,
             database_url,
@@ -4191,6 +4207,44 @@ END;
         read precisely when the backlog is large. The fact is advisory by the
         time the caller holds it; the terminal batch update re-checks it under
         the writer fence.
+
+        **Gate.** This is one read-only statement, and it takes the bounded
+        read slot rather than the global writer lock (issue #211). Waiting for
+        writer admission bought this page nothing: the query already crosses
+        no in-process state, and every fact it returns is advisory the instant
+        the statement commits -- a candidate can land, or be terminalized by
+        another path, between the snapshot and anything the caller does with
+        it. What holding the lock did buy was a convoy. During accepted-block
+        accounting the enumeration spent most or all of its bounded budget
+        queued behind an unrelated long write, and on ``union-mainnet`` that
+        cost the fast-call budget outright while PostgreSQL was idle: the
+        outer call reported ``exceeded 5s`` with only ~0.4-1.3s of the inner
+        statement deadline consumed, and accepted candidates converged in
+        79-186s with ``qbit_prism_accepted_parent_unresolved_oldest_seconds``
+        reaching ~101s.
+
+        Nothing downstream weakens as a result, because nothing downstream
+        ever trusted this snapshot:
+
+        * ``mark_block_candidates_abandoned`` re-asks ``qbit_pool_blocks``
+          *inside* the fenced ``UPDATE``, under the writer-id/epoch/
+          session-token lease predicate, and returns the exact hash set it
+          transitioned -- so a row that acquired a pool block after this read
+          is silently absent instead of abandoned.
+        * ``mark_block_candidate_attempted`` and ``_finish_block_candidate``
+          carry the same lease fence and additionally require
+          ``state = 'pending'``, so a row another path terminalized between
+          the snapshot and the write transitions nobody.
+        * The node-offer path re-reads ``pool_block_state`` and the chain at
+          dequeue rather than reusing a page fact
+          (``_skip_superseded_block_candidate_at_dequeue``).
+
+        Capacity is unchanged too: the read semaphore admits
+        ``read_concurrency`` callers and the pooled client holds
+        ``read_concurrency + 1`` connections, so moving this statement from
+        the writer-lock class to the read-slot class still cannot demand more
+        connections than the pool has, and it opens no connection and starts
+        no thread of its own.
         """
         if limit <= 0:
             return []
@@ -4243,8 +4297,12 @@ FROM (
     LIMIT {int(limit)}
 ) pending;
 """
-        with self._operation_gate(self._lock, "writer lock"):
-            rows = list(self._run_retry_safe_read_json(sql))
+        rows = list(
+            self._run_attributed_read_json(
+                sql,
+                operation="pending_block_candidate_rows",
+            )
+        )
         # A row whose existence fact did not arrive is not a row with no pool
         # block: reading a missing key as false would hand a caller a false
         # negative on the one fact that keeps an offered, landed candidate out
@@ -8468,6 +8526,144 @@ END;
     def _run_read_json(self, sql: str) -> Any:
         with self._operation_gate(self._read_semaphore, "read slot"):
             return self._run_retry_safe_read_json(sql)
+
+    def _run_attributed_read_json(self, sql: str, *, operation: str) -> Any:
+        """Run one read-slot query, timing admission apart from execution.
+
+        Identical to ``_run_read_json`` in what it acquires and what it
+        executes -- the same bounded read semaphore, the same retry-safe
+        statement, no extra connection and no extra thread -- and different
+        only in what it records.
+
+        That record is the point. Issue #211 was diagnosed against an outer
+        call reporting ``replay-outbox-query exceeded 5s`` while the inner
+        PostgreSQL deadline still had seconds left and the server showed zero
+        blocked backends: the budget had gone to coordinator-local admission,
+        and nothing on ``/metrics`` said so. One duration covering both halves
+        cannot answer "database or convoy?", so the halves are counted
+        separately here and exported per operation.
+
+        Execution time is measured across the whole statement including the
+        tail a server-cancelled statement spends returning, so a deadline that
+        expires inside PostgreSQL is attributed to PostgreSQL (cancel lag
+        included) rather than to the gate.
+
+        Every exit path records, so a timed-out read is counted rather than
+        lost, and the gate is released in ``finally`` exactly as
+        ``_operation_gate`` releases it.
+        """
+        gate_started = self._monotonic()
+        try:
+            self._acquire_operation_gate(self._read_semaphore, "read slot")
+        except BaseException as exc:
+            # Admission itself expired: no statement was ever sent, so there
+            # is no execution sample to record and the call counts as a gate
+            # timeout rather than a database one.
+            self._note_ledger_read_timing(
+                operation,
+                gate_wait_seconds=max(0.0, self._monotonic() - gate_started),
+                execute_seconds=None,
+                timed_out=isinstance(exc, TimeoutError),
+            )
+            raise
+        gate_wait_seconds = max(0.0, self._monotonic() - gate_started)
+        execute_started = self._monotonic()
+        timed_out = False
+        try:
+            return self._run_retry_safe_read_json(sql)
+        except BaseException as exc:
+            timed_out = isinstance(exc, TimeoutError)
+            raise
+        finally:
+            execute_seconds = max(0.0, self._monotonic() - execute_started)
+            # Released before the record is taken: a bookkeeping failure must
+            # never leak the read slot it was measuring.
+            self._read_semaphore.release()
+            self._note_ledger_read_timing(
+                operation,
+                gate_wait_seconds=gate_wait_seconds,
+                execute_seconds=execute_seconds,
+                timed_out=timed_out,
+            )
+
+    def _ensure_ledger_read_timings(self) -> Lock:
+        """Return the lock guarding this instance's read-timing record."""
+        stats_lock = getattr(self, "_ledger_read_timings_lock", None)
+        if stats_lock is not None:
+            return stats_lock
+        with PsqlShareLedger._ledger_read_timings_bootstrap:
+            stats_lock = getattr(self, "_ledger_read_timings_lock", None)
+            if stats_lock is None:
+                self._ledger_read_timings = {}
+                stats_lock = Lock()
+                # Published last, so a caller that observes the lock also
+                # observes the dict the lock guards.
+                self._ledger_read_timings_lock = stats_lock
+        return stats_lock
+
+    def _note_ledger_read_timing(
+        self,
+        operation: str,
+        *,
+        gate_wait_seconds: float,
+        execute_seconds: float | None,
+        timed_out: bool,
+    ) -> None:
+        stats_lock = self._ensure_ledger_read_timings()
+        gate_wait_seconds = max(0.0, float(gate_wait_seconds))
+        with stats_lock:
+            stats = self._ledger_read_timings.setdefault(
+                operation,
+                {
+                    "calls_total": 0,
+                    "gate_wait_seconds_total": 0.0,
+                    "gate_wait_seconds_max": 0.0,
+                    "gate_timeouts_total": 0,
+                    "execute_seconds_total": 0.0,
+                    "execute_seconds_max": 0.0,
+                    "execute_timeouts_total": 0,
+                },
+            )
+            stats["calls_total"] = int(stats["calls_total"]) + 1
+            stats["gate_wait_seconds_total"] = (
+                float(stats["gate_wait_seconds_total"]) + gate_wait_seconds
+            )
+            stats["gate_wait_seconds_max"] = max(
+                float(stats["gate_wait_seconds_max"]), gate_wait_seconds
+            )
+            if execute_seconds is None:
+                if timed_out:
+                    stats["gate_timeouts_total"] = (
+                        int(stats["gate_timeouts_total"]) + 1
+                    )
+                return
+            execute_seconds = max(0.0, float(execute_seconds))
+            stats["execute_seconds_total"] = (
+                float(stats["execute_seconds_total"]) + execute_seconds
+            )
+            stats["execute_seconds_max"] = max(
+                float(stats["execute_seconds_max"]), execute_seconds
+            )
+            if timed_out:
+                stats["execute_timeouts_total"] = (
+                    int(stats["execute_timeouts_total"]) + 1
+                )
+
+    def ledger_read_gate_stats(self) -> dict[str, dict[str, float | int]]:
+        """Read-slot admission wait against SQL execution, by operation.
+
+        The series this feeds exist so the *next* budget exhaustion is
+        attributable without a live debugging session: a rising
+        ``gate_wait_seconds_max`` is coordinator-local contention, a rising
+        ``execute_seconds_max`` is PostgreSQL. See
+        ``_run_attributed_read_json``.
+        """
+        stats_lock = self._ensure_ledger_read_timings()
+        with stats_lock:
+            return {
+                operation: dict(stats)
+                for operation, stats in self._ledger_read_timings.items()
+            }
 
     def _run_retry_safe_read_json(self, sql: str) -> Any:
         native = getattr(self, "_native", None)

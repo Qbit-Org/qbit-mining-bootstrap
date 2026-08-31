@@ -88,8 +88,13 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 
-from lab.prism.share_ledger import PendingShare, PsqlShareLedger
+from lab.prism.share_ledger import (
+    LedgerOperationTimeout,
+    PendingShare,
+    PsqlShareLedger,
+)
 
 
 def pending(
@@ -236,6 +241,127 @@ assert_equal(len(snapshot), share_count, "snapshot returns all committed shares"
 
 metrics = ledger.metrics()
 assert_equal(metrics["shares"], share_count, "metrics share count from cached stats")
+
+# Issue #211: the replay enumeration is a read and must not queue on the
+# coordinator-local writer gate. This is the production call shape -- the real
+# statement, over the real pooled psycopg client, against a real server -- run
+# while an accounting-shaped writer holds that gate for longer than the whole
+# fast-call budget. Before the fix the page spent that budget on admission and
+# never reached PostgreSQL.
+candidate_hash = "ab" * 32
+second_candidate_hash = "cd" * 32
+candidate_intent = {
+    "schema": "qbit.prism.block-candidate-intent.v1",
+    "block_hash_hex": candidate_hash,
+    "block_hex": "00",
+}
+assert ledger.persist_block_candidate_intent(candidate_intent)
+assert ledger.persist_block_candidate_intent(
+    {**candidate_intent, "block_hash_hex": second_candidate_hash}
+)
+
+FAST_CALL_BUDGET_SECONDS = 1.0
+gate_taken = threading.Event()
+release_gate = threading.Event()
+holder_error: list[BaseException] = []
+
+
+def hold_writer_gate() -> None:
+    try:
+        with ledger._operation_gate(ledger._lock, "writer lock"):
+            gate_taken.set()
+            release_gate.wait(timeout=60)
+    except BaseException as exc:  # noqa: BLE001 - surfaced below
+        holder_error.append(exc)
+        gate_taken.set()
+
+
+holder = threading.Thread(target=hold_writer_gate, daemon=True)
+holder.start()
+if not gate_taken.wait(timeout=30):
+    raise SystemExit("the writer gate holder never acquired the gate")
+if holder_error:
+    raise holder_error[0]
+
+try:
+    started = time.monotonic()
+    with ledger.operation_timeout(FAST_CALL_BUDGET_SECONDS):
+        page = ledger.pending_block_candidate_rows(limit=1)
+    enumeration_seconds = time.monotonic() - started
+
+    # It completed, inside its own budget, with the gate still held.
+    assert_equal(
+        [row["block_hash"] for row in page],
+        [candidate_hash],
+        "pending page enumerated while the writer gate was held",
+    )
+    assert_equal(
+        [row["pool_block_exists"] for row in page],
+        [False],
+        "pending page carried the landed-block fact from the same snapshot",
+    )
+    if enumeration_seconds >= FAST_CALL_BUDGET_SECONDS:
+        raise SystemExit(
+            "pending page took "
+            f"{enumeration_seconds:.3f}s of a {FAST_CALL_BUDGET_SECONDS:g}s budget"
+        )
+
+    # Pagination stays exact across the same held gate: the cursor resumes
+    # strictly after its own row and the short page proves the end.
+    with ledger.operation_timeout(FAST_CALL_BUDGET_SECONDS):
+        second_page = ledger.pending_block_candidate_rows(
+            limit=1,
+            after_cursor=page[0]["cursor"],
+        )
+    assert_equal(
+        [row["block_hash"] for row in second_page],
+        [second_candidate_hash],
+        "pending page cursor resumed strictly after its own row",
+    )
+    with ledger.operation_timeout(FAST_CALL_BUDGET_SECONDS):
+        assert_equal(
+            ledger.pending_block_candidate_rows(
+                limit=1,
+                after_cursor=second_page[0]["cursor"],
+            ),
+            [],
+            "a cursor past every pending row proves the walk complete",
+        )
+
+    # The control. The same gate, the same budget, asked for writer admission
+    # instead: it times out, which is what the enumeration used to do.
+    try:
+        with ledger.operation_timeout(FAST_CALL_BUDGET_SECONDS):
+            ledger._acquire_operation_gate(ledger._lock, "writer lock")
+    except LedgerOperationTimeout as exc:
+        if "writer lock" not in str(exc):
+            raise
+    else:
+        ledger._lock.release()
+        raise SystemExit("the writer gate was not actually held")
+finally:
+    release_gate.set()
+    holder.join(timeout=30)
+if holder.is_alive():
+    raise SystemExit("the writer gate holder never released the gate")
+if holder_error:
+    raise holder_error[0]
+
+# The attribution the next budget exhaustion will be read from: no time on
+# local admission, real time in PostgreSQL, and neither timeout counter armed.
+read_gate_stats = ledger.ledger_read_gate_stats()["pending_block_candidate_rows"]
+assert_equal(int(read_gate_stats["calls_total"]), 3, "read-slot calls counted")
+assert_equal(int(read_gate_stats["gate_timeouts_total"]), 0, "no admission expiry")
+assert_equal(int(read_gate_stats["execute_timeouts_total"]), 0, "no statement expiry")
+if float(read_gate_stats["execute_seconds_total"]) <= 0.0:
+    raise SystemExit("pending page recorded no PostgreSQL execution time")
+if float(read_gate_stats["gate_wait_seconds_max"]) >= FAST_CALL_BUDGET_SECONDS:
+    raise SystemExit(
+        "pending page charged "
+        f"{read_gate_stats['gate_wait_seconds_max']}s to local admission"
+    )
+
+ledger._run_sql("DELETE FROM qbit_block_candidate_outbox;")
 
 try:
     PsqlShareLedger(
