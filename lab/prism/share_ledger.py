@@ -7282,6 +7282,33 @@ CROSS JOIN window_summary;
         lookback_seconds: int = 0,
         range_anchor_epoch: int | None = None,
     ) -> list[dict[str, object]]:
+        """Serve the per-bucket credited hashrate series in O(buckets).
+
+        The series is answered from the incremental rollup tables plus a
+        live tail over the shares the maintenance watermark has not folded
+        in yet, so its cost tracks the number of buckets in range rather
+        than the number of shares. The rollup path must stay byte-identical
+        to the historical raw ``qbit_share_ledger`` aggregation for the same
+        underlying shares -- same buckets, counts, difficulty strings, and
+        ordering -- which pins three invariants:
+
+        - The watermark, the rollup rows, and the tail scan are read inside
+          one statement, so they share one snapshot. Reading the watermark
+          in a separate statement would let a concurrent maintenance pass
+          advance it in between and double-count the shares it folded in.
+        - A range lower bound that is not bucket-aligned makes the raw scan
+          emit a partial leading bucket (only the shares at or after the
+          bound). Full rollup buckets cannot reproduce that, so the bucket
+          straddling the bound is re-aggregated from the ledger over the
+          already-rolled-up sequence range; that scan is bounded by one
+          bucket span of shares regardless of the requested range.
+        - An absent progress row gates the rollup and boundary branches off
+          and widens the tail to the whole ledger (``share_seq > -1``), so
+          the merged output degrades to exactly the raw scan; a database
+          missing the rollup tables entirely runs the raw statement
+          unchanged. Both keep pre-migration and mid-backfill states
+          correct without operator action.
+        """
         from lab.prism import public_api
 
         bucket_seconds = {"5m": 300, "1h": 3600, "1d": 86400}[bucket]
@@ -7293,6 +7320,7 @@ CROSS JOIN window_summary;
             "all": None,
         }[range_id]
         range_filter = ""
+        range_start_sql: str | None = None
         if range_interval is not None:
             # Anchor the range lower bound on the caller's clock when provided
             # so it agrees with the caller's min_epoch trim even when the
@@ -7302,15 +7330,17 @@ CROSS JOIN window_summary;
                 if range_anchor_epoch is not None
                 else "bounds.ended_at"
             )
-            range_filter = f"AND ledger.accepted_at >= {range_anchor_sql} - interval '{range_interval}'"
+            range_start_sql = f"{range_anchor_sql} - interval '{range_interval}'"
             if lookback_seconds > 0:
                 # Pre-range context requested by the smoother; the caller trims
                 # these buckets from the response after windowing.
-                range_filter += f" - interval '{int(lookback_seconds)} seconds'"
+                range_start_sql += f" - interval '{int(lookback_seconds)} seconds'"
+            range_filter = f"AND ledger.accepted_at >= {range_start_sql}"
         subject_filter = ""
         if subject_type == "miner":
             subject_filter = f"AND ledger.miner_id = {self._text_literal(str(subject_id))}"
-        sql = f"""
+        if not self._hashrate_rollup_schema_present():
+            sql = f"""
 	WITH bounds AS (
 	    SELECT clock_timestamp() AS ended_at
 	),
@@ -7333,6 +7363,118 @@ SELECT COALESCE(json_agg(json_build_object(
 ) ORDER BY bucket_epoch ASC), '[]'::json)
 FROM bucketed;
 """
+            rows = self._run_read_json(sql)
+            return [
+                {
+                    "timestamp": row["timestamp"],
+                    "hashrate_ths": public_api.hashrate_ths_from_difficulty(row["accepted_share_difficulty"], bucket_seconds),
+                    "accepted_share_count": int(row["accepted_share_count"]),
+                    "accepted_share_difficulty": str(row["accepted_share_difficulty"]),
+                }
+                for row in rows
+            ]
+        if subject_type == "miner":
+            rollup_table = "qbit_hashrate_rollup_miner"
+            rollup_subject_filter = (
+                f"\n      AND rollup.miner_id = {self._text_literal(str(subject_id))}"
+            )
+        else:
+            rollup_table = "qbit_hashrate_rollup_pool"
+            rollup_subject_filter = ""
+        if range_start_sql is not None:
+            range_buckets_cte = f"""range_buckets AS (
+    SELECT
+        range_bounds.range_started_at,
+        (ceil(extract(epoch FROM range_bounds.range_started_at) / {int(bucket_seconds)}))::bigint * {int(bucket_seconds)} AS first_full_bucket_epoch
+    FROM (SELECT {range_start_sql} AS range_started_at FROM bounds) range_bounds
+),
+"""
+            rollup_lower_bound = (
+                "\n      AND rollup.bucket_epoch >= (SELECT first_full_bucket_epoch FROM range_buckets)"
+            )
+            boundary_cte = f"""boundary AS (
+    SELECT
+        floor(extract(epoch FROM ledger.accepted_at) / {int(bucket_seconds)})::bigint * {int(bucket_seconds)} AS bucket_epoch,
+        count(*) AS accepted_share_count,
+        sum(ledger.share_difficulty) AS accepted_share_difficulty
+    FROM qbit_share_ledger ledger, bounds
+    WHERE (SELECT rollups_ready FROM watermark)
+      AND ledger.accepted
+      AND ledger.share_seq <= (SELECT last_share_seq FROM watermark)
+      AND ledger.accepted_at <= bounds.ended_at
+      AND ledger.accepted_at >= (SELECT range_started_at FROM range_buckets)
+      AND ledger.accepted_at < to_timestamp((SELECT first_full_bucket_epoch FROM range_buckets))
+      {subject_filter}
+    GROUP BY bucket_epoch
+),
+"""
+            boundary_union = """        UNION ALL
+        SELECT bucket_epoch, accepted_share_count, accepted_share_difficulty FROM boundary
+"""
+            tail_range_filter = (
+                "\n      AND ledger.accepted_at >= (SELECT range_started_at FROM range_buckets)"
+            )
+        else:
+            range_buckets_cte = ""
+            rollup_lower_bound = ""
+            boundary_cte = ""
+            boundary_union = ""
+            tail_range_filter = ""
+        sql = f"""
+WITH bounds AS (
+    SELECT clock_timestamp() AS ended_at
+),
+progress AS (
+    SELECT last_share_seq
+    FROM qbit_hashrate_rollup_progress
+    WHERE singleton
+),
+watermark AS (
+    SELECT
+        COALESCE((SELECT last_share_seq FROM progress), -1) AS last_share_seq,
+        EXISTS (SELECT 1 FROM progress) AS rollups_ready
+),
+{range_buckets_cte}rolled AS (
+    SELECT
+        rollup.bucket_epoch,
+        rollup.accepted_share_count,
+        rollup.accepted_share_difficulty
+    FROM {rollup_table} rollup, bounds
+    WHERE (SELECT rollups_ready FROM watermark)
+      AND rollup.grain_seconds = {int(bucket_seconds)}
+      AND rollup.bucket_epoch <= floor(extract(epoch FROM bounds.ended_at) / {int(bucket_seconds)})::bigint * {int(bucket_seconds)}{rollup_lower_bound}{rollup_subject_filter}
+),
+{boundary_cte}tail AS (
+    SELECT
+        floor(extract(epoch FROM ledger.accepted_at) / {int(bucket_seconds)})::bigint * {int(bucket_seconds)} AS bucket_epoch,
+        count(*) AS accepted_share_count,
+        sum(ledger.share_difficulty) AS accepted_share_difficulty
+    FROM qbit_share_ledger ledger, bounds
+    WHERE ledger.accepted
+      AND ledger.share_seq > (SELECT last_share_seq FROM watermark)
+      AND ledger.accepted_at <= bounds.ended_at{tail_range_filter}
+      {subject_filter}
+    GROUP BY bucket_epoch
+),
+merged AS (
+    SELECT
+        parts.bucket_epoch,
+        sum(parts.accepted_share_count)::bigint AS accepted_share_count,
+        sum(parts.accepted_share_difficulty) AS accepted_share_difficulty
+    FROM (
+        SELECT bucket_epoch, accepted_share_count, accepted_share_difficulty FROM rolled
+{boundary_union}        UNION ALL
+        SELECT bucket_epoch, accepted_share_count, accepted_share_difficulty FROM tail
+    ) parts
+    GROUP BY parts.bucket_epoch
+)
+SELECT COALESCE(json_agg(json_build_object(
+    'timestamp', to_char(to_timestamp(bucket_epoch) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    'accepted_share_count', accepted_share_count,
+    'accepted_share_difficulty', accepted_share_difficulty::text
+) ORDER BY bucket_epoch ASC), '[]'::json)
+FROM merged;
+"""
         rows = self._run_read_json(sql)
         return [
             {
@@ -7343,6 +7485,165 @@ FROM bucketed;
             }
             for row in rows
         ]
+
+    def _hashrate_rollup_schema_present(self) -> bool:
+        """Report whether the incremental hashrate rollup tables exist.
+
+        The serving statement cannot even parse against a database that
+        predates the rollup DDL, so table existence has to be settled before
+        choosing a statement. A positive answer is cached for the life of
+        this instance: the rollup tables are only ever created (by the
+        writer's idempotent schema apply), never dropped. A negative answer
+        is deliberately not cached, so a read tier pointed at a database
+        whose writer applies the DDL mid-flight picks up the rollup path
+        without a restart.
+        """
+        if getattr(self, "_hashrate_rollup_schema_ready", False):
+            return True
+        row = self._run_read_json(
+            """
+SELECT json_build_object(
+    'rollup_schema_ready',
+    to_regclass('qbit_hashrate_rollup_progress') IS NOT NULL
+    AND to_regclass('qbit_hashrate_rollup_pool') IS NOT NULL
+    AND to_regclass('qbit_hashrate_rollup_miner') IS NOT NULL
+);
+"""
+        )
+        ready = bool(row["rollup_schema_ready"])
+        if ready:
+            self._hashrate_rollup_schema_ready = True
+        return ready
+
+    def advance_hashrate_rollups(self, *, batch_limit: int) -> dict[str, object]:
+        """Fold the next watermarked share batch into the hashrate rollups.
+
+        One statement, one transaction. ``qbit_share_ledger`` rows are
+        immutable and ``share_seq`` is append-only, so scanning strictly
+        above the stored watermark in sequence order folds every share into
+        its (grain, bucket) rows exactly once -- a late-clocked share still
+        lands in its correct ``accepted_at`` bucket, and no re-aggregation
+        window is needed. Rejected rows are read only to advance the
+        watermark. The first pass seeds the progress row itself and starts
+        from sequence 0, which is also how a grown ledger backfills.
+
+        The watermark advance is a guarded upsert: it only applies while the
+        progress row still holds the value this statement read, and the
+        rollup upserts are gated on that advance having won. A concurrent
+        advance therefore leaves this pass writing nothing at all -- the
+        guarded upsert matches no row and both rollup inserts see an empty
+        gate -- and the caller raises instead of double-counting, because
+        two live maintenance passes mean the single-writer invariant is
+        already broken.
+        """
+        batch_limit = int(batch_limit)
+        if batch_limit <= 0:
+            raise ValueError("hashrate rollup batch limit must be positive")
+        sql = f"""
+WITH progress AS (
+    SELECT COALESCE((
+        SELECT last_share_seq
+        FROM qbit_hashrate_rollup_progress
+        WHERE singleton
+    ), 0) AS last_share_seq
+),
+batch AS (
+    SELECT
+        ledger.share_seq,
+        ledger.accepted,
+        ledger.accepted_at,
+        ledger.miner_id,
+        ledger.share_difficulty
+    FROM qbit_share_ledger ledger
+    WHERE ledger.share_seq > (SELECT last_share_seq FROM progress)
+    ORDER BY ledger.share_seq ASC
+    LIMIT {batch_limit}
+),
+batch_stats AS (
+    SELECT
+        count(*) AS scanned,
+        COALESCE(max(batch.share_seq), (SELECT last_share_seq FROM progress)) AS next_share_seq
+    FROM batch
+),
+advance AS (
+    INSERT INTO qbit_hashrate_rollup_progress (singleton, last_share_seq)
+    VALUES (true, (SELECT next_share_seq FROM batch_stats))
+    ON CONFLICT (singleton) DO UPDATE
+        SET last_share_seq = EXCLUDED.last_share_seq,
+            updated_at = clock_timestamp()
+        WHERE qbit_hashrate_rollup_progress.last_share_seq = (SELECT last_share_seq FROM progress)
+    RETURNING last_share_seq
+),
+grains AS (
+    SELECT grain_seconds
+    FROM (VALUES (300), (3600), (86400)) AS grain(grain_seconds)
+),
+pool_rollup AS (
+    INSERT INTO qbit_hashrate_rollup_pool (
+        grain_seconds,
+        bucket_epoch,
+        accepted_share_count,
+        accepted_share_difficulty
+    )
+    SELECT
+        grains.grain_seconds,
+        floor(extract(epoch FROM batch.accepted_at) / grains.grain_seconds)::bigint * grains.grain_seconds AS bucket_epoch,
+        count(*) AS accepted_share_count,
+        sum(batch.share_difficulty) AS accepted_share_difficulty
+    FROM batch, grains
+    WHERE batch.accepted
+      AND EXISTS (SELECT 1 FROM advance)
+    GROUP BY grains.grain_seconds, bucket_epoch
+    ON CONFLICT (grain_seconds, bucket_epoch) DO UPDATE
+        SET accepted_share_count = qbit_hashrate_rollup_pool.accepted_share_count
+                + EXCLUDED.accepted_share_count,
+            accepted_share_difficulty = qbit_hashrate_rollup_pool.accepted_share_difficulty
+                + EXCLUDED.accepted_share_difficulty
+    RETURNING 1
+),
+miner_rollup AS (
+    INSERT INTO qbit_hashrate_rollup_miner (
+        grain_seconds,
+        bucket_epoch,
+        miner_id,
+        accepted_share_count,
+        accepted_share_difficulty
+    )
+    SELECT
+        grains.grain_seconds,
+        floor(extract(epoch FROM batch.accepted_at) / grains.grain_seconds)::bigint * grains.grain_seconds AS bucket_epoch,
+        batch.miner_id,
+        count(*) AS accepted_share_count,
+        sum(batch.share_difficulty) AS accepted_share_difficulty
+    FROM batch, grains
+    WHERE batch.accepted
+      AND EXISTS (SELECT 1 FROM advance)
+    GROUP BY grains.grain_seconds, bucket_epoch, batch.miner_id
+    ON CONFLICT (grain_seconds, bucket_epoch, miner_id) DO UPDATE
+        SET accepted_share_count = qbit_hashrate_rollup_miner.accepted_share_count
+                + EXCLUDED.accepted_share_count,
+            accepted_share_difficulty = qbit_hashrate_rollup_miner.accepted_share_difficulty
+                + EXCLUDED.accepted_share_difficulty
+    RETURNING 1
+)
+SELECT json_build_object(
+    'scanned', (SELECT scanned FROM batch_stats),
+    'last_share_seq', (SELECT next_share_seq FROM batch_stats),
+    'advanced', (SELECT count(*) FROM advance),
+    'caught_up', (SELECT scanned FROM batch_stats) < {batch_limit}
+);
+"""
+        result = self._run_fenced_json(sql)
+        if int(result["advanced"]) != 1:
+            raise RuntimeError(
+                "hashrate rollup watermark advanced concurrently; "
+                "this pass wrote nothing (writer-fencing bug)"
+            )
+        return {
+            "scanned": int(result["scanned"]),
+            "last_share_seq": int(result["last_share_seq"]),
+            "caught_up": bool(result["caught_up"]),
+        }
 
     def _audit_store(self) -> AuditArtifactStore:
         store = getattr(self, "_audit_artifact_store", None)

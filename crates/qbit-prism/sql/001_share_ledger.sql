@@ -2562,6 +2562,50 @@ CREATE TABLE IF NOT EXISTS qbit_worker_difficulty (
 CREATE INDEX IF NOT EXISTS qbit_worker_difficulty_evidence_idx
     ON qbit_worker_difficulty (evidence_at DESC, listener, worker_username);
 
+-- Incremental hashrate rollups for the public dashboard hashrate-series
+-- endpoint. qbit_share_ledger rows are immutable after insert and share_seq
+-- is append-only, so a single monotonically advancing watermark
+-- (qbit_hashrate_rollup_progress.last_share_seq) makes per-bucket
+-- accumulation exact: every share is folded into its (grain, bucket) rows
+-- exactly once, regardless of accepted_at ordering. Buckets are keyed by
+-- floor(extract(epoch FROM accepted_at) / grain)::bigint * grain -- the
+-- exact expression the serving query uses -- so rollup and raw bucketing
+-- can never disagree. Only the lease-holding coordinator maintains these
+-- tables; the public read tier only reads them. accepted_share_difficulty
+-- mirrors qbit_share_ledger.share_difficulty's numeric(78, 0) so summed
+-- text renderings stay byte-identical to a raw-scan aggregation.
+CREATE TABLE IF NOT EXISTS qbit_hashrate_rollup_pool (
+    grain_seconds integer NOT NULL CHECK (grain_seconds IN (300, 3600, 86400)),
+    bucket_epoch bigint NOT NULL CHECK (bucket_epoch >= 0),
+    accepted_share_count bigint NOT NULL CHECK (accepted_share_count >= 0),
+    accepted_share_difficulty numeric(78, 0) NOT NULL CHECK (accepted_share_difficulty >= 0),
+    PRIMARY KEY (grain_seconds, bucket_epoch)
+);
+
+CREATE TABLE IF NOT EXISTS qbit_hashrate_rollup_miner (
+    grain_seconds integer NOT NULL CHECK (grain_seconds IN (300, 3600, 86400)),
+    bucket_epoch bigint NOT NULL CHECK (bucket_epoch >= 0),
+    miner_id text NOT NULL,
+    accepted_share_count bigint NOT NULL CHECK (accepted_share_count >= 0),
+    accepted_share_difficulty numeric(78, 0) NOT NULL CHECK (accepted_share_difficulty >= 0),
+    PRIMARY KEY (grain_seconds, bucket_epoch, miner_id)
+);
+
+CREATE INDEX IF NOT EXISTS qbit_hashrate_rollup_miner_series_idx
+    ON qbit_hashrate_rollup_miner (miner_id, grain_seconds, bucket_epoch);
+
+-- Single-row watermark. A missing row means the rollups have never run:
+-- the serving query then degrades to the raw ledger scan, so a
+-- pre-migration database or a half-deployed writer stays correct. The
+-- first maintenance pass seeds the row itself and starts from sequence 0,
+-- which is also how a grown ledger backfills -- there is no separate
+-- migration path.
+CREATE TABLE IF NOT EXISTS qbit_hashrate_rollup_progress (
+    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    last_share_seq bigint NOT NULL CHECK (last_share_seq >= 0),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
 -- Pairs with the BEGIN at the top of the file: the apply is one transaction
 -- no matter which client performs it.
 COMMIT;
