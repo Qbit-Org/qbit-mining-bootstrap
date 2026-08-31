@@ -21,6 +21,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from lab.prism import public_api
 from lab.prism.share_ledger import PsqlShareLedger, SingleWriterShareLedger
 
 
@@ -2105,6 +2106,149 @@ WHERE singleton;
         ledger.close()
 
 
+def _marker_iso(epoch: int) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_dashboard_block_markers_read_model() -> None:
+    """The block-marker SQL over real qbit_pool_blocks rows.
+
+    Seeds found blocks across two 1h buckets plus one block just below the 1w
+    range's lower bound and one reversed block, then asserts the read model's
+    counts, per-bucket top-3 ordering (found_at DESC, height DESC), range
+    filtering against the caller-provided anchor, and the unbounded ``all``
+    range.
+    """
+    schema = create_owned_schema("block_markers")
+    ledger = ScopedPsqlLedger(
+        test_schema=schema,
+        writer_id="a1-block-markers",
+        writer_epoch=1,
+        initialize_schema=True,
+    )
+    anchor_epoch = 1_750_000_000
+    bucket_a = public_api.hashrate_series_min_epoch(anchor_epoch, 7 * 86400, 3600)
+    bucket_b = anchor_epoch // 3600 * 3600 - 7200
+    hash_in_a = "71" * 32
+    hash_below_range = "72" * 32
+    hashes_in_b = {201: "73" * 32, 202: "74" * 32, 203: "75" * 32, 204: "76" * 32}
+    hash_reversed = "77" * 32
+    found_in_a = bucket_a + 10
+    found_in_b = {201: bucket_b + 100, 202: bucket_b + 200, 203: bucket_b + 300, 204: bucket_b + 300}
+    try:
+        rows = [
+            (hash_in_a, 100, found_in_a, "confirmed"),
+            # One second below the range lower bound: dropped from 1w with the
+            # whole straddling bucket, present in the unbounded all range.
+            (hash_below_range, 99, bucket_a - 1, "confirmed"),
+            (hashes_in_b[201], 201, found_in_b[201], "confirmed"),
+            (hashes_in_b[202], 202, found_in_b[202], "confirmed"),
+            # Two blocks tied on found_at so the height tiebreak is observable.
+            (hashes_in_b[203], 203, found_in_b[203], "confirmed"),
+            (hashes_in_b[204], 204, found_in_b[204], "confirmed"),
+        ]
+        values = ",\n    ".join(
+            f"('{block_hash}', {height}, '{'10' * 32}', '{'20' * 32}', "
+            f"'{'30' * 32}', to_timestamp({epoch}), '{chain_state}', 'immature', NULL)"
+            for block_hash, height, epoch, chain_state in rows
+        )
+        ledger._run_sql(
+            f"""
+INSERT INTO qbit_pool_blocks (
+    block_hash, block_height, parent_hash, coinbase_txid,
+    payout_manifest_sha256, found_at, chain_state, maturity_state,
+    disconnected_at
+) VALUES
+    {values},
+    ('{hash_reversed}', 205, '{'10' * 32}', '{'20' * 32}', '{'30' * 32}',
+     to_timestamp({bucket_b + 400}), 'reversed', 'reversed',
+     to_timestamp({bucket_b + 500}));
+"""
+        )
+
+        week = ledger.dashboard_block_markers(
+            range_id="1w",
+            bucket="1h",
+            range_anchor_epoch=anchor_epoch,
+        )
+        assert_equal(
+            week,
+            {
+                "total_blocks": 5,
+                "points": [
+                    {
+                        "timestamp": _marker_iso(bucket_a),
+                        "block_count": 1,
+                        "blocks": [
+                            {
+                                "height": 100,
+                                "hash": hash_in_a,
+                                "found_at": _marker_iso(found_in_a),
+                            }
+                        ],
+                    },
+                    {
+                        "timestamp": _marker_iso(bucket_b),
+                        "block_count": 4,
+                        "blocks": [
+                            {
+                                "height": 204,
+                                "hash": hashes_in_b[204],
+                                "found_at": _marker_iso(found_in_b[204]),
+                            },
+                            {
+                                "height": 203,
+                                "hash": hashes_in_b[203],
+                                "found_at": _marker_iso(found_in_b[203]),
+                            },
+                            {
+                                "height": 202,
+                                "hash": hashes_in_b[202],
+                                "found_at": _marker_iso(found_in_b[202]),
+                            },
+                        ],
+                    },
+                ],
+            },
+            "1w block markers",
+        )
+
+        everything = ledger.dashboard_block_markers(
+            range_id="all",
+            bucket="1d",
+            range_anchor_epoch=None,
+        )
+        assert_equal(everything["total_blocks"], 6, "all-range total excludes reversed only")
+        assert_equal(
+            sum(int(point["block_count"]) for point in everything["points"]),
+            6,
+            "all-range bucket counts sum to the total",
+        )
+        listed_hashes = {
+            block["hash"]
+            for point in everything["points"]
+            for block in point["blocks"]
+        }
+        if hash_below_range not in listed_hashes:
+            raise GateFailure("all range must include the below-1w-range block")
+        if hash_reversed in listed_hashes:
+            raise GateFailure("reversed block leaked into the marker series")
+        epochs = [
+            int(
+                datetime.strptime(str(point["timestamp"]), "%Y-%m-%dT%H:%M:%SZ")
+                .replace(tzinfo=timezone.utc)
+                .timestamp()
+            )
+            for point in everything["points"]
+        ]
+        assert_equal(epochs, sorted(epochs), "all-range points ascend")
+        for epoch in epochs:
+            assert_equal(epoch % 86400, 0, "all-range 1d bucket alignment")
+    finally:
+        ledger.release_writer_lease()
+        ledger.close()
+
+
 def main() -> None:
     public_before = public_sentinel()
     failure: BaseException | None = None
@@ -2119,6 +2263,7 @@ def main() -> None:
         test_hashrate_rollup_watermark_guard()
         test_hashrate_rollup_difficulty_overflow_headroom()
         test_hashrate_rollup_lease_fence()
+        test_dashboard_block_markers_read_model()
     except BaseException as error:
         failure = error
     try:
@@ -2143,7 +2288,8 @@ def main() -> None:
         "exact-transition-parity empty-fresh empty-legacy "
         "ordinary-decoy-binding temporary-decoy-binding durable-floor-gaps "
         "hashrate-rollup-parity hashrate-rollup-guard "
-        "hashrate-rollup-overflow hashrate-rollup-lease-fence"
+        "hashrate-rollup-overflow hashrate-rollup-lease-fence "
+        "block-markers"
     )
 
 
