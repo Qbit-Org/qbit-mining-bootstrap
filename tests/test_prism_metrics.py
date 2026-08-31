@@ -279,6 +279,71 @@ def reference_landing_observability_metrics_lines(server) -> list[str]:
                 f"qbit_prism_prior_balances_read_max_seconds {float(prior_stats['max_seconds']):.6f}",
             ]
         )
+    read_gate_fn = getattr(server.ledger, "ledger_read_gate_stats", None)
+    read_gate_stats = read_gate_fn() if callable(read_gate_fn) else {}
+    if read_gate_stats:
+        families = (
+            (
+                "qbit_prism_ledger_read_calls_total",
+                "counter",
+                "Ledger read-slot operations completed or failed, by operation.",
+                "calls_total",
+                True,
+            ),
+            (
+                "qbit_prism_ledger_read_gate_wait_seconds_total",
+                "counter",
+                "Cumulative coordinator-local read-slot admission wait, by operation.",
+                "gate_wait_seconds_total",
+                False,
+            ),
+            (
+                "qbit_prism_ledger_read_gate_wait_seconds_max",
+                "gauge",
+                "Longest coordinator-local read-slot admission wait since process start, by operation.",
+                "gate_wait_seconds_max",
+                False,
+            ),
+            (
+                "qbit_prism_ledger_read_gate_timeouts_total",
+                "counter",
+                "Read-slot operations whose deadline expired before admission, so no statement was ever sent.",
+                "gate_timeouts_total",
+                True,
+            ),
+            (
+                "qbit_prism_ledger_read_execute_seconds_total",
+                "counter",
+                "Cumulative PostgreSQL execution time for admitted read-slot statements, by operation.",
+                "execute_seconds_total",
+                False,
+            ),
+            (
+                "qbit_prism_ledger_read_execute_seconds_max",
+                "gauge",
+                "Longest PostgreSQL execution time for an admitted read-slot statement since process start, by operation.",
+                "execute_seconds_max",
+                False,
+            ),
+            (
+                "qbit_prism_ledger_read_execute_timeouts_total",
+                "counter",
+                "Admitted read-slot statements whose deadline expired inside PostgreSQL, cancel lag included.",
+                "execute_timeouts_total",
+                True,
+            ),
+        )
+        operations = [
+            (server.prometheus_label_value(str(operation)), stats)
+            for operation, stats in sorted(read_gate_stats.items())
+        ]
+        for name, metric_type, help_text, field, integral in families:
+            lines.append(f"# HELP {name} {help_text}")
+            lines.append(f"# TYPE {name} {metric_type}")
+            for label, stats in operations:
+                value = stats.get(field, 0)
+                rendered = f"{int(value)}" if integral else f"{float(value):.6f}"
+                lines.append(f'{name}{{operation="{label}"}} {rendered}')
     startup_phases = server.startup_phase_seconds()
     if startup_phases:
         lines.extend(
@@ -1231,6 +1296,19 @@ class MetricsRenderParityTests(unittest.TestCase):
             "last_seconds": 0.01,
             "max_seconds": 0.02,
         }
+        # Issue #211's attribution: local admission and server execution are
+        # separate series so a budget exhaustion names the half it went to.
+        server.ledger.ledger_read_gate_stats = lambda: {
+            "pending_block_candidate_rows": {
+                "calls_total": 7,
+                "gate_wait_seconds_total": 0.125,
+                "gate_wait_seconds_max": 0.1,
+                "gate_timeouts_total": 1,
+                "execute_seconds_total": 4.5,
+                "execute_seconds_max": 2.25,
+                "execute_timeouts_total": 2,
+            }
+        }
         server.ledger.block_candidate_pending_metrics = lambda: {
             "pending_count": 2,
             "oldest_pending_age_seconds": 1.5,
@@ -1292,6 +1370,11 @@ class MetricsRenderParityTests(unittest.TestCase):
             'qbit_prism_block_ledger_calls_total{call_class="fast"} 1',
             'qbit_prism_block_ledger_call_timeouts_total{call_class="fast"} 1',
             "qbit_prism_prior_balances_reads_total 3",
+            'qbit_prism_ledger_read_calls_total{operation="pending_block_candidate_rows"} 7',
+            'qbit_prism_ledger_read_gate_wait_seconds_max{operation="pending_block_candidate_rows"} 0.100000',
+            'qbit_prism_ledger_read_gate_timeouts_total{operation="pending_block_candidate_rows"} 1',
+            'qbit_prism_ledger_read_execute_seconds_max{operation="pending_block_candidate_rows"} 2.250000',
+            'qbit_prism_ledger_read_execute_timeouts_total{operation="pending_block_candidate_rows"} 2',
             'qbit_prism_startup_phase_seconds{phase="audit_listener_bound"}',
             "qbit_prism_accepted_parent_preview_wait_timeouts_total 2",
             "qbit_prism_tip_refresh_wave_outcomes_total",

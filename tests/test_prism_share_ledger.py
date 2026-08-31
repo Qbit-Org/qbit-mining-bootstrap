@@ -2200,13 +2200,272 @@ class PrismShareLedgerTests(unittest.TestCase):
         """A failed page read must not read as an empty backlog."""
 
         class FailingPageLedger(FakeLeasePsqlShareLedger):
-            def _run_retry_safe_read_json(self, sql: str) -> Any:
+            def _run_retry_safe_read_json(
+                self,
+                sql: str,
+                *,
+                on_statement_start: Any = None,
+            ) -> Any:
+                if on_statement_start is not None:
+                    on_statement_start()
                 raise RuntimeError("connection reset by peer")
 
         ledger = FailingPageLedger([acquired_lease()])
 
         with self.assertRaisesRegex(RuntimeError, "connection reset by peer"):
             ledger.pending_block_candidate_rows(limit=32)
+
+    def test_postgres_pending_candidate_page_never_touches_the_writer_gate(
+        self,
+    ) -> None:
+        """The page is a read, so it takes the read slot and nothing else.
+
+        Issue #211: waiting for writer admission bought this statement
+        nothing and cost it its whole fast-call budget whenever accepted-block
+        accounting held the gate. A gate that refuses every acquisition is the
+        strongest available statement of "this path does not go there" --
+        stronger than timing a wait, because it fails whether the gate is
+        contended or free.
+        """
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                [
+                    {
+                        "block_hash": BULK_PENDING_A,
+                        "candidate": {"block_hash_hex": BULK_PENDING_A},
+                        "pool_block_exists": False,
+                        "cursor": ["2026-08-31T00:00:00.000001Z", BULK_PENDING_A],
+                    }
+                ],
+            ]
+        )
+        ledger._lock = share_ledger_module._RefusingWriterGate()
+
+        rows = ledger.pending_block_candidate_rows(limit=32)
+
+        self.assertEqual([row["block_hash"] for row in rows], [BULK_PENDING_A])
+        # The read slot is still taken and still handed back: bounded, not
+        # ungated.
+        self.assertEqual(ledger._read_semaphore._value, 4)
+
+    def test_postgres_pending_candidate_page_splits_gate_wait_from_execution(
+        self,
+    ) -> None:
+        """Attribution, not a single opaque duration.
+
+        The incident reported ``exceeded 5s`` for a call whose statement
+        deadline was barely touched, and nothing exported said where the
+        budget went. These two fields are that answer, so a scenario drives
+        the clock across each half separately and reads them back.
+        """
+        ledger = FakeLeasePsqlShareLedger([acquired_lease(), []])
+        # Installed after construction so the script covers exactly this
+        # call's four reads -- admission start, admission end, statement
+        # start, statement end -- and an unexpected fifth fails loudly rather
+        # than silently re-using a stamp.
+        clock = iter([100.0, 100.25, 100.25, 101.75])
+        ledger._monotonic = lambda: next(clock)
+
+        ledger.pending_block_candidate_rows(limit=32)
+
+        self.assertEqual(list(clock), [])
+
+        stats = ledger.ledger_read_gate_stats()["pending_block_candidate_rows"]
+        self.assertEqual(stats["calls_total"], 1)
+        self.assertAlmostEqual(stats["gate_wait_seconds_total"], 0.25)
+        self.assertAlmostEqual(stats["gate_wait_seconds_max"], 0.25)
+        self.assertAlmostEqual(stats["execute_seconds_total"], 1.5)
+        self.assertAlmostEqual(stats["execute_seconds_max"], 1.5)
+        self.assertEqual(stats["gate_timeouts_total"], 0)
+        self.assertEqual(stats["execute_timeouts_total"], 0)
+
+    def test_postgres_pending_candidate_page_attributes_a_statement_deadline(
+        self,
+    ) -> None:
+        """A deadline that expires inside PostgreSQL is PostgreSQL's.
+
+        Including the tail a cancelled statement spends returning: cancel lag
+        is server time, and charging it to local admission would point the
+        next investigation at the wrong half of the system.
+        """
+
+        class TimingOutPageLedger(FakeLeasePsqlShareLedger):
+            def _run_retry_safe_read_json(
+                self,
+                sql: str,
+                *,
+                on_statement_start: Any = None,
+            ) -> Any:
+                if on_statement_start is not None:
+                    on_statement_start()
+                raise LedgerOperationTimeout("postgres operation exceeded 5s")
+
+        ledger = TimingOutPageLedger([acquired_lease()])
+
+        with self.assertRaises(LedgerOperationTimeout):
+            ledger.pending_block_candidate_rows(limit=32)
+
+        stats = ledger.ledger_read_gate_stats()["pending_block_candidate_rows"]
+        self.assertEqual(stats["calls_total"], 1)
+        self.assertEqual(stats["execute_timeouts_total"], 1)
+        self.assertEqual(stats["gate_timeouts_total"], 0)
+        # The failed read still handed its slot back, or the next enumeration
+        # would queue behind a slot nobody holds.
+        self.assertEqual(ledger._read_semaphore._value, 4)
+
+    def test_postgres_pending_candidate_page_attributes_pre_send_expiry_locally(
+        self,
+    ) -> None:
+        """A deadline exhausted after admission is still not server time."""
+
+        class NeverRunNative:
+            def run_json(self, sql: str, **kwargs: Any) -> Any:
+                raise AssertionError("deadline-expired read must not reach PostgreSQL")
+
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._read_semaphore = threading.BoundedSemaphore(1)
+        ledger._native = NeverRunNative()
+        deadline_local = threading.local()
+        deadline_local.deadline = 1.0
+        ledger._operation_timeout_local = deadline_local
+        # admission start, deadline check while acquiring, admission end,
+        # deadline check immediately before the native statement
+        clock = iter([0.0, 0.5, 0.75, 1.01])
+        ledger._monotonic = lambda: next(clock)
+
+        with self.assertRaisesRegex(LedgerOperationTimeout, "deadline expired"):
+            ledger._run_attributed_read_json(
+                "SELECT json_build_object('ok', true);",
+                operation="pending_block_candidate_rows",
+            )
+
+        self.assertEqual(list(clock), [])
+        stats = ledger.ledger_read_gate_stats()["pending_block_candidate_rows"]
+        self.assertEqual(stats["calls_total"], 1)
+        self.assertEqual(stats["gate_timeouts_total"], 1)
+        self.assertEqual(stats["execute_timeouts_total"], 0)
+        self.assertEqual(stats["execute_seconds_total"], 0.0)
+        self.assertEqual(ledger._read_semaphore._value, 1)
+
+    def test_psql_pending_candidate_page_attributes_pre_spawn_expiry_locally(
+        self,
+    ) -> None:
+        """The subprocess backend validates its deadline before execution."""
+
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._read_semaphore = threading.BoundedSemaphore(1)
+        ledger._native = None
+        ledger._command = ["psql"]
+        ledger._session_guards = None
+        deadline_local = threading.local()
+        deadline_local.deadline = 1.0
+        ledger._operation_timeout_local = deadline_local
+        # admission start, deadline check while acquiring, admission end,
+        # deadline check in _run_sql immediately before subprocess setup
+        clock = iter([0.0, 0.5, 0.75, 1.01])
+        ledger._monotonic = lambda: next(clock)
+
+        with unittest.mock.patch.object(
+            share_ledger_module.subprocess,
+            "run",
+            side_effect=AssertionError("deadline-expired read must not spawn psql"),
+        ) as run:
+            with self.assertRaisesRegex(LedgerOperationTimeout, "deadline expired"):
+                ledger._run_attributed_read_json(
+                    "SELECT json_build_object('ok', true);",
+                    operation="pending_block_candidate_rows",
+                )
+
+        run.assert_not_called()
+        self.assertEqual(list(clock), [])
+        stats = ledger.ledger_read_gate_stats()["pending_block_candidate_rows"]
+        self.assertEqual(stats["calls_total"], 1)
+        self.assertEqual(stats["gate_timeouts_total"], 1)
+        self.assertEqual(stats["execute_timeouts_total"], 0)
+        self.assertEqual(stats["execute_seconds_total"], 0.0)
+        self.assertEqual(ledger._read_semaphore._value, 1)
+
+    def test_run_json_preserves_legacy_run_sql_override_signature(self) -> None:
+        """Private one-argument subprocess seams remain supported."""
+
+        calls: list[str] = []
+        starts: list[str] = []
+
+        class LegacyRunSqlLedger(PsqlShareLedger):
+            def _run_sql(self, sql: str) -> str:
+                calls.append(sql)
+                return '{"ok": true}'
+
+        ledger = LegacyRunSqlLedger.__new__(LegacyRunSqlLedger)
+        ledger._native = None
+
+        result = ledger._run_json(
+            "SELECT json_build_object('ok', true);",
+            on_statement_start=lambda: starts.append("started"),
+        )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(calls, ["SELECT json_build_object('ok', true);"])
+        self.assertEqual(starts, ["started"])
+
+    def test_postgres_pending_candidate_page_attributes_an_admission_expiry(
+        self,
+    ) -> None:
+        """An expiry before admission is a gate timeout with no SQL sample.
+
+        No statement was sent, so recording an execution duration for it
+        would invent server time that never happened.
+        """
+        ledger = FakeLeasePsqlShareLedger([acquired_lease()])
+        ledger._read_semaphore = threading.BoundedSemaphore(1)
+        self.assertTrue(ledger._read_semaphore.acquire())
+
+        with self.assertRaisesRegex(LedgerOperationTimeout, "read slot"):
+            with ledger.operation_timeout(0.01):
+                ledger.pending_block_candidate_rows(limit=32)
+
+        stats = ledger.ledger_read_gate_stats()["pending_block_candidate_rows"]
+        self.assertEqual(stats["calls_total"], 1)
+        self.assertEqual(stats["gate_timeouts_total"], 1)
+        self.assertEqual(stats["execute_timeouts_total"], 0)
+        self.assertEqual(stats["execute_seconds_total"], 0.0)
+        self.assertGreater(stats["gate_wait_seconds_total"], 0.0)
+
+    def test_ledger_read_gate_stats_start_empty_and_are_per_instance(self) -> None:
+        """No operation, no series: an unused ledger exports nothing.
+
+        The lazy bootstrap exists for ledgers built through ``__new__``; it
+        must not hand two of them the same dict, or one instance's admission
+        wait would appear on another's series.
+        """
+        first = PsqlShareLedger.__new__(PsqlShareLedger)
+        second = PsqlShareLedger.__new__(PsqlShareLedger)
+
+        self.assertEqual(first.ledger_read_gate_stats(), {})
+        first._note_ledger_read_timing(
+            "pending_block_candidate_rows",
+            gate_wait_seconds=0.5,
+            execute_seconds=1.0,
+            timed_out=False,
+        )
+
+        self.assertEqual(second.ledger_read_gate_stats(), {})
+        self.assertEqual(
+            first.ledger_read_gate_stats()["pending_block_candidate_rows"][
+                "calls_total"
+            ],
+            1,
+        )
+        # The accessor hands back a copy, so a caller cannot edit the record.
+        snapshot = first.ledger_read_gate_stats()
+        snapshot["pending_block_candidate_rows"]["calls_total"] = 99
+        self.assertEqual(
+            first.ledger_read_gate_stats()["pending_block_candidate_rows"][
+                "calls_total"
+            ],
+            1,
+        )
 
     def test_writer_lease_ttl_defaults_to_sixty_seconds(self) -> None:
         ledger = FakeLeasePsqlShareLedger([acquired_lease()])
@@ -6924,6 +7183,49 @@ class NativeClientSelectionTests(unittest.TestCase):
         self.assertRegex(executions[0], r"^SET LOCAL statement_timeout = '\d+ms'$")
         self.assertRegex(executions[1], r"^SET LOCAL lock_timeout = '\d+ms'$")
         self.assertEqual(executions[2], "SELECT json_build_object('ok', true)")
+
+    def test_native_connection_setup_expiry_does_not_start_statement_timing(
+        self,
+    ) -> None:
+        """A budget exhausted while connecting never becomes server time."""
+
+        class OperationalError(Exception):
+            pass
+
+        class FakePsycopg:
+            pass
+
+        FakePsycopg.OperationalError = OperationalError  # type: ignore[attr-defined]
+
+        client = _NativePostgresClient.__new__(_NativePostgresClient)
+        client._psycopg = FakePsycopg
+        starts: list[str] = []
+
+        @contextlib.contextmanager
+        def connection(*, timeout_seconds: float | None = None) -> Any:
+            self.assertGreater(float(timeout_seconds), 0.0)
+            yield unittest.mock.Mock()
+
+        client.connection = connection  # type: ignore[method-assign]
+
+        # Establish deadline, calculate the connection budget, then discover
+        # that connection setup consumed it before SET LOCAL or the query.
+        with unittest.mock.patch.object(
+            share_ledger_module.time,
+            "monotonic",
+            side_effect=[0.0, 0.1, 0.6],
+        ):
+            with self.assertRaisesRegex(
+                LedgerOperationTimeout,
+                "statement deadline expired",
+            ):
+                client.run_json(
+                    "SELECT json_build_object('ok', true)",
+                    timeout_seconds=0.5,
+                    on_statement_start=lambda: starts.append("started"),
+                )
+
+        self.assertEqual(starts, [])
 
     def test_native_server_deadline_raises_operation_timeout(self) -> None:
         class OperationalError(Exception):

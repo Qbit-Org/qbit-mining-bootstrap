@@ -844,6 +844,8 @@ class LandingOp(str, Enum):
     OUTBOX_RECORD = "outbox_record"
     OUTBOX_ATTEMPT = "outbox_attempt"
     OUTBOX_FINISH = "outbox_finish"
+    OUTBOX_PENDING_PAGE = "outbox_pending_page"
+    OUTBOX_BATCH_ABANDON = "outbox_batch_abandon"
     ALL_SHARES = "all_shares"
     PRIOR_BALANCES = "prior_balances"
     PRIOR_BALANCES_AS_OF = "prior_balances_as_of"
@@ -965,6 +967,19 @@ _LANDING_SIGNATURES: tuple[tuple[LandingOp, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        LandingOp.OUTBOX_PENDING_PAGE,
+        (
+            # The read-only replay enumeration (issue #211). Its fragments
+            # name the three facts one page must answer from one snapshot:
+            # the row, whether the candidate already landed, and the keyset
+            # cursor the next page resumes from.
+            "'pool_block_exists', EXISTS (",
+            "FROM qbit_pool_blocks pool",
+            "FROM qbit_block_candidate_outbox",
+            "WHERE state = 'pending'",
+        ),
+    ),
+    (
         LandingOp.OUTBOX_RECORD,
         (
             "INSERT INTO qbit_block_candidate_outbox (",
@@ -980,6 +995,20 @@ _LANDING_SIGNATURES: tuple[tuple[LandingOp, tuple[str, ...]], ...] = (
             # incidental: it is the SQL-level statement of which caller owns
             # the row.
             "ON CONFLICT (block_hash) DO NOTHING",
+        ),
+    ),
+    (
+        LandingOp.OUTBOX_BATCH_ABANDON,
+        (
+            # The page-oriented terminal write (issue #196), listed before
+            # OUTBOX_FINISH because it satisfies that signature too: the
+            # discriminators are the set predicate and the pool-block
+            # re-check, which is the clause that makes acting on a stale
+            # enumeration safe.
+            "UPDATE qbit_block_candidate_outbox",
+            "SET state = 'abandoned',",
+            "WHERE block_hash = ANY(ARRAY[",
+            "FROM qbit_pool_blocks pool",
         ),
     ),
     (
@@ -1054,7 +1083,18 @@ _LEASE_IDENTITY_RE = re.compile(
     re.DOTALL,
 )
 _POOL_BLOCK_HASH_RE = re.compile(r"WHERE block_hash = '([0-9a-f]+)'")
+# The pending page's own two arguments: the bounded window and the optional
+# keyset cursor. Both are inlined as literals by pending_block_candidate_rows.
+_PENDING_PAGE_LIMIT_RE = re.compile(r"LIMIT (\d+)\n\) pending;")
+_PENDING_PAGE_CURSOR_RE = re.compile(
+    r"AND \(created_at, block_hash\) > "
+    r"\('((?:[^']|'')*)'::timestamptz, '((?:[^']|'')*)'\)"
+)
 _OUTBOX_STATE_RE = re.compile(r"SET state = '(submitted|abandoned)'")
+_OUTBOX_BATCH_HASHES_RE = re.compile(
+    r"WHERE block_hash = ANY\(ARRAY\[(.*?)\]::text\[\]\)",
+    re.DOTALL,
+)
 _OUTBOX_ERROR_RE = re.compile(r"last_error = (NULL|'(?:[^']|'')*')")
 _OUTBOX_SHA_RE = re.compile(r"candidate_sha256 <> '([0-9a-f]+)'")
 
@@ -1322,6 +1362,44 @@ def _landing_payload(op: LandingOp, sql: str) -> dict[str, Any]:
             "candidate_sha256": sha_match.group(1),
             **_lease_identity(op, sql),
         }
+    if op is LandingOp.OUTBOX_BATCH_ABANDON:
+        hashes_match = _OUTBOX_BATCH_HASHES_RE.search(sql)
+        error_match = _OUTBOX_ERROR_RE.search(sql)
+        if hashes_match is None:
+            raise UnsupportedStatement(
+                "outbox batch abandon statement named no block hash set"
+            )
+        raw_error = None if error_match is None else error_match.group(1)
+        return {
+            "block_hashes": tuple(
+                _unquote(element.strip()[1:-1])
+                for element in _split_sql_arguments(hashes_match.group(1))
+            ),
+            "last_error": (
+                None
+                if raw_error in (None, "NULL")
+                else str(raw_error)[1:-1].replace("''", "'")
+            ),
+            **_lease_identity(op, sql),
+        }
+    if op is LandingOp.OUTBOX_PENDING_PAGE:
+        limit_match = _PENDING_PAGE_LIMIT_RE.search(sql)
+        if limit_match is None:
+            raise UnsupportedStatement(
+                "pending candidate page statement carried no bounded LIMIT"
+            )
+        cursor_match = _PENDING_PAGE_CURSOR_RE.search(sql)
+        return {
+            "limit": int(limit_match.group(1)),
+            "after_cursor": (
+                None
+                if cursor_match is None
+                else (
+                    _unquote(cursor_match.group(1)),
+                    _unquote(cursor_match.group(2)),
+                )
+            ),
+        }
     if op in {LandingOp.OUTBOX_ATTEMPT, LandingOp.OUTBOX_FINISH}:
         hash_match = _POOL_BLOCK_HASH_RE.search(sql)
         if hash_match is None:
@@ -1422,6 +1500,12 @@ class OutboxRow:
 
     block_hash: str
     candidate_sha256: str
+    # ``created_at DEFAULT clock_timestamp()``. The pending page orders and
+    # keysets on ``(created_at, block_hash)``, so the model has to carry the
+    # stamp the real column would: an ordering that came from insertion order
+    # would answer the cursor questions the enumeration actually asks with a
+    # property production does not have.
+    created_at: datetime = CLOCK_ORIGIN
     state: str = "pending"
     attempt_count: int = 0
     last_error: str | None = None
@@ -2259,6 +2343,14 @@ class FakePostgres:
                     "audit_publication_sequence": row.audit_publication_sequence,
                 }
             }
+        if kind is LandingOp.OUTBOX_PENDING_PAGE:
+            # Deliberately grouped with the reads above, before
+            # _renew_lease_for_landing: the production statement opens no
+            # lease CTE, so a model that renewed here would report a
+            # lease-touching read the ledger does not perform -- and would
+            # hide the very property issue #211 turns on, that enumeration
+            # neither takes the writer gate nor touches the lease row.
+            return self._pending_candidate_page(transaction, payload)
         if kind is LandingOp.CONFIRMED_SEQUENCE:
             row = self._visible_pool_block(transaction, str(payload["block_hash"]))
             confirmed = (
@@ -2307,6 +2399,25 @@ class FakePostgres:
             return self._persist_pool_block(statement, transaction)
         if kind is LandingOp.OUTBOX_RECORD:
             return self._record_outbox_row(statement, transaction)
+        if kind is LandingOp.OUTBOX_BATCH_ABANDON:
+            # The pool-block clause lives *inside* this fenced UPDATE for the
+            # reason issue #211 depends on: the caller's page fact is advisory
+            # by the time it gets here, and a candidate that landed in between
+            # must be absent from the returned set rather than abandoned.
+            pool_blocks = self._visible_pool_blocks(transaction)
+            abandoned: list[str] = []
+            for block_hash in payload["block_hashes"]:
+                row = self._visible_outbox_row(transaction, str(block_hash))
+                if row is None or row.state != "pending":
+                    continue
+                if row.block_hash in pool_blocks:
+                    continue
+                staged = replace(row)
+                staged.state = "abandoned"
+                staged.last_error = payload.get("last_error")
+                transaction.staged_outbox[staged.block_hash] = staged
+                abandoned.append(staged.block_hash)
+            return {"abandoned": sorted(abandoned)}
         if kind in {LandingOp.OUTBOX_ATTEMPT, LandingOp.OUTBOX_FINISH}:
             row = self._visible_outbox_row(transaction, str(payload["block_hash"]))
             if row is None or row.state != "pending":
@@ -2419,6 +2530,69 @@ class FakePostgres:
             "onchain_output_count": 0,
         }
 
+    def _pending_candidate_page(
+        self,
+        transaction: Transaction,
+        payload: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """One snapshot answering row, landed-block fact and cursor together.
+
+        The three facts come from one visible set here for the same reason
+        they come from one statement in production: a caller that read the
+        rows and their pool-block facts at different instants could see a
+        candidate as pending *and* unlanded when it was neither.
+
+        The order and the keyset predicate are ``(created_at, block_hash)``,
+        the total order the production index provides. The block-hash
+        tiebreak is not decoration -- creation stamps collide under one
+        transaction's ``clock_timestamp()``, and a cursor on the stamp alone
+        would replay or skip a whole colliding group.
+        """
+        visible = dict(self.outbox)
+        visible.update(transaction.staged_outbox)
+        pool_blocks = self._visible_pool_blocks(transaction)
+        after = payload.get("after_cursor")
+        rows = sorted(
+            (
+                row
+                for row in visible.values()
+                if row.state == "pending"
+            ),
+            key=lambda row: (row.created_at, row.block_hash),
+        )
+        page: list[dict[str, Any]] = []
+        for row in rows:
+            cursor_stamp = self._pending_cursor_stamp(row.created_at)
+            if after is not None and (cursor_stamp, row.block_hash) <= (
+                str(after[0]),
+                str(after[1]),
+            ):
+                continue
+            page.append(
+                {
+                    "block_hash": row.block_hash,
+                    "candidate": {"block_hash_hex": row.block_hash},
+                    "pool_block_exists": row.block_hash in pool_blocks,
+                    "cursor": [cursor_stamp, row.block_hash],
+                }
+            )
+            if len(page) >= int(payload["limit"]):
+                break
+        return page
+
+    @staticmethod
+    def _pending_cursor_stamp(moment: datetime) -> str:
+        """``to_char(created_at AT TIME ZONE 'UTC', ...US"Z"')``, exactly.
+
+        Microsecond precision with an explicit UTC marker, because the cursor
+        is compared as text and a truncated stamp would re-emit or skip whole
+        sub-second groups.
+        """
+        return (
+            f"{moment.astimezone(timezone.utc):%Y-%m-%dT%H:%M:%S}"
+            f".{moment.microsecond:06d}Z"
+        )
+
     def _record_outbox_row(
         self,
         statement: Statement,
@@ -2432,6 +2606,7 @@ class FakePostgres:
             transaction.staged_outbox[block_hash] = OutboxRow(
                 block_hash=block_hash,
                 candidate_sha256=digest,
+                created_at=self.clock.now(),
             )
             return {"inserted": 1, "state": "pending"}
         if existing.candidate_sha256 != digest:
@@ -2547,12 +2722,15 @@ class FakeSqlBackend:
         *,
         retry_safe: bool = False,
         timeout_seconds: float | None = None,
+        on_statement_start: Callable[[], None] | None = None,
     ) -> Any:
         if self.closed:
             raise RuntimeError("connection pool is closed")
         backend = self._acquire(timeout_seconds)
         transaction: Transaction | None = None
         try:
+            if on_statement_start is not None:
+                on_statement_start()
             if timeout_seconds is not None:
                 # `with conn.transaction():` — SET LOCAL statement_timeout and
                 # lock_timeout, run the statement, then send COMMIT.

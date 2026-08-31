@@ -889,6 +889,7 @@ class MetricsRenderer:
                     f"qbit_prism_prior_balances_read_max_seconds {float(prior_stats['max_seconds']):.6f}",
                 ]
             )
+        lines.extend(self._ledger_read_gate_metric_lines())
         startup_phases = self.port.startup_phase_seconds()
         if startup_phases:
             lines.extend(
@@ -902,6 +903,96 @@ class MetricsRenderer:
                 lines.append(
                     f'qbit_prism_startup_phase_seconds{{phase="{label}"}} {float(seconds):.6f}'
                 )
+        return lines
+
+    def _ledger_read_gate_metric_lines(self) -> list[str]:
+        """Split read-slot admission wait from SQL execution, per operation.
+
+        A single duration per ledger call cannot say whether a budget went to
+        coordinator-local admission or to PostgreSQL, and issue #211 turned on
+        exactly that distinction: the replay enumeration reported
+        ``exceeded 5s`` while its statement deadline was barely touched and
+        the database showed no blocked backends. These two families answer it
+        from a scrape -- ``..._gate_wait_seconds_*`` is contention inside this
+        process, ``..._execute_seconds_*`` is the server (a cancelled
+        statement's return tail included). The timeout counters are split the
+        same way, so an admission expiry and a statement expiry never land on
+        one series.
+        """
+        stats_fn = getattr(self.port.ledger, "ledger_read_gate_stats", None)
+        if not callable(stats_fn):
+            return []
+        stats_by_operation = stats_fn()
+        if not stats_by_operation:
+            return []
+        # Samples stay grouped under their own family: the exposition format
+        # wants every line of a metric emitted as one block, so the loop is
+        # over families and the operations are the inner dimension.
+        families: tuple[tuple[str, str, str, str, bool], ...] = (
+            (
+                "qbit_prism_ledger_read_calls_total",
+                "counter",
+                "Ledger read-slot operations completed or failed, by operation.",
+                "calls_total",
+                True,
+            ),
+            (
+                "qbit_prism_ledger_read_gate_wait_seconds_total",
+                "counter",
+                "Cumulative coordinator-local read-slot admission wait, by operation.",
+                "gate_wait_seconds_total",
+                False,
+            ),
+            (
+                "qbit_prism_ledger_read_gate_wait_seconds_max",
+                "gauge",
+                "Longest coordinator-local read-slot admission wait since process start, by operation.",
+                "gate_wait_seconds_max",
+                False,
+            ),
+            (
+                "qbit_prism_ledger_read_gate_timeouts_total",
+                "counter",
+                "Read-slot operations whose deadline expired before admission, so no statement was ever sent.",
+                "gate_timeouts_total",
+                True,
+            ),
+            (
+                "qbit_prism_ledger_read_execute_seconds_total",
+                "counter",
+                "Cumulative PostgreSQL execution time for admitted read-slot statements, by operation.",
+                "execute_seconds_total",
+                False,
+            ),
+            (
+                "qbit_prism_ledger_read_execute_seconds_max",
+                "gauge",
+                "Longest PostgreSQL execution time for an admitted read-slot statement since process start, by operation.",
+                "execute_seconds_max",
+                False,
+            ),
+            (
+                "qbit_prism_ledger_read_execute_timeouts_total",
+                "counter",
+                "Admitted read-slot statements whose deadline expired inside PostgreSQL, cancel lag included.",
+                "execute_timeouts_total",
+                True,
+            ),
+        )
+        operations = [
+            (self.port.prometheus_label_value(str(operation)), stats)
+            for operation, stats in sorted(stats_by_operation.items())
+        ]
+        lines: list[str] = []
+        for name, metric_type, help_text, field, integral in families:
+            lines.append(f"# HELP {name} {help_text}")
+            lines.append(f"# TYPE {name} {metric_type}")
+            for label, stats in operations:
+                value = stats.get(field, 0)
+                rendered = (
+                    f"{int(value)}" if integral else f"{float(value):.6f}"
+                )
+                lines.append(f'{name}{{operation="{label}"}} {rendered}')
         return lines
 
     def accepted_stats_reconcile_metric_lines(self) -> list[str]:

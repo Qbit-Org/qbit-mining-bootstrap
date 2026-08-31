@@ -205,6 +205,33 @@ Landing-path observability lives on `/metrics`:
 `qbit_prism_accepted_parent_preview_wait_timeouts_total`,
 `qbit_prism_prior_balances_reads_total` / `_read_last_seconds` /
 `_read_max_seconds`, and `qbit_prism_startup_phase_seconds{phase=...}`.
+
+Read-slot ledger operations additionally split local admission from server
+execution, labelled by `operation`:
+`qbit_prism_ledger_read_calls_total`,
+`qbit_prism_ledger_read_gate_wait_seconds_total` / `_max` and
+`qbit_prism_ledger_read_gate_timeouts_total` (coordinator-local admission —
+waiting for `PRISM_POSTGRES_READ_CONCURRENCY`; a gate timeout means no
+statement was ever sent), against
+`qbit_prism_ledger_read_execute_seconds_total` / `_max` and
+`qbit_prism_ledger_read_execute_timeouts_total` (PostgreSQL, including the
+tail a cancelled statement spends returning). One duration covering both is
+what made the #211 exhaustion unattributable from a scrape: the replay
+enumeration reported `exceeded 5s` while its statement deadline was barely
+touched and the database showed no blocked backends. Read the two halves
+before widening any budget — a rising gate series is contention in this
+process, a rising execute series is the database.
+
+Pending block-candidate enumeration
+(`pending_block_candidate_rows`, the `replay-outbox-query` phase) is a
+read-only single-snapshot statement and takes the bounded read slot, not the
+writer lock (#211). It is therefore unaffected by an accounting write holding
+the writer gate. The page it returns is advisory: a candidate can land or be
+terminalized between the snapshot and the caller's decision, so every terminal
+transition re-checks under the writer lease — `mark_block_candidates_abandoned`
+re-asks `qbit_pool_blocks` inside its fenced `UPDATE`, and the single-hash
+terminal updates additionally require `state = 'pending'`.
+
 Alert before the landing deadline is exhausted, not after: page when
 `qbit_prism_prior_balances_read_max_seconds` exceeds ~20% of the
 landing budget or the poll budget, when any

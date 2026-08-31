@@ -428,6 +428,51 @@ assert_equal(
     "already-terminal rows are not re-won",
 )
 ledger._run_sql(f"DELETE FROM qbit_pool_blocks WHERE block_hash = '{bulk_landed}';")
+# The stale-page case below asserts an exact page and terminal set. Isolate it
+# from the pending row intentionally retained by the bulk-abandon case above.
+ledger._run_sql("DELETE FROM qbit_block_candidate_outbox;")
+
+# Issue #211 removed the writer gate from the page read, which makes the page
+# advisory by construction: a candidate can land between the snapshot and
+# whatever the caller does with it. The case above inserted the pool block
+# first, so its page was never stale. This one reads the page *before* the
+# landing, so the set handed to the terminal write genuinely disagrees with
+# the durable state -- and the veto has to come from the fenced UPDATE's own
+# re-check rather than from the fact the caller carried.
+stale_pending = "2a" * 32
+stale_landed = "2b" * 32
+for stale_hash in (stale_pending, stale_landed):
+    assert ledger.persist_block_candidate_intent(
+        {**candidate_intent, "block_hash_hex": stale_hash}
+    )
+stale_page = ledger.pending_block_candidate_rows(limit=32)
+assert_equal(
+    {row["block_hash"]: row["pool_block_exists"] for row in stale_page},
+    {stale_pending: False, stale_landed: False},
+    "a page read before the landing reports no pool block for either row",
+)
+ledger._run_sql(
+    "INSERT INTO qbit_pool_blocks "
+    "(block_hash, block_height, parent_hash, coinbase_txid, payout_manifest_sha256) "
+    f"VALUES ('{stale_landed}', 12, '{'00' * 32}', '{'33' * 32}', '{'44' * 32}');"
+)
+assert_equal(
+    list(
+        ledger.mark_block_candidates_abandoned(
+            block_hashes=[str(row["block_hash"]) for row in stale_page],
+            error="acted on a stale page",
+        )
+    ),
+    [stale_pending],
+    "a candidate that landed after the page read is refused by the fence",
+)
+assert_equal(
+    [row["block_hash"] for row in ledger.pending_block_candidate_rows(limit=32)],
+    [stale_landed],
+    "the landed candidate survived a stale page that named it",
+)
+ledger._run_sql(f"DELETE FROM qbit_pool_blocks WHERE block_hash = '{stale_landed}';")
+
 ledger._run_sql(
     """
 DELETE FROM qbit_block_candidate_outbox;

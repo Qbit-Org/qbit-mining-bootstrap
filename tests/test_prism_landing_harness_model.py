@@ -686,6 +686,47 @@ class LandingStatementClassificationTests(unittest.TestCase):
                 "as-of",
             ).value()
 
+            # The replay path's two statements (issues #196 and #211). Neither
+            # is on a landing's own critical path -- the enumeration recovers
+            # missed wakeups and the batch abandon collapses superseded
+            # siblings -- so both are driven explicitly here.
+            _prepared(harness, BLOCK_C, height=12, parent_hash=BLOCK_B)
+            _run(
+                harness,
+                harness.client,
+                lambda: ledger.persist_block_candidate_intent(
+                    {
+                        "schema": "qbit.prism.block-candidate-intent.v1",
+                        "block_hash_hex": BLOCK_C,
+                        "block_hex": "00",
+                    }
+                ),
+                "intent-c",
+            ).value()
+            page = _run(
+                harness,
+                harness.client,
+                lambda: ledger.pending_block_candidate_rows(limit=32),
+                "pending-page",
+            ).value()
+            self.assertEqual([row["block_hash"] for row in page], [BLOCK_C])
+            # BLOCK_C has a prepared pool-block row, so the fenced batch write
+            # re-checks it and reports nothing: the page fact and the write's
+            # own veto are exercised together.
+            self.assertTrue(page[0]["pool_block_exists"])
+            self.assertEqual(
+                _run(
+                    harness,
+                    harness.client,
+                    lambda: ledger.mark_block_candidates_abandoned(
+                        block_hashes=[BLOCK_C],
+                        error="superseded by a decided height",
+                    ),
+                    "batch-abandon",
+                ).value(),
+                (),
+            )
+
             observed = {
                 kind
                 for kind in harness.statement_kinds()
