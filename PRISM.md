@@ -231,6 +231,9 @@ Operational knobs shared by the PRISM listeners:
 | `PRISM_STRATUM_STALE_GRACE_SECONDS` | `3` | after a tip flip, credits same-connection prior-tip shares until this long after that connection receives new-tip work (shares stay creditable while delivery is still pending); set `0` to reject all prior-tip shares |
 | `PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS` | `15` | cadence for checking zero-submitted, zero-accepted vardiff windows so over-diffed idle miners can step down; set `0` to disable |
 | `PRISM_WORKER_METRICS_LIMIT` | `100` | maximum distinct worker labels in private metrics before new workers aggregate into `_other` |
+| `PRISM_HASHRATE_ROLLUP_ENABLED` | `1` | coordinator background maintenance of the incremental hashrate rollups the public hashrate-series endpoint serves from; set `0` to fall back to raw share scans |
+| `PRISM_HASHRATE_ROLLUP_INTERVAL_SECONDS` | `15` | sleep between hashrate rollup maintenance passes once caught up |
+| `PRISM_HASHRATE_ROLLUP_BATCH_SHARES` | `50000` | shares folded into the hashrate rollups per pass; catch-up (including the initial backfill of a grown ledger) loops passes back to back |
 
 `/healthz` remains healthy across arbitrarily long periods without a new block
 when the observed template and payout generation are unchanged. It returns HTTP
@@ -570,6 +573,21 @@ are operator surfaces like the coordinator's own — do not expose them publicly
 runs no Stratum listener, so it cannot infer the pool's endpoint, and the
 fallback would advertise `127.0.0.1` to miners. It also refuses to run on the
 in-memory ledger.
+
+### Hashrate rollups
+
+`/public/v1/hashrate-series` is served from incremental per-bucket rollups
+(`qbit_hashrate_rollup_pool` / `qbit_hashrate_rollup_miner`) rather than by
+re-aggregating raw share rows, so its cost tracks buckets in range instead of
+shares in range and long ranges (`1m`, `6m`, `all`) stay cheap as the ledger
+grows. The coordinator maintains the rollups in a background loop (the
+`PRISM_HASHRATE_ROLLUP_*` knobs above) that folds shares past a single durable
+watermark; a cold or pre-existing database backfills itself through the same
+loop with no separate migration, and the serving query merges a live tail of
+not-yet-rolled-up shares — mid-backfill included — so responses stay exactly
+equal to the raw aggregation. A database missing the rollup tables or
+watermark entirely is served from the unchanged raw scan. The public read
+tier only reads the rollups; it never maintains them.
 
 ## Run PRISM Locally
 

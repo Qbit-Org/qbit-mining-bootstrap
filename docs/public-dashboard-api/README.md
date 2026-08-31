@@ -216,6 +216,13 @@ smoothing window of pre-range history so the first in-range trailing windows
 average over real data, then trim those context buckets from the response. Any
 other non-empty `view` value is rejected with `400 bad_request`. `view` is part
 of the origin cache key, so the two views never share a cached response.
+
+The series is served from incremental per-bucket rollups the coordinator
+maintains in the ledger database, merged with a live tail of shares the
+rollups have not folded in yet, so every range — `all` included — costs
+buckets rather than raw shares. This is a serving-side optimization only: the
+response schemas, values, and both views are unchanged from the raw
+aggregation they replace.
 `fixtures/hashrate-series.json` mocks the v1 response and
 `fixtures/hashrate-series-dual-rate.json` mocks the v2 response.
 
