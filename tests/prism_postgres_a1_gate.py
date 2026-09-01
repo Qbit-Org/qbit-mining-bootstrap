@@ -1572,7 +1572,10 @@ def test_hashrate_rollup_series_parity() -> None:
     statement). The range anchor is deliberately not bucket-aligned so the
     raw scan emits a partial bucket straddling the range lower bound, which
     the rollup path must reproduce from the ledger rather than from full
-    rollup buckets.
+    rollup buckets. A future-dated share (a coordinator clock running ahead
+    of the database clock) is folded into the rollups and must stay excluded
+    from every serving state, exactly as the raw scan's
+    accepted_at <= ended_at excludes it.
     """
     schema = create_owned_schema("hashrate")
     ledger = ScopedPsqlLedger(
@@ -1613,6 +1616,12 @@ def test_hashrate_rollup_series_parity() -> None:
                 # seq 13-14: recent tail-of-history shares.
                 {"miner_id": "m2", "accepted_epoch": anchor - 50, "share_difficulty": 1300, "accepted": False},
                 {"miner_id": "m1", "accepted_epoch": anchor - 30, "share_difficulty": 1400},
+                # seq 15: future-dated relative to the database clock (a
+                # coordinator clock running ahead). It is folded into the
+                # rollups like any other share, and every serving state must
+                # exclude it exactly as the raw scan's
+                # accepted_at <= ended_at does.
+                {"miner_id": "m2", "accepted_epoch": anchor + 3600, "share_difficulty": 1500},
             ],
         )
         raw_truth = hashrate_series_matrix(ledger, anchor=anchor, forced_raw=True)
@@ -1690,7 +1699,7 @@ WHERE grain_seconds = 300 AND bucket_epoch = {bucket_base} AND miner_id = 'm1';
 
         assert_equal(
             ledger.advance_hashrate_rollups(batch_limit=50000),
-            {"scanned": 5, "last_share_seq": 14, "caught_up": True},
+            {"scanned": 6, "last_share_seq": 15, "caught_up": True},
             "final rollup pass reports caught up",
         )
         assert_hashrate_matrices_equal(
@@ -1700,7 +1709,7 @@ WHERE grain_seconds = 300 AND bucket_epoch = {bucket_base} AND miner_id = 'm1';
         )
         assert_equal(
             hashrate_rollup_progress_row(ledger),
-            14,
+            15,
             "watermark covers rejected rows",
         )
         assert_equal(
@@ -1715,12 +1724,13 @@ SELECT json_build_object(
 );
 """
             )["count"],
-            12,
-            "rejected shares never reach the rollup rows",
+            13,
+            "rejected shares never reach the rollup rows; the future-dated"
+            " share does",
         )
         assert_equal(
             ledger.advance_hashrate_rollups(batch_limit=50000),
-            {"scanned": 0, "last_share_seq": 14, "caught_up": True},
+            {"scanned": 0, "last_share_seq": 15, "caught_up": True},
             "caught-up pass is an idempotent no-op",
         )
 

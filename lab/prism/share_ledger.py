@@ -7298,10 +7298,14 @@ CROSS JOIN window_summary;
           advance it in between and double-count the shares it folded in.
         - A range lower bound that is not bucket-aligned makes the raw scan
           emit a partial leading bucket (only the shares at or after the
-          bound). Full rollup buckets cannot reproduce that, so the bucket
-          straddling the bound is re-aggregated from the ledger over the
-          already-rolled-up sequence range; that scan is bounded by one
-          bucket span of shares regardless of the requested range.
+          bound), and the bucket containing the statement's upper bound can
+          hold a rollup-folded share whose coordinator-assigned accepted_at
+          runs ahead of the database clock -- a share the raw scan's
+          ``accepted_at <= ended_at`` excludes until the clocks catch up.
+          Neither partial end can be served from full rollup buckets, so
+          both are re-aggregated from the ledger over the already-rolled-up
+          sequence range; each scan is bounded by one bucket span of shares
+          regardless of the requested range.
         - An absent progress row gates the rollup and boundary branches off
           and widens the tail to the whole ledger (``share_seq > -1``), so
           the merged output degrades to exactly the raw scan; a database
@@ -7381,6 +7385,13 @@ FROM bucketed;
         else:
             rollup_table = "qbit_hashrate_rollup_pool"
             rollup_subject_filter = ""
+        # The bucket containing bounds.ended_at is never served from its
+        # rollup row: maintenance folds by sequence, so a coordinator clock
+        # running ahead of the database clock can put a share into that
+        # bucket's rollup that the raw scan's accepted_at <= ended_at would
+        # exclude. Like the partial lower-bound bucket, it is re-aggregated
+        # from the already-rolled-up sequence range -- one bucket span of
+        # shares, whatever the requested range.
         if range_start_sql is not None:
             range_buckets_cte = f"""range_buckets AS (
     SELECT
@@ -7392,7 +7403,25 @@ FROM bucketed;
             rollup_lower_bound = (
                 "\n      AND rollup.bucket_epoch >= (SELECT first_full_bucket_epoch FROM range_buckets)"
             )
-            boundary_cte = f"""boundary AS (
+            boundary_window = """(
+        ledger.accepted_at < to_timestamp((SELECT first_full_bucket_epoch FROM range_buckets))
+        OR ledger.accepted_at >= to_timestamp((SELECT bucket_epoch FROM current_bucket))
+      )"""
+            boundary_range_filter = (
+                "\n      AND ledger.accepted_at >= (SELECT range_started_at FROM range_buckets)"
+            )
+            tail_range_filter = (
+                "\n      AND ledger.accepted_at >= (SELECT range_started_at FROM range_buckets)"
+            )
+        else:
+            range_buckets_cte = ""
+            rollup_lower_bound = ""
+            boundary_window = (
+                "ledger.accepted_at >= to_timestamp((SELECT bucket_epoch FROM current_bucket))"
+            )
+            boundary_range_filter = ""
+            tail_range_filter = ""
+        boundary_cte = f"""boundary AS (
     SELECT
         floor(extract(epoch FROM ledger.accepted_at) / {int(bucket_seconds)})::bigint * {int(bucket_seconds)} AS bucket_epoch,
         count(*) AS accepted_share_count,
@@ -7402,24 +7431,14 @@ FROM bucketed;
       AND ledger.accepted
       AND ledger.share_seq <= (SELECT last_share_seq FROM watermark)
       AND ledger.accepted_at <= bounds.ended_at
-      AND ledger.accepted_at >= (SELECT range_started_at FROM range_buckets)
-      AND ledger.accepted_at < to_timestamp((SELECT first_full_bucket_epoch FROM range_buckets))
+      AND {boundary_window}{boundary_range_filter}
       {subject_filter}
     GROUP BY bucket_epoch
 ),
 """
-            boundary_union = """        UNION ALL
+        boundary_union = """        UNION ALL
         SELECT bucket_epoch, accepted_share_count, accepted_share_difficulty FROM boundary
 """
-            tail_range_filter = (
-                "\n      AND ledger.accepted_at >= (SELECT range_started_at FROM range_buckets)"
-            )
-        else:
-            range_buckets_cte = ""
-            rollup_lower_bound = ""
-            boundary_cte = ""
-            boundary_union = ""
-            tail_range_filter = ""
         sql = f"""
 WITH bounds AS (
     SELECT clock_timestamp() AS ended_at
@@ -7434,6 +7453,10 @@ watermark AS (
         COALESCE((SELECT last_share_seq FROM progress), -1) AS last_share_seq,
         EXISTS (SELECT 1 FROM progress) AS rollups_ready
 ),
+current_bucket AS (
+    SELECT floor(extract(epoch FROM bounds.ended_at) / {int(bucket_seconds)})::bigint * {int(bucket_seconds)} AS bucket_epoch
+    FROM bounds
+),
 {range_buckets_cte}rolled AS (
     SELECT
         rollup.bucket_epoch,
@@ -7442,7 +7465,7 @@ watermark AS (
     FROM {rollup_table} rollup, bounds
     WHERE (SELECT rollups_ready FROM watermark)
       AND rollup.grain_seconds = {int(bucket_seconds)}
-      AND rollup.bucket_epoch <= floor(extract(epoch FROM bounds.ended_at) / {int(bucket_seconds)})::bigint * {int(bucket_seconds)}{rollup_lower_bound}{rollup_subject_filter}
+      AND rollup.bucket_epoch < (SELECT bucket_epoch FROM current_bucket){rollup_lower_bound}{rollup_subject_filter}
 ),
 {boundary_cte}tail AS (
     SELECT
