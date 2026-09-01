@@ -837,10 +837,12 @@ class SlowPublicLedger(FakePublicLedger):
 
 
 class StatementTimeoutRecordingLedger(FakePublicLedger):
-    """Duck-typed statement_timeout scope, recording what the handler arms.
+    """Duck-typed operation_timeout scope, recording what the handler arms.
 
     Mirrors PsqlShareLedger's contextmanager signature so the read service's
     getattr + callable probe takes the same branch it takes in production.
+    The operation scope, not the statement scope: one budget must cover the
+    whole dispatch, however many ledger reads it performs.
     """
 
     def __init__(self) -> None:
@@ -848,7 +850,7 @@ class StatementTimeoutRecordingLedger(FakePublicLedger):
         self.statement_timeout_budgets: list[float] = []
 
     @contextmanager
-    def statement_timeout(self, timeout_seconds: float) -> Iterator[None]:
+    def operation_timeout(self, timeout_seconds: float) -> Iterator[None]:
         self.statement_timeout_budgets.append(timeout_seconds)
         yield
 
@@ -2961,6 +2963,43 @@ class PublicResponseCacheStaleWhileRevalidateTests(unittest.TestCase):
         while keep_key in cache._inflight and time.monotonic() < deadline:
             time.sleep(0.01)
         self.assertNotIn(keep_key, cache._inflight)
+
+    def test_a_failed_refresh_thread_start_frees_the_slot(self) -> None:
+        """Thread creation failure must not strand the registered slot.
+
+        The refresh slot is registered before Thread.start() runs, and under
+        resource pressure start() can raise. Without cleanup no thread ever
+        frees the slot: later stale hits skip their refresh forever and,
+        past the window, blocking requests coalesce onto an event nobody can
+        set. The stale answer is still served; the slot is freed and the
+        event set so the next request proceeds normally.
+        """
+        cache = public_api.PublicResponseCache()
+        self.prime(cache, {"v": "stale"})
+        self.age_entry(cache, age_seconds=65)
+
+        with patch.object(
+            threading.Thread, "start", side_effect=RuntimeError("can't start new thread")
+        ):
+            status, payload, state, age = self.lookup(
+                cache, lambda: (200, {"v": "unused"})
+            )
+
+        self.assertEqual((200, {"v": "stale"}, "STALE", 65), (status, payload, state, age))
+        self.assertNotIn(self.KEY, cache._inflight)
+        # The next stale hit retries the refresh with a working thread...
+        refreshed = threading.Event()
+
+        def refresh() -> tuple[int, object]:
+            refreshed.set()
+            return 200, {"v": "fresh"}
+
+        status, payload, state, _age = self.lookup(cache, refresh)
+        self.assertEqual((200, {"v": "stale"}, "STALE"), (status, payload, state))
+        self.assertTrue(refreshed.wait(timeout=5))
+        self.wait_for_refresh_slot_to_clear(cache)
+        status, payload, state, _age = self.lookup(cache, lambda: (200, {"v": "wrong"}))
+        self.assertEqual((200, {"v": "fresh"}, "HIT"), (status, payload, state))
 
     def test_a_fresh_entry_is_a_hit_with_the_window_armed(self) -> None:
         cache = public_api.PublicResponseCache()

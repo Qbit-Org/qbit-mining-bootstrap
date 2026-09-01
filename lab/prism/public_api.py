@@ -206,12 +206,25 @@ class PublicResponseCache:
 
         if stale_result is not None:
             if refresh is not None:
-                threading.Thread(
-                    target=self._refresh_entry,
-                    args=(key, ttl_seconds, stale_while_revalidate_seconds, compute, refresh),
-                    name="prism-public-cache-refresh",
-                    daemon=True,
-                ).start()
+                try:
+                    threading.Thread(
+                        target=self._refresh_entry,
+                        args=(key, ttl_seconds, stale_while_revalidate_seconds, compute, refresh),
+                        name="prism-public-cache-refresh",
+                        daemon=True,
+                    ).start()
+                except Exception:
+                    # Thread creation can fail under resource pressure, after
+                    # the refresh slot was already registered. Free the slot
+                    # and wake any coalesced waiter, or a burst of stale keys
+                    # would pin refreshes off forever and, past the window,
+                    # leave blocking requests waiting on an event nobody can
+                    # set. The stale answer below is still the right response;
+                    # the next stale hit simply retries the refresh.
+                    with self._lock:
+                        if self._inflight.get(key) is refresh:
+                            del self._inflight[key]
+                    refresh.event.set()
             return stale_result
 
         if not owner:

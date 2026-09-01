@@ -727,14 +727,14 @@ class StalenessContractTests(unittest.TestCase):
 
 
 class StatementTimeoutScopeLedger(FullReadModelLedger):
-    """FullReadModelLedger plus PsqlShareLedger's statement_timeout scope shape."""
+    """FullReadModelLedger plus PsqlShareLedger's operation_timeout scope shape."""
 
     def __init__(self) -> None:
         super().__init__()
         self.statement_timeout_budgets: list[float] = []
 
     @contextmanager
-    def statement_timeout(self, timeout_seconds: float) -> Iterator[None]:
+    def operation_timeout(self, timeout_seconds: float) -> Iterator[None]:
         self.statement_timeout_budgets.append(timeout_seconds)
         yield
 
@@ -781,6 +781,23 @@ class StatementTimeoutWiringTests(unittest.TestCase):
         path = "/public/v1/mining-configuration"
         self.assertFalse(public_read_service.path_occupies_read_slot(path))
         self.assertFalse(public_read_service.path_reads_database(path))
+
+    def test_one_budget_covers_a_multi_read_dispatch(self) -> None:
+        """The scope is entered once around the whole dispatch, not per read.
+
+        The miner detail route performs several sequential ledger reads; a
+        per-statement scope would hand each a fresh budget and let the
+        request run many multiples of the configured limit. Exactly one
+        operation_timeout entry proves the deadline spans them all.
+        """
+        ledger = StatementTimeoutScopeLedger()
+        harness = ServiceHarness(FakeCoordinator(ledger=ledger))
+        self.addCleanup(harness.close)
+
+        served = harness.get(f"/public/v1/miners/{RECIPIENT_ID}")
+
+        self.assertEqual(200, served.status)
+        self.assertEqual(1, len(ledger.statement_timeout_budgets))
 
 
 class StaleServeTests(unittest.TestCase):

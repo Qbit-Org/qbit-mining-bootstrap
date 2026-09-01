@@ -661,12 +661,20 @@ def bounded_public_dispatch(
     plus a matching local admission bound, so the whole request stops costing
     anything shortly after its caller stops listening.
 
+    The scope is the ledger's ``operation_timeout``, not ``statement_timeout``:
+    the latter hands every admission and SQL statement a fresh budget, so a
+    route that performs several sequential ledger reads (the miner detail
+    page does) could run many multiples of the configured limit after the
+    proxy hung up. ``operation_timeout`` is one deadline counting down across
+    the entire dispatch -- every statement still gets server-side
+    cancellation, armed with whatever remains of the request's budget.
+
     Duck-typed exactly like the coordinator's block-submitter scope: a ledger
     without the scope runs unbounded, as it always has. On the ledger's
     psql-subprocess fallback the server-side statement deadline is not armed;
-    admission waits and the subprocess itself still observe the bound, and
-    no deadline at all is an acceptable degradation there. Routes are wrapped
-    by ``path_occupies_read_slot`` -- registry READ_SLOT access, immutable or
+    admission waits still observe the bound, and no deadline at all is an
+    acceptable degradation there. Routes are wrapped by
+    ``path_occupies_read_slot`` -- registry READ_SLOT access, immutable or
     not -- rather than by the staleness gates' ``path_reads_database``: a
     cold content-addressed artifact lookup holds a read slot exactly like any
     other cold read, even though its body, once found, is correct at any
@@ -679,11 +687,11 @@ def bounded_public_dispatch(
     if not occupies_read_slot:
         return public_api.dispatch(coordinator, path, query)
     timeout_seconds = public_read_statement_timeout_seconds()
-    statement_timeout = getattr(coordinator.ledger, "statement_timeout", None)
-    if timeout_seconds <= 0 or not callable(statement_timeout):
+    operation_timeout = getattr(coordinator.ledger, "operation_timeout", None)
+    if timeout_seconds <= 0 or not callable(operation_timeout):
         return public_api.dispatch(coordinator, path, query)
     try:
-        with statement_timeout(float(timeout_seconds)):
+        with operation_timeout(float(timeout_seconds)):
             return public_api.dispatch(coordinator, path, query)
     except LedgerOperationTimeout as exc:
         raise public_api.PublicApiError(
