@@ -1925,6 +1925,176 @@ SELECT json_build_object('waiting', (
         ledger.close()
 
 
+def test_hashrate_rollup_difficulty_overflow_headroom() -> None:
+    """Bucket totals may exceed one share's numeric(78, 0) precision.
+
+    Individually valid 78-digit share difficulties land in one bucket, so
+    the total needs 79 digits. The aggregate columns are unconstrained
+    numeric precisely for this: a constrained column would make the
+    maintenance upsert overflow on every retry and wedge the watermark.
+    Both the insert fold and the accumulate (ON CONFLICT) fold must carry
+    the oversized total exactly, matching the raw scan's unconstrained
+    sum(numeric). The dashboard's TH/s shaping is not exercised here: its
+    Decimal rendering cannot represent such magnitudes on the raw path
+    either, and this scenario pins the storage layer, not that shared
+    shaping.
+    """
+    schema = create_owned_schema("hashrate_overflow")
+    ledger = ScopedPsqlLedger(
+        test_schema=schema,
+        writer_id="a1-hashrate-overflow",
+        writer_epoch=1,
+        initialize_schema=True,
+    )
+    try:
+        anchor = int(time.time())
+        # All three shares inside one 5m bucket, so every grain folds them
+        # into a single row whose total needs 79 digits.
+        bucket_epoch = anchor // 300 * 300 - 600
+        huge = 6 * 10**77
+        seed_hashrate_shares(
+            ledger,
+            [
+                {"miner_id": "m1", "accepted_epoch": bucket_epoch + 10, "share_difficulty": huge},
+                {"miner_id": "m1", "accepted_epoch": bucket_epoch + 20, "share_difficulty": huge},
+                {"miner_id": "m1", "accepted_epoch": bucket_epoch + 30, "share_difficulty": huge},
+            ],
+        )
+        # First pass exercises the oversized insert fold...
+        assert_equal(
+            ledger.advance_hashrate_rollups(batch_limit=2),
+            {"scanned": 2, "last_share_seq": 2, "caught_up": False},
+            "overflow insert fold advances",
+        )
+        total = str(2 * huge)
+        snapshot = hashrate_rollup_snapshot(ledger)
+        assert_equal(
+            [(row["grain"], row["count"], row["difficulty"]) for row in snapshot["pool"]],
+            [(300, 2, total), (3600, 2, total), (86400, 2, total)],
+            "pool rollup carries the 79-digit total",
+        )
+        assert_equal(
+            [(row["grain"], row["miner"], row["difficulty"]) for row in snapshot["miner"]],
+            [(300, "m1", total), (3600, "m1", total), (86400, "m1", total)],
+            "miner rollup carries the 79-digit total",
+        )
+        # ...and the second pass exercises the oversized accumulate fold,
+        # the exact statement a constrained column would fail on every retry.
+        assert_equal(
+            ledger.advance_hashrate_rollups(batch_limit=100),
+            {"scanned": 1, "last_share_seq": 3, "caught_up": True},
+            "overflow accumulate fold advances",
+        )
+        accumulated = str(3 * huge)
+        snapshot = hashrate_rollup_snapshot(ledger)
+        assert_equal(
+            [(row["grain"], row["count"], row["difficulty"]) for row in snapshot["pool"]],
+            [(300, 3, accumulated), (3600, 3, accumulated), (86400, 3, accumulated)],
+            "pool rollup accumulates past one share's precision",
+        )
+        assert_equal(
+            [(row["grain"], row["miner"], row["difficulty"]) for row in snapshot["miner"]],
+            [(300, "m1", accumulated), (3600, "m1", accumulated), (86400, "m1", accumulated)],
+            "miner rollup accumulates past one share's precision",
+        )
+    finally:
+        ledger.release_writer_lease()
+        ledger.close()
+
+
+def test_hashrate_rollup_lease_fence() -> None:
+    """A fenced-out coordinator's rollup advance writes nothing and raises.
+
+    The maintenance statement renews the exact writer lease tuple and gates
+    the watermark advance on that renewal matching, so a coordinator whose
+    lease another session took over must fail loudly without touching the
+    watermark or either rollup table -- its process-local writer lock alone
+    does not authorize mutating ledger-derived state.
+    """
+    schema = create_owned_schema("hashrate_lease")
+    ledger = ScopedPsqlLedger(
+        test_schema=schema,
+        writer_id="a1-hashrate-lease",
+        writer_epoch=1,
+        initialize_schema=True,
+    )
+    try:
+        now_epoch = int(time.time())
+        seed_hashrate_shares(
+            ledger,
+            [
+                {"miner_id": "m1", "accepted_epoch": now_epoch - 500, "share_difficulty": 100},
+                {"miner_id": "m2", "accepted_epoch": now_epoch - 400, "share_difficulty": 200},
+                {"miner_id": "m1", "accepted_epoch": now_epoch - 300, "share_difficulty": 300},
+            ],
+        )
+        # Bootstrap with one share left behind the watermark so a broken
+        # fence would visibly fold it rather than trivially writing nothing.
+        assert_equal(
+            ledger.advance_hashrate_rollups(batch_limit=2),
+            {"scanned": 2, "last_share_seq": 2, "caught_up": False},
+            "lease scenario bootstrap pass",
+        )
+        before_rows = hashrate_rollup_snapshot(ledger)
+        original_lease = ledger._run_json(
+            """
+SELECT json_build_object(
+    'writer_id', writer_id,
+    'writer_epoch', writer_epoch,
+    'writer_session_token', writer_session_token
+)
+FROM qbit_ledger_writer_lease
+WHERE singleton;
+"""
+        )
+        ledger._run_sql(
+            "UPDATE qbit_ledger_writer_lease\n"
+            "SET writer_id = 'a1-hashrate-usurper',\n"
+            "    writer_epoch = 2,\n"
+            "    writer_session_token = 'a1-hashrate-usurper-session',\n"
+            "    lease_expires_at = clock_timestamp() + interval '60 seconds',\n"
+            "    updated_at = clock_timestamp()\n"
+            "WHERE singleton;"
+        )
+        try:
+            ledger.advance_hashrate_rollups(batch_limit=100)
+        except RuntimeError as error:
+            if "writer lease is not active" not in str(error):
+                raise GateFailure(
+                    f"fenced-out advance raised {error!r}; expected the lease refusal"
+                ) from error
+        else:
+            raise GateFailure("fenced-out advance did not raise")
+        assert_equal(
+            hashrate_rollup_progress_row(ledger),
+            2,
+            "fenced-out advance leaves the watermark alone",
+        )
+        assert_equal(
+            hashrate_rollup_snapshot(ledger),
+            before_rows,
+            "fenced-out advance writes no rollup rows",
+        )
+        # Hand the lease back so release and cleanup run as the owner.
+        ledger._run_sql(
+            "UPDATE qbit_ledger_writer_lease\n"
+            f"SET writer_id = '{original_lease['writer_id']}',\n"
+            f"    writer_epoch = {int(original_lease['writer_epoch'])},\n"
+            f"    writer_session_token = '{original_lease['writer_session_token']}',\n"
+            "    lease_expires_at = clock_timestamp() + interval '60 seconds',\n"
+            "    updated_at = clock_timestamp()\n"
+            "WHERE singleton;"
+        )
+        assert_equal(
+            ledger.advance_hashrate_rollups(batch_limit=100),
+            {"scanned": 1, "last_share_seq": 3, "caught_up": True},
+            "restored lease folds the held-back share",
+        )
+    finally:
+        ledger.release_writer_lease()
+        ledger.close()
+
+
 def main() -> None:
     public_before = public_sentinel()
     failure: BaseException | None = None
@@ -1937,6 +2107,8 @@ def main() -> None:
         test_durable_floor_ignores_allocator_gaps()
         test_hashrate_rollup_series_parity()
         test_hashrate_rollup_watermark_guard()
+        test_hashrate_rollup_difficulty_overflow_headroom()
+        test_hashrate_rollup_lease_fence()
     except BaseException as error:
         failure = error
     try:
@@ -1960,7 +2132,8 @@ def main() -> None:
         "prism postgres A1 gate PASS "
         "exact-transition-parity empty-fresh empty-legacy "
         "ordinary-decoy-binding temporary-decoy-binding durable-floor-gaps "
-        "hashrate-rollup-parity hashrate-rollup-guard"
+        "hashrate-rollup-parity hashrate-rollup-guard "
+        "hashrate-rollup-overflow hashrate-rollup-lease-fence"
     )
 
 

@@ -7535,12 +7535,30 @@ SELECT json_build_object(
         gate -- and the caller raises instead of double-counting, because
         two live maintenance passes mean the single-writer invariant is
         already broken.
+
+        The whole pass is additionally fenced on the writer lease, exactly
+        like every other mutation of ledger-derived state: the statement
+        renews the exact ``(writer_id, writer_epoch, writer_session_token)``
+        lease tuple and the advance applies only when that renewal matched,
+        so a coordinator whose lease expired or was taken over cannot keep
+        mutating the rollups on the strength of its process-local lock
+        alone. A fenced-out pass writes nothing and raises.
         """
         batch_limit = int(batch_limit)
         if batch_limit <= 0:
             raise ValueError("hashrate rollup batch limit must be positive")
         sql = f"""
-WITH progress AS (
+WITH lease AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    WHERE singleton
+      AND writer_id = {self._text_literal(self._writer_id)}
+      AND writer_epoch = {int(self._writer_epoch)}
+      AND writer_session_token = {self._text_literal(self._writer_session_token)}
+    RETURNING writer_id
+),
+progress AS (
     SELECT COALESCE((
         SELECT last_share_seq
         FROM qbit_hashrate_rollup_progress
@@ -7567,7 +7585,8 @@ batch_stats AS (
 ),
 advance AS (
     INSERT INTO qbit_hashrate_rollup_progress (singleton, last_share_seq)
-    VALUES (true, (SELECT next_share_seq FROM batch_stats))
+    SELECT true, (SELECT next_share_seq FROM batch_stats)
+    WHERE EXISTS (SELECT 1 FROM lease)
     ON CONFLICT (singleton) DO UPDATE
         SET last_share_seq = EXCLUDED.last_share_seq,
             updated_at = clock_timestamp()
@@ -7626,14 +7645,21 @@ miner_rollup AS (
                 + EXCLUDED.accepted_share_difficulty
     RETURNING 1
 )
-SELECT json_build_object(
-    'scanned', (SELECT scanned FROM batch_stats),
-    'last_share_seq', (SELECT next_share_seq FROM batch_stats),
-    'advanced', (SELECT count(*) FROM advance),
-    'caught_up', (SELECT scanned FROM batch_stats) < {batch_limit}
-);
+SELECT CASE
+    WHEN NOT EXISTS (SELECT 1 FROM lease) THEN
+        json_build_object('error', 'writer lease is not active')
+    ELSE
+        json_build_object(
+            'scanned', (SELECT scanned FROM batch_stats),
+            'last_share_seq', (SELECT next_share_seq FROM batch_stats),
+            'advanced', (SELECT count(*) FROM advance),
+            'caught_up', (SELECT scanned FROM batch_stats) < {batch_limit}
+        )
+END;
 """
         result = self._run_fenced_json(sql)
+        if "error" in result:
+            raise RuntimeError(str(result["error"]))
         if int(result["advanced"]) != 1:
             raise RuntimeError(
                 "hashrate rollup watermark advanced concurrently; "

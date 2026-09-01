@@ -2572,13 +2572,16 @@ CREATE INDEX IF NOT EXISTS qbit_worker_difficulty_evidence_idx
 -- exact expression the serving query uses -- so rollup and raw bucketing
 -- can never disagree. Only the lease-holding coordinator maintains these
 -- tables; the public read tier only reads them. accepted_share_difficulty
--- mirrors qbit_share_ledger.share_difficulty's numeric(78, 0) so summed
--- text renderings stay byte-identical to a raw-scan aggregation.
+-- is unconstrained numeric: source rows are numeric(78, 0), but a bucket
+-- total sums many of them and may need more digits than any single share --
+-- a constrained aggregate column would make the maintenance upsert overflow
+-- on every retry and wedge the watermark. sum(numeric) in the raw scan is
+-- likewise unconstrained, so text renderings stay byte-identical.
 CREATE TABLE IF NOT EXISTS qbit_hashrate_rollup_pool (
     grain_seconds integer NOT NULL CHECK (grain_seconds IN (300, 3600, 86400)),
     bucket_epoch bigint NOT NULL CHECK (bucket_epoch >= 0),
     accepted_share_count bigint NOT NULL CHECK (accepted_share_count >= 0),
-    accepted_share_difficulty numeric(78, 0) NOT NULL CHECK (accepted_share_difficulty >= 0),
+    accepted_share_difficulty numeric NOT NULL CHECK (accepted_share_difficulty >= 0),
     PRIMARY KEY (grain_seconds, bucket_epoch)
 );
 
@@ -2587,9 +2590,17 @@ CREATE TABLE IF NOT EXISTS qbit_hashrate_rollup_miner (
     bucket_epoch bigint NOT NULL CHECK (bucket_epoch >= 0),
     miner_id text NOT NULL,
     accepted_share_count bigint NOT NULL CHECK (accepted_share_count >= 0),
-    accepted_share_difficulty numeric(78, 0) NOT NULL CHECK (accepted_share_difficulty >= 0),
+    accepted_share_difficulty numeric NOT NULL CHECK (accepted_share_difficulty >= 0),
     PRIMARY KEY (grain_seconds, bucket_epoch, miner_id)
 );
+
+-- Databases that applied the earlier constrained definition are widened in
+-- place; from numeric(78, 0) to unconstrained numeric this is a
+-- catalog-only change, and it is a no-op once the column is unconstrained.
+ALTER TABLE qbit_hashrate_rollup_pool
+    ALTER COLUMN accepted_share_difficulty TYPE numeric;
+ALTER TABLE qbit_hashrate_rollup_miner
+    ALTER COLUMN accepted_share_difficulty TYPE numeric;
 
 CREATE INDEX IF NOT EXISTS qbit_hashrate_rollup_miner_series_idx
     ON qbit_hashrate_rollup_miner (miner_id, grain_seconds, bucket_epoch);
