@@ -17,6 +17,8 @@ import signal
 import subprocess
 import tempfile
 import threading
+import time
+from datetime import datetime, timezone
 from typing import Any
 
 from lab.prism.share_ledger import PsqlShareLedger, SingleWriterShareLedger
@@ -1417,6 +1419,692 @@ INSERT INTO qbit_pool_blocks (
         restart.close()
 
 
+HASHRATE_SERIES_SUBJECTS: list[tuple[str, str | None]] = [
+    ("pool", None),
+    ("miner", "m1"),
+    ("miner", "m2"),
+    # An unknown miner keeps the empty-series ('[]') path in the sweep.
+    ("miner", "m3"),
+]
+# (range_id, bucket, lookback_seconds); the internal "window" range id rides
+# the same statement as the public ranges and must stay working.
+HASHRATE_SERIES_RANGES: list[tuple[str, str, int]] = [
+    ("all", "5m", 0),
+    ("all", "1h", 0),
+    ("all", "1d", 0),
+    ("1w", "5m", 900),
+    ("1w", "1h", 0),
+    ("1m", "1h", 3600),
+    ("6m", "1d", 0),
+    ("window", "5m", 900),
+]
+
+
+def seed_hashrate_shares(
+    ledger: ScopedPsqlLedger,
+    shares: list[dict[str, object]],
+) -> None:
+    """Insert shares in list order so share_seq mirrors the list index + 1."""
+    values = []
+    for index, share in enumerate(shares, start=1):
+        accepted = bool(share.get("accepted", True))
+        values.append(
+            "("
+            f"'hashrate-share-{index}', "
+            f"'{share['miner_id']}', "
+            f"'{index:04d}', "
+            f"decode('{index:02x}' || repeat('00', 31), 'hex'), "
+            f"{int(share['share_difficulty'])}, "  # type: ignore[call-overload]
+            "1000, 10, "
+            f"'hashrate-job-{index}', "
+            f"to_timestamp({int(share['accepted_epoch']) - 1}), "  # type: ignore[call-overload]
+            f"{1_700_000_000 + index}, "
+            f"to_timestamp({int(share['accepted_epoch'])}), "  # type: ignore[call-overload]
+            f"{'true' if accepted else 'false'}, "
+            f"{'NULL' if accepted else chr(39) + 'low-difficulty' + chr(39)}, "
+            "'a1-hashrate', 1"
+            ")"
+        )
+    ledger._run_sql(
+        "INSERT INTO qbit_share_ledger (\n"
+        "    share_id, miner_id, payout_order_key, p2mr_program,\n"
+        "    share_difficulty, network_difficulty, template_height, job_id,\n"
+        "    job_issued_at, ntime, accepted_at, accepted, reject_reason,\n"
+        "    writer_id, writer_epoch\n"
+        ") VALUES\n    "
+        + ",\n    ".join(values)
+        + ";"
+    )
+
+
+def hashrate_series_matrix(
+    ledger: ScopedPsqlLedger,
+    *,
+    anchor: int,
+    forced_raw: bool,
+) -> dict[tuple[str, str | None, str, str], list[dict[str, object]]]:
+    """Fetch every subject x range x bucket combination in one sweep.
+
+    ``forced_raw`` shadows the schema probe so the historical raw-scan
+    statement runs against the same database; its output is the parity
+    ground truth every rollup-backed sweep is compared against byte for
+    byte.
+    """
+    if forced_raw:
+        ledger.__dict__["_hashrate_rollup_schema_present"] = lambda: False
+    try:
+        results = {}
+        for subject_type, subject_id in HASHRATE_SERIES_SUBJECTS:
+            for range_id, bucket, lookback_seconds in HASHRATE_SERIES_RANGES:
+                results[(subject_type, subject_id, range_id, bucket)] = (
+                    ledger.dashboard_hashrate_series(
+                        subject_type=subject_type,
+                        subject_id=subject_id,
+                        range_id=range_id,
+                        bucket=bucket,
+                        lookback_seconds=lookback_seconds,
+                        range_anchor_epoch=None if range_id == "all" else anchor,
+                    )
+                )
+        return results
+    finally:
+        ledger.__dict__.pop("_hashrate_rollup_schema_present", None)
+
+
+def assert_hashrate_matrices_equal(
+    actual: dict[tuple[str, str | None, str, str], list[dict[str, object]]],
+    expected: dict[tuple[str, str | None, str, str], list[dict[str, object]]],
+    message: str,
+) -> None:
+    assert_equal(sorted(actual), sorted(expected), f"{message} combination set")
+    for key in expected:
+        assert_equal(actual[key], expected[key], f"{message} {key}")
+
+
+def hashrate_rollup_progress_row(ledger: ScopedPsqlLedger) -> object:
+    return ledger._run_json(
+        """
+SELECT json_build_object(
+    'last_share_seq', (
+        SELECT last_share_seq FROM qbit_hashrate_rollup_progress WHERE singleton
+    )
+);
+"""
+    )["last_share_seq"]
+
+
+def hashrate_rollup_snapshot(ledger: ScopedPsqlLedger) -> dict[str, object]:
+    return ledger._run_json(
+        """
+SELECT json_build_object(
+    'pool', (
+        SELECT COALESCE(json_agg(json_build_object(
+            'grain', grain_seconds,
+            'bucket', bucket_epoch,
+            'count', accepted_share_count,
+            'difficulty', accepted_share_difficulty::text
+        ) ORDER BY grain_seconds, bucket_epoch), '[]'::json)
+        FROM qbit_hashrate_rollup_pool
+    ),
+    'miner', (
+        SELECT COALESCE(json_agg(json_build_object(
+            'grain', grain_seconds,
+            'bucket', bucket_epoch,
+            'miner', miner_id,
+            'count', accepted_share_count,
+            'difficulty', accepted_share_difficulty::text
+        ) ORDER BY grain_seconds, bucket_epoch, miner_id), '[]'::json)
+        FROM qbit_hashrate_rollup_miner
+    )
+);
+"""
+    )
+
+
+def test_hashrate_rollup_series_parity() -> None:
+    """Rollup-served hashrate series must be byte-identical to the raw scan.
+
+    Covers the acceptance bar for every serving state: before any rollup
+    pass (absent progress row), mid-backfill (watermark inside history, so
+    the live tail must cover the un-rolled remainder), fully caught up,
+    after the progress row is deleted with stale rollup rows left behind,
+    and with the rollup tables missing entirely (the pre-migration raw
+    statement). The range anchor is deliberately not bucket-aligned so the
+    raw scan emits a partial bucket straddling the range lower bound, which
+    the rollup path must reproduce from the ledger rather than from full
+    rollup buckets. A future-dated share (a coordinator clock running ahead
+    of the database clock) is folded into the rollups and must stay excluded
+    from every serving state, exactly as the raw scan's
+    accepted_at <= ended_at excludes it.
+    """
+    schema = create_owned_schema("hashrate")
+    ledger = ScopedPsqlLedger(
+        test_schema=schema,
+        writer_id="a1-hashrate",
+        writer_epoch=1,
+        initialize_schema=True,
+    )
+    try:
+        anchor = int(time.time())
+        anchor -= anchor % 300
+        anchor += 7  # unaligned modulo every grain, so boundary buckets exist
+        lookback_1w = 900
+        range_start_1w = anchor - 7 * 86400 - lookback_1w
+        bucket_base = anchor - 7 - 86400  # aligned 5m bucket, one day back
+        seed_hashrate_shares(
+            ledger,
+            [
+                # seq 1-6: one aligned 5m bucket split across two maintenance
+                # passes below, so the same rollup rows must accumulate.
+                {"miner_id": "m1", "accepted_epoch": bucket_base + 10, "share_difficulty": 100},
+                {"miner_id": "m2", "accepted_epoch": bucket_base + 20, "share_difficulty": 200},
+                {"miner_id": "m1", "accepted_epoch": bucket_base + 30, "share_difficulty": 300},
+                {"miner_id": "m1", "accepted_epoch": bucket_base + 40, "share_difficulty": 400},
+                {"miner_id": "m2", "accepted_epoch": bucket_base + 50, "share_difficulty": 500},
+                {"miner_id": "m1", "accepted_epoch": bucket_base + 60, "share_difficulty": 600},
+                # seq 7: rejected rows advance the watermark without counting.
+                {"miner_id": "m1", "accepted_epoch": bucket_base + 70, "share_difficulty": 700, "accepted": False},
+                # seq 8: outside the 1w window, inside 1m/6m/all.
+                {"miner_id": "m2", "accepted_epoch": anchor - 9 * 86400, "share_difficulty": 800},
+                # seq 9-12: around the 1w lower bound. seq 9 sits inside the
+                # straddling 5m bucket but before the bound, so it must stay
+                # excluded; 10-12 form the raw scan's partial leading bucket.
+                {"miner_id": "m1", "accepted_epoch": range_start_1w - 5, "share_difficulty": 900},
+                {"miner_id": "m1", "accepted_epoch": range_start_1w, "share_difficulty": 1000},
+                {"miner_id": "m2", "accepted_epoch": range_start_1w + 10, "share_difficulty": 1100},
+                {"miner_id": "m1", "accepted_epoch": range_start_1w + 290, "share_difficulty": 1200},
+                # seq 13-14: recent tail-of-history shares.
+                {"miner_id": "m2", "accepted_epoch": anchor - 50, "share_difficulty": 1300, "accepted": False},
+                {"miner_id": "m1", "accepted_epoch": anchor - 30, "share_difficulty": 1400},
+                # seq 15: future-dated relative to the database clock (a
+                # coordinator clock running ahead). It is folded into the
+                # rollups like any other share, and every serving state must
+                # exclude it exactly as the raw scan's
+                # accepted_at <= ended_at does.
+                {"miner_id": "m2", "accepted_epoch": anchor + 3600, "share_difficulty": 1500},
+            ],
+        )
+        raw_truth = hashrate_series_matrix(ledger, anchor=anchor, forced_raw=True)
+        straddle_epoch = range_start_1w - range_start_1w % 300
+        straddle_stamp = datetime.fromtimestamp(
+            straddle_epoch, timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        partial_bucket = [
+            point
+            for point in raw_truth[("pool", None, "1w", "5m")]
+            if point["timestamp"] == straddle_stamp
+        ]
+        assert_equal(
+            [
+                (point["accepted_share_count"], point["accepted_share_difficulty"])
+                for point in partial_bucket
+            ],
+            [(3, "3300")],
+            "raw ground truth contains the partial range-boundary bucket",
+        )
+
+        assert_hashrate_matrices_equal(
+            hashrate_series_matrix(ledger, anchor=anchor, forced_raw=False),
+            raw_truth,
+            "absent progress row serves the raw scan",
+        )
+
+        assert_equal(
+            ledger.advance_hashrate_rollups(batch_limit=5),
+            {"scanned": 5, "last_share_seq": 5, "caught_up": False},
+            "first rollup pass bootstraps the watermark",
+        )
+        assert_hashrate_matrices_equal(
+            hashrate_series_matrix(ledger, anchor=anchor, forced_raw=False),
+            raw_truth,
+            "mid-backfill rollup + tail merge",
+        )
+
+        assert_equal(
+            ledger.advance_hashrate_rollups(batch_limit=4),
+            {"scanned": 4, "last_share_seq": 9, "caught_up": False},
+            "second rollup pass advances the watermark",
+        )
+        # seq 1-5 landed in the first pass and seq 6 in the second, all in
+        # the same aligned 5m bucket: the upsert must accumulate, and the
+        # rejected seq 7 must advance the watermark without counting.
+        assert_equal(
+            ledger._run_json(
+                f"""
+SELECT json_build_object(
+    'count', accepted_share_count,
+    'difficulty', accepted_share_difficulty::text
+)
+FROM qbit_hashrate_rollup_pool
+WHERE grain_seconds = 300 AND bucket_epoch = {bucket_base};
+"""
+            ),
+            {"count": 6, "difficulty": "2100"},
+            "adjacent passes accumulate into the same pool bucket",
+        )
+        assert_equal(
+            ledger._run_json(
+                f"""
+SELECT json_build_object(
+    'count', accepted_share_count,
+    'difficulty', accepted_share_difficulty::text
+)
+FROM qbit_hashrate_rollup_miner
+WHERE grain_seconds = 300 AND bucket_epoch = {bucket_base} AND miner_id = 'm1';
+"""
+            ),
+            {"count": 4, "difficulty": "1400"},
+            "adjacent passes accumulate into the same miner bucket",
+        )
+
+        assert_equal(
+            ledger.advance_hashrate_rollups(batch_limit=50000),
+            {"scanned": 6, "last_share_seq": 15, "caught_up": True},
+            "final rollup pass reports caught up",
+        )
+        assert_hashrate_matrices_equal(
+            hashrate_series_matrix(ledger, anchor=anchor, forced_raw=False),
+            raw_truth,
+            "caught-up rollup serving",
+        )
+        assert_equal(
+            hashrate_rollup_progress_row(ledger),
+            15,
+            "watermark covers rejected rows",
+        )
+        assert_equal(
+            ledger._run_json(
+                """
+SELECT json_build_object(
+    'count', (
+        SELECT COALESCE(sum(accepted_share_count), 0)
+        FROM qbit_hashrate_rollup_pool
+        WHERE grain_seconds = 300
+    )
+);
+"""
+            )["count"],
+            13,
+            "rejected shares never reach the rollup rows; the future-dated"
+            " share does",
+        )
+        assert_equal(
+            ledger.advance_hashrate_rollups(batch_limit=50000),
+            {"scanned": 0, "last_share_seq": 15, "caught_up": True},
+            "caught-up pass is an idempotent no-op",
+        )
+
+        # Deleting only the progress row leaves fully populated rollup
+        # tables behind; the gate on the watermark must exclude them and the
+        # widened tail alone must reproduce the raw scan -- if the gating
+        # were broken every bucket would double.
+        ledger._run_sql("DELETE FROM qbit_hashrate_rollup_progress;")
+        assert_hashrate_matrices_equal(
+            hashrate_series_matrix(ledger, anchor=anchor, forced_raw=False),
+            raw_truth,
+            "deleted progress row falls back to the raw scan",
+        )
+
+        # A database that predates the rollup DDL cannot even parse the
+        # rollup statement; the probe must route to the unchanged raw
+        # statement.
+        ledger._run_sql(
+            "DROP TABLE qbit_hashrate_rollup_miner;\n"
+            "DROP TABLE qbit_hashrate_rollup_pool;\n"
+            "DROP TABLE qbit_hashrate_rollup_progress;"
+        )
+        ledger.__dict__.pop("_hashrate_rollup_schema_ready", None)
+        assert_hashrate_matrices_equal(
+            hashrate_series_matrix(ledger, anchor=anchor, forced_raw=False),
+            raw_truth,
+            "missing rollup tables run the raw statement",
+        )
+    finally:
+        ledger.release_writer_lease()
+        ledger.close()
+
+
+def test_hashrate_rollup_watermark_guard() -> None:
+    """A concurrent watermark advance must fail the pass without writes.
+
+    The guard can only trip when the progress row changes between the
+    statement's snapshot and its guarded upsert, so the race is staged for
+    real: a second session updates the row inside an open transaction, the
+    ledger pass is started and provably blocks on that row lock, and only
+    then does the second session commit. The blocked pass must resume,
+    lose the guard, write no rollup rows at all, and raise.
+    """
+    schema = create_owned_schema("hashrate_guard")
+    ledger = ScopedPsqlLedger(
+        test_schema=schema,
+        writer_id="a1-hashrate-guard",
+        writer_epoch=1,
+        initialize_schema=True,
+    )
+    locker: subprocess.Popen[str] | None = None
+    try:
+        now_epoch = int(time.time())
+        seed_hashrate_shares(
+            ledger,
+            [
+                {"miner_id": "m1", "accepted_epoch": now_epoch - 500, "share_difficulty": 100},
+                {"miner_id": "m2", "accepted_epoch": now_epoch - 400, "share_difficulty": 200},
+                {"miner_id": "m1", "accepted_epoch": now_epoch - 300, "share_difficulty": 300},
+                {"miner_id": "m2", "accepted_epoch": now_epoch - 200, "share_difficulty": 400},
+            ],
+        )
+        assert_equal(
+            ledger.advance_hashrate_rollups(batch_limit=100),
+            {"scanned": 4, "last_share_seq": 4, "caught_up": True},
+            "guard scenario bootstrap pass",
+        )
+        before = hashrate_rollup_snapshot(ledger)
+        # Give the raced pass real work so a broken guard would visibly
+        # double-count rather than trivially writing nothing.
+        seed_hashrate_shares_offset = [
+            {"miner_id": "m1", "accepted_epoch": now_epoch - 100, "share_difficulty": 500},
+            {"miner_id": "m2", "accepted_epoch": now_epoch - 90, "share_difficulty": 600},
+        ]
+        ledger._run_sql(
+            "INSERT INTO qbit_share_ledger (\n"
+            "    share_id, miner_id, payout_order_key, p2mr_program,\n"
+            "    share_difficulty, network_difficulty, template_height, job_id,\n"
+            "    job_issued_at, ntime, accepted_at, accepted, reject_reason,\n"
+            "    writer_id, writer_epoch\n"
+            ") VALUES\n"
+            + ",\n".join(
+                "("
+                f"'hashrate-guard-share-{index}', "
+                f"'{share['miner_id']}', "
+                f"'9{index:03d}', "
+                f"decode('9{index:01d}' || repeat('00', 31), 'hex'), "
+                f"{share['share_difficulty']}, "
+                "1000, 10, "
+                f"'hashrate-guard-job-{index}', "
+                f"to_timestamp({int(share['accepted_epoch']) - 1}), "  # type: ignore[call-overload]
+                f"{1_700_009_000 + index}, "
+                f"to_timestamp({int(share['accepted_epoch'])}), "  # type: ignore[call-overload]
+                "true, NULL, 'a1-hashrate-guard', 1)"
+                for index, share in enumerate(seed_hashrate_shares_offset, start=1)
+            )
+            + ";"
+        )
+
+        locker = subprocess.Popen(
+            [
+                *BASE_PSQL_ARGV,
+                "--no-psqlrc",
+                "--set",
+                "ON_ERROR_STOP=1",
+                "--quiet",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            start_new_session=True,
+        )
+        with ACTIVE_CHILDREN_LOCK:
+            ACTIVE_CHILDREN.add(locker)
+        assert locker.stdin is not None
+        locker.stdin.write(
+            f'SET search_path TO "{schema}", pg_catalog;\n'
+            "BEGIN;\n"
+            "UPDATE qbit_hashrate_rollup_progress\n"
+            "SET last_share_seq = last_share_seq + 100,\n"
+            "    updated_at = clock_timestamp()\n"
+            "WHERE singleton;\n"
+        )
+        locker.stdin.flush()
+        deadline = time.monotonic() + 20.0
+        while True:
+            holding = run_json(
+                """
+SELECT json_build_object('holding', (
+    SELECT count(*)
+    FROM pg_stat_activity
+    WHERE state = 'idle in transaction'
+      AND query LIKE '%last_share_seq = last_share_seq + 100%'
+));
+"""
+            )["holding"]
+            if int(holding) > 0:
+                break
+            if time.monotonic() > deadline:
+                raise GateFailure("watermark lock holder never reached its open transaction")
+            time.sleep(0.1)
+
+        outcome: dict[str, object] = {}
+
+        def run_raced_advance() -> None:
+            try:
+                outcome["result"] = ledger.advance_hashrate_rollups(batch_limit=100)
+            except BaseException as error:  # noqa: BLE001 - reported below
+                outcome["error"] = error
+
+        raced = threading.Thread(target=run_raced_advance, daemon=True)
+        raced.start()
+        deadline = time.monotonic() + 20.0
+        while True:
+            waiting = run_json(
+                """
+SELECT json_build_object('waiting', (
+    SELECT count(*)
+    FROM pg_stat_activity
+    WHERE state = 'active'
+      AND wait_event_type = 'Lock'
+      AND pid <> pg_backend_pid()
+      AND query LIKE '%qbit_hashrate_rollup_progress%'
+));
+"""
+            )["waiting"]
+            if int(waiting) > 0:
+                break
+            if time.monotonic() > deadline:
+                raise GateFailure("raced rollup advance never blocked on the progress row")
+            time.sleep(0.1)
+        locker.stdin.write("COMMIT;\n")
+        locker.stdin.flush()
+        locker.stdin.close()
+        raced.join(timeout=25.0)
+        if raced.is_alive():
+            raise GateFailure("raced rollup advance did not finish after the commit")
+        error = outcome.get("error")
+        if not isinstance(error, RuntimeError) or "advanced concurrently" not in str(error):
+            raise GateFailure(
+                f"raced rollup advance outcome was {outcome!r}; expected the loud watermark failure"
+            )
+        assert_equal(
+            hashrate_rollup_snapshot(ledger),
+            before,
+            "lost watermark race writes no rollup rows",
+        )
+        assert_equal(
+            hashrate_rollup_progress_row(ledger),
+            104,
+            "only the concurrent watermark advance landed",
+        )
+    finally:
+        if locker is not None:
+            _terminate_and_reap(locker)
+            if locker.stdin is not None and not locker.stdin.closed:
+                locker.stdin.close()
+            with ACTIVE_CHILDREN_LOCK:
+                ACTIVE_CHILDREN.discard(locker)
+        ledger.release_writer_lease()
+        ledger.close()
+
+
+def test_hashrate_rollup_difficulty_overflow_headroom() -> None:
+    """Bucket totals may exceed one share's numeric(78, 0) precision.
+
+    Individually valid 78-digit share difficulties land in one bucket, so
+    the total needs 79 digits. The aggregate columns are unconstrained
+    numeric precisely for this: a constrained column would make the
+    maintenance upsert overflow on every retry and wedge the watermark.
+    Both the insert fold and the accumulate (ON CONFLICT) fold must carry
+    the oversized total exactly, matching the raw scan's unconstrained
+    sum(numeric). The dashboard's TH/s shaping is not exercised here: its
+    Decimal rendering cannot represent such magnitudes on the raw path
+    either, and this scenario pins the storage layer, not that shared
+    shaping.
+    """
+    schema = create_owned_schema("hashrate_overflow")
+    ledger = ScopedPsqlLedger(
+        test_schema=schema,
+        writer_id="a1-hashrate-overflow",
+        writer_epoch=1,
+        initialize_schema=True,
+    )
+    try:
+        anchor = int(time.time())
+        # All three shares inside one 5m bucket, so every grain folds them
+        # into a single row whose total needs 79 digits.
+        bucket_epoch = anchor // 300 * 300 - 600
+        huge = 6 * 10**77
+        seed_hashrate_shares(
+            ledger,
+            [
+                {"miner_id": "m1", "accepted_epoch": bucket_epoch + 10, "share_difficulty": huge},
+                {"miner_id": "m1", "accepted_epoch": bucket_epoch + 20, "share_difficulty": huge},
+                {"miner_id": "m1", "accepted_epoch": bucket_epoch + 30, "share_difficulty": huge},
+            ],
+        )
+        # First pass exercises the oversized insert fold...
+        assert_equal(
+            ledger.advance_hashrate_rollups(batch_limit=2),
+            {"scanned": 2, "last_share_seq": 2, "caught_up": False},
+            "overflow insert fold advances",
+        )
+        total = str(2 * huge)
+        snapshot = hashrate_rollup_snapshot(ledger)
+        assert_equal(
+            [(row["grain"], row["count"], row["difficulty"]) for row in snapshot["pool"]],
+            [(300, 2, total), (3600, 2, total), (86400, 2, total)],
+            "pool rollup carries the 79-digit total",
+        )
+        assert_equal(
+            [(row["grain"], row["miner"], row["difficulty"]) for row in snapshot["miner"]],
+            [(300, "m1", total), (3600, "m1", total), (86400, "m1", total)],
+            "miner rollup carries the 79-digit total",
+        )
+        # ...and the second pass exercises the oversized accumulate fold,
+        # the exact statement a constrained column would fail on every retry.
+        assert_equal(
+            ledger.advance_hashrate_rollups(batch_limit=100),
+            {"scanned": 1, "last_share_seq": 3, "caught_up": True},
+            "overflow accumulate fold advances",
+        )
+        accumulated = str(3 * huge)
+        snapshot = hashrate_rollup_snapshot(ledger)
+        assert_equal(
+            [(row["grain"], row["count"], row["difficulty"]) for row in snapshot["pool"]],
+            [(300, 3, accumulated), (3600, 3, accumulated), (86400, 3, accumulated)],
+            "pool rollup accumulates past one share's precision",
+        )
+        assert_equal(
+            [(row["grain"], row["miner"], row["difficulty"]) for row in snapshot["miner"]],
+            [(300, "m1", accumulated), (3600, "m1", accumulated), (86400, "m1", accumulated)],
+            "miner rollup accumulates past one share's precision",
+        )
+    finally:
+        ledger.release_writer_lease()
+        ledger.close()
+
+
+def test_hashrate_rollup_lease_fence() -> None:
+    """A fenced-out coordinator's rollup advance writes nothing and raises.
+
+    The maintenance statement renews the exact writer lease tuple and gates
+    the watermark advance on that renewal matching, so a coordinator whose
+    lease another session took over must fail loudly without touching the
+    watermark or either rollup table -- its process-local writer lock alone
+    does not authorize mutating ledger-derived state.
+    """
+    schema = create_owned_schema("hashrate_lease")
+    ledger = ScopedPsqlLedger(
+        test_schema=schema,
+        writer_id="a1-hashrate-lease",
+        writer_epoch=1,
+        initialize_schema=True,
+    )
+    try:
+        now_epoch = int(time.time())
+        seed_hashrate_shares(
+            ledger,
+            [
+                {"miner_id": "m1", "accepted_epoch": now_epoch - 500, "share_difficulty": 100},
+                {"miner_id": "m2", "accepted_epoch": now_epoch - 400, "share_difficulty": 200},
+                {"miner_id": "m1", "accepted_epoch": now_epoch - 300, "share_difficulty": 300},
+            ],
+        )
+        # Bootstrap with one share left behind the watermark so a broken
+        # fence would visibly fold it rather than trivially writing nothing.
+        assert_equal(
+            ledger.advance_hashrate_rollups(batch_limit=2),
+            {"scanned": 2, "last_share_seq": 2, "caught_up": False},
+            "lease scenario bootstrap pass",
+        )
+        before_rows = hashrate_rollup_snapshot(ledger)
+        original_lease = ledger._run_json(
+            """
+SELECT json_build_object(
+    'writer_id', writer_id,
+    'writer_epoch', writer_epoch,
+    'writer_session_token', writer_session_token
+)
+FROM qbit_ledger_writer_lease
+WHERE singleton;
+"""
+        )
+        ledger._run_sql(
+            "UPDATE qbit_ledger_writer_lease\n"
+            "SET writer_id = 'a1-hashrate-usurper',\n"
+            "    writer_epoch = 2,\n"
+            "    writer_session_token = 'a1-hashrate-usurper-session',\n"
+            "    lease_expires_at = clock_timestamp() + interval '60 seconds',\n"
+            "    updated_at = clock_timestamp()\n"
+            "WHERE singleton;"
+        )
+        try:
+            ledger.advance_hashrate_rollups(batch_limit=100)
+        except RuntimeError as error:
+            if "writer lease is not active" not in str(error):
+                raise GateFailure(
+                    f"fenced-out advance raised {error!r}; expected the lease refusal"
+                ) from error
+        else:
+            raise GateFailure("fenced-out advance did not raise")
+        assert_equal(
+            hashrate_rollup_progress_row(ledger),
+            2,
+            "fenced-out advance leaves the watermark alone",
+        )
+        assert_equal(
+            hashrate_rollup_snapshot(ledger),
+            before_rows,
+            "fenced-out advance writes no rollup rows",
+        )
+        # Hand the lease back so release and cleanup run as the owner.
+        ledger._run_sql(
+            "UPDATE qbit_ledger_writer_lease\n"
+            f"SET writer_id = '{original_lease['writer_id']}',\n"
+            f"    writer_epoch = {int(original_lease['writer_epoch'])},\n"
+            f"    writer_session_token = '{original_lease['writer_session_token']}',\n"
+            "    lease_expires_at = clock_timestamp() + interval '60 seconds',\n"
+            "    updated_at = clock_timestamp()\n"
+            "WHERE singleton;"
+        )
+        assert_equal(
+            ledger.advance_hashrate_rollups(batch_limit=100),
+            {"scanned": 1, "last_share_seq": 3, "caught_up": True},
+            "restored lease folds the held-back share",
+        )
+    finally:
+        ledger.release_writer_lease()
+        ledger.close()
+
+
 def main() -> None:
     public_before = public_sentinel()
     failure: BaseException | None = None
@@ -1427,6 +2115,10 @@ def main() -> None:
         assert_transition_binding_case(temporary=False)
         assert_transition_binding_case(temporary=True)
         test_durable_floor_ignores_allocator_gaps()
+        test_hashrate_rollup_series_parity()
+        test_hashrate_rollup_watermark_guard()
+        test_hashrate_rollup_difficulty_overflow_headroom()
+        test_hashrate_rollup_lease_fence()
     except BaseException as error:
         failure = error
     try:
@@ -1449,7 +2141,9 @@ def main() -> None:
     print(
         "prism postgres A1 gate PASS "
         "exact-transition-parity empty-fresh empty-legacy "
-        "ordinary-decoy-binding temporary-decoy-binding durable-floor-gaps"
+        "ordinary-decoy-binding temporary-decoy-binding durable-floor-gaps "
+        "hashrate-rollup-parity hashrate-rollup-guard "
+        "hashrate-rollup-overflow hashrate-rollup-lease-fence"
     )
 
 

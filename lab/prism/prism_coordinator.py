@@ -2481,6 +2481,17 @@ class PrismCoordinator:
             lifecycle_config.writer_quiescence_timeout_seconds
         )
         self.ledger = self.make_ledger()
+        # Incremental hashrate rollup maintenance rides the writer because
+        # only the lease holder may mutate ledger-derived state; the public
+        # read tier never runs it. The flag and cadence stay plain
+        # attributes so tests and embedders can retune a live coordinator.
+        self.hashrate_rollup_enabled = env_bool("PRISM_HASHRATE_ROLLUP_ENABLED", "1")
+        self.hashrate_rollup_interval_seconds = env_positive_float(
+            "PRISM_HASHRATE_ROLLUP_INTERVAL_SECONDS", 15.0
+        )
+        self.hashrate_rollup_batch_shares = env_positive_int(
+            "PRISM_HASHRATE_ROLLUP_BATCH_SHARES", 50000
+        )
         self._upgrade_legacy_audit_evidence()
         self._ctv_fanout_market_fee_rate_cache: dict[tuple[int | None, str | None], int] = {}
         self.lock = _ObservedRLock(
@@ -5691,7 +5702,13 @@ class PrismCoordinator:
         watchdog specification is deliberately absent here: serve() registers
         it inline at its start boundary so the mandatory
         publication-progress watchdog thread is created before any
-        synchronous startup prewarm/recovery work.
+        synchronous startup prewarm/recovery work. The one capability
+        conditional is hashrate rollup maintenance: it exists only for
+        ledgers that expose ``advance_hashrate_rollups`` (the Postgres
+        backend), because a memory-backed ledger never grows that method at
+        runtime -- unlike an enable flag, the capability cannot flip after
+        construction, so registering an unstartable service would only
+        mislead the registry snapshot.
         """
         specifications = [
             BackgroundServiceSpec(
@@ -5760,6 +5777,20 @@ class PrismCoordinator:
             self._health_snapshot_service_spec(),
             self._metrics_snapshot_service_spec(),
         ]
+        if callable(
+            getattr(getattr(self, "ledger", None), "advance_hashrate_rollups", None)
+        ):
+            specifications.append(
+                BackgroundServiceSpec(
+                    name="hashrate-rollup-maintenance",
+                    thread_name="prism-hashrate-rollup-maintenance",
+                    target=lambda: self.hashrate_rollup_maintenance_loop(),
+                    daemon=True,
+                    join_timeout=1.0,
+                    watchdog_monitored=False,
+                    registration_identity=("hashrate-rollup-maintenance",),
+                )
+            )
         return BackgroundServiceRegistry(specifications)
 
     def _health_snapshot_service_spec(self) -> BackgroundServiceSpec:
@@ -6579,6 +6610,7 @@ class PrismCoordinator:
                 f"chunk_size={self.ctv_broadcaster_chunk_size}",
                 flush=True,
             )
+        self._start_hashrate_rollup_maintenance_if_enabled()
         if self.watchdog_enabled:
             print(
                 "prism coordinator: liveness and publication-progress watchdog enabled "
@@ -6844,6 +6876,78 @@ class PrismCoordinator:
             observe_pass=self.observe_ctv_fanout_broadcaster_pass,
             record_yield=self._record_ctv_fanout_broadcaster_yield,
         )
+
+    def _start_hashrate_rollup_maintenance_if_enabled(self) -> None:
+        """Start rollup maintenance when configured on and the ledger can.
+
+        The capability check mirrors the registration conditional: a
+        memory-backed ledger has no ``advance_hashrate_rollups`` and no
+        registered service to start, so asking the registry for the name
+        would fail rather than no-op. Lightweight test/embedder
+        coordinators built without the full constructor carry neither the
+        flag nor a capable ledger, so an absent flag reads as disabled.
+        """
+        if not getattr(self, "hashrate_rollup_enabled", False):
+            return
+        if not callable(
+            getattr(getattr(self, "ledger", None), "advance_hashrate_rollups", None)
+        ):
+            return
+        self._start_background_service("hashrate-rollup-maintenance")
+        print(
+            "prism coordinator: hashrate rollup maintenance enabled "
+            f"interval={self.hashrate_rollup_interval_seconds:g}s "
+            f"batch={self.hashrate_rollup_batch_shares}",
+            flush=True,
+        )
+
+    def hashrate_rollup_maintenance_loop(self) -> None:
+        """Advance the incremental hashrate rollups until shutdown.
+
+        Each pass folds one watermarked batch into the rollup tables and
+        keeps going while the ledger reports more history behind the
+        watermark -- which is exactly how a cold database backfills itself:
+        the first passes replay all existing shares through the same
+        statement live shares take, so there is no separate migration to
+        operate. A failed pass is logged and retried on the next interval;
+        the watermark guarantees a retry can never double-count what a
+        partial pass already folded in.
+
+        Every pass runs inside the writer-operation admission, like every
+        other mutation of ledger-derived state: shutdown quiescence must
+        count an in-flight pass, and admission must refuse a new one, or a
+        pass slipping past the stop check could renew the just-released
+        lease -- the maintenance statement renews on exact identity, which
+        an orderly release keeps -- and mutate rollups after shutdown
+        reported the writer quiesced. A refused admission is the orderly
+        stop, not a failure.
+        """
+        while not self.stop_event.is_set():
+            try:
+                while not self.stop_event.is_set():
+                    with self._writer_operation("hashrate_rollup_maintenance"):
+                        result = self.ledger.advance_hashrate_rollups(
+                            batch_limit=self.hashrate_rollup_batch_shares,
+                        )
+                    print(
+                        "prism coordinator: hashrate rollup advance "
+                        f"scanned={result['scanned']} "
+                        f"last_share_seq={result['last_share_seq']} "
+                        f"caught_up={'true' if result['caught_up'] else 'false'}",
+                        flush=True,
+                    )
+                    if result["caught_up"]:
+                        break
+            except ShutdownInProgress:
+                return
+            except Exception:
+                print(
+                    "prism coordinator: hashrate rollup maintenance pass failed",
+                    flush=True,
+                )
+                traceback.print_exc()
+            if self.stop_event.wait(self.hashrate_rollup_interval_seconds):
+                break
 
     def _tip_refresh_artifacts(
         self,
