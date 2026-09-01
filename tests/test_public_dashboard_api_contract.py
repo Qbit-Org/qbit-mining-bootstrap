@@ -26,6 +26,7 @@ EXPECTED_FIXTURES = {
     "leaderboard.json": "prism.dashboard.leaderboard.v2",
     "leaderboard-legacy.json": "prism.dashboard.leaderboard.v1",
     "blocks.json": "prism.dashboard.blocks.v1",
+    "blocks-chain-states.json": "prism.dashboard.blocks.v2",
     "settlement-artifacts.json": "prism.dashboard.settlement-artifacts.v1",
     "settlement-artifacts-direct-coinbase.json": "prism.dashboard.settlement-artifacts.v1",
     "pending-fanouts.json": "prism.dashboard.pending-fanouts.v1",
@@ -130,6 +131,7 @@ class PublicDashboardApiContractTests(unittest.TestCase):
             "leaderboard.json",
             "leaderboard-legacy.json",
             "blocks.json",
+            "blocks-chain-states.json",
             "pending-fanouts.json",
             "miner-earnings.json",
             "miner-payouts.json",
@@ -475,11 +477,97 @@ class PublicDashboardApiContractTests(unittest.TestCase):
         )
 
     def test_historical_block_fixture_difficulty_is_derived_from_compact_bits(self) -> None:
+        for fixture_name in ("blocks.json", "blocks-chain-states.json"):
+            for row in self.load_fixture(fixture_name)["rows"]:
+                self.assertEqual(
+                    Decimal(row["network_difficulty"]),
+                    public_api.scaled_network_difficulty(row["bits"]),
+                    fixture_name,
+                )
+
+    BLOCK_ROW_V1_KEYS = {
+        "height",
+        "hash",
+        "found_at",
+        "network_difficulty",
+        "bits",
+        "solver_recipient_id",
+        "solver_worker_name",
+        "solver_share_difficulty",
+        "reward_window_weight",
+        "coinbase_value_bits",
+        "audit_bundle_sha256",
+        "payout_manifest_sha256",
+        "explorer_url",
+    }
+
+    def test_default_blocks_fixture_keeps_exact_v1_row_shape(self) -> None:
+        # The chain_state filter must not leak into the default response: the
+        # v1 fixture stays byte-shape identical to the pre-filter contract.
         for row in self.load_fixture("blocks.json")["rows"]:
+            self.assertEqual(set(row), self.BLOCK_ROW_V1_KEYS)
+
+    def test_chain_state_blocks_fixture_adds_only_reorg_visibility_fields(self) -> None:
+        fixture = self.load_fixture("blocks-chain-states.json")
+        rows = fixture["rows"]
+
+        self.assertGreater(len(rows), 0)
+        reversed_rows = [row for row in rows if row["chain_state"] == "reversed"]
+        self.assertGreater(len(reversed_rows), 0)
+        for row in rows:
             self.assertEqual(
-                Decimal(row["network_difficulty"]),
-                public_api.scaled_network_difficulty(row["bits"]),
+                set(row),
+                self.BLOCK_ROW_V1_KEYS | {"chain_state", "disconnected_at"},
             )
+            self.assertIn(
+                row["chain_state"],
+                {"prepared", "confirmed", "inactive", "rejected", "reversed"},
+            )
+            if row["chain_state"] == "reversed":
+                self.assertIsNotNone(row["disconnected_at"])
+            else:
+                self.assertIsNone(row["disconnected_at"])
+
+    def test_pool_summary_fixture_reports_reorg_counts_and_network_hashrate(self) -> None:
+        pool_summary = self.load_fixture("pool-summary.json")
+        pool = pool_summary["pool"]
+
+        for key in ("blocks_reversed_total", "blocks_inactive_total"):
+            self.assertIsInstance(pool[key], int)
+            self.assertGreaterEqual(pool[key], 0)
+        network_hashrate = pool_summary["network"]["hashrate_ths"]
+        self.assertIsInstance(network_hashrate, str)
+        self.assertRegex(network_hashrate, DECIMAL_PATTERN)
+        # The pool's 3h credited rate divided by the network estimate is the
+        # documented share-of-network ratio; the fixture keeps it plausible.
+        share = Decimal(pool["hashrate_ths"]["h3"]) / Decimal(network_hashrate)
+        self.assertGreater(share, 0)
+        self.assertLess(share, 1)
+
+    def test_openapi_declares_blocks_chain_state_filter_and_summary_reorg_fields(self) -> None:
+        text = OPENAPI_PATH.read_text(encoding="utf-8")
+        self.assertIn("- name: chain_state\n          in: query", text)
+        self.assertIn("enum: [active, all, reversed]", text)
+        self.assertIn('- $ref: "#/components/schemas/BlocksResponse"', text)
+        self.assertIn('- $ref: "#/components/schemas/BlocksChainStateResponse"', text)
+        self.assertIn("ChainStateBlockRow:", text)
+        self.assertIn("const: prism.dashboard.blocks.v2", text)
+        self.assertIn("ChainState:", text)
+        self.assertIn("- disconnected_at", text)
+        self.assertIn("- blocks_reversed_total", text)
+        self.assertIn("- blocks_inactive_total", text)
+        # network.hashrate_ths is required-but-nullable and documents the
+        # credited-work vs chain-estimate caveat.
+        self.assertIn("- hashrate_ths\n        - initial_block_download", text)
+        self.assertIn("ratio is approximate", text)
+
+        readme_text = (CONTRACT_DIR / "README.md").read_text(encoding="utf-8")
+        self.assertIn("`chain_state=all`", readme_text)
+        self.assertIn("`chain_state=reversed`", readme_text)
+        self.assertIn("prism.dashboard.blocks.v2", readme_text)
+        self.assertIn("blocks_reversed_total", readme_text)
+        self.assertIn("blocks_inactive_total", readme_text)
+        self.assertIn("network.hashrate_ths", readme_text)
 
     def test_miner_summary_embeds_only_bounded_previews(self) -> None:
         miner = self.load_fixture("miner.json")

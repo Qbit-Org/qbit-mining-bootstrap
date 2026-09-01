@@ -3640,6 +3640,8 @@ class PrismShareLedgerTests(unittest.TestCase):
                     "participants_3h": 0,
                     "blocks_found_total": 0,
                     "prism_blocks_total": 0,
+                    "blocks_reversed_total": 0,
+                    "blocks_inactive_total": 0,
                     "total_mined_bits": 0,
                     "latest_block": None,
                     "oldest_share_accepted_at": None,
@@ -3911,6 +3913,8 @@ class PrismShareLedgerTests(unittest.TestCase):
                     "participants_3h": 0,
                     "blocks_found_total": 0,
                     "prism_blocks_total": 0,
+                    "blocks_reversed_total": 0,
+                    "blocks_inactive_total": 0,
                     "total_mined_bits": 0,
                     "latest_block": None,
                     "oldest_share_accepted_at": None,
@@ -4124,6 +4128,8 @@ class PrismShareLedgerTests(unittest.TestCase):
                     "participants_3h": 0,
                     "blocks_found_total": 0,
                     "prism_blocks_total": 0,
+                    "blocks_reversed_total": 0,
+                    "blocks_inactive_total": 0,
                     "total_mined_bits": 0,
                     "latest_block": None,
                     "oldest_share_accepted_at": None,
@@ -4175,6 +4181,98 @@ class PrismShareLedgerTests(unittest.TestCase):
         )
         self.assertIn("'bits', COALESCE(rows.audit_bits, '00000000')", query)
         self.assertNotIn("rows.audit_bundle#>>", query)
+
+    def test_postgres_dashboard_blocks_chain_state_filters_partition_count_and_rows(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {"total_count": 0, "rows": []},
+                {"total_count": 0, "rows": []},
+                {"total_count": 0, "rows": []},
+            ]
+        )
+
+        ledger.dashboard_blocks(page=1, limit=15)
+        default_query = ledger.lease_queries[-1]
+        ledger.dashboard_blocks(page=1, limit=15, chain_state="all")
+        all_query = ledger.lease_queries[-1]
+        ledger.dashboard_blocks(page=1, limit=15, chain_state="reversed")
+        reversed_query = ledger.lease_queries[-1]
+
+        # The default emits exactly the pre-filter SQL: reversed rows hidden
+        # from both the page and the total, and no state fields in the rows.
+        self.assertIn("WHERE chain_state <> 'reversed'", default_query)
+        self.assertIn("WHERE block.chain_state <> 'reversed'", default_query)
+        self.assertNotIn("'chain_state'", default_query)
+        self.assertNotIn("disconnected_at", default_query)
+
+        # chain_state=all drops the filter from the page and the pagination
+        # count alike, and surfaces the public state fields.
+        self.assertIn("WHERE true", all_query)
+        self.assertNotIn("WHERE chain_state", all_query)
+        self.assertNotIn("WHERE block.chain_state", all_query)
+        self.assertIn("'chain_state', rows.chain_state", all_query)
+        # disconnected_at is a reorg disconnect time: rejected rows carry the
+        # column too (their maturity flip requires it), so the public row
+        # masks it to reversed chain states.
+        self.assertIn(
+            "'disconnected_at', CASE WHEN rows.chain_state = 'reversed'"
+            " THEN to_char(rows.disconnected_at AT TIME ZONE 'UTC'",
+            all_query,
+        )
+
+        # chain_state=reversed inverts the default filter in both places.
+        self.assertIn("WHERE chain_state = 'reversed'", reversed_query)
+        self.assertIn("WHERE block.chain_state = 'reversed'", reversed_query)
+        self.assertIn("'chain_state', rows.chain_state", reversed_query)
+
+        with self.assertRaisesRegex(ValueError, "chain_state"):
+            ledger.dashboard_blocks(page=1, limit=15, chain_state="orphaned")
+
+    def test_postgres_pool_snapshot_reports_reorg_state_counts(self) -> None:
+        ledger = FakeLeasePsqlShareLedger(
+            [
+                acquired_lease(),
+                {
+                    "h1_difficulty": "0",
+                    "h3_difficulty": "0",
+                    "h24_difficulty": "0",
+                    "participants_3h": 0,
+                    "blocks_found_total": 7,
+                    "prism_blocks_total": 7,
+                    "blocks_reversed_total": 4,
+                    "blocks_inactive_total": 2,
+                    "total_mined_bits": 0,
+                    "latest_block": None,
+                    "oldest_share_accepted_at": None,
+                    "newest_share_accepted_at": None,
+                    "included_share_count": 0,
+                },
+            ]
+        )
+
+        snapshot = ledger.dashboard_pool_snapshot(
+            current_network_difficulty="1", generated_at=public_api.utc_now_iso()
+        )
+        query = ledger.lease_queries[-1]
+
+        # The public reorg counters reuse the audit summary's per-state count
+        # shape, and blocks_found_total keeps excluding only reversed rows.
+        self.assertIn(
+            "'blocks_reversed_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'reversed')",
+            query,
+        )
+        self.assertIn(
+            "'blocks_inactive_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'inactive')",
+            query,
+        )
+        self.assertIn(
+            "'blocks_found_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state <> 'reversed')",
+            query,
+        )
+        self.assertEqual(snapshot["blocks_reversed_total"], 4)
+        self.assertEqual(snapshot["blocks_inactive_total"], 2)
+        self.assertEqual(snapshot["blocks_found_total"], 7)
 
     def test_psql_externalizes_audit_body_and_resolves_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

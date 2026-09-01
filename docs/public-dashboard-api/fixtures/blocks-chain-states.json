@@ -1,0 +1,63 @@
+{
+  "schema": "prism.dashboard.blocks.v2",
+  "generated_at": "2026-06-26T20:45:00Z",
+  "pagination": {
+    "page": 1,
+    "limit": 15,
+    "total_count": 130,
+    "total_pages": 9
+  },
+  "rows": [
+    {
+      "height": 123450,
+      "hash": "0000000000000000000abc1230000000000000000000000000000000000000aa",
+      "found_at": "2026-06-26T19:55:00Z",
+      "network_difficulty": "2147516160496101",
+      "bits": "1d00ffff",
+      "solver_recipient_id": "qbrt1prismminer000000000000000000000000000000000000001",
+      "solver_worker_name": "rig-a",
+      "solver_share_difficulty": "2200000000000000",
+      "reward_window_weight": "17180129283968808",
+      "coinbase_value_bits": 250000000,
+      "audit_bundle_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "payout_manifest_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "explorer_url": "https://explorer.example/block/0000000000000000000abc1230000000000000000000000000000000000000aa",
+      "chain_state": "confirmed",
+      "disconnected_at": null
+    },
+    {
+      "height": 123430,
+      "hash": "0000000000000000000abc1230000000000000000000000000000000000000cc",
+      "found_at": "2026-06-26T16:58:00Z",
+      "network_difficulty": "2147516160496101",
+      "bits": "1d00ffff",
+      "solver_recipient_id": "qbrt1prismminer000000000000000000000000000000000000003",
+      "solver_worker_name": "rig-b",
+      "solver_share_difficulty": "2150000000000000",
+      "reward_window_weight": "17180129283968808",
+      "coinbase_value_bits": 250000000,
+      "audit_bundle_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "payout_manifest_sha256": null,
+      "explorer_url": null,
+      "chain_state": "reversed",
+      "disconnected_at": "2026-06-26T17:05:00Z"
+    },
+    {
+      "height": 123401,
+      "hash": "0000000000000000000abc1230000000000000000000000000000000000000bb",
+      "found_at": "2026-06-26T15:20:00Z",
+      "network_difficulty": "2147516160496101",
+      "bits": "1d00ffff",
+      "solver_recipient_id": "qbrt1prismminer000000000000000000000000000000000000002",
+      "solver_worker_name": null,
+      "solver_share_difficulty": null,
+      "reward_window_weight": "17180129283968808",
+      "coinbase_value_bits": 250000000,
+      "audit_bundle_sha256": null,
+      "payout_manifest_sha256": null,
+      "explorer_url": null,
+      "chain_state": "confirmed",
+      "disconnected_at": null
+    }
+  ]
+}

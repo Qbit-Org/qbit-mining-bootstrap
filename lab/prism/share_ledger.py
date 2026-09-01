@@ -1779,6 +1779,8 @@ class SingleWriterShareLedger:
             ),
             "blocks_found_total": 0,
             "prism_blocks_total": 0,
+            "blocks_reversed_total": 0,
+            "blocks_inactive_total": 0,
             "total_mined_bits": 0,
             "latest_block": None,
             "reward_window": {
@@ -1819,9 +1821,11 @@ class SingleWriterShareLedger:
             "share_percent": share_percent,
         }
 
-    def dashboard_blocks(self, *, page: int, limit: int) -> dict[str, object]:
+    def dashboard_blocks(self, *, page: int, limit: int, chain_state: str = "active") -> dict[str, object]:
         from lab.prism import public_api
 
+        if chain_state not in public_api.BLOCKS_CHAIN_STATE_FILTERS:
+            raise ValueError("chain_state must be one of active, all, reversed")
         return {"pagination": public_api.pagination(page, limit, 0), "rows": []}
 
     def dashboard_miner_lifetime_earnings_bits(self, *, recipient_id: str) -> int:
@@ -6818,6 +6822,8 @@ SELECT json_build_object(
     'participants_3h', (SELECT participants_3h FROM rollups),
     'blocks_found_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state <> 'reversed'),
     'prism_blocks_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state <> 'reversed'),
+    'blocks_reversed_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'reversed'),
+    'blocks_inactive_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'inactive'),
     'total_mined_bits', COALESCE((
         SELECT sum(carry.gross_amount_sats)
         FROM qbit_payout_carry_forward carry
@@ -6853,6 +6859,8 @@ SELECT json_build_object(
             "participants_3h": int(row["participants_3h"]),
             "blocks_found_total": int(row["blocks_found_total"]),
             "prism_blocks_total": int(row["prism_blocks_total"]),
+            "blocks_reversed_total": int(row["blocks_reversed_total"]),
+            "blocks_inactive_total": int(row["blocks_inactive_total"]),
             "total_mined_bits": int(row["total_mined_bits"]),
             "latest_block": row["latest_block"],
             "reward_window": {
@@ -6864,25 +6872,53 @@ SELECT json_build_object(
             },
         }
 
-    def dashboard_blocks(self, *, page: int, limit: int) -> dict[str, object]:
+    def dashboard_blocks(self, *, page: int, limit: int, chain_state: str = "active") -> dict[str, object]:
         from lab.prism import public_api
 
+        # The default filter is exactly the pre-filter read (hide reversed
+        # rows), and the default emits exactly the pre-filter SQL and row
+        # shape so the v1 response stays byte-compatible. The non-default
+        # filters additionally surface chain_state and disconnected_at, which
+        # the public v2 block row reports.
+        state_predicates = {
+            "active": "{column} <> 'reversed'",
+            "all": "true",
+            "reversed": "{column} = 'reversed'",
+        }
+        if chain_state not in state_predicates:
+            raise ValueError("chain_state must be one of active, all, reversed")
+        total_predicate = state_predicates[chain_state].format(column="chain_state")
+        page_predicate = state_predicates[chain_state].format(column="block.chain_state")
+        include_state = chain_state != "active"
+        state_columns = "\n        block.chain_state,\n        block.disconnected_at," if include_state else ""
+        # disconnected_at is a reorg disconnect time in the public contract,
+        # null for every non-reversed row. The ledger also stamps the column
+        # on rejected rows (their maturity_state 'reversed' requires it), so
+        # it is masked to reversed chain states rather than serialized as
+        # recorded.
+        state_json_fields = (
+            "\n            'chain_state', rows.chain_state,"
+            "\n            'disconnected_at', CASE WHEN rows.chain_state = 'reversed'"
+            " THEN to_char(rows.disconnected_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') END,"
+            if include_state
+            else ""
+        )
         offset = (page - 1) * limit
         explorer_prefix = os.environ.get("PRISM_PUBLIC_EXPLORER_BLOCK_URL_PREFIX")
         sql = f"""
 WITH total AS (
     SELECT count(*) AS total_count
     FROM qbit_pool_blocks
-    WHERE chain_state <> 'reversed'
+    WHERE {total_predicate}
 ),
 page_blocks AS (
     SELECT
         block.block_hash,
         block.block_height,
-        block.found_at,
+        block.found_at,{state_columns}
         block.payout_manifest_sha256
     FROM qbit_pool_blocks block
-    WHERE block.chain_state <> 'reversed'
+    WHERE {page_predicate}
     ORDER BY block.block_height DESC, block.found_at DESC
     LIMIT {int(limit)} OFFSET {int(offset)}
 ),
@@ -6890,7 +6926,7 @@ rows AS (
     SELECT
         block.block_hash,
         block.block_height,
-        block.found_at,
+        block.found_at,{state_columns}
         block.payout_manifest_sha256,
         COALESCE(bundle.found_block_network_difficulty::text, bundle.audit_bundle#>>'{{found_block,network_difficulty}}') AS audit_network_difficulty,
         COALESCE(bundle.found_block_bits, bundle.audit_bundle#>>'{{found_block,bits}}') AS audit_bits,
@@ -6931,7 +6967,7 @@ SELECT json_build_object(
             END,
             'coinbase_value_bits', COALESCE(rows.audit_coinbase_value_sats::bigint, 0),
             'audit_bundle_sha256', rows.audit_bundle_sha256,
-            'payout_manifest_sha256', rows.payout_manifest_sha256,
+            'payout_manifest_sha256', rows.payout_manifest_sha256,{state_json_fields}
             'explorer_url', null
         ) ORDER BY rows.block_height DESC, rows.found_at DESC)
         FROM rows

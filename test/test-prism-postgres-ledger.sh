@@ -1180,6 +1180,56 @@ WHERE block_hash = '""" + alias_block_hash + """';
 """
 )
 
+# Reorg visibility on the public block read model, against a real reversed
+# row: the default view keeps hiding it, chain_state=reversed surfaces it
+# with its disconnect time, and every pagination total describes exactly its
+# own filtered set.
+default_blocks = replacement.dashboard_blocks(page=1, limit=50)
+all_blocks = replacement.dashboard_blocks(page=1, limit=50, chain_state="all")
+reversed_blocks = replacement.dashboard_blocks(page=1, limit=50, chain_state="reversed")
+if any(row["hash"] == alias_block_hash for row in default_blocks["rows"]):
+    raise SystemExit("default dashboard blocks view leaked a reversed block")
+if any("chain_state" in row or "disconnected_at" in row for row in default_blocks["rows"]):
+    raise SystemExit("default dashboard blocks view leaked chain-state fields")
+assert_equal(
+    all_blocks["pagination"]["total_count"],
+    default_blocks["pagination"]["total_count"] + reversed_blocks["pagination"]["total_count"],
+    "chain_state filters partition the block history",
+)
+reversed_rows_by_hash = {row["hash"]: row for row in reversed_blocks["rows"]}
+if alias_block_hash not in reversed_rows_by_hash:
+    raise SystemExit("chain_state=reversed did not surface the reversed block")
+reversed_row = reversed_rows_by_hash[alias_block_hash]
+assert_equal(reversed_row["chain_state"], "reversed", "reversed block reports its chain state")
+if not str(reversed_row["disconnected_at"] or "").endswith("Z"):
+    raise SystemExit("reversed block disconnected_at is not a UTC timestamp")
+for row in all_blocks["rows"]:
+    if "chain_state" not in row or "disconnected_at" not in row:
+        raise SystemExit("chain_state=all rows must carry the state fields")
+    if (row["chain_state"] == "reversed") != (row["disconnected_at"] is not None):
+        raise SystemExit("disconnected_at must be set exactly for reversed rows")
+paged_reversed = replacement.dashboard_blocks(page=1, limit=1, chain_state="reversed")
+assert_equal(
+    paged_reversed["pagination"]["total_count"],
+    reversed_blocks["pagination"]["total_count"],
+    "reversed pagination total is limit-independent",
+)
+assert_equal(len(paged_reversed["rows"]), 1, "reversed page honours its limit")
+reorg_snapshot = replacement.dashboard_pool_snapshot(
+    current_network_difficulty="1000",
+    generated_at="2026-01-01T00:00:00Z",
+)
+assert_equal(
+    reorg_snapshot["blocks_reversed_total"],
+    reversed_blocks["pagination"]["total_count"],
+    "pool snapshot reversed counter matches the reversed block view",
+)
+assert_equal(
+    reorg_snapshot["blocks_found_total"],
+    default_blocks["pagination"]["total_count"],
+    "blocks_found_total keeps excluding reversed blocks",
+)
+
 zero_net_bundle = copy.deepcopy(bundle)
 zero_net_bundle["signed_coinbase_manifest"]["manifest"]["payout_count"] = 1
 zero_net_bundle["payout_policy_manifest"]["accounts"] = [
@@ -1286,6 +1336,20 @@ assert_equal(
     {"chain_state": "rejected", "maturity_state": "reversed"},
     "rejected prepared block state",
 )
+# The reject flip stamps disconnected_at (its maturity_state 'reversed'
+# requires it), but the public contract defines disconnected_at as a reorg
+# disconnect time that is null for every non-reversed row -- a rejected
+# block must not read as a reorg casualty.
+rejected_all_view = replacement.dashboard_blocks(page=1, limit=50, chain_state="all")
+rejected_public_row = next(
+    (row for row in rejected_all_view["rows"] if row["hash"] == "46" * 32),
+    None,
+)
+if rejected_public_row is None:
+    raise SystemExit("chain_state=all did not surface the rejected block")
+assert_equal(rejected_public_row["chain_state"], "rejected", "rejected block reports its chain state")
+if rejected_public_row["disconnected_at"] is not None:
+    raise SystemExit("rejected block must not report a reorg disconnect time")
 assert_equal(
     replacement.confirm_accepted_block(
         block_hash="46" * 32,

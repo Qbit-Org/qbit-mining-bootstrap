@@ -28,6 +28,14 @@ HASHES_PER_QBIT_SCALED_DIFFICULTY = (
 )
 MAX_SEARCH_LENGTH = 128
 MAX_RECIPIENT_ID_LENGTH = 256
+BLOCKS_CHAIN_STATE_FILTERS = ("active", "all", "reversed")
+# getnetworkhashps window and lane. The pool's shares are credited against the
+# permissionless lane, so the ratio pool hashrate_ths / network hashrate_ths is
+# only meaningful against that lane's estimate, not the all-lanes aggregate.
+# 120 blocks and height -1 are the RPC's own documented defaults, passed
+# explicitly because the lane argument is positional after them.
+NETWORK_HASHRATE_BLOCK_WINDOW = 120
+NETWORK_HASHRATE_LANE = "permissionless"
 HASHRATE_SERIES_BUCKET_SECONDS = {"5m": 300, "1h": 3600, "1d": 86400}
 HASHRATE_SERIES_RANGE_SECONDS = {
     "1w": 7 * 86400,
@@ -348,7 +356,14 @@ def dispatch(coordinator: Any, path: str, query: dict[str, list[str]]) -> tuple[
         return 200, pool_summary(coordinator)
     if path == "/public/v1/blocks":
         page, limit = pagination_params(query)
-        return 200, blocks(coordinator, page=page, limit=limit)
+        chain_state = first_query_value(query, "chain_state") or "active"
+        if chain_state not in BLOCKS_CHAIN_STATE_FILTERS:
+            raise PublicApiError(
+                400,
+                "invalid_chain_state",
+                "chain_state must be one of active, all, reversed",
+            )
+        return 200, blocks(coordinator, page=page, limit=limit, chain_state=chain_state)
     if path == "/public/v1/leaderboard":
         page, limit = pagination_params(query)
         search = search_param(query)
@@ -445,6 +460,10 @@ def error_payload(code: str, message: str) -> dict[str, object]:
 def pool_summary(coordinator: Any) -> dict[str, object]:
     generated_at = utc_now_iso()
     network = network_summary(coordinator)
+    # Looked up after network_summary so a missing-compact-bits 503 still
+    # short-circuits first; a failed hashrate lookup alone must never fail
+    # this endpoint (the field is nullable by contract).
+    network["hashrate_ths"] = network_hashrate_ths(coordinator)
     ledger_snapshot = coordinator.ledger.dashboard_pool_snapshot(
         current_network_difficulty=network["network_difficulty"],
         generated_at=generated_at,
@@ -459,6 +478,8 @@ def pool_summary(coordinator: Any) -> dict[str, object]:
             "participants_3h": ledger_snapshot["participants_3h"],
             "blocks_found_total": ledger_snapshot["blocks_found_total"],
             "prism_blocks_total": ledger_snapshot["prism_blocks_total"],
+            "blocks_reversed_total": ledger_snapshot["blocks_reversed_total"],
+            "blocks_inactive_total": ledger_snapshot["blocks_inactive_total"],
             "total_mined_bits": ledger_snapshot["total_mined_bits"],
             "expected_time_to_block_seconds": expected_time_to_block_seconds(
                 hashrate_ths=str(ledger_snapshot["hashrate_ths"]["h3"]),
@@ -470,9 +491,17 @@ def pool_summary(coordinator: Any) -> dict[str, object]:
     }
 
 
-def blocks(coordinator: Any, *, page: int, limit: int) -> dict[str, object]:
+def blocks(coordinator: Any, *, page: int, limit: int, chain_state: str = "active") -> dict[str, object]:
     generated_at = utc_now_iso()
-    payload = coordinator.ledger.dashboard_blocks(page=page, limit=limit)
+    if chain_state == "active":
+        # The default keeps today's read-model call and today's schema tag
+        # exactly: no chain_state argument reaches the ledger, so the default
+        # response stays byte-compatible with pre-filter consumers.
+        payload = coordinator.ledger.dashboard_blocks(page=page, limit=limit)
+        schema = "prism.dashboard.blocks.v1"
+    else:
+        payload = coordinator.ledger.dashboard_blocks(page=page, limit=limit, chain_state=chain_state)
+        schema = "prism.dashboard.blocks.v2"
     for row in payload["rows"]:
         row.setdefault("bits", "00000000")
         if row.get("bits") is None:
@@ -481,7 +510,7 @@ def blocks(coordinator: Any, *, page: int, limit: int) -> dict[str, object]:
         if row.get("network_difficulty") is None:
             row["network_difficulty"] = "0"
     return {
-        "schema": "prism.dashboard.blocks.v1",
+        "schema": schema,
         "generated_at": generated_at,
         "pagination": payload["pagination"],
         "rows": payload["rows"],
@@ -1267,6 +1296,34 @@ def network_summary(coordinator: Any) -> dict[str, object]:
         "initial_block_download": bool(blockchain_info.get("initialblockdownload", False)),
         "peers": peers,
     }
+
+
+def network_hashrate_ths(coordinator: Any) -> str | None:
+    """Chain-derived estimate of the permissionless-lane network hashrate, TH/s.
+
+    qbitd's getnetworkhashps answers in H/s over a trailing block window; the
+    permissionless lane is requested because that is the lane pool shares are
+    credited against, so consumers can divide a pool hashrate_ths window by
+    this value for an approximate share-of-network. Nullable and non-fatal by
+    contract: any RPC failure or non-numeric answer yields None, never an
+    error response -- pool-summary may only 503 over missing compact bits.
+    """
+    try:
+        raw = coordinator.rpc.call(
+            "getnetworkhashps",
+            [NETWORK_HASHRATE_BLOCK_WINDOW, -1, NETWORK_HASHRATE_LANE],
+        )
+    except Exception:
+        return None
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        hashes_per_second = Decimal(str(raw))
+    except (ArithmeticError, ValueError, TypeError):
+        return None
+    if not hashes_per_second.is_finite() or hashes_per_second < 0:
+        return None
+    return decimal_string(hashes_per_second / TERAHASH)
 
 
 def first_present(*values: object) -> object | None:

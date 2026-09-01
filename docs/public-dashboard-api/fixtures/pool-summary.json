@@ -7,6 +7,7 @@
     "tip_hash": "0000000000000000000abc123000000000000000000000000000000000000001",
     "bits": "181b32da",
     "network_difficulty": "86812541144089706339356132",
+    "hashrate_ths": "7716669.17",
     "initial_block_download": false,
     "peers": 8
   },
@@ -20,6 +21,8 @@
     "participants_3h": 42,
     "blocks_found_total": 128,
     "prism_blocks_total": 128,
+    "blocks_reversed_total": 2,
+    "blocks_inactive_total": 1,
     "total_mined_bits": 32000000000,
     "expected_time_to_block_seconds": 75,
     "latest_block": {
