@@ -2080,6 +2080,19 @@ class SingleWriterShareLedger:
             for bucket_epoch, entry in sorted(buckets.items())
         ]
 
+    def dashboard_block_markers(
+        self,
+        *,
+        range_id: str,
+        bucket: str,
+        range_anchor_epoch: int | None = None,
+    ) -> dict[str, object]:
+        # The in-memory backend records no found_at or solver detail for its
+        # pool blocks -- dashboard_blocks serves an empty page for the same
+        # reason -- so the marker series degrades to empty the way the other
+        # in-memory dashboard read models do.
+        return {"total_blocks": 0, "points": []}
+
     def persist_accepted_block(
         self,
         *,
@@ -7728,6 +7741,97 @@ END;
             "scanned": int(result["scanned"]),
             "last_share_seq": int(result["last_share_seq"]),
             "caught_up": bool(result["caught_up"]),
+        }
+
+    def dashboard_block_markers(
+        self,
+        *,
+        range_id: str,
+        bucket: str,
+        range_anchor_epoch: int | None = None,
+    ) -> dict[str, object]:
+        from lab.prism import public_api
+
+        bucket_seconds = {"5m": 300, "1h": 3600, "1d": 86400}[bucket]
+        range_seconds = {
+            "1w": 7 * 86400,
+            "1m": 30 * 86400,
+            "6m": 180 * 86400,
+            "all": None,
+        }[range_id]
+        range_filter = ""
+        if range_seconds is not None:
+            # Anchor the range lower bound on the caller's clock when provided
+            # so marker buckets sit on exactly the grid the hashrate series is
+            # trimmed against, even when the database clock disagrees with the
+            # application clock. Only fully covered buckets are kept: a bucket
+            # straddling the range start is dropped whole, the same boundary
+            # hashrate_series_min_epoch draws for the chart's points. `all`
+            # carries no lower bound.
+            anchor_epoch = (
+                int(range_anchor_epoch)
+                if range_anchor_epoch is not None
+                else int(datetime.now(timezone.utc).timestamp())
+            )
+            min_epoch = public_api.hashrate_series_min_epoch(
+                anchor_epoch,
+                range_seconds,
+                bucket_seconds,
+            )
+            range_filter = f"AND block.found_at >= to_timestamp({int(min_epoch)})"
+        # qbit_pool_blocks holds ~10^4 rows, so one grouped scan is cheap and
+        # no index beyond the primary key is needed. Reversed blocks are
+        # excluded by the same predicate dashboard_blocks applies.
+        sql = f"""
+WITH in_range AS (
+    SELECT
+        floor(extract(epoch FROM block.found_at) / {int(bucket_seconds)})::bigint * {int(bucket_seconds)} AS bucket_epoch,
+        block.block_hash,
+        block.block_height,
+        block.found_at
+    FROM qbit_pool_blocks block
+    WHERE block.chain_state <> 'reversed'
+      AND block.found_at <= clock_timestamp()
+      {range_filter}
+),
+ranked AS (
+    SELECT
+        in_range.*,
+        row_number() OVER (
+            PARTITION BY bucket_epoch
+            ORDER BY found_at DESC, block_height DESC
+        ) AS bucket_rank
+    FROM in_range
+),
+points AS (
+    SELECT
+        bucket_epoch,
+        count(*) AS block_count,
+        json_agg(json_build_object(
+            'height', block_height,
+            'hash', block_hash,
+            'found_at', to_char(found_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+        ) ORDER BY found_at DESC, block_height DESC)
+            FILTER (WHERE bucket_rank <= {int(public_api.BLOCK_MARKERS_MAX_BLOCKS_PER_BUCKET)}) AS blocks
+    FROM ranked
+    GROUP BY bucket_epoch
+)
+SELECT json_build_object(
+    'total_blocks', COALESCE((SELECT sum(block_count)::bigint FROM points), 0),
+    'points', COALESCE((
+        SELECT json_agg(json_build_object(
+            'timestamp', to_char(to_timestamp(bucket_epoch) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+            'block_count', block_count,
+            'blocks', blocks
+        ) ORDER BY bucket_epoch ASC)
+        FROM points
+    ), '[]'::json)
+);
+"""
+        payload = self._run_read_json(sql)
+        return {
+            "total_blocks": int(payload["total_blocks"]),
+            "points": payload["points"],
         }
 
     def _audit_store(self) -> AuditArtifactStore:

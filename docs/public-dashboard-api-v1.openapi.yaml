@@ -117,6 +117,56 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "503":
           $ref: "#/components/responses/UpstreamUnavailable"
+  /block-markers:
+    get:
+      tags: [dashboard]
+      operationId: getBlockMarkers
+      summary: Get found-block markers pre-bucketed onto the hashrate chart grid.
+      description: >
+        Serves the found-block markers the dashboard draws over the hashrate
+        series. Bucket epochs use the identical floor arithmetic the hashrate
+        buckets use, and bounded ranges keep only fully covered buckets, so
+        markers land in the same buckets as the hashrate points on every
+        timeframe. Buckets with no found blocks are omitted. Each bucket lists
+        at most its 3 most recent blocks and reports the full count, so long
+        ranges stay bounded without paging `/blocks`. Finer buckets than a
+        range's chart renders are rejected with `400 bad_request`: 1w allows
+        5m/1h/1d, 1m allows 1h/1d, 6m and all allow 1d only.
+      parameters:
+        - name: range
+          in: query
+          required: false
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/HashrateRange"
+            default: 1m
+        - name: bucket
+          in: query
+          required: false
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/HashrateBucket"
+            default: auto
+      responses:
+        "200":
+          description: Found-block marker series.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/BrowserCacheControl"
+            CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Vercel-CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Age:
+              $ref: "#/components/headers/Age"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BlockMarkersResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
   /leaderboard:
     get:
       tags: [dashboard]
@@ -1014,6 +1064,80 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/DualRateHashratePoint"
+    BlockMarkerBlock:
+      type: object
+      additionalProperties: false
+      required: [height, hash, found_at]
+      properties:
+        height:
+          type: integer
+          minimum: 0
+        hash:
+          $ref: "#/components/schemas/HexHash"
+        found_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+    BlockMarkerPoint:
+      type: object
+      additionalProperties: false
+      required: [timestamp, block_count, blocks, truncated]
+      properties:
+        timestamp:
+          allOf:
+            - $ref: "#/components/schemas/IsoTimestamp"
+          description: >
+            Bucket start, on the same floor-aligned grid as the hashrate
+            series buckets for the identical range and bucket.
+        block_count:
+          type: integer
+          minimum: 1
+          description: Every non-reversed block found in the bucket, listed or not.
+        blocks:
+          type: array
+          maxItems: 3
+          items:
+            $ref: "#/components/schemas/BlockMarkerBlock"
+          description: >
+            At most the 3 most recent blocks in the bucket, ordered by
+            found_at descending with height breaking ties.
+        truncated:
+          type: boolean
+          description: True when block_count exceeds the 3 blocks listed.
+    BlockMarkersResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - schema
+        - generated_at
+        - range
+        - bucket
+        - bucket_seconds
+        - total_blocks
+        - points
+      properties:
+        schema:
+          type: string
+          const: prism.dashboard.block-markers.v1
+        generated_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        range:
+          $ref: "#/components/schemas/HashrateRange"
+        bucket:
+          $ref: "#/components/schemas/HashrateBucket"
+        bucket_seconds:
+          type: integer
+          enum: [300, 3600, 86400]
+          description: Duration of every bucket, matching the hashrate series.
+        total_blocks:
+          type: integer
+          minimum: 0
+          description: All non-reversed found blocks inside the range.
+        points:
+          type: array
+          items:
+            $ref: "#/components/schemas/BlockMarkerPoint"
+          description: >
+            Only buckets containing found blocks, ascending by timestamp;
+            consumers synthesize gaps.
     WindowInfo:
       type: object
       additionalProperties: false

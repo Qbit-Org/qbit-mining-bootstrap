@@ -300,6 +300,9 @@ class StalenessBudgetTests(unittest.TestCase):
             "/public/v1/blocks": derive(cache_ttl_seconds=plain),
             "/public/v1/leaderboard": derive(cache_ttl_seconds=plain),
             "/public/v1/hashrate-series": derive(cache_ttl_seconds=aggregate),
+            # A cheap grouped scan of the small pool-blocks table, so it is a
+            # plain row read rather than an aggregate despite serving a chart.
+            "/public/v1/block-markers": derive(cache_ttl_seconds=plain),
             "/public/v1/mining-configuration": derive(cache_ttl_seconds=config),
             # The one route with a second cache in series beneath it.
             "/public/v1/miners/{recipient_id}": derive(
@@ -331,6 +334,7 @@ class StalenessBudgetTests(unittest.TestCase):
             ("/public/v1/hashrate-series", endpoint_registry.PUBLIC_AGGREGATE_CACHE_TTL_DEFAULT_SECONDS),
             ("/public/v1/miners/miner-1/workers", endpoint_registry.PUBLIC_AGGREGATE_CACHE_TTL_DEFAULT_SECONDS),
             ("/public/v1/blocks", endpoint_registry.PUBLIC_CACHE_TTL_DEFAULT_SECONDS),
+            ("/public/v1/block-markers", endpoint_registry.PUBLIC_CACHE_TTL_DEFAULT_SECONDS),
             ("/public/v1/miners/miner-1/earnings", endpoint_registry.PUBLIC_CACHE_TTL_DEFAULT_SECONDS),
             ("/public/v1/mining-configuration", endpoint_registry.PUBLIC_CONFIG_CACHE_TTL_DEFAULT_SECONDS),
         ):
@@ -573,6 +577,7 @@ class RegistryCoverageTests(unittest.TestCase):
         {
             "/",
             "/public/v1/artifacts/",
+            "/public/v1/block-markers",
             "/public/v1/blocks",
             "/public/v1/blocks/",
             "/public/v1/fanouts/",
@@ -635,10 +640,11 @@ class RegistryCoverageTests(unittest.TestCase):
 
     def test_path_counts_are_pinned(self) -> None:
         # The extraction set and the total surface are contract numbers:
-        # PR 2 moves exactly the 13 /public/v1 routes, and the registry
-        # classifies all 31 request paths the HTTP surface serves.
-        self.assertEqual(13, len(endpoint_registry.extracted_paths()))
-        self.assertEqual(31, len(self.registry_paths()))
+        # PR 2 moved exactly the 13 original /public/v1 routes,
+        # /public/v1/block-markers joined the extracted surface later, and the
+        # registry classifies all 32 request paths the HTTP surface serves.
+        self.assertEqual(14, len(endpoint_registry.extracted_paths()))
+        self.assertEqual(32, len(self.registry_paths()))
 
     def test_http_handler_is_get_only(self) -> None:
         # The registry -- and the snapshot guard above -- only inspect do_GET

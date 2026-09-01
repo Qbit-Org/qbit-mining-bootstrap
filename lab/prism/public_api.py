@@ -59,6 +59,7 @@ HASHRATE_SERIES_ALLOWED_BUCKETS: dict[str, frozenset[str]] = {
     "all": frozenset({"1d"}),
 }
 DEFAULT_HASHRATE_SMOOTHING_SECONDS = 30 * 60
+BLOCK_MARKERS_MAX_BLOCKS_PER_BUCKET = 3
 
 PUBLIC_ERROR_CODES = {
     "not_found": "not_found",
@@ -540,6 +541,10 @@ def dispatch(coordinator: Any, path: str, query: dict[str, list[str]]) -> tuple[
         bucket = first_query_value(query, "bucket") or "auto"
         view = first_query_value(query, "view")
         return 200, hashrate_series(coordinator, subject=subject, range_id=range_id, bucket=bucket, view=view)
+    if path == "/public/v1/block-markers":
+        range_id = first_query_value(query, "range") or "1m"
+        bucket = first_query_value(query, "bucket") or "auto"
+        return 200, block_markers(coordinator, range_id=range_id, bucket=bucket)
     if path == "/public/v1/mining-configuration":
         return 200, mining_configuration(coordinator)
     if path.startswith("/public/v1/miners/"):
@@ -811,6 +816,68 @@ def hashrate_series(
         "range": range_id,
         "bucket": bucket,
         "unit": "ths",
+        "points": points,
+    }
+
+
+def block_markers(coordinator: Any, *, range_id: str, bucket: str) -> dict[str, object]:
+    """Found-block markers pre-bucketed onto the hashrate chart's grid.
+
+    The dashboard draws markers over the hashrate series, so every bucket
+    epoch here is floor(epoch(found_at) / bucket_seconds) * bucket_seconds --
+    the identical arithmetic the hashrate buckets use -- and the bounded
+    ranges keep only fully covered buckets via the same
+    hashrate_series_min_epoch anchor the chart trims against. Paging
+    /public/v1/blocks cannot serve this: at hundreds of found blocks a day the
+    long timeframes would need hundreds of pages per chart render.
+    """
+    if range_id not in {"1w", "1m", "6m", "all"}:
+        raise PublicApiError(400, "invalid_range", "range must be one of 1w, 1m, 6m, all")
+    if bucket == "auto":
+        bucket = auto_bucket(range_id)
+    if bucket not in {"5m", "1h", "1d"}:
+        raise PublicApiError(400, "invalid_bucket", "bucket must be one of auto, 5m, 1h, 1d")
+    # Markers land on top of the hashrate chart, so the hashrate series'
+    # static bucket-per-range vocabulary is the markers' vocabulary too.
+    allowed_hashrate_bucket(range_id, bucket)
+    now = datetime.now(timezone.utc)
+    generated_at = iso_datetime(now)
+    bucket_seconds = HASHRATE_SERIES_BUCKET_SECONDS[bucket]
+    range_seconds = HASHRATE_SERIES_RANGE_SECONDS[range_id]
+    # Anchor the range lower bound on this process's clock, exactly as
+    # hashrate_series does, so marker buckets and hashrate buckets share one
+    # grid even when the database clock disagrees. `all` has no lower bound.
+    range_anchor_epoch = int(now.timestamp()) if range_seconds is not None else None
+    payload = coordinator.ledger.dashboard_block_markers(
+        range_id=range_id,
+        bucket=bucket,
+        range_anchor_epoch=range_anchor_epoch,
+    )
+    points: list[dict[str, object]] = []
+    for row in payload["points"]:
+        block_count = int(row["block_count"])
+        points.append(
+            {
+                "timestamp": row["timestamp"],
+                "block_count": block_count,
+                "blocks": [
+                    {
+                        "height": int(block["height"]),
+                        "hash": str(block["hash"]),
+                        "found_at": str(block["found_at"]),
+                    }
+                    for block in row["blocks"]
+                ],
+                "truncated": block_count > BLOCK_MARKERS_MAX_BLOCKS_PER_BUCKET,
+            }
+        )
+    return {
+        "schema": "prism.dashboard.block-markers.v1",
+        "generated_at": generated_at,
+        "range": range_id,
+        "bucket": bucket,
+        "bucket_seconds": bucket_seconds,
+        "total_blocks": int(payload["total_blocks"]),
         "points": points,
     }
 

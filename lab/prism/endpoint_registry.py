@@ -510,6 +510,24 @@ _PUBLIC_READ: tuple[Endpoint, ...] = (
         ),
     ),
     Endpoint(
+        paths=("/public/v1/block-markers",),
+        audience=Audience.PUBLIC_READ,
+        disposition=Disposition.EXTRACT,
+        access=(LedgerAccess.READ_SLOT,),
+        ledger_methods=("dashboard_block_markers",),
+        rationale=(
+            "Found-block markers pre-aggregated onto the hashrate chart's "
+            "bucket grid. The pool finds hundreds of blocks a day, so the "
+            "dashboard cannot place markers on long timeframes by paging "
+            "/public/v1/blocks; this groups the small qbit_pool_blocks table "
+            "per bucket instead -- a cheap read-slot scan, so it carries the "
+            "plain row-read TTL rather than the aggregate one."
+        ),
+        max_staleness_seconds=staleness_budget_seconds(
+            cache_ttl_seconds=PUBLIC_CACHE_TTL_DEFAULT_SECONDS,
+        ),
+    ),
+    Endpoint(
         paths=("/public/v1/mining-configuration",),
         audience=Audience.PUBLIC_READ,
         disposition=Disposition.EXTRACT,
