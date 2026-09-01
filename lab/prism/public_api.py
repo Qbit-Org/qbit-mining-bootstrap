@@ -820,24 +820,6 @@ def hashrate_series(
     }
 
 
-# Buckets one range may be charted with. Finer buckets over longer ranges
-# would let a stranger request an unbounded-length public series (a year of 5m
-# buckets is six figures of points), so each range is clamped to the buckets
-# its chart actually renders. Markers land on top of the hashrate chart, so
-# this is the hashrate chart's own per-range table; if hashrate-series grows
-# an equivalent clamp helper, the two should collapse into one.
-BLOCK_MARKERS_ALLOWED_BUCKETS = {
-    "1w": ("5m", "1h", "1d"),
-    "1m": ("1h", "1d"),
-    "6m": ("1d",),
-    "all": ("1d",),
-}
-
-
-def allowed_block_marker_buckets(range_id: str) -> tuple[str, ...]:
-    return BLOCK_MARKERS_ALLOWED_BUCKETS[range_id]
-
-
 def block_markers(coordinator: Any, *, range_id: str, bucket: str) -> dict[str, object]:
     """Found-block markers pre-bucketed onto the hashrate chart's grid.
 
@@ -855,12 +837,9 @@ def block_markers(coordinator: Any, *, range_id: str, bucket: str) -> dict[str, 
         bucket = auto_bucket(range_id)
     if bucket not in {"5m", "1h", "1d"}:
         raise PublicApiError(400, "invalid_bucket", "bucket must be one of auto, 5m, 1h, 1d")
-    if bucket not in allowed_block_marker_buckets(range_id):
-        raise PublicApiError(
-            400,
-            "invalid_bucket",
-            f"bucket {bucket} is not available for range {range_id}",
-        )
+    # Markers land on top of the hashrate chart, so the hashrate series'
+    # static bucket-per-range vocabulary is the markers' vocabulary too.
+    allowed_hashrate_bucket(range_id, bucket)
     now = datetime.now(timezone.utc)
     generated_at = iso_datetime(now)
     bucket_seconds = HASHRATE_SERIES_BUCKET_SECONDS[bucket]

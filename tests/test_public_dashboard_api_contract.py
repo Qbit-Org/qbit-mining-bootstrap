@@ -380,7 +380,7 @@ class PublicDashboardApiContractTests(unittest.TestCase):
         )
         bucket_seconds = markers["bucket_seconds"]
         self.assertEqual(bucket_seconds, public_api.HASHRATE_SERIES_BUCKET_SECONDS[markers["bucket"]])
-        self.assertIn(markers["bucket"], public_api.allowed_block_marker_buckets(markers["range"]))
+        self.assertIn(markers["bucket"], public_api.HASHRATE_SERIES_ALLOWED_BUCKETS[markers["range"]])
         points = markers["points"]
         self.assertGreater(len(points), 0)
         epochs = [self.epoch(point["timestamp"]) for point in points]
