@@ -31,6 +31,8 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
+from contextlib import contextmanager
 from threading import BoundedSemaphore, Lock
 import unittest
 import urllib.error
@@ -38,6 +40,7 @@ import urllib.parse
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from typing import Iterator
 from unittest.mock import patch
 
 from lab.prism import endpoint_registry, public_api, public_read_service
@@ -593,13 +596,23 @@ class NoWriterLockReadTests(unittest.TestCase):
 class StubCache:
     """A response cache that answers with a chosen age, to drive staleness."""
 
-    def __init__(self, age_seconds: int) -> None:
+    def __init__(self, age_seconds: int, cache_state: str = "HIT") -> None:
         self.age_seconds = age_seconds
+        self.cache_state = cache_state
+        self.stale_windows: list[int] = []
 
-    def get_or_compute(self, *, key: object, ttl_seconds: int, compute) -> tuple:
+    def get_or_compute(
+        self,
+        *,
+        key: object,
+        ttl_seconds: int,
+        compute,
+        stale_while_revalidate_seconds: int = 0,
+    ) -> tuple:
         del key, ttl_seconds
+        self.stale_windows.append(stale_while_revalidate_seconds)
         status, payload = compute()
-        return status, payload, "HIT", self.age_seconds
+        return status, payload, self.cache_state, self.age_seconds
 
 
 class StalenessContractTests(unittest.TestCase):
@@ -711,6 +724,171 @@ class StalenessContractTests(unittest.TestCase):
             "qbit_prism_public_staleness_refusals_total 1",
             metrics.body.decode(),
         )
+
+
+class StatementTimeoutScopeLedger(FullReadModelLedger):
+    """FullReadModelLedger plus PsqlShareLedger's operation_timeout scope shape."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.statement_timeout_budgets: list[float] = []
+
+    @contextmanager
+    def operation_timeout(self, timeout_seconds: float) -> Iterator[None]:
+        self.statement_timeout_budgets.append(timeout_seconds)
+        yield
+
+
+class StatementTimeoutWiringTests(unittest.TestCase):
+    """The per-request database deadline arms exactly where a read slot is held.
+
+    The deadline's own semantics (budget value, env kill switch, the
+    read_timeout 503, cache non-poisoning) are pinned in
+    tests/test_prism_public_dashboard_api.py; what belongs to this service is
+    the classification -- path_occupies_read_slot(), which is deliberately
+    wider than the staleness gates' path_reads_database(): a cold immutable
+    artifact lookup holds a Postgres read slot exactly like any other cold
+    read even though its body, once found, is correct at any age.
+    """
+
+    def test_the_scope_wraps_every_read_slot_route_and_nothing_else(self) -> None:
+        ledger = StatementTimeoutScopeLedger()
+        harness = ServiceHarness(FakeCoordinator(ledger=ledger))
+        self.addCleanup(harness.close)
+
+        for route in EXTRACTED_ROUTES:
+            path = route[0]
+            with self.subTest(path=path):
+                armed_before = len(ledger.statement_timeout_budgets)
+                served = harness.get(request_path(route))
+                self.assertEqual(200, served.status)
+                armed = len(ledger.statement_timeout_budgets) > armed_before
+                # mining-configuration touches no read slot; every other
+                # extracted route -- the immutable artifact route included --
+                # occupies one on a cold request and owes the deadline.
+                self.assertEqual(
+                    public_read_service.path_occupies_read_slot(path), armed
+                )
+
+    def test_artifacts_owe_the_deadline_but_not_the_staleness_gates(self) -> None:
+        path = f"/public/v1/artifacts/{ARTIFACT_SHA256}"
+        self.assertTrue(public_read_service.path_occupies_read_slot(path))
+        # Deliberately split from path_reads_database: immutable content is
+        # exempt from replica/outage refusals, never from the deadline.
+        self.assertFalse(public_read_service.path_reads_database(path))
+
+    def test_mining_configuration_arms_nothing(self) -> None:
+        path = "/public/v1/mining-configuration"
+        self.assertFalse(public_read_service.path_occupies_read_slot(path))
+        self.assertFalse(public_read_service.path_reads_database(path))
+
+    def test_one_budget_covers_a_multi_read_dispatch(self) -> None:
+        """The scope is entered once around the whole dispatch, not per read.
+
+        The miner detail route performs several sequential ledger reads; a
+        per-statement scope would hand each a fresh budget and let the
+        request run many multiples of the configured limit. Exactly one
+        operation_timeout entry proves the deadline spans them all.
+        """
+        ledger = StatementTimeoutScopeLedger()
+        harness = ServiceHarness(FakeCoordinator(ledger=ledger))
+        self.addCleanup(harness.close)
+
+        served = harness.get(f"/public/v1/miners/{RECIPIENT_ID}")
+
+        self.assertEqual(200, served.status)
+        self.assertEqual(1, len(ledger.statement_timeout_budgets))
+
+
+class StaleServeTests(unittest.TestCase):
+    """Read-service wiring for the in-process stale-while-revalidate window."""
+
+    def setUp(self) -> None:
+        self.cache = public_api.PublicResponseCache()
+        self.metrics = public_read_service.ServiceMetrics()
+        self.harness = ServiceHarness(
+            FakeCoordinator(ledger=FullReadModelLedger()),
+            response_cache=self.cache,
+            metrics=self.metrics,
+        )
+        self.addCleanup(self.harness.close)
+
+    def age_blocks_entry(self, age_seconds: float) -> None:
+        """Age the warm /public/v1/blocks entry to a chosen served age.
+
+        The route's default TTL is 5s, so any age beyond that is expired;
+        the bounds are edited directly for the reason cached_entry() states.
+        """
+        entry = cached_entry(self.cache, "/public/v1/blocks")
+        assert entry is not None
+        entry.stored_at = time.monotonic() - age_seconds  # type: ignore[union-attr]
+        entry.expires_at = entry.stored_at + 5.0  # type: ignore[union-attr]
+
+    def test_a_stale_entry_inside_the_budget_is_served_with_its_age(self) -> None:
+        warm = self.harness.get("/public/v1/blocks")
+        self.age_blocks_entry(8.0)  # 3s past the 5s TTL, inside the 15s budget
+
+        served = self.harness.get("/public/v1/blocks")
+
+        self.assertEqual(200, served.status)
+        self.assertEqual(warm.body, served.body)
+        self.assertEqual("8", served.headers.get("Age"))
+
+    def test_stale_serves_are_counted_in_cache_metrics(self) -> None:
+        self.harness.get("/public/v1/blocks")
+        self.age_blocks_entry(8.0)
+        self.harness.get("/public/v1/blocks")
+
+        body = self.harness.get("/metrics").body.decode()
+
+        self.assertIn('qbit_prism_public_cache_total{state="stale"} 1', body)
+
+    def test_the_window_is_clamped_to_the_route_staleness_budget(self) -> None:
+        """A stale serve must never turn an age the blocking path handled into a 503.
+
+        Age 20 is inside the raw 30s stale-while-revalidate window but past
+        the 15s budget /public/v1/blocks publishes. Unclamped, the cache
+        would serve it STALE and the unconditional budget check would refuse
+        it; clamped to budget minus TTL, the request falls through to the
+        blocking recompute exactly as it did before the window existed.
+        """
+        self.harness.get("/public/v1/blocks")
+        self.age_blocks_entry(20.0)
+
+        served = self.harness.get("/public/v1/blocks")
+
+        self.assertEqual(200, served.status)
+        self.assertEqual("0", served.headers.get("Age"))
+
+    def test_an_outage_withdraws_the_window(self) -> None:
+        """While degraded, only unexpired entries are served (the #164 contract).
+
+        The stale-while-revalidate window must not widen what an outage may
+        answer with, and its background refresh must not become a second
+        origin path the outage gate does not see.
+        """
+        probe = ScriptedReadiness()
+        readiness = public_read_service.ReadinessProbe(probe, interval_seconds=3600)
+        readiness.check_once()
+        cache = public_api.PublicResponseCache()
+        harness = ServiceHarness(
+            FakeCoordinator(ledger=FullReadModelLedger()),
+            response_cache=cache,
+            readiness=readiness,
+        )
+        self.addCleanup(harness.close)
+        harness.get("/public/v1/blocks")
+        entry = cached_entry(cache, "/public/v1/blocks")
+        assert entry is not None
+        entry.stored_at = time.monotonic() - 8.0  # type: ignore[union-attr]
+        entry.expires_at = entry.stored_at + 5.0  # type: ignore[union-attr]
+        probe.healthy = False
+        readiness.check_once()
+
+        served = harness.get("/public/v1/blocks")
+
+        self.assertEqual(503, served.status)
+        self.assertEqual("upstream_unavailable", served.payload["error"]["code"])
 
 
 class FakeClock:
@@ -1099,8 +1277,16 @@ class CoalescingCache:
         self.result = result
         self.computes = 0
 
-    def get_or_compute(self, *, key: object, ttl_seconds: int, compute) -> tuple:
-        del key, ttl_seconds, compute  # a waiter never runs compute()
+    def get_or_compute(
+        self,
+        *,
+        key: object,
+        ttl_seconds: int,
+        compute,
+        stale_while_revalidate_seconds: int = 0,
+    ) -> tuple:
+        # a waiter never runs compute()
+        del key, ttl_seconds, compute, stale_while_revalidate_seconds
         return self.result
 
 

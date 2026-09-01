@@ -88,11 +88,18 @@ from lab.prism.coordinator_config import (
     env_positive_int,
 )
 from lab.prism.rpc import JsonRpc
-from lab.prism.share_ledger import PsqlShareLedger
+from lab.prism.share_ledger import LedgerOperationTimeout, PsqlShareLedger
 
 
 DEFAULT_PUBLIC_API_BIND = "0.0.0.0"
 DEFAULT_PUBLIC_API_PORT = 3342
+
+# Deadline for one origin computation's database work. Sized above the ~15s
+# nginx proxy timeout in front of this tier: a statement that outlives the
+# client's patience by a little may still land a cache entry the retry can
+# hit, but one that runs for minutes after the client hung up only holds a
+# read slot against every other public read.
+DEFAULT_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS = 20
 
 # Emitted on every extracted response: the age this route is willing to serve.
 # The observed age travels beside it in the standard Age header.
@@ -185,7 +192,15 @@ class ServiceMetrics:
         self._lock = threading.Lock()
         self._requests_total = 0
         self._responses_by_status: dict[int, int] = {}
-        self._cache_by_state: dict[str, int] = {"hit": 0, "miss": 0, "bypass": 0}
+        # "stale" is a served response: an expired entry inside its
+        # stale-while-revalidate window, answered immediately while one
+        # background refresh recomputes it.
+        self._cache_by_state: dict[str, int] = {
+            "hit": 0,
+            "miss": 0,
+            "bypass": 0,
+            "stale": 0,
+        }
         self._staleness_refusals = 0
         self._replica_refusals = 0
         self._degraded_responses = 0
@@ -597,6 +612,95 @@ def path_reads_database(path: str) -> bool:
     return endpoint_registry.LedgerAccess.READ_SLOT in endpoint.access
 
 
+def path_occupies_read_slot(path: str) -> bool:
+    """Does serving this route's origin miss take a ledger read slot?
+
+    Deliberately not ``path_reads_database``: that predicate exempts
+    content-addressed routes because an immutable body is correct at any age,
+    which is an answer about *staleness* -- replica lag and outages. The
+    statement deadline asks a different question: does a cold request occupy
+    one of the bounded Postgres read slots while it computes? A cold
+    ``/public/v1/artifacts/{sha256}`` does exactly that, for as long as the
+    lookup takes, so the deadline must cover it even though the staleness
+    gates never should.
+    """
+    endpoint = endpoint_registry.endpoint_for_request_path(path)
+    if endpoint is None:
+        return False
+    return endpoint_registry.LedgerAccess.READ_SLOT in endpoint.access
+
+
+def public_read_statement_timeout_seconds() -> int:
+    """The per-request database deadline, in seconds. 0 disables the bound.
+
+    Read per request rather than captured at startup, so the knob behaves
+    like the cache TTL knobs beside it and a background cache refresh sees
+    the same value a foreground request would.
+    """
+    return public_api.env_nonnegative_int(
+        "PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS",
+        DEFAULT_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS,
+    )
+
+
+def bounded_public_dispatch(
+    coordinator: Any,
+    path: str,
+    query: dict[str, list[str]],
+    *,
+    occupies_read_slot: bool,
+) -> tuple[int, object]:
+    """One origin computation, deadline-bounded when it takes a read slot.
+
+    Without a bound, a request the fronting proxy has already abandoned at
+    its ~15s timeout keeps its Postgres statement running to completion,
+    holding one of the bounded read slots (PRISM_POSTGRES_READ_CONCURRENCY)
+    against every other public read and competing with the share writer's
+    I/O for as long as the scan takes. The ledger's ``statement_timeout``
+    scope arms a server-side ``SET LOCAL statement_timeout`` per statement
+    plus a matching local admission bound, so the whole request stops costing
+    anything shortly after its caller stops listening.
+
+    The scope is the ledger's ``operation_timeout``, not ``statement_timeout``:
+    the latter hands every admission and SQL statement a fresh budget, so a
+    route that performs several sequential ledger reads (the miner detail
+    page does) could run many multiples of the configured limit after the
+    proxy hung up. ``operation_timeout`` is one deadline counting down across
+    the entire dispatch -- every statement still gets server-side
+    cancellation, armed with whatever remains of the request's budget.
+
+    Duck-typed exactly like the coordinator's block-submitter scope: a ledger
+    without the scope runs unbounded, as it always has. On the ledger's
+    psql-subprocess fallback the server-side statement deadline is not armed;
+    admission waits still observe the bound, and no deadline at all is an
+    acceptable degradation there. Routes are wrapped by
+    ``path_occupies_read_slot`` -- registry READ_SLOT access, immutable or
+    not -- rather than by the staleness gates' ``path_reads_database``: a
+    cold content-addressed artifact lookup holds a read slot exactly like any
+    other cold read, even though its body, once found, is correct at any
+    age.
+
+    A ledger-reported deadline becomes the public ``read_timeout`` 503. Its
+    error response is no-store and never cached, so one expensive miss
+    cannot poison the response cache with a refusal.
+    """
+    if not occupies_read_slot:
+        return public_api.dispatch(coordinator, path, query)
+    timeout_seconds = public_read_statement_timeout_seconds()
+    operation_timeout = getattr(coordinator.ledger, "operation_timeout", None)
+    if timeout_seconds <= 0 or not callable(operation_timeout):
+        return public_api.dispatch(coordinator, path, query)
+    try:
+        with operation_timeout(float(timeout_seconds)):
+            return public_api.dispatch(coordinator, path, query)
+    except LedgerOperationTimeout as exc:
+        raise public_api.PublicApiError(
+            503,
+            "read_timeout",
+            "the read timed out; try again shortly",
+        ) from exc
+
+
 def staleness_budget_for_path(path: str) -> float | None:
     """The budget for one concrete request path, or None when it has none.
 
@@ -795,13 +899,38 @@ def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
                 and readiness.snapshot()[0] != 200
             )
             cache_policy = public_api.public_cache_policy(path)
+            budget_seconds = staleness_budget_for_path(path)
+            # The stale-while-revalidate window the policy advertises to CDNs
+            # also lets the in-process cache serve an expired entry while one
+            # background refresh recomputes it -- but the budget check below
+            # is unconditional, so the window is clamped to what the route's
+            # staleness budget leaves after the TTL. Without the clamp, a
+            # route whose ttl+swr exceeds its budget (the 5s routes: 5+30
+            # against a 15s budget) would turn ages the blocking path used to
+            # recompute into 503 refusals. While the database is unreachable
+            # the window is withdrawn entirely: the outage contract serves
+            # only unexpired entries, and its refusal compute must not be
+            # deferred to a background thread nobody answers.
+            swr_seconds = cache_policy.stale_while_revalidate_seconds
+            if budget_seconds is not None:
+                swr_seconds = max(
+                    0, min(swr_seconds, int(budget_seconds) - cache_policy.ttl_seconds)
+                )
+            if degraded:
+                swr_seconds = 0
             status, payload, cache_state, age_seconds = cache.get_or_compute(
                 key=public_api.public_cache_key(path, query),
                 ttl_seconds=cache_policy.ttl_seconds,
+                stale_while_revalidate_seconds=swr_seconds,
                 compute=(
                     database_unavailable_response
                     if degraded
-                    else lambda: public_api.dispatch(coordinator, path, query)
+                    else lambda: bounded_public_dispatch(
+                        coordinator,
+                        path,
+                        query,
+                        occupies_read_slot=path_occupies_read_slot(path),
+                    )
                 ),
             )
             service_metrics.record_cache_state(cache_state)
@@ -832,7 +961,6 @@ def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
                     headers=self.with_budget(path, headers),
                 )
                 return
-            budget_seconds = staleness_budget_for_path(path)
             if budget_seconds is not None and age_seconds > budget_seconds:
                 # Refuse rather than serve past the budget. A silently stale
                 # dashboard is worse than an honest one.

@@ -11,15 +11,18 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Iterator
 from unittest.mock import patch
 
 from lab.prism import direct_stratum, public_api, public_read_service
 from lab.prism.share_ledger import (
+    LedgerOperationTimeout,
     PendingShare,
     PsqlShareLedger,
     SingleWriterShareLedger,
@@ -831,6 +834,33 @@ class SlowPublicLedger(FakePublicLedger):
             "pagination": {"page": page, "limit": limit, "total_count": 1, "total_pages": 1},
             "rows": rows,
         }
+
+
+class StatementTimeoutRecordingLedger(FakePublicLedger):
+    """Duck-typed operation_timeout scope, recording what the handler arms.
+
+    Mirrors PsqlShareLedger's contextmanager signature so the read service's
+    getattr + callable probe takes the same branch it takes in production.
+    The operation scope, not the statement scope: one budget must cover the
+    whole dispatch, however many ledger reads it performs.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.statement_timeout_budgets: list[float] = []
+
+    @contextmanager
+    def operation_timeout(self, timeout_seconds: float) -> Iterator[None]:
+        self.statement_timeout_budgets.append(timeout_seconds)
+        yield
+
+
+class TimingOutPublicLedger(StatementTimeoutRecordingLedger):
+    """Every hashrate query dies the way a server-cancelled statement does."""
+
+    def dashboard_hashrate_series(self, **kwargs: object) -> list[dict[str, object]]:
+        self.hashrate_series_calls += 1
+        raise LedgerOperationTimeout("postgres statement deadline expired")
 
 
 class FakeCoordinator:
@@ -2688,6 +2718,394 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
         self.assertEqual(public_api.pending_maturity_bits_for_recipient(ledger, "miner-a"), 17)
         self.assertEqual(ledger.request, ("miner-a", 1_000))
+
+
+class PublicHandlerTestCase(unittest.TestCase):
+    """One extracted-handler server per ledger, torn down with the test."""
+
+    def serve(self, ledger: FakePublicLedger) -> str:
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop() -> None:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.addCleanup(stop)
+        return f"http://127.0.0.1:{server.server_port}"
+
+    def get_error(self, url: str) -> tuple[int, dict[str, object], dict[str, str]]:
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(url, timeout=5)
+        with raised.exception as error:
+            return error.code, json.loads(error.read()), dict(error.headers.items())
+
+
+# Every range/bucket pair outside HASHRATE_SERIES_ALLOWED_BUCKETS, and every
+# concrete pair inside it. Derived by hand rather than from the constant so a
+# vocabulary regression cannot rewrite the test that guards it.
+FORBIDDEN_BUCKET_COMBOS = (
+    ("1m", "5m"),
+    ("6m", "5m"),
+    ("6m", "1h"),
+    ("all", "5m"),
+    ("all", "1h"),
+)
+ALLOWED_BUCKET_COMBOS = (
+    ("1w", "5m"),
+    ("1w", "1h"),
+    ("1w", "1d"),
+    ("1m", "1h"),
+    ("1m", "1d"),
+    ("6m", "1d"),
+    ("all", "1d"),
+)
+
+
+class HashrateBucketClampTests(PublicHandlerTestCase):
+    """The static bucket-per-range vocabulary closes the unbounded-cost combos."""
+
+    def test_forbidden_combinations_are_rejected_before_any_ledger_call(self) -> None:
+        ledger = FakePublicLedger()
+        base = self.serve(ledger)
+        for range_id, bucket in FORBIDDEN_BUCKET_COMBOS:
+            with self.subTest(range=range_id, bucket=bucket):
+                status, payload, headers = self.get_error(
+                    f"{base}/public/v1/hashrate-series?range={range_id}&bucket={bucket}"
+                )
+                self.assertEqual(400, status)
+                self.assertEqual("prism.dashboard.error.v1", payload["schema"])
+                self.assertEqual("bad_request", payload["error"]["code"])
+                self.assertIn(
+                    f"bucket {bucket} is not allowed for range {range_id}",
+                    payload["error"]["message"],
+                )
+                self.assertEqual("no-store", headers.get("Cache-Control"))
+        self.assertEqual(0, ledger.hashrate_series_calls)
+
+    def test_the_refusal_names_the_allowed_buckets(self) -> None:
+        base = self.serve(FakePublicLedger())
+        _status, payload, _headers = self.get_error(
+            f"{base}/public/v1/hashrate-series?range=1m&bucket=5m"
+        )
+        self.assertIn("allowed: 1h, 1d", payload["error"]["message"])
+
+    def test_allowed_combinations_still_serve(self) -> None:
+        ledger = FakePublicLedger()
+        base = self.serve(ledger)
+        combos = ALLOWED_BUCKET_COMBOS + tuple(
+            (range_id, "auto") for range_id in public_api.HASHRATE_SERIES_RANGE_SECONDS
+        )
+        for range_id, bucket in combos:
+            with self.subTest(range=range_id, bucket=bucket):
+                url = f"{base}/public/v1/hashrate-series?range={range_id}&bucket={bucket}"
+                with urllib.request.urlopen(url, timeout=5) as response:
+                    payload = json.loads(response.read())
+                self.assertEqual("prism.dashboard.hashrate-series.v1", payload["schema"])
+        self.assertEqual(len(combos), ledger.hashrate_series_calls)
+
+    def test_every_auto_resolution_is_inside_the_allowed_vocabulary(self) -> None:
+        for range_id in public_api.HASHRATE_SERIES_RANGE_SECONDS:
+            resolved = public_api.auto_bucket(range_id)
+            self.assertIn(resolved, public_api.HASHRATE_SERIES_ALLOWED_BUCKETS[range_id])
+            # And the helper itself agrees: a resolved auto bucket never raises.
+            public_api.allowed_hashrate_bucket(range_id, resolved)
+
+
+class PublicReadStatementTimeoutTests(PublicHandlerTestCase):
+    """The per-request database deadline and its read_timeout refusal."""
+
+    def test_a_ledger_deadline_becomes_a_503_read_timeout_and_is_never_cached(self) -> None:
+        ledger = TimingOutPublicLedger()
+        base = self.serve(ledger)
+        # Patch only the deadline knob: clearing the whole environment also
+        # drops NO_PROXY, and on a proxy-configured machine urllib then routes
+        # this localhost request through the proxy instead of the test server.
+        with patch.dict(os.environ):
+            os.environ.pop("PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS", None)
+            for expected_origin_calls in (1, 2):
+                status, payload, headers = self.get_error(
+                    f"{base}/public/v1/hashrate-series"
+                )
+                self.assertEqual(503, status)
+                self.assertEqual("prism.dashboard.error.v1", payload["schema"])
+                self.assertEqual("read_timeout", payload["error"]["code"])
+                self.assertEqual("no-store", headers.get("Cache-Control"))
+                self.assertIsNone(headers.get("CDN-Cache-Control"))
+                # The second request re-ran the origin: a timeout stored no
+                # cache entry, so one expensive miss cannot poison the cache
+                # with a refusal.
+                self.assertEqual(expected_origin_calls, ledger.hashrate_series_calls)
+        self.assertEqual([20.0, 20.0], ledger.statement_timeout_budgets)
+
+    def test_the_scope_is_entered_with_the_configured_budget(self) -> None:
+        ledger = StatementTimeoutRecordingLedger()
+        base = self.serve(ledger)
+        with patch.dict(
+            os.environ,
+            {"PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS": "7"},
+        ):
+            with urllib.request.urlopen(
+                f"{base}/public/v1/hashrate-series", timeout=5
+            ) as response:
+                json.loads(response.read())
+        self.assertEqual([7.0], ledger.statement_timeout_budgets)
+        self.assertEqual(1, ledger.hashrate_series_calls)
+
+    def test_env_zero_disables_the_scope_entirely(self) -> None:
+        ledger = StatementTimeoutRecordingLedger()
+        base = self.serve(ledger)
+        with patch.dict(
+            os.environ,
+            {"PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS": "0"},
+        ):
+            with urllib.request.urlopen(
+                f"{base}/public/v1/hashrate-series", timeout=5
+            ) as response:
+                json.loads(response.read())
+        self.assertEqual([], ledger.statement_timeout_budgets)
+        self.assertEqual(1, ledger.hashrate_series_calls)
+
+
+class PublicResponseCacheStaleWhileRevalidateTests(unittest.TestCase):
+    """In-process stale-while-revalidate on PublicResponseCache.
+
+    Entry expiry is keyed on time.monotonic(), which is not injectable, so
+    these tests age entries by editing the stored bounds directly -- the
+    precedent tests/test_prism_public_read_service.py sets for the outage
+    contract -- rather than sleeping out real TTLs.
+    """
+
+    KEY = ("/swr", ())
+    TTL = 60
+
+    def prime(self, cache: public_api.PublicResponseCache, payload: object) -> None:
+        status, served, state, _age = cache.get_or_compute(
+            key=self.KEY, ttl_seconds=self.TTL, compute=lambda: (200, payload)
+        )
+        self.assertEqual((200, payload, "MISS"), (status, served, state))
+
+    def age_entry(
+        self,
+        cache: public_api.PublicResponseCache,
+        *,
+        age_seconds: float,
+        key: tuple[str, tuple[tuple[str, tuple[str, ...]], ...]] | None = None,
+        stale_while_revalidate_seconds: int = 30,
+    ) -> None:
+        entry = cache._entries[key if key is not None else self.KEY]
+        entry.stored_at = time.monotonic() - age_seconds
+        entry.expires_at = entry.stored_at + self.TTL
+        entry.stale_until = entry.expires_at + stale_while_revalidate_seconds
+
+    def lookup(
+        self,
+        cache: public_api.PublicResponseCache,
+        compute,
+    ) -> tuple[int, object, str, int]:
+        return cache.get_or_compute(
+            key=self.KEY,
+            ttl_seconds=self.TTL,
+            stale_while_revalidate_seconds=30,
+            compute=compute,
+        )
+
+    def wait_for_refresh_slot_to_clear(self, cache: public_api.PublicResponseCache) -> None:
+        # Bounded: the refresh thread frees the inflight slot in its finally
+        # clause, so a few milliseconds suffice and 5s is a hard failure.
+        deadline = time.monotonic() + 5
+        while self.KEY in cache._inflight and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertNotIn(self.KEY, cache._inflight)
+
+    def test_capacity_reaping_spares_stale_servable_entries(self) -> None:
+        """Reaping removes entries past their whole window, not merely expired.
+
+        A full cache receiving a new key must shed dead weight first: an entry
+        past TTL *and* its recorded revalidate window is gone, but one still
+        inside the window stays exactly as servable as the stale-serve path
+        promises -- reaping it would turn its next visitor's instant STALE
+        answer into a blocking recompute.
+        """
+        cache = public_api.PublicResponseCache()
+        keep_key = ("/swr-keep", ())
+        dead_key = ("/swr-dead", ())
+        for key in (keep_key, dead_key):
+            cache.get_or_compute(
+                key=key,
+                ttl_seconds=self.TTL,
+                stale_while_revalidate_seconds=30,
+                compute=lambda: (200, {"k": key[0]}),
+            )
+        # keep: expired 5s ago, inside its 30s window. dead: past the window.
+        self.age_entry(cache, age_seconds=65, key=keep_key)
+        self.age_entry(cache, age_seconds=100, key=dead_key)
+        with patch.dict(os.environ, {"PRISM_PUBLIC_CACHE_MAX_ENTRIES": "2"}):
+            cache.get_or_compute(
+                key=("/swr-new", ()),
+                ttl_seconds=self.TTL,
+                stale_while_revalidate_seconds=30,
+                compute=lambda: (200, {"k": "new"}),
+            )
+        self.assertNotIn(dead_key, cache._entries)
+        self.assertIn(keep_key, cache._entries)
+        status, payload, state, age = cache.get_or_compute(
+            key=keep_key,
+            ttl_seconds=self.TTL,
+            stale_while_revalidate_seconds=30,
+            compute=lambda: (200, {"k": "refreshed"}),
+        )
+        self.assertEqual((200, {"k": "/swr-keep"}, "STALE", 65), (status, payload, state, age))
+        deadline = time.monotonic() + 5
+        while keep_key in cache._inflight and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertNotIn(keep_key, cache._inflight)
+
+    def test_a_failed_refresh_thread_start_frees_the_slot(self) -> None:
+        """Thread creation failure must not strand the registered slot.
+
+        The refresh slot is registered before Thread.start() runs, and under
+        resource pressure start() can raise. Without cleanup no thread ever
+        frees the slot: later stale hits skip their refresh forever and,
+        past the window, blocking requests coalesce onto an event nobody can
+        set. The stale answer is still served; the slot is freed and the
+        event set so the next request proceeds normally.
+        """
+        cache = public_api.PublicResponseCache()
+        self.prime(cache, {"v": "stale"})
+        self.age_entry(cache, age_seconds=65)
+
+        with patch.object(
+            threading.Thread, "start", side_effect=RuntimeError("can't start new thread")
+        ):
+            status, payload, state, age = self.lookup(
+                cache, lambda: (200, {"v": "unused"})
+            )
+
+        self.assertEqual((200, {"v": "stale"}, "STALE", 65), (status, payload, state, age))
+        self.assertNotIn(self.KEY, cache._inflight)
+        # The next stale hit retries the refresh with a working thread...
+        refreshed = threading.Event()
+
+        def refresh() -> tuple[int, object]:
+            refreshed.set()
+            return 200, {"v": "fresh"}
+
+        status, payload, state, _age = self.lookup(cache, refresh)
+        self.assertEqual((200, {"v": "stale"}, "STALE"), (status, payload, state))
+        self.assertTrue(refreshed.wait(timeout=5))
+        self.wait_for_refresh_slot_to_clear(cache)
+        status, payload, state, _age = self.lookup(cache, lambda: (200, {"v": "wrong"}))
+        self.assertEqual((200, {"v": "fresh"}, "HIT"), (status, payload, state))
+
+    def test_a_fresh_entry_is_a_hit_with_the_window_armed(self) -> None:
+        cache = public_api.PublicResponseCache()
+        self.prime(cache, {"v": "fresh"})
+
+        status, payload, state, age = self.lookup(cache, lambda: (200, {"v": "wrong"}))
+
+        self.assertEqual((200, {"v": "fresh"}, "HIT", 0), (status, payload, state, age))
+
+    def test_a_stale_entry_is_served_while_one_background_refresh_recomputes(self) -> None:
+        cache = public_api.PublicResponseCache()
+        self.prime(cache, {"v": "stale"})
+        self.age_entry(cache, age_seconds=65)  # expired 5s ago, inside the 30s window
+        refreshed = threading.Event()
+
+        def refresh() -> tuple[int, object]:
+            refreshed.set()
+            return 200, {"v": "fresh"}
+
+        status, payload, state, age = self.lookup(cache, refresh)
+
+        # Served immediately, from the expired entry, with its honest age.
+        self.assertEqual((200, {"v": "stale"}, "STALE", 65), (status, payload, state, age))
+        self.assertTrue(refreshed.wait(timeout=5))
+        self.wait_for_refresh_slot_to_clear(cache)
+        status, payload, state, age = self.lookup(cache, lambda: (200, {"v": "wrong"}))
+        self.assertEqual((200, {"v": "fresh"}, "HIT", 0), (status, payload, state, age))
+
+    def test_a_failed_refresh_keeps_the_stale_entry_and_frees_the_slot(self) -> None:
+        cache = public_api.PublicResponseCache()
+        self.prime(cache, {"v": "stale"})
+        self.age_entry(cache, age_seconds=61)
+        failed = threading.Event()
+
+        def failing_refresh() -> tuple[int, object]:
+            failed.set()
+            raise RuntimeError("origin down")
+
+        status, payload, state, _age = self.lookup(cache, failing_refresh)
+
+        self.assertEqual((200, {"v": "stale"}, "STALE"), (status, payload, state))
+        self.assertTrue(failed.wait(timeout=5))
+        self.wait_for_refresh_slot_to_clear(cache)
+        # Still servable -- the failure deleted nothing -- and the freed slot
+        # lets this later stale hit start a second refresh, which succeeds.
+        recovered = threading.Event()
+
+        def recovering_refresh() -> tuple[int, object]:
+            recovered.set()
+            return 200, {"v": "fresh"}
+
+        status, payload, state, _age = self.lookup(cache, recovering_refresh)
+        self.assertEqual((200, {"v": "stale"}, "STALE"), (status, payload, state))
+        self.assertTrue(recovered.wait(timeout=5))
+        self.wait_for_refresh_slot_to_clear(cache)
+        _status, payload, state, _age = self.lookup(cache, lambda: (200, {"v": "wrong"}))
+        self.assertEqual(({"v": "fresh"}, "HIT"), (payload, state))
+
+    def test_beyond_the_window_the_next_request_blocks_and_recomputes(self) -> None:
+        cache = public_api.PublicResponseCache()
+        self.prime(cache, {"v": "stale"})
+        self.age_entry(cache, age_seconds=95)  # expired 35s ago, past the 30s window
+
+        status, payload, state, age = self.lookup(cache, lambda: (200, {"v": "fresh"}))
+
+        self.assertEqual((200, {"v": "fresh"}, "MISS", 0), (status, payload, state, age))
+
+    def test_concurrent_stale_hits_share_exactly_one_refresh(self) -> None:
+        cache = public_api.PublicResponseCache()
+        self.prime(cache, {"v": "stale"})
+        self.age_entry(cache, age_seconds=61)
+        release = threading.Event()
+        compute_calls: list[int] = []
+        compute_lock = threading.Lock()
+
+        def slow_refresh() -> tuple[int, object]:
+            with compute_lock:
+                compute_calls.append(1)
+            self.assertTrue(release.wait(timeout=5))
+            return 200, {"v": "fresh"}
+
+        results: list[tuple[int, object, str, int]] = []
+        results_lock = threading.Lock()
+
+        def stale_hit() -> None:
+            result = self.lookup(cache, slow_refresh)
+            with results_lock:
+                results.append(result)
+
+        workers = [threading.Thread(target=stale_hit) for _ in range(5)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5)
+
+        # Every requester was answered immediately from the stale entry; none
+        # blocked behind the (still running) refresh, and none started one of
+        # its own.
+        self.assertEqual(5, len(results))
+        for status, payload, state, _age in results:
+            self.assertEqual((200, {"v": "stale"}, "STALE"), (status, payload, state))
+        release.set()
+        self.wait_for_refresh_slot_to_clear(cache)
+        self.assertEqual([1], compute_calls)
+        _status, payload, state, _age = self.lookup(cache, lambda: (200, {"v": "wrong"}))
+        self.assertEqual(({"v": "fresh"}, "HIT"), (payload, state))
 
 
 class PublicArtifactByteExactnessTests(unittest.TestCase):
