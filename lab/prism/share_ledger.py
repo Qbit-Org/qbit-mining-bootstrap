@@ -7791,6 +7791,7 @@ WITH in_range AS (
         block.found_at
     FROM qbit_pool_blocks block
     WHERE block.chain_state <> 'reversed'
+      AND block.found_at <= clock_timestamp()
       {range_filter}
 ),
 ranked AS (

@@ -2114,10 +2114,12 @@ def test_dashboard_block_markers_read_model() -> None:
     """The block-marker SQL over real qbit_pool_blocks rows.
 
     Seeds found blocks across two 1h buckets plus one block just below the 1w
-    range's lower bound and one reversed block, then asserts the read model's
-    counts, per-bucket top-3 ordering (found_at DESC, height DESC), range
-    filtering against the caller-provided anchor, and the unbounded ``all``
-    range.
+    range's lower bound, one reversed block, and one future-dated block, then
+    asserts the read model's counts, per-bucket top-3 ordering (found_at
+    DESC, height DESC), range filtering against the caller-provided anchor,
+    the unbounded ``all`` range, and the upper cutoff at the statement clock
+    that keeps a future-dated block off the chart -- the same bound the
+    hashrate series applies.
     """
     schema = create_owned_schema("block_markers")
     ledger = ScopedPsqlLedger(
@@ -2133,6 +2135,7 @@ def test_dashboard_block_markers_read_model() -> None:
     hash_below_range = "72" * 32
     hashes_in_b = {201: "73" * 32, 202: "74" * 32, 203: "75" * 32, 204: "76" * 32}
     hash_reversed = "77" * 32
+    hash_future = "78" * 32
     found_in_a = bucket_a + 10
     found_in_b = {201: bucket_b + 100, 202: bucket_b + 200, 203: bucket_b + 300, 204: bucket_b + 300}
     try:
@@ -2146,6 +2149,10 @@ def test_dashboard_block_markers_read_model() -> None:
             # Two blocks tied on found_at so the height tiebreak is observable.
             (hashes_in_b[203], 203, found_in_b[203], "confirmed"),
             (hashes_in_b[204], 204, found_in_b[204], "confirmed"),
+            # Future-dated relative to the database clock (a clock jump or a
+            # bad import): capped out by found_at <= clock_timestamp() so it
+            # can never render beyond the chart's current endpoint.
+            (hash_future, 300, int(time.time()) + 3600, "confirmed"),
         ]
         values = ",\n    ".join(
             f"('{block_hash}', {height}, '{'10' * 32}', '{'20' * 32}', "
@@ -2233,6 +2240,8 @@ INSERT INTO qbit_pool_blocks (
             raise GateFailure("all range must include the below-1w-range block")
         if hash_reversed in listed_hashes:
             raise GateFailure("reversed block leaked into the marker series")
+        if hash_future in listed_hashes:
+            raise GateFailure("future-dated block leaked into the marker series")
         epochs = [
             int(
                 datetime.strptime(str(point["timestamp"]), "%Y-%m-%dT%H:%M:%SZ")
