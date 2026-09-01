@@ -6912,13 +6912,23 @@ class PrismCoordinator:
         operate. A failed pass is logged and retried on the next interval;
         the watermark guarantees a retry can never double-count what a
         partial pass already folded in.
+
+        Every pass runs inside the writer-operation admission, like every
+        other mutation of ledger-derived state: shutdown quiescence must
+        count an in-flight pass, and admission must refuse a new one, or a
+        pass slipping past the stop check could renew the just-released
+        lease -- the maintenance statement renews on exact identity, which
+        an orderly release keeps -- and mutate rollups after shutdown
+        reported the writer quiesced. A refused admission is the orderly
+        stop, not a failure.
         """
         while not self.stop_event.is_set():
             try:
                 while not self.stop_event.is_set():
-                    result = self.ledger.advance_hashrate_rollups(
-                        batch_limit=self.hashrate_rollup_batch_shares,
-                    )
+                    with self._writer_operation("hashrate_rollup_maintenance"):
+                        result = self.ledger.advance_hashrate_rollups(
+                            batch_limit=self.hashrate_rollup_batch_shares,
+                        )
                     print(
                         "prism coordinator: hashrate rollup advance "
                         f"scanned={result['scanned']} "
@@ -6928,6 +6938,8 @@ class PrismCoordinator:
                     )
                     if result["caught_up"]:
                         break
+            except ShutdownInProgress:
+                return
             except Exception:
                 print(
                     "prism coordinator: hashrate rollup maintenance pass failed",

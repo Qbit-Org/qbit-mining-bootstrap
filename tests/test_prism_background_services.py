@@ -942,6 +942,60 @@ class HashrateRollupMaintenanceServiceTests(unittest.TestCase):
         self.assertEqual(ledger.calls, [3, 3, 3])
         self.assertEqual(stop.waits, [15.0])
 
+    def test_rollup_passes_run_inside_the_writer_admission(self) -> None:
+        """Each pass is a writer operation the shutdown controller counts.
+
+        The maintenance statement renews the writer lease on exact identity,
+        which an orderly release keeps -- so a pass outside the admission
+        could slip past the stop check, renew the just-released lease, and
+        mutate rollups after shutdown reported the writer quiesced. Running
+        the ledger call inside _writer_operation makes quiescence wait for
+        an in-flight pass.
+        """
+        stop = ScriptedStopEvent()
+        server = self.rollup_coordinator(None)
+        server.stop_event = stop  # type: ignore[assignment]
+        controller = server._ensure_shutdown_controller()
+        observed: list[int] = []
+
+        class AdmissionObservingLedger(ScriptedRollupLedger):
+            def advance_hashrate_rollups(self, *, batch_limit: int) -> dict[str, object]:
+                observed.append(controller.active_writers.get("hashrate_rollup_maintenance", 0))
+                return super().advance_hashrate_rollups(batch_limit=batch_limit)
+
+        server.ledger = AdmissionObservingLedger(
+            [{"scanned": 0, "last_share_seq": 8, "caught_up": True}],
+            on_exhausted=lambda: setattr(stop, "stopped", True),
+        )
+
+        with patch("builtins.print"):
+            server.hashrate_rollup_maintenance_loop()
+
+        self.assertEqual([1], observed)
+        self.assertEqual(
+            0, controller.active_writers.get("hashrate_rollup_maintenance", 0)
+        )
+
+    def test_rollup_loop_stops_cleanly_when_admission_is_closed(self) -> None:
+        """A refused admission is the orderly shutdown, not a failure.
+
+        The race this pins: shutdown begins after the loop's stop check but
+        before the pass enters the admission. The pass must be refused, and
+        the loop must exit without logging an error or running the ledger.
+        """
+        stop = ScriptedStopEvent()
+        ledger = ScriptedRollupLedger([])
+        server = self.rollup_coordinator(ledger)
+        server.stop_event = stop  # type: ignore[assignment]
+        server._ensure_shutdown_controller().request_shutdown(None)
+
+        with patch("builtins.print"), patch("traceback.print_exc") as print_exc:
+            server.hashrate_rollup_maintenance_loop()
+
+        self.assertEqual([], ledger.calls)
+        self.assertEqual([], stop.waits)
+        self.assertEqual(0, print_exc.call_count)
+
     def test_rollup_loop_logs_the_error_and_retries_next_interval(self) -> None:
         stop = ScriptedStopEvent()
         ledger = ScriptedRollupLedger(
