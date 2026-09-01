@@ -97,13 +97,14 @@ aggregate (`PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS`, default 30 seconds, 0
 disables), so requests for different miners reuse a single recursive
 reward-window scan instead of each re-running it.
 
-Database-backed origin computations run under a per-request statement deadline
-(`PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS`, default 20 seconds, `0`
-disables). A read that exceeds it is cancelled server-side, frees its bounded
-read slot instead of running to completion for a client that has long since
-hung up, and returns `503` with error code `read_timeout` and `Cache-Control:
-no-store`. The refusal is never cached, so the next request — or a
-stale-while-revalidate refresh — retries the origin.
+Every origin computation that takes a ledger read slot — the immutable
+artifact route included, on a cold request — runs under a per-request
+statement deadline (`PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS`, default 20
+seconds, `0` disables). A read that exceeds it is cancelled server-side,
+frees its bounded read slot instead of running to completion for a client
+that has long since hung up, and returns `503` with error code `read_timeout`
+and `Cache-Control: no-store`. The refusal is never cached, so the next
+request — or a stale-while-revalidate refresh — retries the origin.
 
 ## Staleness
 

@@ -120,6 +120,10 @@ class _PublicCacheEntry:
     payload: object
     stored_at: float
     expires_at: float
+    # When the entry stops being servable even as a stale-while-revalidate
+    # answer. Recorded at store time so capacity reaping can honor the window
+    # this entry was stored under without re-deriving the route's policy.
+    stale_until: float
 
 
 @dataclass
@@ -204,7 +208,7 @@ class PublicResponseCache:
             if refresh is not None:
                 threading.Thread(
                     target=self._refresh_entry,
-                    args=(key, ttl_seconds, compute, refresh),
+                    args=(key, ttl_seconds, stale_while_revalidate_seconds, compute, refresh),
                     name="prism-public-cache-refresh",
                     daemon=True,
                 ).start()
@@ -227,7 +231,13 @@ class PublicResponseCache:
         try:
             status, payload = compute()
             if 200 <= status < 300 and cacheable_payload_size(payload):
-                self._store_entry(key, status=status, payload=payload, ttl_seconds=ttl_seconds)
+                self._store_entry(
+                    key,
+                    status=status,
+                    payload=payload,
+                    ttl_seconds=ttl_seconds,
+                    stale_while_revalidate_seconds=stale_while_revalidate_seconds,
+                )
                 inflight.result = (status, payload, "MISS", 0)
             else:
                 inflight.result = (status, payload, "BYPASS", 0)
@@ -247,6 +257,7 @@ class PublicResponseCache:
         status: int,
         payload: object,
         ttl_seconds: int,
+        stale_while_revalidate_seconds: int = 0,
     ) -> None:
         now = time.monotonic()
         with self._lock:
@@ -255,16 +266,21 @@ class PublicResponseCache:
                 payload=payload,
                 stored_at=now,
                 expires_at=now + ttl_seconds,
+                stale_until=now + ttl_seconds + max(0, stale_while_revalidate_seconds),
             )
             self._entries.move_to_end(key)
             max_entries = public_cache_max_entries()
             if len(self._entries) > max_entries:
-                # Reap expired entries before LRU eviction so dead slots
-                # never push out still-fresh keys.
+                # Reap dead entries before LRU eviction so dead slots never
+                # push out still-fresh keys. Dead means past the entry's own
+                # recorded revalidation window, not merely past its TTL: an
+                # expired entry inside that window is still the promised
+                # instant answer for its next visitor, and discarding it here
+                # would turn that visitor's stale hit into a blocking miss.
                 for stale_key in [
                     stored_key
                     for stored_key, stored in self._entries.items()
-                    if stored_key != key and stored.expires_at <= now
+                    if stored_key != key and stored.stale_until <= now
                 ]:
                     del self._entries[stale_key]
             while len(self._entries) > max_entries:
@@ -274,6 +290,7 @@ class PublicResponseCache:
         self,
         key: tuple[str, tuple[tuple[str, tuple[str, ...]], ...]],
         ttl_seconds: int,
+        stale_while_revalidate_seconds: int,
         compute: Callable[[], tuple[int, object]],
         inflight: _PublicInflight,
     ) -> None:
@@ -291,7 +308,13 @@ class PublicResponseCache:
         try:
             status, payload = compute()
             if 200 <= status < 300 and cacheable_payload_size(payload):
-                self._store_entry(key, status=status, payload=payload, ttl_seconds=ttl_seconds)
+                self._store_entry(
+                    key,
+                    status=status,
+                    payload=payload,
+                    ttl_seconds=ttl_seconds,
+                    stale_while_revalidate_seconds=stale_while_revalidate_seconds,
+                )
                 inflight.result = (status, payload, "MISS", 0)
             else:
                 inflight.result = (status, payload, "BYPASS", 0)

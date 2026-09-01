@@ -612,6 +612,24 @@ def path_reads_database(path: str) -> bool:
     return endpoint_registry.LedgerAccess.READ_SLOT in endpoint.access
 
 
+def path_occupies_read_slot(path: str) -> bool:
+    """Does serving this route's origin miss take a ledger read slot?
+
+    Deliberately not ``path_reads_database``: that predicate exempts
+    content-addressed routes because an immutable body is correct at any age,
+    which is an answer about *staleness* -- replica lag and outages. The
+    statement deadline asks a different question: does a cold request occupy
+    one of the bounded Postgres read slots while it computes? A cold
+    ``/public/v1/artifacts/{sha256}`` does exactly that, for as long as the
+    lookup takes, so the deadline must cover it even though the staleness
+    gates never should.
+    """
+    endpoint = endpoint_registry.endpoint_for_request_path(path)
+    if endpoint is None:
+        return False
+    return endpoint_registry.LedgerAccess.READ_SLOT in endpoint.access
+
+
 def public_read_statement_timeout_seconds() -> int:
     """The per-request database deadline, in seconds. 0 disables the bound.
 
@@ -630,9 +648,9 @@ def bounded_public_dispatch(
     path: str,
     query: dict[str, list[str]],
     *,
-    reads_database: bool,
+    occupies_read_slot: bool,
 ) -> tuple[int, object]:
-    """One origin computation, deadline-bounded when it reads the database.
+    """One origin computation, deadline-bounded when it takes a read slot.
 
     Without a bound, a request the fronting proxy has already abandoned at
     its ~15s timeout keeps its Postgres statement running to completion,
@@ -647,16 +665,18 @@ def bounded_public_dispatch(
     without the scope runs unbounded, as it always has. On the ledger's
     psql-subprocess fallback the server-side statement deadline is not armed;
     admission waits and the subprocess itself still observe the bound, and
-    no deadline at all is an acceptable degradation there. Only
-    database-backed routes are wrapped -- the same classification the
-    replica and outage gates use -- because a route that touches no read
-    slot has nothing this deadline could bound.
+    no deadline at all is an acceptable degradation there. Routes are wrapped
+    by ``path_occupies_read_slot`` -- registry READ_SLOT access, immutable or
+    not -- rather than by the staleness gates' ``path_reads_database``: a
+    cold content-addressed artifact lookup holds a read slot exactly like any
+    other cold read, even though its body, once found, is correct at any
+    age.
 
     A ledger-reported deadline becomes the public ``read_timeout`` 503. Its
     error response is no-store and never cached, so one expensive miss
     cannot poison the response cache with a refusal.
     """
-    if not reads_database:
+    if not occupies_read_slot:
         return public_api.dispatch(coordinator, path, query)
     timeout_seconds = public_read_statement_timeout_seconds()
     statement_timeout = getattr(coordinator.ledger, "statement_timeout", None)
@@ -898,7 +918,10 @@ def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
                     database_unavailable_response
                     if degraded
                     else lambda: bounded_public_dispatch(
-                        coordinator, path, query, reads_database=reads_database
+                        coordinator,
+                        path,
+                        query,
+                        occupies_read_slot=path_occupies_read_slot(path),
                     )
                 ),
             )

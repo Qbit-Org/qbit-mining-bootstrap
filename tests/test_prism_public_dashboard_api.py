@@ -2819,7 +2819,11 @@ class PublicReadStatementTimeoutTests(PublicHandlerTestCase):
     def test_a_ledger_deadline_becomes_a_503_read_timeout_and_is_never_cached(self) -> None:
         ledger = TimingOutPublicLedger()
         base = self.serve(ledger)
-        with patch.dict(os.environ, {}, clear=True):
+        # Patch only the deadline knob: clearing the whole environment also
+        # drops NO_PROXY, and on a proxy-configured machine urllib then routes
+        # this localhost request through the proxy instead of the test server.
+        with patch.dict(os.environ):
+            os.environ.pop("PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS", None)
             for expected_origin_calls in (1, 2):
                 status, payload, headers = self.get_error(
                     f"{base}/public/v1/hashrate-series"
@@ -2841,7 +2845,6 @@ class PublicReadStatementTimeoutTests(PublicHandlerTestCase):
         with patch.dict(
             os.environ,
             {"PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS": "7"},
-            clear=True,
         ):
             with urllib.request.urlopen(
                 f"{base}/public/v1/hashrate-series", timeout=5
@@ -2856,7 +2859,6 @@ class PublicReadStatementTimeoutTests(PublicHandlerTestCase):
         with patch.dict(
             os.environ,
             {"PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS": "0"},
-            clear=True,
         ):
             with urllib.request.urlopen(
                 f"{base}/public/v1/hashrate-series", timeout=5
@@ -2884,10 +2886,18 @@ class PublicResponseCacheStaleWhileRevalidateTests(unittest.TestCase):
         )
         self.assertEqual((200, payload, "MISS"), (status, served, state))
 
-    def age_entry(self, cache: public_api.PublicResponseCache, *, age_seconds: float) -> None:
-        entry = cache._entries[self.KEY]
+    def age_entry(
+        self,
+        cache: public_api.PublicResponseCache,
+        *,
+        age_seconds: float,
+        key: tuple[str, tuple[tuple[str, tuple[str, ...]], ...]] | None = None,
+        stale_while_revalidate_seconds: int = 30,
+    ) -> None:
+        entry = cache._entries[key if key is not None else self.KEY]
         entry.stored_at = time.monotonic() - age_seconds
         entry.expires_at = entry.stored_at + self.TTL
+        entry.stale_until = entry.expires_at + stale_while_revalidate_seconds
 
     def lookup(
         self,
@@ -2908,6 +2918,49 @@ class PublicResponseCacheStaleWhileRevalidateTests(unittest.TestCase):
         while self.KEY in cache._inflight and time.monotonic() < deadline:
             time.sleep(0.01)
         self.assertNotIn(self.KEY, cache._inflight)
+
+    def test_capacity_reaping_spares_stale_servable_entries(self) -> None:
+        """Reaping removes entries past their whole window, not merely expired.
+
+        A full cache receiving a new key must shed dead weight first: an entry
+        past TTL *and* its recorded revalidate window is gone, but one still
+        inside the window stays exactly as servable as the stale-serve path
+        promises -- reaping it would turn its next visitor's instant STALE
+        answer into a blocking recompute.
+        """
+        cache = public_api.PublicResponseCache()
+        keep_key = ("/swr-keep", ())
+        dead_key = ("/swr-dead", ())
+        for key in (keep_key, dead_key):
+            cache.get_or_compute(
+                key=key,
+                ttl_seconds=self.TTL,
+                stale_while_revalidate_seconds=30,
+                compute=lambda: (200, {"k": key[0]}),
+            )
+        # keep: expired 5s ago, inside its 30s window. dead: past the window.
+        self.age_entry(cache, age_seconds=65, key=keep_key)
+        self.age_entry(cache, age_seconds=100, key=dead_key)
+        with patch.dict(os.environ, {"PRISM_PUBLIC_CACHE_MAX_ENTRIES": "2"}):
+            cache.get_or_compute(
+                key=("/swr-new", ()),
+                ttl_seconds=self.TTL,
+                stale_while_revalidate_seconds=30,
+                compute=lambda: (200, {"k": "new"}),
+            )
+        self.assertNotIn(dead_key, cache._entries)
+        self.assertIn(keep_key, cache._entries)
+        status, payload, state, age = cache.get_or_compute(
+            key=keep_key,
+            ttl_seconds=self.TTL,
+            stale_while_revalidate_seconds=30,
+            compute=lambda: (200, {"k": "refreshed"}),
+        )
+        self.assertEqual((200, {"k": "/swr-keep"}, "STALE", 65), (status, payload, state, age))
+        deadline = time.monotonic() + 5
+        while keep_key in cache._inflight and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertNotIn(keep_key, cache._inflight)
 
     def test_a_fresh_entry_is_a_hit_with_the_window_armed(self) -> None:
         cache = public_api.PublicResponseCache()

@@ -740,16 +740,18 @@ class StatementTimeoutScopeLedger(FullReadModelLedger):
 
 
 class StatementTimeoutWiringTests(unittest.TestCase):
-    """The per-request database deadline arms exactly where a database is read.
+    """The per-request database deadline arms exactly where a read slot is held.
 
     The deadline's own semantics (budget value, env kill switch, the
     read_timeout 503, cache non-poisoning) are pinned in
     tests/test_prism_public_dashboard_api.py; what belongs to this service is
-    the classification -- the same path_reads_database() predicate the replica
-    and outage gates use decides which routes arm it.
+    the classification -- path_occupies_read_slot(), which is deliberately
+    wider than the staleness gates' path_reads_database(): a cold immutable
+    artifact lookup holds a Postgres read slot exactly like any other cold
+    read even though its body, once found, is correct at any age.
     """
 
-    def test_the_scope_wraps_all_database_reading_routes_and_nothing_else(self) -> None:
+    def test_the_scope_wraps_every_read_slot_route_and_nothing_else(self) -> None:
         ledger = StatementTimeoutScopeLedger()
         harness = ServiceHarness(FakeCoordinator(ledger=ledger))
         self.addCleanup(harness.close)
@@ -761,12 +763,24 @@ class StatementTimeoutWiringTests(unittest.TestCase):
                 served = harness.get(request_path(route))
                 self.assertEqual(200, served.status)
                 armed = len(ledger.statement_timeout_budgets) > armed_before
-                # mining-configuration touches no read slot and the immutable
-                # artifact route already publishes an unbounded budget; every
-                # other route reads the database and owes the deadline.
+                # mining-configuration touches no read slot; every other
+                # extracted route -- the immutable artifact route included --
+                # occupies one on a cold request and owes the deadline.
                 self.assertEqual(
-                    public_read_service.path_reads_database(path), armed
+                    public_read_service.path_occupies_read_slot(path), armed
                 )
+
+    def test_artifacts_owe_the_deadline_but_not_the_staleness_gates(self) -> None:
+        path = f"/public/v1/artifacts/{ARTIFACT_SHA256}"
+        self.assertTrue(public_read_service.path_occupies_read_slot(path))
+        # Deliberately split from path_reads_database: immutable content is
+        # exempt from replica/outage refusals, never from the deadline.
+        self.assertFalse(public_read_service.path_reads_database(path))
+
+    def test_mining_configuration_arms_nothing(self) -> None:
+        path = "/public/v1/mining-configuration"
+        self.assertFalse(public_read_service.path_occupies_read_slot(path))
+        self.assertFalse(public_read_service.path_reads_database(path))
 
 
 class StaleServeTests(unittest.TestCase):
