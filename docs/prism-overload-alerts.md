@@ -360,13 +360,15 @@ destination as the critical rules, and consider an Alertmanager inhibition
 so that scrape loss suppresses the (now meaningless) body-metric alerts
 rather than the reverse.
 
-**`-1` sentinels are values, not gaps.** Four gauges here use `-1`:
-`qbit_prism_accepted_parent_unresolved_oldest_seconds` (no unresolved
+**`-1` sentinels are values, not gaps.** Four gauges in the #188 rules use
+`-1`: `qbit_prism_accepted_parent_unresolved_oldest_seconds` (no unresolved
 transitions *carrying a landing timestamp* — see rule 3, which can read
 `-1` while the depth gauge is nonzero),
 `qbit_prism_block_candidates_pending` and
 `qbit_prism_block_candidate_oldest_pending_seconds` (state unavailable),
-and `qbit_prism_metrics_snapshot_age_seconds` (before first success). All
+and `qbit_prism_metrics_snapshot_age_seconds` (before first success); issue
+#198's `qbit_prism_block_candidate_cleanup_retry_oldest_seconds` (nothing
+owed) is a fifth, covered in its own section below. All
 threshold comparisons above are `>` against positive numbers, so `-1`
 never triggers them — but any rule added later using `<`, `avg_over_time`,
 `min_over_time`, or a rate must exclude `-1` explicitly, or it will read
@@ -423,3 +425,240 @@ Before these rules are trusted on mainnet:
    detectors. Remember that the remaining 503 case, warm-up with no
    complete snapshot, is covered by `up == 0` rather than by
    `qbit_prism_metrics_snapshot_available`.
+
+## Issue #198: the bounded collapse cleanup-retry backlog
+
+Issue #198. The decided-height collapse (#183, #196, #181 item 2) wins rows
+with one fenced batch write and then tears down each won row's in-memory
+state — its payout preview or tombstone, its pending-share floor holder,
+its retry, outstanding and tip-observation markers, its terminal-outcome
+record and its abandonment accounting. A won row is durably terminal the
+moment the write returns, so a cleanup step that fails has no durable
+replay source left: the coordinator keeps one in-memory retry record per
+such row (`_CollapsedCandidateCleanup` in `lab/prism/block_candidates.py`)
+and the accounting lane retries one hash per pass. Under a *systemic*
+cleanup fault that registry grew by one record per row the collapse won,
+with no bound at all, each record retaining its exact pending-share holder
+objects and pinning its terminal-outcome fence against eviction.
+
+The bound this section documents is applied to **admission, never to
+cleanup authority**. Once the registry holds the configured number of
+records, the collapse stops handing rows to its fenced bulk
+terminalization; every row it declines stays durable and pending and takes
+the ordinary per-row path. Nothing already terminal ever loses its record,
+its holders or its fence, and #196's selection predicate and fencing are
+untouched: the same rows are selected, only fewer of them are admitted per
+pass.
+
+### Signal inventory
+
+All names were verified against `lab/prism/metrics.py`
+(`block_candidate_cleanup_backlog_metrics_lines`). Every series is a single
+unlabelled time series per target; none can grow with the candidate
+population or carry a hash. The backlog snapshot they render is copied
+under the coordinator lock in one O(backlog) walk, which the bound keeps at
+a few thousand entries at most.
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `qbit_prism_block_candidate_cleanup_retry_backlog` | gauge | Durably terminal collapsed rows whose in-memory cleanup is still owed (registered or actively retrying authority depth). |
+| `qbit_prism_block_candidate_cleanup_retry_backlog_max` | gauge | The configured admission bound, exported so rules compare against the running contract rather than a literal. |
+| `qbit_prism_block_candidate_cleanup_retry_oldest_seconds` | gauge, `-1` when nothing is owed | Age of the oldest owed cleanup measured from its *first* deferral (a failed retry re-registers the record without resetting this). |
+| `qbit_prism_block_candidate_cleanup_retry_pending_share_holders` | gauge | Pending-share floor holders the backlog retains, by exact object identity. |
+| `qbit_prism_block_candidate_cleanup_retry_terminal_outcome_pins` | gauge | Terminal-outcome fences the backlog pins against eviction. Equals the depth whenever the apply's fence publication succeeded; a smaller value names records whose fence is still owed to the `terminal-outcome` step. |
+| `qbit_prism_block_candidate_cleanup_backpressure_active` | gauge, 0/1 | Whether the backlog is at its bound and bulk terminalization is refusing new rows. |
+| `qbit_prism_block_candidate_cleanup_backpressure_total` | counter | Occasions on which the bound preserved at least one row. |
+| `qbit_prism_block_candidate_collapse_total{outcome="backlog_deferred"}` | counter, closed label set | Rows preserved by the bound (the existing collapse-outcome family gained this one fixed outcome). |
+
+The accompanying warning is rate limited to one line per 60 s
+(`BLOCK_CANDIDATE_CLEANUP_BACKPRESSURE_LOG_SECONDS`) and every field is a
+count or a closed-vocabulary name; the `backlog_deferred` counter still
+moves per row while the line is suppressed:
+
+```text
+prism coordinator: collapsed block candidate cleanup backpressure engaged caller=replay-page rows_preserved=1024 admitted=0 backlog=4096 backlog_max=4096 oldest_seconds=12.345; admitting them to bulk terminalization would take the cleanup-retry backlog past its bound, so they stay durable and pending for the per-row path until it drains
+```
+
+`caller` is `replay-page` (the replay-adoption page walk) or `dequeue` (the
+dequeue-time stale sibling skip); `admitted` is how many rows the same pass
+still handed on, so `admitted=2 backlog=0 backlog_max=2 rows_preserved=4`
+reads as "two filled an empty backlog, four were declined".
+
+### Configuration knob
+
+`PRISM_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX` (default
+`DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX = 4096`, loaded into
+`BlockConfig.candidate_cleanup_retry_backlog_max` in
+`lab/prism/coordinator_config.py`). Startup refuses a non-integer, a
+non-positive value, and any value above
+`MAX_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX = 8192`, which restates the
+terminal-outcome registry bound (`MAX_BLOCK_CANDIDATE_TERMINAL_OUTCOMES`; a
+test pins the two equal): every retry record pins one fence, and a backlog
+allowed past the registry would leave the fence eviction with nothing it
+may drop. At runtime the service reads the coordinator attribute
+`block_candidate_cleanup_retry_backlog_max` first (the seam tests and
+embedders pin), then the loaded block config, then the default, and clamps
+below at one so a misconfigured runtime value degrades into "admit one row
+at a time from an empty backlog" rather than into a collapse that admits
+nothing.
+
+### Measurement basis
+
+Measured with `tests/prism_candidate_storm.py --cleanup-fault all
+--credit-shares` (CPython 3.12.3, Linux x86_64, in-memory ledger, one
+thread) at the observed 3,120-candidate cardinality, restart view unless
+noted, one fresh storm per run. `CleanupFaultInjector` breaks exactly one
+cleanup dependency at its shipped seam — the seven cleanup steps plus the
+page-scope holder index whose failure aborts the apply — while counting
+every seam per hash; the walk, the fence, the registry and the retry pass
+are the shipped code. Two independent memory readings are reported: a
+`sys.getsizeof` walk of the shipped registry (records, step sets, hash
+keys, and the exact holder objects retained, each charged once), and the
+change in live `tracemalloc` bytes attributed to the block-candidate owner
+module across the faulted walk, taken as a marginal figure against a clean
+walk of the same storm.
+
+| Fault (restart view, 3,120 rows) | Records | Holders | Pins | Registry bytes | Bytes / record (deep) | Owner-traced marginal bytes / record | Recovery passes | Recovery s | Records / s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| payout-preview-withdrawal | 3,119 | 3,119 | 3,119 | 3,018,422 | 967.8 | 560.3 | 3,119 | 0.118 | 26,335 |
+| finalize-retry | 3,119 | 3,119 | 3,119 | 3,018,411 | 967.8 | 559.7 | 3,119 | 0.055 | 57,066 |
+| retry-state | 3,119 | 3,119 | 3,119 | 3,018,408 | 967.7 | 559.7 | 3,119 | 0.057 | 54,914 |
+| outstanding-and-tip-observation | 3,119 | 3,119 | 3,119 | 3,018,428 | 967.8 | 559.7 | 3,119 | 0.065 | 47,792 |
+| terminal-outcome | 3,119 | 3,119 | 3,119 | 3,018,413 | 967.8 | 559.7 | 3,119 | 0.068 | 46,173 |
+| abandonment-accounting | 3,119 | 3,119 | 3,119 | 3,018,419 | 967.8 | 412.6 | 3,119 | 0.060 | 51,846 |
+| pending-share-floor | 3,119 | 3,119 | 3,119 | 3,018,416 | 967.8 | 562.3 | 3,119 | 0.062 | 50,125 |
+| floor-index (apply abort) | 3,119 | 0 | 3,119 | 3,351,703 | 1,074.6 | 774.2 | 3,119 | 8.577 | 364 |
+
+Of the 967.8 deep bytes per record, 357.3 are the retained
+`PendingShare` holder itself; a record that retains none costs 610.5 bytes
+(the live view, where only the 32 queued wakeups own a holder, measures
+566.9 bytes per record over 3,119 records and 1,004 bytes per record when
+only the 32 holder-owing records exist). The abort-shaped record is larger
+(1,074.6 bytes: it owes all seven steps and must re-index its holders) and
+drains far slower (364 records/s) because each retry re-scans the whole
+replay queue for its holders — an O(n²) cost at storm size that is inherent
+to the abort contract, not to the bound.
+
+Every fault also sustained 64 consecutive failing retry passes with depth,
+holders and pins unchanged, then recovered with zero double cleanups (each
+seam ran exactly once more per hash), zero cleanup calls after a record was
+discharged, zero terminal rows replay-adopted, zero node offers, and the
+decided winner's floor holder retained while the other 3,119 were released
+once each by identity (floor 3,120 → 1). The walk itself took 0.68–1.17 s
+per 3,120 rows.
+
+With the bound pinned below the storm (`--backlog-max 1024`): the first
+1,024-row page filled the backlog, the remaining three pages (2,096 rows,
+the winner among them) were preserved in three engagements, sustained
+failure left the 1,024 records intact, recovery drained them in 0.022 s,
+and the next walk collapsed the 2,095 preserved siblings in 0.25 s with the
+same clean recovery proof. The optional 312,000-candidate run was
+attempted (`--candidates 312000 --cleanup-fault retry-state
+--credit-shares --no-tracemalloc`) and stopped after 12 min 47 s of CPU
+time at about 1.7 GB resident without completing; no figure from it is
+used, and none is needed for the derivation.
+
+### Threshold policy: how 4,096 was derived
+
+Two anchors bound the default and two checks confirm it:
+
+1. **Upper anchor — the fence registry.** Every record pins its terminal
+   outcome. `MAX_BLOCK_CANDIDATE_TERMINAL_OUTCOMES` is 8,192, so the
+   backlog may pin at most half of it and still leave the eviction the
+   other half to work with: `≤ 8192 / 2 = 4096`. The knob's hard limit is
+   the full 8,192.
+2. **Lower anchor — absorption.** The bound must not engage on the storm
+   this machinery was built for, nor inside a single page: `≥ 3119`
+   (the observed storm's siblings) and `≥ 1024`
+   (`MAX_BLOCK_REPLAY_ENUMERATION_ROWS`).
+3. **Memory check.** `4096 × 967.8 B ≈ 3.96 MB` with every holder retained
+   (`≈ 4.4 MB` for abort-shaped records; `≈ 8.8 MB` at the 8,192 limit).
+   The unbounded 312,000-record case the issue describes would have been
+   `≈ 302–335 MB` of retained records plus their pinned fences.
+4. **Drain check.** On an idle accounting lane `4096 / 26,335 ≈ 0.16 s`
+   for a step fault and `4096 / 364 ≈ 11 s` for the abort shape; on a busy
+   lane the cadence (`DEFAULT_BLOCK_ACCOUNTING_CLEANUP_RETRY_WORK_ITEMS`,
+   8) bounds the drain at `4096 × 8 = 32,768` completed work items, which
+   is the shipped cadence contract rather than a property of this bound.
+
+`4096` is the only power of two that satisfies both anchors, and both
+checks hold at it. It is configuration-derived, not cadence-dependent: a
+mainnet storm of a different size changes how quickly the bound is
+*reached*, not whether it is correct.
+
+### Alert rules
+
+#### 8. `PrismCollapseCleanupBacklog` / `PrismCollapseCleanupBackpressure`
+
+- **Purpose:** collapsed rows are owing in-memory cleanup that the
+  accounting lane is not finishing, and at the bound the collapse has
+  stopped bulk-terminalizing new rows.
+- **Condition (warning, owed and not draining):**
+  `qbit_prism_block_candidate_cleanup_retry_backlog > 0`
+- **Condition (warning, oldest owed cleanup):**
+  `qbit_prism_block_candidate_cleanup_retry_oldest_seconds > 300`
+- **Condition (warning, near the bound):**
+  ```
+  qbit_prism_block_candidate_cleanup_retry_backlog
+    >= on(job, instance)
+      (qbit_prism_block_candidate_cleanup_retry_backlog_max * 0.5)
+  ```
+- **Condition (critical, at the bound):**
+  `qbit_prism_block_candidate_cleanup_backpressure_active == 1`
+- **Condition (warning, engaged recently):**
+  `increase(qbit_prism_block_candidate_cleanup_backpressure_total[15m]) > 0`
+- **`for`:** `10m` (owed), `5m` (oldest), `5m` (near), `2m` (at bound),
+  `0m` (engaged)
+- **Interpretation / first action:** a transient nonzero depth right after
+  a storm collapses is normal and drains within seconds (see the measured
+  throughput). A depth that holds for ten minutes, or an oldest age past
+  300 s — roughly seventeen consecutive failed attempts under the shipped
+  0.25 s-doubling-to-30 s backoff — means one cleanup dependency is
+  persistently failing; `qbit_prism_block_candidate_collapse_total{outcome="cleanup_retry_failed"}`
+  climbs in step and the coordinator log names the failing step
+  (`collapsed block candidate cleanup failed step=… hash=…`, detailed for
+  the first three per pass). At the bound the process is protecting its
+  own memory: preserved siblings take the per-row path, so expect the #181
+  symptoms to return for them — one `submitblock`, ~6 chain reads and two
+  ledger writes per preserved row, visible as `backlog_deferred` climbing
+  and `qbit_prism_block_candidates_pending` draining slowly rather than in
+  page-sized steps. That is the intended degradation, not a second fault.
+- **Cadence-dependent:** no. Every threshold is against the exported bound
+  or the in-process retry pacing.
+
+### Operator symptoms and the recovery contract
+
+Symptoms while the bound is engaged, in the order they appear:
+
+1. `cleanup_failed` and then `cleanup_retry_failed` outcomes climb; the
+   backlog, holders and pins gauges rise together.
+2. `qbit_prism_block_candidate_cleanup_backpressure_active` flips to 1 and
+   one `cleanup backpressure engaged` line prints (then at most one per
+   60 s); `backlog_deferred` and `..._backpressure_total` climb per pass.
+3. Preserved rows stay in `qbit_prism_block_candidates_pending` and are
+   disposed of by the per-row path at per-row cost. Nothing is abandoned
+   on an unknown, nothing is offered twice, and no terminal row is
+   re-adopted: the fence published at the write still holds for every
+   backlog entry.
+
+The recovery contract, proven by `tests/test_prism_block_candidates.py`
+(deterministically, including the active-retry window and at the shipped
+bound) and corroborated at 3,120 rows by
+`tests/test_prism_candidate_storm.py`: once the failing dependency heals,
+the accounting lane drains one hash per retry pass — immediately while
+idle, otherwise once per `DEFAULT_BLOCK_ACCOUNTING_CLEANUP_RETRY_WORK_ITEMS`
+completed work items — and each hash runs exactly the steps it still owes,
+once. Fences stay published throughout; holders are released exactly once
+by object identity and only for the collapsed row's own object; records,
+holders and pins are never shed while the fault persists. The moment the
+depth drops below the bound admission resumes, and the next enumeration
+walk collapses the preserved rows in bulk again. No operator action is
+needed beyond fixing the dependency; nothing needs to be restarted, and a
+restart would not help — the records are the only replay source those rows
+have, and a restart discards them along with the fault.
+
+Re-baselining: rerun `python3 tests/prism_candidate_storm.py --cleanup-fault
+all --credit-shares` (add `--cleanup-view live`, `--backlog-max N`) and
+re-derive step 3 and step 4 above from its `registry_bytes_per_record` and
+`retry_records_per_second`; the two anchors are configuration constants
+and do not move with cadence.

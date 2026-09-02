@@ -331,6 +331,31 @@ DEFAULT_ACCEPTED_PARENT_REDRIVE_DEFER_THRESHOLD = 3
 # the fix and the watchdog restart remains the backstop, so the re-drive
 # itself can never livelock the submitter.
 DEFAULT_ACCEPTED_PARENT_REDRIVE_ATTEMPT_MAX = 3
+# Issue #198: the decided-height collapse keeps one in-memory retry record
+# per terminal row whose post-write cleanup failed (see
+# ``_CollapsedCandidateCleanup`` in ``lab/prism/block_candidates.py``). Those
+# records are the only replay source the row has left, so they are never
+# dropped; what is bounded instead is *admission*: once the backlog holds
+# this many records the collapse stops handing new rows to its fenced bulk
+# terminalization and every unselected row stays durable and pending for
+# the ordinary per-row path.
+#
+# The default is derived from the candidate-storm measurement recorded in
+# ``docs/prism-overload-alerts.md``: one record costs on the order of a
+# kilobyte plus the pending-share holders it retains, a drained backlog
+# recovers at thousands of records per second on an idle accounting lane,
+# and the registry pins one terminal-outcome fence per record. The bound is
+# half the terminal-outcome registry (MAX_BLOCK_CANDIDATE_TERMINAL_OUTCOMES,
+# 8,192) so a saturated backlog can never pin the whole fence registry, and
+# it absorbs the observed 3,120-candidate storm (3,119 siblings) plus one
+# full replay page (1,024 rows) without engaging.
+DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX = 4096
+# The knob may not exceed the terminal-outcome registry bound: every retry
+# record pins its hash's fence, and a backlog allowed to grow past the
+# registry would leave the fence eviction with nothing it may drop. Restated
+# here rather than imported because ``block_candidates`` imports this module;
+# a block-candidate test pins the two equal.
+MAX_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX = 8192
 DEFAULT_HIGHDIFF_DIFFICULTY = "500000"
 DEFAULT_HIGHDIFF_MAX_DIFFICULTY = "4294967296"
 # Coinbase output ordering policies accepted by PRISM_COINBASE_OUTPUT_POLICY.
@@ -559,6 +584,23 @@ def validate_same_tip_job_retention_limits(
             "production mode requires a positive PRISM_STRATUM_MAX_CONNECTIONS "
             "when same-tip retention is enabled"
         )
+
+
+def validate_block_candidate_cleanup_retry_backlog_max(value: int) -> int:
+    """Refuse a cleanup-retry backlog bound the fence registry cannot carry.
+
+    Positivity is checked by the env reader; this is the upper bound. The
+    error names both the limit and why it exists so an operator retuning
+    the knob learns the contract rather than a bare number.
+    """
+    if int(value) > MAX_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX:
+        raise SystemExit(
+            "PRISM_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX cannot exceed "
+            f"{MAX_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX}: every retry "
+            "record pins a terminal-outcome fence and the fence registry is "
+            "bounded at that size"
+        )
+    return int(value)
 
 
 def require_production_env(name: str, *, environ: Env | None = None) -> str:
@@ -1203,6 +1245,11 @@ class BlockConfig:
     accepted_parent_redrive_attempt_max: int = (
         DEFAULT_ACCEPTED_PARENT_REDRIVE_ATTEMPT_MAX
     )
+    # Issue #198: retry records the collapse cleanup backlog may hold before
+    # bulk terminalization stops admitting new rows.
+    candidate_cleanup_retry_backlog_max: int = (
+        DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX
+    )
 
 
 @dataclass(frozen=True)
@@ -1683,6 +1730,15 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
             "PRISM_ACCEPTED_PARENT_REDRIVE_ATTEMPT_MAX",
             DEFAULT_ACCEPTED_PARENT_REDRIVE_ATTEMPT_MAX,
             environ=source,
+        ),
+        candidate_cleanup_retry_backlog_max=(
+            validate_block_candidate_cleanup_retry_backlog_max(
+                env_positive_int(
+                    "PRISM_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX",
+                    DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX,
+                    environ=source,
+                )
+            )
         ),
     )
 

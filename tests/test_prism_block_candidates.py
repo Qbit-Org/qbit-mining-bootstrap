@@ -11706,3 +11706,597 @@ class DuplicateDropSnapshotFloorTests(unittest.TestCase):
 
         self.assertIs(server._retry_block_candidate, live)
         self.assertEqual(server._job_snapshot_anchor_ms(1_000), 999)
+
+
+# -- issue #198: bounded collapse cleanup-retry backlog ------------------------
+
+from contextlib import redirect_stderr, redirect_stdout  # noqa: E402
+from io import StringIO  # noqa: E402
+from typing import Any  # noqa: E402
+
+from lab.prism.block_candidates import (  # noqa: E402
+    BLOCK_CANDIDATE_COLLAPSE_CLEANUP_STEPS,
+    MAX_BLOCK_CANDIDATE_TERMINAL_OUTCOMES,
+    PRISM_BLOCK_CANDIDATE_CLEANUP_BACKPRESSURE_CALLERS,
+    PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES,
+    PRISM_BLOCK_CANDIDATE_COLLAPSE_REASON,
+)
+from lab.prism.coordinator_config import (  # noqa: E402
+    DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX,
+    MAX_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX,
+    load_coordinator_config,
+)
+from tests.prism_candidate_storm import OBSERVED_TESTNET_CANDIDATE_STORM  # noqa: E402
+from tests.test_prism_block_candidate_collapse import (  # noqa: E402
+    CollapseFixture as _CollapseFixture,
+    _break_cleanup_step as _break_collapse_cleanup_step,
+    _hash as _collapse_hash,
+)
+
+_BACKLOG_KNOB = "PRISM_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX"
+
+
+def _minimal_config_environment(root: Path) -> dict[str, str]:
+    return {
+        "QBIT_RPC_HOST": "qbit.example",
+        "QBIT_RPC_USER": "rpc-user",
+        "QBIT_RPC_PASSWORD": "rpc-password",
+        "PRISM_ALLOW_MEMORY_LEDGER": "1",
+        "PRISM_ALLOW_TEST_SIGNING_SEEDS": "1",
+        "PRISM_ALLOW_BUNDLE_EMBEDDED_LEDGER_KEY": "1",
+        "PRISM_AUDIT_DIR": str(root),
+        "PRISM_EVIDENCE_PATH": str(root / "evidence.json"),
+    }
+
+
+class BlockCandidateCleanupRetryBacklogBoundTests(unittest.TestCase):
+    """Issue #198: the cleanup-retry backlog is bounded at admission.
+
+    A won row whose post-write cleanup failed keeps one in-memory retry
+    record, the only replay source it has left. Under a systemic cleanup
+    fault the collapse would otherwise mint one record per row it wins --
+    unbounded at storm scale -- so once the registry holds the configured
+    number of records the collapse stops handing rows to its fenced bulk
+    terminalization. Everything already terminal keeps its record, its
+    exact pending-share holders, and its fence; everything declined stays
+    durable and pending for the per-row path; and once the backlog drains
+    admission resumes and the preserved rows collapse on the next walk.
+
+    Every test here is deterministic: the retry pass is driven directly,
+    the walk is the shipped enumeration, and no thread or sleep is used.
+    """
+
+    BOUND = DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX
+
+    @staticmethod
+    def _quiet() -> Any:
+        stack = contextlib.ExitStack()
+        stack.enter_context(redirect_stdout(StringIO()))
+        stack.enter_context(redirect_stderr(StringIO()))
+        return stack
+
+    @staticmethod
+    def _snapshot(fixture: _CollapseFixture) -> dict[str, Any]:
+        return fixture.service.collapsed_candidate_cleanup_backlog_snapshot()
+
+    def _drain(self, fixture: _CollapseFixture) -> int:
+        passes = 0
+        with self._quiet():
+            while fixture.service._run_one_collapsed_block_candidate_cleanup_retry():
+                passes += 1
+        return passes
+
+    def _walk(self, fixture: _CollapseFixture) -> tuple[int, str]:
+        """The shipped enumeration walk, both streams captured."""
+        errors = StringIO()
+        with redirect_stderr(errors):
+            queued, log = fixture.replay()
+        return queued, log
+
+    # -- the knob ----------------------------------------------------------
+
+    def test_the_default_bound_is_derived_from_the_pinned_contracts(self) -> None:
+        fixture = _CollapseFixture()
+        self.assertEqual(
+            fixture.service._collapse_cleanup_retry_backlog_max(),
+            self.BOUND,
+        )
+        # The restated limit is the fence registry's bound, and the default
+        # pins at most half of it.
+        self.assertEqual(
+            MAX_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX,
+            MAX_BLOCK_CANDIDATE_TERMINAL_OUTCOMES,
+        )
+        self.assertLessEqual(self.BOUND, MAX_BLOCK_CANDIDATE_TERMINAL_OUTCOMES // 2)
+        # It absorbs the observed storm's siblings and one full replay page
+        # without engaging.
+        self.assertGreaterEqual(self.BOUND, OBSERVED_TESTNET_CANDIDATE_STORM - 1)
+        self.assertGreaterEqual(self.BOUND, MAX_BLOCK_REPLAY_ENUMERATION_ROWS)
+        self.assertIn("backlog_deferred", PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES)
+        self.assertEqual(
+            PRISM_BLOCK_CANDIDATE_CLEANUP_BACKPRESSURE_CALLERS,
+            ("replay-page", "dequeue"),
+        )
+
+    def test_the_bound_reads_the_coordinator_then_the_loaded_config(self) -> None:
+        fixture = _CollapseFixture()
+        server = fixture.server
+        server.config = SimpleNamespace(
+            block=SimpleNamespace(candidate_cleanup_retry_backlog_max=77)
+        )
+        self.assertEqual(fixture.service._collapse_cleanup_retry_backlog_max(), 77)
+        server.block_candidate_cleanup_retry_backlog_max = 5
+        self.assertEqual(fixture.service._collapse_cleanup_retry_backlog_max(), 5)
+        # A misconfigured runtime value degrades to admitting one row at a
+        # time from an empty backlog, never to a collapse that admits nothing.
+        server.block_candidate_cleanup_retry_backlog_max = 0
+        self.assertEqual(fixture.service._collapse_cleanup_retry_backlog_max(), 1)
+        self.assertEqual(
+            fixture.service._collapse_cleanup_admission_headroom(),
+            (1, 0, 1),
+        )
+
+    def test_startup_validation_refuses_an_unusable_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = _minimal_config_environment(Path(tmp))
+            self.assertEqual(
+                load_coordinator_config(base).block.candidate_cleanup_retry_backlog_max,
+                self.BOUND,
+            )
+            for raw, message in (
+                ("0", f"{_BACKLOG_KNOB} must be positive"),
+                ("-1", f"{_BACKLOG_KNOB} must be positive"),
+                ("abc", f"{_BACKLOG_KNOB} must be an integer"),
+                (
+                    str(MAX_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX + 1),
+                    f"{_BACKLOG_KNOB} cannot exceed "
+                    f"{MAX_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX}",
+                ),
+            ):
+                with self.subTest(raw=raw), self.assertRaisesRegex(SystemExit, message):
+                    load_coordinator_config({**base, _BACKLOG_KNOB: raw})
+            for raw in ("1", "2048", str(MAX_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX)):
+                with self.subTest(raw=raw):
+                    config = load_coordinator_config({**base, _BACKLOG_KNOB: raw})
+                    self.assertEqual(
+                        config.block.candidate_cleanup_retry_backlog_max,
+                        int(raw),
+                    )
+
+    # -- the gauges --------------------------------------------------------
+
+    def test_the_snapshot_reports_depth_age_holders_and_pins(self) -> None:
+        fixture = _CollapseFixture()
+        empty = self._snapshot(fixture)
+        self.assertEqual(
+            empty,
+            {
+                "depth": 0,
+                "backlog_max": self.BOUND,
+                "oldest_age_seconds": -1.0,
+                "pending_share_holders": 0,
+                "terminal_outcome_pins": 0,
+                "backpressure_active": False,
+                "backpressure_engagements": 0,
+            },
+        )
+        target = _collapse_hash(1)
+        candidate = fixture.seed([target], credit_share_on_accept=True)[0]
+        fixture.server._ensure_share_writer_service().adopt_pending_share(
+            candidate.pending_share
+        )
+        fixture.service.candidate_queue.put_nowait(candidate)
+        broken = _break_collapse_cleanup_step(
+            fixture.server,
+            "_finish_pending_share_commit",
+        )
+        with self._quiet():
+            fixture.collapse()
+        snapshot = self._snapshot(fixture)
+        self.assertEqual(snapshot["depth"], 1)
+        self.assertEqual(snapshot["pending_share_holders"], 1)
+        self.assertEqual(snapshot["terminal_outcome_pins"], 1)
+        self.assertFalse(snapshot["backpressure_active"])
+        self.assertGreaterEqual(snapshot["oldest_age_seconds"], 0.0)
+        # The retained holder is the exact object the queue held.
+        record = fixture.service._block_candidate_collapse_cleanup_retries[target]
+        self.assertEqual(len(record.shares), 1)
+        self.assertIs(record.shares[0], candidate.pending_share)
+        broken["on"] = False
+        self.assertEqual(self._drain(fixture), 1)
+        self.assertEqual(self._snapshot(fixture)["depth"], 0)
+        self.assertEqual(self._snapshot(fixture)["oldest_age_seconds"], -1.0)
+
+    def test_pins_count_only_records_whose_fence_is_published(self) -> None:
+        """A record whose fence publication degraded still owes it."""
+        fixture = _CollapseFixture()
+        target = _collapse_hash(1)
+        fixture.seed([target])
+        # The degraded branch the publication itself contains: nothing is
+        # stamped, and the terminal-outcome step is what still owes it.
+        fixture.service._publish_collapsed_candidate_terminal_fence = (
+            lambda abandoned: None
+        )
+        broken = _break_collapse_cleanup_step(
+            fixture.server,
+            "_record_block_candidate_terminal_outcome",
+        )
+        with self._quiet():
+            fixture.collapse()
+        snapshot = self._snapshot(fixture)
+        self.assertEqual(snapshot["depth"], 1)
+        self.assertEqual(snapshot["terminal_outcome_pins"], 0)
+        self.assertIn("terminal-outcome", fixture.cleanup_backlog()[target])
+        broken["on"] = False
+        self.assertEqual(self._drain(fixture), 1)
+        with fixture.server.lock:
+            self.assertIs(
+                fixture.service._block_candidate_terminal_outcomes[target],
+                False,
+            )
+        self.assertEqual(self._snapshot(fixture)["depth"], 0)
+
+    def test_the_oldest_age_is_measured_from_the_first_deferral(self) -> None:
+        fixture = _CollapseFixture()
+        target = _collapse_hash(1)
+        fixture.seed([target])
+        broken = _break_collapse_cleanup_step(
+            fixture.server,
+            "_clear_block_candidate_retry_state",
+        )
+        with self._quiet():
+            fixture.collapse()
+        registry = fixture.service._block_candidate_collapse_cleanup_retries
+        with fixture.server.lock:
+            registry[target].deferred_monotonic = time.monotonic() - 60.0
+        # A failed retry takes the record out and re-registers it; the
+        # stamp must survive that round trip.
+        with self._quiet():
+            self.assertTrue(fixture.retry_cleanup(force_due=True)[0])
+        with fixture.server.lock:
+            self.assertEqual(registry[target].attempts, 1)
+        self.assertGreaterEqual(self._snapshot(fixture)["oldest_age_seconds"], 60.0)
+        broken["on"] = False
+        self.assertEqual(self._drain(fixture), 1)
+
+    def test_an_inflight_retry_remains_counted_and_pins_its_fence(self) -> None:
+        """The accounting attempt cannot open an admission or fence gap."""
+        fixture = _CollapseFixture()
+        service = fixture.service
+        server = fixture.server
+        server.block_candidate_cleanup_retry_backlog_max = 1
+        target = _collapse_hash(1)
+        service._defer_collapsed_candidate_cleanup(target, ("retry-state",))
+        service._ensure_block_candidate_disposition_state()
+        with server.lock:
+            service._stamp_block_candidate_terminal_outcome(
+                service._block_candidate_terminal_outcomes,
+                target,
+                False,
+            )
+
+        observed: dict[str, Any] = {}
+
+        def observe_inflight(*_args: Any, **_kwargs: Any) -> tuple[dict, dict]:
+            observed["registry_empty"] = not (
+                service._block_candidate_collapse_cleanup_retries
+            )
+            observed["inflight"] = target in (
+                service._block_candidate_collapse_cleanup_inflight
+            )
+            observed["headroom"] = service._collapse_cleanup_admission_headroom()
+            observed["snapshot"] = self._snapshot(fixture)
+            # Make this fence the oldest entry in an overflowing outcome
+            # registry. The in-flight authority must still pin it while an
+            # unrelated unpinned outcome is evicted.
+            with server.lock:
+                outcomes = service._block_candidate_terminal_outcomes
+                for index in range(MAX_BLOCK_CANDIDATE_TERMINAL_OUTCOMES + 1):
+                    other = _collapse_hash((1 << 40) + index)
+                    service._stamp_block_candidate_terminal_outcome(
+                        outcomes,
+                        other,
+                        False,
+                    )
+                service._bound_block_candidate_terminal_outcomes()
+                observed["fence_pinned"] = target in outcomes
+            return {}, {target: ()}
+
+        service._run_collapsed_candidate_cleanup_steps = observe_inflight
+        with self._quiet():
+            self.assertTrue(
+                service._run_one_collapsed_block_candidate_cleanup_retry()
+            )
+
+        self.assertTrue(observed["registry_empty"])
+        self.assertTrue(observed["inflight"])
+        self.assertEqual(observed["headroom"], (0, 1, 1))
+        snapshot = observed["snapshot"]
+        self.assertEqual(snapshot["depth"], 1)
+        self.assertEqual(snapshot["terminal_outcome_pins"], 1)
+        self.assertTrue(snapshot["backpressure_active"])
+        self.assertTrue(observed["fence_pinned"])
+        self.assertEqual(self._snapshot(fixture)["depth"], 0)
+
+    # -- backpressure at the shipped bound: the replay-page walk ------------
+
+    def test_bulk_terminalization_stops_admitting_rows_at_the_bound(self) -> None:
+        """Sustained failure at the shipped bound, then recovery, page path."""
+        overflow = 128
+        hashes = [_collapse_hash(index) for index in range(1, self.BOUND + overflow + 1)]
+        fixture = _CollapseFixture()
+        fixture.seed(hashes)
+        broken = _break_collapse_cleanup_step(
+            fixture.server,
+            "_clear_block_candidate_retry_state",
+        )
+        # Four full pages are admitted and mint BOUND records; the fifth
+        # page finds no headroom and is preserved before any chain read.
+        queued, log = self._walk(fixture)
+        counts = fixture.counts()
+        snapshot = self._snapshot(fixture)
+        self.assertEqual(snapshot["depth"], self.BOUND)
+        self.assertTrue(snapshot["backpressure_active"])
+        self.assertEqual(snapshot["backpressure_engagements"], 1)
+        self.assertEqual(snapshot["terminal_outcome_pins"], self.BOUND)
+        self.assertEqual(counts["abandoned"], self.BOUND)
+        self.assertEqual(counts["cleanup_failed"], self.BOUND)
+        self.assertEqual(counts["backlog_deferred"], overflow)
+        self.assertEqual(counts["considered"], self.BOUND)
+        # The preserved rows stayed durable and were adopted for the
+        # per-row path exactly as an unprobed height leaves them.
+        self.assertEqual(len(fixture.pending()), overflow)
+        self.assertEqual(queued, overflow)
+        self.assertEqual(len(fixture.ledger.abandon_calls), 4)
+        self.assertIn(
+            "cleanup backpressure engaged caller=replay-page "
+            f"rows_preserved={overflow} admitted=0 backlog={self.BOUND} "
+            f"backlog_max={self.BOUND}",
+            log,
+        )
+        warning = next(line for line in log.splitlines() if "backpressure engaged" in line)
+        for block_hash in hashes:
+            self.assertNotIn(block_hash, warning)
+        # Sustained failure: retries keep failing, nothing is shed.
+        for attempt in range(1, 17):
+            with self._quiet():
+                self.assertTrue(fixture.retry_cleanup(force_due=True)[0])
+            self.assertEqual(self._snapshot(fixture)["depth"], self.BOUND)
+        self.assertEqual(fixture.counts()["cleanup_retry_failed"], 16)
+        self.assertEqual(self._snapshot(fixture)["terminal_outcome_pins"], self.BOUND)
+        # A second walk while the fault persists admits nothing more and
+        # re-adopts nothing; the warning is rate limited, the counter is not.
+        queued, log = self._walk(fixture)
+        self.assertEqual(queued, 0)
+        self.assertNotIn("backpressure engaged", log)
+        counts = fixture.counts()
+        self.assertEqual(counts["abandoned"], self.BOUND)
+        self.assertEqual(counts["backlog_deferred"], 2 * overflow)
+        self.assertEqual(self._snapshot(fixture)["backpressure_engagements"], 2)
+        self.assertEqual(len(fixture.ledger.abandon_calls), 4)
+        # Recovery: the backlog drains one hash per pass, admission resumes,
+        # and the preserved remainder collapses on the next walk.
+        broken["on"] = False
+        self.assertEqual(self._drain(fixture), self.BOUND)
+        snapshot = self._snapshot(fixture)
+        self.assertEqual(snapshot["depth"], 0)
+        self.assertFalse(snapshot["backpressure_active"])
+        self.assertEqual(fixture.counts()["cleanup_recovered"], self.BOUND)
+        self.assertEqual(fixture.cleanup_backlog(), {})
+        queued, log = self._walk(fixture)
+        self.assertEqual(queued, 0)
+        self.assertEqual(fixture.pending(), set())
+        counts = fixture.counts()
+        self.assertEqual(counts["abandoned"], self.BOUND + overflow)
+        self.assertEqual(counts["backlog_deferred"], 2 * overflow)
+        self.assertEqual(len(fixture.ledger.abandon_calls), 5)
+        # Every terminal row is fenced and none was ever offered.
+        self.assertNotIn("submitblock", fixture.rpc.counts())
+        with fixture.server.lock:
+            outcomes = fixture.service._block_candidate_terminal_outcomes
+            self.assertTrue(all(outcomes.get(block_hash) is False for block_hash in hashes))
+        self.assertEqual(
+            fixture.server.block_candidate_abandoned_counts,
+            {PRISM_BLOCK_CANDIDATE_COLLAPSE_REASON: self.BOUND + overflow},
+        )
+
+    # -- backpressure at the shipped bound: the dequeue-time skip -----------
+
+    def test_the_dequeue_time_skip_honours_the_same_bound(self) -> None:
+        fixture = _CollapseFixture()
+        service = fixture.service
+        server = fixture.server
+        # Fill the backlog to the bound through the shipped deferral.
+        with self._quiet():
+            for index in range(self.BOUND):
+                service._defer_collapsed_candidate_cleanup(
+                    _collapse_hash((1 << 20) + index),
+                    ("retry-state",),
+                )
+        self.assertEqual(self._snapshot(fixture)["depth"], self.BOUND)
+        fixture.rpc.results["submitblock"] = None
+        server.block_submit_rpc_timeout_seconds = 0.5
+
+        def offers() -> int:
+            return sum(1 for method, _ in fixture.rpc.calls if method == "submitblock")
+
+        first = _collapse_hash(1)
+        candidate = fixture.seed([first])[0]
+        service.candidate_queue.put_nowait(candidate)
+        with self._quiet():
+            self.assertTrue(server.submit_next_block_candidate(defer_accounting=True))
+        counts = fixture.counts()
+        # Not considered, not skipped: preserved for the ordinary offer path,
+        # which offered it.
+        self.assertEqual(counts["backlog_deferred"], 1)
+        self.assertEqual(counts["dequeue_considered"], 0)
+        self.assertEqual(counts["dequeue_skipped"], 0)
+        self.assertEqual(offers(), 1)
+        self.assertIn(first, fixture.pending())
+        self.assertEqual(self._snapshot(fixture)["depth"], self.BOUND)
+        self.assertEqual(self._snapshot(fixture)["backpressure_engagements"], 1)
+        # Once the backlog drains the skip is back.
+        self.assertEqual(self._drain(fixture), self.BOUND)
+        second = _collapse_hash(2)
+        candidate = fixture.seed([second])[0]
+        service.candidate_queue.put_nowait(candidate)
+        with self._quiet():
+            self.assertTrue(server.submit_next_block_candidate(defer_accounting=True))
+        counts = fixture.counts()
+        self.assertEqual(counts["dequeue_considered"], 1)
+        self.assertEqual(counts["dequeue_skipped"], 1)
+        self.assertEqual(counts["backlog_deferred"], 1)
+        self.assertEqual(offers(), 1)
+        self.assertNotIn(second, fixture.pending())
+
+    # -- what backpressure preserves, and what it never touches -------------
+
+    def test_holders_and_fences_survive_backpressure_and_release_once(self) -> None:
+        fixture = _CollapseFixture()
+        server = fixture.server
+        server.block_candidate_cleanup_retry_backlog_max = 2
+        hashes = [_collapse_hash(index) for index in range(1, 5)]
+        candidates = fixture.seed(hashes, credit_share_on_accept=True)
+        writer = server._ensure_share_writer_service()
+        for candidate in candidates:
+            writer.adopt_pending_share(candidate.pending_share)
+            fixture.service.candidate_queue.put_nowait(candidate)
+        by_hash = dict(zip(hashes, candidates))
+        releases: dict[int, int] = {}
+        original = server._finish_pending_share_commit
+        broken = {"on": True}
+
+        def finish(pending_share: Any) -> None:
+            if broken["on"]:
+                raise RuntimeError("floor release boom")
+            releases[id(pending_share)] = releases.get(id(pending_share), 0) + 1
+            original(pending_share)
+
+        server._finish_pending_share_commit = finish
+        with self._quiet():
+            fixture.collapse()
+        admitted = set(fixture.cleanup_backlog())
+        preserved = set(hashes) - admitted
+        self.assertEqual(len(admitted), 2)
+        self.assertEqual(fixture.pending(), preserved)
+        self.assertEqual(fixture.counts()["backlog_deferred"], 2)
+        registry = fixture.service._block_candidate_collapse_cleanup_retries
+        for block_hash in admitted:
+            self.assertEqual(registry[block_hash].shares, (by_hash[block_hash].pending_share,))
+        with server.lock:
+            outcomes = fixture.service._block_candidate_terminal_outcomes
+            for block_hash in admitted:
+                self.assertIs(outcomes[block_hash], False)
+            for block_hash in preserved:
+                self.assertNotIn(block_hash, outcomes)
+        # Sustained failure keeps the exact holder objects and the fences.
+        for _ in range(2):
+            with self._quiet():
+                self.assertTrue(fixture.retry_cleanup(force_due=True)[0])
+        for block_hash in admitted:
+            self.assertEqual(registry[block_hash].shares, (by_hash[block_hash].pending_share,))
+        snapshot = self._snapshot(fixture)
+        self.assertEqual(snapshot["pending_share_holders"], 2)
+        self.assertEqual(snapshot["terminal_outcome_pins"], 2)
+        self.assertEqual({id(candidate.pending_share) for candidate in candidates}, set(fixture.floor()))
+        # Recovery releases exactly the admitted holders, once each; the
+        # preserved candidates keep theirs until their own collapse.
+        broken["on"] = False
+        self.assertEqual(self._drain(fixture), 2)
+        self.assertEqual(
+            set(fixture.floor()),
+            {id(by_hash[block_hash].pending_share) for block_hash in preserved},
+        )
+        with self._quiet():
+            fixture.collapse()
+        self.assertEqual(fixture.pending(), set())
+        self.assertEqual(fixture.floor(), {})
+        self.assertEqual(set(releases.values()), {1})
+        self.assertEqual(len(releases), 4)
+        self.assertEqual(fixture.cleanup_backlog(), {})
+        self.assertNotIn("submitblock", fixture.rpc.counts())
+
+    def test_admission_resumes_as_the_backlog_drains(self) -> None:
+        fixture = _CollapseFixture()
+        fixture.server.block_candidate_cleanup_retry_backlog_max = 4
+        hashes = [_collapse_hash(index) for index in range(1, 9)]
+        fixture.seed(hashes)
+        broken = _break_collapse_cleanup_step(
+            fixture.server,
+            "_clear_block_candidate_retry_state",
+        )
+        with self._quiet():
+            fixture.collapse()
+        self.assertEqual(self._snapshot(fixture)["depth"], 4)
+        self.assertEqual(len(fixture.pending()), 4)
+        self.assertEqual(fixture.counts()["backlog_deferred"], 4)
+        broken["on"] = False
+        for _ in range(2):
+            with self._quiet():
+                self.assertTrue(fixture.retry_cleanup()[0])
+        # Two records drained, so two rows of headroom: exactly two more
+        # rows are admitted and the other two preserved again.
+        with self._quiet():
+            fixture.collapse()
+        counts = fixture.counts()
+        self.assertEqual(counts["abandoned"], 6)
+        self.assertEqual(counts["backlog_deferred"], 6)
+        self.assertEqual(len(fixture.pending()), 2)
+        self.assertEqual(self._snapshot(fixture)["depth"], 2)
+        self.assertEqual(self._drain(fixture), 2)
+        with self._quiet():
+            fixture.collapse()
+        self.assertEqual(fixture.pending(), set())
+        self.assertEqual(fixture.counts()["abandoned"], 8)
+        self.assertEqual(self._snapshot(fixture)["backpressure_engagements"], 2)
+
+    def test_the_backpressure_warning_is_bounded_and_hash_free(self) -> None:
+        fixture = _CollapseFixture()
+        fixture.server.block_candidate_cleanup_retry_backlog_max = 2
+        hashes = [_collapse_hash(index) for index in range(1, 7)]
+        fixture.seed(hashes)
+        broken = _break_collapse_cleanup_step(
+            fixture.server,
+            "_clear_block_candidate_retry_state",
+        )
+        with redirect_stderr(StringIO()):
+            _retained, first_log = fixture.collapse()
+            _retained, second_log = fixture.collapse()
+        broken["on"] = False
+        warnings = [
+            line
+            for log in (first_log, second_log)
+            for line in log.splitlines()
+            if "cleanup backpressure engaged" in line
+        ]
+        self.assertEqual(len(warnings), 1)
+        # Two admitted from an empty backlog, four preserved: the bound is
+        # what the pass would have exceeded, not what it had reached.
+        self.assertIn(
+            "caller=replay-page rows_preserved=4 admitted=2 backlog=0 backlog_max=2",
+            warnings[0],
+        )
+        self.assertIn("oldest_seconds=", warnings[0])
+        for block_hash in hashes:
+            self.assertNotIn(block_hash, warnings[0])
+        # The counter and the engagement count moved for both occasions.
+        self.assertEqual(fixture.counts()["backlog_deferred"], 8)
+        self.assertEqual(self._snapshot(fixture)["backpressure_engagements"], 2)
+        self.assertEqual(fixture.counts()["selected"], 6)
+        self.assertEqual(fixture.counts()["considered"], 6)
+        with self.assertRaises(ValueError):
+            fixture.service._note_block_candidate_cleanup_backpressure(
+                caller="not-a-caller",
+                rows=1,
+                admitted=0,
+                depth=2,
+                maximum=2,
+            )
+
+    def test_the_fault_vocabulary_the_rig_injects_matches_the_cleanup_steps(self) -> None:
+        from tests.prism_candidate_storm import CLEANUP_FAULTS
+
+        self.assertEqual(
+            set(CLEANUP_FAULTS) - {"floor-index"},
+            set(BLOCK_CANDIDATE_COLLAPSE_CLEANUP_STEPS),
+        )

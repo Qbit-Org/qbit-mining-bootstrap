@@ -143,6 +143,7 @@ class MetricsPort(Protocol):
 
     def _accepted_parent_unresolved_depth(self) -> int: ...
     def _accepted_parent_unresolved_depth_cap(self) -> int: ...
+    def _ensure_block_candidate_service(self) -> Any: ...
     def _ensure_connection_capacity_state(self) -> Any: ...
     def _ensure_evicted_job_state(self) -> Any: ...
     def _ensure_initial_job_state(self) -> Any: ...
@@ -608,6 +609,7 @@ class MetricsRenderer:
         lines.extend(self.shutdown_metrics_lines())
         lines.extend(self.coordinator_lock_metrics_lines())
         lines.extend(self.block_submitter_metrics_lines())
+        lines.extend(self.block_candidate_cleanup_backlog_metrics_lines())
         lines.extend(self.share_ack_metrics_lines())
         lines.extend(self.port.ctv_fanout_broadcaster_metrics_lines())
         lines.extend(self.port.vardiff_idle_metrics_lines())
@@ -804,6 +806,45 @@ class MetricsRenderer:
                 f'qbit_prism_block_candidate_collapse_total{{outcome="{outcome}"}} {int(collapse_counts.get(outcome, 0))}'
                 for outcome in PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES
             ],
+        ]
+
+    def block_candidate_cleanup_backlog_metrics_lines(self) -> list[str]:
+        """Issue #198: the collapse cleanup-retry backlog and its bound.
+
+        Seven single-series families, none labelled: the B1 owner copies
+        the values under the coordinator lock and the key set of its
+        snapshot is closed, so the export cannot grow with the candidate
+        population or carry a hash. The bound is exported beside the depth
+        so an alert can be a ratio against the configured contract instead
+        of a deployment-specific literal (the same shape as the
+        accepted-parent depth cap).
+        """
+        snapshot = (
+            self.port._ensure_block_candidate_service()
+            .collapsed_candidate_cleanup_backlog_snapshot()
+        )
+        return [
+            "# HELP qbit_prism_block_candidate_cleanup_retry_backlog Durably terminal collapsed block candidates whose in-memory cleanup is still owed and retried by the accounting lane.",
+            "# TYPE qbit_prism_block_candidate_cleanup_retry_backlog gauge",
+            f"qbit_prism_block_candidate_cleanup_retry_backlog {int(snapshot['depth'])}",
+            "# HELP qbit_prism_block_candidate_cleanup_retry_backlog_max Configured cleanup-retry backlog depth at which the decided-height collapse stops admitting rows to bulk terminalization.",
+            "# TYPE qbit_prism_block_candidate_cleanup_retry_backlog_max gauge",
+            f"qbit_prism_block_candidate_cleanup_retry_backlog_max {int(snapshot['backlog_max'])}",
+            "# HELP qbit_prism_block_candidate_cleanup_retry_oldest_seconds Age of the oldest owed collapse cleanup since it was first deferred, or -1 when none is owed.",
+            "# TYPE qbit_prism_block_candidate_cleanup_retry_oldest_seconds gauge",
+            f"qbit_prism_block_candidate_cleanup_retry_oldest_seconds {float(snapshot['oldest_age_seconds']):.6f}",
+            "# HELP qbit_prism_block_candidate_cleanup_retry_pending_share_holders Pending-share floor holders retained by owed collapse cleanups, by exact object identity.",
+            "# TYPE qbit_prism_block_candidate_cleanup_retry_pending_share_holders gauge",
+            f"qbit_prism_block_candidate_cleanup_retry_pending_share_holders {int(snapshot['pending_share_holders'])}",
+            "# HELP qbit_prism_block_candidate_cleanup_retry_terminal_outcome_pins Terminal-outcome fences the cleanup-retry backlog pins against eviction.",
+            "# TYPE qbit_prism_block_candidate_cleanup_retry_terminal_outcome_pins gauge",
+            f"qbit_prism_block_candidate_cleanup_retry_terminal_outcome_pins {int(snapshot['terminal_outcome_pins'])}",
+            "# HELP qbit_prism_block_candidate_cleanup_backpressure_active Whether the cleanup-retry backlog is at its bound and bulk terminalization is refusing new rows.",
+            "# TYPE qbit_prism_block_candidate_cleanup_backpressure_active gauge",
+            f"qbit_prism_block_candidate_cleanup_backpressure_active {1 if snapshot['backpressure_active'] else 0}",
+            "# HELP qbit_prism_block_candidate_cleanup_backpressure_total Occasions on which the cleanup-retry backlog bound preserved at least one row from bulk terminalization.",
+            "# TYPE qbit_prism_block_candidate_cleanup_backpressure_total counter",
+            f"qbit_prism_block_candidate_cleanup_backpressure_total {int(snapshot['backpressure_engagements'])}",
         ]
 
     def landing_observability_metrics_lines(self) -> list[str]:
