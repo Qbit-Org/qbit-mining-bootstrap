@@ -252,6 +252,36 @@ unbounded` and never refuses for staleness. The only observable staleness is the
 404→200 transition for an artifact published moments ago, which no budget would
 fix.
 
+## Health is a contract
+
+The coordinator's `/healthz` answers one question: is this instance failing to
+deliver work to the miners it has admitted? It fails closed (HTTP 503, with
+`initial-delivery-stalled` in `unhealthy_reasons`) for two conditions, both
+measured against `PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS`:
+
+- **Genuine first-job starvation.** An authorized miner has waited the full
+  deadline without any delivered work
+  (`oldest_genuinely_pending_initial_job_age_seconds`).
+- **Sustained semantic current-work loss.** Fewer than 95% of authorized miners
+  hold work matching the current template fingerprint and payout generation
+  (`semantic_current_work_ratio`) for longer than the deadline
+  (`semantic_current_work_gap_age_seconds`), with no exact-tip work covering
+  the gap either.
+
+Exact-tip churn by itself stays diagnostic. When the observed tip advances
+faster than fanout, `current_tip_job_coverage` drops and
+`current_tip_coverage_gap_age_seconds` grows while miners still hold the latest
+published work; the 2026-08-31 incident read 4 of 33 miners on the exact tip
+with all 33 semantically current. Those fields keep reporting the churn, and
+exact coverage still corroborates `overload` and the
+`connection-capacity-saturated` and `stale-unknown-rejection-storm` reasons,
+each of which needs an independent pressure signal. It no longer fails health
+on its own (issue #216).
+
+Router-facing mining readiness, whether a load balancer should send new miners
+to this instance, is a distinct signal to be added by issue #186. It is not
+derivable from `/healthz`, and this document does not classify it.
+
 ## Out of scope
 
 Anything payout-affecting stays on the coordinator: the writer lease, share
