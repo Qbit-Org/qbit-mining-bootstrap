@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
+import math
 import threading
 import time
 from typing import Callable, Mapping
@@ -17,6 +18,64 @@ PROGRESS_HEALTH_REASONS = (
     "current_generation_not_delivered",
     "bundle_build_stuck",
 )
+
+# --- Router-facing mining readiness (issue #186) ----------------------------
+#
+# /healthz answers "is this process alive and delivering?" and is deliberately
+# quick to fail. A load balancer deciding where to send *new* miners needs a
+# slower, latched answer: one that ignores the coverage dip every accepted tip
+# causes, degrades only when a bad condition is sustained, and recovers only
+# after the fleet has been demonstrably stable. The tracker below is that
+# hysteresis, pure and scripted-clock testable; the observability owner feeds
+# it from the background health refresh and caches its snapshot.
+
+MINING_READINESS_SCHEMA = "qbit.prism.mining-readiness.v1"
+MINING_READINESS_STATE_READY = "ready"
+MINING_READINESS_STATE_DEGRADED = "degraded"
+MINING_READINESS_STATES = (
+    MINING_READINESS_STATE_READY,
+    MINING_READINESS_STATE_DEGRADED,
+)
+
+# The closed reason vocabulary. Each name is one series of the fixed reason
+# gauge and one possible member of the response's ``reasons`` list; nothing
+# here carries a block hash, a client id, or any other unbounded value.
+MINING_READINESS_REASON_WARMING_UP = "warming_up"
+MINING_READINESS_REASON_SEMANTIC_COVERAGE_LOW = "semantic_coverage_low"
+MINING_READINESS_REASON_REFRESH_PENDING_TOO_LONG = "refresh_pending_too_long"
+MINING_READINESS_REASON_REFRESH_PENDING = "refresh_pending"
+MINING_READINESS_REASON_RECOVERY_WINDOW_PENDING = "recovery_window_pending"
+MINING_READINESS_REASON_DURABLE_CANDIDATE_OLD = "durable_candidate_old"
+MINING_READINESS_REASON_PREVIEW_TIMEOUTS = "accepted_parent_preview_timeouts"
+MINING_READINESS_REASONS = (
+    MINING_READINESS_REASON_WARMING_UP,
+    MINING_READINESS_REASON_SEMANTIC_COVERAGE_LOW,
+    MINING_READINESS_REASON_REFRESH_PENDING_TOO_LONG,
+    MINING_READINESS_REASON_REFRESH_PENDING,
+    MINING_READINESS_REASON_RECOVERY_WINDOW_PENDING,
+    MINING_READINESS_REASON_DURABLE_CANDIDATE_OLD,
+    MINING_READINESS_REASON_PREVIEW_TIMEOUTS,
+)
+
+# Coverage thresholds are named policy, not tuning knobs. Entry mirrors the
+# delivery-health predicate's five-percent loss; recovery demands the fleet
+# be nearly whole so a partially refreshed fleet cannot count as stable.
+MINING_READINESS_ENTRY_COVERAGE_RATIO = 0.95
+MINING_READINESS_RECOVERY_COVERAGE_RATIO = 0.99
+
+# A durable pending block candidate older than this annotates a degraded or
+# recovering snapshot. It is the documented warning threshold on
+# qbit_prism_block_candidate_oldest_pending_seconds (docs/prism-overload-
+# alerts.md) and never latches a transition on its own.
+MINING_READINESS_OLD_CANDIDATE_AGE_SECONDS = 60.0
+
+# Defaults for the two hysteresis windows. The entry dwell exceeds the
+# 2026-08-21 normal tip-refresh cycle (pending age peaked near 36.77s), so the
+# 0 -> partial -> 1 -> 0 coverage sweep at each accepted tip cannot flap the
+# signal. The recovery window exceeds the 213-second 2026-08-20 oscillation
+# between the apparent healthy point at 20:10:27Z and stability at 20:14:00Z.
+DEFAULT_PRISM_MINING_READINESS_ENTRY_DWELL_SECONDS = 60.0
+DEFAULT_PRISM_MINING_READINESS_RECOVERY_WINDOW_SECONDS = 240.0
 
 
 @dataclass(frozen=True)
@@ -668,6 +727,274 @@ class ProgressHealthService:
         )
 
 
+@dataclass(frozen=True)
+class MiningReadinessConfig:
+    """The two hysteresis windows, validated once at construction."""
+
+    entry_dwell_seconds: float = DEFAULT_PRISM_MINING_READINESS_ENTRY_DWELL_SECONDS
+    recovery_window_seconds: float = (
+        DEFAULT_PRISM_MINING_READINESS_RECOVERY_WINDOW_SECONDS
+    )
+
+    def __post_init__(self) -> None:
+        for name in ("entry_dwell_seconds", "recovery_window_seconds"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"mining readiness {name} must be a number")
+            if not math.isfinite(value):
+                raise ValueError(f"mining readiness {name} must be finite")
+            if value < 0:
+                raise ValueError(f"mining readiness {name} must be nonnegative")
+            object.__setattr__(self, name, float(value))
+        if self.recovery_window_seconds < self.entry_dwell_seconds:
+            raise ValueError(
+                "mining readiness recovery_window_seconds must be at least "
+                "entry_dwell_seconds"
+            )
+
+
+@dataclass(frozen=True)
+class MiningReadinessSample:
+    """One background observation, already reduced to the facts policy needs.
+
+    Every field is copied from snapshots the refresher already maintains: the
+    delivery snapshot's semantic ratio, the progress-health mapping's refresh
+    facts, the candidate outbox aggregate, and the accepted-parent preview
+    timeout counter. Nothing here is read on a request thread.
+    """
+
+    monotonic: float
+    semantic_current_work_ratio: float
+    refresh_pending: bool
+    refresh_pending_age_seconds: float | None
+    refresh_pending_too_long: bool
+    eligible_clients_requiring_refresh: int
+    # None when the durable outbox aggregate is unavailable (the metrics
+    # gauge reports -1 for the same condition).
+    oldest_durable_candidate_age_seconds: float | None
+    # Monotonic process counter; the tracker differences consecutive samples.
+    accepted_parent_preview_wait_timeouts: int
+
+    @property
+    def entry_condition(self) -> bool:
+        """True when this sample alone argues for degrading."""
+
+        return bool(
+            self.semantic_current_work_ratio
+            < MINING_READINESS_ENTRY_COVERAGE_RATIO
+            or self.refresh_pending_too_long
+        )
+
+    @property
+    def recovery_condition(self) -> bool:
+        """True when this sample alone argues the fleet is stable."""
+
+        return bool(
+            self.semantic_current_work_ratio
+            >= MINING_READINESS_RECOVERY_COVERAGE_RATIO
+            and not self.refresh_pending_too_long
+            and self.eligible_clients_requiring_refresh <= 0
+            and not self.refresh_pending
+        )
+
+
+@dataclass(frozen=True)
+class MiningReadinessSnapshot:
+    """One immutable latched answer plus the diagnostics that qualify it."""
+
+    state: str
+    state_since_monotonic: float
+    sample_monotonic: float
+    reasons: tuple[str, ...]
+    transitions: int
+    entry_streak_seconds: float
+    recovery_streak_seconds: float
+    semantic_current_work_ratio: float
+    refresh_pending: bool
+    refresh_pending_age_seconds: float | None
+    refresh_pending_too_long: bool
+    eligible_clients_requiring_refresh: int
+    oldest_durable_candidate_age_seconds: float | None
+    accepted_parent_preview_timeout_rate_per_second: float
+    entry_dwell_seconds: float
+    recovery_window_seconds: float
+
+    @property
+    def ready(self) -> bool:
+        return self.state == MINING_READINESS_STATE_READY
+
+    def state_age_seconds(self, now: float) -> float:
+        return max(0.0, now - self.state_since_monotonic)
+
+    def sample_age_seconds(self, now: float) -> float:
+        return max(0.0, now - self.sample_monotonic)
+
+
+class MiningReadinessTracker:
+    """Latch mining readiness with independent entry and recovery windows.
+
+    Not thread-safe by design: the observability owner drives ``observe`` from
+    its single background refresher and publishes the returned snapshot under
+    its own lock. The tracker keeps exactly two timers and the last counter
+    sample -- no history that can grow with uptime.
+
+    Policy, stated once:
+
+    - Ready is the initial latched state at the first sample. Before that
+      there is no snapshot, and the owner answers fail-closed warming-up.
+    - While ready, a sample whose ``entry_condition`` holds extends the entry
+      streak; any other sample resets it. The state changes to degraded
+      exactly when the streak reaches ``entry_dwell_seconds``.
+    - While degraded, a sample whose ``recovery_condition`` holds extends the
+      recovery streak; any other sample resets it. The state changes to ready
+      exactly when the streak reaches ``recovery_window_seconds``.
+    - The candidate age and the preview-timeout rate annotate a degraded or
+      recovering snapshot's reasons. They never start or extend a streak.
+    """
+
+    def __init__(self, config: MiningReadinessConfig) -> None:
+        self.config = config
+        self._state = MINING_READINESS_STATE_READY
+        self._state_since: float | None = None
+        self._entry_since: float | None = None
+        self._recovery_since: float | None = None
+        self._transitions = 0
+        self._last_timeout_count: int | None = None
+        self._last_timeout_monotonic: float | None = None
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def transitions(self) -> int:
+        return self._transitions
+
+    def _timeout_rate(self, sample: MiningReadinessSample) -> float:
+        """Per-second rate from consecutive counter samples; zero at first."""
+
+        previous_count = self._last_timeout_count
+        previous_monotonic = self._last_timeout_monotonic
+        self._last_timeout_count = int(sample.accepted_parent_preview_wait_timeouts)
+        self._last_timeout_monotonic = sample.monotonic
+        if previous_count is None or previous_monotonic is None:
+            return 0.0
+        elapsed = sample.monotonic - previous_monotonic
+        if elapsed <= 0.0:
+            return 0.0
+        # A counter that appears to run backwards (a test override, or a
+        # replaced owner) is read as no activity rather than a negative rate.
+        delta = max(0, self._last_timeout_count - previous_count)
+        return delta / elapsed
+
+    def observe(self, sample: MiningReadinessSample) -> MiningReadinessSnapshot:
+        now = float(sample.monotonic)
+        if self._state_since is None:
+            self._state_since = now
+        timeout_rate = self._timeout_rate(sample)
+
+        if self._state == MINING_READINESS_STATE_READY:
+            if sample.entry_condition:
+                if self._entry_since is None:
+                    self._entry_since = now
+                if now - self._entry_since >= self.config.entry_dwell_seconds:
+                    self._state = MINING_READINESS_STATE_DEGRADED
+                    self._state_since = now
+                    self._transitions += 1
+                    self._entry_since = None
+                    # A sample that just degraded cannot also be stable.
+                    self._recovery_since = None
+            else:
+                self._entry_since = None
+        else:
+            if sample.recovery_condition:
+                if self._recovery_since is None:
+                    self._recovery_since = now
+                if now - self._recovery_since >= self.config.recovery_window_seconds:
+                    self._state = MINING_READINESS_STATE_READY
+                    self._state_since = now
+                    self._transitions += 1
+                    self._recovery_since = None
+                    self._entry_since = None
+            else:
+                self._recovery_since = None
+
+        entry_streak = (
+            0.0 if self._entry_since is None else max(0.0, now - self._entry_since)
+        )
+        recovery_streak = (
+            0.0
+            if self._recovery_since is None
+            else max(0.0, now - self._recovery_since)
+        )
+        return MiningReadinessSnapshot(
+            state=self._state,
+            state_since_monotonic=self._state_since,
+            sample_monotonic=now,
+            reasons=self._reasons(sample, timeout_rate),
+            transitions=self._transitions,
+            entry_streak_seconds=entry_streak,
+            recovery_streak_seconds=recovery_streak,
+            semantic_current_work_ratio=float(sample.semantic_current_work_ratio),
+            refresh_pending=bool(sample.refresh_pending),
+            refresh_pending_age_seconds=sample.refresh_pending_age_seconds,
+            refresh_pending_too_long=bool(sample.refresh_pending_too_long),
+            eligible_clients_requiring_refresh=int(
+                sample.eligible_clients_requiring_refresh
+            ),
+            oldest_durable_candidate_age_seconds=(
+                sample.oldest_durable_candidate_age_seconds
+            ),
+            accepted_parent_preview_timeout_rate_per_second=timeout_rate,
+            entry_dwell_seconds=self.config.entry_dwell_seconds,
+            recovery_window_seconds=self.config.recovery_window_seconds,
+        )
+
+    def _reasons(
+        self,
+        sample: MiningReadinessSample,
+        timeout_rate: float,
+    ) -> tuple[str, ...]:
+        """Reasons in vocabulary order, judged against the latched state.
+
+        Ready: the entry conditions currently being dwelled on, so an
+        operator can see a dwell counting before it lands. Degraded: every
+        condition currently blocking recovery, or the open recovery window
+        when nothing blocks it, plus the two corroborating annotations.
+        """
+
+        reasons: list[str] = []
+        if self._state == MINING_READINESS_STATE_READY:
+            if (
+                sample.semantic_current_work_ratio
+                < MINING_READINESS_ENTRY_COVERAGE_RATIO
+            ):
+                reasons.append(MINING_READINESS_REASON_SEMANTIC_COVERAGE_LOW)
+            if sample.refresh_pending_too_long:
+                reasons.append(MINING_READINESS_REASON_REFRESH_PENDING_TOO_LONG)
+            return tuple(reasons)
+        if (
+            sample.semantic_current_work_ratio
+            < MINING_READINESS_RECOVERY_COVERAGE_RATIO
+        ):
+            reasons.append(MINING_READINESS_REASON_SEMANTIC_COVERAGE_LOW)
+        if sample.refresh_pending_too_long:
+            reasons.append(MINING_READINESS_REASON_REFRESH_PENDING_TOO_LONG)
+        elif sample.refresh_pending or sample.eligible_clients_requiring_refresh > 0:
+            reasons.append(MINING_READINESS_REASON_REFRESH_PENDING)
+        if sample.recovery_condition:
+            reasons.append(MINING_READINESS_REASON_RECOVERY_WINDOW_PENDING)
+        candidate_age = sample.oldest_durable_candidate_age_seconds
+        if (
+            candidate_age is not None
+            and candidate_age >= MINING_READINESS_OLD_CANDIDATE_AGE_SECONDS
+        ):
+            reasons.append(MINING_READINESS_REASON_DURABLE_CANDIDATE_OLD)
+        if timeout_rate > 0.0:
+            reasons.append(MINING_READINESS_REASON_PREVIEW_TIMEOUTS)
+        return tuple(reasons)
+
+
 def overlay_progress_health(
     base_health: Mapping[str, object],
     progress: Mapping[str, object],
@@ -686,8 +1013,29 @@ def overlay_progress_health(
 
 __all__ = [
     "BundleBuildToken",
+    "DEFAULT_PRISM_MINING_READINESS_ENTRY_DWELL_SECONDS",
+    "DEFAULT_PRISM_MINING_READINESS_RECOVERY_WINDOW_SECONDS",
     "DeliveryProof",
     "EligibilitySnapshot",
+    "MINING_READINESS_ENTRY_COVERAGE_RATIO",
+    "MINING_READINESS_OLD_CANDIDATE_AGE_SECONDS",
+    "MINING_READINESS_REASONS",
+    "MINING_READINESS_REASON_DURABLE_CANDIDATE_OLD",
+    "MINING_READINESS_REASON_PREVIEW_TIMEOUTS",
+    "MINING_READINESS_REASON_RECOVERY_WINDOW_PENDING",
+    "MINING_READINESS_REASON_REFRESH_PENDING",
+    "MINING_READINESS_REASON_REFRESH_PENDING_TOO_LONG",
+    "MINING_READINESS_REASON_SEMANTIC_COVERAGE_LOW",
+    "MINING_READINESS_REASON_WARMING_UP",
+    "MINING_READINESS_RECOVERY_COVERAGE_RATIO",
+    "MINING_READINESS_SCHEMA",
+    "MINING_READINESS_STATES",
+    "MINING_READINESS_STATE_DEGRADED",
+    "MINING_READINESS_STATE_READY",
+    "MiningReadinessConfig",
+    "MiningReadinessSample",
+    "MiningReadinessSnapshot",
+    "MiningReadinessTracker",
     "PROGRESS_HEALTH_REASONS",
     "ProgressHealthConfig",
     "ProgressHealthService",

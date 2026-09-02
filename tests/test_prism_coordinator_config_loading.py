@@ -119,6 +119,104 @@ class CoordinatorConfigLoadingTests(unittest.TestCase):
             config.lifecycle.metrics_refresh_seconds,
         )
 
+    def test_mining_readiness_windows_default_and_reach_the_coordinator(self) -> None:
+        # Issue #186: the two hysteresis knobs behind /readyz/mining.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = minimal_environment(Path(temp_dir))
+            config = load_coordinator_config(source)
+            coordinator = self.construct(source)
+
+        self.assertEqual(config.lifecycle.mining_readiness_entry_dwell_seconds, 60.0)
+        self.assertEqual(config.lifecycle.mining_readiness_recovery_window_seconds, 240.0)
+        self.assertEqual(coordinator.mining_readiness_entry_dwell_seconds, 60.0)
+        self.assertEqual(coordinator.mining_readiness_recovery_window_seconds, 240.0)
+        readiness = coordinator._ensure_observability_service()._mining_readiness_tracker.config
+        self.assertEqual(
+            (readiness.entry_dwell_seconds, readiness.recovery_window_seconds),
+            (60.0, 240.0),
+        )
+
+    def test_mining_readiness_windows_are_independent_knobs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = {
+                **minimal_environment(Path(temp_dir)),
+                "PRISM_MINING_READINESS_ENTRY_DWELL_SECONDS": "90",
+                "PRISM_MINING_READINESS_RECOVERY_WINDOW_SECONDS": "600",
+            }
+            config = load_coordinator_config(source)
+            coordinator = self.construct(source)
+
+        self.assertEqual(config.lifecycle.mining_readiness_entry_dwell_seconds, 90.0)
+        self.assertEqual(config.lifecycle.mining_readiness_recovery_window_seconds, 600.0)
+        readiness = coordinator._ensure_observability_service()._mining_readiness_tracker.config
+        self.assertEqual(
+            (readiness.entry_dwell_seconds, readiness.recovery_window_seconds),
+            (90.0, 600.0),
+        )
+        # Equal windows and zero windows are accepted.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = minimal_environment(Path(temp_dir))
+            for entry, recovery in (("30", "30"), ("0", "0"), ("0", "15")):
+                with self.subTest(entry=entry, recovery=recovery):
+                    config = load_coordinator_config(
+                        {
+                            **base,
+                            "PRISM_MINING_READINESS_ENTRY_DWELL_SECONDS": entry,
+                            "PRISM_MINING_READINESS_RECOVERY_WINDOW_SECONDS": recovery,
+                        }
+                    )
+                    self.assertEqual(
+                        (
+                            config.lifecycle.mining_readiness_entry_dwell_seconds,
+                            config.lifecycle.mining_readiness_recovery_window_seconds,
+                        ),
+                        (float(entry), float(recovery)),
+                    )
+
+    def test_mining_readiness_recovery_shorter_than_dwell_refuses_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = minimal_environment(Path(temp_dir))
+            for entry, recovery in (("60", "59.999"), ("300", "240"), ("1", "0")):
+                with self.subTest(entry=entry, recovery=recovery):
+                    with self.assertRaisesRegex(
+                        SystemExit,
+                        "PRISM_MINING_READINESS_RECOVERY_WINDOW_SECONDS must be at "
+                        "least PRISM_MINING_READINESS_ENTRY_DWELL_SECONDS",
+                    ):
+                        load_coordinator_config(
+                            {
+                                **base,
+                                "PRISM_MINING_READINESS_ENTRY_DWELL_SECONDS": entry,
+                                "PRISM_MINING_READINESS_RECOVERY_WINDOW_SECONDS": recovery,
+                            }
+                        )
+            # The default recovery window with a dwell raised past it.
+            with self.assertRaisesRegex(SystemExit, "must be at least"):
+                load_coordinator_config(
+                    {**base, "PRISM_MINING_READINESS_ENTRY_DWELL_SECONDS": "241"}
+                )
+
+    def test_mining_readiness_windows_reject_non_finite_negative_and_non_numeric(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = minimal_environment(Path(temp_dir))
+            for name in (
+                "PRISM_MINING_READINESS_ENTRY_DWELL_SECONDS",
+                "PRISM_MINING_READINESS_RECOVERY_WINDOW_SECONDS",
+            ):
+                for raw, message in (
+                    ("nan", "must be finite"),
+                    ("inf", "must be finite"),
+                    ("-inf", "must be finite"),
+                    ("-1", "must be non-negative"),
+                    ("-0.001", "must be non-negative"),
+                    ("soon", "must be a number"),
+                ):
+                    with self.subTest(name=name, raw=raw):
+                        with self.assertRaisesRegex(SystemExit, f"{name} {message}"):
+                            load_coordinator_config({**base, name: raw})
+
     def test_metrics_refresh_interval_must_be_positive(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             source = {

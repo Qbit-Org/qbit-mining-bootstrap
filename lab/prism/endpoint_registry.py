@@ -265,6 +265,26 @@ _OPERATOR: tuple[Endpoint, ...] = (
         ),
     ),
     Endpoint(
+        paths=("/readyz/mining",),
+        audience=Audience.OPERATOR,
+        disposition=Disposition.RETAIN,
+        access=(LedgerAccess.PROCESS_STATE,),
+        rationale=(
+            "Router-facing mining readiness of this coordinator instance "
+            "(issue #186): whether a load balancer should send new miners "
+            "here. A latched, hysteretic signal computed by the background "
+            "health refresher from the delivery snapshot, progress health, "
+            "the candidate-outbox age, and the accepted-parent preview "
+            "timeout counter, and served only as a copy of that cache -- "
+            "the request path takes no coordinator, delivery, or candidate "
+            "lock and runs no ledger read. Distinct from /healthz, which is "
+            "process liveness and deliberately quick to fail, and from the "
+            "extracted public tier's own health, which describes a "
+            "different process. Fails closed 503 until the first complete "
+            "sample. Never public: it names the instance behind the router."
+        ),
+    ),
+    Endpoint(
         paths=("/metrics",),
         audience=Audience.OPERATOR,
         disposition=Disposition.RETAIN,

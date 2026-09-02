@@ -34,6 +34,10 @@ from lab.prism.job_delivery import (
     PRISM_EVICTED_JOB_CLASSES,
     PRISM_EVICTED_JOB_SUBMIT_OUTCOMES,
 )
+from lab.prism.progress_health import (
+    MINING_READINESS_REASONS,
+    MINING_READINESS_REASON_WARMING_UP,
+)
 from lab.prism.reorg_reconciler import (
     PRISM_REORG_RECONCILE_LOOKUP_PATHS,
     PRISM_REORG_RECONCILE_LOOKUP_SOURCES,
@@ -618,7 +622,34 @@ class MetricsRenderer:
         lines.extend(self.port.payout_state_metrics_lines())
         lines.extend(self.initial_delivery_metrics_lines())
         lines.extend(self.port.progress_health_metrics_lines())
+        lines.extend(self.mining_readiness_metrics_lines())
         return "\n".join(lines) + "\n"
+
+    def mining_readiness_metrics_lines(self) -> list[str]:
+        """Issue #186: the latched router-facing readiness signal.
+
+        Rendered from the observability owner's cached snapshot only. This
+        renderer never samples readiness itself: the health refresher is the
+        single writer, so a scrape and /readyz/mining always agree.
+        """
+        snapshot = self.port._ensure_observability_service().mining_readiness_snapshot()
+        ready = snapshot is not None and snapshot.ready
+        active_reasons = (
+            {MINING_READINESS_REASON_WARMING_UP}
+            if snapshot is None
+            else set(snapshot.reasons)
+        )
+        return [
+            "# HELP qbit_prism_mining_ready Whether this coordinator instance is ready to receive routed miners: the latched, hysteretic signal served at /readyz/mining, 0 until the first complete health refresh.",
+            "# TYPE qbit_prism_mining_ready gauge",
+            f"qbit_prism_mining_ready {1 if ready else 0}",
+            "# HELP qbit_prism_mining_readiness_reason Mining-readiness reason flags by bounded reason; the label set is closed and carries no per-client or per-block value.",
+            "# TYPE qbit_prism_mining_readiness_reason gauge",
+            *(
+                f'qbit_prism_mining_readiness_reason{{reason="{reason}"}} {1 if reason in active_reasons else 0}'
+                for reason in MINING_READINESS_REASONS
+            ),
+        ]
 
     def share_ack_metrics_lines(self) -> list[str]:
         histograms = self.port.share_ack_snapshot()
@@ -767,6 +798,16 @@ class MetricsRenderer:
         # population.
         preview_publication = snapshot["accepted_preview_publication"]
         assert isinstance(preview_publication, dict)
+        # Issue #186: the readiness sample wants this age too, but the
+        # Postgres aggregate behind it is fenced by the writer lock, which
+        # the health refresher must never wait on. This renderer already
+        # paid for the read, so it hands the value to the observability
+        # owner instead of that owner reading it again.
+        observability = getattr(self.port, "_ensure_observability_service", None)
+        if callable(observability):
+            observability().record_oldest_durable_candidate_age(
+                float(snapshot["oldest_pending_age_seconds"])
+            )
         return [
             "# HELP qbit_prism_block_submit_seconds Seconds from a block candidate landing in this process to its submitblock RPC returning.",
             "# TYPE qbit_prism_block_submit_seconds histogram",

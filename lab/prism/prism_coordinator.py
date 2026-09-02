@@ -363,7 +363,11 @@ from lab.prism.stratum_session import (
 )
 # Compatibility re-exports; new callers should import lab.prism.progress_health.
 from lab.prism.progress_health import (
+    DEFAULT_PRISM_MINING_READINESS_ENTRY_DWELL_SECONDS,
+    DEFAULT_PRISM_MINING_READINESS_RECOVERY_WINDOW_SECONDS,
     EligibilitySnapshot,  # noqa: F401 - compatibility re-export
+    MiningReadinessConfig,
+    MiningReadinessSnapshot,
     ProgressHealthConfig,
     ProgressHealthService,
     ProgressHealthSnapshot,
@@ -1126,6 +1130,36 @@ class _CoordinatorObservability(ObservabilityPort):
             )
         )
 
+    def mining_readiness_config(self) -> MiningReadinessConfig:
+        # Issue #186: configuration only. The hysteresis policy lives in
+        # lab/prism/progress_health.py and the cache in lab/prism/observability.py.
+        return MiningReadinessConfig(
+            entry_dwell_seconds=float(
+                getattr(
+                    self.coordinator,
+                    "mining_readiness_entry_dwell_seconds",
+                    DEFAULT_PRISM_MINING_READINESS_ENTRY_DWELL_SECONDS,
+                )
+            ),
+            recovery_window_seconds=float(
+                getattr(
+                    self.coordinator,
+                    "mining_readiness_recovery_window_seconds",
+                    DEFAULT_PRISM_MINING_READINESS_RECOVERY_WINDOW_SECONDS,
+                )
+            ),
+        )
+
+    def accepted_parent_preview_wait_timeouts(self) -> int:
+        # The same copy the metrics renderer takes: one short hold of the
+        # coordinator lock from the background refresher, never a request.
+        coordinator = self.coordinator
+        lock = getattr(coordinator, "lock", None)
+        if lock is None:
+            return int(getattr(coordinator, "_accepted_parent_preview_wait_timeouts", 0))
+        with lock:
+            return int(getattr(coordinator, "_accepted_parent_preview_wait_timeouts", 0))
+
     def render_metrics_payload(self) -> str:
         return self.coordinator._render_metrics_payload()
 
@@ -1175,6 +1209,14 @@ class _CoordinatorAuditHttp(AuditHttpPort):
         if self.allow_uncached_compatibility:
             return 200, self.coordinator.health_payload()
         raise RuntimeError("cached health is unavailable")
+
+    def cached_mining_readiness_payload(self) -> tuple[int, Mapping[str, object]]:
+        # Cache only, on every path: there is no inline fallback because
+        # readiness must never be sampled on a request thread (issue #186).
+        cached = getattr(self.coordinator, "cached_mining_readiness_payload", None)
+        if callable(cached):
+            return cached()
+        raise RuntimeError("cached mining readiness is unavailable")
 
     def cached_metrics_payload(self) -> MetricsSnapshotResponse:
         cached = getattr(self.coordinator, "cached_metrics_payload", None)
@@ -2431,6 +2473,12 @@ class PrismCoordinator:
         )
         self.mining_health_startup_grace_seconds = (
             lifecycle_config.mining_health_startup_grace_seconds
+        )
+        self.mining_readiness_entry_dwell_seconds = (
+            lifecycle_config.mining_readiness_entry_dwell_seconds
+        )
+        self.mining_readiness_recovery_window_seconds = (
+            lifecycle_config.mining_readiness_recovery_window_seconds
         )
         self.stratum_accept_resource_exhaustion_backoff_seconds = (
             stratum_config.accept_resource_exhaustion_backoff_seconds
@@ -9753,6 +9801,12 @@ class PrismCoordinator:
 
     def cached_health_payload(self) -> tuple[int, dict[str, object]]:
         return self._ensure_observability_service().cached_health_payload()
+
+    def cached_mining_readiness_payload(self) -> tuple[int, dict[str, object]]:
+        return self._ensure_observability_service().cached_mining_readiness_payload()
+
+    def mining_readiness_snapshot(self) -> MiningReadinessSnapshot | None:
+        return self._ensure_observability_service().mining_readiness_snapshot()
 
     def health_snapshot_loop(self) -> None:
         self._ensure_observability_service().health_snapshot_loop()

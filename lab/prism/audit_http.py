@@ -39,6 +39,10 @@ class AuditHttpPort(Protocol):
 
     def cached_health_payload(self) -> tuple[int, Mapping[str, object]]: ...
 
+    def cached_mining_readiness_payload(
+        self,
+    ) -> tuple[int, Mapping[str, object]]: ...
+
     def cached_metrics_payload(self) -> MetricsResponse: ...
 
     def latest_evidence_payload(self) -> Mapping[str, object] | None: ...
@@ -357,6 +361,19 @@ class AuditHttpFacade:
                     if path == "/healthz":
                         status, payload = facade.port.cached_health_payload()
                         self.write_json(status, payload)
+                        return
+                    if path == "/readyz/mining":
+                        # Router-facing mining readiness (issue #186): a
+                        # copy of the latched snapshot the health refresher
+                        # publishes, distinct from /healthz liveness. The
+                        # port answers from its cache only; a router polling
+                        # this must never be handed a re-servable body.
+                        status, payload = facade.port.cached_mining_readiness_payload()
+                        self.write_json(
+                            status,
+                            payload,
+                            headers={"Cache-Control": "no-store"},
+                        )
                         return
                     if path == "/metrics":
                         metrics = facade.port.cached_metrics_payload()

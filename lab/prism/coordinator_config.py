@@ -15,6 +15,10 @@ from typing import Mapping
 from lab.auxpow import vardiff
 from lab.prism import direct_stratum
 from lab.prism.ctv_broadcaster_daemon import MAX_CTV_FANOUT_BROADCASTER_CHUNK_SIZE
+from lab.prism.progress_health import (
+    DEFAULT_PRISM_MINING_READINESS_ENTRY_DWELL_SECONDS,
+    DEFAULT_PRISM_MINING_READINESS_RECOVERY_WINDOW_SECONDS,
+)
 from lab.prism.share_ledger import (
     DEFAULT_AUDIT_SHARE_SEGMENT_SIZE,
     DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT,
@@ -123,6 +127,14 @@ DEFAULT_PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME = 0
 DEFAULT_PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS = 128
 DEFAULT_PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS = 30.0
 DEFAULT_PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS = 30.0
+# Issue #186: the environment names of the two hysteresis windows behind
+# /readyz/mining. Their defaults, and the incident reasoning behind them,
+# live with the tracker in lab/prism/progress_health.py and are imported
+# above so every environment-facing default stays reachable from this module.
+PRISM_MINING_READINESS_ENTRY_DWELL_ENV = "PRISM_MINING_READINESS_ENTRY_DWELL_SECONDS"
+PRISM_MINING_READINESS_RECOVERY_WINDOW_ENV = (
+    "PRISM_MINING_READINESS_RECOVERY_WINDOW_SECONDS"
+)
 DEFAULT_PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS = 1.0
 # Kernel accept backlog per stratum listener. Sized so a whole fleet
 # reconnecting inside a restart window parks in the backlog instead of being
@@ -1266,6 +1278,8 @@ class LifecycleConfig:
     pending_refresh_health_deadline_seconds: float
     coherent_tip_poll_health_deadline_seconds: float
     mining_health_startup_grace_seconds: float
+    mining_readiness_entry_dwell_seconds: float
+    mining_readiness_recovery_window_seconds: float
     writer_quiescence_timeout_seconds: float
     coordination_blocked_exit_seconds: float
     watchdog_enabled: bool
@@ -1917,6 +1931,27 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
             "below the tolerance"
         )
 
+    mining_readiness_entry_dwell_seconds = env_nonnegative_float(
+        PRISM_MINING_READINESS_ENTRY_DWELL_ENV,
+        DEFAULT_PRISM_MINING_READINESS_ENTRY_DWELL_SECONDS,
+        environ=source,
+    )
+    mining_readiness_recovery_window_seconds = env_nonnegative_float(
+        PRISM_MINING_READINESS_RECOVERY_WINDOW_ENV,
+        DEFAULT_PRISM_MINING_READINESS_RECOVERY_WINDOW_SECONDS,
+        environ=source,
+    )
+    if mining_readiness_recovery_window_seconds < mining_readiness_entry_dwell_seconds:
+        # A recovery window shorter than the entry dwell would let the
+        # signal return to ready faster than it took to leave, which is the
+        # flapping the hysteresis exists to prevent.
+        raise SystemExit(
+            f"{PRISM_MINING_READINESS_RECOVERY_WINDOW_ENV} must be at least "
+            f"{PRISM_MINING_READINESS_ENTRY_DWELL_ENV} "
+            f"({mining_readiness_recovery_window_seconds:g}s < "
+            f"{mining_readiness_entry_dwell_seconds:g}s)"
+        )
+
     lifecycle = LifecycleConfig(
         health_refresh_seconds=env_positive_float(
             "PRISM_HEALTH_REFRESH_SECONDS", DEFAULT_PRISM_HEALTH_REFRESH_SECONDS, environ=source
@@ -1940,6 +1975,10 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
             "PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS",
             DEFAULT_PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS,
             environ=source,
+        ),
+        mining_readiness_entry_dwell_seconds=mining_readiness_entry_dwell_seconds,
+        mining_readiness_recovery_window_seconds=(
+            mining_readiness_recovery_window_seconds
         ),
         writer_quiescence_timeout_seconds=env_positive_float(
             "PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS",
