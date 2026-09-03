@@ -12118,6 +12118,49 @@ class BlockCandidateCleanupRetryBacklogBoundTests(unittest.TestCase):
             {PRISM_BLOCK_CANDIDATE_COLLAPSE_REASON: self.BOUND + overflow},
         )
 
+    def test_forced_walk_pauses_after_one_full_backpressured_page(self) -> None:
+        """A deep fault cannot move the durable storm into the replay queue."""
+        page_rows = MAX_BLOCK_REPLAY_ENUMERATION_ROWS
+        total = 2 * page_rows + 7
+        fixture = _CollapseFixture()
+        fixture.server.block_candidate_cleanup_retry_backlog_max = page_rows
+        fixture.seed([_collapse_hash(index) for index in range(1, total + 1)])
+        _break_collapse_cleanup_step(
+            fixture.server,
+            "_clear_block_candidate_retry_state",
+        )
+
+        queued, log = self._walk(fixture)
+
+        self.assertEqual(self._snapshot(fixture)["depth"], page_rows)
+        self.assertEqual(queued, page_rows)
+        self.assertEqual(
+            fixture.service._block_replay_candidate_queue.qsize(),
+            page_rows,
+        )
+        self.assertEqual(len(fixture.pending()), page_rows + 7)
+        self.assertIn("enumeration page=1", log)
+        self.assertIn("enumeration page=2", log)
+        self.assertNotIn("enumeration page=3", log)
+        self.assertIn("paused after cleanup backpressure", log)
+        self.assertTrue(fixture.server._block_replay_enumeration_owed())
+
+        # Even a direct forced re-entry waits for the adopted page to drain;
+        # it cannot append the seven rows still sitting on a later page.
+        engagements = self._snapshot(fixture)["backpressure_engagements"]
+        queued_again, log_again = self._walk(fixture)
+        self.assertEqual(queued_again, 0)
+        self.assertEqual(log_again, "")
+        self.assertEqual(
+            fixture.service._block_replay_candidate_queue.qsize(),
+            page_rows,
+        )
+        self.assertEqual(
+            self._snapshot(fixture)["backpressure_engagements"],
+            engagements,
+        )
+        self.assertTrue(fixture.server._block_replay_enumeration_owed())
+
     # -- backpressure at the shipped bound: the dequeue-time skip -----------
 
     def test_the_dequeue_time_skip_honours_the_same_bound(self) -> None:

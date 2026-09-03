@@ -1340,6 +1340,11 @@ class BlockCandidateService:
             str, float | None
         ] = {}
         self._block_replay_enumeration_owed_flag = False
+        # A forced enumeration that meets cleanup backpressure adopts at
+        # most that one bounded page, then lets the submitter drain it before
+        # another outbox walk. This flag prevents an eager re-entry from
+        # growing the otherwise-unbounded replay queue page by page.
+        self._block_replay_backpressure_drain_pending = False
         # Targeted ancestor re-drive state (issue #190), all under
         # coordinator.lock. A found block whose finalization keeps deferring
         # on the same unresolved accepted-ancestor payout transition arms a
@@ -1493,6 +1498,8 @@ class BlockCandidateService:
                 self._block_quarantine_queue = queue.Queue()
             if not hasattr(self, "_block_quarantine_hashes"):
                 self._block_quarantine_hashes: set[str] = set()
+            if not hasattr(self, "_block_replay_backpressure_drain_pending"):
+                self._block_replay_backpressure_drain_pending = False
 
     def _enqueue_replayed_block_candidate(
         self,
@@ -2495,6 +2502,12 @@ class BlockCandidateService:
                 self._block_candidate_collapse_cleanup_inflight
             )
         return max(0, maximum - depth), depth, maximum
+
+    def _collapse_cleanup_backpressure_engagement_count(self) -> int:
+        """Return the monotonic engagement counter without walking records."""
+        self._ensure_block_candidate_collapse_state()
+        with self._coordinator.lock:
+            return int(self._block_candidate_cleanup_backpressure_engagements)
 
     def collapsed_candidate_cleanup_backlog_snapshot(self) -> dict[str, Any]:
         """Fixed-key gauges over the cleanup-retry backlog, for metrics.
@@ -3823,6 +3836,15 @@ class BlockCandidateService:
     def replay_pending(self) -> int:
         """Queue durable candidate intents not completed by an earlier process."""
         self._coordinator._record_block_submitter_phase("replay-check-memory")
+        self._ensure_block_replay_state()
+        # The normal submitter loop drains replay work before asking the
+        # outbox again. Enforce that ordering here too for direct callers: a
+        # forced walk paused by cleanup backpressure must not append another
+        # page to the unbounded replay queue before its bounded page drains.
+        if self._block_replay_backpressure_drain_pending:
+            if not self._block_replay_candidate_queue.empty():
+                return 0
+            self._block_replay_backpressure_drain_pending = False
         # While startup enumeration is still owed, correctness requires the
         # outbox query even if live candidates are queued: job builds stay
         # blocked until pending candidates are known, and only a successful
@@ -3854,7 +3876,6 @@ class BlockCandidateService:
             and not queue_obj.empty()
         ):
             return 0
-        self._ensure_block_replay_state()
         if (
             not forced_enumeration
             and not self._block_replay_candidate_queue.empty()
@@ -3994,14 +4015,20 @@ class BlockCandidateService:
                 # short-page proof stay bound to the *fetched* page: what the
                 # collapse removes was removed from the outbox too, so the
                 # enumeration is still complete.
-                queued += self._adopt_durable_block_candidate_rows(
-                    self._collapse_superseded_block_candidates(
-                        durable_rows,
-                        timeout_seconds=replay_query_timeout,
-                        call_class=replay_query_call_class,
-                        probe_budget=collapse_probe_budget,
-                    )
+                backpressure_before = (
+                    self._collapse_cleanup_backpressure_engagement_count()
                 )
+                retained_rows = self._collapse_superseded_block_candidates(
+                    durable_rows,
+                    timeout_seconds=replay_query_timeout,
+                    call_class=replay_query_call_class,
+                    probe_budget=collapse_probe_budget,
+                )
+                cleanup_backpressured = (
+                    self._collapse_cleanup_backpressure_engagement_count()
+                    != backpressure_before
+                )
+                queued += self._adopt_durable_block_candidate_rows(retained_rows)
                 print(
                     "prism coordinator: pending block candidate enumeration "
                     f"page={page} rows={len(durable_rows)}",
@@ -4011,6 +4038,22 @@ class BlockCandidateService:
                     # A short page proves no pending row followed it at query
                     # time, which is the completeness the job-build gate waits
                     # on.
+                    break
+                if cleanup_backpressured:
+                    # A full preserved page may have more pending rows behind
+                    # it. Stop here rather than materializing every later page
+                    # in the unbounded replay queue; the enumeration stays
+                    # owed and resumes only after this bounded page drains.
+                    enumeration_truncated = True
+                    self._block_replay_backpressure_drain_pending = True
+                    print(
+                        "prism coordinator: pending block candidate "
+                        f"enumeration page={page} paused after cleanup "
+                        "backpressure; replay queue drains before enumeration "
+                        "resumes and job builds stay blocked until a complete "
+                        "enumeration succeeds",
+                        flush=True,
+                    )
                     break
                 if self._block_replay_should_yield_to_live_candidates(
                     collapse_probe_budget
@@ -4053,18 +4096,36 @@ class BlockCandidateService:
                 # Same collapse-then-adopt order on the legacy widening
                 # window; the truncation proof below still measures the
                 # fetched window, not the surviving remainder.
-                queued += self._adopt_durable_block_candidate_rows(
-                    self._collapse_superseded_block_candidates(
-                        durable_rows,
-                        timeout_seconds=replay_query_timeout,
-                        call_class=replay_query_call_class,
-                        probe_budget=collapse_probe_budget,
-                    )
+                backpressure_before = (
+                    self._collapse_cleanup_backpressure_engagement_count()
                 )
+                retained_rows = self._collapse_superseded_block_candidates(
+                    durable_rows,
+                    timeout_seconds=replay_query_timeout,
+                    call_class=replay_query_call_class,
+                    probe_budget=collapse_probe_budget,
+                )
+                cleanup_backpressured = (
+                    self._collapse_cleanup_backpressure_engagement_count()
+                    != backpressure_before
+                )
+                queued += self._adopt_durable_block_candidate_rows(retained_rows)
                 if len(durable_rows) < enumeration_limit or not forced_enumeration:
                     # A short page proves no further pending row existed at
                     # query time -- the completeness the re-drive's
                     # stale-transition sweep below also relies on.
+                    break
+                if cleanup_backpressured:
+                    enumeration_truncated = True
+                    self._block_replay_backpressure_drain_pending = True
+                    print(
+                        "prism coordinator: pending block candidate "
+                        f"enumeration at {enumeration_limit} rows paused after "
+                        "cleanup backpressure; replay queue drains before "
+                        "enumeration resumes and job builds stay blocked until "
+                        "a complete enumeration succeeds",
+                        flush=True,
+                    )
                     break
                 if self._block_replay_should_yield_to_live_candidates(
                     collapse_probe_budget

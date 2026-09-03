@@ -1080,16 +1080,15 @@ class CleanupBacklogStormTests(unittest.TestCase):
             sustained_passes=16,
         )
         self.assertEqual(report.backlog_max, bound)
-        # The first page fills the backlog; the remaining pages are
-        # preserved whole, one engagement each.
-        pages = -(-OBSERVED_TESTNET_CANDIDATE_STORM // MAX_BLOCK_REPLAY_ENUMERATION_ROWS)
+        # The first page fills the backlog; exactly one following page is
+        # preserved and adopted before pagination pauses for it to drain.
         self.assertEqual(report.collapsed_rows, bound)
         self.assertEqual(report.deferred_records, bound)
         self.assertEqual(
             report.preserved_rows,
-            OBSERVED_TESTNET_CANDIDATE_STORM - bound,
+            MAX_BLOCK_REPLAY_ENUMERATION_ROWS,
         )
-        self.assertEqual(report.backpressure_engagements, pages - 1)
+        self.assertEqual(report.backpressure_engagements, 1)
         self.assertTrue(report.backpressure_active)
         self.assertEqual(report.pending_share_holders, bound)
         self.assertEqual(report.terminal_outcome_pins, bound)

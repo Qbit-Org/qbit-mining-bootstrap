@@ -448,7 +448,11 @@ terminalization; every row it declines stays durable and pending and takes
 the ordinary per-row path. Nothing already terminal ever loses its record,
 its holders or its fence, and #196's selection predicate and fencing are
 untouched: the same rows are selected, only fewer of them are admitted per
-pass.
+pass. If a forced replay walk fills a page after backpressure engages, it
+adopts that one bounded page and pauses pagination until the replay queue has
+drained. The startup enumeration remains owed, so job builds stay blocked and
+the walk resumes from the durable outbox instead of materializing every later
+page in the unbounded replay queue.
 
 ### Signal inventory
 

@@ -1706,6 +1706,39 @@ class CandidateStormRig:
         elapsed = time.monotonic() - started
         return before - self._pending_hashes(), elapsed, adopted
 
+    def _drain_backpressured_replay_page(
+        self,
+        server: Any,
+        *,
+        stop_before_hash: str,
+    ) -> set[str]:
+        """Drive the bounded spill page through the shipped dequeue collapse."""
+        service = server._ensure_block_candidate_service()
+        if not service._block_replay_backpressure_drain_pending:
+            return set()
+        terminalized: set[str] = set()
+        replay_queue = service._block_replay_candidate_queue
+        # The queue cannot grow in this synchronous rig. Bound the driver by
+        # the captured page size so a failed disposition cannot spin.
+        rounds = replay_queue.qsize()
+        with self._silence_all():
+            for _ in range(rounds):
+                if replay_queue.empty():
+                    break
+                candidate = replay_queue.queue[0]
+                block_hash = str(candidate.submission.block_hash_hex).lower()
+                if block_hash == stop_before_hash:
+                    break
+                row = self.ledger._block_candidate_outbox[block_hash]
+                before = str(row["state"])
+                if not server.submit_next_block_candidate(defer_accounting=True):
+                    break
+                self._run_block_accounting_tasks(server)
+                after = str(row["state"])
+                if before == "pending" and after != "pending":
+                    terminalized.add(block_hash)
+        return terminalized
+
     def measure_cleanup_backlog(
         self,
         fault: str,
@@ -1729,9 +1762,11 @@ class CandidateStormRig:
            holders and pins unchanged -- the backlog is never shed.
         4. Heal the fault and drain the backlog through the shipped retry
            pass until it reports nothing due, timing the drain.
-        5. Run the walk again so admission can resume over whatever the
-           bound preserved, then drive ``drain_per_row`` over every queued
-           wakeup to prove no terminal row reaches the node.
+        5. Drain the one replay page adopted at backpressure through the
+           shipped dequeue collapse, run the walk again so admission can
+           resume over whatever remains durable, then drive ``drain_per_row``
+           over every queued wakeup to prove no terminal row reaches the
+           node.
 
         ``view`` selects the coordinator: ``live`` holds the storm's first
         ``queue_depth`` wakeups in the bounded queue with the rest coalesced,
@@ -1818,10 +1853,14 @@ class CandidateStormRig:
             )
             after_recovery = service.collapsed_candidate_cleanup_backlog_snapshot()
             recovered_calls = injector.snapshot_calls()
+            resumed_at_dequeue = self._drain_backpressured_replay_page(
+                server,
+                stop_before_hash=winner,
+            )
             collapsed_after, second_walk_seconds, _adopted = self._collapse_walk(server)
             with server.lock:
                 inflight_after = set(service._block_replay_inflight_hashes)
-            every_collapsed = collapsed | collapsed_after
+            every_collapsed = collapsed | resumed_at_dequeue | collapsed_after
             excess = injector.excess_calls(every_collapsed)
             missing = injector.missing_calls(every_collapsed)
             terminal_adopted = len((inflight_after - inflight_before) & every_collapsed)
@@ -1889,7 +1928,9 @@ class CandidateStormRig:
             ),
             depth_after_recovery=int(after_recovery["depth"]),
             second_walk_seconds=second_walk_seconds,
-            collapsed_rows_after_recovery=len(collapsed_after),
+            collapsed_rows_after_recovery=len(
+                resumed_at_dequeue | collapsed_after
+            ),
             excess_cleanup_calls=excess,
             missing_cleanup_calls=missing,
             post_recovery_cleanup_calls=post_recovery_calls,
