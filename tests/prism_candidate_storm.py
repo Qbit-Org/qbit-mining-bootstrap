@@ -59,17 +59,35 @@ drive this way also matters for correctness, not just fidelity:
 ``submit_next`` claims the disposition lease *blocking* unless accounting
 is deferred, and ``_restore_replayed_candidate_acceptance_evidence`` runs
 only inside the accounting task.
+
+The cleanup-backlog extension (issue #198) measures the one collapse state
+with no durable replay source: the in-memory retry record a won row leaves
+behind when its post-write cleanup fails.  ``CleanupFaultInjector`` breaks
+exactly one cleanup dependency (``CLEANUP_FAULTS``) at the shipped seam
+while counting every seam per hash, and ``measure_cleanup_backlog`` drives
+the shipped collapse walk under that fault, reports the backlog it produces
+-- depth, oldest age, retained pending-share holders, terminal-outcome pins,
+deep and traced bytes per record, and the rows the admission bound
+preserved -- holds the fault for a bounded run of failing retry passes,
+heals it, and then proves recovery: the backlog drains through the shipped
+retry pass at a measured throughput, admission resumes, every collapsed
+hash runs each cleanup seam exactly once more (no double cleanup), no
+terminal row is replay-adopted or re-offered to the node, and the decided
+winner keeps its pending-share floor authority.
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import linecache
 import queue
 import sys
 import threading
 import time
-from contextlib import nullcontext, redirect_stdout
+import tracemalloc
+from contextlib import ExitStack, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass
 from io import StringIO
 from pathlib import Path
@@ -80,11 +98,16 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lab.prism.block_candidates import (  # noqa: E402
+    BLOCK_CANDIDATE_COLLAPSE_CLEANUP_PAYOUT_STEP,
+    BLOCK_CANDIDATE_COLLAPSE_CLEANUP_STEPS,
     COLLAPSE_DIFFICULTY_SCALE,
     COLLAPSE_POW_LIMIT_BITS,
     MAX_BLOCK_REPLAY_ENUMERATION_ROWS,
     MAX_PENDING_BLOCK_CANDIDATES,
     _BlockCandidateNodeSubmission,
+)
+from lab.prism.coordinator_config import (  # noqa: E402
+    DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX,
 )
 from lab.prism.share_ledger import (  # noqa: E402
     PendingShare,
@@ -111,6 +134,44 @@ PERTURBATIONS = (
     "prepared_pool_block",
     "terminal",
 )
+
+# Issue #198: every in-memory dependency one won row's terminal cleanup runs
+# through, each injectable as a fault through CleanupFaultInjector.  The
+# first seven are the shipped cleanup steps, named exactly as the retry
+# registry names what a hash still owes; ``floor-index`` is the page-scope
+# pending-share holder scan that precedes them, whose failure aborts the
+# whole apply's cleanup and is the path the retry re-indexes for.
+CLEANUP_FAULTS = tuple(BLOCK_CANDIDATE_COLLAPSE_CLEANUP_STEPS) + ("floor-index",)
+# Install the seam counters without breaking anything: the clean baseline
+# every marginal per-record figure is taken against.
+CLEANUP_FAULT_NONE = "none"
+# seam -> (owner, attribute, successful calls one collapsed hash is owed).
+# The payout withdrawal is two calls (invalidate, then drop the tombstone);
+# the floor release is once per retained holder and the holder index once
+# per page, so neither has a per-hash expectation.
+_CLEANUP_SEAMS: dict[str, tuple[str, str, int | None]] = {
+    BLOCK_CANDIDATE_COLLAPSE_CLEANUP_PAYOUT_STEP: (
+        "server",
+        "_clear_accepted_block_payout_preview",
+        2,
+    ),
+    "finalize-retry": ("service", "finalize_retries", 1),
+    "retry-state": ("server", "_clear_block_candidate_retry_state", 1),
+    "outstanding-and-tip-observation": (
+        "server",
+        "_discard_outstanding_block_candidate",
+        1,
+    ),
+    "terminal-outcome": ("server", "_record_block_candidate_terminal_outcome", 1),
+    "abandonment-accounting": (
+        "server",
+        "_record_committed_block_candidate_abandonment",
+        1,
+    ),
+    "pending-share-floor": ("server", "_finish_pending_share_commit", None),
+    "floor-index": ("service", "_collapsed_candidate_floor_holders", None),
+}
+assert set(_CLEANUP_SEAMS) == set(CLEANUP_FAULTS)
 
 
 @dataclass(frozen=True)
@@ -351,6 +412,323 @@ class PerRowDrainReport:
         return len(self.pending_hashes)
 
 
+class _FaultableRegistry(dict):
+    """``finalize_retries`` with a breakable ``pop``.
+
+    The finalize-retry cleanup step reaches no coordinator seam -- it pops
+    the service's own registry under the lock -- so the fault has to live
+    on the container.  Membership reads stay plain dict reads.
+    """
+
+    def __init__(self, injector: "CleanupFaultInjector", seam: str, contents: Any) -> None:
+        super().__init__(contents)
+        self._injector = injector
+        self._seam = seam
+
+    def pop(self, key: Any, *default: Any) -> Any:  # type: ignore[override]
+        self._injector._guard(self._seam)
+        result = super().pop(key, *default)
+        self._injector._count(self._seam, str(key).lower())
+        return result
+
+
+class CleanupFaultInjector:
+    """Break one cleanup dependency until healed; count every seam meanwhile.
+
+    Every seam the terminal cleanup runs through is wrapped so a *successful*
+    call is counted per hash (per holder for the floor release, per page for
+    the holder index), and exactly one of them -- ``fault`` -- raises while
+    ``on`` is true.  Nothing else is replaced: the collapse, the fence, the
+    retry registry and the retry pass all stay as shipped, so the backlog
+    this produces is the backlog production would produce under the same
+    fault.  ``CLEANUP_FAULT_NONE`` installs the counters alone, which is the
+    clean baseline the marginal memory figure is taken against.
+
+    The counters are what make recovery provable rather than believed: after
+    healing, every collapsed hash must show exactly the calls one terminal
+    cleanup is owed at every seam -- one more than that is a double cleanup,
+    one fewer is a step the retry never finished -- and a floor holder must
+    be released at most once by identity.
+    """
+
+    def __init__(self, server: Any, fault: str) -> None:
+        if fault != CLEANUP_FAULT_NONE and fault not in CLEANUP_FAULTS:
+            raise ValueError(f"unknown cleanup fault: {fault}")
+        self.server = server
+        self.service = server._ensure_block_candidate_service()
+        self.fault = fault
+        self.on = fault != CLEANUP_FAULT_NONE
+        self.failed_calls = 0
+        # seam -> key -> successful calls.
+        self.calls: dict[str, dict[str, int]] = {seam: {} for seam in _CLEANUP_SEAMS}
+        # Floor releases by holder identity.
+        self.floor_releases: dict[int, int] = {}
+        self._originals: dict[str, tuple[Any, str, Any]] = {}
+
+    def install(self) -> None:
+        if self._originals:
+            raise RuntimeError("cleanup faults are already installed")
+        for seam, (owner_name, attribute, _expected) in _CLEANUP_SEAMS.items():
+            owner = self.server if owner_name == "server" else self.service
+            original = getattr(owner, attribute)
+            self._originals[seam] = (owner, attribute, original)
+            if seam == "finalize-retry":
+                setattr(owner, attribute, _FaultableRegistry(self, seam, original))
+                continue
+            setattr(owner, attribute, self._wrap(seam, original))
+
+    def uninstall(self) -> None:
+        for seam, (owner, attribute, original) in self._originals.items():
+            if seam == "finalize-retry":
+                # Hand the live contents back to the shipped container.
+                current = getattr(owner, attribute)
+                original.clear()
+                original.update(current)
+            setattr(owner, attribute, original)
+        self._originals.clear()
+
+    def heal(self) -> None:
+        self.on = False
+
+    def _wrap(self, seam: str, original: Any) -> Any:
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            self._guard(seam)
+            result = original(*args, **kwargs)
+            self._count(seam, self._key(seam, args, kwargs))
+            return result
+
+        return wrapped
+
+    def _guard(self, seam: str) -> None:
+        if self.on and seam == self.fault:
+            self.failed_calls += 1
+            raise RuntimeError(f"injected cleanup fault: {seam}")
+
+    def _key(self, seam: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
+        if seam == "pending-share-floor":
+            share = args[0] if args else kwargs["pending_share"]
+            self.floor_releases[id(share)] = self.floor_releases.get(id(share), 0) + 1
+            # The rig stamps ``share_id`` as ``miner:<hash>``.
+            return str(getattr(share, "share_id", "")).rsplit(":", 1)[-1].lower()
+        if seam == "floor-index":
+            return "page"
+        value = args[0] if args else kwargs.get("block_hash", "")
+        return str(value).lower()
+
+    def _count(self, seam: str, key: str) -> None:
+        counts = self.calls[seam]
+        counts[key] = counts.get(key, 0) + 1
+
+    def snapshot_calls(self) -> dict[str, dict[str, int]]:
+        return {seam: dict(counts) for seam, counts in self.calls.items()}
+
+    def _expected(self, seam: str, expected: int) -> int:
+        # An aborted apply -- the holder index raising -- has already run the
+        # payout withdrawal for the whole page before it stops, and the
+        # retry then re-runs every step because the abort proved nothing
+        # about which ones completed. That documented repeat of an
+        # idempotent step is the shipped abort contract, not a double
+        # cleanup, so the expectation carries it.
+        if self.fault == "floor-index" and seam == BLOCK_CANDIDATE_COLLAPSE_CLEANUP_PAYOUT_STEP:
+            return 2 * expected
+        return expected
+
+    def excess_calls(self, hashes: Iterable[str]) -> dict[str, int]:
+        """Per seam, how many of ``hashes`` were cleaned up more than once."""
+        wanted = {str(value).lower() for value in hashes}
+        return {
+            seam: sum(
+                1
+                for key in wanted
+                if self.calls[seam].get(key, 0) > self._expected(seam, expected)
+            )
+            for seam, (_owner, _attribute, expected) in _CLEANUP_SEAMS.items()
+            if expected is not None
+        }
+
+    def calls_since(
+        self,
+        earlier: dict[str, dict[str, int]],
+        hashes: Iterable[str],
+    ) -> int:
+        """Successful seam calls for ``hashes`` made after ``earlier`` was taken."""
+        wanted = {str(value).lower() for value in hashes}
+        return sum(
+            counts.get(key, 0) - earlier.get(seam, {}).get(key, 0)
+            for seam, counts in self.calls.items()
+            for key in wanted
+        )
+
+    def missing_calls(self, hashes: Iterable[str]) -> dict[str, int]:
+        """Per seam, how many of ``hashes`` still lack their one cleanup."""
+        wanted = {str(value).lower() for value in hashes}
+        return {
+            seam: sum(1 for key in wanted if self.calls[seam].get(key, 0) < expected)
+            for seam, (_owner, _attribute, expected) in _CLEANUP_SEAMS.items()
+            if expected is not None
+        }
+
+    @property
+    def floor_double_releases(self) -> int:
+        return sum(1 for count in self.floor_releases.values() if count > 1)
+
+
+def _deep_size(value: Any, seen: set[int]) -> int:
+    """Bytes reachable from ``value`` through containers and instance dicts.
+
+    Each object is charged once per ``seen`` set, so a string or holder
+    shared by two records is counted for the first and free for the second
+    -- the same accounting the process pays.
+    """
+    if id(value) in seen:
+        return 0
+    seen.add(id(value))
+    size = sys.getsizeof(value)
+    if isinstance(value, dict):
+        for key, item in value.items():
+            size += _deep_size(key, seen) + _deep_size(item, seen)
+    elif isinstance(value, (tuple, list, set, frozenset)):
+        for item in value:
+            size += _deep_size(item, seen)
+    elif hasattr(value, "__dict__"):
+        size += _deep_size(vars(value), seen)
+    slots = getattr(type(value), "__slots__", ())
+    if isinstance(slots, str):
+        slots = (slots,)
+    for name in slots:
+        if hasattr(value, name):
+            size += _deep_size(getattr(value, name), seen)
+    return size
+
+
+@dataclass(frozen=True)
+class CleanupBacklogReport:
+    """One faulted collapse walk, its backlog, and the recovery that drained it.
+
+    Every figure is from one :meth:`CandidateStormRig.measure_cleanup_backlog`
+    call.  The memory figures are two independent readings of the same
+    state: ``registry_bytes`` walks the shipped registry with
+    ``sys.getsizeof`` (records, their step sets, hash keys, and the exact
+    holder objects they retain, each object charged once), while
+    ``traced_walk_bytes`` is ``tracemalloc``'s change in live traced bytes
+    across the faulted walk -- which also carries everything else the walk
+    allocated (fences, counters, the adopted remainder), so the per-record
+    marginal figure is taken against a ``CLEANUP_FAULT_NONE`` walk of the
+    same storm by :func:`cleanup_backlog_marginal_bytes_per_record`.
+
+    The recovery block is the contract this measurement exists to prove:
+    ``excess_cleanup_calls`` and ``floor_double_releases`` must be zero (no
+    double cleanup), ``missing_cleanup_calls`` must be zero (every owed
+    step ran), ``terminal_rows_adopted`` must be zero (no replay adoption of
+    a terminal row), ``node_offers`` and ``drain_rounds`` must be zero (no
+    re-offer), and ``winner_floor_holder_retained`` must hold when the rig
+    seeded credit shares (no loss of payout-floor authority).
+    """
+
+    fault: str
+    view: str
+    candidates: int
+    credit_shares: bool
+    backlog_max: int
+    # -- the faulted walk --------------------------------------------------
+    walk_seconds: float
+    collapsed_rows: int
+    deferred_records: int
+    preserved_rows: int
+    backpressure_engagements: int
+    backpressure_active: bool
+    pending_share_holders: int
+    terminal_outcome_pins: int
+    oldest_age_seconds: float
+    registry_bytes: int
+    holder_bytes: int
+    registry_bytes_per_record: float
+    holder_bytes_per_holder: float
+    traced_walk_bytes: int
+    traced_owner_bytes: int
+    traced_peak_bytes: int
+    # -- sustained failure -------------------------------------------------
+    sustained_passes: int
+    sustained_failed_passes: int
+    depth_after_sustained: int
+    holders_after_sustained: int
+    pins_after_sustained: int
+    # -- recovery ----------------------------------------------------------
+    recovery_seconds: float
+    recovery_passes: int
+    recovered_records: int
+    retry_records_per_second: float
+    depth_after_recovery: int
+    second_walk_seconds: float
+    collapsed_rows_after_recovery: int
+    excess_cleanup_calls: dict[str, int]
+    missing_cleanup_calls: dict[str, int]
+    post_recovery_cleanup_calls: int
+    floor_double_releases: int
+    terminal_rows_adopted: int
+    node_offers: int
+    drain_rounds: int
+    pending_rows_after_drain: int
+    floor_holders_before: int
+    floor_holders_after: int
+    winner_floor_holder_retained: bool
+
+    @property
+    def recovered_cleanly(self) -> bool:
+        return (
+            self.depth_after_recovery == 0
+            and not any(self.excess_cleanup_calls.values())
+            and not any(self.missing_cleanup_calls.values())
+            and self.post_recovery_cleanup_calls == 0
+            and self.floor_double_releases == 0
+            and self.terminal_rows_adopted == 0
+            and self.node_offers == 0
+            and self.drain_rounds == 0
+        )
+
+
+def cleanup_backlog_marginal_bytes_per_record(
+    faulted: CleanupBacklogReport,
+    clean: CleanupBacklogReport,
+    *,
+    owner_only: bool = False,
+) -> float:
+    """Traced bytes one retry record cost over a clean walk of the same storm.
+
+    ``owner_only`` restricts both readings to allocations made by the
+    block-candidate owner module, which is where the record, its step set
+    and its registry entry are allocated.
+    """
+    if faulted.deferred_records <= 0:
+        return 0.0
+    if owner_only:
+        return (faulted.traced_owner_bytes - clean.traced_owner_bytes) / faulted.deferred_records
+    return (faulted.traced_walk_bytes - clean.traced_walk_bytes) / faulted.deferred_records
+
+
+def _warm_traceback_caches() -> None:
+    """Load the source lines a faulted cleanup's tracebacks will print.
+
+    ``traceback.print_exc`` fills ``linecache`` with the whole source of
+    every frame's file the first time it runs, hundreds of kilobytes that
+    would otherwise land inside the first faulted walk's traced delta.
+    """
+    import lab.prism.block_candidates as block_candidates
+
+    for path in (block_candidates.__file__, __file__):
+        linecache.getlines(path)
+
+
+def _owner_traced_bytes(snapshot: Any) -> int:
+    """Live traced bytes allocated by the block-candidate owner module."""
+    import lab.prism.block_candidates as block_candidates
+
+    filtered = snapshot.filter_traces(
+        (tracemalloc.Filter(True, block_candidates.__file__),)
+    )
+    return sum(statistic.size for statistic in filtered.statistics("filename"))
+
+
 class DecidedHeightRpc(FakeRpc):
     """A chain whose best tip is one storm candidate at the storm height.
 
@@ -426,14 +804,27 @@ class CandidateStormRig:
         candidates: int = OBSERVED_TESTNET_CANDIDATE_STORM,
         queue_depth: int = MAX_PENDING_BLOCK_CANDIDATES,
         quiet: bool = True,
+        credit_shares: bool = False,
+        backlog_max: int | None = None,
     ) -> None:
         if candidates <= 0:
             raise ValueError("candidates must be positive")
         if queue_depth <= 0:
             raise ValueError("queue_depth must be positive")
+        if backlog_max is not None and backlog_max <= 0:
+            raise ValueError("backlog_max must be positive")
         self.candidates = candidates
         self.queue_depth = queue_depth
         self.quiet = quiet
+        # Issue #198. ``credit_shares`` seeds every candidate as credit-bearing
+        # and registers its pending share on the writer's floor, so the
+        # collapse cleanup has real floor authority to release and the
+        # decided winner has real authority to keep; the restart view adopts
+        # holders through the shipped decode exactly as production does.
+        # ``backlog_max`` pins the cleanup-retry admission bound on every
+        # coordinator the rig owns (the shipped default otherwise).
+        self.credit_shares = bool(credit_shares)
+        self.backlog_max = backlog_max
         self.ledger = SingleWriterShareLedger()
         self.live_server: Any | None = None
         self.restarted_server: Any | None = None
@@ -451,6 +842,8 @@ class CandidateStormRig:
         # This is a component oracle, not a pacing test: every wakeup must be
         # re-offerable in the same round it was parked.
         server.block_candidate_retry_initial_seconds = 0.0
+        if self.backlog_max is not None:
+            server.block_candidate_cleanup_retry_backlog_max = int(self.backlog_max)
         if self.decided_rpc is not None:
             server.rpc = self.decided_rpc
         return server, state
@@ -459,6 +852,15 @@ class CandidateStormRig:
         if not self.quiet:
             return nullcontext()
         return redirect_stdout(StringIO())
+
+    def _silence_all(self) -> ContextManager[Any]:
+        """Silence both streams: a faulted cleanup prints tracebacks to stderr."""
+        if not self.quiet:
+            return nullcontext()
+        stack = ExitStack()
+        stack.enter_context(redirect_stdout(StringIO()))
+        stack.enter_context(redirect_stderr(StringIO()))
+        return stack
 
     def _candidate(self, server: Any, state: Any, index: int) -> tuple[Any, Any]:
         block_hash = f"{index:064x}"
@@ -486,6 +888,7 @@ class CandidateStormRig:
                 block_pass=True,
             ),
             pending_share=pending,
+            credit_share_on_accept=self.credit_shares,
         )
         return candidate, (pending, server.block_candidate_intent(candidate))
 
@@ -506,6 +909,13 @@ class CandidateStormRig:
             for candidate in candidates
         ]
         self.ledger.append_batch(durable_records)
+        if self.credit_shares:
+            # The live stamp path registers a credit-bearing share on the
+            # floor before its candidate is admitted; the rig appends the
+            # batch directly, so it registers the same holder here.
+            writer = server._ensure_share_writer_service()
+            for candidate in candidates:
+                writer.adopt_pending_share(candidate.pending_share)
         with self._silence():
             for candidate in candidates:
                 server.enqueue_block_candidate(candidate)
@@ -1256,6 +1666,287 @@ class CandidateStormRig:
             wall_seconds=time.monotonic() - started,
         )
 
+    # -- cleanup-retry backlog (issue #198) ---------------------------------
+
+    def _pending_hashes(self) -> set[str]:
+        return {
+            str(row["block_hash"]).lower()
+            for row in self.ledger.pending_block_candidate_rows(
+                limit=self.candidates + 1
+            )
+        }
+
+    def _registry_bytes(self, server: Any) -> tuple[int, int, int]:
+        """(registry bytes, holder bytes within them, retained holders).
+
+        Read under the coordinator lock like every other registry reader.
+        Holders are charged inside the registry total first, then measured
+        again on their own so the per-holder figure can be reported apart
+        from the per-record one.
+        """
+        service = server._ensure_block_candidate_service()
+        with server.lock:
+            registry = service._block_candidate_collapse_cleanup_retries
+            total = _deep_size(registry, set())
+            holders: dict[int, Any] = {}
+            for record in registry.values():
+                for share in record.shares:
+                    holders[id(share)] = share
+            holder_seen: set[int] = set()
+            holder_bytes = sum(_deep_size(share, holder_seen) for share in holders.values())
+        return total, holder_bytes, len(holders)
+
+    def _collapse_walk(self, server: Any) -> tuple[set[str], float, int]:
+        """Run the shipped enumeration walk; return (rows it won, seconds, adoptions)."""
+        before = self._pending_hashes()
+        started = time.monotonic()
+        with self._silence_all():
+            server._note_block_replay_enumeration_owed()
+            adopted = int(server.replay_pending_block_candidates())
+        elapsed = time.monotonic() - started
+        return before - self._pending_hashes(), elapsed, adopted
+
+    def _drain_backpressured_replay_page(
+        self,
+        server: Any,
+        *,
+        stop_before_hash: str,
+    ) -> set[str]:
+        """Drive the bounded spill page through the shipped dequeue collapse."""
+        service = server._ensure_block_candidate_service()
+        if not service._block_replay_backpressure_drain_pending:
+            return set()
+        terminalized: set[str] = set()
+        replay_queue = service._block_replay_candidate_queue
+        # The queue cannot grow in this synchronous rig. Bound the driver by
+        # the captured page size so a failed disposition cannot spin.
+        rounds = replay_queue.qsize()
+        with self._silence_all():
+            for _ in range(rounds):
+                if replay_queue.empty():
+                    break
+                candidate = replay_queue.queue[0]
+                block_hash = str(candidate.submission.block_hash_hex).lower()
+                if block_hash == stop_before_hash:
+                    break
+                row = self.ledger._block_candidate_outbox[block_hash]
+                before = str(row["state"])
+                if not server.submit_next_block_candidate(defer_accounting=True):
+                    break
+                self._run_block_accounting_tasks(server)
+                after = str(row["state"])
+                if before == "pending" and after != "pending":
+                    terminalized.add(block_hash)
+        return terminalized
+
+    def measure_cleanup_backlog(
+        self,
+        fault: str,
+        *,
+        view: str = "restart",
+        sustained_passes: int = 64,
+        trace_memory: bool = True,
+    ) -> CleanupBacklogReport:
+        """Drive the shipped collapse under one cleanup fault, then recover it.
+
+        Phases, each on the shipped code path:
+
+        1. Seed the storm (and restart, for the restart view), decide the
+           height, and install ``fault`` at its seam.
+        2. Run the enumeration walk.  Every row the fenced write wins whose
+           cleanup the fault breaks becomes one retry record; rows the
+           admission bound declines stay durable and are counted as
+           preserved.  The registry is measured in place.
+        3. With the fault still on, run up to ``sustained_passes`` retry
+           passes: each must fail, re-register its record, and leave depth,
+           holders and pins unchanged -- the backlog is never shed.
+        4. Heal the fault and drain the backlog through the shipped retry
+           pass until it reports nothing due, timing the drain.
+        5. Drain the one replay page adopted at backpressure through the
+           shipped dequeue collapse, run the walk again so admission can
+           resume over whatever remains durable, then drive ``drain_per_row``
+           over every queued wakeup to prove no terminal row reaches the
+           node.
+
+        ``view`` selects the coordinator: ``live`` holds the storm's first
+        ``queue_depth`` wakeups in the bounded queue with the rest coalesced,
+        so only that many holders can be retained; ``restart`` holds every
+        row in the replay queue, so every record retains a holder -- the
+        heavier and more instructive case.
+        """
+        if fault != CLEANUP_FAULT_NONE and fault not in CLEANUP_FAULTS:
+            raise ValueError(f"unknown cleanup fault: {fault}")
+        if view not in ("live", "restart"):
+            raise ValueError("view must be 'live' or 'restart'")
+        if self.live_server is None:
+            self.seed_live()
+        if view == "restart" and self.restarted_server is None:
+            self.restart_and_enumerate()
+        server = self.restarted_server if view == "restart" else self.live_server
+        assert server is not None
+        winner = (
+            self.decide_height()
+            if self.decided_rpc is None
+            else self.decided_rpc.winner_hash
+        )
+        service = server._ensure_block_candidate_service()
+        service._ensure_block_replay_state()
+        service._ensure_block_candidate_disposition_state()
+        writer = server._ensure_share_writer_service()
+        floor_before = len(writer._pending_share_commit_floor)
+        injector = CleanupFaultInjector(server, fault)
+        injector.install()
+        traced_walk = -1
+        traced_owner = -1
+        traced_peak = -1
+        try:
+            counts_before = service.block_candidate_collapse_snapshot()
+            with server.lock:
+                inflight_before = set(service._block_replay_inflight_hashes)
+            if trace_memory:
+                _warm_traceback_caches()
+                gc.collect()
+                tracemalloc.start()
+                tracemalloc.reset_peak()
+                traced_before = tracemalloc.get_traced_memory()[0]
+                owner_before = _owner_traced_bytes(tracemalloc.take_snapshot())
+            collapsed, walk_seconds, _adopted = self._collapse_walk(server)
+            if trace_memory:
+                gc.collect()
+                traced_after, traced_peak_after = tracemalloc.get_traced_memory()
+                owner_after = _owner_traced_bytes(tracemalloc.take_snapshot())
+                tracemalloc.stop()
+                traced_walk = traced_after - traced_before
+                traced_owner = owner_after - owner_before
+                traced_peak = traced_peak_after - traced_before
+            counts_after = service.block_candidate_collapse_snapshot()
+            snapshot = service.collapsed_candidate_cleanup_backlog_snapshot()
+            registry_bytes, holder_bytes, holders = self._registry_bytes(server)
+            records = int(snapshot["depth"])
+            # -- sustained failure ------------------------------------------
+            sustained = 0
+            failed_before = counts_after["cleanup_retry_failed"]
+            with self._silence_all():
+                for _ in range(min(int(sustained_passes), records)):
+                    if not service._run_one_collapsed_block_candidate_cleanup_retry():
+                        break
+                    sustained += 1
+            sustained_failed = (
+                service.block_candidate_collapse_snapshot()["cleanup_retry_failed"]
+                - failed_before
+            )
+            after_sustained = service.collapsed_candidate_cleanup_backlog_snapshot()
+            # -- recovery ---------------------------------------------------
+            injector.heal()
+            recovered_before = service.block_candidate_collapse_snapshot()[
+                "cleanup_recovered"
+            ]
+            passes = 0
+            started = time.monotonic()
+            with self._silence_all():
+                while service._run_one_collapsed_block_candidate_cleanup_retry():
+                    passes += 1
+            recovery_seconds = time.monotonic() - started
+            recovered = (
+                service.block_candidate_collapse_snapshot()["cleanup_recovered"]
+                - recovered_before
+            )
+            after_recovery = service.collapsed_candidate_cleanup_backlog_snapshot()
+            recovered_calls = injector.snapshot_calls()
+            resumed_at_dequeue = self._drain_backpressured_replay_page(
+                server,
+                stop_before_hash=winner,
+            )
+            collapsed_after, second_walk_seconds, _adopted = self._collapse_walk(server)
+            with server.lock:
+                inflight_after = set(service._block_replay_inflight_hashes)
+            every_collapsed = collapsed | resumed_at_dequeue | collapsed_after
+            excess = injector.excess_calls(every_collapsed)
+            missing = injector.missing_calls(every_collapsed)
+            terminal_adopted = len((inflight_after - inflight_before) & every_collapsed)
+            drain = self.drain_per_row(server, stop_before_hash=winner)
+            # A hash whose record was discharged must never be cleaned up
+            # again: not by the second walk, not by the queued duplicates
+            # the drain drops.
+            post_recovery_calls = injector.calls_since(recovered_calls, collapsed)
+        finally:
+            if trace_memory and tracemalloc.is_tracing():
+                tracemalloc.stop()
+            injector.uninstall()
+        # The winner's holder is the one the shipped path still owns: in the
+        # restart view the object adopted at restart, in the live view the
+        # object the first walk's recovery enumeration adopted (the seeded
+        # live wakeup coalesced and was never queued). Looked up after the
+        # walks for exactly that reason.
+        winner_share = next(
+            (
+                item.pending_share
+                for queue_obj in (
+                    service.candidate_queue,
+                    service._block_replay_candidate_queue,
+                )
+                for item in list(queue_obj.queue)
+                if str(item.submission.block_hash_hex).lower() == winner
+            ),
+            None,
+        )
+        floor_after = len(writer._pending_share_commit_floor)
+        return CleanupBacklogReport(
+            fault=fault,
+            view=view,
+            candidates=self.candidates,
+            credit_shares=self.credit_shares,
+            backlog_max=int(snapshot["backlog_max"]),
+            walk_seconds=walk_seconds,
+            collapsed_rows=len(collapsed),
+            deferred_records=records,
+            preserved_rows=(
+                counts_after["backlog_deferred"] - counts_before["backlog_deferred"]
+            ),
+            backpressure_engagements=int(snapshot["backpressure_engagements"]),
+            backpressure_active=bool(snapshot["backpressure_active"]),
+            pending_share_holders=int(snapshot["pending_share_holders"]),
+            terminal_outcome_pins=int(snapshot["terminal_outcome_pins"]),
+            oldest_age_seconds=float(snapshot["oldest_age_seconds"]),
+            registry_bytes=registry_bytes,
+            holder_bytes=holder_bytes,
+            registry_bytes_per_record=(registry_bytes / records) if records else 0.0,
+            holder_bytes_per_holder=(holder_bytes / holders) if holders else 0.0,
+            traced_walk_bytes=traced_walk,
+            traced_owner_bytes=traced_owner,
+            traced_peak_bytes=traced_peak,
+            sustained_passes=sustained,
+            sustained_failed_passes=int(sustained_failed),
+            depth_after_sustained=int(after_sustained["depth"]),
+            holders_after_sustained=int(after_sustained["pending_share_holders"]),
+            pins_after_sustained=int(after_sustained["terminal_outcome_pins"]),
+            recovery_seconds=recovery_seconds,
+            recovery_passes=passes,
+            recovered_records=int(recovered),
+            retry_records_per_second=(
+                (recovered / recovery_seconds) if recovery_seconds > 0 else 0.0
+            ),
+            depth_after_recovery=int(after_recovery["depth"]),
+            second_walk_seconds=second_walk_seconds,
+            collapsed_rows_after_recovery=len(
+                resumed_at_dequeue | collapsed_after
+            ),
+            excess_cleanup_calls=excess,
+            missing_cleanup_calls=missing,
+            post_recovery_cleanup_calls=post_recovery_calls,
+            floor_double_releases=injector.floor_double_releases,
+            terminal_rows_adopted=terminal_adopted,
+            node_offers=int(self.decided_rpc.calls.get("submitblock", 0)),
+            drain_rounds=drain.rounds,
+            pending_rows_after_drain=drain.pending_rows,
+            floor_holders_before=floor_before,
+            floor_holders_after=floor_after,
+            winner_floor_holder_retained=(
+                winner_share is not None
+                and id(winner_share) in writer._pending_share_commit_floor
+            ),
+        )
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1285,6 +1976,38 @@ def main() -> int:
         action="store_true",
         help="with --decide, also drive the shipped per-row disposition path "
         "over every sibling on the restarted coordinator and report its cost",
+    )
+    parser.add_argument(
+        "--cleanup-fault",
+        action="append",
+        choices=(CLEANUP_FAULT_NONE, "all", *CLEANUP_FAULTS),
+        help="issue #198: run the shipped collapse walk under this injected "
+        "cleanup fault on a fresh storm, measure the retry backlog, and prove "
+        "its recovery; repeatable, 'all' runs the clean baseline and every fault",
+    )
+    parser.add_argument(
+        "--cleanup-view",
+        choices=("live", "restart"),
+        default="restart",
+        help="coordinator view the cleanup-fault runs use (default: restart)",
+    )
+    parser.add_argument(
+        "--backlog-max",
+        type=int,
+        default=None,
+        help="pin the cleanup-retry admission bound for the cleanup-fault runs "
+        f"(default: the shipped {DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX})",
+    )
+    parser.add_argument(
+        "--credit-shares",
+        action="store_true",
+        help="seed credit-bearing candidates so the cleanup-fault runs exercise "
+        "real pending-share floor authority",
+    )
+    parser.add_argument(
+        "--no-tracemalloc",
+        action="store_true",
+        help="skip the tracemalloc reading in the cleanup-fault runs",
     )
     args = parser.parse_args()
     rig = CandidateStormRig(
@@ -1335,6 +2058,54 @@ def main() -> int:
                 "ledger_attempt_marks": drain.ledger_attempt_marks,
                 "wall_seconds": drain.wall_seconds,
             }
+    if args.cleanup_fault:
+        faults: list[str] = []
+        for fault in args.cleanup_fault:
+            if fault == "all":
+                faults.extend([CLEANUP_FAULT_NONE, *CLEANUP_FAULTS])
+            else:
+                faults.append(fault)
+        runs: list[dict[str, Any]] = []
+        clean: CleanupBacklogReport | None = None
+        for fault in dict.fromkeys(faults):
+            # A fresh storm per run: the backlog and its memory are only
+            # comparable across runs that started from the same state.
+            fault_rig = CandidateStormRig(
+                candidates=args.candidates,
+                queue_depth=args.queue_depth,
+                quiet=not args.verbose,
+                credit_shares=args.credit_shares,
+                backlog_max=args.backlog_max,
+            )
+            measured = fault_rig.measure_cleanup_backlog(
+                fault,
+                view=args.cleanup_view,
+                trace_memory=not args.no_tracemalloc,
+            )
+            if fault == CLEANUP_FAULT_NONE:
+                clean = measured
+            entry = asdict(measured)
+            entry["recovered_cleanly"] = measured.recovered_cleanly
+            entry["traced_marginal_bytes_per_record"] = (
+                cleanup_backlog_marginal_bytes_per_record(measured, clean)
+                if clean is not None and fault != CLEANUP_FAULT_NONE
+                else None
+            )
+            entry["traced_owner_marginal_bytes_per_record"] = (
+                cleanup_backlog_marginal_bytes_per_record(
+                    measured,
+                    clean,
+                    owner_only=True,
+                )
+                if clean is not None and fault != CLEANUP_FAULT_NONE
+                else None
+            )
+            runs.append(entry)
+        report["cleanup_backlog"] = {
+            "python": sys.version.split()[0],
+            "platform": sys.platform,
+            "runs": runs,
+        }
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 

@@ -10,7 +10,9 @@ Prometheus document byte-for-byte for identical inputs.
 
 from __future__ import annotations
 
+from contextlib import redirect_stdout
 from decimal import Decimal
+from io import StringIO
 from pathlib import Path
 import tempfile
 import time
@@ -20,6 +22,7 @@ from unittest import mock
 
 from lab.prism.coordinator_config import (
     DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX,
+    DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX,
     DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS,
     DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS,
 )
@@ -205,6 +208,52 @@ def reference_block_submitter_metrics_lines(server) -> list[str]:
             for outcome in PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES
         ],
     ]
+
+
+def reference_block_candidate_cleanup_backlog_metrics_lines(server) -> list[str]:
+    # Issue #198. Pinned deliberately: seven unlabelled single-series
+    # families over the B1 owner's fixed-key backlog snapshot. Adding a
+    # label, a key, or a family here is a metrics-contract change and must
+    # be mirrored in docs/prism-overload-alerts.md.
+    snapshot = (
+        server._ensure_block_candidate_service()
+        .collapsed_candidate_cleanup_backlog_snapshot()
+    )
+    return [
+        "# HELP qbit_prism_block_candidate_cleanup_retry_backlog Durably terminal collapsed block candidates whose in-memory cleanup is still owed and retried by the accounting lane.",
+        "# TYPE qbit_prism_block_candidate_cleanup_retry_backlog gauge",
+        f"qbit_prism_block_candidate_cleanup_retry_backlog {int(snapshot['depth'])}",
+        "# HELP qbit_prism_block_candidate_cleanup_retry_backlog_max Configured cleanup-retry backlog depth at which the decided-height collapse stops admitting rows to bulk terminalization.",
+        "# TYPE qbit_prism_block_candidate_cleanup_retry_backlog_max gauge",
+        f"qbit_prism_block_candidate_cleanup_retry_backlog_max {int(snapshot['backlog_max'])}",
+        "# HELP qbit_prism_block_candidate_cleanup_retry_oldest_seconds Age of the oldest owed collapse cleanup since it was first deferred, or -1 when none is owed.",
+        "# TYPE qbit_prism_block_candidate_cleanup_retry_oldest_seconds gauge",
+        f"qbit_prism_block_candidate_cleanup_retry_oldest_seconds {float(snapshot['oldest_age_seconds']):.6f}",
+        "# HELP qbit_prism_block_candidate_cleanup_retry_pending_share_holders Pending-share floor holders retained by owed collapse cleanups, by exact object identity.",
+        "# TYPE qbit_prism_block_candidate_cleanup_retry_pending_share_holders gauge",
+        f"qbit_prism_block_candidate_cleanup_retry_pending_share_holders {int(snapshot['pending_share_holders'])}",
+        "# HELP qbit_prism_block_candidate_cleanup_retry_terminal_outcome_pins Terminal-outcome fences the cleanup-retry backlog pins against eviction.",
+        "# TYPE qbit_prism_block_candidate_cleanup_retry_terminal_outcome_pins gauge",
+        f"qbit_prism_block_candidate_cleanup_retry_terminal_outcome_pins {int(snapshot['terminal_outcome_pins'])}",
+        "# HELP qbit_prism_block_candidate_cleanup_backpressure_active Whether the cleanup-retry backlog is at its bound and bulk terminalization is refusing new rows.",
+        "# TYPE qbit_prism_block_candidate_cleanup_backpressure_active gauge",
+        f"qbit_prism_block_candidate_cleanup_backpressure_active {1 if snapshot['backpressure_active'] else 0}",
+        "# HELP qbit_prism_block_candidate_cleanup_backpressure_total Occasions on which the cleanup-retry backlog bound preserved at least one row from bulk terminalization.",
+        "# TYPE qbit_prism_block_candidate_cleanup_backpressure_total counter",
+        f"qbit_prism_block_candidate_cleanup_backpressure_total {int(snapshot['backpressure_engagements'])}",
+    ]
+
+
+# The closed family set issue #198 exports; a test pins the renderer to it.
+BLOCK_CANDIDATE_CLEANUP_BACKLOG_METRIC_FAMILIES = (
+    ("qbit_prism_block_candidate_cleanup_retry_backlog", "gauge"),
+    ("qbit_prism_block_candidate_cleanup_retry_backlog_max", "gauge"),
+    ("qbit_prism_block_candidate_cleanup_retry_oldest_seconds", "gauge"),
+    ("qbit_prism_block_candidate_cleanup_retry_pending_share_holders", "gauge"),
+    ("qbit_prism_block_candidate_cleanup_retry_terminal_outcome_pins", "gauge"),
+    ("qbit_prism_block_candidate_cleanup_backpressure_active", "gauge"),
+    ("qbit_prism_block_candidate_cleanup_backpressure_total", "counter"),
+)
 
 
 def reference_landing_observability_metrics_lines(server) -> list[str]:
@@ -1248,6 +1297,7 @@ def reference_render_metrics_payload(server) -> str:
     lines.extend(reference_shutdown_metrics_lines(server))
     lines.extend(reference_coordinator_lock_metrics_lines(server))
     lines.extend(reference_block_submitter_metrics_lines(server))
+    lines.extend(reference_block_candidate_cleanup_backlog_metrics_lines(server))
     lines.extend(reference_share_ack_metrics_lines(server))
     lines.extend(server.ctv_fanout_broadcaster_metrics_lines())
     lines.extend(server.vardiff_idle_metrics_lines())
@@ -1325,6 +1375,24 @@ class MetricsRenderParityTests(unittest.TestCase):
             "ab" * 32,
             result="published",
         )
+        # Issue #198's cleanup-retry backlog, seeded through the shipped
+        # deferral and backpressure entry points: one owed hash carrying one
+        # retained holder and a published fence, and one engagement that
+        # preserved two rows, so every new family renders a non-zero value.
+        service._record_block_candidate_terminal_outcome("cd" * 32, accepted=False)
+        service._defer_collapsed_candidate_cleanup(
+            "cd" * 32,
+            ("retry-state",),
+            shares=(SimpleNamespace(share_id="miner-a:" + "cd" * 32),),
+        )
+        with redirect_stdout(StringIO()):
+            service._note_block_candidate_cleanup_backpressure(
+                caller="replay-page",
+                rows=2,
+                admitted=0,
+                depth=1,
+                maximum=1,
+            )
         server._record_block_ledger_call(
             call_class="landing",
             budget_seconds=30.0,
@@ -1453,8 +1521,24 @@ class MetricsRenderParityTests(unittest.TestCase):
             'qbit_prism_lease_heartbeat_policy_seconds{term="scheduler_slack"}',
             'qbit_prism_lease_heartbeat_policy_seconds{term="exit_envelope"}',
             'qbit_prism_lease_heartbeat_policy_seconds{term="server_proven_cap"}',
+            "qbit_prism_block_candidate_cleanup_retry_backlog 1",
+            f"qbit_prism_block_candidate_cleanup_retry_backlog_max {DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX}",
+            "qbit_prism_block_candidate_cleanup_retry_pending_share_holders 1",
+            "qbit_prism_block_candidate_cleanup_retry_terminal_outcome_pins 1",
+            "qbit_prism_block_candidate_cleanup_backpressure_active 0",
+            "qbit_prism_block_candidate_cleanup_backpressure_total 1",
+            'qbit_prism_block_candidate_collapse_total{outcome="backlog_deferred"} 2',
         ):
             self.assertIn(needle, actual)
+        # The oldest-age gauge is a real elapsed interval, not the -1
+        # sentinel, once a record is owed.
+        oldest = [
+            line
+            for line in actual.splitlines()
+            if line.startswith("qbit_prism_block_candidate_cleanup_retry_oldest_seconds ")
+        ]
+        self.assertEqual(len(oldest), 1)
+        self.assertGreaterEqual(float(oldest[0].split()[1]), 0.0)
 
     def test_renderer_bypasses_cached_metrics_path(self) -> None:
         server = self._seeded_coordinator()
@@ -1717,6 +1801,91 @@ class MetricsRendererTests(unittest.TestCase):
         self.assertIn(
             "qbit_prism_accepted_block_preview_publication_seconds_count"
             '{result="degraded"} 0',
+            lines,
+        )
+
+    def test_cleanup_backlog_formatter_consumes_one_owner_snapshot(self) -> None:
+        """Issue #198: one snapshot read, seven unlabelled families."""
+        snapshot_calls = 0
+
+        def snapshot() -> dict[str, object]:
+            nonlocal snapshot_calls
+            snapshot_calls += 1
+            return {
+                "depth": 3,
+                "backlog_max": 4096,
+                "oldest_age_seconds": 12.5,
+                "pending_share_holders": 2,
+                "terminal_outcome_pins": 3,
+                "backpressure_active": False,
+                "backpressure_engagements": 4,
+            }
+
+        port = SimpleNamespace(
+            _ensure_block_candidate_service=lambda: SimpleNamespace(
+                collapsed_candidate_cleanup_backlog_snapshot=snapshot,
+            ),
+        )
+        lines = MetricsRenderer(port).block_candidate_cleanup_backlog_metrics_lines()  # type: ignore[arg-type]
+
+        self.assertEqual(snapshot_calls, 1)
+        self.assertIn("qbit_prism_block_candidate_cleanup_retry_backlog 3", lines)
+        self.assertIn("qbit_prism_block_candidate_cleanup_retry_backlog_max 4096", lines)
+        self.assertIn(
+            "qbit_prism_block_candidate_cleanup_retry_oldest_seconds 12.500000",
+            lines,
+        )
+        self.assertIn(
+            "qbit_prism_block_candidate_cleanup_retry_pending_share_holders 2",
+            lines,
+        )
+        self.assertIn(
+            "qbit_prism_block_candidate_cleanup_retry_terminal_outcome_pins 3",
+            lines,
+        )
+        self.assertIn("qbit_prism_block_candidate_cleanup_backpressure_active 0", lines)
+        self.assertIn("qbit_prism_block_candidate_cleanup_backpressure_total 4", lines)
+        # Fixed cardinality: no series in the family carries a label.
+        for line in lines:
+            if not line.startswith("#"):
+                self.assertNotIn("{", line)
+        self.assertEqual(
+            [
+                (line.split()[2], line.split()[3])
+                for line in lines
+                if line.startswith("# TYPE ")
+            ],
+            list(BLOCK_CANDIDATE_CLEANUP_BACKLOG_METRIC_FAMILIES),
+        )
+
+    def test_cleanup_backlog_families_render_from_the_shipped_owner(self) -> None:
+        """An empty backlog renders the -1 age sentinel and the default bound."""
+        server = support.coordinator()
+        lines = MetricsRenderer(server).block_candidate_cleanup_backlog_metrics_lines()
+        self.assertIn("qbit_prism_block_candidate_cleanup_retry_backlog 0", lines)
+        self.assertIn(
+            "qbit_prism_block_candidate_cleanup_retry_backlog_max "
+            f"{DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX}",
+            lines,
+        )
+        self.assertIn(
+            "qbit_prism_block_candidate_cleanup_retry_oldest_seconds -1.000000",
+            lines,
+        )
+        self.assertIn("qbit_prism_block_candidate_cleanup_backpressure_active 0", lines)
+        # A pinned coordinator bound is the one exported, so an alert can be
+        # written as a ratio against the running configuration.
+        server.block_candidate_cleanup_retry_backlog_max = 12
+        lines = MetricsRenderer(server).block_candidate_cleanup_backlog_metrics_lines()
+        self.assertIn("qbit_prism_block_candidate_cleanup_retry_backlog_max 12", lines)
+        self.assertEqual(lines, reference_block_candidate_cleanup_backlog_metrics_lines(server))
+
+    def test_collapse_counter_carries_the_backlog_deferred_outcome(self) -> None:
+        self.assertIn("backlog_deferred", PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES)
+        server = support.coordinator()
+        lines = MetricsRenderer(server).block_submitter_metrics_lines()
+        self.assertIn(
+            'qbit_prism_block_candidate_collapse_total{outcome="backlog_deferred"} 0',
             lines,
         )
 

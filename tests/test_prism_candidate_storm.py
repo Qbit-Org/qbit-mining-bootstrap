@@ -6,14 +6,23 @@ from __future__ import annotations
 import unittest
 
 from lab.prism.block_candidates import (
+    BLOCK_CANDIDATE_COLLAPSE_CLEANUP_STEPS,
     MAX_BLOCK_REPLAY_ENUMERATION_ROWS,
     MAX_PENDING_BLOCK_CANDIDATES,
 )
+from lab.prism.coordinator_config import (
+    DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX,
+)
 from tests.prism_candidate_storm import (
+    CLEANUP_FAULT_NONE,
+    CLEANUP_FAULTS,
     OBSERVED_TESTNET_CANDIDATE_STORM,
     PERTURBATIONS,
     STORM_PARENT_HASH,
     CandidateStormRig,
+    CleanupBacklogReport,
+    CleanupFaultInjector,
+    cleanup_backlog_marginal_bytes_per_record,
 )
 
 # A storm large enough to overflow the live queue by 2x and to exercise the
@@ -973,6 +982,168 @@ class DecidedCandidateStormTests(unittest.TestCase):
             1,
         )
         self.assertEqual(selected, (rig.block_hashes[-1], False))
+
+
+class CleanupBacklogStormTests(unittest.TestCase):
+    """Issue #198: wall-clock corroboration at the observed cardinality.
+
+    The deterministic contract lives in ``tests/test_prism_block_candidates``;
+    these runs drive the shipped collapse walk over 3,120 durable rows under
+    each injected cleanup dependency fault, hold the fault for a bounded run
+    of failing retries, heal it, and require the rig's recovery proof to
+    hold: the backlog drains through the shipped retry pass, every collapsed
+    hash is cleaned up exactly once, no terminal row is replay-adopted or
+    re-offered, and the decided winner keeps its pending-share floor
+    authority.  Wall-clock bounds are deliberately loose; they corroborate
+    the measured throughput rather than pin it.
+    """
+
+    SIBLINGS = OBSERVED_TESTNET_CANDIDATE_STORM - 1
+
+    def _assert_recovered(self, report: CleanupBacklogReport) -> None:
+        self.assertEqual(report.depth_after_recovery, 0, report)
+        self.assertEqual(report.recovered_records, report.deferred_records, report)
+        self.assertEqual(report.recovery_passes, report.deferred_records, report)
+        self.assertEqual(set(report.excess_cleanup_calls.values()), {0}, report)
+        self.assertEqual(set(report.missing_cleanup_calls.values()), {0}, report)
+        self.assertEqual(report.post_recovery_cleanup_calls, 0, report)
+        self.assertEqual(report.floor_double_releases, 0, report)
+        self.assertEqual(report.terminal_rows_adopted, 0, report)
+        self.assertEqual(report.node_offers, 0, report)
+        self.assertEqual(report.drain_rounds, 0, report)
+        self.assertEqual(report.pending_rows_after_drain, 1, report)
+        self.assertTrue(report.recovered_cleanly, report)
+
+    def test_the_fault_vocabulary_covers_every_cleanup_dependency(self) -> None:
+        self.assertEqual(
+            set(CLEANUP_FAULTS),
+            set(BLOCK_CANDIDATE_COLLAPSE_CLEANUP_STEPS) | {"floor-index"},
+        )
+        rig = CandidateStormRig(candidates=DECIDED_STORM_CANDIDATES)
+        rig.seed_live()
+        with self.assertRaises(ValueError):
+            CleanupFaultInjector(rig.live_server, "not-a-cleanup-dependency")
+        with self.assertRaises(ValueError):
+            rig.measure_cleanup_backlog("not-a-cleanup-dependency")
+
+    def test_every_cleanup_dependency_fault_at_the_observed_storm_recovers(
+        self,
+    ) -> None:
+        for fault in CLEANUP_FAULTS:
+            with self.subTest(fault=fault):
+                rig = CandidateStormRig(credit_shares=True)
+                report = rig.measure_cleanup_backlog(
+                    fault,
+                    view="restart",
+                    sustained_passes=16,
+                )
+                # The shipped bound absorbs the whole storm: every sibling
+                # is collapsed and every one of them owes cleanup.
+                self.assertEqual(report.backlog_max, DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX)
+                self.assertEqual(report.collapsed_rows, self.SIBLINGS)
+                self.assertEqual(report.deferred_records, self.SIBLINGS)
+                self.assertEqual(report.preserved_rows, 0)
+                self.assertEqual(report.backpressure_engagements, 0)
+                self.assertFalse(report.backpressure_active)
+                self.assertEqual(report.terminal_outcome_pins, self.SIBLINGS)
+                # The restart view holds every row in the replay queue, so
+                # every record retains its holder -- except under the
+                # index abort, which never got to read them.
+                expected_holders = 0 if fault == "floor-index" else self.SIBLINGS
+                self.assertEqual(report.pending_share_holders, expected_holders)
+                self.assertGreater(report.registry_bytes_per_record, 0.0)
+                self.assertGreaterEqual(report.oldest_age_seconds, 0.0)
+                # Sustained failure sheds nothing.
+                self.assertEqual(report.sustained_passes, 16)
+                self.assertEqual(report.sustained_failed_passes, 16)
+                self.assertEqual(report.depth_after_sustained, self.SIBLINGS)
+                self.assertEqual(report.holders_after_sustained, expected_holders)
+                self.assertEqual(report.pins_after_sustained, self.SIBLINGS)
+                # Recovery, and the floor authority it leaves behind.
+                self._assert_recovered(report)
+                self.assertEqual(report.collapsed_rows_after_recovery, 0)
+                self.assertEqual(report.floor_holders_before, OBSERVED_TESTNET_CANDIDATE_STORM)
+                self.assertEqual(report.floor_holders_after, 1)
+                self.assertTrue(report.winner_floor_holder_retained)
+                # Wall-clock corroboration of the measured drain rate.
+                self.assertLess(report.recovery_seconds, 60.0)
+                self.assertGreater(report.retry_records_per_second, 50.0)
+
+    def test_the_bound_engages_at_the_observed_storm_and_admission_resumes(
+        self,
+    ) -> None:
+        bound = MAX_BLOCK_REPLAY_ENUMERATION_ROWS
+        rig = CandidateStormRig(credit_shares=True, backlog_max=bound)
+        report = rig.measure_cleanup_backlog(
+            "retry-state",
+            view="restart",
+            sustained_passes=16,
+        )
+        self.assertEqual(report.backlog_max, bound)
+        # The first page fills the backlog; exactly one following page is
+        # preserved and adopted before pagination pauses for it to drain.
+        self.assertEqual(report.collapsed_rows, bound)
+        self.assertEqual(report.deferred_records, bound)
+        self.assertEqual(
+            report.preserved_rows,
+            MAX_BLOCK_REPLAY_ENUMERATION_ROWS,
+        )
+        self.assertEqual(report.backpressure_engagements, 1)
+        self.assertTrue(report.backpressure_active)
+        self.assertEqual(report.pending_share_holders, bound)
+        self.assertEqual(report.terminal_outcome_pins, bound)
+        self.assertEqual(report.depth_after_sustained, bound)
+        self.assertEqual(report.holders_after_sustained, bound)
+        # Once drained, the next walk collapses everything the bound
+        # preserved, and the rig's recovery proof still holds over the
+        # union.
+        self._assert_recovered(report)
+        self.assertEqual(report.collapsed_rows_after_recovery, self.SIBLINGS - bound)
+        self.assertEqual(report.floor_holders_after, 1)
+        self.assertTrue(report.winner_floor_holder_retained)
+
+    def test_the_live_view_retains_only_the_queued_holders(self) -> None:
+        """Only a queued wakeup owns a holder the cleanup can retain."""
+        rig = CandidateStormRig()
+        report = rig.measure_cleanup_backlog(
+            "pending-share-floor",
+            view="live",
+            sustained_passes=8,
+        )
+        self.assertEqual(report.collapsed_rows, self.SIBLINGS)
+        # The coalesced siblings had no in-memory object, so their cleanup
+        # had no floor step to fail: only the bounded queue's wakeups owe.
+        self.assertEqual(report.deferred_records, MAX_PENDING_BLOCK_CANDIDATES)
+        self.assertEqual(report.pending_share_holders, MAX_PENDING_BLOCK_CANDIDATES)
+        self.assertEqual(report.terminal_outcome_pins, MAX_PENDING_BLOCK_CANDIDATES)
+        self._assert_recovered(report)
+
+    def test_a_clean_walk_leaves_no_backlog_and_the_marginal_cost_is_measurable(
+        self,
+    ) -> None:
+        clean = CandidateStormRig(candidates=DECIDED_STORM_CANDIDATES).measure_cleanup_backlog(
+            CLEANUP_FAULT_NONE,
+            view="restart",
+        )
+        self.assertEqual(clean.deferred_records, 0)
+        self.assertEqual(clean.collapsed_rows, DECIDED_STORM_CANDIDATES - 1)
+        self.assertEqual(clean.registry_bytes_per_record, 0.0)
+        self.assertEqual(clean.pending_share_holders, 0)
+        self.assertTrue(clean.recovered_cleanly)
+        faulted = CandidateStormRig(candidates=DECIDED_STORM_CANDIDATES).measure_cleanup_backlog(
+            "retry-state",
+            view="restart",
+        )
+        self.assertEqual(faulted.deferred_records, DECIDED_STORM_CANDIDATES - 1)
+        # The process-wide live-byte delta also includes allocator and cache
+        # churn from the clean walk, so it is diagnostic rather than a
+        # monotonic assertion. The owner-filtered delta and the independent
+        # deep registry walk isolate the retained retry records.
+        self.assertGreater(
+            cleanup_backlog_marginal_bytes_per_record(faulted, clean, owner_only=True),
+            0.0,
+        )
+        self.assertGreater(faulted.registry_bytes_per_record, 0.0)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ from lab.prism.coordinator_config import (
     BLOCK_LANDING_DB_TIMEOUT_WATCHDOG_FRACTION,
     DEFAULT_ACCEPTED_PARENT_REDRIVE_ATTEMPT_MAX,
     DEFAULT_ACCEPTED_PARENT_REDRIVE_DEFER_THRESHOLD,
+    DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX,
     DEFAULT_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS,
     DEFAULT_BLOCK_LANDING_DB_TIMEOUT_SECONDS,
     DEFAULT_BLOCK_SUBMIT_DB_TIMEOUT_SECONDS,
@@ -40,6 +41,7 @@ from lab.prism.coordinator_config import (
     DEFAULT_BLOCK_SUBMIT_STUCK_CALL_EXIT_SECONDS,
     DEFAULT_PRISM_OBSERVED_TIP_ACCEPT_WINDOW_SECONDS,
     DEFAULT_PRISM_WATCHDOG_TIMEOUT_SECONDS,
+    MAX_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX,
 )
 from lab.prism.coordinator_shutdown import ShutdownInProgress
 from lab.prism.job_bundle import PRISM_JOB_BUILD_SECONDS_BUCKETS
@@ -139,6 +141,32 @@ BLOCK_ACCOUNTING_ACCEPTED_DISPATCH_QUOTA = 4
 # still-owed steps and the cadence resets on every offer -- including one
 # that finds nothing due -- so neither lane can starve the other.
 DEFAULT_BLOCK_ACCOUNTING_CLEANUP_RETRY_WORK_ITEMS = 8
+# Issue #198. A cleanup-retry record is the only replay source a durably
+# terminal row has left, so the registry never sheds one; under a systemic
+# cleanup fault it therefore grows by one record per row the collapse wins.
+# At the observed 312,000-candidate storm that is an unbounded in-memory
+# backlog -- each record retaining its exact pending-share floor holders and
+# pinning its terminal-outcome fence -- driven by a lane that retries one
+# hash per pass. The bound is applied to *admission* instead: once the
+# backlog holds ``_collapse_cleanup_retry_backlog_max()`` records
+# (PRISM_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX, default
+# DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX) the collapse hands no
+# further rows to its fenced bulk terminalization, and every row it declines
+# stays durable and pending for the ordinary per-row path. Nothing already
+# terminal loses its record, its holders, or its fence.
+#
+# A persistently engaged backpressure would otherwise print one line per
+# page or per dequeued sibling; the warning is rate limited to this interval
+# while the ``backlog_deferred`` counter still moves per row.
+BLOCK_CANDIDATE_CLEANUP_BACKPRESSURE_LOG_SECONDS = 60.0
+# The closed vocabulary the backpressure warning names its caller from, so
+# the field can never carry a hash, a page cursor, or a free-form reason.
+PRISM_BLOCK_CANDIDATE_CLEANUP_BACKPRESSURE_CALLERS = (
+    # The replay-adoption page walk (#183/#196).
+    "replay-page",
+    # The dequeue-time stale sibling skip (#181 item 2).
+    "dequeue",
+)
 # The same-hash disposition guard remembers every terminal outcome so a late
 # duplicate -- queued, replayed, retried, parked, or quarantined -- joins the
 # decision instead of re-offering a block qbitd already answered for. That
@@ -224,6 +252,13 @@ PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES = (
     "cleanup_recovered",
     # Retry passes that ran but still left at least one step owed.
     "cleanup_retry_failed",
+    # -- issue #198: cleanup-retry backlog backpressure -----------------------
+    # Rows that satisfied (or were never asked) predicate S and were
+    # preserved -- left durable and pending for the per-row path -- because
+    # the cleanup-retry backlog was at its configured admission bound. Shared
+    # by the replay-page walk and the dequeue-time skip like the outcomes
+    # above; the warning names the caller, the counter counts rows.
+    "backlog_deferred",
     # -- issue #181 item 2: the dequeue-time stale sibling skip -------------
     # These three name the *population* the skip judged, one dequeued
     # candidate at a time, and partition it exactly:
@@ -581,6 +616,10 @@ class _CollapsedCandidateCleanup:
     attempts: int = 0
     delay_seconds: float = 0.0
     not_before_monotonic: float = 0.0
+    # When this hash's cleanup was first deferred. Kept across merges and
+    # reschedules so the oldest-age gauge measures how long the row has
+    # owed cleanup, not how long since its last failed attempt.
+    deferred_monotonic: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1301,6 +1340,11 @@ class BlockCandidateService:
             str, float | None
         ] = {}
         self._block_replay_enumeration_owed_flag = False
+        # A forced enumeration that meets cleanup backpressure adopts at
+        # most that one bounded page, then lets the submitter drain it before
+        # another outbox walk. This flag prevents an eager re-entry from
+        # growing the otherwise-unbounded replay queue page by page.
+        self._block_replay_backpressure_drain_pending = False
         # Targeted ancestor re-drive state (issue #190), all under
         # coordinator.lock. A found block whose finalization keeps deferring
         # on the same unresolved accepted-ancestor payout transition arms a
@@ -1454,6 +1498,8 @@ class BlockCandidateService:
                 self._block_quarantine_queue = queue.Queue()
             if not hasattr(self, "_block_quarantine_hashes"):
                 self._block_quarantine_hashes: set[str] = set()
+            if not hasattr(self, "_block_replay_backpressure_drain_pending"):
+                self._block_replay_backpressure_drain_pending = False
 
     def _enqueue_replayed_block_candidate(
         self,
@@ -1581,9 +1627,11 @@ class BlockCandidateService:
 
     def _ensure_block_candidate_collapse_state(self) -> None:
         """Backfill the collapse counters and cleanup-retry registry."""
-        if hasattr(self, "_block_candidate_collapse_counts") and hasattr(
-            self,
-            "_block_candidate_collapse_cleanup_retries",
+        if (
+            hasattr(self, "_block_candidate_collapse_counts")
+            and hasattr(self, "_block_candidate_collapse_cleanup_retries")
+            and hasattr(self, "_block_candidate_collapse_cleanup_inflight")
+            and hasattr(self, "_block_candidate_cleanup_backpressure_engagements")
         ):
             return
         with _STATE_BACKFILL_LOCK:
@@ -1597,6 +1645,23 @@ class BlockCandidateService:
                     str,
                     _CollapsedCandidateCleanup,
                 ] = {}
+            if not hasattr(self, "_block_candidate_collapse_cleanup_inflight"):
+                # A retry moves its record here for the duration of the
+                # attempt. It must remain part of both the admission depth
+                # and the terminal-outcome pin set while the accounting lane
+                # is running cleanup outside coordinator.lock.
+                self._block_candidate_collapse_cleanup_inflight: dict[
+                    str,
+                    _CollapsedCandidateCleanup,
+                ] = {}
+            if not hasattr(self, "_block_candidate_cleanup_backpressure_engagements"):
+                # Occasions on which the admission bound withheld at least
+                # one row from bulk terminalization, and when the last
+                # bounded warning was printed. Both under coordinator.lock.
+                self._block_candidate_cleanup_backpressure_engagements = 0
+                self._block_candidate_cleanup_backpressure_logged_monotonic: (
+                    float | None
+                ) = None
 
     def _record_block_candidate_collapse(
         self,
@@ -2337,6 +2402,7 @@ class BlockCandidateService:
                         # The first attempt is due immediately; only a failed
                         # attempt starts the backoff.
                         not_before_monotonic=now,
+                        deferred_monotonic=now,
                     )
                 else:
                     # The floor keys holders by object identity, so merge by
@@ -2354,6 +2420,8 @@ class BlockCandidateService:
                         record.not_before_monotonic,
                         now,
                     )
+                    if not record.deferred_monotonic:
+                        record.deferred_monotonic = now
                 # Re-inserted at the tail so a storm-sized backlog is retried
                 # round-robin instead of starving behind its oldest entry.
                 registry[block_hash] = record
@@ -2375,10 +2443,173 @@ class BlockCandidateService:
         """The cleanup steps each terminal hash still owes (diagnostics)."""
         registry = self._collapsed_candidate_cleanup_registry()
         with self._coordinator.lock:
-            return {
-                block_hash: record.steps
-                for block_hash, record in registry.items()
-            }
+            combined: dict[str, frozenset[str]] = {}
+            for source in (
+                registry,
+                self._block_candidate_collapse_cleanup_inflight,
+            ):
+                for block_hash, record in source.items():
+                    combined[block_hash] = (
+                        combined.get(block_hash, frozenset()) | record.steps
+                    )
+            return combined
+
+    # -- cleanup-retry backlog bound (#198) --------------------------------
+
+    def _collapse_cleanup_retry_backlog_max(self) -> int:
+        """Retry records the backlog may hold before admission stops.
+
+        Read from the coordinator attribute first, so an embedder or a test
+        can pin it the way the sibling accounting knobs are pinned, then
+        from the loaded ``BlockConfig``, then the shipped default. Clamp it
+        into the same safe range enforced by startup validation. A direct
+        runtime value below one degrades into "admit one row at a time while
+        the backlog is empty"; one above the fence registry's capacity can
+        never weaken the hard memory bound.
+        """
+        coordinator = self._coordinator
+        value = getattr(
+            coordinator,
+            "block_candidate_cleanup_retry_backlog_max",
+            None,
+        )
+        if value is None:
+            block_config = getattr(getattr(coordinator, "config", None), "block", None)
+            value = getattr(
+                block_config,
+                "candidate_cleanup_retry_backlog_max",
+                None,
+            )
+        if value is None:
+            value = DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX
+        return min(
+            MAX_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX,
+            max(1, int(value)),
+        )
+
+    def _collapse_cleanup_admission_headroom(self) -> tuple[int, int, int]:
+        """(rows the collapse may still admit, backlog depth, bound).
+
+        Only the collapse callers on the block-submitter thread add records.
+        The accounting lane moves one record into the in-flight registry
+        while retrying it, so the owed authority remains counted until the
+        attempt either discharges or re-registers it.
+        """
+        registry = self._collapsed_candidate_cleanup_registry()
+        maximum = self._collapse_cleanup_retry_backlog_max()
+        with self._coordinator.lock:
+            depth = len(registry) + len(
+                self._block_candidate_collapse_cleanup_inflight
+            )
+        return max(0, maximum - depth), depth, maximum
+
+    def _collapse_cleanup_backpressure_engagement_count(self) -> int:
+        """Return the monotonic engagement counter without walking records."""
+        self._ensure_block_candidate_collapse_state()
+        with self._coordinator.lock:
+            return int(self._block_candidate_cleanup_backpressure_engagements)
+
+    def collapsed_candidate_cleanup_backlog_snapshot(self) -> dict[str, Any]:
+        """Fixed-key gauges over the cleanup-retry backlog, for metrics.
+
+        The key set is closed and carries no hash or step name. The walk is
+        O(backlog) under ``coordinator.lock``, which the admission bound
+        keeps at a few thousand entries at most; every value is a copy, so
+        the renderer never holds a reference into the registry.
+
+        ``terminal_outcome_pins`` counts the records whose hash currently
+        holds a published terminal-outcome fence -- the entries the
+        registry forbids the fence eviction from dropping. It equals the
+        depth whenever the apply's fence publication succeeded; a smaller
+        value names records whose fence is still owed to the
+        ``terminal-outcome`` step.
+        """
+        self._ensure_block_candidate_collapse_state()
+        self._ensure_block_candidate_disposition_state()
+        maximum = self._collapse_cleanup_retry_backlog_max()
+        now = time.monotonic()
+        with self._coordinator.lock:
+            registry = self._block_candidate_collapse_cleanup_retries
+            inflight = self._block_candidate_collapse_cleanup_inflight
+            outcomes = self._block_candidate_terminal_outcomes
+            records = tuple(registry.values()) + tuple(inflight.values())
+            depth = len(records)
+            holder_ids: set[int] = set()
+            pinned_hashes: set[str] = set()
+            oldest: float | None = None
+            for record in records:
+                holder_ids.update(id(share) for share in record.shares)
+                if record.block_hash in outcomes:
+                    pinned_hashes.add(record.block_hash)
+                stamp = float(record.deferred_monotonic)
+                if oldest is None or stamp < oldest:
+                    oldest = stamp
+            engagements = int(
+                self._block_candidate_cleanup_backpressure_engagements
+            )
+        return {
+            "depth": depth,
+            "backlog_max": maximum,
+            "oldest_age_seconds": (
+                -1.0 if oldest is None else max(0.0, now - oldest)
+            ),
+            "pending_share_holders": len(holder_ids),
+            "terminal_outcome_pins": len(pinned_hashes),
+            "backpressure_active": depth >= maximum,
+            "backpressure_engagements": engagements,
+        }
+
+    def _note_block_candidate_cleanup_backpressure(
+        self,
+        *,
+        caller: str,
+        rows: int,
+        admitted: int,
+        depth: int,
+        maximum: int,
+    ) -> None:
+        """Count rows the admission bound preserved and warn at a bounded rate.
+
+        Every field of the warning is drawn from a closed vocabulary or is a
+        count: the caller name, the rows preserved, the rows this same pass
+        still admitted, the backlog depth and bound at the decision, and the
+        oldest record's age. No hash, parent, page cursor, or step name ever
+        appears, so a storm-long engagement cannot grow the log line's shape
+        and a persistent one cannot flood the journal.
+        """
+        if caller not in PRISM_BLOCK_CANDIDATE_CLEANUP_BACKPRESSURE_CALLERS:
+            raise ValueError(f"unknown cleanup backpressure caller: {caller}")
+        if rows <= 0:
+            return
+        self._record_block_candidate_collapse("backlog_deferred", rows)
+        now = time.monotonic()
+        with self._coordinator.lock:
+            self._block_candidate_cleanup_backpressure_engagements = (
+                int(self._block_candidate_cleanup_backpressure_engagements) + 1
+            )
+            last = self._block_candidate_cleanup_backpressure_logged_monotonic
+            due = (
+                last is None
+                or (now - float(last))
+                >= BLOCK_CANDIDATE_CLEANUP_BACKPRESSURE_LOG_SECONDS
+            )
+            if due:
+                self._block_candidate_cleanup_backpressure_logged_monotonic = now
+        if not due:
+            return
+        oldest_age = float(
+            self.collapsed_candidate_cleanup_backlog_snapshot()["oldest_age_seconds"]
+        )
+        print(
+            "prism coordinator: collapsed block candidate cleanup backpressure "
+            f"engaged caller={caller} rows_preserved={rows} admitted={admitted} "
+            f"backlog={depth} backlog_max={maximum} "
+            f"oldest_seconds={oldest_age:.3f}; admitting them to bulk "
+            "terminalization would take the cleanup-retry backlog past its "
+            "bound, so they stay durable and pending for the per-row path "
+            "until it drains",
+            flush=True,
+        )
 
     def _run_one_collapsed_block_candidate_cleanup_retry(self) -> bool:
         """Retry one deferred collapse cleanup; True when one was attempted.
@@ -2397,20 +2628,49 @@ class BlockCandidateService:
         neither re-adopted nor re-offered from here.
         """
         registry = self._collapsed_candidate_cleanup_registry()
+        inflight = self._block_candidate_collapse_cleanup_inflight
         now = time.monotonic()
         with self._coordinator.lock:
             due: _CollapsedCandidateCleanup | None = None
             for record in registry.values():
-                if record.not_before_monotonic <= now:
+                if (
+                    record.block_hash not in inflight
+                    and record.not_before_monotonic <= now
+                ):
                     due = record
                     break
             if due is None:
                 return False
-            # Taken out of the registry for the duration of the attempt so a
-            # second lane cannot run the same hash's steps concurrently;
-            # whatever it still owes afterwards is re-registered below.
+            # Move, rather than drop, the authority record for the duration
+            # of the attempt. Admission, gauges, and terminal-outcome
+            # eviction all count the in-flight registry, so cleanup can run
+            # outside coordinator.lock without opening an undercount or an
+            # unfenced window. A second lane also skips the same hash.
             registry.pop(due.block_hash, None)
+            inflight[due.block_hash] = due
             due.attempts += 1
+        attempt_returned = False
+        try:
+            result = self._attempt_collapsed_block_candidate_cleanup_retry(due)
+            attempt_returned = True
+            return result
+        finally:
+            with self._coordinator.lock:
+                retained = inflight.pop(due.block_hash, None)
+                if (
+                    not attempt_returned
+                    and retained is not None
+                    and due.block_hash not in registry
+                ):
+                    # An unexpected exception outside the contained step
+                    # runner must not discard the only cleanup authority.
+                    registry[due.block_hash] = retained
+
+    def _attempt_collapsed_block_candidate_cleanup_retry(
+        self,
+        due: _CollapsedCandidateCleanup,
+    ) -> bool:
+        """Run one claimed retry while its authority remains in-flight."""
         self._coordinator._record_block_submitter_phase(
             "replay-collapse-cleanup-retry"
         )
@@ -2521,6 +2781,15 @@ class BlockCandidateService:
             rescheduled.attempts = max(rescheduled.attempts, record.attempts)
             rescheduled.delay_seconds = delay
             rescheduled.not_before_monotonic = time.monotonic() + delay
+            # The retry took the record out of the registry before the
+            # attempt, so the re-registration above minted a fresh stamp;
+            # the age gauge measures from the first deferral, not the
+            # latest failure.
+            if record.deferred_monotonic:
+                rescheduled.deferred_monotonic = min(
+                    rescheduled.deferred_monotonic or record.deferred_monotonic,
+                    record.deferred_monotonic,
+                )
 
     def _log_collapsed_block_candidates(
         self,
@@ -2829,6 +3098,26 @@ class BlockCandidateService:
                 len(durable_rows),
             )
             return durable_rows
+        headroom, backlog_depth, backlog_max = (
+            self._collapse_cleanup_admission_headroom()
+        )
+        if headroom <= 0:
+            # Issue #198. The cleanup-retry backlog is at its bound: every
+            # row the fenced write could win here would add one more record
+            # that only the accounting lane can ever drain. Nothing is
+            # selected and no chain read is spent; every row stays durable
+            # and pending for the per-row path, exactly as an unprobed
+            # height leaves it. Rows already terminal keep their records,
+            # holders, and fences untouched -- this bounds admission, never
+            # cleanup authority.
+            self._note_block_candidate_cleanup_backpressure(
+                caller="replay-page",
+                rows=len(durable_rows),
+                admitted=0,
+                depth=backlog_depth,
+                maximum=backlog_max,
+            )
+            return durable_rows
         self._coordinator._record_block_submitter_phase("replay-collapse-select")
         self._record_block_candidate_collapse("considered", len(durable_rows))
         chain = _BlockCandidateChainView(self, probe_budget=probe_budget)
@@ -2848,6 +3137,21 @@ class BlockCandidateService:
         if not selected:
             return durable_rows
         self._record_block_candidate_collapse("selected", len(selected))
+        if len(selected) > headroom:
+            # Predicate S is unchanged: every one of these rows satisfied
+            # it and is counted as selected. Admission is what is bounded:
+            # the fenced write may win at most ``headroom`` more rows before
+            # the backlog reaches its bound, so only that many, in page
+            # order, are handed on. The remainder is preserved, not
+            # disposed of.
+            self._note_block_candidate_cleanup_backpressure(
+                caller="replay-page",
+                rows=len(selected) - headroom,
+                admitted=headroom,
+                depth=backlog_depth,
+                maximum=backlog_max,
+            )
+            selected = selected[:headroom]
         try:
             abandoned = self._apply_superseded_block_candidate_collapse(
                 selected,
@@ -3019,6 +3323,22 @@ class BlockCandidateService:
             return False
         block_hash = _block_candidate_hash_of(candidate)
         if block_hash is None:
+            return False
+        headroom, backlog_depth, backlog_max = (
+            self._collapse_cleanup_admission_headroom()
+        )
+        if headroom <= 0:
+            # Issue #198: same bound, same answer as the page walk. The
+            # candidate is not considered at all -- the dequeue partition
+            # counters stay exact -- and it takes the ordinary offer path,
+            # whose per-row disposition has its own cleanup contract.
+            self._note_block_candidate_cleanup_backpressure(
+                caller="dequeue",
+                rows=1,
+                admitted=0,
+                depth=backlog_depth,
+                maximum=backlog_max,
+            )
             return False
         held = frozenset((block_hash,))
         self._record_block_candidate_collapse("dequeue_considered")
@@ -3516,6 +3836,15 @@ class BlockCandidateService:
     def replay_pending(self) -> int:
         """Queue durable candidate intents not completed by an earlier process."""
         self._coordinator._record_block_submitter_phase("replay-check-memory")
+        self._ensure_block_replay_state()
+        # The normal submitter loop drains replay work before asking the
+        # outbox again. Enforce that ordering here too for direct callers: a
+        # forced walk paused by cleanup backpressure must not append another
+        # page to the unbounded replay queue before its bounded page drains.
+        if self._block_replay_backpressure_drain_pending:
+            if not self._block_replay_candidate_queue.empty():
+                return 0
+            self._block_replay_backpressure_drain_pending = False
         # While startup enumeration is still owed, correctness requires the
         # outbox query even if live candidates are queued: job builds stay
         # blocked until pending candidates are known, and only a successful
@@ -3547,7 +3876,6 @@ class BlockCandidateService:
             and not queue_obj.empty()
         ):
             return 0
-        self._ensure_block_replay_state()
         if (
             not forced_enumeration
             and not self._block_replay_candidate_queue.empty()
@@ -3687,14 +4015,20 @@ class BlockCandidateService:
                 # short-page proof stay bound to the *fetched* page: what the
                 # collapse removes was removed from the outbox too, so the
                 # enumeration is still complete.
-                queued += self._adopt_durable_block_candidate_rows(
-                    self._collapse_superseded_block_candidates(
-                        durable_rows,
-                        timeout_seconds=replay_query_timeout,
-                        call_class=replay_query_call_class,
-                        probe_budget=collapse_probe_budget,
-                    )
+                backpressure_before = (
+                    self._collapse_cleanup_backpressure_engagement_count()
                 )
+                retained_rows = self._collapse_superseded_block_candidates(
+                    durable_rows,
+                    timeout_seconds=replay_query_timeout,
+                    call_class=replay_query_call_class,
+                    probe_budget=collapse_probe_budget,
+                )
+                cleanup_backpressured = (
+                    self._collapse_cleanup_backpressure_engagement_count()
+                    != backpressure_before
+                )
+                queued += self._adopt_durable_block_candidate_rows(retained_rows)
                 print(
                     "prism coordinator: pending block candidate enumeration "
                     f"page={page} rows={len(durable_rows)}",
@@ -3704,6 +4038,22 @@ class BlockCandidateService:
                     # A short page proves no pending row followed it at query
                     # time, which is the completeness the job-build gate waits
                     # on.
+                    break
+                if cleanup_backpressured:
+                    # A full preserved page may have more pending rows behind
+                    # it. Stop here rather than materializing every later page
+                    # in the unbounded replay queue; the enumeration stays
+                    # owed and resumes only after this bounded page drains.
+                    enumeration_truncated = True
+                    self._block_replay_backpressure_drain_pending = True
+                    print(
+                        "prism coordinator: pending block candidate "
+                        f"enumeration page={page} paused after cleanup "
+                        "backpressure; replay queue drains before enumeration "
+                        "resumes and job builds stay blocked until a complete "
+                        "enumeration succeeds",
+                        flush=True,
+                    )
                     break
                 if self._block_replay_should_yield_to_live_candidates(
                     collapse_probe_budget
@@ -3746,18 +4096,36 @@ class BlockCandidateService:
                 # Same collapse-then-adopt order on the legacy widening
                 # window; the truncation proof below still measures the
                 # fetched window, not the surviving remainder.
-                queued += self._adopt_durable_block_candidate_rows(
-                    self._collapse_superseded_block_candidates(
-                        durable_rows,
-                        timeout_seconds=replay_query_timeout,
-                        call_class=replay_query_call_class,
-                        probe_budget=collapse_probe_budget,
-                    )
+                backpressure_before = (
+                    self._collapse_cleanup_backpressure_engagement_count()
                 )
+                retained_rows = self._collapse_superseded_block_candidates(
+                    durable_rows,
+                    timeout_seconds=replay_query_timeout,
+                    call_class=replay_query_call_class,
+                    probe_budget=collapse_probe_budget,
+                )
+                cleanup_backpressured = (
+                    self._collapse_cleanup_backpressure_engagement_count()
+                    != backpressure_before
+                )
+                queued += self._adopt_durable_block_candidate_rows(retained_rows)
                 if len(durable_rows) < enumeration_limit or not forced_enumeration:
                     # A short page proves no further pending row existed at
                     # query time -- the completeness the re-drive's
                     # stale-transition sweep below also relies on.
+                    break
+                if cleanup_backpressured:
+                    enumeration_truncated = True
+                    self._block_replay_backpressure_drain_pending = True
+                    print(
+                        "prism coordinator: pending block candidate "
+                        f"enumeration at {enumeration_limit} rows paused after "
+                        "cleanup backpressure; replay queue drains before "
+                        "enumeration resumes and job builds stay blocked until "
+                        "a complete enumeration succeeds",
+                        flush=True,
+                    )
                     break
                 if self._block_replay_should_yield_to_live_candidates(
                     collapse_probe_budget
@@ -5228,6 +5596,7 @@ class BlockCandidateService:
                 getattr(self, "finalize_retries", None),
                 getattr(self, "_block_candidate_retained_node_submissions", None),
                 getattr(self, "_block_candidate_collapse_cleanup_retries", None),
+                getattr(self, "_block_candidate_collapse_cleanup_inflight", None),
                 getattr(self, "_block_candidate_dequeued_hashes", None),
             )
             if registry
