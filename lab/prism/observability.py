@@ -116,6 +116,7 @@ class ObservabilityState:
     health_snapshot_refresh_failure_count: int
     mining_overload_started_monotonic: float | None
     mining_delivery_failure_started_monotonic: float | None
+    mining_semantic_work_gap_started_monotonic: float | None
 
 
 @dataclass(frozen=True)
@@ -186,6 +187,7 @@ class ObservabilityService:
         self._health_snapshot_refresh_failure_count = 0
         self._mining_overload_started_monotonic: float | None = None
         self._mining_delivery_failure_started_monotonic: float | None = None
+        self._mining_semantic_work_gap_started_monotonic: float | None = None
         self._mining_delivery_lock = threading.Lock()
         self._metrics_lock = threading.RLock()
         self._metrics_collection_lock = threading.Lock()
@@ -218,6 +220,9 @@ class ObservabilityService:
                 ),
                 mining_delivery_failure_started_monotonic=(
                     self._mining_delivery_failure_started_monotonic
+                ),
+                mining_semantic_work_gap_started_monotonic=(
+                    self._mining_semantic_work_gap_started_monotonic
                 ),
             )
 
@@ -265,8 +270,11 @@ class ObservabilityService:
         self,
         value: float | None,
     ) -> None:
+        # A test that starts past the deadline means the whole delivery gap:
+        # seed the semantic timer alongside the strict tip-hash one.
         with self._lock:
             self._mining_delivery_failure_started_monotonic = value
+            self._mining_semantic_work_gap_started_monotonic = value
 
     def reset_delivery_failure(self) -> None:
         """Start the next current-tip coverage gap with a fresh grace window."""
@@ -307,6 +315,16 @@ class ObservabilityService:
         # nearly every miner is missing work. Treat any sustained loss of
         # at least five percent of current-job coverage as degraded.
         poor_coverage = authorized > 0 and coverage < 0.95
+        # Exact-tip churn alone must not fail health (#216): a fleet holding
+        # work for the current template content is being served even while
+        # the strict tip-hash gauge lags the observed tip, so the delivery
+        # stall is timed on semantic coverage. Boundary: overload_now,
+        # reject_storm, and the cap-saturated reason deliberately stay on
+        # exact-tip coverage. Each already needs independent corroboration
+        # (queue/cap saturation or an observed rejection storm) and
+        # diagnoses strict-tip operational pressure; semantic coverage
+        # changes only the delivery-stalled predicate.
+        poor_semantic_coverage = authorized > 0 and semantic_coverage < 0.95
         overload_now = pending_saturated or (cap_saturated and poor_coverage)
         with self._lock:
             if poor_coverage:
@@ -317,6 +335,14 @@ class ObservabilityService:
             delivery_failure_started = (
                 self._mining_delivery_failure_started_monotonic
             )
+            if poor_semantic_coverage:
+                if self._mining_semantic_work_gap_started_monotonic is None:
+                    self._mining_semantic_work_gap_started_monotonic = now
+            else:
+                self._mining_semantic_work_gap_started_monotonic = None
+            semantic_gap_started = (
+                self._mining_semantic_work_gap_started_monotonic
+            )
             if overload_now:
                 if self._mining_overload_started_monotonic is None:
                     self._mining_overload_started_monotonic = now
@@ -326,6 +352,11 @@ class ObservabilityService:
         delivery_failure_age = (
             max(0.0, now - delivery_failure_started)
             if delivery_failure_started is not None
+            else 0.0
+        )
+        semantic_gap_age = (
+            max(0.0, now - semantic_gap_started)
+            if semantic_gap_started is not None
             else 0.0
         )
         overload_age = (
@@ -347,13 +378,23 @@ class ObservabilityService:
             deadline is not None
             and inputs.oldest_genuinely_pending_initial_job_age_seconds >= deadline
         )
-        current_tip_coverage_stalled = bool(
+        # The semantic gap must be sustained for a full deadline, and the
+        # strict gap alone can never fire it. Exact current-tip work is
+        # checked against the same template fingerprint, payout generation,
+        # and client-session generations whenever a template snapshot is
+        # published, so in production it is a subset of the semantic count
+        # and this reduces to the semantic gap; an embedder that publishes
+        # only the observed tip has no semantic evidence, and its exact-tip
+        # work must still count as delivered.
+        current_work_coverage_stalled = bool(
             deadline is not None
+            and poor_semantic_coverage
+            and semantic_gap_age >= deadline
             and poor_coverage
             and delivery_failure_age >= deadline
         )
         no_delivery_progress = bool(
-            initial_job_starved or current_tip_coverage_stalled
+            initial_job_starved or current_work_coverage_stalled
         )
         reject_storm = (
             poor_coverage
@@ -397,6 +438,10 @@ class ObservabilityService:
             "semantic_current_work_ratio": round(semantic_coverage, 6),
             "current_tip_coverage_gap_age_seconds": round(
                 delivery_failure_age,
+                3,
+            ),
+            "semantic_current_work_gap_age_seconds": round(
+                semantic_gap_age,
                 3,
             ),
             "connection_capacity_saturated": cap_saturated,

@@ -931,15 +931,14 @@ class _CoordinatorObservability(ObservabilityPort):
                 if coordinator._client_has_current_tip_job_locked(client)
             ]
             current = len(clients_with_current_work)
-            # Semantic currency alongside the strict gauge above: fingerprint
-            # and payout generation only, no template-generation or object
-            # identity terms. The strict predicate reads 0 whenever a
-            # generation was minted since the last fanout (it also gates
-            # mining health, so its fail-closed shape stays untouched);
-            # this gauge answers the operational question the 2026-07-31
-            # review had to reconstruct from share-acceptance rates --
-            # whether miners actually hold work for the current template
-            # content.
+            # Semantic currency alongside the strict gauge above: template
+            # fingerprint and payout generation, plus the connection,
+            # authorization, and difficulty generations that make the job
+            # usable by this client. Template-generation and object-identity
+            # churn remain intentionally excluded. The strict predicate reads
+            # 0 whenever a template generation was minted since the last
+            # fanout; this gauge instead answers whether miners actually hold
+            # usable work for the current template content.
             payout_generation_now = int(
                 getattr(coordinator, "_payout_state_generation", 0)
             )
@@ -954,6 +953,22 @@ class _CoordinatorObservability(ObservabilityPort):
                     getattr(client.active_job, "payout_state_generation", -1)
                 )
                 == payout_generation_now
+                and int(
+                    getattr(
+                        client.active_job,
+                        "connection_id",
+                        client.connection_id,
+                    )
+                )
+                == client.connection_id
+                and int(
+                    getattr(client.active_job, "authorization_generation", 0)
+                )
+                == int(getattr(client, "authorization_generation", 0))
+                and int(
+                    getattr(client.active_job, "difficulty_generation", 0)
+                )
+                == int(getattr(client, "difficulty_generation", 0))
             )
             clients_with_no_active_job = sum(
                 1 for client in authorized_clients if client.active_job is None

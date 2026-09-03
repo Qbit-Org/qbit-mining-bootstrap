@@ -64,6 +64,21 @@ def healthy_inputs() -> MiningDeliveryInputs:
     )
 
 
+def incident_inputs() -> MiningDeliveryInputs:
+    """The 2026-08-31 fleet: 4 of 33 miners on the exact observed tip while
+    all 33 held semantically current work and nothing was genuinely pending."""
+
+    return replace(
+        healthy_inputs(),
+        active_connections=33,
+        subscribed_connections=33,
+        authorized_connections=33,
+        clients_with_current_tip_jobs=4,
+        clients_with_semantically_current_work=33,
+        last_initial_job_delivery_monotonic=99.5,
+    )
+
+
 class FakeObservabilityPort:
     def __init__(self) -> None:
         self.now = 100.0
@@ -244,12 +259,14 @@ class ObservabilityServiceTests(unittest.TestCase):
             port.inputs,
             pending_initial_jobs=0,
             clients_with_current_tip_jobs=1,
+            clients_with_semantically_current_work=1,
         )
         recovered = service.mining_delivery_snapshot()
         self.assertTrue(recovered["mining_ready"])
         state = service.state()
         self.assertIsNone(state.mining_overload_started_monotonic)
         self.assertIsNone(state.mining_delivery_failure_started_monotonic)
+        self.assertIsNone(state.mining_semantic_work_gap_started_monotonic)
 
     def test_semantic_gauges_report_count_and_six_decimal_ratio(self) -> None:
         port = FakeObservabilityPort()
@@ -277,30 +294,6 @@ class ObservabilityServiceTests(unittest.TestCase):
         self.assertEqual(snapshot["clients_with_semantically_current_work"], 0)
         self.assertEqual(snapshot["semantic_current_work_ratio"], 1.0)
         self.assertTrue(snapshot["mining_ready"])
-
-    def test_strict_coverage_alone_drives_fail_closed_health(self) -> None:
-        # Perfect semantic currency must not mask a strict-coverage gap: the
-        # strict gauge alone feeds the coverage timers and unhealthy reasons.
-        port = FakeObservabilityPort()
-        port.inputs = replace(
-            port.inputs,
-            active_connections=4,
-            subscribed_connections=4,
-            authorized_connections=4,
-            clients_with_current_tip_jobs=0,
-            clients_with_semantically_current_work=4,
-        )
-        service = ObservabilityService(port)
-
-        first = service.mining_delivery_snapshot()
-        self.assertTrue(first["mining_ready"])
-        port.now += 6.0
-        stalled = service.mining_delivery_snapshot()
-
-        self.assertFalse(stalled["mining_ready"])
-        self.assertIn("initial-delivery-stalled", stalled["unhealthy_reasons"])
-        self.assertEqual(stalled["clients_with_semantically_current_work"], 4)
-        self.assertEqual(stalled["semantic_current_work_ratio"], 1.0)
 
     def test_delivery_timer_observations_are_applied_in_capture_order(self) -> None:
         first_captured = threading.Event()
@@ -637,6 +630,338 @@ class ObservabilityServiceTests(unittest.TestCase):
         self.assertFalse(service.metrics_state().metrics_refresh_loop_running)
 
 
+class SemanticCoverageDeliveryHealthTests(unittest.TestCase):
+    """Issue #216: the delivery stall is timed on semantic coverage."""
+
+    def test_rapid_tip_churn_with_complete_semantic_coverage_stays_ready(
+        self,
+    ) -> None:
+        port = FakeObservabilityPort()
+        port.inputs = incident_inputs()
+        service = ObservabilityService(port)
+
+        # Exact coverage churns below 95% for four times the 5s deadline
+        # while every miner keeps semantically current work, nothing is
+        # genuinely pending, and deliveries keep landing. The refresher's
+        # cached /healthz answer must hold 200 on every sample, not flap.
+        for step, exact in enumerate((4, 12, 1, 20, 7, 30)):
+            port.now = 100.0 + 4.0 * step
+            port.inputs = replace(
+                port.inputs,
+                clients_with_current_tip_jobs=exact,
+                last_initial_job_delivery_monotonic=port.now - 0.5,
+            )
+            service.refresh_health_snapshot()
+            status, payload = service.cached_health_payload()
+
+            self.assertEqual(status, 200, payload)
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["mining_ready"])
+            self.assertFalse(payload["initial_delivery_stalled"])
+            self.assertEqual(payload["unhealthy_reasons"], [])
+            self.assertEqual(payload["pending_initial_jobs"], 0)
+            self.assertEqual(
+                payload["oldest_genuinely_pending_initial_job_age_seconds"],
+                0.0,
+            )
+            self.assertLess(payload["current_tip_job_coverage"], 0.95)
+            self.assertEqual(payload["semantic_current_work_ratio"], 1.0)
+            # The exact gap keeps reporting the churn as telemetry.
+            self.assertEqual(
+                payload["current_tip_coverage_gap_age_seconds"],
+                4.0 * step,
+            )
+            self.assertEqual(payload["semantic_current_work_gap_age_seconds"], 0.0)
+
+        state = service.state()
+        self.assertEqual(state.mining_delivery_failure_started_monotonic, 100.0)
+        self.assertIsNone(state.mining_semantic_work_gap_started_monotonic)
+
+    def test_genuine_first_job_starvation_fails_closed_after_deadline(
+        self,
+    ) -> None:
+        port = FakeObservabilityPort()
+        port.inputs = replace(
+            healthy_inputs(),
+            active_connections=3,
+            subscribed_connections=3,
+            authorized_connections=3,
+            pending_initial_jobs=3,
+            oldest_pending_initial_job_age_seconds=4.999,
+            oldest_genuinely_pending_initial_job_age_seconds=4.999,
+            clients_with_no_active_job=3,
+        )
+        service = ObservabilityService(port)
+
+        self.assertTrue(service.mining_delivery_snapshot()["mining_ready"])
+
+        # Only the genuine pending age crosses the deadline here: both
+        # coverage gaps are a millisecond old, so starvation fires on its own.
+        port.now += 0.001
+        port.inputs = replace(
+            port.inputs,
+            oldest_pending_initial_job_age_seconds=5.0,
+            oldest_genuinely_pending_initial_job_age_seconds=5.0,
+        )
+        starved = service.mining_delivery_snapshot()
+
+        self.assertFalse(starved["mining_ready"])
+        self.assertTrue(starved["initial_delivery_stalled"])
+        self.assertIn("initial-delivery-stalled", starved["unhealthy_reasons"])
+        self.assertEqual(starved["semantic_current_work_gap_age_seconds"], 0.001)
+
+    def test_sustained_semantic_work_loss_fails_closed_after_deadline(
+        self,
+    ) -> None:
+        # Every miner holds work, so nothing is genuinely pending, but none
+        # of it matches the current template content and none is on the
+        # observed tip: fanout has stopped. This must still fail closed.
+        port = FakeObservabilityPort()
+        port.inputs = replace(
+            healthy_inputs(),
+            active_connections=4,
+            subscribed_connections=4,
+            authorized_connections=4,
+            clients_with_current_tip_jobs=0,
+            clients_with_semantically_current_work=0,
+        )
+        service = ObservabilityService(port)
+
+        self.assertTrue(service.mining_delivery_snapshot()["mining_ready"])
+        port.now = 104.999
+        grace = service.mining_delivery_snapshot()
+        self.assertTrue(grace["mining_ready"])
+        self.assertEqual(grace["semantic_current_work_gap_age_seconds"], 4.999)
+        self.assertEqual(grace["current_tip_coverage_gap_age_seconds"], 4.999)
+
+        port.now = 105.0
+        stalled = service.mining_delivery_snapshot()
+        self.assertFalse(stalled["mining_ready"])
+        self.assertTrue(stalled["initial_delivery_stalled"])
+        self.assertEqual(stalled["unhealthy_reasons"], ["initial-delivery-stalled"])
+        self.assertEqual(
+            stalled["oldest_genuinely_pending_initial_job_age_seconds"],
+            0.0,
+        )
+
+        # Semantic recovery alone ends the stall and closes the semantic gap
+        # while the strict gauge is still lagging the observed tip.
+        port.now = 106.0
+        port.inputs = replace(port.inputs, clients_with_semantically_current_work=4)
+        recovered = service.mining_delivery_snapshot()
+        self.assertTrue(recovered["mining_ready"])
+        self.assertFalse(recovered["initial_delivery_stalled"])
+        self.assertEqual(recovered["semantic_current_work_gap_age_seconds"], 0.0)
+        self.assertEqual(recovered["current_tip_coverage_gap_age_seconds"], 6.0)
+        state = service.state()
+        self.assertIsNone(state.mining_semantic_work_gap_started_monotonic)
+        self.assertEqual(state.mining_delivery_failure_started_monotonic, 100.0)
+
+    def test_semantic_gap_must_be_sustained_not_sampled(self) -> None:
+        # A long-running exact gap plus one poor semantic sample is not a
+        # stall: the semantic gap has its own timer and must itself last a
+        # full deadline before health fails.
+        port = FakeObservabilityPort()
+        port.inputs = incident_inputs()
+        service = ObservabilityService(port)
+        service.mining_delivery_snapshot()
+
+        port.now = 120.0
+        port.inputs = replace(port.inputs, clients_with_semantically_current_work=20)
+        dip = service.mining_delivery_snapshot()
+        self.assertTrue(dip["mining_ready"])
+        self.assertEqual(dip["current_tip_coverage_gap_age_seconds"], 20.0)
+        self.assertEqual(dip["semantic_current_work_gap_age_seconds"], 0.0)
+
+        port.now = 124.0
+        port.inputs = replace(port.inputs, clients_with_semantically_current_work=33)
+        back = service.mining_delivery_snapshot()
+        self.assertTrue(back["mining_ready"])
+        self.assertIsNone(service.state().mining_semantic_work_gap_started_monotonic)
+
+        port.now = 128.0
+        port.inputs = replace(port.inputs, clients_with_semantically_current_work=20)
+        self.assertTrue(service.mining_delivery_snapshot()["mining_ready"])
+        port.now = 132.999
+        self.assertTrue(service.mining_delivery_snapshot()["mining_ready"])
+        port.now = 133.0
+        stalled = service.mining_delivery_snapshot()
+        self.assertFalse(stalled["mining_ready"])
+        self.assertEqual(stalled["unhealthy_reasons"], ["initial-delivery-stalled"])
+        self.assertEqual(stalled["semantic_current_work_gap_age_seconds"], 5.0)
+
+    def test_exact_tip_work_without_semantic_evidence_keeps_health_ready(
+        self,
+    ) -> None:
+        # An embedder that publishes only the observed tip (no template
+        # snapshot) reads semantic coverage 0 for every client while the
+        # strict gauge is complete. In production strict currency is checked
+        # against the same fingerprint and payout generation, so this state
+        # means "no semantic evidence", never "semantically stale", and the
+        # strict gauge must still count as delivered work.
+        port = FakeObservabilityPort()
+        port.inputs = replace(
+            healthy_inputs(),
+            active_connections=4,
+            subscribed_connections=4,
+            authorized_connections=4,
+            clients_with_current_tip_jobs=4,
+            clients_with_semantically_current_work=0,
+        )
+        service = ObservabilityService(port)
+
+        service.mining_delivery_snapshot()
+        port.now += 10.0
+        payload = service.mining_delivery_snapshot()
+
+        self.assertTrue(payload["mining_ready"])
+        self.assertFalse(payload["initial_delivery_stalled"])
+        self.assertEqual(payload["semantic_current_work_gap_age_seconds"], 10.0)
+        self.assertEqual(payload["current_tip_coverage_gap_age_seconds"], 0.0)
+
+    def test_incident_payload_retains_exact_and_semantic_telemetry(self) -> None:
+        port = FakeObservabilityPort()
+        port.inputs = incident_inputs()
+        service = ObservabilityService(port)
+        service.mining_delivery_snapshot()
+
+        port.now += 6.0
+        payload = service.mining_delivery_snapshot()
+
+        self.assertEqual(payload["authorized_connections"], 33)
+        self.assertEqual(payload["clients_with_current_tip_jobs"], 4)
+        self.assertEqual(payload["current_tip_job_coverage"], 0.121212)
+        self.assertEqual(payload["clients_with_semantically_current_work"], 33)
+        self.assertEqual(payload["semantic_current_work_ratio"], 1.0)
+        self.assertEqual(payload["pending_initial_jobs"], 0)
+        self.assertEqual(
+            payload["oldest_genuinely_pending_initial_job_age_seconds"],
+            0.0,
+        )
+        self.assertEqual(payload["clients_with_no_active_job"], 0)
+        self.assertEqual(payload["current_tip_coverage_gap_age_seconds"], 6.0)
+        self.assertEqual(payload["semantic_current_work_gap_age_seconds"], 0.0)
+        # Compatibility aliases keep their exact-tip meaning.
+        self.assertEqual(payload["clients_with_current_tip_job"], 4)
+        self.assertEqual(payload["clients_without_current_tip_job"], 29)
+        self.assertEqual(payload["current_tip_job_coverage_ratio"], 4 / 33)
+        self.assertEqual(payload["oldest_initial_job_pending_seconds"], 0.0)
+        self.assertTrue(payload["mining_ready"])
+        self.assertTrue(payload["mining_delivery_healthy"])
+        self.assertFalse(payload["initial_delivery_stalled"])
+        self.assertFalse(payload["overload"])
+        self.assertEqual(payload["unhealthy_reasons"], [])
+
+    def test_overload_now_keeps_using_exact_coverage(self) -> None:
+        port = FakeObservabilityPort()
+        port.inputs = replace(
+            incident_inputs(),
+            active_connections=64,
+            subscribed_connections=64,
+            authorized_connections=64,
+            clients_with_current_tip_jobs=8,
+            clients_with_semantically_current_work=64,
+        )
+        service = ObservabilityService(port)
+
+        strict_pressure = service.mining_delivery_snapshot()
+
+        self.assertTrue(strict_pressure["connection_capacity_saturated"])
+        self.assertTrue(strict_pressure["overload"])
+        self.assertTrue(strict_pressure["mining_ready"])
+        self.assertEqual(
+            service.state().mining_overload_started_monotonic,
+            100.0,
+        )
+
+        # Semantic loss with complete exact coverage is not overload.
+        port.now += 1.0
+        port.inputs = replace(
+            port.inputs,
+            clients_with_current_tip_jobs=64,
+            clients_with_semantically_current_work=0,
+        )
+        semantic_only = service.mining_delivery_snapshot()
+
+        self.assertTrue(semantic_only["connection_capacity_saturated"])
+        self.assertFalse(semantic_only["overload"])
+        self.assertEqual(semantic_only["overload_age_seconds"], 0.0)
+        self.assertIsNone(service.state().mining_overload_started_monotonic)
+
+    def test_reject_storm_keeps_using_exact_coverage(self) -> None:
+        port = FakeObservabilityPort()
+        port.inputs = replace(
+            incident_inputs(),
+            submitted_shares=100,
+            stale_unknown_rejections=95,
+        )
+        service = ObservabilityService(port)
+
+        storm = service.mining_delivery_snapshot()
+
+        self.assertTrue(storm["overload"])
+        self.assertFalse(storm["mining_ready"])
+        self.assertEqual(
+            storm["unhealthy_reasons"],
+            ["stale-unknown-rejection-storm"],
+        )
+
+        # The same rejection ratio with complete exact coverage and no
+        # semantic coverage is not a storm: the semantic gauge does not
+        # corroborate it.
+        port.now += 1.0
+        port.inputs = replace(
+            port.inputs,
+            clients_with_current_tip_jobs=33,
+            clients_with_semantically_current_work=0,
+        )
+        quiet = service.mining_delivery_snapshot()
+
+        self.assertFalse(quiet["overload"])
+        self.assertTrue(quiet["mining_ready"])
+        self.assertEqual(quiet["unhealthy_reasons"], [])
+
+    def test_cap_saturated_reason_keeps_using_exact_coverage(self) -> None:
+        port = FakeObservabilityPort()
+        port.inputs = replace(
+            incident_inputs(),
+            active_connections=64,
+            subscribed_connections=64,
+            authorized_connections=64,
+            clients_with_current_tip_jobs=8,
+            clients_with_semantically_current_work=64,
+        )
+        service = ObservabilityService(port)
+        service.mining_delivery_snapshot()
+
+        port.now += 5.0
+        persistent = service.mining_delivery_snapshot()
+
+        # Strict-tip pressure under a full cap is surfaced on its own; the
+        # delivery stall does not ride along on the exact gap.
+        self.assertFalse(persistent["mining_ready"])
+        self.assertEqual(
+            persistent["unhealthy_reasons"],
+            ["connection-capacity-saturated"],
+        )
+        self.assertFalse(persistent["initial_delivery_stalled"])
+        self.assertEqual(persistent["current_tip_coverage_gap_age_seconds"], 5.0)
+
+        # Exact coverage restored under the same full cap clears the reason
+        # even though semantic coverage is now gone.
+        port.now += 5.0
+        port.inputs = replace(
+            port.inputs,
+            clients_with_current_tip_jobs=64,
+            clients_with_semantically_current_work=0,
+        )
+        cleared = service.mining_delivery_snapshot()
+
+        self.assertTrue(cleared["connection_capacity_saturated"])
+        self.assertTrue(cleared["mining_ready"])
+        self.assertEqual(cleared["unhealthy_reasons"], [])
+
+
 def bare_semantic_coordinator() -> PrismCoordinator:
     server = PrismCoordinator.__new__(PrismCoordinator)
     server.lock = threading.RLock()
@@ -684,13 +1009,12 @@ def semantic_client(server: PrismCoordinator, connection_id: int) -> ClientState
 
 
 class SemanticCurrencyAdapterTests(unittest.TestCase):
-    def test_fingerprint_and_payout_generation_alone_determine_the_count(
+    def test_template_generation_and_identity_do_not_affect_the_count(
         self,
     ) -> None:
-        # Upstream #107: the semantic gauge compares template fingerprint and
-        # payout generation only. Template generation and template object
-        # identity do not participate, and the strict fail-closed gauge stays
-        # untouched by semantic matches.
+        # Upstream #107: template generation and template object identity do
+        # not participate in semantic currency. Client-session generations do,
+        # and the strict fail-closed gauge stays untouched by semantic matches.
         server = bare_semantic_coordinator()
         fingerprint = "ff" * 32
         server.tip_template_snapshot = SimpleNamespace(
@@ -707,6 +1031,9 @@ class SemanticCurrencyAdapterTests(unittest.TestCase):
             # template object: neither may disqualify semantic currency.
             template_generation=3,
             payout_state_generation=0,
+            connection_id=matching.connection_id,
+            authorization_generation=matching.authorization_generation,
+            difficulty_generation=matching.difficulty_generation,
         )
         mismatched = semantic_client(server, 2)
         mismatched.active_job = SimpleNamespace(
@@ -714,6 +1041,9 @@ class SemanticCurrencyAdapterTests(unittest.TestCase):
             template_fingerprint="ee" * 32,
             template_generation=7,
             payout_state_generation=0,
+            connection_id=mismatched.connection_id,
+            authorization_generation=mismatched.authorization_generation,
+            difficulty_generation=mismatched.difficulty_generation,
         )
 
         snapshot = server.mining_delivery_snapshot()
@@ -739,8 +1069,46 @@ class SemanticCurrencyAdapterTests(unittest.TestCase):
             template_fingerprint=fingerprint,
             template_generation=7,
             payout_state_generation=99,
+            connection_id=stale.connection_id,
+            authorization_generation=stale.authorization_generation,
+            difficulty_generation=stale.difficulty_generation,
         )
 
+        snapshot = server.mining_delivery_snapshot()
+
+        self.assertEqual(snapshot["clients_with_semantically_current_work"], 0)
+        self.assertEqual(snapshot["semantic_current_work_ratio"], 0.0)
+
+    def test_session_generation_changes_disqualify_semantic_currency(self) -> None:
+        server = bare_semantic_coordinator()
+        fingerprint = "ff" * 32
+        server.tip_template_snapshot = SimpleNamespace(
+            bestblockhash="aa" * 32,
+            template_fingerprint=fingerprint,
+            template_generation=7,
+            template_artifacts=None,
+        )
+        reauthorized = semantic_client(server, 1)
+        reauthorized.active_job = SimpleNamespace(
+            template={"previousblockhash": "aa" * 32},
+            template_fingerprint=fingerprint,
+            payout_state_generation=0,
+            connection_id=reauthorized.connection_id,
+            authorization_generation=reauthorized.authorization_generation,
+            difficulty_generation=reauthorized.difficulty_generation,
+        )
+        retargeted = semantic_client(server, 2)
+        retargeted.active_job = SimpleNamespace(
+            template={"previousblockhash": "aa" * 32},
+            template_fingerprint=fingerprint,
+            payout_state_generation=0,
+            connection_id=retargeted.connection_id,
+            authorization_generation=retargeted.authorization_generation,
+            difficulty_generation=retargeted.difficulty_generation,
+        )
+
+        reauthorized.authorization_generation += 1
+        retargeted.difficulty_generation += 1
         snapshot = server.mining_delivery_snapshot()
 
         self.assertEqual(snapshot["clients_with_semantically_current_work"], 0)

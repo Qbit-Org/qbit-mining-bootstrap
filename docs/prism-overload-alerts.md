@@ -102,8 +102,8 @@ Explicitly **not** used: current-tip coverage
 (`current_tip_job_coverage`) and the initial-job queue series
 (`pending_initial_jobs`, `pending_initial_job_capacity`). They are
 similarly named but measure different populations; the semantic ratio is
-the signal that accounts for both template fingerprint and payout
-generation.
+the signal that accounts for template fingerprint, payout generation, and
+client-session currency.
 
 ## Threshold provenance
 
@@ -260,7 +260,7 @@ Severity convention: `warning` means investigate within the working day;
 ### 5. `PrismSemanticWorkCoverageLoss`
 
 - **Purpose:** authorized clients are mining work that no longer matches
-  the current template fingerprint and payout generation.
+  the current template fingerprint, payout generation, or client session.
 - **Condition (warning):**
   ```
   qbit_prism_stratum_semantic_current_work_ratio < 0.95
