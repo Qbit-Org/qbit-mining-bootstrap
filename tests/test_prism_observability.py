@@ -1378,13 +1378,12 @@ def semantic_client(server: PrismCoordinator, connection_id: int) -> ClientState
 
 
 class SemanticCurrencyAdapterTests(unittest.TestCase):
-    def test_fingerprint_and_payout_generation_alone_determine_the_count(
+    def test_template_generation_and_identity_do_not_affect_the_count(
         self,
     ) -> None:
-        # Upstream #107: the semantic gauge compares template fingerprint and
-        # payout generation only. Template generation and template object
-        # identity do not participate, and the strict fail-closed gauge stays
-        # untouched by semantic matches.
+        # Upstream #107: template generation and template object identity do
+        # not participate in semantic currency. Client-session generations do,
+        # and the strict fail-closed gauge stays untouched by semantic matches.
         server = bare_semantic_coordinator()
         fingerprint = "ff" * 32
         server.tip_template_snapshot = SimpleNamespace(
@@ -1401,6 +1400,9 @@ class SemanticCurrencyAdapterTests(unittest.TestCase):
             # template object: neither may disqualify semantic currency.
             template_generation=3,
             payout_state_generation=0,
+            connection_id=matching.connection_id,
+            authorization_generation=matching.authorization_generation,
+            difficulty_generation=matching.difficulty_generation,
         )
         mismatched = semantic_client(server, 2)
         mismatched.active_job = SimpleNamespace(
@@ -1408,6 +1410,9 @@ class SemanticCurrencyAdapterTests(unittest.TestCase):
             template_fingerprint="ee" * 32,
             template_generation=7,
             payout_state_generation=0,
+            connection_id=mismatched.connection_id,
+            authorization_generation=mismatched.authorization_generation,
+            difficulty_generation=mismatched.difficulty_generation,
         )
 
         snapshot = server.mining_delivery_snapshot()
@@ -1433,8 +1438,46 @@ class SemanticCurrencyAdapterTests(unittest.TestCase):
             template_fingerprint=fingerprint,
             template_generation=7,
             payout_state_generation=99,
+            connection_id=stale.connection_id,
+            authorization_generation=stale.authorization_generation,
+            difficulty_generation=stale.difficulty_generation,
         )
 
+        snapshot = server.mining_delivery_snapshot()
+
+        self.assertEqual(snapshot["clients_with_semantically_current_work"], 0)
+        self.assertEqual(snapshot["semantic_current_work_ratio"], 0.0)
+
+    def test_session_generation_changes_disqualify_semantic_currency(self) -> None:
+        server = bare_semantic_coordinator()
+        fingerprint = "ff" * 32
+        server.tip_template_snapshot = SimpleNamespace(
+            bestblockhash="aa" * 32,
+            template_fingerprint=fingerprint,
+            template_generation=7,
+            template_artifacts=None,
+        )
+        reauthorized = semantic_client(server, 1)
+        reauthorized.active_job = SimpleNamespace(
+            template={"previousblockhash": "aa" * 32},
+            template_fingerprint=fingerprint,
+            payout_state_generation=0,
+            connection_id=reauthorized.connection_id,
+            authorization_generation=reauthorized.authorization_generation,
+            difficulty_generation=reauthorized.difficulty_generation,
+        )
+        retargeted = semantic_client(server, 2)
+        retargeted.active_job = SimpleNamespace(
+            template={"previousblockhash": "aa" * 32},
+            template_fingerprint=fingerprint,
+            payout_state_generation=0,
+            connection_id=retargeted.connection_id,
+            authorization_generation=retargeted.authorization_generation,
+            difficulty_generation=retargeted.difficulty_generation,
+        )
+
+        reauthorized.authorization_generation += 1
+        retargeted.difficulty_generation += 1
         snapshot = server.mining_delivery_snapshot()
 
         self.assertEqual(snapshot["clients_with_semantically_current_work"], 0)

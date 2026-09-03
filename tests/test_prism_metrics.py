@@ -1029,7 +1029,7 @@ def reference_render_metrics_payload(server) -> str:
         "# HELP qbit_prism_stratum_current_tip_job_coverage Ratio of authorized clients holding current-tip work.",
         "# TYPE qbit_prism_stratum_current_tip_job_coverage gauge",
         f"qbit_prism_stratum_current_tip_job_coverage {mining_metrics['current_tip_job_coverage']}",
-        "# HELP qbit_prism_stratum_semantic_current_work_ratio Ratio of authorized clients whose work matches the current template fingerprint and payout generation.",
+        "# HELP qbit_prism_stratum_semantic_current_work_ratio Ratio of authorized clients whose work matches the current template fingerprint, payout generation, and client session.",
         "# TYPE qbit_prism_stratum_semantic_current_work_ratio gauge",
         f"qbit_prism_stratum_semantic_current_work_ratio {mining_metrics['semantic_current_work_ratio']}",
         "# HELP qbit_prism_stratum_handler_threads Active per-connection Stratum handler threads.",

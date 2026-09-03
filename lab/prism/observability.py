@@ -407,12 +407,12 @@ class ObservabilityService:
         )
         # The semantic gap must be sustained for a full deadline, and the
         # strict gap alone can never fire it. Exact current-tip work is
-        # checked against the same template fingerprint and payout
-        # generation whenever a template snapshot is published, so in
-        # production it is a subset of the semantic count and this reduces
-        # to the semantic gap; an embedder that publishes only the observed
-        # tip has no semantic evidence, and its exact-tip work must still
-        # count as delivered.
+        # checked against the same template fingerprint, payout generation,
+        # and client-session generations whenever a template snapshot is
+        # published, so in production it is a subset of the semantic count
+        # and this reduces to the semantic gap; an embedder that publishes
+        # only the observed tip has no semantic evidence, and its exact-tip
+        # work must still count as delivered.
         current_work_coverage_stalled = bool(
             deadline is not None
             and poor_semantic_coverage

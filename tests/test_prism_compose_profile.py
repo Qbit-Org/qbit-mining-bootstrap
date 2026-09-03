@@ -64,6 +64,8 @@ class PrismComposeProfileTests(unittest.TestCase):
                 "PRISM_COORDINATION_BLOCKED_EXIT_SECONDS": "37",
                 "PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS": "23",
                 "PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS": "29",
+                "PRISM_MINING_READINESS_ENTRY_DWELL_SECONDS": "91",
+                "PRISM_MINING_READINESS_RECOVERY_WINDOW_SECONDS": "601",
                 "PRISM_METRICS_REFRESH_SECONDS": "17",
                 "PRISM_STRATUM_STALE_GRACE_SECONDS": "4",
                 "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_SECONDS": "31",
@@ -166,6 +168,14 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_COORDINATION_BLOCKED_EXIT_SECONDS"], "37")
         self.assertEqual(env["PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS"], "23")
         self.assertEqual(env["PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS"], "29")
+        self.assertEqual(
+            env["PRISM_MINING_READINESS_ENTRY_DWELL_SECONDS"],
+            "91",
+        )
+        self.assertEqual(
+            env["PRISM_MINING_READINESS_RECOVERY_WINDOW_SECONDS"],
+            "601",
+        )
         self.assertEqual(env["PRISM_METRICS_REFRESH_SECONDS"], "17")
         self.assertEqual(env["PRISM_STRATUM_STALE_GRACE_SECONDS"], "4")
         self.assertEqual(env["PRISM_STRATUM_SAME_TIP_JOB_RETENTION_SECONDS"], "31")
