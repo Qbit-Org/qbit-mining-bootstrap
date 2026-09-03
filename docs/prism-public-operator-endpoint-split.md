@@ -263,7 +263,8 @@ measured against `PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS`:
   deadline without any delivered work
   (`oldest_genuinely_pending_initial_job_age_seconds`).
 - **Sustained semantic current-work loss.** Fewer than 95% of authorized miners
-  hold work matching the current template fingerprint and payout generation
+  hold work matching the current template fingerprint, payout generation, and
+  their current connection, authorization, and difficulty generations
   (`semantic_current_work_ratio`) for longer than the deadline
   (`semantic_current_work_gap_age_seconds`), with no exact-tip work covering
   the gap either.

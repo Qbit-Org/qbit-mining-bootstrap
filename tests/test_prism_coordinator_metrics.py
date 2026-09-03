@@ -1111,7 +1111,8 @@ class MetricsSnapshotTests(_JobSupportTestCase):
 
     def test_renderer_emits_semantic_current_work_ratio_gauge(self) -> None:
         # Upstream #107: the complete document carries the semantic-currency
-        # gauge derived from fingerprint + payout generation only.
+        # gauge derived from fingerprint, payout generation, and client
+        # session currency.
         server, _ = coordinator()
 
         metrics = server._render_metrics_payload()
