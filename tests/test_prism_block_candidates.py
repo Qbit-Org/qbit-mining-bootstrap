@@ -11836,6 +11836,24 @@ class BlockCandidateCleanupRetryBacklogBoundTests(unittest.TestCase):
             (1, 0, 1),
         )
 
+        # Direct embedder/test overrides bypass startup validation, so they
+        # are clamped to the terminal-fence registry's hard capacity.
+        server.block_candidate_cleanup_retry_backlog_max = (
+            MAX_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX + 1
+        )
+        self.assertEqual(
+            fixture.service._collapse_cleanup_retry_backlog_max(),
+            MAX_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX,
+        )
+        self.assertEqual(
+            fixture.service._collapse_cleanup_admission_headroom(),
+            (
+                MAX_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX,
+                0,
+                MAX_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX,
+            ),
+        )
+
     def test_startup_validation_refuses_an_unusable_bound(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = _minimal_config_environment(Path(tmp))

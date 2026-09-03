@@ -41,6 +41,7 @@ from lab.prism.coordinator_config import (
     DEFAULT_BLOCK_SUBMIT_STUCK_CALL_EXIT_SECONDS,
     DEFAULT_PRISM_OBSERVED_TIP_ACCEPT_WINDOW_SECONDS,
     DEFAULT_PRISM_WATCHDOG_TIMEOUT_SECONDS,
+    MAX_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX,
 )
 from lab.prism.coordinator_shutdown import ShutdownInProgress
 from lab.prism.job_bundle import PRISM_JOB_BUILD_SECONDS_BUCKETS
@@ -2453,11 +2454,11 @@ class BlockCandidateService:
 
         Read from the coordinator attribute first, so an embedder or a test
         can pin it the way the sibling accounting knobs are pinned, then
-        from the loaded ``BlockConfig``, then the shipped default. Bounded
-        below at one so a misconfigured value degrades into "admit one row
-        at a time while the backlog is empty" rather than into a collapse
-        that can never admit anything; the startup loader refuses the
-        non-positive and over-limit values outright.
+        from the loaded ``BlockConfig``, then the shipped default. Clamp it
+        into the same safe range enforced by startup validation. A direct
+        runtime value below one degrades into "admit one row at a time while
+        the backlog is empty"; one above the fence registry's capacity can
+        never weaken the hard memory bound.
         """
         coordinator = self._coordinator
         value = getattr(
@@ -2474,7 +2475,10 @@ class BlockCandidateService:
             )
         if value is None:
             value = DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX
-        return max(1, int(value))
+        return min(
+            MAX_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX,
+            max(1, int(value)),
+        )
 
     def _collapse_cleanup_admission_headroom(self) -> tuple[int, int, int]:
         """(rows the collapse may still admit, backlog depth, bound).

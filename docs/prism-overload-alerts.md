@@ -497,10 +497,10 @@ test pins the two equal): every retry record pins one fence, and a backlog
 allowed past the registry would leave the fence eviction with nothing it
 may drop. At runtime the service reads the coordinator attribute
 `block_candidate_cleanup_retry_backlog_max` first (the seam tests and
-embedders pin), then the loaded block config, then the default, and clamps
-below at one so a misconfigured runtime value degrades into "admit one row
-at a time from an empty backlog" rather than into a collapse that admits
-nothing.
+embedders pin), then the loaded block config, then the default. Runtime values
+are clamped to the same 1..8192 safety range: a non-positive override degrades
+into "admit one row at a time from an empty backlog", while an over-limit
+override cannot outgrow the terminal-fence registry.
 
 ### Measurement basis
 
@@ -652,10 +652,14 @@ once. Fences stay published throughout; holders are released exactly once
 by object identity and only for the collapsed row's own object; records,
 holders and pins are never shed while the fault persists. The moment the
 depth drops below the bound admission resumes, and the next enumeration
-walk collapses the preserved rows in bulk again. No operator action is
-needed beyond fixing the dependency; nothing needs to be restarted, and a
-restart would not help — the records are the only replay source those rows
-have, and a restart discards them along with the fault.
+walk collapses the preserved rows in bulk again. No operator action is needed
+beyond fixing the dependency, and no restart is required for durable recovery.
+A controlled restart is nevertheless a valid short-term mitigation: the
+backlog, retained holders, and terminal-outcome pins are process-local and are
+cleared, while the durable terminal rows are not selected by pending-row replay
+and therefore are neither re-adopted nor re-offered. Restarting does not repair
+the cleanup dependency; new collapses can rebuild the backlog and re-engage
+backpressure until the underlying fault is fixed.
 
 Re-baselining: rerun `python3 tests/prism_candidate_storm.py --cleanup-fault
 all --credit-shares` (add `--cleanup-view live`, `--backlog-max N`) and
