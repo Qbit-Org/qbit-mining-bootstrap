@@ -14,6 +14,15 @@ from __future__ import annotations
 import time
 from typing import Any, Protocol
 
+from lab.prism.accepted_preview_telemetry import (
+    PRISM_ACCEPTED_LANDING_PHASES,
+    PRISM_PAYOUT_WINDOW_FULL_RESCAN_PATHS,
+    PRISM_PAYOUT_WINDOW_FULL_RESCAN_REASONS,
+    PRISM_REORG_RECONCILE_CALLERS,
+    PRISM_REORG_RECONCILE_STEPS,
+    ensure_accepted_preview_telemetry,
+    fold_ledger_read_stats,
+)
 from lab.prism.block_candidates import (
     PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_RESULTS,
     PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_SECONDS_BUCKETS,
@@ -53,7 +62,11 @@ class MetricsPort(Protocol):
 
     The renderer is observational but not pure: it still performs live
     RPC/ledger reads and calls bounded retained-job pruning, and several
-    ``_ensure_*`` calls can initialize owner state on first touch.
+    ``_ensure_*`` calls can initialize owner state on first touch. The
+    issue #224 attribution owner is likewise attached to the port's
+    instance ``__dict__`` on first render
+    (``ensure_accepted_preview_telemetry``), so the port needs an
+    instance dictionary but no dedicated attribute or method for it.
     """
 
     ledger: Any
@@ -620,6 +633,7 @@ class MetricsRenderer:
         lines.extend(self.port.payout_state_metrics_lines())
         lines.extend(self.initial_delivery_metrics_lines())
         lines.extend(self.port.progress_health_metrics_lines())
+        lines.extend(self.accepted_preview_attribution_metrics_lines())
         return "\n".join(lines) + "\n"
 
     def share_ack_metrics_lines(self) -> list[str]:
@@ -971,7 +985,12 @@ class MetricsRenderer:
         stats_fn = getattr(self.port.ledger, "ledger_read_gate_stats", None)
         if not callable(stats_fn):
             return []
-        stats_by_operation = stats_fn()
+        # Issue #224 Wave 0: the operation label is bounded by
+        # PRISM_LEDGER_READ_OPERATIONS. Names outside the contract fold
+        # into ``other`` (summed) instead of opening a series; members
+        # pass through untouched, so the shipped operation renders
+        # byte-for-byte as before.
+        stats_by_operation = fold_ledger_read_stats(stats_fn() or {})
         if not stats_by_operation:
             return []
         # Samples stay grouped under their own family: the exposition format
@@ -1042,6 +1061,93 @@ class MetricsRenderer:
                     f"{int(value)}" if integral else f"{float(value):.6f}"
                 )
                 lines.append(f'{name}{{operation="{label}"}} {rendered}')
+        return lines
+
+    @staticmethod
+    def _duration_summary_lines(
+        name: str,
+        labels: str,
+        stats: dict[str, Any],
+    ) -> list[str]:
+        """``_sum`` / ``_count`` / ``_max`` for one labelled cell."""
+        return [
+            f'{name}_sum{{{labels}}} {float(stats["sum"]):.6f}',
+            f'{name}_count{{{labels}}} {int(stats["count"])}',
+            f'{name}_max{{{labels}}} {float(stats["max"]):.6f}',
+        ]
+
+    def accepted_preview_attribution_metrics_lines(self) -> list[str]:
+        """Issue #224 Wave 0: the shared acceptance-to-preview attribution.
+
+        Four summary families, one owner snapshot per render, every label
+        drawn from a closed vocabulary in
+        ``lab.prism.accepted_preview_telemetry`` and every cell of every
+        product rendered from zero. The export is therefore constant-size
+        regardless of block cadence and carries no hash or height; the
+        per-publication record that may carry those is the owner's
+        diagnostics ring, which is deliberately not a metric.
+        """
+        snapshot = ensure_accepted_preview_telemetry(self.port).snapshot()
+        landing = snapshot["landing_phases"]
+        passes = snapshot["reconcile_passes"]
+        steps = snapshot["reconcile_steps"]
+        rescans = snapshot["full_rescans"]
+        landing_name = "qbit_prism_accepted_block_landing_phase_seconds"
+        pass_name = "qbit_prism_reorg_reconcile_pass_seconds"
+        step_name = "qbit_prism_reorg_reconcile_step_seconds"
+        rescan_name = "qbit_prism_payout_window_full_rescan_seconds"
+        lines = [
+            f"# HELP {landing_name} Accepted-block landing wall time between definitive node acceptance and payout preview publication, by bounded sub-phase; prior_balances_check is a prior-balances reread, never a payout-window rescan.",
+            f"# TYPE {landing_name} summary",
+        ]
+        for phase in PRISM_ACCEPTED_LANDING_PHASES:
+            lines.extend(
+                self._duration_summary_lines(
+                    landing_name, f'phase="{phase}"', landing[phase]
+                )
+            )
+        lines.extend(
+            [
+                f"# HELP {pass_name} Reorg reconciliation passes by bounded caller; _count is the pass count, and a pass minus the sum of its steps is the unattributed remainder.",
+                f"# TYPE {pass_name} summary",
+            ]
+        )
+        for caller in PRISM_REORG_RECONCILE_CALLERS:
+            lines.extend(
+                self._duration_summary_lines(
+                    pass_name, f'caller="{caller}"', passes[caller]
+                )
+            )
+        lines.extend(
+            [
+                f"# HELP {step_name} Reorg reconciliation wall time by bounded caller and step; admission_wait is writer admission plus the payout-balance mutation lock, and candidate_prepare is where a reconcile_invalidation full rescan executes.",
+                f"# TYPE {step_name} summary",
+            ]
+        )
+        for caller in PRISM_REORG_RECONCILE_CALLERS:
+            for step in PRISM_REORG_RECONCILE_STEPS:
+                lines.extend(
+                    self._duration_summary_lines(
+                        step_name,
+                        f'caller="{caller}",step="{step}"',
+                        steps[(caller, step)],
+                    )
+                )
+        lines.extend(
+            [
+                f"# HELP {rescan_name} Full payout-window oracle rescans by bounded reason and window pipeline path; a prior-balances reread is a ledger read operation, not an observation here.",
+                f"# TYPE {rescan_name} summary",
+            ]
+        )
+        for reason in PRISM_PAYOUT_WINDOW_FULL_RESCAN_REASONS:
+            for path in PRISM_PAYOUT_WINDOW_FULL_RESCAN_PATHS:
+                lines.extend(
+                    self._duration_summary_lines(
+                        rescan_name,
+                        f'reason="{reason}",path="{path}"',
+                        rescans[(reason, path)],
+                    )
+                )
         return lines
 
     def accepted_stats_reconcile_metric_lines(self) -> list[str]:
