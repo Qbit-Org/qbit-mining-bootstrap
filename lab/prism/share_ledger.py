@@ -4343,6 +4343,8 @@ FROM (
             self._run_attributed_read_json(
                 sql,
                 operation="pending_block_candidate_rows",
+                gate=self._read_semaphore,
+                gate_name="read slot",
             )
         )
         # A row whose existence fact did not arrive is not a row with no pool
@@ -4670,9 +4672,21 @@ FROM rows;
         # Job construction is a retry-safe MVCC read. Use the independent read
         # pool so an accepted block's fenced bulk write cannot stall replacement
         # work behind the single-writer connection lock.
+        #
+        # Attributed (#224) as ``payout_window_snapshot``: this fold is the
+        # payout-window read an accepted preview waits behind, and the alert
+        # could not say whether a slow one was queued for a read slot or slow
+        # inside PostgreSQL. The slot taken is the same slot ``_run_read_json``
+        # takes, in the same order, under the same deadline; only the
+        # bookkeeping is new.
         return [
             self._record_from_json(item)
-            for item in self._run_read_json(sql)
+            for item in self._run_attributed_read_json(
+                sql,
+                operation="payout_window_snapshot",
+                gate=self._read_semaphore,
+                gate_name="read slot",
+            )
         ]
 
     def snapshot_between_job_issues(
@@ -4731,9 +4745,18 @@ SELECT COALESCE(json_agg(json_build_object(
 ) ORDER BY share_seq ASC), '[]'::json)
 FROM rows;
 """
+        # Attributed (#224) as ``payout_window_delta``, apart from the whole
+        # snapshot above: an incremental advance and a full fold are different
+        # amounts of work, and folding them into one series would hide which
+        # of the two a landing actually paid for. Same read slot as before.
         return [
             self._record_from_json(item)
-            for item in self._run_read_json(sql)
+            for item in self._run_attributed_read_json(
+                sql,
+                operation="payout_window_delta",
+                gate=self._read_semaphore,
+                gate_name="read slot",
+            )
         ]
 
     def all_shares(self) -> list[AcceptedShareRecord]:
@@ -5050,7 +5073,17 @@ SELECT COALESCE(json_agg(json_build_object(
 ) ORDER BY payout_order_key, miner_id, encode(p2mr_program, 'hex')), '[]'::json)
 FROM balances;
 """
-        balances = list(self._run_read_json(sql))
+        # Attributed (#224). Still the read slot: this is a retry-safe MVCC
+        # read of already-confirmed rows, and the audit path that asks for it
+        # never needed writer serialization.
+        balances = list(
+            self._run_attributed_read_json(
+                sql,
+                operation="prior_balances_after_pool_block",
+                gate=self._read_semaphore,
+                gate_name="read slot",
+            )
+        )
         for balance in balances:
             balance["balance_sats"] = int(balance["balance_sats"])
         return balances
@@ -5065,9 +5098,28 @@ SELECT COALESCE(json_agg(json_build_object(
 ) ORDER BY payout_order_key, miner_id, encode(p2mr_program, 'hex')), '[]'::json)
 FROM qbit_current_carry_forward_balances();
 """
+        # Attributed (#224) without changing the primitive. This reread stays
+        # on the *writer lock*, which is where the landing's prior-balances
+        # check has always taken it: it must observe the fenced state a payout
+        # mutation leaves behind, so it serializes against that mutation
+        # rather than running beside it on a read slot. The attribution is the
+        # only thing added, and it is exactly the split the alert lacked --
+        # whether a slow reread was queued behind a landing or slow inside
+        # PostgreSQL.
+        #
+        # The legacy aggregate below is left as it was: one duration covering
+        # admission and execution together, recorded only on success.
+        # ``qbit_prism_prior_balances_*`` is an existing operator-facing
+        # series and a reader comparing it across this change must not find
+        # its meaning quietly redefined, so it duplicates part of the new
+        # per-operation sample on purpose.
         started = time.monotonic()
-        with self._operation_gate(self._lock, "writer lock"):
-            balances = self._run_retry_safe_read_json(sql)
+        balances = self._run_attributed_read_json(
+            sql,
+            operation="current_prior_balances",
+            gate=self._lock,
+            gate_name="writer lock",
+        )
         self._note_prior_balances_read(max(0.0, time.monotonic() - started))
         for balance in balances:
             balance["balance_sats"] = int(balance["balance_sats"])
@@ -9042,13 +9094,41 @@ END;
         with self._operation_gate(self._read_semaphore, "read slot"):
             return self._run_retry_safe_read_json(sql)
 
-    def _run_attributed_read_json(self, sql: str, *, operation: str) -> Any:
-        """Run one read-slot query, timing admission apart from execution.
+    def _run_attributed_read_json(
+        self,
+        sql: str,
+        *,
+        operation: str,
+        gate: Any,
+        gate_name: str,
+    ) -> Any:
+        """Run one gated read query, timing admission apart from execution.
 
-        Identical to ``_run_read_json`` in what it acquires and what it
-        executes -- the same bounded read semaphore, the same retry-safe
+        Identical to wrapping ``_operation_gate(gate, gate_name)`` around
+        ``_run_retry_safe_read_json`` in what it acquires and what it
+        executes -- the caller's own admission primitive, the same retry-safe
         statement, no extra connection and no extra thread -- and different
         only in what it records.
+
+        The gate is the caller's and stays the caller's. A read that takes the
+        bounded read semaphore keeps taking it; a read that takes the writer
+        lock keeps taking it. Attribution is a measurement, and a measurement
+        that quietly moved a statement between admission classes would change
+        which writes it serializes against -- the one property the rest of the
+        ledger reasons about. ``gate_name`` is the same string
+        ``_operation_gate`` would have been given, so an admission that
+        expires still names the primitive it was waiting for.
+
+        ``operation`` is written at each call site as a bare string literal
+        taken from ``PRISM_LEDGER_READ_OPERATIONS`` in
+        ``lab.prism.accepted_preview_telemetry``, and deliberately not as an
+        imported constant: ``tests.test_prism_accepted_preview_telemetry``
+        harvests these literals out of this file's source to fail the moment
+        a call site attributes a read under a name the closed vocabulary does
+        not carry. Importing the names instead would leave that check with
+        nothing to read. A name that escaped anyway is still bounded --
+        ``fold_ledger_read_stats`` folds it into ``other`` before rendering,
+        so a drifted call site costs an attribution, never a new series.
 
         That record is the point. Issue #211 was diagnosed against an outer
         call reporting ``replay-outbox-query exceeded 5s`` while the inner
@@ -9069,7 +9149,7 @@ END;
         """
         gate_started = self._monotonic()
         try:
-            self._acquire_operation_gate(self._read_semaphore, "read slot")
+            self._acquire_operation_gate(gate, gate_name)
         except BaseException as exc:
             # Admission itself expired: no statement was ever sent, so there
             # is no execution sample to record and the call counts as a gate
@@ -9109,8 +9189,8 @@ END;
                 else max(0.0, self._monotonic() - execute_started)
             )
             # Released before the record is taken: a bookkeeping failure must
-            # never leak the read slot it was measuring.
-            self._read_semaphore.release()
+            # never leak the gate it was measuring.
+            gate.release()
             self._note_ledger_read_timing(
                 operation,
                 gate_wait_seconds=gate_wait_seconds,

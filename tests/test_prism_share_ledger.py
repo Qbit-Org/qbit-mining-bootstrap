@@ -2346,6 +2346,8 @@ class PrismShareLedgerTests(unittest.TestCase):
             ledger._run_attributed_read_json(
                 "SELECT json_build_object('ok', true);",
                 operation="pending_block_candidate_rows",
+                gate=ledger._read_semaphore,
+                gate_name="read slot",
             )
 
         self.assertEqual(list(clock), [])
@@ -2383,6 +2385,8 @@ class PrismShareLedgerTests(unittest.TestCase):
                 ledger._run_attributed_read_json(
                     "SELECT json_build_object('ok', true);",
                     operation="pending_block_candidate_rows",
+                    gate=ledger._read_semaphore,
+                    gate_name="read slot",
                 )
 
         run.assert_not_called()
