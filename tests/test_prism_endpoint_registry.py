@@ -83,6 +83,9 @@ class _RoutingPort:
     def cached_health_payload(self) -> tuple[int, dict[str, object]]:
         return 200, {"ok": True}
 
+    def cached_mining_readiness_payload(self) -> tuple[int, dict[str, object]]:
+        return 200, {"ready": True, "state": "ready", "reasons": []}
+
     def cached_metrics_payload(self) -> MetricsSnapshotResponse:
         return MetricsSnapshotResponse(
             status=200,
@@ -216,6 +219,39 @@ class EndpointRegistryShapeTests(unittest.TestCase):
         retained = endpoint_registry.retained_paths()
         self.assertIn("/healthz", retained)
         self.assertIn("/metrics", retained)
+        self.assertIn("/readyz/mining", retained)
+
+    def test_mining_readiness_is_retained_non_public_process_state(self) -> None:
+        # Issue #186: the router-facing readiness signal names the instance
+        # behind the load balancer, so it is operator surface answered from
+        # process state and must never appear on the extracted public tier.
+        endpoint = endpoint_registry.endpoint_for_request_path("/readyz/mining")
+        assert endpoint is not None
+        self.assertEqual(endpoint.paths, ("/readyz/mining",))
+        self.assertIs(endpoint.audience, Audience.OPERATOR)
+        self.assertIs(endpoint.disposition, Disposition.RETAIN)
+        self.assertEqual(endpoint.access, (LedgerAccess.PROCESS_STATE,))
+        self.assertEqual(endpoint.ledger_methods, ())
+        self.assertIsNone(endpoint.extraction_blocker)
+        self.assertIsNone(endpoint.max_staleness_seconds)
+        self.assertFalse(endpoint.immutable_content)
+        self.assertNotIn("/readyz/mining", endpoint_registry.extracted_paths())
+        self.assertNotIn(
+            endpoint,
+            endpoint_registry.endpoints_by_audience(Audience.PUBLIC_READ),
+        )
+        self.assertFalse(
+            any(
+                path.startswith("/readyz")
+                for path in endpoint_registry.extracted_paths()
+            )
+        )
+        self.assertNotIn("/readyz/mining", endpoint_registry.writer_lock_paths())
+        # Distinct from process health: two routes, two classifications.
+        self.assertIsNot(
+            endpoint,
+            endpoint_registry.endpoint_for_request_path("/healthz"),
+        )
 
     def test_drift_count_and_owed_dump_stay_on_the_coordinator(self) -> None:
         retained = endpoint_registry.retained_paths()
@@ -568,6 +604,7 @@ class RegistryCoverageTests(unittest.TestCase):
             "/owed-balances",
             "/payouts",
             "/payouts/",
+            "/readyz/mining",
             "/status",
         }
     )
@@ -641,10 +678,12 @@ class RegistryCoverageTests(unittest.TestCase):
     def test_path_counts_are_pinned(self) -> None:
         # The extraction set and the total surface are contract numbers:
         # PR 2 moved exactly the 13 original /public/v1 routes,
-        # /public/v1/block-markers joined the extracted surface later, and the
-        # registry classifies all 32 request paths the HTTP surface serves.
+        # /public/v1/block-markers joined the extracted surface later,
+        # /readyz/mining joined the retained operator surface (issue #186),
+        # and the registry classifies all 33 request paths the HTTP surface
+        # serves.
         self.assertEqual(14, len(endpoint_registry.extracted_paths()))
-        self.assertEqual(32, len(self.registry_paths()))
+        self.assertEqual(33, len(self.registry_paths()))
 
     def test_http_handler_is_get_only(self) -> None:
         # The registry -- and the snapshot guard above -- only inspect do_GET

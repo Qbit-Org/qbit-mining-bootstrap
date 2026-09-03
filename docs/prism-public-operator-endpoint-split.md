@@ -126,6 +126,7 @@ fallbacks would reintroduce writer-lock reads on public routes.
 | Path(s) | Ledger access | Why operator |
 | --- | --- | --- |
 | `/healthz` | `PROCESS_STATE` | Liveness of this instance: job-build progress, tip refresh, writer-lease state. Answered from a background-refreshed in-memory snapshot (`PRISM_HEALTH_REFRESH_SECONDS`, default 5s), overlaid with live progress on every request so a cached `ok=true` cannot mask a failed refresh. Wired to the compose healthcheck (`compose.yaml`, pinned by `tests/test_prism_compose_profile.py`) and to `make prism-self-check`. |
+| `/readyz/mining` | `PROCESS_STATE` | Router-facing mining readiness of this instance (issue #186): whether a load balancer should send new miners here. A latched, hysteretic signal computed by the same background health refresher and served only as a copy of that cache. Distinct from `/healthz` and never public; see [Mining readiness is a separate contract](#mining-readiness-is-a-separate-contract). |
 | `/metrics` | `PROCESS_STATE` | Prometheus exposition of this process's counters. Serves only the complete cached snapshot (`PRISM_METRICS_REFRESH_SECONDS`, default 5s). |
 | `/audit/latest` | `ARTIFACT_FILE` | The operator's view of the live evidence envelope. Public consumers reach the same evidence content-addressed via `/public/v1/artifacts/{sha256}`. |
 | `/audit/share-window` | `WRITER_LOCK` | Raw per-share rows for a caller-supplied anchor. The window is caller-controlled and unbounded. The public equivalent is the aggregated reward leaderboard. |
@@ -280,8 +281,122 @@ each of which needs an independent pressure signal. It no longer fails health
 on its own (issue #216).
 
 Router-facing mining readiness, whether a load balancer should send new miners
-to this instance, is a distinct signal to be added by issue #186. It is not
-derivable from `/healthz`, and this document does not classify it.
+to this instance, is a distinct signal. It is not derivable from `/healthz`,
+and it has its own route and contract below.
+
+## Mining readiness is a separate contract
+
+`GET /readyz/mining` (issue #186) answers a different question from `/healthz`:
+not "is this process alive and delivering right now?" but "should a router keep
+sending *new* miners here?". The two deliberately disagree at the edges.
+`/healthz` is quick to fail and re-reads live progress on every request, which
+is right for a liveness probe and wrong for a routing decision: every accepted
+tip sweeps semantic coverage `0 -> partial -> 1 -> 0` for roughly the
+tip-refresh cycle, and a router that followed that would move traffic on every
+block. `/readyz/mining` is latched with hysteresis instead.
+
+### Ownership
+
+- **Policy** lives in `lab/prism/progress_health.py` as
+  `MiningReadinessTracker`: a pure, scripted-clock state machine with two
+states (`ready`, `degraded`), two independent timers, and the closed reason
+vocabulary `MINING_READINESS_REASONS`. It keeps no history that grows with
+uptime: the two streak stamps, the last successful sample time, and the last
+preview-timeout counter sample.
+- **Sampling and the cache** live in `lab/prism/observability.py`, the same
+  owner that caches `/healthz`. `refresh_health_snapshot` builds one
+  `MiningReadinessSample` from the delivery snapshot and progress mapping it
+  has already computed for that refresh, observes it, and publishes the
+  returned immutable `MiningReadinessSnapshot` under the owner lock together
+  with the base health snapshot.
+- **Configuration** is loaded in `lab/prism/coordinator_config.py` into
+  `LifecycleConfig` and handed to the observability owner by the coordinator
+  adapter. `prism_coordinator.py` carries no readiness policy: it supplies the
+  config, the preview-timeout counter read, and the HTTP wrapper.
+- **The route** is classified in `lab/prism/endpoint_registry.py` as
+  `OPERATOR` / `RETAIN` / `PROCESS_STATE` and dispatched by
+  `lab/prism/audit_http.py`. `tests/test_prism_endpoint_registry.py` pins that
+  it is absent from `extracted_paths()` and from every `/public/v1` literal.
+
+### Cache and lock behaviour
+
+The request path copies the published snapshot under the observability owner
+lock, reads the monotonic clock, and returns. It never takes the coordinator
+lock, the job-delivery or candidate-processing locks, and never queries the
+ledger; `tests/test_prism_observability.py` drives the route against a
+coordinator whose lock records any acquisition and whose ledger raises on any
+attribute, and asserts a `200`.
+
+Every input is sampled by a background refresher:
+
+| Input | Sampled by | Source |
+| --- | --- | --- |
+| `semantic_current_work_ratio` | health refresher | the delivery snapshot already computed for `/healthz` (WP1's semantic gauge) |
+| `pending_refresh`, `pending_refresh_age_seconds`, `refresh_pending_too_long`, `eligible_clients_requiring_refresh` | health refresher | the progress-health mapping already computed for `/healthz` |
+| accepted-parent preview timeout counter | health refresher | one short hold of the coordinator lock, the same copy `/metrics` takes |
+| oldest durable candidate age | **metrics refresher** | the Postgres pending-candidate aggregate is fenced behind the writer lock, which the health refresher must never wait on (a block landing holds it for up to the landing budget). The metrics renderer already pays for that read every cycle and hands the value to the observability owner (`record_oldest_durable_candidate_age`); the next health refresh reads the last one. The gauge's `-1` (unavailable) crosses over as `null`. |
+
+Before the first complete health refresh there is no snapshot and the route
+answers a fail-closed `503` with `reasons: ["warming_up"]`. Unlike `/healthz`,
+there is no inline fallback when no refresher is running: readiness is never
+sampled on a request thread. A failed refresh leaves the last snapshot in
+place. The response carries `sample_age_seconds` and `sample_stale`
+(`max(3 * PRISM_HEALTH_REFRESH_SECONDS, 15s)`, the `/healthz` budget) as
+diagnostics; the latched state is served either way so a wedged refresher
+cannot make the signal flap, and a consumer that wants to treat a stale sample
+as not-ready has the facts to. The same budget also bounds streak continuity:
+after a larger gap, the next complete refresh resets any entry or recovery
+streak before applying its sample. Time with no successful observation can
+therefore never count toward either hysteresis window.
+
+### Hysteresis
+
+- **Entry condition**: semantic coverage below `0.95`, or the progress
+  snapshot reporting `refresh_pending_too_long`. An ordinary in-budget pending
+  refresh is not an entry condition.
+- **Recovery condition**: semantic coverage at least `0.99`, no
+  `refresh_pending_too_long`, no eligible client still requiring refresh, and
+  no pending refresh at all.
+- The entry condition must hold continuously for
+  `PRISM_MINING_READINESS_ENTRY_DWELL_SECONDS` (default `60`) before the
+  state changes to `degraded`; the recovery condition must hold continuously
+  for `PRISM_MINING_READINESS_RECOVERY_WINDOW_SECONDS` (default `240`) before
+  it returns to `ready`. Any contrary sample resets the timer in progress. The
+  sampling gap rule above also resets it. The state changes exactly once per
+  sustained episode and `state_age_seconds` counts from that change. Ready is
+  the initial latched state at the first sample.
+- The defaults are set by the two incidents: `60s` exceeds the 2026-08-21
+  normal tip-refresh cycle (pending age peaked near `36.77s`), and `240s`
+  exceeds the 213-second 2026-08-20 oscillation between the apparent healthy
+  point at 20:10:27Z and stability at 20:14:00Z. Both traces are replayed on
+  a scripted clock in `tests/test_prism_progress_health.py`, each with a
+  counterfactual pin showing the shorter window flapping.
+- Startup validates both knobs as finite, nonnegative numbers with the
+  recovery window at least the entry dwell. The coverage thresholds and the
+  `60s` old-candidate age are named constants, not knobs.
+- The oldest durable candidate age (`>= 60s`, the documented warning alert on
+  `qbit_prism_block_candidate_oldest_pending_seconds`) and the accepted-parent
+  preview timeout rate annotate a degraded or recovering snapshot's `reasons`
+  and are always reported as fields. Neither starts, extends, or blocks a
+  transition.
+
+### Metrics
+
+`/metrics` renders `qbit_prism_mining_ready` (`0`/`1`) and the fixed-cardinality
+`qbit_prism_mining_readiness_reason{reason=...}` gauge from the same cached
+snapshot, so a scrape and the route always agree; `warming_up` reads `1` until
+the first complete refresh. The families are part of the frozen render
+reference in `tests/test_prism_metrics.py`.
+
+### Distinction from the public tier
+
+The extracted public read service serves its own `/healthz` and `/metrics`
+describing *that* process. `/readyz/mining` names the coordinator instance
+behind the router, is answered from the coordinator's process state, and is
+listed as private/internal alongside `/healthz`. It must not be exposed
+through the public tier or a public reverse proxy. The exact consumer contract
+for qbit-tools is in [`router-integration-notes.md`](router-integration-notes.md);
+the router implementation itself is out of scope here.
 
 ## Out of scope
 

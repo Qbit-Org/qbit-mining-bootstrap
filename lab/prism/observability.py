@@ -6,7 +6,17 @@ from dataclasses import dataclass
 import threading
 from typing import Callable, Iterator, Mapping, Protocol
 
-from lab.prism.progress_health import overlay_progress_health
+from lab.prism.progress_health import (
+    MINING_READINESS_REASON_REFRESH_PENDING_TOO_LONG,
+    MINING_READINESS_REASON_WARMING_UP,
+    MINING_READINESS_SCHEMA,
+    MINING_READINESS_STATE_DEGRADED,
+    MiningReadinessConfig,
+    MiningReadinessSample,
+    MiningReadinessSnapshot,
+    MiningReadinessTracker,
+    overlay_progress_health,
+)
 
 
 HEALTH_SCHEMA = "qbit.prism.audit-health.v1"
@@ -92,6 +102,10 @@ class ObservabilityPort(Protocol):
     def progress_health(self) -> Mapping[str, object]: ...
 
     def health_refresh_seconds(self) -> float: ...
+
+    def mining_readiness_config(self) -> MiningReadinessConfig: ...
+
+    def accepted_parent_preview_wait_timeouts(self) -> int: ...
 
     def render_metrics_payload(self) -> str: ...
 
@@ -188,6 +202,19 @@ class ObservabilityService:
         self._mining_overload_started_monotonic: float | None = None
         self._mining_delivery_failure_started_monotonic: float | None = None
         self._mining_semantic_work_gap_started_monotonic: float | None = None
+        # Issue #186: the latched router-facing readiness signal. The tracker
+        # is driven only by the health refresher (serialized from collection
+        # through publication by its own lock so a test driving refreshes
+        # concurrently cannot publish an older observation after a newer
+        # one); the published snapshot and the candidate age the metrics
+        # renderer hands over live under the owner lock like every other
+        # cached answer.
+        self._mining_readiness_tracker = MiningReadinessTracker(
+            port.mining_readiness_config()
+        )
+        self._mining_readiness_observe_lock = threading.Lock()
+        self._mining_readiness_snapshot: MiningReadinessSnapshot | None = None
+        self._oldest_durable_candidate_age_seconds: float | None = None
         self._mining_delivery_lock = threading.Lock()
         self._metrics_lock = threading.RLock()
         self._metrics_collection_lock = threading.Lock()
@@ -532,14 +559,181 @@ class ObservabilityService:
         return self._with_current_progress(self.base_health_payload())
 
     def refresh_health_snapshot(self) -> dict[str, object]:
-        # Cache only ledger/session-backed base health. Progress is monotonic,
-        # in-memory state and is deliberately re-read for every response.
-        base_health = self.base_health_payload()
-        with self._lock:
-            self._health_snapshot = base_health
-            self._health_snapshot_monotonic = self.port.monotonic()
+        # Production has one health-refresher thread, but the compatibility
+        # path can refresh inline when no loop is running. Serialize the whole
+        # collection -> observation -> publication transaction so overlapping
+        # inline callers cannot publish an older snapshot after a newer one.
+        with self._mining_readiness_observe_lock:
+            # Cache only ledger/session-backed base health. Progress is
+            # monotonic, in-memory state and is deliberately re-read for every
+            # response.
+            base_health = self.base_health_payload()
+            # The readiness sample is taken from this same refresh's delivery
+            # snapshot and progress mapping, so the latched signal and
+            # /healthz never disagree about what the fleet looked like at one
+            # instant.
+            progress = self.port.progress_health()
+            readiness = self._observe_mining_readiness(base_health, progress)
+            with self._lock:
+                self._health_snapshot = base_health
+                self._health_snapshot_monotonic = self.port.monotonic()
+                self._mining_readiness_snapshot = readiness
         self.port.record_startup_phase("health_snapshot_warm")
-        return self._with_current_progress(base_health)
+        return self.apply_progress_health(base_health, progress)
+
+    # --- Mining readiness (issue #186) -----------------------------------
+
+    def record_oldest_durable_candidate_age(
+        self,
+        age_seconds: float | None,
+    ) -> None:
+        """Accept the candidate-outbox age the metrics renderer already read.
+
+        The Postgres pending-candidate aggregate is fenced behind the writer
+        lock. The metrics refresher already pays for it every cycle; the
+        health refresher must not, or a block landing holding the writer
+        lock would stall /healthz. So the value crosses owners here, once
+        per metrics cycle, and the readiness sample reads the last one. A
+        negative age is the gauge's "unavailable" and is stored as None.
+        """
+
+        value = (
+            None
+            if age_seconds is None or float(age_seconds) < 0.0
+            else float(age_seconds)
+        )
+        with self._lock:
+            self._oldest_durable_candidate_age_seconds = value
+
+    def _observe_mining_readiness(
+        self,
+        base_health: Mapping[str, object],
+        progress: Mapping[str, object],
+    ) -> MiningReadinessSnapshot:
+        reasons = progress.get("reasons") or ()
+        pending_age = progress.get("pending_refresh_age_seconds")
+        requiring_refresh = progress.get("eligible_clients_requiring_refresh")
+        timeouts = int(self.port.accepted_parent_preview_wait_timeouts())
+        with self._lock:
+            candidate_age = self._oldest_durable_candidate_age_seconds
+        sample = MiningReadinessSample(
+            monotonic=self.port.monotonic(),
+            semantic_current_work_ratio=float(
+                base_health.get("semantic_current_work_ratio", 1.0)
+            ),
+            refresh_pending=bool(progress.get("pending_refresh", False)),
+            refresh_pending_age_seconds=(
+                None if pending_age is None else float(pending_age)
+            ),
+            refresh_pending_too_long=(
+                MINING_READINESS_REASON_REFRESH_PENDING_TOO_LONG in reasons
+            ),
+            eligible_clients_requiring_refresh=int(requiring_refresh or 0),
+            oldest_durable_candidate_age_seconds=candidate_age,
+            accepted_parent_preview_wait_timeouts=timeouts,
+        )
+        return self._mining_readiness_tracker.observe(
+            sample,
+            max_sample_gap_seconds=self._mining_readiness_stale_after(),
+        )
+
+    def mining_readiness_snapshot(self) -> MiningReadinessSnapshot | None:
+        """The cached latched answer, or None before the first refresh."""
+
+        with self._lock:
+            return self._mining_readiness_snapshot
+
+    def _mining_readiness_stale_after(self) -> float:
+        return max(
+            3 * self.port.health_refresh_seconds(),
+            MINIMUM_HEALTH_STALE_SECONDS,
+        )
+
+    def cached_mining_readiness_payload(self) -> tuple[int, dict[str, object]]:
+        """Answer /readyz/mining from the cache alone.
+
+        This copies the published snapshot and reads the clock. It never
+        takes the coordinator lock, never touches job delivery or candidate
+        processing, and never queries the ledger; before the first complete
+        refresh it fails closed with a warming-up 503 rather than sampling
+        anything on the request thread.
+        """
+
+        with self._lock:
+            snapshot = self._mining_readiness_snapshot
+        now = self.port.monotonic()
+        stale_after = self._mining_readiness_stale_after()
+        if snapshot is None:
+            return 503, {
+                "schema": MINING_READINESS_SCHEMA,
+                "ready": False,
+                "state": MINING_READINESS_STATE_DEGRADED,
+                "reasons": [MINING_READINESS_REASON_WARMING_UP],
+                "state_age_seconds": 0.0,
+                "transitions": 0,
+                "entry_streak_seconds": 0.0,
+                "recovery_streak_seconds": 0.0,
+                "semantic_current_work_ratio": None,
+                "refresh_pending": None,
+                "refresh_pending_age_seconds": None,
+                "refresh_pending_too_long": None,
+                "eligible_clients_requiring_refresh": None,
+                "oldest_durable_candidate_age_seconds": None,
+                "accepted_parent_preview_timeout_rate_per_second": 0.0,
+                "entry_dwell_seconds": (
+                    self._mining_readiness_tracker.config.entry_dwell_seconds
+                ),
+                "recovery_window_seconds": (
+                    self._mining_readiness_tracker.config.recovery_window_seconds
+                ),
+                "sample_age_seconds": None,
+                "sample_stale": True,
+                "sample_stale_after_seconds": round(stale_after, 3),
+                "error": "mining readiness warm-up has not completed yet",
+            }
+        sample_age = snapshot.sample_age_seconds(now)
+        payload: dict[str, object] = {
+            "schema": MINING_READINESS_SCHEMA,
+            "ready": snapshot.ready,
+            "state": snapshot.state,
+            "reasons": list(snapshot.reasons),
+            "state_age_seconds": round(snapshot.state_age_seconds(now), 3),
+            "transitions": snapshot.transitions,
+            "entry_streak_seconds": round(snapshot.entry_streak_seconds, 3),
+            "recovery_streak_seconds": round(snapshot.recovery_streak_seconds, 3),
+            "semantic_current_work_ratio": round(
+                snapshot.semantic_current_work_ratio,
+                6,
+            ),
+            "refresh_pending": snapshot.refresh_pending,
+            "refresh_pending_age_seconds": (
+                None
+                if snapshot.refresh_pending_age_seconds is None
+                else round(snapshot.refresh_pending_age_seconds, 3)
+            ),
+            "refresh_pending_too_long": snapshot.refresh_pending_too_long,
+            "eligible_clients_requiring_refresh": (
+                snapshot.eligible_clients_requiring_refresh
+            ),
+            "oldest_durable_candidate_age_seconds": (
+                None
+                if snapshot.oldest_durable_candidate_age_seconds is None
+                else round(snapshot.oldest_durable_candidate_age_seconds, 3)
+            ),
+            "accepted_parent_preview_timeout_rate_per_second": round(
+                snapshot.accepted_parent_preview_timeout_rate_per_second,
+                6,
+            ),
+            "entry_dwell_seconds": snapshot.entry_dwell_seconds,
+            "recovery_window_seconds": snapshot.recovery_window_seconds,
+            "sample_age_seconds": round(sample_age, 3),
+            # Diagnostic only: the latched state is served either way, so a
+            # wedged refresher cannot make the signal flap. A consumer that
+            # wants to treat a stale sample as not-ready has the facts to.
+            "sample_stale": sample_age > stale_after,
+            "sample_stale_after_seconds": round(stale_after, 3),
+        }
+        return (200 if snapshot.ready else 503), payload
 
     def cached_health_payload(self) -> tuple[int, dict[str, object]]:
         with self._lock:

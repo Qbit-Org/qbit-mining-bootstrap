@@ -12,6 +12,18 @@ from concurrent.futures import CancelledError
 
 from lab.prism.prism_coordinator import QbitTipTemplateSnapshot
 from lab.prism.progress_health import (
+    DEFAULT_PRISM_MINING_READINESS_ENTRY_DWELL_SECONDS,
+    DEFAULT_PRISM_MINING_READINESS_RECOVERY_WINDOW_SECONDS,
+    MINING_READINESS_ENTRY_COVERAGE_RATIO,
+    MINING_READINESS_OLD_CANDIDATE_AGE_SECONDS,
+    MINING_READINESS_REASONS,
+    MINING_READINESS_RECOVERY_COVERAGE_RATIO,
+    MINING_READINESS_SCHEMA,
+    MINING_READINESS_STATES,
+    MiningReadinessConfig,
+    MiningReadinessSample,
+    MiningReadinessSnapshot,
+    MiningReadinessTracker,
     ProgressHealthConfig,
     ProgressHealthService,
     WorkGeneration,
@@ -948,6 +960,519 @@ class ProgressTokenOwnershipTests(unittest.TestCase):
             ],
         )
         build.finish()
+
+
+# --- Router-facing mining readiness (issue #186) ----------------------------
+
+
+def readiness_sample(
+    now: float,
+    *,
+    ratio: float = 1.0,
+    pending: bool = False,
+    pending_age: float | None = None,
+    too_long: bool = False,
+    requiring: int = 0,
+    candidate_age: float | None = None,
+    timeouts: int = 0,
+) -> MiningReadinessSample:
+    return MiningReadinessSample(
+        monotonic=now,
+        semantic_current_work_ratio=ratio,
+        refresh_pending=pending,
+        refresh_pending_age_seconds=pending_age,
+        refresh_pending_too_long=too_long,
+        eligible_clients_requiring_refresh=requiring,
+        oldest_durable_candidate_age_seconds=candidate_age,
+        accepted_parent_preview_wait_timeouts=timeouts,
+    )
+
+
+def hms(clock: str) -> float:
+    """Seconds after 20:00:00Z on the incident day, from an HH:MM:SS string."""
+
+    hours, minutes, seconds = (int(part) for part in clock.split(":"))
+    return float((hours - 20) * 3600 + minutes * 60 + seconds)
+
+
+class Trace:
+    """Feed a tracker samples in order and record every state change."""
+
+    def __init__(self, config: MiningReadinessConfig | None = None) -> None:
+        self.tracker = MiningReadinessTracker(config or MiningReadinessConfig())
+        self.transitions: list[tuple[float, str]] = []
+        self.snapshots: list[MiningReadinessSnapshot] = []
+        self._last_state: str | None = None
+        self._last_now: float | None = None
+
+    def observe(self, sample: MiningReadinessSample) -> MiningReadinessSnapshot:
+        if self._last_now is not None and sample.monotonic < self._last_now:
+            raise AssertionError("trace samples must be monotonic")
+        self._last_now = sample.monotonic
+        snapshot = self.tracker.observe(sample)
+        if snapshot.state != self._last_state:
+            self.transitions.append((sample.monotonic, snapshot.state))
+            self._last_state = snapshot.state
+        self.snapshots.append(snapshot)
+        return snapshot
+
+
+class MiningReadinessPolicyTests(unittest.TestCase):
+    """The hysteresis contract, pinned on a scripted clock."""
+
+    def test_vocabulary_thresholds_and_defaults_are_pinned(self) -> None:
+        # Fixed cardinality: these names are the only labels the reason
+        # gauge carries and the only members ``reasons`` may list.
+        self.assertEqual(
+            MINING_READINESS_REASONS,
+            (
+                "warming_up",
+                "semantic_coverage_low",
+                "refresh_pending_too_long",
+                "refresh_pending",
+                "recovery_window_pending",
+                "durable_candidate_old",
+                "accepted_parent_preview_timeouts",
+            ),
+        )
+        self.assertEqual(MINING_READINESS_STATES, ("ready", "degraded"))
+        self.assertEqual(MINING_READINESS_SCHEMA, "qbit.prism.mining-readiness.v1")
+        self.assertEqual(MINING_READINESS_ENTRY_COVERAGE_RATIO, 0.95)
+        self.assertEqual(MINING_READINESS_RECOVERY_COVERAGE_RATIO, 0.99)
+        self.assertEqual(MINING_READINESS_OLD_CANDIDATE_AGE_SECONDS, 60.0)
+        self.assertEqual(DEFAULT_PRISM_MINING_READINESS_ENTRY_DWELL_SECONDS, 60.0)
+        self.assertEqual(
+            DEFAULT_PRISM_MINING_READINESS_RECOVERY_WINDOW_SECONDS,
+            240.0,
+        )
+        config = MiningReadinessConfig()
+        self.assertEqual(config.entry_dwell_seconds, 60.0)
+        self.assertEqual(config.recovery_window_seconds, 240.0)
+
+    def test_config_rejects_recovery_shorter_than_dwell_and_bad_numbers(self) -> None:
+        with self.assertRaisesRegex(ValueError, "at least entry_dwell_seconds"):
+            MiningReadinessConfig(entry_dwell_seconds=60.0, recovery_window_seconds=59.999)
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=bad), self.assertRaisesRegex(ValueError, "finite"):
+                MiningReadinessConfig(entry_dwell_seconds=bad)
+            with self.subTest(value=bad), self.assertRaisesRegex(ValueError, "finite"):
+                MiningReadinessConfig(recovery_window_seconds=bad)
+        with self.assertRaisesRegex(ValueError, "nonnegative"):
+            MiningReadinessConfig(entry_dwell_seconds=-1.0)
+        with self.assertRaisesRegex(ValueError, "nonnegative"):
+            MiningReadinessConfig(entry_dwell_seconds=0.0, recovery_window_seconds=-0.5)
+        with self.assertRaisesRegex(ValueError, "must be a number"):
+            MiningReadinessConfig(entry_dwell_seconds="60")  # type: ignore[arg-type]
+        with self.assertRaisesRegex(ValueError, "must be a number"):
+            MiningReadinessConfig(entry_dwell_seconds=True)  # type: ignore[arg-type]
+        # Equal windows and zero windows are legitimate, and ints are
+        # normalized to floats so the response echoes one type.
+        equal = MiningReadinessConfig(entry_dwell_seconds=30, recovery_window_seconds=30)
+        self.assertEqual(
+            (equal.entry_dwell_seconds, equal.recovery_window_seconds),
+            (30.0, 30.0),
+        )
+        zero = MiningReadinessConfig(entry_dwell_seconds=0, recovery_window_seconds=0)
+        self.assertEqual((zero.entry_dwell_seconds, zero.recovery_window_seconds), (0.0, 0.0))
+
+    def test_first_sample_latches_ready_and_starts_the_clock(self) -> None:
+        trace = Trace()
+        snapshot = trace.observe(readiness_sample(100.0, ratio=0.0, too_long=True))
+
+        # Ready is the initial latch even on a bad first sample: the dwell
+        # must be sustained before the signal ever degrades.
+        self.assertTrue(snapshot.ready)
+        self.assertEqual(snapshot.state, "ready")
+        self.assertEqual(snapshot.transitions, 0)
+        self.assertEqual(snapshot.state_since_monotonic, 100.0)
+        self.assertEqual(snapshot.state_age_seconds(100.0), 0.0)
+        self.assertEqual(snapshot.entry_streak_seconds, 0.0)
+        self.assertEqual(snapshot.recovery_streak_seconds, 0.0)
+        # The conditions being dwelled on are visible while still ready.
+        self.assertEqual(
+            snapshot.reasons,
+            ("semantic_coverage_low", "refresh_pending_too_long"),
+        )
+        self.assertEqual(snapshot.accepted_parent_preview_timeout_rate_per_second, 0.0)
+
+    def test_2026_08_20_incident_degrades_once_and_recovers_after_stable_window(
+        self,
+    ) -> None:
+        # Samples every 5s on the health-refresh cadence, phased so the
+        # apparent healthy point at 20:10:27Z is itself a sample.
+        trace = Trace()
+        clocks: list[tuple[float, MiningReadinessSample]] = []
+
+        def cycle(start: str, end: str, make: object) -> None:
+            now = hms(start)
+            while now <= hms(end):
+                clocks.append((now, make(now)))  # type: ignore[operator]
+                now += 5.0
+
+        # A calm minute before the incident.
+        cycle("20:00:02", "20:00:57", lambda now: readiness_sample(now))
+        # The incident: coverage collapses to 0.077 / 0.286 while the
+        # refresh stays pending far past the progress-health deadline.
+        incident_ratios = (0.077, 0.286)
+        cycle(
+            "20:01:02",
+            "20:10:22",
+            lambda now: readiness_sample(
+                now,
+                ratio=incident_ratios[int(now // 5) % 2],
+                pending=True,
+                pending_age=now - hms("20:01:02"),
+                too_long=True,
+                requiring=30,
+            ),
+        )
+        # Apparent health at 20:10:27Z, then two regressions inside the
+        # 213 seconds before real stability at 20:14:00Z.
+        cycle("20:10:27", "20:11:57", lambda now: readiness_sample(now))
+        cycle(
+            "20:12:02",
+            "20:12:02",
+            lambda now: readiness_sample(now, ratio=0.5, pending=True, pending_age=3.0),
+        )
+        cycle("20:12:07", "20:13:27", lambda now: readiness_sample(now))
+        cycle(
+            "20:13:32",
+            "20:13:52",
+            lambda now: readiness_sample(
+                now, ratio=0.286, pending=True, pending_age=now - hms("20:13:30"), too_long=True
+            ),
+        )
+        # Stability from 20:14:00Z, held well past the recovery window.
+        cycle("20:14:02", "20:20:02", lambda now: readiness_sample(now))
+
+        for now, sample in clocks:
+            snapshot = trace.observe(sample)
+            self.assertEqual(snapshot.state_age_seconds(now), now - snapshot.state_since_monotonic)
+            if hms("20:01:02") <= now < hms("20:02:02"):
+                # Dwelling: still ready, streak counting, no transition yet.
+                self.assertTrue(snapshot.ready, now)
+                self.assertEqual(snapshot.entry_streak_seconds, now - hms("20:01:02"))
+                self.assertIn("semantic_coverage_low", snapshot.reasons)
+                self.assertIn("refresh_pending_too_long", snapshot.reasons)
+            elif hms("20:02:02") <= now < hms("20:18:02"):
+                self.assertFalse(snapshot.ready, now)
+                self.assertEqual(snapshot.transitions, 1, now)
+                self.assertEqual(snapshot.state_since_monotonic, hms("20:02:02"))
+            if hms("20:10:27") <= now <= hms("20:11:57"):
+                # Recovery counting from the apparent healthy point.
+                self.assertEqual(snapshot.recovery_streak_seconds, now - hms("20:10:27"))
+                self.assertEqual(snapshot.reasons, ("recovery_window_pending",))
+            if now == hms("20:12:02"):
+                # A contrary sample cancels the streak outright.
+                self.assertEqual(snapshot.recovery_streak_seconds, 0.0)
+                self.assertEqual(
+                    snapshot.reasons,
+                    ("semantic_coverage_low", "refresh_pending"),
+                )
+            if now == hms("20:13:52"):
+                self.assertEqual(snapshot.recovery_streak_seconds, 0.0)
+                self.assertEqual(
+                    snapshot.reasons,
+                    ("semantic_coverage_low", "refresh_pending_too_long"),
+                )
+            if now == hms("20:17:57"):
+                self.assertFalse(snapshot.ready)
+                self.assertEqual(snapshot.recovery_streak_seconds, 235.0)
+            if now >= hms("20:18:02"):
+                self.assertTrue(snapshot.ready, now)
+                self.assertEqual(snapshot.transitions, 2)
+                self.assertEqual(snapshot.state_since_monotonic, hms("20:18:02"))
+                self.assertEqual(snapshot.reasons, ())
+
+        # Exactly one degradation and one recovery across the whole trace:
+        # the initial latch, the dwell landing at 20:02:02Z, and the stable
+        # window closing 240s after 20:14:02Z. No intermediate flap.
+        self.assertEqual(
+            trace.transitions,
+            [
+                (hms("20:00:02"), "ready"),
+                (hms("20:02:02"), "degraded"),
+                (hms("20:18:02"), "ready"),
+            ],
+        )
+        self.assertEqual(trace.tracker.transitions, 2)
+
+        # Counterfactual pin for the 240s default: a window shorter than the
+        # 213-second oscillation would have announced ready off the apparent
+        # healthy point, 125 seconds before the fleet was actually stable.
+        short = Trace(MiningReadinessConfig(entry_dwell_seconds=60.0, recovery_window_seconds=90.0))
+        for _, sample in clocks:
+            short.observe(sample)
+        self.assertEqual(short.transitions[2], (hms("20:11:57"), "ready"))
+        self.assertLess(short.transitions[2][0], hms("20:14:02"))
+
+    def test_2026_08_21_accepted_tip_cycles_never_transition(self) -> None:
+        # Every accepted tip sweeps semantic coverage 0 -> 0.83 -> 0.91 -> 1
+        # -> 0 while the refresh resolves within the observed ~36.77s. The
+        # progress-health deadline (15s) marks the tail of each cycle as
+        # refresh_pending_too_long, so the entry condition is genuinely
+        # true for most of every cycle -- and still never long enough.
+        cycle_seconds = 45.0
+        resolution_seconds = 36.77
+        steps = (
+            (0.0, 0.0, True),
+            (5.0, 0.0, True),
+            (10.0, 0.0, True),
+            (15.0, 0.0, True),
+            (20.0, 0.83, True),
+            (25.0, 0.83, True),
+            (30.0, 0.91, True),
+            (35.0, 0.91, True),
+            (resolution_seconds, 1.0, False),
+            (40.0, 1.0, False),
+        )
+        samples: list[MiningReadinessSample] = []
+        for cycle in range(40):
+            start = 1_000.0 + cycle * cycle_seconds
+            for offset, ratio, pending in steps:
+                samples.append(
+                    readiness_sample(
+                        start + offset,
+                        ratio=ratio,
+                        pending=pending,
+                        pending_age=offset if pending else None,
+                        too_long=pending and offset > 15.0,
+                        requiring=0 if ratio >= 1.0 else 12,
+                    )
+                )
+
+        trace = Trace()
+        longest_dwell = 0.0
+        for sample in samples:
+            snapshot = trace.observe(sample)
+            self.assertTrue(snapshot.ready, sample.monotonic)
+            self.assertEqual(snapshot.transitions, 0)
+            longest_dwell = max(longest_dwell, snapshot.entry_streak_seconds)
+        self.assertEqual(trace.transitions, [(1_000.0, "ready")])
+        # The dwell really was exercised: the entry condition held for the
+        # whole 35s bad stretch of each cycle and was reset by the 1.0 sample.
+        self.assertEqual(longest_dwell, 35.0)
+        self.assertLess(resolution_seconds, MiningReadinessConfig().entry_dwell_seconds)
+
+        # Counterfactual pin for the 60s default: a dwell inside the normal
+        # cycle would have degraded on the first tip, and the few seconds of
+        # full coverage between tips could never satisfy any recovery window.
+        short = Trace(MiningReadinessConfig(entry_dwell_seconds=30.0, recovery_window_seconds=30.0))
+        for sample in samples:
+            short.observe(sample)
+        self.assertEqual(short.transitions, [(1_000.0, "ready"), (1_030.0, "degraded")])
+
+    def test_timers_reset_on_contrary_samples_and_change_state_once(self) -> None:
+        trace = Trace()
+        now = 0.0
+
+        def run(seconds: float, **sample_kwargs: object) -> MiningReadinessSnapshot:
+            nonlocal now
+            snapshot = trace.observe(readiness_sample(now, **sample_kwargs))  # type: ignore[arg-type]
+            end = now + seconds
+            while now + 5.0 <= end:
+                now += 5.0
+                snapshot = trace.observe(readiness_sample(now, **sample_kwargs))  # type: ignore[arg-type]
+            now += 5.0
+            return snapshot
+
+        # 55s bad, one good sample, 55s bad: two separate dwells, no latch.
+        self.assertTrue(run(55.0, ratio=0.5).ready)
+        self.assertEqual(trace.tracker.transitions, 0)
+        cleared = run(0.0)
+        self.assertEqual(cleared.entry_streak_seconds, 0.0)
+        self.assertTrue(run(55.0, ratio=0.5).ready)
+        self.assertEqual(trace.tracker.transitions, 0)
+        # Only a full 60s dwell latches, and only once for the episode.
+        degraded = run(120.0, ratio=0.5)
+        self.assertFalse(degraded.ready)
+        self.assertEqual(trace.tracker.transitions, 1)
+        self.assertEqual(degraded.entry_streak_seconds, 0.0)
+        # 235s good, one contrary sample, 235s good: no recovery.
+        self.assertFalse(run(235.0).ready)
+        self.assertEqual(run(0.0, ratio=0.97).recovery_streak_seconds, 0.0)
+        self.assertFalse(run(235.0).ready)
+        self.assertEqual(trace.tracker.transitions, 1)
+        # A full 240s stable window recovers exactly once.
+        recovered = run(300.0)
+        self.assertTrue(recovered.ready)
+        self.assertEqual(trace.tracker.transitions, 2)
+        self.assertEqual(len(trace.transitions), 3)
+
+    def test_sampling_gaps_reset_entry_and_recovery_streaks(self) -> None:
+        tracker = MiningReadinessTracker(
+            MiningReadinessConfig(
+                entry_dwell_seconds=10.0,
+                recovery_window_seconds=20.0,
+            )
+        )
+
+        def observe(now: float, *, ratio: float) -> MiningReadinessSnapshot:
+            return tracker.observe(
+                readiness_sample(now, ratio=ratio),
+                max_sample_gap_seconds=10.0,
+            )
+
+        self.assertTrue(observe(0.0, ratio=0.0).ready)
+        self.assertEqual(observe(5.0, ratio=0.0).entry_streak_seconds, 5.0)
+        # Fifteen seconds without a successful observation resets the dwell;
+        # the current bad sample starts a new streak at zero.
+        after_entry_gap = observe(20.0, ratio=0.0)
+        self.assertTrue(after_entry_gap.ready)
+        self.assertEqual(after_entry_gap.entry_streak_seconds, 0.0)
+        self.assertFalse(observe(30.0, ratio=0.0).ready)
+
+        self.assertEqual(observe(35.0, ratio=1.0).recovery_streak_seconds, 0.0)
+        self.assertEqual(observe(45.0, ratio=1.0).recovery_streak_seconds, 10.0)
+        # A gap beyond the same budget cannot complete recovery from the
+        # isolated healthy observations on either side of it.
+        after_recovery_gap = observe(56.0, ratio=1.0)
+        self.assertFalse(after_recovery_gap.ready)
+        self.assertEqual(after_recovery_gap.recovery_streak_seconds, 0.0)
+        self.assertFalse(observe(66.0, ratio=1.0).ready)
+        self.assertTrue(observe(76.0, ratio=1.0).ready)
+
+    def test_entry_and_recovery_windows_are_independent(self) -> None:
+        immediate = Trace(MiningReadinessConfig(entry_dwell_seconds=0.0, recovery_window_seconds=0.0))
+        self.assertFalse(immediate.observe(readiness_sample(1.0, ratio=0.0)).ready)
+        self.assertTrue(immediate.observe(readiness_sample(2.0)).ready)
+        self.assertEqual(immediate.tracker.transitions, 2)
+
+        skewed = Trace(MiningReadinessConfig(entry_dwell_seconds=10.0, recovery_window_seconds=100.0))
+        for now in (0.0, 5.0, 9.0):
+            self.assertTrue(skewed.observe(readiness_sample(now, ratio=0.0)).ready)
+        self.assertFalse(skewed.observe(readiness_sample(10.0, ratio=0.0)).ready)
+        # Recovery counts from the first good sample at 20s, not from the
+        # degradation at 10s: the windows do not share a clock.
+        for now in (20.0, 60.0, 119.0):
+            self.assertFalse(skewed.observe(readiness_sample(now)).ready)
+        self.assertTrue(skewed.observe(readiness_sample(120.0)).ready)
+        self.assertEqual(skewed.transitions[-1], (120.0, "ready"))
+
+    def test_short_pending_refresh_neither_degrades_nor_counts_as_stable(self) -> None:
+        trace = Trace()
+        # Ready: an in-budget pending refresh with full coverage is ordinary
+        # tip handling and must not start a dwell.
+        for now in range(0, 600, 5):
+            snapshot = trace.observe(
+                readiness_sample(float(now), pending=True, pending_age=float(now % 40))
+            )
+            self.assertTrue(snapshot.ready)
+            self.assertEqual(snapshot.entry_streak_seconds, 0.0)
+            self.assertEqual(snapshot.reasons, ())
+        self.assertEqual(trace.tracker.transitions, 0)
+
+        # Degraded: the same pending refresh blocks recovery, as does an
+        # eligible client still requiring refresh or coverage under 0.99.
+        degraded = Trace(MiningReadinessConfig(entry_dwell_seconds=0.0, recovery_window_seconds=10.0))
+        degraded.observe(readiness_sample(0.0, ratio=0.0))
+        pending = degraded.observe(readiness_sample(5.0, pending=True, pending_age=2.0))
+        self.assertFalse(pending.ready)
+        self.assertEqual(pending.recovery_streak_seconds, 0.0)
+        self.assertEqual(pending.reasons, ("refresh_pending",))
+        requiring = degraded.observe(readiness_sample(10.0, requiring=1))
+        self.assertEqual(requiring.reasons, ("refresh_pending",))
+        self.assertEqual(requiring.recovery_streak_seconds, 0.0)
+        partial = degraded.observe(readiness_sample(15.0, ratio=0.985))
+        self.assertEqual(partial.reasons, ("semantic_coverage_low",))
+        self.assertEqual(partial.recovery_streak_seconds, 0.0)
+        stable = degraded.observe(readiness_sample(20.0, ratio=0.99))
+        self.assertEqual(stable.reasons, ("recovery_window_pending",))
+        self.assertFalse(stable.ready)
+        self.assertTrue(degraded.observe(readiness_sample(30.0, ratio=0.99)).ready)
+
+    def test_annotations_decorate_degraded_snapshots_but_never_latch(self) -> None:
+        trace = Trace(MiningReadinessConfig(entry_dwell_seconds=10.0, recovery_window_seconds=20.0))
+        # Ready, with an ancient candidate and a preview-timeout burst:
+        # both are reported as fields, neither is a reason, nothing latches.
+        first = trace.observe(readiness_sample(0.0, candidate_age=500.0, timeouts=0))
+        burst = trace.observe(readiness_sample(5.0, candidate_age=505.0, timeouts=10))
+        self.assertTrue(burst.ready)
+        self.assertEqual(first.reasons, ())
+        self.assertEqual(burst.reasons, ())
+        self.assertEqual(burst.oldest_durable_candidate_age_seconds, 505.0)
+        self.assertEqual(burst.accepted_parent_preview_timeout_rate_per_second, 2.0)
+        for now in (100.0, 200.0, 300.0):
+            self.assertTrue(trace.observe(readiness_sample(now, candidate_age=now, timeouts=10 + int(now))).ready)
+        self.assertEqual(trace.tracker.transitions, 0)
+
+        # Degraded: the same facts annotate the snapshot ...
+        trace.observe(readiness_sample(400.0, ratio=0.0, candidate_age=59.999, timeouts=1000))
+        degraded = trace.observe(readiness_sample(410.0, ratio=0.0, candidate_age=60.0, timeouts=1005))
+        self.assertFalse(degraded.ready)
+        self.assertEqual(
+            degraded.reasons,
+            (
+                "semantic_coverage_low",
+                "durable_candidate_old",
+                "accepted_parent_preview_timeouts",
+            ),
+        )
+        below = trace.observe(readiness_sample(415.0, ratio=0.0, candidate_age=59.999, timeouts=1005))
+        self.assertEqual(below.reasons, ("semantic_coverage_low",))
+        # ... and do not block recovery either.
+        recovering = trace.observe(readiness_sample(420.0, candidate_age=900.0, timeouts=1100))
+        self.assertEqual(
+            recovering.reasons,
+            (
+                "recovery_window_pending",
+                "durable_candidate_old",
+                "accepted_parent_preview_timeouts",
+            ),
+        )
+        self.assertTrue(trace.observe(readiness_sample(440.0, candidate_age=920.0, timeouts=1200)).ready)
+        self.assertEqual(trace.tracker.transitions, 2)
+
+    def test_preview_timeout_rate_is_a_bounded_counter_difference(self) -> None:
+        tracker = MiningReadinessTracker(MiningReadinessConfig())
+        # First sample: no prior counter, so a safe zero rather than a guess.
+        self.assertEqual(
+            tracker.observe(readiness_sample(0.0, timeouts=7)).accepted_parent_preview_timeout_rate_per_second,
+            0.0,
+        )
+        self.assertEqual(
+            tracker.observe(readiness_sample(5.0, timeouts=10)).accepted_parent_preview_timeout_rate_per_second,
+            0.6,
+        )
+        self.assertEqual(
+            tracker.observe(readiness_sample(15.0, timeouts=10)).accepted_parent_preview_timeout_rate_per_second,
+            0.0,
+        )
+        # A counter that runs backwards reads as no activity, never negative.
+        self.assertEqual(
+            tracker.observe(readiness_sample(20.0, timeouts=3)).accepted_parent_preview_timeout_rate_per_second,
+            0.0,
+        )
+        # Zero elapsed time cannot divide; it also reads as no activity.
+        self.assertEqual(
+            tracker.observe(readiness_sample(20.0, timeouts=9)).accepted_parent_preview_timeout_rate_per_second,
+            0.0,
+        )
+        # Only the last pair is retained: no history grows with uptime.
+        self.assertEqual(
+            sorted(name for name in vars(tracker) if "timeout" in name),
+            ["_last_timeout_count", "_last_timeout_monotonic"],
+        )
+
+    def test_state_age_is_monotonic_between_transitions(self) -> None:
+        trace = Trace(MiningReadinessConfig(entry_dwell_seconds=10.0, recovery_window_seconds=10.0))
+        ages: list[float] = []
+        for now in range(0, 100, 5):
+            snapshot = trace.observe(readiness_sample(float(now), ratio=0.0 if now < 50 else 1.0))
+            ages.append(snapshot.state_age_seconds(float(now)))
+        # ready 0..5 (age 0,5), degraded from 10 (age 0..35), ready from 60.
+        self.assertEqual(
+            ages,
+            [0.0, 5.0, 0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0],
+        )
+        self.assertEqual(
+            trace.transitions,
+            [(0.0, "ready"), (10.0, "degraded"), (60.0, "ready")],
+        )
+        # Age keeps growing between refreshes, from the same latched stamp.
+        last = trace.snapshots[-1]
+        self.assertEqual(last.state_age_seconds(1_000.0), 940.0)
+        self.assertEqual(last.sample_age_seconds(1_000.0), 905.0)
 
 
 if __name__ == "__main__":

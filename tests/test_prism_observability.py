@@ -4,11 +4,15 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 import threading
 import time
 import unittest
 from types import SimpleNamespace
+import urllib.error
+import urllib.request
 
+from lab.prism.audit_http import AuditHttpConfig, AuditHttpFacade
 from lab.prism.observability import (
     HEALTH_SCHEMA,
     METRICS_STALE_WARNING,
@@ -24,7 +28,14 @@ from lab.prism.prism_coordinator import (
     ClientState,
     PrismCoordinator,
     WorkerIdentity,
+    _CoordinatorAuditHttp,
 )
+from lab.prism.progress_health import (
+    MINING_READINESS_REASONS,
+    MINING_READINESS_SCHEMA,
+    MiningReadinessConfig,
+)
+from tests.prism_coordinator_test_support import ObservedRLock, coordinator
 
 
 def healthy_inputs() -> MiningDeliveryInputs:
@@ -90,6 +101,11 @@ class FakeObservabilityPort:
         }
         self.raise_on_stats = False
         self.stats_calls = 0
+        self.inputs_calls = 0
+        self.progress_calls = 0
+        self.readiness_config = MiningReadinessConfig()
+        self.preview_timeouts = 0
+        self.preview_timeout_reads = 0
         self.metrics_payload = "qbit_prism_fixture 1\n"
         self.metrics_error: Exception | None = None
         self.metrics_render_count = 0
@@ -102,6 +118,7 @@ class FakeObservabilityPort:
 
     def mining_delivery_inputs(self, now: float) -> MiningDeliveryInputs:
         self.assert_current_time(now)
+        self.inputs_calls += 1
         return self.inputs
 
     def assert_current_time(self, now: float) -> None:
@@ -121,10 +138,18 @@ class FakeObservabilityPort:
         return 1, 2
 
     def progress_health(self) -> dict[str, object]:
+        self.progress_calls += 1
         return dict(self.progress)
 
     def health_refresh_seconds(self) -> float:
         return 1.0
+
+    def mining_readiness_config(self) -> MiningReadinessConfig:
+        return self.readiness_config
+
+    def accepted_parent_preview_wait_timeouts(self) -> int:
+        self.preview_timeout_reads += 1
+        return self.preview_timeouts
 
     def render_metrics_payload(self) -> str:
         self.metrics_render_count += 1
@@ -960,6 +985,400 @@ class SemanticCoverageDeliveryHealthTests(unittest.TestCase):
         self.assertTrue(cleared["connection_capacity_saturated"])
         self.assertTrue(cleared["mining_ready"])
         self.assertEqual(cleared["unhealthy_reasons"], [])
+
+
+def tip_cycle_inputs(semantic: int, authorized: int = 12) -> MiningDeliveryInputs:
+    return replace(
+        healthy_inputs(),
+        active_connections=authorized,
+        subscribed_connections=authorized,
+        authorized_connections=authorized,
+        clients_with_current_tip_jobs=semantic,
+        clients_with_semantically_current_work=semantic,
+    )
+
+
+class MiningReadinessCacheTests(unittest.TestCase):
+    """Issue #186: the latched signal is sampled by the refresher only."""
+
+    def assert_no_live_reads(self, port: FakeObservabilityPort) -> None:
+        self.assertEqual(port.inputs_calls, 0)
+        self.assertEqual(port.stats_calls, 0)
+        self.assertEqual(port.progress_calls, 0)
+        self.assertEqual(port.preview_timeout_reads, 0)
+
+    def test_warm_up_fails_closed_without_sampling_on_the_request_thread(self) -> None:
+        port = FakeObservabilityPort()
+        service = ObservabilityService(port)
+
+        status, payload = service.cached_mining_readiness_payload()
+
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["schema"], MINING_READINESS_SCHEMA)
+        self.assertFalse(payload["ready"])
+        self.assertEqual(payload["state"], "degraded")
+        self.assertEqual(payload["reasons"], ["warming_up"])
+        self.assertEqual(payload["state_age_seconds"], 0.0)
+        self.assertIsNone(payload["semantic_current_work_ratio"])
+        self.assertIsNone(payload["refresh_pending_age_seconds"])
+        self.assertIsNone(payload["oldest_durable_candidate_age_seconds"])
+        self.assertEqual(payload["accepted_parent_preview_timeout_rate_per_second"], 0.0)
+        self.assertEqual(payload["entry_dwell_seconds"], 60.0)
+        self.assertEqual(payload["recovery_window_seconds"], 240.0)
+        self.assertTrue(payload["sample_stale"])
+        self.assertIsNone(service.mining_readiness_snapshot())
+        # Unlike /healthz, there is no inline fallback when no refresher
+        # runs: warm-up stays a cache miss whether or not the loop is armed.
+        self.assertTrue(service.begin_refresh_loop())
+        self.assertEqual(service.cached_mining_readiness_payload()[0], 503)
+        self.assert_no_live_reads(port)
+
+    def test_refresh_publishes_one_snapshot_and_requests_only_copy_it(self) -> None:
+        port = FakeObservabilityPort()
+        port.inputs = tip_cycle_inputs(12)
+        port.progress = {
+            "ok": True,
+            "reason": None,
+            "reasons": [],
+            "pending_refresh": False,
+            "pending_refresh_age_seconds": None,
+            "eligible_clients_requiring_refresh": 0,
+        }
+        service = ObservabilityService(port)
+        service.refresh_health_snapshot()
+        reads = (port.inputs_calls, port.stats_calls, port.progress_calls, port.preview_timeout_reads)
+        self.assertEqual(reads, (1, 1, 1, 1))
+
+        status, payload = service.cached_mining_readiness_payload()
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ready"])
+        self.assertEqual(payload["state"], "ready")
+        self.assertEqual(payload["reasons"], [])
+        self.assertEqual(payload["semantic_current_work_ratio"], 1.0)
+        self.assertEqual(payload["transitions"], 0)
+        self.assertEqual(payload["sample_age_seconds"], 0.0)
+        self.assertFalse(payload["sample_stale"])
+        self.assertEqual(payload["sample_stale_after_seconds"], 15.0)
+
+        # The world changes underneath without a refresh: the request keeps
+        # serving the latched copy, ages it, and reads nothing live.
+        port.inputs = tip_cycle_inputs(0)
+        port.progress = {
+            "ok": False,
+            "reason": "refresh_pending_too_long",
+            "reasons": ["refresh_pending_too_long"],
+        }
+        port.now += 20.0
+        status, later = service.cached_mining_readiness_payload()
+        self.assertEqual(status, 200)
+        self.assertEqual(later["semantic_current_work_ratio"], 1.0)
+        self.assertEqual(later["state_age_seconds"], 20.0)
+        self.assertEqual(later["sample_age_seconds"], 20.0)
+        self.assertTrue(later["sample_stale"])
+        self.assertEqual(
+            (port.inputs_calls, port.stats_calls, port.progress_calls, port.preview_timeout_reads),
+            reads,
+        )
+        # /healthz keeps its own semantics: the fresh progress overlay
+        # fails it right now while readiness holds its latch.
+        health_status, health = service.cached_health_payload()
+        self.assertEqual(health_status, 503)
+        self.assertEqual(health["reason"], "refresh_pending_too_long")
+
+    def test_sustained_entry_condition_degrades_the_cached_answer_once(self) -> None:
+        port = FakeObservabilityPort()
+        port.inputs = tip_cycle_inputs(12)
+        port.progress = {"ok": True, "reason": None, "reasons": []}
+        service = ObservabilityService(port)
+        service.refresh_health_snapshot()
+
+        port.inputs = tip_cycle_inputs(1)
+        port.progress = {
+            "ok": False,
+            "reason": "refresh_pending_too_long",
+            "reasons": ["refresh_pending_too_long", "current_generation_not_delivered"],
+            "pending_refresh": True,
+            "pending_refresh_age_seconds": 30.0,
+            "eligible_clients_requiring_refresh": 11,
+        }
+        statuses: list[int] = []
+        for step in range(1, 14):
+            port.now = 100.0 + 5.0 * step
+            service.refresh_health_snapshot()
+            statuses.append(service.cached_mining_readiness_payload()[0])
+        # The bad streak starts at 105s and is ready through 55s of dwell;
+        # the sample at 165s is the first with a full 60s behind it.
+        self.assertEqual(statuses, [200] * 12 + [503])
+
+        status, payload = service.cached_mining_readiness_payload()
+        self.assertEqual(status, 503)
+        self.assertFalse(payload["ready"])
+        self.assertEqual(payload["state"], "degraded")
+        self.assertEqual(
+            payload["reasons"],
+            ["semantic_coverage_low", "refresh_pending_too_long"],
+        )
+        self.assertEqual(payload["transitions"], 1)
+        self.assertEqual(payload["state_age_seconds"], 0.0)
+        self.assertEqual(payload["semantic_current_work_ratio"], round(1 / 12, 6))
+        self.assertEqual(payload["refresh_pending_age_seconds"], 30.0)
+        self.assertTrue(payload["refresh_pending_too_long"])
+        self.assertEqual(payload["eligible_clients_requiring_refresh"], 11)
+        # Every reason served is drawn from the pinned vocabulary.
+        for reason in payload["reasons"]:
+            self.assertIn(reason, MINING_READINESS_REASONS)
+
+    def test_2026_08_21_tip_cycles_through_the_refresher_stay_200(self) -> None:
+        # The refresher sees each accepted tip as 0 -> 10/12 -> 11/12 -> 12/12
+        # -> 0 with the refresh resolving inside the ~36.77s normal cycle.
+        port = FakeObservabilityPort()
+        service = ObservabilityService(port)
+        steps = (
+            (0.0, 0, True),
+            (5.0, 0, True),
+            (10.0, 0, True),
+            (15.0, 0, True),
+            (20.0, 10, True),
+            (25.0, 10, True),
+            (30.0, 11, True),
+            (35.0, 11, True),
+            (36.77, 12, False),
+            (40.0, 12, False),
+        )
+        seen_ratios: set[float] = set()
+        for cycle in range(30):
+            start = 100.0 + 45.0 * cycle
+            for offset, semantic, pending in steps:
+                port.now = start + offset
+                port.inputs = tip_cycle_inputs(semantic)
+                port.progress = {
+                    "ok": not (pending and offset > 15.0),
+                    "reason": None,
+                    "reasons": ["refresh_pending_too_long"] if pending and offset > 15.0 else [],
+                    "pending_refresh": pending,
+                    "pending_refresh_age_seconds": offset if pending else None,
+                    "eligible_clients_requiring_refresh": 12 - semantic,
+                }
+                service.refresh_health_snapshot()
+                status, payload = service.cached_mining_readiness_payload()
+                seen_ratios.add(payload["semantic_current_work_ratio"])
+                self.assertEqual(status, 200, payload)
+                self.assertTrue(payload["ready"])
+                self.assertEqual(payload["transitions"], 0)
+                self.assertAlmostEqual(payload["state_age_seconds"], port.now - 100.0, places=3)
+        self.assertEqual(seen_ratios, {0.0, round(10 / 12, 6), round(11 / 12, 6), 1.0})
+
+    def test_candidate_age_is_handed_over_by_the_metrics_renderer(self) -> None:
+        port = FakeObservabilityPort()
+        port.inputs = tip_cycle_inputs(12)
+        service = ObservabilityService(port)
+        # The gauge's -1 "unavailable" and a missing handoff both read None.
+        service.refresh_health_snapshot()
+        self.assertIsNone(service.cached_mining_readiness_payload()[1]["oldest_durable_candidate_age_seconds"])
+        service.record_oldest_durable_candidate_age(-1.0)
+        port.now += 5.0
+        service.refresh_health_snapshot()
+        self.assertIsNone(service.cached_mining_readiness_payload()[1]["oldest_durable_candidate_age_seconds"])
+
+        service.record_oldest_durable_candidate_age(75.25)
+        port.now += 5.0
+        service.refresh_health_snapshot()
+        _, ready = service.cached_mining_readiness_payload()
+        self.assertEqual(ready["oldest_durable_candidate_age_seconds"], 75.25)
+        # Annotates only a degraded snapshot; never a transition cause.
+        self.assertEqual(ready["reasons"], [])
+        self.assertTrue(ready["ready"])
+
+    def test_health_refresh_failure_keeps_the_last_readiness_snapshot(self) -> None:
+        port = FakeObservabilityPort()
+        port.inputs = tip_cycle_inputs(12)
+        service = ObservabilityService(port)
+        service.refresh_health_snapshot()
+        before = service.mining_readiness_snapshot()
+
+        port.raise_on_stats = True
+        port.now += 5.0
+        with self.assertRaises(RuntimeError):
+            service.refresh_health_snapshot()
+
+        self.assertIs(service.mining_readiness_snapshot(), before)
+        self.assertEqual(service.cached_mining_readiness_payload()[0], 200)
+
+    def test_refresh_gap_cannot_complete_recovery(self) -> None:
+        port = FakeObservabilityPort()
+        port.readiness_config = MiningReadinessConfig(
+            entry_dwell_seconds=0.0,
+            recovery_window_seconds=20.0,
+        )
+        port.inputs = tip_cycle_inputs(0)
+        port.progress = {
+            "ok": False,
+            "reason": "refresh_pending_too_long",
+            "reasons": ["refresh_pending_too_long"],
+            "pending_refresh": True,
+            "pending_refresh_age_seconds": 30.0,
+            "eligible_clients_requiring_refresh": 12,
+        }
+        service = ObservabilityService(port)
+        service.refresh_health_snapshot()
+        self.assertEqual(service.cached_mining_readiness_payload()[0], 503)
+
+        port.inputs = tip_cycle_inputs(12)
+        port.progress = {
+            "ok": True,
+            "reason": None,
+            "reasons": [],
+            "pending_refresh": False,
+            "pending_refresh_age_seconds": None,
+            "eligible_clients_requiring_refresh": 0,
+        }
+        port.now = 105.0
+        service.refresh_health_snapshot()
+
+        # This failed refresh publishes no sample. The next success is more
+        # than the 15-second cache-staleness budget after the prior success.
+        port.raise_on_stats = True
+        port.now = 120.0
+        with self.assertRaises(RuntimeError):
+            service.refresh_health_snapshot()
+        port.raise_on_stats = False
+        port.now = 125.0
+        service.refresh_health_snapshot()
+        status, payload = service.cached_mining_readiness_payload()
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["recovery_streak_seconds"], 0.0)
+
+        # Continuous 10-second samples can now satisfy the 20-second window.
+        for now in (135.0, 145.0):
+            port.now = now
+            service.refresh_health_snapshot()
+        self.assertEqual(service.cached_mining_readiness_payload()[0], 200)
+
+    def test_overlapping_inline_refreshes_publish_in_collection_order(self) -> None:
+        port = FakeObservabilityPort()
+        port.inputs = tip_cycle_inputs(0)
+        service = ObservabilityService(port)
+        first_observed = threading.Event()
+        release_first = threading.Event()
+        second_started = threading.Event()
+        second_finished = threading.Event()
+        original_observe = service._observe_mining_readiness
+
+        def pause_first_observation(
+            base_health: dict[str, object],
+            progress: dict[str, object],
+        ) -> object:
+            snapshot = original_observe(base_health, progress)
+            if not first_observed.is_set():
+                first_observed.set()
+                self.assertTrue(release_first.wait(2.0))
+            return snapshot
+
+        service._observe_mining_readiness = pause_first_observation  # type: ignore[method-assign]
+
+        first = threading.Thread(target=service.refresh_health_snapshot)
+        first.start()
+        self.assertTrue(first_observed.wait(2.0))
+
+        port.now = 105.0
+        port.inputs = tip_cycle_inputs(12)
+
+        def refresh_second() -> None:
+            second_started.set()
+            service.refresh_health_snapshot()
+            second_finished.set()
+
+        second = threading.Thread(target=refresh_second)
+        second.start()
+        self.assertTrue(second_started.wait(2.0))
+        # The second collection stays behind the first publication. Without
+        # refresh-wide serialization it finishes here and the first caller
+        # can subsequently overwrite its newer cached answer.
+        self.assertFalse(second_finished.wait(0.1))
+        release_first.set()
+        first.join(2.0)
+        second.join(2.0)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertTrue(second_finished.is_set())
+        snapshot = service.mining_readiness_snapshot()
+        assert snapshot is not None
+        self.assertEqual(snapshot.sample_monotonic, 105.0)
+        self.assertEqual(snapshot.semantic_current_work_ratio, 1.0)
+
+    def test_request_path_takes_no_coordinator_lock_and_no_ledger_read(self) -> None:
+        server, _ = coordinator()
+        server._accepted_parent_preview_wait_timeouts = 3
+        facade = AuditHttpFacade(
+            _CoordinatorAuditHttp(server),
+            AuditHttpConfig("127.0.0.1", 0, join_timeout_seconds=1.0),
+        )
+        state = facade.start()
+        self.addCleanup(facade.stop)
+        assert state.bound_address is not None
+        base_url = f"http://127.0.0.1:{state.bound_address[1]}"
+
+        def get(path: str) -> tuple[int, dict[str, object], str | None]:
+            try:
+                with urllib.request.urlopen(base_url + path, timeout=5) as response:
+                    return (
+                        response.status,
+                        json.loads(response.read()),
+                        response.headers.get("Cache-Control"),
+                    )
+            except urllib.error.HTTPError as error:
+                with error:
+                    return error.code, json.loads(error.read()), error.headers.get("Cache-Control")
+
+        # Warm-up: fail closed, and nothing sampled on the handler thread.
+        status, payload, cache_control = get("/readyz/mining")
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["reasons"], ["warming_up"])
+        self.assertEqual(cache_control, "no-store")
+
+        # One background refresh publishes the sample; the route serves it.
+        server.refresh_health_snapshot()
+        status, payload, cache_control = get("/readyz/mining")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ready"])
+        self.assertEqual(payload["schema"], MINING_READINESS_SCHEMA)
+        self.assertEqual(cache_control, "no-store")
+
+        # Now make every live path explode: the coordinator lock records any
+        # acquisition, the ledger raises on any attribute, and the delivery
+        # census / progress snapshot / counter reads all assert.
+        observed = ObservedRLock()
+        observed.observe_acquires = True
+        server.lock = observed  # type: ignore[assignment]
+
+        class ExplodingLedger:
+            def __getattr__(self, name: str) -> object:
+                raise AssertionError(f"ledger.{name} reached from /readyz/mining")
+
+        server.ledger = ExplodingLedger()  # type: ignore[assignment]
+        for name in (
+            "mining_delivery_snapshot",
+            "progress_health_snapshot",
+            "accepted_share_stats",
+            "refresh_health_snapshot",
+            "block_submitter_snapshot",
+        ):
+            setattr(
+                server,
+                name,
+                lambda *args, _name=name, **kwargs: (_ for _ in ()).throw(
+                    AssertionError(f"{_name} reached from /readyz/mining")
+                ),
+            )
+
+        status, payload, cache_control = get("/readyz/mining")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ready"])
+        self.assertFalse(observed.acquire_attempted.is_set())
+        self.assertEqual(cache_control, "no-store")
 
 
 def bare_semantic_coordinator() -> PrismCoordinator:

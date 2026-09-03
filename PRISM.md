@@ -158,6 +158,12 @@ delivery failure can make health non-green. A full connection cap alone does
 not fail health while admitted miners retain current work and delivery is
 progressing.
 
+`/readyz/mining` is the separate router-facing signal for admitting new miners.
+It is cached, fail-closed during warm-up, and latched with hysteresis so normal
+tip-refresh coverage cycles do not flap traffic. See
+[docs/router-integration-notes.md](docs/router-integration-notes.md#prism-coordinator-mining-readiness)
+for the response and consumer contract.
+
 The high-diff listener is disabled unless `PRISM_STRATUM_HIGHDIFF_PORT` is
 set:
 
@@ -222,6 +228,8 @@ Operational knobs shared by the PRISM listeners:
 | `PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS` | `60` | fail-closed timeout for one signed shared-bundle subprocess |
 | `PRISM_COORDINATION_BLOCKED_EXIT_SECONDS` | `900` | maximum continuous age of coordination-only template-refresh deferrals before the publication watchdog restarts the coordinator |
 | `PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS` | `15` | maximum monotonic age of a known tip/template/payout refresh before `/healthz` returns HTTP 503 |
+| `PRISM_MINING_READINESS_ENTRY_DWELL_SECONDS` | `60` | continuous low semantic coverage or over-budget refresh required before `/readyz/mining` enters `degraded` |
+| `PRISM_MINING_READINESS_RECOVERY_WINDOW_SECONDS` | `240` | continuous near-complete coverage with no pending refresh required before `/readyz/mining` returns to `ready`; must be at least the entry dwell |
 | `PRISM_INITIAL_JOB_MAX_WORKERS` | `4` | dedicated first-job delivery workers; raise under sustained reconnect churn so first notifies do not queue behind each other; explicit values above `PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS` are rejected, while the implicit default caps itself to that bound |
 | `PRISM_JOB_BUILD_EXECUTOR_WORKERS` | `2` | shared job-build executor threads; the scheduler admits at most two concurrent flights, so values above `2` are rejected — lower to `1` to serialize builds on constrained hosts |
 | `PRISM_OBSERVED_TIP_ACCEPT_WINDOW_SECONDS` | `300` | how long an own-hash tip observation (blockwait/blockpoll seeing a pool block candidate as the chain tip) keeps protecting that candidate from terminal abandonment while fresh chain probes cannot prove it active; expired windows restore terminal stale abandons |
@@ -540,6 +548,7 @@ slow block landing.
 Private/internal endpoints, served by the coordinator, include:
 
 - `/healthz`
+- `/readyz/mining`
 - `/metrics`
 - `/audit/latest`
 - `/owed-balances`
@@ -551,8 +560,8 @@ Private/internal endpoints, served by the coordinator, include:
 - `/audit/fanouts/{fanout_txid}/status`
 - `/audit/carry-forward-integrity`
 
-Do not expose `/audit/*`, `/metrics`, `/healthz`, Postgres, qbit RPC, or Docker
-volumes directly to the internet.
+Do not expose `/audit/*`, `/metrics`, `/healthz`, `/readyz/mining`, Postgres,
+qbit RPC, or Docker volumes directly to the internet.
 
 Dashboard-safe endpoints live under `/public/v1`, served by `prism-public-api`
 on `PRISM_PUBLIC_API_PORT` (default `3342`). The public API contract is:

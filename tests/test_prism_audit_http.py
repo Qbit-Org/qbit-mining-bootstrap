@@ -31,6 +31,11 @@ class FakeAuditHttpPort:
         self.health_entered: threading.Event | None = None
         self.health_release: threading.Event | None = None
         self.health_calls = 0
+        self.readiness_calls = 0
+        self.readiness_response: tuple[int, dict[str, object]] = (
+            200,
+            {"ready": True, "state": "ready", "reasons": []},
+        )
         self.metrics_calls = 0
         self.metrics_response = MetricsSnapshotResponse(
             status=200,
@@ -46,6 +51,10 @@ class FakeAuditHttpPort:
         if self.health_release is not None:
             self.health_release.wait(2.0)
         return 200, {"ok": True, "schema": "health-fixture"}
+
+    def cached_mining_readiness_payload(self) -> tuple[int, dict[str, object]]:
+        self.readiness_calls += 1
+        return self.readiness_response
 
     def cached_metrics_payload(self) -> MetricsSnapshotResponse:
         self.metrics_calls += 1
@@ -221,6 +230,47 @@ class AuditHttpFacadeTests(unittest.TestCase):
         self.assertEqual(stopped.lifecycle, "stopped")
         self.assertFalse(stopped.thread_alive)
         self.assertIsNone(stopped.bound_address)
+
+    def test_mining_readiness_route_serves_the_cached_answer_only(self) -> None:
+        # Issue #186: /readyz/mining is its own retained route, answered from
+        # the port's cached readiness read and never from /healthz's read.
+        port = FakeAuditHttpPort()
+        facade = AuditHttpFacade(
+            port,  # type: ignore[arg-type]
+            AuditHttpConfig("127.0.0.1", 0),
+        )
+        state = facade.start()
+        self.addCleanup(facade.stop)
+        assert state.bound_address is not None
+        base_url = f"http://127.0.0.1:{state.bound_address[1]}"
+
+        with urllib.request.urlopen(base_url + "/readyz/mining", timeout=2) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers["Content-Type"], "application/json")
+            # A router must never be handed a re-servable readiness body.
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+            self.assertEqual(
+                json.loads(response.read()),
+                {"ready": True, "state": "ready", "reasons": []},
+            )
+
+        port.readiness_response = (
+            503,
+            {"ready": False, "state": "degraded", "reasons": ["warming_up"]},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(base_url + "/readyz/mining/", timeout=2)
+        with caught.exception as error:
+            self.assertEqual(error.code, 503)
+            self.assertEqual(error.headers["Cache-Control"], "no-store")
+            self.assertEqual(
+                json.loads(error.read()),
+                {"ready": False, "state": "degraded", "reasons": ["warming_up"]},
+            )
+
+        self.assertEqual(port.readiness_calls, 2)
+        self.assertEqual(port.health_calls, 0)
+        self.assertEqual(port.metrics_calls, 0)
 
     def test_metrics_publishes_freshness_in_response_metadata(self) -> None:
         """A scraper must tell fresh from stale from unavailable (issue #184).

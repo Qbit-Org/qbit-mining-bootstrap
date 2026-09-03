@@ -42,6 +42,10 @@ from lab.prism.job_delivery import (
 from lab.prism.metrics import MetricsRenderer
 from lab.prism.payout_state import AcceptedBlockPayoutTransition
 from lab.prism.prism_coordinator import PRISM_REJECTION_REASON_IDS
+from lab.prism.progress_health import (
+    MINING_READINESS_REASONS,
+    MINING_READINESS_REASON_WARMING_UP,
+)
 from lab.prism.reorg_reconciler import (
     PRISM_REORG_RECONCILE_LOOKUP_PATHS,
     PRISM_REORG_RECONCILE_LOOKUP_SOURCES,
@@ -58,6 +62,7 @@ from lab.prism.writer_lease_timing import (
     LEASE_HEARTBEAT_POLICY_TERMS,
 )
 from tests import prism_vardiff_test_support as support
+from tests.prism_coordinator_test_support import coordinator as health_coordinator
 
 
 def reference_share_ack_metrics_lines(server) -> list[str]:
@@ -831,6 +836,29 @@ def reference_vardiff_convergence_metrics_lines(server) -> list[str]:
     ]
 
 
+def reference_mining_readiness_metrics_lines(server) -> list[str]:
+    # Issue #186: rendered from the observability owner's cached snapshot
+    # only, never sampled by the renderer.
+    snapshot = server._ensure_observability_service().mining_readiness_snapshot()
+    ready = snapshot is not None and snapshot.ready
+    active_reasons = (
+        {MINING_READINESS_REASON_WARMING_UP}
+        if snapshot is None
+        else set(snapshot.reasons)
+    )
+    return [
+        "# HELP qbit_prism_mining_ready Whether this coordinator instance is ready to receive routed miners: the latched, hysteretic signal served at /readyz/mining, 0 until the first complete health refresh.",
+        "# TYPE qbit_prism_mining_ready gauge",
+        f"qbit_prism_mining_ready {1 if ready else 0}",
+        "# HELP qbit_prism_mining_readiness_reason Mining-readiness reason flags by bounded reason; the label set is closed and carries no per-client or per-block value.",
+        "# TYPE qbit_prism_mining_readiness_reason gauge",
+        *(
+            f'qbit_prism_mining_readiness_reason{{reason="{reason}"}} {1 if reason in active_reasons else 0}'
+            for reason in MINING_READINESS_REASONS
+        ),
+    ]
+
+
 def reference_render_metrics_payload(server) -> str:
     ledger_metrics = server.ledger.metrics()
     audit_metrics = server.audit_artifact_metrics()
@@ -1258,6 +1286,7 @@ def reference_render_metrics_payload(server) -> str:
     lines.extend(server.payout_state_metrics_lines())
     lines.extend(reference_initial_delivery_metrics_lines(server))
     lines.extend(server.progress_health_metrics_lines())
+    lines.extend(reference_mining_readiness_metrics_lines(server))
     return "\n".join(lines) + "\n"
 
 
@@ -1453,6 +1482,8 @@ class MetricsRenderParityTests(unittest.TestCase):
             'qbit_prism_lease_heartbeat_policy_seconds{term="scheduler_slack"}',
             'qbit_prism_lease_heartbeat_policy_seconds{term="exit_envelope"}',
             'qbit_prism_lease_heartbeat_policy_seconds{term="server_proven_cap"}',
+            "qbit_prism_mining_ready 0",
+            'qbit_prism_mining_readiness_reason{reason="warming_up"} 1',
         ):
             self.assertIn(needle, actual)
 
@@ -1466,6 +1497,85 @@ class MetricsRenderParityTests(unittest.TestCase):
         )
         payload = MetricsRenderer(server).render()
         self.assertIn("qbit_prism_accepted_shares_total", payload)
+
+
+class MiningReadinessMetricsTests(unittest.TestCase):
+    """Issue #186: the readiness families are pinned and cache-only."""
+
+    def test_reason_label_set_is_the_pinned_vocabulary(self) -> None:
+        server, _ = health_coordinator()
+        lines = MetricsRenderer(server).mining_readiness_metrics_lines()
+
+        self.assertEqual(lines[2], "qbit_prism_mining_ready 0")
+        labelled = [
+            line for line in lines if line.startswith("qbit_prism_mining_readiness_reason{")
+        ]
+        self.assertEqual(
+            labelled,
+            [
+                f'qbit_prism_mining_readiness_reason{{reason="{reason}"}} '
+                f"{1 if reason == 'warming_up' else 0}"
+                for reason in MINING_READINESS_REASONS
+            ],
+        )
+        self.assertEqual(
+            [line for line in lines if line.startswith("# TYPE")],
+            [
+                "# TYPE qbit_prism_mining_ready gauge",
+                "# TYPE qbit_prism_mining_readiness_reason gauge",
+            ],
+        )
+
+    def test_gauges_follow_the_cached_snapshot_and_never_sample(self) -> None:
+        server, _ = health_coordinator()
+        observability = server._ensure_observability_service()
+        # Warming up: the renderer must not take a sample of its own.
+        observability._observe_mining_readiness = mock.Mock(  # type: ignore[method-assign]
+            side_effect=AssertionError("the metrics renderer sampled readiness")
+        )
+        cold = MetricsRenderer(server).mining_readiness_metrics_lines()
+        self.assertIn("qbit_prism_mining_ready 0", cold)
+        self.assertIn('qbit_prism_mining_readiness_reason{reason="warming_up"} 1', cold)
+        # Drop the instance override so the class method is reachable again.
+        del observability._observe_mining_readiness
+
+        # One background health refresh publishes the sample the gauge reads.
+        server.refresh_health_snapshot()
+        warm = MetricsRenderer(server).mining_readiness_metrics_lines()
+        self.assertIn("qbit_prism_mining_ready 1", warm)
+        self.assertIn('qbit_prism_mining_readiness_reason{reason="warming_up"} 0', warm)
+        self.assertNotIn('qbit_prism_mining_readiness_reason{reason="warming_up"} 1', warm)
+        document = server.metrics_payload()
+        self.assertIn("\nqbit_prism_mining_ready 1\n", document)
+
+    def test_block_submitter_render_hands_the_candidate_age_to_the_owner(self) -> None:
+        server, _ = health_coordinator()
+        server.ledger.block_candidate_pending_metrics = lambda: {
+            "pending_count": 1,
+            "oldest_pending_age_seconds": 75.5,
+            "oldest_unattempted_age_seconds": 0.0,
+        }
+        self.assertIsNone(
+            server._ensure_observability_service()._oldest_durable_candidate_age_seconds
+        )
+
+        MetricsRenderer(server).block_submitter_metrics_lines()
+        server.refresh_health_snapshot()
+
+        snapshot = server.mining_readiness_snapshot()
+        assert snapshot is not None
+        self.assertEqual(snapshot.oldest_durable_candidate_age_seconds, 75.5)
+        _, payload = server.cached_mining_readiness_payload()
+        self.assertEqual(payload["oldest_durable_candidate_age_seconds"], 75.5)
+        # The -1 "unavailable" gauge value crosses over as unknown.
+        server.ledger.block_candidate_pending_metrics = lambda: (_ for _ in ()).throw(
+            RuntimeError("outbox unavailable")
+        )
+        MetricsRenderer(server).block_submitter_metrics_lines()
+        server.refresh_health_snapshot()
+        snapshot = server.mining_readiness_snapshot()
+        assert snapshot is not None
+        self.assertIsNone(snapshot.oldest_durable_candidate_age_seconds)
 
 
 class RemovedCompatibilitySurfaceTests(unittest.TestCase):
