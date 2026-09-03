@@ -165,8 +165,19 @@ class ReorgReconcilerServiceTests(unittest.TestCase):
         guard_exit = events.index(("guard", "exit"))
         self.assertLess(guard_enter, guard_exit)
         self.assertEqual(ledger.reactivated, ["bb"])
-        # Preparation passes the mutation-derived rescan flag (#112).
-        self.assertIn(("prepare", {"force_full_window_rescan": True}), events)
+        # A confirmed mutation moves payout balances but never the share
+        # ledger, so preparation asks for a live prior-balances reread over
+        # the still-exact window instead of the #112 full rescan (#224).
+        self.assertIn(
+            (
+                "prepare",
+                {
+                    "force_full_window_rescan": False,
+                    "force_prior_balances_read": True,
+                },
+            ),
+            events,
+        )
         state = service.snapshot()
         self.assertEqual(state.inactive_block_count, 1)
         self.assertEqual(state.reactivated_block_count, 1)
@@ -463,8 +474,18 @@ class StrandedPreparedSweepTests(unittest.TestCase):
         self.assertEqual(summary["stranded_prepared_canonical"], 0)
         # The rejection cascades payout entries, carry forward, and fanout
         # artifacts, so the pass must republish rather than serve balances
-        # computed before it.
-        self.assertIn(("prepare", {"force_full_window_rescan": True}), events)
+        # computed before it -- rereading balances over the exact window
+        # (#224), since the cascade never touches the share ledger.
+        self.assertIn(
+            (
+                "prepare",
+                {
+                    "force_full_window_rescan": False,
+                    "force_prior_balances_read": True,
+                },
+            ),
+            events,
+        )
         self.assertEqual(summary["published_generation"], 7)
         self.assertIn(("block", {"force": True}), events)
         # A row mutation invalidates proofs memoized for every other tip.

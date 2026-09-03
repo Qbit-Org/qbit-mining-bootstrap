@@ -15,12 +15,27 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 import threading
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
+from lab.prism.accepted_preview_telemetry import (
+    AcceptedPreviewTelemetry,
+    PRISM_REORG_RECONCILE_CALLERS,
+    RECONCILE_CALLER_JOB_BUILD,
+    RECONCILE_CALLER_LANDING,
+    RECONCILE_CALLER_OTHER,
+    RECONCILE_CALLER_POST_CONFIRM,
+    RECONCILE_CALLER_TIP_REFRESH,
+    RECONCILE_STEP_ADMISSION_WAIT,
+    RECONCILE_STEP_CANDIDATE_PREPARE,
+    RECONCILE_STEP_CHAIN_PROBE,
+    RECONCILE_STEP_MUTATIONS,
+    RECONCILE_STEP_PUBLISH,
+    RECONCILE_STEP_WATCH_QUERY,
+)
 from lab.prism.coordinator_config import (
     DEFAULT_PRISM_REORG_RECONCILE_CACHE_SECONDS,
     TESTNET_QBIT_CHAINS,
@@ -128,6 +143,15 @@ class ReorgPorts:
     # thread; ports built without one get a sink so background reconciliation
     # and focused tests are unchanged.
     record_progress: Callable[[str], None] = _no_reconcile_progress
+    # Issue #224 attribution owner: the coordinator supplies
+    # ``ensure_accepted_preview_telemetry(self)`` so the reconcile pass,
+    # step and caller families land in the one owner the renderer reads.
+    # Ports built without one get a private owner so focused tests observe
+    # the same families; nothing recorded here changes flight, memo,
+    # admission, lock or publication behavior.
+    accepted_preview_telemetry: (
+        Callable[[], AcceptedPreviewTelemetry] | None
+    ) = None
 
 
 @dataclass(frozen=True)
@@ -241,6 +265,96 @@ class ReorgReconcilerService:
             for path in PRISM_REORG_RECONCILE_LOOKUP_PATHS
             for source in PRISM_REORG_RECONCILE_LOOKUP_SOURCES
         }
+        # Issue #224 caller attribution. Entry points stamp the bounded
+        # caller on the calling thread (the landing's in-lock ensure_tip,
+        # the job-build ensure_current, the tip-refresh prefetch lane) and
+        # the core pass reads it there, so the coordinator's monkeypatch
+        # seams (reconcile_with_admission / reconcile_serialized /
+        # ensure_tip) keep their exact signatures. The same slot carries
+        # the stamp ``admission_wait`` is measured from.
+        self._reconcile_attribution = threading.local()
+        self._fallback_telemetry_lock = threading.Lock()
+        self._fallback_telemetry: AcceptedPreviewTelemetry | None = None
+
+    @property
+    def accepted_preview_telemetry(self) -> AcceptedPreviewTelemetry:
+        """The shared #224 owner, or a private one for ports without it."""
+        port = self._ports.accepted_preview_telemetry
+        if port is not None:
+            return port()
+        telemetry = self._fallback_telemetry
+        if telemetry is None:
+            with self._fallback_telemetry_lock:
+                telemetry = self._fallback_telemetry
+                if telemetry is None:
+                    telemetry = AcceptedPreviewTelemetry()
+                    self._fallback_telemetry = telemetry
+        return telemetry
+
+    def _attributed_caller(self) -> str | None:
+        return getattr(self._reconcile_attribution, "caller", None)
+
+    @contextmanager
+    def _attributed(self, caller: str | None) -> Iterator[None]:
+        """Stamp ``caller`` on this thread for the passes it runs.
+
+        The outermost entry point wins: a tip-refresh prefetch that reaches
+        ``ensure_tip`` through the coordinator keeps ``tip_refresh``, and a
+        forced publication inside an attributed stretch keeps that stretch's
+        label. ``None`` stamps nothing.
+        """
+        local = self._reconcile_attribution
+        previous = getattr(local, "caller", None)
+        if caller is None or previous is not None:
+            yield
+            return
+        if caller not in PRISM_REORG_RECONCILE_CALLERS:
+            raise ValueError(f"unknown reorg reconcile caller: {caller!r}")
+        local.caller = caller
+        try:
+            yield
+        finally:
+            local.caller = previous
+
+    def _serialized_pass(
+        self,
+        caller: str | None,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        """Run one pass through the serialized adapter, attributed and stamped.
+
+        The stamp is what ``reconcile`` measures ``admission_wait`` from: the
+        writer admission and payout-balance mutation lock the coordinator
+        adapter takes before the core pass starts. It is cleared on every
+        exit so a pass refused before the core (a landed preview) cannot
+        leave a stale stamp for a later direct call on this thread.
+        """
+        local = self._reconcile_attribution
+        with self._attributed(caller):
+            local.admission_started = time.monotonic()
+            try:
+                return self._ports.reconcile_serialized(**kwargs)
+            finally:
+                local.admission_started = None
+
+    @staticmethod
+    def _candidate_intent(payout_changed: bool) -> dict[str, bool]:
+        """Preparation intent for a pass whose mutations may have moved balances.
+
+        Reconciliation mutates pool-block, payout-entry and carry state but
+        never ``qbit_share_ledger`` (the verified invariant recorded in
+        ``lab.prism.accepted_preview_telemetry``), so the accepted-share
+        window at a fixed anchor stays exact after a maturation, an inactive
+        marking or a reactivation. A confirmed mutation therefore asks for a
+        live prior-balances reread, not the O(window) oracle rescan that
+        ``force_full_window_rescan`` still means everywhere else (#224). The
+        reread intent is forwarded only when it applies so preparation seams
+        that predate it keep their exact signature.
+        """
+        intent: dict[str, bool] = {"force_full_window_rescan": False}
+        if payout_changed:
+            intent["force_prior_balances_read"] = True
+        return intent
 
     def snapshot(self) -> ReorgState:
         with self._ports.state_lock():
@@ -361,7 +475,8 @@ class ReorgReconcilerService:
             self.record_lookup("job_build", "memo_hit")
             return True
         self.record_lookup("job_build", "serial")
-        return self._ports.ensure_tip(current_tip)
+        with self._attributed(RECONCILE_CALLER_JOB_BUILD):
+            return self._ports.ensure_tip(current_tip)
 
     def memo_fresh(self, tip_hash: str) -> bool:
         """True when a trusted pass for ``tip_hash`` is inside the cache TTL
@@ -412,7 +527,9 @@ class ReorgReconcilerService:
         """
         if not prove and self.memo_fresh(tip_hash):
             return True
-        return self._ports.ensure_tip(tip_hash)
+        # Only the tip-refresh owner submits prefetches and re-proves.
+        with self._attributed(RECONCILE_CALLER_TIP_REFRESH):
+            return self._ports.ensure_tip(tip_hash)
 
     def submit_prefetch(
         self,
@@ -555,7 +672,8 @@ class ReorgReconcilerService:
 
         prefetch = self.submit_prefetch(tip_hash, prove=True)
         if prefetch is None:
-            return self._ports.ensure_tip(tip_hash)
+            with self._attributed(RECONCILE_CALLER_TIP_REFRESH):
+                return self._ports.ensure_tip(tip_hash)
         return self.join_prefetch_bounded(prefetch)
 
     def shutdown_prefetch_executor(self) -> None:
@@ -575,22 +693,32 @@ class ReorgReconcilerService:
         tip_hash: str,
         *,
         _coalesce_same_tip: bool = True,
+        _caller: str | None = None,
     ) -> bool:
         """Reconcile one tip, optionally bypassing same-tip flight reuse.
 
         Lock-owning accepted-block callers disable waiting for an existing
         leader because it may itself be waiting for the payout-balance
         mutation lock. Their own pass remains visible to ordinary followers.
+        ``_caller`` is the optional #224 attribution label; without one, the
+        flight bypass identifies the accepted-block landing (its only user)
+        and every other caller keeps whatever label its entry point stamped.
         """
         if not self.enabled:
             return True
-        if _coalesce_same_tip:
-            summary = self._ports.reconcile_with_admission(tip_hash=tip_hash)
-        else:
-            summary = self._ports.reconcile_with_admission(
-                tip_hash=tip_hash,
-                _wait_for_same_tip_flight=False,
-            )
+        caller = _caller
+        if caller is None and not _coalesce_same_tip:
+            caller = RECONCILE_CALLER_LANDING
+        with self._attributed(caller):
+            if _coalesce_same_tip:
+                summary = self._ports.reconcile_with_admission(
+                    tip_hash=tip_hash
+                )
+            else:
+                summary = self._ports.reconcile_with_admission(
+                    tip_hash=tip_hash,
+                    _wait_for_same_tip_flight=False,
+                )
         return not bool(summary.get("untrusted") or summary.get("superseded"))
 
     def reconcile_with_flights(
@@ -600,6 +728,7 @@ class ReorgReconcilerService:
         _force_publish: bool = False,
         _source_reserved: bool = False,
         _wait_for_same_tip_flight: bool = True,
+        _caller: str | None = None,
     ) -> dict[str, object]:
         """Reconcile pool blocks, coalescing same-tip concurrent callers.
 
@@ -609,11 +738,17 @@ class ReorgReconcilerService:
         forced publication or an already-reserved source) and callers without
         a tip always run their own pass. Lock-owning callers may disable
         waiting for an existing flight while still registering as the visible
-        leader when no same-tip flight exists.
+        leader when no same-tip flight exists. ``_caller`` is the optional
+        #224 attribution label; a forced publication without one is the
+        post-confirm path (its only user).
         """
         self._ports.ensure_job_cache_state()
+        caller = _caller
+        if caller is None and _force_publish:
+            caller = RECONCILE_CALLER_POST_CONFIRM
         if tip_hash is None or _force_publish or _source_reserved:
-            return self._ports.reconcile_serialized(
+            return self._serialized_pass(
+                caller,
                 tip_hash=tip_hash,
                 _force_publish=_force_publish,
                 _source_reserved=_source_reserved,
@@ -626,9 +761,7 @@ class ReorgReconcilerService:
                 self._reconcile_flights[tip_hash] = flight
         if not leading:
             if not _wait_for_same_tip_flight:
-                return self._ports.reconcile_serialized(
-                    tip_hash=tip_hash
-                )
+                return self._serialized_pass(caller, tip_hash=tip_hash)
             wait_seconds = float(self._ports.flight_wait_seconds())
             if flight.event.wait(timeout=wait_seconds):
                 exception = flight.exception
@@ -641,13 +774,9 @@ class ReorgReconcilerService:
                 return dict(summary)
             # Liveness backstop: the leader outlived the wait. Run our own
             # pass; the writer lock still serializes the actual work.
-            return self._ports.reconcile_serialized(
-                tip_hash=tip_hash
-            )
+            return self._serialized_pass(caller, tip_hash=tip_hash)
         try:
-            summary = self._ports.reconcile_serialized(
-                tip_hash=tip_hash
-            )
+            summary = self._serialized_pass(caller, tip_hash=tip_hash)
             flight.summary = summary
             return summary
         except BaseException as exc:
@@ -664,8 +793,17 @@ class ReorgReconcilerService:
         tip_hash: str | None = None,
         force_publish: bool = False,
         source_reserved: bool = False,
+        caller: str | None = None,
     ) -> dict[str, object]:
-        """The core reconcile state machine (behind the serialized adapter)."""
+        """The core reconcile state machine (behind the serialized adapter).
+
+        ``caller`` is the bounded #224 attribution label. When omitted it is
+        the label the entry point stamped on this thread, ``post_confirm``
+        for a forced publication without one, and ``other`` for tools,
+        benchmarks and periodic passes. The pass family is recorded on every
+        exit -- success, untrusted skip, superseded budget, and the
+        error-after-possible-commit path -- and never changes the outcome.
+        """
         summary: dict[str, object] = {
             "enabled": bool(self.enabled),
             "untrusted": False,
@@ -681,6 +819,58 @@ class ReorgReconcilerService:
         if not self.enabled:
             return summary
         self._ports.ensure_job_cache_state()
+        if caller is None:
+            caller = self._attributed_caller()
+        if caller is None:
+            caller = (
+                RECONCILE_CALLER_POST_CONFIRM
+                if force_publish
+                else RECONCILE_CALLER_OTHER
+            )
+        if caller not in PRISM_REORG_RECONCILE_CALLERS:
+            raise ValueError(f"unknown reorg reconcile caller: {caller!r}")
+        telemetry = self.accepted_preview_telemetry
+        pass_started = time.monotonic()
+        local = self._reconcile_attribution
+        admission_started = getattr(local, "admission_started", None)
+        local.admission_started = None
+        if admission_started is not None:
+            # Stamped by _serialized_pass ahead of the coordinator adapter's
+            # writer admission and payout-balance mutation lock: the one
+            # stretch a tip-refresh caller spends behind a landing.
+            telemetry.observe_reconcile_step(
+                caller,
+                RECONCILE_STEP_ADMISSION_WAIT,
+                pass_started - admission_started,
+            )
+
+        def step(name: str) -> AbstractContextManager[None]:
+            return telemetry.reconcile_step(caller, name)
+
+        try:
+            return self._reconcile_pass(
+                summary,
+                tip_hash=tip_hash,
+                force_publish=force_publish,
+                source_reserved=source_reserved,
+                step=step,
+            )
+        finally:
+            telemetry.observe_reconcile_pass(
+                caller,
+                time.monotonic() - pass_started,
+            )
+
+    def _reconcile_pass(
+        self,
+        summary: dict[str, object],
+        *,
+        tip_hash: str | None,
+        force_publish: bool,
+        source_reserved: bool,
+        step: Callable[[str], AbstractContextManager[None]],
+    ) -> dict[str, object]:
+        """One attributed pass; ``step`` times each bounded reconcile step."""
         if not source_reserved and tip_hash is not None:
             # Tip observation normally reserves this source before queueing
             # reconciliation. Direct callers only need a new source when they
@@ -775,11 +965,12 @@ class ReorgReconcilerService:
                             summary["untrusted"] = True
                             attempt_trusted = False
                             if force_publish:
-                                candidate_to_publish = (
-                                    self._ports.prepared_candidate(
-                                        captured_source
+                                with step(RECONCILE_STEP_CANDIDATE_PREPARE):
+                                    candidate_to_publish = (
+                                        self._ports.prepared_candidate(
+                                            captured_source
+                                        )
                                     )
-                                )
                         else:
                             # Every stamp below marks one completed round
                             # trip. A landing thread's watchdog budget is
@@ -790,9 +981,10 @@ class ReorgReconcilerService:
                             self._ports.record_progress(
                                 "reorg-reconcile:tip-height"
                             )
-                            active_tip_height = int(
-                                self._ports.rpc_call("getblockcount")
-                            )
+                            with step(RECONCILE_STEP_CHAIN_PROBE):
+                                active_tip_height = int(
+                                    self._ports.rpc_call("getblockcount")
+                                )
                             ledger = self._ports.ledger()
                             watch_blocks = getattr(
                                 ledger,
@@ -806,19 +998,23 @@ class ReorgReconcilerService:
                                         captured_source
                                     )
                                 ):
-                                    candidate_to_publish = (
-                                        self._ports.prepared_candidate(
-                                            captured_source,
-                                            force_full_window_rescan=payout_changed,
+                                    with step(RECONCILE_STEP_CANDIDATE_PREPARE):
+                                        candidate_to_publish = (
+                                            self._ports.prepared_candidate(
+                                                captured_source,
+                                                **self._candidate_intent(
+                                                    payout_changed
+                                                ),
+                                            )
                                         )
-                                    )
                             else:
                                 self._ports.record_progress(
                                     "reorg-reconcile:watch-blocks"
                                 )
-                                rows = watch_blocks(
-                                    active_tip_height=active_tip_height
-                                )
+                                with step(RECONCILE_STEP_WATCH_QUERY):
+                                    rows = watch_blocks(
+                                        active_tip_height=active_tip_height
+                                    )
                                 summary["watched_blocks"] = len(rows)
 
                                 for row in rows:
@@ -836,12 +1032,13 @@ class ReorgReconcilerService:
                                     if block_height > active_tip_height:
                                         if chain_state == "confirmed":
                                             payout_mutation_attempted = True
-                                            inactive = (
-                                                ledger.mark_pool_block_inactive(
-                                                    block_hash=block_hash,
-                                                    active_tip_height=active_tip_height,
+                                            with step(RECONCILE_STEP_MUTATIONS):
+                                                inactive = (
+                                                    ledger.mark_pool_block_inactive(
+                                                        block_hash=block_hash,
+                                                        active_tip_height=active_tip_height,
+                                                    )
                                                 )
-                                            )
                                             inactive_count = int(
                                                 inactive.get("inactive_count", 0)
                                             )
@@ -851,23 +1048,25 @@ class ReorgReconcilerService:
                                                 or bool(inactive_count)
                                             )
                                         continue
-                                    active_hash = str(
-                                        self._ports.rpc_call(
-                                            "getblockhash",
-                                            [block_height],
-                                        )
-                                    ).lower()
+                                    with step(RECONCILE_STEP_CHAIN_PROBE):
+                                        active_hash = str(
+                                            self._ports.rpc_call(
+                                                "getblockhash",
+                                                [block_height],
+                                            )
+                                        ).lower()
                                     on_active_chain = active_hash == block_hash
                                     if (
                                         on_active_chain
                                         and chain_state == "inactive"
                                     ):
                                         payout_mutation_attempted = True
-                                        with self._ports.publication_guard():
-                                            reactivated = ledger.reactivate_pool_block(
-                                                block_hash=block_hash,
-                                                active_tip_height=active_tip_height,
-                                            )
+                                        with step(RECONCILE_STEP_MUTATIONS):
+                                            with self._ports.publication_guard():
+                                                reactivated = ledger.reactivate_pool_block(
+                                                    block_hash=block_hash,
+                                                    active_tip_height=active_tip_height,
+                                                )
                                         reactivated_count = int(
                                             reactivated.get(
                                                 "reactivated_count",
@@ -884,12 +1083,13 @@ class ReorgReconcilerService:
                                         and chain_state == "confirmed"
                                     ):
                                         payout_mutation_attempted = True
-                                        inactive = (
-                                            ledger.mark_pool_block_inactive(
-                                                block_hash=block_hash,
-                                                active_tip_height=active_tip_height,
+                                        with step(RECONCILE_STEP_MUTATIONS):
+                                            inactive = (
+                                                ledger.mark_pool_block_inactive(
+                                                    block_hash=block_hash,
+                                                    active_tip_height=active_tip_height,
+                                                )
                                             )
-                                        )
                                         inactive_count = int(
                                             inactive.get("inactive_count", 0)
                                         )
@@ -916,13 +1116,16 @@ class ReorgReconcilerService:
                                     self._ports.record_progress(
                                         "reorg-reconcile:stranded-prepared-blocks"
                                     )
-                                    stranded_rows = stranded_prepared(
-                                        active_tip_height=active_tip_height,
-                                        min_depth=(
-                                            STRANDED_PREPARED_REJECT_MIN_DEPTH
-                                        ),
-                                        limit=STRANDED_PREPARED_SWEEP_LIMIT,
-                                    )
+                                    # The sweep's row read is the same kind
+                                    # of watch-set query as the watch loop's.
+                                    with step(RECONCILE_STEP_WATCH_QUERY):
+                                        stranded_rows = stranded_prepared(
+                                            active_tip_height=active_tip_height,
+                                            min_depth=(
+                                                STRANDED_PREPARED_REJECT_MIN_DEPTH
+                                            ),
+                                            limit=STRANDED_PREPARED_SWEEP_LIMIT,
+                                        )
                                     for row in stranded_rows:
                                         # Per row for the same reason as the
                                         # watch loop: a getblockhash plus a
@@ -934,12 +1137,13 @@ class ReorgReconcilerService:
                                         block_hash = str(
                                             row["block_hash"]
                                         ).lower()
-                                        active_hash = str(
-                                            self._ports.rpc_call(
-                                                "getblockhash",
-                                                [block_height],
-                                            )
-                                        ).lower()
+                                        with step(RECONCILE_STEP_CHAIN_PROBE):
+                                            active_hash = str(
+                                                self._ports.rpc_call(
+                                                    "getblockhash",
+                                                    [block_height],
+                                                )
+                                            ).lower()
                                         if active_hash == block_hash:
                                             # Canonical but never confirmed:
                                             # the confirm path owns audit
@@ -961,10 +1165,11 @@ class ReorgReconcilerService:
                                             )
                                             continue
                                         payout_mutation_attempted = True
-                                        rejected = ledger.reject_prepared_block(
-                                            block_hash=block_hash,
-                                            active_tip_height=active_tip_height,
-                                        )
+                                        with step(RECONCILE_STEP_MUTATIONS):
+                                            rejected = ledger.reject_prepared_block(
+                                                block_hash=block_hash,
+                                                active_tip_height=active_tip_height,
+                                            )
                                         # The fenced ledger function cascades
                                         # payout entries, carry forward, and
                                         # fanout artifacts, and returns 0 when
@@ -1001,9 +1206,10 @@ class ReorgReconcilerService:
                                     self._ports.record_progress(
                                         "reorg-reconcile:mature-payouts"
                                     )
-                                    matured = mark_mature(
-                                        active_tip_height=active_tip_height
-                                    )
+                                    with step(RECONCILE_STEP_MUTATIONS):
+                                        matured = mark_mature(
+                                            active_tip_height=active_tip_height
+                                        )
                                     matured_payouts = int(
                                         matured.get("matured_count", 0)
                                     )
@@ -1031,16 +1237,23 @@ class ReorgReconcilerService:
                                     # Candidate preparation embeds the ledger
                                     # snapshot artifact; a pass that will not
                                     # publish must not pay for one only to
-                                    # discard it.
+                                    # discard it. A confirmed payout mutation
+                                    # asks for a live prior-balances reread
+                                    # over the still-exact share window, not
+                                    # a full rescan (#224; see
+                                    # _candidate_intent).
                                     self._ports.record_progress(
                                         "reorg-reconcile:prepare-candidate"
                                     )
-                                    candidate_to_publish = (
-                                        self._ports.prepared_candidate(
-                                            captured_source,
-                                            force_full_window_rescan=payout_changed,
+                                    with step(RECONCILE_STEP_CANDIDATE_PREPARE):
+                                        candidate_to_publish = (
+                                            self._ports.prepared_candidate(
+                                                captured_source,
+                                                **self._candidate_intent(
+                                                    payout_changed
+                                                ),
+                                            )
                                         )
-                                    )
                     except Exception:
                         inactive_blocks_total += inactive_blocks
                         reactivated_blocks_total += reactivated_blocks
@@ -1063,12 +1276,18 @@ class ReorgReconcilerService:
                             # mutation. Read-only failures never reach this flag.
                             payout_changed = True
                         if payout_changed:
-                            error_candidate = (
-                                self._ports.prepared_candidate(
-                                    captured_source,
-                                    force_full_window_rescan=True,
+                            # Fail closed on the uncertain path: the forced
+                            # full rescan is unchanged here and necessarily
+                            # rereads the current prior balances, so a lost
+                            # mutator response can never republish stale
+                            # balances.
+                            with step(RECONCILE_STEP_CANDIDATE_PREPARE):
+                                error_candidate = (
+                                    self._ports.prepared_candidate(
+                                        captured_source,
+                                        force_full_window_rescan=True,
+                                    )
                                 )
-                            )
                             self._ports.block_publication(force=True)
                         with self._ports.state_lock():
                             self.inactive_block_count += (
@@ -1099,18 +1318,20 @@ class ReorgReconcilerService:
                         self._ports.block_publication(force=True)
             except Exception:
                 if error_candidate is not None:
-                    if (
-                        self._ports.publish_candidate(error_candidate)
-                        is None
-                    ):
+                    with step(RECONCILE_STEP_PUBLISH):
+                        published_after_error = self._ports.publish_candidate(
+                            error_candidate
+                        )
+                    if published_after_error is None:
                         self._ports.block_publication()
                 raise
 
             if candidate_to_publish is not None:
                 self._ports.record_progress("reorg-reconcile:publish")
-                published = self._ports.publish_candidate(
-                    candidate_to_publish
-                )
+                with step(RECONCILE_STEP_PUBLISH):
+                    published = self._ports.publish_candidate(
+                        candidate_to_publish
+                    )
                 if published is None:
                     # Preserve durable counts and retry iteratively against the
                     # newest source. The explicit budget prevents tip churn
