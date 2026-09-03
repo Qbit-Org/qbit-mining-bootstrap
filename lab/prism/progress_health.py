@@ -848,6 +848,10 @@ class MiningReadinessTracker:
     - While degraded, a sample whose ``recovery_condition`` holds extends the
       recovery streak; any other sample resets it. The state changes to ready
       exactly when the streak reaches ``recovery_window_seconds``.
+    - The sampling owner may supply its staleness budget to ``observe``. A
+      larger gap between successful observations resets both streaks before
+      the new sample is applied, so elapsed wall time without evidence can
+      never satisfy either continuous window.
     - The candidate age and the preview-timeout rate annotate a degraded or
       recovering snapshot's reasons. They never start or extend a streak.
     """
@@ -858,6 +862,7 @@ class MiningReadinessTracker:
         self._state_since: float | None = None
         self._entry_since: float | None = None
         self._recovery_since: float | None = None
+        self._last_sample_monotonic: float | None = None
         self._transitions = 0
         self._last_timeout_count: int | None = None
         self._last_timeout_monotonic: float | None = None
@@ -887,8 +892,33 @@ class MiningReadinessTracker:
         delta = max(0, self._last_timeout_count - previous_count)
         return delta / elapsed
 
-    def observe(self, sample: MiningReadinessSample) -> MiningReadinessSnapshot:
+    def observe(
+        self,
+        sample: MiningReadinessSample,
+        *,
+        max_sample_gap_seconds: float | None = None,
+    ) -> MiningReadinessSnapshot:
         now = float(sample.monotonic)
+        previous_sample_monotonic = self._last_sample_monotonic
+        sample_gap_exceeded = False
+        if max_sample_gap_seconds is not None:
+            max_gap = float(max_sample_gap_seconds)
+            if not math.isfinite(max_gap) or max_gap < 0.0:
+                raise ValueError(
+                    "mining readiness max_sample_gap_seconds must be finite "
+                    "and nonnegative"
+                )
+            sample_gap_exceeded = (
+                previous_sample_monotonic is not None
+                and now - previous_sample_monotonic > max_gap
+            )
+        self._last_sample_monotonic = now
+        if sample_gap_exceeded:
+            # ``observe`` is called only after a complete health refresh,
+            # so a larger interval is a period with no successful sample,
+            # not evidence that either condition held continuously.
+            self._entry_since = None
+            self._recovery_since = None
         if self._state_since is None:
             self._state_since = now
         timeout_rate = self._timeout_rate(sample)

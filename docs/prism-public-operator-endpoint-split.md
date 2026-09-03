@@ -299,9 +299,10 @@ block. `/readyz/mining` is latched with hysteresis instead.
 
 - **Policy** lives in `lab/prism/progress_health.py` as
   `MiningReadinessTracker`: a pure, scripted-clock state machine with two
-  states (`ready`, `degraded`), two independent timers, and the closed reason
-  vocabulary `MINING_READINESS_REASONS`. It keeps no history that grows with
-  uptime: the two streak stamps and the last preview-timeout counter sample.
+states (`ready`, `degraded`), two independent timers, and the closed reason
+vocabulary `MINING_READINESS_REASONS`. It keeps no history that grows with
+uptime: the two streak stamps, the last successful sample time, and the last
+preview-timeout counter sample.
 - **Sampling and the cache** live in `lab/prism/observability.py`, the same
   owner that caches `/healthz`. `refresh_health_snapshot` builds one
   `MiningReadinessSample` from the delivery snapshot and progress mapping it
@@ -343,7 +344,10 @@ place. The response carries `sample_age_seconds` and `sample_stale`
 (`max(3 * PRISM_HEALTH_REFRESH_SECONDS, 15s)`, the `/healthz` budget) as
 diagnostics; the latched state is served either way so a wedged refresher
 cannot make the signal flap, and a consumer that wants to treat a stale sample
-as not-ready has the facts to.
+as not-ready has the facts to. The same budget also bounds streak continuity:
+after a larger gap, the next complete refresh resets any entry or recovery
+streak before applying its sample. Time with no successful observation can
+therefore never count toward either hysteresis window.
 
 ### Hysteresis
 
@@ -358,9 +362,9 @@ as not-ready has the facts to.
   state changes to `degraded`; the recovery condition must hold continuously
   for `PRISM_MINING_READINESS_RECOVERY_WINDOW_SECONDS` (default `240`) before
   it returns to `ready`. Any contrary sample resets the timer in progress. The
-  state changes exactly once per sustained episode and `state_age_seconds`
-  counts from that change. Ready is the initial latched state at the first
-  sample.
+  sampling gap rule above also resets it. The state changes exactly once per
+  sustained episode and `state_age_seconds` counts from that change. Ready is
+  the initial latched state at the first sample.
 - The defaults are set by the two incidents: `60s` exceeds the 2026-08-21
   normal tip-refresh cycle (pending age peaked near `36.77s`), and `240s`
   exceeds the 213-second 2026-08-20 oscillation between the apparent healthy

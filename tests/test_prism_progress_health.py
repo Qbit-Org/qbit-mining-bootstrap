@@ -1299,6 +1299,39 @@ class MiningReadinessPolicyTests(unittest.TestCase):
         self.assertEqual(trace.tracker.transitions, 2)
         self.assertEqual(len(trace.transitions), 3)
 
+    def test_sampling_gaps_reset_entry_and_recovery_streaks(self) -> None:
+        tracker = MiningReadinessTracker(
+            MiningReadinessConfig(
+                entry_dwell_seconds=10.0,
+                recovery_window_seconds=20.0,
+            )
+        )
+
+        def observe(now: float, *, ratio: float) -> MiningReadinessSnapshot:
+            return tracker.observe(
+                readiness_sample(now, ratio=ratio),
+                max_sample_gap_seconds=10.0,
+            )
+
+        self.assertTrue(observe(0.0, ratio=0.0).ready)
+        self.assertEqual(observe(5.0, ratio=0.0).entry_streak_seconds, 5.0)
+        # Fifteen seconds without a successful observation resets the dwell;
+        # the current bad sample starts a new streak at zero.
+        after_entry_gap = observe(20.0, ratio=0.0)
+        self.assertTrue(after_entry_gap.ready)
+        self.assertEqual(after_entry_gap.entry_streak_seconds, 0.0)
+        self.assertFalse(observe(30.0, ratio=0.0).ready)
+
+        self.assertEqual(observe(35.0, ratio=1.0).recovery_streak_seconds, 0.0)
+        self.assertEqual(observe(45.0, ratio=1.0).recovery_streak_seconds, 10.0)
+        # A gap beyond the same budget cannot complete recovery from the
+        # isolated healthy observations on either side of it.
+        after_recovery_gap = observe(56.0, ratio=1.0)
+        self.assertFalse(after_recovery_gap.ready)
+        self.assertEqual(after_recovery_gap.recovery_streak_seconds, 0.0)
+        self.assertFalse(observe(66.0, ratio=1.0).ready)
+        self.assertTrue(observe(76.0, ratio=1.0).ready)
+
     def test_entry_and_recovery_windows_are_independent(self) -> None:
         immediate = Trace(MiningReadinessConfig(entry_dwell_seconds=0.0, recovery_window_seconds=0.0))
         self.assertFalse(immediate.observe(readiness_sample(1.0, ratio=0.0)).ready)

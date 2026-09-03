@@ -1205,6 +1205,56 @@ class MiningReadinessCacheTests(unittest.TestCase):
         self.assertIs(service.mining_readiness_snapshot(), before)
         self.assertEqual(service.cached_mining_readiness_payload()[0], 200)
 
+    def test_refresh_gap_cannot_complete_recovery(self) -> None:
+        port = FakeObservabilityPort()
+        port.readiness_config = MiningReadinessConfig(
+            entry_dwell_seconds=0.0,
+            recovery_window_seconds=20.0,
+        )
+        port.inputs = tip_cycle_inputs(0)
+        port.progress = {
+            "ok": False,
+            "reason": "refresh_pending_too_long",
+            "reasons": ["refresh_pending_too_long"],
+            "pending_refresh": True,
+            "pending_refresh_age_seconds": 30.0,
+            "eligible_clients_requiring_refresh": 12,
+        }
+        service = ObservabilityService(port)
+        service.refresh_health_snapshot()
+        self.assertEqual(service.cached_mining_readiness_payload()[0], 503)
+
+        port.inputs = tip_cycle_inputs(12)
+        port.progress = {
+            "ok": True,
+            "reason": None,
+            "reasons": [],
+            "pending_refresh": False,
+            "pending_refresh_age_seconds": None,
+            "eligible_clients_requiring_refresh": 0,
+        }
+        port.now = 105.0
+        service.refresh_health_snapshot()
+
+        # This failed refresh publishes no sample. The next success is more
+        # than the 15-second cache-staleness budget after the prior success.
+        port.raise_on_stats = True
+        port.now = 120.0
+        with self.assertRaises(RuntimeError):
+            service.refresh_health_snapshot()
+        port.raise_on_stats = False
+        port.now = 125.0
+        service.refresh_health_snapshot()
+        status, payload = service.cached_mining_readiness_payload()
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["recovery_streak_seconds"], 0.0)
+
+        # Continuous 10-second samples can now satisfy the 20-second window.
+        for now in (135.0, 145.0):
+            port.now = now
+            service.refresh_health_snapshot()
+        self.assertEqual(service.cached_mining_readiness_payload()[0], 200)
+
     def test_overlapping_inline_refreshes_publish_in_collection_order(self) -> None:
         port = FakeObservabilityPort()
         port.inputs = tip_cycle_inputs(0)

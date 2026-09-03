@@ -632,7 +632,10 @@ class ObservabilityService:
             oldest_durable_candidate_age_seconds=candidate_age,
             accepted_parent_preview_wait_timeouts=timeouts,
         )
-        return self._mining_readiness_tracker.observe(sample)
+        return self._mining_readiness_tracker.observe(
+            sample,
+            max_sample_gap_seconds=self._mining_readiness_stale_after(),
+        )
 
     def mining_readiness_snapshot(self) -> MiningReadinessSnapshot | None:
         """The cached latched answer, or None before the first refresh."""
