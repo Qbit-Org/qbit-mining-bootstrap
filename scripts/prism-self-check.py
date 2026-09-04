@@ -492,15 +492,16 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
     except ValueError as exc:
         reporter.fail("mining.share_diff", str(exc))
 
+    # Match the coordinator's env_nonnegative_float(): any finite, non-negative
+    # decimal is a valid window, fractional seconds included.
     stale_grace = env_value(env, "PRISM_STRATUM_STALE_GRACE_SECONDS", "3").strip()
     try:
-        stale_grace_value = int(stale_grace)
+        stale_grace_value = parse_decimal(stale_grace)
         if stale_grace_value < 0:
-            raise ValueError
-    except ValueError:
-        reporter.fail("mining.stale_grace", "PRISM_STRATUM_STALE_GRACE_SECONDS must be a non-negative integer")
-    else:
+            raise ValueError("stale grace must be non-negative")
         reporter.pass_("mining.stale_grace", f"{stale_grace_value} seconds")
+    except ValueError:
+        reporter.fail("mining.stale_grace", "PRISM_STRATUM_STALE_GRACE_SECONDS must be a non-negative number")
 
     if prod and bitcoin_chain != "regtest":
         qbit_miner_address = env_value(env, "QBIT_MINER_ADDRESS", "auto").strip()

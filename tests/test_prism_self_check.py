@@ -554,6 +554,26 @@ class PrismSelfCheckTests(unittest.TestCase):
         self.assertIn(("PASS", "mining.stale_grace"), rows)
         self.assertNotIn(("FAIL", "mining.stale_grace"), rows)
 
+    def test_static_checks_parse_stale_grace_with_runtime_float_semantics(self) -> None:
+        # The coordinator parses the window with env_nonnegative_float(), so a
+        # fractional window is valid while negative or non-finite values are not.
+        for grace, expected in (
+            ("0.5", "PASS"),
+            ("0", "PASS"),
+            ("-1", "FAIL"),
+            ("nan", "FAIL"),
+            ("abc", "FAIL"),
+        ):
+            with self.subTest(grace=grace):
+                env = self.valid_env()
+                env["PRISM_STRATUM_STALE_GRACE_SECONDS"] = grace
+                reporter = self.self_check.Reporter()
+
+                self.self_check.static_checks(env, reporter)
+
+                rows = {(row.status, row.name) for row in reporter.rows}
+                self.assertIn((expected, "mining.stale_grace"), rows)
+
     def test_static_checks_require_explicit_production_auxpow_payouts(self) -> None:
         env = self.valid_env()
         env.update(
