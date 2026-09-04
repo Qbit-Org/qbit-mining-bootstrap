@@ -175,6 +175,34 @@ SELECT json_build_object(
     assert_equal(int(comparison["drift_count"]), 0, message + " (drift count)")
 
 
+def share_ledger_identity(runner: PsqlShareLedger) -> dict[str, object]:
+    """The exact identity of qbit_share_ledger, for the #224 invariant.
+
+    Every column of every row in sequence order, digested together with
+    each tuple's ctid and xmin -- so an UPDATE that rewrote a row to the
+    same values still changes it -- plus the sequence allocator, so an
+    INSERT that rolled back still changes it.
+    """
+    return runner._run_json(
+        """
+SELECT json_build_object(
+    'row_count', (SELECT count(*) FROM qbit_share_ledger),
+    'digest', (
+        SELECT md5(COALESCE(string_agg(
+            ctid::text || '|' || xmin::text || '|' || ledger::text,
+            E'\\n' ORDER BY share_seq
+        ), ''))
+        FROM qbit_share_ledger AS ledger
+    ),
+    'sequence', (
+        SELECT json_build_object('last_value', last_value, 'is_called', is_called)
+        FROM qbit_share_ledger_share_seq_seq
+    )
+);
+"""
+    )
+
+
 def force_expired_idle_lease(runner: PsqlShareLedger) -> None:
     runner._run_sql(
         """
@@ -1435,20 +1463,52 @@ replacement.persist_accepted_block(
     audit_report=report,
 )
 replacement.confirm_accepted_block(block_hash="66" * 32, active_tip_height=8)
+
+# Issue #224: the reconciliation-owned mutations below (inactive quarantine,
+# the maturation sweep, reactivation) move pool-block, payout-entry and carry
+# state, and the coordinator relies on their never writing qbit_share_ledger
+# to answer a confirmed mutation with a prior-balances reread instead of a
+# full window rescan. Capture the share ledger's exact identity here and
+# require it back after every transition, while the owed balance proves each
+# transition actually happened.
+share_ledger_identity_before = share_ledger_identity(replacement)
+
+
+def assert_share_ledger_untouched(transition: str) -> None:
+    assert_equal(
+        share_ledger_identity(replacement),
+        share_ledger_identity_before,
+        f"qbit_share_ledger identity after {transition} (#224)",
+    )
+
+
+def owed_balances() -> list[tuple[str, int]]:
+    return [(row["recipient_id"], row["balance_sats"]) for row in replacement.current_owed_balances()]
+
+
+assert_equal(owed_balances(), [("miner-a", 1000)], "confirmed block 66 owes its accrued balance")
 inactive_count = replacement.mark_pool_block_inactive(block_hash="66" * 32, active_tip_height=8)["inactive_count"]
 assert_equal(inactive_count, 1, "inactive block 66 quarantine count")
+assert_equal(owed_balances(), [], "inactive block 66 owes nothing")
+assert_share_ledger_untouched("inactive quarantine")
 matured_while_inactive = replacement._run_json("SELECT json_build_object('count', qbit_mark_mature_pool_payouts(1008));")["count"]
 assert_equal(matured_while_inactive, 0, "mature payout sweep ignores inactive blocks")
+assert_share_ledger_untouched("maturation sweep over an inactive block")
 inactive_count = replacement.mark_pool_block_inactive(block_hash="66" * 32, active_tip_height=1008)["inactive_count"]
 assert_equal(inactive_count, 0, "height-mature inactive block quarantine is idempotent")
 reactivated_count = replacement.reactivate_pool_block(block_hash="66" * 32, active_tip_height=1008)["reactivated_count"]
 assert_equal(reactivated_count, 1, "height-mature inactive block reactivation count")
+assert_equal(owed_balances(), [("miner-a", 1000)], "reactivated block 66 owes its accrued balance again")
+assert_share_ledger_untouched("reactivation")
 inactive_count = replacement.mark_pool_block_inactive(block_hash="66" * 32, active_tip_height=1008)["inactive_count"]
 assert_equal(inactive_count, 1, "height-mature immature confirmed block can be quarantined")
+assert_share_ledger_untouched("second inactive quarantine")
 reactivated_count = replacement.reactivate_pool_block(block_hash="66" * 32, active_tip_height=1008)["reactivated_count"]
 assert_equal(reactivated_count, 1, "height-mature re-quarantined block reactivation count")
+assert_share_ledger_untouched("second reactivation")
 matured_count = replacement._run_json("SELECT json_build_object('count', qbit_mark_mature_pool_payouts(1008));")["count"]
 assert_equal(matured_count, 2, "mature payout entry count")
+assert_share_ledger_untouched("maturation")
 carry_states = replacement._run_json(
     """
 SELECT COALESCE(json_agg(DISTINCT maturity_state ORDER BY maturity_state), '[]'::json)
@@ -2143,7 +2203,7 @@ assert_equal(
 )
 control_writer.close()
 
-print("prism postgres ledger PASS shares=14 lease=replay startup-retry persist-fence sql-window bulk-abandon=fenced maturity=reorg carry-replay integrity multipage-window=9000 read-only-session")
+print("prism postgres ledger PASS shares=14 lease=replay startup-retry persist-fence sql-window bulk-abandon=fenced maturity=reorg carry-replay integrity multipage-window=9000 read-only-session share-ledger-identity=inactive+reactivate+mature")
 PY
 
   PRISM_PSQL_COMMAND="${PSQL_COMMAND}" \

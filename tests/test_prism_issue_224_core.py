@@ -553,8 +553,13 @@ class CarryLedger(IncrementalRecordingLedger):
         return {"backend": "memory", "matured_count": matured}
 
 
-def configured_coordinator():
-    ledger = CarryLedger()
+def configured_coordinator(ledger: CarryLedger | None = None):
+    """A ready coordinator over a three-share window on a carry ledger.
+
+    ``ledger`` lets the Wave 2 cadence module supply its subclass without
+    re-stating this setup.
+    """
+    ledger = CarryLedger() if ledger is None else ledger
     append_incremental_share(ledger, share_seq=1, accepted_at_ms=999_900)
     append_incremental_share(ledger, share_seq=2, accepted_at_ms=999_910)
     append_incremental_share(ledger, share_seq=3, accepted_at_ms=999_920)
