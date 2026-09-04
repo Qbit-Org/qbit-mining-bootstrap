@@ -38,7 +38,7 @@ def authorize_mainnet_prelaunch(env: dict[str, str]) -> dict[str, str]:
             "CKPOOL_NON_TEST_READINESS_GATE": "0",
             "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED": "0",
             "PRISM_POSTGRES_PASSWORD": "not-default",
-            "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+            "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
         }
     )
     return env
@@ -360,7 +360,7 @@ class PrismSelfCheckTests(unittest.TestCase):
                 "QBIT_CHAIN_FLAG": "-chain=main",
                 "QBIT_EXPECTED_GENESIS_HASH": "11" * 32,
                 "QBIT_GIT_COMMIT": "41" * 20,
-                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
                 "PRISM_ALLOW_TEST_SIGNING_SEEDS": "1",
             }
         )
@@ -395,7 +395,7 @@ class PrismSelfCheckTests(unittest.TestCase):
                 "QBIT_CHAIN_FLAG": "-chain=main",
                 "QBIT_EXPECTED_GENESIS_HASH": "AB" * 32,
                 "QBIT_GIT_COMMIT": "41" * 20,
-                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             }
         )
         reporter = self.self_check.Reporter()
@@ -419,7 +419,7 @@ class PrismSelfCheckTests(unittest.TestCase):
                     {
                         "QBIT_PRODUCTION": "1",
                         "QBIT_GIT_COMMIT": commit,
-                        "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                        "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
                     }
                 )
                 reporter = self.self_check.Reporter()
@@ -437,7 +437,7 @@ class PrismSelfCheckTests(unittest.TestCase):
             {
                 "QBIT_PRODUCTION": "1",
                 "QBIT_GIT_COMMIT": "AB" * 20,
-                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             }
         )
         reporter = self.self_check.Reporter()
@@ -460,7 +460,7 @@ class PrismSelfCheckTests(unittest.TestCase):
                 "QBIT_PRODUCTION": "1",
                 "QBIT_GIT_COMMIT": "41" * 20,
                 "PRISM_POSTGRES_PASSWORD": "not-default",
-                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
                 "PRISM_STRATUM_SHARE_DIFF": "1024",
                 "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
                 "PRISM_STRATUM_VARDIFF_START_DIFF": "4096",
@@ -484,7 +484,7 @@ class PrismSelfCheckTests(unittest.TestCase):
                 "QBIT_EXPECTED_GENESIS_HASH": "AB" * 32,
                 "QBIT_GIT_COMMIT": "41" * 20,
                 "QBIT_REQUIRE_RELEASE_PROVENANCE": "0",
-                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
                 "PRISM_STRATUM_SHARE_DIFF": "1024",
                 "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
                 "PRISM_STRATUM_VARDIFF_START_DIFF": "4096",
@@ -503,7 +503,7 @@ class PrismSelfCheckTests(unittest.TestCase):
             {
                 "QBIT_PRODUCTION": "1",
                 "QBIT_GIT_COMMIT": "41" * 20,
-                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             }
         )
         reporter = self.self_check.Reporter()
@@ -515,7 +515,10 @@ class PrismSelfCheckTests(unittest.TestCase):
             {(row.status, row.name) for row in reporter.rows},
         )
 
-    def test_static_checks_require_zero_mainnet_stale_grace(self) -> None:
+    def test_static_checks_accept_bounded_mainnet_stale_grace(self) -> None:
+        # Mainnet follows the same bounded-grace rule as every other chain:
+        # zero grace rejects every in-flight prior-tip share at each block,
+        # which miners read as pool failure.
         env = self.valid_env()
         env.update(
             {
@@ -530,10 +533,9 @@ class PrismSelfCheckTests(unittest.TestCase):
 
         self.self_check.static_checks(env, reporter)
 
-        self.assertIn(
-            ("FAIL", "mining.stale_grace"),
-            {(row.status, row.name) for row in reporter.rows},
-        )
+        rows = {(row.status, row.name) for row in reporter.rows}
+        self.assertIn(("PASS", "mining.stale_grace"), rows)
+        self.assertNotIn(("FAIL", "mining.stale_grace"), rows)
 
     def test_static_checks_accept_bounded_stale_grace_off_mainnet(self) -> None:
         env = self.valid_env()
@@ -552,13 +554,38 @@ class PrismSelfCheckTests(unittest.TestCase):
         self.assertIn(("PASS", "mining.stale_grace"), rows)
         self.assertNotIn(("FAIL", "mining.stale_grace"), rows)
 
+    def test_static_checks_parse_stale_grace_with_runtime_float_semantics(self) -> None:
+        # The coordinator parses the window with env_nonnegative_float(), so a
+        # fractional window is valid while negative or non-finite values are not.
+        for grace, expected in (
+            ("0.5", "PASS"),
+            ("0", "PASS"),
+            ("1e-1", "PASS"),
+            (".5", "PASS"),
+            ("3.", "PASS"),
+            ("-1", "FAIL"),
+            ("nan", "FAIL"),
+            ("inf", "FAIL"),
+            ("1" + "0" * 400, "FAIL"),
+            ("abc", "FAIL"),
+        ):
+            with self.subTest(grace=grace):
+                env = self.valid_env()
+                env["PRISM_STRATUM_STALE_GRACE_SECONDS"] = grace
+                reporter = self.self_check.Reporter()
+
+                self.self_check.static_checks(env, reporter)
+
+                rows = {(row.status, row.name) for row in reporter.rows}
+                self.assertIn((expected, "mining.stale_grace"), rows)
+
     def test_static_checks_require_explicit_production_auxpow_payouts(self) -> None:
         env = self.valid_env()
         env.update(
             {
                 "QBIT_PRODUCTION": "1",
                 "QBIT_GIT_COMMIT": "41" * 20,
-                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
                 "BITCOIN_CHAIN": "mainnet",
                 "BITCOIN_CHAIN_FLAG": "-chain=main",
                 "QBIT_MINER_ADDRESS": "auto",
@@ -579,7 +606,7 @@ class PrismSelfCheckTests(unittest.TestCase):
             {
                 "QBIT_PRODUCTION": "1",
                 "QBIT_GIT_COMMIT": "41" * 20,
-                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
                 "BITCOIN_CHAIN": "mainnet",
                 "BITCOIN_CHAIN_FLAG": "-chain=main",
                 "QBIT_MINER_ADDRESS": "qb1explicit",

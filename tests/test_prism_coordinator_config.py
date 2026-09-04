@@ -1132,7 +1132,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             "PRISM_LEDGER_WRITER_EPOCH": "7",
             "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
             "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
-            "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+            "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             "PRISM_STRATUM_SHARE_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF_START_DIFF": "4096",
@@ -1182,15 +1182,17 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             ):
                 validate_prism_production_gate()
 
+        # Mainnet follows the same bounded-grace rule as every other chain:
+        # zero grace rejects every in-flight prior-tip share at each block,
+        # which miners read as pool failure.
         with patch.dict(
             os.environ,
             {**base, "QBIT_CHAIN": "mainnet", "PRISM_STRATUM_STALE_GRACE_SECONDS": "3"},
             clear=True,
         ):
-            with self.assertRaisesRegex(SystemExit, "mainnet requires PRISM_STRATUM_STALE_GRACE_SECONDS=0"):
-                validate_prism_production_gate()
+            validate_prism_production_gate()
 
-        # Off mainnet, production mode accepts a bounded grace window.
+        # Off mainnet, production mode accepts a bounded grace window too.
         with patch.dict(
             os.environ,
             {**base, "PRISM_STRATUM_STALE_GRACE_SECONDS": "2"},
@@ -1229,7 +1231,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             "PRISM_LEDGER_WRITER_EPOCH": "7",
             "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
             "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
-            "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+            "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             "PRISM_STRATUM_SHARE_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF_START_DIFF": "4096",
@@ -1258,7 +1260,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             os.environ,
             {
                 "QBIT_CHAIN": "mainnet",
-                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             },
             clear=True,
         ):
@@ -1271,7 +1273,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             {
                 "QBIT_CHAIN": "testnet4",
                 "QBIT_TOOLS_PRODUCTION": "1",
-                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             },
             clear=True,
         ):
@@ -1292,7 +1294,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             "PRISM_LEDGER_WRITER_EPOCH": "7",
             "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
             "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
-            "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+            "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             "PRISM_STRATUM_SHARE_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF_START_DIFF": "4096",

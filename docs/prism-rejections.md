@@ -80,7 +80,7 @@ hash against the tip for which the refresh path published coherent work, not
 against a per-share `getbestblockhash` RPC. This removes the
 submit-races-ahead-of-the-refresh failure mode: a submit-path RPC could observe
 a new tip seconds before jobs refreshed, and with
-`PRISM_STRATUM_STALE_GRACE_SECONDS=0` (mainnet-forced) that rejected every
+`PRISM_STRATUM_STALE_GRACE_SECONDS=0` (then pinned on mainnet) that rejected every
 in-flight share on the old tip. The observed tip is also the anchor the
 stale-grace window and evicted-job classification already use, so all three
 now agree.

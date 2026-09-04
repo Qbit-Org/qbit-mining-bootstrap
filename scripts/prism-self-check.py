@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import os
 import shutil
 import socket
@@ -492,22 +493,16 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
     except ValueError as exc:
         reporter.fail("mining.share_diff", str(exc))
 
+    # Match the coordinator's env_nonnegative_float(): the runtime's float
+    # syntax and range, finite and non-negative (fractional seconds included).
     stale_grace = env_value(env, "PRISM_STRATUM_STALE_GRACE_SECONDS", "3").strip()
-    if qbit_chain == "mainnet" and stale_grace != "0":
-        reporter.fail(
-            "mining.stale_grace",
-            "mainnet requires PRISM_STRATUM_STALE_GRACE_SECONDS=0",
-            hint="Enable stale-credit grace only after proving verifier compatibility for the deployed release.",
-        )
-    else:
-        try:
-            stale_grace_value = int(stale_grace)
-            if stale_grace_value < 0:
-                raise ValueError
-        except ValueError:
-            reporter.fail("mining.stale_grace", "PRISM_STRATUM_STALE_GRACE_SECONDS must be a non-negative integer")
-        else:
-            reporter.pass_("mining.stale_grace", f"{stale_grace_value} seconds")
+    try:
+        stale_grace_value = float(stale_grace)
+        if not math.isfinite(stale_grace_value) or stale_grace_value < 0:
+            raise ValueError("stale grace must be a finite non-negative number")
+        reporter.pass_("mining.stale_grace", f"{stale_grace_value:g} seconds")
+    except ValueError:
+        reporter.fail("mining.stale_grace", "PRISM_STRATUM_STALE_GRACE_SECONDS must be a finite non-negative number")
 
     if prod and bitcoin_chain != "regtest":
         qbit_miner_address = env_value(env, "QBIT_MINER_ADDRESS", "auto").strip()

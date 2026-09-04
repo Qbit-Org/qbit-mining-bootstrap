@@ -623,14 +623,12 @@ def validate_prism_production_gate(*, environ: Env | None = None) -> None:
         if env_bool(name, "0", environ=environ):
             raise SystemExit(f"production mode rejects {name}=1")
 
-    if env("QBIT_CHAIN", "regtest", environ=environ).lower() in {"main", "mainnet"} and env_nonnegative_float(
-        "PRISM_STRATUM_STALE_GRACE_SECONDS",
-        DEFAULT_PRISM_STALE_GRACE_SECONDS,
-        environ=environ,
-    ) != 0:
-        raise SystemExit(
-            "mainnet requires PRISM_STRATUM_STALE_GRACE_SECONDS=0"
-        )
+    # Stale grace is deliberately not pinned to zero on mainnet: with a zero
+    # window every in-flight prior-tip share is rejected (Stratum error 21) at
+    # each block, which miners read as pool failure rather than as stale
+    # work. The bounded default credits those shares instead (see
+    # docs/prism-rejections.md; bundles with credited rows use the v1.1
+    # audit schema, which this release's verifier accepts).
 
     production_difficulties: dict[str, Decimal] = {}
     for name in (

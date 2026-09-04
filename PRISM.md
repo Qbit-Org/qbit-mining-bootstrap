@@ -263,8 +263,9 @@ are still counted under the existing rejection reason IDs. The one exception
 is a hash that solves a block while missing the share target (possible while
 the listener floor sits above network difficulty): its share credit lands only
 when qbitd accepts the block, as before. Audit bundles containing any
-`credit_policy` row use `qbit.prism.audit-bundle.v1.1`; upgrade mirrors and
-verifiers before enabling a non-zero stale-grace window in production.
+`credit_policy` row use `qbit.prism.audit-bundle.v1.1`; the stale-grace window
+is non-zero by default on every chain, so keep mirrors and verifiers on a
+release that accepts that schema.
 
 ## How Reward Accounting Works
 

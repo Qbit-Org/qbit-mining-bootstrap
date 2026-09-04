@@ -3592,7 +3592,7 @@ class TipRefreshService:
         so mining.submit never blocks on a getbestblockhash RPC per share. This
         also removes the submit-races-ahead-of-the-refresh failure mode: a
         submit-path RPC can observe a new tip seconds before jobs refresh, and
-        with PRISM_STRATUM_STALE_GRACE_SECONDS=0 (mainnet-forced) that
+        with PRISM_STRATUM_STALE_GRACE_SECONDS=0 (then pinned on mainnet) that
         rejected every in-flight share on the old tip. Classifying against the
         published tip keeps shares valid until the coordinator has prepared,
         validated, and published the flip, and it is the same tip source the
