@@ -999,6 +999,23 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         self.assertNotIn("PRISM_STRATUM_STALE_GRACE_SECONDS", result.stderr)
         self.assertNotIn("docker is required", result.stderr)
 
+    def test_prism_rejects_invalid_stale_grace_before_docker_check(self) -> None:
+        # The exported value is what Compose hands the coordinator, so the
+        # doctor validates it (not the .env.example default) in every mode.
+        for grace in ("-1", "not-a-number"):
+            with self.subTest(grace=grace):
+                result = self.run_check_env(
+                    MINING_LANES="prism",
+                    PRISM_STRATUM_STALE_GRACE_SECONDS=grace,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "PRISM_STRATUM_STALE_GRACE_SECONDS must be a non-negative number",
+                    result.stderr,
+                )
+                self.assertNotIn("docker is required", result.stderr)
+
     def test_non_mainnet_production_accepts_bounded_stale_grace(self) -> None:
         # A public-chain production pool may credit shares that raced a block
         # within a bounded grace window.
