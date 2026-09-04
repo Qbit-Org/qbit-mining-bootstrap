@@ -5445,14 +5445,26 @@ class BlockCandidateService:
                     )
                 # Everything from definitive acceptance to here was queue,
                 # disposition and admission time the landing itself did not
-                # control (issue #224). The attempt marker below is this
-                # landing's own PostgreSQL write, so it is deliberately left
-                # outside ``lane_wait``: charging it there would grow the one
-                # stretch that exonerates the landing exactly when the writer
-                # is degraded, and a marker that times out would keep growing
-                # it across the retry backoff.
+                # control (issue #224). A candidate whose earlier pass already
+                # stamped acceptance closes its lane here, before the retained
+                # offer is even looked up, so none of this landing's own work
+                # can reach ``lane_wait``.
                 self._note_accepted_landing_lane_start(candidate)
                 node_submission = coordinator._node_submission_for_candidate_or_retained(candidate)
+                # A *fresh* candidate has no stamp until the call above makes
+                # the offer, so the close before it found no interval to
+                # measure. Close again now that one may exist: it is a no-op
+                # once this interval's lane was recorded, so the retained case
+                # keeps the earlier, tighter sample and the fresh case reports
+                # the zero queue time it genuinely had rather than no sample
+                # at all.
+                self._note_accepted_landing_lane_start(candidate)
+                # Both closes sit above the attempt marker on purpose. The
+                # marker is this landing's own PostgreSQL write: charging it
+                # to ``lane_wait`` would grow the one stretch that exonerates
+                # the landing exactly when the writer is degraded, and a
+                # marker that timed out would keep growing it across the
+                # retry backoff.
                 coordinator._mark_block_candidate_attempted(block_hash)
                 with coordinator._block_landing_ledger_statement_timeout_scope(block_hash):
                     # The same-hash disposition is already held here, so the
@@ -6861,14 +6873,20 @@ class BlockCandidateService:
                 outcome=outcome,
             )
         # The queue, disposition and admission time ends here: everything
-        # below is work this landing runs (issue #224). The attempt marker is
-        # this landing's own PostgreSQL write and must fall outside
-        # ``lane_wait`` -- a degraded writer would otherwise inflate the one
-        # stretch that exonerates the landing, and would keep inflating it
-        # across the retry backoff a timed-out marker triggers.
+        # below is work this landing runs (issue #224). A candidate whose
+        # earlier pass already stamped acceptance closes its lane here, before
+        # any retained offer is resolved.
         self._note_accepted_landing_lane_start(candidate)
         if node_submission is None:
             node_submission = coordinator._node_submission_for_candidate_or_retained(candidate)
+        # A fresh candidate is stamped by the offer that call makes, so the
+        # close above found no interval. Close again against the stamp that
+        # now exists; it is a no-op once this interval's lane was recorded.
+        self._note_accepted_landing_lane_start(candidate)
+        # Both closes sit above the attempt marker on purpose. The marker is
+        # this landing's own PostgreSQL write, and a degraded writer must not
+        # inflate the one stretch that exonerates the landing -- nor keep
+        # inflating it across the retry backoff a timed-out marker triggers.
         try:
             coordinator._mark_block_candidate_attempted(block_hash)
         except Exception:

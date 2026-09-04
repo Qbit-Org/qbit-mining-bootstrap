@@ -273,6 +273,64 @@ class LandingLaneWaitTests(unittest.TestCase):
         service._note_accepted_landing_lane_start(SimpleNamespace())
         self.assertEqual(service.accepted_landing_attribution_snapshot(), {})
 
+    def _candidate(self, block_hash: str, height: int = 10) -> Any:
+        return SimpleNamespace(
+            submission=SimpleNamespace(block_hash_hex=block_hash),
+            context=SimpleNamespace(template={"height": height}),
+        )
+
+    def test_a_lane_closed_before_the_stamp_is_closed_again_after_it(
+        self,
+    ) -> None:
+        # A fresh candidate carries no acceptance stamp until the node offer
+        # the landing itself makes returns definitively, so the close that
+        # runs before that offer finds no interval to measure. The second
+        # close is what turns a first-pass landing into a recorded sample
+        # instead of a silent gap: a zero sample and a missing sample read
+        # identically in the diagnostic, and only the family count separates
+        # them.
+        server, service = self._service()
+        block_hash = "5c" * 32
+        candidate = self._candidate(block_hash)
+
+        service._note_accepted_landing_lane_start(candidate)
+        service._note_accepted_block_preview_acceptance(block_hash)
+        service._note_accepted_landing_lane_start(candidate)
+
+        lane_wait = ensure_accepted_preview_telemetry(server).snapshot()[
+            "landing_phases"
+        ][LANDING_PHASE_LANE_WAIT]
+        self.assertEqual(lane_wait["count"], 1)
+        self.assertEqual(
+            service.accepted_landing_attribution_snapshot()[block_hash][
+                LANDING_PHASE_LANE_WAIT
+            ],
+            float(lane_wait["sum"]),
+        )
+
+    def test_a_retained_acceptance_keeps_the_earlier_tighter_sample(
+        self,
+    ) -> None:
+        # The reverse case: the stamp already existed, so the close before
+        # the retained offer is looked up owns the sample and the one after
+        # it must not extend the stretch with the landing's own work.
+        server, service = self._service()
+        block_hash = "6d" * 32
+        candidate = self._candidate(block_hash)
+        with mock.patch(
+            "lab.prism.block_candidates.time.monotonic",
+            side_effect=[10.0, 12.0, 45.0],
+        ):
+            service._note_accepted_block_preview_acceptance(block_hash)
+            service._note_accepted_landing_lane_start(candidate)
+            service._note_accepted_landing_lane_start(candidate)
+
+        lane_wait = ensure_accepted_preview_telemetry(server).snapshot()[
+            "landing_phases"
+        ][LANDING_PHASE_LANE_WAIT]
+        self.assertEqual(lane_wait["count"], 1)
+        self.assertAlmostEqual(float(lane_wait["sum"]), 2.0)
+
     def test_the_lane_closes_before_the_attempt_marker_is_written(self) -> None:
         # ``_mark_block_candidate_attempted`` is the landing's own PostgreSQL
         # write, not queue time. Closing the lane after it charges the write
@@ -299,11 +357,25 @@ class LandingLaneWaitTests(unittest.TestCase):
             ]
             if not lane_starts or not markers:
                 continue
+            offers = [
+                node.lineno
+                for node in ast.walk(function)
+                if isinstance(node, ast.Call)
+                and _call_name(node)
+                == "_node_submission_for_candidate_or_retained"
+            ]
             ordered += 1
             self.assertLess(
                 max(lane_starts),
                 min(markers),
                 f"{function.name} closes the lane after its attempt marker",
+            )
+            # A fresh candidate is stamped by the offer itself, so a path that
+            # only closed the lane before making it would record no sample at
+            # all for every first-pass landing.
+            self.assertTrue(
+                offers and max(lane_starts) > max(offers),
+                f"{function.name} never closes the lane after its node offer",
             )
         # Both queued landing paths write the marker; a rename that loses one
         # would otherwise make this test vacuously true.
