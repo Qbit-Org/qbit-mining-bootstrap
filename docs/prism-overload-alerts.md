@@ -670,3 +670,347 @@ all --credit-shares` (add `--cleanup-view live`, `--backlog-max N`) and
 re-derive step 3 and step 4 above from its `registry_bytes_per_record` and
 `retry_records_per_second`; the two anchors are configuration constants
 and do not move with cadence.
+
+## Issue #224: accepted-preview latency attribution and rollout validation
+
+Issue #224. `PrismAcceptedPreviewPublicationLatencyHigh` (the external rule
+on `qbit_prism_accepted_block_preview_publication_seconds`, warning at 4 s)
+fired on Union mainnet while the coordinator stayed healthy, and nothing on
+`/metrics` said which stretch of the landing owned a sample above the 4 s
+warning or the 5 s accepted-parent child wait budget
+(`DEFAULT_ACCEPTED_BLOCK_PAYOUT_PREVIEW_WAIT_SECONDS` in
+`lab/prism/payout_state.py`). The #224 build does three things:
+
+- A reconcile pass that **confirmed** a payout mutation (maturation,
+  inactive marking, reactivation, stranded-prepared rejection) now asks
+  candidate preparation for a live prior-balances reread over the
+  still-exact accepted-share window (`force_prior_balances_read=True`,
+  `force_full_window_rescan=False`) instead of the O(window) oracle rescan.
+  This rests on the verified invariant that reconciliation never writes
+  `qbit_share_ledger` (proved in `test/test-prism-postgres-ledger.sh`,
+  `share-ledger-identity=inactive+reactivate+mature`). Every other full
+  rescan trigger is unchanged, including the fail-closed one below.
+- The landing, the reconciler and the payout-window oracle record
+  fixed-cardinality attribution families (below). Every label is a closed
+  vocabulary from `lab/prism/accepted_preview_telemetry.py`; hashes,
+  heights, miner identities and exception text never become labels.
+- The four payout-window and prior-balances ledger reads are attributed by
+  operation with admission split from PostgreSQL execution, on the same
+  gate each read always took.
+
+This section is the operator contract for judging the 4 s and 5 s
+boundaries from the shipped metrics. Like the rest of this document it is
+a specification: the rules and queries are transcribed by the external
+rule repository, and the ordering requirement (#184 first) applies.
+
+### Signal inventory
+
+All names were verified against `lab/prism/metrics.py`
+(`_accepted_block_preview_publication_lines`,
+`_ledger_read_gate_metric_lines`,
+`accepted_preview_attribution_metrics_lines`), `lab/prism/tip_refresh.py`
+and `lab/prism/progress_health.py`.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `qbit_prism_accepted_block_preview_publication_seconds` | histogram | `result` ∈ `published`, `degraded`; `le` | Definitive node acceptance to the preview becoming visible to waiting children. The bucket boundaries include exactly `4` and `5`; the renderer prints `le` with `%g`, so the label values are `le="4"` and `le="5"`, not `"4.0"`. Only the **first** publication of a hash is observed. |
+| `qbit_prism_accepted_block_landing_phase_seconds` | summary (`_sum`, `_count`, `_max`) | `phase` ∈ `lane_wait`, `balance_lock_wait`, `reconcile`, `prior_balances_check`, `chain_probe`, `preview_prepare`, `preview_publish` | Wall time of each landing stretch. `prior_balances_check` is a prior-balances **reread**, never a window rescan. Every cell renders from zero at process start. |
+| `qbit_prism_reorg_reconcile_pass_seconds` | summary | `caller` ∈ `landing`, `post_confirm`, `tip_refresh`, `job_build`, `other` | One observation per reconcile pass, on every exit (success, untrusted skip, superseded, error). `_count` is the pass count by caller. `tip_refresh`/`job_build` are spelled as in `qbit_prism_reorg_reconcile_lookups_total{path}` so the two families join. |
+| `qbit_prism_reorg_reconcile_step_seconds` | summary | `caller`, `step` ∈ `admission_wait`, `watch_query`, `chain_probe`, `mutations`, `candidate_prepare`, `publish` | Where a pass spent its time. `admission_wait` (writer admission plus the payout-balance mutation lock) is measured **before** the pass timer starts, so it is not part of the pass total. `candidate_prepare` is where a `reconcile_invalidation` rescan executes when one is forced. |
+| `qbit_prism_payout_window_full_rescan_seconds` | summary | `reason` (18 fixed values, see below), `path` ∈ `daemon`, `in_process` | **True** whole-window oracle rescans only. A prior-balances reread is never an observation here. |
+| `qbit_prism_ledger_read_calls_total`, `..._gate_wait_seconds_total`, `..._gate_wait_seconds_max`, `..._gate_timeouts_total`, `..._execute_seconds_total`, `..._execute_seconds_max`, `..._execute_timeouts_total` | counters and gauges | `operation` ∈ `pending_block_candidate_rows`, `payout_window_snapshot`, `payout_window_delta`, `current_prior_balances`, `prior_balances_after_pool_block`, `other` | Coordinator-local admission (`gate_wait`) against PostgreSQL execution (`execute`) per read. `current_prior_balances` waits on the **writer lock**; the other four wait on the bounded read slot (`PRISM_POSTGRES_READ_CONCURRENCY`). Any out-of-contract name folds into `other`. A series appears only after that operation's first call. |
+| `qbit_prism_payout_artifact_events_total` | counter | `event` (`built`, `debounced`, `incremental`, `full_rescan`, …) | Artifact lifecycle counts. `full_rescan` counts builds whose window came from the oracle, without a reason; use the rescan family for the reason. |
+| `qbit_prism_prior_balances_reads_total` / `_read_last_seconds` / `_read_max_seconds` | counter / gauges | none | Legacy carry-read aggregate, deliberately unchanged: one duration over admission plus execution, recorded on success only. |
+| `qbit_prism_accepted_parent_preview_wait_timeouts_total` | counter | none | Child builds that waited the full 5 s budget and failed closed (rule 1 above). |
+| `qbit_prism_reorg_reconcile_errors_total` | counter | none | Reconcile passes that errored. One that had already attempted a payout mutation forces the fail-closed `reconcile_invalidation` rescan below; a read-only failure does not. |
+| `qbit_prism_stratum_semantic_current_work_ratio`, `qbit_prism_block_candidates_pending`, `qbit_prism_block_candidate_oldest_pending_seconds`, `qbit_prism_refresh_pending`, `qbit_prism_refresh_pending_age_seconds` | gauges | none | Current-work coverage and candidate/refresh backlog (rules 4–6 above, same `-1` cautions). |
+
+The rescan `reason` vocabulary, in render order: `reconcile_invalidation`,
+`cold_start`, `cache_invalidated`, `late_visible_append`,
+`anchor_regression`, `snapshot_window_weight_out_of_band`,
+`window_pipeline_mode_changed`, `window_mirror_divergence`,
+`window_daemon_unavailable`, `window_daemon_busy`,
+`window_daemon_state_lost`, `window_value_out_of_range`,
+`delta_api_unavailable`, `incremental_invariant_failed`,
+`periodic_self_check`, `periodic_self_check_failed`,
+`periodic_self_check_balance_check_failed`, `other`.
+
+Two shapes matter for the queries. The `_max` cell of every summary family
+is the maximum **since process start**, so it answers "has this phase ever
+exceeded X on this process" and cannot be windowed; use `_sum` and
+`_count` under `increase()` for a rolling hour. And the histogram counts
+publications, so a landing that never published (abandoned, collapsed)
+is absent from it by design and shows up instead in
+`qbit_prism_block_candidates_pending` and the collapse outcomes.
+
+### Structured log lines
+
+Block identity lives in two bounded log lines, never in a label:
+
+- `prism coordinator: {"event": "accepted_block_preview_landing", ...}`
+  (`lab/prism/block_candidates.py`), emitted **once** per closed
+  acceptance-to-publication interval, from the first `published` or
+  `degraded` publication, with `block_hash`, `block_height`, `result`,
+  `acceptance_to_publication_seconds`, `reconcile_caller` (always
+  `landing`), one `phase_<phase>_seconds` per phase, and the neutral
+  `full_rescan_*` / `ledger_*` fields (always `null`/`0` in this build:
+  no per-landing causal evidence for those exists without claiming another
+  lane's work, so use the rescan and ledger families instead). The same
+  record is retained in an in-process ring of 64 entries
+  (`PRISM_ACCEPTED_PREVIEW_DIAGNOSTICS_CAPACITY`); that ring is not served
+  on any endpoint in this build, so the log line is the operator's copy.
+- `prism coordinator: {"event": "payout_artifact_built" | "payout_artifact_build_debounced", ...}`
+  (`lab/prism/payout_state.py`) with `payout_state_generation`,
+  `window_build_mode`, `prior_balances_source` (`published` or `ledger`),
+  `prior_balances_read_forced` (`true` exactly when the #224 reread intent
+  drove the build) and, only when the oracle ran, `full_rescan_reason`.
+
+### Queries
+
+**Breach counts over a rolling hour, from the buckets.** A bucket counts
+samples `<= le`, so "above 4 s" is the count minus the `le="4"` bucket:
+
+```
+# published previews above 4 s in the last hour
+increase(qbit_prism_accepted_block_preview_publication_seconds_count{result="published"}[1h])
+  - ignoring(le)
+increase(qbit_prism_accepted_block_preview_publication_seconds_bucket{result="published",le="4"}[1h])
+
+# published previews above 5 s in the last hour
+increase(qbit_prism_accepted_block_preview_publication_seconds_count{result="published"}[1h])
+  - ignoring(le)
+increase(qbit_prism_accepted_block_preview_publication_seconds_bucket{result="published",le="5"}[1h])
+```
+
+To judge **every** rolling hour of a soak at once, wrap either expression
+in a subquery and take the maximum (a recording rule of the inner
+expression plus `max_over_time` is equivalent where subqueries are not
+available):
+
+```
+max_over_time(
+  (
+    increase(qbit_prism_accepted_block_preview_publication_seconds_count{result="published"}[1h])
+      - ignoring(le)
+    increase(qbit_prism_accepted_block_preview_publication_seconds_bucket{result="published",le="4"}[1h])
+  )[24h:1m]
+) < 1.5
+```
+
+`increase()` extrapolates to the window edges and can return a fraction;
+with a 15 s scrape interval the distortion is under one percent, so
+compare against `1.5` for "fewer than two" and `0.5` for "none". Do not
+`ceil()` the value and do not substitute a percentile: `histogram_quantile`
+interpolates inside a bucket and cannot prove a breach count. The same
+shape gives the other two hard counts:
+
+```
+# degraded publications in the last hour (must stay 0)
+increase(qbit_prism_accepted_block_preview_publication_seconds_count{result="degraded"}[1h])
+
+# child preview-wait timeouts in the last hour (must not rise over baseline)
+increase(qbit_prism_accepted_parent_preview_wait_timeouts_total[1h])
+```
+
+**Which landing phase owned the hour.** Total and mean seconds per phase:
+
+```
+sum by (phase) (increase(qbit_prism_accepted_block_landing_phase_seconds_sum[1h]))
+
+increase(qbit_prism_accepted_block_landing_phase_seconds_sum[1h])
+  / increase(qbit_prism_accepted_block_landing_phase_seconds_count[1h])
+```
+
+`qbit_prism_accepted_block_landing_phase_seconds_max > 4` names any phase
+that has, on its own, exceeded the warning at least once since the
+process started; read it during a soak that began at the deploy.
+
+**Reconcile callers and steps.** Pass counts by caller, step seconds by
+caller and step, and the remainder a pass spent outside every step:
+
+```
+sum by (caller) (increase(qbit_prism_reorg_reconcile_pass_seconds_count[1h]))
+
+sum by (caller, step) (increase(qbit_prism_reorg_reconcile_step_seconds_sum[1h]))
+
+increase(qbit_prism_reorg_reconcile_pass_seconds_sum[1h])
+  - on (job, instance, caller)
+sum by (job, instance, caller) (
+  increase(qbit_prism_reorg_reconcile_step_seconds_sum{step!="admission_wait"}[1h])
+)
+```
+
+For `caller="landing"`, `admission_wait` plus the pass is the landing's
+`reconcile` phase. A large `admission_wait` under `tip_refresh` or
+`job_build` is time spent behind a landing that holds the payout-balance
+mutation lock, not reconcile work.
+
+**True full rescans against balance-only rereads.** Rescans by reason:
+
+```
+sum by (reason, path) (increase(qbit_prism_payout_window_full_rescan_seconds_count[1h]))
+```
+
+During normal forward progress expect `cold_start` once per process
+start, one of the `periodic_self_check*` reasons at most about once per
+`PRISM_PAYOUT_ARTIFACT_FULL_RESCAN_SECONDS` (default 3600 s), and every
+other cell, `reconcile_invalidation` included, at zero. A successful #224
+reread has **no family of its own**: it is one
+`qbit_prism_ledger_read_calls_total{operation="current_prior_balances"}`
+increment (that operation also counts the landing's prior-balances checks
+and cold builds) together with a `payout_artifact_build_debounced` or
+`payout_artifact_built` line carrying `"prior_balances_read_forced": true`,
+`"prior_balances_source": "ledger"` and no `full_rescan_reason`, while
+`qbit_prism_payout_artifact_events_total{event="full_rescan"}` and the
+`reconcile_invalidation` cell do not move.
+
+**Ledger admission against execution.** Per operation, which half of a
+slow read grew:
+
+```
+sum by (operation) (increase(qbit_prism_ledger_read_gate_wait_seconds_total[1h]))
+sum by (operation) (increase(qbit_prism_ledger_read_execute_seconds_total[1h]))
+sum by (operation) (increase(qbit_prism_ledger_read_gate_timeouts_total[1h]))
+sum by (operation) (increase(qbit_prism_ledger_read_execute_timeouts_total[1h]))
+```
+
+A rising `gate_wait` for `current_prior_balances` is contention on the
+writer lock inside this process (an accounting write or another landing);
+a rising `gate_wait` for `payout_window_snapshot` / `payout_window_delta`
+is read-slot exhaustion; a rising `execute` is PostgreSQL. A missing
+series means the operation has not run since the process started.
+
+**Coverage and backlog over the soak.**
+
+```
+min_over_time(qbit_prism_stratum_semantic_current_work_ratio[24h])
+max_over_time(qbit_prism_block_candidates_pending[24h])
+max_over_time(qbit_prism_block_candidate_oldest_pending_seconds[24h])
+max_over_time(qbit_prism_refresh_pending_age_seconds[24h])
+```
+
+### Correlating a slow publication with the log
+
+Take the slow publications from the landing line, never from a label:
+
+```sh
+rg '"event": "accepted_block_preview_landing"' "$PRISM_COORDINATOR_LOG" \
+  | sed -E 's/^.*prism coordinator: //' \
+  | jq -c 'select(.acceptance_to_publication_seconds > 4)
+           | {block_hash, block_height, result,
+              total: .acceptance_to_publication_seconds,
+              lane_wait: .phase_lane_wait_seconds,
+              balance_lock_wait: .phase_balance_lock_wait_seconds,
+              reconcile: .phase_reconcile_seconds,
+              prior_balances_check: .phase_prior_balances_check_seconds,
+              chain_probe: .phase_chain_probe_seconds,
+              preview_prepare: .phase_preview_prepare_seconds,
+              preview_publish: .phase_preview_publish_seconds}'
+```
+
+The phases sum to at most the total; the remainder is queue and
+disposition time that no phase claims (for the fallback landing that
+submits inside the balance serializer, `lane_wait` is legitimately zero,
+because acceptance is stamped after that lane started). Then read the
+`payout_artifact_*` and `reorg-reconcile` lines adjacent in the
+timestamped log for the same window: they carry `payout_state_generation`,
+`window_build_mode`, `full_rescan_reason` and `prior_balances_read_forced`,
+so a `reconcile` phase that owned the sample can be tied to a forced
+rescan (a reason is present) or to a reread (no reason,
+`prior_balances_read_forced: true`) without either the hash or the height
+ever entering Prometheus. Keep the extracted lines with the rollout
+evidence exactly as `docs/prism-payout-artifact-measurement.md` §3 keeps
+the artifact events.
+
+### Validation checklist
+
+**Pre-deploy baseline (current build, 24 h, same windows as
+`docs/prism-payout-artifact-measurement.md`).** Record the commit and image
+digest, the UTC window, the accepted-block count
+(`increase(qbit_prism_accepted_block_preview_publication_seconds_count{result="published"}[24h])`)
+and, per rolling hour via the subqueries above, the maximum count above
+4 s and above 5 s, the degraded count and the preview-wait timeouts.
+Record `increase(qbit_prism_payout_artifact_events_total{event="full_rescan"}[24h])`,
+`increase(qbit_prism_prior_balances_reads_total[24h])`, the pages-CTE
+call count from the measurement runbook §1, and the four coverage/backlog
+extremes. Confirm the baseline build exports **no**
+`qbit_prism_accepted_block_landing_phase_seconds` series, so the
+post-deploy presence check below is meaningful.
+
+**Post-deploy, testnet cadence.**
+
+1. From the first scrape after the restart, confirm every cell of the four
+   attribution families renders at zero (for example
+   `qbit_prism_accepted_block_landing_phase_seconds_count{phase="lane_wait"} == 0`)
+   and that both `result` values carry `le="4"` and `le="5"` bucket lines.
+2. Drive an accepted-tip cadence at least as dense as the alert hour (35
+   accepted blocks in one hour) that includes payout maturations and,
+   where the chain allows it, an inactive/reactivate transition.
+3. Through the cadence, `reconcile_invalidation` stays at zero, the
+   `current_prior_balances` call count rises with confirmed mutations, the
+   artifact lines show `prior_balances_read_forced: true` with no
+   `full_rescan_reason`, and `full_rescan` events are limited to the cold
+   start and the periodic self-check.
+4. Evaluate the pass/fail criteria on every rolling hour of the cadence.
+
+**Post-deploy, Union mainnet soak (24 h minimum).** Repeat the baseline
+captures on the new build, evaluate the criteria on every rolling hour,
+and attach the phase, caller/step, rescan and ledger breakdowns for every
+hour that carried a sample above 4 s, with the correlated landing lines.
+
+### Pass/fail criteria
+
+The build passes when all of the following hold over the whole soak:
+
+- fewer than two `published` previews above 4 s in every modeled rolling
+  hour (`max_over_time(...[soak:1m]) < 1.5` on the 4 s expression);
+- no `published` preview above 5 s during normal forward progress
+  (`< 0.5` on the 5 s expression), where normal forward progress means an
+  hour with no increase in `qbit_prism_reorg_reconcile_errors_total`, no
+  `reconcile_invalidation` or `window_daemon_*` rescan, and no restart; a
+  sample above 5 s inside such an hour is a fail, and one outside it is
+  reported with its attribution;
+- the `degraded` count stays at zero;
+- `qbit_prism_accepted_parent_preview_wait_timeouts_total` does not
+  increase over the baseline rate;
+- no regression against the baseline in the coverage floor or the
+  candidate/refresh backlog extremes.
+
+### Fail-closed rollback and escalation
+
+A failing soak never moves a safety boundary. Do not raise the 4 s alert
+threshold, do not extend the 5 s child wait, do not lengthen or disable
+the periodic self-check or the landing's prior-balances check, and do not
+disable or bypass the conservative `reconcile_invalidation` full rescan:
+the reread optimisation is only sound because that fallback still runs
+whenever a mutation outcome is unknown. The decision is:
+
+1. **Regression against baseline** (any `degraded` publication, a rising
+   timeout rate, a coverage or backlog regression, or
+   `reconcile_invalidation` rescans or reconcile errors during normal
+   forward progress): stop the rollout and return to the prior reviewed
+   artifact under `docs/mainnet-deployment.md` "Stop And Rollback",
+   attaching the captures. The prior build fails closed in every place
+   this one does, so rolling back is always safe.
+2. **No regression, criteria still unmet** (breach counts unchanged or
+   improved but not below the bar): the build is safe to keep, since it
+   changes no fail-closed path, but it does not close #224. Escalate on
+   #224 with the per-hour phase, caller/step, rescan-reason and
+   admission/execution breakdowns and the correlated landing lines; that
+   evidence is what the next change must be designed from.
+
+### Scope notes
+
+- `reconcile_invalidation` is **deliberate**, not a regression of the
+  reread. It is recorded only where `force_full_window_rescan=True` still
+  runs: the reconciler's error-after-possible-commit path (a mutator whose
+  response was lost may have committed, so the pass republishes against a
+  forced full rescan that necessarily rereads the balances) and the
+  accepted-preview withdrawal path. A successful balance-only reread never
+  reaches the rescan family; see the reread markers above.
+- `window_daemon_state_lost` is the open #207 scope (the Rust window
+  daemon losing its state), not #224. A rescan under that reason during
+  the soak is a #207 finding to report separately; it still counts toward
+  the breach criteria if it lands inside a publication interval, which is
+  why the 5 s criterion excludes such hours from "normal forward
+  progress".

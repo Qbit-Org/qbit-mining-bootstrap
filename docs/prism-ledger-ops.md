@@ -222,6 +222,18 @@ touched and the database showed no blocked backends. Read the two halves
 before widening any budget — a rising gate series is contention in this
 process, a rising execute series is the database.
 
+Since #224 the same split covers the payout-window and prior-balances reads
+under fixed operation names: `payout_window_snapshot`,
+`payout_window_delta` and `prior_balances_after_pool_block` on the read
+slot, and `current_prior_balances` on the **writer lock**, where the
+landing's prior-balances check has always taken it. The `operation` label
+is closed (`PRISM_LEDGER_READ_OPERATIONS` in
+`lab/prism/accepted_preview_telemetry.py`); any other name folds into
+`other`. The operator validation contract for these series, the landing
+phase / reconcile caller / full-rescan families, and the 4 s and 5 s
+accepted-preview boundaries is in `docs/prism-overload-alerts.md`,
+"Issue #224".
+
 Pending block-candidate enumeration
 (`pending_block_candidate_rows`, the `replay-outbox-query` phase) is a
 read-only single-snapshot statement and takes the bounded read slot, not the
