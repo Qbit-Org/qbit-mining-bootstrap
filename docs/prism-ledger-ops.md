@@ -86,6 +86,114 @@ path through `qbit_prism_shutdowns_total`,
 `qbit_prism_shutdown_non_writer_drain_seconds`, and
 `qbit_prism_shutdown_release_withheld_total`.
 
+### Heartbeat Monitor Lateness and In-Process Stalls
+
+The writer-lease heartbeat's timing policy (`lab/prism/writer_lease_timing.py`)
+guarantees that a coordinator whose guard session has died hard-exits before a
+replacement may adopt the lease, *provided* the monitor thread that takes that
+decision wakes no later than `scheduler_slack + monitor_interval` after its
+poll is due (0.55 s at the shipped numbers; the module docstring derives this
+as inequality (4)). That proviso is an assumption about the process, not a
+property of the policy. Issue #227 recorded a 0.648 s monitor wake delay on
+`union-mainnet` with the host idle: the stall was in-process, an interpreter
+held by a multi-second payout-window rescan.
+
+Two consequences are exported and one is decided.
+
+**Attribution that survives GIL stalls.** Every guard statement returns its own
+server-side execution time, so `guard_sql` in
+`qbit_prism_lease_heartbeat_phase_seconds{phase}` and its `worst_` twin is now
+server execution, the new `guard_client_resume` phase is the part of the round
+trip during which PostgreSQL had already answered and this process had not
+resumed, and `scheduler_delay` is the whole process-side residual
+(`guard_slot_wait + guard_sql + scheduler_delay = total`; `guard_client_resume`
+is the in-round-trip share of `scheduler_delay`). `guard_sql` is now bounded by the
+server rather than by the client: each statement can run for at most the 0.5 s
+server-enforced statement timeout, and a renewing verification may lawfully run
+two statements inside one guard slot (the attribution recheck), so `guard_sql`
+sums both and can legitimately reach about 1.0 s on a two-statement attempt
+(`WRITER_LEASE_VERIFICATION_MAX_STATEMENTS` × 0.5 s) and cannot exceed that; the
+`(N stmt)` count in the attempt summary says which case applies. Read a large
+`guard_client_resume` as "this process, not PostgreSQL".
+
+**The monitor's lateness as re-armable signals.**
+`qbit_prism_lease_heartbeat_monitor_wake_delay_seconds` stays the lifetime
+high-water mark for dashboard continuity. Alert on the new families instead,
+all fixed-cardinality:
+
+- `qbit_prism_lease_heartbeat_monitor_wake_lateness_seconds` (histogram; every
+  poll's lateness, closed bucket set);
+- `qbit_prism_lease_heartbeat_monitor_late_wakes_total{slack_fraction}` with
+  `slack_fraction` in `0.5`, `0.8`, `1.0` (wakes at least that fraction of
+  `scheduler_slack` late; a counter, so `increase(...[5m]) > 0` on the `1.0`
+  series re-expresses the wake-delay alert without a never-resetting gauge);
+- `qbit_prism_lease_heartbeat_monitor_wake_delay_window_max_seconds` (the worst
+  lateness in the trailing 300 s; falls back to zero once a stall ages out);
+- `qbit_prism_lease_heartbeat_monitor_wake_delay_record_age_seconds` (how old
+  the lifetime record is, so an exit message's figure can be dated);
+- `qbit_prism_lease_heartbeat_monitor_exit_guarantee_breaches_total` and
+  `qbit_prism_lease_heartbeat_monitor_worst_exit_guarantee_overrun_seconds`
+  (wakes later than `max_guaranteed_monitor_lateness`, and the worst amount
+  by which the exit could have landed after the adoption edge);
+- `qbit_prism_lease_heartbeat_policy_seconds{term="max_guaranteed_monitor_lateness"}`
+  (the bound itself, for alert expressions);
+- `qbit_prism_lease_heartbeat_stall_probe_samples_total` and
+  `..._stall_probe_suppressed_total` (stack samples the stall probe took, and
+  triggers it refused under its rate limit);
+- `qbit_prism_process_gc_pause_seconds{generation}` (histogram),
+  `qbit_prism_process_gc_last_pause_seconds{generation}` and
+  `qbit_prism_process_gc_max_pause_seconds{generation}`: cyclic-collector
+  pause *durations* from `gc.callbacks`. These complement, and do not replace,
+  the `qbit_prism_process_gc_*` count families from issue #226, which report
+  how many passes ran and what they freed but not how long any pass held the
+  interpreter.
+
+**What a breach means and the decided response.** A wake later than
+`scheduler_slack` (0.50 s) is a *lateness-beyond-slack breach*: the assumption
+the policy budgets was exceeded. A wake later than
+`max_guaranteed_monitor_lateness` (0.55 s) is an *exit-guarantee breach*: on
+that beat, had the guard session died, this process could have outlived the
+successor's adoption edge by the overrun. The monitor does **not** tighten its
+cap or hard-exit on a breach (that would restart healthy coordinators under a
+transient stall, issue #212's failure mode, without moving the exit earlier on
+the beat that breached). It accepts the residual because every effect that
+could escape is fenced: every ledger write joins the exact-session lease CTE
+and matches nothing once adoption rewrites the session token, and every
+external effect runs behind a synchronous exact-session verification that
+hard-exits the moment the row names another session. A breach is therefore
+counted, its overrun kept, and one structured warning is logged
+(`prism coordinator: WARNING ledger lease heartbeat monitor wake delay ... exceeded
+the ... scheduler slack`), rate-limited to at most 3 per 60 s and never from a
+blocking write. A wake at least half a slack late additionally takes a stack
+sample of the running threads, under the same 3-per-60 s limit
+(`LEASE_MONITOR_STALL_PROBE_MAX_SAMPLES_PER_WINDOW` /
+`LEASE_MONITOR_STALL_PROBE_WINDOW_SECONDS` in `writer_lease_timing.py`), so the
+instrument cannot turn a stall into a stall storm.
+
+**Operator action on a lateness-beyond-slack warning.**
+
+1. Read the warning: it states whether exit-before-adoption still held, the
+   overrun if not, the phase attribution of the last and worst attempts, the
+   worst GC pause and its generation, and the sampled thread stacks. The
+   stacks name the frame that held the interpreter; a payout-window rescan
+   (`reconcile_invalidation`) or a large collection are the known causes.
+2. Confirm it was in-process rather than host contention: PSI, steal, and
+   cgroup throttling on the host should be quiet. If they are not, the host is
+   the problem and the policy's slack is not the lever.
+3. Check `qbit_prism_lease_heartbeat_monitor_exit_guarantee_breaches_total`.
+   An isolated breach with no coincident guard loss changed nothing; the
+   fences carried it. Repeated breaches mean the workload has outgrown the
+   interpreter's ability to schedule the monitor, and the durable fix is the
+   out-of-process watchdog tracked in issue #130 — not a larger slack, which
+   only lengthens failover, and not a shorter cap, which manufactures issue
+   #212.
+4. Reduce the stall source: if the rescan attribution
+   (`qbit_prism_payout_window_full_rescan_seconds`) shows multi-second full
+   rescans, that is the workload to bound. If the worst GC pause is the stall,
+   the heap growth tracked by the issue #226 families is the lead.
+5. Do not disable the heartbeat, do not raise only the failure budget, and do
+   not weaken PostgreSQL durability.
+
 ### Orphaned Locks and Bounded Startup Acquisition
 
 A coordinator that vanishes without closing its sockets — network partition,

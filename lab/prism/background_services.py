@@ -25,13 +25,17 @@ delegate routes back into :meth:`WatchdogService.hard_exit`.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import gc
 import inspect
+import os
 import queue
+import sys
 import threading
 import time
 from typing import Any, Callable, Iterable
 
 from lab.prism.coordinator_shutdown import ShutdownInProgress
+from lab.prism.process_telemetry import PRISM_GC_GENERATIONS
 from lab.prism.share_ledger import (
     DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
     WRITER_LEASE_VERIFICATION_MAX_STATEMENTS,
@@ -49,11 +53,44 @@ from lab.prism.writer_lease_timing import (
     LEASE_HEARTBEAT_OUTCOME_RENEWAL_DUE,
     LEASE_HEARTBEAT_OUTCOME_RENEWED,
     LEASE_HEARTBEAT_OUTCOMES,
+    LEASE_MONITOR_LATE_WAKE_SLACK_FRACTIONS,
+    LEASE_MONITOR_STALL_PROBE_MAX_SAMPLES_PER_WINDOW,
+    LEASE_MONITOR_STALL_PROBE_TRIGGER_SLACK_FRACTION,
+    LEASE_MONITOR_STALL_PROBE_WINDOW_SECONDS,
+    LEASE_MONITOR_WAKE_DELAY_BUCKETS,
+    LEASE_MONITOR_WAKE_DELAY_WINDOW_SECONDS,
+    LEASE_MONITOR_WAKE_DELAY_WINDOW_SLICES,
     UNATTRIBUTED_PHASES,
     WriterLeaseHeartbeatPolicy,
     WriterLeaseVerificationAttempt,
     WriterLeaseVerificationPhases,
 )
+
+# GC pause histogram buckets (issue #227). A closed set, like every other
+# bucket vocabulary on /metrics. Distinct from the WP1a gc families in
+# lab.prism.process_telemetry, which export gc.get_stats() counts (passes,
+# objects collected, uncollectable) and say nothing about how long a pass
+# held the interpreter; these are the pause durations, measured from the
+# collector's own start/stop callbacks.
+PRISM_GC_PAUSE_SECONDS_BUCKETS = (
+    0.001,
+    0.0025,
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+)
+
+# Bounds on one stall-probe stack sample, so a sample of a 64-thread
+# process stays a few kilobytes: the innermost frames of each thread, and
+# at most this many threads.
+LEASE_MONITOR_STALL_PROBE_MAX_FRAMES_PER_THREAD = 12
+LEASE_MONITOR_STALL_PROBE_MAX_THREADS = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -563,9 +600,428 @@ def verifier_callbacks(verify: Callable[..., object]) -> frozenset[str]:
             "on_query_start",
             "on_statement_progress",
             "on_statement_end",
+            "on_statement_server_seconds",
         )
         if name in parameters
     )
+
+
+def _print_line(line: str) -> None:
+    """Default log port for the monitor's diagnostics: a flushed print.
+
+    Only ever invoked from the monitor's diagnostics thread
+    (:meth:`LedgerLeaseHeartbeatService._run_diagnostics`), never from the
+    monitor thread itself. The monitor is the thread that must notice a
+    dead guard session and hard-exit before a successor adopts, so a full
+    container log pipe stalling this flush must stall a throwaway thread,
+    not the thread that decides the exit.
+    """
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass
+
+
+class _WindowRateLimiter:
+    """At most ``max_events`` admissions per ``window_seconds``, then refuse.
+
+    A fixed window keyed on the first admission, not a token bucket: the
+    property the stall probe needs is a hard ceiling on the number of
+    samples any interval can produce, so that a stall can never be turned
+    into a stall storm by the instrument that reports it.
+    """
+
+    __slots__ = ("max_events", "window_seconds", "_window_started", "_admitted")
+
+    def __init__(self, *, max_events: int, window_seconds: float) -> None:
+        self.max_events = int(max_events)
+        self.window_seconds = float(window_seconds)
+        self._window_started: float | None = None
+        self._admitted = 0
+
+    def admit(self, now: float) -> bool:
+        if (
+            self._window_started is None
+            or now - self._window_started >= self.window_seconds
+        ):
+            self._window_started = now
+            self._admitted = 0
+        if self._admitted >= self.max_events:
+            return False
+        self._admitted += 1
+        return True
+
+
+class MonitorWakeTelemetry:
+    """The heartbeat monitor's own lateness, as signals that can re-arm.
+
+    Issue #227: the only export of the monitor's lateness was a lifetime
+    high-water mark. Every stall smaller than the record was invisible, the
+    alert built on it could fire once per process lifetime, and a hard-exit
+    message quoted a possibly hours-old worst case. This keeps the lifetime
+    maximum for dashboard continuity and adds the signals an alert can
+    actually be expressed on:
+
+    * a fixed-bucket histogram of every wake's lateness;
+    * counters of wakes at or above 0.5x, 0.8x and 1.0x the policy's
+      scheduler slack (closed label set);
+    * a rolling-window maximum that falls back once a stall ages out;
+    * the age of the current lifetime record.
+
+    Written only by the monitor thread; read by the metrics thread. No
+    lock: every field is a Python int or float, so a scrape sees either the
+    value before or after one ``observe``, never a torn one.
+    """
+
+    __slots__ = (
+        "_buckets",
+        "_bucket_counts",
+        "_count",
+        "_sum",
+        "lifetime_max_seconds",
+        "_record_monotonic",
+        "_late",
+        "_slice_seconds",
+        "_slice_index",
+        "_slice_max",
+    )
+
+    def __init__(
+        self,
+        *,
+        buckets: tuple[float, ...] = LEASE_MONITOR_WAKE_DELAY_BUCKETS,
+        window_seconds: float = LEASE_MONITOR_WAKE_DELAY_WINDOW_SECONDS,
+        window_slices: int = LEASE_MONITOR_WAKE_DELAY_WINDOW_SLICES,
+    ) -> None:
+        self._buckets = tuple(float(bucket) for bucket in buckets)
+        # Cumulative, in Prometheus's own convention: bucket i counts every
+        # observation <= its upper bound.
+        self._bucket_counts = [0 for _ in self._buckets]
+        self._count = 0
+        self._sum = 0.0
+        self.lifetime_max_seconds = 0.0
+        self._record_monotonic: float | None = None
+        self._late = {
+            fraction: 0 for fraction in LEASE_MONITOR_LATE_WAKE_SLACK_FRACTIONS
+        }
+        slices = max(1, int(window_slices))
+        self._slice_seconds = float(window_seconds) / slices
+        # A ring of per-slice maxima keyed by absolute slice number, so an
+        # old slice is recognised as stale rather than read as current.
+        self._slice_index = [-1 for _ in range(slices)]
+        self._slice_max = [0.0 for _ in range(slices)]
+
+    @property
+    def buckets(self) -> tuple[float, ...]:
+        return self._buckets
+
+    def observe(
+        self,
+        wake_delay_seconds: float,
+        *,
+        slack_seconds: float,
+        now: float,
+    ) -> None:
+        delay = max(0.0, float(wake_delay_seconds))
+        self._count += 1
+        self._sum += delay
+        for index, bound in enumerate(self._buckets):
+            if delay <= bound:
+                self._bucket_counts[index] += 1
+        for fraction in self._late:
+            if delay >= float(fraction) * float(slack_seconds):
+                self._late[fraction] += 1
+        if delay > self.lifetime_max_seconds:
+            self.lifetime_max_seconds = delay
+            self._record_monotonic = now
+        absolute = int(now // self._slice_seconds)
+        slot = absolute % len(self._slice_max)
+        if self._slice_index[slot] != absolute:
+            self._slice_index[slot] = absolute
+            self._slice_max[slot] = delay
+        elif delay > self._slice_max[slot]:
+            self._slice_max[slot] = delay
+
+    def window_max_seconds(self, now: float) -> float:
+        """Largest lateness observed inside the trailing window."""
+        oldest = int(now // self._slice_seconds) - len(self._slice_max) + 1
+        worst = 0.0
+        for index, value in zip(self._slice_index, self._slice_max):
+            if index >= oldest and value > worst:
+                worst = value
+        return worst
+
+    def record_age_seconds(self, now: float) -> float:
+        """Seconds since the lifetime maximum was last raised (0 before any)."""
+        if self._record_monotonic is None:
+            return 0.0
+        return max(0.0, now - self._record_monotonic)
+
+    def snapshot(self, now: float) -> dict[str, object]:
+        """Fixed-key view for the metrics surface."""
+        return {
+            "buckets": {
+                bound: int(count)
+                for bound, count in zip(self._buckets, self._bucket_counts)
+            },
+            "count": int(self._count),
+            "sum": float(self._sum),
+            "late_wakes": dict(self._late),
+            "lifetime_max_seconds": float(self.lifetime_max_seconds),
+            "window_max_seconds": self.window_max_seconds(now),
+            "record_age_seconds": self.record_age_seconds(now),
+        }
+
+
+class GcPauseTelemetry:
+    """Cyclic-collector pause durations per generation, from ``gc.callbacks``.
+
+    Issue #227's stall attribution needs to know whether the interpreter
+    was inside a collection when the monitor could not run. The WP1a
+    families (``qbit_prism_process_gc_*`` in ``process_telemetry``) export
+    ``gc.get_stats()`` — how many passes ran and what they freed — and
+    cannot say how long any pass held the interpreter. This is the missing
+    duration: the collector calls back at the start and stop of every
+    pass with the generation, and the difference is the pause.
+
+    The callback must never raise (an exception in a GC callback is
+    reported as unraisable and can hide the pass) and must never take a
+    lock: a collection can start on any thread, including one that holds
+    a lock the callback would need. Every field is a plain int or float,
+    so the metrics thread reads them lock-free like the rest of the
+    heartbeat's counters.
+
+    ``generation`` is CPython's closed three-value set. Anything else
+    (there is nothing else on CPython) is ignored rather than allowed to
+    grow the label set.
+    """
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.perf_counter,
+        buckets: tuple[float, ...] = PRISM_GC_PAUSE_SECONDS_BUCKETS,
+    ) -> None:
+        self._clock = clock
+        self._buckets = tuple(float(bucket) for bucket in buckets)
+        self._bucket_counts = {
+            generation: [0 for _ in self._buckets]
+            for generation in PRISM_GC_GENERATIONS
+        }
+        self._count = {generation: 0 for generation in PRISM_GC_GENERATIONS}
+        self._sum = {generation: 0.0 for generation in PRISM_GC_GENERATIONS}
+        self._last = {generation: 0.0 for generation in PRISM_GC_GENERATIONS}
+        self._max = {generation: 0.0 for generation in PRISM_GC_GENERATIONS}
+        self._started_at: float | None = None
+        self._started_generation: str | None = None
+        self._installed = False
+
+    @property
+    def buckets(self) -> tuple[float, ...]:
+        return self._buckets
+
+    @property
+    def installed(self) -> bool:
+        return self._installed
+
+    def install(self) -> None:
+        """Register on ``gc.callbacks`` once; idempotent."""
+        if self._installed:
+            return
+        gc.callbacks.append(self._callback)
+        self._installed = True
+
+    def uninstall(self) -> None:
+        if not self._installed:
+            return
+        self._installed = False
+        try:
+            gc.callbacks.remove(self._callback)
+        except ValueError:
+            pass
+
+    def _callback(self, phase: str, info: dict[str, Any]) -> None:
+        try:
+            if phase == "start":
+                self._started_at = self._clock()
+                self._started_generation = str(info.get("generation", ""))
+            elif phase == "stop":
+                started = self._started_at
+                if started is None:
+                    return
+                self._started_at = None
+                generation = str(
+                    info.get("generation", self._started_generation or "")
+                )
+                self.record(generation, self._clock() - started)
+        except Exception:
+            # Never let telemetry disturb a collection.
+            self._started_at = None
+
+    def record(self, generation: str, pause_seconds: float) -> None:
+        """Account one pause to ``generation``; unknown generations are dropped.
+
+        Ordering matters because nothing locks against the scrape thread:
+        the count is bumped *before* the buckets here and read *after*
+        them in :meth:`snapshot`, so whichever way a scrape interleaves it
+        sees every ``le`` bucket at or below ``+Inf``. The other order
+        renders a bucket larger than the count, which Prometheus ingests
+        as a malformed histogram (the same discipline as
+        :meth:`MonitorWakeTelemetry.observe`).
+        """
+        if generation not in self._count:
+            return
+        pause = max(0.0, float(pause_seconds))
+        self._count[generation] += 1
+        self._sum[generation] += pause
+        counts = self._bucket_counts[generation]
+        for index, bound in enumerate(self._buckets):
+            if pause <= bound:
+                counts[index] += 1
+        self._last[generation] = pause
+        if pause > self._max[generation]:
+            self._max[generation] = pause
+
+    def worst(self) -> tuple[str | None, float]:
+        """The longest pause seen and its generation (``None`` before any)."""
+        generation: str | None = None
+        worst = 0.0
+        for candidate in PRISM_GC_GENERATIONS:
+            if self._count[candidate] and (
+                generation is None or self._max[candidate] > worst
+            ):
+                generation = candidate
+                worst = self._max[candidate]
+        return generation, worst
+
+    def snapshot(self) -> dict[str, dict[str, object]]:
+        """Fixed-key view: one entry per generation, each with fixed keys."""
+        return {
+            generation: {
+                "buckets": {
+                    bound: int(count)
+                    for bound, count in zip(
+                        self._buckets, self._bucket_counts[generation]
+                    )
+                },
+                "count": int(self._count[generation]),
+                "sum": float(self._sum[generation]),
+                "last_seconds": float(self._last[generation]),
+                "max_seconds": float(self._max[generation]),
+            }
+            for generation in PRISM_GC_GENERATIONS
+        }
+
+
+class StallProbe:
+    """Rate-limited stack sample of the running threads during a stall.
+
+    When the monitor wakes at least half a scheduler slack late, the
+    question is *what held the interpreter*. ``sys._current_frames()``
+    answers it at the only moment it can be asked — the instant the
+    monitor gets the GIL back — at a cost of one frame walk per thread.
+
+    The rate limit is load-bearing, not decorative. A stall storm is by
+    definition many late wakes in a row, and an instrument that paid a
+    frame walk plus a log line for each of them would deepen the storm it
+    is reporting. ``LEASE_MONITOR_STALL_PROBE_MAX_SAMPLES_PER_WINDOW``
+    samples per ``LEASE_MONITOR_STALL_PROBE_WINDOW_SECONDS`` is the ceiling;
+    every trigger beyond it is counted as suppressed and costs nothing.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_samples_per_window: int = LEASE_MONITOR_STALL_PROBE_MAX_SAMPLES_PER_WINDOW,
+        window_seconds: float = LEASE_MONITOR_STALL_PROBE_WINDOW_SECONDS,
+        max_threads: int = LEASE_MONITOR_STALL_PROBE_MAX_THREADS,
+        max_frames_per_thread: int = LEASE_MONITOR_STALL_PROBE_MAX_FRAMES_PER_THREAD,
+    ) -> None:
+        self._limiter = _WindowRateLimiter(
+            max_events=max_samples_per_window,
+            window_seconds=window_seconds,
+        )
+        self._max_threads = int(max_threads)
+        self._max_frames = int(max_frames_per_thread)
+        self.samples_total = 0
+        self.suppressed_total = 0
+        self.last_sample: dict[str, object] | None = None
+
+    @property
+    def max_samples_per_window(self) -> int:
+        return self._limiter.max_events
+
+    @property
+    def window_seconds(self) -> float:
+        return self._limiter.window_seconds
+
+    def admit(self, now: float) -> bool:
+        """O(1): may a sample be taken now? Counts the refusals.
+
+        This is the only part of the probe the monitor thread runs; the
+        frame walk itself is deferred to the diagnostics thread through
+        :meth:`capture`.
+        """
+        if self._limiter.admit(now):
+            return True
+        self.suppressed_total += 1
+        return False
+
+    def capture(self, *, now: float, wake_delay_seconds: float) -> str:
+        """Walk the other threads' stacks for an already-admitted sample."""
+        stacks = self.capture_stacks()
+        self.samples_total += 1
+        self.last_sample = {
+            "monotonic": float(now),
+            "wake_delay_seconds": float(wake_delay_seconds),
+            "stacks": stacks,
+        }
+        return stacks
+
+    def sample(self, *, now: float, wake_delay_seconds: float) -> str | None:
+        """Admit and capture in one step, or ``None`` when rate-limited."""
+        if not self.admit(now):
+            return None
+        return self.capture(now=now, wake_delay_seconds=wake_delay_seconds)
+
+    def capture_stacks(self) -> str:
+        """One line per other thread: name, ident, innermost frames first.
+
+        Walks the frame objects directly — ``f_code.co_name``, the basename
+        of ``f_code.co_filename``, ``f_lineno``, ``f_back`` — and never
+        touches ``linecache``. ``traceback.extract_stack`` would stat every
+        file and read every source line (milliseconds, and megabytes kept
+        in ``linecache``) for text this sample does not print; even
+        ``StackSummary.extract(lookup_lines=False)`` still calls
+        ``linecache.checkcache`` per file. Nothing here reads a file.
+        """
+        current = threading.get_ident()
+        names = {thread.ident: thread.name for thread in threading.enumerate()}
+        frames = sys._current_frames()
+        lines: list[str] = []
+        listed = 0
+        for ident, frame in frames.items():
+            if ident == current:
+                continue
+            if listed >= self._max_threads:
+                lines.append(
+                    f"... {len(frames) - 1 - listed} more threads not listed"
+                )
+                break
+            listed += 1
+            entries: list[str] = []
+            walker = frame
+            while walker is not None and len(entries) < self._max_frames:
+                code = walker.f_code
+                entries.append(
+                    f"{code.co_name}@{os.path.basename(code.co_filename)}"
+                    f":{walker.f_lineno}"
+                )
+                walker = walker.f_back
+            lines.append(
+                f"thread {names.get(ident, '?')} ({ident}): " + " <- ".join(entries)
+            )
+        return "\n".join(lines)
 
 
 def _default_monotonic() -> float:
@@ -617,6 +1073,12 @@ class LedgerLeaseHeartbeatPorts:
     scheduler_slack_seconds: Callable[[], float] = (
         lambda: WRITER_LEASE_HEARTBEAT_SCHEDULER_SLACK_SECONDS
     )
+    # Where the monitor's stall diagnostics go (issue #227). Invoked only
+    # from the diagnostics thread the service spawns after the exit
+    # decision, never from the monitor thread, so a blocking default is
+    # safe here; see LedgerLeaseHeartbeatService._run_diagnostics. Tests
+    # substitute a list append to assert on the structured warning.
+    log: Callable[[str], None] = _print_line
 
 
 class LedgerLeaseHeartbeatService:
@@ -659,7 +1121,32 @@ class LedgerLeaseHeartbeatService:
         # The monitor's own lateness. It decides the hard exit, so a stalled
         # monitor thread consumes envelope exactly like a stalled heartbeat
         # thread and must be attributable separately from database latency.
+        # This is the lifetime high-water mark, kept for the existing gauge
+        # and exit message; the histogram, threshold counters, rolling
+        # maximum and record age that issue #227 asked for live in
+        # ``monitor_wakes``.
         self.monitor_wake_delay_seconds = 0.0
+        self.monitor_wakes = MonitorWakeTelemetry()
+        # Issue #227's response to lateness beyond slack: a wake later than
+        # the policy's max_guaranteed_monitor_lateness is a beat on which
+        # exit-before-adoption was not guaranteed. Counted, with the worst
+        # overrun kept, and warned about (rate-limited, never blocking).
+        self.exit_guarantee_breaches = 0
+        self.worst_exit_guarantee_overrun_seconds = 0.0
+        self.last_slack_breach: dict[str, object] | None = None
+        self.suppressed_slack_breach_warnings = 0
+        self._slack_breach_warnings = _WindowRateLimiter(
+            max_events=LEASE_MONITOR_STALL_PROBE_MAX_SAMPLES_PER_WINDOW,
+            window_seconds=LEASE_MONITOR_STALL_PROBE_WINDOW_SECONDS,
+        )
+        self.stall_probe = StallProbe()
+        # The most recent diagnostics thread (stack walk, formatting and
+        # the log write all happen there, after the exit decision); kept so
+        # a test can join it before asserting on what it logged.
+        self.diagnostics_thread: threading.Thread | None = None
+        # Installed on gc.callbacks by start() and removed by stop(), so a
+        # coordinator that never arms the heartbeat registers nothing.
+        self.gc_pauses = GcPauseTelemetry()
 
     def record_success(self, renewal_started_monotonic: float) -> None:
         """Advance the conservative freshness edge without regression."""
@@ -824,11 +1311,28 @@ class LedgerLeaseHeartbeatService:
         last = self.last_phases
         worst = self.worst_phases
         thread = self.thread
+        now = self._ports.monotonic()
         return {
             "running": bool(thread is not None and thread.is_alive()),
             "activity_age_seconds": self.activity_age_seconds(),
             "server_proven_age_seconds": self.server_proven_age_seconds(),
             "monitor_wake_delay_seconds": self.monitor_wake_delay_seconds,
+            # Issue #227: the re-armable signals. Bucket, fraction and
+            # generation vocabularies are closed sets from
+            # writer_lease_timing / process_telemetry.
+            "monitor_wakes": self.monitor_wakes.snapshot(now),
+            "exit_guarantee_breaches": int(self.exit_guarantee_breaches),
+            "worst_exit_guarantee_overrun_seconds": float(
+                self.worst_exit_guarantee_overrun_seconds
+            ),
+            "stall_probe": {
+                "samples": int(self.stall_probe.samples_total),
+                "suppressed": int(self.stall_probe.suppressed_total),
+            },
+            "slack_breach_warnings_suppressed": int(
+                self.suppressed_slack_breach_warnings
+            ),
+            "gc_pauses": self.gc_pauses.snapshot(),
             "attempts": dict(self.attempt_counts),
             "outcomes": dict(self.outcome_counts),
             "last_phase_seconds": last.phase_seconds(),
@@ -848,6 +1352,9 @@ class LedgerLeaseHeartbeatService:
                 "server_proven_cap": policy.server_proven_cap_seconds,
                 "max_healthy_server_gap": policy.max_healthy_server_gap_seconds,
                 "stability_surplus": policy.stability_surplus_seconds,
+                "max_guaranteed_monitor_lateness": (
+                    policy.max_guaranteed_monitor_lateness_seconds
+                ),
             },
         }
 
@@ -924,6 +1431,10 @@ class LedgerLeaseHeartbeatService:
         self.failed = threading.Event()
         self.ready = threading.Event()
         self.stop_event = threading.Event()
+        # GC pause durations are process-wide but the stall attribution is
+        # this service's question, so the collector callbacks are armed
+        # with the threads and disarmed with them (see stop()).
+        self.gc_pauses.install()
         thread = threading.Thread(
             target=self._ports.heartbeat_loop,
             name="prism-ledger-lease-heartbeat",
@@ -1028,7 +1539,7 @@ class LedgerLeaseHeartbeatService:
         def on_statement_end() -> None:
             self.record_server_proven(attempt.statement_completed())
 
-        kwargs: dict[str, Callable[[], None]] = {}
+        kwargs: dict[str, Callable[..., None]] = {}
         if "on_query_start" in callbacks:
             kwargs["on_query_start"] = on_query_start
         if "on_statement_end" in callbacks:
@@ -1038,6 +1549,14 @@ class LedgerLeaseHeartbeatService:
             # statements, which is enough to keep a lawful attribution
             # recheck from looking wedged but carries no phase timing.
             kwargs["on_statement_progress"] = self.record_server_proven
+        if "on_statement_server_seconds" in callbacks:
+            # Issue #227: the statement's own server-side execution time,
+            # so a GIL stall between PostgreSQL answering and this thread
+            # resuming is attributed to this process rather than to SQL.
+            # Timing only; the proven edge above stays the send edge.
+            kwargs["on_statement_server_seconds"] = (
+                attempt.statement_server_seconds
+            )
         try:
             result = call(**kwargs)
         except BaseException:
@@ -1201,6 +1720,17 @@ class LedgerLeaseHeartbeatService:
             )
             if wake_delay > self.monitor_wake_delay_seconds:
                 self.monitor_wake_delay_seconds = wake_delay
+            # Issue #227: the lifetime maximum above is a signal that can
+            # fire once per process. Feed the histogram, the slack-fraction
+            # counters, the rolling maximum and the record age, and decide
+            # whether the documented response is due. All of that is O(1)
+            # arithmetic; anything heavier (the stack walk, the formatting,
+            # the log write) comes back as a deferred job and runs only
+            # *after* the exit decision below, and never on this thread.
+            # The instrument must not extend what it measures: work done
+            # here would consume the very envelope it is reporting, and
+            # work done between polls is not measured as lateness at all.
+            diagnostics = self._observe_monitor_wake(wake_delay, policy)
             # Mid-verification progress counts: the budget — sized for one
             # statement plus one idle wait plus scheduler slack so it stays
             # under the adoption silence — cannot absorb a whole multi-step
@@ -1214,7 +1744,12 @@ class LedgerLeaseHeartbeatService:
                 age_seconds < failure_seconds
                 and server_age_seconds < server_cap_seconds
             ):
+                if diagnostics is not None:
+                    self._run_diagnostics(diagnostics)
                 continue
+            # Exiting: the deferred diagnostics are dropped. The exit reason
+            # below already carries the wake-delay figures and the worst GC
+            # pause, and nothing may run ahead of the exit.
             # Name the bound that tripped and the phase that consumed it.
             # Issue #212 was unresolvable in production precisely because
             # the exit said only how stale the heartbeat was, never where
@@ -1229,6 +1764,11 @@ class LedgerLeaseHeartbeatService:
                     f"server-proven {server_age_seconds:.3f}s >= adoption "
                     f"envelope cap {server_cap_seconds:.3f}s"
                 )
+            # The wake-delay figures are the lifetime record, the trailing
+            # window's worst and the record's age, so an operator can tell
+            # a stall that just happened from one hours old (issue #227).
+            exit_now = self._ports.monotonic()
+            gc_generation, gc_worst = self.gc_pauses.worst()
             self._ports.lease_hard_exit(
                 "prism coordinator: ledger lease heartbeat stopped making "
                 f"progress for {age_seconds:.3f}s "
@@ -1237,17 +1777,214 @@ class LedgerLeaseHeartbeatService:
                 f"Tripped: {tripped}. Last attempt: "
                 f"{self.last_phases.summary()}. Worst attempt: "
                 f"{self.worst_phases.summary()}. Monitor wake delay: "
-                f"{self.monitor_wake_delay_seconds:.3f}s. Policy: "
-                f"{policy.describe()}",
+                f"{self.monitor_wake_delay_seconds:.3f}s lifetime record "
+                f"({self.monitor_wakes.record_age_seconds(exit_now):.1f}s old), "
+                f"{self.monitor_wakes.window_max_seconds(exit_now):.3f}s in the "
+                f"last {LEASE_MONITOR_WAKE_DELAY_WINDOW_SECONDS:g}s, "
+                f"{self.exit_guarantee_breaches} exit-guarantee breach(es). "
+                f"Worst GC pause: {gc_worst:.3f}s "
+                f"(generation {gc_generation if gc_generation is not None else 'none'}). "
+                f"Policy: {policy.describe()}",
                 include_traceback=False,
             )
             return
+
+    def _observe_monitor_wake(
+        self,
+        wake_delay: float,
+        policy: WriterLeaseHeartbeatPolicy,
+    ) -> Callable[[], None] | None:
+        """Account one monitor wake in O(1); return the deferred diagnostics.
+
+        The decision issue #227 asked for, argued in the
+        ``writer_lease_timing`` module docstring: lateness beyond the slack
+        is *accepted* rather than turned into a tightened cap (which would
+        hard-exit healthy coordinators under a transient stall — issue
+        #212 — without moving the exit earlier on the beat that breached),
+        because every effect that could escape during the un-covered
+        interval is fenced at the row or behind a synchronous
+        exact-session verification. What changes is that the breach is no
+        longer invisible: it is counted, its overrun past the
+        exit-guarantee bound is kept, one structured warning names it, and
+        a stack sample says what held the interpreter.
+
+        Three tiers, all keyed on the policy's ``scheduler_slack``:
+
+        * at or above half the slack: take a rate-limited stack sample;
+        * above the slack: the budgeted assumption was exceeded — record
+          the breach and warn (rate-limited);
+        * above ``max_guaranteed_monitor_lateness`` (slack plus one
+          monitor interval): exit-before-adoption was not guaranteed for
+          this beat — count it and keep the worst overrun.
+
+        This runs on the monitor thread *before* the staleness decision, so
+        it does arithmetic only: the histogram, the counters, the
+        rate-limit admissions and a handful of float reads. Everything that
+        walks frames, formats text or writes a log line is returned as a
+        closure for :meth:`monitor_loop` to hand to
+        :meth:`_run_diagnostics` after the exit decision — or to drop, when
+        the decision is to exit. The instrument must not extend the
+        envelope it reports on.
+        """
+        now = self._ports.monotonic()
+        slack = float(policy.scheduler_slack_seconds)
+        self.monitor_wakes.observe(wake_delay, slack_seconds=slack, now=now)
+        if wake_delay < LEASE_MONITOR_STALL_PROBE_TRIGGER_SLACK_FRACTION * slack:
+            return None
+        probe_admitted = self.stall_probe.admit(now)
+        if wake_delay <= slack:
+            if not probe_admitted:
+                return None
+            last_summary = self.last_phases.summary()
+            return lambda: self._emit_probe_sample(
+                now=now,
+                wake_delay=wake_delay,
+                slack=slack,
+                last_summary=last_summary,
+            )
+        bound = policy.max_guaranteed_monitor_lateness_seconds
+        overrun = policy.exit_guarantee_overrun_seconds(wake_delay)
+        if overrun > 0.0:
+            self.exit_guarantee_breaches += 1
+            if overrun > self.worst_exit_guarantee_overrun_seconds:
+                self.worst_exit_guarantee_overrun_seconds = overrun
+        # The figures the warning quotes are read now, at the wake, not
+        # when the diagnostics thread gets around to formatting them.
+        server_proven_age = self.server_proven_age_seconds()
+        activity_age = self.activity_age_seconds()
+        window_max = self.monitor_wakes.window_max_seconds(now)
+        breaches = self.exit_guarantee_breaches
+        self.last_slack_breach = {
+            "monotonic": now,
+            "wake_delay_seconds": float(wake_delay),
+            "overrun_seconds": float(overrun),
+            "server_proven_age_seconds": server_proven_age,
+            "stacks": None,
+        }
+        warning_admitted = self._slack_breach_warnings.admit(now)
+        if not warning_admitted:
+            self.suppressed_slack_breach_warnings += 1
+        if not probe_admitted and not warning_admitted:
+            return None
+        return lambda: self._emit_slack_breach(
+            now=now,
+            wake_delay=wake_delay,
+            slack=slack,
+            bound=bound,
+            overrun=overrun,
+            breaches=breaches,
+            server_proven_age=server_proven_age,
+            activity_age=activity_age,
+            window_max=window_max,
+            policy=policy,
+            probe_admitted=probe_admitted,
+            warning_admitted=warning_admitted,
+        )
+
+    def _run_diagnostics(self, job: Callable[[], None]) -> None:
+        """Run deferred wake diagnostics on a throwaway daemon thread.
+
+        Never on the monitor thread. The monitor's poll spacing is one
+        interval plus its lateness plus whatever it does between polls,
+        and that last term is not measured as lateness, so it has to stay
+        O(1): a frame walk, string formatting or a print here would be
+        unmeasured envelope consumption on the thread that decides the
+        hard exit. The rate limits upstream (probe and warning admissions)
+        bound how many of these threads a stall storm can create.
+        """
+        thread = threading.Thread(
+            target=job,
+            name="prism-ledger-lease-monitor-diagnostics",
+            daemon=True,
+        )
+        self.diagnostics_thread = thread
+        try:
+            thread.start()
+        except Exception:
+            pass
+
+    def _emit_probe_sample(
+        self,
+        *,
+        now: float,
+        wake_delay: float,
+        slack: float,
+        last_summary: str,
+    ) -> None:
+        """Diagnostics thread: an admitted half-slack sample and its log line."""
+        stacks = self.stall_probe.capture(now=now, wake_delay_seconds=wake_delay)
+        self._ports.log(
+            "prism coordinator: ledger lease heartbeat monitor woke "
+            f"{wake_delay:.3f}s late (scheduler slack {slack:.3f}s); "
+            "stall probe sampled the running threads. Last attempt: "
+            f"{last_summary}. Threads:\n{stacks}"
+        )
+
+    def _emit_slack_breach(
+        self,
+        *,
+        now: float,
+        wake_delay: float,
+        slack: float,
+        bound: float,
+        overrun: float,
+        breaches: int,
+        server_proven_age: float,
+        activity_age: float,
+        window_max: float,
+        policy: WriterLeaseHeartbeatPolicy,
+        probe_admitted: bool,
+        warning_admitted: bool,
+    ) -> None:
+        """Diagnostics thread: the sample and the structured breach warning."""
+        stacks: str | None = None
+        if probe_admitted:
+            stacks = self.stall_probe.capture(now=now, wake_delay_seconds=wake_delay)
+            breach = self.last_slack_breach
+            if breach is not None and breach.get("monotonic") == now:
+                breach["stacks"] = stacks
+        if not warning_admitted:
+            return
+        if overrun > 0.0:
+            verdict = (
+                "exit-before-adoption was NOT guaranteed for this beat: "
+                f"the worst-case exit lands {overrun:.3f}s after the "
+                f"adoption edge (bound {bound:.3f}s)"
+            )
+        else:
+            verdict = (
+                "exit-before-adoption still held for this beat, with the "
+                "strictness reserve consumed "
+                f"(bound {bound:.3f}s)"
+            )
+        gc_generation, gc_worst = self.gc_pauses.worst()
+        self._ports.log(
+            "prism coordinator: WARNING ledger lease heartbeat monitor wake "
+            f"delay {wake_delay:.3f}s exceeded the {slack:.3f}s scheduler "
+            "slack the timing policy budgets (issue #227 lateness-beyond-"
+            f"slack breach; {breaches} exit-guarantee "
+            f"breach(es) this process); {verdict}. The stall was in-process "
+            "(this thread could not be scheduled); every ledger write is "
+            "session-token fenced and every external effect is behind an "
+            "exact-session verification, so no effect escapes, but the "
+            "process may have outlived the adoption edge had its guard "
+            "session died. "
+            f"server_proven_age={server_proven_age:.3f}s "
+            f"activity_age={activity_age:.3f}s "
+            f"window_max={window_max:.3f}s "
+            f"worst_gc_pause={gc_worst:.3f}s"
+            f"(generation {gc_generation if gc_generation is not None else 'none'}). "
+            f"Last attempt: {self.last_phases.summary()}. Worst attempt: "
+            f"{self.worst_phases.summary()}. Policy: {policy.describe()}."
+            + (f" Threads:\n{stacks}" if stacks is not None else "")
+        )
 
     def stop(self, *, deadline: float | None = None) -> bool:
         heartbeat_stop = self.stop_event
         if heartbeat_stop is None:
             return True
         heartbeat_stop.set()
+        self.gc_pauses.uninstall()
         threads = (self.thread, self.monitor_thread)
         # A heartbeat or monitor thread that armed the hard exit is blocked in
         # _watchdog_hard_exit joining the very release worker that runs this
@@ -1358,6 +2095,9 @@ class LedgerLeaseHeartbeatService:
             not verify_reports_statement_end
             and "on_statement_progress" in callbacks
         )
+        verify_reports_server_seconds = (
+            "on_statement_server_seconds" in callbacks
+        )
         # The fence is a guard-slot caller like the heartbeat, so its phases
         # belong in the same attribution: a fence that spent its budget
         # queueing behind an in-flight renewal reads very differently from
@@ -1385,7 +2125,7 @@ class LedgerLeaseHeartbeatService:
 
         def verify_exact_session() -> None:
             try:
-                verify_kwargs: dict[str, Callable[[], None]] = {}
+                verify_kwargs: dict[str, Callable[..., None]] = {}
                 if verify_reports_query_start:
                     verify_kwargs["on_query_start"] = on_query_start
                 if verify_reports_statement_end:
@@ -1393,6 +2133,10 @@ class LedgerLeaseHeartbeatService:
                 elif verify_reports_statement_progress:
                     verify_kwargs["on_statement_progress"] = (
                         self.record_server_proven
+                    )
+                if verify_reports_server_seconds:
+                    verify_kwargs["on_statement_server_seconds"] = (
+                        attempt.statement_server_seconds
                     )
                 result = verify(**verify_kwargs)
             except BaseException as exc:

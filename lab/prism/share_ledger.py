@@ -2517,8 +2517,10 @@ class LeaseGuardPort(Protocol):
     heartbeat's liveness proof depends on the session's identity surviving.
     A substitute must honour the same contract, including the serialized
     query slot that `on_query_start` marks, the per-statement round trip
-    `on_statement_end` marks, and the in-slot `followup` statement the
-    attribution recheck relies on.
+    `on_statement_end` marks, the per-statement parsed result
+    `on_statement_result` hands back (issue #227: how a statement's own
+    server-side execution time reaches the caller), and the in-slot
+    `followup` statement the attribution recheck relies on.
     """
 
     def try_acquire(self) -> bool: ...
@@ -2532,6 +2534,7 @@ class LeaseGuardPort(Protocol):
         *,
         on_query_start: Callable[[], None] | None = None,
         on_statement_end: Callable[[], None] | None = None,
+        on_statement_result: Callable[[Any], None] | None = None,
         followup: Callable[[Any], str | None] | None = None,
     ) -> Any: ...
 
@@ -2888,6 +2891,7 @@ class _NativePostgresLeaseGuard:
         *,
         on_query_start: Callable[[], None] | None = None,
         on_statement_end: Callable[[], None] | None = None,
+        on_statement_result: Callable[[Any], None] | None = None,
         followup: Callable[[Any], str | None] | None = None,
     ) -> Any:
         with self._query_lock:
@@ -2905,8 +2909,15 @@ class _NativePostgresLeaseGuard:
             # boundary the caller's phase attribution charges guard SQL
             # against. It fires after the result is parsed so a malformed
             # response is not counted as a healthy round trip.
+            # ``on_statement_result`` then hands the same round trip's parsed
+            # result to the caller, which is how a statement that reports
+            # its own server-side execution time (issue #227) gets that
+            # figure back per statement without a second round trip. The
+            # guard stays agnostic about the result's shape.
             if on_statement_end is not None:
                 on_statement_end()
+            if on_statement_result is not None:
+                on_statement_result(result)
             # A followup runs inside this same serialized slot: no second
             # queue wait behind other guard callers can be charged to the
             # caller's execution budget. Each execute on this autocommit
@@ -2921,6 +2932,8 @@ class _NativePostgresLeaseGuard:
                 result = parse_single_json_value(row[0] if row else None)
                 if on_statement_end is not None:
                     on_statement_end()
+                if on_statement_result is not None:
+                    on_statement_result(result)
             return result
 
     def close(self) -> None:
@@ -2933,6 +2946,39 @@ class _NativePostgresLeaseGuard:
             self._connection.close()
         except Exception:
             pass
+
+
+# The JSON key both guard statements use to report their own server-side
+# execution time (issue #227): ``clock_timestamp() - statement_timestamp()``
+# evaluated by the statement itself, so it costs no extra round trip and
+# takes no lock. It is timing metadata only; nothing about liveness,
+# identity, or the server-proven edge is read from it.
+GUARD_SERVER_EXECUTION_SECONDS_KEY = "server_execution_seconds"
+GUARD_SERVER_EXECUTION_SECONDS_SQL = (
+    "extract(epoch FROM clock_timestamp() - statement_timestamp())"
+)
+
+
+def guard_server_execution_seconds(result: object) -> float | None:
+    """Server-reported execution seconds of one guard round trip, if any.
+
+    ``None`` for a result that does not carry the key (an older statement
+    shape, a test fake) or carries something that is not a finite
+    non-negative number; callers then keep their conservative client-side
+    attribution rather than trusting a malformed figure.
+    """
+    if not isinstance(result, dict):
+        return None
+    value = result.get(GUARD_SERVER_EXECUTION_SECONDS_KEY)
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds) or seconds < 0.0:
+        return None
+    return seconds
 
 
 def parse_single_json_value(value: object) -> Any:
@@ -9708,6 +9754,7 @@ SELECT COALESCE(
         *,
         on_query_start: Callable[[], None] | None = None,
         on_statement_end: Callable[[], None] | None = None,
+        on_statement_server_seconds: Callable[[float | None], None] | None = None,
     ) -> dict[str, Any]:
         """Prove ownership on one cheap read-only statement; never renew.
 
@@ -9767,6 +9814,16 @@ SELECT COALESCE(
         slot is acquired and ``on_statement_end`` once the round trip
         returns, so a caller can attribute queue wait and server time
         separately.
+
+        ``on_statement_server_seconds`` receives, for the same round trip,
+        the execution time the statement measured on the server
+        (``clock_timestamp() - statement_timestamp()``, returned as a
+        column of the statement itself, so it costs no extra round trip
+        and takes no lock), or ``None`` when the answer did not carry one.
+        Issue #227: ``on_statement_end`` is a client-side instant, so a GIL
+        stall between PostgreSQL answering and this thread resuming is
+        indistinguishable from database time without it.  It is timing
+        metadata only — the server-proven edge is still the send edge.
         """
         if not self.writer_lease_fast_adoption_capable:
             raise RuntimeError("writer session is not heartbeat-capable")
@@ -9826,14 +9883,21 @@ SELECT json_build_object(
           AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
           AND qbit_ledger_writer_lease.lease_expires_at
               <= clock_timestamp() + {self._lease_authority_margin_sql}
-    )
+    ),
+    '{GUARD_SERVER_EXECUTION_SECONDS_KEY}', {GUARD_SERVER_EXECUTION_SECONDS_SQL}
 );
 """
-        run_kwargs: dict[str, Callable[[], None]] = {}
+        run_kwargs: dict[str, Callable[..., None]] = {}
         if on_query_start is not None:
             run_kwargs["on_query_start"] = on_query_start
         if on_statement_end is not None:
             run_kwargs["on_statement_end"] = on_statement_end
+        if on_statement_server_seconds is not None:
+            run_kwargs["on_statement_result"] = (
+                lambda statement_result: on_statement_server_seconds(
+                    guard_server_execution_seconds(statement_result)
+                )
+            )
         result = guard.run_json(sql, **run_kwargs)
         if not isinstance(result, dict):
             raise RuntimeError(
@@ -9866,6 +9930,7 @@ SELECT json_build_object(
         on_query_start: Callable[[], None] | None = None,
         on_statement_progress: Callable[[], None] | None = None,
         on_statement_end: Callable[[], None] | None = None,
+        on_statement_server_seconds: Callable[[float | None], None] | None = None,
     ) -> dict[str, int | str]:
         """Prove the guard session live; renew the TTL only without waiting.
 
@@ -9989,6 +10054,17 @@ SELECT json_build_object(
         which is what a caller attributing guard SQL time per phase needs.
         A caller that supplies it does not also need
         ``on_statement_progress``.
+
+        ``on_statement_server_seconds`` fires alongside ``on_statement_end``
+        for every completed round trip with the execution time that
+        statement measured on the server (``clock_timestamp() -
+        statement_timestamp()``, one more column of the same statement —
+        no extra round trip, no lock), or ``None`` when the answer did not
+        carry one.  Issue #227: the end mark is a client-side instant, so
+        without the server's own figure a GIL stall between the answer
+        leaving PostgreSQL and this thread resuming is booked as database
+        time.  Timing metadata only: the server-proven edge is still the
+        conservative send edge, never a server clock reading.
         """
         if not self.writer_lease_fast_adoption_capable:
             raise RuntimeError("writer session is not heartbeat-capable")
@@ -10077,7 +10153,8 @@ SELECT json_build_object(
           AND pg_stat_activity.application_name = data->>'pool_application_name'
           AND pg_stat_activity.backend_xid IS NOT NULL
           AND pg_stat_activity.backend_xid = qbit_ledger_writer_lease.xmax
-    )
+    ),
+    '{GUARD_SERVER_EXECUTION_SECONDS_KEY}', {GUARD_SERVER_EXECUTION_SECONDS_SQL}
 );
 """
         attribution_rechecks_left = WRITER_LEASE_VERIFICATION_MAX_STATEMENTS - 1
@@ -10110,6 +10187,12 @@ SELECT json_build_object(
             run_kwargs["on_query_start"] = on_query_start
         if on_statement_end is not None:
             run_kwargs["on_statement_end"] = on_statement_end
+        if on_statement_server_seconds is not None:
+            run_kwargs["on_statement_result"] = (
+                lambda statement_result: on_statement_server_seconds(
+                    guard_server_execution_seconds(statement_result)
+                )
+            )
         result = guard.run_json(sql, **run_kwargs)
         if not isinstance(result, dict):
             raise RuntimeError(

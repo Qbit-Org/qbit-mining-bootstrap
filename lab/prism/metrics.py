@@ -45,6 +45,7 @@ from lab.prism.job_delivery import (
     PRISM_EVICTED_JOB_CLASSES,
     PRISM_EVICTED_JOB_SUBMIT_OUTCOMES,
 )
+from lab.prism.background_services import PRISM_GC_PAUSE_SECONDS_BUCKETS
 from lab.prism.process_telemetry import (
     PRISM_GC_GENERATIONS,
     ProcessHeapTelemetry,
@@ -61,6 +62,8 @@ from lab.prism.writer_lease_timing import (
     LEASE_HEARTBEAT_OUTCOMES,
     LEASE_HEARTBEAT_PHASES,
     LEASE_HEARTBEAT_POLICY_TERMS,
+    LEASE_MONITOR_LATE_WAKE_SLACK_FRACTIONS,
+    LEASE_MONITOR_WAKE_DELAY_BUCKETS,
 )
 
 # Issue #226 (and the gauge list issue #185 asked for): the closed component
@@ -746,9 +749,63 @@ class MetricsRenderer:
         lines.extend(self.initial_delivery_metrics_lines())
         lines.extend(self.port.progress_health_metrics_lines())
         lines.extend(self.accepted_preview_attribution_metrics_lines())
+        lines.extend(self.gc_pause_metrics_lines())
         lines.extend(self.process_heap_metrics_lines())
         lines.extend(self.component_cardinality_metrics_lines())
         return "\n".join(lines) + "\n"
+
+    def gc_pause_metrics_lines(self) -> list[str]:
+        """Issue #227: cyclic-collector pause durations, per generation.
+
+        Three families, each labelled only by the closed
+        PRISM_GC_GENERATIONS set. They sit immediately before the issue
+        #226 heap block whose ``qbit_prism_process_gc_*`` families they
+        complement: those export ``gc.get_stats()`` -- how many passes ran
+        and what they freed -- and cannot say how long any pass held the
+        interpreter; these are the durations, from ``gc.callbacks``. The
+        recorder is armed with the lease heartbeat (it is the stall
+        attribution's instrument), so every series is zero on a
+        coordinator that never armed the heartbeat.
+        """
+        pauses = self.port._ensure_lease_heartbeat_service().snapshot()["gc_pauses"]
+        assert isinstance(pauses, dict)
+        lines = [
+            "# HELP qbit_prism_process_gc_pause_seconds Cyclic collector pause duration per generation, from gc.callbacks; the qbit_prism_process_gc_* count families say how many passes ran, this says how long each held the interpreter.",
+            "# TYPE qbit_prism_process_gc_pause_seconds histogram",
+        ]
+        for generation in PRISM_GC_GENERATIONS:
+            entry = pauses[generation]
+            buckets = entry["buckets"]
+            lines.extend(
+                f'qbit_prism_process_gc_pause_seconds_bucket{{generation="{generation}",le="{bucket:g}"}} {int(buckets.get(bucket, 0))}'
+                for bucket in PRISM_GC_PAUSE_SECONDS_BUCKETS
+            )
+            lines.append(
+                f'qbit_prism_process_gc_pause_seconds_bucket{{generation="{generation}",le="+Inf"}} {int(entry["count"])}'
+            )
+            lines.append(
+                f'qbit_prism_process_gc_pause_seconds_sum{{generation="{generation}"}} {float(entry["sum"]):.6f}'
+            )
+            lines.append(
+                f'qbit_prism_process_gc_pause_seconds_count{{generation="{generation}"}} {int(entry["count"])}'
+            )
+        lines.extend(
+            [
+                "# HELP qbit_prism_process_gc_last_pause_seconds Duration of the most recent cyclic collector pass per generation.",
+                "# TYPE qbit_prism_process_gc_last_pause_seconds gauge",
+                *[
+                    f'qbit_prism_process_gc_last_pause_seconds{{generation="{generation}"}} {float(pauses[generation]["last_seconds"]):.6f}'
+                    for generation in PRISM_GC_GENERATIONS
+                ],
+                "# HELP qbit_prism_process_gc_max_pause_seconds Longest cyclic collector pass observed per generation since the lease heartbeat armed.",
+                "# TYPE qbit_prism_process_gc_max_pause_seconds gauge",
+                *[
+                    f'qbit_prism_process_gc_max_pause_seconds{{generation="{generation}"}} {float(pauses[generation]["max_seconds"]):.6f}'
+                    for generation in PRISM_GC_GENERATIONS
+                ],
+            ]
+        )
+        return lines
 
     def share_ack_metrics_lines(self) -> list[str]:
         histograms = self.port.share_ack_snapshot()
@@ -1532,11 +1589,19 @@ class MetricsRenderer:
         last_phases = snapshot["last_phase_seconds"]
         worst_phases = snapshot["worst_phase_seconds"]
         policy_seconds = snapshot["policy_seconds"]
+        wakes = snapshot["monitor_wakes"]
+        probe = snapshot["stall_probe"]
         assert isinstance(attempts, dict)
         assert isinstance(outcomes, dict)
         assert isinstance(last_phases, dict)
         assert isinstance(worst_phases, dict)
         assert isinstance(policy_seconds, dict)
+        assert isinstance(wakes, dict)
+        assert isinstance(probe, dict)
+        wake_buckets = wakes["buckets"]
+        late_wakes = wakes["late_wakes"]
+        assert isinstance(wake_buckets, dict)
+        assert isinstance(late_wakes, dict)
         return [
             "# HELP qbit_prism_lease_heartbeat_running Whether the writer-lease heartbeat thread is alive.",
             "# TYPE qbit_prism_lease_heartbeat_running gauge",
@@ -1580,6 +1645,44 @@ class MetricsRenderer:
                 f'qbit_prism_lease_heartbeat_policy_seconds{{term="{term}"}} {float(policy_seconds.get(term, 0.0)):.6f}'
                 for term in LEASE_HEARTBEAT_POLICY_TERMS
             ],
+            # Issue #227: the monitor's lateness as signals that re-arm. The
+            # lifetime gauge above never resets; these do the alerting.
+            "# HELP qbit_prism_lease_heartbeat_monitor_wake_lateness_seconds Lateness of every heartbeat-monitor poll wake (issue #227); express the wake-delay alert on this or on the late-wake counters, not on the lifetime gauge.",
+            "# TYPE qbit_prism_lease_heartbeat_monitor_wake_lateness_seconds histogram",
+            *[
+                f'qbit_prism_lease_heartbeat_monitor_wake_lateness_seconds_bucket{{le="{bucket:g}"}} {int(wake_buckets.get(bucket, 0))}'
+                for bucket in LEASE_MONITOR_WAKE_DELAY_BUCKETS
+            ],
+            f'qbit_prism_lease_heartbeat_monitor_wake_lateness_seconds_bucket{{le="+Inf"}} {int(wakes["count"])}',
+            f'qbit_prism_lease_heartbeat_monitor_wake_lateness_seconds_sum {float(wakes["sum"]):.6f}',
+            f'qbit_prism_lease_heartbeat_monitor_wake_lateness_seconds_count {int(wakes["count"])}',
+            "# HELP qbit_prism_lease_heartbeat_monitor_late_wakes_total Monitor wakes at least the labelled fraction of the policy's scheduler slack late.",
+            "# TYPE qbit_prism_lease_heartbeat_monitor_late_wakes_total counter",
+            *[
+                f'qbit_prism_lease_heartbeat_monitor_late_wakes_total{{slack_fraction="{fraction}"}} {int(late_wakes.get(fraction, 0))}'
+                for fraction in LEASE_MONITOR_LATE_WAKE_SLACK_FRACTIONS
+            ],
+            "# HELP qbit_prism_lease_heartbeat_monitor_wake_delay_window_max_seconds Worst monitor wake lateness inside the trailing 300s window; falls back once a stall ages out, unlike the lifetime gauge.",
+            "# TYPE qbit_prism_lease_heartbeat_monitor_wake_delay_window_max_seconds gauge",
+            f"qbit_prism_lease_heartbeat_monitor_wake_delay_window_max_seconds {float(wakes['window_max_seconds']):.6f}",
+            "# HELP qbit_prism_lease_heartbeat_monitor_wake_delay_record_age_seconds Seconds since the lifetime monitor wake-delay record was last raised.",
+            "# TYPE qbit_prism_lease_heartbeat_monitor_wake_delay_record_age_seconds gauge",
+            f"qbit_prism_lease_heartbeat_monitor_wake_delay_record_age_seconds {float(wakes['record_age_seconds']):.6f}",
+            "# HELP qbit_prism_lease_heartbeat_monitor_exit_guarantee_breaches_total Monitor wakes later than the policy's max_guaranteed_monitor_lateness: beats on which exit-before-adoption was not guaranteed (issue #227).",
+            "# TYPE qbit_prism_lease_heartbeat_monitor_exit_guarantee_breaches_total counter",
+            f"qbit_prism_lease_heartbeat_monitor_exit_guarantee_breaches_total {int(snapshot['exit_guarantee_breaches'])}",
+            "# HELP qbit_prism_lease_heartbeat_monitor_worst_exit_guarantee_overrun_seconds Worst amount by which a late monitor wake could have placed the hard exit after the successor's adoption edge.",
+            "# TYPE qbit_prism_lease_heartbeat_monitor_worst_exit_guarantee_overrun_seconds gauge",
+            f"qbit_prism_lease_heartbeat_monitor_worst_exit_guarantee_overrun_seconds {float(snapshot['worst_exit_guarantee_overrun_seconds']):.6f}",
+            "# HELP qbit_prism_lease_heartbeat_stall_probe_samples_total Stack samples the stall probe took on monitor wakes at least half a scheduler slack late.",
+            "# TYPE qbit_prism_lease_heartbeat_stall_probe_samples_total counter",
+            f"qbit_prism_lease_heartbeat_stall_probe_samples_total {int(probe['samples'])}",
+            "# HELP qbit_prism_lease_heartbeat_stall_probe_suppressed_total Stall-probe triggers refused by its rate limit (at most 3 samples per 60s).",
+            "# TYPE qbit_prism_lease_heartbeat_stall_probe_suppressed_total counter",
+            f"qbit_prism_lease_heartbeat_stall_probe_suppressed_total {int(probe['suppressed'])}",
+            "# HELP qbit_prism_lease_heartbeat_monitor_breach_warnings_suppressed_total Lateness-beyond-slack warnings the monitor refused under its rate limit (at most 3 per 60s); the breaches themselves are still counted.",
+            "# TYPE qbit_prism_lease_heartbeat_monitor_breach_warnings_suppressed_total counter",
+            f"qbit_prism_lease_heartbeat_monitor_breach_warnings_suppressed_total {int(snapshot['slack_breach_warnings_suppressed'])}",
         ]
 
     def shutdown_metrics_lines(self) -> list[str]:
