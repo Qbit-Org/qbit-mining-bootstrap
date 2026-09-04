@@ -911,7 +911,13 @@ rg '"event": "accepted_block_preview_landing"' "$PRISM_COORDINATOR_LOG" \
 The phases sum to at most the total; the remainder is queue and
 disposition time that no phase claims (for the fallback landing that
 submits inside the balance serializer, `lane_wait` is legitimately zero,
-because acceptance is stamped after that lane started). Then read the
+because acceptance is stamped after that lane started). The candidate
+attempt-marker write is deliberately part of that remainder rather than
+part of `lane_wait`: it is the landing's own PostgreSQL write, so a
+degraded writer must not inflate the one stretch that exonerates the
+landing. A large remainder alongside small phases is therefore queue,
+disposition or marker-write time, and no phase in this family will name
+it. Then read the
 `payout_artifact_*` and `reorg-reconcile` lines adjacent in the
 timestamped log for the same window: they carry `payout_state_generation`,
 `window_build_mode`, `full_rescan_reason` and `prior_balances_read_forced`,

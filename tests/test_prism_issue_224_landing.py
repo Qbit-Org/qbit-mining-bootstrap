@@ -273,6 +273,42 @@ class LandingLaneWaitTests(unittest.TestCase):
         service._note_accepted_landing_lane_start(SimpleNamespace())
         self.assertEqual(service.accepted_landing_attribution_snapshot(), {})
 
+    def test_the_lane_closes_before_the_attempt_marker_is_written(self) -> None:
+        # ``_mark_block_candidate_attempted`` is the landing's own PostgreSQL
+        # write, not queue time. Closing the lane after it charges the write
+        # to ``lane_wait`` -- and a marker that times out keeps charging the
+        # retry backoff there too, so the one stretch that exonerates the
+        # landing grows precisely when the writer is degraded. The ordering is
+        # the whole guarantee, so it is pinned where it is written.
+        tree = _module_tree(block_candidates_module)
+        ordered = 0
+        for function in ast.walk(tree):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            lane_starts = [
+                node.lineno
+                for node in ast.walk(function)
+                if isinstance(node, ast.Call)
+                and _call_name(node) == "_note_accepted_landing_lane_start"
+            ]
+            markers = [
+                node.lineno
+                for node in ast.walk(function)
+                if isinstance(node, ast.Call)
+                and _call_name(node) == "_mark_block_candidate_attempted"
+            ]
+            if not lane_starts or not markers:
+                continue
+            ordered += 1
+            self.assertLess(
+                max(lane_starts),
+                min(markers),
+                f"{function.name} closes the lane after its attempt marker",
+            )
+        # Both queued landing paths write the marker; a rename that loses one
+        # would otherwise make this test vacuously true.
+        self.assertEqual(ordered, 2)
+
 
 class LandingPublicationDiagnosticTests(unittest.TestCase):
     """One closed interval, one retained diagnostic, one structured line."""
@@ -629,6 +665,55 @@ class LandingAttributionCleanupTests(unittest.TestCase):
         # Eviction is oldest-first, so the newest landing is the survivor.
         newest = f"{MAX_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_STAMPS + 63:064x}"
         self.assertIn(newest, retained)
+
+    def test_an_unstamped_publication_leaves_nothing_in_flight(self) -> None:
+        # A startup replay or a chain-proven candidate publishes without an
+        # in-process acceptance stamp, so the observer returns before it can
+        # pop anything. A record opened by the publish span would then report
+        # a finished publication as in flight for as long as the bound kept
+        # it.
+        server, service = self._service()
+        block_hash = "7b" * 32
+        with service._accepted_landing_publish_span(block_hash, block_height=12):
+            server._observe_accepted_block_preview_publication(
+                block_hash,
+                result="published",
+            )
+
+        self.assertEqual(service.accepted_landing_attribution_snapshot(), {})
+        telemetry = ensure_accepted_preview_telemetry(server)
+        self.assertEqual(telemetry.diagnostics_snapshot(), ())
+        # The stretch still ran, so the phase family still owns its sample.
+        self.assertEqual(
+            telemetry.snapshot()["landing_phases"][
+                LANDING_PHASE_PREVIEW_PUBLISH
+            ]["count"],
+            1,
+        )
+
+    def test_unstamped_publications_never_evict_a_live_landing(self) -> None:
+        # The failure this guards is the replay storm: enough unattributable
+        # publications to fill the shared cap would push live landings out of
+        # it before their diagnostics were ever emitted.
+        server, service = self._service()
+        live = "01" * 32
+        service._note_accepted_block_preview_acceptance(live)
+        with service._accepted_landing_phase(live, LANDING_PHASE_RECONCILE):
+            pass
+        for index in range(MAX_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_STAMPS + 8):
+            with service._accepted_landing_publish_span(f"{index:064x}"):
+                pass
+
+        self.assertEqual(
+            list(service.accepted_landing_attribution_snapshot()),
+            [live],
+        )
+        server._observe_accepted_block_preview_publication(
+            live,
+            result="published",
+        )
+        diagnostics = ensure_accepted_preview_telemetry(server).diagnostics_snapshot()
+        self.assertEqual([entry.block_hash for entry in diagnostics], [live])
 
     def test_publication_pops_the_in_flight_state(self) -> None:
         server, service = self._service()

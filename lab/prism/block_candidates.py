@@ -5443,12 +5443,17 @@ class BlockCandidateService:
                     raise RuntimeError(
                         "block candidate is waiting for fast-lane capacity"
                     )
-                node_submission = coordinator._node_submission_for_candidate_or_retained(candidate)
-                coordinator._mark_block_candidate_attempted(block_hash)
                 # Everything from definitive acceptance to here was queue,
                 # disposition and admission time the landing itself did not
-                # control (issue #224).
+                # control (issue #224). The attempt marker below is this
+                # landing's own PostgreSQL write, so it is deliberately left
+                # outside ``lane_wait``: charging it there would grow the one
+                # stretch that exonerates the landing exactly when the writer
+                # is degraded, and a marker that times out would keep growing
+                # it across the retry backoff.
                 self._note_accepted_landing_lane_start(candidate)
+                node_submission = coordinator._node_submission_for_candidate_or_retained(candidate)
+                coordinator._mark_block_candidate_attempted(block_hash)
                 with coordinator._block_landing_ledger_statement_timeout_scope(block_hash):
                     # The same-hash disposition is already held here, so the
                     # coordinator may run its serialized inner tail rather
@@ -6855,6 +6860,13 @@ class BlockCandidateService:
                 error=error,
                 outcome=outcome,
             )
+        # The queue, disposition and admission time ends here: everything
+        # below is work this landing runs (issue #224). The attempt marker is
+        # this landing's own PostgreSQL write and must fall outside
+        # ``lane_wait`` -- a degraded writer would otherwise inflate the one
+        # stretch that exonerates the landing, and would keep inflating it
+        # across the retry backoff a timed-out marker triggers.
+        self._note_accepted_landing_lane_start(candidate)
         if node_submission is None:
             node_submission = coordinator._node_submission_for_candidate_or_retained(candidate)
         try:
@@ -6871,7 +6883,6 @@ class BlockCandidateService:
             return True
         accepted = False
         error = "candidate became stale or submission failed"
-        self._note_accepted_landing_lane_start(candidate)
         try:
             coordinator._record_block_submitter_phase("accounting")
             with coordinator._block_landing_ledger_statement_timeout_scope(block_hash):
@@ -7908,45 +7919,79 @@ class BlockCandidateService:
         the visibility instant it already measures, or this context manager's
         exit when the call published nothing this hash was waiting for. Never
         both -- the start value is the span's token.
+
+        The record is allocated only for an open interval, exactly as every
+        other stretch allocates one. A startup replay or a chain-proven
+        candidate publishes without an in-process acceptance stamp, and the
+        observer returns before it can pop anything; a record opened for one of
+        those would be reported as in flight forever and would spend a slot the
+        bound reserves for live landings. The family observation below stays
+        unconditional either way -- every stretch a landing ran belongs in the
+        phase histogram.
         """
         telemetry = ensure_accepted_preview_telemetry(self._coordinator)
         key = str(block_hash).lower()
         started = time.monotonic()
         with self._accepted_block_preview_publication_lock:
-            record = self._accepted_landing_attribution_locked(
-                key,
-                block_height=block_height,
-            )
-            record.publish_started_monotonic = started
+            attributed = self._accepted_landing_interval_open_locked(key)
+            if attributed:
+                record = self._accepted_landing_attribution_locked(
+                    key,
+                    block_height=block_height,
+                )
+                record.publish_started_monotonic = started
         try:
             yield
         finally:
-            self._close_accepted_landing_publish_span(telemetry, key, started)
+            self._close_accepted_landing_publish_span(
+                telemetry,
+                key,
+                started,
+                attributed=attributed,
+            )
 
     def _close_accepted_landing_publish_span(
         self,
         telemetry: Any,
         key: str,
         started: float,
+        *,
+        attributed: bool = True,
     ) -> None:
-        """Close a publish span this caller still owns, if it still owns it."""
+        """Close a publish span this caller still owns, if it still owns it.
+
+        ``attributed`` is what the span found when it opened: False means no
+        interval was running and no record was allocated, so there is nothing
+        to own and nothing the observer could have taken -- only the family
+        histogram is owed a sample.
+        """
         ended = time.monotonic()
+        elapsed = max(0.0, ended - started)
         with self._accepted_block_preview_publication_lock:
-            record = self._accepted_landing_attributions.get(key)
-            if record is None or record.publish_started_monotonic != started:
-                # The observer closed this span at the visibility instant and
-                # recorded it there, or terminal cleanup discarded the record
-                # while the publication was in flight.
-                return
-            record.publish_started_monotonic = None
-            elapsed = max(0.0, ended - started)
-            if self._accepted_landing_interval_open_locked(key):
-                record.phase_seconds[LANDING_PHASE_PREVIEW_PUBLISH] = (
-                    float(
-                        record.phase_seconds.get(LANDING_PHASE_PREVIEW_PUBLISH, 0.0)
+            if attributed:
+                record = self._accepted_landing_attributions.get(key)
+                if record is None or record.publish_started_monotonic != started:
+                    # The observer closed this span at the visibility instant
+                    # and recorded it there, or terminal cleanup discarded the
+                    # record while the publication was in flight.
+                    return
+                record.publish_started_monotonic = None
+                if self._accepted_landing_interval_open_locked(key):
+                    record.phase_seconds[LANDING_PHASE_PREVIEW_PUBLISH] = (
+                        float(
+                            record.phase_seconds.get(
+                                LANDING_PHASE_PREVIEW_PUBLISH, 0.0
+                            )
+                        )
+                        + elapsed
                     )
-                    + elapsed
-                )
+                else:
+                    # The interval closed under this publication without the
+                    # observer taking the span: the acceptance stamp aged out
+                    # of the shared cap. Nothing can build a diagnostic from
+                    # this record now, so drop it rather than leave it in
+                    # flight for the bound to evict a live landing over.
+                    self._accepted_landing_attributions.pop(key, None)
         telemetry.observe_landing_phase(LANDING_PHASE_PREVIEW_PUBLISH, elapsed)
 
     def _discard_accepted_landing_attribution(self, block_hash: str) -> None:
