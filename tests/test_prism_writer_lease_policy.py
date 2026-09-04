@@ -36,11 +36,15 @@ from lab.prism.coordinator_config import (
     DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_MONITOR_SECONDS,
     DEFAULT_PRISM_LEDGER_LEASE_HEARTBEAT_SECONDS,
 )
+import lab.prism.writer_lease_timing as writer_lease_timing
 from lab.prism.writer_lease_timing import (
     DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
     DEFAULT_WRITER_LEASE_HEARTBEAT_POLICY,
     LEASE_HEARTBEAT_MODE_PROOF,
     LEASE_HEARTBEAT_OUTCOME_PROVEN,
+    LEASE_HEARTBEAT_PHASES,
+    LEASE_HEARTBEAT_POLICY_TERMS,
+    OBSERVED_MONITOR_WAKE_DELAY_SECONDS_227,
     WRITER_LEASE_GUARD_STATEMENT_TIMEOUT_SECONDS,
     WriterLeaseHeartbeatPolicy,
     WriterLeaseHeartbeatPolicyError,
@@ -422,10 +426,21 @@ class VerificationAttributionTests(unittest.TestCase):
         self.assertAlmostEqual(phases.scheduler_delay_seconds, 0.05)
         self.assertAlmostEqual(phases.total_seconds, 0.75)
         self.assertEqual(phases.statement_count, 1)
+        # No server-reported time: the conservative reading, with the
+        # whole statement span in guard_sql and nothing in client resume.
+        self.assertFalse(phases.server_reported)
+        self.assertAlmostEqual(phases.client_resume_seconds, 0.0)
         self.assertEqual(
             set(phases.phase_seconds()),
-            {"guard_slot_wait", "guard_sql", "scheduler_delay", "total"},
+            {
+                "guard_slot_wait",
+                "guard_sql",
+                "guard_client_resume",
+                "scheduler_delay",
+                "total",
+            },
         )
+        self.assertEqual(tuple(phases.phase_seconds()), LEASE_HEARTBEAT_PHASES)
 
     def test_summary_names_the_phase_that_consumed_the_time(self) -> None:
         clock = self.Clock()
@@ -496,6 +511,149 @@ class VerificationAttributionTests(unittest.TestCase):
         self.assertAlmostEqual(phases.guard_sql_seconds, 0.0)
         self.assertAlmostEqual(phases.scheduler_delay_seconds, 0.9)
         self.assertEqual(phases.statement_count, 0)
+
+
+class ProofDocstringTests(unittest.TestCase):
+    """The module docstring is the proof; it must not drift from the code.
+
+    Issue #227 found the proof presenting ``1.95 < 2.00`` as though the
+    slack term bounded reality, three days after production had exceeded
+    it. These tests hold the docstring to the constants, hold the stated
+    monitor-lateness bound (inequality (4)) to the policy, and pin the
+    production observation the docstring now discusses to the number the
+    code carries.
+    """
+
+    DOCSTRING = writer_lease_timing.__doc__ or ""
+
+    def _documented_number(self, term: str) -> float:
+        """The value a ``term = ... = <number>`` line in the defaults table states."""
+        import re
+
+        heading = "The shipped defaults\n"
+        self.assertIn(heading, self.DOCSTRING)
+        table = self.DOCSTRING.split(heading, 1)[1]
+        pattern = re.compile(
+            r"^\s+(?:=>\s+)?" + re.escape(term) + r"\s+=\s+(?P<expr>[^(\n]+)",
+            re.MULTILINE,
+        )
+        match = pattern.search(table)
+        self.assertIsNotNone(match, f"defaults table has no line for {term}")
+        assert match is not None
+        numbers = re.findall(r"[0-9]+\.[0-9]+", match.group("expr"))
+        self.assertTrue(numbers, f"no number on the {term} line")
+        # A derived line spells the arithmetic and ends with its result.
+        return float(numbers[-1])
+
+    def test_documented_shipped_numbers_match_the_constants(self) -> None:
+        policy = DEFAULT_WRITER_LEASE_HEARTBEAT_POLICY
+        for term, actual in (
+            ("guard_statement_timeout", policy.guard_statement_timeout_seconds),
+            ("heartbeat_interval", policy.heartbeat_interval_seconds),
+            ("scheduler_slack", policy.scheduler_slack_seconds),
+            ("max_healthy_server_gap", policy.max_healthy_server_gap_seconds),
+            ("failure_budget", policy.failure_budget_seconds),
+            ("monitor_interval", policy.monitor_interval_seconds),
+            ("exit_margin", policy.exit_margin_seconds),
+            ("exit_envelope", policy.exit_envelope_seconds),
+            ("adoption_silence", policy.adoption_silence_seconds),
+            ("server_proven_cap", policy.server_proven_cap_seconds),
+            ("stability surplus", policy.stability_surplus_seconds),
+            (
+                "max_guaranteed_monitor_lateness",
+                policy.max_guaranteed_monitor_lateness_seconds,
+            ),
+        ):
+            with self.subTest(term=term):
+                self.assertAlmostEqual(self._documented_number(term), actual)
+
+    def test_inequality_one_is_still_rejected_when_violated(self) -> None:
+        """Guarding the proof: an unsafe silence is refused, not advised."""
+        policy = DEFAULT_WRITER_LEASE_HEARTBEAT_POLICY
+        floor = policy.failure_budget_seconds + policy.exit_envelope_seconds
+        for silence in (floor, floor - 0.01, 1.0):
+            with self.subTest(adoption_silence=silence):
+                unsafe = WriterLeaseHeartbeatPolicy(
+                    adoption_silence_seconds=silence,
+                    heartbeat_interval_seconds=policy.heartbeat_interval_seconds,
+                    failure_budget_seconds=policy.failure_budget_seconds,
+                    monitor_interval_seconds=policy.monitor_interval_seconds,
+                    exit_margin_seconds=policy.exit_margin_seconds,
+                )
+                self.assertTrue(unsafe.violations())
+                with self.assertRaises(WriterLeaseHeartbeatPolicyError):
+                    unsafe.validate()
+
+    def test_monitor_lateness_bound_is_inequality_four(self) -> None:
+        """(4): exit precedes adoption iff L < slack + monitor_interval.
+
+        Stated from the worst-case timeline rather than from the property:
+        the poll that first sees the stale edge is at most one interval
+        plus L after the cap elapsed, the exit spends its margin, and the
+        successor is eligible one silence after the proven edge.
+        """
+        policy = DEFAULT_WRITER_LEASE_HEARTBEAT_POLICY
+        bound = policy.max_guaranteed_monitor_lateness_seconds
+        self.assertAlmostEqual(
+            bound,
+            policy.scheduler_slack_seconds + policy.monitor_interval_seconds,
+        )
+        self.assertAlmostEqual(bound, 0.55)
+        for lateness, guaranteed in (
+            (policy.scheduler_slack_seconds, True),
+            (bound - 1e-9, True),
+            (bound + 1e-9, False),
+            (OBSERVED_MONITOR_WAKE_DELAY_SECONDS_227, False),
+        ):
+            with self.subTest(lateness=lateness):
+                worst_case_exit = (
+                    policy.server_proven_cap_seconds
+                    + policy.monitor_interval_seconds
+                    + lateness
+                    + policy.exit_margin_seconds
+                )
+                self.assertEqual(
+                    worst_case_exit < policy.adoption_silence_seconds,
+                    guaranteed,
+                )
+                self.assertEqual(
+                    policy.exit_guarantee_overrun_seconds(lateness) == 0.0,
+                    guaranteed,
+                )
+
+    def test_production_observation_exceeds_the_bound_and_is_documented(
+        self,
+    ) -> None:
+        """The #227 record breaks the assumption, and the docstring says so."""
+        policy = DEFAULT_WRITER_LEASE_HEARTBEAT_POLICY
+        observed = OBSERVED_MONITOR_WAKE_DELAY_SECONDS_227
+        self.assertGreater(observed, policy.scheduler_slack_seconds)
+        self.assertGreater(observed, policy.max_guaranteed_monitor_lateness_seconds)
+        self.assertAlmostEqual(
+            policy.exit_guarantee_overrun_seconds(observed),
+            observed - 0.55,
+        )
+        # The sum the spec quotes, with the real lateness in place of slack.
+        self.assertAlmostEqual(
+            policy.server_proven_cap_seconds
+            + policy.monitor_interval_seconds
+            + observed
+            + policy.exit_margin_seconds,
+            2.098,
+        )
+        self.assertIn(f"{observed:.3f}s", self.DOCSTRING)
+        self.assertIn("2.098 > 2.00", self.DOCSTRING)
+        self.assertIn("issue #227", self.DOCSTRING)
+        # The decision is recorded, not just the observation.
+        self.assertIn("(b)", self.DOCSTRING)
+        self.assertIn("the shipped response is (b)", self.DOCSTRING)
+
+    def test_policy_terms_and_describe_include_the_lateness_bound(self) -> None:
+        self.assertIn("max_guaranteed_monitor_lateness", LEASE_HEARTBEAT_POLICY_TERMS)
+        self.assertIn(
+            "max_monitor_lateness=0.55s",
+            DEFAULT_WRITER_LEASE_HEARTBEAT_POLICY.describe(),
+        )
 
 
 if __name__ == "__main__":

@@ -95,14 +95,133 @@ issue #212.  It is reported as an advisory, because a deliberately tiny
 test or lab policy is allowed to trade stability away, and refusing to
 start would be worse than restarting.
 
+What (1) actually guarantees
+----------------------------
+(1) is a statement about a *budget*, not about the process.  Write ``L``
+for the monitor's real lateness on the poll that first observes the stale
+edge.  That poll happens no later than ``p + cap + monitor_interval + L``
+and the exit completes ``exit_margin`` after it, so exit-before-adoption
+holds for that beat if and only if
+
+    L  <  adoption_silence - cap - monitor_interval - exit_margin
+       =  scheduler_slack + monitor_interval                         (4)
+
+(``max_guaranteed_monitor_lateness_seconds`` below; the identity on the
+right holds whenever the cap is the silence minus the exit envelope, which
+it is for every policy that is not floored at the failure budget).  Three
+regimes follow:
+
+``L <= scheduler_slack``
+    the case (1) budgets: the exit completes one whole monitor poll before
+    the adoption edge.
+``scheduler_slack < L < scheduler_slack + monitor_interval``
+    the strictness reserve is consumed: the exit still completes before
+    the adoption edge, but by less than one poll.
+``L >= scheduler_slack + monitor_interval``
+    exit-before-adoption is **not guaranteed** for that beat; the process
+    may still be alive up to ``L - (scheduler_slack + monitor_interval)``
+    after the adoption edge.
+
+Production exceeded the assumption (issue #227)
+-----------------------------------------------
+Three days after this policy shipped, ``union-mainnet`` (bootstrap pin
+``9c41894``, coordinator up 45h, zero restarts, no heartbeat exit) recorded
+a monitor wake delay of **0.648s** — above the 0.50s slack and above the
+0.55s bound (4).  For the duration of that stall the sum on the left of
+(1), evaluated with the real lateness, was ``1.30 + 0.05 + 0.648 + 0.10 =
+2.098 > 2.00``.  No guard loss coincided, so nothing happened; but the
+assumption the proof rests on was violated in production.
+
+The stall was in-process, not on the host (32 cores 93% idle, PSI near
+zero, no cgroup throttling).  The window held a 5.1s
+``reconcile_invalidation`` full rescan of a 52k-share payout window, and
+the phase attribution of the same period showed why the old telemetry
+could not see it: the worst ``guard_sql`` was 0.714s against a
+server-enforced 0.50s statement timeout while ``scheduler_delay`` never
+exceeded 22 microseconds in 645k attempts.  ``guard_sql`` was measured
+client-side, so a GIL stall between PostgreSQL answering and the heartbeat
+thread resuming was booked as database time.
+
+Attribution that survives GIL stalls
+------------------------------------
+Each guard statement now returns its own server-side execution time
+(``clock_timestamp() - statement_timestamp()``, computed and returned by
+the statement itself, so no extra round trip and no extra lock).  The
+attempt accumulator splits the client-measured statement span into
+``guard_sql`` (server execution, when the statement reports it) and
+``guard_client_resume`` (the remainder of the round trip: network transit
+plus the time this process took to resume after the answer arrived).  The
+residual ``scheduler_delay = total - slot_wait - guard_sql`` therefore
+absorbs every process-side delay, inside or outside a round trip;
+``guard_client_resume`` is the part of it that fell inside one.  A
+statement that reports no server time keeps the old, deliberately
+conservative attribution (the whole span is ``guard_sql``).  The
+server-proven edge is untouched: it is still the conservative send edge,
+never a server-reported timestamp, because the ``p <= t_d`` step above
+depends on it.
+
+The response to lateness beyond slack (the decision)
+----------------------------------------------------
+Two responses were on the table.  (a) Treat lateness beyond slack as
+envelope consumed for that beat and tighten the cap for that beat.  (b)
+Accept the residual and rely on the fences.
+
+(a) is refused, on the arithmetic rather than on taste.  On the late wake
+``w`` the monitor can only exit *now*, completing at ``w + exit_margin``;
+that bound does not move whether the threshold it compares the age
+against is ``cap`` or ``cap - (L - slack)``.  Tightening changes behaviour
+only for server-proven ages in ``[cap - (L - slack), cap)`` — a band that a
+healthy coordinator occupies whenever a slow statement coincides with the
+stall (with the observed 0.648s the tightened threshold is 1.152s, below
+the 1.25s a healthy gap may reach).  So (a) hard-exits healthy
+coordinators — issue #212's failure mode — and buys nothing against the
+breach it is reacting to.
+
+(b) is safe because the un-covered interval permits no mutation.  Three
+observations:
+
+* A successor cannot begin its silence until the predecessor's *guard
+  session* is gone (``PsqlShareLedger._writer_lease_adoption_wait_seconds``
+  cannot even be reached while the advisory guard is held).  A stalled but
+  live process is therefore never adopted over; the hazard is the compound
+  event of a guard-session death *and* a monitor lateness beyond (4) in the
+  same window.
+* During a GIL stall no Python thread runs, so nothing escapes *during* the
+  stall.  What could escape is work done in the interval between the
+  adoption edge and the (late) exit, at most ``L - (slack +
+  monitor_interval)`` long.
+* Every ledger write is fenced at the row: share appends and every landing
+  statement open with the exact-session ``lease AS (UPDATE
+  qbit_ledger_writer_lease ... WHERE writer_session_token = ...)`` CTE and
+  join it, and adoption rewrites ``writer_session_token``, so a stale
+  writer's statement matches zero lease rows and reports "writer lease is
+  not active".  Every external effect (submitblock, CTV fanout, wallet)
+  runs behind ``require_fresh_lease_for_external_side_effect``, a
+  synchronous exact-session verification on the guard session that raises
+  — and hard-exits — the moment the committed row names another session.
+  The fence-to-RPC residual is the documented preflight residual between
+  independent systems and is not widened by the monitor's lateness.  The
+  heartbeat's own next proof fails the same way.
+
+So the shipped response is (b), with the breach made loud instead of
+invisible: the monitor's lateness feeds a fixed-bucket histogram, three
+threshold counters (0.5x, 0.8x and 1.0x slack), a rolling-window maximum
+and the age of the lifetime record; a wake beyond (4) increments an
+exit-guarantee breach counter, records the worst overrun, and emits one
+structured warning naming the breach; a wake beyond half the slack takes a
+rate-limited stack sample of the running threads.  The operator action is
+in ``docs/prism-ledger-ops.md``.  The durable fix — an exit path that does
+not depend on the interpreter being scheduled — is an out-of-process
+watchdog fed by the server-proven edge, scoped in issue #130.
+
 The shipped defaults
 --------------------
     guard_statement_timeout = 0.50   (server-enforced, unchanged)
     heartbeat_interval      = 0.25
     scheduler_slack         = 0.50   (~3x the worst delay observed in the
-                                      union-mainnet burst, where completed
-                                      round trips lagged the 0.75s
-                                      interval+statement bound by <=0.16s)
+                                      union-mainnet burst behind #212;
+                                      exceeded once since, by a 0.648s
+                                      in-process stall, see #227 above)
     max_healthy_server_gap  = 0.25 + 0.50 + 0.50 = 1.25
     failure_budget          = 1.25   (the same bound; one number, not two)
     monitor_interval        = 0.05
@@ -111,14 +230,17 @@ The shipped defaults
     adoption_silence        = 2.00   (> 1.25 + 0.70 = 1.95)
     => server_proven_cap    = 2.00 - 0.70 = 1.30
     => stability surplus    = 1.30 - 1.25 = 0.05
+    => max_guaranteed_monitor_lateness = 0.50 + 0.05 = 0.55
 
-Checking (1) at the shipped numbers, with a maximally late monitor:
+Checking (1) at the shipped numbers, with a monitor exactly as late as the
+policy budgets:
 
     1.30 + 0.05 + 0.50 + 0.10 = 1.95  <  2.00
 
 so the old coordinator is gone 0.05s — one monitor poll — before the
-successor may compare-and-swap, under the worst scheduler stall this
-policy claims to tolerate.
+successor may compare-and-swap, *provided* the monitor's real lateness is
+within the 0.55s bound (4).  That proviso is an assumption about the
+process, not a property of the policy; production has exceeded it once.
 
 Genuine writer failover therefore costs 2.0s of adoption silence rather
 than 1.0s.  That is the price of the guard session's own 0.5s statement
@@ -170,7 +292,9 @@ WRITER_LEASE_VERIFICATION_MAX_STATEMENTS = 2
 # and the monitor observing that answer: heartbeat thread wake-up, GIL
 # contention behind a rapid-block burst, result handling, and the monitor's
 # own late wake. Sized at roughly three times the worst delay observed in the
-# union-mainnet burst that produced issue #212.
+# union-mainnet burst that produced issue #212. Issue #227 recorded a 0.648s
+# monitor wake delay on union-mainnet, above this allowance; the module
+# docstring states what is and is not guaranteed when that happens.
 WRITER_LEASE_HEARTBEAT_SCHEDULER_SLACK_SECONDS = 0.5
 
 WRITER_LEASE_HEARTBEAT_INTERVAL_SECONDS = 0.25
@@ -190,6 +314,12 @@ WRITER_LEASE_HEARTBEAT_FAILURE_SECONDS = (
 # of stability surplus above the healthy-gap bound.
 DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS = 2.0
 
+# The monitor wake-delay lateness observed on union-mainnet at 2026-09-04
+# (issue #227), the production evidence that the slack allowance is an
+# assumption rather than a bound. Kept as a named constant so the tests that
+# judge the policy against it cannot drift from the docstring.
+OBSERVED_MONITOR_WAKE_DELAY_SECONDS_227 = 0.648
+
 # Heartbeat modes, and the phase names the attribution and metrics use.
 # Fixed vocabularies: metric label cardinality must not grow with traffic.
 LEASE_HEARTBEAT_MODE_PROOF = "proof"
@@ -201,9 +331,15 @@ LEASE_HEARTBEAT_MODES = (
     LEASE_HEARTBEAT_MODE_FENCE,
 )
 
+# guard_slot_wait + guard_sql + scheduler_delay = total. guard_client_resume
+# is the part of scheduler_delay that fell inside a round trip (the answer
+# had left PostgreSQL but this process had not resumed); it is reported
+# separately because it is exactly the delay issue #227's client-side
+# attribution could not see.
 LEASE_HEARTBEAT_PHASES = (
     "guard_slot_wait",
     "guard_sql",
+    "guard_client_resume",
     "scheduler_delay",
     "total",
 )
@@ -222,6 +358,7 @@ LEASE_HEARTBEAT_POLICY_TERMS = (
     "server_proven_cap",
     "max_healthy_server_gap",
     "stability_surplus",
+    "max_guaranteed_monitor_lateness",
 )
 
 LEASE_HEARTBEAT_OUTCOME_PROVEN = "proven"
@@ -236,6 +373,44 @@ LEASE_HEARTBEAT_OUTCOMES = (
     LEASE_HEARTBEAT_OUTCOME_DEFERRED,
     LEASE_HEARTBEAT_OUTCOME_FAILED,
 )
+
+# Monitor wake-delay telemetry (issue #227). Every set below is closed, so
+# the rendered cardinality is fixed: the histogram has these buckets and
+# +Inf, the late-wake counters carry exactly these slack fractions, and the
+# rolling window is a fixed number of slices.
+#
+# The buckets straddle the shipped policy's decision points: 0.25 (half the
+# slack, the stall-probe trigger), 0.4 (0.8x slack), 0.5 (the slack itself),
+# and 0.75 / 1.0 (the region the 0.648s production record fell in).
+LEASE_MONITOR_WAKE_DELAY_BUCKETS = (
+    0.001,
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.4,
+    0.5,
+    0.75,
+    1.0,
+    2.0,
+)
+# Label values are the fraction text, so a PromQL author can read
+# `slack_fraction="1.0"` as "wakes at least a whole scheduler_slack late".
+LEASE_MONITOR_LATE_WAKE_SLACK_FRACTIONS = ("0.5", "0.8", "1.0")
+# The rolling-window maximum falls back once a stall ages out of the window,
+# unlike the lifetime gauge. Thirty 10s slices give a 5-minute window, the
+# same horizon the qbit-tools alert's changes[5m] clause reasons over.
+LEASE_MONITOR_WAKE_DELAY_WINDOW_SECONDS = 300.0
+LEASE_MONITOR_WAKE_DELAY_WINDOW_SLICES = 30
+# The stall probe samples the running threads' stacks when a wake is at
+# least this fraction of the slack late. Rate-limited so it can never turn a
+# stall into a stall storm: at most MAX_SAMPLES per WINDOW, the rest are
+# counted as suppressed.
+LEASE_MONITOR_STALL_PROBE_TRIGGER_SLACK_FRACTION = 0.5
+LEASE_MONITOR_STALL_PROBE_MAX_SAMPLES_PER_WINDOW = 3
+LEASE_MONITOR_STALL_PROBE_WINDOW_SECONDS = 60.0
 
 
 class WriterLeaseHeartbeatPolicyError(ValueError):
@@ -330,6 +505,42 @@ class WriterLeaseHeartbeatPolicy:
             - self.max_healthy_server_gap_seconds
         )
 
+    @property
+    def max_guaranteed_monitor_lateness_seconds(self) -> float:
+        """Largest real monitor lateness for which exit precedes adoption.
+
+        Inequality (4) of the module docstring. The monitor that first
+        observes the stale edge does so no later than ``p + cap +
+        monitor_interval + L`` and exits ``exit_margin`` later; the
+        successor is eligible no earlier than ``p + adoption_silence``. So
+        the exit is guaranteed to precede adoption exactly when ``L`` is
+        below this value, which equals ``scheduler_slack +
+        monitor_interval`` whenever the cap is not floored at the failure
+        budget. A wake later than this is an exit-guarantee breach for
+        that beat, whether or not a guard loss coincided.
+        """
+        return max(
+            0.0,
+            self.adoption_silence_seconds
+            - self.server_proven_cap_seconds
+            - self.monitor_interval_seconds
+            - self.exit_margin_seconds,
+        )
+
+    def exit_guarantee_overrun_seconds(self, monitor_lateness_seconds: float) -> float:
+        """How far one monitor wake pushed the worst-case exit past adoption.
+
+        Zero while the wake is within
+        :attr:`max_guaranteed_monitor_lateness_seconds`; otherwise the time
+        by which the process could still have been alive after the
+        successor's adoption edge on that beat, had its guard session died.
+        """
+        return max(
+            0.0,
+            float(monitor_lateness_seconds)
+            - self.max_guaranteed_monitor_lateness_seconds,
+        )
+
     def violations(self) -> tuple[str, ...]:
         """Reasons this policy cannot guarantee exit before adoption."""
         reasons: list[str] = []
@@ -417,7 +628,8 @@ class WriterLeaseHeartbeatPolicy:
             f"exit_envelope={self.exit_envelope_seconds:g}s "
             f"=> server_proven_cap={self.server_proven_cap_seconds:g}s "
             f"healthy_gap={self.max_healthy_server_gap_seconds:g}s "
-            f"surplus={self.stability_surplus_seconds:g}s"
+            f"surplus={self.stability_surplus_seconds:g}s "
+            f"max_monitor_lateness={self.max_guaranteed_monitor_lateness_seconds:g}s"
         )
 
 
@@ -442,6 +654,15 @@ class WriterLeaseVerificationPhases:
     consumed the safety envelope?".  Every heartbeat attempt now finishes
     with this breakdown, the monitor's hard exit quotes the last one, and
     the metrics surface exposes it with fixed cardinality.
+
+    ``slot_wait + guard_sql + scheduler_delay == total``.
+    ``client_resume`` is the part of ``scheduler_delay`` that fell inside a
+    statement's round trip (issue #227): PostgreSQL had answered, or the
+    answer was in transit, and this process had not yet resumed.  It is
+    only non-zero when the statement reported its own server-side
+    execution time (``server_reported``); otherwise ``guard_sql`` is the
+    whole client-measured span, as it was before #227, which is the
+    conservative reading.
     """
 
     mode: str
@@ -451,13 +672,17 @@ class WriterLeaseVerificationPhases:
     statement_count: int
     scheduler_delay_seconds: float
     total_seconds: float
+    client_resume_seconds: float = 0.0
+    server_reported: bool = False
 
     def summary(self) -> str:
         return (
             f"mode={self.mode} outcome={self.outcome} "
             f"slot_wait={self.slot_wait_seconds:.3f}s "
             f"guard_sql={self.guard_sql_seconds:.3f}s"
-            f"({self.statement_count} stmt) "
+            f"({self.statement_count} stmt"
+            f"{', server-timed' if self.server_reported else ''}) "
+            f"client_resume={self.client_resume_seconds:.3f}s "
             f"scheduler={self.scheduler_delay_seconds:.3f}s "
             f"total={self.total_seconds:.3f}s"
         )
@@ -467,6 +692,7 @@ class WriterLeaseVerificationPhases:
         return {
             "guard_slot_wait": self.slot_wait_seconds,
             "guard_sql": self.guard_sql_seconds,
+            "guard_client_resume": self.client_resume_seconds,
             "scheduler_delay": self.scheduler_delay_seconds,
             "total": self.total_seconds,
         }
@@ -503,6 +729,8 @@ class WriterLeaseVerificationAttempt:
         "_statement_count",
         "_pending_send",
         "_proven_edge",
+        "_server_seconds",
+        "_server_reported",
     )
 
     def __init__(
@@ -528,6 +756,11 @@ class WriterLeaseVerificationAttempt:
         # that cannot overstate freshness.
         self._pending_send = self._started
         self._proven_edge = self._started
+        # Server-reported execution time, summed over the statements that
+        # reported one (issue #227). Kept apart from the client marks: it
+        # refines the attribution and never touches the proven edge.
+        self._server_seconds = 0.0
+        self._server_reported = False
 
     @property
     def started_monotonic(self) -> float:
@@ -563,6 +796,29 @@ class WriterLeaseVerificationAttempt:
         self._statement_count += 1
         return self._proven_edge
 
+    def statement_server_seconds(self, seconds: float | None) -> None:
+        """One guarded statement reported its own server-side execution time.
+
+        ``seconds`` is ``clock_timestamp() - statement_timestamp()`` as
+        evaluated by the statement itself, so it excludes the answer's
+        transit and everything this process did after receipt.  ``None``
+        (a statement that does not report, or a malformed value) leaves
+        the attribution on its conservative client-side reading.  Never
+        consulted for the server-proven edge: a server clock reading is
+        not a monotonic instant in this process, and the exit-ordering
+        proof needs the send edge.
+        """
+        if seconds is None:
+            return
+        try:
+            value = float(seconds)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(value) or value < 0.0:
+            return
+        self._server_seconds += value
+        self._server_reported = True
+
     def finish(self, outcome: str) -> WriterLeaseVerificationPhases:
         finished = self._monotonic()
         total = max(0.0, finished - self._started)
@@ -572,13 +828,24 @@ class WriterLeaseVerificationAttempt:
             else 0.0
         )
         # Statement 1 spans [slot acquisition, first response]; statement k
-        # spans [response k-1, response k]. The sub-millisecond client gap
-        # between them is charged to SQL, which keeps the attribution
-        # conservative rather than flattering the database.
+        # spans [response k-1, response k]. Without server-reported timing
+        # the sub-millisecond client gap between them is charged to SQL,
+        # which keeps the attribution conservative rather than flattering
+        # the database. With it, guard_sql is the server's own execution
+        # time (clamped to the span it must physically fit inside) and the
+        # rest of the span is client resume: transit plus this process's
+        # delay in handling an answer PostgreSQL had already given, which
+        # is the GIL stall issue #227 could not see.
         if self._last_statement_end is not None and self._slot_acquired is not None:
-            guard_sql = max(0.0, self._last_statement_end - self._slot_acquired)
+            statement_span = max(0.0, self._last_statement_end - self._slot_acquired)
         else:
-            guard_sql = 0.0
+            statement_span = 0.0
+        if self._server_reported:
+            guard_sql = min(statement_span, self._server_seconds)
+            client_resume = statement_span - guard_sql
+        else:
+            guard_sql = statement_span
+            client_resume = 0.0
         return WriterLeaseVerificationPhases(
             mode=self.mode,
             outcome=outcome,
@@ -587,4 +854,6 @@ class WriterLeaseVerificationAttempt:
             statement_count=self._statement_count,
             scheduler_delay_seconds=max(0.0, total - slot_wait - guard_sql),
             total_seconds=total,
+            client_resume_seconds=client_resume,
+            server_reported=self._server_reported,
         )

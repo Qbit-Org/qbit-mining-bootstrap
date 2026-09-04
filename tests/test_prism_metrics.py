@@ -96,7 +96,10 @@ from lab.prism.writer_lease_timing import (
     LEASE_HEARTBEAT_OUTCOMES,
     LEASE_HEARTBEAT_PHASES,
     LEASE_HEARTBEAT_POLICY_TERMS,
+    LEASE_MONITOR_LATE_WAKE_SLACK_FRACTIONS,
+    LEASE_MONITOR_WAKE_DELAY_BUCKETS,
 )
+from lab.prism.background_services import PRISM_GC_PAUSE_SECONDS_BUCKETS
 from tests import prism_vardiff_test_support as support
 
 
@@ -733,11 +736,19 @@ def reference_lease_heartbeat_metrics_lines(server) -> list[str]:
     last_phases = snapshot["last_phase_seconds"]
     worst_phases = snapshot["worst_phase_seconds"]
     policy_seconds = snapshot["policy_seconds"]
+    wakes = snapshot["monitor_wakes"]
+    probe = snapshot["stall_probe"]
     assert isinstance(attempts, dict)
     assert isinstance(outcomes, dict)
     assert isinstance(last_phases, dict)
     assert isinstance(worst_phases, dict)
     assert isinstance(policy_seconds, dict)
+    assert isinstance(wakes, dict)
+    assert isinstance(probe, dict)
+    wake_buckets = wakes["buckets"]
+    late_wakes = wakes["late_wakes"]
+    assert isinstance(wake_buckets, dict)
+    assert isinstance(late_wakes, dict)
     return [
         "# HELP qbit_prism_lease_heartbeat_running Whether the writer-lease heartbeat thread is alive.",
         "# TYPE qbit_prism_lease_heartbeat_running gauge",
@@ -781,7 +792,85 @@ def reference_lease_heartbeat_metrics_lines(server) -> list[str]:
             f'qbit_prism_lease_heartbeat_policy_seconds{{term="{term}"}} {float(policy_seconds.get(term, 0.0)):.6f}'
             for term in LEASE_HEARTBEAT_POLICY_TERMS
         ],
+        "# HELP qbit_prism_lease_heartbeat_monitor_wake_lateness_seconds Lateness of every heartbeat-monitor poll wake (issue #227); express the wake-delay alert on this or on the late-wake counters, not on the lifetime gauge.",
+        "# TYPE qbit_prism_lease_heartbeat_monitor_wake_lateness_seconds histogram",
+        *[
+            f'qbit_prism_lease_heartbeat_monitor_wake_lateness_seconds_bucket{{le="{bucket:g}"}} {int(wake_buckets.get(bucket, 0))}'
+            for bucket in LEASE_MONITOR_WAKE_DELAY_BUCKETS
+        ],
+        f'qbit_prism_lease_heartbeat_monitor_wake_lateness_seconds_bucket{{le="+Inf"}} {int(wakes["count"])}',
+        f'qbit_prism_lease_heartbeat_monitor_wake_lateness_seconds_sum {float(wakes["sum"]):.6f}',
+        f'qbit_prism_lease_heartbeat_monitor_wake_lateness_seconds_count {int(wakes["count"])}',
+        "# HELP qbit_prism_lease_heartbeat_monitor_late_wakes_total Monitor wakes at least the labelled fraction of the policy's scheduler slack late.",
+        "# TYPE qbit_prism_lease_heartbeat_monitor_late_wakes_total counter",
+        *[
+            f'qbit_prism_lease_heartbeat_monitor_late_wakes_total{{slack_fraction="{fraction}"}} {int(late_wakes.get(fraction, 0))}'
+            for fraction in LEASE_MONITOR_LATE_WAKE_SLACK_FRACTIONS
+        ],
+        "# HELP qbit_prism_lease_heartbeat_monitor_wake_delay_window_max_seconds Worst monitor wake lateness inside the trailing 300s window; falls back once a stall ages out, unlike the lifetime gauge.",
+        "# TYPE qbit_prism_lease_heartbeat_monitor_wake_delay_window_max_seconds gauge",
+        f"qbit_prism_lease_heartbeat_monitor_wake_delay_window_max_seconds {float(wakes['window_max_seconds']):.6f}",
+        "# HELP qbit_prism_lease_heartbeat_monitor_wake_delay_record_age_seconds Seconds since the lifetime monitor wake-delay record was last raised.",
+        "# TYPE qbit_prism_lease_heartbeat_monitor_wake_delay_record_age_seconds gauge",
+        f"qbit_prism_lease_heartbeat_monitor_wake_delay_record_age_seconds {float(wakes['record_age_seconds']):.6f}",
+        "# HELP qbit_prism_lease_heartbeat_monitor_exit_guarantee_breaches_total Monitor wakes later than the policy's max_guaranteed_monitor_lateness: beats on which exit-before-adoption was not guaranteed (issue #227).",
+        "# TYPE qbit_prism_lease_heartbeat_monitor_exit_guarantee_breaches_total counter",
+        f"qbit_prism_lease_heartbeat_monitor_exit_guarantee_breaches_total {int(snapshot['exit_guarantee_breaches'])}",
+        "# HELP qbit_prism_lease_heartbeat_monitor_worst_exit_guarantee_overrun_seconds Worst amount by which a late monitor wake could have placed the hard exit after the successor's adoption edge.",
+        "# TYPE qbit_prism_lease_heartbeat_monitor_worst_exit_guarantee_overrun_seconds gauge",
+        f"qbit_prism_lease_heartbeat_monitor_worst_exit_guarantee_overrun_seconds {float(snapshot['worst_exit_guarantee_overrun_seconds']):.6f}",
+        "# HELP qbit_prism_lease_heartbeat_stall_probe_samples_total Stack samples the stall probe took on monitor wakes at least half a scheduler slack late.",
+        "# TYPE qbit_prism_lease_heartbeat_stall_probe_samples_total counter",
+        f"qbit_prism_lease_heartbeat_stall_probe_samples_total {int(probe['samples'])}",
+        "# HELP qbit_prism_lease_heartbeat_stall_probe_suppressed_total Stall-probe triggers refused by its rate limit (at most 3 samples per 60s).",
+        "# TYPE qbit_prism_lease_heartbeat_stall_probe_suppressed_total counter",
+        f"qbit_prism_lease_heartbeat_stall_probe_suppressed_total {int(probe['suppressed'])}",
+        "# HELP qbit_prism_lease_heartbeat_monitor_breach_warnings_suppressed_total Lateness-beyond-slack warnings the monitor refused under its rate limit (at most 3 per 60s); the breaches themselves are still counted.",
+        "# TYPE qbit_prism_lease_heartbeat_monitor_breach_warnings_suppressed_total counter",
+        f"qbit_prism_lease_heartbeat_monitor_breach_warnings_suppressed_total {int(snapshot['slack_breach_warnings_suppressed'])}",
     ]
+
+
+def reference_gc_pause_metrics_lines(server) -> list[str]:
+    pauses = server._ensure_lease_heartbeat_service().snapshot()["gc_pauses"]
+    assert isinstance(pauses, dict)
+    lines = [
+        "# HELP qbit_prism_process_gc_pause_seconds Cyclic collector pause duration per generation, from gc.callbacks; the qbit_prism_process_gc_* count families say how many passes ran, this says how long each held the interpreter.",
+        "# TYPE qbit_prism_process_gc_pause_seconds histogram",
+    ]
+    for generation in PRISM_GC_GENERATIONS:
+        entry = pauses[generation]
+        buckets = entry["buckets"]
+        lines.extend(
+            f'qbit_prism_process_gc_pause_seconds_bucket{{generation="{generation}",le="{bucket:g}"}} {int(buckets.get(bucket, 0))}'
+            for bucket in PRISM_GC_PAUSE_SECONDS_BUCKETS
+        )
+        lines.append(
+            f'qbit_prism_process_gc_pause_seconds_bucket{{generation="{generation}",le="+Inf"}} {int(entry["count"])}'
+        )
+        lines.append(
+            f'qbit_prism_process_gc_pause_seconds_sum{{generation="{generation}"}} {float(entry["sum"]):.6f}'
+        )
+        lines.append(
+            f'qbit_prism_process_gc_pause_seconds_count{{generation="{generation}"}} {int(entry["count"])}'
+        )
+    lines.extend(
+        [
+            "# HELP qbit_prism_process_gc_last_pause_seconds Duration of the most recent cyclic collector pass per generation.",
+            "# TYPE qbit_prism_process_gc_last_pause_seconds gauge",
+            *[
+                f'qbit_prism_process_gc_last_pause_seconds{{generation="{generation}"}} {float(pauses[generation]["last_seconds"]):.6f}'
+                for generation in PRISM_GC_GENERATIONS
+            ],
+            "# HELP qbit_prism_process_gc_max_pause_seconds Longest cyclic collector pass observed per generation since the lease heartbeat armed.",
+            "# TYPE qbit_prism_process_gc_max_pause_seconds gauge",
+            *[
+                f'qbit_prism_process_gc_max_pause_seconds{{generation="{generation}"}} {float(pauses[generation]["max_seconds"]):.6f}'
+                for generation in PRISM_GC_GENERATIONS
+            ],
+        ]
+    )
+    return lines
 
 
 def reference_shutdown_metrics_lines(server) -> list[str]:
@@ -1671,6 +1760,7 @@ def reference_render_metrics_payload(server) -> str:
     lines.extend(reference_initial_delivery_metrics_lines(server))
     lines.extend(server.progress_health_metrics_lines())
     lines.extend(reference_accepted_preview_attribution_metrics_lines(server))
+    lines.extend(reference_gc_pause_metrics_lines(server))
     lines.extend(reference_process_heap_metrics_lines(PINNED_HEAP_SAMPLE))
     lines.extend(reference_component_cardinality_metrics_lines(server))
     return "\n".join(lines) + "\n"
@@ -1981,9 +2071,20 @@ class MetricsRenderParityTests(unittest.TestCase):
             'qbit_prism_vardiff_lane_accepted_shares_per_second{lane="default"}',
             'qbit_prism_lease_heartbeat_attempts_total{mode="proof"}',
             'qbit_prism_lease_heartbeat_phase_seconds{phase="guard_slot_wait"}',
+            'qbit_prism_lease_heartbeat_phase_seconds{phase="guard_client_resume"}',
             'qbit_prism_lease_heartbeat_policy_seconds{term="scheduler_slack"}',
             'qbit_prism_lease_heartbeat_policy_seconds{term="exit_envelope"}',
             'qbit_prism_lease_heartbeat_policy_seconds{term="server_proven_cap"}',
+            'qbit_prism_lease_heartbeat_policy_seconds{term="max_guaranteed_monitor_lateness"} 0.550000',
+            'qbit_prism_lease_heartbeat_monitor_wake_lateness_seconds_bucket{le="+Inf"}',
+            'qbit_prism_lease_heartbeat_monitor_late_wakes_total{slack_fraction="1.0"}',
+            "qbit_prism_lease_heartbeat_monitor_wake_delay_window_max_seconds",
+            "qbit_prism_lease_heartbeat_monitor_wake_delay_record_age_seconds",
+            "qbit_prism_lease_heartbeat_monitor_exit_guarantee_breaches_total",
+            "qbit_prism_lease_heartbeat_stall_probe_samples_total",
+            "qbit_prism_lease_heartbeat_monitor_breach_warnings_suppressed_total",
+            'qbit_prism_process_gc_pause_seconds_bucket{generation="2",le="+Inf"}',
+            'qbit_prism_process_gc_max_pause_seconds{generation="0"}',
             "qbit_prism_block_candidate_cleanup_retry_backlog 1",
             f"qbit_prism_block_candidate_cleanup_retry_backlog_max {DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX}",
             "qbit_prism_block_candidate_cleanup_retry_pending_share_holders 1",
@@ -3127,6 +3228,199 @@ class HeapAndComponentCardinalityTelemetryTests(unittest.TestCase):
         start.assert_not_called()
         take_snapshot.assert_not_called()
         self.assertFalse(tracemalloc.is_tracing())
+
+
+# Issue #227: the closed family sets of the monitor-lateness signals and the
+# GC pause durations; tests pin the renderer to both.
+LEASE_MONITOR_STALL_METRIC_FAMILIES = (
+    ("qbit_prism_lease_heartbeat_monitor_wake_lateness_seconds", "histogram"),
+    ("qbit_prism_lease_heartbeat_monitor_late_wakes_total", "counter"),
+    ("qbit_prism_lease_heartbeat_monitor_wake_delay_window_max_seconds", "gauge"),
+    ("qbit_prism_lease_heartbeat_monitor_wake_delay_record_age_seconds", "gauge"),
+    ("qbit_prism_lease_heartbeat_monitor_exit_guarantee_breaches_total", "counter"),
+    ("qbit_prism_lease_heartbeat_monitor_worst_exit_guarantee_overrun_seconds", "gauge"),
+    ("qbit_prism_lease_heartbeat_stall_probe_samples_total", "counter"),
+    ("qbit_prism_lease_heartbeat_stall_probe_suppressed_total", "counter"),
+    ("qbit_prism_lease_heartbeat_monitor_breach_warnings_suppressed_total", "counter"),
+)
+GC_PAUSE_METRIC_FAMILIES = (
+    ("qbit_prism_process_gc_pause_seconds", "histogram"),
+    ("qbit_prism_process_gc_last_pause_seconds", "gauge"),
+    ("qbit_prism_process_gc_max_pause_seconds", "gauge"),
+)
+
+
+class LeaseMonitorStallTelemetryTests(unittest.TestCase):
+    """Issue #227: the re-armable monitor-lateness signals and GC pauses."""
+
+    @staticmethod
+    def _series_keys(lines: list[str]) -> list[tuple[str, tuple[tuple[str, str], ...]]]:
+        return [
+            (family, tuple(sorted(labels.items())))
+            for family, labels, _value in (
+                _parse_series(line) for line in lines if not line.startswith("#")
+            )
+        ]
+
+    def test_monitor_wake_delay_histogram_and_threshold_counters_are_pinned(
+        self,
+    ) -> None:
+        """Family set, bucket boundaries and the slack-fraction counters.
+
+        All fixed cardinality: the series set after two thousand more
+        observations is identical to the series set before them. The
+        lifetime ``..._monitor_wake_delay_seconds`` gauge still renders.
+        """
+        server = support.coordinator()
+        service = server._ensure_lease_heartbeat_service()
+        slack = service.policy().scheduler_slack_seconds
+        # The renderer's snapshot reads the service clock (time.monotonic
+        # here), so the seeded wakes are stamped on that clock too; the
+        # rolling window and the record age are then read at "now".
+        now = time.monotonic() - 10.0
+        for delay in [0.0] * 100 + [0.3] * 40 + [0.45] * 30 + [0.6] * 20:
+            now += 0.05
+            service.monitor_wakes.observe(delay, slack_seconds=slack, now=now)
+        service.monitor_wakes.observe(0.648, slack_seconds=slack, now=now + 0.05)
+        # The lifetime gauge is the monitor loop's own high-water mark.
+        service.monitor_wake_delay_seconds = 0.648
+        renderer = MetricsRenderer(server)
+        lines = renderer.lease_heartbeat_metrics_lines()
+
+        families = _type_families(lines)
+        self.assertIn(
+            ("qbit_prism_lease_heartbeat_monitor_wake_delay_seconds", "gauge"), families
+        )
+        self.assertIn("qbit_prism_lease_heartbeat_monitor_wake_delay_seconds 0.648000", lines)
+        self.assertEqual(
+            families[-len(LEASE_MONITOR_STALL_METRIC_FAMILIES):],
+            list(LEASE_MONITOR_STALL_METRIC_FAMILIES),
+        )
+        # Bucket boundaries are the closed set plus +Inf, cumulative.
+        histogram = "qbit_prism_lease_heartbeat_monitor_wake_lateness_seconds"
+        bucket_lines = [line for line in lines if line.startswith(histogram + "_bucket{")]
+        self.assertEqual(
+            [_parse_series(line)[1] for line in bucket_lines],
+            [{"le": f"{bucket:g}"} for bucket in LEASE_MONITOR_WAKE_DELAY_BUCKETS]
+            + [{"le": "+Inf"}],
+        )
+        counts = [int(_parse_series(line)[2]) for line in bucket_lines]
+        self.assertEqual(counts, sorted(counts))
+        self.assertEqual(counts[-1], 191)
+        self.assertEqual(_series_value(lines, histogram + "_count"), 191)
+        by_bound = dict(zip(LEASE_MONITOR_WAKE_DELAY_BUCKETS, counts))
+        self.assertEqual(by_bound[0.001], 100)
+        self.assertEqual(by_bound[0.4], 140)
+        self.assertEqual(by_bound[0.5], 170)
+        self.assertEqual(by_bound[0.75], 191)
+        # The 0.5 / 0.8 / 1.0 x slack counters, exactly that label set.
+        counter = "qbit_prism_lease_heartbeat_monitor_late_wakes_total"
+        fraction_lines = [line for line in lines if line.startswith(counter + "{")]
+        self.assertEqual(
+            [_parse_series(line)[1]["slack_fraction"] for line in fraction_lines],
+            list(LEASE_MONITOR_LATE_WAKE_SLACK_FRACTIONS),
+        )
+        self.assertEqual(_series_value(lines, counter + '{slack_fraction="0.5"}'), 91)
+        self.assertEqual(_series_value(lines, counter + '{slack_fraction="0.8"}'), 51)
+        self.assertEqual(_series_value(lines, counter + '{slack_fraction="1.0"}'), 21)
+        # Rolling maximum, record age, the breach counters and the probe.
+        self.assertIn(
+            "qbit_prism_lease_heartbeat_monitor_wake_delay_window_max_seconds 0.648000",
+            lines,
+        )
+        self.assertTrue(
+            any(
+                line.startswith(
+                    "qbit_prism_lease_heartbeat_monitor_wake_delay_record_age_seconds "
+                )
+                for line in lines
+            )
+        )
+        self.assertEqual(
+            _series_value(lines, "qbit_prism_lease_heartbeat_monitor_exit_guarantee_breaches_total"),
+            0,
+        )
+        self.assertEqual(
+            _series_value(lines, "qbit_prism_lease_heartbeat_stall_probe_samples_total"), 0
+        )
+        # Suppressed breach warnings are exported alongside the probe's.
+        service.suppressed_slack_breach_warnings = 4
+        self.assertEqual(
+            _series_value(
+                renderer.lease_heartbeat_metrics_lines(),
+                "qbit_prism_lease_heartbeat_monitor_breach_warnings_suppressed_total",
+            ),
+            4,
+        )
+        # The policy term alerts compare against, and the new phase.
+        self.assertIn(
+            'qbit_prism_lease_heartbeat_policy_seconds{term="max_guaranteed_monitor_lateness"} 0.550000',
+            lines,
+        )
+        self.assertEqual(
+            [
+                _parse_series(line)[1]["phase"]
+                for line in lines
+                if line.startswith("qbit_prism_lease_heartbeat_phase_seconds{")
+            ],
+            list(LEASE_HEARTBEAT_PHASES),
+        )
+        self.assertIn("guard_client_resume", LEASE_HEARTBEAT_PHASES)
+        # Fixed cardinality: traffic moves values, never the series set.
+        before = self._series_keys(lines)
+        for _ in range(2_000):
+            now += 0.05
+            service.monitor_wakes.observe(1.7, slack_seconds=slack, now=now)
+        self.assertEqual(self._series_keys(renderer.lease_heartbeat_metrics_lines()), before)
+
+    def test_gc_pause_families_are_pinned_to_the_closed_generation_set(self) -> None:
+        server = support.coordinator()
+        service = server._ensure_lease_heartbeat_service()
+        service.gc_pauses.record("2", 0.3)
+        service.gc_pauses.record("0", 0.0004)
+        service.gc_pauses.record("7", 9.0)  # not a CPython generation: dropped
+        renderer = MetricsRenderer(server)
+        lines = renderer.gc_pause_metrics_lines()
+        self.assertEqual(_type_families(lines), list(GC_PAUSE_METRIC_FAMILIES))
+        rendered: dict[str, list[str]] = {}
+        for line in lines:
+            if line.startswith("#"):
+                continue
+            family, labels, _value = _parse_series(line)
+            self.assertEqual(set(labels) - {"le"}, {"generation"})
+            self.assertIn(labels["generation"], PRISM_GC_GENERATIONS)
+            if family == "qbit_prism_process_gc_pause_seconds_bucket":
+                rendered.setdefault(labels["generation"], []).append(labels["le"])
+        for generation in PRISM_GC_GENERATIONS:
+            self.assertEqual(
+                rendered[generation],
+                [f"{bucket:g}" for bucket in PRISM_GC_PAUSE_SECONDS_BUCKETS] + ["+Inf"],
+            )
+        self.assertEqual(
+            _series_value(lines, 'qbit_prism_process_gc_pause_seconds_count{generation="2"}'),
+            1,
+        )
+        self.assertEqual(
+            _series_value(lines, 'qbit_prism_process_gc_pause_seconds_count{generation="1"}'),
+            0,
+        )
+        self.assertIn('qbit_prism_process_gc_last_pause_seconds{generation="2"} 0.300000', lines)
+        self.assertIn('qbit_prism_process_gc_max_pause_seconds{generation="0"} 0.000400', lines)
+        # In the full document the block sits immediately before the issue
+        # #226 heap block it complements.
+        type_lines = [
+            line for line in server.metrics_payload().splitlines()
+            if line.startswith("# TYPE ")
+        ]
+        index = type_lines.index("# TYPE qbit_prism_process_gc_pause_seconds histogram")
+        self.assertEqual(
+            type_lines[index : index + len(GC_PAUSE_METRIC_FAMILIES)],
+            [f"# TYPE {family} {kind}" for family, kind in GC_PAUSE_METRIC_FAMILIES],
+        )
+        self.assertEqual(
+            type_lines[index + len(GC_PAUSE_METRIC_FAMILIES)],
+            "# TYPE qbit_prism_process_allocated_blocks gauge",
+        )
 
 
 if __name__ == "__main__":

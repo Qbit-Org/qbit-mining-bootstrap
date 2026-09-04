@@ -1594,6 +1594,9 @@ class FakePostgres:
         self.statement_latency_seconds: (
             Callable[[Statement], float] | None
         ) = None
+        # Server time charged to the statement currently being evaluated;
+        # the guard statements report it as server_execution_seconds.
+        self._last_statement_server_seconds = 0.0
         # Landing tables. Insertion-ordered dicts, because the trace and every
         # assertion made against them has to be order-stable across runs.
         self.pool_blocks: dict[str, PoolBlockRow] = {}
@@ -1759,7 +1762,11 @@ class FakePostgres:
             effective_timeout = session_bound
             timeout_kind = "statement"
         try:
-            self._charge_execution_latency(
+            # The modelled server time is also what the guard statements
+            # report about themselves (issue #227): production computes
+            # clock_timestamp() - statement_timestamp() inside the
+            # statement, and here that is exactly the latency just charged.
+            self._last_statement_server_seconds = self._charge_execution_latency(
                 statement,
                 effective_timeout,
                 timeout_kind,
@@ -1786,8 +1793,11 @@ class FakePostgres:
         statement: Statement,
         timeout_seconds: float | None,
         timeout_kind: str,
-    ) -> None:
+    ) -> float:
         """Spend modelled server time for this statement, honouring its bound.
+
+        Returns the seconds charged, which the guard statements report back
+        as their own ``server_execution_seconds`` (issue #227).
 
         Lock waits were already modelled (``_await_lease_lock``); this is the
         other half — a statement that is simply *slow*, which is what the
@@ -1805,16 +1815,17 @@ class FakePostgres:
         """
         latency_for = self.statement_latency_seconds
         if latency_for is None:
-            return
+            return 0.0
         latency = float(latency_for(statement) or 0.0)
         if latency <= 0.0:
-            return
+            return 0.0
         if timeout_seconds is not None and latency > timeout_seconds:
             self.clock.advance(max(0.0, timeout_seconds))
             raise LockTimeout(
                 f"canceling statement due to {timeout_kind} timeout"
             )
         self.clock.advance(latency)
+        return latency
 
     def _evaluate(
         self,
@@ -2219,6 +2230,9 @@ class FakePostgres:
                 exact
                 and snapshot.lease_expires_at <= now + timedelta(seconds=margin)
             ),
+            "server_execution_seconds": float(
+                self._last_statement_server_seconds
+            ),
         }
 
     def _evaluate_verify(
@@ -2281,6 +2295,9 @@ class FakePostgres:
                 and snapshot.lease_expires_at <= now + timedelta(seconds=margin)
             ),
             "lease_locked_by_this_process": bool(locked_by_this_process),
+            "server_execution_seconds": float(
+                self._last_statement_server_seconds
+            ),
         }
 
     # -- block candidate landing -------------------------------------------
@@ -2950,6 +2967,7 @@ class FakeLeaseGuard:
         *,
         on_query_start: Callable[[], None] | None = None,
         on_statement_end: Callable[[], None] | None = None,
+        on_statement_result: Callable[[Any], None] | None = None,
         followup: Callable[[Any], str | None] | None = None,
     ) -> Any:
         actor = self.server.scheduler.current()
@@ -2973,8 +2991,13 @@ class FakeLeaseGuard:
                     tag=self.tag,
                 )
             )
+            # Same order as the native guard: the client-side end mark,
+            # then the parsed result (which carries the statement's own
+            # server execution time, issue #227).
             if on_statement_end is not None:
                 on_statement_end()
+            if on_statement_result is not None:
+                on_statement_result(result)
             while followup is not None:
                 next_sql = followup(result)
                 if next_sql is None:
@@ -2990,6 +3013,8 @@ class FakeLeaseGuard:
                 )
                 if on_statement_end is not None:
                     on_statement_end()
+                if on_statement_result is not None:
+                    on_statement_result(result)
             return result
         finally:
             self._slot_owner = None
