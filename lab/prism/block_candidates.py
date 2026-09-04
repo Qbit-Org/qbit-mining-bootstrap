@@ -28,6 +28,15 @@ from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Iterator, Protocol
 
 from lab.prism import direct_stratum
+from lab.prism.accepted_preview_telemetry import (
+    LANDING_PHASE_LANE_WAIT,
+    LANDING_PHASE_PREVIEW_PREPARE,
+    LANDING_PHASE_PREVIEW_PUBLISH,
+    PRISM_ACCEPTED_LANDING_PHASES,
+    RECONCILE_CALLER_LANDING,
+    AcceptedPreviewPublicationDiagnostic,
+    ensure_accepted_preview_telemetry,
+)
 from lab.prism.coordinator_config import (
     BLOCK_LANDING_DB_TIMEOUT_WATCHDOG_FRACTION,
     DEFAULT_ACCEPTED_PARENT_REDRIVE_ATTEMPT_MAX,
@@ -323,6 +332,11 @@ PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_SECONDS_BUCKETS = (
 # Max-block admission and the physical block rate keep the live population
 # far below it; this is a leak bound, not a working set.
 MAX_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_STAMPS = 512
+# Issue #224: the event name of the one bounded structured line each closed
+# acceptance-to-publication interval emits. It is the only place in this
+# lane's output where a block hash and height appear alongside the timings;
+# the phase metrics carry the fixed phase label and nothing else.
+PRISM_ACCEPTED_LANDING_LOG_EVENT = "accepted_block_preview_landing"
 # The terminal cleanup one won row owes, in the order the apply runs it.
 # A deferred retry replays exactly the steps its own hash still owes, so
 # the step names are a closed set: a retry can never repeat a step that
@@ -833,6 +847,59 @@ class _BlockCandidateChainView:
         return difficulty
 
 
+@dataclass
+class _AcceptedLandingAttribution:
+    """One landing's in-flight phase attribution, keyed by block hash.
+
+    Issue #224. A landing's sub-phases are measured on the accounting and
+    block-work threads, while the interval they belong to is owned by the
+    acceptance stamp taken on the submitter thread; the block hash is the only
+    identity both sides share, exactly as it is for the stamp itself.
+
+    ``phase_seconds`` accumulates only while that hash's interval is open, so
+    a stretch that ran before definitive acceptance -- the fallback landing
+    that submits inside the balance serializer reaches its reconcile and
+    chain-probe stretches before the offer resolves -- and a retry's stretch
+    after the interval already closed both land in the process-wide phase
+    family without ever being claimed by a landing's diagnostic.
+    """
+
+    block_height: int | None = None
+    phase_seconds: dict[str, float] = field(default_factory=dict)
+    lane_wait_recorded: bool = False
+    publish_started_monotonic: float | None = None
+
+
+def _accepted_landing_log(event: str, **fields: object) -> None:
+    """Single-line JSON lifecycle log, the payout-artifact line's shape."""
+    print(
+        "prism coordinator: "
+        + json.dumps({"event": event, **fields}, sort_keys=True),
+        flush=True,
+    )
+
+
+def _accepted_landing_candidate_identity(
+    candidate: Any,
+) -> tuple[str | None, int | None]:
+    """This candidate's hash and height, or ``None`` when unreadable.
+
+    Attribution is observability: a candidate shape this cannot read must
+    never turn the start of a landing into an exception.
+    """
+    try:
+        block_hash = str(candidate.submission.block_hash_hex).lower()
+    except Exception:
+        return (None, None)
+    if not block_hash:
+        return (None, None)
+    try:
+        block_height: int | None = int(candidate.context.template["height"])
+    except Exception:
+        block_height = None
+    return (block_hash, block_height)
+
+
 @dataclass(frozen=True)
 class PrismBlockCandidate:
     """A block-worthy submission queued for the block-submitter thread.
@@ -1338,6 +1405,15 @@ class BlockCandidateService:
         }
         self._accepted_block_preview_acceptance_monotonic: dict[
             str, float | None
+        ] = {}
+        # Issue #224: the landing phase attribution for the hashes whose
+        # intervals are open, under the same leaf lock as the stamps above and
+        # bounded by the same cap with the same oldest-first eviction. A record
+        # is popped by the publication that closes its interval and discarded
+        # on terminal abandonment, so like the stamps this cap is a leak bound
+        # rather than a working set.
+        self._accepted_landing_attributions: dict[
+            str, _AcceptedLandingAttribution
         ] = {}
         self._block_replay_enumeration_owed_flag = False
         # A forced enumeration that meets cleanup backpressure adopts at
@@ -2176,6 +2252,7 @@ class BlockCandidateService:
                         invalidate_published=True,
                     )
                     coordinator._clear_accepted_block_payout_preview(block_hash)
+                    self._discard_accepted_landing_attribution(block_hash)
                 except Exception:
                     note_failure(
                         block_hash,
@@ -5366,7 +5443,28 @@ class BlockCandidateService:
                     raise RuntimeError(
                         "block candidate is waiting for fast-lane capacity"
                     )
+                # Everything from definitive acceptance to here was queue,
+                # disposition and admission time the landing itself did not
+                # control (issue #224). A candidate whose earlier pass already
+                # stamped acceptance closes its lane here, before the retained
+                # offer is even looked up, so none of this landing's own work
+                # can reach ``lane_wait``.
+                self._note_accepted_landing_lane_start(candidate)
                 node_submission = coordinator._node_submission_for_candidate_or_retained(candidate)
+                # A *fresh* candidate has no stamp until the call above makes
+                # the offer, so the close before it found no interval to
+                # measure. Close again now that one may exist: it is a no-op
+                # once this interval's lane was recorded, so the retained case
+                # keeps the earlier, tighter sample and the fresh case reports
+                # the zero queue time it genuinely had rather than no sample
+                # at all.
+                self._note_accepted_landing_lane_start(candidate)
+                # Both closes sit above the attempt marker on purpose. The
+                # marker is this landing's own PostgreSQL write: charging it
+                # to ``lane_wait`` would grow the one stretch that exonerates
+                # the landing exactly when the writer is degraded, and a
+                # marker that timed out would keep growing it across the
+                # retry backoff.
                 coordinator._mark_block_candidate_attempted(block_hash)
                 with coordinator._block_landing_ledger_statement_timeout_scope(block_hash):
                     # The same-hash disposition is already held here, so the
@@ -5856,6 +5954,9 @@ class BlockCandidateService:
             return
         if reason in self.retryable_reasons:
             return
+        # Terminal for this hash: no later attempt can close its interval, so
+        # the phase state it accumulated has no consumer left (issue #224).
+        self._discard_accepted_landing_attribution(block_hash)
         stale_job_class = getattr(outcome, "stale_job_class", None)
         key = block_hash.lower()
         with self._coordinator.lock:
@@ -6703,6 +6804,7 @@ class BlockCandidateService:
         """Run one direct landing attempt and structure its outcome."""
         self.outcome.reason = None
         error = "candidate became stale or submission failed"
+        self._note_accepted_landing_lane_start(candidate)
         try:
             accepted = self.ports.submit_candidate(candidate)
         except Exception:
@@ -6770,8 +6872,21 @@ class BlockCandidateService:
                 error=error,
                 outcome=outcome,
             )
+        # The queue, disposition and admission time ends here: everything
+        # below is work this landing runs (issue #224). A candidate whose
+        # earlier pass already stamped acceptance closes its lane here, before
+        # any retained offer is resolved.
+        self._note_accepted_landing_lane_start(candidate)
         if node_submission is None:
             node_submission = coordinator._node_submission_for_candidate_or_retained(candidate)
+        # A fresh candidate is stamped by the offer that call makes, so the
+        # close above found no interval. Close again against the stamp that
+        # now exists; it is a no-op once this interval's lane was recorded.
+        self._note_accepted_landing_lane_start(candidate)
+        # Both closes sit above the attempt marker on purpose. The marker is
+        # this landing's own PostgreSQL write, and a degraded writer must not
+        # inflate the one stretch that exonerates the landing -- nor keep
+        # inflating it across the retry backoff a timed-out marker triggers.
         try:
             coordinator._mark_block_candidate_attempted(block_hash)
         except Exception:
@@ -7444,12 +7559,22 @@ class BlockCandidateService:
                 # rather than staying coordination-blocked across the
                 # deferral cycles until the accepted tail republishes it.
                 try:
-                    coordinator._publish_accepted_block_payout_preview(
+                    with self._accepted_landing_phase(
                         block_hash,
-                        coordinator._materialize_prior_balance_preview(
+                        LANDING_PHASE_PREVIEW_PREPARE,
+                        block_height=expected_height,
+                    ):
+                        materialized = coordinator._materialize_prior_balance_preview(
                             withdrawn_transition.preview
-                        ),
-                    )
+                        )
+                    with self._accepted_landing_publish_span(
+                        block_hash,
+                        block_height=expected_height,
+                    ):
+                        coordinator._publish_accepted_block_payout_preview(
+                            block_hash,
+                            materialized,
+                        )
                 except Exception:
                     print(
                         "prism coordinator: could not republish withdrawn "
@@ -7656,6 +7781,304 @@ class BlockCandidateService:
                 for stale in list(stamps)[:overflow]:
                     del stamps[stale]
 
+    def _accepted_landing_attribution_locked(
+        self,
+        key: str,
+        *,
+        block_height: int | None = None,
+    ) -> _AcceptedLandingAttribution:
+        """Get or create one hash's record; the caller holds the leaf lock.
+
+        Bounded exactly as the acceptance stamps are: past the shared cap the
+        oldest entries are evicted. The record returned here was just inserted
+        at the newest end, so the trim can never drop the one in use.
+        """
+        records = self._accepted_landing_attributions
+        record = records.get(key)
+        if record is None:
+            record = _AcceptedLandingAttribution()
+            records[key] = record
+            overflow = (
+                len(records) - MAX_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_STAMPS
+            )
+            if overflow > 0:
+                for stale in list(records)[:overflow]:
+                    del records[stale]
+        if block_height is not None and record.block_height is None:
+            record.block_height = int(block_height)
+        return record
+
+    def _accepted_landing_interval_open_locked(self, key: str) -> bool:
+        """Whether this hash's acceptance-to-publication interval is running."""
+        stamps = self._accepted_block_preview_acceptance_monotonic
+        return stamps.get(key) is not None
+
+    def _commit_accepted_landing_phase(
+        self,
+        telemetry: Any,
+        key: str,
+        phase: str,
+        seconds: float,
+        *,
+        block_height: int | None = None,
+    ) -> None:
+        """Record one measured sub-phase of a landing.
+
+        The family observation is unconditional -- every stretch a landing ran
+        belongs in the phase histogram, and its only label is the fixed phase
+        name. Only the per-landing diagnostic is conditional, because a stretch
+        outside an open interval was not part of the latency that interval
+        measures.
+        """
+        elapsed = max(0.0, float(seconds))
+        with self._accepted_block_preview_publication_lock:
+            if self._accepted_landing_interval_open_locked(key):
+                record = self._accepted_landing_attribution_locked(
+                    key,
+                    block_height=block_height,
+                )
+                record.phase_seconds[phase] = (
+                    float(record.phase_seconds.get(phase, 0.0)) + elapsed
+                )
+        # Deliberately outside the leaf lock: the shared telemetry owner has a
+        # lock of its own, and this one never nests.
+        telemetry.observe_landing_phase(phase, elapsed)
+
+    @contextmanager
+    def _accepted_landing_phase(
+        self,
+        block_hash: str,
+        phase: str,
+        *,
+        block_height: int | None = None,
+    ) -> Iterator[None]:
+        """Time one landing sub-phase; records on every exit, raising or not.
+
+        The phase name is validated and the shared owner resolved before the
+        guarded body, so everything the ``finally`` below runs is arithmetic
+        under two leaf locks and can never replace the exception a failing
+        stretch is raising.
+        """
+        if phase not in PRISM_ACCEPTED_LANDING_PHASES:
+            raise ValueError(f"unknown accepted landing phase: {phase!r}")
+        telemetry = ensure_accepted_preview_telemetry(self._coordinator)
+        key = str(block_hash).lower()
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            self._commit_accepted_landing_phase(
+                telemetry,
+                key,
+                phase,
+                time.monotonic() - started,
+                block_height=block_height,
+            )
+
+    def _close_accepted_landing_lane_wait(
+        self,
+        block_hash: str,
+        *,
+        block_height: int | None = None,
+    ) -> None:
+        """Close ``lane_wait`` where the lane starts this hash's landing task.
+
+        Once per open interval. A retried landing re-enters the lane, and
+        measuring again from the same acceptance stamp would charge the retry's
+        queue time to a stretch the first attempt already owns -- and would
+        keep growing that stretch for as long as the candidate kept retrying.
+        """
+        key = str(block_hash).lower()
+        now = time.monotonic()
+        with self._accepted_block_preview_publication_lock:
+            started = self._accepted_block_preview_acceptance_monotonic.get(key)
+            if started is None:
+                # No definitive acceptance was stamped for this hash in this
+                # process, or its interval already closed. There is no lane
+                # wait to measure either way.
+                return
+            record = self._accepted_landing_attribution_locked(
+                key,
+                block_height=block_height,
+            )
+            if record.lane_wait_recorded:
+                return
+            record.lane_wait_recorded = True
+            elapsed = max(0.0, now - float(started))
+            record.phase_seconds[LANDING_PHASE_LANE_WAIT] = elapsed
+        ensure_accepted_preview_telemetry(self._coordinator).observe_landing_phase(
+            LANDING_PHASE_LANE_WAIT,
+            elapsed,
+        )
+
+    def _note_accepted_landing_lane_start(self, candidate: Any) -> None:
+        """Close ``lane_wait`` for the candidate whose landing starts now."""
+        block_hash, block_height = _accepted_landing_candidate_identity(candidate)
+        if block_hash is None:
+            return
+        self._close_accepted_landing_lane_wait(
+            block_hash,
+            block_height=block_height,
+        )
+
+    @contextmanager
+    def _accepted_landing_publish_span(
+        self,
+        block_hash: str,
+        *,
+        block_height: int | None = None,
+    ) -> Iterator[None]:
+        """Time ``preview_publish`` up to the preview's visibility instant.
+
+        The publication path closes the interval from inside the publish call,
+        so a plain timer around that call would record its phase after the
+        diagnostic had already been built from an empty cell. The span is
+        opened here and closed by whichever comes first: the observer below, at
+        the visibility instant it already measures, or this context manager's
+        exit when the call published nothing this hash was waiting for. Never
+        both -- the start value is the span's token.
+
+        The record is allocated only for an open interval, exactly as every
+        other stretch allocates one. A startup replay or a chain-proven
+        candidate publishes without an in-process acceptance stamp, and the
+        observer returns before it can pop anything; a record opened for one of
+        those would be reported as in flight forever and would spend a slot the
+        bound reserves for live landings. The family observation below stays
+        unconditional either way -- every stretch a landing ran belongs in the
+        phase histogram.
+        """
+        telemetry = ensure_accepted_preview_telemetry(self._coordinator)
+        key = str(block_hash).lower()
+        started = time.monotonic()
+        with self._accepted_block_preview_publication_lock:
+            attributed = self._accepted_landing_interval_open_locked(key)
+            if attributed:
+                record = self._accepted_landing_attribution_locked(
+                    key,
+                    block_height=block_height,
+                )
+                record.publish_started_monotonic = started
+        try:
+            yield
+        finally:
+            self._close_accepted_landing_publish_span(
+                telemetry,
+                key,
+                started,
+                attributed=attributed,
+            )
+
+    def _close_accepted_landing_publish_span(
+        self,
+        telemetry: Any,
+        key: str,
+        started: float,
+        *,
+        attributed: bool = True,
+    ) -> None:
+        """Close a publish span this caller still owns, if it still owns it.
+
+        ``attributed`` is what the span found when it opened: False means no
+        interval was running and no record was allocated, so there is nothing
+        to own and nothing the observer could have taken -- only the family
+        histogram is owed a sample.
+        """
+        ended = time.monotonic()
+        elapsed = max(0.0, ended - started)
+        with self._accepted_block_preview_publication_lock:
+            if attributed:
+                record = self._accepted_landing_attributions.get(key)
+                if record is None or record.publish_started_monotonic != started:
+                    # The observer closed this span at the visibility instant
+                    # and recorded it there, or terminal cleanup discarded the
+                    # record while the publication was in flight.
+                    return
+                record.publish_started_monotonic = None
+                if self._accepted_landing_interval_open_locked(key):
+                    record.phase_seconds[LANDING_PHASE_PREVIEW_PUBLISH] = (
+                        float(
+                            record.phase_seconds.get(
+                                LANDING_PHASE_PREVIEW_PUBLISH, 0.0
+                            )
+                        )
+                        + elapsed
+                    )
+                else:
+                    # The interval closed under this publication without the
+                    # observer taking the span: the acceptance stamp aged out
+                    # of the shared cap. Nothing can build a diagnostic from
+                    # this record now, so drop it rather than leave it in
+                    # flight for the bound to evict a live landing over.
+                    self._accepted_landing_attributions.pop(key, None)
+        telemetry.observe_landing_phase(LANDING_PHASE_PREVIEW_PUBLISH, elapsed)
+
+    def _discard_accepted_landing_attribution(self, block_hash: str) -> None:
+        """Drop one hash's in-flight phase state on terminal disposition.
+
+        Nothing can close the interval of a hash that will never publish, so
+        its record has no consumer left. The cap above would evict it
+        eventually; dropping it here keeps a storm of terminal candidates from
+        pushing live landings out of the bound.
+        """
+        key = str(block_hash).lower()
+        with self._accepted_block_preview_publication_lock:
+            self._accepted_landing_attributions.pop(key, None)
+
+    def accepted_landing_attribution_snapshot(self) -> dict[str, dict[str, float]]:
+        """Copied in-flight per-hash phase state, oldest first."""
+        with self._accepted_block_preview_publication_lock:
+            return {
+                key: dict(record.phase_seconds)
+                for key, record in self._accepted_landing_attributions.items()
+            }
+
+    def _record_accepted_landing_diagnostic(
+        self,
+        key: str,
+        *,
+        result: str,
+        elapsed: float,
+        record: _AcceptedLandingAttribution | None,
+        publish_seconds: float | None,
+    ) -> None:
+        """Retain and log one closed landing, outside the leaf lock.
+
+        The rescan and ledger totals stay at the contract's neutral values.
+        This lane can obtain no per-landing causal evidence for either without
+        reading a process-wide delta, and such a read here would claim whatever
+        else the process happened to be doing -- a concurrent job build's
+        rescan, another lane's ledger reads -- as this block's work. The
+        separately attributed rescan and ledger-read families answer those
+        questions without the race.
+        """
+        telemetry = ensure_accepted_preview_telemetry(self._coordinator)
+        if publish_seconds is not None:
+            telemetry.observe_landing_phase(
+                LANDING_PHASE_PREVIEW_PUBLISH,
+                publish_seconds,
+            )
+        try:
+            diagnostic = AcceptedPreviewPublicationDiagnostic(
+                block_hash=key,
+                block_height=None if record is None else record.block_height,
+                result=result,
+                acceptance_to_publication_seconds=elapsed,
+                phase_seconds=(
+                    dict(record.phase_seconds) if record is not None else {}
+                ),
+                reconcile_caller=RECONCILE_CALLER_LANDING,
+            )
+            telemetry.record_publication_diagnostic(diagnostic)
+            _accepted_landing_log(
+                PRISM_ACCEPTED_LANDING_LOG_EVENT,
+                **diagnostic.log_fields(),
+            )
+        except Exception:
+            # Attribution is observability. A record the contract refuses, or
+            # a log line that cannot be written, must not fail a publication
+            # that has already made the preview visible to waiting children.
+            traceback.print_exc()
+
     def _observe_accepted_block_preview_publication(
         self,
         block_hash: str,
@@ -7668,6 +8091,11 @@ class BlockCandidateService:
         made the preview visible to children already waiting on the
         transition, which is the latency the 5 s child wait budget is spent
         against. Later matching republications observe nothing.
+
+        That same first publication owns the landing's attribution (issue
+        #224): it is the only moment at which the interval, the phases
+        measured under it, and the publication result are all known and
+        final, so the diagnostic is built here and nowhere else.
         """
         key = str(block_hash).lower()
         published = time.monotonic()
@@ -7701,6 +8129,34 @@ class BlockCandidateService:
             for bucket in tuple(buckets):
                 if elapsed <= bucket:
                     buckets[bucket] = int(buckets.get(bucket, 0)) + 1
+            # Pop the landing's attribution under the same lock that
+            # tombstoned the stamp, so a retry or a later republication of
+            # this hash can never build a second diagnostic for it. An open
+            # publish span belongs to this call: the preview is visible to
+            # waiting children exactly now.
+            record = self._accepted_landing_attributions.pop(key, None)
+            publish_seconds: float | None = None
+            if record is not None and record.publish_started_monotonic is not None:
+                publish_seconds = max(
+                    0.0,
+                    published - float(record.publish_started_monotonic),
+                )
+                record.publish_started_monotonic = None
+                record.phase_seconds[LANDING_PHASE_PREVIEW_PUBLISH] = (
+                    float(
+                        record.phase_seconds.get(LANDING_PHASE_PREVIEW_PUBLISH, 0.0)
+                    )
+                    + publish_seconds
+                )
+        # Outside the leaf lock: the telemetry owner locks for itself and the
+        # lifecycle line is I/O.
+        self._record_accepted_landing_diagnostic(
+            key,
+            result=result,
+            elapsed=elapsed,
+            record=record,
+            publish_seconds=publish_seconds,
+        )
 
 
 class BlockCandidateCompatibilityField:

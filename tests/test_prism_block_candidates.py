@@ -4805,7 +4805,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             [("watch", 10), ("mature", 10), ("watch", 10), ("mature", 10)],
         )
 
-    def test_payout_change_forces_publication_and_builds_artifact(self) -> None:
+    def test_payout_change_forces_publication_and_rereads_balances(self) -> None:
         tip = "5d" * 32
         pool_block_hash = "ae" * 32
         ledger = ReorgLedger([])
@@ -4839,7 +4839,12 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         self.assertEqual(second["inactive_blocks"], 1)
         self.assertEqual(second["published_generation"], 2)
         self.assertEqual(len(build_calls), 2)
-        self.assertTrue(build_calls[1][2])
+        self.assertEqual(
+            build_calls[1][2:],
+            (False, True),
+            "a confirmed payout mutation keeps the exact share window and "
+            "only rereads current prior balances",
+        )
         self.assertEqual(ledger.rows[0]["chain_state"], "inactive")
         self.assertIn(("inactive", pool_block_hash, 10), ledger.events)
 
@@ -6443,7 +6448,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
     def _reconcile_coordinator_with_artifact_counter(
         ledger: ReorgLedger,
         rpc: ReorgRpc,
-    ) -> tuple[PrismCoordinator, list[tuple[int, int, bool]]]:
+    ) -> tuple[PrismCoordinator, list[tuple[int, int, bool, bool]]]:
         """Coordinator armed so candidate preparation would build an artifact."""
         server = coordinator()
         server.reorg_reconciler_enabled = True
@@ -6455,7 +6460,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
         server._payout_artifact_executor_shutdown = True
         server._pool_ready_latched = True
         server._template_artifacts = SimpleNamespace(network_difficulty=1)
-        build_calls: list[tuple[int, int, bool]] = []
+        build_calls: list[tuple[int, int, bool, bool]] = []
 
         def fake_build(
             expected_payout_state_generation: int,
@@ -6464,6 +6469,8 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             force_full_rescan: bool = False,
             bypass_build_interval: bool = False,
             during_publication: bool = False,
+            *,
+            force_prior_balances_read: bool = False,
         ) -> None:
             del network_difficulty, bypass_build_interval, during_publication
             build_calls.append(
@@ -6471,6 +6478,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
                     expected_payout_state_generation,
                     artifact_payout_state_generation,
                     force_full_rescan,
+                    force_prior_balances_read,
                 )
             )
             return None

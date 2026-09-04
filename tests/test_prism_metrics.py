@@ -26,6 +26,16 @@ from lab.prism.coordinator_config import (
     DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS,
     DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS,
 )
+from lab.prism.accepted_preview_telemetry import (
+    PRISM_ACCEPTED_LANDING_PHASES,
+    PRISM_PAYOUT_WINDOW_FULL_RESCAN_PATHS,
+    PRISM_PAYOUT_WINDOW_FULL_RESCAN_REASONS,
+    PRISM_REORG_RECONCILE_CALLERS,
+    PRISM_REORG_RECONCILE_STEPS,
+    AcceptedPreviewTelemetry,
+    ensure_accepted_preview_telemetry,
+    fold_ledger_read_stats,
+)
 from lab.prism.block_candidates import (
     PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_RESULTS,
     PRISM_ACCEPTED_BLOCK_PREVIEW_PUBLICATION_SECONDS_BUCKETS,
@@ -335,7 +345,11 @@ def reference_landing_observability_metrics_lines(server) -> list[str]:
             ]
         )
     read_gate_fn = getattr(server.ledger, "ledger_read_gate_stats", None)
-    read_gate_stats = read_gate_fn() if callable(read_gate_fn) else {}
+    read_gate_stats = (
+        fold_ledger_read_stats(read_gate_fn() or {})
+        if callable(read_gate_fn)
+        else {}
+    )
     if read_gate_stats:
         families = (
             (
@@ -880,6 +894,79 @@ def reference_vardiff_convergence_metrics_lines(server) -> list[str]:
     ]
 
 
+def reference_accepted_preview_attribution_metrics_lines(server) -> list[str]:
+    snapshot = ensure_accepted_preview_telemetry(server).snapshot()
+    landing = snapshot["landing_phases"]
+    passes = snapshot["reconcile_passes"]
+    steps = snapshot["reconcile_steps"]
+    rescans = snapshot["full_rescans"]
+
+    def summary(name: str, labels: str, stats: dict[str, object]) -> list[str]:
+        return [
+            f'{name}_sum{{{labels}}} {float(stats["sum"]):.6f}',
+            f'{name}_count{{{labels}}} {int(stats["count"])}',
+            f'{name}_max{{{labels}}} {float(stats["max"]):.6f}',
+        ]
+
+    lines = [
+        "# HELP qbit_prism_accepted_block_landing_phase_seconds Accepted-block landing wall time between definitive node acceptance and payout preview publication, by bounded sub-phase; prior_balances_check is a prior-balances reread, never a payout-window rescan.",
+        "# TYPE qbit_prism_accepted_block_landing_phase_seconds summary",
+    ]
+    for phase in PRISM_ACCEPTED_LANDING_PHASES:
+        lines.extend(
+            summary(
+                "qbit_prism_accepted_block_landing_phase_seconds",
+                f'phase="{phase}"',
+                landing[phase],
+            )
+        )
+    lines.extend(
+        [
+            "# HELP qbit_prism_reorg_reconcile_pass_seconds Reorg reconciliation passes by bounded caller; _count is the pass count, and a pass minus the sum of its steps is the unattributed remainder.",
+            "# TYPE qbit_prism_reorg_reconcile_pass_seconds summary",
+        ]
+    )
+    for caller in PRISM_REORG_RECONCILE_CALLERS:
+        lines.extend(
+            summary(
+                "qbit_prism_reorg_reconcile_pass_seconds",
+                f'caller="{caller}"',
+                passes[caller],
+            )
+        )
+    lines.extend(
+        [
+            "# HELP qbit_prism_reorg_reconcile_step_seconds Reorg reconciliation wall time by bounded caller and step; admission_wait is writer admission plus the payout-balance mutation lock, and candidate_prepare is where a reconcile_invalidation full rescan executes.",
+            "# TYPE qbit_prism_reorg_reconcile_step_seconds summary",
+        ]
+    )
+    for caller in PRISM_REORG_RECONCILE_CALLERS:
+        for step in PRISM_REORG_RECONCILE_STEPS:
+            lines.extend(
+                summary(
+                    "qbit_prism_reorg_reconcile_step_seconds",
+                    f'caller="{caller}",step="{step}"',
+                    steps[(caller, step)],
+                )
+            )
+    lines.extend(
+        [
+            "# HELP qbit_prism_payout_window_full_rescan_seconds Full payout-window oracle rescans by bounded reason and window pipeline path; a prior-balances reread is a ledger read operation, not an observation here.",
+            "# TYPE qbit_prism_payout_window_full_rescan_seconds summary",
+        ]
+    )
+    for reason in PRISM_PAYOUT_WINDOW_FULL_RESCAN_REASONS:
+        for path in PRISM_PAYOUT_WINDOW_FULL_RESCAN_PATHS:
+            lines.extend(
+                summary(
+                    "qbit_prism_payout_window_full_rescan_seconds",
+                    f'reason="{reason}",path="{path}"',
+                    rescans[(reason, path)],
+                )
+            )
+    return lines
+
+
 def reference_render_metrics_payload(server) -> str:
     ledger_metrics = server.ledger.metrics()
     audit_metrics = server.audit_artifact_metrics()
@@ -1308,6 +1395,7 @@ def reference_render_metrics_payload(server) -> str:
     lines.extend(server.payout_state_metrics_lines())
     lines.extend(reference_initial_delivery_metrics_lines(server))
     lines.extend(server.progress_health_metrics_lines())
+    lines.extend(reference_accepted_preview_attribution_metrics_lines(server))
     return "\n".join(lines) + "\n"
 
 
@@ -1431,6 +1519,9 @@ class MetricsRenderParityTests(unittest.TestCase):
         }
         # Issue #211's attribution: local admission and server execution are
         # separate series so a budget exhaustion names the half it went to.
+        # Issue #224 Wave 0: a contract operation renders under its own
+        # name, an operation outside PRISM_LEDGER_READ_OPERATIONS folds
+        # into ``other`` instead of opening a series.
         server.ledger.ledger_read_gate_stats = lambda: {
             "pending_block_candidate_rows": {
                 "calls_total": 7,
@@ -1440,8 +1531,42 @@ class MetricsRenderParityTests(unittest.TestCase):
                 "execute_seconds_total": 4.5,
                 "execute_seconds_max": 2.25,
                 "execute_timeouts_total": 2,
-            }
+            },
+            "current_prior_balances": {
+                "calls_total": 3,
+                "gate_wait_seconds_total": 0.5,
+                "gate_wait_seconds_max": 0.4,
+                "gate_timeouts_total": 0,
+                "execute_seconds_total": 0.75,
+                "execute_seconds_max": 0.5,
+                "execute_timeouts_total": 0,
+            },
+            "legacy_probe": {
+                "calls_total": 1,
+                "gate_wait_seconds_total": 0.01,
+                "gate_wait_seconds_max": 0.01,
+                "gate_timeouts_total": 0,
+                "execute_seconds_total": 0.02,
+                "execute_seconds_max": 0.02,
+                "execute_timeouts_total": 0,
+            },
         }
+        # Issue #224 Wave 0's attribution families, seeded through the
+        # shared owner every lane will record into, including one
+        # out-of-vocabulary rescan reason that must fold into ``other``.
+        telemetry = ensure_accepted_preview_telemetry(server)
+        telemetry.observe_landing_phase("reconcile", 0.25)
+        telemetry.observe_landing_phase("reconcile", 0.75)
+        telemetry.observe_landing_phase("preview_publish", 0.05)
+        telemetry.observe_reconcile_pass("landing", 0.5)
+        telemetry.observe_reconcile_step("landing", "watch_query", 0.125)
+        telemetry.observe_reconcile_step("post_confirm", "candidate_prepare", 3.5)
+        telemetry.observe_payout_window_full_rescan(
+            "reconcile_invalidation", "daemon", 3.5
+        )
+        telemetry.observe_payout_window_full_rescan(
+            "not-a-contract-reason", "in_process", 0.5
+        )
         server.ledger.block_candidate_pending_metrics = lambda: {
             "pending_count": 2,
             "oldest_pending_age_seconds": 1.5,
@@ -1528,8 +1653,21 @@ class MetricsRenderParityTests(unittest.TestCase):
             "qbit_prism_block_candidate_cleanup_backpressure_active 0",
             "qbit_prism_block_candidate_cleanup_backpressure_total 1",
             'qbit_prism_block_candidate_collapse_total{outcome="backlog_deferred"} 2',
+            'qbit_prism_ledger_read_calls_total{operation="current_prior_balances"} 3',
+            'qbit_prism_ledger_read_calls_total{operation="other"} 1',
+            'qbit_prism_accepted_block_landing_phase_seconds_count{phase="reconcile"} 2',
+            'qbit_prism_accepted_block_landing_phase_seconds_max{phase="reconcile"} 0.750000',
+            'qbit_prism_accepted_block_landing_phase_seconds_sum{phase="lane_wait"} 0.000000',
+            'qbit_prism_reorg_reconcile_pass_seconds_count{caller="landing"} 1',
+            'qbit_prism_reorg_reconcile_step_seconds_sum{caller="landing",step="watch_query"} 0.125000',
+            'qbit_prism_reorg_reconcile_step_seconds_max{caller="post_confirm",step="candidate_prepare"} 3.500000',
+            'qbit_prism_payout_window_full_rescan_seconds_count{reason="reconcile_invalidation",path="daemon"} 1',
+            'qbit_prism_payout_window_full_rescan_seconds_count{reason="other",path="in_process"} 1',
+            'qbit_prism_payout_window_full_rescan_seconds_count{reason="window_daemon_state_lost",path="daemon"} 0',
         ):
             self.assertIn(needle, actual)
+        self.assertNotIn('operation="legacy_probe"', actual)
+        self.assertNotIn("not-a-contract-reason", actual)
         # The oldest-age gauge is a real elapsed interval, not the -1
         # sentinel, once a record is owed.
         oldest = [
@@ -1886,6 +2024,104 @@ class MetricsRendererTests(unittest.TestCase):
         lines = MetricsRenderer(server).block_submitter_metrics_lines()
         self.assertIn(
             'qbit_prism_block_candidate_collapse_total{outcome="backlog_deferred"} 0',
+            lines,
+        )
+
+    def test_accepted_preview_attribution_formatter_consumes_one_owner_snapshot(
+        self,
+    ) -> None:
+        """Issue #224 Wave 0: one snapshot read, four closed-product families."""
+        snapshot_calls = 0
+        telemetry = AcceptedPreviewTelemetry()
+        telemetry.observe_landing_phase("balance_lock_wait", 1.5)
+        telemetry.observe_reconcile_pass("tip_refresh", 0.25)
+        telemetry.observe_reconcile_step("tip_refresh", "admission_wait", 0.2)
+        telemetry.observe_payout_window_full_rescan(
+            "window_daemon_state_lost", "in_process", 2.0
+        )
+        real_snapshot = telemetry.snapshot
+
+        def snapshot() -> dict[str, object]:
+            nonlocal snapshot_calls
+            snapshot_calls += 1
+            return real_snapshot()
+
+        telemetry.snapshot = snapshot  # type: ignore[method-assign]
+        port = SimpleNamespace(_accepted_preview_telemetry=telemetry)
+        lines = MetricsRenderer(port).accepted_preview_attribution_metrics_lines()  # type: ignore[arg-type]
+
+        self.assertEqual(snapshot_calls, 1)
+        self.assertIn(
+            'qbit_prism_accepted_block_landing_phase_seconds_max{phase="balance_lock_wait"} 1.500000',
+            lines,
+        )
+        self.assertIn(
+            'qbit_prism_reorg_reconcile_pass_seconds_count{caller="tip_refresh"} 1',
+            lines,
+        )
+        self.assertIn(
+            'qbit_prism_reorg_reconcile_step_seconds_sum{caller="tip_refresh",step="admission_wait"} 0.200000',
+            lines,
+        )
+        self.assertIn(
+            'qbit_prism_payout_window_full_rescan_seconds_count{reason="window_daemon_state_lost",path="in_process"} 1',
+            lines,
+        )
+        # Every cell of every closed product renders, at zero when unobserved.
+        expected_samples = 3 * (
+            len(PRISM_ACCEPTED_LANDING_PHASES)
+            + len(PRISM_REORG_RECONCILE_CALLERS)
+            + len(PRISM_REORG_RECONCILE_CALLERS) * len(PRISM_REORG_RECONCILE_STEPS)
+            + len(PRISM_PAYOUT_WINDOW_FULL_RESCAN_REASONS)
+            * len(PRISM_PAYOUT_WINDOW_FULL_RESCAN_PATHS)
+        )
+        self.assertEqual(
+            len([line for line in lines if not line.startswith("#")]),
+            expected_samples,
+        )
+
+    def test_ledger_read_operations_outside_the_contract_fold_into_other(
+        self,
+    ) -> None:
+        """Issue #224 Wave 0: the operation label cannot grow past the vocabulary."""
+        stats = {
+            "calls_total": 2,
+            "gate_wait_seconds_total": 0.25,
+            "gate_wait_seconds_max": 0.2,
+            "gate_timeouts_total": 1,
+            "execute_seconds_total": 1.0,
+            "execute_seconds_max": 0.75,
+            "execute_timeouts_total": 0,
+        }
+        port = SimpleNamespace(
+            ledger=SimpleNamespace(
+                ledger_read_gate_stats=lambda: {
+                    "zeta_probe": dict(stats),
+                    "pending_block_candidate_rows": dict(stats),
+                    "alpha_probe": dict(stats, gate_wait_seconds_max=0.9),
+                }
+            ),
+            prometheus_label_value=lambda value: value,
+        )
+        lines = MetricsRenderer(port)._ledger_read_gate_metric_lines()  # type: ignore[arg-type]
+
+        operations = [
+            line.split('operation="', 1)[1].split('"', 1)[0]
+            for line in lines
+            if line.startswith("qbit_prism_ledger_read_calls_total{")
+        ]
+        self.assertEqual(operations, ["other", "pending_block_candidate_rows"])
+        self.assertIn('qbit_prism_ledger_read_calls_total{operation="other"} 4', lines)
+        self.assertIn(
+            'qbit_prism_ledger_read_gate_wait_seconds_max{operation="other"} 0.900000',
+            lines,
+        )
+        self.assertIn(
+            'qbit_prism_ledger_read_gate_timeouts_total{operation="other"} 2',
+            lines,
+        )
+        self.assertIn(
+            'qbit_prism_ledger_read_calls_total{operation="pending_block_candidate_rows"} 2',
             lines,
         )
 

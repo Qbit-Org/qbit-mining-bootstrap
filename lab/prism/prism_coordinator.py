@@ -217,6 +217,9 @@ from lab.prism.block_finalization import (
     PRISM_REJECTION_SUBMITBLOCK_REJECTED,
     BlockFinalizationService,
 )
+from lab.prism.accepted_preview_telemetry import (
+    ensure_accepted_preview_telemetry,
+)
 from lab.prism.metrics import MetricsRenderer
 from lab.prism.reorg_reconciler import (
     DEFAULT_PRISM_RECONCILE_FLIGHT_WAIT_SECONDS,
@@ -4017,6 +4020,12 @@ class PrismCoordinator:
                     record_progress=lambda phase: (
                         self._record_block_submitter_phase(phase)
                     ),
+                    # Issue #224: the one attribution owner every lane and
+                    # the renderer share; resolved live so it is the same
+                    # object the metrics port reads.
+                    accepted_preview_telemetry=lambda: (
+                        ensure_accepted_preview_telemetry(self)
+                    ),
                 ),
                 enabled=bool(self.reorg_reconciler_enabled),
                 cache_seconds=self.reorg_reconcile_cache_seconds,
@@ -4169,9 +4178,9 @@ class PrismCoordinator:
         """Return an exact window using debounce, delta folding, or the oracle."""
         return self._ensure_payout_state_service()._incremental_payout_window_materialization(snapshot_anchor_ms=snapshot_anchor_ms, snapshot_window_weight=snapshot_window_weight, force_full_rescan=force_full_rescan, bypass_build_interval=bypass_build_interval, append_invalidation_epoch=append_invalidation_epoch, reused_prior_balances_sha256=reused_prior_balances_sha256)
 
-    def _build_payout_ledger_artifact(self, expected_payout_state_generation: int, artifact_payout_state_generation: int, network_difficulty: int, force_full_rescan: bool=False, bypass_build_interval: bool=False, during_publication: bool=False) -> PayoutLedgerArtifact | None:
+    def _build_payout_ledger_artifact(self, expected_payout_state_generation: int, artifact_payout_state_generation: int, network_difficulty: int, force_full_rescan: bool=False, bypass_build_interval: bool=False, during_publication: bool=False, *, force_prior_balances_read: bool=False) -> PayoutLedgerArtifact | None:
         """Build a stable ledger snapshot without publishing it."""
-        return self._ensure_payout_state_service()._build_payout_ledger_artifact(expected_payout_state_generation, artifact_payout_state_generation, network_difficulty, force_full_rescan, bypass_build_interval, during_publication)
+        return self._ensure_payout_state_service()._build_payout_ledger_artifact(expected_payout_state_generation, artifact_payout_state_generation, network_difficulty, force_full_rescan, bypass_build_interval, during_publication, force_prior_balances_read=force_prior_balances_read)
 
     def _prepare_payout_ledger_artifact(self, payout_state_generation: int, network_difficulty: int, *, bypass_build_interval: bool=False) -> None:
         """Prepare and atomically publish an artifact for a current generation."""
@@ -4494,8 +4503,8 @@ class PrismCoordinator:
     def _capture_payout_state_source(self) -> tuple[int, int, str | None, str, float]:
         return self._ensure_payout_state_service()._capture_payout_state_source()
 
-    def _prepared_payout_state_candidate(self, captured: tuple[int, int, str | None, str, float], *, force_full_window_rescan: bool=False, bypass_build_interval: bool=False) -> PayoutStateCandidate:
-        return self._ensure_payout_state_service()._prepared_payout_state_candidate(captured, force_full_window_rescan=force_full_window_rescan, bypass_build_interval=bypass_build_interval)
+    def _prepared_payout_state_candidate(self, captured: tuple[int, int, str | None, str, float], *, force_full_window_rescan: bool=False, force_prior_balances_read: bool=False, bypass_build_interval: bool=False) -> PayoutStateCandidate:
+        return self._ensure_payout_state_service()._prepared_payout_state_candidate(captured, force_full_window_rescan=force_full_window_rescan, force_prior_balances_read=force_prior_balances_read, bypass_build_interval=bypass_build_interval)
 
     def _cached_found_block_payout_artifact(self, *, base_generation: int, artifact_payout_state_generation: int, network_difficulty: int, fallback_reason: str) -> PayoutLedgerArtifact | None:
         """Retag an exact armed window when immediate preparation is unavailable."""
@@ -7506,16 +7515,20 @@ class PrismCoordinator:
         tip_hash: str,
         *,
         _coalesce_same_tip: bool = True,
+        _caller: str | None = None,
     ) -> bool:
         """Reconcile one tip, optionally bypassing same-tip flight reuse.
 
         Lock-owning accepted-block callers disable waiting for an existing
         leader because it may itself be waiting for the payout-balance
         mutation lock. Their own pass remains visible to ordinary followers.
+        ``_caller`` optionally names the #224 attribution caller; the
+        service infers ``landing`` from the flight bypass when omitted.
         """
         return self._ensure_reorg_reconciler_service().ensure_tip(
             tip_hash,
             _coalesce_same_tip=_coalesce_same_tip,
+            _caller=_caller,
         )
 
     def qbit_chain_view_untrusted(self) -> bool:
@@ -7647,18 +7660,22 @@ class PrismCoordinator:
         _force_publish: bool = False,
         _source_reserved: bool = False,
         _wait_for_same_tip_flight: bool = True,
+        _caller: str | None = None,
     ) -> dict[str, object]:
         """Public reconcile entrypoint: service flight admission runs first.
 
         Same-tip flight coalescing happens *before* the serialized adapter's
         writer admission so followers never queue behind it; see the service
-        docstring for the full contract.
+        docstring for the full contract. ``_caller`` optionally names the
+        #224 attribution caller; a forced publication without one is the
+        post-confirm path.
         """
         return self._ensure_reorg_reconciler_service().reconcile_with_flights(
             tip_hash=tip_hash,
             _force_publish=_force_publish,
             _source_reserved=_source_reserved,
             _wait_for_same_tip_flight=_wait_for_same_tip_flight,
+            _caller=_caller,
         )
 
     @ledger_writer_operation("payout_reconciliation")

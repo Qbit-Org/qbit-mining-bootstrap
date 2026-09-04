@@ -37,6 +37,11 @@ import threading
 import time
 from typing import Any, Callable, Iterator, Protocol, Sequence
 
+from lab.prism.accepted_preview_telemetry import (
+    FULL_RESCAN_PATH_DAEMON,
+    FULL_RESCAN_PATH_IN_PROCESS,
+    ensure_accepted_preview_telemetry,
+)
 from lab.prism.coordinator_config import (
     DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX,
     DEFAULT_PRISM_PAYOUT_ARTIFACT_FULL_RESCAN_SECONDS,
@@ -895,6 +900,23 @@ class PayoutStateService:
             for record in records
         )
 
+    def _observe_payout_window_full_rescan(
+        self,
+        reason: str,
+        path: str,
+        seconds: float,
+    ) -> None:
+        """Record one executed full oracle rescan in the #224 owner.
+
+        Only the two places that actually run the whole-window oracle call
+        this: ``_full_payout_window_materialization`` and the periodic
+        self-check inside the incremental materialization. A prior-balances
+        reread (``force_prior_balances_read``) never reaches here.
+        """
+        ensure_accepted_preview_telemetry(
+            self._runtime
+        ).observe_payout_window_full_rescan(reason, path, seconds)
+
     def _full_payout_window_materialization(
         self,
         *,
@@ -906,6 +928,40 @@ class PayoutStateService:
         bypass_build_interval: bool = False,
     ) -> _PayoutWindowMaterialization:
         """Run the exact ledger oracle and atomically replace cached pages."""
+        rescan_started = time.monotonic()
+        # The path is chosen by which pipeline folded the window; the ledger
+        # read and any daemon decline that degrades to the in-process fold
+        # belong to the rescan either way. Recorded on every exit so a
+        # rescan that dies with the ledger still owns its wall-clock.
+        rescan_path = FULL_RESCAN_PATH_IN_PROCESS
+        try:
+            materialized, rescan_path = self._full_payout_window_oracle(
+                snapshot_anchor_ms=snapshot_anchor_ms,
+                snapshot_window_weight=snapshot_window_weight,
+                reason=reason,
+                observed_monotonic=observed_monotonic,
+                append_invalidation_epoch=append_invalidation_epoch,
+                bypass_build_interval=bypass_build_interval,
+            )
+        finally:
+            self._observe_payout_window_full_rescan(
+                reason,
+                rescan_path,
+                time.monotonic() - rescan_started,
+            )
+        return materialized
+
+    def _full_payout_window_oracle(
+        self,
+        *,
+        snapshot_anchor_ms: int,
+        snapshot_window_weight: int,
+        reason: str,
+        observed_monotonic: float,
+        append_invalidation_epoch: int,
+        bypass_build_interval: bool = False,
+    ) -> tuple[_PayoutWindowMaterialization, str]:
+        """The oracle read plus fold; returns the window and the fold path."""
         runtime = self._runtime
 
         records = list(
@@ -925,14 +981,19 @@ class PayoutStateService:
             # expose the complete AcceptedShareRecord shape.
             runtime._incremental_payout_artifact_window = None
             shares_json = tuple(record.to_prism_json() for record in records)
-            return _PayoutWindowMaterialization(
-                shares_json=shares_json,
-                share_snapshot_sha256=self._canonical_json_sha256(shares_json),
-                snapshot_anchor_ms=int(snapshot_anchor_ms),
-                mode="full_rescan",
-                record_count=len(records),
-                stats=zero_stats,
-                full_rescan_reason=reason,
+            return (
+                _PayoutWindowMaterialization(
+                    shares_json=shares_json,
+                    share_snapshot_sha256=self._canonical_json_sha256(
+                        shares_json
+                    ),
+                    snapshot_anchor_ms=int(snapshot_anchor_ms),
+                    mode="full_rescan",
+                    record_count=len(records),
+                    stats=zero_stats,
+                    full_rescan_reason=reason,
+                ),
+                FULL_RESCAN_PATH_IN_PROCESS,
             )
 
         if self._window_pipeline_rust_enabled():
@@ -946,7 +1007,7 @@ class PayoutStateService:
                 bypass_build_interval=bypass_build_interval,
             )
             if materialized is not None:
-                return materialized
+                return materialized, FULL_RESCAN_PATH_DAEMON
             # Any daemon outcome that cannot produce a window here -- an
             # anomaly (already retired), the transport disabled, a daemon
             # another build owns, a snapshot the fold must reject, or a
@@ -974,14 +1035,17 @@ class PayoutStateService:
                 append_invalidation_epoch=append_invalidation_epoch,
             )
         )
-        return _PayoutWindowMaterialization(
-            shares_json=shares_json,
-            share_snapshot_sha256=digest,
-            snapshot_anchor_ms=int(snapshot_anchor_ms),
-            mode="full_rescan",
-            record_count=len(shares_json),
-            stats=zero_stats,
-            full_rescan_reason=reason,
+        return (
+            _PayoutWindowMaterialization(
+                shares_json=shares_json,
+                share_snapshot_sha256=digest,
+                snapshot_anchor_ms=int(snapshot_anchor_ms),
+                mode="full_rescan",
+                record_count=len(shares_json),
+                stats=zero_stats,
+                full_rescan_reason=reason,
+            ),
+            FULL_RESCAN_PATH_IN_PROCESS,
         )
 
     def _window_pipeline_rust_enabled(self) -> bool:
@@ -1374,6 +1438,10 @@ class PayoutStateService:
         balance_check_prior_balances: tuple[dict[str, object], ...] | None = None
         balance_check_mismatch = False
         if not bypass_build_interval and self_check_overdue:
+            # The self-check is a whole-window oracle read at the cached
+            # weight; it is recorded as a full rescan under its check reason
+            # (the periodic family) and always folds in-process.
+            self_check_started = time.monotonic()
             try:
                 # Within the tolerance band the cached and live snapshot
                 # weights legitimately differ. The match verdict must
@@ -1533,6 +1601,12 @@ class PayoutStateService:
                         check_reason = (
                             "periodic_self_check_balance_check_failed"
                         )
+            if check_reason is not None:
+                self._observe_payout_window_full_rescan(
+                    check_reason,
+                    FULL_RESCAN_PATH_IN_PROCESS,
+                    time.monotonic() - self_check_started,
+                )
 
         runtime._incremental_payout_artifact_window = advanced
         return _PayoutWindowMaterialization(
@@ -1555,6 +1629,8 @@ class PayoutStateService:
         force_full_rescan: bool = False,
         bypass_build_interval: bool = False,
         during_publication: bool = False,
+        *,
+        force_prior_balances_read: bool = False,
     ) -> PayoutLedgerArtifact | None:
         """Build a stable ledger snapshot without publishing it.
 
@@ -1564,6 +1640,14 @@ class PayoutStateService:
         reproducible no matter how many shares commit while the walk runs.
         Shares stamped above the anchor deterministically belong to the next
         window; concurrent writers therefore never invalidate this attempt.
+
+        ``force_full_rescan`` discards the incremental window and runs the
+        oracle (``reconcile_invalidation``), which also rereads the prior
+        balances. ``force_prior_balances_read`` is the narrower #224 intent:
+        the share window is still exact (reconciliation never writes
+        ``qbit_share_ledger``) but the published prior balances may not be,
+        so the window is reused through the normal debounce/delta path and
+        only the carry aggregate is read live. It is never a full rescan.
         """
         runtime = self._runtime
         runtime._ensure_job_cache_state()
@@ -1600,6 +1684,7 @@ class PayoutStateService:
                     invalidated_balances_sha256 = None
                 reuse_published_balances = bool(
                     not force_full_rescan
+                    and not force_prior_balances_read
                     and published_payout_artifact is not None
                     and published_payout_artifact.generation
                     == expected_payout_state_generation
@@ -1775,6 +1860,7 @@ class PayoutStateService:
             "during_publication": bool(during_publication),
             "build_interval_bypassed": bool(bypass_build_interval),
             "prior_balances_source": prior_balances_source,
+            "prior_balances_read_forced": bool(force_prior_balances_read),
             "balance_check_mismatch": materialized.balance_check_mismatch,
         }
         if materialized.full_rescan_reason is not None:
@@ -3504,8 +3590,16 @@ class PayoutStateService:
         captured: tuple[int, int, str | None, str, float],
         *,
         force_full_window_rescan: bool = False,
+        force_prior_balances_read: bool = False,
         bypass_build_interval: bool = False,
     ) -> PayoutStateCandidate:
+        """Prepare a candidate, optionally forcing the window or balance read.
+
+        ``force_full_window_rescan`` keeps its full fail-closed meaning (the
+        withdrawal path and every explicit caller). ``force_prior_balances_read``
+        is the reconciler's intent after a confirmed payout mutation: reuse
+        the exact armed share window and reread the carry aggregate (#224).
+        """
         runtime = self._runtime
         base_generation, source_generation, source_tip, cause, invalidated = captured
         ledger_artifact: PayoutLedgerArtifact | None = None
@@ -3545,6 +3639,13 @@ class PayoutStateService:
                 prepare_lock_acquired = runtime._payout_state_prepare_lock.acquire(
                     blocking=False
                 )
+            # Forwarded only when set: the build seam predates the intent
+            # and per-instance patches of it keep their exact signature.
+            build_intent: dict[str, bool] = (
+                {"force_prior_balances_read": True}
+                if force_prior_balances_read
+                else {}
+            )
             if prepare_lock_acquired:
                 try:
                     ledger_artifact = runtime._build_payout_ledger_artifact(
@@ -3554,6 +3655,7 @@ class PayoutStateService:
                         force_full,
                         bypass_interval,
                         True,
+                        **build_intent,
                     )
                 except self._shutdown_error:
                     raise
