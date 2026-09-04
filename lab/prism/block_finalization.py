@@ -16,7 +16,7 @@ fenced fallback calls B1's node-offer seam through the runtime.
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -27,6 +27,13 @@ import traceback
 from typing import Any, Callable, Iterator, Mapping, Protocol
 
 from lab.prism import direct_stratum, public_api
+from lab.prism.accepted_preview_telemetry import (
+    LANDING_PHASE_BALANCE_LOCK_WAIT,
+    LANDING_PHASE_CHAIN_PROBE,
+    LANDING_PHASE_PREVIEW_PREPARE,
+    LANDING_PHASE_PRIOR_BALANCES_CHECK,
+    LANDING_PHASE_RECONCILE,
+)
 from lab.prism.audit_artifacts import AuditArtifactStore, AuditPublicationIdentity
 from lab.prism.block_candidates import (
     PRISM_REJECTION_LEDGER_CONFIRMATION_SUPERSEDED,
@@ -253,6 +260,8 @@ class BlockFinalizationPort(Protocol):
     ) -> bool: ...
 
     def _ensure_audit_artifact_store(self) -> AuditArtifactStore: ...
+
+    def _ensure_block_candidate_service(self) -> Any: ...
 
     def _ensure_job_cache_state(self) -> None: ...
 
@@ -511,9 +520,77 @@ class BlockFinalizationService:
         # subclass override; the base implementation forwards to the port.
         self.runtime._record_block_candidate_progress(phase)
 
+    def _accepted_landing_owner(self) -> Any | None:
+        """The B1 owner of per-landing phase attribution (issue #224).
+
+        The landing's sub-phases are measured here, but the interval they
+        belong to is opened by B1 at definitive node acceptance and closed by
+        B1 at the first publication, so the per-hash state lives beside B1's
+        acceptance stamps rather than in this service. A runtime without that
+        seam -- the focused fakes that drive this service directly -- records
+        nothing and behaves exactly as before.
+        """
+        ensure = getattr(self.runtime, "_ensure_block_candidate_service", None)
+        if not callable(ensure):
+            return None
+        return ensure()
+
+    @contextmanager
+    def _landing_phase(
+        self,
+        phase: str,
+        *,
+        block_hash: str | None,
+        block_height: int | None = None,
+    ) -> Iterator[None]:
+        """Time one accepted-landing sub-phase through the B1 owner.
+
+        The owner is resolved before the guarded body, so the recording it
+        runs on the way out is arithmetic under leaf locks and can never
+        replace the exception a failing stretch is raising. A call with no
+        block hash -- the disposition-path reread that is not landing a
+        candidate -- times nothing.
+        """
+        owner = None if block_hash is None else self._accepted_landing_owner()
+        if owner is None:
+            yield
+            return
+        with owner._accepted_landing_phase(
+            block_hash,
+            phase,
+            block_height=block_height,
+        ):
+            yield
+
+    @contextmanager
+    def _landing_publish_span(
+        self,
+        *,
+        block_hash: str,
+        block_height: int | None = None,
+    ) -> Iterator[None]:
+        """Time ``preview_publish`` up to the preview's visibility instant.
+
+        The publication closes the interval from inside the publish call, so
+        B1 owns both ends of this span: it is opened here and closed by
+        whichever comes first, the publication observer or this exit.
+        """
+        owner = self._accepted_landing_owner()
+        if owner is None:
+            yield
+            return
+        with owner._accepted_landing_publish_span(
+            block_hash,
+            block_height=block_height,
+        ):
+            yield
+
     def _stamped_prior_balances_match_current(
         self,
         prior_balances: list[dict[str, object]],
+        *,
+        block_hash: str | None = None,
+        block_height: int | None = None,
     ) -> bool:
         """Compare the job's payout base against the ledger, bracketed.
 
@@ -528,7 +605,12 @@ class BlockFinalizationService:
         dispositions are unaffected.
         """
         self.runtime._record_block_submitter_phase("prior-balances-check")
-        matched = bool(self.runtime.prior_balances_match_current(prior_balances))
+        with self._landing_phase(
+            LANDING_PHASE_PRIOR_BALANCES_CHECK,
+            block_hash=block_hash,
+            block_height=block_height,
+        ):
+            matched = bool(self.runtime.prior_balances_match_current(prior_balances))
         self.runtime._record_block_submitter_phase("prior-balances-check:complete")
         return matched
 
@@ -625,10 +707,22 @@ class BlockFinalizationService:
         durable_payout_state = bool(
             getattr(self.runtime.ledger, "durable_payout_state", False)
         )
-        with self.runtime._block_submitter_lock(
-            self.runtime._payout_balance_mutation_lock,
-            "payout-balance-mutation",
-        ):
+        with ExitStack() as balance_serializer:
+            # The wait for the balance serializer is a landing stretch of its
+            # own (issue #224). The stack holds the lock for exactly the block
+            # the plain ``with`` held it for, so only the acquisition is timed
+            # and the release point is unchanged.
+            with self._landing_phase(
+                LANDING_PHASE_BALANCE_LOCK_WAIT,
+                block_hash=block_hash,
+                block_height=expected_height,
+            ):
+                balance_serializer.enter_context(
+                    self.runtime._block_submitter_lock(
+                        self.runtime._payout_balance_mutation_lock,
+                        "payout-balance-mutation",
+                    )
+                )
             if self.runtime._defer_for_pending_parent_payout_transition(
                 block_hash=block_hash,
                 parent_hash=parent_hash,
@@ -657,10 +751,17 @@ class BlockFinalizationService:
                     # boundary stamps mark the stretch itself so a landing
                     # that enters it is never mistaken for a wedged thread.
                     self.runtime._record_block_submitter_phase("reorg-reconcile")
-                    reorg_reconciled = self.runtime.ensure_reorg_reconciled_for_tip(
-                        current_tip,
-                        _coalesce_same_tip=False,
-                    )
+                    with self._landing_phase(
+                        LANDING_PHASE_RECONCILE,
+                        block_hash=block_hash,
+                        block_height=expected_height,
+                    ):
+                        reorg_reconciled = (
+                            self.runtime.ensure_reorg_reconciled_for_tip(
+                                current_tip,
+                                _coalesce_same_tip=False,
+                            )
+                        )
                     self.runtime._record_block_submitter_phase(
                         "reorg-reconcile:complete"
                     )
@@ -683,7 +784,12 @@ class BlockFinalizationService:
                     return None
             if already_active and callable(block_state_reader):
                 self.runtime._record_block_submitter_phase("pool-block-state")
-                block_state = block_state_reader(block_hash=block_hash)
+                with self._landing_phase(
+                    LANDING_PHASE_CHAIN_PROBE,
+                    block_hash=block_hash,
+                    block_height=expected_height,
+                ):
+                    block_state = block_state_reader(block_hash=block_hash)
                 self.runtime._record_block_submitter_phase("pool-block-state:complete")
             already_confirmed = bool(
                 block_state is not None
@@ -715,10 +821,17 @@ class BlockFinalizationService:
                 try:
                     # Same unbounded chain walk as the replay path above.
                     self.runtime._record_block_submitter_phase("reorg-reconcile")
-                    reorg_reconciled = self.runtime.ensure_reorg_reconciled_for_tip(
-                        current_tip,
-                        _coalesce_same_tip=False,
-                    )
+                    with self._landing_phase(
+                        LANDING_PHASE_RECONCILE,
+                        block_hash=block_hash,
+                        block_height=expected_height,
+                    ):
+                        reorg_reconciled = (
+                            self.runtime.ensure_reorg_reconciled_for_tip(
+                                current_tip,
+                                _coalesce_same_tip=False,
+                            )
+                        )
                     self.runtime._record_block_submitter_phase(
                         "reorg-reconcile:complete"
                     )
@@ -820,7 +933,9 @@ class BlockFinalizationService:
                 durable_payout_state
                 and not already_active
                 and not self._stamped_prior_balances_match_current(
-                    context.prior_balances
+                    context.prior_balances,
+                    block_hash=block_hash,
+                    block_height=expected_height,
                 )
             ):
                 self.runtime._abandon_block_candidate(
@@ -837,7 +952,12 @@ class BlockFinalizationService:
                 # stretches on the block-work thread; leaving it unnamed puts
                 # an unbounded node response inside somebody else's phase.
                 self.runtime._record_block_submitter_phase("tip-height-rpc")
-                before_height = int(self.runtime.rpc.call("getblockcount"))
+                with self._landing_phase(
+                    LANDING_PHASE_CHAIN_PROBE,
+                    block_hash=block_hash,
+                    block_height=expected_height,
+                ):
+                    before_height = int(self.runtime.rpc.call("getblockcount"))
                 self.runtime._record_block_submitter_phase("tip-height-rpc:complete")
                 if before_height + 1 != expected_height:
                     self.runtime._abandon_block_candidate(
@@ -1041,10 +1161,19 @@ class BlockFinalizationService:
                 # The compact preview came from the immutable issued job
                 # summary. Publish it before rebuilding/canonicalizing the full
                 # audit bundle, without retaining that bundle's shares tree.
-                preview = self.runtime._materialize_prior_balance_preview(issued_preview)
+                with self._landing_phase(
+                    LANDING_PHASE_PREVIEW_PREPARE,
+                    block_hash=block_hash,
+                    block_height=expected_height,
+                ):
+                    preview = self.runtime._materialize_prior_balance_preview(
+                        issued_preview
+                    )
                 if durable_payout_state and not (
                     self._stamped_prior_balances_match_current(
-                        context.prior_balances
+                        context.prior_balances,
+                        block_hash=block_hash,
+                        block_height=expected_height,
                     )
                 ):
                     self.runtime.request_shutdown()
@@ -1059,7 +1188,14 @@ class BlockFinalizationService:
                         worker=worker,
                     )
                     return None
-                self.runtime._publish_accepted_block_payout_preview(block_hash, preview)
+                with self._landing_publish_span(
+                    block_hash=block_hash,
+                    block_height=expected_height,
+                ):
+                    self.runtime._publish_accepted_block_payout_preview(
+                        block_hash,
+                        preview,
+                    )
 
             self.runtime._record_block_submitter_phase("audit-build")
             # The bundle derives only from inputs frozen on the candidate
@@ -1197,21 +1333,38 @@ class BlockFinalizationService:
                         if verified_audit.canonical_copy_eligible
                         else None
                     )
-                    verified_preview = (
-                        self.runtime._accepted_block_payout_preview_from_bundle(
-                            final_bundle,
-                            prior_balances=context.prior_balances,
+                    with self._landing_phase(
+                        LANDING_PHASE_PREVIEW_PREPARE,
+                        block_hash=block_hash,
+                        block_height=expected_height,
+                    ):
+                        verified_preview = (
+                            self.runtime._accepted_block_payout_preview_from_bundle(
+                                final_bundle,
+                                prior_balances=context.prior_balances,
+                            )
                         )
-                    )
                 self.runtime._record_block_submitter_phase("audit-verify:complete")
                 if not already_confirmed:
                     if preview is None and durable_payout_state:
-                        live_prior_balances = self.runtime.settlement_balances_by_program(
-                            self.runtime.ledger.current_prior_balances()
-                        )
-                        expected_prior_balances = self.runtime.settlement_balances_by_program(
-                            context.prior_balances
-                        )
+                        # A prior-balances reread, never a payout-window
+                        # rescan: the ledger read below re-observes the base
+                        # this candidate's coinbase pays from.
+                        with self._landing_phase(
+                            LANDING_PHASE_PRIOR_BALANCES_CHECK,
+                            block_hash=block_hash,
+                            block_height=expected_height,
+                        ):
+                            live_prior_balances = (
+                                self.runtime.settlement_balances_by_program(
+                                    self.runtime.ledger.current_prior_balances()
+                                )
+                            )
+                            expected_prior_balances = (
+                                self.runtime.settlement_balances_by_program(
+                                    context.prior_balances
+                                )
+                            )
                         if live_prior_balances != expected_prior_balances:
                             self.runtime.request_shutdown()
                             self.runtime._clear_accepted_block_payout_preview(
@@ -1226,10 +1379,14 @@ class BlockFinalizationService:
                             )
                             return None
                     try:
-                        self.runtime._publish_accepted_block_payout_preview(
-                            block_hash,
-                            verified_preview,
-                        )
+                        with self._landing_publish_span(
+                            block_hash=block_hash,
+                            block_height=expected_height,
+                        ):
+                            self.runtime._publish_accepted_block_payout_preview(
+                                block_hash,
+                                verified_preview,
+                            )
                     except RuntimeError as exc:
                         self.runtime.request_shutdown()
                         self.runtime._clear_accepted_block_payout_preview(
@@ -1573,18 +1730,25 @@ class BlockFinalizationService:
                     or (bool(self.runtime.stop_after_block) and accepted_count >= 1)
                 )
             )
-        if pool_closed and self.runtime._block_candidate_chain_probe(
-            block_hash,
-            expected_height=expected_height,
-        ) is True:
-            # The chain provably contains this block; its payout accounting
-            # must complete regardless of when the pool stopped accepting
-            # new work. Fall through to the normal disposition below, which
-            # resumes the accepted success tail. Observation evidence alone
-            # deliberately does not open this gate -- an unprovable view
-            # defers via the abandon path instead, so a closed pool can
-            # never fall through to submitblock on stale evidence.
-            pool_closed = False
+        if pool_closed:
+            with self._landing_phase(
+                LANDING_PHASE_CHAIN_PROBE,
+                block_hash=block_hash,
+                block_height=expected_height,
+            ):
+                closed_pool_chain_probe = self.runtime._block_candidate_chain_probe(
+                    block_hash,
+                    expected_height=expected_height,
+                )
+            if closed_pool_chain_probe is True:
+                # The chain provably contains this block; its payout accounting
+                # must complete regardless of when the pool stopped accepting
+                # new work. Fall through to the normal disposition below, which
+                # resumes the accepted success tail. Observation evidence alone
+                # deliberately does not open this gate -- an unprovable view
+                # defers via the abandon path instead, so a closed pool can
+                # never fall through to submitblock on stale evidence.
+                pool_closed = False
         if pool_closed:
             self.runtime._abandon_block_candidate(
                 PRISM_REJECTION_POOL_CLOSED,
