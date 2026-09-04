@@ -32,6 +32,8 @@ from lab.prism.block_candidates import (
 from lab.prism.coordinator_config import (
     DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS,
     DEFAULT_PRISM_JOB_BUILD_EXECUTOR_WORKERS,
+    DEFAULT_PRISM_MALLOC_TELEMETRY,
+    env_malloc_telemetry,
 )
 from lab.prism.job_bundle import (
     PRISM_JOB_BUILD_PHASES,
@@ -43,10 +45,15 @@ from lab.prism.job_delivery import (
     PRISM_EVICTED_JOB_CLASSES,
     PRISM_EVICTED_JOB_SUBMIT_OUTCOMES,
 )
+from lab.prism.process_telemetry import (
+    PRISM_GC_GENERATIONS,
+    ProcessHeapTelemetry,
+)
 from lab.prism.reorg_reconciler import (
     PRISM_REORG_RECONCILE_LOOKUP_PATHS,
     PRISM_REORG_RECONCILE_LOOKUP_SOURCES,
 )
+from lab.prism.share_ledger import DaemonShareWindowMirror
 from lab.prism.share_submission import PRISM_SHARE_ACK_RESULTS
 from lab.prism.vardiff_service import PRISM_VARDIFF_RESUME_OUTCOMES
 from lab.prism.writer_lease_timing import (
@@ -54,6 +61,73 @@ from lab.prism.writer_lease_timing import (
     LEASE_HEARTBEAT_OUTCOMES,
     LEASE_HEARTBEAT_PHASES,
     LEASE_HEARTBEAT_POLICY_TERMS,
+)
+
+# Issue #226 (and the gauge list issue #185 asked for): the closed component
+# label set of qbit_prism_component_entries. Every entry is one len() or
+# Queue.qsize() over a structure its owner constructs in __init__ (or
+# backfills through its own _ensure_* method), so a scrape costs a fixed
+# number of constant-time reads and the series set cannot grow with jobs,
+# tips, candidates, connections, or generations. Extend this tuple
+# deliberately: tests/test_prism_metrics.py pins it as the family's exact
+# series set.
+PRISM_COMPONENT_ENTRY_KINDS = (
+    # The payout window: the in-process incremental window's pages and
+    # records, the armed ledger artifact's share sequence, and the
+    # payout-state maps that are keyed by hash, epoch, or token.
+    "payout_window_pages",
+    "payout_window_records",
+    "payout_ledger_artifact_shares",
+    "accepted_block_payout_previews",
+    "invalidated_accepted_block_payout_previews",
+    "payout_append_invalidation_stamps",
+    "payout_window_inflight_scan_anchors",
+    "payout_unfenced_append_inflight_stamps",
+    # The single-slot share-window serialization cache: shares it covers.
+    "share_window_serialization_shares",
+    # Job contexts and the bundle cache.
+    "job_contexts",
+    "job_bundle_cache",
+    "job_build_issued_stamps",
+    "bundle_preparation_flights",
+    "active_job_bundle_builds",
+    # The evicted-job graveyard.
+    "evicted_job_graveyard",
+    "evicted_same_tip_job_ids",
+    # Candidate and replay state: the live, replay, and quarantine lanes
+    # plus every hash-keyed registry the B1 owner retains.
+    "block_candidate_queue",
+    "block_replay_queue",
+    "block_replay_inflight_hashes",
+    "block_quarantine_queue",
+    "block_quarantine_hashes",
+    "outstanding_block_candidate_hashes",
+    "tip_observed_accepted_block_hashes",
+    "counted_block_candidate_abandonments",
+    "accepted_block_preview_stamps",
+    "ancestor_redrive_records",
+    "block_candidate_terminal_outcomes",
+    "block_candidate_disposition_flights",
+    "block_disposition_waiting_retries",
+    "block_candidate_dequeued_hashes",
+    "accounted_accepted_block_hashes",
+    # Reconcile flights and the trusted-tip memo.
+    "reconcile_flights",
+    "reconcile_trusted_memo",
+    # Pending-share holders on the snapshot-anchor floor.
+    "pending_share_commit_floor",
+    # The daemon mirror: records in a mirror-backed window, and the
+    # compiler's bounded mirror of the daemon's uploaded-window LRU.
+    "daemon_window_mirror_records",
+    "daemon_uploaded_windows",
+)
+# The closed component label set of qbit_prism_component_bytes: the retained
+# byte-sized payloads whose size, not count, is what scales with the window.
+PRISM_COMPONENT_BYTE_KINDS = (
+    "payout_window_canonical_json",
+    "daemon_window_mirror_canonical_items",
+    "share_window_serialization_spool",
+    "share_window_serialization_compact_json",
 )
 
 
@@ -153,16 +227,21 @@ class MetricsPort(Protocol):
     accepted_parent_redrive_attempt_count: Any
     accepted_parent_redrive_resolved_count: Any
     accepted_parent_redrive_exhausted_count: Any
+    _accounted_accepted_block_hashes: Any
 
     def _accepted_parent_unresolved_depth(self) -> int: ...
     def _accepted_parent_unresolved_depth_cap(self) -> int: ...
     def _ensure_block_candidate_service(self) -> Any: ...
+    def _ensure_bundle_compiler(self) -> Any: ...
     def _ensure_connection_capacity_state(self) -> Any: ...
     def _ensure_evicted_job_state(self) -> Any: ...
     def _ensure_initial_job_state(self) -> Any: ...
+    def _ensure_job_bundle_service(self) -> Any: ...
     def _ensure_job_cache_state(self) -> Any: ...
     def _ensure_observability_service(self) -> Any: ...
     def _ensure_lease_heartbeat_service(self) -> Any: ...
+    def _ensure_payout_state_service(self) -> Any: ...
+    def _ensure_share_writer_service(self) -> Any: ...
     def _ensure_shutdown_controller(self) -> Any: ...
     def _ensure_worker_metrics_state(self) -> Any: ...
     def _job_build_is_publication_critical(self, request: Any) -> bool: ...
@@ -193,8 +272,41 @@ class MetricsPort(Protocol):
 class MetricsRenderer:
     """Collect and format one complete metrics generation."""
 
-    def __init__(self, port: MetricsPort) -> None:
+    def __init__(
+        self,
+        port: MetricsPort,
+        *,
+        process_telemetry: ProcessHeapTelemetry | None = None,
+    ) -> None:
         self.port = port
+        if process_telemetry is None:
+            # Resolution order, most authoritative first. A port attribute
+            # lets an embedder or a test pin the switch outright. Otherwise
+            # the validated lifecycle snapshot the coordinator was built with
+            # wins: a caller that passed an explicit CoordinatorConfig with
+            # telemetry disabled must not have mallinfo2 run anyway because
+            # the ambient environment happens to say otherwise. Only with no
+            # snapshot at all do we read the environment. Resolved once here
+            # so a scrape never touches any of them.
+            enabled = getattr(port, "malloc_telemetry_enabled", None)
+            if enabled is None:
+                config = getattr(port, "config", None)
+                lifecycle = getattr(config, "lifecycle", None)
+                enabled = getattr(lifecycle, "malloc_telemetry_enabled", None)
+            if enabled is None:
+                try:
+                    enabled = env_malloc_telemetry()
+                except BaseException:
+                    # The config loader validated this switch at startup, so
+                    # reaching here means the environment changed underneath a
+                    # running process. env_malloc_telemetry is fail-closed and
+                    # exits on a bad value, which is right at startup and wrong
+                    # on a metrics thread: killing the coordinator over a
+                    # telemetry switch would turn an observability knob into an
+                    # outage. Fall back to the shipped default instead.
+                    enabled = DEFAULT_PRISM_MALLOC_TELEMETRY
+            process_telemetry = ProcessHeapTelemetry(malloc_enabled=bool(enabled))
+        self._process_telemetry = process_telemetry
 
     def render(self) -> str:
         ledger_metrics = self.port.ledger.metrics()
@@ -634,6 +746,8 @@ class MetricsRenderer:
         lines.extend(self.initial_delivery_metrics_lines())
         lines.extend(self.port.progress_health_metrics_lines())
         lines.extend(self.accepted_preview_attribution_metrics_lines())
+        lines.extend(self.process_heap_metrics_lines())
+        lines.extend(self.component_cardinality_metrics_lines())
         return "\n".join(lines) + "\n"
 
     def share_ack_metrics_lines(self) -> list[str]:
@@ -859,6 +973,231 @@ class MetricsRenderer:
             "# HELP qbit_prism_block_candidate_cleanup_backpressure_total Occasions on which the cleanup-retry backlog bound preserved at least one row from bulk terminalization.",
             "# TYPE qbit_prism_block_candidate_cleanup_backpressure_total counter",
             f"qbit_prism_block_candidate_cleanup_backpressure_total {int(snapshot['backpressure_engagements'])}",
+        ]
+
+    def process_heap_metrics_lines(self) -> list[str]:
+        """Issue #226: always-on interpreter and glibc allocator readings.
+
+        Eleven families. Only the three GC families carry a label, and its
+        value set is the closed PRISM_GC_GENERATIONS; nothing here can grow
+        with traffic. The collector is a snapshot read -- allocation and
+        GC counters, the thread count, and one mallinfo2 call -- and never
+        walks the heap. Where mallinfo2 is unavailable (musl, macOS, glibc
+        before 2.33, or PRISM_MALLOC_TELEMETRY=0) the availability gauge
+        renders 0 and the four byte gauges render -1, never 0.
+        """
+        sample = self._process_telemetry.sample()
+        return [
+            "# HELP qbit_prism_process_allocated_blocks Memory blocks currently allocated by the CPython allocator (sys.getallocatedblocks); a live-object proxy that rises with retention and stays flat under pure allocator fragmentation.",
+            "# TYPE qbit_prism_process_allocated_blocks gauge",
+            f"qbit_prism_process_allocated_blocks {int(sample.allocated_blocks)}",
+            "# HELP qbit_prism_process_gc_trigger_count gc.get_count(): the cyclic collector's per-generation trigger counters, compared against gc.get_threshold() to decide when to collect. Generation 0 is allocations minus deallocations, NOT a count of retained objects. CPython 3.13 made the collector incremental, so the third entry is unused and reads 0; the series is kept for a fixed family set.",
+            "# TYPE qbit_prism_process_gc_trigger_count gauge",
+            *[
+                f'qbit_prism_process_gc_trigger_count{{generation="{generation}"}} {int(count)}'
+                for generation, count in zip(PRISM_GC_GENERATIONS, sample.gc_pending)
+            ],
+            "# HELP qbit_prism_process_gc_collections_total Cyclic collector passes completed per generation since process start (gc.get_stats).",
+            "# TYPE qbit_prism_process_gc_collections_total counter",
+            *[
+                f'qbit_prism_process_gc_collections_total{{generation="{generation}"}} {int(count)}'
+                for generation, count in zip(PRISM_GC_GENERATIONS, sample.gc_collections)
+            ],
+            "# HELP qbit_prism_process_gc_collected_objects_total Objects the cyclic collector freed per generation since process start.",
+            "# TYPE qbit_prism_process_gc_collected_objects_total counter",
+            *[
+                f'qbit_prism_process_gc_collected_objects_total{{generation="{generation}"}} {int(count)}'
+                for generation, count in zip(PRISM_GC_GENERATIONS, sample.gc_collected)
+            ],
+            "# HELP qbit_prism_process_gc_uncollectable_objects_total Objects the cyclic collector found unreachable but could not free per generation since process start; growth is a leak the collector already knows about.",
+            "# TYPE qbit_prism_process_gc_uncollectable_objects_total counter",
+            *[
+                f'qbit_prism_process_gc_uncollectable_objects_total{{generation="{generation}"}} {int(count)}'
+                for generation, count in zip(PRISM_GC_GENERATIONS, sample.gc_uncollectable)
+            ],
+            "# HELP qbit_prism_process_threads Live Python threads (threading.active_count); each one is a candidate glibc malloc arena.",
+            "# TYPE qbit_prism_process_threads gauge",
+            f"qbit_prism_process_threads {int(sample.threads)}",
+            "# HELP qbit_prism_process_malloc_info_available Whether glibc mallinfo2 is bound and PRISM_MALLOC_TELEMETRY is on (1), or the allocator byte gauges are unavailable (0): the symbol is glibc 2.33+ only and absent on musl and macOS. While 0 the byte gauges render -1, never 0.",
+            "# TYPE qbit_prism_process_malloc_info_available gauge",
+            f"qbit_prism_process_malloc_info_available {1 if sample.malloc_info_available else 0}",
+            "# HELP qbit_prism_process_malloc_arena_bytes Heap space glibc malloc holds for its arenas across every thread arena, excluding mmapped chunks (mallinfo2.arena), or -1 when unavailable.",
+            "# TYPE qbit_prism_process_malloc_arena_bytes gauge",
+            f"qbit_prism_process_malloc_arena_bytes {int(sample.malloc_arena_bytes)}",
+            "# HELP qbit_prism_process_malloc_in_use_bytes Bytes in allocated chunks across every glibc malloc arena (mallinfo2.uordblks), or -1 when unavailable; arena minus this is the fragmentation glibc has not returned to the kernel.",
+            "# TYPE qbit_prism_process_malloc_in_use_bytes gauge",
+            f"qbit_prism_process_malloc_in_use_bytes {int(sample.malloc_in_use_bytes)}",
+            "# HELP qbit_prism_process_malloc_free_bytes Bytes in free chunks glibc malloc retains across every arena (mallinfo2.fordblks), or -1 when unavailable.",
+            "# TYPE qbit_prism_process_malloc_free_bytes gauge",
+            f"qbit_prism_process_malloc_free_bytes {int(sample.malloc_free_bytes)}",
+            "# HELP qbit_prism_process_malloc_mmapped_bytes Bytes in chunks glibc malloc served directly through mmap (mallinfo2.hblkhd), or -1 when unavailable.",
+            "# TYPE qbit_prism_process_malloc_mmapped_bytes gauge",
+            f"qbit_prism_process_malloc_mmapped_bytes {int(sample.malloc_mmapped_bytes)}",
+        ]
+
+    def component_cardinality_metrics_lines(self) -> list[str]:
+        """Issue #226 (and #185's gauge list): retained entries per component.
+
+        Two families, each a closed ``component`` label set: entry counts and
+        retained bytes over the state that plausibly scales with the payout
+        window, the job population, or a candidate storm. The reads are
+        deliberately direct attribute loads on the owning services rather
+        than tolerant ``getattr`` defaults: a renamed owner field must fail
+        the shipped-owner test loudly, never report a silent zero. The owners
+        are the ones the renderer already constructs through
+        ``_ensure_job_cache_state``; the reorg reconciler is read only when
+        it exists, because the coordinator builds it lazily and it is the
+        sole holder of its flights, so an absent service is a true zero.
+
+        Every read is one ``len()``, ``qsize()``, or attribute load, atomic
+        under the GIL, so no owner lock is taken beyond the coordinator lock
+        the renderer already holds for the graveyard: a gauge that
+        tolerates one entry of skew must never queue the scrape behind a
+        daemon round trip or a payout-window walk.
+
+        The one exception is the page-backed payout window, where records and
+        canonical bytes are summed over the window's pages: O(pages), about
+        120 iterations of two ``len()`` calls for a 63k-share window at the
+        default page size, not O(shares). A mirror-backed window costs neither
+        sum. This is a bounded per-scrape cost, not a heap walk.
+        """
+        port = self.port
+        port._ensure_job_cache_state()
+        bundles = port._ensure_job_bundle_service()
+        payout = port._ensure_payout_state_service()
+        writer = port._ensure_share_writer_service()
+        compiler = port._ensure_bundle_compiler()
+        candidates = port._ensure_block_candidate_service()
+        candidates._ensure_block_replay_state()
+        candidates._ensure_block_candidate_disposition_state()
+        reconciler = getattr(port, "__dict__", {}).get("_reorg_reconciler_service")
+        serialization = bundles._share_window_serialization
+        cached_window = payout._incremental_payout_artifact_window
+        artifact = payout._payout_ledger_artifact
+        daemon_client = compiler._serve_builder
+        window = cached_window.window if cached_window is not None else None
+        window_pages = window_records = window_canonical_bytes = 0
+        mirror_records = mirror_bytes = 0
+        # Exactly one component accounts for the cached window, because these
+        # gauges exist to attribute resident bytes and an operator summing the
+        # family must not count the same object twice. The two backings are
+        # mutually exclusive -- the mirror *is* the cached window on the Rust
+        # path -- so a mirror-backed window reports zero pages, records, and
+        # canonical bytes under payout_window_*, and its size appears only
+        # under daemon_window_mirror_*. Which pair is non-zero is also how an
+        # operator reads the backing off /metrics.
+        if isinstance(window, DaemonShareWindowMirror):
+            mirror_records = int(window.record_count)
+            mirror_bytes = len(window.canonical_items)
+        elif window is not None:
+            pages = window.pages
+            window_pages = len(pages)
+            window_records = sum(len(page.records) for page in pages)
+            window_canonical_bytes = sum(
+                len(page.canonical_json_items) for page in pages
+            )
+        with port.lock:
+            port._ensure_evicted_job_state()
+            graveyard_entries = len(port.evicted_job_graveyard)
+            same_tip_entries = len(port.evicted_same_tip_job_ids)
+            outstanding_hashes = len(candidates._outstanding_block_candidate_hashes)
+            tip_observed_hashes = len(candidates._tip_observed_accepted_block_hashes)
+            counted_abandonments = len(candidates._counted_block_candidate_abandonments)
+            ancestor_redrives = len(candidates._ancestor_redrive_records)
+            terminal_outcomes = len(candidates._block_candidate_terminal_outcomes)
+            waiting_retries = len(candidates._block_disposition_waiting_retries)
+            dequeued_hashes = len(candidates._block_candidate_dequeued_hashes)
+            accounted_hashes = len(port._accounted_accepted_block_hashes)
+            trusted_memo = (
+                len(reconciler._reorg_reconcile_trusted_memo)
+                if reconciler is not None
+                else 0
+            )
+        entries = {
+            "payout_window_pages": window_pages,
+            "payout_window_records": window_records,
+            "payout_ledger_artifact_shares": (
+                len(artifact.shares_json) if artifact is not None else 0
+            ),
+            "accepted_block_payout_previews": len(payout._accepted_block_payout_previews),
+            "invalidated_accepted_block_payout_previews": len(
+                payout._invalidated_accepted_block_payout_previews
+            ),
+            "payout_append_invalidation_stamps": len(
+                payout._payout_append_invalidation_stamps
+            ),
+            "payout_window_inflight_scan_anchors": len(
+                payout._payout_window_inflight_scan_anchors
+            ),
+            "payout_unfenced_append_inflight_stamps": len(
+                payout._payout_unfenced_append_inflight_stamps
+            ),
+            "share_window_serialization_shares": (
+                int(serialization.share_count) if serialization is not None else 0
+            ),
+            "job_contexts": len(port.jobs),
+            "job_bundle_cache": len(bundles._job_bundle_cache),
+            "job_build_issued_stamps": len(bundles._job_build_issued_at_ms),
+            "bundle_preparation_flights": len(bundles._bundle_preparation_flights),
+            "active_job_bundle_builds": len(bundles._active_job_bundle_builds),
+            "evicted_job_graveyard": graveyard_entries,
+            "evicted_same_tip_job_ids": same_tip_entries,
+            "block_candidate_queue": candidates.candidate_queue.qsize(),
+            "block_replay_queue": candidates._block_replay_candidate_queue.qsize(),
+            "block_replay_inflight_hashes": len(candidates._block_replay_inflight_hashes),
+            "block_quarantine_queue": candidates._block_quarantine_queue.qsize(),
+            "block_quarantine_hashes": len(candidates._block_quarantine_hashes),
+            "outstanding_block_candidate_hashes": outstanding_hashes,
+            "tip_observed_accepted_block_hashes": tip_observed_hashes,
+            "counted_block_candidate_abandonments": counted_abandonments,
+            "accepted_block_preview_stamps": len(
+                candidates._accepted_block_preview_acceptance_monotonic
+            ),
+            "ancestor_redrive_records": ancestor_redrives,
+            "block_candidate_terminal_outcomes": terminal_outcomes,
+            "block_candidate_disposition_flights": len(
+                candidates._block_candidate_disposition_flights
+            ),
+            "block_disposition_waiting_retries": waiting_retries,
+            "block_candidate_dequeued_hashes": dequeued_hashes,
+            "accounted_accepted_block_hashes": accounted_hashes,
+            "reconcile_flights": (
+                len(reconciler._reconcile_flights) if reconciler is not None else 0
+            ),
+            "reconcile_trusted_memo": trusted_memo,
+            "pending_share_commit_floor": len(writer._pending_share_commit_floor),
+            "daemon_window_mirror_records": mirror_records,
+            "daemon_uploaded_windows": (
+                len(daemon_client.uploaded_windows) if daemon_client is not None else 0
+            ),
+        }
+        byte_sizes = {
+            "payout_window_canonical_json": window_canonical_bytes,
+            "daemon_window_mirror_canonical_items": mirror_bytes,
+            "share_window_serialization_spool": (
+                int(serialization._spool_size) if serialization is not None else 0
+            ),
+            # json.dumps with its ASCII default, so characters are bytes.
+            "share_window_serialization_compact_json": (
+                len(serialization._compact_shares_json or "")
+                + len(serialization._compact_share_identities_json or "")
+                if serialization is not None
+                else 0
+            ),
+        }
+        return [
+            "# HELP qbit_prism_component_entries Entries retained by each in-process coordinator component; the component label set is closed and carries no job id, tip hash, generation, or worker name.",
+            "# TYPE qbit_prism_component_entries gauge",
+            *[
+                f'qbit_prism_component_entries{{component="{kind}"}} {int(entries[kind])}'
+                for kind in PRISM_COMPONENT_ENTRY_KINDS
+            ],
+            "# HELP qbit_prism_component_bytes Bytes retained by each byte-sized coordinator payload (the cached payout window's canonical JSON, the daemon window mirror, and the share-window serialization compact strings); the component label set is closed. All are resident bytes except share_window_serialization_spool, which is an on-disk temporary file and is not part of RSS.",
+            "# TYPE qbit_prism_component_bytes gauge",
+            *[
+                f'qbit_prism_component_bytes{{component="{kind}"}} {int(byte_sizes[kind])}'
+                for kind in PRISM_COMPONENT_BYTE_KINDS
+            ],
         ]
 
     def landing_observability_metrics_lines(self) -> list[str]:

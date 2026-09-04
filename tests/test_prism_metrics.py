@@ -10,12 +10,17 @@ Prometheus document byte-for-byte for identical inputs.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from contextlib import redirect_stdout
 from decimal import Decimal
+import gc
+import hashlib
 from io import StringIO
 from pathlib import Path
+import re
 import tempfile
 import time
+import tracemalloc
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -42,6 +47,7 @@ from lab.prism.block_candidates import (
     PRISM_BLOCK_CANDIDATE_COLLAPSE_OUTCOMES,
     PRISM_STALE_JOB_ABANDON_CLASSES,
 )
+from lab.prism.bundle_compiler import _ServeBuilderClient, _ShareWindowSerialization
 from lab.prism.job_bundle import (
     PRISM_JOB_BUILD_PHASES,
     PRISM_JOB_BUILD_SECONDS_BUCKETS,
@@ -52,12 +58,33 @@ from lab.prism.job_delivery import (
     PRISM_EVICTED_JOB_CLASSES,
     PRISM_EVICTED_JOB_SUBMIT_OUTCOMES,
 )
-from lab.prism.metrics import MetricsRenderer
-from lab.prism.payout_state import AcceptedBlockPayoutTransition
+from lab.prism.metrics import (
+    PRISM_COMPONENT_BYTE_KINDS,
+    PRISM_COMPONENT_ENTRY_KINDS,
+    MetricsRenderer,
+)
+from lab.prism.payout_state import (
+    AcceptedBlockPayoutTransition,
+    PayoutLedgerArtifact,
+    _IncrementalPayoutArtifactWindow,
+)
 from lab.prism.prism_coordinator import PRISM_REJECTION_REASON_IDS
+from lab.prism.process_telemetry import (
+    PRISM_GC_GENERATIONS,
+    MallInfo2,
+    ProcessHeapSample,
+    ProcessHeapTelemetry,
+)
 from lab.prism.reorg_reconciler import (
     PRISM_REORG_RECONCILE_LOOKUP_PATHS,
     PRISM_REORG_RECONCILE_LOOKUP_SOURCES,
+    _ReconcileFlight,
+)
+from lab.prism.share_ledger import (
+    DaemonShareWindowMirror,
+    IncrementalShareJsonSequence,
+    IncrementalShareWindow,
+    _IncrementalShareWindowPage,
 )
 from lab.prism.share_submission import (
     PRISM_SHARE_ACK_RESULTS,
@@ -264,6 +291,254 @@ BLOCK_CANDIDATE_CLEANUP_BACKLOG_METRIC_FAMILIES = (
     ("qbit_prism_block_candidate_cleanup_backpressure_active", "gauge"),
     ("qbit_prism_block_candidate_cleanup_backpressure_total", "counter"),
 )
+
+
+# Issue #226 part 1: the closed family sets of the always-on heap telemetry
+# and the component-cardinality gauges; tests pin the renderer to both.
+PROCESS_HEAP_METRIC_FAMILIES = (
+    ("qbit_prism_process_allocated_blocks", "gauge"),
+    ("qbit_prism_process_gc_trigger_count", "gauge"),
+    ("qbit_prism_process_gc_collections_total", "counter"),
+    ("qbit_prism_process_gc_collected_objects_total", "counter"),
+    ("qbit_prism_process_gc_uncollectable_objects_total", "counter"),
+    ("qbit_prism_process_threads", "gauge"),
+    ("qbit_prism_process_malloc_info_available", "gauge"),
+    ("qbit_prism_process_malloc_arena_bytes", "gauge"),
+    ("qbit_prism_process_malloc_in_use_bytes", "gauge"),
+    ("qbit_prism_process_malloc_free_bytes", "gauge"),
+    ("qbit_prism_process_malloc_mmapped_bytes", "gauge"),
+)
+# The only labelled heap families; their sole label is the closed
+# three-value generation set.
+PROCESS_HEAP_GENERATION_FAMILIES = frozenset(
+    {
+        "qbit_prism_process_gc_trigger_count",
+        "qbit_prism_process_gc_collections_total",
+        "qbit_prism_process_gc_collected_objects_total",
+        "qbit_prism_process_gc_uncollectable_objects_total",
+    }
+)
+COMPONENT_CARDINALITY_METRIC_FAMILIES = (
+    ("qbit_prism_component_entries", "gauge"),
+    ("qbit_prism_component_bytes", "gauge"),
+)
+# The parity fixture pins the collector to this sample: allocation and GC
+# counters move between the reference and the actual render.
+PINNED_HEAP_SAMPLE = ProcessHeapSample(
+    allocated_blocks=123_456,
+    gc_pending=(5, 6, 7),
+    gc_collections=(100, 10, 1),
+    gc_collected=(1_000, 100, 10),
+    gc_uncollectable=(0, 0, 2),
+    threads=64,
+    malloc_info_available=True,
+    malloc_arena_bytes=9_000,
+    malloc_in_use_bytes=6_000,
+    malloc_free_bytes=3_000,
+    malloc_mmapped_bytes=500,
+)
+
+
+def reference_process_heap_metrics_lines(sample: ProcessHeapSample) -> list[str]:
+    lines = [
+        "# HELP qbit_prism_process_allocated_blocks Memory blocks currently allocated by the CPython allocator (sys.getallocatedblocks); a live-object proxy that rises with retention and stays flat under pure allocator fragmentation.",
+        "# TYPE qbit_prism_process_allocated_blocks gauge",
+        f"qbit_prism_process_allocated_blocks {int(sample.allocated_blocks)}",
+        "# HELP qbit_prism_process_gc_trigger_count gc.get_count(): the cyclic collector's per-generation trigger counters, compared against gc.get_threshold() to decide when to collect. Generation 0 is allocations minus deallocations, NOT a count of retained objects. CPython 3.13 made the collector incremental, so the third entry is unused and reads 0; the series is kept for a fixed family set.",
+        "# TYPE qbit_prism_process_gc_trigger_count gauge",
+    ]
+    lines.extend(
+        f'qbit_prism_process_gc_trigger_count{{generation="{generation}"}} {int(count)}'
+        for generation, count in zip(PRISM_GC_GENERATIONS, sample.gc_pending)
+    )
+    lines.extend(
+        [
+            "# HELP qbit_prism_process_gc_collections_total Cyclic collector passes completed per generation since process start (gc.get_stats).",
+            "# TYPE qbit_prism_process_gc_collections_total counter",
+        ]
+    )
+    lines.extend(
+        f'qbit_prism_process_gc_collections_total{{generation="{generation}"}} {int(count)}'
+        for generation, count in zip(PRISM_GC_GENERATIONS, sample.gc_collections)
+    )
+    lines.extend(
+        [
+            "# HELP qbit_prism_process_gc_collected_objects_total Objects the cyclic collector freed per generation since process start.",
+            "# TYPE qbit_prism_process_gc_collected_objects_total counter",
+        ]
+    )
+    lines.extend(
+        f'qbit_prism_process_gc_collected_objects_total{{generation="{generation}"}} {int(count)}'
+        for generation, count in zip(PRISM_GC_GENERATIONS, sample.gc_collected)
+    )
+    lines.extend(
+        [
+            "# HELP qbit_prism_process_gc_uncollectable_objects_total Objects the cyclic collector found unreachable but could not free per generation since process start; growth is a leak the collector already knows about.",
+            "# TYPE qbit_prism_process_gc_uncollectable_objects_total counter",
+        ]
+    )
+    lines.extend(
+        f'qbit_prism_process_gc_uncollectable_objects_total{{generation="{generation}"}} {int(count)}'
+        for generation, count in zip(PRISM_GC_GENERATIONS, sample.gc_uncollectable)
+    )
+    lines.extend(
+        [
+            "# HELP qbit_prism_process_threads Live Python threads (threading.active_count); each one is a candidate glibc malloc arena.",
+            "# TYPE qbit_prism_process_threads gauge",
+            f"qbit_prism_process_threads {int(sample.threads)}",
+            "# HELP qbit_prism_process_malloc_info_available Whether glibc mallinfo2 is bound and PRISM_MALLOC_TELEMETRY is on (1), or the allocator byte gauges are unavailable (0): the symbol is glibc 2.33+ only and absent on musl and macOS. While 0 the byte gauges render -1, never 0.",
+            "# TYPE qbit_prism_process_malloc_info_available gauge",
+            f"qbit_prism_process_malloc_info_available {1 if sample.malloc_info_available else 0}",
+            "# HELP qbit_prism_process_malloc_arena_bytes Heap space glibc malloc holds for its arenas across every thread arena, excluding mmapped chunks (mallinfo2.arena), or -1 when unavailable.",
+            "# TYPE qbit_prism_process_malloc_arena_bytes gauge",
+            f"qbit_prism_process_malloc_arena_bytes {int(sample.malloc_arena_bytes)}",
+            "# HELP qbit_prism_process_malloc_in_use_bytes Bytes in allocated chunks across every glibc malloc arena (mallinfo2.uordblks), or -1 when unavailable; arena minus this is the fragmentation glibc has not returned to the kernel.",
+            "# TYPE qbit_prism_process_malloc_in_use_bytes gauge",
+            f"qbit_prism_process_malloc_in_use_bytes {int(sample.malloc_in_use_bytes)}",
+            "# HELP qbit_prism_process_malloc_free_bytes Bytes in free chunks glibc malloc retains across every arena (mallinfo2.fordblks), or -1 when unavailable.",
+            "# TYPE qbit_prism_process_malloc_free_bytes gauge",
+            f"qbit_prism_process_malloc_free_bytes {int(sample.malloc_free_bytes)}",
+            "# HELP qbit_prism_process_malloc_mmapped_bytes Bytes in chunks glibc malloc served directly through mmap (mallinfo2.hblkhd), or -1 when unavailable.",
+            "# TYPE qbit_prism_process_malloc_mmapped_bytes gauge",
+            f"qbit_prism_process_malloc_mmapped_bytes {int(sample.malloc_mmapped_bytes)}",
+        ]
+    )
+    return lines
+
+
+def reference_component_cardinality_metrics_lines(server) -> list[str]:
+    server._ensure_job_cache_state()
+    bundles = server._ensure_job_bundle_service()
+    payout = server._ensure_payout_state_service()
+    writer = server._ensure_share_writer_service()
+    compiler = server._ensure_bundle_compiler()
+    candidates = server._ensure_block_candidate_service()
+    candidates._ensure_block_replay_state()
+    candidates._ensure_block_candidate_disposition_state()
+    reconciler = server.__dict__.get("_reorg_reconciler_service")
+    serialization = bundles._share_window_serialization
+    cached_window = payout._incremental_payout_artifact_window
+    artifact = payout._payout_ledger_artifact
+    client = compiler._serve_builder
+    window = cached_window.window if cached_window is not None else None
+    pages = records = canonical = mirror_records = mirror_bytes = 0
+    if isinstance(window, DaemonShareWindowMirror):
+        # The mirror is the cached window on the Rust path, so it is accounted
+        # once, under daemon_window_mirror_*; payout_window_* stays zero.
+        mirror_records = int(window.record_count)
+        mirror_bytes = len(window.canonical_items)
+    elif window is not None:
+        pages = len(window.pages)
+        records = sum(len(page.records) for page in window.pages)
+        canonical = sum(len(page.canonical_json_items) for page in window.pages)
+    with server.lock:
+        server._ensure_evicted_job_state()
+        locked = {
+            "evicted_job_graveyard": len(server.evicted_job_graveyard),
+            "evicted_same_tip_job_ids": len(server.evicted_same_tip_job_ids),
+            "outstanding_block_candidate_hashes": len(
+                candidates._outstanding_block_candidate_hashes
+            ),
+            "tip_observed_accepted_block_hashes": len(
+                candidates._tip_observed_accepted_block_hashes
+            ),
+            "counted_block_candidate_abandonments": len(
+                candidates._counted_block_candidate_abandonments
+            ),
+            "ancestor_redrive_records": len(candidates._ancestor_redrive_records),
+            "block_candidate_terminal_outcomes": len(
+                candidates._block_candidate_terminal_outcomes
+            ),
+            "block_disposition_waiting_retries": len(
+                candidates._block_disposition_waiting_retries
+            ),
+            "block_candidate_dequeued_hashes": len(
+                candidates._block_candidate_dequeued_hashes
+            ),
+            "accounted_accepted_block_hashes": len(
+                server._accounted_accepted_block_hashes
+            ),
+            "reconcile_trusted_memo": (
+                len(reconciler._reorg_reconcile_trusted_memo)
+                if reconciler is not None
+                else 0
+            ),
+        }
+    entries = {
+        "payout_window_pages": pages,
+        "payout_window_records": records,
+        "payout_ledger_artifact_shares": (
+            len(artifact.shares_json) if artifact is not None else 0
+        ),
+        "accepted_block_payout_previews": len(payout._accepted_block_payout_previews),
+        "invalidated_accepted_block_payout_previews": len(
+            payout._invalidated_accepted_block_payout_previews
+        ),
+        "payout_append_invalidation_stamps": len(
+            payout._payout_append_invalidation_stamps
+        ),
+        "payout_window_inflight_scan_anchors": len(
+            payout._payout_window_inflight_scan_anchors
+        ),
+        "payout_unfenced_append_inflight_stamps": len(
+            payout._payout_unfenced_append_inflight_stamps
+        ),
+        "share_window_serialization_shares": (
+            int(serialization.share_count) if serialization is not None else 0
+        ),
+        "job_contexts": len(getattr(server, "jobs", {})),
+        "job_bundle_cache": len(bundles._job_bundle_cache),
+        "job_build_issued_stamps": len(bundles._job_build_issued_at_ms),
+        "bundle_preparation_flights": len(bundles._bundle_preparation_flights),
+        "active_job_bundle_builds": len(bundles._active_job_bundle_builds),
+        "block_candidate_queue": candidates.candidate_queue.qsize(),
+        "block_replay_queue": candidates._block_replay_candidate_queue.qsize(),
+        "block_replay_inflight_hashes": len(candidates._block_replay_inflight_hashes),
+        "block_quarantine_queue": candidates._block_quarantine_queue.qsize(),
+        "block_quarantine_hashes": len(candidates._block_quarantine_hashes),
+        "accepted_block_preview_stamps": len(
+            candidates._accepted_block_preview_acceptance_monotonic
+        ),
+        "block_candidate_disposition_flights": len(
+            candidates._block_candidate_disposition_flights
+        ),
+        "reconcile_flights": (
+            len(reconciler._reconcile_flights) if reconciler is not None else 0
+        ),
+        "pending_share_commit_floor": len(writer._pending_share_commit_floor),
+        "daemon_window_mirror_records": mirror_records,
+        "daemon_uploaded_windows": (
+            len(client.uploaded_windows) if client is not None else 0
+        ),
+        **locked,
+    }
+    byte_sizes = {
+        "payout_window_canonical_json": canonical,
+        "daemon_window_mirror_canonical_items": mirror_bytes,
+        "share_window_serialization_spool": (
+            int(serialization._spool_size) if serialization is not None else 0
+        ),
+        "share_window_serialization_compact_json": (
+            len(serialization._compact_shares_json or "")
+            + len(serialization._compact_share_identities_json or "")
+            if serialization is not None
+            else 0
+        ),
+    }
+    return [
+        "# HELP qbit_prism_component_entries Entries retained by each in-process coordinator component; the component label set is closed and carries no job id, tip hash, generation, or worker name.",
+        "# TYPE qbit_prism_component_entries gauge",
+        *[
+            f'qbit_prism_component_entries{{component="{kind}"}} {int(entries[kind])}'
+            for kind in PRISM_COMPONENT_ENTRY_KINDS
+        ],
+        "# HELP qbit_prism_component_bytes Bytes retained by each byte-sized coordinator payload (the cached payout window's canonical JSON, the daemon window mirror, and the share-window serialization compact strings); the component label set is closed. All are resident bytes except share_window_serialization_spool, which is an on-disk temporary file and is not part of RSS.",
+        "# TYPE qbit_prism_component_bytes gauge",
+        *[
+            f'qbit_prism_component_bytes{{component="{kind}"}} {int(byte_sizes[kind])}'
+            for kind in PRISM_COMPONENT_BYTE_KINDS
+        ],
+    ]
 
 
 def reference_landing_observability_metrics_lines(server) -> list[str]:
@@ -1396,6 +1671,8 @@ def reference_render_metrics_payload(server) -> str:
     lines.extend(reference_initial_delivery_metrics_lines(server))
     lines.extend(server.progress_health_metrics_lines())
     lines.extend(reference_accepted_preview_attribution_metrics_lines(server))
+    lines.extend(reference_process_heap_metrics_lines(PINNED_HEAP_SAMPLE))
+    lines.extend(reference_component_cardinality_metrics_lines(server))
     return "\n".join(lines) + "\n"
 
 
@@ -1417,6 +1694,67 @@ class MetricsRenderParityTests(unittest.TestCase):
         self.addCleanup(cleanup)
         # Pin the /proc-derived gauges: RSS moves between the two renders.
         server.process_resource_metrics = lambda: (123_456_789, 42)
+        # Pin issue #226's heap collector the same way: allocation and GC
+        # counters move between the reference and the actual render. The
+        # pinned renderer is the one metrics_payload() resolves.
+        server.__dict__["_metrics_renderer"] = MetricsRenderer(
+            server,
+            process_telemetry=SimpleNamespace(sample=lambda: PINNED_HEAP_SAMPLE),
+        )
+        # Issue #226's component gauges, seeded through the shipped owners
+        # so the parity document carries non-zero values: a bundle-cache
+        # entry, a cached two-page payout window, a serialization slot with
+        # a spool, a reconcile flight and memo entry, a pending-share floor
+        # holder, a terminal outcome, and one daemon-uploaded window.
+        bundles = server._ensure_job_bundle_service()
+        bundles._job_bundle_cache[("parity-bundle",)] = object()
+        bundles._share_window_serialization = _ShareWindowSerialization(
+            key=("parity-digest", 3, 0),
+            share_count=3,
+            share_snapshot_sha256="parity-digest",
+        )
+        bundles._share_window_serialization._spool_size = 4_096
+        parity_pages = (
+            _IncrementalShareWindowPage(
+                records=(object(), object()),
+                total_difficulty=0,
+                prism_json_records=({}, {}),
+                canonical_json_items=b'{"a":1},{"b":2}',
+            ),
+            _IncrementalShareWindowPage(
+                records=(object(),),
+                total_difficulty=0,
+                prism_json_records=({},),
+                canonical_json_items=b'{"c":3}',
+            ),
+        )
+        payout = server._ensure_payout_state_service()
+        payout._incremental_payout_artifact_window = _IncrementalPayoutArtifactWindow(
+            window=IncrementalShareWindow(
+                anchor_job_issued_at_ms=1,
+                window_weight=1,
+                page_size=512,
+                pages=parity_pages,
+                total_difficulty=0,
+            ),
+            shares_json=IncrementalShareJsonSequence(pages=parity_pages, record_count=3),
+            share_snapshot_sha256="parity-digest",
+            refreshed_monotonic=0.0,
+            full_rescan_monotonic=0.0,
+            full_rescan_attempt_monotonic=0.0,
+        )
+        reconciler = server._ensure_reorg_reconciler_service()
+        reconciler._reconcile_flights["parity-tip"] = _ReconcileFlight()
+        reconciler._reorg_reconcile_trusted_memo["parity-tip"] = 1.0
+        server._ensure_share_writer_service().adopt_pending_share(
+            SimpleNamespace(share_id="parity-share")
+        )
+        candidate_service = server._ensure_block_candidate_service()
+        candidate_service._ensure_block_candidate_disposition_state()
+        candidate_service._block_candidate_terminal_outcomes["ef" * 32] = True
+        daemon_client = _ServeBuilderClient(process=SimpleNamespace())
+        daemon_client.note_uploaded_window("parity-digest")
+        server._ensure_bundle_compiler()._serve_builder = daemon_client
         # Share accounting and rejection counters.
         server.submitted_share_count = 10
         server.stale_share_count = 2
@@ -1664,6 +2002,25 @@ class MetricsRenderParityTests(unittest.TestCase):
             'qbit_prism_payout_window_full_rescan_seconds_count{reason="reconcile_invalidation",path="daemon"} 1',
             'qbit_prism_payout_window_full_rescan_seconds_count{reason="other",path="in_process"} 1',
             'qbit_prism_payout_window_full_rescan_seconds_count{reason="window_daemon_state_lost",path="daemon"} 0',
+            "qbit_prism_process_allocated_blocks 123456",
+            'qbit_prism_process_gc_trigger_count{generation="2"} 7',
+            'qbit_prism_process_gc_uncollectable_objects_total{generation="2"} 2',
+            "qbit_prism_process_threads 64",
+            "qbit_prism_process_malloc_info_available 1",
+            "qbit_prism_process_malloc_arena_bytes 9000",
+            "qbit_prism_process_malloc_mmapped_bytes 500",
+            'qbit_prism_component_entries{component="payout_window_pages"} 2',
+            'qbit_prism_component_entries{component="payout_window_records"} 3',
+            'qbit_prism_component_entries{component="share_window_serialization_shares"} 3',
+            'qbit_prism_component_entries{component="job_bundle_cache"} 1',
+            # The #198 seed above publishes one terminal outcome of its own.
+            'qbit_prism_component_entries{component="block_candidate_terminal_outcomes"} 2',
+            'qbit_prism_component_entries{component="reconcile_flights"} 1',
+            'qbit_prism_component_entries{component="reconcile_trusted_memo"} 1',
+            'qbit_prism_component_entries{component="pending_share_commit_floor"} 1',
+            'qbit_prism_component_entries{component="daemon_uploaded_windows"} 1',
+            'qbit_prism_component_bytes{component="payout_window_canonical_json"} 22',
+            'qbit_prism_component_bytes{component="share_window_serialization_spool"} 4096',
         ):
             self.assertIn(needle, actual)
         self.assertNotIn('operation="legacy_probe"', actual)
@@ -2234,6 +2591,542 @@ class AcceptedParentUnresolvedDepthGaugeTests(unittest.TestCase):
             f"qbit_prism_accepted_parent_unresolved_depth_max {non_default}",
             self._landing_lines(server),
         )
+
+
+_SERIES_LINE = re.compile(r"^(?P<family>[a-z_]+)(?:\{(?P<labels>[^}]*)\})? (?P<value>\S+)$")
+
+
+def _parse_series(line: str) -> tuple[str, dict[str, str], str]:
+    """Split one exposition sample into (family, labels, value)."""
+    match = _SERIES_LINE.match(line)
+    if match is None:
+        raise AssertionError(f"not a sample line: {line!r}")
+    labels: dict[str, str] = {}
+    if match.group("labels"):
+        for pair in match.group("labels").split(","):
+            key, _, quoted = pair.partition("=")
+            labels[key] = quoted.strip('"')
+    return match.group("family"), labels, match.group("value")
+
+
+def _type_families(lines: list[str]) -> list[tuple[str, str]]:
+    return [
+        (line.split()[2], line.split()[3])
+        for line in lines
+        if line.startswith("# TYPE ")
+    ]
+
+
+def _series_value(lines: list[str], series: str) -> int:
+    matches = [line for line in lines if line.startswith(series + " ")]
+    if len(matches) != 1:
+        raise AssertionError(f"{series!r} rendered {len(matches)} times")
+    return int(matches[0].split()[-1])
+
+
+class HeapAndComponentCardinalityTelemetryTests(unittest.TestCase):
+    """Issue #226 part 1: always-on heap telemetry and component gauges.
+
+    The five behaviours the work package pins: the exact family set, the
+    mallinfo2-absent path rendering as unavailable rather than zero, every
+    component gauge reading its shipped owner, no unbounded label anywhere
+    in the component families, and a scrape that never walks the heap.
+    """
+
+    TIP = "aa" * 32
+
+    def _seeded_owners(self) -> tuple[object, dict[str, int], dict[str, int]]:
+        """Seed every component through its shipped owner; return the expectations.
+
+        Each seed goes through the real owning structure -- the service
+        field, the queue, the LRU, the floor -- never a stub on the port,
+        so a renamed owner field breaks the read instead of reporting 0.
+        """
+        server = support.coordinator()
+        server._ensure_job_cache_state()
+        server.jobs = {"job-1": object(), "job-2": object()}
+        bundles = server._ensure_job_bundle_service()
+        bundles._job_bundle_cache[("bundle-a",)] = object()
+        bundles._job_bundle_cache[("bundle-b",)] = object()
+        bundles._job_build_issued_at_ms[7] = 7_000
+        bundles._bundle_preparation_flights[("flight",)] = object()
+        bundles._active_job_bundle_builds[("build",)] = object()
+        serialization = _ShareWindowSerialization(
+            key=("digest", 5, 0),
+            share_count=5,
+            share_snapshot_sha256="digest",
+        )
+        serialization._spool_size = 4_096
+        serialization._compact_shares_json = "[" + "x" * 98 + "]"
+        serialization._compact_share_identities_json = "y" * 20
+        bundles._share_window_serialization = serialization
+        pages = (
+            _IncrementalShareWindowPage(
+                records=(object(), object()),
+                total_difficulty=0,
+                prism_json_records=({}, {}),
+                canonical_json_items=b'{"a":1},{"b":2}',
+            ),
+            _IncrementalShareWindowPage(
+                records=(object(),),
+                total_difficulty=0,
+                prism_json_records=({},),
+                canonical_json_items=b'{"c":3}',
+            ),
+        )
+        payout = server._ensure_payout_state_service()
+        payout._incremental_payout_artifact_window = _IncrementalPayoutArtifactWindow(
+            window=IncrementalShareWindow(
+                anchor_job_issued_at_ms=1,
+                window_weight=1,
+                page_size=512,
+                pages=pages,
+                total_difficulty=0,
+            ),
+            shares_json=IncrementalShareJsonSequence(pages=pages, record_count=3),
+            share_snapshot_sha256="digest",
+            refreshed_monotonic=0.0,
+            full_rescan_monotonic=0.0,
+            full_rescan_attempt_monotonic=0.0,
+        )
+        payout._payout_ledger_artifact = PayoutLedgerArtifact(
+            generation=1,
+            payout_state_generation=1,
+            network_difficulty=1,
+            accepted_share_count=3,
+            shares_json=IncrementalShareJsonSequence(pages=pages, record_count=3),
+            prior_balances=(),
+            prepared_monotonic=0.0,
+        )
+        payout._accepted_block_payout_previews["b1" * 32] = AcceptedBlockPayoutTransition(
+            block_height=11,
+            landed=True,
+        )
+        payout._invalidated_accepted_block_payout_previews["b2" * 32] = 5
+        payout._payout_append_invalidation_stamps[1] = 100
+        payout._payout_append_invalidation_stamps[2] = 200
+        payout._payout_window_inflight_scan_anchors[1] = 100
+        payout._payout_unfenced_append_inflight_stamps[1] = 100
+        server.evicted_job_graveyard = {
+            "job-old": (
+                SimpleNamespace(
+                    job_id="job-old",
+                    template={"previousblockhash": "bb" * 32},
+                ),
+                1,
+                time.monotonic(),
+            ),
+        }
+        candidates = server._ensure_block_candidate_service()
+        candidates._ensure_block_replay_state()
+        candidates._ensure_block_candidate_disposition_state()
+        candidates.candidate_queue.put_nowait(object())
+        candidates._block_replay_candidate_queue.put_nowait(object())
+        candidates._block_replay_candidate_queue.put_nowait(object())
+        candidates._block_replay_inflight_hashes.add("c1" * 32)
+        candidates._block_quarantine_queue.put_nowait(object())
+        candidates._block_quarantine_hashes.add("c2" * 32)
+        candidates._outstanding_block_candidate_hashes.update({"c3" * 32, "c4" * 32})
+        candidates._tip_observed_accepted_block_hashes["c5" * 32] = 1.0
+        candidates._counted_block_candidate_abandonments.add("c6" * 32)
+        candidates._accepted_block_preview_acceptance_monotonic["c7" * 32] = None
+        candidates._ancestor_redrive_records["c8" * 32] = object()
+        candidates._block_candidate_terminal_outcomes["c9" * 32] = True
+        candidates._block_candidate_terminal_outcomes["ca" * 32] = False
+        candidates._block_candidate_disposition_flights["cb" * 32] = object()
+        candidates._block_disposition_waiting_retries["cc" * 32] = object()
+        candidates._block_candidate_dequeued_hashes["cd" * 32] = 1
+        server._accounted_accepted_block_hashes.add("ce" * 32)
+        reconciler = server._ensure_reorg_reconciler_service()
+        reconciler._reconcile_flights[self.TIP] = _ReconcileFlight()
+        reconciler._reorg_reconcile_trusted_memo[self.TIP] = 1.0
+        reconciler._reorg_reconcile_trusted_memo["dd" * 32] = 2.0
+        writer = server._ensure_share_writer_service()
+        writer.adopt_pending_share(SimpleNamespace(share_id="miner-a:s1"))
+        writer.adopt_pending_share(SimpleNamespace(share_id="miner-a:s2"))
+        daemon_client = _ServeBuilderClient(process=SimpleNamespace())
+        daemon_client.note_uploaded_window("digest")
+        daemon_client.note_uploaded_window("digest-2")
+        server._ensure_bundle_compiler()._serve_builder = daemon_client
+        expected_entries = {
+            "payout_window_pages": 2,
+            "payout_window_records": 3,
+            "payout_ledger_artifact_shares": 3,
+            "accepted_block_payout_previews": 1,
+            "invalidated_accepted_block_payout_previews": 1,
+            "payout_append_invalidation_stamps": 2,
+            "payout_window_inflight_scan_anchors": 1,
+            "payout_unfenced_append_inflight_stamps": 1,
+            "share_window_serialization_shares": 5,
+            "job_contexts": 2,
+            "job_bundle_cache": 2,
+            "job_build_issued_stamps": 1,
+            "bundle_preparation_flights": 1,
+            "active_job_bundle_builds": 1,
+            "evicted_job_graveyard": 1,
+            # With no published tip the delivery owner classes every retained
+            # context as same-tip, so its same-tip index holds the entry too.
+            "evicted_same_tip_job_ids": 1,
+            "block_candidate_queue": 1,
+            "block_replay_queue": 2,
+            "block_replay_inflight_hashes": 1,
+            "block_quarantine_queue": 1,
+            "block_quarantine_hashes": 1,
+            "outstanding_block_candidate_hashes": 2,
+            "tip_observed_accepted_block_hashes": 1,
+            "counted_block_candidate_abandonments": 1,
+            "accepted_block_preview_stamps": 1,
+            "ancestor_redrive_records": 1,
+            "block_candidate_terminal_outcomes": 2,
+            "block_candidate_disposition_flights": 1,
+            "block_disposition_waiting_retries": 1,
+            "block_candidate_dequeued_hashes": 1,
+            "accounted_accepted_block_hashes": 1,
+            "reconcile_flights": 1,
+            "reconcile_trusted_memo": 2,
+            "pending_share_commit_floor": 2,
+            "daemon_window_mirror_records": 0,
+            "daemon_uploaded_windows": 2,
+        }
+        expected_bytes = {
+            "payout_window_canonical_json": 22,
+            "daemon_window_mirror_canonical_items": 0,
+            "share_window_serialization_spool": 4_096,
+            "share_window_serialization_compact_json": 120,
+        }
+        return server, expected_entries, expected_bytes
+
+    def test_process_heap_telemetry_families_are_pinned(self) -> None:
+        """The exact (family, type) sequence renders, in order, fixed cardinality."""
+        server = support.coordinator()
+        renderer = MetricsRenderer(server)
+        heap = renderer.process_heap_metrics_lines()
+        self.assertEqual(_type_families(heap), list(PROCESS_HEAP_METRIC_FAMILIES))
+        rendered_generations: dict[str, list[str]] = {}
+        for line in heap:
+            if line.startswith("#"):
+                continue
+            family, labels, _value = _parse_series(line)
+            if family in PROCESS_HEAP_GENERATION_FAMILIES:
+                # The one permitted label, drawn from the closed set.
+                self.assertEqual(set(labels), {"generation"})
+                self.assertIn(labels["generation"], PRISM_GC_GENERATIONS)
+                rendered_generations.setdefault(family, []).append(labels["generation"])
+            else:
+                self.assertNotIn("{", line)
+        for family in PROCESS_HEAP_GENERATION_FAMILIES:
+            self.assertEqual(rendered_generations[family], list(PRISM_GC_GENERATIONS))
+        components = renderer.component_cardinality_metrics_lines()
+        self.assertEqual(
+            _type_families(components),
+            list(COMPONENT_CARDINALITY_METRIC_FAMILIES),
+        )
+        entry_kinds = [
+            _parse_series(line)[1]["component"]
+            for line in components
+            if line.startswith("qbit_prism_component_entries{")
+        ]
+        byte_kinds = [
+            _parse_series(line)[1]["component"]
+            for line in components
+            if line.startswith("qbit_prism_component_bytes{")
+        ]
+        self.assertEqual(entry_kinds, list(PRISM_COMPONENT_ENTRY_KINDS))
+        self.assertEqual(byte_kinds, list(PRISM_COMPONENT_BYTE_KINDS))
+        self.assertEqual(len(set(PRISM_COMPONENT_ENTRY_KINDS)), len(PRISM_COMPONENT_ENTRY_KINDS))
+        # Every component the issue names has a gauge.
+        for named in (
+            "payout_window_pages",
+            "share_window_serialization_shares",
+            "job_contexts",
+            "job_bundle_cache",
+            "evicted_job_graveyard",
+            "block_candidate_queue",
+            "block_replay_queue",
+            "reconcile_flights",
+            "pending_share_commit_floor",
+            "daemon_window_mirror_records",
+        ):
+            self.assertIn(named, PRISM_COMPONENT_ENTRY_KINDS)
+        # The full document carries both blocks, in this order, at its tail.
+        type_lines = [
+            line for line in server.metrics_payload().splitlines()
+            if line.startswith("# TYPE ")
+        ]
+        expected_tail = [
+            f"# TYPE {family} {kind}"
+            for family, kind in (
+                PROCESS_HEAP_METRIC_FAMILIES + COMPONENT_CARDINALITY_METRIC_FAMILIES
+            )
+        ]
+        self.assertEqual(type_lines[-len(expected_tail):], expected_tail)
+
+    def test_mallinfo_absence_renders_unavailable_not_zero(self) -> None:
+        """A failed ctypes lookup renders availability 0 and -1 bytes, never 0."""
+        server = support.coordinator()
+        resolver = mock.Mock(side_effect=AttributeError("mallinfo2: symbol not found"))
+        telemetry = ProcessHeapTelemetry(mallinfo_resolver=resolver)
+        renderer = MetricsRenderer(server, process_telemetry=telemetry)
+        first = renderer.process_heap_metrics_lines()
+        second = renderer.process_heap_metrics_lines()
+        self.assertEqual(_series_value(first, "qbit_prism_process_malloc_info_available"), 0)
+        for gauge in ("arena", "in_use", "free", "mmapped"):
+            self.assertEqual(
+                _series_value(first, f"qbit_prism_process_malloc_{gauge}_bytes"),
+                -1,
+            )
+        # The interpreter readings are real even when glibc's are not.
+        self.assertGreater(_series_value(first, "qbit_prism_process_allocated_blocks"), 0)
+        self.assertGreaterEqual(_series_value(first, "qbit_prism_process_threads"), 1)
+        # Resolved once and remembered: no per-scrape lookup, no per-scrape log.
+        self.assertEqual(resolver.call_count, 1)
+        self.assertEqual(_type_families(second), _type_families(first))
+        self.assertEqual(_series_value(second, "qbit_prism_process_malloc_info_available"), 0)
+        # The family set is identical to the available case, so a dashboard
+        # built on either platform reads the same series.
+        self.assertEqual(_type_families(first), list(PROCESS_HEAP_METRIC_FAMILIES))
+        # A symbol that binds but fails at call time degrades the same way
+        # and is not retried on the next scrape.
+        broken = mock.Mock(side_effect=OSError("mallinfo2 call failed"))
+        renderer = MetricsRenderer(
+            server,
+            process_telemetry=ProcessHeapTelemetry(mallinfo_resolver=lambda: broken),
+        )
+        lines = renderer.process_heap_metrics_lines()
+        renderer.process_heap_metrics_lines()
+        self.assertEqual(_series_value(lines, "qbit_prism_process_malloc_info_available"), 0)
+        self.assertEqual(_series_value(lines, "qbit_prism_process_malloc_arena_bytes"), -1)
+        self.assertEqual(broken.call_count, 1)
+        # Where the symbol binds, the struct's fields render; the fake makes
+        # this branch platform-independent too.
+        def fake_mallinfo2() -> MallInfo2:
+            info = MallInfo2()
+            info.arena = 9_000
+            info.uordblks = 6_000
+            info.fordblks = 3_000
+            info.hblkhd = 500
+            return info
+
+        lines = MetricsRenderer(
+            server,
+            process_telemetry=ProcessHeapTelemetry(mallinfo_resolver=lambda: fake_mallinfo2),
+        ).process_heap_metrics_lines()
+        self.assertEqual(_series_value(lines, "qbit_prism_process_malloc_info_available"), 1)
+        self.assertEqual(_series_value(lines, "qbit_prism_process_malloc_arena_bytes"), 9_000)
+        self.assertEqual(_series_value(lines, "qbit_prism_process_malloc_in_use_bytes"), 6_000)
+        self.assertEqual(_series_value(lines, "qbit_prism_process_malloc_free_bytes"), 3_000)
+        self.assertEqual(_series_value(lines, "qbit_prism_process_malloc_mmapped_bytes"), 500)
+        # The operator switch renders unavailable without probing at all.
+        resolver = mock.Mock()
+        lines = MetricsRenderer(
+            server,
+            process_telemetry=ProcessHeapTelemetry(
+                malloc_enabled=False,
+                mallinfo_resolver=resolver,
+            ),
+        ).process_heap_metrics_lines()
+        self.assertEqual(_series_value(lines, "qbit_prism_process_malloc_info_available"), 0)
+        self.assertEqual(_series_value(lines, "qbit_prism_process_malloc_in_use_bytes"), -1)
+        resolver.assert_not_called()
+
+    def test_component_cardinality_gauges_render_from_the_shipped_owner(self) -> None:
+        """Each gauge reads the real owning structure, not a stub."""
+        server, expected_entries, expected_bytes = self._seeded_owners()
+        self.assertEqual(set(expected_entries), set(PRISM_COMPONENT_ENTRY_KINDS))
+        self.assertEqual(set(expected_bytes), set(PRISM_COMPONENT_BYTE_KINDS))
+        lines = MetricsRenderer(server).component_cardinality_metrics_lines()
+        for kind, value in expected_entries.items():
+            self.assertIn(
+                f'qbit_prism_component_entries{{component="{kind}"}} {value}',
+                lines,
+            )
+        for kind, value in expected_bytes.items():
+            self.assertIn(
+                f'qbit_prism_component_bytes{{component="{kind}"}} {value}',
+                lines,
+            )
+        self.assertEqual(lines, reference_component_cardinality_metrics_lines(server))
+        # A mirror-backed window reports the daemon's bytes and records and
+        # no in-process pages: the same slot, the other shipped window type.
+        items = b'{"a":1},{"b":2}'
+        digest = hashlib.sha256(b"[" + items + b"]").hexdigest()
+        mirror = DaemonShareWindowMirror.from_full_items(
+            anchor_job_issued_at_ms=1,
+            window_weight=1,
+            page_size=512,
+            record_count=2,
+            canonical_items=items,
+            share_snapshot_sha256=digest,
+        )
+        payout = server._ensure_payout_state_service()
+        payout._incremental_payout_artifact_window = _IncrementalPayoutArtifactWindow(
+            window=mirror,
+            shares_json=mirror.json_records(),
+            share_snapshot_sha256=digest,
+            refreshed_monotonic=0.0,
+            full_rescan_monotonic=0.0,
+            full_rescan_attempt_monotonic=0.0,
+        )
+        lines = MetricsRenderer(server).component_cardinality_metrics_lines()
+        # Accounted exactly once. The mirror *is* the cached window here, so
+        # its size appears only under daemon_window_mirror_*; reporting it
+        # under payout_window_* as well would make an operator summing
+        # qbit_prism_component_bytes for RSS attribution count it twice.
+        self.assertIn('qbit_prism_component_entries{component="payout_window_pages"} 0', lines)
+        self.assertIn('qbit_prism_component_entries{component="payout_window_records"} 0', lines)
+        self.assertIn(
+            'qbit_prism_component_entries{component="daemon_window_mirror_records"} 2',
+            lines,
+        )
+        self.assertIn(
+            'qbit_prism_component_bytes{component="payout_window_canonical_json"} 0',
+            lines,
+        )
+        self.assertIn(
+            f'qbit_prism_component_bytes{{component="daemon_window_mirror_canonical_items"}} {len(items)}',
+            lines,
+        )
+        # The same property stated as a sum, so a future backing that reports
+        # under both slots fails here rather than in an operator's dashboard.
+        self.assertEqual(
+            sum(
+                int(line.rsplit(" ", 1)[1])
+                for line in lines
+                if line.startswith("qbit_prism_component_bytes{")
+                and (
+                    'component="payout_window_canonical_json"' in line
+                    or 'component="daemon_window_mirror_canonical_items"' in line
+                )
+            ),
+            len(items),
+        )
+        # An empty window slot and an absent daemon client are true zeros.
+        payout._incremental_payout_artifact_window = None
+        server._ensure_bundle_compiler()._serve_builder = None
+        lines = MetricsRenderer(server).component_cardinality_metrics_lines()
+        self.assertIn('qbit_prism_component_entries{component="payout_window_records"} 0', lines)
+        self.assertIn('qbit_prism_component_entries{component="daemon_uploaded_windows"} 0', lines)
+        # The reads are direct: renaming an owner field breaks the scrape
+        # loudly instead of reporting a silent zero.
+        reconciler = server._ensure_reorg_reconciler_service()
+        flights = reconciler._reconcile_flights
+        del reconciler._reconcile_flights
+        try:
+            with self.assertRaises(AttributeError):
+                MetricsRenderer(server).component_cardinality_metrics_lines()
+        finally:
+            reconciler._reconcile_flights = flights
+        candidates = server._ensure_block_candidate_service()
+        outstanding = candidates._outstanding_block_candidate_hashes
+        del candidates._outstanding_block_candidate_hashes
+        try:
+            with self.assertRaises(AttributeError):
+                MetricsRenderer(server).component_cardinality_metrics_lines()
+        finally:
+            candidates._outstanding_block_candidate_hashes = outstanding
+
+    def test_component_cardinality_gauges_carry_no_unbounded_label(self) -> None:
+        """No series carries a label that varies per job, tip, hash, or generation."""
+        server, _entries, _bytes = self._seeded_owners()
+
+        def series_set(lines: list[str]) -> list[tuple[str, str]]:
+            observed: list[tuple[str, str]] = []
+            for line in lines:
+                if line.startswith("#"):
+                    continue
+                family, labels, _value = _parse_series(line)
+                self.assertEqual(set(labels), {"component"}, line)
+                closed = (
+                    PRISM_COMPONENT_ENTRY_KINDS
+                    if family == "qbit_prism_component_entries"
+                    else PRISM_COMPONENT_BYTE_KINDS
+                )
+                self.assertIn(labels["component"], closed, line)
+                observed.append((family, labels["component"]))
+            return observed
+
+        before = MetricsRenderer(server).component_cardinality_metrics_lines()
+        baseline = series_set(before)
+        self.assertEqual(len(baseline), len(set(baseline)))
+        self.assertEqual(
+            len(baseline),
+            len(PRISM_COMPONENT_ENTRY_KINDS) + len(PRISM_COMPONENT_BYTE_KINDS),
+        )
+        # Grow every unbounded population the issue names -- more jobs, more
+        # tips, more candidate hashes, more generations, more workers -- and
+        # the series set must not move by one.
+        seeded_identifiers = []
+        for index in range(5):
+            job_id = f"job-growth-{index}"
+            tip_hash = f"{index:02x}" * 32
+            block_hash = f"e{index}" * 32
+            seeded_identifiers.extend((job_id, tip_hash, block_hash, f"worker-{index}"))
+            server.jobs[job_id] = object()
+            reconciler = server._ensure_reorg_reconciler_service()
+            reconciler._reorg_reconcile_trusted_memo[tip_hash] = float(index)
+            reconciler._reconcile_flights[tip_hash] = _ReconcileFlight()
+            candidates = server._ensure_block_candidate_service()
+            candidates._outstanding_block_candidate_hashes.add(block_hash)
+            candidates._block_candidate_terminal_outcomes[block_hash] = True
+            server._ensure_payout_state_service()._payout_append_invalidation_stamps[
+                10 + index
+            ] = index
+            server._ensure_share_writer_service().adopt_pending_share(
+                SimpleNamespace(share_id=f"worker-{index}:{block_hash}")
+            )
+        after = MetricsRenderer(server).component_cardinality_metrics_lines()
+        self.assertEqual(series_set(after), baseline)
+        self.assertEqual(_type_families(after), _type_families(before))
+        rendered = "\n".join(after)
+        for identifier in seeded_identifiers:
+            self.assertNotIn(identifier, rendered)
+        # The values moved; only the label set stayed put.
+        self.assertGreater(
+            _series_value(after, 'qbit_prism_component_entries{component="job_contexts"}'),
+            _series_value(before, 'qbit_prism_component_entries{component="job_contexts"}'),
+        )
+
+    def test_heap_telemetry_scrape_does_not_walk_the_heap(self) -> None:
+        """The collector never calls gc.get_objects or starts tracemalloc."""
+        server, _entries, _bytes = self._seeded_owners()
+        self.assertFalse(tracemalloc.is_tracing())
+        with (
+            mock.patch.object(
+                gc,
+                "get_objects",
+                side_effect=AssertionError("gc.get_objects walked the heap on a scrape"),
+            ) as get_objects,
+            mock.patch.object(
+                gc,
+                "collect",
+                side_effect=AssertionError("gc.collect ran on a scrape"),
+            ) as collect,
+            mock.patch.object(
+                tracemalloc,
+                "start",
+                side_effect=AssertionError("tracemalloc started on a scrape"),
+            ) as start,
+            mock.patch.object(
+                tracemalloc,
+                "take_snapshot",
+                side_effect=AssertionError("tracemalloc snapshot on a scrape"),
+            ) as take_snapshot,
+        ):
+            renderer = MetricsRenderer(server)
+            heap = renderer.process_heap_metrics_lines()
+            components = renderer.component_cardinality_metrics_lines()
+            document = renderer.render()
+        self.assertEqual(_type_families(heap), list(PROCESS_HEAP_METRIC_FAMILIES))
+        self.assertEqual(
+            _type_families(components),
+            list(COMPONENT_CARDINALITY_METRIC_FAMILIES),
+        )
+        self.assertIn("qbit_prism_process_allocated_blocks ", document)
+        get_objects.assert_not_called()
+        collect.assert_not_called()
+        start.assert_not_called()
+        take_snapshot.assert_not_called()
+        self.assertFalse(tracemalloc.is_tracing())
 
 
 if __name__ == "__main__":
