@@ -15,6 +15,7 @@ from typing import Mapping
 from lab.auxpow import vardiff
 from lab.prism import direct_stratum
 from lab.prism.ctv_broadcaster_daemon import MAX_CTV_FANOUT_BROADCASTER_CHUNK_SIZE
+from lab.prism.process_telemetry import HeapCensusConfig
 from lab.prism.share_ledger import (
     DEFAULT_AUDIT_SHARE_SEGMENT_SIZE,
     DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT,
@@ -85,6 +86,41 @@ DEFAULT_PRISM_WINDOW_PIPELINE_RUST = False
 # stop that call without a redeploy. Off renders the allocator gauges as
 # unavailable (availability 0, bytes -1); the interpreter gauges stay on.
 DEFAULT_PRISM_MALLOC_TELEMETRY = True
+# Issue #226 part 2: the operator-triggered heap census. Off by default and
+# armed only by this switch: the walk (gc.get_objects plus a pass over every
+# tracked object) holds the GIL for seconds on a multi-gigabyte heap, so it
+# must never be reachable by accident. On, SIGUSR1 writes one bounded JSON
+# report per signal to PRISM_HEAP_CENSUS_DIR; nothing else changes.
+DEFAULT_PRISM_HEAP_CENSUS = False
+# Where reports land: a subdirectory of the audit directory, which is the
+# one persistent volume the compose stack mounts into the coordinator.
+DEFAULT_PRISM_HEAP_CENSUS_SUBDIR = "heap-census"
+# The bounds. Top-N caps both type lists and both tracemalloc lists; the
+# byte cap is enforced by halving top-N until the JSON fits, never by cutting
+# the document; the walk cap stops the per-object pass and marks the report
+# truncated. The ceilings below are hard: a value above them refuses startup
+# rather than promising a "bounded" census that is not.
+DEFAULT_PRISM_HEAP_CENSUS_TOP_N = 40
+MAX_PRISM_HEAP_CENSUS_TOP_N = 200
+DEFAULT_PRISM_HEAP_CENSUS_MAX_BYTES = 262_144
+MIN_PRISM_HEAP_CENSUS_MAX_BYTES = 4_096
+MAX_PRISM_HEAP_CENSUS_MAX_BYTES = 4 * 1024 * 1024
+DEFAULT_PRISM_HEAP_CENSUS_MAX_SECONDS = 10.0
+MAX_PRISM_HEAP_CENSUS_MAX_SECONDS = 120.0
+# Signals arriving closer together than this coalesce into one action, so a
+# repeated kill cannot stack heap walks or arena-lock trims.
+DEFAULT_PRISM_HEAP_CENSUS_MIN_INTERVAL_SECONDS = 60.0
+# tracemalloc has a standing cost on every allocation for as long as it
+# traces, so it is a second, separate opt-in that only means anything with
+# the census on; on without the census refuses startup.
+DEFAULT_PRISM_HEAP_CENSUS_TRACEMALLOC = False
+# malloc_trim on SIGRTMIN+1. It takes every glibc arena lock in turn while
+# it walks that arena's free lists, so it is an operator action, not a
+# default; the periodic variant is paced and floored so it cannot become a
+# steady stall. 0 disables the periodic trim.
+DEFAULT_PRISM_MALLOC_TRIM_SIGNAL = False
+DEFAULT_PRISM_MALLOC_TRIM_INTERVAL_SECONDS = 0.0
+MIN_PRISM_MALLOC_TRIM_INTERVAL_SECONDS = 60.0
 
 
 def validate_payout_artifact_age_bounds(
@@ -567,6 +603,104 @@ def env_malloc_telemetry(*, environ: Env | None = None) -> bool:
         DEFAULT_PRISM_MALLOC_TELEMETRY,
         environ=environ,
     )
+
+
+def env_heap_census_config(
+    *,
+    environ: Env | None = None,
+    audit_dir: Path | None = None,
+) -> HeapCensusConfig:
+    """The issue #226 census, trim, and tracing switches, validated fail-closed.
+
+    Every switch is strict like the Rust and malloc-telemetry switches, and
+    every bound is range-checked against the ceilings beside its default: a
+    census that is "bounded" by a top-N of a million or a walk cap of an hour
+    is not bounded, so those values refuse startup. ``audit_dir`` is the
+    resolved ``PRISM_AUDIT_DIR`` when the coordinator loader already has it;
+    standalone callers get the same derivation the loader uses.
+    """
+    source = _current_environ(environ)
+    if audit_dir is None:
+        evidence_path = Path(env("PRISM_EVIDENCE_PATH", "prism-live-evidence.json", environ=source))
+        audit_dir = Path(env("PRISM_AUDIT_DIR", str(evidence_path.parent), environ=source))
+    enabled = env_strict_bool("PRISM_HEAP_CENSUS", DEFAULT_PRISM_HEAP_CENSUS, environ=source)
+    # Optional: the compose passthrough delivers an empty string when the
+    # deploy dotenv leaves it unset, and empty must mean the default, not a
+    # refused startup.
+    output_dir = env_optional("PRISM_HEAP_CENSUS_DIR", environ=source) or str(
+        audit_dir / DEFAULT_PRISM_HEAP_CENSUS_SUBDIR
+    )
+    top_n = env_positive_int(
+        "PRISM_HEAP_CENSUS_TOP_N", DEFAULT_PRISM_HEAP_CENSUS_TOP_N, environ=source
+    )
+    if top_n > MAX_PRISM_HEAP_CENSUS_TOP_N:
+        raise SystemExit(
+            f"PRISM_HEAP_CENSUS_TOP_N must be at most {MAX_PRISM_HEAP_CENSUS_TOP_N}"
+        )
+    max_bytes = env_positive_int(
+        "PRISM_HEAP_CENSUS_MAX_BYTES", DEFAULT_PRISM_HEAP_CENSUS_MAX_BYTES, environ=source
+    )
+    if not MIN_PRISM_HEAP_CENSUS_MAX_BYTES <= max_bytes <= MAX_PRISM_HEAP_CENSUS_MAX_BYTES:
+        raise SystemExit(
+            "PRISM_HEAP_CENSUS_MAX_BYTES must be between "
+            f"{MIN_PRISM_HEAP_CENSUS_MAX_BYTES} and {MAX_PRISM_HEAP_CENSUS_MAX_BYTES}"
+        )
+    max_seconds = env_positive_float(
+        "PRISM_HEAP_CENSUS_MAX_SECONDS", DEFAULT_PRISM_HEAP_CENSUS_MAX_SECONDS, environ=source
+    )
+    if max_seconds > MAX_PRISM_HEAP_CENSUS_MAX_SECONDS:
+        raise SystemExit(
+            f"PRISM_HEAP_CENSUS_MAX_SECONDS must be at most {MAX_PRISM_HEAP_CENSUS_MAX_SECONDS:g}"
+        )
+    min_interval = env_nonnegative_float(
+        "PRISM_HEAP_CENSUS_MIN_INTERVAL_SECONDS",
+        DEFAULT_PRISM_HEAP_CENSUS_MIN_INTERVAL_SECONDS,
+        environ=source,
+    )
+    tracemalloc_enabled = env_strict_bool(
+        "PRISM_HEAP_CENSUS_TRACEMALLOC", DEFAULT_PRISM_HEAP_CENSUS_TRACEMALLOC, environ=source
+    )
+    if tracemalloc_enabled and not enabled:
+        raise SystemExit("PRISM_HEAP_CENSUS_TRACEMALLOC requires PRISM_HEAP_CENSUS=1")
+    trim_signal = env_strict_bool(
+        "PRISM_MALLOC_TRIM_SIGNAL", DEFAULT_PRISM_MALLOC_TRIM_SIGNAL, environ=source
+    )
+    trim_interval = env_nonnegative_float(
+        "PRISM_MALLOC_TRIM_INTERVAL_SECONDS",
+        DEFAULT_PRISM_MALLOC_TRIM_INTERVAL_SECONDS,
+        environ=source,
+    )
+    if 0 < trim_interval < MIN_PRISM_MALLOC_TRIM_INTERVAL_SECONDS:
+        raise SystemExit(
+            "PRISM_MALLOC_TRIM_INTERVAL_SECONDS must be 0 or at least "
+            f"{MIN_PRISM_MALLOC_TRIM_INTERVAL_SECONDS:g}"
+        )
+    return HeapCensusConfig(
+        enabled=enabled,
+        output_dir=output_dir,
+        top_n=top_n,
+        max_bytes=max_bytes,
+        max_seconds=max_seconds,
+        min_interval_seconds=min_interval,
+        tracemalloc_enabled=tracemalloc_enabled,
+        malloc_trim_signal_enabled=trim_signal,
+        malloc_trim_interval_seconds=trim_interval,
+    )
+
+
+# The census as shipped: every switch off, every bound at its default. The
+# lifecycle config carries this so a positional construction keeps working.
+DEFAULT_PRISM_HEAP_CENSUS_CONFIG = HeapCensusConfig(
+    enabled=DEFAULT_PRISM_HEAP_CENSUS,
+    output_dir=str(Path("prism-live-evidence.json").parent / DEFAULT_PRISM_HEAP_CENSUS_SUBDIR),
+    top_n=DEFAULT_PRISM_HEAP_CENSUS_TOP_N,
+    max_bytes=DEFAULT_PRISM_HEAP_CENSUS_MAX_BYTES,
+    max_seconds=DEFAULT_PRISM_HEAP_CENSUS_MAX_SECONDS,
+    min_interval_seconds=DEFAULT_PRISM_HEAP_CENSUS_MIN_INTERVAL_SECONDS,
+    tracemalloc_enabled=DEFAULT_PRISM_HEAP_CENSUS_TRACEMALLOC,
+    malloc_trim_signal_enabled=DEFAULT_PRISM_MALLOC_TRIM_SIGNAL,
+    malloc_trim_interval_seconds=DEFAULT_PRISM_MALLOC_TRIM_INTERVAL_SECONDS,
+)
 
 
 def env_optional_bool(name: str, *, environ: Env | None = None) -> bool | None:
@@ -1354,6 +1488,12 @@ class LifecycleConfig:
     # the same switch from the environment itself; this field records the
     # validated value in the config snapshot.
     malloc_telemetry_enabled: bool = DEFAULT_PRISM_MALLOC_TELEMETRY
+    # Issue #226 part 2. Validated by the loader so a bad census bound
+    # refuses startup. prism_coordinator.main re-reads the same strict
+    # switches from the environment when it arms the census (the
+    # malloc-telemetry precedent above), so this field records the validated
+    # value in the config snapshot and can only ever agree with what main saw.
+    heap_census: HeapCensusConfig = DEFAULT_PRISM_HEAP_CENSUS_CONFIG
 
 
 @dataclass(frozen=True)
@@ -2062,6 +2202,7 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
             DEFAULT_PRISM_LEDGER_LEASE_EXTERNAL_FENCE_TIMEOUT_SECONDS
         ),
         malloc_telemetry_enabled=env_malloc_telemetry(environ=source),
+        heap_census=env_heap_census_config(environ=source, audit_dir=audit_dir),
     )
     max_blocks = env_int("PRISM_MAX_BLOCKS", 1, environ=source)
     if max_blocks <= 0:

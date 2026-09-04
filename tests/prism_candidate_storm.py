@@ -82,7 +82,11 @@ import argparse
 import gc
 import json
 import linecache
+import os
+import platform
 import queue
+import random
+import subprocess
 import sys
 import threading
 import time
@@ -92,7 +96,7 @@ from dataclasses import asdict, dataclass
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, ContextManager, Iterable
+from typing import Any, ContextManager, Iterable, Sequence
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -108,6 +112,14 @@ from lab.prism.block_candidates import (  # noqa: E402
 )
 from lab.prism.coordinator_config import (  # noqa: E402
     DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX,
+)
+from lab.prism.process_telemetry import (  # noqa: E402
+    MallocTrimmer,
+    ProcessHeapTelemetry,
+    read_anonymous_map_shape,
+    read_malloc_arena_count,
+    read_malloc_info_summary,
+    read_resident_memory_bytes,
 )
 from lab.prism.share_ledger import (  # noqa: E402
     PendingShare,
@@ -1948,75 +1960,278 @@ class CandidateStormRig:
         )
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--candidates",
-        type=int,
-        default=OBSERVED_TESTNET_CANDIDATE_STORM,
+# -- heap and allocator readings (issue #226) ------------------------------
+#
+# #185 measured the coordinator at 125 MiB before a storm and 613 MiB after
+# the drain, and #226 found the mainnet resident set growing 390 MB/h with a
+# memory map shaped like glibc per-thread arenas. These readings put the same
+# instrument around the storm so both can be re-run on any host: the resident
+# set, the interpreter's live-block count, glibc's arena/in-use/free bytes and
+# arena count, and the anonymous-map band histogram, at every phase boundary,
+# then after the storm's objects are released and collected, then after one
+# malloc_trim. Every number is host-specific -- absolutes vary by up to an
+# order of magnitude across hosts -- and the instrument reports the platform
+# beside them; what transfers is the mechanism: does the live-block count
+# return, does the free-bytes reading grow, does the trim return it.
+
+ARENA_PROBE_MIN_BYTES = 4 * 1024
+# Under glibc's initial 128 KiB mmap threshold, so the buffers come from the
+# arenas rather than from direct mmap; over pymalloc's 512-byte ceiling, so
+# they come from glibc at all.
+ARENA_PROBE_MAX_BYTES = 120 * 1024
+ARENA_PROBE_LIVE_BUFFERS = 64
+# A worker's wait at the barrier, and half the join ceiling. 64 threads x
+# 2,000 rounds take about a second on a development host; a slow host has
+# an order of magnitude of headroom before the probe reports a failure.
+ARENA_PROBE_BARRIER_TIMEOUT_SECONDS = 60.0
+
+
+@dataclass(frozen=True)
+class HeapReading:
+    """One phase boundary's resident-set and allocator readings."""
+
+    phase: str
+    elapsed_seconds: float
+    resident_bytes: int
+    allocated_blocks: int
+    threads: int
+    malloc_info_available: bool
+    malloc_arena_bytes: int
+    malloc_in_use_bytes: int
+    malloc_free_bytes: int
+    malloc_mmapped_bytes: int
+    malloc_arena_count: int
+    # Free bytes split by where they sit: interior bins, which malloc_trim
+    # returns in every arena, and per-thread heap tops, which it cannot.
+    malloc_free_top_bytes: int
+    malloc_free_bin_bytes: int
+    anonymous_regions: int
+    anonymous_bytes: int
+    anonymous_regions_4mib_to_64mib: int
+    heap_segment_bytes: int
+
+
+def take_heap_reading(
+    phase: str,
+    telemetry: ProcessHeapTelemetry,
+    started_monotonic: float,
+) -> HeapReading:
+    sample = telemetry.sample()
+    shape = read_anonymous_map_shape()
+    malloc_info = read_malloc_info_summary()
+    return HeapReading(
+        phase=phase,
+        elapsed_seconds=round(time.monotonic() - started_monotonic, 3),
+        resident_bytes=read_resident_memory_bytes(),
+        allocated_blocks=sample.allocated_blocks,
+        threads=sample.threads,
+        malloc_info_available=sample.malloc_info_available,
+        malloc_arena_bytes=sample.malloc_arena_bytes,
+        malloc_in_use_bytes=sample.malloc_in_use_bytes,
+        malloc_free_bytes=sample.malloc_free_bytes,
+        malloc_mmapped_bytes=sample.malloc_mmapped_bytes,
+        malloc_arena_count=malloc_info.arenas,
+        malloc_free_top_bytes=malloc_info.top_bytes,
+        malloc_free_bin_bytes=malloc_info.bin_bytes,
+        anonymous_regions=shape.regions,
+        anonymous_bytes=shape.total_bytes,
+        anonymous_regions_4mib_to_64mib=shape.band_regions.get("4mib_to_64mib", -1),
+        heap_segment_bytes=shape.heap_segment_bytes,
     )
-    parser.add_argument(
-        "--queue-depth",
-        type=int,
-        default=MAX_PENDING_BLOCK_CANDIDATES,
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="show coordinator coalescing and replay logs before the JSON report",
-    )
-    parser.add_argument(
-        "--decide",
-        action="store_true",
-        help="after restart enumeration, make the last candidate the active "
-        "block at the storm height and report ownership/evidence gauges",
-    )
-    parser.add_argument(
-        "--drain-per-row",
-        action="store_true",
-        help="with --decide, also drive the shipped per-row disposition path "
-        "over every sibling on the restarted coordinator and report its cost",
-    )
-    parser.add_argument(
-        "--cleanup-fault",
-        action="append",
-        choices=(CLEANUP_FAULT_NONE, "all", *CLEANUP_FAULTS),
-        help="issue #198: run the shipped collapse walk under this injected "
-        "cleanup fault on a fresh storm, measure the retry backlog, and prove "
-        "its recovery; repeatable, 'all' runs the clean baseline and every fault",
-    )
-    parser.add_argument(
-        "--cleanup-view",
-        choices=("live", "restart"),
-        default="restart",
-        help="coordinator view the cleanup-fault runs use (default: restart)",
-    )
-    parser.add_argument(
-        "--backlog-max",
-        type=int,
-        default=None,
-        help="pin the cleanup-retry admission bound for the cleanup-fault runs "
-        f"(default: the shipped {DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX})",
-    )
-    parser.add_argument(
-        "--credit-shares",
-        action="store_true",
-        help="seed credit-bearing candidates so the cleanup-fault runs exercise "
-        "real pending-share floor authority",
-    )
-    parser.add_argument(
-        "--no-tracemalloc",
-        action="store_true",
-        help="skip the tracemalloc reading in the cleanup-fault runs",
-    )
-    args = parser.parse_args()
+
+
+def allocator_environment() -> dict[str, str]:
+    """The glibc and CPython allocator variables this process started with."""
+    return {
+        name: value
+        for name, value in sorted(os.environ.items())
+        if name.startswith("MALLOC_") or name in ("GLIBC_TUNABLES", "PYTHONMALLOC")
+    }
+
+
+def run_arena_probe(
+    threads: int,
+    rounds: int,
+    *,
+    seed: int = 226,
+    telemetry: ProcessHeapTelemetry | None = None,
+    allocate: Any = bytes,
+) -> dict[str, Any]:
+    """Reproduce the per-thread arena shape and report what it costs.
+
+    ``threads`` Python threads each allocate ``rounds`` medium buffers
+    (4-120 KiB: over pymalloc's ceiling, under glibc's initial mmap
+    threshold) into a small ring so a bounded number stay live at once, then
+    drop the ring and exit. glibc assigns a thread its own arena on its first
+    allocation (up to ``MALLOC_ARENA_MAX``) only while no exited thread's
+    arena is waiting on the free list, so the threads meet at a barrier
+    before any exits -- the coordinator's 64 threads are long-lived, and
+    that is the shape under test. The arena count after the probe is the
+    mechanism: it should approach ``threads + 1`` at glibc's default and stop
+    at the configured cap otherwise. The rings' freed buffers stay on each
+    arena's free lists after the threads exit -- arenas outlive threads --
+    which is the retained-free-bytes reading the trim that follows is judged
+    by. ``allocate`` is the buffer constructor (``bytes``); a test injects a
+    failing one to prove a broken worker cannot wedge the probe.
+    """
+    telemetry = telemetry if telemetry is not None else ProcessHeapTelemetry()
+    before = telemetry.sample()
+    resident_before = read_resident_memory_bytes()
+    arenas_before = read_malloc_arena_count()
+    started = time.monotonic()
+    # Bounded: a worker that fails breaks the barrier for everyone, a worker
+    # that stalls trips the barrier timeout, and the join below has its own
+    # ceiling, so one bad thread cannot wedge the instrument. Every such
+    # event is reported in ``failures`` rather than raised mid-probe.
+    all_allocated = threading.Barrier(threads)
+    failures: list[str] = []
+
+    def worker(index: int) -> None:
+        rng = random.Random(seed + index)
+        ring: list[bytes | None] = [None] * ARENA_PROBE_LIVE_BUFFERS
+        try:
+            for round_index in range(rounds):
+                size = rng.randint(ARENA_PROBE_MIN_BYTES, ARENA_PROBE_MAX_BYTES)
+                ring[round_index % ARENA_PROBE_LIVE_BUFFERS] = allocate(size)
+            all_allocated.wait(timeout=ARENA_PROBE_BARRIER_TIMEOUT_SECONDS)
+        except threading.BrokenBarrierError:
+            failures.append(f"worker {index}: barrier broken or timed out")
+        except Exception as exc:
+            all_allocated.abort()
+            failures.append(f"worker {index}: {exc!r}")
+        finally:
+            ring.clear()
+
+    workers = [
+        threading.Thread(target=worker, args=(index,), name=f"arena-probe-{index}")
+        for index in range(threads)
+    ]
+    for thread in workers:
+        thread.start()
+    join_deadline = time.monotonic() + ARENA_PROBE_BARRIER_TIMEOUT_SECONDS * 2
+    for thread in workers:
+        thread.join(timeout=max(0.0, join_deadline - time.monotonic()))
+        if thread.is_alive():
+            all_allocated.abort()
+            failures.append(f"{thread.name}: did not finish before the join ceiling")
+    seconds = time.monotonic() - started
+    after = telemetry.sample()
+    return {
+        "threads": threads,
+        "rounds": rounds,
+        "buffer_bytes": [ARENA_PROBE_MIN_BYTES, ARENA_PROBE_MAX_BYTES],
+        "live_buffers_per_thread": ARENA_PROBE_LIVE_BUFFERS,
+        "failures": failures,
+        "seconds": round(seconds, 6),
+        "arena_count_before": arenas_before,
+        "arena_count_after": read_malloc_arena_count(),
+        "resident_before": resident_before,
+        "resident_after": read_resident_memory_bytes(),
+        "malloc_info_available": before.malloc_info_available and after.malloc_info_available,
+        "malloc_arena_before": before.malloc_arena_bytes,
+        "malloc_arena_after": after.malloc_arena_bytes,
+        "malloc_free_before": before.malloc_free_bytes,
+        "malloc_free_after": after.malloc_free_bytes,
+        "malloc_in_use_before": before.malloc_in_use_bytes,
+        "malloc_in_use_after": after.malloc_in_use_bytes,
+    }
+
+
+def allocator_experiment_child_args(argv: Sequence[str]) -> list[str]:
+    """The child invocation: this run's arguments minus the experiment options.
+
+    ``--verbose`` is dropped too: a child's coordinator logs would precede
+    the JSON document on the same stdout the parent parses, and the parse
+    would fail only after the whole storm had run.
+    """
+    child: list[str] = []
+    skip_next = False
+    for token in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in ("--allocator-experiment", "--allocator-mmap-threshold"):
+            skip_next = True
+            continue
+        if token.startswith("--allocator-experiment=") or token.startswith(
+            "--allocator-mmap-threshold="
+        ):
+            continue
+        if token == "--verbose":
+            continue
+        child.append(token)
+    if "--heap-report" not in child:
+        child.append("--heap-report")
+    return child
+
+
+def run_allocator_experiment(
+    settings: Sequence[str],
+    child_args: Sequence[str],
+    *,
+    mmap_threshold: int | None = None,
+) -> list[dict[str, Any]]:
+    """Run this instrument once per ``MALLOC_ARENA_MAX`` setting, in a child each.
+
+    glibc reads its environment once at process start, so every setting
+    needs its own process; ``default`` runs with the variable unset. The
+    children inherit everything else, and ``mmap_threshold`` (when given)
+    pins ``MALLOC_MMAP_THRESHOLD_`` in each of them, which also switches
+    glibc's dynamic threshold off.
+    """
+    results: list[dict[str, Any]] = []
+    for setting in settings:
+        env = dict(os.environ)
+        env.pop("MALLOC_ARENA_MAX", None)
+        if setting != "default":
+            env["MALLOC_ARENA_MAX"] = str(int(setting))
+        if mmap_threshold is not None:
+            env["MALLOC_MMAP_THRESHOLD_"] = str(int(mmap_threshold))
+        completed = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), *child_args],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        child = json.loads(completed.stdout)
+        decided = child.get("decided") or {}
+        results.append(
+            {
+                "malloc_arena_max": setting,
+                "malloc_mmap_threshold": mmap_threshold,
+                "heap": child["heap"],
+                "per_row_drain": decided.get("per_row_drain"),
+            }
+        )
+    return results
+
+
+def _run_storm_phases(
+    args: argparse.Namespace,
+    read_heap: Any,
+    phase_seconds: dict[str, float],
+) -> dict[str, Any]:
+    """Seed, restart, optionally decide/drain, optionally fault; return the report.
+
+    Everything the storm allocates is referenced only from this frame, so a
+    caller that wants the post-storm resident set reads it after this
+    returns. ``read_heap`` is called at every phase boundary and
+    ``phase_seconds`` receives each phase's wall-clock.
+    """
     rig = CandidateStormRig(
         candidates=args.candidates,
         queue_depth=args.queue_depth,
         quiet=not args.verbose,
     )
+    phase_started = time.monotonic()
     live = rig.seed_live()
+    phase_seconds["seed_live"] = round(time.monotonic() - phase_started, 6)
+    read_heap("after_seed_live")
+    phase_started = time.monotonic()
     restarted = rig.restart_and_enumerate()
+    phase_seconds["restart_enumerate"] = round(time.monotonic() - phase_started, 6)
+    read_heap("after_restart_enumerate")
     report: dict[str, Any] = {
         "bounds": {
             "live_queue": MAX_PENDING_BLOCK_CANDIDATES,
@@ -2036,11 +2251,15 @@ def main() -> int:
             "winner_hash": winner,
             "restart": asdict(decided),
         }
+        read_heap("after_decide")
         if args.drain_per_row:
+            phase_started = time.monotonic()
             drain = rig.drain_per_row(
                 rig.restarted_server,
                 stop_before_hash=winner,
             )
+            phase_seconds["drain_per_row"] = round(time.monotonic() - phase_started, 6)
+            read_heap("after_drain")
             # The abandoned/submitted hash sets are the programmatic output
             # and are storm-sized; only the bounded sets are printed.
             report["decided"]["per_row_drain"] = {
@@ -2105,6 +2324,180 @@ def main() -> int:
             "python": sys.version.split()[0],
             "platform": sys.platform,
             "runs": runs,
+        }
+        read_heap("after_cleanup_faults")
+    return report
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--candidates",
+        type=int,
+        default=OBSERVED_TESTNET_CANDIDATE_STORM,
+    )
+    parser.add_argument(
+        "--queue-depth",
+        type=int,
+        default=MAX_PENDING_BLOCK_CANDIDATES,
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show coordinator coalescing and replay logs before the JSON report",
+    )
+    parser.add_argument(
+        "--decide",
+        action="store_true",
+        help="after restart enumeration, make the last candidate the active "
+        "block at the storm height and report ownership/evidence gauges",
+    )
+    parser.add_argument(
+        "--drain-per-row",
+        action="store_true",
+        help="with --decide, also drive the shipped per-row disposition path "
+        "over every sibling on the restarted coordinator and report its cost",
+    )
+    parser.add_argument(
+        "--cleanup-fault",
+        action="append",
+        choices=(CLEANUP_FAULT_NONE, "all", *CLEANUP_FAULTS),
+        help="issue #198: run the shipped collapse walk under this injected "
+        "cleanup fault on a fresh storm, measure the retry backlog, and prove "
+        "its recovery; repeatable, 'all' runs the clean baseline and every fault",
+    )
+    parser.add_argument(
+        "--cleanup-view",
+        choices=("live", "restart"),
+        default="restart",
+        help="coordinator view the cleanup-fault runs use (default: restart)",
+    )
+    parser.add_argument(
+        "--backlog-max",
+        type=int,
+        default=None,
+        help="pin the cleanup-retry admission bound for the cleanup-fault runs "
+        f"(default: the shipped {DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX})",
+    )
+    parser.add_argument(
+        "--credit-shares",
+        action="store_true",
+        help="seed credit-bearing candidates so the cleanup-fault runs exercise "
+        "real pending-share floor authority",
+    )
+    parser.add_argument(
+        "--no-tracemalloc",
+        action="store_true",
+        help="skip the tracemalloc reading in the cleanup-fault runs",
+    )
+    parser.add_argument(
+        "--heap-report",
+        action="store_true",
+        help="issue #226: report resident set, glibc arena, and anonymous-map "
+        "readings at every phase, after the storm is released and collected, "
+        "and after one malloc_trim (host-specific numbers; the platform is "
+        "reported beside them)",
+    )
+    parser.add_argument(
+        "--arena-probe-threads",
+        type=int,
+        default=0,
+        help="with --heap-report, run this many allocating threads after the "
+        "storm to reproduce the per-thread arena shape (0 skips the probe)",
+    )
+    parser.add_argument(
+        "--arena-probe-rounds",
+        type=int,
+        default=2_000,
+        help="medium-buffer allocations per arena-probe thread (default 2000)",
+    )
+    parser.add_argument(
+        "--allocator-experiment",
+        default=None,
+        help="comma-separated MALLOC_ARENA_MAX settings ('default', '2', '4'); "
+        "runs this instrument once per setting in a child process with "
+        "--heap-report and reports every child's heap section side by side",
+    )
+    parser.add_argument(
+        "--allocator-mmap-threshold",
+        type=int,
+        default=None,
+        help="with --allocator-experiment, also pin MALLOC_MMAP_THRESHOLD_ in "
+        "every child (which switches glibc's dynamic threshold off)",
+    )
+    args = parser.parse_args()
+    if args.allocator_experiment:
+        settings = [
+            token.strip()
+            for token in args.allocator_experiment.split(",")
+            if token.strip()
+        ]
+        runs = run_allocator_experiment(
+            settings,
+            allocator_experiment_child_args(sys.argv[1:]),
+            mmap_threshold=args.allocator_mmap_threshold,
+        )
+        print(
+            json.dumps(
+                {
+                    "allocator_experiment": {
+                        "python": sys.version.split()[0],
+                        "platform": sys.platform,
+                        "libc": " ".join(platform.libc_ver()),
+                        "machine": platform.machine(),
+                        "cpu_count": os.cpu_count(),
+                        "runs": runs,
+                    }
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    telemetry = ProcessHeapTelemetry() if args.heap_report else None
+    readings: list[HeapReading] = []
+    phase_seconds: dict[str, float] = {}
+    instrument_started = time.monotonic()
+
+    def read_heap(phase: str) -> None:
+        if telemetry is not None:
+            readings.append(take_heap_reading(phase, telemetry, instrument_started))
+
+    read_heap("start")
+    # The storm runs in its own frame so that, when it returns, nothing in
+    # this function still references the rig, the drain, or a fault run.
+    report = _run_storm_phases(args, read_heap, phase_seconds)
+    if telemetry is not None:
+        probe: dict[str, Any] | None = None
+        if args.arena_probe_threads > 0:
+            probe = run_arena_probe(
+                args.arena_probe_threads,
+                args.arena_probe_rounds,
+                telemetry=telemetry,
+            )
+            read_heap("after_arena_probe")
+        # #185's question: once the storm's own objects are gone, does the
+        # process return to its pre-storm size? Every reference to the storm
+        # died with _run_storm_phases' frame; collect, and read. The gap
+        # between "after_release_gc" and "start" that survives is what the
+        # interpreter still holds (allocated_blocks) plus what glibc has not
+        # returned (malloc_free_bytes and the resident set); the trim that
+        # follows shows how much of the latter one malloc_trim recovers.
+        gc.collect()
+        read_heap("after_release_gc")
+        trim = MallocTrimmer(telemetry, log=lambda _line: None).trim_once("storm")
+        read_heap("after_malloc_trim")
+        report["heap"] = {
+            "python": sys.version.split()[0],
+            "platform": sys.platform,
+            "libc": " ".join(platform.libc_ver()),
+            "machine": platform.machine(),
+            "cpu_count": os.cpu_count(),
+            "allocator_env": allocator_environment(),
+            "phase_seconds": phase_seconds,
+            "readings": [asdict(reading) for reading in readings],
+            "arena_probe": probe,
+            "malloc_trim": trim.as_dict() if trim is not None else None,
         }
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0

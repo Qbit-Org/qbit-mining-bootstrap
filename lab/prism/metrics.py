@@ -1052,7 +1052,7 @@ class MetricsRenderer:
             "# TYPE qbit_prism_process_gc_trigger_count gauge",
             *[
                 f'qbit_prism_process_gc_trigger_count{{generation="{generation}"}} {int(count)}'
-                for generation, count in zip(PRISM_GC_GENERATIONS, sample.gc_pending)
+                for generation, count in zip(PRISM_GC_GENERATIONS, sample.gc_trigger_count)
             ],
             "# HELP qbit_prism_process_gc_collections_total Cyclic collector passes completed per generation since process start (gc.get_stats).",
             "# TYPE qbit_prism_process_gc_collections_total counter",
