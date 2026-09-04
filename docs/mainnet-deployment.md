@@ -334,9 +334,9 @@ Keep `PRISM_STRATUM_STALE_GRACE_SECONDS` at its bounded default (3 seconds)
 on every chain, mainnet included. At zero, every in-flight prior-tip share is
 rejected with Stratum error 21 at each block, which miners read as pool
 failure rather than as stale work. Reward windows that contain a credited
-prior-tip share publish `qbit.prism.audit-bundle.v1.1`; this release's
-verifier accepts it, so keep external mirrors and verifiers on a release that
-does too.
+prior-tip share publish the logical `qbit.prism.audit-bundle.v1.1` schema;
+this release's verifier accepts it, so keep external mirrors and verifiers on
+a release that does too.
 
 `PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS` bounds a persistent
 PRISM template-refresh outage; it must be shorter than the operator alert and

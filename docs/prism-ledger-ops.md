@@ -350,8 +350,8 @@ empty; `stale-grace` marks a prior-tip share credited by the coordinator's short
 stale-grace policy. Reward-window queries still count these rows because they
 are accepted shares, while audits can distinguish them from normal current-tip
 shares. Audit bundles containing a credited row use
-`qbit.prism.audit-bundle.v1.1`; external auditors must upgrade before operators
-enable stale-grace crediting.
+the logical `qbit.prism.audit-bundle.v1.1` schema, and the window is enabled by
+default on every chain, so external auditors must run a release that accepts it.
 
 Deployments that run with `PRISM_POSTGRES_INIT_SCHEMA=0` must apply
 `crates/qbit-prism/sql/001_share_ledger.sql` before starting any upgraded
@@ -688,8 +688,8 @@ full 40-character object ID. The environment doctor verifies that the resolved
 checkout is at that exact commit instead of trusting a mutable branch or tag.
 Stale-credit grace (`PRISM_STRATUM_STALE_GRACE_SECONDS`, default 3) stays
 enabled in production, mainnet included; reward windows that contain a credited
-prior-tip share publish `qbit.prism.audit-bundle.v1.1`, so keep the deployed
-verifier and accounting release on a version that accepts it.
+prior-tip share publish the logical `qbit.prism.audit-bundle.v1.1` schema, so
+keep the deployed verifier and accounting release on a version that accepts it.
 
 The parent-chain selector is checked independently: `BITCOIN_CHAIN` and
 `BITCOIN_CHAIN_FLAG` must be an exact pair, including `mainnet` with

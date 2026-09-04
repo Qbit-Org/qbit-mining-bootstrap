@@ -900,7 +900,15 @@ check_bitcoin_chain_selection() {
 check_prism_stale_grace() {
   mining_lane_enabled prism || return 0
 
-  command -v python3 >/dev/null 2>&1 || fail "python3 is required to validate PRISM_STRATUM_STALE_GRACE_SECONDS"
+  if ! command -v python3 >/dev/null 2>&1; then
+    # Production already requires python3 (check_prism_production_difficulty);
+    # lab bring-up does not, so skip rather than add a prerequisite there.
+    if production_mode_enabled; then
+      fail "python3 is required to validate PRISM_STRATUM_STALE_GRACE_SECONDS"
+    fi
+    printf 'doctor: python3 not found; skipping PRISM_STRATUM_STALE_GRACE_SECONDS validation\n'
+    return 0
+  fi
   # Mirror the coordinator's env_nonnegative_float(): the runtime's float
   # syntax and range, finite and non-negative.
   if ! python3 - "${PRISM_STRATUM_STALE_GRACE_SECONDS:-3}" >/dev/null 2>&1 <<'PY'

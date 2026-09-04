@@ -40,7 +40,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             "PRISM_LEDGER_WRITER_EPOCH": "7",
             "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
             "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
-            "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+            "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             "PRISM_STRATUM_SHARE_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF": "1",
             "PRISM_STRATUM_VARDIFF_TARGET_SECONDS": "15",
@@ -137,7 +137,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             "PRISM_LEDGER_WRITER_EPOCH": "7",
             "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
             "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
-            "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+            "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             "PRISM_STRATUM_SHARE_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF_START_DIFF": "4096",
@@ -920,7 +920,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             "BITCOIN_EXPECTED_GENESIS_HASH": (
                 "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
             ).upper(),
-            "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+            "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
         }
         for qbit_address, bitcoin_address, expected_name in (
             ("auto", "bc1explicit", "QBIT_MINER_ADDRESS"),
@@ -956,7 +956,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
                     "PRISM_LEDGER_WRITER_EPOCH": "7",
                     "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
                     "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
-                    "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                    "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
                     "CKPOOL_MINDIFF": "1024",
                     "CKPOOL_STARTDIFF": "65536",
                     "CKPOOL_REQUIRE_P2MR_PAYOUT": "1",
@@ -985,19 +985,86 @@ class CheckEnvProductionGateTests(unittest.TestCase):
     def test_mainnet_accepts_bounded_stale_grace(self) -> None:
         # Mainnet follows the same bounded-grace rule as every other chain:
         # zero grace rejects every in-flight prior-tip share at each block,
-        # which miners read as pool failure.
-        result = self.run_check_env(
-            MINING_LANES="prism",
-            QBIT_CHAIN="mainnet",
-            QBIT_CHAIN_FLAG="-chain=main",
-            QBIT_EXPECTED_GENESIS_HASH="11" * 32,
-            QBIT_GIT_COMMIT="41" * 20,
-            PRISM_STRATUM_STALE_GRACE_SECONDS="3",
-        )
+        # which miners read as pool failure. Run a complete mainnet production
+        # environment so a clean exit proves the gate accepts the window,
+        # rather than only that the old message is gone.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            checkout, commit = self.write_pinned_qbit_checkout(root)
+            fake_bin = self.write_fake_docker(root)
+            common = self.production_prism_env(root)
+            common.update({
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "QBIT_CHAIN": "mainnet",
+                "QBIT_CHAIN_FLAG": "-chain=main",
+                "QBIT_EXPECTED_GENESIS_HASH": "11" * 32,
+                "QBIT_GIT_COMMIT": commit,
+                "QBIT_SRC_DIR": str(checkout),
+                "QBIT_SRC_DIR_OVERRIDE": str(checkout),
+            })
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertNotIn("PRISM_STRATUM_STALE_GRACE_SECONDS", result.stderr)
-        self.assertNotIn("docker is required", result.stderr)
+            for grace in ("3", "0.5", "0"):
+                with self.subTest(grace=grace):
+                    result = self.run_check_env(
+                        **{**common, "PRISM_STRATUM_STALE_GRACE_SECONDS": grace}
+                    )
+
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn("PRISM_STRATUM_STALE_GRACE_SECONDS", result.stderr)
+
+    def test_prism_stale_grace_python3_requirement_matches_prior_prerequisites(self) -> None:
+        # python3 was already required in production (production difficulty), but
+        # never for lab bring-up. Validating stale grace must not change that:
+        # production still fails loudly, lab skips the check instead.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            minimal_bin = root / "no-python-bin"
+            minimal_bin.mkdir()
+            for tool in (
+                "bash",
+                "sh",
+                "cat",
+                "dirname",
+                "docker",
+                "env",
+                "git",
+                "rm",
+                "sed",
+                "tr",
+                "uname",
+            ):
+                resolved = shutil.which(tool)
+                if resolved is not None:
+                    (minimal_bin / tool).symlink_to(resolved)
+            self.assertIsNone(
+                shutil.which("python3", path=str(minimal_bin)),
+                "the minimal PATH must not expose python3",
+            )
+
+            lab = self.run_check_env(
+                PATH=str(minimal_bin),
+                MINING_LANES="prism",
+                PRISM_STRATUM_STALE_GRACE_SECONDS="not-a-number",
+            )
+            self.assertNotIn("PRISM_STRATUM_STALE_GRACE_SECONDS", lab.stderr)
+            self.assertIn(
+                "python3 not found; skipping PRISM_STRATUM_STALE_GRACE_SECONDS validation",
+                lab.stdout,
+            )
+
+            production = self.run_check_env(
+                PATH=str(minimal_bin),
+                MINING_LANES="prism",
+                QBIT_PRODUCTION="1",
+                QBIT_CHAIN="signet",
+                QBIT_CHAIN_FLAG="-signet",
+                PRISM_STRATUM_STALE_GRACE_SECONDS="not-a-number",
+            )
+            self.assertNotEqual(production.returncode, 0)
+            self.assertIn(
+                "python3 is required to validate PRISM_STRATUM_STALE_GRACE_SECONDS",
+                production.stderr,
+            )
 
     def test_prism_rejects_invalid_stale_grace_before_docker_check(self) -> None:
         # The exported value is what Compose hands the coordinator, so the
@@ -1246,7 +1313,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             "PRISM_LEDGER_WRITER_EPOCH": "7",
             "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
             "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
-            "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+            "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             "CKPOOL_MINDIFF": "1024",
             "CKPOOL_STARTDIFF": "65536",
         }

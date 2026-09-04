@@ -1132,7 +1132,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             "PRISM_LEDGER_WRITER_EPOCH": "7",
             "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
             "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
-            "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+            "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             "PRISM_STRATUM_SHARE_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF_START_DIFF": "4096",
@@ -1231,7 +1231,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             "PRISM_LEDGER_WRITER_EPOCH": "7",
             "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
             "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
-            "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+            "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             "PRISM_STRATUM_SHARE_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF_START_DIFF": "4096",
@@ -1260,7 +1260,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             os.environ,
             {
                 "QBIT_CHAIN": "mainnet",
-                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             },
             clear=True,
         ):
@@ -1273,7 +1273,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             {
                 "QBIT_CHAIN": "testnet4",
                 "QBIT_TOOLS_PRODUCTION": "1",
-                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             },
             clear=True,
         ):
@@ -1294,7 +1294,7 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             "PRISM_LEDGER_WRITER_EPOCH": "7",
             "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
             "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
-            "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+            "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             "PRISM_STRATUM_SHARE_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF_START_DIFF": "4096",

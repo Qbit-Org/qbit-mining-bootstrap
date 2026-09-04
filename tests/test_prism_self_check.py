@@ -38,7 +38,7 @@ def authorize_mainnet_prelaunch(env: dict[str, str]) -> dict[str, str]:
             "CKPOOL_NON_TEST_READINESS_GATE": "0",
             "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED": "0",
             "PRISM_POSTGRES_PASSWORD": "not-default",
-            "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+            "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
         }
     )
     return env
@@ -360,7 +360,7 @@ class PrismSelfCheckTests(unittest.TestCase):
                 "QBIT_CHAIN_FLAG": "-chain=main",
                 "QBIT_EXPECTED_GENESIS_HASH": "11" * 32,
                 "QBIT_GIT_COMMIT": "41" * 20,
-                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
                 "PRISM_ALLOW_TEST_SIGNING_SEEDS": "1",
             }
         )
@@ -395,7 +395,7 @@ class PrismSelfCheckTests(unittest.TestCase):
                 "QBIT_CHAIN_FLAG": "-chain=main",
                 "QBIT_EXPECTED_GENESIS_HASH": "AB" * 32,
                 "QBIT_GIT_COMMIT": "41" * 20,
-                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             }
         )
         reporter = self.self_check.Reporter()
@@ -419,7 +419,7 @@ class PrismSelfCheckTests(unittest.TestCase):
                     {
                         "QBIT_PRODUCTION": "1",
                         "QBIT_GIT_COMMIT": commit,
-                        "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                        "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
                     }
                 )
                 reporter = self.self_check.Reporter()
@@ -437,7 +437,7 @@ class PrismSelfCheckTests(unittest.TestCase):
             {
                 "QBIT_PRODUCTION": "1",
                 "QBIT_GIT_COMMIT": "AB" * 20,
-                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             }
         )
         reporter = self.self_check.Reporter()
@@ -460,7 +460,7 @@ class PrismSelfCheckTests(unittest.TestCase):
                 "QBIT_PRODUCTION": "1",
                 "QBIT_GIT_COMMIT": "41" * 20,
                 "PRISM_POSTGRES_PASSWORD": "not-default",
-                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
                 "PRISM_STRATUM_SHARE_DIFF": "1024",
                 "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
                 "PRISM_STRATUM_VARDIFF_START_DIFF": "4096",
@@ -484,7 +484,7 @@ class PrismSelfCheckTests(unittest.TestCase):
                 "QBIT_EXPECTED_GENESIS_HASH": "AB" * 32,
                 "QBIT_GIT_COMMIT": "41" * 20,
                 "QBIT_REQUIRE_RELEASE_PROVENANCE": "0",
-                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
                 "PRISM_STRATUM_SHARE_DIFF": "1024",
                 "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
                 "PRISM_STRATUM_VARDIFF_START_DIFF": "4096",
@@ -503,7 +503,7 @@ class PrismSelfCheckTests(unittest.TestCase):
             {
                 "QBIT_PRODUCTION": "1",
                 "QBIT_GIT_COMMIT": "41" * 20,
-                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             }
         )
         reporter = self.self_check.Reporter()
@@ -585,7 +585,7 @@ class PrismSelfCheckTests(unittest.TestCase):
             {
                 "QBIT_PRODUCTION": "1",
                 "QBIT_GIT_COMMIT": "41" * 20,
-                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
                 "BITCOIN_CHAIN": "mainnet",
                 "BITCOIN_CHAIN_FLAG": "-chain=main",
                 "QBIT_MINER_ADDRESS": "auto",
@@ -606,7 +606,7 @@ class PrismSelfCheckTests(unittest.TestCase):
             {
                 "QBIT_PRODUCTION": "1",
                 "QBIT_GIT_COMMIT": "41" * 20,
-                "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
                 "BITCOIN_CHAIN": "mainnet",
                 "BITCOIN_CHAIN_FLAG": "-chain=main",
                 "QBIT_MINER_ADDRESS": "qb1explicit",
