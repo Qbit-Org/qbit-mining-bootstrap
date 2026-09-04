@@ -560,8 +560,13 @@ class PrismSelfCheckTests(unittest.TestCase):
         for grace, expected in (
             ("0.5", "PASS"),
             ("0", "PASS"),
+            ("1e-1", "PASS"),
+            (".5", "PASS"),
+            ("3.", "PASS"),
             ("-1", "FAIL"),
             ("nan", "FAIL"),
+            ("inf", "FAIL"),
+            ("1" + "0" * 400, "FAIL"),
             ("abc", "FAIL"),
         ):
             with self.subTest(grace=grace):

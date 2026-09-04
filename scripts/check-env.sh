@@ -899,8 +899,23 @@ check_bitcoin_chain_selection() {
 
 check_prism_stale_grace() {
   mining_lane_enabled prism || return 0
-  local grace="${PRISM_STRATUM_STALE_GRACE_SECONDS:-3}"
-  [[ "${grace}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || fail "PRISM_STRATUM_STALE_GRACE_SECONDS must be a non-negative number"
+
+  command -v python3 >/dev/null 2>&1 || fail "python3 is required to validate PRISM_STRATUM_STALE_GRACE_SECONDS"
+  # Mirror the coordinator's env_nonnegative_float(): the runtime's float
+  # syntax and range, finite and non-negative.
+  if ! python3 - "${PRISM_STRATUM_STALE_GRACE_SECONDS:-3}" >/dev/null 2>&1 <<'PY'
+import math
+import sys
+
+try:
+    value = float(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if math.isfinite(value) and value >= 0 else 1)
+PY
+  then
+    fail "PRISM_STRATUM_STALE_GRACE_SECONDS must be a finite non-negative number"
+  fi
 }
 
 check_ctv_fee_config() {
