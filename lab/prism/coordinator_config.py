@@ -75,6 +75,16 @@ DEFAULT_PRISM_PAYOUT_ARTIFACT_FULL_RESCAN_SECONDS = 3_600.0
 # per-component-switch method, and any daemon anomaly still degrades to the
 # in-process pipeline for that materialization without flipping this.
 DEFAULT_PRISM_WINDOW_PIPELINE_RUST = False
+# Issue #226: bind glibc mallinfo2 through ctypes on every /metrics scrape
+# and export arena/in-use/free/mmapped bytes beside the interpreter's own
+# allocation and GC counters. On by default: it is the one always-on reading
+# that separates glibc arena fragmentation from Python retention on a
+# running coordinator. The switch exists because mallinfo2 walks glibc's
+# free lists under each arena lock -- negligible on a healthy heap, but the
+# only reading here that is not a plain counter load -- so an operator can
+# stop that call without a redeploy. Off renders the allocator gauges as
+# unavailable (availability 0, bytes -1); the interpreter gauges stay on.
+DEFAULT_PRISM_MALLOC_TELEMETRY = True
 
 
 def validate_payout_artifact_age_bounds(
@@ -539,6 +549,22 @@ def env_window_pipeline_rust(*, environ: Env | None = None) -> bool:
     return env_strict_bool(
         "PRISM_WINDOW_PIPELINE_RUST",
         DEFAULT_PRISM_WINDOW_PIPELINE_RUST,
+        environ=environ,
+    )
+
+
+def env_malloc_telemetry(*, environ: Env | None = None) -> bool:
+    """Whether /metrics binds glibc mallinfo2 for the allocator gauges.
+
+    Strict like the Rust switch: a non-boolean value refuses startup through
+    the coordinator config loader rather than silently landing on either
+    side. The metrics renderer reads the same strict switch when it is
+    constructed, so it can only ever see a value the loader already
+    validated in this process's environment.
+    """
+    return env_strict_bool(
+        "PRISM_MALLOC_TELEMETRY",
+        DEFAULT_PRISM_MALLOC_TELEMETRY,
         environ=environ,
     )
 
@@ -1322,6 +1348,12 @@ class LifecycleConfig:
     ledger_lease_heartbeat_monitor_seconds: float
     ledger_lease_heartbeat_exit_timeout_seconds: float
     ledger_lease_external_fence_timeout_seconds: float
+    # Appended with a default so existing positional constructions keep
+    # working. The loader passes the strict env read, so a non-boolean
+    # PRISM_MALLOC_TELEMETRY refuses startup. The metrics renderer resolves
+    # the same switch from the environment itself; this field records the
+    # validated value in the config snapshot.
+    malloc_telemetry_enabled: bool = DEFAULT_PRISM_MALLOC_TELEMETRY
 
 
 @dataclass(frozen=True)
@@ -2029,6 +2061,7 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
         ledger_lease_external_fence_timeout_seconds=(
             DEFAULT_PRISM_LEDGER_LEASE_EXTERNAL_FENCE_TIMEOUT_SECONDS
         ),
+        malloc_telemetry_enabled=env_malloc_telemetry(environ=source),
     )
     max_blocks = env_int("PRISM_MAX_BLOCKS", 1, environ=source)
     if max_blocks <= 0:
