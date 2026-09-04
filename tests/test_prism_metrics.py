@@ -65,6 +65,8 @@ from lab.prism.metrics import (
 )
 from lab.prism.payout_state import (
     AcceptedBlockPayoutTransition,
+    PRISM_PAYOUT_WINDOW_BUILD_OUTCOMES,
+    PRISM_PAYOUT_WINDOW_BUILD_PHASES,
     PayoutLedgerArtifact,
     _IncrementalPayoutArtifactWindow,
 )
@@ -1975,6 +1977,8 @@ class MetricsRenderParityTests(unittest.TestCase):
             "qbit_prism_accepted_parent_preview_wait_timeouts_total 2",
             "qbit_prism_tip_refresh_wave_outcomes_total",
             "qbit_prism_payout_artifact_events_total",
+            'qbit_prism_payout_window_build_phase_seconds_count{phase="ledger_read",outcome="completed"}',
+            'qbit_prism_payout_window_build_phase_seconds_count{phase="lock_wait",outcome="failed"}',
             "qbit_prism_vardiff_sessions_at_max_difficulty",
             'qbit_prism_vardiff_resume_total{outcome="clamped"}',
             'qbit_prism_vardiff_resume_total{outcome="overridden"} 2',
@@ -2034,6 +2038,56 @@ class MetricsRenderParityTests(unittest.TestCase):
         ]
         self.assertEqual(len(oldest), 1)
         self.assertGreaterEqual(float(oldest[0].split()[1]), 0.0)
+
+    def test_payout_window_build_phase_family_is_fixed_cardinality(self) -> None:
+        """Issue #228: one histogram family over closed phase and outcome sets."""
+        server = self._seeded_coordinator()
+        payload = server.metrics_payload()
+        family = "qbit_prism_payout_window_build_phase_seconds"
+        self.assertEqual(
+            PRISM_PAYOUT_WINDOW_BUILD_PHASES,
+            ("ledger_read", "record_conversion", "daemon_prepare", "lock_wait"),
+        )
+        self.assertEqual(
+            PRISM_PAYOUT_WINDOW_BUILD_OUTCOMES,
+            ("completed", "debounced", "aborted", "failed"),
+        )
+        self.assertEqual(payload.count(f"# TYPE {family} histogram\n"), 1)
+        series = [
+            line
+            for line in payload.splitlines()
+            if line.startswith(f"{family}_")
+        ]
+        self.assertTrue(series)
+        cells_seen: set[tuple[str, str]] = set()
+        for line in series:
+            labels = line.split("{", 1)[1].split("}", 1)[0]
+            keys = {pair.split("=", 1)[0] for pair in labels.split(",")}
+            # Only the closed phase and outcome labels and the histogram's
+            # own ``le``: no per-tip, per-generation or per-reason label
+            # may ever ride this family.
+            self.assertTrue(keys <= {"phase", "outcome", "le"}, line)
+            phase = labels.split('phase="', 1)[1].split('"', 1)[0]
+            outcome = labels.split('outcome="', 1)[1].split('"', 1)[0]
+            cells_seen.add((phase, outcome))
+        self.assertEqual(
+            cells_seen,
+            {
+                (phase, outcome)
+                for phase in PRISM_PAYOUT_WINDOW_BUILD_PHASES
+                for outcome in PRISM_PAYOUT_WINDOW_BUILD_OUTCOMES
+            },
+        )
+        for phase, outcome in cells_seen:
+            labels = f'phase="{phase}",outcome="{outcome}"'
+            self.assertEqual(
+                sum(1 for line in series if line.startswith(f"{family}_count{{{labels}}}")),
+                1,
+            )
+            self.assertEqual(
+                sum(1 for line in series if line.startswith(f"{family}_sum{{{labels}}}")),
+                1,
+            )
 
     def test_renderer_bypasses_cached_metrics_path(self) -> None:
         server = self._seeded_coordinator()

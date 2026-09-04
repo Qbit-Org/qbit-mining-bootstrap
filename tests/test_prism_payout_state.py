@@ -4,12 +4,16 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 
 from lab.prism.payout_state import AcceptedParentPayoutPreviewPending
 from lab.prism.payout_state import _snapshot_window_weight_within_band
+from lab.prism.payout_state import PRISM_PAYOUT_WINDOW_BUILD_OUTCOMES
+from lab.prism.payout_state import PRISM_PAYOUT_WINDOW_BUILD_PHASES
 from lab.prism.payout_state import PRISM_REWARD_WINDOW_MULTIPLIER
 from lab.prism.payout_state import PRISM_SNAPSHOT_WINDOW_MARGIN
+from lab.prism.payout_state import PRISM_TIP_REFRESH_WINDOW_STALENESS_SECONDS
 from tests.prism_coordinator_test_support import *
 
 
@@ -3386,6 +3390,21 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
             self.assertEqual(ledger.delta_snapshot_calls, 1)
             self.assertEqual(len(advanced.shares_json), 4)
 
+            # A payout mutation (the reconciler's #224 intent) re-reads the
+            # balances and advances the append-only window from its delta;
+            # it is never a full rescan.
+            mutated = server._build_payout_ledger_artifact(
+                0,
+                0,
+                artifacts.network_difficulty,
+                force_prior_balances_read=True,
+            )
+            assert mutated is not None
+            self.assertEqual(mutated.window_build_mode, "incremental")
+            self.assertIsNone(mutated.window_full_rescan_reason)
+            self.assertEqual(ledger.full_snapshot_calls, 1)
+            self.assertEqual(ledger.delta_snapshot_calls, 2)
+            # The positional flag keeps its full fail-closed meaning.
             forced = server._build_payout_ledger_artifact(
                 0,
                 0,
@@ -3399,6 +3418,9 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
                 "reconcile_invalidation",
             )
             self.assertEqual(ledger.full_snapshot_calls, 2)
+            self.assertEqual(
+                forced.share_snapshot_sha256, mutated.share_snapshot_sha256
+            )
 
     def test_periodic_self_check_compares_delta_to_full_oracle(self) -> None:
         server, ledger, artifacts = self.configured_server()
@@ -3543,6 +3565,7 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
             )
 
         assert repaired is not None and forced is not None
+        self.assertEqual(forced.window_build_mode, "full_rescan")
         self.assertEqual(repaired.window_build_mode, "self_check_mismatch")
         self.assertEqual(list(repaired.shares_json), list(forced.shares_json))
         self.assertEqual(
@@ -4206,6 +4229,8 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
             )
 
         assert incremental is not None and forced is not None
+        self.assertEqual(incremental.window_build_mode, "incremental")
+        self.assertEqual(forced.window_build_mode, "full_rescan")
         incremental_bytes = canonical_json_text(
             {
                 "shares": list(incremental.shares_json),
@@ -4644,6 +4669,1083 @@ class IncrementalPayoutArtifactTests(unittest.TestCase):
                 (0, int(artifacts.network_difficulty)),
             )
             self.assertEqual(executor.submissions, 1)
+
+
+@contextmanager
+def _captured_payout_artifact_logs():
+    """Collect the JSON payout-artifact lifecycle lines a build prints."""
+    lines: list[dict[str, object]] = []
+    prefix = "prism coordinator: "
+
+    def fake_print(*args: object, **_kwargs: object) -> None:
+        text = " ".join(str(arg) for arg in args)
+        if text.startswith(prefix + "{"):
+            try:
+                lines.append(json.loads(text[len(prefix):]))
+            except ValueError:
+                pass
+
+    with patch("builtins.print", side_effect=fake_print):
+        yield lines
+
+
+class PayoutWindowRescanBoundTests(unittest.TestCase):
+    """Issue #228: forced full rescans are rare, attributable, and bounded."""
+
+    # Wall-clock ceiling a routine (tip-refresh path) candidate preparation
+    # may take while another build holds the prepare lock and a window inside
+    # PRISM_TIP_REFRESH_WINDOW_STALENESS_SECONDS is armed. The preparation
+    # must not queue behind the lock at all, so this is generous for a
+    # non-blocking path and far below any build the lock holder could be
+    # running; a join that times out means the path blocked.
+    NON_BLOCKING_BUDGET_SECONDS = 2.0
+
+    def configured_server(
+        self,
+    ) -> tuple[PrismCoordinator, IncrementalRecordingLedger, object]:
+        ledger = IncrementalRecordingLedger()
+        append_incremental_share(ledger, share_seq=1, accepted_at_ms=999_900)
+        append_incremental_share(ledger, share_seq=2, accepted_at_ms=999_910)
+        append_incremental_share(ledger, share_seq=3, accepted_at_ms=999_920)
+        server, rpc = coordinator(ledger=ledger)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        server.payout_artifact_min_build_interval_seconds = 60.0
+        server.payout_artifact_full_rescan_seconds = 3_600.0
+        return server, ledger, artifacts
+
+    @staticmethod
+    def _built_lines(
+        lines: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        return [line for line in lines if line.get("event") == "payout_artifact_built"]
+
+    def test_sticky_invalidation_cause_does_not_force_later_full_rescans(
+        self,
+    ) -> None:
+        # The defect: _capture_payout_state_source re-reads the sticky
+        # source tuple without consuming it, so every later capture at the
+        # same source generation inherited a withdrawal's cause and forced
+        # the full oracle again. The withdrawal's own preparation is the
+        # only one entitled to act on the cause it reserved.
+        server, ledger, artifacts = self.configured_server()
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ), _captured_payout_artifact_logs() as lines:
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert initial is not None
+            self.assertEqual(ledger.full_snapshot_calls, 1)
+
+            captured = server._capture_payout_state_source()
+            reserved = server._reserve_payout_state_source_if_current(
+                captured[1],
+                "accepted_block_preview_withdrawn",
+                tip_hash=captured[2],
+            )
+            assert reserved is not None
+            # The withdrawal path's own preparation: explicit flag plus the
+            # reserved cause. Balances must come from the ledger; the
+            # append-only share window is advanced, not rescanned.
+            own = server._prepared_payout_state_candidate(
+                reserved,
+                force_full_window_rescan=True,
+                bypass_build_interval=True,
+            )
+            assert own.ledger_artifact is not None
+            full_after_own = ledger.full_snapshot_calls
+            own_line = self._built_lines(lines)[-1]
+            self.assertEqual(
+                own_line["invalidation_cause"],
+                "accepted_block_preview_withdrawn",
+            )
+            self.assertEqual(
+                own_line["force_origin"], "caller_flag+reserved_cause"
+            )
+            self.assertFalse(own_line["cause_inherited"])
+            self.assertTrue(own_line["payout_mutated"])
+            self.assertEqual(own_line["prior_balances_source"], "ledger")
+
+            # A routine build through the capture path at the same, still
+            # current, source generation must not rescan.
+            server.payout_artifact_min_build_interval_seconds = 0.0
+            append_incremental_share(
+                ledger, share_seq=4, accepted_at_ms=1_000_010
+            )
+            clock_ms[0] = 1_000_020
+            routine = server._current_payout_state_candidate()
+            assert routine.ledger_artifact is not None
+            self.assertNotEqual(
+                routine.ledger_artifact.window_build_mode, "full_rescan"
+            )
+            self.assertEqual(ledger.full_snapshot_calls, full_after_own)
+            self.assertEqual(routine.ledger_artifact.window_delta_rows, 1)
+            routine_line = self._built_lines(lines)[-1]
+            self.assertEqual(
+                routine_line["invalidation_cause"],
+                "accepted_block_preview_withdrawn",
+            )
+            self.assertTrue(routine_line["cause_inherited"])
+            self.assertEqual(routine_line["force_origin"], "none")
+            self.assertFalse(routine_line["payout_mutated"])
+        # The tuple itself is untouched: supersession readers still see it.
+        self.assertEqual(
+            server._payout_state_source[2],
+            "accepted_block_preview_withdrawn",
+        )
+
+    def test_payout_state_source_supersession_still_detected_after_the_fix(
+        self,
+    ) -> None:
+        server, ledger, artifacts = self.configured_server()
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ), _captured_payout_artifact_logs():
+            captured = server._capture_payout_state_source()
+            stale = server._prepared_payout_state_candidate(captured)
+            # A newer source is reserved before publication: the candidate
+            # prepared against generation N is discarded, not published.
+            server._reserve_payout_state_source(
+                "external_tip", tip_hash="ab" * 32
+            )
+            server._block_payout_state_publication(force=True)
+            self.assertIsNone(server._publish_payout_state_candidate(stale))
+            self.assertEqual(server.payout_state_candidates_discarded, 1)
+            self.assertEqual(server._payout_state_generation, 0)
+            # Reserve-if-current refuses a superseded expectation exactly as
+            # before, so a withdrawal cannot attach its cause to a source
+            # generation that already moved.
+            self.assertIsNone(
+                server._reserve_payout_state_source_if_current(
+                    captured[1],
+                    "accepted_block_preview_withdrawn",
+                    tip_hash=captured[2],
+                )
+            )
+            # The current source still publishes.
+            fresh = server._current_payout_state_candidate()
+            self.assertEqual(fresh.source_generation, server._payout_state_source[0])
+            self.assertEqual(server._publish_payout_state_candidate(fresh), 1)
+            self.assertEqual(server._payout_state_generation, 1)
+            self.assertEqual(
+                server._published_payout_state.source_generation,
+                fresh.source_generation,
+            )
+
+    def test_window_build_phase_attribution_pins_the_split(self) -> None:
+        class SlowOracleLedger(IncrementalRecordingLedger):
+            oracle_delay_seconds = 0.3
+
+            def snapshot_at_job_issue(
+                self,
+                anchor_job_issued_at_ms: int,
+                *,
+                window_weight: int | None = None,
+            ) -> list[object]:
+                time.sleep(self.oracle_delay_seconds)
+                return super().snapshot_at_job_issue(
+                    anchor_job_issued_at_ms,
+                    window_weight=window_weight,
+                )
+
+        ledger = SlowOracleLedger()
+        for share_seq in range(1, 4):
+            append_incremental_share(
+                ledger,
+                share_seq=share_seq,
+                accepted_at_ms=999_900 + share_seq,
+            )
+        server, rpc = coordinator(ledger=ledger)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            return_value=1_000_000,
+        ), _captured_payout_artifact_logs() as lines:
+            built = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+        assert built is not None
+        self.assertEqual(built.window_build_mode, "full_rescan")
+        line = self._built_lines(lines)[-1]
+        phases = line["phase_seconds"]
+        assert isinstance(phases, dict)
+        self.assertEqual(
+            set(phases), set(PRISM_PAYOUT_WINDOW_BUILD_PHASES)
+        )
+        self.assertEqual(
+            PRISM_PAYOUT_WINDOW_BUILD_PHASES,
+            ("ledger_read", "record_conversion", "daemon_prepare", "lock_wait"),
+        )
+        # The known-slow ledger read lands in the ledger-read phase and not
+        # in conversion, daemon, or lock time.
+        self.assertGreaterEqual(
+            float(phases["ledger_read"]), ledger.oracle_delay_seconds
+        )
+        other = (
+            float(phases["record_conversion"])
+            + float(phases["daemon_prepare"])
+            + float(phases["lock_wait"])
+        )
+        self.assertLess(other, 0.1)
+        self.assertEqual(float(phases["daemon_prepare"]), 0.0)
+        # The phases account for the reported build within 0.1 s (the
+        # unattributed remainder is artifact construction and the cheap
+        # accepted-share count, both microseconds on this ledger).
+        tolerance_seconds = 0.1
+        self.assertLessEqual(
+            abs(sum(float(value) for value in phases.values()) - float(line["duration_seconds"])),
+            tolerance_seconds,
+        )
+        # Exported as one fixed-cardinality histogram family over the
+        # closed phase and outcome sets.
+        metrics = server.payout_state_metrics_lines()
+        family = "qbit_prism_payout_window_build_phase_seconds"
+        count_lines = [
+            entry for entry in metrics if entry.startswith(f"{family}_count{{")
+        ]
+        exported_phases = {
+            entry.split('phase="', 1)[1].split('"', 1)[0] for entry in count_lines
+        }
+        exported_outcomes = {
+            entry.split('outcome="', 1)[1].split('"', 1)[0] for entry in count_lines
+        }
+        self.assertEqual(exported_phases, set(PRISM_PAYOUT_WINDOW_BUILD_PHASES))
+        self.assertEqual(exported_outcomes, set(PRISM_PAYOUT_WINDOW_BUILD_OUTCOMES))
+        completed = 'phase="ledger_read",outcome="completed"'
+        self.assertIn(f"{family}_count{{{completed}}} 1", metrics)
+        self.assertIn(f"# TYPE {family} histogram", metrics)
+        ledger_sum = [
+            entry for entry in metrics if entry.startswith(f"{family}_sum{{{completed}}}")
+        ]
+        self.assertEqual(len(ledger_sum), 1)
+        self.assertGreaterEqual(
+            float(ledger_sum[0].split()[-1]), ledger.oracle_delay_seconds
+        )
+
+    def test_tip_refresh_wave_does_not_wait_for_a_full_rescan_when_a_recent_window_exists(
+        self,
+    ) -> None:
+        server, ledger, artifacts = self.configured_server()
+        recorded = install_fake_bundle_builder(server)
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ), _captured_payout_artifact_logs() as lines:
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert initial is not None
+            self.assertTrue(server._install_payout_ledger_artifact(initial))
+            # Publish the generation's balance artifact up front, as every
+            # publication does in production, so the job build below never
+            # needs the prepare lock for a balance read.
+            server._current_payout_state_artifact()
+
+            # An invalidating build (a forced reorg or withdrawal rescan)
+            # owns the prepare lock for longer than the whole budget.
+            lock_held = threading.Event()
+            release_lock = threading.Event()
+
+            def hold_prepare_lock() -> None:
+                with server._payout_state_prepare_lock:
+                    lock_held.set()
+                    release_lock.wait(30.0)
+
+            holder = threading.Thread(target=hold_prepare_lock, daemon=True)
+            holder.start()
+            self.assertTrue(lock_held.wait(5.0))
+            try:
+                # The routine candidate (what the tip-refresh path prepares)
+                # comes back inside the budget with the armed window.
+                candidates: list[PayoutStateCandidate] = []
+                routine = threading.Thread(
+                    target=lambda: candidates.append(
+                        server._current_payout_state_candidate()
+                    ),
+                    daemon=True,
+                )
+                routine.start()
+                routine.join(self.NON_BLOCKING_BUDGET_SECONDS)
+                self.assertFalse(
+                    routine.is_alive(),
+                    "routine candidate preparation queued behind the rescan",
+                )
+                candidate = candidates[0]
+                artifact = candidate.ledger_artifact
+                assert artifact is not None
+                self.assertEqual(artifact.window_build_mode, "tip_refresh_cached")
+                self.assertEqual(
+                    artifact.window_full_rescan_reason, "prepare_lock_busy"
+                )
+                self.assertEqual(
+                    artifact.share_snapshot_sha256,
+                    initial.share_snapshot_sha256,
+                )
+                self.assertEqual(artifact.payout_state_generation, 1)
+                self.assertEqual(ledger.full_snapshot_calls, 1)
+                self.assertEqual(ledger.delta_snapshot_calls, 0)
+                cached_line = [
+                    line
+                    for line in lines
+                    if line.get("event") == "payout_artifact_tip_refresh_cached"
+                ][-1]
+                self.assertLessEqual(
+                    float(cached_line["anchor_age_ms"]),
+                    PRISM_TIP_REFRESH_WINDOW_STALENESS_SECONDS * 1000.0,
+                )
+                self.assertEqual(
+                    server.payout_artifact_event_counts["tip_refresh_cached"],
+                    1,
+                )
+
+                # Fanout itself: a ready job build during the same window
+                # completes on the armed window without touching the lock.
+                bundles: list[object] = []
+                build = threading.Thread(
+                    target=lambda: bundles.append(
+                        server.shared_job_bundle(artifacts, mode="ready")
+                    ),
+                    daemon=True,
+                )
+                build.start()
+                build.join(self.NON_BLOCKING_BUDGET_SECONDS)
+                self.assertFalse(build.is_alive(), "job build queued behind the rescan")
+                self.assertEqual(len(bundles), 1)
+                self.assertEqual(recorded["calls"], 1)
+                self.assertEqual(ledger.full_snapshot_calls, 1)
+
+                # Past the accepted staleness bound the routine path must
+                # queue for a fresh build instead of propagating a window
+                # the re-anchor has already flagged stale.
+                clock_ms[0] = 1_000_000 + int(
+                    PRISM_TIP_REFRESH_WINDOW_STALENESS_SECONDS * 1000.0
+                ) + 1_000
+                stale_candidates: list[PayoutStateCandidate] = []
+                stale_routine = threading.Thread(
+                    target=lambda: stale_candidates.append(
+                        server._current_payout_state_candidate()
+                    ),
+                    daemon=True,
+                )
+                stale_routine.start()
+                stale_routine.join(0.5)
+                self.assertTrue(
+                    stale_routine.is_alive(),
+                    "a window past the staleness bound was reused",
+                )
+            finally:
+                release_lock.set()
+                holder.join(5.0)
+            stale_routine.join(10.0)
+            self.assertFalse(stale_routine.is_alive())
+            stale_artifact = stale_candidates[0].ledger_artifact
+            assert stale_artifact is not None
+            self.assertNotEqual(
+                stale_artifact.window_build_mode, "tip_refresh_cached"
+            )
+            self.assertEqual(
+                server.payout_artifact_event_counts["tip_refresh_cached"], 1
+            )
+
+    def test_production_shaped_cadence_keeps_full_rescans_rare(self) -> None:
+        # Two simulated hours at the mainnet cadence (75 s blocks), with
+        # accepted-block confirmations, one reorg withdrawal, and maturity
+        # mutations at the observed 48 h ratio (55 confirmations and 8
+        # reorgs per 48 h, rounded up per two hours). The assertion is a
+        # count, a property of the invalidation logic, never a duration.
+        server, ledger, artifacts = self.configured_server()
+        server.payout_artifact_min_build_interval_seconds = 0.0
+        difficulty = int(artifacts.network_difficulty)
+        block_seconds = 75
+        simulated_hours = 2
+        blocks = simulated_hours * 3600 // block_seconds
+        confirmations_at = {20, 60}
+        withdrawal_at = {40}
+        maturity_at = {30, 70}
+        preview = [
+            {
+                "recipient_id": "miner-a",
+                "order_key": "miner-a",
+                "p2mr_program_hex": "11" * 32,
+                "balance_sats": 25,
+            }
+        ]
+        clock_ms = [1_000_000]
+        share_seq = 3
+
+        def drain_background() -> None:
+            future = server._payout_artifact_future
+            if future is not None:
+                future.result(timeout=30.0)
+
+        def reconciler_pass(*, payout_changed: bool) -> None:
+            # The reorg reconciler's candidate path, minus the RPC and
+            # ledger mutations: prepare under the lock with the #224
+            # intent (a confirmed mutation rereads balances, never the
+            # window), fence, publish.
+            with server._payout_state_prepare_lock:
+                captured = server._capture_payout_state_source()
+                if not (
+                    payout_changed
+                    or server._captured_payout_source_requires_publication(captured)
+                ):
+                    return
+                candidate = server._prepared_payout_state_candidate(
+                    captured,
+                    force_full_window_rescan=False,
+                    force_prior_balances_read=payout_changed,
+                )
+                server._block_payout_state_publication(force=True)
+            self.assertIsNotNone(server._publish_payout_state_candidate(candidate))
+            drain_background()
+
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ), _captured_payout_artifact_logs() as lines:
+            self.assertIsNotNone(
+                server._build_payout_ledger_artifact(0, 0, difficulty)
+            )
+            pending_own_block: str | None = None
+            next_reanchor_ms = clock_ms[0] + 60_000
+            for block in range(1, blocks + 1):
+                # Shares land between blocks.
+                for _ in range(5):
+                    share_seq += 1
+                    clock_ms[0] += block_seconds * 1000 // 6
+                    append_incremental_share(
+                        ledger,
+                        share_seq=share_seq,
+                        accepted_at_ms=clock_ms[0] - 5,
+                    )
+                clock_ms[0] += block_seconds * 1000 // 6
+                if pending_own_block is not None:
+                    # Our accepted block becomes the tip: the source tip
+                    # already names it, so no external_tip is reserved.
+                    tip_hash = pending_own_block
+                    pending_own_block = None
+                else:
+                    tip_hash = f"{block:064x}"
+                if server._payout_state_source[1] != tip_hash:
+                    server._reserve_payout_state_source(
+                        "external_tip", tip_hash=tip_hash
+                    )
+                reconciler_pass(payout_changed=block in maturity_at)
+                if block in confirmations_at or block in withdrawal_at:
+                    own_hash = f"{0xA000 + block:064x}"
+                    server._begin_accepted_block_payout_preview(
+                        own_hash, block_height=100 + block
+                    )
+                    server._mark_accepted_block_payout_landed(
+                        own_hash, block_height=100 + block
+                    )
+                    server._publish_accepted_block_payout_preview(own_hash, preview)
+                    drain_background()
+                    if block in withdrawal_at:
+                        server._clear_accepted_block_payout_preview(
+                            own_hash, invalidate_published=True
+                        )
+                        drain_background()
+                    else:
+                        server._clear_accepted_block_payout_preview(own_hash)
+                        pending_own_block = own_hash
+                if clock_ms[0] >= next_reanchor_ms:
+                    # The background re-anchor cadence.
+                    server._prepare_payout_ledger_artifact(
+                        server._payout_state_generation, difficulty
+                    )
+                    next_reanchor_ms = clock_ms[0] + 60_000
+
+        built = self._built_lines(lines)
+        full_rescans = [
+            line for line in built if line["window_build_mode"] == "full_rescan"
+        ]
+        reasons = sorted(str(line.get("full_rescan_reason")) for line in full_rescans)
+        self.assertLessEqual(
+            len(full_rescans),
+            1 * simulated_hours,
+            f"full rescans per simulated hour exceeded 1: {reasons}",
+        )
+        # The withdrawal path keeps its fail-closed full rescan (#224); the
+        # maturity passes never produce one.
+        self.assertLessEqual(
+            reasons.count("reconcile_invalidation"), len(withdrawal_at)
+        )
+        self.assertEqual(
+            server.payout_artifact_event_counts["full_rescan"], len(full_rescans)
+        )
+        # Every payout mutation re-read its balances from the ledger, and
+        # every one that was not an explicit fail-closed rescan advanced the
+        # append-only window instead of rescanning it.
+        mutated = [line for line in built if line.get("payout_mutated")]
+        self.assertGreaterEqual(len(mutated), len(maturity_at) + len(withdrawal_at))
+        for line in mutated:
+            self.assertEqual(line["prior_balances_source"], "ledger")
+            if not line["window_oracle_forced"]:
+                self.assertNotEqual(line["window_build_mode"], "full_rescan")
+        self.assertGreaterEqual(
+            sum(1 for line in mutated if line["prior_balances_read_forced"]),
+            len(maturity_at),
+        )
+        # Each build is attributable from its own log line.
+        for line in built:
+            self.assertIn("invalidation_cause", line)
+            self.assertIn("force_origin", line)
+            self.assertIn("cause_inherited", line)
+        self.assertGreater(len(built), blocks)
+
+    def test_preview_reservation_ownership_survives_interleaved_foreign_reservation(
+        self,
+    ) -> None:
+        # Review finding: ownership was a single newest-wins slot, so a
+        # foreign reservation at a later generation displaced the preview's
+        # record and its own preparation fell through to the routine path,
+        # losing the found-block immediacy and degrade of issue #188.
+        class BusyPrepareLock:
+            def acquire(self, blocking: bool = True) -> bool:
+                if blocking:
+                    raise AssertionError("found-block path attempted to wait")
+                return False
+
+            def release(self) -> None:
+                raise AssertionError("unacquired lock was released")
+
+        class FailingDeltaLedger(IncrementalRecordingLedger):
+            fail_delta = False
+
+            def snapshot_between_job_issues(
+                self,
+                previous_anchor_job_issued_at_ms: int,
+                anchor_job_issued_at_ms: int,
+            ) -> list[object]:
+                if self.fail_delta:
+                    raise RuntimeError("delta unavailable")
+                return super().snapshot_between_job_issues(
+                    previous_anchor_job_issued_at_ms,
+                    anchor_job_issued_at_ms,
+                )
+
+        ledger = FailingDeltaLedger()
+        for share_seq in range(1, 4):
+            append_incremental_share(
+                ledger,
+                share_seq=share_seq,
+                accepted_at_ms=999_900 + share_seq,
+            )
+        server, rpc = coordinator(ledger=ledger)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        server.payout_artifact_min_build_interval_seconds = 0.0
+        server.payout_artifact_full_rescan_seconds = 3_600.0
+        real_lock = server._payout_state_prepare_lock
+        clock_ms = [1_000_000]
+
+        def interleave_foreign_work(tip_hash: str) -> None:
+            # Another thread captures and prepares at the preview's
+            # generation, then reserves the next generation, before the
+            # preview path reaches its own preparation.
+            failures: list[BaseException] = []
+
+            def foreign() -> None:
+                try:
+                    server._prepared_payout_state_candidate(
+                        server._capture_payout_state_source()
+                    )
+                    server._reserve_payout_state_source(
+                        "external_tip", tip_hash=tip_hash
+                    )
+                except BaseException as exc:  # pragma: no cover - asserted
+                    failures.append(exc)
+
+            thread = threading.Thread(target=foreign, daemon=True)
+            thread.start()
+            thread.join(10.0)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(failures, [])
+
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ), patch("builtins.print"):
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert initial is not None
+            self.assertTrue(server._install_payout_ledger_artifact(initial))
+            server._current_payout_state_artifact()
+
+            # Cycle one: a busy prepare lock. The preview's preparation must
+            # not wait and must degrade to the armed window as a found-block
+            # candidate, not as a routine one.
+            captured = server._capture_payout_state_source()
+            reserved = server._reserve_payout_state_source_if_current(
+                captured[1], "accepted_block_preview", tip_hash="44" * 32
+            )
+            assert reserved is not None
+            interleave_foreign_work("55" * 32)
+            server._payout_state_prepare_lock = BusyPrepareLock()  # type: ignore[assignment]
+            try:
+                candidate = server._prepared_payout_state_candidate(reserved)
+            finally:
+                server._payout_state_prepare_lock = real_lock
+            artifact = candidate.ledger_artifact
+            assert artifact is not None
+            self.assertEqual(artifact.window_build_mode, "found_block_cached")
+            self.assertEqual(artifact.window_full_rescan_reason, "prepare_lock_busy")
+            self.assertEqual(candidate.cause, "accepted_block_preview")
+            self.assertEqual(server.payout_artifact_event_counts["tip_refresh_cached"], 0)
+
+            # Cycle two: a build that dies with the ledger. The preview's
+            # preparation must degrade instead of raising.
+            captured = server._capture_payout_state_source()
+            reserved = server._reserve_payout_state_source_if_current(
+                captured[1], "accepted_block_preview", tip_hash="66" * 32
+            )
+            assert reserved is not None
+            interleave_foreign_work("77" * 32)
+            ledger.fail_delta = True
+            clock_ms[0] = 1_000_020
+            try:
+                candidate = server._prepared_payout_state_candidate(reserved)
+            finally:
+                ledger.fail_delta = False
+            artifact = candidate.ledger_artifact
+            assert artifact is not None
+            self.assertEqual(artifact.window_build_mode, "found_block_cached")
+            self.assertEqual(artifact.window_full_rescan_reason, "build_failed")
+        self.assertEqual(server.payout_artifact_event_counts["found_block_cached"], 2)
+
+    def test_stale_preparation_cannot_rewind_cause_consumption(self) -> None:
+        # Review finding: a preparation carrying an older source generation
+        # could reset the consumed marker, after which the newer
+        # generation's reserved cause was honoured a second time and forced
+        # a duplicate payout-mutated build.
+        server, ledger, artifacts = self.configured_server()
+        clock_ms = [1_000_000]
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ), _captured_payout_artifact_logs() as lines:
+            # Publish the generation's balance artifact so a routine build
+            # can reuse the published bytes: a build that honours the
+            # withdrawal cause a second time would show up as a ledger read.
+            server._current_payout_state_artifact()
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert initial is not None
+            self.assertEqual(
+                self._built_lines(lines)[-1]["prior_balances_source"],
+                "published",
+            )
+            stale_captured = server._capture_payout_state_source()
+            reserved = server._reserve_payout_state_source_if_current(
+                stale_captured[1],
+                "accepted_block_preview_withdrawn",
+                tip_hash=stale_captured[2],
+            )
+            assert reserved is not None
+            own = server._prepared_payout_state_candidate(
+                reserved,
+                force_full_window_rescan=True,
+                bypass_build_interval=True,
+            )
+            assert own.ledger_artifact is not None
+            own_line = self._built_lines(lines)[-1]
+            self.assertEqual(own_line["force_origin"], "caller_flag+reserved_cause")
+            self.assertEqual(own_line["prior_balances_source"], "ledger")
+            # The stale capture, taken before the reservation, is prepared
+            # afterwards (a slow reconciler pass would do this). It acts on
+            # nothing, and its candidate is discarded at publication.
+            server.payout_artifact_min_build_interval_seconds = 0.0
+            stale = server._prepared_payout_state_candidate(stale_captured)
+            self.assertEqual(stale.source_generation, stale_captured[1])
+            stale_line = self._built_lines(lines)[-1]
+            self.assertEqual(stale_line["force_origin"], "none")
+            self.assertFalse(stale_line["payout_mutated"])
+            server._block_payout_state_publication(force=True)
+            self.assertIsNone(server._publish_payout_state_candidate(stale))
+            # The withdrawal generation's cause is not honoured again.
+            append_incremental_share(
+                ledger, share_seq=4, accepted_at_ms=1_000_010
+            )
+            clock_ms[0] = 1_000_020
+            routine = server._current_payout_state_candidate()
+            assert routine.ledger_artifact is not None
+            routine_line = self._built_lines(lines)[-1]
+            self.assertEqual(
+                routine_line["invalidation_cause"],
+                "accepted_block_preview_withdrawn",
+            )
+            self.assertTrue(routine_line["cause_inherited"])
+            self.assertEqual(routine_line["force_origin"], "none")
+            self.assertFalse(routine_line["payout_mutated"])
+            self.assertEqual(routine_line["prior_balances_source"], "published")
+
+    def test_owner_entitlement_survives_a_foreign_preparation_at_a_later_generation(
+        self,
+    ) -> None:
+        # Review finding: pruning below the consumption high-water mark
+        # deleted the reserver's own record once a foreign preparation at
+        # a later generation moved the mark, so the preview's preparation
+        # fell to the routine path. The entitlement now travels with the
+        # reserved tuple, where no bookkeeping rule can reach it: after a
+        # burst of foreign reservations and a foreign preparation at the
+        # newest of them, the owner's preparation still takes the
+        # immediate path, non-blocking on a busy lock and degrading when
+        # its build dies with the ledger.
+        class BusyPrepareLock:
+            def acquire(self, blocking: bool = True) -> bool:
+                if blocking:
+                    raise AssertionError("found-block path attempted to wait")
+                return False
+
+            def release(self) -> None:
+                raise AssertionError("unacquired lock was released")
+
+        class FailingDeltaLedger(IncrementalRecordingLedger):
+            fail_delta = False
+
+            def snapshot_between_job_issues(
+                self,
+                previous_anchor_job_issued_at_ms: int,
+                anchor_job_issued_at_ms: int,
+            ) -> list[object]:
+                if self.fail_delta:
+                    raise RuntimeError("delta unavailable")
+                return super().snapshot_between_job_issues(
+                    previous_anchor_job_issued_at_ms,
+                    anchor_job_issued_at_ms,
+                )
+
+        ledger = FailingDeltaLedger()
+        for share_seq in range(1, 4):
+            append_incremental_share(
+                ledger,
+                share_seq=share_seq,
+                accepted_at_ms=999_900 + share_seq,
+            )
+        server, rpc = coordinator(ledger=ledger)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        server.payout_artifact_min_build_interval_seconds = 0.0
+        server.payout_artifact_full_rescan_seconds = 3_600.0
+        service = server._ensure_payout_state_service()
+        real_lock = server._payout_state_prepare_lock
+        clock_ms = [1_000_000]
+
+        def foreign_burst_then_preparation(burst: int, tip_base: int) -> None:
+            failures: list[BaseException] = []
+
+            def foreign() -> None:
+                try:
+                    for index in range(burst):
+                        server._reserve_payout_state_source(
+                            "external_tip", tip_hash=f"{tip_base + index:064x}"
+                        )
+                    # A foreign preparation at the newest generation moves
+                    # the consumption mark past the owner's generation.
+                    server._prepared_payout_state_candidate(
+                        server._capture_payout_state_source()
+                    )
+                except BaseException as exc:  # pragma: no cover - asserted
+                    failures.append(exc)
+
+            thread = threading.Thread(target=foreign, daemon=True)
+            thread.start()
+            thread.join(10.0)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(failures, [])
+
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ), patch("builtins.print"):
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert initial is not None
+            self.assertTrue(server._install_payout_ledger_artifact(initial))
+            server._current_payout_state_artifact()
+
+            # Cycle one: busy prepare lock after a burst and a foreign
+            # preparation at a later generation.
+            captured = server._capture_payout_state_source()
+            reserved = server._reserve_payout_state_source_if_current(
+                captured[1], "accepted_block_preview", tip_hash="44" * 32
+            )
+            assert reserved is not None
+            owner_generation = reserved[1]
+            foreign_burst_then_preparation(200, 0x1000)
+            self.assertGreater(
+                service._payout_source_cause_high_water or 0, owner_generation
+            )
+            server._payout_state_prepare_lock = BusyPrepareLock()  # type: ignore[assignment]
+            try:
+                candidate = server._prepared_payout_state_candidate(reserved)
+            finally:
+                server._payout_state_prepare_lock = real_lock
+            artifact = candidate.ledger_artifact
+            assert artifact is not None
+            self.assertEqual(artifact.window_build_mode, "found_block_cached")
+            self.assertEqual(artifact.window_full_rescan_reason, "prepare_lock_busy")
+            self.assertEqual(server.payout_artifact_event_counts["tip_refresh_cached"], 0)
+            # The entitlement is one-shot: presenting the reserved tuple
+            # again inherits, exactly like a capture would.
+            self.assertFalse(service._consume_payout_source_cause(reserved))
+            # And the mark was not rewound by the owner's older generation.
+            self.assertGreater(
+                service._payout_source_cause_high_water or 0, owner_generation
+            )
+
+            # Cycle two: a build that dies with the ledger, same
+            # interleaving. The preview's preparation degrades instead of
+            # raising.
+            captured = server._capture_payout_state_source()
+            reserved = server._reserve_payout_state_source_if_current(
+                captured[1], "accepted_block_preview", tip_hash="66" * 32
+            )
+            assert reserved is not None
+            foreign_burst_then_preparation(3, 0x2000)
+            ledger.fail_delta = True
+            clock_ms[0] = 1_000_020
+            try:
+                candidate = server._prepared_payout_state_candidate(reserved)
+            finally:
+                ledger.fail_delta = False
+            artifact = candidate.ledger_artifact
+            assert artifact is not None
+            self.assertEqual(artifact.window_build_mode, "found_block_cached")
+            self.assertEqual(artifact.window_full_rescan_reason, "build_failed")
+        self.assertEqual(server.payout_artifact_event_counts["found_block_cached"], 2)
+
+    def test_aborted_and_failed_builds_still_contribute_their_phases(self) -> None:
+        # Review finding: phases were observed only when a build finished,
+        # which biased the family toward fast builds. Every exit observes
+        # now, under a closed outcome, so a slow read that ends in an abort
+        # or a failure keeps its measured time.
+        class SlowThenEmptyLedger(IncrementalRecordingLedger):
+            oracle_delay_seconds = 0.2
+            raise_after_read = False
+
+            def snapshot_at_job_issue(
+                self,
+                anchor_job_issued_at_ms: int,
+                *,
+                window_weight: int | None = None,
+            ) -> list[object]:
+                # A slow oracle that comes back empty (or dies): the build
+                # pays for the read and then aborts on the empty window.
+                self.full_snapshot_calls += 1
+                time.sleep(self.oracle_delay_seconds)
+                if self.raise_after_read:
+                    raise RuntimeError("postgres statement deadline expired")
+                return []
+
+        # Shares exist (so the anchor clamp is ordinary and the build gets
+        # as far as the read), but the oracle answers with an empty window.
+        ledger = SlowThenEmptyLedger()
+        for share_seq in range(1, 4):
+            append_incremental_share(
+                ledger,
+                share_seq=share_seq,
+                accepted_at_ms=999_900 + share_seq,
+            )
+        server, rpc = coordinator(ledger=ledger)
+        artifacts = server.store_template_artifacts(dict(rpc.template))
+        assert artifacts is not None
+        server._pool_ready_latched = True
+        family = "qbit_prism_payout_window_build_phase_seconds"
+
+        def cell(metrics: list[str], phase: str, outcome: str, product: str) -> float:
+            prefix = f'{family}_{product}{{phase="{phase}",outcome="{outcome}"}} '
+            values = [entry for entry in metrics if entry.startswith(prefix)]
+            self.assertEqual(len(values), 1, prefix)
+            return float(values[0].split()[-1])
+
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            return_value=1_000_000,
+        ), patch("builtins.print"):
+            self.assertIsNone(
+                server._build_payout_ledger_artifact(
+                    0, 0, artifacts.network_difficulty
+                )
+            )
+            metrics = server.payout_state_metrics_lines()
+            self.assertEqual(cell(metrics, "ledger_read", "aborted", "count"), 1)
+            self.assertGreaterEqual(
+                cell(metrics, "ledger_read", "aborted", "sum"),
+                ledger.oracle_delay_seconds,
+            )
+            self.assertEqual(cell(metrics, "ledger_read", "completed", "count"), 0)
+
+            # The read itself dies: a failed build keeps its time too.
+            ledger.raise_after_read = True
+            self.assertIsNone(
+                server._build_payout_ledger_artifact(
+                    0, 0, artifacts.network_difficulty
+                )
+            )
+            metrics = server.payout_state_metrics_lines()
+            self.assertEqual(cell(metrics, "ledger_read", "failed", "count"), 1)
+            self.assertGreaterEqual(
+                cell(metrics, "ledger_read", "failed", "sum"),
+                ledger.oracle_delay_seconds,
+            )
+            # A lost generation race aborts before any read and is counted
+            # as such, with no ledger time.
+            ledger.raise_after_read = False
+            self.assertIsNone(
+                server._build_payout_ledger_artifact(
+                    7, 7, artifacts.network_difficulty
+                )
+            )
+            metrics = server.payout_state_metrics_lines()
+            self.assertEqual(cell(metrics, "ledger_read", "aborted", "count"), 2)
+            self.assertLess(
+                cell(metrics, "ledger_read", "aborted", "sum"),
+                2 * ledger.oracle_delay_seconds,
+            )
+            for outcome in PRISM_PAYOUT_WINDOW_BUILD_OUTCOMES:
+                for phase in PRISM_PAYOUT_WINDOW_BUILD_PHASES:
+                    cell(metrics, phase, outcome, "count")
+
+    def test_deferred_self_check_is_bounded_under_frequent_builds(self) -> None:
+        # Review finding: the deferral measured freshness against the last
+        # build, so candidates arriving faster than the staleness bound
+        # deferred the hourly self-check every time it came due. It is now
+        # bounded against the last self-check attempt, and a deferral hands
+        # the check to the background walker at the next publication.
+        server, ledger, artifacts = self.configured_server()
+        # Part one: no background walker at all (reuse off), builds every
+        # 20 s against a 100 s check interval and a 60 s bound, across two
+        # check intervals. The check must run on the critical path once the
+        # grace expires, and never later than that.
+        server.payout_artifact_reuse_enabled = False
+        server.payout_artifact_min_build_interval_seconds = 0.0
+        server.payout_artifact_full_rescan_seconds = 100.0
+        self.assertEqual(PRISM_TIP_REFRESH_WINDOW_STALENESS_SECONDS, 60.0)
+        clock_ms = [1_000_000]
+        monotonic_seconds = [1_000.0]
+        share_seq = 3
+        outcomes: list[tuple[int, str, bool]] = []
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ), patch(
+            "lab.prism.prism_coordinator.time.monotonic",
+            side_effect=lambda: monotonic_seconds[0],
+        ), _captured_payout_artifact_logs() as lines:
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert initial is not None
+            for step in range(1, 17):
+                elapsed = 20 * step
+                monotonic_seconds[0] = 1_000.0 + elapsed
+                clock_ms[0] = 1_000_000 + elapsed * 1_000
+                share_seq += 1
+                append_incremental_share(
+                    ledger, share_seq=share_seq, accepted_at_ms=clock_ms[0] - 5
+                )
+                candidate = server._current_payout_state_candidate()
+                assert candidate.ledger_artifact is not None
+                line = self._built_lines(lines)[-1]
+                outcomes.append(
+                    (
+                        elapsed,
+                        str(line["window_build_mode"]),
+                        bool(line["self_check_deferred"]),
+                    )
+                )
+        self.assertEqual(
+            [elapsed for elapsed, mode, _ in outcomes if mode == "self_check_match"],
+            [160, 320],
+        )
+        self.assertEqual(
+            [elapsed for elapsed, _, deferred in outcomes if deferred],
+            [100, 120, 140, 260, 280, 300],
+        )
+        self.assertEqual(ledger.full_snapshot_calls, 3)
+        self.assertIsNone(server._payout_artifact_future)
+
+        # Part two: with the walker available, a deferral is handed to it at
+        # the next publication and the check runs there, off the critical
+        # path, before the grace expires.
+        server, ledger, artifacts = self.configured_server()
+        server.payout_artifact_min_build_interval_seconds = 0.0
+        server.payout_artifact_full_rescan_seconds = 100.0
+        clock_ms = [1_000_000]
+        monotonic_seconds = [1_000.0]
+        share_seq = 3
+        with patch(
+            "lab.prism.prism_coordinator.now_ms",
+            side_effect=lambda: clock_ms[0],
+        ), patch(
+            "lab.prism.prism_coordinator.time.monotonic",
+            side_effect=lambda: monotonic_seconds[0],
+        ), _captured_payout_artifact_logs() as lines:
+            initial = server._build_payout_ledger_artifact(
+                0, 0, artifacts.network_difficulty
+            )
+            assert initial is not None
+            self.assertTrue(server._install_payout_ledger_artifact(initial))
+            server._current_payout_state_artifact()
+            candidate: PayoutStateCandidate | None = None
+            for step in range(1, 6):
+                elapsed = 20 * step
+                monotonic_seconds[0] = 1_000.0 + elapsed
+                clock_ms[0] = 1_000_000 + elapsed * 1_000
+                share_seq += 1
+                append_incremental_share(
+                    ledger, share_seq=share_seq, accepted_at_ms=clock_ms[0] - 5
+                )
+                candidate = server._current_payout_state_candidate()
+            assert candidate is not None and candidate.ledger_artifact is not None
+            deferred_line = self._built_lines(lines)[-1]
+            self.assertTrue(deferred_line["self_check_deferred"])
+            self.assertEqual(deferred_line["window_build_mode"], "incremental")
+            self.assertEqual(ledger.full_snapshot_calls, 1)
+            server._block_payout_state_publication(force=True)
+            self.assertEqual(server._publish_payout_state_candidate(candidate), 1)
+            future = server._payout_artifact_future
+            self.assertIsNotNone(future, "publication did not hand the owed check to the walker")
+            assert future is not None
+            future.result(timeout=30.0)
+            background = [
+                line
+                for line in self._built_lines(lines)
+                if line["invalidation_cause"] is None
+                and line["window_build_mode"] == "self_check_match"
+            ]
+            self.assertEqual(len(background), 1)
+            self.assertEqual(background[0]["payout_state_generation"], 1)
+            self.assertEqual(ledger.full_snapshot_calls, 2)
+            # The next routine build is not overdue and defers nothing.
+            monotonic_seconds[0] = 1_120.0
+            clock_ms[0] = 1_120_000
+            share_seq += 1
+            append_incremental_share(
+                ledger, share_seq=share_seq, accepted_at_ms=clock_ms[0] - 5
+            )
+            later = server._current_payout_state_candidate()
+            assert later.ledger_artifact is not None
+            later_line = self._built_lines(lines)[-1]
+            self.assertFalse(later_line["self_check_deferred"])
+            self.assertEqual(later_line["window_build_mode"], "incremental")
+            self.assertEqual(ledger.full_snapshot_calls, 2)
 
 
 class UnfencedAppendDrainTests(unittest.TestCase):

@@ -168,6 +168,50 @@ PRISM_PAYOUT_SECONDS_BUCKETS = (
     10.0,
     30.0,
 )
+# Where one payout-window build spends its time, as a closed phase set
+# (issue #228). ``ledger_read`` is every PostgreSQL read the build issues
+# (full oracle, delta, periodic self-check, carry balances);
+# ``record_conversion`` is folding records into pages, canonical JSON and
+# digests in-process; ``daemon_prepare`` is the Rust daemon round trip
+# (prepare or upload); ``lock_wait`` is time queued for the preparation
+# lock. Fixed cardinality: no per-tip, per-generation or per-reason label.
+PRISM_PAYOUT_WINDOW_BUILD_PHASES = (
+    "ledger_read",
+    "record_conversion",
+    "daemon_prepare",
+    "lock_wait",
+)
+# Staleness the coordinator accepts on the tip-refresh path (issue #228).
+# A routine candidate preparation that finds the preparation lock busy
+# reuses the armed share window instead of queueing behind the lock
+# holder, provided the window's anchor is no older than this; and a
+# candidate build on that path defers an overdue periodic self-check
+# while its cached window is inside the same bound, for at most this long
+# past the check's due time (measured from the last self-check attempt,
+# so build frequency cannot extend it). The number is one background
+# re-anchor interval (DEFAULT_PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS): in
+# steady state the re-anchor keeps the armed window younger than this,
+# so a window inside the bound is one the delivery path is already
+# serving to new jobs as fresh, and a fanout that reuses it declares an
+# anchor no older than reuse itself declares. Past the bound the wave
+# pays the (incremental) build instead: the re-anchor has already flagged
+# that window for replacement, and carrying it into a new payout
+# generation would let a stalled background walker pin a stale anchor
+# for every following generation. It sits well inside the 300 s audit
+# ceiling that bounds how far any served window may trail the live
+# ledger.
+PRISM_TIP_REFRESH_WINDOW_STALENESS_SECONDS = 60.0
+# How one payout-window build ended, as a closed set (issue #228). The
+# phase family is observed under this label on every exit, so a build that
+# lost its generation race, hit the audit ceiling, found an empty window or
+# died with the ledger still contributes the time it measured; those are
+# exactly the slow builds the split exists to attribute.
+PRISM_PAYOUT_WINDOW_BUILD_OUTCOMES = (
+    "completed",
+    "debounced",
+    "aborted",
+    "failed",
+)
 
 
 def canonical_json_text(value: object) -> str:
@@ -371,6 +415,11 @@ class PayoutLedgerArtifact:
         compare=False,
         repr=False,
     )
+    window_self_check_recentered: bool = field(
+        default=False,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -384,6 +433,13 @@ class _IncrementalPayoutArtifactWindow:
     full_rescan_monotonic: float
     full_rescan_attempt_monotonic: float
     append_invalidation_epoch: int = 0
+    # Set when a daemon mirror was adopted from the in-process oracle
+    # without the daemon being prepared for its digest (issue #207): a
+    # periodic self-check re-center or repair whose daemon preparation
+    # was declined. The next advance then answers ``needs_full`` for a
+    # deliberate coordinator decision, and this names it in the rebuild
+    # reason instead of reporting a daemon eviction.
+    daemon_unprepared_reason: str | None = None
 
 
 class _DaemonWindowRebuildRequired(Exception):
@@ -419,6 +475,80 @@ class _PayoutWindowMaterialization:
         repr=False,
     )
     balance_check_mismatch: bool = False
+    # An overdue periodic self-check was left for the next build off the
+    # critical path because this build's cached window was inside
+    # PRISM_TIP_REFRESH_WINDOW_STALENESS_SECONDS (issue #228).
+    self_check_deferred: bool = False
+    # The periodic self-check re-centered an oversized window at the live
+    # weight (issue #207); a deliberate coordinator decision, flagged apart
+    # from any daemon reason.
+    self_check_recentered: bool = False
+
+
+class _ReservedPayoutSource(tuple):
+    """The source tuple handed back to the caller that reserved it.
+
+    Unpacks, indexes and compares exactly like the plain five-tuple a
+    capture returns; the difference is the one-shot entitlement it carries
+    (issue #228). The reserving caller's own preparation acts on the cause
+    it reserved by presenting this object, whatever other preparations
+    have done at any generation in between, so no shared bookkeeping and
+    no pruning rule can take that turn away. The entitlement is consumed
+    the first time it is honoured; a second presentation inherits the
+    tuple like any capture.
+    """
+
+    def __new__(
+        cls,
+        base_generation: int,
+        source_generation: int,
+        tip_hash: str | None,
+        cause: str,
+        invalidated_monotonic: float,
+    ) -> "_ReservedPayoutSource":
+        self = super().__new__(
+            cls,
+            (
+                base_generation,
+                source_generation,
+                tip_hash,
+                cause,
+                invalidated_monotonic,
+            ),
+        )
+        self._entitled = True
+        return self
+
+    def consume_entitlement(self) -> bool:
+        """Take the reserver's one honoured turn; caller holds runtime.lock."""
+        if self._entitled:
+            self._entitled = False
+            return True
+        return False
+
+
+@dataclass(frozen=True)
+class _PayoutWindowBuildAttribution:
+    """Why one candidate build was requested, for its log line (issue #228).
+
+    Set on the building thread by ``_prepared_payout_state_candidate`` and
+    read by ``_build_payout_ledger_artifact``, which the coordinator
+    delegate reaches with a fixed positional signature; the thread-local
+    carries what that signature cannot.
+    """
+
+    # The cause string in the captured source tuple, verbatim.
+    cause: str
+    # True when the capture found a cause another preparation had already
+    # acted on: the tuple was inherited for supersession identity only.
+    cause_inherited: bool
+    # "caller_flag", "reserved_cause", "caller_flag+reserved_cause" or
+    # "none": what, if anything, marked this build as a payout mutation.
+    force_origin: str
+    # A routine candidate on the tip-refresh path: an overdue periodic
+    # self-check is deferred while the cached window is inside the
+    # accepted staleness bound.
+    critical_path: bool
 
 
 @dataclass
@@ -847,6 +977,38 @@ class PayoutStateService:
             for relation in PRISM_PAYOUT_DELIVERY_GENERATIONS
         }
         self.payout_state_candidates_discarded = 0
+        # Guarded by _payout_state_metrics_lock. Where builds spend their
+        # time, by the closed phase set and the closed outcome set (issue
+        # #228).
+        self.payout_window_build_phase_histograms = {
+            (phase, outcome): {
+                "buckets": {
+                    bucket: 0 for bucket in PRISM_PAYOUT_SECONDS_BUCKETS
+                },
+                "sum": 0.0,
+                "count": 0,
+            }
+            for phase in PRISM_PAYOUT_WINDOW_BUILD_PHASES
+            for outcome in PRISM_PAYOUT_WINDOW_BUILD_OUTCOMES
+        }
+        # Per-thread build state: the attribution a candidate preparation
+        # hands its build, and the phase accumulator of the build in
+        # progress on this thread.
+        self._payout_window_build_context = threading.local()
+        # Guarded by runtime.lock. The highest source generation any
+        # candidate preparation has acted on; it never moves backwards. A
+        # capture at that generation or below inherits the tuple for
+        # supersession identity only, so the cause a withdrawal reserved is
+        # acted on once (issue #228). The reserver's own turn does not live
+        # here: it travels in the _ReservedPayoutSource its reservation
+        # returned. The tuple itself is never cleared, because publication
+        # supersession and the finalizer's pending-cause read depend on it
+        # staying readable.
+        self._payout_source_cause_high_water: int | None = None
+        # Guarded by runtime.lock. A critical-path build deferred an overdue
+        # periodic self-check; the next publication requests a background
+        # preparation so the check runs off the critical path promptly.
+        self._payout_self_check_owed = False
         self._payout_first_delivery_pending: tuple[int, float] | None = None
         self._payout_state_publication_blocked = False
         # Artifact lifecycle observability (the 2026-07-29 incident was
@@ -865,6 +1027,7 @@ class PayoutStateService:
                 "self_check_failed",
                 "balance_check_mismatch",
                 "found_block_cached",
+                "tip_refresh_cached",
                 "installed",
                 "refreshed",
                 "already_current",
@@ -964,12 +1127,21 @@ class PayoutStateService:
         """The oracle read plus fold; returns the window and the fold path."""
         runtime = self._runtime
 
-        records = list(
-            runtime.ledger.snapshot_at_job_issue(
-                snapshot_anchor_ms,
-                window_weight=snapshot_window_weight,
+        # Timed in a finally: a read that dies with the ledger is exactly
+        # the slow read the phase family exists to attribute.
+        read_started = time.monotonic()
+        try:
+            records = list(
+                runtime.ledger.snapshot_at_job_issue(
+                    snapshot_anchor_ms,
+                    window_weight=snapshot_window_weight,
+                )
             )
-        )
+        finally:
+            self._note_window_build_phase(
+                "ledger_read",
+                time.monotonic() - read_started,
+            )
         zero_stats = IncrementalWindowAdvanceStats(
             added_rows=0,
             expired_rows=0,
@@ -980,13 +1152,17 @@ class PayoutStateService:
             # legacy full-read behavior. Production ledger records always
             # expose the complete AcceptedShareRecord shape.
             runtime._incremental_payout_artifact_window = None
+            conversion_started = time.monotonic()
             shares_json = tuple(record.to_prism_json() for record in records)
+            digest = self._canonical_json_sha256(shares_json)
+            self._note_window_build_phase(
+                "record_conversion",
+                time.monotonic() - conversion_started,
+            )
             return (
                 _PayoutWindowMaterialization(
                     shares_json=shares_json,
-                    share_snapshot_sha256=self._canonical_json_sha256(
-                        shares_json
-                    ),
+                    share_snapshot_sha256=digest,
                     snapshot_anchor_ms=int(snapshot_anchor_ms),
                     mode="full_rescan",
                     record_count=len(records),
@@ -1017,6 +1193,7 @@ class PayoutStateService:
             # also where an invalid snapshot raises its authoritative error
             # and where unbounded integers fold the out-of-range window.
 
+        conversion_started = time.monotonic()
         window = IncrementalShareWindow.from_full_snapshot(
             records,
             anchor_job_issued_at_ms=snapshot_anchor_ms,
@@ -1024,6 +1201,10 @@ class PayoutStateService:
         )
         shares_json = window.json_records()
         digest = self._canonical_json_sha256(shares_json)
+        self._note_window_build_phase(
+            "record_conversion",
+            time.monotonic() - conversion_started,
+        )
         runtime._incremental_payout_artifact_window = (
             _IncrementalPayoutArtifactWindow(
                 window=window,
@@ -1090,19 +1271,34 @@ class PayoutStateService:
         prepare = getattr(runtime, "prepare_payout_window", None)
         if not callable(prepare):
             return None
-        outcome = prepare(
-            mode="full",
-            records_json=[record.to_prism_json() for record in records],
-            anchor_job_issued_at_ms=int(snapshot_anchor_ms),
-            append_invalidation_epoch=int(append_invalidation_epoch),
-            window_weight=int(snapshot_window_weight),
-            page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
-            # An accepted-block preview publishes on the critical path; it
-            # folds in-process rather than queueing behind another build.
-            wait_for_daemon=not bypass_build_interval,
+        conversion_started = time.monotonic()
+        records_json = [record.to_prism_json() for record in records]
+        self._note_window_build_phase(
+            "record_conversion",
+            time.monotonic() - conversion_started,
         )
+        daemon_started = time.monotonic()
+        try:
+            outcome = prepare(
+                mode="full",
+                records_json=records_json,
+                anchor_job_issued_at_ms=int(snapshot_anchor_ms),
+                append_invalidation_epoch=int(append_invalidation_epoch),
+                window_weight=int(snapshot_window_weight),
+                page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+                # An accepted-block preview publishes on the critical path;
+                # it folds in-process rather than queueing behind another
+                # build.
+                wait_for_daemon=not bypass_build_interval,
+            )
+        finally:
+            self._note_window_build_phase(
+                "daemon_prepare",
+                time.monotonic() - daemon_started,
+            )
         if outcome is None or outcome.status != "prepared":
             return None
+        conversion_started = time.monotonic()
         try:
             mirror = DaemonShareWindowMirror.from_full_items(
                 anchor_job_issued_at_ms=int(snapshot_anchor_ms),
@@ -1116,6 +1312,10 @@ class PayoutStateService:
             runtime._note_window_mirror_divergence()
             return None
         shares_json = mirror.json_records()
+        self._note_window_build_phase(
+            "record_conversion",
+            time.monotonic() - conversion_started,
+        )
         runtime._incremental_payout_artifact_window = (
             _IncrementalPayoutArtifactWindow(
                 window=mirror,
@@ -1149,6 +1349,7 @@ class PayoutStateService:
         snapshot_anchor_ms: int,
         append_invalidation_epoch: int,
         bypass_build_interval: bool = False,
+        unprepared_reason: str | None = None,
     ) -> tuple[DaemonShareWindowMirror, IncrementalWindowAdvanceStats]:
         """Advance the daemon-prepared window by one append-only delta.
 
@@ -1165,6 +1366,13 @@ class PayoutStateService:
         where the daemon declines the snapshot the same way and the
         in-process fold takes the window -- reasoned
         ``window_value_out_of_range``, the daemon untouched.
+
+        ``unprepared_reason`` is the cached entry's own account of why the
+        daemon may not hold this base: a periodic self-check adopted the
+        mirror from the in-process oracle and its daemon preparation was
+        declined (issue #207). A ``needs_full`` for such a mirror is that
+        deliberate decision surfacing, and is reasoned with it rather than
+        reported as daemon state loss.
         """
         runtime = self._runtime
         prepare = getattr(runtime, "prepare_payout_window", None)
@@ -1175,14 +1383,27 @@ class PayoutStateService:
                 "window_pipeline_mode_changed",
                 clear_cache=True,
             )
-        outcome = prepare(
-            mode="advance",
-            records_json=[record.to_prism_json() for record in delta_records],
-            anchor_job_issued_at_ms=int(snapshot_anchor_ms),
-            append_invalidation_epoch=int(append_invalidation_epoch),
-            base_digest=mirror.share_snapshot_sha256,
-            wait_for_daemon=not bypass_build_interval,
+        conversion_started = time.monotonic()
+        records_json = [record.to_prism_json() for record in delta_records]
+        self._note_window_build_phase(
+            "record_conversion",
+            time.monotonic() - conversion_started,
         )
+        daemon_started = time.monotonic()
+        try:
+            outcome = prepare(
+                mode="advance",
+                records_json=records_json,
+                anchor_job_issued_at_ms=int(snapshot_anchor_ms),
+                append_invalidation_epoch=int(append_invalidation_epoch),
+                base_digest=mirror.share_snapshot_sha256,
+                wait_for_daemon=not bypass_build_interval,
+            )
+        finally:
+            self._note_window_build_phase(
+                "daemon_prepare",
+                time.monotonic() - daemon_started,
+            )
         if outcome is None:
             raise _DaemonWindowRebuildRequired(
                 "window_daemon_unavailable",
@@ -1198,11 +1419,13 @@ class PayoutStateService:
                 clear_cache=False,
             )
         if outcome.status == "needs_full":
-            # Respawn or eviction: the daemon no longer holds the base
-            # window. The coordinator mirror is still digest-verified, so
-            # only the daemon needs re-seeding via the full path.
+            # The daemon no longer holds the base window. A mirror adopted
+            # without a daemon preparation names its own reason; anything
+            # else is a respawn or eviction. Either way the coordinator
+            # mirror is still digest-verified, so only the daemon needs
+            # re-seeding via the full path.
             raise _DaemonWindowRebuildRequired(
-                "window_daemon_state_lost",
+                unprepared_reason or "window_daemon_state_lost",
                 clear_cache=False,
             )
         if outcome.status == "fallback":
@@ -1223,6 +1446,7 @@ class PayoutStateService:
                 "window_daemon_unavailable",
                 clear_cache=True,
             )
+        conversion_started = time.monotonic()
         try:
             advanced = mirror.advanced(
                 anchor_job_issued_at_ms=int(snapshot_anchor_ms),
@@ -1237,11 +1461,129 @@ class PayoutStateService:
                 "window_mirror_divergence",
                 clear_cache=True,
             ) from None
+        finally:
+            self._note_window_build_phase(
+                "record_conversion",
+                time.monotonic() - conversion_started,
+            )
         return advanced, IncrementalWindowAdvanceStats(
             added_rows=int(outcome.added_rows),
             expired_rows=int(outcome.expired_rows),
             touched_pages=int(outcome.touched_pages),
         )
+
+    def _daemon_adopted_window(
+        self,
+        *,
+        full_window: IncrementalShareWindow,
+        shares_json: IncrementalShareJsonSequence,
+        digest: str,
+        advanced_window: IncrementalShareWindow | DaemonShareWindowMirror,
+        snapshot_anchor_ms: int,
+        append_invalidation_epoch: int,
+    ) -> tuple[DaemonShareWindowMirror, str | None]:
+        """Adopt the self-check oracle's window as a mirror the daemon holds.
+
+        Issue #207: the periodic self-check used to install a mirror built
+        from the oracle's own pages without telling the daemon, so after an
+        oversized re-center (or a repair after a mismatch or an outage) the
+        next advance answered ``needs_full`` and paid a second full
+        ``snapshot_at_job_issue`` under the writer lock, recorded as
+        ``window_daemon_state_lost``. When the daemon already holds the
+        adopted digest (its own advance produced it) the mirror is taken
+        from the oracle pages as before. Otherwise the daemon is prepared
+        for the adopted window here, once, so the next build advances
+        incrementally. If that preparation is declined -- busy, unavailable,
+        out of range, or a digest the in-process oracle refutes -- the
+        oracle mirror is installed anyway and tagged with the daemon's own
+        outcome reason (``window_daemon_busy``, ``window_daemon_unavailable``,
+        ``window_value_out_of_range`` or ``window_mirror_divergence``, all
+        members of the closed rescan-reason vocabulary), so the
+        ``needs_full`` it will draw is reported as what declined the
+        adoption and never as daemon state loss.
+        """
+        runtime = self._runtime
+
+        def mirror_from_oracle_pages() -> DaemonShareWindowMirror:
+            # The bytes come from the oracle's own pages (already encoded);
+            # the digest is a function of exactly the retained records.
+            return DaemonShareWindowMirror(
+                anchor_job_issued_at_ms=full_window.anchor_job_issued_at_ms,
+                window_weight=full_window.window_weight,
+                page_size=full_window.page_size,
+                record_count=len(shares_json),
+                canonical_items=b",".join(
+                    page.canonical_json_items
+                    for page in full_window.pages
+                    if page.canonical_json_items
+                ),
+                share_snapshot_sha256=digest,
+            )
+
+        if (
+            isinstance(advanced_window, DaemonShareWindowMirror)
+            and advanced_window.share_snapshot_sha256 == digest
+        ):
+            return mirror_from_oracle_pages(), None
+        prepare = getattr(runtime, "prepare_payout_window", None)
+        if not callable(prepare):
+            return mirror_from_oracle_pages(), "window_daemon_unavailable"
+        conversion_started = time.monotonic()
+        records_json = [record.to_prism_json() for record in full_window.records()]
+        self._note_window_build_phase(
+            "record_conversion",
+            time.monotonic() - conversion_started,
+        )
+        daemon_started = time.monotonic()
+        try:
+            outcome = prepare(
+                mode="full",
+                records_json=records_json,
+                anchor_job_issued_at_ms=int(snapshot_anchor_ms),
+                append_invalidation_epoch=int(append_invalidation_epoch),
+                window_weight=int(full_window.window_weight),
+                page_size=int(full_window.page_size),
+                # The self-check only runs off the found-block critical path.
+                wait_for_daemon=True,
+            )
+        finally:
+            self._note_window_build_phase(
+                "daemon_prepare",
+                time.monotonic() - daemon_started,
+            )
+        if outcome is None:
+            return mirror_from_oracle_pages(), "window_daemon_unavailable"
+        if outcome.status == "busy":
+            return mirror_from_oracle_pages(), "window_daemon_busy"
+        if outcome.status == "out_of_range":
+            return mirror_from_oracle_pages(), "window_value_out_of_range"
+        if outcome.status != "prepared":
+            return mirror_from_oracle_pages(), "window_daemon_unavailable"
+        if outcome.share_snapshot_sha256 != digest:
+            # The daemon folded the same records to a different digest.
+            # The in-process oracle is authoritative here; surface the
+            # disagreement and keep its window.
+            runtime._record_payout_artifact_event("window_mirror_divergence")
+            return mirror_from_oracle_pages(), "window_mirror_divergence"
+        conversion_started = time.monotonic()
+        try:
+            mirror = DaemonShareWindowMirror.from_full_items(
+                anchor_job_issued_at_ms=int(snapshot_anchor_ms),
+                window_weight=int(full_window.window_weight),
+                page_size=int(full_window.page_size),
+                record_count=int(outcome.record_count),
+                canonical_items=outcome.window_items or b"",
+                share_snapshot_sha256=outcome.share_snapshot_sha256 or "",
+            )
+        except DaemonWindowMirrorDivergence:
+            runtime._record_payout_artifact_event("window_mirror_divergence")
+            return mirror_from_oracle_pages(), "window_mirror_divergence"
+        finally:
+            self._note_window_build_phase(
+                "record_conversion",
+                time.monotonic() - conversion_started,
+            )
+        return mirror, None
 
     def _incremental_payout_window_materialization(
         self,
@@ -1258,7 +1600,9 @@ class PayoutStateService:
         Must run under ``_payout_state_prepare_lock``. The cache replacement
         happens only after a complete materialization, except an explicit
         forced invalidation clears it before the oracle so a failed reorg
-        check cannot later resume from unverified append-only state.
+        check cannot later resume from unverified append-only state. The
+        append-epoch check below is what keeps a late-visible append from
+        being advanced over; it does not depend on the request flag.
         """
         runtime = self._runtime
 
@@ -1340,6 +1684,41 @@ class PayoutStateService:
             observed - cached.full_rescan_attempt_monotonic
             >= full_rescan_seconds
         )
+        # Issue #228: a routine candidate on the tip-refresh path must not
+        # pay the oracle while a valid recent window exists. If its cached
+        # window is inside the accepted staleness bound, an overdue
+        # self-check is left for a build off that path. The deferral is
+        # bounded in wall-clock terms against the last self-check attempt,
+        # not against the last build: once the check is a full staleness
+        # bound past due it runs here whatever the build frequency, so
+        # candidates arriving faster than the bound cannot defer it
+        # forever. A deferral also leaves the check owed, and the next
+        # publication requests a background preparation that normally runs
+        # it off the critical path before that grace expires.
+        attribution = getattr(
+            self._payout_window_build_context, "attribution", None
+        )
+        critical_path = attribution is not None and attribution.critical_path
+        cached_window_fresh = (
+            int(snapshot_anchor_ms) - int(cached.window.anchor_job_issued_at_ms)
+            <= PRISM_TIP_REFRESH_WINDOW_STALENESS_SECONDS * 1000.0
+        )
+        self_check_grace_exhausted = (
+            observed - cached.full_rescan_attempt_monotonic
+            >= full_rescan_seconds + PRISM_TIP_REFRESH_WINDOW_STALENESS_SECONDS
+        )
+        self_check_deferred = bool(
+            self_check_overdue
+            and not bypass_build_interval
+            and critical_path
+            and cached_window_fresh
+            and not self_check_grace_exhausted
+        )
+        run_self_check = (
+            not bypass_build_interval
+            and self_check_overdue
+            and not self_check_deferred
+        )
         if (
             not bypass_build_interval
             and not self_check_overdue
@@ -1366,12 +1745,19 @@ class PayoutStateService:
             )
 
         try:
-            delta_records = list(
-                delta_reader(
-                    cached.window.anchor_job_issued_at_ms,
-                    snapshot_anchor_ms,
+            delta_started = time.monotonic()
+            try:
+                delta_records = list(
+                    delta_reader(
+                        cached.window.anchor_job_issued_at_ms,
+                        snapshot_anchor_ms,
+                    )
                 )
-            )
+            finally:
+                self._note_window_build_phase(
+                    "ledger_read",
+                    time.monotonic() - delta_started,
+                )
             if isinstance(cached.window, DaemonShareWindowMirror):
                 advanced_window, stats = self._daemon_advance_window(
                     cached.window,
@@ -1379,12 +1765,20 @@ class PayoutStateService:
                     snapshot_anchor_ms=snapshot_anchor_ms,
                     append_invalidation_epoch=append_invalidation_epoch,
                     bypass_build_interval=bypass_build_interval,
+                    unprepared_reason=cached.daemon_unprepared_reason,
                 )
             else:
-                advanced_window, stats = cached.window.advance(
-                    delta_records,
-                    anchor_job_issued_at_ms=snapshot_anchor_ms,
-                )
+                advance_started = time.monotonic()
+                try:
+                    advanced_window, stats = cached.window.advance(
+                        delta_records,
+                        anchor_job_issued_at_ms=snapshot_anchor_ms,
+                    )
+                finally:
+                    self._note_window_build_phase(
+                        "record_conversion",
+                        time.monotonic() - advance_started,
+                    )
         except _DaemonWindowRebuildRequired as rebuild:
             # Daemon window loss (respawn/eviction), a daemon anomaly, a
             # daemon another build owns, or a refuted byte mirror. The cached
@@ -1416,8 +1810,13 @@ class PayoutStateService:
             # identities survive normal advancement, so this view and its
             # digest convert only append/head boundary pages; retained share
             # records are never flattened or re-encoded here.
+            conversion_started = time.monotonic()
             shares_json = advanced_window.json_records()
             digest = self._canonical_json_sha256(shares_json)
+            self._note_window_build_phase(
+                "record_conversion",
+                time.monotonic() - conversion_started,
+            )
         else:
             shares_json = cached.shares_json
             digest = cached.share_snapshot_sha256
@@ -1435,9 +1834,10 @@ class PayoutStateService:
         )
         mode = "incremental"
         check_reason: str | None = None
+        self_check_recentered = False
         balance_check_prior_balances: tuple[dict[str, object], ...] | None = None
         balance_check_mismatch = False
-        if not bypass_build_interval and self_check_overdue:
+        if run_self_check:
             # The self-check is a whole-window oracle read at the cached
             # weight; it is recorded as a full rescan under its check reason
             # (the periodic family) and always folds in-process.
@@ -1466,12 +1866,20 @@ class PayoutStateService:
                 recenter_oversized = (
                     cached_window_weight * 4 > live_window_weight * 5
                 )
-                full_records = list(
-                    runtime.ledger.snapshot_at_job_issue(
-                        snapshot_anchor_ms,
-                        window_weight=cached_window_weight,
+                oracle_started = time.monotonic()
+                try:
+                    full_records = list(
+                        runtime.ledger.snapshot_at_job_issue(
+                            snapshot_anchor_ms,
+                            window_weight=cached_window_weight,
+                        )
                     )
-                )
+                finally:
+                    self._note_window_build_phase(
+                        "ledger_read",
+                        time.monotonic() - oracle_started,
+                    )
+                conversion_started = time.monotonic()
                 comparison_window = IncrementalShareWindow.from_full_snapshot(
                     full_records,
                     anchor_job_issued_at_ms=snapshot_anchor_ms,
@@ -1507,6 +1915,10 @@ class PayoutStateService:
                         comparison_window.records()
                         == advanced_window.records()
                     )
+                self._note_window_build_phase(
+                    "record_conversion",
+                    time.monotonic() - conversion_started,
+                )
             except Exception:
                 # The already-validated delta remains usable. Space failed
                 # oracle attempts by the configured runtime-check interval so a
@@ -1522,28 +1934,26 @@ class PayoutStateService:
                 oracle_window: (
                     IncrementalShareWindow | DaemonShareWindowMirror
                 ) = full_window
+                daemon_unprepared_reason: str | None = None
                 if self._window_pipeline_rust_enabled():
                     # Keep the cache in mirror form so the next delta build
                     # advances through the daemon rather than mode-cycling;
                     # this is also how a Python-advancing cache (the degraded
-                    # state after a daemon outage) converts back. The bytes
-                    # come from the oracle's own pages (already encoded); on
-                    # a match the daemon holds this same digest, and on a
-                    # mismatch (or after an outage) its next advance answers
-                    # needs_full and re-prepares from the oracle's window.
-                    oracle_window = DaemonShareWindowMirror(
-                        anchor_job_issued_at_ms=(
-                            full_window.anchor_job_issued_at_ms
-                        ),
-                        window_weight=full_window.window_weight,
-                        page_size=full_window.page_size,
-                        record_count=len(shares_json),
-                        canonical_items=b",".join(
-                            page.canonical_json_items
-                            for page in full_window.pages
-                            if page.canonical_json_items
-                        ),
-                        share_snapshot_sha256=digest,
+                    # state after a daemon outage) converts back. When the
+                    # daemon does not already hold the adopted digest (an
+                    # oversized re-center, a mismatch repair, or the
+                    # conversion after an outage) it is prepared for it here
+                    # (issue #207), so the next advance never answers
+                    # needs_full for a decision the coordinator itself made.
+                    oracle_window, daemon_unprepared_reason = (
+                        self._daemon_adopted_window(
+                            full_window=full_window,
+                            shares_json=shares_json,
+                            digest=digest,
+                            advanced_window=advanced_window,
+                            snapshot_anchor_ms=snapshot_anchor_ms,
+                            append_invalidation_epoch=append_invalidation_epoch,
+                        )
                     )
                 advanced = _IncrementalPayoutArtifactWindow(
                     window=oracle_window,
@@ -1553,14 +1963,28 @@ class PayoutStateService:
                     full_rescan_monotonic=observed,
                     full_rescan_attempt_monotonic=observed,
                     append_invalidation_epoch=append_invalidation_epoch,
+                    daemon_unprepared_reason=daemon_unprepared_reason,
                 )
                 mode = "self_check_match" if matched else "self_check_mismatch"
                 check_reason = "periodic_self_check"
+                # A deliberate re-center is flagged on the build (issue
+                # #207) rather than given a reason of its own: the rescan
+                # reason vocabulary is closed in the #224 telemetry owner,
+                # and with the daemon prepared for the adopted digest the
+                # re-center draws no rebuild for a later build to name.
+                self_check_recentered = bool(recenter_oversized)
                 if reused_prior_balances_sha256 is not None:
                     try:
-                        checked_balances = tuple(
-                            runtime.ledger.current_prior_balances()
-                        )
+                        balances_started = time.monotonic()
+                        try:
+                            checked_balances = tuple(
+                                runtime.ledger.current_prior_balances()
+                            )
+                        finally:
+                            self._note_window_build_phase(
+                                "ledger_read",
+                                time.monotonic() - balances_started,
+                            )
                         checked_balances_sha256 = self._canonical_json_sha256(
                             checked_balances
                         )
@@ -1619,6 +2043,8 @@ class PayoutStateService:
             full_rescan_reason=check_reason,
             balance_check_prior_balances=balance_check_prior_balances,
             balance_check_mismatch=balance_check_mismatch,
+            self_check_deferred=self_check_deferred,
+            self_check_recentered=self_check_recentered,
         )
 
     def _build_payout_ledger_artifact(
@@ -1634,6 +2060,47 @@ class PayoutStateService:
     ) -> PayoutLedgerArtifact | None:
         """Build a stable ledger snapshot without publishing it.
 
+        The build proper is ``_build_payout_ledger_artifact_scoped``; this
+        seam owns the per-build phase accumulator and observes it on every
+        exit under a closed outcome (issue #228), so a build that aborts (a
+        lost generation race, an anchor past the audit ceiling, an empty
+        window) or dies with the ledger still contributes the time it
+        measured. The slow builds are exactly the ones that lose those
+        races, and a family that only counted finished builds would read
+        as healthy during the incident it exists for.
+        """
+        phases = self._begin_window_build_phases()
+        outcome = "failed"
+        try:
+            artifact, outcome = self._build_payout_ledger_artifact_scoped(
+                expected_payout_state_generation,
+                artifact_payout_state_generation,
+                network_difficulty,
+                force_full_rescan,
+                bypass_build_interval,
+                during_publication,
+                force_prior_balances_read=force_prior_balances_read,
+                phases=phases,
+            )
+            return artifact
+        finally:
+            self._finish_window_build_phases()
+            self._observe_window_build_phases(phases, outcome)
+
+    def _build_payout_ledger_artifact_scoped(
+        self,
+        expected_payout_state_generation: int,
+        artifact_payout_state_generation: int,
+        network_difficulty: int,
+        force_full_rescan: bool = False,
+        bypass_build_interval: bool = False,
+        during_publication: bool = False,
+        *,
+        force_prior_balances_read: bool = False,
+        phases: dict[str, float],
+    ) -> tuple[PayoutLedgerArtifact | None, str]:
+        """The build proper; returns the artifact and its closed outcome.
+
         Validity is anchor-scoped, not count-scoped. The pending-commit clamp
         selects the highest clean anchor: every share stamped at or below it
         is already durable, so the window read at that anchor is exact and
@@ -1648,20 +2115,36 @@ class PayoutStateService:
         ``qbit_share_ledger``) but the published prior balances may not be,
         so the window is reused through the normal debounce/delta path and
         only the carry aggregate is read live. It is never a full rescan.
+
+        Issue #228 adds attribution: a candidate preparation on the calling
+        thread says which cause and flag asked for the build (read from the
+        thread-local context, since the coordinator delegate reaches this
+        seam with a fixed signature), and every build is timed by phase.
         """
         runtime = self._runtime
         runtime._ensure_job_cache_state()
+        # A candidate preparation on this thread says why it asked for
+        # this build; background preparations carry no attribution.
+        attribution = getattr(
+            self._payout_window_build_context, "attribution", None
+        )
+        payout_mutated = bool(force_full_rescan or force_prior_balances_read)
         build_started = time.monotonic()
         ledger_started = time.monotonic()
         materialized: _PayoutWindowMaterialization
         try:
+            lock_wait_started = time.monotonic()
             with runtime._payout_state_prepare_lock:
+                self._note_window_build_phase(
+                    "lock_wait",
+                    time.monotonic() - lock_wait_started,
+                )
                 with runtime._job_cache_lock:
                     if (
                         expected_payout_state_generation
                         != runtime._payout_state_generation
                     ):
-                        return None
+                        return None, "aborted"
                     append_invalidation_epoch = int(
                         runtime._payout_ledger_append_invalidation_epoch
                     )
@@ -1683,8 +2166,7 @@ class PayoutStateService:
                     runtime._payout_prior_balances_reuse_invalidated_sha256 = None
                     invalidated_balances_sha256 = None
                 reuse_published_balances = bool(
-                    not force_full_rescan
-                    and not force_prior_balances_read
+                    not payout_mutated
                     and published_payout_artifact is not None
                     and published_payout_artifact.generation
                     == expected_payout_state_generation
@@ -1708,7 +2190,7 @@ class PayoutStateService:
                     # expired -- on arrival. Abort before paying the window
                     # walk: the re-arm backoff paces retries and the
                     # share-commit liveness watchdog owns recovery.
-                    return None
+                    return None, "aborted"
                 window_started = time.monotonic()
                 # Publish the walk's anchor before the ledger read: a
                 # late-visible append committing mid-walk can predate it
@@ -1791,7 +2273,14 @@ class PayoutStateService:
                     )
                     prior_balances_source = "published"
                 else:
-                    prior_balances = runtime.ledger.current_prior_balances()
+                    balances_started = time.monotonic()
+                    try:
+                        prior_balances = runtime.ledger.current_prior_balances()
+                    finally:
+                        self._note_window_build_phase(
+                            "ledger_read",
+                            time.monotonic() - balances_started,
+                        )
                     prior_balances_source = "ledger"
             accepted_share_count, _ = runtime.accepted_share_stats()
         except Exception as exc:
@@ -1811,15 +2300,23 @@ class PayoutStateService:
                     during_publication=True,
                     build_interval_bypassed=bool(bypass_build_interval),
                     abort_reason=type(exc).__name__,
+                    phase_seconds={
+                        phase: round(float(phases.get(phase, 0.0)), 6)
+                        for phase in PRISM_PAYOUT_WINDOW_BUILD_PHASES
+                    },
                 )
-            return None
+            return None, "failed"
         finally:
             runtime._observe_tip_refresh_build_phase(
                 "ledger_snapshot",
                 time.monotonic() - ledger_started,
             )
+        if materialized.self_check_deferred:
+            # Owed until a publication hands it to the background walker.
+            with runtime.lock:
+                self._payout_self_check_owed = True
         if not materialized.shares_json:
-            return None
+            return None, "aborted"
         copy_started = time.monotonic()
         shares_json = materialized.shares_json
         frozen_balances = tuple(prior_balances)
@@ -1845,6 +2342,7 @@ class PayoutStateService:
             window_touched_pages=materialized.stats.touched_pages,
             window_build_seconds=window_build_seconds,
             window_full_rescan_reason=materialized.full_rescan_reason,
+            window_self_check_recentered=materialized.self_check_recentered,
         )
         build_seconds = time.monotonic() - build_started
         log_fields: dict[str, object] = {
@@ -1862,6 +2360,31 @@ class PayoutStateService:
             "prior_balances_source": prior_balances_source,
             "prior_balances_read_forced": bool(force_prior_balances_read),
             "balance_check_mismatch": materialized.balance_check_mismatch,
+            # Issue #228: which caller forced this build and why, readable
+            # from the line alone. ``invalidation_cause`` is the captured
+            # source cause verbatim; ``force_origin`` says whether a payout
+            # mutation came from the caller's explicit flag, from the
+            # reserved cause, both, or neither; ``cause_inherited`` marks a
+            # capture that found a cause already acted on (the sticky-tuple
+            # shape that used to force full rescans); ``window_oracle_forced``
+            # is the explicit exact-oracle request.
+            "invalidation_cause": (
+                attribution.cause if attribution is not None else None
+            ),
+            "force_origin": (
+                attribution.force_origin if attribution is not None else "none"
+            ),
+            "cause_inherited": bool(
+                attribution is not None and attribution.cause_inherited
+            ),
+            "payout_mutated": payout_mutated,
+            "window_oracle_forced": bool(force_full_rescan),
+            "self_check_deferred": bool(materialized.self_check_deferred),
+            "self_check_recentered": bool(materialized.self_check_recentered),
+            "phase_seconds": {
+                phase: round(float(phases.get(phase, 0.0)), 6)
+                for phase in PRISM_PAYOUT_WINDOW_BUILD_PHASES
+            },
         }
         if materialized.full_rescan_reason is not None:
             log_fields["full_rescan_reason"] = materialized.full_rescan_reason
@@ -1885,7 +2408,9 @@ class PayoutStateService:
             else:
                 runtime._record_payout_artifact_event("incremental")
             runtime._payout_artifact_log("payout_artifact_built", **log_fields)
-        return artifact
+        return artifact, (
+            "debounced" if materialized.mode == "debounced" else "completed"
+        )
 
     def _prepare_payout_ledger_artifact(
         self,
@@ -3558,7 +4083,9 @@ class PayoutStateService:
                     cause,
                     invalidated,
                 )
-                return (
+                # The reserver's entitlement to act on this cause travels
+                # with the tuple it gets back (issue #228).
+                return _ReservedPayoutSource(
                     runtime._payout_state_generation,
                     source_generation,
                     tip_hash,
@@ -3585,6 +4112,177 @@ class PayoutStateService:
             invalidated,
         )
 
+    def _consume_payout_source_cause(
+        self,
+        captured: tuple[int, int, str | None, str, float],
+    ) -> bool:
+        """Whether this preparation may act on the source's reserved cause.
+
+        Two rules, and nothing shared between them that a pruning policy
+        could reach:
+
+        - The reserver's own preparation presents the ``_ReservedPayoutSource``
+          its reservation returned, and acts on the cause exactly once,
+          whatever other preparations have done at any generation since.
+          The entitlement lives in that object, so a foreign preparation
+          at a later generation cannot defeat it; its candidate may be
+          doomed at the publication check, but its build keeps the
+          found-block immediacy and degrade of issue #188.
+        - A plain capture acts only if its source generation is above the
+          high-water mark of everything acted on so far, and moves the mark
+          there. At the mark, someone already acted (the mark got there by
+          acting); below it, the capture is stale. Neither ever rewinds
+          the mark, so a stale preparation cannot re-enable a newer
+          generation's cause.
+
+        The reserver's turn also lifts the mark to its generation when that
+        is newer, so a later capture at the same generation inherits. The
+        tuple itself is never cleared: candidate supersession and the
+        finalizer's pending-cause read depend on it staying readable.
+        """
+        runtime = self._runtime
+        source_generation = int(captured[1])
+        with runtime.lock:
+            high_water = self._payout_source_cause_high_water
+            newer = high_water is None or source_generation > high_water
+            if isinstance(captured, _ReservedPayoutSource):
+                if not captured.consume_entitlement():
+                    return False
+                if newer:
+                    self._payout_source_cause_high_water = source_generation
+                return True
+            if newer:
+                self._payout_source_cause_high_water = source_generation
+                return True
+            return False
+
+    def _begin_window_build_phases(self) -> dict[str, float]:
+        phases = {phase: 0.0 for phase in PRISM_PAYOUT_WINDOW_BUILD_PHASES}
+        self._payout_window_build_context.phases = phases
+        return phases
+
+    def _finish_window_build_phases(self) -> None:
+        self._payout_window_build_context.phases = None
+
+    def _note_window_build_phase(self, phase: str, elapsed_seconds: float) -> None:
+        """Attribute one timed slice of the build in progress on this thread."""
+        if phase not in PRISM_PAYOUT_WINDOW_BUILD_PHASES:
+            raise ValueError(f"unknown payout window build phase: {phase}")
+        phases = getattr(self._payout_window_build_context, "phases", None)
+        if phases is not None:
+            phases[phase] = float(phases.get(phase, 0.0)) + max(
+                0.0, float(elapsed_seconds)
+            )
+
+    def _observe_window_build_phases(
+        self,
+        phases: dict[str, float],
+        outcome: str,
+    ) -> None:
+        if outcome not in PRISM_PAYOUT_WINDOW_BUILD_OUTCOMES:
+            raise ValueError(f"unknown payout window build outcome: {outcome}")
+        runtime = self._runtime
+        with runtime._payout_state_metrics_lock:
+            for phase in PRISM_PAYOUT_WINDOW_BUILD_PHASES:
+                elapsed = max(0.0, float(phases.get(phase, 0.0)))
+                histogram = self.payout_window_build_phase_histograms[
+                    (phase, outcome)
+                ]
+                histogram["count"] = int(histogram["count"]) + 1
+                histogram["sum"] = float(histogram["sum"]) + elapsed
+                buckets = histogram["buckets"]
+                assert isinstance(buckets, dict)
+                for bucket in PRISM_PAYOUT_SECONDS_BUCKETS:
+                    if elapsed <= bucket:
+                        buckets[bucket] = int(buckets.get(bucket, 0)) + 1
+
+    def _cached_tip_refresh_payout_artifact(
+        self,
+        *,
+        base_generation: int,
+        artifact_payout_state_generation: int,
+        network_difficulty: int,
+    ) -> PayoutLedgerArtifact | None:
+        """Reuse the armed window for a routine candidate when the lock is busy.
+
+        The tip-refresh path's counterpart of the found-block degrade
+        (issue #188): a routine candidate must not queue behind another
+        build's oracle while an exact, still-valid armed window exists.
+        Reuse holds exactly where the delivery path's own reuse holds --
+        current payout generation, current append epoch, balances equal
+        to the published bytes -- narrowed to an anchor no older than
+        PRISM_TIP_REFRESH_WINDOW_STALENESS_SECONDS and a live difficulty
+        inside the snapshot-weight band the incremental window already
+        serves across (in-band ASERT drift keeps the cached weight; the
+        artifact is tagged with the template difficulty either way).
+        Balances are the published bytes, which is what a routine build
+        would reuse itself. Anything else returns None and the caller
+        queues for a fresh build as before.
+        """
+        runtime = self._runtime
+        if not runtime._payout_artifact_reuse_active():
+            return None
+        with runtime._job_cache_lock:
+            artifact = runtime._payout_ledger_artifact
+            published_artifact = runtime._published_payout_state.artifact
+            generation_current = base_generation == runtime._payout_state_generation
+            append_epoch_current = bool(
+                artifact is not None
+                and artifact.append_invalidation_epoch
+                == runtime._payout_ledger_append_invalidation_epoch
+            )
+        if (
+            artifact is None
+            or published_artifact is None
+            or not generation_current
+            or not append_epoch_current
+            or artifact.payout_state_generation != base_generation
+            or artifact.snapshot_anchor_ms is None
+        ):
+            return None
+        anchor_age_ms = self._now_ms() - int(artifact.snapshot_anchor_ms)
+        if anchor_age_ms > PRISM_TIP_REFRESH_WINDOW_STALENESS_SECONDS * 1000.0:
+            return None
+        weight_per_difficulty = (
+            PRISM_REWARD_WINDOW_MULTIPLIER * PRISM_SNAPSHOT_WINDOW_MARGIN
+        )
+        if not _snapshot_window_weight_within_band(
+            weight_per_difficulty * int(artifact.network_difficulty),
+            weight_per_difficulty * int(network_difficulty),
+        ):
+            return None
+        balances_sha256 = artifact.prior_balances_sha256 or self._canonical_json_sha256(
+            artifact.prior_balances
+        )
+        if balances_sha256 != published_artifact.prior_balances_sha256:
+            return None
+        reused = dataclass_replace(
+            artifact,
+            generation=0,
+            payout_state_generation=int(artifact_payout_state_generation),
+            network_difficulty=int(network_difficulty),
+            prepared_monotonic=time.monotonic(),
+            window_build_mode="tip_refresh_cached",
+            window_delta_rows=0,
+            window_expired_rows=0,
+            window_touched_pages=0,
+            window_build_seconds=0.0,
+            window_full_rescan_reason="prepare_lock_busy",
+        )
+        runtime._record_payout_artifact_event("tip_refresh_cached")
+        runtime._payout_artifact_log(
+            "payout_artifact_tip_refresh_cached",
+            payout_state_generation=int(artifact_payout_state_generation),
+            duration_seconds=0.0,
+            window_build_mode="tip_refresh_cached",
+            window_shares=len(reused.shares_json),
+            anchor_age_ms=anchor_age_ms,
+            during_publication=True,
+            build_interval_bypassed=False,
+            fallback_reason="prepare_lock_busy",
+        )
+        return reused
+
     def _prepared_payout_state_candidate(
         self,
         captured: tuple[int, int, str | None, str, float],
@@ -3609,36 +4307,58 @@ class PayoutStateService:
             template_artifacts is not None
             and getattr(runtime, "_pool_ready_latched", False)
         ):
-            force_full = (
-                force_full_window_rescan
-                or cause == "accepted_block_preview_withdrawn"
+            # A reserved cause is acted on once, by the preparation that
+            # consumed it. Before this, a withdrawal's cause stayed readable
+            # in the sticky source tuple until the next tip displaced it,
+            # and every routine capture in between forced the full oracle
+            # for a window nothing had changed (issue #228).
+            cause_honored = self._consume_payout_source_cause(captured)
+            decisive_cause = cause if cause_honored else None
+            cause_forces_rescan = (
+                decisive_cause == "accepted_block_preview_withdrawn"
             )
+            force_full = force_full_window_rescan or cause_forces_rescan
+            # Either flag invalidates the published balances; only the
+            # fail-closed full rescan touches the share window. The #224
+            # intent (``force_prior_balances_read``) is what reconciliation
+            # asks for after a confirmed mutation, because it moves
+            # pool-block, payout-entry and carry rows and never the
+            # append-only share ledger.
+            payout_mutated = force_full or force_prior_balances_read
+            caller_flag = force_full_window_rescan or force_prior_balances_read
+            if caller_flag and cause_forces_rescan:
+                force_origin = "caller_flag+reserved_cause"
+            elif caller_flag:
+                force_origin = "caller_flag"
+            elif cause_forces_rescan:
+                force_origin = "reserved_cause"
+            else:
+                force_origin = "none"
             bypass_interval = (
                 bypass_build_interval
-                or cause
+                or decisive_cause
                 in {
                     "accepted_block_preview",
                     "accepted_block_preview_withdrawn",
                 }
             )
             immediate_preview = (
-                cause == "accepted_block_preview"
+                decisive_cause == "accepted_block_preview"
                 or (
                     bypass_build_interval
                     and not force_full_window_rescan
-                    and cause != "accepted_block_preview_withdrawn"
+                    and decisive_cause != "accepted_block_preview_withdrawn"
                 )
             )
-            prepare_lock_acquired = True
-            if immediate_preview:
-                # A routine periodic oracle may already own this lock and its
-                # Postgres query cannot be cancelled safely. Found-block
-                # publication must not queue behind that 11--36 second scan:
-                # use the last exact, still-valid armed window and patch its
-                # balances with the verified preview below.
-                prepare_lock_acquired = runtime._payout_state_prepare_lock.acquire(
-                    blocking=False
+            routine = not payout_mutated and not immediate_preview
+            self._payout_window_build_context.attribution = (
+                _PayoutWindowBuildAttribution(
+                    cause=cause,
+                    cause_inherited=not cause_honored,
+                    force_origin=force_origin,
+                    critical_path=routine,
                 )
+            )
             # Forwarded only when set: the build seam predates the intent
             # and per-instance patches of it keep their exact signature.
             build_intent: dict[str, bool] = (
@@ -3646,40 +4366,69 @@ class PayoutStateService:
                 if force_prior_balances_read
                 else {}
             )
-            if prepare_lock_acquired:
-                try:
-                    ledger_artifact = runtime._build_payout_ledger_artifact(
-                        base_generation,
-                        base_generation + 1,
-                        template_artifacts.network_difficulty,
-                        force_full,
-                        bypass_interval,
-                        True,
-                        **build_intent,
+            try:
+                prepare_lock_acquired = True
+                lock_acquired_here = False
+                reused_armed_window = False
+                if immediate_preview or routine:
+                    # A periodic oracle may already own this lock and its
+                    # Postgres query cannot be cancelled safely. Found-block
+                    # publication must not queue behind that 11--36 second
+                    # scan (issue #188): use the last exact, still-valid
+                    # armed window and patch its balances with the verified
+                    # preview below. A routine tip-refresh candidate follows
+                    # the same rule while an armed window inside the
+                    # accepted staleness bound exists (issue #228); without
+                    # one it queues for a fresh build as before.
+                    prepare_lock_acquired = runtime._payout_state_prepare_lock.acquire(
+                        blocking=False
                     )
-                except self._shutdown_error:
-                    raise
-                except Exception as exc:
-                    if not immediate_preview:
+                    lock_acquired_here = prepare_lock_acquired
+                    if routine and not prepare_lock_acquired:
+                        ledger_artifact = self._cached_tip_refresh_payout_artifact(
+                            base_generation=base_generation,
+                            artifact_payout_state_generation=base_generation + 1,
+                            network_difficulty=template_artifacts.network_difficulty,
+                        )
+                        reused_armed_window = ledger_artifact is not None
+                        prepare_lock_acquired = not reused_armed_window
+                if prepare_lock_acquired and not reused_armed_window:
+                    try:
+                        ledger_artifact = runtime._build_payout_ledger_artifact(
+                            base_generation,
+                            base_generation + 1,
+                            template_artifacts.network_difficulty,
+                            force_full,
+                            bypass_interval,
+                            True,
+                            **build_intent,
+                        )
+                    except self._shutdown_error:
                         raise
-                    # Found-block publication exists to decouple child job
-                    # issuance from slow landing bookkeeping (issue #188). A
-                    # window build that dies with the ledger must not abort
-                    # the atomic publication that reopens admission: degrade
-                    # to the cached armed window below, exactly like a busy
-                    # prepare lock. The preview itself never depends on this
-                    # build; it is the verified balance state either way.
-                    print(
-                        "prism coordinator: found-block payout window build "
-                        f"failed; degrading to cached armed window: {exc}",
-                        flush=True,
-                    )
+                    except Exception as exc:
+                        if not immediate_preview:
+                            raise
+                        # Found-block publication exists to decouple child
+                        # job issuance from slow landing bookkeeping (issue
+                        # #188). A window build that dies with the ledger
+                        # must not abort the atomic publication that reopens
+                        # admission: degrade to the cached armed window
+                        # below, exactly like a busy prepare lock. The
+                        # preview itself never depends on this build; it is
+                        # the verified balance state either way.
+                        print(
+                            "prism coordinator: found-block payout window build "
+                            f"failed; degrading to cached armed window: {exc}",
+                            flush=True,
+                        )
+                        ledger_artifact = None
+                    finally:
+                        if lock_acquired_here:
+                            runtime._payout_state_prepare_lock.release()
+                elif not reused_armed_window:
                     ledger_artifact = None
-                finally:
-                    if immediate_preview:
-                        runtime._payout_state_prepare_lock.release()
-            else:
-                ledger_artifact = None
+            finally:
+                self._payout_window_build_context.attribution = None
             if immediate_preview and ledger_artifact is None:
                 ledger_artifact = runtime._cached_found_block_payout_artifact(
                     base_generation=base_generation,
@@ -4229,15 +4978,23 @@ class PayoutStateService:
             candidate.accepted_block_hash is not None
             and not candidate.accepted_block_withdrawal
         )
+        with runtime.lock:
+            self_check_owed = self._payout_self_check_owed
         if (
             current_artifacts is not None
-            and published_artifact_usable is None
+            and (published_artifact_usable is None or self_check_owed)
             and not accepted_preview_pending_durability
         ):
             # A background artifact built before accepted-block confirmation
             # would carry the old database balances under the new payout
             # generation. Child builders use the compact preview until the
             # durable state catches up; artifact preparation resumes then.
+            # A self-check deferred by this generation's candidate build is
+            # handed to the same background walker here (issue #228), so
+            # it runs off the critical path instead of waiting for a
+            # re-anchor that fresh publications keep postponing.
+            with runtime.lock:
+                self._payout_self_check_owed = False
             runtime._schedule_payout_ledger_artifact_preparation(
                 published_generation,
                 current_artifacts.network_difficulty,
@@ -5034,6 +5791,14 @@ class PayoutStateService:
                 }
                 for relation, histogram in runtime.payout_gate_wait_histograms.items()
             }
+            phase_histograms = {
+                key: {
+                    "buckets": dict(histogram["buckets"]),
+                    "sum": float(histogram["sum"]),
+                    "count": int(histogram["count"]),
+                }
+                for key, histogram in self.payout_window_build_phase_histograms.items()
+            }
             discarded = runtime.payout_state_candidates_discarded
 
         metric_names = {
@@ -5087,6 +5852,30 @@ class PayoutStateService:
                     f'{gate_name}_count{{generation="{relation}"}} {histogram["count"]}',
                 ]
             )
+        phase_name = "qbit_prism_payout_window_build_phase_seconds"
+        lines.extend(
+            [
+                f"# HELP {phase_name} Payout-window build time by phase (PostgreSQL reads, in-process record conversion, Rust daemon prepare or upload, preparation-lock waits) and by how the build ended, observed on every exit so aborted and failed builds keep the time they measured. Both label sets are closed.",
+                f"# TYPE {phase_name} histogram",
+            ]
+        )
+        for phase in PRISM_PAYOUT_WINDOW_BUILD_PHASES:
+            for outcome in PRISM_PAYOUT_WINDOW_BUILD_OUTCOMES:
+                histogram = phase_histograms[(phase, outcome)]
+                buckets = histogram["buckets"]
+                assert isinstance(buckets, dict)
+                labels = f'phase="{phase}",outcome="{outcome}"'
+                lines.extend(
+                    [
+                        *[
+                            f'{phase_name}_bucket{{{labels},le="{bucket:g}"}} {int(buckets.get(bucket, 0))}'
+                            for bucket in PRISM_PAYOUT_SECONDS_BUCKETS
+                        ],
+                        f'{phase_name}_bucket{{{labels},le="+Inf"}} {histogram["count"]}',
+                        f'{phase_name}_sum{{{labels}}} {float(histogram["sum"]):.6f}',
+                        f'{phase_name}_count{{{labels}}} {histogram["count"]}',
+                    ]
+                )
         lines.extend(
             [
                 "# HELP qbit_prism_payout_candidates_discarded_total Prepared payout candidates discarded after source supersession.",
@@ -5105,6 +5894,9 @@ __all__ = [
     "PRISM_PAYOUT_ARTIFACT_REARM_BACKOFF_CAP",
     "PRISM_PAYOUT_DELIVERY_GENERATIONS",
     "PRISM_PAYOUT_SECONDS_BUCKETS",
+    "PRISM_PAYOUT_WINDOW_BUILD_OUTCOMES",
+    "PRISM_PAYOUT_WINDOW_BUILD_PHASES",
+    "PRISM_TIP_REFRESH_WINDOW_STALENESS_SECONDS",
     "PayoutDeliveryAdmission",
     "PayoutLedgerArtifact",
     "PayoutStateArtifact",
