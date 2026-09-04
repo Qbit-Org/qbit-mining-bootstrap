@@ -493,21 +493,14 @@ def static_checks(env: dict[str, str], reporter: Reporter) -> None:
         reporter.fail("mining.share_diff", str(exc))
 
     stale_grace = env_value(env, "PRISM_STRATUM_STALE_GRACE_SECONDS", "3").strip()
-    if qbit_chain == "mainnet" and stale_grace != "0":
-        reporter.fail(
-            "mining.stale_grace",
-            "mainnet requires PRISM_STRATUM_STALE_GRACE_SECONDS=0",
-            hint="Enable stale-credit grace only after proving verifier compatibility for the deployed release.",
-        )
+    try:
+        stale_grace_value = int(stale_grace)
+        if stale_grace_value < 0:
+            raise ValueError
+    except ValueError:
+        reporter.fail("mining.stale_grace", "PRISM_STRATUM_STALE_GRACE_SECONDS must be a non-negative integer")
     else:
-        try:
-            stale_grace_value = int(stale_grace)
-            if stale_grace_value < 0:
-                raise ValueError
-        except ValueError:
-            reporter.fail("mining.stale_grace", "PRISM_STRATUM_STALE_GRACE_SECONDS must be a non-negative integer")
-        else:
-            reporter.pass_("mining.stale_grace", f"{stale_grace_value} seconds")
+        reporter.pass_("mining.stale_grace", f"{stale_grace_value} seconds")
 
     if prod and bitcoin_chain != "regtest":
         qbit_miner_address = env_value(env, "QBIT_MINER_ADDRESS", "auto").strip()

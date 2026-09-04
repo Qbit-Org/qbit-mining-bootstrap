@@ -40,10 +40,7 @@ parent-node release pins.
 Validation runs in two tiers. The behavioral production checks (non-default
 credentials, explicit payout addresses, strict difficulty and readiness
 policies, commit-pinned sources) apply whenever `QBIT_PRODUCTION=1`,
-`QBIT_TOOLS_PRODUCTION=1`, or `QBIT_CHAIN=mainnet`; zero stale grace
-(`PRISM_STRATUM_STALE_GRACE_SECONDS=0`) is pinned only on mainnet, so a public
-test-chain pool may credit shares that raced a block within a bounded grace
-window. The
+`QBIT_TOOLS_PRODUCTION=1`, or `QBIT_CHAIN=mainnet`. The
 release-provenance checks (digest-qualified `*_IMAGE` references and absolute
 `*_DATA_SOURCE` host paths) are enforced unconditionally on mainnet — no
 environment variable can disable them there — and on other chains only with
@@ -333,9 +330,15 @@ Keep Postgres `fsync`, `full_page_writes`, and `synchronous_commit` enabled.
 Measure acknowledgment latency under representative accepted-share load rather
 than weakening database durability.
 
-Production requires `PRISM_STRATUM_STALE_GRACE_SECONDS=0` until every published
-audit consumer has demonstrated compatibility with stale-grace receipts.
-`PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS` similarly bounds a persistent
+Keep `PRISM_STRATUM_STALE_GRACE_SECONDS` at its bounded default (3 seconds)
+on every chain, mainnet included. At zero, every in-flight prior-tip share is
+rejected with Stratum error 21 at each block, which miners read as pool
+failure rather than as stale work. Reward windows that contain a credited
+prior-tip share publish `qbit.prism.audit-bundle.v1.1`; this release's
+verifier accepts it, so keep external mirrors and verifiers on a release that
+does too.
+
+`PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS` bounds a persistent
 PRISM template-refresh outage; it must be shorter than the operator alert and
 response window. Coordination-only refresh deferrals remain outside that
 ordinary failure budget, but only for

@@ -1182,15 +1182,17 @@ class PrismCoordinatorVardiffTests(unittest.TestCase):
             ):
                 validate_prism_production_gate()
 
+        # Mainnet follows the same bounded-grace rule as every other chain:
+        # zero grace rejects every in-flight prior-tip share at each block,
+        # which miners read as pool failure.
         with patch.dict(
             os.environ,
             {**base, "QBIT_CHAIN": "mainnet", "PRISM_STRATUM_STALE_GRACE_SECONDS": "3"},
             clear=True,
         ):
-            with self.assertRaisesRegex(SystemExit, "mainnet requires PRISM_STRATUM_STALE_GRACE_SECONDS=0"):
-                validate_prism_production_gate()
+            validate_prism_production_gate()
 
-        # Off mainnet, production mode accepts a bounded grace window.
+        # Off mainnet, production mode accepts a bounded grace window too.
         with patch.dict(
             os.environ,
             {**base, "PRISM_STRATUM_STALE_GRACE_SECONDS": "2"},

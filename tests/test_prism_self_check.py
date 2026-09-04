@@ -515,7 +515,10 @@ class PrismSelfCheckTests(unittest.TestCase):
             {(row.status, row.name) for row in reporter.rows},
         )
 
-    def test_static_checks_require_zero_mainnet_stale_grace(self) -> None:
+    def test_static_checks_accept_bounded_mainnet_stale_grace(self) -> None:
+        # Mainnet follows the same bounded-grace rule as every other chain:
+        # zero grace rejects every in-flight prior-tip share at each block,
+        # which miners read as pool failure.
         env = self.valid_env()
         env.update(
             {
@@ -530,10 +533,9 @@ class PrismSelfCheckTests(unittest.TestCase):
 
         self.self_check.static_checks(env, reporter)
 
-        self.assertIn(
-            ("FAIL", "mining.stale_grace"),
-            {(row.status, row.name) for row in reporter.rows},
-        )
+        rows = {(row.status, row.name) for row in reporter.rows}
+        self.assertIn(("PASS", "mining.stale_grace"), rows)
+        self.assertNotIn(("FAIL", "mining.stale_grace"), rows)
 
     def test_static_checks_accept_bounded_stale_grace_off_mainnet(self) -> None:
         env = self.valid_env()

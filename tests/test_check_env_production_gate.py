@@ -982,7 +982,10 @@ class CheckEnvProductionGateTests(unittest.TestCase):
                 )
                 self.assertNotIn("docker is required", result.stderr)
 
-    def test_mainnet_requires_zero_stale_grace(self) -> None:
+    def test_mainnet_accepts_bounded_stale_grace(self) -> None:
+        # Mainnet follows the same bounded-grace rule as every other chain:
+        # zero grace rejects every in-flight prior-tip share at each block,
+        # which miners read as pool failure.
         result = self.run_check_env(
             MINING_LANES="prism",
             QBIT_CHAIN="mainnet",
@@ -993,12 +996,12 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("mainnet requires PRISM_STRATUM_STALE_GRACE_SECONDS=0", result.stderr)
+        self.assertNotIn("PRISM_STRATUM_STALE_GRACE_SECONDS", result.stderr)
         self.assertNotIn("docker is required", result.stderr)
 
     def test_non_mainnet_production_accepts_bounded_stale_grace(self) -> None:
         # A public-chain production pool may credit shares that raced a block
-        # within a bounded grace window; only mainnet pins the strict zero.
+        # within a bounded grace window.
         result = self.run_check_env(
             MINING_LANES="prism",
             QBIT_PRODUCTION="1",

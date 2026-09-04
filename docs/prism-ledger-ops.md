@@ -686,9 +686,10 @@ against the pin.
 Production builds using the git source provider must set `QBIT_GIT_COMMIT` to a
 full 40-character object ID. The environment doctor verifies that the resolved
 checkout is at that exact commit instead of trusting a mutable branch or tag.
-Production also requires `PRISM_STRATUM_STALE_GRACE_SECONDS=0`; stale-credit
-grace should be enabled only after the deployed verifier and accounting release
-have an explicit compatibility proof for it.
+Stale-credit grace (`PRISM_STRATUM_STALE_GRACE_SECONDS`, default 3) stays
+enabled in production, mainnet included; reward windows that contain a credited
+prior-tip share publish `qbit.prism.audit-bundle.v1.1`, so keep the deployed
+verifier and accounting release on a version that accepts it.
 
 The parent-chain selector is checked independently: `BITCOIN_CHAIN` and
 `BITCOIN_CHAIN_FLAG` must be an exact pair, including `mainnet` with
