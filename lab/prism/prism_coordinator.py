@@ -134,6 +134,7 @@ from lab.prism.coordinator_config import (
     default_prism_username_fallback_address,  # noqa: F401 - compatibility re-export
     env,
     env_bool,
+    env_heap_census_config,
     env_int,
     env_nonnegative_float,
     env_nonnegative_int,
@@ -337,6 +338,7 @@ from lab.prism.payout_state import (
     _IncrementalPayoutArtifactWindow,  # noqa: F401 - compatibility re-export
     _PayoutWindowMaterialization,
 )
+from lab.prism.process_telemetry import install_heap_census
 # Compatibility re-exports; new callers should import lab.prism.share_writer.
 from lab.prism.share_writer import (
     MAX_PENDING_SHARE_APPENDS,
@@ -10130,6 +10132,15 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, _request_shutdown)
     signal.signal(signal.SIGINT, _request_shutdown)
+    # Issue #226 part 2: the operator-triggered heap census (SIGUSR1) and
+    # malloc_trim (SIGRTMIN+1). Nothing is registered unless the switches are
+    # on, and each handler only writes one byte to the census thread's pipe --
+    # the SIGUSR2 shape above with the work moved off the handler. The strict
+    # reader here sees the same environment the config loader validated when
+    # the coordinator loaded its configuration (the malloc-telemetry
+    # precedent), so the hook needs nothing from the instance. The census
+    # itself lives in process_telemetry.
+    install_heap_census(env_heap_census_config())
     try:
         coordinator.serve()
     finally:

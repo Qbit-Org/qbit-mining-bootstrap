@@ -585,6 +585,27 @@ services:
       PRISM_STRATUM_PORT_HOST: ${PRISM_STRATUM_PORT_HOST:-3340}
       PRISM_BLOCKPOLL_SECONDS: ${PRISM_BLOCKPOLL_SECONDS:-2}
       PRISM_MALLOC_TELEMETRY: ${PRISM_MALLOC_TELEMETRY:-1}
+      # Issue #226 part 2. glibc, not the coordinator, reads MALLOC_ARENA_MAX,
+      # but a deploy dotenv value still reaches the container process only
+      # through this passthrough; without it the image's ENV silently wins.
+      # The default here must equal the image's ARG default in
+      # lab/prism/Dockerfile (tests/test_prism_heap_census.py pins both), and
+      # it must never be empty: glibc parses "" as 0.
+      MALLOC_ARENA_MAX: ${MALLOC_ARENA_MAX:-2}
+      # The operator-triggered heap census and malloc_trim, all off by
+      # default; docs/prism-capacity-readiness.md before enabling any. The
+      # defaults mirror lab/prism/coordinator_config.py and are pinned there.
+      PRISM_HEAP_CENSUS: ${PRISM_HEAP_CENSUS:-0}
+      # No interpolation default on purpose: empty reaches the coordinator as
+      # unset and the reports land under PRISM_AUDIT_DIR/heap-census.
+      PRISM_HEAP_CENSUS_DIR: ${PRISM_HEAP_CENSUS_DIR:-}
+      PRISM_HEAP_CENSUS_TOP_N: ${PRISM_HEAP_CENSUS_TOP_N:-40}
+      PRISM_HEAP_CENSUS_MAX_BYTES: ${PRISM_HEAP_CENSUS_MAX_BYTES:-262144}
+      PRISM_HEAP_CENSUS_MAX_SECONDS: ${PRISM_HEAP_CENSUS_MAX_SECONDS:-10}
+      PRISM_HEAP_CENSUS_MIN_INTERVAL_SECONDS: ${PRISM_HEAP_CENSUS_MIN_INTERVAL_SECONDS:-60}
+      PRISM_HEAP_CENSUS_TRACEMALLOC: ${PRISM_HEAP_CENSUS_TRACEMALLOC:-0}
+      PRISM_MALLOC_TRIM_SIGNAL: ${PRISM_MALLOC_TRIM_SIGNAL:-0}
+      PRISM_MALLOC_TRIM_INTERVAL_SECONDS: ${PRISM_MALLOC_TRIM_INTERVAL_SECONDS:-0}
       PRISM_BLOCKWAIT_ENABLED: ${PRISM_BLOCKWAIT_ENABLED:-1}
       PRISM_BLOCKWAIT_TIMEOUT_SECONDS: ${PRISM_BLOCKWAIT_TIMEOUT_SECONDS:-5}
       PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS: ${PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS:-1}

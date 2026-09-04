@@ -30,6 +30,31 @@ RUN cargo build --locked --release -p qbit-prism --bins
 
 ENV PRISM_TOOL_BIN_DIR=/app/target/release
 
+# Issue #226: glibc malloc arena policy, set deliberately rather than left to
+# glibc. The mainnet coordinator runs about 64 threads and its memory map is
+# hundreds of 4-64 MiB anonymous regions -- the per-thread arena signature --
+# on a host where glibc's default arena limit is 8 x cores = 256, so every
+# thread that ever mallocs owns an arena and that arena's retained free lists.
+# Two arenas is the default because it is safe before the soak decides
+# between 2 and 4: under the GIL at most one Python thread allocates at a
+# time, so arena-lock contention can only come from GIL-released native code
+# (libpq I/O on a handful of pooled connections), and the audit-builder
+# daemon this process spawns inherits the setting but is single-threaded. The
+# failure mode of too few arenas is measurable lock wait on /metrics share-ack
+# latency; the failure mode of too many is the 17.7 GB resident set. Override
+# at build time with --build-arg MALLOC_ARENA_MAX=4 or at run time with
+# -e MALLOC_ARENA_MAX=4; docs/mainnet-deployment.md records the decision and
+# docs/prism-capacity-readiness.md the soak that revisits it.
+#
+# PYTHONMALLOC is deliberately unset: pymalloc keeps objects of 512 bytes and
+# under out of glibc entirely, and routing them through glibc would enlarge
+# the very arenas this bounds. No other MALLOC_* variable is set here. Never
+# set one to an empty value: glibc parses "" as 0, and MALLOC_MMAP_THRESHOLD_=0
+# would send every allocation through mmap. tests/test_prism_heap_census.py
+# pins exactly this allocator environment.
+ARG MALLOC_ARENA_MAX=2
+ENV MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX}
+
 # Keep Python as PID 1 so watchdog os._exit(1) reaches Docker unchanged. Any
 # future wrapper must exec the coordinator or explicitly propagate its status.
 CMD ["python3", "-m", "lab.prism.prism_coordinator"]

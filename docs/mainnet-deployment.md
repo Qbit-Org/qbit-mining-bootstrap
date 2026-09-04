@@ -484,6 +484,80 @@ especially during a PostgreSQL restart or network partition. Strict elimination
 of that residual window requires qbitd/wallet RPCs to validate a fencing
 generation supplied by the coordinator.
 
+### PRISM Allocator Settings
+
+The PRISM image sets `MALLOC_ARENA_MAX=2` (issue #226). This is a deliberate
+allocator decision, recorded here so that a future change to it is a decision
+too; `tests/test_prism_heap_census.py` pins the image's allocator environment.
+
+Why: on `union-mainnet` at pin `9c41894` the coordinator's resident set grew by
+roughly 390 MB per hour across 45 hours of uptime with no restart, while the
+process ran about 64 threads and its memory map was 943 anonymous regions, 658
+of them between 4 and 64 MiB. That band is the glibc per-thread malloc arena
+signature (each arena grows in 64 MiB heaps), and glibc's default arena limit is
+eight times the core count, 256 on the 32-core host, so every thread that ever
+allocates keeps its own arena and its own retained free lists. Two arenas bound
+that multiplication. The storm instrument reproduces the mechanism on any host
+(`docs/prism-capacity-readiness.md`, "Allocator settings"): at the default a
+64-thread probe creates 64 arenas and the 4-64 MiB region count climbs to the
+mainnet shape; at `MALLOC_ARENA_MAX=2` the arena count stays at 2, and
+`malloc_trim` can return the freed memory, which with 64 arenas it cannot,
+because a per-thread heap's top is not something `malloc_trim` shrinks.
+
+Why it is safe before the testnet soak decides between 2 and 4: under the GIL
+at most one Python thread allocates at a time, so arena-lock contention can only
+come from native code that runs with the GIL released, which in this process is
+libpq I/O on a handful of pooled connections; the audit-builder daemon the
+coordinator spawns inherits the variable but is single-threaded; and the
+failure mode of too few arenas is a measurable wait on share-ack latency
+(`qbit_prism_share_ack_seconds`), whereas the failure mode of too many is the
+17.7 GB resident set. The local storm drain ran at the same wall-clock under
+the default, 2, and 4 on the development host.
+
+Override it per deployment rather than editing the image:
+
+```dotenv
+MALLOC_ARENA_MAX=4
+```
+
+How that value reaches the process: the `prism-coordinator` service in
+`compose.yaml` passes it through as `MALLOC_ARENA_MAX: ${MALLOC_ARENA_MAX:-2}`.
+Compose has no `env_file:` for this service, so a dotenv value reaches the
+container only through that line; the image's `ENV` is what applies when the
+dotenv leaves the variable unset, and the passthrough's default is pinned equal
+to the image default by `tests/test_prism_heap_census.py` so the two cannot
+drift. A deployment that sets the coordinator's environment by some other
+means must set the variable there. The public read service
+(`prism-public-api`) runs from the same image and keeps the image default; it
+is not part of the experiment. At build time `--build-arg MALLOC_ARENA_MAX=4`
+changes the image default. Do not set it to `1`: that forces every thread onto
+the main arena, whose `brk` heap shrinks only from its end. Confirm the
+setting actually applied before reading any arena gauge: a census report's
+`process.malloc_arena_count` cannot exceed the cap, and
+`docker exec <prism-coordinator-container> sh -c 'echo $MALLOC_ARENA_MAX'`
+shows what the process started with.
+
+Do not set any other `MALLOC_*` variable, `GLIBC_TUNABLES`, or `PYTHONMALLOC`
+in production without a soak. In particular never set an allocator variable to
+an empty value: glibc reads `""` as `0`, and `MALLOC_MMAP_THRESHOLD_=0` would
+route every allocation through `mmap`. `PYTHONMALLOC` stays unset so pymalloc
+keeps objects of 512 bytes and under out of glibc; routing them through glibc
+would enlarge the arenas this setting bounds.
+
+The heap census (`PRISM_HEAP_CENSUS`), its `tracemalloc` tracing
+(`PRISM_HEAP_CENSUS_TRACEMALLOC`), the `malloc_trim` signal
+(`PRISM_MALLOC_TRIM_SIGNAL`) and the periodic trim
+(`PRISM_MALLOC_TRIM_INTERVAL_SECONDS`) are all off in production by default and
+stay off unless an operator turns one on for a diagnosis window. Each is a
+strict boolean or a floored interval validated at startup, each passes through
+`compose.yaml` to the coordinator service (so a dotenv value reaches the
+process), and `.env.example` lists them; the census writes under
+`PRISM_AUDIT_DIR/heap-census` by default. Read
+`docs/prism-capacity-readiness.md`, "Heap census, allocator control, and the
+resident-set bound", before enabling any of them: the census holds the GIL for
+the duration of one `gc.get_objects()` call, and `tracemalloc` costs every
+allocation for as long as it traces.
+
 ### PRISM Watchdog Exit Forensics
 
 The PRISM image has no entrypoint or init wrapper: its exec-form Dockerfile

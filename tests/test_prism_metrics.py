@@ -326,7 +326,7 @@ COMPONENT_CARDINALITY_METRIC_FAMILIES = (
 # counters move between the reference and the actual render.
 PINNED_HEAP_SAMPLE = ProcessHeapSample(
     allocated_blocks=123_456,
-    gc_pending=(5, 6, 7),
+    gc_trigger_count=(5, 6, 7),
     gc_collections=(100, 10, 1),
     gc_collected=(1_000, 100, 10),
     gc_uncollectable=(0, 0, 2),
@@ -349,7 +349,7 @@ def reference_process_heap_metrics_lines(sample: ProcessHeapSample) -> list[str]
     ]
     lines.extend(
         f'qbit_prism_process_gc_trigger_count{{generation="{generation}"}} {int(count)}'
-        for generation, count in zip(PRISM_GC_GENERATIONS, sample.gc_pending)
+        for generation, count in zip(PRISM_GC_GENERATIONS, sample.gc_trigger_count)
     )
     lines.extend(
         [

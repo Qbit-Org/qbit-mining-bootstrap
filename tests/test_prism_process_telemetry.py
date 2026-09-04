@@ -85,7 +85,7 @@ class ProcessHeapTelemetryTests(unittest.TestCase):
         self.assertGreater(sample.allocated_blocks, 0)
         self.assertGreaterEqual(sample.threads, 1)
         for reading in (
-            sample.gc_pending,
+            sample.gc_trigger_count,
             sample.gc_collections,
             sample.gc_collected,
             sample.gc_uncollectable,
@@ -113,7 +113,7 @@ class ProcessHeapTelemetryTests(unittest.TestCase):
             ),
         ):
             sample = ProcessHeapTelemetry(malloc_enabled=False).sample()
-        self.assertEqual(sample.gc_pending, (4, 2, -1))
+        self.assertEqual(sample.gc_trigger_count, (4, 2, -1))
         self.assertEqual(sample.gc_collections, (9, 3, -1))
         self.assertEqual(sample.gc_collected, (8, 2, -1))
         self.assertEqual(sample.gc_uncollectable, (1, 0, -1))
