@@ -8,6 +8,8 @@ import gzip
 import hashlib
 import io
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -35,11 +37,13 @@ from lab.prism.share_ledger import (
     parse_single_json_value,
     AUDIT_BODY_REF_SCHEMA,
     AUDIT_BUNDLE_V2_SCHEMA,
+    AcceptedShareRecord,
     PendingShare,
     PsqlShareLedger,
     ShareReplayConflict,
     ShareReplayResult,
     LedgerOperationTimeout,
+    PAYOUT_WINDOW_ROW_BATCH_SIZE,
     AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA,
     DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
     SingleWriterShareLedger,
@@ -8701,6 +8705,894 @@ class AcceptedStatsBackgroundReconcileTests(unittest.TestCase):
             {"accepted_share_count": 5, "distinct_miner_count": 1},
         )
         self.assertIsNone(ledger._stats_background_refresh_thread)
+
+
+# A stand-in psql for the subprocess backend's row-result path (#236). It is
+# a real child process -- spawned, fed the statement on stdin, killed on a
+# deadline and reaped -- so the tests below exercise the shipped spool,
+# timeout and exit translation rather than a mock of subprocess. The mode
+# argument selects its behaviour; the ledger's own flags follow it and are
+# echoed back by the ``env`` mode so the invocation can be asserted on.
+FAKE_PSQL_SCRIPT = """
+import json
+import os
+import sys
+import time
+
+mode = sys.argv[1]
+sys.stdin.read()
+
+
+def row(index):
+    return json.dumps({
+        "share_seq": index,
+        "share_id": f"share-{index}",
+        "miner_id": f"miner-{index % 3}",
+        "order_key": f"{index % 3:04d}",
+        "p2mr_program_hex": "11" * 32,
+        "share_difficulty": "4096",
+        "network_difficulty": "1048576",
+        "template_height": 800000 + index,
+        "job_id": f"job-{index}",
+        "job_issued_at_ms": 1000 + index,
+        "accepted_at_ms": 1001 + index,
+        "ntime": 1700000000 + index,
+        "credit_policy": None,
+    })
+
+
+if mode == "rows":
+    count = int(os.environ.get("FAKE_PSQL_ROWS", "0"))
+    for index in range(1, count + 1):
+        sys.stdout.write(row(index) + "\\n")
+    sys.stdout.write("\\n")
+elif mode == "empty":
+    pass
+elif mode == "fail":
+    sys.stderr.write('ERROR:  42P01: relation "missing" does not exist\\n')
+    sys.exit(3)
+elif mode == "partial-then-fail":
+    for index in range(1, 4):
+        sys.stdout.write(row(index) + "\\n")
+    sys.stdout.flush()
+    sys.stderr.write("ERROR:  XX000: server closed the connection unexpectedly\\n")
+    sys.exit(2)
+elif mode == "deadline":
+    sys.stderr.write("ERROR:  57014: canceling statement due to statement timeout\\n")
+    sys.exit(3)
+elif mode == "hang":
+    time.sleep(30)
+elif mode == "malformed":
+    sys.stdout.write(row(1) + "\\n")
+    sys.stdout.write("{not json\\n")
+elif mode == "env":
+    sys.stdout.write(json.dumps({
+        "pgoptions": os.environ.get("PGOPTIONS", ""),
+        "pgconnect_timeout": os.environ.get("PGCONNECT_TIMEOUT", ""),
+        "argv": sys.argv[2:],
+    }) + "\\n")
+else:
+    sys.stderr.write(f"unknown mode {mode}\\n")
+    sys.exit(4)
+"""
+
+
+def row_payload(index: int) -> dict[str, Any]:
+    """One accepted-share payload in the shape the per-row projection returns."""
+    return {
+        "share_seq": index,
+        "share_id": f"share-{index}",
+        "miner_id": f"miner-{index % 3}",
+        "order_key": f"{index % 3:04d}",
+        "p2mr_program_hex": "11" * 32,
+        "share_difficulty": "4096",
+        "network_difficulty": "1048576",
+        "template_height": 800_000 + index,
+        "job_id": f"job-{index}",
+        "job_issued_at_ms": 1_000 + index,
+        "accepted_at_ms": 1_001 + index,
+        "ntime": 1_700_000_000 + index,
+        "credit_policy": None,
+    }
+
+
+class PayoutWindowRowDecodingTests(unittest.TestCase):
+    """Issue #236: the payout-window reads decode one row at a time.
+
+    The snapshot and delta used to return one ``json_agg`` value the size of
+    the whole window, decoded in one C call that never released the GIL.
+    Both production backends now project one JSON object per row and
+    convert the rows in bounded batches, rechecking the caller's deadline
+    and stamping liveness between batches. These tests pin that contract on
+    the psql subprocess backend (through a real child process), on the
+    native client (through a fake driver), on the ledger plumbing that
+    joins them, and on the supported subclass seams.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._script_dir = tempfile.TemporaryDirectory()
+        cls.script_path = str(Path(cls._script_dir.name) / "fake_psql.py")
+        Path(cls.script_path).write_text(FAKE_PSQL_SCRIPT, encoding="utf-8")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._script_dir.cleanup()
+
+    # -- fixtures -----------------------------------------------------------
+
+    def psql_ledger(
+        self,
+        mode: str,
+        *,
+        batch_size: int | None = None,
+        session_guards: Any = None,
+    ) -> PsqlShareLedger:
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._native = None
+        ledger._command = [sys.executable, self.script_path, mode]
+        ledger._session_guards = session_guards
+        ledger._lock = threading.Lock()
+        ledger._read_semaphore = threading.BoundedSemaphore(1)
+        if batch_size is not None:
+            ledger._json_row_batch_size = batch_size
+        return ledger
+
+    @staticmethod
+    def arm_deadline(ledger: PsqlShareLedger, deadline: float) -> None:
+        deadline_local = threading.local()
+        deadline_local.deadline = deadline
+        ledger._operation_timeout_local = deadline_local
+
+    # -- psql subprocess backend --------------------------------------------
+
+    def test_psql_snapshot_decodes_one_json_object_per_line(self) -> None:
+        ledger = self.psql_ledger("rows", batch_size=512)
+
+        with unittest.mock.patch.dict(os.environ, {"FAKE_PSQL_ROWS": "1200"}):
+            records = ledger.snapshot_at_job_issue(1_005, window_weight=64)
+
+        self.assertEqual(len(records), 1200)
+        self.assertEqual([type(record) for record in records[:2]], [AcceptedShareRecord] * 2)
+        self.assertEqual([record.share_seq for record in records[:3]], [1, 2, 3])
+        self.assertEqual(records[-1].share_id, "share-1200")
+        self.assertEqual(records[0].share_difficulty, 4096)
+        self.assertIsNone(records[0].credit_policy)
+        stats = ledger.ledger_read_gate_stats()["payout_window_snapshot"]
+        self.assertEqual(stats["calls_total"], 1)
+        self.assertEqual(stats["execute_timeouts_total"], 0)
+        self.assertEqual(ledger._read_semaphore._value, 1)
+
+    def test_psql_empty_window_is_an_empty_list(self) -> None:
+        """psql prints nothing for zero rows; that is a window, not an error."""
+        ledger = self.psql_ledger("empty")
+
+        self.assertEqual(ledger.snapshot_at_job_issue(1_005, window_weight=64), [])
+        self.assertEqual(ledger.snapshot_between_job_issues(1_005, 1_006), [])
+
+    def test_psql_failure_after_partial_output_publishes_nothing(self) -> None:
+        ledger = self.psql_ledger("partial-then-fail", batch_size=1)
+        stamped: list[str] = []
+
+        with (
+            ledger.operation_progress(lambda: stamped.append("x"), slice_seconds=1.0),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"psql command failed \(exit 2\): ERROR:  XX000",
+            ),
+        ):
+            ledger.snapshot_at_job_issue(1_005, window_weight=64)
+
+        # The spool was never read: exit status is validated first, so not
+        # a single row of the partial output was decoded or stamped.
+        self.assertEqual(stamped, [])
+        self.assertEqual(ledger._read_semaphore._value, 1)
+        stats = ledger.ledger_read_gate_stats()["payout_window_snapshot"]
+        self.assertEqual(stats["calls_total"], 1)
+        self.assertEqual(stats["execute_timeouts_total"], 0)
+
+    def test_psql_generic_failure_keeps_its_stderr(self) -> None:
+        ledger = self.psql_ledger("fail")
+
+        with self.assertRaisesRegex(RuntimeError, r"\(exit 3\): ERROR:  42P01"):
+            ledger.snapshot_between_job_issues(1_005, 1_006)
+
+    def test_psql_deadline_cancellation_is_a_timeout(self) -> None:
+        ledger = self.psql_ledger("deadline")
+
+        with ledger.operation_timeout(5.0):
+            with self.assertRaisesRegex(LedgerOperationTimeout, "psql operation exceeded"):
+                ledger.snapshot_at_job_issue(1_005, window_weight=64)
+
+        stats = ledger.ledger_read_gate_stats()["payout_window_snapshot"]
+        self.assertEqual(stats["execute_timeouts_total"], 1)
+        self.assertEqual(ledger._read_semaphore._value, 1)
+
+    def test_psql_hang_is_killed_and_reaped_at_the_deadline(self) -> None:
+        ledger = self.psql_ledger("hang")
+        spawned: list[subprocess.Popen[bytes]] = []
+        real_popen = share_ledger_module.subprocess.Popen
+
+        def spy(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+            process = real_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        started = time.monotonic()
+        with unittest.mock.patch.object(share_ledger_module.subprocess, "Popen", spy):
+            with ledger.operation_timeout(0.5):
+                with self.assertRaisesRegex(LedgerOperationTimeout, "psql operation exceeded"):
+                    ledger.snapshot_at_job_issue(1_005, window_weight=64)
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 10.0)
+        self.assertEqual(len(spawned), 1)
+        # Reaped, and by our signal rather than its own exit.
+        self.assertIsNotNone(spawned[0].returncode)
+        self.assertLess(spawned[0].returncode, 0)
+
+    def test_psql_malformed_line_is_an_error_not_a_partial_snapshot(self) -> None:
+        ledger = self.psql_ledger("malformed")
+
+        with self.assertRaisesRegex(RuntimeError, "malformed JSON on output line 2"):
+            ledger.snapshot_at_job_issue(1_005, window_weight=64)
+
+    def test_psql_row_invocation_carries_guards_flags_and_deadline(self) -> None:
+        """The row path and the single-value path share one invocation."""
+        guards = make_session_guards(idle_in_transaction_timeout_seconds=2.5)
+        ledger = self.psql_ledger("env", session_guards=guards)
+
+        with ledger.operation_timeout(2.0):
+            rows = ledger._run_retry_safe_read_json_rows("SELECT 1;")
+
+        self.assertEqual(len(rows), 1)
+        echoed = rows[0]
+        self.assertIn("-c idle_in_transaction_session_timeout=2500ms", echoed["pgoptions"])
+        self.assertRegex(echoed["pgoptions"], r"-c statement_timeout=\d+ms -c lock_timeout=\d+ms")
+        self.assertEqual(echoed["pgconnect_timeout"], "2")
+        for flag in (
+            "--no-psqlrc",
+            "--single-transaction",
+            "--tuples-only",
+            "--no-align",
+            "--quiet",
+            "ON_ERROR_STOP=1",
+        ):
+            self.assertIn(flag, echoed["argv"])
+
+    def test_psql_decode_deadline_expires_between_batches(self) -> None:
+        """A budget that runs out mid-decode fails at the next batch boundary."""
+        clock = FakeMonotonicClock(start=0.0)
+        ledger = self.psql_ledger("rows", batch_size=500)
+        ledger._monotonic = clock.monotonic
+        self.arm_deadline(ledger, deadline=10.0)
+        stamps: list[float] = []
+
+        def on_progress() -> None:
+            stamps.append(clock.now)
+            clock.sleep(6.0)
+
+        with unittest.mock.patch.dict(os.environ, {"FAKE_PSQL_ROWS": "2000"}):
+            with ledger.operation_progress(on_progress, slice_seconds=1.0):
+                with self.assertRaisesRegex(LedgerOperationTimeout, "deadline expired"):
+                    ledger.snapshot_at_job_issue(1_005, window_weight=64)
+
+        # Batch 1 decoded at t=0 and stamped; batch 2 decoded at t=6 (still
+        # inside the 10s budget) and stamped; the check before batch 3 sees
+        # t=12 and fails. Nothing was returned for the 1000 rows decoded.
+        self.assertEqual(stamps, [0.0, 6.0])
+        self.assertEqual(ledger._read_semaphore._value, 1)
+        stats = ledger.ledger_read_gate_stats()["payout_window_snapshot"]
+        self.assertEqual(stats["execute_timeouts_total"], 1)
+
+    def test_psql_progress_is_stamped_between_batches(self) -> None:
+        ledger = self.psql_ledger("rows", batch_size=500)
+        stamped: list[str] = []
+
+        with unittest.mock.patch.dict(os.environ, {"FAKE_PSQL_ROWS": "2000"}):
+            with ledger.operation_progress(lambda: stamped.append("x"), slice_seconds=1.0):
+                records = ledger.snapshot_at_job_issue(1_005, window_weight=64)
+
+        self.assertEqual(len(records), 2000)
+        self.assertEqual(len(stamped), 4)
+
+    def test_psql_deadline_expiring_in_the_final_partial_batch_publishes_nothing(self) -> None:
+        """A short trailing batch is still deadline-checked before the result is returned."""
+        clock = FakeMonotonicClock(start=0.0)
+        ledger = self.psql_ledger("rows", batch_size=500)
+        ledger._monotonic = clock.monotonic
+        self.arm_deadline(ledger, deadline=10.0)
+        stamps: list[float] = []
+
+        def on_progress() -> None:
+            stamps.append(clock.now)
+            clock.sleep(12.0)
+
+        with unittest.mock.patch.dict(os.environ, {"FAKE_PSQL_ROWS": "700"}):
+            with ledger.operation_progress(on_progress, slice_seconds=1.0):
+                with self.assertRaisesRegex(LedgerOperationTimeout, "deadline expired"):
+                    ledger.snapshot_at_job_issue(1_005, window_weight=64)
+
+        # One full batch stamped at t=0; the 200-row tail converted at t=12
+        # and the final check refused to publish it.
+        self.assertEqual(stamps, [0.0])
+        self.assertEqual(ledger._read_semaphore._value, 1)
+        stats = ledger.ledger_read_gate_stats()["payout_window_snapshot"]
+        self.assertEqual(stats["execute_timeouts_total"], 1)
+
+    def test_psql_deadline_expiring_before_decoding_publishes_nothing(self) -> None:
+        """A result smaller than one batch is deadline-checked before any row is decoded.
+
+        The clock advances 3s on every read, so the budget that was still
+        open when psql was dispatched (a 13s deadline read at t=9) has run
+        out by the time the child has exited and decoding would start.
+        Whichever of the two deadlines the pre-decode check trips first,
+        the read must fail as a timeout: the fixture's second line is not
+        JSON, so a missing pre-check would surface as a parse error instead.
+        """
+        ledger = self.psql_ledger("malformed", batch_size=512)
+        now = 0.0
+
+        def stepping() -> float:
+            nonlocal now
+            value = now
+            now += 3.0
+            return value
+
+        ledger._monotonic = stepping
+        self.arm_deadline(ledger, deadline=13.0)
+
+        with self.assertRaisesRegex(LedgerOperationTimeout, "deadline expired"):
+            ledger.snapshot_at_job_issue(1_005, window_weight=64)
+
+        self.assertEqual(ledger._read_semaphore._value, 1)
+
+    def test_legacy_run_sql_seam_checks_the_deadline_before_decoding(self) -> None:
+        clock = FakeMonotonicClock(start=0.0)
+
+        class SlowTextLedger(PsqlShareLedger):
+            def __init__(self) -> None:
+                self._native = None
+                self._lock = threading.Lock()
+                self._read_semaphore = threading.BoundedSemaphore(1)
+                self._monotonic = clock.monotonic
+
+            def _run_sql(self, sql: str) -> str:
+                clock.sleep(11.0)
+                # Not a share row: converting it would raise KeyError.
+                return json.dumps({"share_seq": 1})
+
+        ledger = SlowTextLedger()
+        self.arm_deadline(ledger, deadline=10.0)
+
+        with self.assertRaisesRegex(LedgerOperationTimeout, "statement deadline expired"):
+            ledger.snapshot_between_job_issues(1_005, 1_006)
+
+    def test_legacy_run_json_seam_checks_the_deadline_around_the_final_batch(self) -> None:
+        clock = FakeMonotonicClock(start=0.0)
+        stamps: list[float] = []
+
+        class LegacyJsonLedger(PsqlShareLedger):
+            def __init__(self, rows: list[Any], *, slow: bool) -> None:
+                self._native = None
+                self._lock = threading.Lock()
+                self._read_semaphore = threading.BoundedSemaphore(1)
+                self._json_row_batch_size = 2
+                self._monotonic = clock.monotonic
+                self.rows = rows
+                self.slow = slow
+
+            def _run_json(self, sql: str) -> Any:
+                if self.slow:
+                    clock.sleep(11.0)
+                return self.rows
+
+        def on_progress() -> None:
+            stamps.append(clock.now)
+            clock.sleep(12.0)
+
+        # Final partial batch: two rows convert and stamp at t=0, the third
+        # converts after the stamp moved the clock to t=12, and the final
+        # check refuses to publish.
+        clock.now = 0.0
+        ledger = LegacyJsonLedger([row_payload(1), row_payload(2), row_payload(3)], slow=False)
+        self.arm_deadline(ledger, deadline=10.0)
+        with ledger.operation_progress(on_progress, slice_seconds=1.0):
+            with self.assertRaisesRegex(LedgerOperationTimeout, "deadline expired"):
+                ledger.snapshot_at_job_issue(1_005, window_weight=64)
+        self.assertEqual(stamps, [0.0])
+
+        # Before decoding: the seam answered after the budget, with a row
+        # that would raise KeyError if it were converted.
+        clock.now = 0.0
+        ledger = LegacyJsonLedger([{"share_seq": 1}], slow=True)
+        self.arm_deadline(ledger, deadline=10.0)
+        with self.assertRaisesRegex(LedgerOperationTimeout, "statement deadline expired"):
+            ledger.snapshot_at_job_issue(1_005, window_weight=64)
+        self.assertEqual(ledger._read_semaphore._value, 1)
+
+    def test_native_rows_deadline_expiring_in_the_final_partial_batch(self) -> None:
+        clock = FakeMonotonicClock(start=0.0)
+        rows = [row_payload(index) for index in range(1, 6)]
+        client, events, cursors = self.native_client(results=[{"rows": rows}], clock=clock)
+
+        with self.assertRaisesRegex(LedgerOperationTimeout, "expired while decoding rows"):
+            client.run_json_rows(
+                "SELECT rows",
+                retry_safe=True,
+                timeout_seconds=9.0,
+                batch_size=2,
+                on_batch=lambda: clock.sleep(4.0),
+            )
+
+        # Checks at t=0, t=4 and t=8 admit three fetches (2, 2 and the
+        # trailing 1); the check before the terminating fetch, at t=12,
+        # refuses to publish the converted rows.
+        self.assertEqual(events.count("fetch:2"), 2)
+        self.assertEqual(events.count("fetch:1"), 1)
+        self.assertNotIn("fetch:0", events)
+        self.assertTrue(cursors[0].closed)
+
+    def test_native_rows_deadline_expiring_during_execute_decodes_nothing(self) -> None:
+        clock = FakeMonotonicClock(start=0.0)
+        events: list[str] = []
+
+        class OperationalError(Exception):
+            pass
+
+        class FakePsycopg:
+            pass
+
+        FakePsycopg.OperationalError = OperationalError  # type: ignore[attr-defined]
+        cursor = self.FakeCursor([], events)
+
+        class SlowConnection:
+            def execute(self, sql: str) -> Any:
+                events.append(f"execute:{sql[:24]}")
+                if not sql.startswith("SET LOCAL"):
+                    clock.sleep(6.0)
+                    return cursor
+                return None
+
+            @contextlib.contextmanager
+            def transaction(self) -> Any:
+                yield
+
+        client = _NativePostgresClient.__new__(_NativePostgresClient)
+        client._psycopg = FakePsycopg
+        client._monotonic = clock.monotonic
+
+        @contextlib.contextmanager
+        def connection(*, timeout_seconds: float | None = None) -> Any:
+            yield SlowConnection()
+
+        client.connection = connection  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(LedgerOperationTimeout, "expired while decoding rows"):
+            client.run_json_rows("SELECT rows", timeout_seconds=5.0, batch_size=2)
+
+        # An empty result is not published either: no fetch happened.
+        self.assertNotIn("fetch:0", events)
+        self.assertTrue(cursor.closed)
+
+    # -- supported subclass seams -----------------------------------------------
+
+    def test_legacy_run_json_override_answers_with_the_row_list(self) -> None:
+        """A ``_run_json`` fake keeps working: it returns what json_agg decoded to."""
+        stamped: list[str] = []
+
+        class LegacyJsonLedger(PsqlShareLedger):
+            def __init__(self) -> None:
+                self._native = None
+                self._lock = threading.Lock()
+                self._read_semaphore = threading.BoundedSemaphore(1)
+                self._json_row_batch_size = 2
+                self.queries: list[str] = []
+
+            def _run_json(self, sql: str) -> Any:
+                self.queries.append(sql)
+                return [row_payload(1), row_payload(2), row_payload(3)]
+
+        ledger = LegacyJsonLedger()
+        with ledger.operation_progress(lambda: stamped.append("x"), slice_seconds=1.0):
+            records = ledger.snapshot_at_job_issue(1_005, window_weight=64)
+
+        self.assertEqual([record.share_seq for record in records], [1, 2, 3])
+        self.assertEqual(len(ledger.queries), 1)
+        self.assertNotIn("json_agg", ledger.queries[0])
+        # One boundary between the two batches of two and one.
+        self.assertEqual(stamped, ["x"])
+
+    def test_legacy_run_json_override_returning_a_scalar_is_rejected(self) -> None:
+        class ScalarLedger(PsqlShareLedger):
+            def __init__(self) -> None:
+                self._native = None
+                self._lock = threading.Lock()
+                self._read_semaphore = threading.BoundedSemaphore(1)
+
+            def _run_json(self, sql: str) -> Any:
+                return {"count": 3}
+
+        with self.assertRaisesRegex(RuntimeError, "non-list value: dict"):
+            ScalarLedger().snapshot_at_job_issue(1_005, window_weight=64)
+
+    def test_legacy_run_sql_override_is_parsed_line_by_line(self) -> None:
+        """The A1 gate's text seam: one JSON value per psql output line."""
+        calls: list[str] = []
+
+        class LegacyRunSqlLedger(PsqlShareLedger):
+            def __init__(self) -> None:
+                self._native = None
+                self._lock = threading.Lock()
+                self._read_semaphore = threading.BoundedSemaphore(1)
+
+            def _run_sql(self, sql: str) -> str:
+                calls.append(sql)
+                return "\n".join(
+                    [json.dumps(row_payload(1)), "", json.dumps(row_payload(2)), ""]
+                )
+
+        records = LegacyRunSqlLedger().snapshot_between_job_issues(1_005, 1_006)
+
+        self.assertEqual([record.share_seq for record in records], [1, 2])
+        self.assertEqual(len(calls), 1)
+        self.assertIn("UNION ALL", calls[0])
+
+    # -- SQL shape -----------------------------------------------------------------
+
+    def test_payout_window_reads_project_one_json_object_per_row(self) -> None:
+        """Neither production statement builds a whole-window aggregate."""
+        ledger = QueryCapturePsqlShareLedger()
+
+        ledger.snapshot_at_job_issue(1_000, window_weight=8)
+        ledger.snapshot_at_job_issue(1_000)
+        ledger.snapshot_between_job_issues(1_000, 2_000)
+
+        self.assertEqual(len(ledger.queries), 3)
+        for sql in ledger.queries:
+            self.assertNotIn("json_agg", sql)
+            self.assertIn("json_build_object(", sql)
+            self.assertTrue(sql.rstrip().endswith("FROM rows\nORDER BY share_seq ASC;"), sql[-120:])
+        bounded, unbounded, delta = ledger.queries
+        self.assertIn("WITH RECURSIVE pages AS", bounded)
+        self.assertIn("cumulative_difficulty - share_difficulty < 8::numeric", bounded)
+        self.assertNotIn("RECURSIVE", unbounded)
+        self.assertIn("UNION ALL", delta)
+
+    # -- native client -----------------------------------------------------------
+
+    class FakeCursor:
+        def __init__(self, rows: list[Any], events: list[str], fail_at_batch: int | None = None,
+                     error: Exception | None = None) -> None:
+            self._rows = rows
+            self._pos = 0
+            self.events = events
+            self.fail_at_batch = fail_at_batch
+            self.error = error
+            self.batches = 0
+            self.closed = False
+
+        def fetchmany(self, size: int) -> list[tuple[Any]]:
+            self.batches += 1
+            if self.fail_at_batch is not None and self.batches == self.fail_at_batch:
+                assert self.error is not None
+                raise self.error
+            batch = self._rows[self._pos : self._pos + size]
+            self._pos += size
+            self.events.append(f"fetch:{len(batch)}")
+            return [(row,) for row in batch]
+
+        def close(self) -> None:
+            self.closed = True
+            self.events.append("close")
+
+    def native_client(
+        self,
+        *,
+        results: list[Any],
+        clock: FakeMonotonicClock | None = None,
+    ) -> tuple[_NativePostgresClient, list[str], list[Any]]:
+        """A client over a fake driver; ``results`` are per-execute outcomes.
+
+        The client's ``outcomes`` attribute is the live per-execute queue, so
+        a test can seed it with instances of the client's own
+        ``OperationalError`` after construction.
+        """
+        events: list[str] = []
+        cursors: list[Any] = []
+        outcomes = list(results)
+
+        class OperationalError(Exception):
+            def __init__(self, message: str, sqlstate: str | None = None) -> None:
+                super().__init__(message)
+                self.sqlstate = sqlstate
+
+        class FakePsycopg:
+            pass
+
+        FakePsycopg.OperationalError = OperationalError  # type: ignore[attr-defined]
+
+        tests = self
+
+        class FakeConnection:
+            def execute(self, sql: str) -> Any:
+                events.append(f"execute:{sql[:24]}")
+                if sql.startswith("SET LOCAL"):
+                    return None
+                outcome = outcomes.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                cursor = tests.FakeCursor(
+                    outcome["rows"],
+                    events,
+                    fail_at_batch=outcome.get("fail_at_batch"),
+                    error=outcome.get("error"),
+                )
+                cursors.append(cursor)
+                return cursor
+
+            @contextlib.contextmanager
+            def transaction(self) -> Any:
+                events.append("begin")
+                try:
+                    yield
+                finally:
+                    events.append("commit")
+
+        client = _NativePostgresClient.__new__(_NativePostgresClient)
+        client._psycopg = FakePsycopg
+        if clock is not None:
+            client._monotonic = clock.monotonic
+
+        @contextlib.contextmanager
+        def connection(*, timeout_seconds: float | None = None) -> Any:
+            events.append(f"borrow:{timeout_seconds is not None}")
+            try:
+                yield FakeConnection()
+            except BaseException:
+                events.append("discard")
+                raise
+            else:
+                events.append("return")
+
+        client.connection = connection  # type: ignore[method-assign]
+        client.OperationalError = OperationalError  # type: ignore[attr-defined]
+        client.outcomes = outcomes  # type: ignore[attr-defined]
+        return client, events, cursors
+
+    def test_native_rows_are_fetched_in_batches_after_the_deadline_commit(self) -> None:
+        rows = [row_payload(index) for index in range(1, 1201)]
+        client, events, cursors = self.native_client(results=[{"rows": rows}])
+        batches: list[int] = []
+
+        records = client.run_json_rows(
+            "SELECT json_build_object(...)",
+            retry_safe=True,
+            timeout_seconds=5.0,
+            row_converter=PsqlShareLedger._record_from_json,
+            batch_size=512,
+            on_batch=lambda: batches.append(len(events)),
+        )
+
+        self.assertEqual([record.share_seq for record in records[:2]], [1, 2])
+        self.assertEqual(len(records), 1200)
+        self.assertEqual(type(records[0]), AcceptedShareRecord)
+        # One SELECT inside the SET LOCAL transaction, committed before the
+        # first fetch; then three bounded fetches, the empty terminator, and
+        # the cursor closed before the connection goes back to the pool.
+        self.assertEqual(
+            events,
+            [
+                "borrow:True",
+                "begin",
+                "execute:SET LOCAL statement_time",
+                "execute:SET LOCAL lock_timeout =",
+                "execute:SELECT json_build_object",
+                "commit",
+                "fetch:512",
+                "fetch:512",
+                "fetch:176",
+                "fetch:0",
+                "close",
+                "return",
+            ],
+        )
+        self.assertEqual(len(batches), 3)
+        self.assertTrue(cursors[0].closed)
+
+    def test_native_rows_without_a_deadline_run_in_autocommit(self) -> None:
+        client, events, _cursors = self.native_client(
+            results=[{"rows": [row_payload(1)]}]
+        )
+
+        rows = client.run_json_rows("SELECT 1", batch_size=4)
+
+        self.assertEqual(rows, [row_payload(1)])
+        self.assertEqual(
+            events,
+            ["borrow:False", "execute:SELECT 1", "fetch:1", "fetch:0", "close", "return"],
+        )
+
+    def test_native_retry_safe_rows_restart_the_whole_statement(self) -> None:
+        """A connection loss mid-fetch discards the partial rows and re-runs."""
+        rows = [row_payload(index) for index in range(1, 7)]
+        client, events, cursors = self.native_client(
+            results=[
+                {
+                    "rows": rows,
+                    "fail_at_batch": 2,
+                    "error": None,
+                },
+                {"rows": rows},
+            ]
+        )
+        # The first cursor's second fetch raises the driver's OperationalError.
+        first_error = client.OperationalError("SSL connection has been closed unexpectedly")
+        cursors_seen: list[Any] = []
+        original_fetchmany = self.FakeCursor.fetchmany
+
+        def fetchmany(cursor: Any, size: int) -> Any:
+            if cursor not in cursors_seen:
+                cursors_seen.append(cursor)
+            if len(cursors_seen) == 1 and cursor.batches == 1:
+                cursor.batches += 1
+                raise first_error
+            return original_fetchmany(cursor, size)
+
+        with unittest.mock.patch.object(self.FakeCursor, "fetchmany", fetchmany):
+            records = client.run_json_rows(
+                "SELECT rows",
+                retry_safe=True,
+                row_converter=PsqlShareLedger._record_from_json,
+                batch_size=2,
+            )
+
+        self.assertEqual([record.share_seq for record in records], [1, 2, 3, 4, 5, 6])
+        self.assertEqual(events.count("execute:SELECT rows"), 2)
+        # First attempt: borrowed, one batch fetched, the failure discarded
+        # the connection and closed the cursor; second attempt complete.
+        self.assertEqual(events.index("discard"), events.index("close") + 1)
+        self.assertTrue(all(cursor.closed for cursor in cursors))
+
+    def test_native_rows_without_retry_fail_after_the_first_attempt(self) -> None:
+        client, events, _cursors = self.native_client(results=[])
+        client.outcomes[:] = [client.OperationalError("connection reset"), {"rows": []}]
+
+        with self.assertRaisesRegex(RuntimeError, "postgres query failed: connection reset"):
+            client.run_json_rows("SELECT rows", retry_safe=False)
+
+        self.assertEqual(events.count("execute:SELECT rows"), 1)
+
+    def test_native_rows_deadline_expires_between_batches(self) -> None:
+        clock = FakeMonotonicClock(start=0.0)
+        rows = [row_payload(index) for index in range(1, 7)]
+        client, events, cursors = self.native_client(results=[{"rows": rows}], clock=clock)
+
+        def on_batch() -> None:
+            clock.sleep(4.0)
+
+        with self.assertRaisesRegex(LedgerOperationTimeout, "expired while decoding rows"):
+            client.run_json_rows(
+                "SELECT rows",
+                retry_safe=True,
+                timeout_seconds=5.0,
+                batch_size=2,
+                on_batch=on_batch,
+            )
+
+        # Two batches fit inside the budget (checks at t=0 and t=4); the
+        # check before the third, at t=8, fails. No retry: the deadline is
+        # not an OperationalError, and the cursor is closed on the way out.
+        self.assertEqual(events.count("fetch:2"), 2)
+        self.assertEqual(events.count("execute:SELECT rows"), 1)
+        self.assertTrue(cursors[0].closed)
+        self.assertIn("discard", events)
+
+    def test_native_rows_deadline_cancellation_is_not_retried(self) -> None:
+        client, events, _cursors = self.native_client(results=[])
+        client.outcomes[:] = [
+            client.OperationalError("canceling statement due to statement timeout", "57014"),
+            {"rows": []},
+        ]
+
+        with self.assertRaisesRegex(LedgerOperationTimeout, "postgres operation exceeded 2s"):
+            client.run_json_rows("SELECT rows", retry_safe=True, timeout_seconds=2.0)
+
+        self.assertEqual(events.count("execute:SELECT rows"), 1)
+
+    def test_native_null_row_is_rejected(self) -> None:
+        client, _events, _cursors = self.native_client(results=[{"rows": [None]}])
+
+        with self.assertRaisesRegex(RuntimeError, "returned no JSON"):
+            client.run_json_rows("SELECT NULL")
+
+    def test_native_text_rows_are_decoded(self) -> None:
+        client, _events, _cursors = self.native_client(
+            results=[{"rows": [json.dumps(row_payload(7))]}]
+        )
+
+        self.assertEqual(client.run_json_rows("SELECT ...::text"), [row_payload(7)])
+
+    # -- ledger plumbing over the native port -------------------------------
+
+    def test_ledger_hands_the_native_port_the_full_rows_contract(self) -> None:
+        calls: list[dict[str, Any]] = []
+
+        class FakeNative:
+            def run_json_rows(self, sql: str, **kwargs: Any) -> list[Any]:
+                calls.append({"sql": sql, **kwargs})
+                if kwargs.get("on_statement_start") is not None:
+                    kwargs["on_statement_start"]()
+                converter = kwargs["row_converter"]
+                return [converter(row_payload(1)), converter(row_payload(2))]
+
+            def close(self) -> None:
+                return None
+
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._native = FakeNative()
+        ledger._lock = threading.Lock()
+        ledger._read_semaphore = threading.BoundedSemaphore(2)
+
+        with ledger.operation_timeout(3.0):
+            records = ledger.snapshot_at_job_issue(1_005, window_weight=64)
+
+        self.assertEqual([record.share_seq for record in records], [1, 2])
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertTrue(call["retry_safe"])
+        self.assertEqual(call["batch_size"], PAYOUT_WINDOW_ROW_BATCH_SIZE)
+        self.assertEqual(call["on_batch"], ledger._note_json_row_batch)
+        self.assertEqual(call["row_converter"], ledger._record_from_json)
+        self.assertGreater(call["timeout_seconds"], 0.0)
+        self.assertLessEqual(call["timeout_seconds"], 3.0)
+        self.assertNotIn("json_agg", call["sql"])
+        stats = ledger.ledger_read_gate_stats()["payout_window_snapshot"]
+        self.assertEqual(stats["calls_total"], 1)
+        self.assertGreaterEqual(stats["execute_seconds_total"], 0.0)
+        self.assertEqual(ledger._read_semaphore._value, 2)
+
+    def test_ledger_batch_hook_enforces_the_operation_deadline(self) -> None:
+        """The ledger's own absolute deadline is rechecked between batches."""
+        clock = FakeMonotonicClock(start=0.0)
+        stamped: list[float] = []
+
+        class FakeNative:
+            def run_json_rows(self, sql: str, **kwargs: Any) -> list[Any]:
+                kwargs["on_statement_start"]()
+                converter = kwargs["row_converter"]
+                results = []
+                for index in range(1, 4):
+                    results.append(converter(row_payload(index)))
+                    clock.sleep(4.0)
+                    kwargs["on_batch"]()
+                return results
+
+            def close(self) -> None:
+                return None
+
+        ledger = PsqlShareLedger.__new__(PsqlShareLedger)
+        ledger._native = FakeNative()
+        ledger._monotonic = clock.monotonic
+        ledger._lock = threading.Lock()
+        ledger._read_semaphore = threading.BoundedSemaphore(1)
+        self.arm_deadline(ledger, deadline=10.0)
+
+        with ledger.operation_progress(lambda: stamped.append(clock.now), slice_seconds=1.0):
+            with self.assertRaisesRegex(LedgerOperationTimeout, "operation deadline expired"):
+                ledger.snapshot_between_job_issues(1_005, 1_006)
+
+        # Stamped at t=4 and t=8 (both inside the budget); the hook at t=12
+        # raised before stamping, so the decode never completed late.
+        self.assertEqual(stamped, [4.0, 8.0])
+        self.assertEqual(ledger._read_semaphore._value, 1)
+        stats = ledger.ledger_read_gate_stats()["payout_window_delta"]
+        self.assertEqual(stats["execute_timeouts_total"], 1)
+
+    def test_native_client_satisfies_the_row_result_port(self) -> None:
+        client = _NativePostgresClient.__new__(_NativePostgresClient)
+        self.assertIsInstance(client, share_ledger_module.LedgerSqlPort)
+        self.assertTrue(callable(getattr(client, "run_json_rows", None)))
 
 
 class BlockCandidateIdentityDigestTests(unittest.TestCase):
