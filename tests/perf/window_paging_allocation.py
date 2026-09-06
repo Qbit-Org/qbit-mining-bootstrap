@@ -6,11 +6,11 @@ paged the retained records with ``remaining.split_off(page_size)`` in a
 loop. ``Vec::split_off`` keeps the original vector's allocation, so every
 512-record page retained a backing allocation sized for every record still
 unpaged when it was cut, and the tail was copied again on each iteration:
-O(N^2/P) retained memory and copying, measured at 9.6 GB of resident builder
-memory and a 12 s response at the 210k-share window of #236, and a SIGKILL at
-400k. This driver measures that path against the real ``--serve`` daemon
-binary, before and after the fix, with every experiment bounded so it cannot
-exhaust the host.
+O(N^2/P) retained memory and copying. A prior synthetic reproduction for
+#236 measured 9,613 MiB builder RSS and a 12 s response at 210k shares, and
+a SIGKILL at 400k. This driver measures that path against the real
+``--serve`` daemon binary, before and after the fix, with every experiment
+bounded so it cannot exhaust the host.
 
 Per binary and window size it runs one daemon through the coordinator's own
 ``prepare_window`` protocol over blocking pipes:
@@ -74,6 +74,9 @@ database, network or coordinator. Example::
 This is an **on-demand instrument, not a test**: it asserts no thresholds
 and is deliberately not named ``test_*`` so discovery never runs it (#160).
 Nothing under ``lab/`` is modified.
+
+Memory measurements use MiB (2**20 bytes). Existing ``_mb`` result keys and
+``*-mb`` CLI option names are retained and use the same binary units.
 """
 
 from __future__ import annotations
@@ -140,7 +143,7 @@ def read_meminfo_mb(key: str) -> float | None:
 
 
 def read_proc_status_mb(pid: int) -> dict[str, float]:
-    """``VmRSS``/``VmHWM``/``VmSize``/``VmPeak`` of a live process, in MB."""
+    """``VmRSS``/``VmHWM``/``VmSize``/``VmPeak`` of a live process, in MiB."""
     out: dict[str, float] = {}
     try:
         with open(f"/proc/{pid}/status", encoding="ascii") as handle:
@@ -736,7 +739,7 @@ def run_variant(
         load = None
     required = (memory_limit_mb or 0) + memory_margin_mb
     if available is not None and available < required:
-        reason = f"MemAvailable {available:.0f} MB below required {required} MB"
+        reason = f"MemAvailable {available:.0f} MiB below required {required} MiB"
         log(f"    {label} @ {fixture.size}: skipped, {reason}")
         return RunResult(
             label, str(binary), fixture.size, fixture.page_size, available, load,
@@ -904,7 +907,7 @@ def _flag(value: bool | None) -> str:
 
 def render_runs(runs: list[RunResult]) -> str:
     lines = [
-        "| binary | shares | phase | records | request MiB | write s | wait s | read s | parse s | fold s | serialize s | residual s (approx.) | RSS after MB | status | self-check | oracle |",
+        "| binary | shares | phase | records | request MiB | write s | wait s | read s | parse s | fold s | serialize s | residual s (approx.) | RSS after MiB | status | self-check | oracle |",
         "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|",
     ]
     for run in runs:
@@ -930,7 +933,7 @@ def render_runs(runs: list[RunResult]) -> str:
 
 def render_summary(runs: list[RunResult]) -> str:
     lines = [
-        "| binary | shares | peak RSS MB (VmHWM) | peak VSZ MB | MB per 1k shares | full wait s | full fold s | daemon exit | available MB before |",
+        "| binary | shares | peak RSS MiB (VmHWM) | peak VSZ MiB | MiB per 1k shares | full wait s | full fold s | daemon exit | available MiB before |",
         "|---|---:|---:|---:|---:|---:|---:|---|---:|",
     ]
     for run in runs:
@@ -991,7 +994,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--miners", type=int, default=DEFAULT_MINERS, help=f"distinct identities in the fixture (default {DEFAULT_MINERS})")
     parser.add_argument("--small-delta", type=int, default=DEFAULT_SMALL_DELTA, help=f"records in the small advance (default {DEFAULT_SMALL_DELTA})")
     parser.add_argument("--large-delta", type=int, default=DEFAULT_LARGE_DELTA, help=f"records in the multi-page advance (default {DEFAULT_LARGE_DELTA})")
-    parser.add_argument("--daemon-memory-limit-mb", type=int, default=6144, help="RLIMIT_AS for every daemon in MB; 0 disables (default 6144)")
+    parser.add_argument("--daemon-memory-limit-mb", type=int, default=6144, help="RLIMIT_AS for every daemon in MiB; 0 disables (default 6144)")
     parser.add_argument("--memory-margin-mb", type=int, default=2048, help="MemAvailable headroom required above the limit before a run (default 2048)")
     parser.add_argument("--sample-interval", type=float, default=0.02, help="RSS sampling interval in seconds (default 0.02)")
     parser.add_argument("--exchange-timeout", type=float, default=DEFAULT_EXCHANGE_TIMEOUT, help=f"wall-clock deadline per exchange, handshake included; the daemon is killed and the phase recorded as a timeout (default {DEFAULT_EXCHANGE_TIMEOUT:g})")
@@ -1028,7 +1031,7 @@ def main(argv: list[str] | None = None) -> int:
     for label, identity in binaries.items():
         print(f"- {label}: {identity['path']} (sha256 {identity['sha256'][:16]}..., {identity['mtime']})")
     print(f"- page_size: {args.page_size}; miners: {args.miners}; deltas: {args.small_delta} / {args.large_delta}")
-    print(f"- daemon RLIMIT_AS: {memory_limit or 'none'} MB; required MemAvailable: {(memory_limit or 0) + args.memory_margin_mb} MB; exchange timeout: {args.exchange_timeout:g} s")
+    print(f"- daemon RLIMIT_AS: {memory_limit or 'none'} MiB; required MemAvailable: {(memory_limit or 0) + args.memory_margin_mb} MiB; exchange timeout: {args.exchange_timeout:g} s")
     print()
 
     plan: list[tuple[str, Path, int]] = []
@@ -1076,7 +1079,7 @@ def main(argv: list[str] | None = None) -> int:
         last = runs[-1]
         if not last.skipped and last.phases:
             log(
-                f"    -> peak RSS {_fmt(last.outcome.get('peak_rss_mb'), 0)} MB, exit {last.outcome.get('exit_code')},"
+                f"    -> peak RSS {_fmt(last.outcome.get('peak_rss_mb'), 0)} MiB, exit {last.outcome.get('exit_code')},"
                 f" phases {[(p.phase, p.status) for p in last.phases]}"
             )
 

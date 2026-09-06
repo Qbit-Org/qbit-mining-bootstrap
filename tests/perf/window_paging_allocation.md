@@ -10,8 +10,8 @@ and copying.
 
 What that cost had been measured at, before this PR: a **prior synthetic
 reproduction on this development host** (`tests/perf/window_pipeline_gil_scaling.md`
-§9, same fixture and page size as below, single run) recorded 9,613 MB peak
-builder RSS and a 12.2 s response for a 210k-share preparation, and 15,623 MB
+§9, same fixture and page size as below, single run) recorded 9,613 MiB peak
+builder RSS and a 12.2 s response for a 210k-share preparation, and 15,623 MiB
 followed by SIGKILL at 400k. Production (#236) separately observed roughly
 9.69 GiB builder RSS at its ~210k-share window; those production figures are
 cited from the incident, not reproduced here.
@@ -44,19 +44,19 @@ advance:
 
 | retained shares | old paging (baseline binary) | fixed paging (this PR) | fixed, single window only |
 |---:|---:|---:|---:|
-| 52,000 | **1,028 MB**, full response 1.05 s | **163 MB**, 0.33 s | 110 MB |
-| 105,000 | **3,884 MB**, 3.78 s | **325 MB**, 0.63 s | 219 MB |
-| 210,000 | 9,613 MB, 12.2 s *(prior synthetic measurement, §5)* | **601 MB**, 1.29 s | 435 MB |
-| 400,000 | 15,623 MB then SIGKILL *(prior synthetic measurement, §5)* | **1,142 MB**, 2.60 s | 826 MB |
+| 52,000 | **1,028 MiB**, full response 1.05 s | **163 MiB**, 0.33 s | 110 MiB |
+| 105,000 | **3,884 MiB**, 3.78 s | **325 MiB**, 0.63 s | 219 MiB |
+| 210,000 | 9,613 MiB, 12.2 s *(prior synthetic measurement, §5)* | **601 MiB**, 1.29 s | 435 MiB |
+| 400,000 | 15,623 MiB then SIGKILL *(prior synthetic measurement, §5)* | **1,142 MiB**, 2.60 s | 826 MiB |
 
 Old-paging memory per 1k shares doubles when the window doubles (19.8 →
-37.0 MB per 1k from 52k to 105k): quadratic, and within 4% of what the
-capacity model predicts (§4). Fixed-paging memory is flat at **2.9–3.1 MB per
+37.0 MiB per 1k from 52k to 105k), consistent with the quadratic record-vector
+capacity model (§4). Fixed-paging memory is flat at **2.9–3.1 MiB per
 1k shares** from 52k to 400k. The 400k preparation completes in 2.6 s with a
 clean daemon exit; no daemon fell back, died, timed out or declined.
 
 **The same binary built inside the production coordinator image gives the
-same numbers** (§7): 601 MB / 1.46 s at 210k and 1,142 MB / 2.60 s at 400k
+same numbers** (§7): 601 MiB / 1.46 s at 210k and 1,142 MiB / 2.60 s at 400k
 under CPython 3.14.7 with `MALLOC_ARENA_MAX=2`.
 
 **Every digest agreed.** All 40 phase outcomes (host: two binaries × sizes ×
@@ -73,7 +73,7 @@ inference:** the fixed daemon reports its own JSON parse, fold and canonical
 serialization times in the `prepare_window` envelope (an additive `metrics`
 field the coordinator ignores). At 210k the 1.29 s response wait is 0.27 s
 parse + 0.38 s fold + 0.63 s canonical digest/items; the blocking-pipe
-transport is 0.15 s to write the 91 MiB request and 0.12 s to read the 91 MB
+transport is 0.15 s to write the 91 MiB request and 0.12 s to read the 91 MiB
 response. The paging fold is now the *smallest* of the three daemon terms.
 
 ---
@@ -89,12 +89,12 @@ response. The paging fold is now the *smallest* of the three daemon terms.
 | Baseline binary | same command from the unmodified base `0bc7fa6`, sha256 `e7f5ca0cccf31b6a3045a3b898ef53b0e2857d7cf276cadf0530147e3c298e2d`, 2,244,296 bytes |
 | Harness | the `tests/perf/window_paging_allocation.py` committed beside this report, byte for byte (the host sweep recorded its tree as `527b3ac` plus the then-uncommitted harness, report and harness tests that the next commit on this branch adds; no `crates/` change) |
 | Toolchain (host) | cargo/rustc 1.97.1 (c980f4866 2026-06-30), stable x86_64-unknown-linux-gnu |
-| Host | Linux 6.8.0-106-generic x86_64, glibc 2.39, KVM guest, 8 vCPU, 23,464 MB RAM, no swap; shared development host |
-| Available memory | 17,436 MB at the start of the host sweep; recorded before every daemon run (16,425–17,281 MB) |
+| Host | Linux 6.8.0-106-generic x86_64, glibc 2.39, KVM guest, 8 vCPU, 23,464 MiB RAM, no swap; shared development host |
+| Available memory | 17,436 MiB at the start of the host sweep; recorded before every daemon run (16,425–17,281 MiB) |
 | Load (1 m) | 0.78 at start, 1.13–1.69 before the larger runs (other worktrees on the host were quiet but not idle) |
 | Python (driver + oracle, host) | CPython 3.12.3, `MALLOC_ARENA_MAX` unset |
 | Page size | 512 (`DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE`) |
-| Bounding | every daemon under `RLIMIT_AS` = 6,144 MB; a run is skipped unless `MemAvailable` ≥ 8,192 MB; one daemon at a time; every exchange (handshake included) under a 600 s deadline that kills and reaps the daemon |
+| Bounding | every daemon under `RLIMIT_AS` = 6,144 MiB; a run is skipped unless `MemAvailable` ≥ 8,192 MiB; one daemon at a time; every exchange (handshake included) under a 600 s deadline that kills and reaps the daemon |
 
 ### Fixture
 
@@ -137,7 +137,7 @@ the fixture's total difficulty so every record is retained. Request sizes:
 - **RSS after** — `VmRSS` from `/proc/<pid>/status` right after the phase.
   **peak so far / peak** — `VmHWM`, the kernel's lifetime high-water mark,
   read before the daemon is reaped (not a sampling artefact; the 20 ms
-  sampler's maximum agreed within 22 MB in every run).
+  sampler's maximum agreed within 22 MiB in every run).
 - **self-check** — `sha256("[" + items + "]")` of the daemon's bytes equals
   its `share_snapshot_sha256`; for advances the coordinator's mirror surgery
   (drop `retained_drop_bytes`, append the returned suffix) is replayed first.
@@ -151,7 +151,7 @@ the fixture's total difficulty so every record is retained. Request sizes:
 
 ### Summary per daemon (lifetime)
 
-| binary | shares | peak RSS MB (VmHWM) | peak VSZ MB | MB per 1k shares | full wait s | full fold s | daemon exit | available MB before |
+| binary | shares | peak RSS MiB (VmHWM) | peak VSZ MiB | MiB per 1k shares | full wait s | full fold s | daemon exit | available MiB before |
 |---|---:|---:|---:|---:|---:|---:|---|---:|
 | baseline | 52,000 | 1,028 | 1,042 | 19.76 | 1.05 | – | clean (0) | 17,281 |
 | fixed | 52,000 | 163 | 177 | 3.14 | 0.33 | 0.085 | clean (0) | 16,903 |
@@ -165,7 +165,7 @@ whole-daemon time.
 
 ### Every phase
 
-| binary | shares | phase | records | request MiB | write s | wait s | read s | parse s | fold s | serialize s | residual s (approx.) | RSS after MB | peak so far MB | status | self-check | oracle |
+| binary | shares | phase | records | request MiB | write s | wait s | read s | parse s | fold s | serialize s | residual s (approx.) | RSS after MiB | peak so far MiB | status | self-check | oracle |
 |---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|
 | baseline | 52,000 | full | 52,000 | 22.5 | 0.03 | 1.05 | 0.02 | – | – | – | – | 623 | 668 | prepared | yes | yes |
 | baseline | 52,000 | advance_small | 16 | 0.0 | 0.00 | 0.14 | 0.00 | – | – | – | – | 625 | 668 | prepared | yes | yes |
@@ -202,8 +202,8 @@ Advance stats returned by both binaries at every size: `advance_small` added
 16 / expired 16 / touched 2 pages; `advance_large` added 1,043 / expired 1,043
 / touched 2; the re-center retained exactly ¾ of the records (39,000; 78,750;
 157,500; 300,000), matching the oracle's counts. An earlier host sweep with
-the pre-hardening harness (same binaries, run about 40 minutes before) gave
-the same peak figures to the megabyte and timings within 0.1 s.
+the pre-hardening harness (same binaries) gave the same peak figures when
+rounded to MiB and comparable timings.
 
 ### The Python oracle beside it (host, CPython 3.12.3)
 
@@ -237,7 +237,7 @@ in the retained count. The fold as a whole still sorts the eligible records
 (`sort_by_key`, O(N log N)) and validates them in one pass; the parse and the
 canonical serialization are proportional to the request and response bytes.
 After the fix the fold is ~29% of daemon time; canonical serialization
-(per-record fragment concatenation plus a SHA-256 over 91–182 MB) is ~49% and
+(per-record fragment concatenation plus a SHA-256 over 91–174 MiB) is ~49% and
 the request parse ~21%. The blocking-pipe transport measured here is under
 0.3 s per direction at 400k; the coordinator's own transport after #237 is
 readiness-driven and was measured in `window_builder_pipe_latency.md`.
@@ -270,20 +270,26 @@ between the two binaries.
 P = 512, the old loop made ⌈N/P⌉ pages whose record vectors kept capacities
 N, N−P, N−2P, …; aggregate capacity Σ(N−kP) records × 224 B:
 
-| N | pages | old aggregate capacity | predicted | measured RSS after `full` (baseline) | new aggregate capacity |
+| N | pages | old aggregate capacity | old record-vector storage (MiB) | measured RSS after `full` (baseline) | new record-vector storage (MiB) |
 |---:|---:|---:|---:|---:|---:|
-| 52,000 | 102 | 2,666,688 records | 597 MB | 623 MB | 12 MB |
-| 105,000 | 206 | 10,819,120 | 2,423 MB | 2,417 MB | 24 MB |
-| 210,000 | 411 | 43,171,440 | 9,670 MB | 9,613 MB peak (prior synthetic measurement, §5) | 47 MB |
-| 400,000 | 782 | 156,450,048 | 35,045 MB | SIGKILL at 15,623 MB (prior synthetic measurement) | 90 MB |
+| 52,000 | 102 | 2,666,688 records | 569.7 | 623 MiB | 11.1 |
+| 105,000 | 206 | 10,819,120 | 2,311.2 | 2,417 MiB | 22.4 |
+| 210,000 | 411 | 43,171,440 | 9,222.4 | 9,613 MiB peak (prior synthetic measurement, §5) | 44.9 |
+| 400,000 | 782 | 156,450,048 | 33,421.3 | SIGKILL at 15,623 MiB before completion (prior synthetic measurement) | 85.4 |
 
-The prediction lands within 4% of every measurement, which attributes the
-defect in full: it needed no leak and no second generation. The fragment
-vectors were never affected (`collect` from an exact-size iterator), and the
-rest of the fixed daemon's footprint is the fragments themselves (the 91 MB
-canonical stream at 210k, held per page), the parsed request during the
-fold, and the items copy sent back — all proportional to the window, which
-the flat 2.9–3.1 MB per 1k shares from 52k to 400k confirms.
+The capacity model counts only record-vector backing storage, in MiB
+(bytes / 2**20). RSS also includes heap-owned record strings, canonical
+fragments, input/output buffers, and allocator overhead, so it is not an
+exact RSS prediction. The smaller completed baseline runs and the structural
+capacity tests establish the quadratic paging defect without requiring a
+leak or a second generation. The 400k run was killed before allocating the
+full window: its observed RSS is a lower bound on that run's memory demand,
+not a completed measurement validating the 33,421.3 MiB storage estimate.
+
+The fragment vectors were never affected (`collect` from an exact-size
+iterator). After the fix, record-vector storage and the other window buffers
+are proportional to the window; the measured 2.9–3.1 MiB per 1k shares from
+52k to 400k is consistent with that bound.
 
 The structural regression tests in `window.rs`
 (`full_snapshot_paging_keeps_aggregate_capacity_linear_across_sizes`,
@@ -306,16 +312,17 @@ assertion, e.g. *"page 0 of 3 retains capacity 234 for 100 records
 ## 5. The 210k/400k baseline is a prior synthetic measurement, cited not repeated
 
 The old binary was measured here only at 52k and 105k, sizes whose predicted
-footprint (§4) fits under the 6 GB address-space limit with margin on a
+footprint (§4) fits under the 6 GiB address-space limit with margin on a
 shared host. The 210k and 400k old-paging figures in the headline are the
 single-run blocking-pipe measurements recorded in
 `tests/perf/window_pipeline_gil_scaling.md` §9 on the same host, same fixture
 and same page size, made while investigating #236 and before this PR: peak
-RSS 9,613 MB with a 12.2 s response at 210k; 15,623 MB then SIGKILL after
+RSS 9,613 MiB with a 12.2 s response at 210k; 15,623 MiB then SIGKILL after
 ~24 s at 400k, with ~15 GB available. They are synthetic development-host
 measurements, not production observations. Re-running the 400k case would
-have exhausted the host again for no new information; the capacity model
-reproduces both figures.
+have risked exhausting the host again. The completed smaller runs and the
+structural capacity tests suffice to reproduce the defect; the killed 400k
+run does not measure its full allocation demand.
 
 ---
 
@@ -360,12 +367,12 @@ from a disposable context holding only `Cargo.toml`, `Cargo.lock`, `crates/`,
 | Image binary | `/app/target/release/qbit-prism-build-audit-bundle` sha256 `50fda6ac0f8e44450545f3b16592b96622ab0c7bab4c7b80fed827d32eabab33`, 2,143,032 bytes (different compiler, so a different binary from the host build of the same source) |
 | Run | `docker run --rm --memory 8g -v $PWD/tests:/app/tests:ro … prism-240-local:test python3 tests/perf/window_paging_allocation.py --daemon-binary /app/target/release --sizes 210000,400000`; driver and oracle under the image's CPython 3.14.7 with `MALLOC_ARENA_MAX=2`; daemon under the same `RLIMIT_AS` and deadline as on the host |
 
-| binary | shares | peak RSS MB (VmHWM) | peak VSZ MB | MB per 1k shares | full wait s | full fold s | daemon exit | available MB before |
+| binary | shares | peak RSS MiB (VmHWM) | peak VSZ MiB | MiB per 1k shares | full wait s | full fold s | daemon exit | available MiB before |
 |---|---:|---:|---:|---:|---:|---:|---|---:|
 | image | 210,000 | 601 | 640 | 2.86 | 1.46 | 0.473 | clean (0) | 16,682 |
 | image | 400,000 | 1,142 | 1,226 | 2.85 | 2.60 | 0.847 | clean (0) | 16,429 |
 
-| binary | shares | phase | records | request MiB | write s | wait s | read s | parse s | fold s | serialize s | residual s (approx.) | RSS after MB | peak so far MB | status | self-check | oracle |
+| binary | shares | phase | records | request MiB | write s | wait s | read s | parse s | fold s | serialize s | residual s (approx.) | RSS after MiB | peak so far MiB | status | self-check | oracle |
 |---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|
 | image | 210,000 | full | 210,000 | 91.0 | 0.17 | 1.46 | 0.11 | 0.334 | 0.473 | 0.646 | 0.012 | 253 | 435 | prepared | yes | yes |
 | image | 210,000 | advance_small | 16 | 0.0 | 0.00 | 0.60 | 0.00 | 0.000 | 0.004 | 0.595 | 0.000 | 255 | 435 | prepared | yes | yes |
@@ -396,8 +403,8 @@ exercising the daemon protocol; it is **not** a coordinator run (§8).
 
 - Single run per configuration on a shared KVM development host. Timings are
   wall-clock with load 0.8–1.7; the memory figures are kernel high-water
-  marks and are not sensitive to load. The pre-hardening host sweep 40
-  minutes earlier reproduced every peak figure exactly.
+  marks and are not sensitive to load. The earlier pre-hardening host sweep
+  reproduced every peak figure when rounded to MiB.
 - Synthetic fixture: uniform difficulty, one share per second, 200
   identities. Production windows have mixed difficulties and credit policies;
   neither changes the paging arithmetic, which depends only on record count
