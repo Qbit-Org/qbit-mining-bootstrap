@@ -54,6 +54,10 @@ from lab.prism.coordinator_config import (
 from lab.prism.coordinator_shutdown import (
     BLOCK_SUBMITTER_WAIT_HEARTBEAT_SLICE_SECONDS,
 )
+from lab.prism.share_json_stream import (
+    release_share_list_incrementally,
+    share_array_json_view,
+)
 from lab.prism.share_ledger import (
     DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
     DaemonShareWindowMirror,
@@ -1154,7 +1158,12 @@ class PayoutStateService:
             runtime._incremental_payout_artifact_window = None
             conversion_started = time.monotonic()
             shares_json = tuple(record.to_prism_json() for record in records)
-            digest = self._canonical_json_sha256(shares_json)
+            # The digest hook prefers a sequence's own canonical digest;
+            # the view streams the freshly converted tuple record-batch by
+            # record-batch instead of one whole-window json.dumps.
+            digest = self._canonical_json_sha256(
+                share_array_json_view(shares_json)
+            )
             self._note_window_build_phase(
                 "record_conversion",
                 time.monotonic() - conversion_started,
@@ -1183,6 +1192,10 @@ class PayoutStateService:
                 bypass_build_interval=bypass_build_interval,
             )
             if materialized is not None:
+                # The daemon holds the window as bytes now; the ledger rows
+                # are finished with. Drop them in bounded slices so their
+                # release is not one refcount cascade under the GIL (#236).
+                release_share_list_incrementally(records)
                 return materialized, FULL_RESCAN_PATH_DAEMON
             # Any daemon outcome that cannot produce a window here -- an
             # anomaly (already retired), the transport disabled, a daemon
@@ -1296,6 +1309,9 @@ class PayoutStateService:
                 "daemon_prepare",
                 time.monotonic() - daemon_started,
             )
+            # The converted dicts were consumed by the request; drop them in
+            # bounded slices rather than in one refcount cascade (#236).
+            release_share_list_incrementally(records_json)
         if outcome is None or outcome.status != "prepared":
             return None
         conversion_started = time.monotonic()
@@ -1551,6 +1567,7 @@ class PayoutStateService:
                 "daemon_prepare",
                 time.monotonic() - daemon_started,
             )
+            release_share_list_incrementally(records_json)
         if outcome is None:
             return mirror_from_oracle_pages(), "window_daemon_unavailable"
         if outcome.status == "busy":

@@ -332,18 +332,21 @@ class ShareWindowSerializationCacheTests(unittest.TestCase):
             first,
         )
 
-        identities_json, compact_json = first.compact_fragments(shares)
+        tail_chunks = first.compact_tail_chunks(shares)
         expected_identities, expected_compact = _compact_share_payload(shares)
+        # The tail completes a JSON object whose only other member is the
+        # (empty) head, so it can be parsed back by prefixing "{".
+        tail = json.loads("{" + "".join(tail_chunks)[1:])
         self.assertEqual(
-            json.loads(identities_json),
+            tail["compact_share_identities"],
             [list(identity) for identity in expected_identities],
         )
         self.assertEqual(
-            json.loads(compact_json),
+            tail["compact_shares"],
             [list(entry) for entry in expected_compact],
         )
-        # Fragments encode once per canonical window and are reused verbatim.
-        self.assertIs(first.compact_fragments(shares)[0], identities_json)
+        # The tail encodes once per canonical window and is reused verbatim.
+        self.assertIs(first.compact_tail_chunks(shares), tail_chunks)
 
         artifact_bump = dataclasses.replace(artifact, generation=2)
         rebuilt = server._share_window_serialization_for_artifact(

@@ -11,10 +11,20 @@ from dataclasses import replace
 from typing import Iterable, Sequence
 from unittest.mock import patch
 
+from lab.prism.share_json_stream import (
+    ShareArrayJsonSequence,
+    canonical_share_array_sha256,
+    canonical_share_items_bytes,
+    iter_json_array_text_chunks,
+    iter_json_object_text_chunks,
+    release_share_list_incrementally,
+    share_array_json_view,
+)
 from lab.prism.share_ledger import (
     AcceptedShareRecord,
     IncrementalShareWindow,
     IncrementalWindowFallback,
+    _IncrementalShareWindowPage,
 )
 
 
@@ -586,6 +596,225 @@ class IncrementalShareWindowGoldenTests(unittest.TestCase):
         self.assertLess(
             stats.touched_pages,
             math.ceil(initial_count / page_size),
+        )
+
+
+def awkward_share_json(seq: int) -> dict[str, object]:
+    """A prism-JSON share that exercises every encoder edge at once.
+
+    Non-ASCII and non-BMP text (surrogate-pair escapes), JSON-significant
+    punctuation inside strings, integers past 64 and 128 bits, and the
+    optional ``credit_policy`` member both present and absent.
+    """
+    payload: dict[str, object] = {
+        "share_seq": seq,
+        "share_id": f"miner-\u00e9.rig{seq}:\U0001F600,}}{{\"\\",
+        "miner_id": f"miner-{seq % 5}",
+        "order_key": f"{seq % 5:02d}:miner-{seq % 5}",
+        "p2mr_program_hex": f"{seq % 256:02x}" * 32,
+        "share_difficulty": (1 << 130) + seq,
+        "network_difficulty": (1 << 70) + 7,
+        "template_height": 800_000 + seq,
+        "job_id": f"job-\u2603-{seq}",
+        "job_issued_at_ms": 1_700_000_000_000 + seq,
+        "accepted_at_ms": 1_700_000_000_100 + seq,
+        "ntime": 1_700_000_000 + seq,
+    }
+    if seq % 3 == 0:
+        payload["credit_policy"] = "template-\u00fc"
+    return payload
+
+
+class BoundedShareJsonEncodingTests(unittest.TestCase):
+    """The batched encoders reproduce ``json.dumps`` byte for byte (#236).
+
+    Every helper in ``share_json_stream`` exists so that no single C call
+    covers a whole 200k-share window; the contract that makes that safe is
+    that the concatenated output is identical to the historical one-call
+    encoding, whatever batch and chunk sizes are in force.
+    """
+
+    BATCH_SIZES = (1, 2, 3, 7, 512)
+    CHUNK_SIZES = (1, 16, 64 * 1024)
+
+    def _shares(self, count: int) -> list[dict[str, object]]:
+        return [awkward_share_json(seq) for seq in range(1, count + 1)]
+
+    def test_array_chunks_match_json_dumps_for_every_batch_and_chunk_size(
+        self,
+    ) -> None:
+        for count in (0, 1, 2, 13, 1_100):
+            shares = self._shares(count)
+            canonical = json.dumps(
+                shares, sort_keys=True, separators=(",", ":"), default=str
+            )[1:-1]
+            compact = json.dumps(shares, separators=(",", ":"))[1:-1]
+            for batch in self.BATCH_SIZES:
+                for chunk in self.CHUNK_SIZES:
+                    with self.subTest(count=count, batch=batch, chunk=chunk):
+                        canonical_chunks = list(
+                            iter_json_array_text_chunks(
+                                shares,
+                                sort_keys=True,
+                                default=str,
+                                batch_records=batch,
+                                chunk_chars=chunk,
+                            )
+                        )
+                        self.assertEqual("".join(canonical_chunks), canonical)
+                        self.assertEqual(
+                            "".join(
+                                iter_json_array_text_chunks(
+                                    shares,
+                                    batch_records=batch,
+                                    chunk_chars=chunk,
+                                )
+                            ),
+                            compact,
+                        )
+                        # No chunk splits a record: every chunk is a run of
+                        # whole records, so it parses once re-framed.
+                        for piece in canonical_chunks:
+                            json.loads("[" + piece.strip(",") + "]")
+                        self.assertTrue(
+                            all(piece.isascii() for piece in canonical_chunks)
+                        )
+
+    def test_object_chunks_match_json_dumps(self) -> None:
+        shares = self._shares(700)
+        fields = {
+            "request": "prepare_window",
+            "mode": "full",
+            "anchor_job_issued_at_ms": 1_700_000_000_000,
+            "records": shares,
+            "window_weight": 1 << 100,
+            "empty": [],
+            "pair": (1, "two"),
+            "nested": {"z": 1, "a": [1.5, None, True]},
+        }
+        for batch in (1, 512):
+            for chunk in self.CHUNK_SIZES:
+                with self.subTest(batch=batch, chunk=chunk):
+                    self.assertEqual(
+                        "".join(
+                            iter_json_object_text_chunks(
+                                fields,
+                                array_keys=("records", "empty", "pair"),
+                                batch_records=batch,
+                                chunk_chars=chunk,
+                            )
+                        ),
+                        json.dumps(fields, separators=(",", ":")),
+                    )
+                    self.assertEqual(
+                        "".join(
+                            iter_json_object_text_chunks(
+                                fields,
+                                array_keys=("records",),
+                                sort_keys=True,
+                                default=str,
+                                batch_records=batch,
+                                chunk_chars=chunk,
+                            )
+                        ),
+                        json.dumps(
+                            fields,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            default=str,
+                        ),
+                    )
+        # A non-string key defers to json.dumps' own coercion rules.
+        mixed = {"a": 1, 2: [1, 2]}
+        self.assertEqual(
+            "".join(iter_json_object_text_chunks(mixed, array_keys=(2,))),
+            json.dumps(mixed, separators=(",", ":")),
+        )
+
+    def test_page_canonical_items_match_per_record_encoding(self) -> None:
+        records = tuple(
+            accepted_share(
+                seq,
+                share_difficulty=(1 << 129) + seq,
+                job_issued_at_ms=1_000 + seq,
+                accepted_at_ms=1_000 + seq,
+                credit_policy="unicode-\u00e9-\U0001F600" if seq % 2 else None,
+            )
+            for seq in range(1, 600)
+        )
+        page = _IncrementalShareWindowPage.from_records(records)
+        expected_items = b",".join(
+            canonical_json_text(record.to_prism_json()).encode()
+            for record in records
+        )
+        self.assertEqual(page.canonical_json_items, expected_items)
+        self.assertEqual(
+            canonical_share_items_bytes(page.prism_json_records),
+            expected_items,
+        )
+        window = IncrementalShareWindow.from_full_snapshot(
+            records,
+            anchor_job_issued_at_ms=10_000,
+            window_weight=sum(int(r.share_difficulty) for r in records),
+            page_size=128,
+        )
+        self.assertEqual(
+            window.json_records().canonical_json_sha256(),
+            canonical_json_sha256(
+                tuple(record.to_prism_json() for record in records)
+            ),
+        )
+        self.assertEqual(
+            _IncrementalShareWindowPage.from_records(()).canonical_json_items,
+            b"",
+        )
+
+    def test_incremental_release_empties_lists_in_bounded_slices(self) -> None:
+        values = list(range(10_001))
+        release_share_list_incrementally(values, batch_records=4_000)
+        self.assertEqual(values, [])
+        # Non-lists (tuples, the paged view) are left to ordinary GC.
+        frozen = (1, 2, 3)
+        release_share_list_incrementally(frozen)
+        self.assertEqual(frozen, (1, 2, 3))
+        # A batch size below one is clamped rather than looping forever.
+        values = [1, 2]
+        release_share_list_incrementally(values, batch_records=0)
+        self.assertEqual(values, [])
+
+    def test_share_array_view_digests_like_the_whole_array(self) -> None:
+        shares = self._shares(1_500)
+        expected = canonical_json_sha256(shares)
+        self.assertEqual(canonical_share_array_sha256(shares), expected)
+        self.assertEqual(canonical_share_array_sha256(tuple(shares)), expected)
+        self.assertEqual(canonical_share_array_sha256([]), canonical_json_sha256([]))
+        view = share_array_json_view(shares)
+        self.assertIsInstance(view, ShareArrayJsonSequence)
+        self.assertEqual(view.canonical_json_sha256(), expected)
+        self.assertEqual(len(view), len(shares))
+        self.assertEqual(list(view), shares)
+        self.assertIs(view[3], shares[3])
+        self.assertEqual(view[-2:], shares[-2:])
+        # A sequence that already carries its digest is handed back as is,
+        # and the streaming digest defers to it.
+        window = IncrementalShareWindow.from_full_snapshot(
+            [
+                accepted_share(
+                    seq,
+                    share_difficulty=1,
+                    job_issued_at_ms=seq,
+                    accepted_at_ms=seq,
+                )
+                for seq in range(1, 4)
+            ],
+            anchor_job_issued_at_ms=10,
+            window_weight=3,
+        )
+        paged = window.json_records()
+        self.assertIs(share_array_json_view(paged), paged)
+        self.assertEqual(
+            canonical_share_array_sha256(paged),
+            paged.canonical_json_sha256(),
         )
 
 
