@@ -360,9 +360,14 @@ class _PipeReadinessWaiter:
     costs no selector -- and ``close`` releases the registration on every
     exit path. A descriptor the selector refuses (a regular file standing
     in for the pipe, a closed or fake descriptor) degrades to the historical
-    bounded sleep so the retry loop keeps working. Readiness reported by the
-    selector may be spurious and EINTR is never a wait: both are resolved by
-    the caller retrying the syscall after its control checks.
+    bounded sleep so the retry loop keeps working; so does one the selector
+    registers but cannot poll (``SelectSelector`` over a Windows pipe
+    handle, a descriptor torn down under the registration): the selector is
+    released once, the descriptor stays unwatchable for the rest of the
+    operation, and the sleep takes only whatever budget the failed poll
+    left. Readiness reported by the selector may be spurious and EINTR is
+    never a wait: both are resolved by the caller retrying the syscall after
+    its control checks.
     """
 
     __slots__ = ("_events", "_file_descriptor", "_selector", "_unwatchable", "waits")
@@ -392,12 +397,12 @@ class _PipeReadinessWaiter:
         before the next syscall.
         """
         self.waits += 1
-        timeout = min(
-            PRISM_BUILDER_PIPE_WAIT_SLICE_SECONDS,
-            deadline - time.monotonic(),
-        )
+        now = time.monotonic()
+        timeout = min(PRISM_BUILDER_PIPE_WAIT_SLICE_SECONDS, deadline - now)
         if timeout <= 0:
             return False
+        # This wait may consume no more than one slice, however it ends.
+        slice_deadline = min(now + timeout, deadline)
         selector = self._selector
         if selector is None and not self._unwatchable:
             try:
@@ -412,11 +417,36 @@ class _PipeReadinessWaiter:
                 self._unwatchable = True
             else:
                 self._selector = selector
-        if selector is None:
-            time.sleep(timeout)
-            return False
-        # select() retries EINTR itself with the remaining timeout (PEP 475).
-        return bool(selector.select(timeout))
+        if selector is not None:
+            try:
+                # select() retries EINTR itself with the remaining timeout
+                # (PEP 475); a signal handler that raises propagates as is.
+                return bool(selector.select(timeout))
+            except InterruptedError:
+                # Not a readiness verdict and not a fault: the caller
+                # re-checks its control signals and retries the syscall.
+                return False
+            except (OSError, ValueError):
+                # Registered, but the selector cannot poll this descriptor.
+                # Release it exactly once, remember that for the rest of the
+                # operation, and finish THIS wait with the bounded sleep
+                # over whatever budget the failed poll left -- never a fresh
+                # full slice, never past the absolute deadline.
+                self._detach_selector()
+                timeout = slice_deadline - time.monotonic()
+                if timeout <= 0:
+                    return False
+        time.sleep(timeout)
+        return False
+
+    def _detach_selector(self) -> None:
+        self._unwatchable = True
+        selector, self._selector = self._selector, None
+        if selector is not None:
+            try:
+                selector.close()
+            except OSError:
+                pass
 
     def close(self) -> None:
         selector, self._selector = self._selector, None

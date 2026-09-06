@@ -220,6 +220,52 @@ class _GatedWaiter(_RecordingWaiter):
         return super().wait(deadline)
 
 
+class _PollFailingSelector:
+    """A DefaultSelector stand-in that registers, then cannot poll.
+
+    Models SelectSelector over a Windows pipe handle (registration succeeds,
+    ``select`` raises), with a hook to spend fake time inside the failed
+    poll. Lifecycle counts are class-level so a test can assert the
+    selector was built and closed exactly once.
+    """
+
+    built = 0
+    closes = 0
+    selects: list[float | None] = []
+    error: BaseException = OSError(10038, "not a socket")
+    on_select: Callable[[], None] | None = None
+
+    @classmethod
+    def reset(
+        cls,
+        *,
+        error: BaseException | None = None,
+        on_select: Callable[[], None] | None = None,
+    ) -> None:
+        cls.built = 0
+        cls.closes = 0
+        cls.selects = []
+        cls.error = OSError(10038, "not a socket") if error is None else error
+        cls.on_select = on_select
+
+    def __init__(self) -> None:
+        type(self).built += 1
+        self.registered: list[tuple[int, int]] = []
+
+    def register(self, file_descriptor: int, events: int, data: Any = None) -> None:
+        self.registered.append((file_descriptor, events))
+
+    def select(self, timeout: float | None = None) -> list[Any]:
+        cls = type(self)
+        cls.selects.append(timeout)
+        if cls.on_select is not None:
+            cls.on_select()
+        raise cls.error
+
+    def close(self) -> None:
+        type(self).closes += 1
+
+
 class _Do:
     """A scripted syscall step: run a side effect, then answer or raise."""
 
@@ -513,6 +559,227 @@ class ReadinessWaiterTests(_TransportCase):
             waiter.close()
         self.assertEqual(len(closed), 1)
         self.assertIsNone(waiter._selector)
+
+    def _fake_clock_module(self) -> tuple[_FakeClock, list[float]]:
+        """Drive the waiter's clock and record its sleeps."""
+        clock = _FakeClock()
+        sleeps: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            clock.advance(seconds)
+
+        patcher = patch.object(
+            compiler_module,
+            "time",
+            SimpleNamespace(monotonic=clock.monotonic, sleep=sleep),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return clock, sleeps
+
+    def test_poll_failure_detaches_once_and_falls_back_to_bounded_sleep(self) -> None:
+        read_end, write_end = os.pipe()
+        self._open_fds += [read_end, write_end]
+        _PollFailingSelector.reset()
+        with patch.object(selectors, "DefaultSelector", _PollFailingSelector), patch.object(
+            compiler_module.time,
+            "sleep",
+        ) as sleep:
+            waiter = _PipeReadinessWaiter(read_end, selectors.EVENT_READ)
+            first = waiter.wait(time.monotonic() + FAR_DEADLINE_SECONDS)
+            second = waiter.wait(time.monotonic() + FAR_DEADLINE_SECONDS)
+            waiter.close()
+            waiter.close()
+
+        self.assertEqual((first, second), (False, False))
+        self.assertEqual(waiter.waits, 2)
+        # Built and polled once; released exactly once at the failed poll,
+        # never rebuilt for the next wait, and not closed again on exit.
+        self.assertEqual(_PollFailingSelector.built, 1)
+        self.assertEqual(len(_PollFailingSelector.selects), 1)
+        self.assertEqual(_PollFailingSelector.closes, 1)
+        self.assertIsNone(waiter._selector)
+        self.assertTrue(waiter._unwatchable)
+        self.assertEqual(sleep.call_count, 2)
+        for call in sleep.call_args_list:
+            self.assertGreater(call.args[0], 0.0)
+            self.assertLessEqual(call.args[0], PRISM_BUILDER_PIPE_WAIT_SLICE_SECONDS)
+
+    def test_poll_failure_sleeps_only_the_remainder_of_the_slice(self) -> None:
+        read_end, write_end = os.pipe()
+        self._open_fds += [read_end, write_end]
+        clock, sleeps = self._fake_clock_module()
+        spent = 0.005
+        _PollFailingSelector.reset(on_select=lambda: clock.advance(spent))
+        with patch.object(selectors, "DefaultSelector", _PollFailingSelector):
+            with _PipeReadinessWaiter(read_end, selectors.EVENT_READ) as waiter:
+                ready = waiter.wait(clock.now + FAR_DEADLINE_SECONDS)
+                after_first = clock.now
+                again = waiter.wait(clock.now + FAR_DEADLINE_SECONDS)
+
+        self.assertEqual((ready, again), (False, False))
+        # The failed poll consumed 5 ms of the 20 ms slice: the fallback
+        # sleeps the 15 ms left, so the wait as a whole still spans exactly
+        # one slice; the next (unwatchable) wait sleeps one full slice.
+        self.assertEqual(
+            [round(seconds, 6) for seconds in sleeps],
+            [
+                round(PRISM_BUILDER_PIPE_WAIT_SLICE_SECONDS - spent, 6),
+                PRISM_BUILDER_PIPE_WAIT_SLICE_SECONDS,
+            ],
+        )
+        self.assertEqual(round(after_first - 1_000.0, 6), PRISM_BUILDER_PIPE_WAIT_SLICE_SECONDS)
+        self.assertEqual(_PollFailingSelector.built, 1)
+        self.assertEqual(_PollFailingSelector.closes, 1)
+
+    def test_poll_failure_after_spending_the_slice_sleeps_no_further(self) -> None:
+        read_end, write_end = os.pipe()
+        self._open_fds += [read_end, write_end]
+        clock, sleeps = self._fake_clock_module()
+        _PollFailingSelector.reset(
+            on_select=lambda: clock.advance(PRISM_BUILDER_PIPE_WAIT_SLICE_SECONDS * 3)
+        )
+        with patch.object(selectors, "DefaultSelector", _PollFailingSelector):
+            with _PipeReadinessWaiter(read_end, selectors.EVENT_READ) as waiter:
+                ready = waiter.wait(clock.now + FAR_DEADLINE_SECONDS)
+
+        self.assertFalse(ready)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(_PollFailingSelector.closes, 1)
+        self.assertTrue(waiter._unwatchable)
+
+    def test_poll_failure_never_overruns_the_absolute_deadline(self) -> None:
+        read_end, write_end = os.pipe()
+        self._open_fds += [read_end, write_end]
+        clock, sleeps = self._fake_clock_module()
+        _PollFailingSelector.reset(on_select=lambda: clock.advance(0.004))
+        with patch.object(selectors, "DefaultSelector", _PollFailingSelector):
+            with _PipeReadinessWaiter(read_end, selectors.EVENT_READ) as waiter:
+                deadline = clock.now + 0.010
+                ready = waiter.wait(deadline)
+                overshoot = clock.now - deadline
+
+        self.assertFalse(ready)
+        # 10 ms of budget, 4 ms spent by the failed poll: the fallback sleeps
+        # the 6 ms to the deadline, not the 16 ms left of the slice.
+        self.assertEqual([round(seconds, 6) for seconds in sleeps], [0.006])
+        self.assertLessEqual(round(overshoot, 9), 0.0)
+
+    def test_poll_failure_with_a_spent_deadline_returns_without_sleeping(self) -> None:
+        read_end, write_end = os.pipe()
+        self._open_fds += [read_end, write_end]
+        clock, sleeps = self._fake_clock_module()
+        _PollFailingSelector.reset(on_select=lambda: clock.advance(0.050))
+        with patch.object(selectors, "DefaultSelector", _PollFailingSelector):
+            with _PipeReadinessWaiter(read_end, selectors.EVENT_READ) as waiter:
+                ready = waiter.wait(clock.now + 0.010)
+                # Subsequent waits against a dead deadline stay free too.
+                later = waiter.wait(clock.now - 1.0)
+
+        self.assertEqual((ready, later), (False, False))
+        self.assertEqual(sleeps, [])
+        self.assertEqual(_PollFailingSelector.built, 1)
+        self.assertEqual(_PollFailingSelector.closes, 1)
+
+    def test_interrupted_poll_is_a_plain_wakeup_and_keeps_the_selector(self) -> None:
+        read_end, write_end = os.pipe()
+        self._open_fds += [read_end, write_end]
+        _PollFailingSelector.reset(error=InterruptedError())
+        with patch.object(selectors, "DefaultSelector", _PollFailingSelector), patch.object(
+            compiler_module.time,
+            "sleep",
+        ) as sleep:
+            waiter = _PipeReadinessWaiter(read_end, selectors.EVENT_READ)
+            first = waiter.wait(time.monotonic() + FAR_DEADLINE_SECONDS)
+            second = waiter.wait(time.monotonic() + FAR_DEADLINE_SECONDS)
+            self.assertEqual(_PollFailingSelector.closes, 0)
+            waiter.close()
+
+        self.assertEqual((first, second), (False, False))
+        # EINTR is not a fault: no sleep, the same selector polled again,
+        # released only by close().
+        sleep.assert_not_called()
+        self.assertEqual(_PollFailingSelector.built, 1)
+        self.assertEqual(len(_PollFailingSelector.selects), 2)
+        self.assertEqual(_PollFailingSelector.closes, 1)
+        self.assertFalse(waiter._unwatchable)
+
+
+class UnpollableDescriptorTransportTests(_TransportCase):
+    """A transport helper over a descriptor the selector cannot poll."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._recording()
+        self.client, _stdout_write, _stdin_read = self._client()
+        self.script = _SyscallScript(self.client.process.stdout.fileno())
+        self.script.install(self)
+        self.clock = _FakeClock()
+        self.sleeps: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            self.sleeps.append(seconds)
+            self.clock.advance(seconds)
+
+        for target, replacement in (
+            ("time", SimpleNamespace(monotonic=self.clock.monotonic, sleep=sleep)),
+        ):
+            patcher = patch.object(compiler_module, target, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        selector_patch = patch.object(selectors, "DefaultSelector", _PollFailingSelector)
+        selector_patch.start()
+        self.addCleanup(selector_patch.stop)
+
+    def test_read_line_completes_through_the_bounded_sleep_fallback(self) -> None:
+        _PollFailingSelector.reset()
+        self.script.reads = [BlockingIOError(), BlockingIOError(), b"ok\n"]
+
+        line = self.compiler._serve_builder_read_line(
+            self.client,
+            self.clock.now + FAR_DEADLINE_SECONDS,
+            None,
+            None,
+        )
+
+        self.assertEqual(line, b"ok")
+        self.assertEqual(self.script.reads, [])
+        # First EAGAIN: the poll fails and the wait finishes on the sleep;
+        # second EAGAIN: unwatchable, straight to the sleep. One selector,
+        # released once at the failed poll, nothing left for close().
+        self.assertEqual(
+            [round(seconds, 6) for seconds in self.sleeps],
+            [PRISM_BUILDER_PIPE_WAIT_SLICE_SECONDS] * 2,
+        )
+        self.assertEqual(_PollFailingSelector.built, 1)
+        self.assertEqual(len(_PollFailingSelector.selects), 1)
+        self.assertEqual(_PollFailingSelector.closes, 1)
+        (waiter,) = _RecordingWaiter.instances
+        self.assertEqual(waiter.waits, 2)
+        self.assertEqual(waiter.closed, 1)
+        self.assertIsNone(waiter._selector)
+        self.assertNoFailureAccounted()
+
+    def test_failed_poll_that_spends_the_deadline_times_out_without_sleeping(self) -> None:
+        _PollFailingSelector.reset(on_select=lambda: self.clock.advance(0.050))
+        self.script.reads = [BlockingIOError(), b"never\n"]
+
+        with self.assertRaisesRegex(_ServeBuilderUnavailable, "timed out"):
+            self.compiler._serve_builder_read_line(
+                self.client,
+                self.clock.now + 0.010,
+                None,
+                None,
+            )
+
+        self.assertEqual(self.sleeps, [])
+        self.assertEqual(self.script.reads, [b"never\n"])
+        self.assertEqual(_PollFailingSelector.closes, 1)
+        (waiter,) = _RecordingWaiter.instances
+        self.assertEqual(waiter.waits, 1)
+        self.assertEqual(waiter.closed, 1)
+        self.assertNoFailureAccounted()
 
 
 class ScriptedReadLineTests(_TransportCase):
