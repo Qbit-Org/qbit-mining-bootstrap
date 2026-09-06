@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 from unittest.mock import patch
@@ -115,17 +116,37 @@ class _PipeEnd:
         return self._file_descriptor
 
 
+class _FakeClock:
+    """A monotonic clock the scripted tests advance by hand."""
+
+    def __init__(self, start: float = 1_000.0) -> None:
+        self.now = start
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+    def sleep(self, seconds: float) -> None:
+        self.advance(seconds)
+
+
 class _ScriptedWaiter:
     """Drop-in for _PipeReadinessWaiter that never blocks.
 
-    Records every wait with the deadline slack it was given and answers
-    readiness from a class-level script (True when the script is empty), so
-    the transport loops can be walked through EAGAIN, spurious readiness and
-    exhausted deadlines without sleeping.
+    Records every wait with the deadline slack it was given (against the
+    scripted fake clock) and answers readiness from a class-level script
+    (True when the script is empty). Each wait may advance the fake clock,
+    so a deadline is exhausted by construction rather than by real time
+    passing: the transport loops can be walked through EAGAIN, spurious
+    readiness and timeouts deterministically.
     """
 
     instances: list[_ScriptedWaiter] = []
     readiness: list[bool] = []
+    clock: _FakeClock = _FakeClock()
+    advance_per_wait: float = 0.0
 
     def __init__(self, file_descriptor: int, events: int) -> None:
         self.file_descriptor = file_descriptor
@@ -143,8 +164,10 @@ class _ScriptedWaiter:
 
     def wait(self, deadline: float) -> bool:
         self.waits += 1
-        self.slack.append(deadline - time.monotonic())
-        script = type(self).readiness
+        cls = type(self)
+        self.slack.append(deadline - cls.clock.monotonic())
+        cls.clock.advance(cls.advance_per_wait)
+        script = cls.readiness
         if script:
             return script.pop(0)
         return True
@@ -166,6 +189,35 @@ class _RecordingWaiter(_PipeReadinessWaiter):
     def close(self) -> None:
         self.closed += 1
         super().close()
+
+
+class _GatedWaiter(_RecordingWaiter):
+    """The real waiter, releasing a held-back peer when the transport blocks.
+
+    Tests that need the transport to block by construction hold their peer
+    back until the transport has actually entered a wait: at that moment
+    the pipe is empty (reads) or full (writes) whatever the scheduler did,
+    so a wait-count assertion is not a timing assumption. The release is an
+    in-process event for thread peers and a marker file for child processes.
+    """
+
+    instances: list[_GatedWaiter] = []
+    released = threading.Event()
+    marker: str | None = None
+
+    @classmethod
+    def arm(cls, marker: str | None = None) -> None:
+        cls.instances = []
+        cls.released = threading.Event()
+        cls.marker = marker
+
+    def wait(self, deadline: float) -> bool:
+        gate = type(self)
+        if not gate.released.is_set():
+            if gate.marker is not None:
+                Path(gate.marker).touch()
+            gate.released.set()
+        return super().wait(deadline)
 
 
 class _Do:
@@ -290,12 +342,32 @@ class _TransportCase(unittest.TestCase):
         return client, stdout_write, stdin_read
 
     def _scripted(self) -> None:
+        """Scripted waiter plus a hand-advanced clock for the module's deadlines."""
+        self.clock = _FakeClock()
         _ScriptedWaiter.instances = []
         _ScriptedWaiter.readiness = []
+        _ScriptedWaiter.clock = self.clock
+        _ScriptedWaiter.advance_per_wait = 0.0
+        for target, replacement in (
+            ("_PipeReadinessWaiter", _ScriptedWaiter),
+            (
+                "time",
+                SimpleNamespace(
+                    monotonic=self.clock.monotonic,
+                    sleep=self.clock.sleep,
+                ),
+            ),
+        ):
+            patcher = patch.object(compiler_module, target, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _gated(self, marker: str | None = None) -> None:
+        _GatedWaiter.arm(marker)
         patcher = patch.object(
             compiler_module,
             "_PipeReadinessWaiter",
-            _ScriptedWaiter,
+            _GatedWaiter,
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -452,7 +524,7 @@ class ScriptedReadLineTests(_TransportCase):
         self.client, _stdout_write, _stdin_read = self._client()
         self.script = _SyscallScript(self.client.process.stdout.fileno())
         self.script.install(self)
-        self.deadline = time.monotonic() + FAR_DEADLINE_SECONDS
+        self.deadline = self.clock.now + FAR_DEADLINE_SECONDS
 
     def _read_line(self, cancellation=None, control=None) -> bytes:
         return self.compiler._serve_builder_read_line(
@@ -475,7 +547,7 @@ class ScriptedReadLineTests(_TransportCase):
         self.assertEqual(waiter.file_descriptor, self.script.file_descriptor)
         self.assertEqual(waiter.waits, 1)
         self.assertEqual(waiter.closed, 1)
-        self.assertLessEqual(waiter.slack[0], FAR_DEADLINE_SECONDS)
+        self.assertEqual(waiter.slack, [FAR_DEADLINE_SECONDS])
         self.assertEqual(self.script.read_sizes, [PRISM_BUILDER_PIPE_READ_CHUNK_BYTES] * 2)
         self.assertNoFailureAccounted()
 
@@ -546,19 +618,23 @@ class ScriptedReadLineTests(_TransportCase):
         self.assertEqual(_ScriptedWaiter.instances[0].closed, 1)
 
     def test_deadline_while_blocked_times_out_without_accounting(self) -> None:
-        self.deadline = time.monotonic() + 0.02
-        self.script.reads = [BlockingIOError()] * 100_000
-        _ScriptedWaiter.readiness = [False] * 100_000
+        self.deadline = self.clock.now + 1.0
+        self.script.reads = [BlockingIOError()] * 3
+        _ScriptedWaiter.readiness = [False, False]
+        _ScriptedWaiter.advance_per_wait = 0.6
 
         with self.assertRaisesRegex(_ServeBuilderUnavailable, "timed out"):
             self._read_line()
 
         self.assertNoFailureAccounted()
         (waiter,) = _ScriptedWaiter.instances
-        self.assertGreaterEqual(waiter.waits, 1)
+        # Two waits, each handed the true remaining slack: the second
+        # exhausts the deadline and the loop's own check raises before any
+        # further syscall.
+        self.assertEqual(waiter.waits, 2)
+        self.assertEqual([round(slack, 6) for slack in waiter.slack], [1.0, 0.4])
+        self.assertEqual(len(self.script.reads), 1)
         self.assertEqual(waiter.closed, 1)
-        # Every wait was handed the true remaining slack, never more.
-        self.assertTrue(all(slack <= 0.02 for slack in waiter.slack))
 
     def test_cancellation_while_blocked_raises_and_cleans_up(self) -> None:
         cancellation = _Cancellation()
@@ -607,7 +683,7 @@ class ScriptedReadExactTests(_TransportCase):
         self.client, _stdout_write, _stdin_read = self._client()
         self.script = _SyscallScript(self.client.process.stdout.fileno())
         self.script.install(self)
-        self.deadline = time.monotonic() + FAR_DEADLINE_SECONDS
+        self.deadline = self.clock.now + FAR_DEADLINE_SECONDS
 
     def _read_exact(self, byte_count: int, cancellation=None, control=None) -> bytes:
         return self.compiler._serve_builder_read_exact(
@@ -690,15 +766,20 @@ class ScriptedReadExactTests(_TransportCase):
         self.assertEqual(_ScriptedWaiter.instances[0].waits, 2)
 
     def test_deadline_times_out_without_accounting(self) -> None:
-        self.deadline = time.monotonic() + 0.02
-        self.script.reads = [BlockingIOError()] * 100_000
-        _ScriptedWaiter.readiness = [False] * 100_000
+        self.deadline = self.clock.now + 1.0
+        self.script.reads = [BlockingIOError()] * 3
+        _ScriptedWaiter.readiness = [False, False]
+        _ScriptedWaiter.advance_per_wait = 0.6
 
         with self.assertRaisesRegex(_ServeBuilderUnavailable, "timed out"):
             self._read_exact(1)
 
         self.assertNoFailureAccounted()
-        self.assertEqual(_ScriptedWaiter.instances[0].closed, 1)
+        (waiter,) = _ScriptedWaiter.instances
+        self.assertEqual(waiter.waits, 2)
+        self.assertEqual([round(slack, 6) for slack in waiter.slack], [1.0, 0.4])
+        self.assertEqual(len(self.script.reads), 1)
+        self.assertEqual(waiter.closed, 1)
 
     def test_cancellation_and_supersession_while_blocked(self) -> None:
         cancellation = _Cancellation()
@@ -724,7 +805,7 @@ class ScriptedWriteTests(_TransportCase):
         self.client, _stdout_write, _stdin_read = self._client()
         self.script = _SyscallScript(self.client.process.stdin.fileno())
         self.script.install(self)
-        self.deadline = time.monotonic() + FAR_DEADLINE_SECONDS
+        self.deadline = self.clock.now + FAR_DEADLINE_SECONDS
 
     def _write(self, data: bytes, cancellation=None, control=None) -> int:
         return self.compiler._serve_builder_write(
@@ -789,15 +870,21 @@ class ScriptedWriteTests(_TransportCase):
         self.assertNoFailureAccounted()
 
     def test_deadline_times_out_without_accounting(self) -> None:
-        self.deadline = time.monotonic() + 0.02
-        self.script.writes = [BlockingIOError()] * 100_000
-        _ScriptedWaiter.readiness = [False] * 100_000
+        self.deadline = self.clock.now + 1.0
+        self.script.writes = [BlockingIOError()] * 3
+        _ScriptedWaiter.readiness = [False, False]
+        _ScriptedWaiter.advance_per_wait = 0.6
 
         with self.assertRaisesRegex(_ServeBuilderUnavailable, "timed out"):
             self._write(b"abcd")
 
         self.assertNoFailureAccounted()
-        self.assertEqual(_ScriptedWaiter.instances[0].closed, 1)
+        (waiter,) = _ScriptedWaiter.instances
+        self.assertEqual(waiter.waits, 2)
+        self.assertEqual([round(slack, 6) for slack in waiter.slack], [1.0, 0.4])
+        self.assertEqual(len(self.script.writes), 1)
+        self.assertEqual(self.script.write_log, [])
+        self.assertEqual(waiter.closed, 1)
 
     def test_cancellation_and_supersession_while_blocked(self) -> None:
         cancellation = _Cancellation()
@@ -823,7 +910,7 @@ class ScriptedSpliceTests(_TransportCase):
         self.client, _stdout_write, _stdin_read = self._client()
         self.script = _SyscallScript(self.client.process.stdin.fileno())
         self.script.install(self)
-        self.deadline = time.monotonic() + FAR_DEADLINE_SECONDS
+        self.deadline = self.clock.now + FAR_DEADLINE_SECONDS
         self.serialization = _Serialization()
         self.spool = tempfile.TemporaryFile()
         self.addCleanup(self.spool.close)
@@ -898,16 +985,21 @@ class ScriptedSpliceTests(_TransportCase):
             self._splice(10)
 
     def test_deadline_times_out_without_accounting(self) -> None:
-        self.deadline = time.monotonic() + 0.02
-        self.script.splices = [BlockingIOError()] * 100_000
-        _ScriptedWaiter.readiness = [False] * 100_000
+        self.deadline = self.clock.now + 1.0
+        self.script.splices = [BlockingIOError()] * 3
+        _ScriptedWaiter.readiness = [False, False]
+        _ScriptedWaiter.advance_per_wait = 0.6
 
         with self.assertRaisesRegex(_ServeBuilderUnavailable, "timed out"):
             self._splice(10)
 
         self.assertNoFailureAccounted()
         self.assertEqual(self.serialization.spool_failures, 0)
-        self.assertEqual(_ScriptedWaiter.instances[0].closed, 1)
+        (waiter,) = _ScriptedWaiter.instances
+        self.assertEqual(waiter.waits, 2)
+        self.assertEqual([round(slack, 6) for slack in waiter.slack], [1.0, 0.4])
+        self.assertEqual(len(self.script.splices), 1)
+        self.assertEqual(waiter.closed, 1)
 
     def test_cancellation_while_blocked(self) -> None:
         cancellation = _Cancellation()
@@ -965,12 +1057,18 @@ class RealPipeTransportTests(_TransportCase):
         self.threads.append(thread)
 
     def test_read_exact_streams_a_multi_megabyte_frame_exactly(self) -> None:
+        self._gated()
         payload = os.urandom(4 << 20)
         stdout_write = self.stdout_write
         self._open_fds.remove(stdout_write)
-        self._start(
-            lambda: _bursty_writer(stdout_write, payload, burst=256 << 10, pause=0.005)
-        )
+
+        def writer() -> None:
+            # Nothing is written until the reader has blocked on the empty
+            # pipe, so the first read meets EAGAIN by construction.
+            _GatedWaiter.released.wait(10.0)
+            _bursty_writer(stdout_write, payload, burst=256 << 10, pause=0.0)
+
+        self._start(writer)
 
         received = self.compiler._serve_builder_read_exact(
             self.client,
@@ -986,9 +1084,8 @@ class RealPipeTransportTests(_TransportCase):
             hashlib.sha256(payload).hexdigest(),
         )
         self.assertEqual(bytes(self.client.stdout_buffer), b"")
-        (waiter,) = _RecordingWaiter.instances
-        # The reader outruns the paced writer, so it blocked at least once
-        # and every block ended with a readiness wakeup or the cadence.
+        (waiter,) = _GatedWaiter.instances
+        self.assertTrue(_GatedWaiter.released.is_set())
         self.assertGreaterEqual(waiter.waits, 1)
         self.assertEqual(waiter.closed, 1)
         self.assertNoFailureAccounted()
@@ -1027,12 +1124,18 @@ class RealPipeTransportTests(_TransportCase):
         self.assertTrue(all(w.closed == 1 for w in _RecordingWaiter.instances))
 
     def test_write_streams_to_a_slow_reader_exactly(self) -> None:
+        self._gated()
         payload = os.urandom(2 << 20)
         received = bytearray()
         stdin_read = self.stdin_read
-        self._start(
-            lambda: _slow_reader(stdin_read, received, chunk=32 << 10, pause=0.0005)
-        )
+
+        def reader() -> None:
+            # Nothing is drained until the writer has blocked on the full
+            # pipe, so the transfer meets EAGAIN by construction.
+            _GatedWaiter.released.wait(10.0)
+            _slow_reader(stdin_read, received, chunk=32 << 10, pause=0.0)
+
+        self._start(reader)
 
         written = self.compiler._serve_builder_write(
             self.client, payload, self.deadline, None, None
@@ -1042,7 +1145,8 @@ class RealPipeTransportTests(_TransportCase):
 
         self.assertEqual(written, len(payload))
         self.assertEqual(bytes(received), payload)
-        (waiter,) = _RecordingWaiter.instances
+        (waiter,) = _GatedWaiter.instances
+        self.assertTrue(_GatedWaiter.released.is_set())
         self.assertGreaterEqual(waiter.waits, 1)
         self.assertEqual(waiter.closed, 1)
         self.assertNoFailureAccounted()
@@ -1057,9 +1161,13 @@ class RealPipeTransportTests(_TransportCase):
         serialization = _Serialization()
         received = bytearray()
         stdin_read = self.stdin_read
-        self._start(
-            lambda: _slow_reader(stdin_read, received, chunk=32 << 10, pause=0.0005)
-        )
+        self._gated()
+
+        def reader() -> None:
+            _GatedWaiter.released.wait(10.0)
+            _slow_reader(stdin_read, received, chunk=32 << 10, pause=0.0)
+
+        self._start(reader)
 
         moved = self.compiler._serve_builder_splice_spool(
             self.client,
@@ -1076,7 +1184,8 @@ class RealPipeTransportTests(_TransportCase):
         self.assertEqual(moved, len(payload))
         self.assertEqual(bytes(received), payload)
         self.assertEqual(serialization.spool_failures, 0)
-        (waiter,) = _RecordingWaiter.instances
+        (waiter,) = _GatedWaiter.instances
+        self.assertTrue(_GatedWaiter.released.is_set())
         self.assertGreaterEqual(waiter.waits, 1)
         self.assertEqual(waiter.closed, 1)
         self.assertNoFailureAccounted()
@@ -1091,8 +1200,9 @@ class RealPipeTransportTests(_TransportCase):
         elapsed = time.monotonic() - started
         self.assertGreaterEqual(elapsed, 0.05)
         self.assertLess(elapsed, 5.0)
+        # The wait path itself is pinned by the scripted timeout tests; a
+        # real deadline cannot guarantee the loop reached a wait first.
         (waiter,) = _RecordingWaiter.instances
-        self.assertGreaterEqual(waiter.waits, 1)
         self.assertEqual(waiter.closed, 1)
         self.assertNoFailureAccounted()
 
@@ -1176,18 +1286,24 @@ class RealPipeTransportTests(_TransportCase):
         self.assertNoFailureAccounted()
 
 
-SLOW_READER_BUILDER_COMMAND = [
+# Echoes its stdin payload like the echo builder, but reads nothing until
+# the marker file named by PRISM_TEST_READER_GATE exists: the coordinator's
+# writer therefore fills the pipe and blocks by construction, and the gated
+# waiter creates the marker on that first wait.
+GATED_READER_BUILDER_COMMAND = [
     sys.executable,
     "-c",
     (
-        "import json, sys, time\n"
+        "import json, os, sys, time\n"
+        "marker = os.environ.get('PRISM_TEST_READER_GATE')\n"
+        "while marker and not os.path.exists(marker):\n"
+        "    time.sleep(0.001)\n"
         "data = bytearray()\n"
         "while True:\n"
-        "    chunk = sys.stdin.buffer.read(4096)\n"
+        "    chunk = sys.stdin.buffer.read(65536)\n"
         "    if not chunk:\n"
         "        break\n"
         "    data += chunk\n"
-        "    time.sleep(0.0003)\n"
         "json.dump({'received': json.loads(bytes(data)), 'transport': 'one-shot'},"
         " sys.stdout)\n"
     ),
@@ -1220,12 +1336,24 @@ class OneShotWriterTests(unittest.TestCase):
             shares,
         )
 
-    def _build(self, server, shares, *, serialization=None, command=None):
-        _RecordingWaiter.instances = []
-        with patch.dict(os.environ, {"PRISM_BUILDER_SERVE": "0"}), patch(
+    def _gate(self) -> str:
+        directory = tempfile.mkdtemp(prefix="prism-reader-gate-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, ignore_errors=True))
+        return os.path.join(directory, "go")
+
+    def _build(self, server, shares, *, serialization=None, command=None, gate=None):
+        environment = {"PRISM_BUILDER_SERVE": "0"}
+        if gate is not None:
+            environment["PRISM_TEST_READER_GATE"] = gate
+            _GatedWaiter.arm(gate)
+            waiter_class: type = _GatedWaiter
+        else:
+            _RecordingWaiter.instances = []
+            waiter_class = _RecordingWaiter
+        with patch.dict(os.environ, environment), patch(
             "lab.prism.prism_coordinator.prism_tool_command",
-            return_value=list(command or SLOW_READER_BUILDER_COMMAND),
-        ), patch.object(compiler_module, "_PipeReadinessWaiter", _RecordingWaiter):
+            return_value=list(command or GATED_READER_BUILDER_COMMAND),
+        ), patch.object(compiler_module, "_PipeReadinessWaiter", waiter_class):
             return server.build_audit_bundle(
                 shares=shares,
                 found_block={
@@ -1241,20 +1369,23 @@ class OneShotWriterTests(unittest.TestCase):
                 share_serialization=serialization,
             )
 
-    def test_buffered_writer_streams_to_a_slow_child_exactly(self) -> None:
+    def test_buffered_writer_streams_to_a_gated_child_exactly(self) -> None:
         server = self._coordinator()
+        server.bundle_build_timeout_seconds = 30.0
+        # Well over one pipe capacity, so the fragment writer must block
+        # before the child is released to read anything.
         shares = [spool_share(seq) for seq in range(1, 6_001)]
+        gate = self._gate()
 
-        result = self._build(server, shares)
+        result = self._build(server, shares, gate=gate)
 
         self.assertEqual(result["transport"], "one-shot")
         self.assertEqual(len(result["received"]["compact_shares"]), 6_000)
         self.assertEqual(result["received"]["found_block"]["block_height"], 10)
-        # Whether the pipe ever filled depends on the child's pace against
-        # the fragment writer's, so the wait count is not asserted here; the
-        # stalled-child test below pins the blocking path deterministically.
-        (waiter,) = _RecordingWaiter.instances
+        self.assertTrue(os.path.exists(gate))
+        (waiter,) = _GatedWaiter.instances
         self.assertEqual(waiter._events, selectors.EVENT_WRITE)
+        self.assertGreaterEqual(waiter.waits, 1)
         self.assertEqual(waiter.closed, 1)
         with server._job_build_scheduler_lock:
             counts = dict(server.job_build_worker_counts)
@@ -1262,17 +1393,20 @@ class OneShotWriterTests(unittest.TestCase):
         self.assertEqual(counts["terminations"], 0)
 
     @unittest.skipUnless(hasattr(os, "splice"), "os.splice is Linux-only")
-    def test_spool_splice_streams_to_a_slow_child_exactly(self) -> None:
+    def test_spool_splice_streams_to_a_gated_child_exactly(self) -> None:
         server = self._coordinator()
-        shares = [spool_share(seq) for seq in range(1, 20_001)]
+        server.bundle_build_timeout_seconds = 30.0
+        shares = [spool_share(seq) for seq in range(1, 6_001)]
         serialization = self._serialization(server, shares)
+        gate = self._gate()
 
-        result = self._build(server, shares, serialization=serialization)
+        result = self._build(server, shares, serialization=serialization, gate=gate)
 
         self.assertEqual(result["transport"], "one-shot")
-        self.assertEqual(len(result["received"]["compact_shares"]), 20_000)
+        self.assertEqual(len(result["received"]["compact_shares"]), 6_000)
         self.assertFalse(serialization._spool_failed)
-        (waiter,) = _RecordingWaiter.instances
+        self.assertTrue(os.path.exists(gate))
+        (waiter,) = _GatedWaiter.instances
         self.assertGreaterEqual(waiter.waits, 1)
         self.assertEqual(waiter.closed, 1)
 
@@ -1359,11 +1493,11 @@ class DaemonRoundTripTests(unittest.TestCase):
             counts = dict(server.serve_builder_counts)
         self.assertEqual(counts["requests"], 2)
         self.assertEqual(counts["fallbacks"], 0)
+        # Every transport operation registered and released its waiter; how
+        # often the fake daemon's parse outran the coordinator is scheduling
+        # and is not asserted.
         self.assertTrue(_RecordingWaiter.instances)
         self.assertTrue(all(w.closed == 1 for w in _RecordingWaiter.instances))
-        # The multi-megabyte upload outran the fake daemon's line reader at
-        # least once; the hit request never carried the window.
-        self.assertGreaterEqual(sum(w.waits for w in _RecordingWaiter.instances), 1)
 
 
 if __name__ == "__main__":
