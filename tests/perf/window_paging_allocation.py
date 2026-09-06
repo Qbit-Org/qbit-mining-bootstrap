@@ -34,7 +34,11 @@ envelope line arrived) and ``response_read`` (the raw canonical-items
 section), the daemon's own ``metrics`` (JSON parse, fold/advance, canonical
 serialization -- Rust processing measured inside the process, so transport
 and processing are separated rather than inferred), the daemon's resident
-set after the phase, and its lifetime peak (``VmHWM``). Every digest the
+set after the phase, and its lifetime peak (``VmHWM``). The derived
+``residual`` column is ``response_wait`` minus the daemon's three timers; the
+client's wall interval and the daemon's internal timers are independent
+intervals on either side of a pipe, so it is an approximation of scheduling
+and envelope handling, not a measured transport term. Every digest the
 daemon returns is checked against its own items bytes, the coordinator's
 mirror surgery (drop prefix, append suffix) is replayed and re-hashed, and
 unless ``--skip-oracle`` is given the shipped Python fold
@@ -44,7 +48,10 @@ oracle for every digest.
 Bounding: the daemon runs under ``RLIMIT_AS`` (``--daemon-memory-limit-mb``,
 default 6144), so a quadratic binary aborts on allocation failure instead of
 taking the host down; a size is skipped, and the skip recorded, when
-``MemAvailable`` is below the limit plus ``--memory-margin-mb``. The
+``MemAvailable`` is below the limit plus ``--memory-margin-mb``; and every
+exchange -- the handshake included -- runs under a wall-clock deadline
+(``--exchange-timeout``) after which the daemon is killed, reaped and the
+phase recorded as a failure, so a stalled daemon cannot hang the run. The
 known-quadratic baseline should only be run at sizes whose expected footprint
 fits the limit (52k and 105k here); the 210k/400k baseline numbers are on
 record in ``window_pipeline_gil_scaling.md`` section 9 and are not repeated.
@@ -111,6 +118,8 @@ DEFAULT_MINERS = 200
 DEFAULT_SMALL_DELTA = 16
 DEFAULT_LARGE_DELTA = 2 * DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE + 19
 WRITE_CHUNK = 1 << 20
+DEFAULT_EXCHANGE_TIMEOUT = 600.0
+DEFAULT_SHUTDOWN_TIMEOUT = 30.0
 PHASES = ("full", "advance_small", "advance_large", "recenter", "recenter_advance")
 
 
@@ -242,13 +251,39 @@ class Exchange:
     error: str | None = None
 
 
-class Daemon:
-    """One ``--serve`` daemon over blocking pipes, memory-bounded."""
+class DaemonTimeout(RuntimeError):
+    """An exchange (or the handshake) exceeded its wall-clock deadline."""
 
-    def __init__(self, binary: Path, *, memory_limit_mb: int | None, stderr_path: Path) -> None:
+
+class Daemon:
+    """One ``--serve`` daemon over blocking pipes, memory- and time-bounded.
+
+    Every exchange, the handshake included, runs under ``exchange_timeout``:
+    a watchdog kills the daemon when it expires, which unblocks the pending
+    pipe read (EOF) and the pending write (EPIPE), and the exchange is
+    reported as a timeout failure. ``close`` is idempotent and always reaps
+    the child and closes every pipe and the stderr capture; the constructor
+    calls it before re-raising if the handshake fails.
+    """
+
+    def __init__(
+        self,
+        binary: Path,
+        *,
+        memory_limit_mb: int | None,
+        stderr_path: Path,
+        exchange_timeout: float = DEFAULT_EXCHANGE_TIMEOUT,
+        shutdown_timeout: float = DEFAULT_SHUTDOWN_TIMEOUT,
+    ) -> None:
         self.binary = binary
         self.stderr_path = stderr_path
+        self.exchange_timeout = exchange_timeout
+        self.shutdown_timeout = shutdown_timeout
         self.exit_code: int | None = None
+        self.timed_out: str | None = None
+        self.status_at_kill: dict[str, float] = {}
+        self._outcome: dict[str, Any] | None = None
+        self._lock = threading.Lock()
         limit_bytes = None if not memory_limit_mb else memory_limit_mb * 1024 * 1024
 
         def preexec() -> None:
@@ -256,33 +291,49 @@ class Daemon:
                 resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
 
         self._stderr = open(stderr_path, "wb")
-        self.process = subprocess.Popen(
-            [
-                str(binary),
-                "--serve",
-                "--signing-key-seed-hex",
-                "42" * 32,
-                "--ledger-signing-key-seed-hex",
-                "43" * 32,
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=self._stderr,
-            preexec_fn=preexec,
-        )
-        assert self.process.stdout is not None
-        handshake_line = self.process.stdout.readline()
-        if not handshake_line:
-            raise RuntimeError(f"{binary} produced no handshake (see {stderr_path})")
-        handshake = json.loads(handshake_line)
-        expected = {
-            "event": "handshake",
-            "tool": DAEMON_BINARY,
-            "protocol": PRISM_SERVE_BUILDER_PROTOCOL_VERSION,
-        }
-        announced = {key: handshake.get(key) for key in expected}
-        if announced != expected:
-            raise RuntimeError(f"daemon announced {announced!r}, expected {expected!r}")
+        try:
+            self.process = subprocess.Popen(
+                [
+                    str(binary),
+                    "--serve",
+                    "--signing-key-seed-hex",
+                    "42" * 32,
+                    "--ledger-signing-key-seed-hex",
+                    "43" * 32,
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=self._stderr,
+                preexec_fn=preexec,
+            )
+        except Exception:
+            self._stderr.close()
+            raise
+        try:
+            assert self.process.stdout is not None
+            with self._watchdog("handshake"):
+                handshake_line = self.process.stdout.readline()
+            if self.timed_out:
+                raise DaemonTimeout(
+                    f"{binary} sent no handshake within {exchange_timeout:g}s; killed"
+                )
+            if not handshake_line:
+                raise RuntimeError(f"{binary} produced no handshake (see {stderr_path})")
+            handshake = json.loads(handshake_line)
+            expected = {
+                "event": "handshake",
+                "tool": DAEMON_BINARY,
+                "protocol": PRISM_SERVE_BUILDER_PROTOCOL_VERSION,
+            }
+            announced = {key: handshake.get(key) for key in expected}
+            if announced != expected:
+                raise RuntimeError(f"daemon announced {announced!r}, expected {expected!r}")
+        except BaseException as error:
+            outcome = self.close()
+            if isinstance(error, Exception):
+                # Let a caller (or a test) see how the child was reaped.
+                error.daemon_outcome = outcome  # type: ignore[attr-defined]
+            raise
 
     @property
     def pid(self) -> int:
@@ -294,10 +345,41 @@ class Daemon:
     def status_mb(self) -> dict[str, float]:
         return read_proc_status_mb(self.process.pid)
 
-    def exchange(self, request: bytes) -> Exchange:
-        """Write one request line, read the envelope and its raw section."""
+    def _kill_on_timeout(self, label: str) -> None:
+        with self._lock:
+            if self.timed_out is None:
+                self.timed_out = label
+                # The high-water mark is lost once the child is reaped, so
+                # sample it before the kill.
+                self.status_at_kill = self.status_mb()
+        if self.process.poll() is None:
+            self.process.kill()
+
+    class _Watchdog:
+        def __init__(self, daemon: Daemon, label: str) -> None:
+            self.timer = threading.Timer(daemon.exchange_timeout, daemon._kill_on_timeout, (label,))
+            self.timer.daemon = True
+
+        def __enter__(self) -> Daemon._Watchdog:
+            self.timer.start()
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            self.timer.cancel()
+
+    def _watchdog(self, label: str) -> Daemon._Watchdog:
+        return Daemon._Watchdog(self, label)
+
+    def exchange(self, request: bytes, label: str = "exchange") -> Exchange:
+        """Write one request line, read the envelope and its raw section.
+
+        Bounded by ``exchange_timeout`` end to end; a timeout kills the daemon
+        and is reported in ``Exchange.error``.
+        """
         process = self.process
         assert process.stdin is not None and process.stdout is not None
+        if self.timed_out or process.poll() is not None:
+            return Exchange(len(request), 0.0, 0.0, 0.0, None, None, error="daemon is not running")
         stdin_fd = process.stdin.fileno()
         stdout = process.stdout
         write_done: list[float] = []
@@ -314,67 +396,71 @@ class Daemon:
             finally:
                 write_done.append(time.perf_counter())
 
-        started = time.perf_counter()
-        thread = threading.Thread(target=writer, name="request-writer", daemon=True)
-        thread.start()
-        envelope_line = stdout.readline()
-        envelope_at = time.perf_counter()
-        thread.join()
-        write_seconds = write_done[0] - started
-        wait_seconds = envelope_at - write_done[0]
-        if not envelope_line:
-            return Exchange(
-                len(request),
-                write_seconds,
-                wait_seconds,
-                0.0,
-                None,
-                None,
-                error=(
-                    "daemon closed its stdout without an envelope"
-                    + (f"; write: {write_error[0]}" if write_error else "")
-                ),
-            )
-        envelope = json.loads(envelope_line)
-        payload: bytes | None = None
-        read_seconds = 0.0
-        if envelope.get("ok") is True:
-            length_key = "window_items_len" if "window_items_len" in envelope else "appended_items_len"
-            length = int(envelope[length_key])
-            chunks: list[bytes] = []
-            remaining = length
-            while remaining > 0:
-                chunk = stdout.read(min(remaining, 1 << 22))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            newline = stdout.read(1)
-            read_seconds = time.perf_counter() - envelope_at
-            payload = b"".join(chunks)
-            if remaining or newline != b"\n":
-                return Exchange(
-                    len(request),
-                    write_seconds,
-                    wait_seconds,
-                    read_seconds,
-                    envelope,
-                    payload,
-                    error=f"short raw section: {len(payload)} of {length} bytes",
+        def timeout_error(detail: str) -> str:
+            return f"{label} exceeded {self.exchange_timeout:g}s; daemon killed ({detail})"
+
+        with self._watchdog(label):
+            started = time.perf_counter()
+            thread = threading.Thread(target=writer, name="request-writer", daemon=True)
+            thread.start()
+            envelope_line = stdout.readline()
+            envelope_at = time.perf_counter()
+            # The write either finished, failed with EPIPE once the daemon
+            # died, or is stuck behind a daemon that stopped reading, which
+            # the watchdog kill also unblocks; the join is bounded regardless.
+            thread.join(timeout=max(1.0, self.exchange_timeout))
+            if thread.is_alive():
+                write_done.append(time.perf_counter())
+                write_error.append("request writer still blocked after the exchange")
+            write_seconds = write_done[0] - started
+            wait_seconds = envelope_at - write_done[0]
+            if not envelope_line:
+                detail = "closed stdout without an envelope" + (
+                    f"; write: {write_error[0]}" if write_error else ""
                 )
-        return Exchange(len(request), write_seconds, wait_seconds, read_seconds, envelope, payload)
+                error = timeout_error(detail) if self.timed_out else f"daemon {detail}"
+                return Exchange(len(request), write_seconds, wait_seconds, 0.0, None, None, error=error)
+            envelope = json.loads(envelope_line)
+            payload: bytes | None = None
+            read_seconds = 0.0
+            if envelope.get("ok") is True:
+                length_key = "window_items_len" if "window_items_len" in envelope else "appended_items_len"
+                length = int(envelope[length_key])
+                chunks: list[bytes] = []
+                remaining = length
+                while remaining > 0:
+                    chunk = stdout.read(min(remaining, 1 << 22))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                newline = stdout.read(1)
+                read_seconds = time.perf_counter() - envelope_at
+                payload = b"".join(chunks)
+                if remaining or newline != b"\n":
+                    detail = f"short raw section: {len(payload)} of {length} bytes"
+                    error = timeout_error(detail) if self.timed_out else detail
+                    return Exchange(len(request), write_seconds, wait_seconds, read_seconds, envelope, payload, error=error)
+            return Exchange(len(request), write_seconds, wait_seconds, read_seconds, envelope, payload)
 
     def close(self) -> dict[str, Any]:
-        """Close stdin, wait, and report how the daemon ended."""
-        final_status = self.status_mb()
+        """Reap the daemon and close every handle; idempotent.
+
+        Closing stdin asks a healthy daemon to exit; one that has not exited
+        within ``shutdown_timeout`` is killed. ``VmHWM`` is read before the
+        child is reaped (it is gone from ``/proc`` afterwards).
+        """
+        if self._outcome is not None:
+            return self._outcome
         process = self.process
+        final_status = self.status_mb() if process.poll() is None else {}
         if process.stdin is not None:
             try:
                 process.stdin.close()
             except OSError:
                 pass
         try:
-            self.exit_code = process.wait(timeout=60.0)
+            self.exit_code = process.wait(timeout=self.shutdown_timeout)
         except subprocess.TimeoutExpired:
             process.kill()
             self.exit_code = process.wait(timeout=10.0)
@@ -386,13 +472,18 @@ class Daemon:
             stderr_tail = self.stderr_path.read_text(errors="replace")[-2000:]
         except OSError:
             pass
-        return {
+        peak = final_status.get("VmHWM", self.status_at_kill.get("VmHWM"))
+        peak_vsize = final_status.get("VmPeak", self.status_at_kill.get("VmPeak"))
+        self._outcome = {
+            "pid": process.pid,
             "exit_code": self.exit_code,
             "signal": -self.exit_code if self.exit_code is not None and self.exit_code < 0 else None,
-            "peak_rss_mb": final_status.get("VmHWM"),
-            "peak_vsize_mb": final_status.get("VmPeak"),
+            "timed_out": self.timed_out,
+            "peak_rss_mb": peak,
+            "peak_vsize_mb": peak_vsize,
             "stderr_tail": stderr_tail,
         }
+        return self._outcome
 
 
 # ---------------------------------------------------------------------------
@@ -591,7 +682,20 @@ class PhaseResult:
     error: str | None = None
 
     @property
-    def unattributed_wait_seconds(self) -> float:
+    def residual_wait_seconds(self) -> float | None:
+        """``response_wait`` minus the daemon's own timers -- an approximation.
+
+        The client's wall interval (from the last request byte accepted to
+        the envelope line received) and the daemon's ``Instant`` timers are
+        independent intervals measured on either side of a pipe: the daemon
+        may still be reading and parsing while the client clock starts, and
+        the envelope write and scheduling are on neither timer. So this is
+        roughly scheduling plus envelope handling, not a measured transport
+        term, and it is clamped at zero. None when the daemon reported no
+        metrics.
+        """
+        if not self.daemon_metrics:
+            return None
         return max(0.0, self.response_wait_seconds - sum(self.daemon_metrics.values()))
 
 
@@ -609,6 +713,7 @@ class RunResult:
     max_sampled_rss_mb: float
     rss_timeline: list[tuple[float, float]]
     skipped: str | None = None
+    error: str | None = None
 
 
 def run_variant(
@@ -620,6 +725,7 @@ def run_variant(
     memory_limit_mb: int | None,
     memory_margin_mb: int,
     sample_interval: float,
+    exchange_timeout: float,
     stderr_dir: Path,
     log: Callable[[str], None],
 ) -> RunResult:
@@ -638,16 +744,27 @@ def run_variant(
         )
 
     stderr_path = stderr_dir / f"{label}-{fixture.size}.stderr"
-    daemon = Daemon(binary, memory_limit_mb=memory_limit_mb, stderr_path=stderr_path)
+    try:
+        daemon = Daemon(
+            binary,
+            memory_limit_mb=memory_limit_mb,
+            stderr_path=stderr_path,
+            exchange_timeout=exchange_timeout,
+        )
+    except Exception as exc:  # noqa: BLE001 - reported per run, not raised
+        error = f"daemon failed to start: {type(exc).__name__}: {exc}"
+        log(f"    {label} @ {fixture.size}: {error}")
+        return RunResult(
+            label, str(binary), fixture.size, fixture.page_size, available, load,
+            memory_limit_mb, [], {}, 0.0, [], error=error,
+        )
     phases: list[PhaseResult] = []
-    mirror: bytes | None = None
     expected = (oracle or {}).get("digests", {})
 
     def run_phase(name: str, request: bytes, records_sent: int, *, base_items: bytes | None) -> tuple[PhaseResult, bytes | None]:
-        nonlocal mirror
         log(f"    {label} @ {fixture.size}: {name} ({records_sent} records, {len(request) / 2**20:.1f} MiB request)")
-        exchange = daemon.exchange(request)
-        status_after = daemon.status_mb()
+        exchange = daemon.exchange(request, label=name)
+        status_after = daemon.status_mb() if daemon.alive() else {}
         result = PhaseResult(
             phase=name,
             records_sent=records_sent,
@@ -661,7 +778,7 @@ def run_variant(
         )
         envelope = exchange.envelope
         if envelope is None:
-            result.status = "no_response"
+            result.status = "timeout" if daemon.timed_out else "no_response"
             return result, None
         metrics = envelope.get("metrics")
         if isinstance(metrics, dict):
@@ -674,6 +791,9 @@ def run_variant(
             else:
                 result.status = "error"
             result.error = str(envelope.get("error"))
+            return result, None
+        if exchange.error:
+            result.status = "timeout" if daemon.timed_out else "short_response"
             return result, None
         result.status = "prepared"
         result.digest = str(envelope["share_snapshot_sha256"])
@@ -693,55 +813,64 @@ def run_variant(
             result.oracle_match = expected[name] == result.digest
         return result, items
 
+    run_error: str | None = None
+    max_sampled = 0.0
+    timeline: list[tuple[float, float]] = []
     try:
         with RssSampler(daemon.pid, sample_interval) as sampler:
-            full, items = run_phase(
-                "full",
-                full_request(fixture.records_json, anchor=fixture.anchor, weight=fixture.weight, page_size=fixture.page_size),
-                fixture.size,
-                base_items=None,
-            )
-            phases.append(full)
-            if full.status == "prepared" and items is not None and daemon.alive():
-                small, items_small = run_phase(
-                    "advance_small",
-                    advance_request([r.to_prism_json() for r in fixture.small_delta], anchor=fixture.small_anchor, base_digest=full.digest or ""),
-                    len(fixture.small_delta),
-                    base_items=items,
-                )
-                phases.append(small)
-                if small.status == "prepared" and items_small is not None and daemon.alive():
-                    large, _ = run_phase(
-                        "advance_large",
-                        advance_request([r.to_prism_json() for r in fixture.large_delta], anchor=fixture.large_anchor, base_digest=small.digest or ""),
-                        len(fixture.large_delta),
-                        base_items=items_small,
-                    )
-                    phases.append(large)
-            if daemon.alive() and full.status == "prepared":
-                recenter, items_recenter = run_phase(
-                    "recenter",
-                    full_request(fixture.records_json, anchor=fixture.anchor, weight=fixture.recenter_weight, page_size=fixture.page_size),
+            try:
+                full, items = run_phase(
+                    "full",
+                    full_request(fixture.records_json, anchor=fixture.anchor, weight=fixture.weight, page_size=fixture.page_size),
                     fixture.size,
                     base_items=None,
                 )
-                phases.append(recenter)
-                if recenter.status == "prepared" and items_recenter is not None and daemon.alive():
-                    recenter_advance, _ = run_phase(
-                        "recenter_advance",
-                        advance_request([r.to_prism_json() for r in fixture.recenter_delta], anchor=fixture.recenter_delta_anchor, base_digest=recenter.digest or ""),
-                        len(fixture.recenter_delta),
-                        base_items=items_recenter,
+                phases.append(full)
+                if full.status == "prepared" and items is not None and daemon.alive():
+                    small, items_small = run_phase(
+                        "advance_small",
+                        advance_request([r.to_prism_json() for r in fixture.small_delta], anchor=fixture.small_anchor, base_digest=full.digest or ""),
+                        len(fixture.small_delta),
+                        base_items=items,
                     )
-                    phases.append(recenter_advance)
-            outcome = daemon.close()
-            max_sampled = sampler.max_sampled_mb
-            timeline = sampler.samples
+                    phases.append(small)
+                    if small.status == "prepared" and items_small is not None and daemon.alive():
+                        large, _ = run_phase(
+                            "advance_large",
+                            advance_request([r.to_prism_json() for r in fixture.large_delta], anchor=fixture.large_anchor, base_digest=small.digest or ""),
+                            len(fixture.large_delta),
+                            base_items=items_small,
+                        )
+                        phases.append(large)
+                if daemon.alive() and full.status == "prepared":
+                    recenter, items_recenter = run_phase(
+                        "recenter",
+                        full_request(fixture.records_json, anchor=fixture.anchor, weight=fixture.recenter_weight, page_size=fixture.page_size),
+                        fixture.size,
+                        base_items=None,
+                    )
+                    phases.append(recenter)
+                    if recenter.status == "prepared" and items_recenter is not None and daemon.alive():
+                        recenter_advance, _ = run_phase(
+                            "recenter_advance",
+                            advance_request([r.to_prism_json() for r in fixture.recenter_delta], anchor=fixture.recenter_delta_anchor, base_digest=recenter.digest or ""),
+                            len(fixture.recenter_delta),
+                            base_items=items_recenter,
+                        )
+                        phases.append(recenter_advance)
+            except Exception as exc:  # noqa: BLE001 - reported per run, not raised
+                run_error = f"{type(exc).__name__}: {exc}"
+                log(f"    {label} @ {fixture.size}: aborted: {run_error}")
+            finally:
+                max_sampled = sampler.max_sampled_mb
+                timeline = sampler.samples
     finally:
-        if daemon.alive():
-            daemon.process.kill()
+        # Always reaps the child and closes every pipe and the stderr
+        # capture, whatever happened above.
+        outcome = daemon.close()
     if outcome.get("peak_rss_mb") is None:
-        outcome["peak_rss_mb"] = max((phase.hwm_after_mb or 0.0) for phase in phases) if phases else None
+        candidates = [phase.hwm_after_mb or 0.0 for phase in phases] + [max_sampled]
+        outcome["peak_rss_mb"] = max(candidates) if any(candidates) else None
     return RunResult(
         label,
         str(binary),
@@ -754,6 +883,7 @@ def run_variant(
         outcome,
         max_sampled,
         timeline,
+        error=run_error,
     )
 
 
@@ -774,12 +904,12 @@ def _flag(value: bool | None) -> str:
 
 def render_runs(runs: list[RunResult]) -> str:
     lines = [
-        "| binary | shares | phase | records | request MiB | write s | wait s | read s | parse s | fold s | serialize s | unattributed s | RSS after MB | status | self-check | oracle |",
+        "| binary | shares | phase | records | request MiB | write s | wait s | read s | parse s | fold s | serialize s | residual s (approx.) | RSS after MB | status | self-check | oracle |",
         "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|",
     ]
     for run in runs:
-        if run.skipped:
-            lines.append(f"| {run.variant} | {run.size:,} | skipped | | | | | | | | | | | {run.skipped} | | |")
+        if run.skipped or (run.error and not run.phases):
+            lines.append(f"| {run.variant} | {run.size:,} | {'skipped' if run.skipped else 'failed'} | | | | | | | | | | | {run.skipped or run.error} | | |")
             continue
         for phase in run.phases:
             metrics = phase.daemon_metrics
@@ -790,7 +920,7 @@ def render_runs(runs: list[RunResult]) -> str:
                 f" {_fmt(metrics.get('input_deserialization_seconds'), 3)} |"
                 f" {_fmt(metrics.get('fold_seconds'), 3)} |"
                 f" {_fmt(metrics.get('output_serialization_seconds'), 3)} |"
-                f" {_fmt(phase.unattributed_wait_seconds, 3)} |"
+                f" {_fmt(phase.residual_wait_seconds, 3)} |"
                 f" {_fmt(phase.rss_after_mb, 0)} | {phase.status}"
                 f"{' (' + phase.error + ')' if phase.error else ''} |"
                 f" {_flag(phase.self_consistent)} | {_flag(phase.oracle_match)} |"
@@ -804,14 +934,16 @@ def render_summary(runs: list[RunResult]) -> str:
         "|---|---:|---:|---:|---:|---:|---:|---|---:|",
     ]
     for run in runs:
-        if run.skipped:
-            lines.append(f"| {run.variant} | {run.size:,} | skipped: {run.skipped} | | | | | | {_fmt(run.mem_available_before_mb, 0)} |")
+        if run.skipped or (run.error and not run.phases):
+            lines.append(f"| {run.variant} | {run.size:,} | {'skipped' if run.skipped else 'failed'}: {run.skipped or run.error} | | | | | | {_fmt(run.mem_available_before_mb, 0)} |")
             continue
         full = next((phase for phase in run.phases if phase.phase == "full"), None)
         peak = run.outcome.get("peak_rss_mb")
         exit_code = run.outcome.get("exit_code")
         signal = run.outcome.get("signal")
         ended = "clean (0)" if exit_code == 0 else (f"signal {signal}" if signal else f"exit {exit_code}")
+        if run.outcome.get("timed_out"):
+            ended += f", killed on {run.outcome['timed_out']} timeout"
         lines.append(
             f"| {run.variant} | {run.size:,} | {_fmt(peak, 0)} | {_fmt(run.outcome.get('peak_vsize_mb'), 0)} |"
             f" {_fmt(None if peak is None else peak / (run.size / 1000.0), 2)} |"
@@ -862,6 +994,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--daemon-memory-limit-mb", type=int, default=6144, help="RLIMIT_AS for every daemon in MB; 0 disables (default 6144)")
     parser.add_argument("--memory-margin-mb", type=int, default=2048, help="MemAvailable headroom required above the limit before a run (default 2048)")
     parser.add_argument("--sample-interval", type=float, default=0.02, help="RSS sampling interval in seconds (default 0.02)")
+    parser.add_argument("--exchange-timeout", type=float, default=DEFAULT_EXCHANGE_TIMEOUT, help=f"wall-clock deadline per exchange, handshake included; the daemon is killed and the phase recorded as a timeout (default {DEFAULT_EXCHANGE_TIMEOUT:g})")
     parser.add_argument("--skip-oracle", action="store_true", help="do not run the Python fold as a digest oracle")
     parser.add_argument("--stderr-dir", default=None, help="directory for daemon stderr captures (default: a temporary directory)")
     parser.add_argument("--json", default=None, help="write structured results to this file")
@@ -895,7 +1028,7 @@ def main(argv: list[str] | None = None) -> int:
     for label, identity in binaries.items():
         print(f"- {label}: {identity['path']} (sha256 {identity['sha256'][:16]}..., {identity['mtime']})")
     print(f"- page_size: {args.page_size}; miners: {args.miners}; deltas: {args.small_delta} / {args.large_delta}")
-    print(f"- daemon RLIMIT_AS: {memory_limit or 'none'} MB; required MemAvailable: {(memory_limit or 0) + args.memory_margin_mb} MB")
+    print(f"- daemon RLIMIT_AS: {memory_limit or 'none'} MB; required MemAvailable: {(memory_limit or 0) + args.memory_margin_mb} MB; exchange timeout: {args.exchange_timeout:g} s")
     print()
 
     plan: list[tuple[str, Path, int]] = []
@@ -935,12 +1068,13 @@ def main(argv: list[str] | None = None) -> int:
                 memory_limit_mb=memory_limit,
                 memory_margin_mb=args.memory_margin_mb,
                 sample_interval=args.sample_interval,
+                exchange_timeout=args.exchange_timeout,
                 stderr_dir=stderr_dir,
                 log=log,
             )
         )
         last = runs[-1]
-        if not last.skipped:
+        if not last.skipped and last.phases:
             log(
                 f"    -> peak RSS {_fmt(last.outcome.get('peak_rss_mb'), 0)} MB, exit {last.outcome.get('exit_code')},"
                 f" phases {[(p.phase, p.status) for p in last.phases]}"
@@ -976,7 +1110,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     **{key: value for key, value in asdict(run).items() if key != "rss_timeline"},
                     "phases": [
-                        {**asdict(phase), "unattributed_wait_seconds": phase.unattributed_wait_seconds}
+                        {**asdict(phase), "residual_wait_seconds": phase.residual_wait_seconds}
                         for phase in run.phases
                     ],
                     "rss_timeline_mb": [
