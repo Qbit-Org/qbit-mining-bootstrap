@@ -460,7 +460,12 @@ fn serve_requests(
         match request.request.as_deref() {
             None => {}
             Some("prepare_window") => {
-                serve_prepare_window(&stdout, request, &mut window_cache)?;
+                serve_prepare_window(
+                    &stdout,
+                    request,
+                    &mut window_cache,
+                    input_deserialization_seconds,
+                )?;
                 continue;
             }
             Some(other) => {
@@ -645,10 +650,18 @@ fn prepare_window_out_of_range_line(line: &str) -> Option<OutOfRangeField> {
 /// coordinator, never daemon anomalies. The two rejection shapes carry the
 /// parity oracle's category in `rejection` so clients never match on the
 /// message text.
+///
+/// Success envelopes carry `metrics`: the request's JSON parse time
+/// (`input_deserialization_seconds`, sampled where the build path samples
+/// it), the fold or advance itself (`fold_seconds`), and the canonical
+/// digest and items serialization (`output_serialization_seconds`). They
+/// let a measurement separate daemon processing from pipe transport (#240);
+/// the coordinator ignores them.
 fn serve_prepare_window(
     stdout: &io::Stdout,
     request: ServeRequest,
     window_cache: &mut Vec<(String, WindowState)>,
+    input_deserialization_seconds: f64,
 ) -> Result<(), Box<dyn Error>> {
     let Some(request_epoch) = request.append_invalidation_epoch else {
         respond_error(
@@ -673,6 +686,7 @@ fn serve_prepare_window(
                 return Ok(());
             };
             let page_size = request.page_size.unwrap_or(DEFAULT_WINDOW_PAGE_SIZE);
+            let fold_started = Instant::now();
             let window = match PayoutWindow::from_full_snapshot(
                 request.records,
                 anchor_job_issued_at_ms,
@@ -715,8 +729,11 @@ fn serve_prepare_window(
                     return Ok(());
                 }
             };
+            let fold_seconds = fold_started.elapsed().as_secs_f64();
+            let output_started = Instant::now();
             let digest = window.canonical_digest_hex();
             let items = window.canonical_items_bytes();
+            let output_serialization_seconds = output_started.elapsed().as_secs_f64();
             let record_count = window.record_count();
             window_cache.retain(|(key, _)| key != &digest);
             window_cache.insert(
@@ -742,6 +759,11 @@ fn serve_prepare_window(
                     "expired_rows": 0,
                     "touched_pages": 0,
                     "window_items_len": items.len(),
+                    "metrics": {
+                        "input_deserialization_seconds": input_deserialization_seconds,
+                        "fold_seconds": fold_seconds,
+                        "output_serialization_seconds": output_serialization_seconds,
+                    },
                 }),
             )?;
             writeln!(out)?;
@@ -774,6 +796,7 @@ fn serve_prepare_window(
                 out.flush()?;
                 return Ok(());
             };
+            let fold_started = Instant::now();
             let (advance_result, base_epoch) = match &window_cache[position].1 {
                 WindowState::Prepared { window, epoch } => (
                     window.advance(request.records, anchor_job_issued_at_ms),
@@ -824,7 +847,10 @@ fn serve_prepare_window(
                     return Ok(());
                 }
             };
+            let fold_seconds = fold_started.elapsed().as_secs_f64();
+            let output_started = Instant::now();
             let digest = advanced.canonical_digest_hex();
+            let output_serialization_seconds = output_started.elapsed().as_secs_f64();
             let record_count = advanced.record_count();
             if digest == base_digest {
                 // Anchor-only advance: replace the entry in place so the
@@ -873,6 +899,11 @@ fn serve_prepare_window(
                     // next to the epoch this request carried. Never acted on.
                     "base_append_invalidation_epoch": base_epoch,
                     "append_invalidation_epoch": request_epoch,
+                    "metrics": {
+                        "input_deserialization_seconds": input_deserialization_seconds,
+                        "fold_seconds": fold_seconds,
+                        "output_serialization_seconds": output_serialization_seconds,
+                    },
                 }),
             )?;
             writeln!(out)?;
