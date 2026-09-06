@@ -581,14 +581,12 @@ class ReadinessWaiterTests(_TransportCase):
     def test_poll_failure_detaches_once_and_falls_back_to_bounded_sleep(self) -> None:
         read_end, write_end = os.pipe()
         self._open_fds += [read_end, write_end]
+        clock, sleeps = self._fake_clock_module()
         _PollFailingSelector.reset()
-        with patch.object(selectors, "DefaultSelector", _PollFailingSelector), patch.object(
-            compiler_module.time,
-            "sleep",
-        ) as sleep:
+        with patch.object(selectors, "DefaultSelector", _PollFailingSelector):
             waiter = _PipeReadinessWaiter(read_end, selectors.EVENT_READ)
-            first = waiter.wait(time.monotonic() + FAR_DEADLINE_SECONDS)
-            second = waiter.wait(time.monotonic() + FAR_DEADLINE_SECONDS)
+            first = waiter.wait(clock.now + FAR_DEADLINE_SECONDS)
+            second = waiter.wait(clock.now + FAR_DEADLINE_SECONDS)
             waiter.close()
             waiter.close()
 
@@ -601,10 +599,12 @@ class ReadinessWaiterTests(_TransportCase):
         self.assertEqual(_PollFailingSelector.closes, 1)
         self.assertIsNone(waiter._selector)
         self.assertTrue(waiter._unwatchable)
-        self.assertEqual(sleep.call_count, 2)
-        for call in sleep.call_args_list:
-            self.assertGreater(call.args[0], 0.0)
-            self.assertLessEqual(call.args[0], PRISM_BUILDER_PIPE_WAIT_SLICE_SECONDS)
+        # The failed poll spent no clock, so the first wait sleeps its whole
+        # slice; the second, unwatchable, sleeps one full slice too.
+        self.assertEqual(
+            [round(seconds, 6) for seconds in sleeps],
+            [PRISM_BUILDER_PIPE_WAIT_SLICE_SECONDS] * 2,
+        )
 
     def test_poll_failure_sleeps_only_the_remainder_of_the_slice(self) -> None:
         read_end, write_end = os.pipe()
