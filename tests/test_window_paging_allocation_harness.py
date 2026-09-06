@@ -9,9 +9,9 @@ stderr capture. These tests exercise that with a fake daemon that stalls in
 three ways -- no handshake, after consuming the request, and without ever
 reading it (so the request writer is blocked on a full pipe) -- and stay
 well under a few seconds each. They also pin the provenance of the reported
-peak resident set: a kernel ``VmHWM`` read while the daemon lived is exact,
-anything reconstructed after a self-exit is a labelled lower bound rendered
-with ``≥``, and nothing observed is ``unavailable``.
+peak resident set: every observation made before process exit, including
+kernel ``VmHWM`` before a kill or normal close, is a lower bound rendered
+with ``≥``; nothing observed is ``unavailable``.
 """
 
 from __future__ import annotations
@@ -251,9 +251,9 @@ class StalledDaemonTests(unittest.TestCase):
         nothing = harness.resolve_peak_rss({"peak_rss_mb": None}, [None, 0.0])
         self.assertEqual((nothing["peak_rss_mb"], nothing["peak_rss_source"]), (None, "unavailable"))
 
-    def test_peak_rendering_distinguishes_exact_lower_bound_and_unavailable(self) -> None:
-        self.assertEqual(harness.format_peak(601.4, "vmhwm"), "601")
-        self.assertEqual(harness.format_peak(601.4, "vmhwm_before_kill"), "601")
+    def test_peak_rendering_marks_all_live_observations_as_lower_bounds(self) -> None:
+        self.assertEqual(harness.format_peak(601.4, "vmhwm"), "≥ 601")
+        self.assertEqual(harness.format_peak(601.4, "vmhwm_before_kill"), "≥ 601")
         self.assertEqual(harness.format_peak(601.4, "lower_bound"), "≥ 601")
         self.assertEqual(harness.format_peak(2.857, "lower_bound", 2), "≥ 2.86")
         self.assertEqual(harness.format_peak(None, "unavailable"), "-")
@@ -275,11 +275,13 @@ class StalledDaemonTests(unittest.TestCase):
             )
 
         exact_row = harness.render_summary([run("vmhwm", 601.0)]).splitlines()[-1]
-        self.assertIn("| 601 | kernel VmHWM at close | 640 | 2.86 |", exact_row)
+        self.assertIn("| ≥ 601 | lower bound (kernel VmHWM at close) | ≥ 640 | ≥ 2.86 |", exact_row)
+        kill_row = harness.render_summary([run("vmhwm_before_kill", 601.0)]).splitlines()[-1]
+        self.assertIn("| ≥ 601 | lower bound (kernel VmHWM before watchdog kill) | ≥ 640 | ≥ 2.86 |", kill_row)
         bound_row = harness.render_summary([run("lower_bound", 601.0)]).splitlines()[-1]
-        self.assertIn("| ≥ 601 | lower bound (highest earlier VmHWM/RSS observation) | 640 | ≥ 2.86 |", bound_row)
+        self.assertIn("| ≥ 601 | lower bound (highest earlier VmHWM/RSS observation) | ≥ 640 | ≥ 2.86 |", bound_row)
         none_row = harness.render_summary([run("unavailable", None)]).splitlines()[-1]
-        self.assertIn("| - | unavailable | 640 | - |", none_row)
+        self.assertIn("| - | unavailable | ≥ 640 | - |", none_row)
         header = harness.render_summary([]).splitlines()[0]
         self.assertIn("| peak RSS MiB | peak source |", header)
         self.assertNotIn("VmHWM", header)

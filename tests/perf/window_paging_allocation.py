@@ -34,8 +34,9 @@ envelope line arrived) and ``response_read`` (the raw canonical-items
 section), the daemon's own ``metrics`` (JSON parse, fold/advance, canonical
 serialization -- Rust processing measured inside the process, so transport
 and processing are separated rather than inferred), the daemon's resident
-set after the phase, and its peak with source provenance (kernel ``VmHWM``
-or a labelled lower bound if only earlier observations survive). The derived
+set after the phase, and the observed peak with source provenance. All peak
+observations precede process exit and are labelled lower bounds on the final
+lifetime peak, including kernel ``VmHWM`` reads. The derived
 ``residual`` column is ``response_wait`` minus the daemon's three timers; the
 client's wall interval and the daemon's internal timers are independent
 intervals on either side of a pipe, so it is an approximation of scheduling
@@ -213,10 +214,9 @@ def binary_identity(binary: Path) -> dict[str, Any]:
 class RssSampler:
     """Samples ``VmRSS`` (and the running ``VmHWM``) of one pid on a thread.
 
-    The authoritative peak is the kernel's ``VmHWM`` read before the daemon
-    is reaped; the samples here are the timeline, and their maxima serve only
-    as a lower bound when that read is no longer possible (see
-    :func:`resolve_peak_rss`).
+    Kernel high-water marks and timeline maxima are observations made while
+    the child can still allocate, so both are lower bounds on its final
+    lifetime peak (see :func:`resolve_peak_rss`).
     """
 
     def __init__(self, pid: int, interval: float) -> None:
@@ -255,8 +255,8 @@ class RssSampler:
 
 
 PEAK_SOURCE_LABELS = {
-    "vmhwm": "kernel VmHWM at close",
-    "vmhwm_before_kill": "kernel VmHWM before watchdog kill",
+    "vmhwm": "lower bound (kernel VmHWM at close)",
+    "vmhwm_before_kill": "lower bound (kernel VmHWM before watchdog kill)",
     "lower_bound": "lower bound (highest earlier VmHWM/RSS observation)",
     "unavailable": "unavailable",
 }
@@ -265,13 +265,11 @@ PEAK_SOURCE_LABELS = {
 def resolve_peak_rss(outcome: dict[str, Any], observations: list[float | None]) -> dict[str, Any]:
     """Settle ``peak_rss_mb`` and its provenance in a daemon outcome.
 
-    A kernel ``VmHWM`` read while the daemon was alive (at close, or sampled
-    just before the watchdog killed it) is exact and is kept as is. When the
-    daemon exited on its own before ``close`` could read it, the figure is
-    gone from ``/proc``; the best that remains is the highest earlier
-    observation (per-phase ``VmHWM`` reads, the sampler's running ``VmHWM``
-    or ``VmRSS`` maxima), which is a **lower bound** on the true peak and is
-    labelled as such; with no observation at all it is unavailable.
+    Keep the numeric observation and its source. A live kernel ``VmHWM``
+    read at close or before SIGKILL is a lower bound: the daemon can still
+    allocate before it exits or the signal is delivered. Earlier phase and
+    sampler maxima are also lower bounds. None of these observations proves
+    the final lifetime peak, even if shutdown later exits cleanly.
     """
     if outcome.get("peak_rss_mb") is not None:
         outcome.setdefault("peak_rss_source", "vmhwm")
@@ -291,7 +289,7 @@ def format_peak(value: float | None, source: str | None, digits: int = 0) -> str
     if value is None:
         return "-"
     text = f"{value:.{digits}f}"
-    return f"≥ {text}" if source == "lower_bound" else text
+    return f"≥ {text}"
 
 
 def peak_source_label(source: str | None) -> str:
@@ -516,7 +514,8 @@ class Daemon:
         (``vmhwm``), the watchdog's read before a kill
         (``vmhwm_before_kill``), or ``unavailable`` because the daemon had
         already exited -- :func:`resolve_peak_rss` may then substitute a
-        labelled lower bound.
+        labelled lower bound. All live reads are lower bounds too: memory
+        may still grow before normal exit or before SIGKILL is delivered.
         """
         if self._outcome is not None:
             return self._outcome
@@ -1030,7 +1029,7 @@ def render_summary(runs: list[RunResult]) -> str:
             ended += f", failed: {run.error}"
         lines.append(
             f"| {run.variant} | {run.size:,} | {format_peak(peak, peak_source)} | {peak_source_label(peak_source)} |"
-            f" {_fmt(run.outcome.get('peak_vsize_mb'), 0)} |"
+            f" {format_peak(run.outcome.get('peak_vsize_mb'), peak_source)} |"
             f" {format_peak(None if peak is None else peak / (run.size / 1000.0), peak_source, 2)} |"
             f" {_fmt(full.response_wait_seconds if full else None)} |"
             f" {_fmt(full.daemon_metrics.get('fold_seconds') if full else None, 3)} |"

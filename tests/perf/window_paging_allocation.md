@@ -149,7 +149,15 @@ the fixture's total difficulty so every record is retained. Request sizes:
 
 ## 2. Host results
 
-### Summary per daemon (lifetime)
+All peak figures below are observed high-water marks before the daemon exits,
+including the clean runs. They are lower bounds on the final lifetime peak:
+a child can allocate between a live `/proc` read and normal exit or delivery
+of `SIGKILL`. The harness now renders `≥` for every such observation, including
+watchdog pre-kill reads, with the source recorded separately. The tables retain
+the captured numeric observations; they do not establish a lifetime memory
+ceiling. Structural page-capacity tests establish the allocation bound.
+
+### Summary per daemon (observed before exit)
 
 | binary | shares | peak RSS MiB (VmHWM) | peak VSZ MiB | MiB per 1k shares | full wait s | full fold s | daemon exit | available MiB before |
 |---|---:|---:|---:|---:|---:|---:|---|---:|
