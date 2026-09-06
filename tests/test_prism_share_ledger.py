@@ -9595,5 +9595,57 @@ class PayoutWindowRowDecodingTests(unittest.TestCase):
         self.assertTrue(callable(getattr(client, "run_json_rows", None)))
 
 
+class BlockCandidateIdentityDigestTests(unittest.TestCase):
+    """The candidate identity digest streams its share window (#236)."""
+
+    def _candidate(self, share_count: int, accepted_at_ms: int) -> dict[str, Any]:
+        shares = [
+            {
+                "share_seq": seq,
+                "share_id": f"miner-\u00e9.rig{seq}:\U0001F600,}}{{",
+                "miner_id": f"miner-{seq % 7}",
+                "order_key": f"{seq % 7:02d}:miner-{seq % 7}",
+                "p2mr_program_hex": "ab" * 32,
+                "share_difficulty": (1 << 130) + seq,
+                "network_difficulty": 5,
+                "template_height": 9,
+                "job_id": f"job-{seq}",
+                "job_issued_at_ms": 1_000 + seq,
+                "accepted_at_ms": 1_100 + seq,
+                "ntime": 1_700_000_000 + seq,
+            }
+            for seq in range(1, share_count + 1)
+        ]
+        return {
+            "schema": "qbit.prism.block-candidate-intent.v1",
+            "block_hash_hex": "ab" * 32,
+            "pending_share": {"share_id": "s", "accepted_at_ms": accepted_at_ms},
+            "shares_json": shares,
+            "prior_balances": [["m", "o", "p", 5]],
+            "found_block": {"block_height": 9, "z": None},
+        }
+
+    def test_streamed_identity_digest_matches_whole_document_digest(self) -> None:
+        for count in (0, 1, 1_300):
+            with self.subTest(count=count):
+                candidate = self._candidate(count, 5)
+                self.assertEqual(
+                    share_ledger_module.block_candidate_identity_sha256(candidate),
+                    share_ledger_module.sha256_json_hex(
+                        share_ledger_module.block_candidate_identity(candidate)
+                    ),
+                )
+        # The acknowledgment stamp stays neutralized: two resubmissions of
+        # the same solved block hash identically.
+        self.assertEqual(
+            share_ledger_module.block_candidate_identity_sha256(self._candidate(9, 5)),
+            share_ledger_module.block_candidate_identity_sha256(self._candidate(9, 6)),
+        )
+        self.assertNotEqual(
+            share_ledger_module.block_candidate_identity_sha256(self._candidate(9, 5)),
+            share_ledger_module.block_candidate_identity_sha256(self._candidate(8, 5)),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

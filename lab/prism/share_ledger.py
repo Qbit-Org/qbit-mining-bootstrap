@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import codecs
 import copy
 import hashlib
 import logging
@@ -29,6 +30,10 @@ from lab.prism.audit_artifacts import (
     AuditArtifactStore,
     CanonicalAuditBundleCorrupt,
     canonical_audit_bundle_bytes,
+)
+from lab.prism.share_json_stream import (
+    canonical_share_items_bytes,
+    iter_json_object_text_chunks,
 )
 from lab.prism.writer_lease_timing import (  # noqa: F401 - compatibility re-export
     DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
@@ -310,19 +315,13 @@ class _IncrementalShareWindowPage:
         records: tuple[AcceptedShareRecord, ...],
     ) -> _IncrementalShareWindowPage:
         prism_json_records = tuple(record.to_prism_json() for record in records)
+        # One bounded json.dumps per page (the page is at most one batch),
+        # byte-identical to encoding each record alone and joining with ",".
         return cls(
             records=records,
             total_difficulty=sum(int(record.share_difficulty) for record in records),
             prism_json_records=prism_json_records,
-            canonical_json_items=b",".join(
-                json.dumps(
-                    record,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    default=str,
-                ).encode()
-                for record in prism_json_records
-            ),
+            canonical_json_items=canonical_share_items_bytes(prism_json_records),
         )
 
 
@@ -610,55 +609,145 @@ class DaemonWindowMirrorDivergence(RuntimeError):
     """
 
 
-def _canonical_items_layout(fragment: bytes) -> tuple[int, bool]:
-    """Record count and trailing-separator flag for one canonical items span.
+# Bytes of one daemon canonical-items stream handed to the incremental UTF-8
+# decoder per call while the stream is walked. Read at call time so a test
+# can shrink it and drive record and multi-byte boundaries across chunks.
+CANONICAL_ITEMS_DECODE_CHUNK_BYTES = 64 * 1024
 
-    Walks the span with ``raw_decode``, which reports where each record's
-    JSON ends without re-encoding anything, so the count comes from the
-    bytes themselves rather than from a number the daemon declared. A span
-    that is not a run of complete records separated by ``,`` -- a truncated
-    record, a doubled or leading separator, junk between records -- is a
-    divergence, not a parse the caller may retry.
 
-    The trailing flag distinguishes ``a,b`` from ``a,b,``: a dropped prefix
+def _walk_canonical_items(
+    fragment: bytes,
+    *,
+    chunk_bytes: int | None = None,
+    share_keys: bool = True,
+) -> Iterator[dict[str, object]]:
+    """Yield each record of one canonical items span; return the trailing flag.
+
+    The span is decoded in bounded chunks through an incremental UTF-8
+    decoder and parsed one record at a time with ``raw_decode``, which
+    reports where each record's JSON ends without re-encoding anything, so
+    no single C call covers more than one chunk or one record whatever the
+    window size (#236): the count comes from the bytes themselves rather
+    than from a number the daemon declared, and the interpreter can switch
+    threads between records. A span that is not a run of complete records
+    separated by ``,`` -- a truncated record, a doubled or leading
+    separator, junk between records, invalid UTF-8 -- raises
+    DaemonWindowMirrorDivergence where it is reached, never a parse the
+    caller may retry.
+
+    The generator's return value (``StopIteration.value``) is the trailing
+    flag, which distinguishes ``a,b`` from ``a,b,``: a dropped prefix
     legitimately ends on a separator when records remain behind it, and a
-    complete stream never does.
+    complete stream never does. An empty span yields nothing and returns
+    False.
+
+    ``share_keys`` makes every yielded record reuse one string object per
+    distinct key, the way a single whole-array ``json.loads`` shares keys
+    through its scanner memo; ``raw_decode`` clears that memo per call, and
+    without the hook a 400k-record parse would carry 13 private key strings
+    per record (about 60% more resident memory, and a proportionally longer
+    release). A walk that only counts records passes False and skips the
+    rebuild.
     """
-    if not fragment:
-        return 0, False
-    try:
-        text = fragment.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise DaemonWindowMirrorDivergence(
-            "daemon window mirror items are not valid UTF-8"
-        ) from exc
-    decoder = json.JSONDecoder()
-    count = 0
+    total = len(fragment)
+    if not total:
+        return False
+    if chunk_bytes is None:
+        chunk_bytes = CANONICAL_ITEMS_DECODE_CHUNK_BYTES
+    chunk_bytes = max(1, int(chunk_bytes))
+    view = memoryview(fragment)
+    utf8 = codecs.getincrementaldecoder("utf-8")()
+    if share_keys:
+        shared_keys: dict[str, str] = {}
+
+        def rekey(record: dict[str, object]) -> dict[str, object]:
+            return {
+                shared_keys.setdefault(key, key): value
+                for key, value in record.items()
+            }
+
+        decoder = json.JSONDecoder(object_hook=rekey)
+    else:
+        decoder = json.JSONDecoder()
+    offset = 0
+    text = ""
     position = 0
-    length = len(text)
+
+    def refill(at_least: int = 0) -> bool:
+        """Decode the next chunk onto the unconsumed text; False once spent."""
+        nonlocal offset, text, position
+        if offset >= total:
+            return False
+        end = min(offset + max(chunk_bytes, at_least), total)
+        try:
+            decoded = utf8.decode(view[offset:end], end >= total)
+        except UnicodeDecodeError as exc:
+            raise DaemonWindowMirrorDivergence(
+                "daemon window mirror items are not valid UTF-8"
+            ) from exc
+        offset = end
+        text = text[position:] + decoded
+        position = 0
+        return True
+
+    after_separator = False
     while True:
+        while position >= len(text):
+            if not refill():
+                # Spent where a record was required: only reachable right
+                # after a separator, so the span ended on one. (A non-empty
+                # span always decodes to at least one character, so the
+                # start never lands here.)
+                return after_separator
         if text[position] != "{":
             raise DaemonWindowMirrorDivergence(
                 "daemon window mirror items hold "
                 f"{text[position]!r} where a record was expected"
             )
-        try:
-            _, end = decoder.raw_decode(text, position)
-        except ValueError as exc:
-            raise DaemonWindowMirrorDivergence(
-                f"daemon window mirror items hold a malformed record: {exc}"
-            ) from exc
-        count += 1
-        if end >= length:
-            return count, False
-        if text[end] != ",":
+        while True:
+            try:
+                record, end = decoder.raw_decode(text, position)
+            except ValueError as exc:
+                # The record may merely be cut by the chunk boundary: pull
+                # more bytes -- at least as many as are already pending, so
+                # a genuinely malformed record is found in logarithmically
+                # many retries rather than one per chunk -- and retry from
+                # the same position.
+                if refill(len(text) - position):
+                    continue
+                raise DaemonWindowMirrorDivergence(
+                    f"daemon window mirror items hold a malformed record: {exc}"
+                ) from exc
+            break
+        after_separator = False
+        yield record
+        position = end
+        while position >= len(text):
+            if not refill():
+                return False
+        if text[position] != ",":
             raise DaemonWindowMirrorDivergence(
                 "daemon window mirror items hold "
-                f"{text[end]!r} where a record separator was expected"
+                f"{text[position]!r} where a record separator was expected"
             )
-        position = end + 1
-        if position >= length:
-            return count, True
+        position += 1
+        after_separator = True
+
+
+def _canonical_items_layout(fragment: bytes) -> tuple[int, bool]:
+    """Record count and trailing-separator flag for one canonical items span.
+
+    Walks the span record by record (see :func:`_walk_canonical_items`),
+    counting what the bytes actually hold and discarding each parsed record.
+    """
+    walker = _walk_canonical_items(fragment, share_keys=False)
+    count = 0
+    while True:
+        try:
+            next(walker)
+        except StopIteration as stop:
+            return count, bool(stop.value)
+        count += 1
 
 
 def _canonical_items_record_count(fragment: bytes) -> int:
@@ -705,7 +794,24 @@ class DaemonShareJsonSequence(Sequence):
     def _records(self) -> tuple[dict[str, object], ...]:
         with self._parse_lock:
             if self._parsed is None:
-                parsed = json.loads(b"[" + self.canonical_items + b"]")
+                # Record at a time through the same strict walker that
+                # reconciled the mirror's count at construction: one
+                # ``raw_decode`` per record and one bounded UTF-8 decode per
+                # chunk, never a whole-window ``json.loads`` (#236). The
+                # parsed tuple is published only after every record parsed
+                # and the count matched, so a failure leaves nothing cached.
+                walker = _walk_canonical_items(self.canonical_items)
+                parsed: list[dict[str, object]] = []
+                while True:
+                    try:
+                        parsed.append(next(walker))
+                    except StopIteration as stop:
+                        trailing = bool(stop.value)
+                        break
+                if trailing:
+                    raise DaemonWindowMirrorDivergence(
+                        "daemon window mirror items end on a record separator"
+                    )
                 if len(parsed) != self.record_count:
                     raise DaemonWindowMirrorDivergence(
                         "daemon window mirror parsed "
@@ -11370,7 +11476,25 @@ def block_candidate_identity(candidate: dict[str, Any]) -> dict[str, Any]:
 
 
 def block_candidate_identity_sha256(candidate: dict[str, Any]) -> str:
-    return sha256_json_hex(block_candidate_identity(candidate))
+    """``sha256_json_hex`` of the candidate identity, streamed.
+
+    The candidate carries the whole payout window under ``shares_json``, so
+    one ``json.dumps`` over it is exactly the whole-window C call the
+    writer-lease monitor must never wait behind (#236). The digest is
+    byte-identical to ``sha256_json_hex(block_candidate_identity(candidate))``;
+    the share array feeds it batch by batch.
+    """
+    identity = block_candidate_identity(candidate)
+    if not isinstance(identity, dict):
+        return sha256_json_hex(identity)
+    digest = hashlib.sha256()
+    for chunk in iter_json_object_text_chunks(
+        identity,
+        array_keys=("shares_json",),
+        sort_keys=True,
+    ):
+        digest.update(chunk.encode("utf-8"))
+    return digest.hexdigest()
 
 
 def sha256_bytes_hex(payload: bytes) -> str:

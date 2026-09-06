@@ -524,8 +524,7 @@ def reference_component_cardinality_metrics_lines(server) -> list[str]:
             int(serialization._spool_size) if serialization is not None else 0
         ),
         "share_window_serialization_compact_json": (
-            len(serialization._compact_shares_json or "")
-            + len(serialization._compact_share_identities_json or "")
+            int(serialization.compact_json_bytes)
             if serialization is not None
             else 0
         ),
@@ -2812,8 +2811,8 @@ class HeapAndComponentCardinalityTelemetryTests(unittest.TestCase):
             share_snapshot_sha256="digest",
         )
         serialization._spool_size = 4_096
-        serialization._compact_shares_json = "[" + "x" * 98 + "]"
-        serialization._compact_share_identities_json = "y" * 20
+        serialization._compact_tail_chunks = ("[" + "x" * 98 + "]", "y" * 20)
+        serialization._compact_tail_chars = 120
         bundles._share_window_serialization = serialization
         pages = (
             _IncrementalShareWindowPage(

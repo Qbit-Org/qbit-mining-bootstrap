@@ -4,8 +4,15 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 from tests.prism_coordinator_test_support import *
+
+from lab.prism.bundle_compiler import (
+    _compact_share_tail_chunks,
+    _iter_prepare_window_request_chunks,
+)
+from lab.prism.share_ledger import DaemonShareWindowMirror
 
 
 class SnapshotAnchorFloorTests(unittest.TestCase):
@@ -3251,6 +3258,79 @@ class ShareWindowSpoolTests(unittest.TestCase):
             "compact_shares": [list(share) for share in compact_shares],
         }
 
+    def _awkward_shares(self, count: int) -> list[dict[str, object]]:
+        shares = []
+        for seq in range(1, count + 1):
+            share = spool_share(seq)
+            share["share_id"] = f"miner-\u00e9.rig{seq}:\U0001F600,}}{{\"\\"
+            share["miner_id"] = f"miner-{seq % 4}-\u2603"
+            share["order_key"] = f"{seq % 4:02d}:miner-{seq % 4}"
+            share["share_difficulty"] = (1 << 130) + seq
+            share["credit_policy"] = "policy-\u00fc" if seq % 3 else None
+            shares.append(share)
+        return shares
+
+    def _historical_tail(self, shares: list[dict[str, object]]) -> str:
+        identities, compact_shares = _compact_share_payload(shares)
+        return (
+            ',"compact_share_identities":'
+            + json.dumps(identities, separators=(",", ":"))
+            + ',"compact_shares":'
+            + json.dumps(compact_shares, separators=(",", ":"))
+            + "}"
+        )
+
+    def test_compact_tail_chunks_match_the_historical_fragment_bytes(self) -> None:
+        for count in (0, 1, 2, 1_300):
+            shares = self._awkward_shares(count)
+            expected = self._historical_tail(shares)
+            for batch, chunk in ((512, 64 * 1024), (1, 1), (7, 100), (5_000, 10)):
+                with self.subTest(count=count, batch=batch, chunk=chunk):
+                    chunks = _compact_share_tail_chunks(
+                        shares,
+                        batch_records=batch,
+                        chunk_chars=chunk,
+                    )
+                    self.assertEqual("".join(chunks), expected)
+                    self.assertTrue(all(piece.isascii() for piece in chunks))
+
+    def test_spool_and_in_memory_tail_hold_identical_bounded_bytes(self) -> None:
+        server = self._coordinator()
+        shares = self._awkward_shares(1_300)
+        serialization = server._share_window_serialization_for_artifact(
+            self._ledger_artifact(shares, generation=1),
+            shares,
+        )
+        expected = self._historical_tail(shares)
+        chunks = serialization.compact_tail_chunks(shares)
+        self.assertGreater(len(chunks), 4)
+        self.assertEqual("".join(chunks), expected)
+        self.assertIs(serialization.compact_tail_chunks(shares), chunks)
+        self.assertEqual(serialization.compact_json_bytes, len(expected))
+        lease = serialization.acquire_spooled_tail(shares)
+        assert lease is not None
+        spool_file, spool_size = lease
+        try:
+            spool_file.seek(0)
+            self.assertEqual(spool_file.read(), expected.encode("utf-8"))
+            self.assertEqual(spool_size, len(expected))
+        finally:
+            serialization.release_spooled_tail()
+        # Both transports deliver the same parsed window.
+        first = self._build_with_echo_builder(server, shares, serialization, height=10)
+        with patch(
+            "lab.prism.prism_coordinator._share_window_spool_file",
+            side_effect=OSError("temp filesystem unavailable"),
+        ):
+            fresh = server._share_window_serialization_for_artifact(
+                self._ledger_artifact(shares, generation=2),
+                shares,
+            )
+            fresh.retire_spool()
+            second = self._build_with_echo_builder(server, shares, fresh, height=10)
+        self.assertEqual(first["received"], self._expected_payload(shares, height=10))
+        self.assertEqual(second["received"], first["received"])
+
     def test_spool_feeds_builder_and_is_written_once_per_generation(
         self,
     ) -> None:
@@ -3528,6 +3608,162 @@ class ServeBuilderTests(unittest.TestCase):
                 share_serialization=serialization,  # type: ignore[arg-type]
                 cancellation=cancellation,  # type: ignore[arg-type]
             )
+
+    @staticmethod
+    def _prepare_record(seq: int, **overrides: object) -> dict[str, object]:
+        record: dict[str, object] = {
+            "share_seq": seq,
+            "share_id": f"share-\u00e9-{seq}:\U0001F600",
+            "miner_id": f"miner-{seq % 3}",
+            "order_key": f"{seq % 3:02d}:miner-{seq % 3}",
+            "p2mr_program_hex": "22" * 32,
+            "share_difficulty": 1,
+            "network_difficulty": 1,
+            "template_height": 9,
+            "job_id": f"job-{seq}",
+            "job_issued_at_ms": 1_700_000_000_000 + seq,
+            "accepted_at_ms": 1_700_000_000_100 + seq,
+            "ntime": 1_700_000_000 + seq,
+        }
+        record.update(overrides)
+        return record
+
+    def _prepare(
+        self,
+        server: PrismCoordinator,
+        records: list[dict[str, object]],
+        *,
+        mode: str = "ok",
+    ) -> object:
+        with patch.dict(
+            os.environ,
+            {"FAKE_SERVE_BUILDER_MODE": mode},
+        ), patch(
+            "lab.prism.prism_coordinator.prism_tool_command",
+            return_value=list(FAKE_SERVE_BUILDER_COMMAND),
+        ):
+            # An anchor past every stamp and a weight equal to the record
+            # count: the fold retains the whole snapshot.
+            return server.prepare_payout_window(
+                mode="full",
+                records_json=records,
+                anchor_job_issued_at_ms=1_700_000_100_000,
+                append_invalidation_epoch=0,
+                window_weight=len(records) or 1,
+                page_size=512,
+            )
+
+    def test_prepare_request_streams_the_same_bytes_as_one_json_dumps(self) -> None:
+        records = [
+            self._prepare_record(seq, share_difficulty=(1 << 130) + seq)
+            for seq in range(1, 1_301)
+        ]
+        for fields in (
+            {
+                "request": "prepare_window",
+                "mode": "full",
+                "append_invalidation_epoch": 3,
+                "anchor_job_issued_at_ms": 1_700_000_001_000,
+                "records": records,
+                "window_weight": 1 << 100,
+                "page_size": 512,
+            },
+            {
+                "request": "prepare_window",
+                "mode": "advance",
+                "append_invalidation_epoch": 3,
+                "anchor_job_issued_at_ms": 1_700_000_001_000,
+                "records": [],
+                "base_digest": "ab" * 32,
+            },
+        ):
+            with self.subTest(mode=fields["mode"]):
+                chunks = list(_iter_prepare_window_request_chunks(fields))
+                self.assertEqual(
+                    b"".join(chunks),
+                    json.dumps(fields, separators=(",", ":")).encode("utf-8")
+                    + b"\n",
+                )
+                self.assertEqual(chunks[-1], b"\n")
+                if fields["records"]:
+                    self.assertGreater(len(chunks), 3)
+
+    def test_prepare_request_reaches_the_daemon_in_bounded_chunks(self) -> None:
+        server = self._coordinator()
+        # Several record batches and past the pipe capacity, so the request
+        # is written as many chunks and the daemon folds it byte-faithfully.
+        records = [self._prepare_record(seq) for seq in range(1, 2_001)]
+        try:
+            outcome = self._prepare(server, records)
+            self.assertEqual(outcome.status, "prepared")
+            self.assertEqual(outcome.record_count, len(records))
+            mirror = DaemonShareWindowMirror.from_full_items(
+                anchor_job_issued_at_ms=1_700_000_100_000,
+                window_weight=len(records),
+                page_size=512,
+                record_count=outcome.record_count,
+                canonical_items=outcome.window_items,
+                share_snapshot_sha256=outcome.share_snapshot_sha256,
+            )
+            self.assertEqual(
+                [share["share_id"] for share in mirror.json_records()],
+                [record["share_id"] for record in records],
+            )
+            client = server._serve_builder
+            assert client is not None
+            self.assertFalse(client.request_incomplete)
+            with server._serve_builder_metrics_lock:
+                counts = dict(server.serve_builder_counts)
+            self.assertEqual(counts["window_prepares"], 1)
+            self.assertEqual(counts["fallbacks"], 0)
+        finally:
+            server.shutdown_serve_builder()
+
+    def test_prepare_request_that_fails_to_encode_mid_stream_retires_daemon(
+        self,
+    ) -> None:
+        server = self._coordinator()
+        records = [self._prepare_record(seq) for seq in range(1, 1_301)]
+        # The failure lands in the third batch: two batches are already on
+        # the daemon's stdin as an unterminated line when it surfaces.
+        records[1_200] = self._prepare_record(1_201, share_id=object())
+        try:
+            outcome = self._prepare(server, records)
+            self.assertIsNone(outcome)
+            self.assertIsNone(server._serve_builder)
+            with server._serve_builder_metrics_lock:
+                counts = dict(server.serve_builder_counts)
+            self.assertEqual(counts["fallbacks"], 1)
+            self.assertEqual(counts["window_prepares"], 0)
+            # The replacement daemon starts clean and serves the next
+            # preparation; nothing of the partial line survived.
+            recovered = self._prepare(server, records[:1_200])
+            self.assertEqual(recovered.status, "prepared")
+            self.assertEqual(recovered.record_count, 1_200)
+            with server._serve_builder_metrics_lock:
+                counts = dict(server.serve_builder_counts)
+            self.assertEqual(counts["spawns"], 2)
+        finally:
+            server.shutdown_serve_builder()
+
+    def test_prepare_request_daemon_death_mid_request_degrades_in_process(
+        self,
+    ) -> None:
+        server = self._coordinator()
+        records = [self._prepare_record(seq) for seq in range(1, 3_001)]
+        try:
+            outcome = self._prepare(
+                server,
+                records,
+                mode="crash-during-prepare",
+            )
+            self.assertIsNone(outcome)
+            self.assertIsNone(server._serve_builder)
+            with server._serve_builder_metrics_lock:
+                counts = dict(server.serve_builder_counts)
+            self.assertEqual(counts["fallbacks"], 1)
+        finally:
+            server.shutdown_serve_builder()
 
     def test_cache_miss_uploads_window_then_hits_on_next_request(self) -> None:
         server = self._coordinator()
