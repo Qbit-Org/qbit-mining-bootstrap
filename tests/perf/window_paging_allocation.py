@@ -830,7 +830,7 @@ def run_variant(
         log(f"    {label} @ {fixture.size}: {error}")
         return RunResult(
             label, str(binary), fixture.size, fixture.page_size, available, load,
-            memory_limit_mb, [], {}, 0.0, [], error=error,
+            memory_limit_mb, [], getattr(exc, "daemon_outcome", {}), 0.0, [], error=error,
         )
     phases: list[PhaseResult] = []
     expected = (oracle or {}).get("digests", {})
@@ -1013,8 +1013,8 @@ def render_summary(runs: list[RunResult]) -> str:
         "|---|---:|---:|---|---:|---:|---:|---:|---|---:|",
     ]
     for run in runs:
-        if run.skipped or (run.error and not run.phases):
-            lines.append(f"| {run.variant} | {run.size:,} | {'skipped' if run.skipped else 'failed'}: {run.skipped or run.error} | | | | | | | {_fmt(run.mem_available_before_mb, 0)} |")
+        if run.skipped:
+            lines.append(f"| {run.variant} | {run.size:,} | skipped: {run.skipped} | | | | | | | {_fmt(run.mem_available_before_mb, 0)} |")
             continue
         full = next((phase for phase in run.phases if phase.phase == "full"), None)
         peak = run.outcome.get("peak_rss_mb")
@@ -1022,8 +1022,12 @@ def render_summary(runs: list[RunResult]) -> str:
         exit_code = run.outcome.get("exit_code")
         signal = run.outcome.get("signal")
         ended = "clean (0)" if exit_code == 0 else (f"signal {signal}" if signal else f"exit {exit_code}")
+        if exit_code is None:
+            ended = "unavailable"
         if run.outcome.get("timed_out"):
             ended += f", killed on {run.outcome['timed_out']} timeout"
+        if run.error and not run.phases:
+            ended += f", failed: {run.error}"
         lines.append(
             f"| {run.variant} | {run.size:,} | {format_peak(peak, peak_source)} | {peak_source_label(peak_source)} |"
             f" {_fmt(run.outcome.get('peak_vsize_mb'), 0)} |"

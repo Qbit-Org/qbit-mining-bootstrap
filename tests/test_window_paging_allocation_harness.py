@@ -159,6 +159,30 @@ class StalledDaemonTests(unittest.TestCase):
         self.assertIn("killed on full timeout", harness.render_summary([result]))
         self.assertIn("| timeout", harness.render_runs([result]))
 
+    def test_handshake_timeout_preserves_outcome_in_result_and_summary(self) -> None:
+        fixture = harness.build_fixture(64, miners=2, page_size=16, small=2, large=3)
+        os.environ["FAKE_DAEMON_MODE"] = "no_handshake"
+        try:
+            result = harness.run_variant(
+                "fake", self.binary, fixture, oracle=None,
+                memory_limit_mb=None, memory_margin_mb=0,
+                sample_interval=0.01, exchange_timeout=0.5,
+                stderr_dir=Path(self.tmp.name), log=lambda _text: None,
+            )
+        finally:
+            os.environ.pop("FAKE_DAEMON_MODE", None)
+        self.assertEqual(result.phases, [])
+        self.assertIn("daemon failed to start", result.error or "")
+        self.assertEqual(result.outcome["timed_out"], "handshake")
+        self.assertEqual(result.outcome["signal"], 9)
+        self.assertIn("stderr_tail", result.outcome)
+        self.assertIn("peak_rss_source", result.outcome)
+        _assert_reaped(self, result.outcome["pid"])
+        summary = harness.render_summary([result])
+        self.assertIn("signal 9, killed on handshake timeout", summary)
+        self.assertIn("failed: daemon failed to start", summary)
+        self.assertIn(harness.peak_source_label(result.outcome["peak_rss_source"]), summary)
+
     def test_close_on_a_live_daemon_reports_the_kernel_high_water_mark(self) -> None:
         daemon = self._daemon("stall_after_handshake")
         outcome = daemon.close()  # alive at close: VmHWM read live, then killed
