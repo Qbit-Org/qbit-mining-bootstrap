@@ -113,6 +113,7 @@ if TYPE_CHECKING:
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lab.prism.share_ledger import (  # noqa: E402
+    PAYOUT_WINDOW_ROW_BATCH_SIZE,
     WRITER_LEASE_HEARTBEAT_SESSION_PREFIX,
     LedgerOperationTimeout,
     PsqlShareLedger,
@@ -2904,6 +2905,51 @@ class FakeSqlBackend:
             raise
         finally:
             self._release(backend)
+
+    def run_json_rows(
+        self,
+        sql: str,
+        *,
+        retry_safe: bool = False,
+        timeout_seconds: float | None = None,
+        on_statement_start: Callable[[], None] | None = None,
+        row_converter: Callable[[Any], Any] | None = None,
+        batch_size: int = PAYOUT_WINDOW_ROW_BATCH_SIZE,
+        on_batch: Callable[[], None] | None = None,
+    ) -> list[Any]:
+        """``LedgerSqlPort.run_json_rows`` over the same modelled server.
+
+        The row-result statements (#236: the payout-window snapshot and
+        delta) take the identical connection, transaction and deadline
+        shape as ``run_json``; only the result differs, and the model
+        answers one with the list of row values. ``FakePostgres`` models no
+        such statement today, so ``classify`` rejects the SQL with
+        ``UnsupportedStatement`` exactly as it rejects any other statement
+        outside the lease vocabulary. Kept here so the fake satisfies the
+        port it stands in for, and so a scenario that does reach the
+        payout-window read fails on the model's vocabulary rather than on
+        a missing method.
+        """
+        rows = self.run_json(
+            sql,
+            retry_safe=retry_safe,
+            timeout_seconds=timeout_seconds,
+            on_statement_start=on_statement_start,
+        )
+        if not isinstance(rows, list):
+            raise UnsupportedStatement(
+                "row-result statement must be modelled as a list of row values"
+            )
+        batch_size = max(1, int(batch_size))
+        results: list[Any] = []
+        for start in range(0, len(rows), batch_size):
+            if start and on_batch is not None:
+                on_batch()
+            batch = rows[start : start + batch_size]
+            results.extend(
+                batch if row_converter is None else [row_converter(v) for v in batch]
+            )
+        return results
 
     def run_script(self, sql: str) -> None:
         raise UnsupportedStatement(

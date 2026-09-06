@@ -95,6 +95,7 @@ from lab.prism.share_ledger import (
     PendingShare,
     PsqlShareLedger,
 )
+from tests.prism_window_rows_reference import assert_rows_match_aggregate
 
 
 def pending(
@@ -239,6 +240,7 @@ ledger._accepted_stats_cache_seconds = 60.0
 snapshot = ledger.snapshot_at_job_issue(1_700_000_002_000)
 assert_equal(len(snapshot), share_count, "snapshot returns all committed shares")
 
+
 metrics = ledger.metrics()
 assert_equal(metrics["shares"], share_count, "metrics share count from cached stats")
 
@@ -376,6 +378,129 @@ except RuntimeError as exc:
         raise
 else:
     raise SystemExit("second writer stole an unexpired lease over the native client")
+
+# Issue #236: the pooled client consumes the payout-window reads one JSON
+# object per row through fetchmany, in bounded batches, from one buffered
+# SELECT. A 3000-row fixture crosses several 512-row batch boundaries; the
+# pre-#236 json_agg statement over the same CTE is the oracle for every
+# variant, exactly as on the psql backend.
+ledger._run_script(
+    """
+INSERT INTO qbit_share_ledger (
+    share_id, miner_id, payout_order_key, p2mr_program,
+    share_difficulty, network_difficulty, template_height, job_id,
+    job_issued_at, ntime, accepted_at, accepted, writer_id, writer_epoch
+)
+SELECT
+    'bulk-' || g,
+    'miner-' || (g % 7),
+    lpad((g % 7)::text, 4, '0'),
+    decode(md5(g::text) || md5((g + 7)::text), 'hex'),
+    1 + (g % 3),
+    1000,
+    10,
+    'job-bulk',
+    to_timestamp(1700001000) + (g * interval '1 millisecond'),
+    1700001000,
+    to_timestamp(1700001000) + (g * interval '1 millisecond'),
+    TRUE,
+    'writer-native',
+    1
+FROM generate_series(1, 3000) AS g;
+ANALYZE qbit_share_ledger;
+"""
+)
+bulk_anchor_ms = 1_700_001_010_000
+assert_equal(ledger.execution_backend, "psycopg-pool", "oracle check runs on the pooled client")
+for weight in (1, 512, 1023, 1024, 1025, 3000, 6000, 10**9):
+    assert_rows_match_aggregate(
+        ledger,
+        lambda: ledger.snapshot_at_job_issue(bulk_anchor_ms, window_weight=weight),
+        label=f"native per-row bounded snapshot at window weight {weight}",
+    )
+full_history = assert_rows_match_aggregate(
+    ledger,
+    lambda: ledger.snapshot_at_job_issue(bulk_anchor_ms),
+    label="native per-row unbounded snapshot",
+    expected_len=share_count + 3000,
+)
+assert_rows_match_aggregate(
+    ledger,
+    lambda: ledger.snapshot_at_job_issue(0, window_weight=64),
+    label="native per-row empty window",
+    expected_len=0,
+)
+assert_rows_match_aggregate(
+    ledger,
+    lambda: ledger.snapshot_between_job_issues(1_700_001_001_000, 1_700_001_002_000),
+    label="native per-row delta inside the bulk fixture",
+    expected_len=1000,
+)
+with ledger.operation_timeout(30.0):
+    assert_rows_match_aggregate(
+        ledger,
+        lambda: ledger.snapshot_at_job_issue(bulk_anchor_ms, window_weight=2048),
+        label="native per-row bounded snapshot under an armed deadline",
+    )
+
+# One SELECT, one MVCC snapshot: a share appended while the rows are still
+# being converted (between the first and second 512-row batches) is not in
+# any part of that snapshot, and is in the next one. The between-batch hook
+# is the ledger's own; a second pooled connection lands the append.
+late_share = pending(share_count + 5000, share_id="appended-mid-decode")
+late_share = PendingShare(
+    **{
+        **late_share.__dict__,
+        "job_issued_at_ms": 1_700_001_005_000,
+        "accepted_at_ms": 1_700_001_005_000,
+    }
+)
+appended_during: list[object] = []
+original_hook = ledger._note_json_row_batch
+
+
+def append_on_first_batch() -> None:
+    if not appended_during:
+        appended_during.append(ledger.append(late_share))
+    original_hook()
+
+
+ledger._note_json_row_batch = append_on_first_batch  # type: ignore[method-assign]
+try:
+    during = ledger.snapshot_at_job_issue(bulk_anchor_ms)
+finally:
+    del ledger._note_json_row_batch
+assert_equal(len(appended_during), 1, "the append landed during row conversion")
+assert_equal(
+    [record.share_id for record in during],
+    [record.share_id for record in full_history],
+    "a share appended mid-decode is absent from the whole in-flight snapshot",
+)
+after = ledger.snapshot_at_job_issue(bulk_anchor_ms)
+assert_equal(len(after), len(full_history) + 1, "the next snapshot includes the appended share")
+assert_equal(after[-1].share_id, "appended-mid-decode", "the appended share is the newest row")
+assert_equal(
+    ledger.ledger_read_gate_stats()["payout_window_snapshot"]["execute_timeouts_total"],
+    0,
+    "no window read timed out",
+)
+print("prism postgres native ledger: OK window-rows=oracle mvcc=single-select", flush=True)
+
+# Restore the 32-share state the fallback and read-only checks below assert
+# on: the bulk fixture and the mid-decode append were this section's only
+# writes, and their sequence numbers sit above the contiguous 1..32 range.
+ledger._run_script(
+    """
+DELETE FROM qbit_share_ledger
+WHERE share_id LIKE 'bulk-%' OR share_id = 'appended-mid-decode';
+ANALYZE qbit_share_ledger;
+"""
+)
+assert_equal(
+    len(ledger.snapshot_at_job_issue(bulk_anchor_ms)),
+    share_count,
+    "window fixture rows removed again",
+)
 
 released = ledger.release_writer_lease()
 assert_equal(released, True, "writer lease released")

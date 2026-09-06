@@ -11,10 +11,11 @@ import os
 import math
 import shlex
 import subprocess
+import tempfile
 import time
 import traceback
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -77,6 +78,15 @@ DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS = 5.0
 # a vanished client at 30 + 3x10 = 60 seconds. Unix-socket connections ignore
 # them, leaving the idle-in-transaction timeout as the guard there.
 DEFAULT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS = 15.0
+# Records decoded per batch by the row-result read the payout-window snapshot
+# and delta run through (issue #236). Both production backends turn one
+# SELECT into one JSON value per row and convert those rows this many at a
+# time, rechecking the caller's deadline and stamping liveness between
+# batches, so no single decode call grows with the window. The figure bounds
+# the size of each C-level decode call and the gap between deadline checks,
+# not the result: the complete snapshot is still returned as one list, and
+# the driver still buffers the raw rows.
+PAYOUT_WINDOW_ROW_BATCH_SIZE = 512
 # read_replica_status() runs on the public read service's background probe
 # thread on a 5s cadence by default; a probe that outlives its own interval
 # tells the freshness gate nothing it does not already know from the previous
@@ -2491,6 +2501,14 @@ class LedgerSqlPort(Protocol):
     a live ledger, which is what the lease and landing concurrency tests
     need: statement timing, tuple-lock waits and transaction lifetime are
     properties of this seam, not of any single method.
+
+    Two statement shapes cross it. ``run_json`` runs a statement that
+    evaluates to one JSON value (every mutation, lease statement and
+    aggregate read). ``run_json_rows`` runs a read-only statement that
+    yields one JSON value per row and hands the rows back in bounded
+    batches (issue #236): the payout-window snapshot and delta, whose
+    single ``json_agg`` value used to be decoded in one GIL-held call the
+    size of the whole window.
     """
 
     def run_json(
@@ -2501,6 +2519,18 @@ class LedgerSqlPort(Protocol):
         timeout_seconds: float | None = None,
         on_statement_start: Callable[[], None] | None = None,
     ) -> Any: ...
+
+    def run_json_rows(
+        self,
+        sql: str,
+        *,
+        retry_safe: bool = False,
+        timeout_seconds: float | None = None,
+        on_statement_start: Callable[[], None] | None = None,
+        row_converter: Callable[[Any], Any] | None = None,
+        batch_size: int = PAYOUT_WINDOW_ROW_BATCH_SIZE,
+        on_batch: Callable[[], None] | None = None,
+    ) -> list[Any]: ...
 
     def run_script(self, sql: str) -> None: ...
 
@@ -2646,6 +2676,12 @@ class _NativePostgresClient:
     writer's own fenced transaction rather than a competing expiry claim
     (see ``verify_writer_lease_guard_session``).
     """
+
+    # The clock ``run_json_rows`` budgets its local decoding against. A class
+    # attribute so a test built through ``__new__`` can drive the
+    # between-batch deadline with a virtual clock; ``run_json``'s
+    # single-value path is unchanged and keeps reading time.monotonic.
+    _monotonic: Callable[[], float] = staticmethod(time.monotonic)
 
     def __init__(
         self,
@@ -2809,6 +2845,156 @@ class _NativePostgresClient:
                 if attempt + 1 >= attempts:
                     raise RuntimeError(f"postgres query failed: {exc}") from exc
         raise AssertionError("unreachable")
+
+    def run_json_rows(
+        self,
+        sql: str,
+        *,
+        retry_safe: bool = False,
+        timeout_seconds: float | None = None,
+        on_statement_start: Callable[[], None] | None = None,
+        row_converter: Callable[[Any], Any] | None = None,
+        batch_size: int = PAYOUT_WINDOW_ROW_BATCH_SIZE,
+        on_batch: Callable[[], None] | None = None,
+    ) -> list[Any]:
+        """Run one read-only statement that yields one JSON value per row.
+
+        The row-result counterpart of ``run_json`` (issue #236). ``run_json``
+        returns a single JSON value, which for the payout-window snapshot
+        meant one ``json_agg`` over the whole window: the driver decoded
+        every record in one C call that never released the GIL, and the
+        lease monitor thread went unscheduled for the duration. Here the
+        statement projects one JSON object per row and the result is
+        consumed with ``fetchmany`` in ``batch_size`` slices, so the driver
+        decodes at most one slice per call and the interpreter can switch
+        threads between slices.
+
+        Same connection borrowing, same deadline transaction shape (``SET
+        LOCAL statement_timeout`` / ``lock_timeout`` when a deadline is
+        armed), same ``OperationalError`` translation and the same
+        once-only retry for ``retry_safe`` statements as ``run_json``. Two
+        properties are specific to this path:
+
+        * One SELECT, one snapshot. The complete result is received from
+          the server before the first row is decoded, and the deadline
+          transaction commits before local decoding starts, so a long
+          decode never holds a server transaction open against
+          ``idle_in_transaction_session_timeout``. A concurrent append
+          cannot appear in part of a snapshot, and a retry after a
+          connection loss discards every partially converted row and
+          re-executes the complete statement inside the original deadline.
+        * The deadline covers decoding. It is rechecked before every
+          batch, so a budget that expires while rows are still being
+          converted raises ``LedgerOperationTimeout`` and publishes
+          nothing, rather than returning late with a complete list.
+
+        ``row_converter`` runs on each row's JSON value inside the batch
+        loop (the ledger passes its record constructor), so one batch's
+        intermediate dicts are released before the next is fetched.
+        ``on_batch`` fires after each converted batch; the ledger uses it to
+        recheck its own operation deadline and stamp liveness. The batch
+        size bounds each decode call and the interval between checks, not
+        client memory: psycopg's client-side cursor still buffers the raw
+        result, exactly as it did under ``run_json``.
+        """
+        attempts = 2 if retry_safe else 1
+        batch_size = max(1, int(batch_size))
+        deadline = (
+            None
+            if timeout_seconds is None
+            else self._monotonic() + max(0.0, timeout_seconds)
+        )
+        for attempt in range(attempts):
+            try:
+                remaining = (
+                    None
+                    if deadline is None
+                    else max(0.0, deadline - self._monotonic())
+                )
+                if remaining is not None and remaining <= 0:
+                    raise LedgerOperationTimeout("postgres statement deadline expired")
+                connection = (
+                    self.connection()
+                    if remaining is None
+                    else self.connection(timeout_seconds=remaining)
+                )
+                with connection as conn:
+                    if deadline is None:
+                        if on_statement_start is not None:
+                            on_statement_start()
+                        cursor = conn.execute(sql)
+                    else:
+                        remaining = deadline - self._monotonic()
+                        if remaining <= 0:
+                            raise LedgerOperationTimeout(
+                                "postgres statement deadline expired"
+                            )
+                        if on_statement_start is not None:
+                            on_statement_start()
+                        timeout_ms = max(1, int(remaining * 1000))
+                        # Same SET LOCAL scoping as run_json. The block ends,
+                        # and the server transaction commits, before any
+                        # row is decoded: the client-side cursor already
+                        # holds the complete result, and a long decode must
+                        # not keep a server transaction open.
+                        with conn.transaction():
+                            conn.execute(
+                                f"SET LOCAL statement_timeout = '{timeout_ms}ms'"
+                            )
+                            conn.execute(
+                                f"SET LOCAL lock_timeout = '{timeout_ms}ms'"
+                            )
+                            cursor = conn.execute(sql)
+                    try:
+                        return self._consume_json_rows(
+                            cursor,
+                            deadline=deadline,
+                            row_converter=row_converter,
+                            batch_size=batch_size,
+                            on_batch=on_batch,
+                        )
+                    finally:
+                        cursor.close()
+            except self._psycopg.OperationalError as exc:
+                if timeout_seconds is not None and _is_postgres_deadline_error(exc):
+                    raise LedgerOperationTimeout(
+                        f"postgres operation exceeded {timeout_seconds:g}s"
+                    ) from exc
+                if attempt + 1 >= attempts:
+                    raise RuntimeError(f"postgres query failed: {exc}") from exc
+        raise AssertionError("unreachable")
+
+    def _consume_json_rows(
+        self,
+        cursor: Any,
+        *,
+        deadline: float | None,
+        row_converter: Callable[[Any], Any] | None,
+        batch_size: int,
+        on_batch: Callable[[], None] | None,
+    ) -> list[Any]:
+        """Convert a buffered row result in bounded batches.
+
+        A NULL row is rejected the way ``run_json`` rejects a NULL value;
+        a text row (a ``::text``-cast projection) is decoded here so both
+        column types produce the same Python objects.
+        """
+        results: list[Any] = []
+        while True:
+            if deadline is not None and self._monotonic() >= deadline:
+                raise LedgerOperationTimeout(
+                    "postgres statement deadline expired while decoding rows"
+                )
+            batch = cursor.fetchmany(batch_size)
+            if not batch:
+                return results
+            for row in batch:
+                value = parse_single_json_value(row[0] if row else None)
+                results.append(
+                    value if row_converter is None else row_converter(value)
+                )
+            if on_batch is not None:
+                on_batch()
 
     def run_script(self, sql: str) -> None:
         """Run a multi-statement script (schema initialization)."""
@@ -2993,6 +3179,28 @@ def parse_single_json_value(value: object) -> Any:
     if isinstance(value, (str, bytes, bytearray)):
         return json.loads(value)
     return value
+
+
+# The per-row JSON projection both payout-window reads return (issue #236):
+# one object per accepted share, decoded row by row by either backend, rather
+# than aggregated server-side with json_agg into a single value the client
+# then had to decode in one call the size of the window. Same keys and value
+# expressions the aggregate carried, so a record parses exactly as before.
+_ACCEPTED_SHARE_JSON_ROW_SQL = """json_build_object(
+    'share_seq', share_seq,
+    'share_id', share_id,
+    'miner_id', miner_id,
+    'order_key', payout_order_key,
+    'p2mr_program_hex', encode(p2mr_program, 'hex'),
+    'share_difficulty', share_difficulty::text,
+    'network_difficulty', network_difficulty::text,
+    'template_height', template_height,
+    'job_id', job_id,
+    'job_issued_at_ms', round(extract(epoch FROM job_issued_at) * 1000)::bigint,
+    'accepted_at_ms', round(extract(epoch FROM accepted_at) * 1000)::bigint,
+    'ntime', ntime,
+    'credit_policy', credit_policy
+)"""
 
 
 class PsqlShareLedger:
@@ -4697,23 +4905,15 @@ rows AS (
     FROM ranked
     WHERE cumulative_difficulty - share_difficulty < {int(window_weight)}::numeric
 )"""
-        sql = rows_cte + """
-SELECT COALESCE(json_agg(json_build_object(
-    'share_seq', share_seq,
-    'share_id', share_id,
-    'miner_id', miner_id,
-    'order_key', payout_order_key,
-    'p2mr_program_hex', encode(p2mr_program, 'hex'),
-    'share_difficulty', share_difficulty::text,
-    'network_difficulty', network_difficulty::text,
-    'template_height', template_height,
-    'job_id', job_id,
-    'job_issued_at_ms', round(extract(epoch FROM job_issued_at) * 1000)::bigint,
-    'accepted_at_ms', round(extract(epoch FROM accepted_at) * 1000)::bigint,
-    'ntime', ntime,
-    'credit_policy', credit_policy
-) ORDER BY share_seq ASC), '[]'::json)
-FROM rows;
+        # One JSON object per row, in the same final order the json_agg
+        # projection imposed (#236). The selection above is untouched: only
+        # the outer projection changed, so the window's membership, the
+        # weighted crossing row and the ascending share_seq order are the
+        # same rows, decoded in bounded batches instead of one call.
+        sql = rows_cte + f"""
+SELECT {_ACCEPTED_SHARE_JSON_ROW_SQL}
+FROM rows
+ORDER BY share_seq ASC;
 """
         # Job construction is a retry-safe MVCC read. Use the independent read
         # pool so an accepted block's fenced bulk write cannot stall replacement
@@ -4725,15 +4925,13 @@ FROM rows;
         # inside PostgreSQL. The slot taken is the same slot ``_run_read_json``
         # takes, in the same order, under the same deadline; only the
         # bookkeeping is new.
-        return [
-            self._record_from_json(item)
-            for item in self._run_attributed_read_json(
-                sql,
-                operation="payout_window_snapshot",
-                gate=self._read_semaphore,
-                gate_name="read slot",
-            )
-        ]
+        return self._run_attributed_read_json_rows(
+            sql,
+            operation="payout_window_snapshot",
+            gate=self._read_semaphore,
+            gate_name="read slot",
+            row_converter=self._record_from_json,
+        )
 
     def snapshot_between_job_issues(
         self,
@@ -4774,36 +4972,22 @@ WITH rows AS (
       AND ledger.job_issued_at <= {anchor}
       AND ledger.accepted_at <= {previous_anchor}
 )
-SELECT COALESCE(json_agg(json_build_object(
-    'share_seq', share_seq,
-    'share_id', share_id,
-    'miner_id', miner_id,
-    'order_key', payout_order_key,
-    'p2mr_program_hex', encode(p2mr_program, 'hex'),
-    'share_difficulty', share_difficulty::text,
-    'network_difficulty', network_difficulty::text,
-    'template_height', template_height,
-    'job_id', job_id,
-    'job_issued_at_ms', round(extract(epoch FROM job_issued_at) * 1000)::bigint,
-    'accepted_at_ms', round(extract(epoch FROM accepted_at) * 1000)::bigint,
-    'ntime', ntime,
-    'credit_policy', credit_policy
-) ORDER BY share_seq ASC), '[]'::json)
-FROM rows;
+SELECT {_ACCEPTED_SHARE_JSON_ROW_SQL}
+FROM rows
+ORDER BY share_seq ASC;
 """
         # Attributed (#224) as ``payout_window_delta``, apart from the whole
         # snapshot above: an incremental advance and a full fold are different
         # amounts of work, and folding them into one series would hide which
-        # of the two a landing actually paid for. Same read slot as before.
-        return [
-            self._record_from_json(item)
-            for item in self._run_attributed_read_json(
-                sql,
-                operation="payout_window_delta",
-                gate=self._read_semaphore,
-                gate_name="read slot",
-            )
-        ]
+        # of the two a landing actually paid for. Same read slot as before,
+        # and the same per-row projection as the snapshot (#236).
+        return self._run_attributed_read_json_rows(
+            sql,
+            operation="payout_window_delta",
+            gate=self._read_semaphore,
+            gate_name="read slot",
+            row_converter=self._record_from_json,
+        )
 
     def all_shares(self) -> list[AcceptedShareRecord]:
         sql = """
@@ -9148,13 +9332,74 @@ END;
         gate: Any,
         gate_name: str,
     ) -> Any:
+        """Run one gated single-value read, timing admission apart from execution.
+
+        See ``_run_attributed_read`` for the bookkeeping; this is that helper
+        with ``_run_retry_safe_read_json`` as the statement.
+        """
+        return self._run_attributed_read(
+            sql,
+            operation=operation,
+            gate=gate,
+            gate_name=gate_name,
+            execute=self._run_retry_safe_read_json,
+        )
+
+    def _run_attributed_read_json_rows(
+        self,
+        sql: str,
+        *,
+        operation: str,
+        gate: Any,
+        gate_name: str,
+        row_converter: Callable[[Any], Any] | None = None,
+    ) -> list[Any]:
+        """Run one gated row-result read, timing admission apart from execution.
+
+        The row-result twin of ``_run_attributed_read_json`` (issue #236):
+        the same gate, taken and released the same way, the same admission
+        and execution samples under the same ``operation`` name, with
+        ``_run_retry_safe_read_json_rows`` as the statement. Execution time
+        still covers the whole statement including local decoding, exactly
+        as the single-value read's did when its decoding was one call.
+        """
+
+        def execute(
+            statement: str,
+            *,
+            on_statement_start: Callable[[], None] | None = None,
+        ) -> list[Any]:
+            return self._run_retry_safe_read_json_rows(
+                statement,
+                row_converter=row_converter,
+                on_statement_start=on_statement_start,
+            )
+
+        return self._run_attributed_read(
+            sql,
+            operation=operation,
+            gate=gate,
+            gate_name=gate_name,
+            execute=execute,
+        )
+
+    def _run_attributed_read(
+        self,
+        sql: str,
+        *,
+        operation: str,
+        gate: Any,
+        gate_name: str,
+        execute: Callable[..., Any],
+    ) -> Any:
         """Run one gated read query, timing admission apart from execution.
 
         Identical to wrapping ``_operation_gate(gate, gate_name)`` around
-        ``_run_retry_safe_read_json`` in what it acquires and what it
-        executes -- the caller's own admission primitive, the same retry-safe
-        statement, no extra connection and no extra thread -- and different
-        only in what it records.
+        ``execute`` (``_run_retry_safe_read_json`` or its row-result twin)
+        in what it acquires and what it executes -- the caller's own
+        admission primitive, the same retry-safe statement, no extra
+        connection and no extra thread -- and different only in what it
+        records.
 
         The gate is the caller's and stays the caller's. A read that takes the
         bounded read semaphore keeps taking it; a read that takes the writer
@@ -9221,7 +9466,7 @@ END;
 
         timed_out = False
         try:
-            return self._run_retry_safe_read_json(
+            return execute(
                 sql,
                 on_statement_start=on_statement_start,
             )
@@ -9353,6 +9598,208 @@ END;
         if on_statement_start is not None:
             on_statement_start()
         return run_json(sql)
+
+    # Batch size for the row-result read path; an instance attribute so a
+    # test can shrink it to exercise batch boundaries with a handful of rows.
+    _json_row_batch_size: int = PAYOUT_WINDOW_ROW_BATCH_SIZE
+
+    def _run_retry_safe_read_json_rows(
+        self,
+        sql: str,
+        *,
+        row_converter: Callable[[Any], Any] | None = None,
+        on_statement_start: Callable[[], None] | None = None,
+    ) -> list[Any]:
+        """Run one read-only statement that yields one JSON value per row.
+
+        The row-result counterpart of ``_run_retry_safe_read_json`` (issue
+        #236), and the only way the payout-window snapshot and delta reach a
+        backend. The statement is one SELECT; each backend decodes its rows
+        in ``_json_row_batch_size`` batches and, between batches, rechecks
+        the caller's absolute operation deadline and stamps liveness
+        (``_note_json_row_batch``), so a window of any size is decoded in
+        bounded calls and a deadline that expires mid-decode fails the read
+        rather than returning late.
+
+        Backend selection mirrors ``_run_retry_safe_read_json`` seam for
+        seam, so no backend keeps a whole-window aggregate by accident:
+
+        * the native client runs ``run_json_rows`` (retry-safe, under the
+          same remaining deadline, with the same statement-start signal);
+        * a subclass that overrides the private ``_run_json`` seam stands in
+          for the whole server and answers a row-result statement with the
+          list of row values -- the same Python shape ``json_agg`` decoded
+          to, which is what the existing fakes already return -- converted
+          here in batches;
+        * a subclass that overrides the private ``_run_sql`` seam returns
+          psql's text, one JSON value per line, parsed line by line;
+        * the shipped subprocess backend spools psql's output and parses it
+          line by line (``_run_psql_json_rows``).
+        """
+        native = getattr(self, "_native", None)
+        if native is not None:
+            timeout_seconds = self._remaining_operation_timeout()
+            run_kwargs: dict[str, Any] = {
+                "retry_safe": True,
+                "row_converter": row_converter,
+                "batch_size": self._json_row_batch_size,
+                "on_batch": self._note_json_row_batch,
+            }
+            if on_statement_start is not None:
+                run_kwargs["on_statement_start"] = on_statement_start
+            if timeout_seconds is not None:
+                run_kwargs["timeout_seconds"] = timeout_seconds
+            return native.run_json_rows(sql, **run_kwargs)
+        run_json = self._run_json
+        if getattr(run_json, "__func__", None) is not PsqlShareLedger._run_json:
+            timeout_seconds = self._remaining_operation_timeout()
+            deadline = (
+                None
+                if timeout_seconds is None
+                else self._monotonic() + timeout_seconds
+            )
+            if on_statement_start is not None:
+                on_statement_start()
+            rows = run_json(sql)
+            if not isinstance(rows, list):
+                raise RuntimeError(
+                    "row-result statement seam returned a non-list value: "
+                    f"{type(rows).__name__}"
+                )
+            return self._convert_json_rows(
+                rows,
+                row_converter=row_converter,
+                deadline=deadline,
+            )
+        run_sql = self._run_sql
+        if getattr(run_sql, "__func__", None) is not PsqlShareLedger._run_sql:
+            timeout_seconds = self._remaining_operation_timeout()
+            deadline = (
+                None
+                if timeout_seconds is None
+                else self._monotonic() + timeout_seconds
+            )
+            if on_statement_start is not None:
+                on_statement_start()
+            output = run_sql(sql)
+            return self._decode_json_lines(
+                output.splitlines(),
+                row_converter=row_converter,
+                deadline=deadline,
+            )
+        return self._run_psql_json_rows(
+            sql,
+            row_converter=row_converter,
+            on_statement_start=on_statement_start,
+        )
+
+    def _note_json_row_batch(self) -> None:
+        """Between two decode batches: recheck the deadline, stamp liveness.
+
+        The native client's ``on_batch`` hook. ``_remaining_operation_timeout``
+        raises once the caller's absolute operation deadline has passed, so
+        a decode that outlives its budget fails at the next batch boundary
+        instead of completing late; the progress stamp is the same one a
+        multi-statement gate body makes between statements, and tells a
+        liveness monitor the read is advancing rather than wedged.
+        """
+        self._remaining_operation_timeout()
+        self._note_operation_progress()
+
+    def _check_json_row_deadline(self, deadline: float | None) -> None:
+        """Raise once the statement deadline or the operation deadline has passed.
+
+        Called before local decoding starts, between batches, and before a
+        result is published -- including after a trailing partial batch and
+        for a result smaller than one batch -- so a read never returns
+        successfully after its budget merely because the last batch was
+        short. ``deadline`` is the per-statement absolute deadline computed
+        at dispatch from the same remaining budget the statement ran under;
+        ``_remaining_operation_timeout`` covers the caller's absolute
+        operation deadline, which is the same instant in production and can
+        differ only under a test's virtual clock.
+        """
+        if deadline is not None and self._monotonic() >= deadline:
+            raise LedgerOperationTimeout(
+                "statement deadline expired while decoding rows"
+            )
+        self._remaining_operation_timeout()
+
+    def _convert_json_rows(
+        self,
+        rows: Sequence[Any],
+        *,
+        row_converter: Callable[[Any], Any] | None,
+        deadline: float | None,
+    ) -> list[Any]:
+        """Convert already-decoded row values in bounded batches.
+
+        Deadline-checked before the first batch, between batches (where
+        liveness is also stamped) and before the result is returned.
+        """
+        batch_size = max(1, int(self._json_row_batch_size))
+        results: list[Any] = []
+        self._check_json_row_deadline(deadline)
+        for start in range(0, len(rows), batch_size):
+            if start:
+                self._check_json_row_deadline(deadline)
+                self._note_operation_progress()
+            batch = rows[start : start + batch_size]
+            if row_converter is None:
+                results.extend(batch)
+            else:
+                results.extend(row_converter(value) for value in batch)
+        self._check_json_row_deadline(deadline)
+        return results
+
+    def _decode_json_lines(
+        self,
+        lines: Iterable[bytes | str],
+        *,
+        row_converter: Callable[[Any], Any] | None,
+        deadline: float | None,
+    ) -> list[Any]:
+        """Parse one JSON value per line, in bounded batches.
+
+        Blank lines are skipped: psql prints nothing at all for an empty
+        result and a trailing newline otherwise. Every other line must be
+        one complete JSON value -- with ``--tuples-only --no-align`` a row is
+        one line, and PostgreSQL's JSON output escapes control characters,
+        so no row spans lines -- and the values are never reassembled into
+        an array for a single ``json.loads``. The statement deadline computed
+        at dispatch and the caller's operation deadline are both checked
+        before decoding starts, between batches (where liveness is stamped)
+        and before the result is returned, so a trailing partial batch or a
+        result shorter than one batch cannot publish after the budget; the
+        native client keeps the same cadence.
+        """
+        batch_size = max(1, int(self._json_row_batch_size))
+        results: list[Any] = []
+        in_batch = 0
+        line_number = 0
+        self._check_json_row_deadline(deadline)
+        for raw_line in lines:
+            line_number += 1
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                if isinstance(line, bytes):
+                    line = line.decode("utf-8")
+                value = json.loads(line)
+            except ValueError as exc:
+                raise RuntimeError(
+                    "psql row-result statement returned malformed JSON on "
+                    f"output line {line_number}: {exc}"
+                ) from exc
+            results.append(value if row_converter is None else row_converter(value))
+            in_batch += 1
+            if in_batch >= batch_size:
+                in_batch = 0
+                self._check_json_row_deadline(deadline)
+                self._note_operation_progress()
+        self._check_json_row_deadline(deadline)
+        return results
 
     def _ensure_writer_lease(self) -> None:
         while True:
@@ -10419,6 +10866,129 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
         *,
         on_statement_start: Callable[[], None] | None = None,
     ) -> str:
+        cmd, run_kwargs, timeout_seconds = self._psql_invocation()
+        # All local deadline validation is complete. Only now does this
+        # invocation count as execution: an expiry raised above never starts
+        # psql and must remain attributed to coordinator-local admission.
+        if on_statement_start is not None:
+            on_statement_start()
+        try:
+            completed = subprocess.run(
+                cmd,
+                input=sql,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                **run_kwargs,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise LedgerOperationTimeout(
+                f"psql operation exceeded {timeout_seconds:g}s"
+            ) from exc
+        self._check_psql_exit(completed.returncode, completed.stderr, timeout_seconds)
+        return completed.stdout
+
+    def _run_psql_json_rows(
+        self,
+        sql: str,
+        *,
+        row_converter: Callable[[Any], Any] | None,
+        on_statement_start: Callable[[], None] | None,
+    ) -> list[Any]:
+        """Row-result counterpart of ``_run_sql`` for the subprocess backend.
+
+        The identical psql invocation (``_psql_invocation``: same flags,
+        session guards, statement/lock deadline, connect timeout and
+        subprocess timeout), with two differences (issue #236). psql's
+        stdout goes to an unnamed temporary file instead of being captured
+        into one string, so no whole-window text ever becomes a single
+        Python object; and the rows are read back from that spool one line
+        at a time and decoded in bounded batches (``_decode_json_lines``).
+
+        The spool is validated before a single row is read from it. The exit
+        status and stderr are translated exactly as ``_run_sql`` translates
+        them, a subprocess timeout kills and reaps the child before raising
+        ``LedgerOperationTimeout``, and the temporary file closes on every
+        exit path, so no record is ever published from a psql run that did
+        not complete successfully.
+        """
+        cmd, run_kwargs, timeout_seconds = self._psql_invocation()
+        decode_deadline = (
+            None
+            if timeout_seconds is None
+            else self._monotonic() + timeout_seconds
+        )
+        # Same boundary as _run_sql: deadline validation is done, execution
+        # starts here.
+        if on_statement_start is not None:
+            on_statement_start()
+        with tempfile.TemporaryFile(mode="w+b") as spool:
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=spool,
+                stderr=subprocess.PIPE,
+                env=run_kwargs.get("env"),
+            )
+            try:
+                _, stderr_bytes = process.communicate(
+                    input=sql.encode("utf-8"),
+                    timeout=run_kwargs.get("timeout"),
+                )
+            except subprocess.TimeoutExpired as exc:
+                process.kill()
+                process.communicate()
+                raise LedgerOperationTimeout(
+                    f"psql operation exceeded {timeout_seconds:g}s"
+                ) from exc
+            except BaseException:
+                process.kill()
+                process.wait()
+                raise
+            self._check_psql_exit(
+                process.returncode,
+                stderr_bytes.decode("utf-8", errors="replace"),
+                timeout_seconds,
+            )
+            spool.seek(0)
+            return self._decode_json_lines(
+                spool,
+                row_converter=row_converter,
+                deadline=decode_deadline,
+            )
+
+    @staticmethod
+    def _check_psql_exit(
+        returncode: int,
+        stderr: str,
+        timeout_seconds: float | None,
+    ) -> None:
+        """Translate a psql exit status the way every subprocess call does."""
+        if returncode == 0:
+            return
+        stderr = stderr.strip()
+        if timeout_seconds is not None and _is_postgres_deadline_error(stderr):
+            raise LedgerOperationTimeout(
+                f"psql operation exceeded {timeout_seconds:g}s"
+            )
+        raise RuntimeError(
+            "psql command failed "
+            f"(exit {returncode}): {stderr}"
+        )
+
+    def _psql_invocation(self) -> tuple[list[str], dict[str, Any], float | None]:
+        """Build the psql argv, subprocess keywords and deadline for one statement.
+
+        Shared by the single-value ``_run_sql`` and the row-result
+        ``_run_psql_json_rows`` so the two cannot drift: the same
+        ``--single-transaction`` / ``ON_ERROR_STOP`` invocation, the same
+        session guards on PGOPTIONS, and the same per-statement deadline
+        (statement_timeout / lock_timeout, PGCONNECT_TIMEOUT and the
+        subprocess timeout) derived from ``_remaining_operation_timeout``.
+        A deadline that has already expired raises here, before any process
+        is spawned, so it stays attributed to coordinator-local admission.
+        """
         cmd = [
             *self._command,
             "--no-psqlrc",
@@ -10477,36 +11047,7 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
                 max(1, math.ceil(timeout_seconds))
             )
             run_kwargs["timeout"] = timeout_seconds
-        # All local deadline validation is complete. Only now does this
-        # invocation count as execution: an expiry raised above never starts
-        # psql and must remain attributed to coordinator-local admission.
-        if on_statement_start is not None:
-            on_statement_start()
-        try:
-            completed = subprocess.run(
-                cmd,
-                input=sql,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-                **run_kwargs,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise LedgerOperationTimeout(
-                f"psql operation exceeded {timeout_seconds:g}s"
-            ) from exc
-        if completed.returncode != 0:
-            stderr = completed.stderr.strip()
-            if timeout_seconds is not None and _is_postgres_deadline_error(stderr):
-                raise LedgerOperationTimeout(
-                    f"psql operation exceeded {timeout_seconds:g}s"
-                )
-            raise RuntimeError(
-                "psql command failed "
-                f"(exit {completed.returncode}): {stderr}"
-            )
-        return completed.stdout
+        return cmd, run_kwargs, timeout_seconds
 
     @staticmethod
     def _record_from_json(payload: dict[str, Any]) -> AcceptedShareRecord:

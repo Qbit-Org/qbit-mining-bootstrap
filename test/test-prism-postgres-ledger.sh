@@ -104,6 +104,7 @@ from lab.prism.share_ledger import (
     ShareReplayConflict,
     SingleWriterShareLedger,
 )
+from tests.prism_window_rows_reference import assert_rows_match_aggregate
 
 
 def pending(
@@ -2155,6 +2156,51 @@ for network_difficulty, expected_len in [(512, 4096), (1024, 8192), (1025, 8200)
         f"multi-page audit window crossing row at network difficulty {network_difficulty}",
     )
 
+# Issue #236: both payout-window reads now return one JSON object per row,
+# decoded by the psql backend line by line from a spooled result instead of
+# one json_agg value. The selection did not change, so the pre-#236 aggregate
+# statement is the oracle: same rows, same order, same field values, across
+# the 9000-row fixture (17 batches of 512, a boundary inside the crossing
+# page), every exact weighted cutoff above, the unbounded full history, an
+# empty window, and the delta's disjoint eligibility branches.
+assert_equal(replacement.execution_backend, "psql-subprocess", "oracle check runs on the psql backend")
+for weight, expected_len in [(4095, 4095), (4096, 4096), (4097, 4097), (8192, 8192), (9000, 9000), (12000, 9000)]:
+    assert_rows_match_aggregate(
+        replacement,
+        lambda: replacement.snapshot_at_job_issue(bulk_anchor_ms, window_weight=weight),
+        label=f"per-row bounded snapshot at window weight {weight}",
+        expected_len=expected_len,
+    )
+assert_rows_match_aggregate(
+    replacement,
+    lambda: replacement.snapshot_at_job_issue(bulk_anchor_ms),
+    label="per-row unbounded snapshot",
+    expected_len=9000,
+)
+assert_rows_match_aggregate(
+    replacement,
+    lambda: replacement.snapshot_at_job_issue(0, window_weight=64),
+    label="per-row empty window",
+    expected_len=0,
+)
+assert_rows_match_aggregate(
+    replacement,
+    lambda: replacement.snapshot_at_job_issue(1_700_000_000_001, window_weight=1),
+    label="per-row single-row window",
+    expected_len=1,
+)
+assert_rows_match_aggregate(
+    replacement,
+    lambda: replacement.snapshot_between_job_issues(1_700_000_004_000, 1_700_000_006_000),
+    label="per-row delta inside the bulk fixture",
+    expected_len=2000,
+)
+assert_rows_match_aggregate(
+    replacement,
+    lambda: replacement.snapshot_between_job_issues(0, bulk_anchor_ms),
+    label="per-row delta over the whole history",
+)
+
 # A read-only ledger against this writable primary. Everything above proved
 # the database accepts writes, which is exactly what makes it the right target:
 # a standby would refuse these writes whoever asked, so it can never show that
@@ -2203,7 +2249,7 @@ assert_equal(
 )
 control_writer.close()
 
-print("prism postgres ledger PASS shares=14 lease=replay startup-retry persist-fence sql-window bulk-abandon=fenced maturity=reorg carry-replay integrity multipage-window=9000 read-only-session share-ledger-identity=inactive+reactivate+mature")
+print("prism postgres ledger PASS shares=14 lease=replay startup-retry persist-fence sql-window bulk-abandon=fenced maturity=reorg carry-replay integrity multipage-window=9000 window-rows=oracle read-only-session share-ledger-identity=inactive+reactivate+mature")
 PY
 
   PRISM_PSQL_COMMAND="${PSQL_COMMAND}" \

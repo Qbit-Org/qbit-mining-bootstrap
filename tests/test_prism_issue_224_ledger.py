@@ -237,6 +237,25 @@ class _UnattributedReadLedger(_AttributedReadLedger):
         with self._operation_gate(gate, gate_name):
             return self._run_retry_safe_read_json(sql)
 
+    def _run_attributed_read_json_rows(
+        self,
+        sql: str,
+        *,
+        operation: str,
+        gate: Any,
+        gate_name: str,
+        row_converter: Any = None,
+    ) -> list[Any]:
+        # The row-result reads (#236: the payout-window snapshot and delta)
+        # get the same restoration: the caller's gate through
+        # ``_operation_gate`` and the same retry-safe row statement,
+        # recording nothing.
+        with self._operation_gate(gate, gate_name):
+            return self._run_retry_safe_read_json_rows(
+                sql,
+                row_converter=row_converter,
+            )
+
 
 def share_row(share_seq: int, *, miner: str = "miner-a") -> dict[str, Any]:
     """One accepted-share payload in the shape the snapshot SQL returns."""
