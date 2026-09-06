@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+import selectors
 import stat
 import subprocess
 import tempfile
@@ -41,6 +42,18 @@ PRISM_BUILDER_PHASE_METRICS_PREFIX = "qbit-prism-build-phase-metrics "
 # Owner-local duplicate of the coordinator's admission poll cadence; the
 # compiler must not import the coordinator for one pacing constant.
 PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS = 0.05
+# Longest one pipe readiness wait may block before a transport loop
+# re-checks cancellation, supersession and its absolute deadline. This is
+# the cadence the retired fixed post-EAGAIN sleeps enforced; a readiness
+# wait wakes the moment the pipe can progress and only sleeps this long
+# when it cannot.
+PRISM_BUILDER_PIPE_WAIT_SLICE_SECONDS = min(
+    0.02,
+    PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS,
+)
+# Largest single os.read from a builder pipe. Matches the default Linux
+# pipe capacity so one wakeup drains one full pipe.
+PRISM_BUILDER_PIPE_READ_CHUNK_BYTES = 1 << 16
 # Upper bound for one kernel transfer from the share-window spool file into
 # the audit builder's stdin pipe. The kernel clamps each call to the free
 # pipe capacity anyway; the bound only paces cancellation checkpoints.
@@ -326,6 +339,119 @@ class _ShareWindowSerialization:
             spool.close()
         except OSError:
             pass
+
+
+class _PipeReadinessWaiter:
+    """Readiness wait for one non-blocking pipe end of a builder process.
+
+    The transport loops drive ``os.read``/``os.write``/``os.splice`` on
+    non-blocking descriptors so that cancellation, supersession and the
+    absolute deadline are checked between syscalls. They used to sleep a
+    fixed 20 ms after every EAGAIN, charging one sleep per drained pipe
+    capacity (64 KiB on Linux): a multi-megabyte window exchange then paid
+    orders of magnitude more in idle waits than in copying (#236). A waiter
+    blocks in the platform selector instead, bounded by BOTH the remaining
+    deadline and the cancellation-check cadence, so a waiting build wakes as
+    soon as bytes arrive or drain and still re-checks its control signals on
+    the old schedule when nothing happens.
+
+    One instance serves one transport operation. Registration is lazy -- an
+    operation satisfied from buffered bytes or by syscalls that never block
+    costs no selector -- and ``close`` releases the registration on every
+    exit path. A descriptor the selector refuses (a regular file standing
+    in for the pipe, a closed or fake descriptor) degrades to the historical
+    bounded sleep so the retry loop keeps working; so does one the selector
+    registers but cannot poll (``SelectSelector`` over a Windows pipe
+    handle, a descriptor torn down under the registration): the selector is
+    released once, the descriptor stays unwatchable for the rest of the
+    operation, and the sleep takes only whatever budget the failed poll
+    left. Readiness reported by the selector may be spurious and EINTR is
+    never a wait: both are resolved by the caller retrying the syscall after
+    its control checks.
+    """
+
+    __slots__ = ("_events", "_file_descriptor", "_selector", "_unwatchable", "waits")
+
+    def __init__(self, file_descriptor: int, events: int) -> None:
+        self._file_descriptor = file_descriptor
+        self._events = events
+        self._selector: selectors.BaseSelector | None = None
+        self._unwatchable = False
+        # Blocked waits taken by this operation; read by tests and the
+        # transport benchmark, never by production metrics.
+        self.waits = 0
+
+    def __enter__(self) -> _PipeReadinessWaiter:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def wait(self, deadline: float) -> bool:
+        """Block until ready, the cadence slice ends, or the deadline passes.
+
+        Returns True when readiness was reported (possibly spuriously) and
+        False when the slice or the deadline elapsed first. It never raises
+        for an exhausted deadline: the calling loop owns the ordering of its
+        cancellation, supersession and deadline checks and performs them
+        before the next syscall.
+        """
+        self.waits += 1
+        now = time.monotonic()
+        timeout = min(PRISM_BUILDER_PIPE_WAIT_SLICE_SECONDS, deadline - now)
+        if timeout <= 0:
+            return False
+        # This wait may consume no more than one slice, however it ends.
+        slice_deadline = min(now + timeout, deadline)
+        selector = self._selector
+        if selector is None and not self._unwatchable:
+            try:
+                selector = selectors.DefaultSelector()
+                try:
+                    selector.register(self._file_descriptor, self._events)
+                except BaseException:
+                    selector.close()
+                    raise
+            except (OSError, ValueError, KeyError):
+                selector = None
+                self._unwatchable = True
+            else:
+                self._selector = selector
+        if selector is not None:
+            try:
+                # select() retries EINTR itself with the remaining timeout
+                # (PEP 475); a signal handler that raises propagates as is.
+                return bool(selector.select(timeout))
+            except InterruptedError:
+                # Not a readiness verdict and not a fault: the caller
+                # re-checks its control signals and retries the syscall.
+                return False
+            except (OSError, ValueError):
+                # Registered, but the selector cannot poll this descriptor.
+                # Release it exactly once, remember that for the rest of the
+                # operation, and finish THIS wait with the bounded sleep
+                # over whatever budget the failed poll left -- never a fresh
+                # full slice, never past the absolute deadline.
+                self._detach_selector()
+                timeout = slice_deadline - time.monotonic()
+                if timeout <= 0:
+                    return False
+        time.sleep(timeout)
+        return False
+
+    def _detach_selector(self) -> None:
+        self._unwatchable = True
+        selector, self._selector = self._selector, None
+        if selector is not None:
+            try:
+                selector.close()
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        selector, self._selector = self._selector, None
+        if selector is not None:
+            selector.close()
 
 
 class _ServeBuilderUnavailable(RuntimeError):
@@ -674,52 +800,64 @@ class BundleCompiler:
         stdout = client.process.stdout
         assert stdout is not None
         file_descriptor = stdout.fileno()
-        while True:
-            newline_index = client.stdout_buffer.find(b"\n")
-            if newline_index >= 0:
-                line = bytes(client.stdout_buffer[:newline_index])
-                del client.stdout_buffer[: newline_index + 1]
-                return line
-            if cancellation is not None:
-                cancellation.raise_if_cancelled("serve builder response")
-            if (
-                build_control is not None
-                and build_control.cancel_event.is_set()
-            ):
-                raise self._superseded_error(
-                    "audit-builder daemon request was canceled after supersession"
-                )
-            if time.monotonic() >= deadline:
-                # Not counted as a worker failure here: the fallback one-shot
-                # runs against this same exhausted deadline and its own
-                # timeout path records the failure exactly once.
-                raise _ServeBuilderUnavailable(
-                    "audit-builder daemon timed out"
-                )
-            try:
-                chunk = os.read(file_descriptor, 1 << 16)
-            except (BlockingIOError, InterruptedError):
-                time.sleep(min(0.02, PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS))
-                continue
-            except OSError as exc:
-                raise _ServeBuilderUnavailable(
-                    f"audit-builder daemon read failed: {exc}"
-                ) from exc
-            if not chunk:
+        # Bytes before this offset were already scanned for the newline; the
+        # buffer only grows until the line is cut, so a long response line
+        # is scanned once rather than once per received chunk.
+        scanned = 0
+        with _PipeReadinessWaiter(file_descriptor, selectors.EVENT_READ) as waiter:
+            while True:
+                newline_index = client.stdout_buffer.find(b"\n", scanned)
+                if newline_index >= 0:
+                    line = bytes(client.stdout_buffer[:newline_index])
+                    del client.stdout_buffer[: newline_index + 1]
+                    return line
+                scanned = len(client.stdout_buffer)
+                if cancellation is not None:
+                    cancellation.raise_if_cancelled("serve builder response")
                 if (
                     build_control is not None
                     and build_control.cancel_event.is_set()
                 ):
                     raise self._superseded_error(
-                        "audit-builder daemon was terminated after supersession"
+                        "audit-builder daemon request was canceled after supersession"
                     )
-                with runtime._job_build_scheduler_lock:
-                    runtime.job_build_worker_counts["crashes"] += 1
-                    runtime._job_build_worker_restart_pending = True
-                raise _ServeBuilderUnavailable(
-                    "audit-builder daemon exited mid-request"
-                )
-            client.stdout_buffer += chunk
+                if time.monotonic() >= deadline:
+                    # Not counted as a worker failure here: the fallback
+                    # one-shot runs against this same exhausted deadline and
+                    # its own timeout path records the failure exactly once.
+                    raise _ServeBuilderUnavailable(
+                        "audit-builder daemon timed out"
+                    )
+                try:
+                    chunk = os.read(
+                        file_descriptor,
+                        PRISM_BUILDER_PIPE_READ_CHUNK_BYTES,
+                    )
+                except InterruptedError:
+                    # Not a wait: retried straight after the control checks.
+                    continue
+                except BlockingIOError:
+                    waiter.wait(deadline)
+                    continue
+                except OSError as exc:
+                    raise _ServeBuilderUnavailable(
+                        f"audit-builder daemon read failed: {exc}"
+                    ) from exc
+                if not chunk:
+                    if (
+                        build_control is not None
+                        and build_control.cancel_event.is_set()
+                    ):
+                        raise self._superseded_error(
+                            "audit-builder daemon was terminated after supersession"
+                        )
+                    with runtime._job_build_scheduler_lock:
+                        runtime.job_build_worker_counts["crashes"] += 1
+                        runtime._job_build_worker_restart_pending = True
+                    raise _ServeBuilderUnavailable(
+                        "audit-builder daemon exited mid-request"
+                    )
+                client.stdout_buffer += chunk
 
     def _serve_builder_read_exact(
         self,
@@ -745,37 +883,46 @@ class BundleCompiler:
             take = min(byte_count, len(client.stdout_buffer))
             out += client.stdout_buffer[:take]
             del client.stdout_buffer[:take]
-        while len(out) < byte_count:
-            if cancellation is not None:
-                cancellation.raise_if_cancelled("serve builder response")
-            if (
-                build_control is not None
-                and build_control.cancel_event.is_set()
-            ):
-                raise self._superseded_error(
-                    "audit-builder daemon request was canceled after supersession"
-                )
-            if time.monotonic() >= deadline:
-                raise _ServeBuilderUnavailable(
-                    "audit-builder daemon timed out"
-                )
-            try:
-                chunk = os.read(file_descriptor, min(1 << 16, byte_count - len(out)))
-            except (BlockingIOError, InterruptedError):
-                time.sleep(min(0.02, PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS))
-                continue
-            except OSError as exc:
-                raise _ServeBuilderUnavailable(
-                    f"audit-builder daemon read failed: {exc}"
-                ) from exc
-            if not chunk:
-                with runtime._job_build_scheduler_lock:
-                    runtime.job_build_worker_counts["crashes"] += 1
-                    runtime._job_build_worker_restart_pending = True
-                raise _ServeBuilderUnavailable(
-                    "audit-builder daemon exited mid-request"
-                )
-            out += chunk
+        with _PipeReadinessWaiter(file_descriptor, selectors.EVENT_READ) as waiter:
+            while len(out) < byte_count:
+                if cancellation is not None:
+                    cancellation.raise_if_cancelled("serve builder response")
+                if (
+                    build_control is not None
+                    and build_control.cancel_event.is_set()
+                ):
+                    raise self._superseded_error(
+                        "audit-builder daemon request was canceled after supersession"
+                    )
+                if time.monotonic() >= deadline:
+                    raise _ServeBuilderUnavailable(
+                        "audit-builder daemon timed out"
+                    )
+                try:
+                    chunk = os.read(
+                        file_descriptor,
+                        min(
+                            PRISM_BUILDER_PIPE_READ_CHUNK_BYTES,
+                            byte_count - len(out),
+                        ),
+                    )
+                except InterruptedError:
+                    continue
+                except BlockingIOError:
+                    waiter.wait(deadline)
+                    continue
+                except OSError as exc:
+                    raise _ServeBuilderUnavailable(
+                        f"audit-builder daemon read failed: {exc}"
+                    ) from exc
+                if not chunk:
+                    with runtime._job_build_scheduler_lock:
+                        runtime.job_build_worker_counts["crashes"] += 1
+                        runtime._job_build_worker_restart_pending = True
+                    raise _ServeBuilderUnavailable(
+                        "audit-builder daemon exited mid-request"
+                    )
+                out += chunk
         return bytes(out)
 
     def _serve_builder_write(
@@ -791,49 +938,52 @@ class BundleCompiler:
         file_descriptor = stdin.fileno()
         remaining = memoryview(data)
         written_total = 0
-        while remaining:
-            if cancellation is not None:
-                cancellation.raise_if_cancelled("serve builder request")
-            if (
-                build_control is not None
-                and build_control.cancel_event.is_set()
-            ):
-                raise self._superseded_error(
-                    "audit-builder daemon request was canceled after supersession"
-                )
-            if time.monotonic() >= deadline:
-                # Not counted as a worker failure here: the fallback one-shot
-                # runs against this same exhausted deadline and its own
-                # timeout path records the failure exactly once.
-                raise _ServeBuilderUnavailable(
-                    "audit-builder daemon timed out"
-                )
-            try:
-                written = os.write(file_descriptor, remaining)
-            except (BlockingIOError, InterruptedError):
-                time.sleep(min(0.02, PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS))
-                continue
-            except BrokenPipeError as exc:
+        with _PipeReadinessWaiter(file_descriptor, selectors.EVENT_WRITE) as waiter:
+            while remaining:
+                if cancellation is not None:
+                    cancellation.raise_if_cancelled("serve builder request")
                 if (
                     build_control is not None
                     and build_control.cancel_event.is_set()
                 ):
                     raise self._superseded_error(
-                        "audit-builder daemon was terminated after supersession"
+                        "audit-builder daemon request was canceled after supersession"
+                    )
+                if time.monotonic() >= deadline:
+                    # Not counted as a worker failure here: the fallback
+                    # one-shot runs against this same exhausted deadline and
+                    # its own timeout path records the failure exactly once.
+                    raise _ServeBuilderUnavailable(
+                        "audit-builder daemon timed out"
+                    )
+                try:
+                    written = os.write(file_descriptor, remaining)
+                except InterruptedError:
+                    continue
+                except BlockingIOError:
+                    waiter.wait(deadline)
+                    continue
+                except BrokenPipeError as exc:
+                    if (
+                        build_control is not None
+                        and build_control.cancel_event.is_set()
+                    ):
+                        raise self._superseded_error(
+                            "audit-builder daemon was terminated after supersession"
+                        ) from exc
+                    raise _ServeBuilderUnavailable(
+                        "audit-builder daemon input pipe closed"
                     ) from exc
-                raise _ServeBuilderUnavailable(
-                    "audit-builder daemon input pipe closed"
-                ) from exc
-            except OSError as exc:
-                raise _ServeBuilderUnavailable(
-                    f"audit-builder daemon write failed: {exc}"
-                ) from exc
-            if written <= 0:
-                raise _ServeBuilderUnavailable(
-                    "audit-builder daemon input pipe closed"
-                )
-            written_total += written
-            remaining = remaining[written:]
+                except OSError as exc:
+                    raise _ServeBuilderUnavailable(
+                        f"audit-builder daemon write failed: {exc}"
+                    ) from exc
+                if written <= 0:
+                    raise _ServeBuilderUnavailable(
+                        "audit-builder daemon input pipe closed"
+                    )
+                written_total += written
+                remaining = remaining[written:]
         return written_total
 
     def _serve_builder_splice_spool(
@@ -851,66 +1001,77 @@ class BundleCompiler:
         stdin_fd = stdin.fileno()
         spool_fd = spool_file.fileno()
         offset = 0
-        while offset < spool_size:
-            if cancellation is not None:
-                cancellation.raise_if_cancelled("serve builder request")
-            if (
-                build_control is not None
-                and build_control.cancel_event.is_set()
-            ):
-                raise self._superseded_error(
-                    "audit-builder daemon request was canceled after supersession"
-                )
-            if time.monotonic() >= deadline:
-                # Not counted as a worker failure here: the fallback one-shot
-                # runs against this same exhausted deadline and its own
-                # timeout path records the failure exactly once.
-                raise _ServeBuilderUnavailable(
-                    "audit-builder daemon timed out"
-                )
-            try:
-                moved = os.splice(
-                    spool_fd,
-                    stdin_fd,
-                    min(PRISM_SPOOL_SPLICE_CHUNK_BYTES, spool_size - offset),
-                    offset_src=offset,
-                )
-            except (BlockingIOError, InterruptedError):
-                time.sleep(min(0.02, PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS))
-                continue
-            except BrokenPipeError as exc:
-                # The daemon's stdin closed; the spool itself is fine.
+        # EAGAIN here always means the pipe is full (the spool is a regular
+        # file), so the wait is for the daemon's stdin to drain. A splice
+        # that raised moved nothing -- offset_src is explicit -- so retrying
+        # from the same offset never repeats a byte, and a splice that moved
+        # part of its request advances the offset by exactly that much.
+        with _PipeReadinessWaiter(stdin_fd, selectors.EVENT_WRITE) as waiter:
+            while offset < spool_size:
+                if cancellation is not None:
+                    cancellation.raise_if_cancelled("serve builder request")
                 if (
                     build_control is not None
                     and build_control.cancel_event.is_set()
                 ):
                     raise self._superseded_error(
-                        "audit-builder daemon was terminated after supersession"
+                        "audit-builder daemon request was canceled after supersession"
+                    )
+                if time.monotonic() >= deadline:
+                    # Not counted as a worker failure here: the fallback
+                    # one-shot runs against this same exhausted deadline and
+                    # its own timeout path records the failure exactly once.
+                    raise _ServeBuilderUnavailable(
+                        "audit-builder daemon timed out"
+                    )
+                try:
+                    moved = os.splice(
+                        spool_fd,
+                        stdin_fd,
+                        min(PRISM_SPOOL_SPLICE_CHUNK_BYTES, spool_size - offset),
+                        offset_src=offset,
+                    )
+                except InterruptedError:
+                    continue
+                except BlockingIOError:
+                    waiter.wait(deadline)
+                    continue
+                except BrokenPipeError as exc:
+                    # The daemon's stdin closed; the spool itself is fine.
+                    if (
+                        build_control is not None
+                        and build_control.cancel_event.is_set()
+                    ):
+                        raise self._superseded_error(
+                            "audit-builder daemon was terminated after supersession"
+                        ) from exc
+                    raise _ServeBuilderUnavailable(
+                        "audit-builder daemon input pipe closed"
                     ) from exc
-                raise _ServeBuilderUnavailable(
-                    "audit-builder daemon input pipe closed"
-                ) from exc
-            except OSError as exc:
-                if (
-                    build_control is not None
-                    and build_control.cancel_event.is_set()
-                ):
-                    raise self._superseded_error(
-                        "audit-builder daemon was terminated after supersession"
+                except OSError as exc:
+                    if (
+                        build_control is not None
+                        and build_control.cancel_event.is_set()
+                    ):
+                        raise self._superseded_error(
+                            "audit-builder daemon was terminated after supersession"
+                        ) from exc
+                    # The spool itself cannot stream. Poison it so the
+                    # one-shot fallback -- and every later build -- writes
+                    # the cached in-memory fragments instead of retrying the
+                    # same transfer and failing mid-stream. Whatever prefix
+                    # already reached the daemon is never re-sent: the
+                    # anomaly retires this daemon with the request marked
+                    # incomplete.
+                    share_serialization.mark_spool_failed()
+                    raise _ServeBuilderUnavailable(
+                        f"audit-builder daemon spool transfer failed: {exc}"
                     ) from exc
-                # The spool itself cannot stream. Poison it so the one-shot
-                # fallback -- and every later build -- writes the cached
-                # in-memory fragments instead of retrying the same transfer
-                # and failing mid-stream.
-                share_serialization.mark_spool_failed()
-                raise _ServeBuilderUnavailable(
-                    f"audit-builder daemon spool transfer failed: {exc}"
-                ) from exc
-            if moved <= 0:
-                raise _ServeBuilderUnavailable(
-                    "audit-builder daemon input pipe closed"
-                )
-            offset += moved
+                if moved <= 0:
+                    raise _ServeBuilderUnavailable(
+                        "audit-builder daemon input pipe closed"
+                    )
+                offset += moved
         return offset
 
     def _serve_builder_request_locked(
@@ -1701,6 +1862,7 @@ class BundleCompiler:
                 class _CancelableInput:
                     def __init__(self, stream: Any) -> None:
                         self.stream = stream
+                        self.waiter: _PipeReadinessWaiter | None = None
                         try:
                             file_descriptor = int(stream.fileno())
                         except (AttributeError, OSError, TypeError, ValueError):
@@ -1710,6 +1872,25 @@ class BundleCompiler:
                         else:
                             os.set_blocking(file_descriptor, False)
                             self.file_descriptor = file_descriptor
+                            self.waiter = _PipeReadinessWaiter(
+                                file_descriptor,
+                                selectors.EVENT_WRITE,
+                            )
+
+                    def wait_writable(self) -> None:
+                        """Block until the child's stdin can drain.
+
+                        Bounded by the build deadline and the cancellation
+                        cadence exactly like the daemon transport; the
+                        caller re-runs check_cancelled before retrying.
+                        """
+                        if self.waiter is not None:
+                            self.waiter.wait(worker_deadline)
+
+                    def close(self) -> None:
+                        waiter, self.waiter = self.waiter, None
+                        if waiter is not None:
+                            waiter.close()
 
                     def check_cancelled(self) -> None:
                         if cancellation is not None:
@@ -1746,13 +1927,10 @@ class BundleCompiler:
                                     self.file_descriptor,
                                     remaining,
                                 )
-                            except (BlockingIOError, InterruptedError):
-                                time.sleep(
-                                    min(
-                                        0.02,
-                                        PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS,
-                                    )
-                                )
+                            except InterruptedError:
+                                continue
+                            except BlockingIOError:
+                                self.wait_writable()
                                 continue
                             if written <= 0:
                                 raise BrokenPipeError(
@@ -1764,6 +1942,7 @@ class BundleCompiler:
 
                 serialization_started = time.monotonic()
                 spool_lease: tuple[Any, int] | None = None
+                sink: _CancelableInput | None = None
                 try:
                     sink = _CancelableInput(process.stdin)
 
@@ -1810,13 +1989,10 @@ class BundleCompiler:
                                         ),
                                         offset_src=offset,
                                     )
-                                except (BlockingIOError, InterruptedError):
-                                    time.sleep(
-                                        min(
-                                            0.02,
-                                            PRISM_TIP_REFRESH_ADMISSION_POLL_SECONDS,
-                                        )
-                                    )
+                                except InterruptedError:
+                                    continue
+                                except BlockingIOError:
+                                    sink.wait_writable()
                                     continue
                                 except BrokenPipeError:
                                     # The child's stdin closed; the spool
@@ -1873,6 +2049,8 @@ class BundleCompiler:
                             runtime._job_build_worker_restart_pending = True
                     raise
                 finally:
+                    if sink is not None:
+                        sink.close()
                     if spool_lease is not None and share_serialization is not None:
                         share_serialization.release_spooled_tail()
                     phases = runtime._job_build_phases()
