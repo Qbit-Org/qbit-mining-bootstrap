@@ -1236,8 +1236,7 @@ class MetricsRenderer:
             ),
             # json.dumps with its ASCII default, so characters are bytes.
             "share_window_serialization_compact_json": (
-                len(serialization._compact_shares_json or "")
-                + len(serialization._compact_share_identities_json or "")
+                int(serialization.compact_json_bytes)
                 if serialization is not None
                 else 0
             ),

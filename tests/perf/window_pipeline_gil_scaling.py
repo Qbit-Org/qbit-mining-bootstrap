@@ -51,7 +51,7 @@ stage                        callable
 ``digest``                   ``IncrementalShareJsonSequence.canonical_json_sha256``
 ``to_prism_json``            ``AcceptedShareRecord.to_prism_json`` (all records)
 ``spool_acquire``            ``_ShareWindowSerialization.acquire_spooled_tail``
-``spool_compact``            ``_ShareWindowSerialization.compact_fragments``
+``spool_compact``            ``_ShareWindowSerialization.compact_tail_chunks``
 ``spool_encode``             ``str.encode("utf-8")`` of both fragments
 ``spool_write``              ``TemporaryFile`` write/flush/seek of the payload
 ===========================  ==================================================
@@ -75,11 +75,24 @@ This is an **on-demand instrument, not a test**: it asserts no thresholds and
 is deliberately not named ``test_*`` so the discovery run never executes it
 (#160 -- a threshold assertion on a shared runner is a flaky test in waiting).
 Nothing under ``lab/`` is imported for anything but read-only measurement.
+
+``--latency-probe`` (#236) is a second mode over the same fixture: instead of
+cores-used across threads it runs each serialization phase once at the
+incident's window sizes (210k and 400k shares by default) in the main thread
+while a monitor thread wakes on the writer-lease monitor's cadence
+(``WRITER_LEASE_HEARTBEAT_MONITOR_SECONDS``) and records how late every wake
+was. A GIL-held C call delays the monitor for its whole duration; a Python
+loop of bounded C calls lets the interpreter switch at its normal interval.
+Each bounded phase is paired with the historical whole-window call it
+replaced, and ``--daemon-binary`` adds the real Rust builder's prepare
+round trip split into request write, response wait and response read. See
+``LATENCY_PROBE_RATIONALE``.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import hashlib
 import json
@@ -92,20 +105,37 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from lab.prism.bundle_compiler import (
+    BundleCompiler,
     _compact_share_payload,
+    _compact_share_tail_chunks,
+    _iter_prepare_window_request_chunks,
     _ShareWindowSerialization,
+)
+from lab.prism.share_json_stream import (
+    canonical_share_array_sha256,
+    iter_canonical_share_item_chunks,
+    iter_json_object_text_chunks,
 )
 from lab.prism.share_ledger import (
     DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
     AcceptedShareRecord,
+    DaemonShareJsonSequence,
+    DaemonShareWindowMirror,
     IncrementalShareWindow,
     _IncrementalShareWindowPage,
+    block_candidate_identity,
+    block_candidate_identity_sha256,
+    sha256_json_hex,
+)
+from lab.prism.writer_lease_timing import (
+    WRITER_LEASE_HEARTBEAT_MONITOR_SECONDS,
+    WRITER_LEASE_HEARTBEAT_SCHEDULER_SLACK_SECONDS,
 )
 
 
@@ -570,8 +600,8 @@ def _spool_acquire(inputs: StageInputs) -> Callable[[], Any]:
 def _spool_compact(inputs: StageInputs) -> Callable[[], Any]:
     shares = inputs.shares
 
-    def run() -> tuple[str, str]:
-        return _new_serialization(inputs).compact_fragments(shares)
+    def run() -> tuple[str, ...]:
+        return _new_serialization(inputs).compact_tail_chunks(shares)
 
     return run
 
@@ -653,10 +683,10 @@ STAGES: tuple[Stage, ...] = (
     ),
     Stage(
         "spool_compact",
-        "_ShareWindowSerialization.compact_fragments (cold)",
+        "_ShareWindowSerialization.compact_tail_chunks (cold)",
         None,
         "spool_acquire",
-        "_compact_share_payload + two json.dumps",
+        "identity dedup + batched json.dumps into bounded chunks (#236)",
         _spool_compact,
     ),
     Stage(
@@ -1274,6 +1304,926 @@ def render_report(results: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# #236 monitor-lateness probe
+# ---------------------------------------------------------------------------
+
+LATENCY_PROBE_RATIONALE = (
+    "The lease monitor thread must wake on its cadence while the payout "
+    "window is being serialized in another thread of the same process. A "
+    "single C call (json.dumps/json.loads over a whole 200k-share window) "
+    "holds the GIL until it returns, so the monitor's wake is late by the "
+    "call's duration; a Python loop of bounded C calls lets the interpreter "
+    "switch threads at its normal interval. The probe therefore measures, "
+    "for each phase, the maximum and p99 lateness of a thread that sleeps "
+    "on WRITER_LEASE_HEARTBEAT_MONITOR_SECONDS and records wake - due. This "
+    "is scheduling evidence on one host, not a proof of hard real-time "
+    "behaviour, and not a production measurement."
+)
+
+PROBE_DEFAULT_SIZES = (210_000, 400_000)
+# Distinct payout identities in the probe fixture: the compact payload's
+# identity table and the fold's per-identity work depend on it.
+PROBE_DEFAULT_MINERS = 200
+# The plan's stricter engineering target for monitor wake lateness, giving
+# headroom against the configured scheduler slack.
+PROBE_STRICT_LATENESS_SECONDS = 0.25
+PROBE_CONTROL_SECONDS = 1.0
+# Records appended by the advance step of the daemon round trip.
+PROBE_ADVANCE_RECORDS = 16
+
+
+class MonitorLatenessProbe:
+    """A thread waking on the lease monitor's cadence, recording lateness.
+
+    Each wake is scheduled ``interval`` after the previous wake (a late
+    wake does not owe a burst of catch-up wakes, exactly like a loop that
+    sleeps for its interval), and its lateness is ``wake - due``. Samples
+    are attributed to whichever phase the main thread has declared current;
+    wakes between phases are discarded.
+    """
+
+    def __init__(self, interval: float) -> None:
+        self._interval = float(interval)
+        self._lock = threading.Lock()
+        self._phase: str | None = None
+        self._samples: dict[str, list[float]] = {}
+        # Cyclic-GC pauses attributed to the current phase: (generation,
+        # seconds) per collection, from gc.callbacks. A full collection over
+        # a large live heap is itself one GIL-held stretch, and is the first
+        # suspect whenever a bounded phase still shows a late wake.
+        self._gc_pauses: dict[str, list[tuple[int, float]]] = {}
+        self._gc_started: float | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="lease-monitor-lateness-probe",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        gc.callbacks.append(self._gc_callback)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join()
+        with contextlib.suppress(ValueError):
+            gc.callbacks.remove(self._gc_callback)
+
+    def _gc_callback(self, event: str, info: dict[str, Any]) -> None:
+        # Runs on whichever thread triggered the collection, under the GIL.
+        if event == "start":
+            self._gc_started = time.perf_counter()
+            return
+        started = self._gc_started
+        self._gc_started = None
+        if started is None:
+            return
+        pause = time.perf_counter() - started
+        with self._lock:
+            phase = self._phase
+            if phase is not None:
+                self._gc_pauses[phase].append((int(info.get("generation", -1)), pause))
+
+    def _run(self) -> None:
+        due = time.monotonic() + self._interval
+        while not self._stop.is_set():
+            delay = due - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            now = time.monotonic()
+            late = now - due
+            with self._lock:
+                phase = self._phase
+                if phase is not None:
+                    self._samples[phase].append(late)
+            due = now + self._interval
+
+    @contextlib.contextmanager
+    def phase(self, name: str) -> Iterator[None]:
+        with self._lock:
+            self._phase = name
+            self._samples[name] = []
+            self._gc_pauses[name] = []
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._phase = None
+
+    def summary(self, name: str) -> dict[str, Any]:
+        with self._lock:
+            samples = list(self._samples.get(name, ()))
+            pauses = list(self._gc_pauses.get(name, ()))
+        gc_summary = {
+            "gc_collections": len(pauses),
+            "gc_full_collections": sum(1 for gen, _ in pauses if gen >= 2),
+            "gc_max_pause_ms": max((pause for _, pause in pauses), default=0.0) * 1e3,
+            "gc_total_pause_ms": sum(pause for _, pause in pauses) * 1e3,
+        }
+        if not samples:
+            return {
+                "wakes": 0,
+                "max_late_ms": None,
+                "p99_late_ms": None,
+                "mean_late_ms": None,
+                "over_strict": 0,
+                "over_slack": 0,
+                **gc_summary,
+            }
+        ordered = sorted(samples)
+        p99_index = min(len(ordered) - 1, int(round(0.99 * (len(ordered) - 1))))
+        return {
+            "wakes": len(samples),
+            "max_late_ms": ordered[-1] * 1e3,
+            "p99_late_ms": ordered[p99_index] * 1e3,
+            "mean_late_ms": sum(samples) / len(samples) * 1e3,
+            "over_strict": sum(
+                1 for late in samples if late > PROBE_STRICT_LATENESS_SECONDS
+            ),
+            "over_slack": sum(
+                1
+                for late in samples
+                if late > WRITER_LEASE_HEARTBEAT_SCHEDULER_SLACK_SECONDS
+            ),
+            **gc_summary,
+        }
+
+
+@dataclass(frozen=True)
+class ProbePhaseResult:
+    key: str
+    kind: str
+    note: str
+    wall_seconds: float
+    cpu_seconds: float
+    bytes: int | None
+    lateness: dict[str, Any]
+    detail: dict[str, float] | None = None
+
+    def as_json(self) -> dict[str, Any]:
+        return {
+            "key": self.key,
+            "kind": self.kind,
+            "note": self.note,
+            "wall_ms": round(self.wall_seconds * 1e3, 3),
+            "cpu_ms": round(self.cpu_seconds * 1e3, 3),
+            "bytes": self.bytes,
+            "lateness": {
+                key: (round(value, 3) if isinstance(value, float) else value)
+                for key, value in self.lateness.items()
+            },
+            "detail_ms": (
+                {key: round(value * 1e3, 3) for key, value in self.detail.items()}
+                if self.detail
+                else None
+            ),
+        }
+
+
+class _ProbeRuntime:
+    """The slice of the coordinator runtime port prepare_payout_window uses."""
+
+    def __init__(self) -> None:
+        self.signing_seed_hex = "42" * 32
+        self.ledger_attestation_signing_seed_hex = "43" * 32
+        self.bundle_build_timeout_seconds = 600.0
+        self._job_build_scheduler_lock = threading.Lock()
+        self.job_build_worker_counts = {
+            "starts": 0,
+            "restarts": 0,
+            "crashes": 0,
+            "terminations": 0,
+        }
+        self._job_build_worker_restart_pending = False
+        self._tip_refresh_metrics_lock = threading.Lock()
+        self.tip_refresh_worker_restarts = 0
+
+    def _ensure_job_cache_state(self) -> None:
+        return None
+
+
+class _ProbeBuildControl:
+    """Placeholder build-control type; the probe never registers one."""
+
+
+def _count_bytes(chunks: Iterator[bytes | str]) -> int:
+    total = 0
+    for chunk in chunks:
+        total += len(chunk)
+    return total
+
+
+def _probe_candidate(shares: list[dict[str, object]]) -> dict[str, Any]:
+    """A durable block-candidate intent shaped like block_candidate_intent."""
+    return {
+        "schema": "qbit.prism.block-candidate-intent.v1",
+        "block_hash_hex": "ab" * 32,
+        "block_hex": "00" * 256,
+        "coinbase_tx_hex": "01" * 128,
+        "parent_hash": "cd" * 32,
+        "expected_height": 800_001,
+        "template": {
+            "previousblockhash": "cd" * 32,
+            "height": 800_001,
+            "coinbasevalue": 50_00000000,
+        },
+        "shares_json": shares,
+        "prior_balances": [],
+        "found_block": {
+            "block_height": 800_001,
+            "coinbase_value_sats": 50_00000000,
+            "network_difficulty": 226646186,
+            "anchor_job_issued_at_ms": FIXED_NOW_MS,
+        },
+        "prospective_prior_balances": None,
+        "witness_merkle_leaves_hex": [],
+        "pending_share": {"share_id": "s", "accepted_at_ms": FIXED_NOW_MS},
+        "username": "bench-miner-0",
+    }
+
+
+def _instrument_transport(
+    compiler: BundleCompiler,
+    timers: dict[str, float],
+) -> None:
+    """Time the compiler's transport helpers on this instance only."""
+    for name in (
+        "_serve_builder_write",
+        "_serve_builder_read_line",
+        "_serve_builder_read_exact",
+    ):
+        original = getattr(compiler, name)
+
+        def wrapper(
+            *args: Any,
+            _original: Callable[..., Any] = original,
+            _name: str = name,
+            **kwargs: Any,
+        ) -> Any:
+            started = time.perf_counter()
+            try:
+                return _original(*args, **kwargs)
+            finally:
+                timers[_name] = timers.get(_name, 0.0) + (
+                    time.perf_counter() - started
+                )
+
+        setattr(compiler, name, wrapper)
+
+
+def run_latency_probe(args: argparse.Namespace) -> dict[str, Any]:
+    daemon_binary = args.daemon_binary
+    if daemon_binary is not None:
+        daemon_path = Path(daemon_binary)
+        if not (daemon_path.is_file() and os.access(daemon_path, os.X_OK)):
+            raise SystemExit(f"--daemon-binary {daemon_binary} is not executable")
+    results: dict[str, Any] = {
+        "environment": describe_environment(),
+        "latency_probe": {
+            "monitor_interval_seconds": WRITER_LEASE_HEARTBEAT_MONITOR_SECONDS,
+            "scheduler_slack_seconds": WRITER_LEASE_HEARTBEAT_SCHEDULER_SLACK_SECONDS,
+            "strict_lateness_seconds": PROBE_STRICT_LATENESS_SECONDS,
+            "miners": args.probe_miners,
+            "share_id_shape": "production",
+            "daemon_binary": daemon_binary,
+            "rationale": LATENCY_PROBE_RATIONALE,
+            "sizes": [],
+        },
+    }
+    probe = MonitorLatenessProbe(WRITER_LEASE_HEARTBEAT_MONITOR_SECONDS)
+    probe.start()
+    try:
+        for size in args.probe_sizes:
+            results["latency_probe"]["sizes"].append(
+                _probe_one_size(
+                    size,
+                    probe=probe,
+                    miners=args.probe_miners,
+                    daemon_binary=daemon_binary,
+                    reps=args.probe_reps,
+                )
+            )
+            gc.collect()
+    finally:
+        probe.stop()
+    results["peak_rss_mb"] = _peak_rss_mb()
+    return results
+
+
+def _probe_one_size(
+    size: int,
+    *,
+    probe: MonitorLatenessProbe,
+    miners: int,
+    daemon_binary: str | None,
+    reps: int,
+) -> dict[str, Any]:
+    records = build_records(size, miners=miners, share_id_shape="production")
+    anchor = int(records[-1].job_issued_at_ms)
+    weight = sum(int(record.share_difficulty) for record in records)
+    state: dict[str, Any] = {}
+    phases: list[ProbePhaseResult] = []
+
+    def measure(
+        key: str,
+        kind: str,
+        note: str,
+        run: Callable[[], int | None],
+        *,
+        detail: dict[str, float] | None = None,
+    ) -> None:
+        best: ProbePhaseResult | None = None
+        for _ in range(max(1, reps)):
+            gc.collect()
+            with probe.phase(key):
+                cpu_started = time.process_time()
+                started = time.perf_counter()
+                byte_count = run()
+                wall = time.perf_counter() - started
+                cpu = time.process_time() - cpu_started
+            lateness = probe.summary(key)
+            result = ProbePhaseResult(
+                key=key,
+                kind=kind,
+                note=note,
+                wall_seconds=wall,
+                cpu_seconds=cpu,
+                bytes=byte_count,
+                lateness=lateness,
+                detail=dict(detail) if detail else None,
+            )
+            # Keep the repetition with the worst lateness: the question is
+            # whether the monitor can be late, not how fast the best run was.
+            if best is None or (
+                (result.lateness["max_late_ms"] or 0.0)
+                > (best.lateness["max_late_ms"] or 0.0)
+            ):
+                best = result
+        assert best is not None
+        phases.append(best)
+
+    # ---- controls ---------------------------------------------------------
+    measure(
+        "idle_control",
+        "control",
+        "main thread sleeps; the monitor's own wake jitter on this host",
+        lambda: time.sleep(PROBE_CONTROL_SECONDS),
+    )
+
+    def busy_python() -> None:
+        deadline = time.perf_counter() + PROBE_CONTROL_SECONDS
+        total = 0
+        while time.perf_counter() < deadline:
+            for value in range(10_000):
+                total += value
+        state["busy_total"] = total
+
+    measure(
+        "busy_python_control",
+        "control",
+        "pure-Python loop; lateness is the interpreter's switch interval",
+        busy_python,
+    )
+
+    # ---- conversion and fold ---------------------------------------------
+    def convert() -> None:
+        state["shares"] = [record.to_prism_json() for record in records]
+
+    measure(
+        "record_conversion",
+        "bounded",
+        "AcceptedShareRecord.to_prism_json per record (Python loop)",
+        convert,
+    )
+    shares: list[dict[str, object]] = state["shares"]
+
+    def fold() -> None:
+        state["window"] = IncrementalShareWindow.from_full_snapshot(
+            records,
+            anchor_job_issued_at_ms=anchor,
+            window_weight=weight,
+        )
+
+    measure(
+        "fold_in_process",
+        "bounded",
+        "IncrementalShareWindow.from_full_snapshot: the in-process fallback "
+        "fold, one bounded json.dumps per 512-record page",
+        fold,
+    )
+    window: IncrementalShareWindow = state["window"]
+    sequence = window.json_records()
+    items = b",".join(
+        page.canonical_json_items for page in window.pages if page.canonical_json_items
+    )
+    digest = sequence.canonical_json_sha256()
+    count = window.record_count
+
+    def fold_again_and_release() -> None:
+        # A second fold whose result is dropped at once: the release of a
+        # whole window's pages (records, dicts, bytes) is what a full rescan
+        # or rotation pays when the previous window goes away.
+        second = IncrementalShareWindow.from_full_snapshot(
+            records,
+            anchor_job_issued_at_ms=anchor,
+            window_weight=weight,
+        )
+        state["second_window"] = second
+
+    measure(
+        "fold_in_process_keep",
+        "bounded",
+        "from_full_snapshot with the result retained (no release inside)",
+        fold_again_and_release,
+    )
+
+    def release_second_window() -> None:
+        del state["second_window"]
+
+    measure(
+        "fold_release",
+        "residual",
+        "del of a whole in-process window (pages, records, dicts, bytes)",
+        release_second_window,
+    )
+
+    # ---- canonical encoding and digest -----------------------------------
+    measure(
+        "canonical_encode_stream",
+        "bounded",
+        "iter_canonical_share_item_chunks over the share dicts",
+        lambda: _count_bytes(iter_canonical_share_item_chunks(shares)),
+    )
+    measure(
+        "canonical_encode_whole",
+        "historical",
+        "json.dumps(shares, sort_keys=True, ...) in one call",
+        lambda: len(
+            json.dumps(
+                shares, sort_keys=True, separators=(",", ":"), default=str
+            ).encode("utf-8")
+        ),
+    )
+    measure(
+        "array_digest_stream",
+        "bounded",
+        "canonical_share_array_sha256 over a plain list (legacy digest path)",
+        lambda: (canonical_share_array_sha256(shares), None)[1],
+    )
+    measure(
+        "array_digest_whole",
+        "historical",
+        "sha256(json.dumps(shares, sort_keys=True, ...)) in one call",
+        lambda: (
+            hashlib.sha256(
+                json.dumps(
+                    shares, sort_keys=True, separators=(",", ":"), default=str
+                ).encode("utf-8")
+            ).hexdigest(),
+            None,
+        )[1],
+    )
+
+    # ---- compact payload and spool ---------------------------------------
+    measure(
+        "compact_tail_stream",
+        "bounded",
+        "_compact_share_tail_chunks: identities + compact rows in batches",
+        lambda: _count_bytes(iter(_compact_share_tail_chunks(shares))),
+    )
+
+    def compact_whole() -> int:
+        identities, compact_shares = _compact_share_payload(shares)
+        return len(json.dumps(identities, separators=(",", ":"))) + len(
+            json.dumps(compact_shares, separators=(",", ":"))
+        )
+
+    measure(
+        "compact_tail_whole",
+        "historical",
+        "_compact_share_payload + two whole json.dumps (old compact_fragments)",
+        compact_whole,
+    )
+
+    def spool_cold() -> int:
+        serialization = _ShareWindowSerialization(
+            key=(digest, count, weight),
+            share_count=count,
+            share_snapshot_sha256=digest,
+        )
+        lease = serialization.acquire_spooled_tail(shares)
+        try:
+            return int(lease[1]) if lease is not None else None
+        finally:
+            serialization.retire_spool()
+            if lease is not None:
+                serialization.release_spooled_tail()
+
+    measure(
+        "spool_write_stream",
+        "bounded",
+        "_ShareWindowSerialization.acquire_spooled_tail cold (encode + write)",
+        spool_cold,
+    )
+
+    # ---- daemon prepare request ------------------------------------------
+    request_fields: dict[str, object] = {
+        "request": "prepare_window",
+        "mode": "full",
+        "append_invalidation_epoch": 0,
+        "anchor_job_issued_at_ms": anchor,
+        "records": shares,
+        "window_weight": weight,
+        "page_size": DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+    }
+    measure(
+        "prepare_request_stream",
+        "bounded",
+        "_iter_prepare_window_request_chunks (envelope + record batches)",
+        lambda: _count_bytes(_iter_prepare_window_request_chunks(request_fields)),
+    )
+    measure(
+        "prepare_request_whole",
+        "historical",
+        "json.dumps(request_fields) in one call (old prepare_payout_window)",
+        lambda: len(
+            json.dumps(request_fields, separators=(",", ":")).encode("utf-8")
+        ),
+    )
+
+    # ---- mirror validation and lazy parse --------------------------------
+    measure(
+        "mirror_validate",
+        "bounded",
+        "DaemonShareWindowMirror.from_full_items: digest + record walk",
+        lambda: (
+            DaemonShareWindowMirror.from_full_items(
+                anchor_job_issued_at_ms=anchor,
+                window_weight=weight,
+                page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+                record_count=count,
+                canonical_items=items,
+                share_snapshot_sha256=digest,
+            ),
+            len(items),
+        )[1],
+    )
+    def parse_stream() -> int:
+        state["parsed_stream"] = DaemonShareJsonSequence(items, count)._records()
+        return len(items)
+
+    measure(
+        "mirror_parse_stream",
+        "bounded",
+        "DaemonShareJsonSequence._records: raw_decode per record, chunked decode",
+        parse_stream,
+    )
+
+    def release_parsed_stream() -> None:
+        # Dropping the parsed tuple frees every dict and string it holds in
+        # one refcount cascade -- a single C call, measured on its own.
+        del state["parsed_stream"]
+
+    measure(
+        "mirror_parse_release",
+        "residual",
+        "del of the parsed record tuple (one deallocation cascade)",
+        release_parsed_stream,
+    )
+
+    def parse_whole() -> int:
+        state["parsed_whole"] = json.loads(b"[" + items + b"]")
+        return len(items)
+
+    measure(
+        "mirror_parse_whole",
+        "historical",
+        'json.loads(b"[" + items + b"]") in one call (old _records)',
+        parse_whole,
+    )
+
+    def release_parsed_whole() -> None:
+        del state["parsed_whole"]
+
+    measure(
+        "mirror_parse_whole_release",
+        "residual",
+        "del of json.loads' record list (one deallocation cascade)",
+        release_parsed_whole,
+    )
+
+    # ---- durable candidate identity --------------------------------------
+    candidate = _probe_candidate(shares)
+    measure(
+        "candidate_identity_stream",
+        "bounded",
+        "block_candidate_identity_sha256 (shares_json streamed)",
+        lambda: (block_candidate_identity_sha256(candidate), None)[1],
+    )
+    measure(
+        "candidate_identity_whole",
+        "historical",
+        "sha256_json_hex(block_candidate_identity(candidate)) in one call",
+        lambda: (sha256_json_hex(block_candidate_identity(candidate)), None)[1],
+    )
+
+    # ---- one-shot canonical build input ----------------------------------
+    payload = {
+        "found_block": candidate["found_block"],
+        "prior_balances": [],
+        "payout_policy": {"policy": "day-one"},
+        "coinbase_script_sig_suffix_hex": "00",
+        "witness_merkle_leaves_hex": [],
+        "shares": shares,
+    }
+    measure(
+        "oneshot_payload_stream",
+        "bounded",
+        "iter_json_object_text_chunks(payload, array_keys=('shares',))",
+        lambda: _count_bytes(
+            iter_json_object_text_chunks(payload, array_keys=("shares",))
+        ),
+    )
+    measure(
+        "oneshot_payload_whole",
+        "historical",
+        "json.dumps(payload) in one call (the canonical build's share array)",
+        lambda: len(json.dumps(payload, separators=(",", ":"))),
+    )
+
+    # ---- real daemon round trip ------------------------------------------
+    daemon: dict[str, Any] | None = None
+    if daemon_binary is not None:
+        daemon = _probe_daemon(
+            probe=probe,
+            measure=measure,
+            records=records,
+            shares=shares,
+            anchor=anchor,
+            weight=weight,
+            miners=miners,
+            daemon_binary=daemon_binary,
+        )
+
+    return {
+        "size": size,
+        "record_count": count,
+        "bytes": {
+            "canonical_items": len(items),
+            "compact_tail": sum(
+                len(chunk) for chunk in _compact_share_tail_chunks(shares)
+            ),
+        },
+        "phases": [phase.as_json() for phase in phases],
+        "daemon": daemon,
+    }
+
+
+def _probe_daemon(
+    *,
+    probe: MonitorLatenessProbe,
+    measure: Callable[..., None],
+    records: list[AcceptedShareRecord],
+    shares: list[dict[str, object]],
+    anchor: int,
+    weight: int,
+    miners: int,
+    daemon_binary: str,
+) -> dict[str, Any]:
+    """The real --serve builder's prepare_window round trip, attributed."""
+    runtime = _ProbeRuntime()
+    compiler = BundleCompiler(
+        runtime,  # type: ignore[arg-type]
+        superseded_error=RuntimeError,
+        cancellation_error_types=(),
+        build_control_type=_ProbeBuildControl,
+        tool_command=lambda _name: [daemon_binary],
+    )
+    timers: dict[str, float] = {}
+    _instrument_transport(compiler, timers)
+    outcomes: dict[str, Any] = {}
+    try:
+        # Spawn and handshake outside the measured phases, with a
+        # one-record window that does not collide with the real one.
+        warm = compiler.prepare_payout_window(
+            mode="full",
+            records_json=[records[0].to_prism_json()],
+            anchor_job_issued_at_ms=anchor,
+            append_invalidation_epoch=0,
+            window_weight=int(records[0].share_difficulty),
+            page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+        )
+        outcomes["warm_status"] = getattr(warm, "status", None)
+        timers.clear()
+
+        def full() -> int:
+            outcome = compiler.prepare_payout_window(
+                mode="full",
+                records_json=shares,
+                anchor_job_issued_at_ms=anchor,
+                append_invalidation_epoch=0,
+                window_weight=weight,
+                page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+            )
+            outcomes["full"] = outcome
+            return len(outcome.window_items or b"") if outcome is not None else None
+
+        measure(
+            "daemon_prepare_full",
+            "daemon",
+            "BundleCompiler.prepare_payout_window(mode='full'): streamed "
+            "request, Rust fold, raw response",
+            full,
+            detail=timers,
+        )
+        full_detail = dict(timers)
+        timers.clear()
+        full_outcome = outcomes.get("full")
+        status = getattr(full_outcome, "status", None)
+        mirror_bytes = None
+        if status == "prepared":
+            measure(
+                "daemon_mirror_validate",
+                "bounded",
+                "DaemonShareWindowMirror.from_full_items on the daemon's bytes",
+                lambda: len(
+                    DaemonShareWindowMirror.from_full_items(
+                        anchor_job_issued_at_ms=anchor,
+                        window_weight=weight,
+                        page_size=DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+                        record_count=full_outcome.record_count,
+                        canonical_items=full_outcome.window_items or b"",
+                        share_snapshot_sha256=full_outcome.share_snapshot_sha256 or "",
+                    ).canonical_items
+                ),
+            )
+            mirror_bytes = len(full_outcome.window_items or b"")
+            programs = benchmark_miner_programs(miners)
+            last = records[-1]
+            delta = []
+            for index in range(PROBE_ADVANCE_RECORDS):
+                seq = int(last.share_seq) + index + 1
+                miner = seq % miners
+                delta.append(
+                    AcceptedShareRecord(
+                        share_seq=seq,
+                        share_id=f"bench-miner-{miner}.rig{seq % 512}:{'ab' * 32}",
+                        miner_id=f"bench-miner-{miner}",
+                        order_key=f"bench-miner-{miner:06d}",
+                        p2mr_program_hex=programs[miner],
+                        share_difficulty=int(last.share_difficulty),
+                        network_difficulty=int(last.network_difficulty),
+                        template_height=int(last.template_height),
+                        job_id=f"bench-job-{seq}",
+                        job_issued_at_ms=int(last.job_issued_at_ms) + index + 1,
+                        accepted_at_ms=int(last.accepted_at_ms) + index + 1,
+                        ntime=int(last.ntime) + index + 1,
+                    ).to_prism_json()
+                )
+            new_anchor = int(last.job_issued_at_ms) + PROBE_ADVANCE_RECORDS + 1
+
+            def advance() -> int:
+                outcome = compiler.prepare_payout_window(
+                    mode="advance",
+                    records_json=delta,
+                    anchor_job_issued_at_ms=new_anchor,
+                    append_invalidation_epoch=0,
+                    base_digest=full_outcome.share_snapshot_sha256,
+                )
+                outcomes["advance"] = outcome
+                return len(outcome.appended_items) if outcome is not None else None
+
+            measure(
+                "daemon_prepare_advance",
+                "daemon",
+                f"prepare_payout_window(mode='advance') with "
+                f"{PROBE_ADVANCE_RECORDS} appended records",
+                advance,
+                detail=timers,
+            )
+    finally:
+        compiler.shutdown_serve_builder()
+    return {
+        "binary": daemon_binary,
+        "warm_status": outcomes.get("warm_status"),
+        "full_status": getattr(outcomes.get("full"), "status", None),
+        "full_error": getattr(outcomes.get("full"), "error", None),
+        "full_transport_ms": {
+            key: round(value * 1e3, 3) for key, value in full_detail.items()
+        },
+        "advance_status": getattr(outcomes.get("advance"), "status", None),
+        "advance_stats": (
+            {
+                "added_rows": outcomes["advance"].added_rows,
+                "expired_rows": outcomes["advance"].expired_rows,
+                "touched_pages": outcomes["advance"].touched_pages,
+            }
+            if getattr(outcomes.get("advance"), "status", None) == "prepared"
+            else None
+        ),
+        "mirror_bytes": mirror_bytes,
+        "worker_counts": dict(runtime.job_build_worker_counts),
+        "serve_counts": dict(compiler.serve_builder_counts),
+    }
+
+
+def render_latency_probe(results: dict[str, Any]) -> str:
+    out: list[str] = []
+    env = results["environment"]
+    probe = results["latency_probe"]
+    out.append("=" * 78)
+    out.append("#236 monitor-lateness probe: PRISM payout-window serialization phases")
+    out.append("=" * 78)
+    out.append("")
+    out.append(f"CPU              {env['cpu']} x{env['cpu_count']} logical")
+    out.append(f"Platform         {env['platform']}")
+    out.append(f"Python           {env['python_version'].splitlines()[0]}")
+    load = env["loadavg_1_5_15"]
+    out.append(
+        "Load at start    "
+        + ("n/a" if load is None else " / ".join(f"{v:.2f}" for v in load))
+    )
+    out.append(
+        f"Monitor cadence  {probe['monitor_interval_seconds'] * 1e3:.0f} ms "
+        f"(WRITER_LEASE_HEARTBEAT_MONITOR_SECONDS); scheduler slack "
+        f"{probe['scheduler_slack_seconds'] * 1e3:.0f} ms; strict target "
+        f"{probe['strict_lateness_seconds'] * 1e3:.0f} ms"
+    )
+    out.append(
+        f"Fixture          production share_id shape, {probe['miners']} identities"
+    )
+    out.append(
+        "Daemon           "
+        + (probe["daemon_binary"] or "not measured (pass --daemon-binary)")
+    )
+    out.append("")
+    out.append("Metric: per phase, wall time of the phase in the main thread and the")
+    out.append("lateness (wake - due) of a monitor thread sleeping on the lease")
+    out.append("monitor's cadence. 'historical' rows are the whole-window calls the")
+    out.append("'bounded' rows replaced; both run the same input in the same process.")
+    out.append("'gc full' counts generation-2 cyclic collections during the phase and")
+    out.append("'gc max' is the longest single collection pause (ms), from gc.callbacks.")
+    out.append("Lateness is what the monitor thread observed on this host, whatever the")
+    out.append("cause (a GIL-held C call, a GC pause, or other load on a shared host).")
+    out.append("")
+    for entry in probe["sizes"]:
+        out.append("=" * 78)
+        out.append(
+            f"WINDOW SIZE: {entry['size']:,} shares "
+            f"({entry['record_count']:,} retained)"
+        )
+        out.append("=" * 78)
+        out.append(
+            f"  canonical items {entry['bytes']['canonical_items'] / 1e6:.1f} MB, "
+            f"compact tail {entry['bytes']['compact_tail'] / 1e6:.1f} MB"
+        )
+        out.append("")
+        head = (
+            f"  {'phase':<28}{'kind':<11}{'wall ms':>9}{'cpu ms':>9}{'MB':>8}"
+            f"{'wakes':>7}{'max late':>10}{'p99 late':>10}{'>250ms':>8}{'>500ms':>8}"
+            f"{'gc full':>8}{'gc max':>8}"
+        )
+        out.append(head)
+        out.append("  " + "-" * (len(head) - 2))
+        for phase in entry["phases"]:
+            late = phase["lateness"]
+            out.append(
+                f"  {phase['key']:<28}{phase['kind']:<11}"
+                f"{phase['wall_ms']:>9.1f}{phase['cpu_ms']:>9.1f}"
+                f"{(phase['bytes'] or 0) / 1e6 if phase['bytes'] else 0:>8.1f}"
+                f"{late['wakes']:>7}"
+                f"{_fmt(late['max_late_ms'], 1):>10}"
+                f"{_fmt(late['p99_late_ms'], 1):>10}"
+                f"{late['over_strict']:>8}{late['over_slack']:>8}"
+                f"{late.get('gc_full_collections', 0):>8}"
+                f"{_fmt(late.get('gc_max_pause_ms'), 1):>8}"
+            )
+            if phase.get("detail_ms"):
+                detail = ", ".join(
+                    f"{key.removeprefix('_serve_builder_')}={value:.1f} ms"
+                    for key, value in phase["detail_ms"].items()
+                )
+                out.append(f"  {'':<28}transport: {detail}")
+        out.append("")
+        daemon = entry.get("daemon")
+        if daemon:
+            out.append(
+                f"  daemon: full={daemon['full_status']} advance={daemon['advance_status']}"
+                f" mirror_bytes={daemon['mirror_bytes']}"
+                f" advance_stats={daemon['advance_stats']}"
+                f" worker_counts={daemon['worker_counts']}"
+            )
+            if daemon.get("full_error"):
+                out.append(f"  daemon error: {daemon['full_error']}")
+            out.append("")
+    peak = results.get("peak_rss_mb")
+    if peak:
+        out.append(f"peak RSS: {peak:.0f} MB")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1366,11 +2316,63 @@ def main(argv: list[str] | None = None) -> int:
             "production: the username:block_hash_hex form share_writer builds"
         ),
     )
+    parser.add_argument(
+        "--latency-probe",
+        action="store_true",
+        help=(
+            "#236 mode: run each serialization phase once per size in the "
+            "main thread while a monitor thread on the lease monitor's "
+            "cadence records its wake lateness; see LATENCY_PROBE_RATIONALE"
+        ),
+    )
+    parser.add_argument(
+        "--probe-sizes",
+        type=_int_list,
+        default=list(PROBE_DEFAULT_SIZES),
+        help="--latency-probe window sizes in shares (default: 210000,400000)",
+    )
+    parser.add_argument(
+        "--probe-reps",
+        type=int,
+        default=1,
+        help=(
+            "--latency-probe repetitions per phase; the repetition with the "
+            "worst monitor lateness is reported (default 1)"
+        ),
+    )
+    parser.add_argument(
+        "--probe-miners",
+        type=int,
+        default=PROBE_DEFAULT_MINERS,
+        help=f"--latency-probe distinct payout identities (default {PROBE_DEFAULT_MINERS})",
+    )
+    parser.add_argument(
+        "--daemon-binary",
+        default=None,
+        help=(
+            "--latency-probe: path to a prebuilt qbit-prism-build-audit-bundle; "
+            "adds the real --serve daemon's prepare round trip"
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.render:
         with open(args.render, encoding="utf-8") as handle:
-            sys.stdout.write(render_report(json.load(handle)))
+            loaded = json.load(handle)
+        sys.stdout.write(
+            render_latency_probe(loaded)
+            if "latency_probe" in loaded
+            else render_report(loaded)
+        )
+        sys.stdout.write("\n")
+        return 0
+
+    if args.latency_probe:
+        results = run_latency_probe(args)
+        if args.json:
+            json.dump(results, sys.stdout, indent=2, default=str)
+        else:
+            sys.stdout.write(render_latency_probe(results))
         sys.stdout.write("\n")
         return 0
 

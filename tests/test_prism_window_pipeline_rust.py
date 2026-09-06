@@ -18,7 +18,9 @@ Rust build, and which declares the real daemon's integer widths.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
+import json
 import os
 import tempfile
 import threading
@@ -26,6 +28,7 @@ import time
 import unittest
 from pathlib import Path
 
+from lab.prism import share_ledger as share_ledger_module
 from lab.prism.coordinator_config import (
     env_window_pipeline_rust,
     load_coordinator_config,
@@ -163,6 +166,148 @@ class DaemonShareWindowMirrorTests(unittest.TestCase):
         self.assertIsNone(sequence._parsed)
         self.assertEqual(list(sequence), list(window.json_records()))
         self.assertEqual(sequence[0], window.json_records()[0])
+
+    def _awkward_window(self, count: int = 40) -> IncrementalShareWindow:
+        """Records whose canonical bytes carry every escape the parser meets."""
+        ledger = SingleWriterShareLedger()
+        appended = []
+        for seq in range(count):
+            # Stamped well inside the anchor so every record is eligible
+            # whatever the count.
+            pending = stamped_pending_share(900_000 + seq)
+            pending = dataclasses.replace(
+                pending,
+                share_id=f"miner-\u00e9.rig{seq}:\U0001F600,}}{{\"\\",
+                miner_id=f"miner-{seq % 3}-\u2603",
+                share_difficulty=(1 << 130) + seq,
+                credit_policy='stale-grace' if seq % 2 else None,
+            )
+            appended.append(ledger.append(pending))
+        # A weight past the whole snapshot's total, so nothing expires.
+        return IncrementalShareWindow.from_full_snapshot(
+            appended,
+            anchor_job_issued_at_ms=1_000_000,
+            window_weight=(1 << 131) * count,
+        )
+
+    def test_lazy_parse_walks_records_across_decode_chunks(self) -> None:
+        window = self._awkward_window()
+        items = _canonical_items(window)
+        expected = json.loads(b"[" + items + b"]")
+        self.assertEqual(expected, list(window.json_records()))
+        # Chunk sizes that cut records, escapes and separators everywhere;
+        # the last is the shipped default.
+        for chunk_bytes in (1, 2, 3, 5, 64, 1_000, None):
+            with self.subTest(chunk_bytes=chunk_bytes), patch.object(
+                share_ledger_module,
+                "CANONICAL_ITEMS_DECODE_CHUNK_BYTES",
+                chunk_bytes or share_ledger_module.CANONICAL_ITEMS_DECODE_CHUNK_BYTES,
+            ):
+                sequence = DaemonShareJsonSequence(items, len(expected))
+                self.assertIsNone(sequence._parsed)
+                self.assertEqual(list(sequence), expected)
+                self.assertEqual(sequence[0], expected[0])
+                self.assertEqual(sequence[-1], expected[-1])
+                self.assertEqual(sequence[3:7], tuple(expected[3:7]))
+                self.assertEqual(len(sequence), len(expected))
+                # The parse ran exactly once and was published whole.
+                self.assertIs(sequence._records(), sequence._parsed)
+                # Keys are shared across records like a whole-array
+                # json.loads shares them: one string object per key.
+                key_ids = {id(key) for record in sequence for key in record}
+                self.assertLessEqual(len(key_ids), 13)
+                self.assertEqual(
+                    share_ledger_module._canonical_items_layout(items),
+                    (len(expected), False),
+                )
+                self.assertEqual(
+                    share_ledger_module._canonical_items_layout(items + b","),
+                    (len(expected), True),
+                )
+
+    def test_lazy_parse_decodes_raw_utf8_split_across_chunks(self) -> None:
+        # Not canonical (the daemon escapes non-ASCII), but valid JSON: the
+        # incremental decoder must never split a multi-byte sequence and
+        # the digest check, not the parser, is what pins canonicality.
+        items = b'{"k":"\xc3\xa9\xf0\x9f\x98\x80"},{"k":"\xe2\x98\x83"}'
+        expected = json.loads(b"[" + items + b"]")
+        for chunk_bytes in (1, 2, 3, 4, 5, 7, 100):
+            with self.subTest(chunk_bytes=chunk_bytes), patch.object(
+                share_ledger_module,
+                "CANONICAL_ITEMS_DECODE_CHUNK_BYTES",
+                chunk_bytes,
+            ):
+                self.assertEqual(
+                    list(DaemonShareJsonSequence(items, 2)),
+                    expected,
+                )
+
+    def test_lazy_parse_rejects_malformed_streams_without_publishing(self) -> None:
+        window = self._awkward_window(6)
+        items = _canonical_items(window)
+        count = window.record_count
+        broken = {
+            "truncated record": items[:-1],
+            "truncated escape": items[: items.index(b"\\ud83d") + 3],
+            "trailing separator": items + b",",
+            "leading separator": b"," + items,
+            "doubled separator": items.replace(b"},{", b"},,{", 1),
+            "missing separator": items.replace(b"},{", b"}{", 1),
+            "junk between records": items.replace(b"},{", b"}x{", 1),
+            "whitespace between records": items.replace(b"},{", b"}, {", 1),
+            "trailing whitespace": items + b" ",
+            "non-object item": items.replace(b"},{", b"},1,{", 1),
+            "invalid utf-8 mid-stream": items.replace(b"},{", b"},\xff{", 1),
+            "invalid utf-8 in a string": items.replace(b"miner", b"mi\xc3ner", 1),
+            "truncated multi-byte tail": items + b",{\"k\":\"\xc3",
+        }
+        for label, stream in broken.items():
+            for chunk_bytes in (1, 4, 64 * 1024):
+                with self.subTest(label=label, chunk_bytes=chunk_bytes), patch.object(
+                    share_ledger_module,
+                    "CANONICAL_ITEMS_DECODE_CHUNK_BYTES",
+                    chunk_bytes,
+                ):
+                    with self.assertRaises(DaemonWindowMirrorDivergence):
+                        share_ledger_module._canonical_items_record_count(stream)
+                    sequence = DaemonShareJsonSequence(stream, count)
+                    with self.assertRaises(DaemonWindowMirrorDivergence):
+                        list(sequence)
+                    # Nothing partial is ever published.
+                    self.assertIsNone(sequence._parsed)
+        # A count the bytes refute is refused after the whole walk, and
+        # the parse is not memoized either.
+        miscounted = DaemonShareJsonSequence(items, count + 1)
+        with self.assertRaisesRegex(
+            DaemonWindowMirrorDivergence,
+            f"parsed {count} records where {count + 1}",
+        ):
+            miscounted[0]
+        self.assertIsNone(miscounted._parsed)
+        self.assertEqual(list(DaemonShareJsonSequence(b"", 0)), [])
+
+    def test_large_mirror_is_counted_and_parsed_chunk_by_chunk(self) -> None:
+        # Past the decode chunk (64 KiB) several times over, so record
+        # boundaries land inside chunk boundaries throughout the stream.
+        window = self._awkward_window(3_000)
+        items = _canonical_items(window)
+        self.assertGreater(
+            len(items),
+            4 * share_ledger_module.CANONICAL_ITEMS_DECODE_CHUNK_BYTES,
+        )
+        self.assertEqual(window.record_count, 3_000)
+        mirror = DaemonShareWindowMirror.from_full_items(
+            anchor_job_issued_at_ms=1_000_000,
+            window_weight=(1 << 131) * 3_000,
+            page_size=512,
+            record_count=3_000,
+            canonical_items=items,
+            share_snapshot_sha256=window.json_records().canonical_json_sha256(),
+        )
+        self.assertEqual(
+            list(mirror.json_records()),
+            list(window.json_records()),
+        )
 
     def test_full_mirror_rejects_bytes_that_do_not_hash_to_the_digest(self) -> None:
         window = self._window()

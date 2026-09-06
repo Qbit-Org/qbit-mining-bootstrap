@@ -36,6 +36,7 @@ from typing import Any, Callable, Protocol
 
 from lab.prism import direct_stratum
 from lab.prism.bundle_compiler import _ShareWindowSerialization
+from lab.prism.share_json_stream import share_array_json_view
 from lab.prism.share_ledger import DaemonShareJsonSequence
 from lab.prism.coordinator_config import (
     DEFAULT_PRISM_JOB_BUILD_CANCEL_GRACE_SECONDS,
@@ -2901,7 +2902,7 @@ class JobBundleService:
                 return cached
             share_snapshot_sha256 = (
                 payout_artifact.share_snapshot_sha256
-                or self._canonical_json_sha256(shares)
+                or self._canonical_json_sha256(share_array_json_view(shares))
             )
             # The compact payload is a pure function of the shares (see the
             # class docstring), so the digest and count fully identify it.
@@ -3198,7 +3199,11 @@ class JobBundleService:
             )
             share_snapshot_sha256 = share_serialization.share_snapshot_sha256
         else:
-            share_snapshot_sha256 = self._canonical_json_sha256(shares)
+            # A plain list digests through the streaming view so the hook's
+            # fallback never serializes the whole window in one call.
+            share_snapshot_sha256 = self._canonical_json_sha256(
+                share_array_json_view(shares)
+            )
         if (
             payout_artifact is None
             and snapshot_accepted_count is not None

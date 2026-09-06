@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 import uuid
-from typing import Any, Callable, Iterator, Protocol
+from typing import Any, Callable, Iterable, Iterator, Protocol
 
 from lab.prism.coordinator_config import (
     DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS,
@@ -34,6 +34,12 @@ from lab.prism.coordinator_config import (
     env_bool,
 )
 from lab.prism.prism_tools import prism_tool_command
+from lab.prism.share_json_stream import (
+    SHARE_JSON_BATCH_RECORDS,
+    SHARE_JSON_CHUNK_BYTES,
+    iter_json_array_text_chunks,
+    iter_json_object_text_chunks,
+)
 from lab.prism.share_ledger import DaemonWindowMirrorDivergence
 
 
@@ -158,6 +164,91 @@ def _compact_share_payload(
     return identities, compact_shares
 
 
+def _compact_share_tail_chunks(
+    shares: Iterable[dict[str, object]],
+    *,
+    batch_records: int = SHARE_JSON_BATCH_RECORDS,
+    chunk_chars: int = SHARE_JSON_CHUNK_BYTES,
+) -> tuple[str, ...]:
+    """The audit-builder payload tail as bounded ASCII chunks.
+
+    Concatenated, the chunks are byte-identical to the historical tail --
+    ``',"compact_share_identities":' + json.dumps(identities) +
+    ',"compact_shares":' + json.dumps(compact_shares) + "}"`` with compact
+    separators over :func:`_compact_share_payload`'s two lists, the exact
+    bytes the spool held and the in-memory fallback wrote -- but no
+    ``json.dumps`` call covers more than ``batch_records`` records, so
+    encoding a 200k-share window no longer holds the GIL in one piece
+    (#236). Identities are indexed in first-seen order exactly as before;
+    the share rows are encoded as they are walked, and the identity table,
+    complete only once the walk ends, is placed ahead of them in the
+    returned order.
+    """
+    identity_indexes: dict[tuple[str, str, str], int] = {}
+    identities: list[tuple[str, str, str]] = []
+
+    def compact_rows() -> Iterator[tuple[object, ...]]:
+        for share in shares:
+            identity = (
+                str(share["miner_id"]),
+                str(share["order_key"]),
+                str(share["p2mr_program_hex"]),
+            )
+            identity_index = identity_indexes.get(identity)
+            if identity_index is None:
+                identity_index = len(identities)
+                identity_indexes[identity] = identity_index
+                identities.append(identity)
+            yield (
+                share["share_seq"],
+                share["share_id"],
+                identity_index,
+                share["share_difficulty"],
+                share["job_issued_at_ms"],
+                share["accepted_at_ms"],
+                share.get("credit_policy"),
+            )
+
+    share_chunks = tuple(
+        iter_json_array_text_chunks(
+            compact_rows(),
+            batch_records=batch_records,
+            chunk_chars=chunk_chars,
+        )
+    )
+    identity_chunks = tuple(
+        iter_json_array_text_chunks(
+            identities,
+            batch_records=batch_records,
+            chunk_chars=chunk_chars,
+        )
+    )
+    return (
+        ',"compact_share_identities":[',
+        *identity_chunks,
+        '],"compact_shares":[',
+        *share_chunks,
+        "]}",
+    )
+
+
+def _iter_prepare_window_request_chunks(
+    request_fields: dict[str, object],
+) -> Iterator[bytes]:
+    """One prepare_window request line in bounded chunks, newline included.
+
+    Byte-identical to ``json.dumps(request_fields, separators=(",", ":"))``
+    plus the terminating newline: the envelope members are each one small
+    ``json.dumps`` and the ``records`` array is encoded batch by batch.
+    """
+    for chunk in iter_json_object_text_chunks(
+        request_fields,
+        array_keys=("records",),
+    ):
+        yield chunk.encode("utf-8")
+    yield b"\n"
+
+
 def _share_window_spool_file() -> Any:
     """Anonymous spool file for the serialized share-window payload tail.
 
@@ -201,11 +292,14 @@ class _ShareWindowSerialization:
         default_factory=threading.Lock,
         repr=False,
     )
-    _compact_share_identities_json: str | None = field(
+    # The audit-builder payload tail (the compact identities and shares
+    # members plus the closing brace) as bounded ASCII chunks, encoded once
+    # per generation; see compact_tail_chunks.
+    _compact_tail_chunks: tuple[str, ...] | None = field(
         default=None,
         repr=False,
     )
-    _compact_shares_json: str | None = field(default=None, repr=False)
+    _compact_tail_chars: int = field(default=0, repr=False)
     _spool_lock: threading.Lock = field(
         default_factory=threading.Lock,
         repr=False,
@@ -224,33 +318,29 @@ class _ShareWindowSerialization:
         compare=False,
     )
 
-    def compact_fragments(
+    def compact_tail_chunks(
         self,
         shares: list[dict[str, object]],
-    ) -> tuple[str, str]:
-        """Encoded compact fragments, computed once per generation.
+    ) -> tuple[str, ...]:
+        """Encoded payload tail chunks, computed once per generation.
 
         Concurrent builders block here instead of duplicating the encode; the
         window is immutable for this key, so first-writer-wins is exact.
+        Every chunk is ASCII (``json.dumps``' ``ensure_ascii`` default), so
+        its character count is its byte count on every transport, and no
+        chunk splits a record.
         """
         with self._compact_lock:
-            if (
-                self._compact_share_identities_json is None
-                or self._compact_shares_json is None
-            ):
-                identities, compact_shares = _compact_share_payload(shares)
-                self._compact_share_identities_json = json.dumps(
-                    identities,
-                    separators=(",", ":"),
-                )
-                self._compact_shares_json = json.dumps(
-                    compact_shares,
-                    separators=(",", ":"),
-                )
-            return (
-                self._compact_share_identities_json,
-                self._compact_shares_json,
-            )
+            if self._compact_tail_chunks is None:
+                chunks = _compact_share_tail_chunks(shares)
+                self._compact_tail_chars = sum(len(chunk) for chunk in chunks)
+                self._compact_tail_chunks = chunks
+            return self._compact_tail_chunks
+
+    @property
+    def compact_json_bytes(self) -> int:
+        """Resident bytes of the encoded tail; 0 until its first use."""
+        return int(self._compact_tail_chars)
 
     def acquire_spooled_tail(
         self,
@@ -267,18 +357,13 @@ class _ShareWindowSerialization:
             if self._spool_failed or self._spool_retired:
                 return None
             if self._spool_file is None:
-                identities_json, compact_shares_json = self.compact_fragments(
-                    shares
-                )
+                chunks = self.compact_tail_chunks(shares)
                 spool = None
                 spool_factory = self._spool_factory or _share_window_spool_file
                 try:
                     spool = spool_factory()
-                    spool.write(b',"compact_share_identities":')
-                    spool.write(identities_json.encode("utf-8"))
-                    spool.write(b',"compact_shares":')
-                    spool.write(compact_shares_json.encode("utf-8"))
-                    spool.write(b"}")
+                    for chunk in chunks:
+                        spool.write(chunk.encode("utf-8"))
                     spool.flush()
                     size = spool.seek(0, os.SEEK_END)
                 except (OSError, ValueError):
@@ -920,7 +1005,7 @@ class BundleCompiler:
         deadline: float,
         payload: dict[str, object],
         shares: list[dict[str, object]],
-        precomposed: Callable[[], tuple[str, str]],
+        precomposed: Callable[[], tuple[str, ...]],
         share_serialization: _ShareWindowSerialization,
         cancellation: CancellationPort | None,
         build_control: BundleBuildControlPort | None,
@@ -990,17 +1075,13 @@ class BundleCompiler:
                     finally:
                         share_serialization.release_spooled_tail()
                 else:
-                    identities_json, compact_shares_json = precomposed()
-                    for fragment in (
-                        b',"compact_share_identities":',
-                        identities_json.encode("utf-8"),
-                        b',"compact_shares":',
-                        compact_shares_json.encode("utf-8"),
-                        b"}",
-                    ):
+                    # Spooling unavailable: the cached tail streams from
+                    # memory chunk by chunk, each one bounded, so this
+                    # fallback never re-encodes the window whole either.
+                    for chunk in precomposed():
                         input_bytes += self._serve_builder_write(
                             client,
-                            fragment,
+                            chunk.encode("utf-8"),
                             deadline,
                             cancellation,
                             build_control,
@@ -1111,7 +1192,7 @@ class BundleCompiler:
         *,
         payload: dict[str, object],
         shares: list[dict[str, object]],
-        precomposed: Callable[[], tuple[str, str]],
+        precomposed: Callable[[], tuple[str, ...]],
         share_serialization: _ShareWindowSerialization,
         cancellation: CancellationPort | None,
         record_phase_metrics: bool,
@@ -1343,17 +1424,27 @@ class BundleCompiler:
                     self._serve_builder = client
                     with self._serve_builder_metrics_lock:
                         self.serve_builder_counts["spawns"] += 1
-                request_line = json.dumps(
-                    request_fields,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-                self._serve_builder_write(
-                    client,
-                    request_line + b"\n",
-                    deadline,
-                    None,
-                    None,
-                )
+                # The request streams in bounded chunks: each envelope
+                # member is one small json.dumps and the record array is
+                # encoded batch by batch, so a 200k-record preparation never
+                # holds the GIL for one whole-window encode (#236). Same
+                # bytes as one json.dumps of the fields. From the first byte
+                # until the terminating newline the daemon's stdin holds a
+                # partial line; anything that escapes in between retires
+                # the daemon below rather than letting the next request
+                # concatenate onto the fragment.
+                client.request_incomplete = True
+                for chunk in _iter_prepare_window_request_chunks(
+                    request_fields
+                ):
+                    self._serve_builder_write(
+                        client,
+                        chunk,
+                        deadline,
+                        None,
+                        None,
+                    )
+                client.request_incomplete = False
                 envelope_line = self._serve_builder_read_line(
                     client,
                     deadline,
@@ -1482,6 +1573,19 @@ class BundleCompiler:
                 with self._serve_builder_metrics_lock:
                     self.serve_builder_counts["fallbacks"] += 1
                 return None
+            except BaseException:
+                # Not a daemon anomaly, so it propagates -- but if it
+                # escaped a half-written request the daemon's stdin holds
+                # an unterminated line, and the daemon goes with the error
+                # rather than answering "malformed serve request" to some
+                # innocent later build.
+                client = self._serve_builder
+                if client is not None and client.request_incomplete:
+                    self._record_live_serve_builder_termination(client)
+                    self._retire_serve_builder_locked()
+                    with self._serve_builder_metrics_lock:
+                        self.serve_builder_counts["fallbacks"] += 1
+                raise
             else:
                 with self._serve_builder_metrics_lock:
                     self.serve_builder_counts["window_prepares"] = (
@@ -1530,7 +1634,7 @@ class BundleCompiler:
         record_phase_metrics = bool(
             getattr(job_build_phase_local, "tip_refresh_metrics", False)
         )
-        precomposed: Callable[[], tuple[str, str]] | None = None
+        precomposed: Callable[[], tuple[str, ...]] | None = None
         if summary_only:
             artifact_started = time.monotonic()
             if (
@@ -1545,9 +1649,9 @@ class BundleCompiler:
                 # transport actually needs the compact bytes.
                 serialization = share_serialization
 
-                def precompose() -> tuple[str, str]:
+                def precompose() -> tuple[str, ...]:
                     with self._routed_window_mirror_divergence():
-                        return serialization.compact_fragments(shares)
+                        return serialization.compact_tail_chunks(shares)
 
                 precomposed = precompose
             else:
@@ -1769,12 +1873,8 @@ class BundleCompiler:
 
                     def write_precomposed_tail() -> None:
                         assert precomposed is not None
-                        identities_json, compact_shares_json = precomposed()
-                        sink.write(',"compact_share_identities":')
-                        sink.write(identities_json)
-                        sink.write(',"compact_shares":')
-                        sink.write(compact_shares_json)
-                        sink.write("}")
+                        for chunk in precomposed():
+                            sink.write(chunk)
 
                     if (
                         precomposed is not None
@@ -1847,14 +1947,22 @@ class BundleCompiler:
                         if not spool_transferred:
                             write_precomposed_tail()
                     else:
-                        # iterencode writes bounded fragments to the child
-                        # instead of allocating a second full JSON
-                        # representation in Python.
-                        json.dump(
+                        # The share arrays (the canonical build's full
+                        # window, or an artifact-less summary's compact
+                        # form) stream in bounded batches and every other
+                        # member is one small json.dumps: the same bytes as
+                        # one json.dump of the payload, without the
+                        # pure-Python encoder's per-token writes or a
+                        # whole-window C call.
+                        for chunk in iter_json_object_text_chunks(
                             payload,
-                            sink,
-                            separators=(",", ":"),
-                        )
+                            array_keys=(
+                                "shares",
+                                "compact_share_identities",
+                                "compact_shares",
+                            ),
+                        ):
+                            sink.write(chunk)
                 except BrokenPipeError:
                     # Prefer the builder's diagnostic below.
                     pass
@@ -2146,6 +2254,8 @@ __all__ = [
     "_ServeBuilderUnavailable",
     "_ShareWindowSerialization",
     "_compact_share_payload",
+    "_compact_share_tail_chunks",
+    "_iter_prepare_window_request_chunks",
     "_share_window_spool_file",
     "canonical_bundle_bytes",
 ]

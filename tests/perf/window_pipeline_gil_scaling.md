@@ -486,3 +486,219 @@ outright, with a printed reason, if eight independent inputs would exceed 80% of
 memory.
 
 The full sweep takes ~35 minutes and peaks at 7.6 GB RSS on this host.
+
+---
+
+## 9. #236 follow-up: bounded serialization and the monitor-lateness probe
+
+**Context.** Issue #236's incident thread samples pointed at whole-window JSON encoding and
+decoding on the coordinator's payout-window paths (~210k shares) while the writer-lease
+monitor thread was late by 0.6–1.05 s. PR 2 of the #236 plan bounds every such call: the
+daemon `prepare_window` request streams in record batches, the audit-builder compact tail is
+encoded batch by batch into bounded chunks (spool, in-memory fallback and one-shot alike),
+plain share lists digest through a streamed SHA-256, the daemon mirror's lazy parse walks one
+record at a time through a chunked UTF-8 decoder, the found-block candidate identity digest
+streams its `shares_json`, the one-shot canonical payload streams its share array, and the
+transient per-share lists on the daemon prepare paths are released in bounded slices. All of
+it is byte-identical to the historical output (pinned by the parity tests in
+`test_prism_incremental_payout_window`, `test_prism_job_builder`,
+`test_prism_window_pipeline_rust` and `test_prism_share_ledger`; the Rust `rust-daemon`
+parity gate is unchanged and passes).
+
+**Instrument.** `python3 tests/perf/window_pipeline_gil_scaling.py --latency-probe
+[--daemon-binary PATH]` runs each phase once per window size in the main thread while a
+monitor thread wakes every `WRITER_LEASE_HEARTBEAT_MONITOR_SECONDS` (50 ms) and records
+`wake - due`. Every bounded phase is paired with the historical whole-window call it
+replaced, on the same input in the same process, and `gc.callbacks` attributes cyclic-GC
+pauses to the phase they landed in. Two controls bracket the host: `idle_control` (main
+thread asleep) is the monitor's own jitter and `busy_python_control` (pure-Python loop) is
+the interpreter's switch interval. See `LATENCY_PROBE_RATIONALE`.
+
+**Read this before the numbers.** Every figure below was taken on `alexdevbox1`, a shared
+8-vCPU KVM guest on which two other #236 implementation agents were running their own tests
+and benchmarks at the same time (load average 1.7–3.5 at the start of the runs). Nothing here
+is an isolated or production measurement. Monitor lateness is what a 50 ms-cadence thread
+observed, whatever the cause; it is **not** by itself a proof of GIL attribution. The
+attribution argument is structural and comparative: a historical row's lateness equals that
+row's own wall time to within a few percent, while the bounded row over the same bytes, in the
+same process and under the same host load, stays at the controls' single-digit milliseconds.
+That pattern is what a GIL-held C call produces and what host contention does not. One run
+per phase (`--probe-reps 1`); a few percent of run-to-run drift is visible between the three
+captures cited below.
+
+### Final capture (bounded and historical phases, production share_id, 200 identities)
+
+`max late`/`p99 late` in ms; `>250ms`/`>500ms` count monitor wakes later than the plan's
+strict target and the configured scheduler slack; `gc full` counts generation-2
+collections in the phase and `gc max` is the longest single collection pause. `residual`
+rows isolate one deallocation cascade (a `del` of a whole parsed tuple or window), measured
+on its own.
+
+#### 210,000 shares (210,000 retained) -- canonical items 95.5 MB, compact tail 29.5 MB
+
+| phase | kind | wall ms | wakes | max late ms | p99 late ms | >250ms | >500ms | gc full | gc max ms |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| idle_control | control | 1000 | 19 | 0.2 | 0.2 | 0 | 0 | 0 | 0.0 |
+| busy_python_control | control | 1000 | 18 | 5.3 | 5.3 | 0 | 0 | 0 | 0.0 |
+| record_conversion | bounded | 243 | 4 | 5.2 | 5.2 | 0 | 0 | 0 | 0.1 |
+| fold_in_process | bounded | 1757 | 31 | 9.5 | 9.5 | 0 | 0 | 0 | 23.9 |
+| fold_in_process_keep | bounded | 1704 | 29 | 20.7 | 20.7 | 0 | 0 | 0 | 23.1 |
+| fold_release | residual | 38 | 0 | n/a | n/a | 0 | 0 | 0 | 0.0 |
+| canonical_encode_stream | bounded | 993 | 17 | 7.4 | 7.4 | 0 | 0 | 0 | 0.0 |
+| canonical_encode_whole | historical | 1131 | 1 | **1057.6** | 1057.6 | 1 | 1 | 0 | 0.0 |
+| array_digest_stream | bounded | 1273 | 24 | 4.5 | 4.5 | 0 | 0 | 0 | 0.0 |
+| array_digest_whole | historical | 1355 | 6 | **1030.4** | 1030.4 | 1 | 1 | 0 | 0.0 |
+| compact_tail_stream | bounded | 425 | 7 | 6.0 | 6.0 | 0 | 0 | 0 | 0.1 |
+| compact_tail_whole | historical | 427 | 3 | **249.6** | 249.6 | 0 | 0 | 0 | 0.2 |
+| spool_write_stream | bounded | 427 | 7 | 6.8 | 6.8 | 0 | 0 | 0 | 0.1 |
+| prepare_request_stream | bounded | 735 | 13 | 8.2 | 8.2 | 0 | 0 | 0 | 0.0 |
+| prepare_request_whole | historical | 882 | 2 | **722.0** | 722.0 | 1 | 1 | 0 | 0.0 |
+| mirror_validate | bounded | 1210 | 22 | 6.0 | 6.0 | 0 | 0 | 0 | 0.0 |
+| mirror_parse_stream | bounded | 1408 | 25 | 5.7 | 5.7 | 0 | 0 | 0 | 0.4 |
+| mirror_parse_release | residual | 66 | 1 | 16.5 | 16.5 | 0 | 0 | 0 | 0.0 |
+| mirror_parse_whole | historical | 949 | 3 | **573.2** | 573.2 | 1 | 1 | 0 | 14.2 |
+| mirror_parse_whole_release | residual | 57 | 1 | 7.3 | 7.3 | 0 | 0 | 0 | 0.0 |
+| candidate_identity_stream | bounded | 1261 | 24 | 2.1 | 2.1 | 0 | 0 | 0 | 0.0 |
+| candidate_identity_whole | historical | 1420 | 6 | **1020.3** | 1020.3 | 1 | 1 | 0 | 0.0 |
+| oneshot_payload_stream | bounded | 740 | 13 | 7.8 | 7.8 | 0 | 0 | 0 | 0.0 |
+| oneshot_payload_whole | historical | 771 | 1 | **714.7** | 714.7 | 1 | 1 | 0 | 0.0 |
+
+#### 400,000 shares (400,000 retained) -- canonical items 182.1 MB, compact tail 56.2 MB
+
+| phase | kind | wall ms | wakes | max late ms | p99 late ms | >250ms | >500ms | gc full | gc max ms |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| idle_control | control | 1000 | 19 | 0.2 | 0.2 | 0 | 0 | 0 | 0.0 |
+| busy_python_control | control | 1000 | 18 | 7.7 | 7.7 | 0 | 0 | 0 | 0.0 |
+| record_conversion | bounded | 294 | 5 | 5.2 | 5.2 | 0 | 0 | 0 | 0.1 |
+| fold_in_process | bounded | 3239 | 56 | 46.8 | 40.5 | 0 | 0 | 0 | 49.5 |
+| fold_in_process_keep | bounded | 3537 | 62 | 38.1 | 17.7 | 0 | 0 | 0 | 60.5 |
+| fold_release | residual | 80 | 1 | 29.9 | 29.9 | 0 | 0 | 0 | 0.0 |
+| canonical_encode_stream | bounded | 1951 | 34 | 8.4 | 8.4 | 0 | 0 | 0 | 0.0 |
+| canonical_encode_whole | historical | 2384 | 2 | **2040.0** | 2040.0 | 1 | 1 | 0 | 0.0 |
+| array_digest_stream | bounded | 2400 | 46 | 4.3 | 4.3 | 0 | 0 | 0 | 0.0 |
+| array_digest_whole | historical | 2650 | 11 | **1942.9** | 1942.9 | 1 | 1 | 0 | 0.0 |
+| compact_tail_stream | bounded | 709 | 12 | 5.8 | 5.8 | 0 | 0 | 0 | 0.1 |
+| compact_tail_whole | historical | 737 | 5 | **438.2** | 438.2 | 1 | 0 | 0 | 0.2 |
+| spool_write_stream | bounded | 760 | 13 | 5.8 | 5.8 | 0 | 0 | 0 | 0.1 |
+| prepare_request_stream | bounded | 1452 | 25 | 7.6 | 7.6 | 0 | 0 | 0 | 0.0 |
+| prepare_request_whole | historical | 1797 | 2 | **1488.9** | 1488.9 | 1 | 1 | 0 | 0.0 |
+| mirror_validate | bounded | 2214 | 40 | 7.4 | 7.4 | 0 | 0 | 0 | 0.0 |
+| mirror_parse_stream | bounded | 2718 | 49 | 9.4 | 9.4 | 0 | 0 | 0 | 0.4 |
+| mirror_parse_release | residual | 113 | 1 | 62.9 | 62.9 | 0 | 0 | 0 | 0.0 |
+| mirror_parse_whole | historical | 1813 | 3 | **1180.9** | 1180.9 | 2 | 1 | 0 | 21.8 |
+| mirror_parse_whole_release | residual | 105 | 1 | 55.3 | 55.3 | 0 | 0 | 0 | 0.0 |
+| candidate_identity_stream | bounded | 2496 | 48 | 4.8 | 4.8 | 0 | 0 | 0 | 0.0 |
+| candidate_identity_whole | historical | 2704 | 11 | **1986.5** | 1986.5 | 1 | 1 | 0 | 0.0 |
+| oneshot_payload_stream | bounded | 1419 | 25 | 6.9 | 6.9 | 0 | 0 | 0 | 0.0 |
+| oneshot_payload_whole | historical | 1510 | 1 | **1449.9** | 1449.9 | 1 | 1 | 0 | 0.0 |
+
+
+### Reading
+
+- **Every historical whole-window call delays the monitor by about its own duration**:
+  0.24–1.06 s at 210k and 0.5–2.2 s at 400k, past the 500 ms scheduler slack in all but one
+  case. Those are the calls the incident's thread samples caught, and every one of them
+  is gone from the coordinator's paths.
+- **Every bounded replacement stays at the controls' level** (≤ 10 ms) at both sizes, with
+  the fold as the one exception at 17–46 ms: its `gc max` column shows that is a cyclic-GC
+  pause (generation 0/1 collections over the hundreds of thousands of new records and
+  dicts), not a JSON call.
+- **The remaining single stretches are deallocation cascades, not parsing.** Before the
+  key-sharing change, an attribution capture on the same fixture had the streamed mirror
+  parse itself late by at most 5.5 ms (210k) and 8.2 ms (400k) while dropping the parsed
+  tuple afterwards took 140 ms wall / 90 ms late and 264 ms / 214 ms respectively: CPython
+  freeing a few hundred thousand dicts and their private key strings in one refcount
+  cascade. Two mitigations went into this PR from that measurement. The walker now shares
+  one string object per key across records (`object_hook`), exactly as a whole-array
+  `json.loads` does through its scanner memo, which returns the parsed representation to
+  the whole-array footprint (105 MB vs 169 MB retained at 100k in a `tracemalloc` check)
+  and brings the release down to the `mirror_parse_release` rows above (66 ms / 17 ms late
+  at 210k, 113 ms / 63 ms at 400k, on par with `json.loads`' own release). And the
+  transient `records`/`records_json` lists on the daemon prepare paths are emptied in
+  2,048-entry slices (`release_share_list_incrementally`) instead of one cascade. What
+  remains unbounded is the release of a long-lived parsed daemon sequence or in-process
+  window when the artifact rotates (`fold_release`, `mirror_parse_release`); both are
+  measured above and stay under the strict target at both sizes.
+- **CPU cost is unchanged or lower.** Batched `json.dumps` over 512 records costs less than
+  one call over the whole array (the canonical encode, digest, request and candidate rows),
+  because the batch strings stay cache-resident. The streamed mirror parse costs ~30% more
+  than one `json.loads` (`raw_decode` per record); that path only runs for found-block
+  consumers.
+
+### The daemon round trip (first capture, `probe-236.json`, `--daemon-binary` set)
+
+| size | phase | wall ms | Python CPU ms | monitor max late | write | read_line | read_exact |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 210k | daemon_prepare_full | 39,832 | 1,547 | 62.5 ms | 24,570 | 13,833 | 415 |
+| 210k | daemon_prepare_advance (16 records) | 571 | 4 | 1.1 ms | 0 | 571 | 0 |
+| 400k | daemon_prepare_full | 60,683 | 2,404 | 62.5 ms | 38,416 | 20,346 | — (daemon exited) |
+
+The round trip is transport- and daemon-bound, not encode-bound: at 210k the streamed
+request encode is 0.83 s of Python CPU, but the shipped write helper needs 24.6 s to move
+95.5 MB because it sleeps 20 ms whenever the 64 KiB pipe is full (PR 3's lane), and
+`read_line` then waits 13.8 s for the daemon. The monitor stayed within 63 ms throughout,
+because the writer spends its time asleep. Writing the same request through blocking pipes
+outside the coordinator (`repro_400k_daemon.py`, same fixture) took 1.0 s and the daemon
+answered 12.2 s later, so ~12 s of the 210k cold preparation is daemon-side work —
+consistent with the incident's 47.5–48.8 s `daemon_prepare` being transport plus daemon
+time rather than Python encoding. At 400k the daemon exited mid-request; see next.
+
+### Rust builder memory at the incident size (outside this PR's lane; reported for #236)
+
+Sending the 210k prepare request to the prebuilt `qbit-prism-build-audit-bundle --serve`
+through blocking pipes: **peak daemon RSS 9,613 MB**, response after 12.2 s. At 400k:
+**peak RSS 15,623 MB, then SIGKILL** (exit −9, no stderr) 24 s in, on a host with ~15 GB
+available. The incident's "roughly 9.7 GiB builder RSS" is therefore reproducible from the
+window size alone and is not a leak: `PayoutWindow::from_full_snapshot`
+(`crates/qbit-prism/src/window.rs`) pages the retained records with
+`remaining.split_off(page_size)` in a loop, and `Vec::split_off` leaves the original
+vector's capacity unchanged, so each 512-record page keeps a backing allocation sized for
+every record still remaining when it was cut — capacity 210k, then 209.5k, … — and the
+tail is copied on every iteration. Summed over 410 pages that is ~9.5 GB of `AcceptedShare`
+capacity (~220 B each) and gigabytes of copying.
+
+A scratch experiment (applied, built into a separate target directory, measured, then
+reverted; nothing under `crates/` is part of this PR) replaced the loop with
+
+```rust
+let mut records = retained.into_iter();
+loop {
+    let page: Vec<AcceptedShare> = records.by_ref().take(page_size).collect();
+    if page.is_empty() {
+        break;
+    }
+    pages.push(Rc::new(WindowPage::from_records(page)));
+}
+```
+
+and measured, same fixture and same host: **210k: 422 MB peak RSS, response 1.4 s after
+the request** (was 9,613 MB / 12.2 s); **400k: 826 MB, 2.8 s** (was SIGKILL at 15.6 GB),
+with digests identical to the shipped daemon's. That is the first thing to land for cold-start
+recovery, in a Rust-crate PR gated by `tests.window_pipeline_parity_gate` (`rust-daemon`
+adapter); with it, the 210k round trip becomes transport-bound outright.
+
+### Limits
+
+- Shared host, single run per phase, synthetic fixture (`build_records`, production
+  share_id shape, 200 identities, difficulty 16384). Not production, not isolated, no
+  24-hour soak, no Docker or production-image run, no concurrent Stratum submissions.
+- Monitor lateness is observed scheduling on this host. The GIL reading rests on the
+  historical-vs-bounded contrast under identical conditions and on the GC attribution, not
+  on a profiler.
+- The daemon phases include the shipped 20 ms polling transport; they are reported to
+  attribute, not to claim, and PR 3 changes those helpers.
+- Nothing here measures first-usable-Stratum-work time or the combined release gates; the
+  `#236` recovery target remains unmeasured.
+
+### Re-running
+
+```
+python3 tests/perf/window_pipeline_gil_scaling.py --latency-probe                      # 210k + 400k
+python3 tests/perf/window_pipeline_gil_scaling.py --latency-probe --json > probe.json   # capture
+python3 tests/perf/window_pipeline_gil_scaling.py --render probe.json                  # re-print
+python3 tests/perf/window_pipeline_gil_scaling.py --latency-probe --probe-sizes 52000,210000 \
+    --probe-reps 2 --daemon-binary target/release/qbit-prism-build-audit-bundle
+```
+
+Run it alone if the point is the lateness numbers; other load on the host lands in the
+`idle_control` row first, which is the row to compare against.
