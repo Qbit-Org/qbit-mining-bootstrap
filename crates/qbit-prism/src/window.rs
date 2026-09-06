@@ -532,8 +532,7 @@ impl PayoutWindow {
         // O(N^2/P) in both retained memory and copying -- 9.6 GB of resident
         // builder memory at the 210k-share window of #236.
         let retained_count = eligible.len() - start;
-        let mut pages: Vec<Rc<WindowPage>> =
-            Vec::with_capacity(retained_count.div_ceil(page_size));
+        let mut pages: Vec<Rc<WindowPage>> = Vec::with_capacity(retained_count.div_ceil(page_size));
         let mut retained = eligible.into_iter().skip(start);
         loop {
             let page_len = retained.len().min(page_size);
@@ -1234,12 +1233,15 @@ mod tests {
     /// Aggregate backing capacity of every page's record and fragment
     /// vectors: the number the #240 defect made quadratic.
     fn aggregate_page_capacity(window: &PayoutWindow) -> (usize, usize) {
-        window.pages.iter().fold((0, 0), |(records, fragments), page| {
-            (
-                records + page.records.capacity(),
-                fragments + page.fragments.capacity(),
-            )
-        })
+        window
+            .pages
+            .iter()
+            .fold((0, 0), |(records, fragments), page| {
+                (
+                    records + page.records.capacity(),
+                    fragments + page.fragments.capacity(),
+                )
+            })
     }
 
     /// The structural bound every paged window must satisfy: no page vector
@@ -1256,7 +1258,11 @@ mod tests {
         for (index, page) in window.pages.iter().enumerate() {
             assert!(!page.records.is_empty(), "page {index} is empty");
             assert!(page.records.len() <= page_size, "page {index} overflows");
-            assert_eq!(page.fragments.len(), page.records.len(), "page {index} fragments");
+            assert_eq!(
+                page.fragments.len(),
+                page.records.len(),
+                "page {index} fragments"
+            );
             assert!(
                 page.records.capacity() <= page_size,
                 "page {index} of {} retains capacity {} for {} records (page_size {page_size})",
@@ -1362,8 +1368,8 @@ mod tests {
 
         // An exact-fit weight retains exactly the crossing share and pages
         // to an exact boundary.
-        let window = PayoutWindow::from_full_snapshot(uniform_shares(1_000, 3), 10, 600, 100)
-            .expect("fold");
+        let window =
+            PayoutWindow::from_full_snapshot(uniform_shares(1_000, 3), 10, 600, 100).expect("fold");
         let expected: Vec<u64> = (801..=1_000).collect();
         assert_linear_paging(&window, &expected, 100);
         assert_eq!(window.total_difficulty, 600);
@@ -1438,8 +1444,14 @@ mod tests {
         for page_size in [1usize, 7, 100, 512, 513] {
             let window = PayoutWindow::from_full_snapshot(records.clone(), 10, 1_500, page_size)
                 .expect("fold");
-            assert_eq!(window.canonical_items_bytes(), reference.canonical_items_bytes());
-            assert_eq!(window.canonical_digest_hex(), reference.canonical_digest_hex());
+            assert_eq!(
+                window.canonical_items_bytes(),
+                reference.canonical_items_bytes()
+            );
+            assert_eq!(
+                window.canonical_digest_hex(),
+                reference.canonical_digest_hex()
+            );
             assert_eq!(window.record_count(), reference.record_count());
             assert_eq!(window.total_difficulty, reference.total_difficulty);
             assert_eq!(window.shares_for_build(), reference.shares_for_build());
@@ -1461,9 +1473,7 @@ mod tests {
         // A delta of 23 records, far larger than one page: two complete the
         // partial page, the remaining 21 become five full pages and one of
         // a single record.
-        let delta: Vec<AcceptedShare> = (39..=61u64)
-            .map(|seq| share(seq, 1, 11, 11))
-            .collect();
+        let delta: Vec<AcceptedShare> = (39..=61u64).map(|seq| share(seq, 1, 11, 11)).collect();
         let (advanced, stats, byte_delta) = window.advance(delta.clone(), 11).expect("advance");
         let expected: Vec<u64> = (1..=61).collect();
         assert_linear_paging(&advanced, &expected, page_size);
@@ -1497,8 +1507,12 @@ mod tests {
         // the reported byte surgery reproduces its items stream.
         let mut union = uniform_shares(38, 1);
         union.extend(delta);
-        let rebuilt = PayoutWindow::from_full_snapshot(union, 11, 1_000, page_size).expect("rebuild");
-        assert_eq!(advanced.canonical_digest_hex(), rebuilt.canonical_digest_hex());
+        let rebuilt =
+            PayoutWindow::from_full_snapshot(union, 11, 1_000, page_size).expect("rebuild");
+        assert_eq!(
+            advanced.canonical_digest_hex(),
+            rebuilt.canonical_digest_hex()
+        );
         let mut mirrored = old_items[byte_delta.retained_drop_bytes..].to_vec();
         mirrored.extend_from_slice(&byte_delta.appended_items);
         assert_eq!(mirrored, advanced.canonical_items_bytes());
@@ -1509,13 +1523,15 @@ mod tests {
             .expect("fold");
         assert_eq!(window.record_count(), 30);
         assert_eq!(window.pages.len(), 8);
-        let delta: Vec<AcceptedShare> = (39..=47u64)
-            .map(|seq| share(seq, 1, 11, 11))
-            .collect();
+        let delta: Vec<AcceptedShare> = (39..=47u64).map(|seq| share(seq, 1, 11, 11)).collect();
         let (advanced, stats, _) = window.advance(delta, 11).expect("advance");
         let expected: Vec<u64> = (18..=47).collect();
         assert_capacity_bounded(&advanced, &expected, page_size);
-        let lengths: Vec<usize> = advanced.pages.iter().map(|page| page.records.len()).collect();
+        let lengths: Vec<usize> = advanced
+            .pages
+            .iter()
+            .map(|page| page.records.len())
+            .collect();
         assert_eq!(lengths, [3, 4, 4, 4, 4, 4, 4, 3]);
         assert_eq!(stats.added_rows, 9);
         assert_eq!(stats.expired_rows, 9);
