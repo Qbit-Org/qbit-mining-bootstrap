@@ -529,8 +529,10 @@ impl PayoutWindow {
         // page: `Vec::split_off` keeps the original allocation, so page k
         // retained capacity for every record still unpaged when it was cut
         // (N, N-P, N-2P, ...) and copied the tail again on every iteration,
-        // O(N^2/P) in both retained memory and copying -- 9.6 GB of resident
-        // builder memory at the 210k-share window of #236.
+        // O(N^2/P) in both retained memory and copying. A prior synthetic
+        // reproduction of the #236 window measured 9,613 MiB of resident
+        // builder memory for one 210k-share preparation
+        // (tests/perf/window_pipeline_gil_scaling.md section 9, cited by #240).
         let retained_count = eligible.len() - start;
         let mut pages: Vec<Rc<WindowPage>> = Vec::with_capacity(retained_count.div_ceil(page_size));
         let mut retained = eligible.into_iter().skip(start);
@@ -1458,6 +1460,56 @@ mod tests {
             let (records_capacity, _) = aggregate_page_capacity(&window);
             assert!(records_capacity <= window.pages.len() * page_size);
         }
+    }
+
+    #[test]
+    fn advance_pages_a_multi_page_delta_onto_a_full_page_within_bound() {
+        // One exactly full page (4 records at page size 4) was within bound
+        // even under the previous paging, so this case isolates the advance
+        // delta loop from the full-snapshot loop: 23 appended records must
+        // land in pages sized for their contents (five full pages and one
+        // of three), never in a vector that kept the whole delta's capacity.
+        let page_size = 4;
+        let window = PayoutWindow::from_full_snapshot(uniform_shares(4, 1), 10, 1_000, page_size)
+            .expect("fold");
+        assert_eq!(window.pages.len(), 1);
+        assert!(window.pages[0].records.capacity() <= page_size);
+        assert!(window.pages[0].fragments.capacity() <= page_size);
+        let old_digest = window.canonical_digest_hex();
+        let old_items = window.canonical_items_bytes();
+
+        let delta: Vec<AcceptedShare> = (5..=27u64).map(|seq| share(seq, 1, 11, 11)).collect();
+        let (advanced, stats, byte_delta) = window.advance(delta.clone(), 11).expect("advance");
+        let expected: Vec<u64> = (1..=27).collect();
+        assert_linear_paging(&advanced, &expected, page_size);
+        assert_eq!(advanced.pages.len(), 7);
+        assert_eq!(
+            stats,
+            WindowAdvanceStats {
+                added_rows: 23,
+                expired_rows: 0,
+                touched_pages: 0
+            }
+        );
+
+        // Nothing merged into the full base page, so it is shared, not
+        // rebuilt, and the previous generation reads exactly as before.
+        assert!(Rc::ptr_eq(&window.pages[0], &advanced.pages[0]));
+        assert_eq!(Rc::strong_count(&window.pages[0]), 2);
+        for page in &advanced.pages[1..] {
+            assert_eq!(Rc::strong_count(page), 1);
+        }
+        assert_eq!(window.record_count(), 4);
+        assert_eq!(window.canonical_digest_hex(), old_digest);
+        assert_eq!(window.canonical_items_bytes(), old_items);
+
+        let mut union = uniform_shares(4, 1);
+        union.extend(delta);
+        let rebuilt = PayoutWindow::from_full_snapshot(union, 11, 1_000, page_size).expect("rebuild");
+        assert_eq!(advanced.canonical_digest_hex(), rebuilt.canonical_digest_hex());
+        let mut mirrored = old_items[byte_delta.retained_drop_bytes..].to_vec();
+        mirrored.extend_from_slice(&byte_delta.appended_items);
+        assert_eq!(mirrored, advanced.canonical_items_bytes());
     }
 
     #[test]

@@ -34,7 +34,8 @@ envelope line arrived) and ``response_read`` (the raw canonical-items
 section), the daemon's own ``metrics`` (JSON parse, fold/advance, canonical
 serialization -- Rust processing measured inside the process, so transport
 and processing are separated rather than inferred), the daemon's resident
-set after the phase, and its lifetime peak (``VmHWM``). The derived
+set after the phase, and its peak with source provenance (kernel ``VmHWM``
+or a labelled lower bound if only earlier observations survive). The derived
 ``residual`` column is ``response_wait`` minus the daemon's three timers; the
 client's wall interval and the daemon's internal timers are independent
 intervals on either side of a pipe, so it is an approximation of scheduling
@@ -210,13 +211,20 @@ def binary_identity(binary: Path) -> dict[str, Any]:
 
 
 class RssSampler:
-    """Samples ``VmRSS`` of one pid on a thread; peak comes from ``VmHWM``."""
+    """Samples ``VmRSS`` (and the running ``VmHWM``) of one pid on a thread.
+
+    The authoritative peak is the kernel's ``VmHWM`` read before the daemon
+    is reaped; the samples here are the timeline, and their maxima serve only
+    as a lower bound when that read is no longer possible (see
+    :func:`resolve_peak_rss`).
+    """
 
     def __init__(self, pid: int, interval: float) -> None:
         self.pid = pid
         self.interval = interval
         self.samples: list[tuple[float, float]] = []
         self.max_sampled_mb = 0.0
+        self.max_sampled_hwm_mb = 0.0
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="rss-sampler", daemon=True)
 
@@ -227,6 +235,9 @@ class RssSampler:
             if rss is not None:
                 self.samples.append((time.perf_counter(), rss))
                 self.max_sampled_mb = max(self.max_sampled_mb, rss)
+            hwm = status.get("VmHWM")
+            if hwm is not None:
+                self.max_sampled_hwm_mb = max(self.max_sampled_hwm_mb, hwm)
             self._stop.wait(self.interval)
 
     def __enter__(self) -> RssSampler:
@@ -236,6 +247,55 @@ class RssSampler:
     def __exit__(self, *_exc: object) -> None:
         self._stop.set()
         self._thread.join()
+
+
+# ---------------------------------------------------------------------------
+# peak provenance
+# ---------------------------------------------------------------------------
+
+
+PEAK_SOURCE_LABELS = {
+    "vmhwm": "kernel VmHWM at close",
+    "vmhwm_before_kill": "kernel VmHWM before watchdog kill",
+    "lower_bound": "lower bound (highest earlier VmHWM/RSS observation)",
+    "unavailable": "unavailable",
+}
+
+
+def resolve_peak_rss(outcome: dict[str, Any], observations: list[float | None]) -> dict[str, Any]:
+    """Settle ``peak_rss_mb`` and its provenance in a daemon outcome.
+
+    A kernel ``VmHWM`` read while the daemon was alive (at close, or sampled
+    just before the watchdog killed it) is exact and is kept as is. When the
+    daemon exited on its own before ``close`` could read it, the figure is
+    gone from ``/proc``; the best that remains is the highest earlier
+    observation (per-phase ``VmHWM`` reads, the sampler's running ``VmHWM``
+    or ``VmRSS`` maxima), which is a **lower bound** on the true peak and is
+    labelled as such; with no observation at all it is unavailable.
+    """
+    if outcome.get("peak_rss_mb") is not None:
+        outcome.setdefault("peak_rss_source", "vmhwm")
+        return outcome
+    candidates = [value for value in observations if value]
+    if candidates:
+        outcome["peak_rss_mb"] = max(candidates)
+        outcome["peak_rss_source"] = "lower_bound"
+    else:
+        outcome["peak_rss_mb"] = None
+        outcome["peak_rss_source"] = "unavailable"
+    return outcome
+
+
+def format_peak(value: float | None, source: str | None, digits: int = 0) -> str:
+    """Render a peak figure, prefixing a lower bound with ``≥``."""
+    if value is None:
+        return "-"
+    text = f"{value:.{digits}f}"
+    return f"≥ {text}" if source == "lower_bound" else text
+
+
+def peak_source_label(source: str | None) -> str:
+    return PEAK_SOURCE_LABELS.get(source or "unavailable", str(source))
 
 
 # ---------------------------------------------------------------------------
@@ -451,7 +511,12 @@ class Daemon:
 
         Closing stdin asks a healthy daemon to exit; one that has not exited
         within ``shutdown_timeout`` is killed. ``VmHWM`` is read before the
-        child is reaped (it is gone from ``/proc`` afterwards).
+        child is reaped (it is gone from ``/proc`` afterwards); the outcome's
+        ``peak_rss_source`` records whether the figure is that live read
+        (``vmhwm``), the watchdog's read before a kill
+        (``vmhwm_before_kill``), or ``unavailable`` because the daemon had
+        already exited -- :func:`resolve_peak_rss` may then substitute a
+        labelled lower bound.
         """
         if self._outcome is not None:
             return self._outcome
@@ -475,7 +540,12 @@ class Daemon:
             stderr_tail = self.stderr_path.read_text(errors="replace")[-2000:]
         except OSError:
             pass
-        peak = final_status.get("VmHWM", self.status_at_kill.get("VmHWM"))
+        if final_status.get("VmHWM") is not None:
+            peak, peak_source = final_status["VmHWM"], "vmhwm"
+        elif self.status_at_kill.get("VmHWM") is not None:
+            peak, peak_source = self.status_at_kill["VmHWM"], "vmhwm_before_kill"
+        else:
+            peak, peak_source = None, "unavailable"
         peak_vsize = final_status.get("VmPeak", self.status_at_kill.get("VmPeak"))
         self._outcome = {
             "pid": process.pid,
@@ -483,6 +553,7 @@ class Daemon:
             "signal": -self.exit_code if self.exit_code is not None and self.exit_code < 0 else None,
             "timed_out": self.timed_out,
             "peak_rss_mb": peak,
+            "peak_rss_source": peak_source,
             "peak_vsize_mb": peak_vsize,
             "stderr_tail": stderr_tail,
         }
@@ -818,6 +889,7 @@ def run_variant(
 
     run_error: str | None = None
     max_sampled = 0.0
+    max_sampled_hwm = 0.0
     timeline: list[tuple[float, float]] = []
     try:
         with RssSampler(daemon.pid, sample_interval) as sampler:
@@ -866,14 +938,18 @@ def run_variant(
                 log(f"    {label} @ {fixture.size}: aborted: {run_error}")
             finally:
                 max_sampled = sampler.max_sampled_mb
+                max_sampled_hwm = sampler.max_sampled_hwm_mb
                 timeline = sampler.samples
     finally:
         # Always reaps the child and closes every pipe and the stderr
         # capture, whatever happened above.
         outcome = daemon.close()
-    if outcome.get("peak_rss_mb") is None:
-        candidates = [phase.hwm_after_mb or 0.0 for phase in phases] + [max_sampled]
-        outcome["peak_rss_mb"] = max(candidates) if any(candidates) else None
+    # A daemon that exited on its own took its VmHWM with it; what remains
+    # is a labelled lower bound from the observations made while it lived.
+    resolve_peak_rss(
+        outcome,
+        [phase.hwm_after_mb for phase in phases] + [max_sampled_hwm, max_sampled],
+    )
     return RunResult(
         label,
         str(binary),
@@ -933,23 +1009,25 @@ def render_runs(runs: list[RunResult]) -> str:
 
 def render_summary(runs: list[RunResult]) -> str:
     lines = [
-        "| binary | shares | peak RSS MiB (VmHWM) | peak VSZ MiB | MiB per 1k shares | full wait s | full fold s | daemon exit | available MiB before |",
-        "|---|---:|---:|---:|---:|---:|---:|---|---:|",
+        "| binary | shares | peak RSS MiB | peak source | peak VSZ MiB | MiB per 1k shares | full wait s | full fold s | daemon exit | available MiB before |",
+        "|---|---:|---:|---|---:|---:|---:|---:|---|---:|",
     ]
     for run in runs:
         if run.skipped or (run.error and not run.phases):
-            lines.append(f"| {run.variant} | {run.size:,} | {'skipped' if run.skipped else 'failed'}: {run.skipped or run.error} | | | | | | {_fmt(run.mem_available_before_mb, 0)} |")
+            lines.append(f"| {run.variant} | {run.size:,} | {'skipped' if run.skipped else 'failed'}: {run.skipped or run.error} | | | | | | | {_fmt(run.mem_available_before_mb, 0)} |")
             continue
         full = next((phase for phase in run.phases if phase.phase == "full"), None)
         peak = run.outcome.get("peak_rss_mb")
+        peak_source = run.outcome.get("peak_rss_source")
         exit_code = run.outcome.get("exit_code")
         signal = run.outcome.get("signal")
         ended = "clean (0)" if exit_code == 0 else (f"signal {signal}" if signal else f"exit {exit_code}")
         if run.outcome.get("timed_out"):
             ended += f", killed on {run.outcome['timed_out']} timeout"
         lines.append(
-            f"| {run.variant} | {run.size:,} | {_fmt(peak, 0)} | {_fmt(run.outcome.get('peak_vsize_mb'), 0)} |"
-            f" {_fmt(None if peak is None else peak / (run.size / 1000.0), 2)} |"
+            f"| {run.variant} | {run.size:,} | {format_peak(peak, peak_source)} | {peak_source_label(peak_source)} |"
+            f" {_fmt(run.outcome.get('peak_vsize_mb'), 0)} |"
+            f" {format_peak(None if peak is None else peak / (run.size / 1000.0), peak_source, 2)} |"
             f" {_fmt(full.response_wait_seconds if full else None)} |"
             f" {_fmt(full.daemon_metrics.get('fold_seconds') if full else None, 3)} |"
             f" {ended} | {_fmt(run.mem_available_before_mb, 0)} |"
@@ -1079,7 +1157,8 @@ def main(argv: list[str] | None = None) -> int:
         last = runs[-1]
         if not last.skipped and last.phases:
             log(
-                f"    -> peak RSS {_fmt(last.outcome.get('peak_rss_mb'), 0)} MiB, exit {last.outcome.get('exit_code')},"
+                f"    -> peak RSS {format_peak(last.outcome.get('peak_rss_mb'), last.outcome.get('peak_rss_source'))} MiB"
+                f" ({peak_source_label(last.outcome.get('peak_rss_source'))}), exit {last.outcome.get('exit_code')},"
                 f" phases {[(p.phase, p.status) for p in last.phases]}"
             )
 

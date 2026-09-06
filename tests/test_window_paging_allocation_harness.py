@@ -8,7 +8,10 @@ child and records the failure, and every exit path closes the pipes and the
 stderr capture. These tests exercise that with a fake daemon that stalls in
 three ways -- no handshake, after consuming the request, and without ever
 reading it (so the request writer is blocked on a full pipe) -- and stay
-well under a few seconds each.
+well under a few seconds each. They also pin the provenance of the reported
+peak resident set: a kernel ``VmHWM`` read while the daemon lived is exact,
+anything reconstructed after a self-exit is a labelled lower bound rendered
+with ``≥``, and nothing observed is ``unavailable``.
 """
 
 from __future__ import annotations
@@ -33,6 +36,8 @@ if mode != "no_handshake":
         "protocol": %d,
     }) + "\\n")
     sys.stdout.flush()
+if mode == "exit_after_handshake":
+    sys.exit(0)
 if mode == "stall_after_handshake":
     sys.stdin.readline()
 time.sleep(120)
@@ -85,6 +90,13 @@ class StalledDaemonTests(unittest.TestCase):
         outcome = daemon.close()
         self.assertEqual(outcome["timed_out"], "full")
         self.assertEqual(outcome["signal"], 9)
+        # The watchdog sampled the kernel high-water mark before killing.
+        if Path("/proc/self/status").exists():
+            self.assertEqual(outcome["peak_rss_source"], "vmhwm_before_kill")
+            self.assertIsInstance(outcome["peak_rss_mb"], float)
+        else:
+            self.assertEqual(outcome["peak_rss_source"], "unavailable")
+            self.assertIsNone(outcome["peak_rss_mb"])
         self.assertTrue(daemon.process.stdin.closed)
         self.assertTrue(daemon.process.stdout.closed)
         self.assertTrue(daemon._stderr.closed)
@@ -146,6 +158,107 @@ class StalledDaemonTests(unittest.TestCase):
         # The tables render a killed run rather than choking on it.
         self.assertIn("killed on full timeout", harness.render_summary([result]))
         self.assertIn("| timeout", harness.render_runs([result]))
+
+    def test_close_on_a_live_daemon_reports_the_kernel_high_water_mark(self) -> None:
+        daemon = self._daemon("stall_after_handshake")
+        outcome = daemon.close()  # alive at close: VmHWM read live, then killed
+        if Path("/proc/self/status").exists():
+            self.assertEqual(outcome["peak_rss_source"], "vmhwm")
+            self.assertIsInstance(outcome["peak_rss_mb"], float)
+        else:
+            self.assertEqual(outcome["peak_rss_source"], "unavailable")
+            self.assertIsNone(outcome["peak_rss_mb"])
+        self.assertEqual(outcome["signal"], 9)
+        _assert_reaped(self, outcome["pid"])
+
+    def test_self_exited_daemon_peak_is_a_lower_bound_or_unavailable(self) -> None:
+        daemon = self._daemon("exit_after_handshake")
+        daemon.process.wait(timeout=5.0)
+        outcome = daemon.close()
+        self.assertEqual(outcome["exit_code"], 0)
+        self.assertEqual(outcome["peak_rss_source"], "unavailable")
+        self.assertIsNone(outcome["peak_rss_mb"])
+        _assert_reaped(self, outcome["pid"])
+
+        fixture = harness.build_fixture(64, miners=2, page_size=16, small=2, large=3)
+        os.environ["FAKE_DAEMON_MODE"] = "exit_after_handshake"
+        try:
+            result = harness.run_variant(
+                "fake",
+                self.binary,
+                fixture,
+                oracle=None,
+                memory_limit_mb=None,
+                memory_margin_mb=0,
+                sample_interval=0.01,
+                exchange_timeout=5.0,
+                stderr_dir=Path(self.tmp.name),
+                log=lambda _text: None,
+            )
+        finally:
+            os.environ.pop("FAKE_DAEMON_MODE", None)
+        self.assertEqual(result.outcome["exit_code"], 0)
+        self.assertEqual(result.phases[0].status, "no_response")
+        # Whatever the sampler caught before the exit, the figure is never
+        # presented as a kernel high-water mark.
+        source = result.outcome["peak_rss_source"]
+        self.assertIn(source, ("lower_bound", "unavailable"))
+        summary = harness.render_summary([result])
+        if source == "lower_bound":
+            self.assertIsInstance(result.outcome["peak_rss_mb"], float)
+            self.assertIn("| ≥ ", summary)
+            self.assertIn("lower bound", summary)
+        else:
+            self.assertIsNone(result.outcome["peak_rss_mb"])
+            self.assertIn("| - | unavailable |", summary)
+        self.assertNotIn("kernel VmHWM", summary)
+
+    def test_resolve_peak_rss_provenance(self) -> None:
+        exact = harness.resolve_peak_rss({"peak_rss_mb": 601.0, "peak_rss_source": "vmhwm"}, [900.0])
+        self.assertEqual((exact["peak_rss_mb"], exact["peak_rss_source"]), (601.0, "vmhwm"))
+        before_kill = harness.resolve_peak_rss(
+            {"peak_rss_mb": 601.0, "peak_rss_source": "vmhwm_before_kill"}, [900.0]
+        )
+        self.assertEqual(before_kill["peak_rss_source"], "vmhwm_before_kill")
+        legacy = harness.resolve_peak_rss({"peak_rss_mb": 601.0}, [])
+        self.assertEqual(legacy["peak_rss_source"], "vmhwm")
+        bound = harness.resolve_peak_rss({"peak_rss_mb": None}, [435.0, None, 0.0, 601.0, 12.5])
+        self.assertEqual((bound["peak_rss_mb"], bound["peak_rss_source"]), (601.0, "lower_bound"))
+        nothing = harness.resolve_peak_rss({"peak_rss_mb": None}, [None, 0.0])
+        self.assertEqual((nothing["peak_rss_mb"], nothing["peak_rss_source"]), (None, "unavailable"))
+
+    def test_peak_rendering_distinguishes_exact_lower_bound_and_unavailable(self) -> None:
+        self.assertEqual(harness.format_peak(601.4, "vmhwm"), "601")
+        self.assertEqual(harness.format_peak(601.4, "vmhwm_before_kill"), "601")
+        self.assertEqual(harness.format_peak(601.4, "lower_bound"), "≥ 601")
+        self.assertEqual(harness.format_peak(2.857, "lower_bound", 2), "≥ 2.86")
+        self.assertEqual(harness.format_peak(None, "unavailable"), "-")
+
+        def run(source: str | None, peak: float | None) -> harness.RunResult:
+            return harness.RunResult(
+                "fixed", "bin", 210_000, 512, 16_000.0, None, 6144,
+                [
+                    harness.PhaseResult(
+                        phase="full", records_sent=210_000, request_bytes=1,
+                        request_write_seconds=0.15, response_wait_seconds=1.29,
+                        response_read_seconds=0.12, daemon_metrics={"fold_seconds": 0.377},
+                        status="prepared",
+                    )
+                ],
+                {"exit_code": 0, "signal": None, "timed_out": None, "peak_rss_mb": peak,
+                 "peak_rss_source": source, "peak_vsize_mb": 640.0},
+                0.0, [],
+            )
+
+        exact_row = harness.render_summary([run("vmhwm", 601.0)]).splitlines()[-1]
+        self.assertIn("| 601 | kernel VmHWM at close | 640 | 2.86 |", exact_row)
+        bound_row = harness.render_summary([run("lower_bound", 601.0)]).splitlines()[-1]
+        self.assertIn("| ≥ 601 | lower bound (highest earlier VmHWM/RSS observation) | 640 | ≥ 2.86 |", bound_row)
+        none_row = harness.render_summary([run("unavailable", None)]).splitlines()[-1]
+        self.assertIn("| - | unavailable | 640 | - |", none_row)
+        header = harness.render_summary([]).splitlines()[0]
+        self.assertIn("| peak RSS MiB | peak source |", header)
+        self.assertNotIn("VmHWM", header)
 
     def test_residual_wait_is_an_approximation_clamped_at_zero(self) -> None:
         phase = harness.PhaseResult(
