@@ -17,11 +17,15 @@ with ``≥``; nothing observed is ``unavailable``.
 from __future__ import annotations
 
 import os
+import io
+import json
 import stat
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from contextlib import redirect_stdout
+from unittest import mock
 
 from tests.perf import window_paging_allocation as harness
 
@@ -158,6 +162,34 @@ class StalledDaemonTests(unittest.TestCase):
         # The tables render a killed run rather than choking on it.
         self.assertIn("killed on full timeout", harness.render_summary([result]))
         self.assertIn("| timeout", harness.render_runs([result]))
+
+    def test_main_skips_before_parent_allocations_when_memory_is_low(self) -> None:
+        fixture = harness.build_fixture(64, miners=2, page_size=16, small=2, large=3)
+        for available, stage, builds in (
+            ([0], "fixture construction", 0),
+            ([10000, 0], "Python oracle", 1),
+        ):
+            with self.subTest(stage=stage), \
+                    mock.patch.object(harness, "read_meminfo_mb", side_effect=available), \
+                    mock.patch.object(harness, "machine_info", return_value={}), \
+                    mock.patch.object(harness, "git_describe", return_value="test"), \
+                    mock.patch.object(harness, "build_fixture", return_value=fixture) as build, \
+                    mock.patch.object(harness, "python_oracle") as oracle, \
+                    mock.patch.object(harness, "run_variant") as variant, \
+                    redirect_stdout(io.StringIO()):
+                output = Path(self.tmp.name) / "low-memory.json"
+                self.assertEqual(harness.main([
+                    "--daemon-binary", str(self.binary), "--sizes", "400000",
+                    "--stderr-dir", self.tmp.name, "--json", str(output), "--quiet",
+                ]), 0)
+                result = json.loads(output.read_text())
+                self.assertEqual(build.call_count, builds)
+                oracle.assert_not_called()
+                variant.assert_not_called()
+                self.assertEqual(result["oracles"], {})
+                self.assertEqual(len(result["runs"]), 1)
+                self.assertEqual(result["runs"][0]["size"], 400000)
+                self.assertIn(f"before {stage}", result["runs"][0]["skipped"])
 
     def test_handshake_timeout_preserves_outcome_in_result_and_summary(self) -> None:
         fixture = harness.build_fixture(64, miners=2, page_size=16, small=2, large=3)

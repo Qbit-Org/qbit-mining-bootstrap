@@ -1130,14 +1130,36 @@ def main(argv: list[str] | None = None) -> int:
     current_size: int | None = None
     fixture: Fixture | None = None
     oracle: dict[str, Any] | None = None
+
+    def skip_parent_work_if_low_memory(label: str, binary: Path, size: int, stage: str) -> bool:
+        available = read_meminfo_mb("MemAvailable")
+        required = (memory_limit or 0) + args.memory_margin_mb
+        if available is None or available >= required:
+            return False
+        reason = f"MemAvailable {available:.0f} MiB below required {required} MiB before {stage}"
+        log(f"    {label} @ {size}: skipped, {reason}")
+        runs.append(RunResult(
+            label, str(binary), size, args.page_size, available, None,
+            memory_limit, [], {}, 0.0, [], skipped=reason,
+        ))
+        return True
+
     for label, binary, size in plan:
         if size != current_size:
+            # Release the preceding fixture before checking headroom for
+            # the next parent-side allocation. The daemon admission check
+            # alone is too late to protect fixture/oracle construction.
             fixture = None
+            oracle = None
+            if skip_parent_work_if_low_memory(label, binary, size, "fixture construction"):
+                continue
             log(f"  building {size:,}-record fixture ...")
             fixture = build_fixture(size, miners=args.miners, page_size=args.page_size, small=args.small_delta, large=args.large_delta)
             fixtures_seconds[size] = fixture.build_seconds
-            oracle = None
             if not args.skip_oracle:
+                if skip_parent_work_if_low_memory(label, binary, size, "Python oracle"):
+                    fixture = None
+                    continue
                 log(f"  running the Python fold oracle at {size:,} ...")
                 oracle = python_oracle(fixture)
                 oracles[size] = oracle
