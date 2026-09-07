@@ -6,6 +6,8 @@ use crate::{
     stratum::{MiningBackend, MiningJob, StratumError, Worker},
 };
 use anyhow::{ensure, Context, Result};
+use num_bigint::BigUint;
+use num_traits::ToPrimitive;
 use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::{AcceptedShare, AuditBundle, FanoutFeeRatePolicy, FoundBlock};
 use serde::{Deserialize, Serialize};
@@ -99,6 +101,68 @@ fn protocol_error(reason: &'static str, message: &str) -> StratumError {
     StratumError::new(code, message, reason)
 }
 
+/// Convert qbit/kweight to bits/kweight, rounding a positive sub-bit remainder
+/// upward without introducing binary floating-point error into the fee policy.
+fn fee_estimate_bits(value: &Value) -> Result<u64> {
+    let text = match value {
+        Value::Number(number) => number.to_string(),
+        Value::String(text) => text.clone(),
+        _ => anyhow::bail!("invalid CTV market fee estimate"),
+    };
+    ensure!(
+        text.len() <= 4096,
+        "CTV fee estimate exceeds decimal length limit"
+    );
+    // Validate number strings with the same decimal grammar as JSON numbers.
+    // arbitrary_precision preserves their exact coefficient and exponent.
+    let decimal = text
+        .parse::<serde_json::Number>()
+        .context("invalid CTV market fee decimal")?
+        .to_string();
+    ensure!(
+        !decimal.starts_with('-'),
+        "CTV market fee estimate must be positive"
+    );
+    let (mantissa, exponent) = match decimal.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (
+            mantissa,
+            exponent
+                .parse::<i64>()
+                .context("CTV fee exponent overflow")?,
+        ),
+        None => (decimal.as_str(), 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = format!("{whole}{fraction}");
+    let significant = digits.trim_start_matches('0');
+    ensure!(
+        !significant.is_empty(),
+        "CTV market fee estimate must be positive"
+    );
+    let power = exponent
+        .checked_add(8)
+        .and_then(|power| power.checked_sub(fraction.len() as i64))
+        .context("CTV fee exponent overflow")?;
+    let coefficient = significant.parse::<BigUint>()?;
+    let amount = if power >= 0 {
+        ensure!(
+            power <= 19 && significant.len() as i64 + power <= 20,
+            "CTV fee rate overflow"
+        );
+        coefficient * BigUint::from(10u8).pow(power as u32)
+    } else {
+        let places = power.unsigned_abs();
+        if places >= significant.len() as u64 {
+            // Any positive amount strictly below one bit rounds up to one.
+            // This also avoids allocating enormous powers for tiny exponents.
+            return Ok(1);
+        }
+        let divisor = BigUint::from(10u8).pow(places as u32);
+        (coefficient + &divisor - BigUint::from(1u8)) / divisor
+    };
+    amount.to_u64().context("CTV fee rate overflow")
+}
+
 impl Coordinator {
     pub async fn new(mut config: Config) -> Result<Arc<Self>> {
         let rpc = Rpc::new(
@@ -189,15 +253,9 @@ impl Coordinator {
             return Ok(Some(*fee));
         }
         let estimate = self.rpc.call("estimatesmartfee", json!([2])).await?;
-        let rate=estimate["feerate"].as_f64().context("CTV fee estimate unavailable; configure PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT")?;
-        ensure!(
-            rate.is_finite() && rate > 0.0,
-            "invalid CTV market fee estimate"
-        );
-        let bits = (rate * 100_000_000.0).ceil();
-        ensure!(bits < u64::MAX as f64, "CTV fee rate overflow");
+        let bits = fee_estimate_bits(&estimate["feerate"]).context("CTV fee estimate unavailable; configure PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT")?;
         Ok(Some(FanoutFeeRatePolicy::new(
-            bits as u64,
+            bits,
             crate::config::number("PRISM_CTV_FANOUT_FEE_PREMIUM_BPS", 12000u64)?,
         )))
     }
@@ -1258,5 +1316,96 @@ impl MiningBackend for Coordinator {
                 ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fee_estimate_tests {
+    use super::*;
+
+    fn assert_number_and_string(decimal: &str, expected: u64) {
+        let number: Value = serde_json::from_str(decimal).unwrap();
+        assert_eq!(fee_estimate_bits(&number).unwrap(), expected, "{decimal}");
+        assert_eq!(
+            fee_estimate_bits(&Value::String(decimal.into())).unwrap(),
+            expected,
+            "string {decimal}"
+        );
+    }
+
+    #[test]
+    fn exact_fee_estimate_does_not_round_an_integer_bit_up() {
+        assert_number_and_string("0.00001", 1000);
+        assert_number_and_string("0.00000001", 1);
+        assert_number_and_string("0.000010000000000000000001", 1001);
+        assert_number_and_string("0.0000100000000000000000000001", 1001);
+        assert_number_and_string("184467440737.09551615", u64::MAX);
+        assert_number_and_string("184467440737.095516150", u64::MAX);
+    }
+
+    #[test]
+    fn exact_fee_estimate_handles_scientific_and_sub_bit_values() {
+        assert_number_and_string("1e-5", 1000);
+        assert_number_and_string("1E-5", 1000);
+        assert_number_and_string("1e+0", 100_000_000);
+        assert_number_and_string("1.000000001e-5", 1001);
+        assert_number_and_string("1e-9", 1);
+        assert_number_and_string("9.999999999e-9", 1);
+        assert_number_and_string("1e-1000000", 1);
+    }
+
+    #[test]
+    fn exact_fee_estimate_rejects_overflow_including_fractional_ceiling() {
+        for decimal in [
+            "184467440737.0955161501",
+            "184467440737.09551616",
+            "1e1000000",
+            "1e9999999999999999999999999999999999999",
+        ] {
+            let number: Value = serde_json::from_str(decimal).unwrap();
+            assert!(fee_estimate_bits(&number).is_err(), "{decimal}");
+            assert!(
+                fee_estimate_bits(&Value::String(decimal.into())).is_err(),
+                "string {decimal}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_fee_estimate_rejects_zero_negative_and_malformed_values() {
+        for value in [
+            Value::Null,
+            json!(true),
+            json!([]),
+            json!({}),
+            json!(0),
+            json!(-1),
+        ] {
+            assert!(fee_estimate_bits(&value).is_err(), "{value}");
+        }
+        for decimal in [
+            "",
+            "0",
+            "0.000000000",
+            "0e1000000",
+            "-0",
+            "-0.00001",
+            "NaN",
+            "Infinity",
+            "+1",
+            ".1",
+            "1.",
+            "01",
+            "1e",
+            "1e+",
+            "1e2e3",
+            r#"{"$serde_json::private::Number":"0.00001"}"#,
+        ] {
+            assert!(
+                fee_estimate_bits(&Value::String(decimal.into())).is_err(),
+                "{decimal}"
+            );
+        }
+        assert!(fee_estimate_bits(&Value::String("1".repeat(4097))).is_err());
     }
 }
