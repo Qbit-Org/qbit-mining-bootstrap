@@ -831,7 +831,18 @@ async fn ctv_artifacts_wait_for_maturity_and_claims_are_fenced() -> Result<()> {
         a.renew_fanout_claim(&first, 60).await.is_err(),
         "expired owner revived its lease"
     );
-    let recovered = b.claim_fanout(60).await?.unwrap();
+    // SQLx queues rollback when the rejected renewal drops its transaction.
+    // SKIP LOCKED may briefly skip that row until the rollback releases it.
+    let recovered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(claim) = b.claim_fanout(60).await? {
+                return Ok::<_, anyhow::Error>(claim);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("expired fanout was not reclaimed after renewal rollback")??;
     assert_eq!(first.fanout_txid, recovered.fanout_txid);
     assert_eq!(recovered.progress["scan_next_height"], json!(1103));
     assert_eq!(
