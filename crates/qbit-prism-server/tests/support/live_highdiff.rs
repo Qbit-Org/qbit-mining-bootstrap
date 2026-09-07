@@ -205,6 +205,7 @@ async fn real_highdiff_block_only_proof_waits_for_active_chain_credit() -> Resul
         ensure!(row.try_get::<String,_>("work")?==network_work.to_string() && row.try_get::<String,_>("network")?==network_work.to_string(),"block-only proof credited assigned highdiff instead of proven network work");
         let block=fixture.rpc("getblockheader",json!([block_hash])).await?;
         ensure!(block["confirmations"].as_i64().unwrap_or(0)>0,"ACKed block is not on the active chain");
+        assert_share_height_boundary(&fixture,&share_id,block["height"].as_u64().context("confirmed block height missing")?).await?;
         drop(miner);
 
         // A valid PoW with an invalid future timestamp reaches submitblock,
@@ -224,6 +225,120 @@ async fn real_highdiff_block_only_proof_waits_for_active_chain_credit() -> Resul
         eprintln!("live highdiff: withheld ACK until durable active-chain credit; credited exactly {network_work} network work; rejected future block received no ACK/credit");
         Ok::<_,anyhow::Error>(())
     }.await;
+    if result.is_err() {
+        eprintln!("{}", fixture.diagnostics());
+    }
+    let cleanup = fixture.cleanup().await;
+    result.and(cleanup)
+}
+
+async fn assert_share_height_boundary(
+    fixture: &Fixture,
+    share_id: &str,
+    candidate_height: u64,
+) -> Result<()> {
+    let candidate_height = i64::try_from(candidate_height)?;
+    let parent_height = candidate_height
+        .checked_sub(1)
+        .context("candidate height has no parent")?;
+    let persisted: i64 =
+        sqlx::query_scalar("SELECT template_height FROM qbit_share_ledger WHERE share_id=$1")
+            .bind(share_id)
+            .fetch_one(&fixture.pool)
+            .await?;
+    ensure!(
+        persisted == parent_height,
+        "share recorded candidate height instead of parent height"
+    );
+    for (minimum, expected) in [(parent_height, true), (candidate_height, false)] {
+        let included: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM qbit_shares_since_template_height($1) WHERE share_id=$2)",
+        )
+        .bind(minimum)
+        .bind(share_id)
+        .fetch_one(&fixture.pool)
+        .await?;
+        ensure!(
+            included == expected,
+            "share crossed incorrect inclusive template-height boundary {minimum}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_share_height_queries_use_template_parent_height() -> Result<()> {
+    use qbit_prism_server::{
+        coordinator::{Coordinator, JobContext},
+        stratum::MiningBackend,
+    };
+    let Some(fixture) = Fixture::open(false).await? else {
+        return Ok(());
+    };
+    let result = async {
+        let coordinator = Coordinator::new(direct_coordinator_config(&fixture)?).await?;
+        coordinator.refresh_once().await?;
+        let worker = coordinator
+            .authorize(&format!("{}.height", fixture.address))
+            .await?;
+        let session = coordinator.new_session_id().await?;
+        let job = coordinator
+            .build_job(&worker, &format!("{session:08x}"), 1e-12, 0.0)
+            .await?;
+        let parent = fixture
+            .rpc("getblockheader", json!([job.wire.previousblockhash]))
+            .await?;
+        let parent_height = parent["height"]
+            .as_u64()
+            .context("template parent height missing")?;
+        let candidate_height = parent_height
+            .checked_add(1)
+            .context("candidate height overflow")?;
+        ensure!(
+            job.context.bundle.found_block.block_height == candidate_height,
+            "job candidate height differs from real node parent"
+        );
+        let submission = (0..10_000u32)
+            .find_map(|nonce| {
+                let proof = job
+                    .wire
+                    .assemble_submission(
+                        &"00".repeat(job.wire.extranonce2_size),
+                        &format!("{:08x}", job.wire.ntime),
+                        &format!("{nonce:08x}"),
+                        None,
+                        0,
+                    )
+                    .ok()?;
+                (proof.share_pass && !proof.block_pass).then_some(proof)
+            })
+            .context("no constrained non-block regtest share")?;
+        // Invalid internal/restored context must fail before any durable ACK;
+        // subtraction must never wrap height zero to a huge ledger height.
+        let mut malformed = job.clone();
+        let mut bundle = (*job.context.bundle).clone();
+        bundle.found_block.block_height = 0;
+        malformed.context = std::sync::Arc::new(JobContext {
+            prepared: job.context.prepared.clone(),
+            worker: job.context.worker.clone(),
+            bundle: std::sync::Arc::new(bundle),
+        });
+        let rejected = coordinator
+            .submit(&worker, &malformed, submission.clone(), false)
+            .await
+            .err()
+            .context("zero candidate height accepted")?;
+        ensure!(
+            rejected.reason_id.as_deref() == Some("internal-error"),
+            "wrong invalid-height error: {rejected}"
+        );
+        let share_id = format!("{}:{}", worker.username, submission.block_hash_hex);
+        coordinator.submit(&worker, &job, submission, false).await?;
+        assert_share_height_boundary(&fixture, &share_id, candidate_height).await?;
+        coordinator.ledger.pool.close().await;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
     if result.is_err() {
         eprintln!("{}", fixture.diagnostics());
     }

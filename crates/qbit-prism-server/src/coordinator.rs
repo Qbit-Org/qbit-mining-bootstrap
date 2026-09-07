@@ -101,6 +101,12 @@ fn protocol_error(reason: &'static str, message: &str) -> StratumError {
     StratumError::new(code, message, reason)
 }
 
+fn template_parent_height(candidate_height: u64) -> Result<u64> {
+    candidate_height
+        .checked_sub(1)
+        .context("candidate block height must be positive")
+}
+
 /// Convert qbit/kweight to bits/kweight, rounding a positive sub-bit remainder
 /// upward without introducing binary floating-point error into the fee policy.
 fn fee_estimate_bits(value: &Value) -> Result<u64> {
@@ -542,7 +548,7 @@ impl Coordinator {
                     p2mr_program_hex: worker.p2mr_program_hex,
                     share_difficulty: network,
                     network_difficulty: network,
-                    template_height: found.block_height - 1,
+                    template_height: template_parent_height(found.block_height)?,
                     job_id: "bootstrap-job".into(),
                     job_issued_at_ms: snapshot.anchor_ms,
                     accepted_at_ms: snapshot.anchor_ms,
@@ -1205,7 +1211,8 @@ impl MiningBackend for Coordinator {
             p2mr_program_hex: context.worker.p2mr_program_hex.clone(),
             share_difficulty: difficulty,
             network_difficulty: network,
-            template_height: context.bundle.found_block.block_height,
+            template_height: template_parent_height(context.bundle.found_block.block_height)
+                .map_err(|_| protocol_error("internal-error", "invalid candidate block height"))?,
             job_id: job.wire.job_id.clone(),
             job_issued_at_ms: context.prepared.snapshot.anchor_ms,
             accepted_at_ms: 0,

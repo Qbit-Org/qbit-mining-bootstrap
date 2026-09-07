@@ -24,7 +24,7 @@ async fn real_cpfp_recovers_reserved_funding_after_owner_crash() -> Result<()> {
         let script=validation["scriptPubKey"].as_str().context("payout script missing")?;
         ledger.append(AcceptedShare {
             share_seq:0,share_id:format!("cpfp:{}","12".repeat(32)),miner_id:fixture.address.clone(),order_key:fixture.address.clone(),
-            p2mr_program_hex:script[4..].into(),share_difficulty:network,network_difficulty:network,template_height:height,
+            p2mr_program_hex:script[4..].into(),share_difficulty:network,network_difficulty:network,template_height:height.checked_sub(1).context("template parent height missing")?,
             job_id:"legacy-cpfp".into(),job_issued_at_ms:1,accepted_at_ms:0,ntime:ntime.try_into()?,credit_policy:None,
         },None).await?;
         let snapshot=ledger.snapshot(network).await?;
