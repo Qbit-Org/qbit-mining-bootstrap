@@ -262,6 +262,7 @@ fn direct_coordinator_config(fixture: &Fixture) -> Result<qbit_prism_server::con
         ctv_config: qbit_prism::SettlementModeConfig::default(),
         ctv_direct_floor: 10_485_760,
         ctv_fee: None,
+        ctv_fee_premium_bps: 12000,
         ctv_broadcast: false,
         ctv_broadcast_interval: Duration::from_secs(10),
         version_mask: qbit_prism_server::codec::VERSION_ROLLING_MASK,

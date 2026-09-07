@@ -37,6 +37,7 @@ pub struct Config {
     pub ctv_config: SettlementModeConfig,
     pub ctv_direct_floor: u64,
     pub ctv_fee: Option<FanoutFeeRatePolicy>,
+    pub ctv_fee_premium_bps: u64,
     pub ctv_broadcast: bool,
     pub ctv_broadcast_interval: Duration,
     pub version_mask: u32,
@@ -280,6 +281,7 @@ impl Config {
             };
         payout_policy.min_output_sats()?;
         let ctv_enabled = flag("PRISM_CTV_SETTLEMENT_ENABLED", false)?;
+        let ctv_fee_premium_bps = positive("PRISM_CTV_FANOUT_FEE_PREMIUM_BPS", 12000)?;
         let ctv_fee = if optional("PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT")
             .or_else(|| optional("PRISM_CTV_FANOUT_FEE_MARKET_RATE_SATS_PER_1000_WEIGHT"))
             .is_some()
@@ -290,7 +292,7 @@ impl Config {
                     "PRISM_CTV_FANOUT_FEE_MARKET_RATE_SATS_PER_1000_WEIGHT",
                     1000,
                 )?,
-                positive("PRISM_CTV_FANOUT_FEE_PREMIUM_BPS", 12000)?,
+                ctv_fee_premium_bps,
             ))
         } else {
             None
@@ -412,6 +414,7 @@ impl Config {
             fee_address,
             ctv_enabled,
             ctv_fee,
+            ctv_fee_premium_bps,
             ctv_config,
             ctv_direct_floor: alias(
                 "PRISM_DIRECT_COINBASE_PAYOUT_FLOOR_BITS",
@@ -429,12 +432,134 @@ impl Config {
     /// Every node in a cluster must construct the same payouts and attestations.
     /// Credentials and local resource limits are intentionally absent.
     pub fn fingerprint(&self, genesis: &str) -> Result<String> {
-        Ok(hex::encode(Sha256::digest(serde_json::to_vec(&json!({
+        let mut policy = json!({
             "schema":2,"genesis":genesis,"ledger_key":self.ledger_public_key,
             "manifest_key":ManifestSigningKey::from_seed_hex(&self.manifest_seed)?.public_key_hex(),
+            "username_fallback":self.username_fallback,
             "payout_policy":self.payout_policy,"ctv_enabled":self.ctv_enabled,"ctv_config":self.ctv_config,
             "ctv_direct_floor":self.ctv_direct_floor,"ctv_fee":self.ctv_fee,
             "window_multiplier":qbit_prism::PRISM_WINDOW_MULTIPLIER
-        }))?)))
+        });
+        // Explicit rates already bind their premium in ctv_fee. Bind the
+        // separate automatic policy only when it can affect a constructed payout.
+        if self.ctv_enabled && self.ctv_fee.is_none() {
+            policy["ctv_auto_fee_premium_bps"] = json!(self.ctv_fee_premium_bps);
+        }
+        Ok(hex::encode(Sha256::digest(serde_json::to_vec(&policy)?)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn automatic_ctv_config() -> Config {
+        Config {
+            database_url: "postgresql://localhost/prism".into(),
+            instance_id: "frontend-a".into(),
+            database_connections: 4,
+            initialize_schema: false,
+            chain: "regtest".into(),
+            rpc_url: "http://127.0.0.1:18452/".into(),
+            rpc_user: "operator".into(),
+            rpc_password: "test-only".into(),
+            rpc_timeout: Duration::from_secs(15),
+            poll_interval: Duration::from_secs(2),
+            blockwait: true,
+            build_workers: 2,
+            runtime_workers: 2,
+            snapshot_interval: Duration::from_secs(60),
+            health_timeout: Duration::from_secs(15),
+            share_commit_timeout: Duration::from_secs(15),
+            extranonce2_size: 8,
+            coinbase_tag: "/PRISM/".into(),
+            manifest_seed: "11".repeat(32),
+            ledger_seed: "22".repeat(32),
+            ledger_public_key: ManifestSigningKey::from_seed_hex(&"22".repeat(32))
+                .unwrap()
+                .public_key_hex(),
+            username_fallback: None,
+            payout_policy: PayoutPolicy::day_one_default(),
+            fee_address: None,
+            ctv_enabled: true,
+            ctv_config: SettlementModeConfig::default(),
+            ctv_direct_floor: 10_485_760,
+            ctv_fee: None,
+            ctv_fee_premium_bps: 12000,
+            ctv_broadcast: false,
+            ctv_broadcast_interval: Duration::from_secs(10),
+            version_mask: 0x1fffe000,
+            audit_bind: "127.0.0.1".into(),
+            audit_port: 3341,
+        }
+    }
+
+    #[test]
+    fn automatic_ctv_fee_premium_binds_the_shared_configuration() {
+        let first = automatic_ctv_config();
+        let mut second = first.clone();
+        second.instance_id = "frontend-b".into();
+        second.database_connections = 16;
+        second.runtime_workers = 4;
+        second.rpc_password = "different-local-credential".into();
+        assert_eq!(
+            first.fingerprint("genesis").unwrap(),
+            second.fingerprint("genesis").unwrap(),
+            "local resources and credentials must not split the pool"
+        );
+        second.ctv_fee_premium_bps = 15000;
+        assert_ne!(
+            first.fingerprint("genesis").unwrap(),
+            second.fingerprint("genesis").unwrap(),
+            "automatic fee premiums change immutable payouts"
+        );
+    }
+
+    #[test]
+    fn explicit_ctv_policy_and_disabled_ctv_keep_their_effective_fingerprint() {
+        let mut first = automatic_ctv_config();
+        first.ctv_fee = Some(FanoutFeeRatePolicy::new(1000, 12000));
+        let mut second = first.clone();
+        second.ctv_fee_premium_bps = 15000;
+        assert_eq!(
+            first.fingerprint("genesis").unwrap(),
+            second.fingerprint("genesis").unwrap(),
+            "explicit fee policy already contains the effective premium"
+        );
+        second.ctv_fee = Some(FanoutFeeRatePolicy::new(1000, 15000));
+        assert_ne!(
+            first.fingerprint("genesis").unwrap(),
+            second.fingerprint("genesis").unwrap()
+        );
+        first.ctv_enabled = false;
+        first.ctv_fee = None;
+        second = first.clone();
+        second.ctv_fee_premium_bps = 15000;
+        assert_eq!(
+            first.fingerprint("genesis").unwrap(),
+            second.fingerprint("genesis").unwrap(),
+            "unused automatic fee policy must not change a non-CTV cluster"
+        );
+    }
+
+    #[test]
+    fn effective_username_fallback_is_shared_policy_even_without_ctv() {
+        let mut first = automatic_ctv_config();
+        first.ctv_enabled = false;
+        first.username_fallback =
+            Some("tq1zlsq9dpxz8mennhdpr9nf9s0f2tjtq6gxs9m84k6xglhkfp92q2zszzu4m3".into());
+        let mut second = first.clone();
+        second.username_fallback = None;
+        assert_ne!(
+            first.fingerprint("genesis").unwrap(),
+            second.fingerprint("genesis").unwrap(),
+            "rejecting an alias and redirecting it to a fallback are different policies"
+        );
+        second.username_fallback = Some("another-payout-address".into());
+        assert_ne!(
+            first.fingerprint("genesis").unwrap(),
+            second.fingerprint("genesis").unwrap(),
+            "an alias must not select its payout recipient by frontend"
+        );
     }
 }

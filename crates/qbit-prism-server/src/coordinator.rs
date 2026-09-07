@@ -256,7 +256,7 @@ impl Coordinator {
         let bits = fee_estimate_bits(&estimate["feerate"]).context("CTV fee estimate unavailable; configure PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT")?;
         Ok(Some(FanoutFeeRatePolicy::new(
             bits,
-            crate::config::number("PRISM_CTV_FANOUT_FEE_PREMIUM_BPS", 12000u64)?,
+            self.config.ctv_fee_premium_bps,
         )))
     }
 

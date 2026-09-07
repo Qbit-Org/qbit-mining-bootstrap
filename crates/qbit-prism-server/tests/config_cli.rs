@@ -288,3 +288,41 @@ async fn healthcheck_reaches_ipv6_loopback_and_wildcard_binds() {
             .unwrap();
     }
 }
+
+#[tokio::test]
+async fn ctv_fee_premiums_are_validated_before_automatic_or_explicit_fee_work() {
+    for market_rate in ["", "1000"] {
+        for premium in ["0", "-1", "invalid", "18446744073709551616"] {
+            rejects(
+                false,
+                &[
+                    ("PRISM_CTV_SETTLEMENT_ENABLED", "1"),
+                    (
+                        "PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT",
+                        market_rate,
+                    ),
+                    ("PRISM_CTV_FANOUT_FEE_PREMIUM_BPS", premium),
+                ],
+                "PRISM_CTV_FANOUT_FEE_PREMIUM_BPS",
+            )
+            .await;
+        }
+        let output = check(
+            false,
+            &[
+                ("PRISM_CTV_SETTLEMENT_ENABLED", "1"),
+                (
+                    "PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT",
+                    market_rate,
+                ),
+                ("PRISM_CTV_FANOUT_FEE_PREMIUM_BPS", "15000"),
+            ],
+        )
+        .await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
