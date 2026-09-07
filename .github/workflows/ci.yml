@@ -165,8 +165,16 @@ jobs:
           docker buildx build \
             --build-context qbit-src=/tmp/qbit-functional-fixture \
             --load \
+            --tag qbit-lab-prism:ci \
             -f lab/prism/Dockerfile \
             .
+
+      - name: Smoke native PRISM runtime image
+        run: |
+          docker run --rm --network none qbit-lab-prism:ci qbit-prism-server --help
+          docker run --rm --network none --cpus 1 --memory 512m \
+            qbit-lab-prism:ci qbit-prism-server benchmark \
+            --shares 32 --miners 4 --iterations 1
 
   qbit-runtime-image:
     name: Build and smoke real qbitd image
