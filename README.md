@@ -82,12 +82,20 @@ To validate a running PRISM operator stack, run:
 make prism-self-check
 ```
 
-`prism-self-check` prints PASS/WARN/FAIL rows for qbit RPC, coordinator
-health, Stratum reachability, Postgres readiness, audit-dir writability,
-production key material, forbidden test flags, and basic mining
-configuration. It exits non-zero on hard failures.
+`prism-self-check` runs the native `qbit-prism-server self-check` command in the
+coordinator container. It validates node identity, configuration, live HTTP
+readiness, database durability, and carry-forward integrity, then emits
+structured JSON. It exits nonzero on failure. When the optional high-difficulty
+listener is enabled, it also checks its initial difficulty through Stratum.
 
 ### Run PRISM Pool
+
+Prism runs entirely in Rust with a multithreaded runtime and can serve several
+physical frontends against one shared HA PostgreSQL writer endpoint. Existing
+Python deployments must use the coordinated [Rust migration
+procedure](docs/prism-rust-migration.md); the old and new runtimes must not write
+to the same database together. See the [native server
+commands](crates/qbit-prism-server/README.md) for deployment and operator tools.
 
 Direct PRISM Stratum requires Postgres and three key values before
 `make up-prism-pool` starts. Generate unique deployment seeds and derive the

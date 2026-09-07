@@ -157,8 +157,8 @@ class MainnetComposeContractTests(unittest.TestCase):
         self.assertEqual(env["PRISM_STRATUM_VARDIFF_MIN_DIFF"], "1024")
         self.assertEqual(env["PRISM_STRATUM_VARDIFF_START_DIFF"], "4096")
         self.assertEqual(env["PRISM_STRATUM_VARDIFF_MAX_DIFF"], "65536")
-        self.assertEqual(env["PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS"], "120")
-        self.assertEqual(env["PRISM_COORDINATION_BLOCKED_EXIT_SECONDS"], "900")
+        self.assertEqual(env["PRISM_DATABASE_MAX_CONNECTIONS"], "16")
+        self.assertEqual(env["PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS"], "15")
 
     def test_prism_runtime_has_no_capacity_evidence_dependency(self) -> None:
         env = self._environment("prism-coordinator")
@@ -307,7 +307,7 @@ class MainnetComposeContractTests(unittest.TestCase):
         self.assertNotIn("-rpcpassword=change-this", bitcoin_command)
         self.assertNotEqual(postgres_env["POSTGRES_PASSWORD"], "change-this")
         self.assertNotIn("change-this", prism_env["PRISM_DATABASE_URL"])
-        self.assertEqual(prism_env["PRISM_LEDGER_WRITER_SESSION_TOKEN"], "")
+        self.assertNotIn("PRISM_LEDGER_WRITER_SESSION_TOKEN", prism_env)
         self.assertEqual(len(prism_env["PRISM_MANIFEST_SIGNING_SEED_HEX"]), 64)
         self.assertEqual(len(prism_env["PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX"]), 64)
         self.assertNotEqual(

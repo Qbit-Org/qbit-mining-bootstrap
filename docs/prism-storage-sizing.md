@@ -1,320 +1,187 @@
-# PRISM Storage and VM Sizing
+# PRISM Storage and Resource Planning
 
-This document sizes the PRISM pool storage footprint for operator planning. It
-separates hot Postgres, audit artifacts, qbit/Bitcoin chain data, Docker
-overhead, WAL, and backups because those are different capacity problems.
+Native Prism keeps the canonical ledger, block accounting, audit metadata,
+normalized audit snapshots, and CTV recovery state in PostgreSQL. Multiple
+frontends use this shared database; new accepted-block audits do not require a
+shared local filesystem.
 
-## Scope
+## What is retained
 
-PRISM stores permanent accounting data in Postgres and writes public audit
-artifacts under `PRISM_AUDIT_DIR`.
+| Data | Storage and lifetime |
+| --- | --- |
+| Accepted shares and proof identity | Permanent immutable PostgreSQL rows |
+| Blocks, payouts, carry-forward, maturity/reorg state | Permanent PostgreSQL accounting history |
+| Native audit share snapshots | Permanent range/count/anchor/digest metadata referencing immutable shares |
+| Native audit bodies | Non-share JSON plus snapshot reference in PostgreSQL |
+| Imported legacy audits | Verified logical inline body in PostgreSQL; original backup retained |
+| CTV manifests, transactions, outcomes | Durable PostgreSQL recovery and audit state |
+| CPFP funding reservations and signed child packages | Durable recovery records; retain until reconciled |
+| Pending block candidates and deferred credit | Durable until resolved; retained identity/status afterward |
+| Jobs and prepared snapshots | Expiring shared records for reconnect/job recovery |
+| Per-process HTTP caches and socket state | Reconstructible memory |
+| qbit/Bitcoin chain data | Separate node storage, sized independently |
 
-Base Compose uses named volumes for local development:
+Accepted ledger rows cannot be updated, deleted, or truncated. Native audits
+reconstruct their exact share slice from those rows and verify the digest and
+canonical bundle hash. Overlapping windows therefore share ledger storage
+instead of embedding another copy of every share in every accepted-block audit.
+There is no supported archive/prune command for this immutable history.
 
-- `prism-postgres-data` at `/var/lib/postgresql/data`
-- `prism-postgres-wal` at `/var/lib/postgresql/wal`
-- `prism-audit-data` at `/var/lib/qbit-prism/audit`
-- `qbit-data` at `/var/lib/qbit`
+Legacy external body refs and v2 segment files remain readable by the offline
+Rust tools. During [migration](prism-rust-migration.md), import these into the
+shared database before relying on another frontend to serve old audits. Preserve
+all referenced bodies and segments in the migration backup. A small live-evidence
+envelope or a stored SHA cannot replace missing artifact bytes.
 
-Production Compose replaces these with pre-created absolute bind mounts supplied
-through `PRISM_POSTGRES_DATA_SOURCE`, `PRISM_POSTGRES_WAL_SOURCE`,
-`PRISM_AUDIT_DATA_SOURCE`, and `QBIT_DATA_SOURCE`. The data and live WAL sources
-must be distinct paths and should be monitored as separate capacity boundaries.
+## Estimate from measured ingest
 
-The current production storage target is:
-
-- keep the canonical accepted-share ledger in Postgres, or in a verified
-  immutable archive when a future archive flow exists
-- keep block, payout, carry-forward, maturity, reorg, and settlement state
-  durable
-- keep canonical audit artifact hashes in Postgres
-- keep large exact audit artifact bodies outside hot Postgres once the artifact
-  externalization work lands
-
-## Pilot Baseline
-
-A small pilot deployment measured on 2026-06-30 showed active PRISM state at
-about 1.2 GB before long-term growth. The useful planning signal is the
-composition of that active state:
-
-| Active PRISM item | Size / count |
-| --- | ---: |
-| Postgres volume | about 195 MB |
-| Database size | about 140 MB |
-| Audit file volume | about 989 MB |
-| qbit data volume | about 61 MB |
-| Active PRISM total | about 1.2 GB |
-
-The active table breakdown was:
-
-| Table | Size / rows |
-| --- | ---: |
-| `qbit_pool_audit_bundles` | 126 MB, 571 rows |
-| `qbit_share_ledger` | 3.7 MB, 5,624 accepted shares |
-| payout, carry-forward, and block tables | about 2.5 MB combined |
-
-The accepted-share ledger was not the disk driver in that pilot. Inline audit
-bundle bodies dominated the hot database footprint, which is why newer artifact
-externalization and share-segment formats matter for production planning.
-
-## Growth Model
-
-qbit targets 60-second aggregate block spacing, so the network produces about
-1,440 blocks per day. PRISM vardiff targets about one accepted share per active
-worker every 15 seconds.
-
-Use:
+Estimate share growth from accepted share rate, not miner hashrate alone:
 
 ```text
-accepted_shares_per_second = active_workers / 15
-accepted_shares_per_year = accepted_shares_per_second * 31,536,000
-hot_share_ledger_bytes = accepted_shares_per_year * 1.2 KB
-pool_blocks_per_day = 1,440 * pool_share_of_blocks
+accepted_shares_per_second ≈ active_workers / target_share_interval_seconds
+accepted_shares_per_year = accepted_shares_per_second × 31,536,000
+annual_ledger_bytes = accepted_shares_per_year × measured_bytes_per_share
 ```
 
-The measured share-ledger cost is about 0.7 to 0.8 KB per accepted share across
-pilot data and local schema probes. Use 1.2 KB per share for planning to cover
-indexes, bloat, and operational headroom.
+At a 15-second target, 150 active workers produce about ten accepted shares per
+second. Vardiff bounds, hashrate changes, reconnects, and listener profiles can
+change the actual rate; measure it under the intended configuration.
 
-The estimates below assume the optimized Postgres pattern: hot Postgres keeps
-the canonical ledger, block/payout/carry rows, and artifact metadata, not the
-full audit JSONB body for every block. If exact artifact bodies remain local,
-provision artifact storage separately.
+The following is arithmetic using a **planning assumption** of 1.2 kB per
+accepted share including indexes. It is not a measured native capacity claim:
 
-Externalizing exact current artifacts reduces hot Postgres size. It does not
-reduce total retained bytes unless artifacts are compressed or replaced by a
-future reduced/window proof format.
+| Accepted shares/second | Shares/year | Ledger bytes/year at 1,200 bytes/share |
+| ---: | ---: | ---: |
+| 1 | 31.5 million | 37.8 GB |
+| 10 | 315 million | 378 GB |
+| 100 | 3.15 billion | 3.78 TB |
+| 500 | 15.8 billion | 18.9 TB |
 
-## One-Year Hot Postgres Scenarios
+Native proof deduplication adds indexed rows; measure its footprint alongside
+the ledger. Non-share audit sections, per-recipient payouts/carry rows, CTV
+transactions, and imported legacy inline bodies add independent growth. The
+number of recipients and pool-found blocks can matter as much as the share rate.
+Do not multiply just one table's row size and call it the database requirement.
 
-| Scenario | Active workers | Shares/sec | Pool share of blocks | Blocks/day | Estimated hot Postgres live data/year | Practical VM disk if backups/artifacts are not local |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Testnet / pilot | 15 | 1 | 1% | 14 | about 38 GB | 250-500 GB |
-| Early public | 150 | 10 | 5% | 72 | about 386 GB | 1.5-2 TB |
-| Serious pool | 1,500 | 100 | 20% | 288 | about 4.1 TB | 8-10 TB |
-| Very large | 7,500 | 500 | 50% | 720 | about 22 TB | 45-60 TB |
+Measure a representative interval after migration and under load. Record table
+and index growth, WAL generation, pending outbox size, expiring job storage,
+backup size, and process peak RSS. Include cold startup and simultaneous job
+refresh across all frontends. Large historical reward windows still require
+memory and CPU to construct or export a full logical audit, even though their
+persistent shares are normalized.
 
-If local artifact bodies, local physical backups, or WAL archives are kept on
-the same VM, increase the practical disk target:
+Provision headroom for peak ingest, autovacuum, index growth, restore staging,
+backups, and the time needed to respond to disk alerts. Estimate replicas and
+backup retention separately; they are additional copies, not free capacity.
 
-| Scenario | Practical disk with local artifacts/backups |
-| --- | ---: |
-| Testnet / pilot | 500 GB-1 TB |
-| Early public | 4-8 TB |
-| Serious pool | 15-25 TB or dedicated database storage |
-| Very large | dedicated storage architecture, not a single small VM |
+## Local and external database deployments
 
-## Permanent Data
+Local development Compose uses:
 
-Keep these forever in hot storage or a verified immutable archive:
+- `prism-postgres-data` for PostgreSQL data
+- `prism-postgres-wal` for live WAL
+- `prism-audit-data` for legacy artifact access/import
+- `qbit-data` for the qbit node
 
-- accepted shares with exact `share_seq` order
-- `share_id`, miner/payout identity, payout order key, and P2MR program
-- share difficulty/work amount and network difficulty context
-- job/template metadata, `job_issued_at`, `accepted_at`, and proof identifiers
-- block reward-window anchors
-- block, payout, carry-forward, maturity, reorg, and reversal rows
-- payout policy inputs, fee policy, minimum payout/floor settings, and
-  settlement-mode decisions
-- canonical audit artifact hashes and verifier/schema versions
-- coinbase txid/hex and manifest hashes needed to match chain evidence
-- CTV/fanout settlement artifacts needed for third-party verification or
-  broadcast recovery
+Production Compose maps these to pre-created absolute paths through
+`PRISM_POSTGRES_DATA_SOURCE`, `PRISM_POSTGRES_WAL_SOURCE`,
+`PRISM_AUDIT_DATA_SOURCE`, and `QBIT_DATA_SOURCE`. The audit mount remains useful
+for migration and archived operator artifacts; the native runtime does not
+write repeated live audit bodies there for every block.
 
-Do not prune `qbit_share_ledger` until the archive contract in
-`docs/prism-ledger-ops.md` is implemented and verified.
+For several physical frontends, use the external-database Compose overlay and
+one HA writer endpoint. Size the external database's data, WAL, replicas, and
+backup archive according to its deployment profile. Frontend hosts primarily
+need CPU, memory, logs, image storage, and any locally managed qbit chain data.
+A separate qbit node per frontend has its own chain-storage requirement.
+CTV recovery without transaction indexing needs retained historical blocks for
+its durable bounded scan; account for that when choosing a node pruning policy.
 
-## Archiveable Or Ephemeral Data
+The native runtime uses `PRISM_RUNTIME_WORKERS` and a bounded
+`PRISM_JOB_BUILD_EXECUTOR_WORKERS` CPU builder limit. Increasing threads cannot
+remove PostgreSQL commit or storage bottlenecks. Sum
+`PRISM_DATABASE_MAX_CONNECTIONS` across frontends before setting the database
+connection budget; reserve operational connections as well.
 
-These can have bounded retention once the policy is explicit:
+## Durability, WAL, and recovery
 
-- rejected-share details after operational/debug retention
-- non-canonical candidate audit artifacts that never became accepted blocks
-- dashboard caches and rollups that can be regenerated or are intentionally
-  lower resolution over time
-- verbose broadcast attempts after terminal status, if latest status, error
-  summary, attempt count, and final artifacts are retained. The live schema
-  now stores this summary on `qbit_ctv_fanout_artifacts` and caps retained
-  detail rows with `PRISM_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT`.
-- Docker images, Docker build cache, and old non-active TIDES volumes after
-  backup or decommission confirmation
+Keep `fsync=on`, `full_page_writes=on`, and `synchronous_commit=on`. WAL is the
+PostgreSQL transaction log, not a second application share queue. Durable share
+ACKs depend on successful commit; disabling these settings to improve benchmark
+numbers changes that guarantee.
 
-Inactive PRISM blocks are not deletion candidates simply because they are
-inactive. They can reactivate after a reorg.
-
-## Artifact Storage Strategy
-
-The live coordinator stores accepted-block audit artifacts with these rules:
-
-1. Exact artifact externalization: Postgres stores hash/pointer metadata while
-   every reader still resolves the body to the logical
-   `qbit.prism.audit-bundle.v1` expected by public API and verifier callers.
-   New rows also store `audit_body_byte_len` so the canonical row has the
-   artifact hash, stored byte size, schema version, and body pointer.
-2. Share-segment proof bodies: when `PRISM_AUDIT_SHARE_SEGMENT_SIZE` is
-   positive, new external body files use `qbit.prism.audit-bundle.v2`. The v2
-   body keeps non-share bundle sections inline, stores a
-   `qbit.prism.window-completeness-proof.v1`, and points at stable
-   `qbit.prism.audit-share-segment.v1` segment-slot files with per-range hashes.
-   This removes the old repeated inline tail/partial-window share arrays while
-   preserving the same reconstructed v1 bundle hash.
-3. Legacy body refs: older compact files using `qbit.prism.audit-body-ref.v1`
-   remain readable. The Rust `qbit-prism-audit-verify` and
-   `qbit-prism-audit-canonicalize` tools accept full v1 bundles, legacy body
-   refs, and v2 proof bodies, verifying referenced segment/range hashes before
-   reconstructing the canonical v1 bundle.
-
-`prism-live-audit-bundle-*.json` files are now small operator envelopes that
-point at the canonical body URI. They are not the durable audit body. Retention
-may prune live envelopes and old candidates; it must not prune
-`prism-audit-bundle-body-*` or `prism-audit-share-segment-*` unless those
-artifacts have first been archived and the resolver policy is explicit. Stable
-`prism-audit-share-segment-slot-*` files may grow as adjacent ranges are first
-referenced, so old body files verify their original range hash against the
-selected slice rather than against the whole mutable slot file.
-
-CTV broadcast retries are bounded separately from audit bodies:
-
-- `PRISM_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT` keeps only the newest N detailed
-  rows per fanout in `qbit_ctv_fanout_broadcast_attempts`.
-- `qbit_ctv_fanout_artifacts` retains total attempt count, per-status counts,
-  first/last timestamps, last package txids/hexes, last submit result, last
-  error, and retry backoff state.
-- `rejected` and `failed` attempts move a fanout to terminal `failed`, and
-  terminal failed fanouts are not selected for broadcast work.
-
-## VM Recommendations
-
-For near-term production or a pilot after audit artifact externalization:
-
-- Use at least 2 TB NVMe if audit bodies and backups are externalized.
-- Use 4 TB if keeping a local artifact mirror.
-- Use 4-8 TB if compact artifact bodies remain local and the pool is expected
-  to grow beyond pilot traffic.
-
-For a serious public pool:
-
-- Treat Postgres as a dedicated service or dedicated volume.
-- Plan 10 TB or more for hot Postgres at roughly 100 accepted shares/sec.
-- Keep immutable audit artifacts and backups in separate object or cold
-  storage.
-- Treat artifact availability separately from artifact integrity. Hashes prove
-  fetched bytes are correct; backups and restore tests prove bytes remain
-  available.
-
-## Postgres Durability And Recovery
-
-Postgres always uses write-ahead logging (WAL). WAL is the database transaction
-log, not a second application-level share queue: changes are recorded in WAL
-before their modified table pages are written. Keep `fsync=on`,
-`full_page_writes=on`, and `synchronous_commit=on`. Disabling any of those to
-reduce share-accept latency weakens the meaning of a committed share and is not
-a production tuning option.
-
-The production Compose contract sets `POSTGRES_INITDB_WALDIR` to the separately
-mounted live WAL path. That setting is honored only when the official Postgres
-entrypoint creates a fresh cluster. It does not move `pg_wal` for an existing
-cluster. Verify the initialized cluster before admitting shares:
+The production local database sets `POSTGRES_INITDB_WALDIR` to the separately
+mounted WAL path. This setting applies only when creating a fresh cluster and
+does not relocate an existing `pg_wal`. Inspect the actual filesystem link and
+mounts after initialization as well as the SQL settings:
 
 ```sql
 SHOW data_directory;
+SHOW fsync;
+SHOW full_page_writes;
+SHOW synchronous_commit;
+SHOW synchronous_standby_names;
 SELECT pg_current_wal_lsn(), pg_walfile_name(pg_current_wal_lsn());
 ```
 
-Also verify that `readlink -f /var/lib/postgresql/data/pg_wal` inside the
-container resolves to `/var/lib/postgresql/wal` and that the container mount
-table maps that target to `PRISM_POSTGRES_WAL_SOURCE`; SQL alone cannot prove
-the storage separation. Losing either the live data path or live WAL path makes
-the primary unavailable, so snapshotting only one is not a recoverable backup.
+A primary-local durable commit survives a frontend crash. To preserve every
+acknowledged share after loss of the database primary, configure synchronous
+replication on independent storage and fail over only to a standby containing
+those flushed commits. An asynchronous standby or a highly available DNS name
+does not establish this recovery point objective.
 
-A commit on one Postgres primary protects against a coordinator restart, but it
-does not by itself protect against loss of that primary and its storage. Choose
-the recovery objective explicitly:
+Keep encrypted off-host base backups plus continuous WAL archives and conduct
+isolated restore drills. Replicas do not replace recovery history: accidental
+changes and corruption can replicate. A restore drill should verify schema,
+share order, representative canonical audit hashes, carry-forward integrity,
+CTV state, and application reads. Include unimported external audit artifacts
+and signing-key recovery material in the recovery plan.
 
-- For a non-zero recovery point objective, use encrypted off-host base backups
-  plus continuous WAL archiving and document the maximum acceptable data loss.
-- For zero loss of acknowledged commits after primary storage failure, add a
-  synchronous standby on independent failure-domain storage. Configure
-  `synchronous_standby_names` and keep `synchronous_commit=on` so commit waits
-  for the selected standby to durably flush WAL. Do not silently fall back to
-  asynchronous replication when that guarantee is required.
-- Replicas do not replace backups. Operator error, corruption, and accidental
-  deletion can replicate immediately, so retain independent point-in-time
-  recovery material.
+Live WAL and archived WAL are distinct. Failed archiving or an inactive
+replication slot can retain live WAL without bound. Measure peak WAL generation
+and reserve enough capacity for the incident response interval. Alert on live
+WAL growth, retained slot bytes, archive failures, standby flush/replay lag,
+synchronous standby availability, backup age, and the last successful restore.
 
-Point-in-time recovery requires a compatible physical base backup and every WAL
-segment from that backup through the requested recovery time. Store both
-encrypted outside the database host, apply a tested retention policy, and run a
-scheduled restore drill into an isolated Postgres instance. A drill is complete
-only after schema checks, ledger continuity checks, artifact-pointer checks, and
-an application read test pass.
-
-Live WAL and archived WAL are different storage classes. Postgres writes active
-segments to `pg_wal`; an archive command copies completed segments to the
-independent point-in-time-recovery archive. The separate Compose WAL mount holds
-the former, not the latter.
-
-WAL consumes disk according to write volume and checkpoint behavior, not just
-accepted-share row size. Healthy archived segments can be recycled from live
-WAL; a failed archive command or an inactive replication slot can retain live
-WAL without bound and fill its filesystem. Measure WAL generated during a
-production-like load test, reserve several times the measured peak between
-operator response windows, and alert on:
-
-- time and bytes since the last successful archived WAL segment
-- `pg_wal` bytes and growth rate
-- replication slot retained bytes and standby replay/flush lag
-- base-backup age and the last successful restore drill
-- synchronous standby count whenever zero acknowledged-share loss is required
-
-Treat recovery as a release gate: perform at least one full backup, primary-loss
-simulation, point-in-time restore, and application verification before accepting
-shares with economic value.
-
-## Monitoring
-
-Track at least:
+## Read-only storage inspection
 
 ```sql
 SELECT pg_size_pretty(pg_database_size(current_database()));
 
-SELECT
-  relname,
-  n_live_tup::bigint AS est_rows,
-  pg_size_pretty(pg_total_relation_size(relid)) AS total
+SELECT relname, n_live_tup::bigint AS estimated_rows,
+       pg_size_pretty(pg_total_relation_size(relid)) AS total_with_indexes
 FROM pg_stat_user_tables
 ORDER BY pg_total_relation_size(relid) DESC;
 
-SELECT count(*) FROM qbit_share_ledger WHERE accepted;
+SELECT count(*) AS audit_count,
+       count(*) FILTER (WHERE share_snapshot_sha256 IS NOT NULL) AS native_references,
+       count(*) FILTER (WHERE audit_bundle IS NULL AND body_uri IS NOT NULL) AS external_bodies,
+       coalesce(sum(pg_column_size(audit_bundle)), 0) AS stored_audit_json_bytes
+FROM qbit_pool_audit_bundles;
 
-SELECT
-  count(*) AS bundles,
-  pg_size_pretty(sum(pg_column_size(audit_bundle))::bigint) AS inline_jsonb
-FROM qbit_pool_audit_bundles
-WHERE audit_bundle IS NOT NULL;
+SELECT count(*) AS snapshots,
+       coalesce(sum(share_count), 0) AS referenced_shares_with_reuse
+FROM qbit_prism_audit_snapshots;
+
+SELECT slot_name, active,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) AS retained_bytes
+FROM pg_replication_slots;
 ```
 
-Filesystem checks:
+`referenced_shares_with_reuse` counts references across snapshots, not unique
+stored share rows. `n_live_tup` is an estimate and can lag; exact counts can be
+expensive on a large ledger. Full logical audit response size is also different
+from stored non-share JSON size.
+
+Inspect data/WAL/legacy artifact filesystems and container image/log usage:
 
 ```sh
-df -h /
 df -h "$PRISM_POSTGRES_DATA_SOURCE" "$PRISM_POSTGRES_WAL_SOURCE" "$PRISM_AUDIT_DATA_SOURCE"
-du -sh "$PRISM_POSTGRES_DATA_SOURCE" "$PRISM_POSTGRES_WAL_SOURCE" "$PRISM_AUDIT_DATA_SOURCE"
-du -sh /var/lib/docker /var/lib/containerd
 docker system df
-docker volume ls
 ```
 
-Add alerts for:
-
-- hot Postgres disk over 70% and 85%
-- WAL or backup archive growth exceeding expected daily ingest
-- audit artifact storage growth exceeding the block/artifact model
-- `qbit_pool_audit_bundles` rows whose inline body remains large after artifact
-  externalization lands
-- missing or hash-mismatched artifact objects
-- `/metrics` gauges `qbit_prism_audit_artifact_bytes` and
-  `qbit_prism_audit_artifact_files`, split by body, share segment, live bundle,
-  candidate, and other artifact kinds
-- CTV retry pressure via `qbit_prism_ctv_fanouts_failed` and the fanout-row
-  broadcast summary fields
+Use explicit retention for logs, expired operational records, and image caches.
+Do not delete inactive pool blocks, referenced shares, snapshots, or canonical
+settlement evidence as routine cleanup. Track storage growth and restore time
+against the measured ingest model rather than relying on the former Python
+pilot's repeated-audit-file footprint.

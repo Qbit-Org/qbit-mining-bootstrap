@@ -67,7 +67,7 @@ struct AuditWindowCompletenessProof {
     share_parts: Vec<SharePart>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(tag = "kind")]
 enum SharePart {
     #[serde(rename = "segment")]
@@ -105,6 +105,96 @@ enum SharePart {
         share_count: usize,
         shares: Vec<AcceptedShare>,
     },
+}
+
+// Serde's internally tagged enum buffer cannot represent u128, including
+// difficulties larger than u64::MAX. Dispatch on the JSON tag explicitly so
+// inline shares retain serde_json's arbitrary-precision integer decoding.
+impl<'de> Deserialize<'de> for SharePart {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Fields {
+            kind: String,
+            first_share_seq: u64,
+            last_share_seq: u64,
+            share_count: usize,
+            segment_first_share_seq: Option<u64>,
+            segment_last_share_seq: Option<u64>,
+            sha256: Option<String>,
+            body_uri: Option<String>,
+            range_sha256: Option<String>,
+            prefix_sha256: Option<String>,
+            shares: Option<Vec<AcceptedShare>>,
+        }
+        let value = Value::deserialize(deserializer)?;
+        let fields: Fields = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        let missing = |field: &'static str| <D::Error as serde::de::Error>::missing_field(field);
+        let first_share_seq = fields.first_share_seq;
+        let last_share_seq = fields.last_share_seq;
+        let share_count = fields.share_count;
+        match fields.kind.as_str() {
+            "segment" => Ok(Self::Segment {
+                first_share_seq,
+                last_share_seq,
+                share_count,
+                sha256: fields.sha256.ok_or_else(|| missing("sha256"))?,
+                body_uri: fields.body_uri.ok_or_else(|| missing("body_uri"))?,
+            }),
+            "segment_range" => Ok(Self::SegmentRange {
+                first_share_seq,
+                last_share_seq,
+                share_count,
+                segment_first_share_seq: fields.segment_first_share_seq,
+                segment_last_share_seq: fields.segment_last_share_seq,
+                range_sha256: fields.range_sha256.ok_or_else(|| missing("range_sha256"))?,
+                body_uri: fields.body_uri.ok_or_else(|| missing("body_uri"))?,
+            }),
+            "segment_prefix" => Ok(Self::SegmentPrefix {
+                first_share_seq,
+                last_share_seq,
+                share_count,
+                prefix_sha256: fields
+                    .prefix_sha256
+                    .ok_or_else(|| missing("prefix_sha256"))?,
+                body_uri: fields.body_uri.ok_or_else(|| missing("body_uri"))?,
+            }),
+            "inline" => Ok(Self::Inline {
+                first_share_seq,
+                last_share_seq,
+                share_count,
+                shares: fields.shares.ok_or_else(|| missing("shares"))?,
+            }),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["segment", "segment_range", "segment_prefix", "inline"],
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod inline_share_tests {
+    use super::*;
+
+    #[test]
+    fn internally_tagged_inline_shares_preserve_u128_difficulty() {
+        let difficulty = u128::from(u64::MAX) + 100;
+        let part = serde_json::json!({
+            "kind":"inline", "first_share_seq":1, "last_share_seq":1,
+            "share_count":1, "shares":[{
+                "share_seq":1,"share_id":"test","miner_id":"miner",
+                "order_key":"miner","p2mr_program_hex":"11".repeat(32),
+                "share_difficulty":difficulty,"network_difficulty":difficulty,
+                "template_height":1,"job_id":"job","job_issued_at_ms":1,
+                "accepted_at_ms":1,"ntime":1
+            }]
+        });
+        let SharePart::Inline { shares, .. } = serde_json::from_value(part).unwrap() else {
+            panic!("expected inline share part")
+        };
+        assert_eq!(shares[0].share_difficulty, difficulty);
+        assert_eq!(shares[0].network_difficulty, difficulty);
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

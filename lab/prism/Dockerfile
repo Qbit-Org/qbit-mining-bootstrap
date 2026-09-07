@@ -1,35 +1,25 @@
 # syntax=docker/dockerfile:1.7
 
-FROM python:3.12-slim
-
-WORKDIR /app
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        cargo \
-        postgresql-client \
-        rustc \
-    && rm -rf /var/lib/apt/lists/*
-
-# Persistent pooled Postgres client for the share-ledger hot path. The psql
-# binary stays installed as the fallback backend (PRISM_POSTGRES_NATIVE_CLIENT=0).
-RUN pip install --no-cache-dir "psycopg[binary]==3.2.*"
-
+FROM rust:1-bookworm AS build
+WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
-COPY lab/auxpow/ ./lab/auxpow/
-COPY lab/prism/ ./lab/prism/
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo build --locked --release -p qbit-prism-server -p qbit-prism --bins
 
-ENV PYTHONPATH=/app
-
-# Release profile plus a direct-binary path: the coordinator shells out to
-# these tools on the job build hot path, so it must not pay `cargo run`
-# build-graph checks per invocation nor debug-profile execution time.
-RUN cargo build --locked --release -p qbit-prism --bins
-
-ENV PRISM_TOOL_BIN_DIR=/app/target/release
-
-# Keep Python as PID 1 so watchdog os._exit(1) reaches Docker unchanged. Any
-# future wrapper must exec the coordinator or explicitly propagate its status.
-CMD ["python3", "-m", "lab.prism.prism_coordinator"]
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=build /build/target/release/qbit-prism-server /usr/local/bin/
+COPY --from=build /build/target/release/qbit-prism-miner /usr/local/bin/
+COPY --from=build /build/target/release/qbit-prism-audit-canonicalize /usr/local/bin/
+COPY --from=build /build/target/release/qbit-prism-audit-verify /usr/local/bin/
+COPY --from=build /build/target/release/qbit-prism-build-audit-bundle /usr/local/bin/
+COPY --from=build /build/target/release/qbit-prism-reorg-verify /usr/local/bin/
+ENV RUST_LOG=info
+EXPOSE 3340 3341
+STOPSIGNAL SIGTERM
+CMD ["qbit-prism-server"]

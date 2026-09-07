@@ -1,0 +1,38 @@
+[package]
+name = "qbit-prism-server"
+version = "2.0.0"
+edition = "2021"
+license = "MIT"
+description = "Native multi-instance Stratum, accounting, and audit server for PRISM"
+default-run = "qbit-prism-server"
+
+[dependencies]
+qbit-prism = { path = "../qbit-prism" }
+qbit-pool-builder = { path = "../qbit-pool-builder" }
+anyhow = "1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+hex = "0.4"
+num-bigint = { version = "0.4", features = ["serde"] }
+num-traits = "0.2"
+percent-encoding = "2"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["arbitrary_precision", "raw_value"] }
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+http-body-util = "0.1"

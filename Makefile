@@ -77,7 +77,7 @@ doctor:
 
 prism-self-check: export MINING_LANES=prism
 prism-self-check:
-	python3 scripts/prism-self-check.py
+	$(COMPOSE) --profile prism exec -T prism-coordinator qbit-prism-server self-check
 
 test-builder:
 	cargo test --workspace
@@ -87,32 +87,28 @@ test-builder-regtest:
 	bash test/test-builder-regtest.sh
 
 test-prism-regtest:
-	@$(WITH_RESOLVED_QBIT) \
-	bash test/test-prism-regtest.sh
+	bash test/prism-native-tests.sh live
 
 test-prism-postgres-ledger:
-	bash test/test-prism-postgres-ledger.sh
+	bash test/prism-native-tests.sh
 
 test-prism-postgres-scale:
-	bash test/test-prism-postgres-scale.sh
+	bash test/prism-native-tests.sh
 
 test-prism-postgres-native-ledger:
-	bash test/test-prism-postgres-native-ledger.sh
+	bash test/prism-native-tests.sh
 
 test-prism-postgres-throughput:
-	bash test/test-prism-postgres-throughput.sh
+	cargo run --locked --release -p qbit-prism-server -- benchmark --shares 100000 --miners 100 --iterations 10
 
 test-prism-stratum-regtest-live:
-	@$(WITH_RESOLVED_QBIT) \
-	bash test/test-prism-stratum-regtest-live.sh
+	bash test/prism-native-tests.sh live
 
 test-prism-stratum-postgres-regtest-live:
-	@$(WITH_RESOLVED_QBIT) \
-	QBIT_PRISM_LIVE_POSTGRES=1 QBIT_PRISM_LIVE_AUDIT_API=1 bash test/test-prism-stratum-regtest-live.sh
+	bash test/prism-native-tests.sh live
 
 test-prism-combined-regtest:
-	@$(WITH_RESOLVED_QBIT) \
-	bash test/test-prism-combined-regtest.sh
+	bash test/prism-native-tests.sh live
 
 test-compose-prism-config:
 	@QBIT_SRC_DIR="$(CURDIR)" \

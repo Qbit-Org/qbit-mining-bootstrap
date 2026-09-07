@@ -1,456 +1,259 @@
-# PRISM Ledger Operations Contract
+# PRISM Ledger Operations
 
-This contract is the public operating model for the qbit PRISM share ledger.
-PRISM means Payouts, Rewards, and Integrity Settlement Manifest.
-It is intentionally narrower than a full production deployment guide: it
-defines the invariants the implementation and regtest evidence rely on, and it
-names the hardening layers that can be added without changing reward semantics.
+This is the operating contract for the native Rust Prism server. The database
+retains the original accounting tables and functions while additive migrations
+provide active-active application instances. For the upgrade procedure, see
+[Rust migration](prism-rust-migration.md).
 
-## Canonical Write Path
+## Share commit and ordering
 
-Accepted shares must enter exactly one ordered log: `qbit_share_ledger`.
-Stratum frontends may scale horizontally, but they do not insert independent
-share sequences. The supported topology is:
+All instances insert accepted shares into `qbit_share_ledger` in one PostgreSQL
+database. A short transaction-scoped advisory lock orders insertion and snapshot
+creation. PostgreSQL assigns the canonical `share_seq`; sequence gaps are
+permitted, and sequence order is authoritative. Local arrival timestamps,
+frontend counters, and per-worker summaries do not determine reward order.
 
-1. Stratum frontend validates miner identity, share shape, job id, and target.
-2. Frontend submits the accepted share to the bounded group-commit writer and
-   waits for Postgres to commit it.
-3. One logical ledger writer owns the Postgres writer lease and inserts shares
-   into `qbit_share_ledger`.
-4. PRISM's TIDES-style reward windows, audit exports, payout policy, and reorg
-   reversal read from that same canonical log.
+The submission path validates identity, job, header, and target before durable
+admission. A normal successful Stratum response follows the database commit,
+with `synchronous_commit=on`. A share meeting the network target also persists
+its complete candidate intent atomically with the share. Connection loss after
+commit can lose the reply without losing the share.
 
-The coordinator runs the frontend and writer in one process. Every accepted
-share receives one monotonic `share_seq`, and all reward windows are derived
-from that ordering. Stratum success is sent only after the transaction commits;
-worker counters and vardiff accounting advance at the same boundary. A full
-queue, commit error, or commit timeout returns no success. Miners may retry the
-same submission safely.
+An exact replay returns the existing share without another reward credit.
+Conflicting reuse of a share identifier fails. The native global proof-hash
+registry prevents the same newly submitted proof receiving separate credits
+under different usernames or on different servers. Historical rows are retained
+unchanged during migration, including any duplicates accepted by older code.
 
-The writer batches up to `PRISM_SHARE_COMMIT_BATCH_SIZE` shares for at most
-`PRISM_SHARE_COMMIT_LINGER_MILLISECONDS` before committing. The defaults are 64
-shares and 5 ms. `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS` bounds queue admission.
-Once admitted, a client waits for a definite commit outcome; the watchdog
-restarts a wedged writer instead of returning an ambiguous timeout. Tune the linger against measured ACK
-latency, but do not weaken Postgres durability settings to reduce it. A batch
-flushes immediately when it contains a block candidate so the normal linger
-does not consume that candidate's tip-race budget.
+There is no Python batch queue or process-wide ledger writer lease. All healthy
+instances may append; transaction locks protect a shared ordering boundary.
+Database connection and statement/lock limits bound resource use. Session
+extranonce allocation also uses the shared database sequence and never cycles.
 
-## Writer Lease and Replay
+## Snapshot and payout boundary
 
-The writer lease is stored in `qbit_ledger_writer_lease`. A writer is identified
-by `(writer_id, writer_epoch, writer_session_token)`. A process may refresh only
-the exact session token it acquired; another process with the same writer id and
-epoch is still fenced until the existing lease expires. During startup, a
-replacement process with the same writer id and epoch waits and retries until
-that predecessor lease expires, then acquires a fresh session token. A different
-writer id or epoch is treated as a conflicting active writer and fails fast.
+`qbit_prism_window(anchor_job_issued_at, window_weight)` selects eligible shares
+newest first by `share_seq`, counting a partial oldest share when the requested
+weight is reached. Both `job_issued_at` and `accepted_at` must be no later than
+the anchor. The audit wrapper fixes the reward weight to eight times network
+difficulty.
 
-`share_id` is globally unique. Replaying an exact share payload is idempotent
-and returns its original sequence without inserting another row. Reusing the ID
-with any different payout, difficulty, job, timestamp, nonce, or credit policy
-fails the complete batch. After failover, the replacement writer resumes at the
-next database sequence value and stale writers are rejected before insert.
+Native snapshots record a database-coordinated monotonic anchor, share range,
+and payout revision. Share acceptance and snapshot creation use the same
+ordering lock, so equal wall-clock timestamps or host clock differences cannot
+let a later share enter an earlier snapshot. Published jobs bind their snapshot;
+later accepted work cannot change their committed coinbase.
 
-The ledger is single-writer, not active-active. A replacement writer takes the
-lease after expiry. Active-active insertion would create ambiguous ordering and
-is outside the accepted PRISM contract.
+Payout-changing operations serialize under the settlement transaction lock.
+They advance the shared payout revision, and job publication checks that its
+revision remains current. A cluster fingerprint binds genesis, ledger and
+manifest public keys, reward multiplier, payout policy, and CTV policy. A
+mismatched instance fails startup. Coordinators can use different local resource
+limits and synchronized qbit nodes on the same chain.
 
-Graceful coordinator shutdown closes Stratum admission and all background
-writer admission first, then waits for admitted share batches, accepted-block
-finalization, CTV status updates, and payout/reorg mutations to finish. It
-releases the exact-session writer lease immediately after that writer barrier;
-client socket delivery, obsolete job fanout, and executor/thread cleanup drain
-after release and therefore cannot delay a replacement writer. SIGTERM only
-closes admission and wakes the serve loop; the barrier and database work run
-outside the signal handler.
+A pool with no historical shares issues solver-paid bootstrap work. There is no
+three-miner gate. A network-valid candidate below its assigned share target is
+stored without ordinary share credit. Active-chain confirmation inserts its
+deferred share at network difficulty; a losing candidate receives no credit.
 
-`PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS` bounds the writer barrier and defaults
-to 15 seconds. This leaves time for conservative synchronous Postgres flushing
-while remaining well below the default 60-second lease TTL. If the timeout
-expires, the coordinator logs each still-active writer component and
-deliberately does not release the lease; process termination and TTL fencing
-then preserve the single-writer invariant. Do not shorten this below the
-durable flush time of the deployed Postgres system.
+## Durable block candidates
 
-Shutdown emits structured JSON log events named `shutdown_start`,
-`writer_quiescence`, `lease_release_attempt`, `lease_release`,
-`lease_release_withheld`, and `non_writer_drain`. Prometheus exposes the same
-path through `qbit_prism_shutdowns_total`,
-`qbit_prism_shutdown_writer_quiescence_seconds`,
-`qbit_prism_shutdown_writer_quiescence_total`,
-`qbit_prism_shutdown_lease_release_attempts_total`,
-`qbit_prism_shutdown_lease_release_total`,
-`qbit_prism_shutdown_lease_release_seconds`,
-`qbit_prism_shutdown_sigterm_to_lease_release_seconds`,
-`qbit_prism_shutdown_non_writer_drain_seconds`, and
-`qbit_prism_shutdown_release_withheld_total`.
+`qbit_block_candidate_outbox` stores complete candidate evidence before a node
+submission can be lost to a process crash. Workers claim pending rows with
+expiring, token-fenced database claims. Multiple instances may process different
+candidates; a stale claimant cannot overwrite a successor's accounting result.
 
-## Block Candidate Outbox
+The worker submits the preserved block bytes, observes the active chain, and
+persists verified block/audit/payout state transactionally. Transient failures
+leave durable retry work. A lost RPC reply is resolved by querying the chain or
+re-offering the same block; an accepted duplicate does not create another payout.
+Terminal candidates retain the evidence needed for replay identity while large
+pending payloads can be released. Deferred below-share-target credit is tied to
+the same durable candidate lifecycle.
 
-A block-worthy share transaction also inserts an immutable intent into
-`qbit_block_candidate_outbox`. The intent contains the complete block, template
-context, reward inputs, and extranonce fields required to finish audit and
-submission. The share and intent become visible atomically before Stratum
-success.
+PostgreSQL and qbitd do not share a transaction. Duplicate node offers are
+possible after an interrupted attempt; accounting effects are idempotent and
+claim-fenced. Do not infer active-chain acceptance from a socket write or a
+missing RPC reply.
 
-The bounded live-candidate queue is only a wakeup path. Queue saturation
-coalesces wakeups; it cannot delete an outbox row. Recovery restores pending
-rows in batches into a separate, lower-priority replay queue, without doing
-per-row database accounting. Live discoveries therefore always outrank restart
-work, while an older replay stalled in accounting cannot hide later durable
-rows. The pre-accept startup recovery pass is best-effort under a slow ledger:
-if its database budget expires, the coordinator finishes starting and the
-block-submitter loop retries every durable pending row with ordinary backoff.
-Because job builds stay blocked until every pending candidate is known, the
-startup enumeration must be provably untruncated: a full batch re-queries
-with a doubled window (capped at 1024 rows) until the outbox returns fewer
-rows than requested. If the cap is ever hit, the gate stays closed while the
-restored batch drains and the submitter loop re-enumerates the remainder.
-Before qbitd can observe a candidate, the coordinator installs a short in-memory
-prospective-payout barrier; this prevents startup prewarm from issuing child
-work from the old balance base without falsely claiming that the block landed.
+## Blocks, balances, and reorgs
 
-Once a durable candidate is dequeued, its qbit `submitblock` RPC is the fast
-lane: it runs before the attempt-marker write, accepted-block writer admission,
-audit construction, or payout publication. The node result and same-hash lease
-then transfer to an independent, height-prioritized accounting lane. A full
-primary handoff spills to a result-preserving overflow queue; it never turns an
-already-offered block back into a raw-submit retry. `block_submitter` and
-`block_accounting` expose independent phase heartbeats, so slow accounting does
-not delay later node offers or disguise the phase that stopped progressing.
+Core durable tables remain:
 
-`PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS` bounds the fast-lane RPC (default 1
-second). `PRISM_BLOCK_SUBMIT_DB_TIMEOUT_SECONDS` gives each later Postgres
-statement and local ledger gate a fresh deadline (default 1 second); direct
-outbox reads and mutations additionally use a single-flight wrapper so a
-driver that ignores its deadline cannot accumulate retry threads. Timeouts
-leave the row pending and enter the ordinary candidate backoff.
+| Table | Purpose |
+| --- | --- |
+| `qbit_share_ledger` | Canonical accepted share history |
+| `qbit_pool_blocks` | Pool blocks and active-chain/maturity state |
+| `qbit_pool_payout_entries` | Per-recipient payout records |
+| `qbit_payout_carry_forward` | Auditable balance deltas |
+| `qbit_pool_audit_bundles` | Canonical audit metadata and stored body |
+| `qbit_ctv_fanout_sets` | Committed fanout sets |
+| `qbit_ctv_fanout_artifacts` | Transactions, maturity, and broadcast state |
 
-Landing-path observability lives on `/metrics`:
-`qbit_prism_block_ledger_calls_total` / `_call_timeouts_total` /
-`_call_budget_seconds` / `_call_last_duration_seconds` /
-`_call_max_duration_seconds` (labelled by `call_class`, `fast` vs
-`landing`), `qbit_prism_accepted_parent_unresolved_transitions` and
-`_unresolved_oldest_seconds`,
-`qbit_prism_accepted_parent_preview_wait_timeouts_total`,
-`qbit_prism_prior_balances_reads_total` / `_read_last_seconds` /
-`_read_max_seconds`, and `qbit_prism_startup_phase_seconds{phase=...}`.
-Alert before the landing deadline is exhausted, not after: page when
-`qbit_prism_prior_balances_read_max_seconds` exceeds ~20% of the
-landing budget or the poll budget, when any
-`qbit_prism_block_ledger_call_timeouts_total{call_class="landing"}`
-increment occurs, and when
-`qbit_prism_accepted_parent_unresolved_oldest_seconds` exceeds the
-preview wait budget. The #188 prior-balances read crossed the one-second
-line silently over several weeks; these series exist so that growth is a
-ticket, not an outage.
+Current balances replay active confirmed carry-forward deltas. Zero net balances
+need no current row; negative balances remain visible debt offsetting future
+rewards. `qbit_carry_forward_integrity_report()` checks stored prior, candidate,
+and carry values against replay and publishes `audit_head_sha256`. Preserve that
+head with independent release/recovery records.
 
-Deadlines are split by call class. The poll-class budget above covers only
-cheap outbox polls and fast-lane-adjacent calls. The landing-class
-accounting tail — persisting an accepted block, reading prior balances,
-confirming it, and rejecting the prepared state of a terminal candidate —
-runs each statement under `PRISM_BLOCK_LANDING_DB_TIMEOUT_SECONDS`
-(default 30 seconds) starting with the first attempt. After an observed
-landing timeout the next attempt for the same block hash doubles its
-budget up to `PRISM_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS` (default 120
-seconds); only ledger-originated deadlines count as landing timeouts —
-a node RPC timing out inside the landing tail neither escalates the
-next PostgreSQL budget nor increments the landing-timeout series; retries stay paced by the candidate backoff, server-side
-cancellation is confirmed by the ledger backends (the pooled session is
-rolled back or replaced, never reused mid-cancel), and the stuck-call and
-coordination watchdogs remain the overall bound. Startup replay of a
-pending accepted candidate re-enters the same landing-class scope, and
-the gating startup outbox enumeration both runs with the landing budget
-and records under `call_class="landing"`, so an enumeration timeout
-fires the landing-timeout alert rather than inflating the fast-call
-budget gauge. A
-landing-class operation must never start at the poll budget: a
-structurally slow landing under a one-second ceiling is statement-canceled
-on every attempt and can never converge (issue #188). Contended
-submit-path locks are acquired in heartbeat slices and identify the lock in a
-periodic diagnostic controlled by `PRISM_BLOCK_SUBMIT_LOCK_WAIT_LOG_SECONDS`
-(default 5 seconds). At most two timeout-ignoring RPC workers and two
-timeout-ignoring ledger workers may remain detached. If either bounded worker
-pool remains exhausted for `PRISM_BLOCK_SUBMIT_STUCK_CALL_EXIT_SECONDS`
-(default 30 seconds), the coordinator requests shutdown and exits nonzero so
-the supervisor replaces the poisoned process; durable outbox rows remain
-pending for replay. One detached call does not interrupt the healthy raw lane
-while the other bounded slot can still make progress.
+Coinbase maturity is 1,000 blocks: a height-H payout becomes mature only at tip
+height H+1,000 or later. An immature disconnected block is marked inactive, so
+its balances stop contributing; it can reactivate. Terminal reversal preserves
+audit history and marks payout/carry rows reversed. A mature disconnect sets a
+shared fatal state and stops ordinary accounting until investigated. Other
+instances must not continue with a different interpretation of that event.
 
-Successful submissions become `submitted`; candidates that definitively lose
-their tip race or fail validation become `abandoned`. If the process exits
-after `submitblock` but before the attempt marker or terminal outbox update,
-restart resubmits the same bytes. qbit's accepted-duplicate response is a
-successful landing signal; block-hash-keyed ledger persistence and the
-finalize-only registry keep accounting and terminal side effects exactly once.
-Restart can also recognize the candidate as the active tip and complete the
-same idempotent confirmation path. Exact miner resubmissions observe an
-existing terminal outbox state in the same durable pre-submit transaction:
-`submitted` coalesces to success and `abandoned` stays rejected before any new
-node offer. Exact share replays return the original row as not newly inserted,
-so process-local worker and vardiff counters are not credited twice.
-Transient RPC, audit, and ledger outcomes remain pending and retry with an
-exponential delay starting at 250 milliseconds and capped at 30 seconds. They
-do not increment terminal abandonment counters. An abandonment is counted only
-after any prepared payout state is rejected and the false disposition is fixed;
-if cleanup fails, the candidate remains pending and can still converge to
-submitted on later chain evidence. Replay carries the database row's block hash
-separately from candidate JSON, so malformed payloads can be quarantined using
-the authoritative outbox key instead of replaying forever.
+## Audit storage and retention
 
-The block submitter heartbeat carries its current phase, including replay
-query, node RPC, lock admission, audit, persistence, and finalization. A stale
-watchdog diagnostic therefore reports a label such as
-`block_submitter:replay-outbox-query` instead of only the thread name.
+Native accepted-block audits store the non-share bundle fields and a
+`share_snapshot_sha256` reference to `qbit_prism_audit_snapshots`. A snapshot
+records the canonical share interval, anchor, count, and digest. Its shares are
+reconstructed from the immutable ledger. Bootstrap snapshots may retain their
+synthetic share inline. The reader verifies the reconstructed share digest and
+canonical bundle SHA before returning a logical v1/v1.1 bundle.
 
-When a network-valid hash is below a listener's advertised share target, the
-coordinator first stores a candidate-only intent, submits it synchronously, and
-links share credit only if the block lands. This closes the submit-to-credit
-crash window without crediting a below-target hash that loses its tip race.
-Terminal outbox rows retain the intent digest but clear the large block/template
-body, bounding permanent outbox storage while preserving exact-replay checks.
+Share UPDATE, DELETE, and TRUNCATE are prohibited. Removing a share could break
+both future accounting and already published audit hashes. No supported pruning
+or share-compaction command exists. Keep the canonical share history and all
+referenced snapshot rows. A future archive design must preserve exact range
+reconstruction and verification before relaxing this invariant.
 
-Production deployments must use the Postgres-backed ledger. The in-memory ledger
-exists only for local/regtest proof runs and requires an explicit
-`PRISM_ALLOW_MEMORY_LEDGER=1` opt-in.
+Imported historical external audits retain their verified inline bundle body;
+they are not silently rewritten into references to potentially incomplete
+legacy share history. Import preserves their published canonical SHA. Legacy
+body-ref and v2 segment formats remain supported by the Rust offline loaders.
+Back up external bodies and their segments until import and restore validation
+are complete, and retain the original backup under the migration retention plan.
 
-## Reward Query Semantics
+## CTV recovery and broadcasting
 
-`qbit_prism_window(anchor_job_issued_at, window_weight)` returns accepted shares
-in descending `share_seq` order until the requested weight is filled. This is
-the TIDES-style reward-window primitive inside PRISM. The oldest included share
-is partially counted when needed. Eligibility requires both:
+Committed fanout artifacts are durable database records. Broadcasting requires
+a mature active parent and a current claim. Workers record transaction/package
+outcomes and retry state so another instance can resume after a crash. Failed,
+reorged, or completed artifacts remain visible through the audit/public API.
 
-- `job_issued_at <= anchor_job_issued_at`
-- `accepted_at <= anchor_job_issued_at`
+To reconstruct missing artifact sets from verified database audits:
 
-That second condition freezes the block view and prevents an old-job share that
-arrives after the found-block anchor from entering the published payout split.
-
-`qbit_audit_share_window(anchor_job_issued_at, network_difficulty)` is the
-public audit wrapper. It fixes the TIDES-style window multiplier at 8x network
-difficulty and returns the counted difficulty for every included share.
-
-Accepted rows may carry a nullable `credit_policy`. Normal shares leave it
-empty; `stale-grace` marks a prior-tip share credited by the coordinator's short
-stale-grace policy. Reward-window queries still count these rows because they
-are accepted shares, while audits can distinguish them from normal current-tip
-shares. Audit bundles containing a credited row use
-`qbit.prism.audit-bundle.v1.1`; external auditors must upgrade before operators
-enable stale-grace crediting.
-
-Deployments that run with `PRISM_POSTGRES_INIT_SCHEMA=0` must apply
-`crates/qbit-prism/sql/001_share_ledger.sql` before starting upgraded
-coordinators. Otherwise share inserts will fail because the `credit_policy`
-column and updated window function signatures are missing.
-
-`qbit_shares_since_template_height(min_template_height)` supports operational
-replay and frontend recovery. It returns accepted shares at or above the
-template height in ascending `share_seq` order and excludes rejected shares.
-
-## Payout and Reorg State
-
-Accepted pool blocks are persisted in `qbit_pool_blocks`, with payout rows in
-`qbit_pool_payout_entries`, carried balances in `qbit_payout_carry_forward`, and
-audit bundles in `qbit_pool_audit_bundles`. The direct coordinator durably
-persists the compact candidate intent before calling `submitblock`, then builds,
-verifies, and persists the full audit and payout state after the block becomes
-active. A definitive pre-acceptance rejection terminalizes the outbox row and
-creates no prepared payout state.
-
-Immature disconnects are first quarantined as `chain_state='inactive'`, which
-removes their carry-forward balances from current owed totals without mutating
-historical shares or payout rows. If the block returns to the active chain, the
-coordinator reactivates it. The terminal reversal path is the fenced ledger
-wrapper `PsqlShareLedger.reverse_immature_block(...)`, backed by
-`qbit_reverse_immature_pool_block(...)`; it marks the block, payout entries, and
-carried balances as reversed. Mature rows, and rows already height-mature at the
-supplied active tip, must not be reversed by that path. qbit coinbase maturity
-is 1000 blocks, so operators must not mark pool payouts mature before
-`block_height + 1000`.
-
-## CTV Fanout Artifact Repair
-
-Schema initialization is also the idempotent repair path for deployed PRISM
-databases. In particular, it drops the old `NOT NULL` constraint from
-`qbit_ctv_fanout_artifacts.anchor_vout` so fee-bearing, anchorless CTV fanouts
-can persist with `anchor_vout = NULL`.
-
-The same schema init path also adds bounded broadcast-attempt summaries to
-`qbit_ctv_fanout_artifacts`. Operators can tune retained detail rows with
-`PRISM_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT`; the summary columns retain total
-attempt count, latest package/result/error context, and per-status counts after
-old detail rows are no longer retained.
-
-If a block was mined while the old constraint was still present, backfill the
-missing fanout artifact rows from the persisted audit bundle, a local
-`prism-live-audit-bundle-*.json` envelope, or a local audit body file:
-
-```bash
-PRISM_DATABASE_URL='postgres://...' \
-python3 -m lab.prism.backfill_ctv_fanouts --db-block-height 21883
+```sh
+qbit-prism-server backfill-ctv
 ```
 
-The repair tool also accepts `--db-block-hash <hash>` or local JSON paths. Local
-paths may be full v1 bundles, live envelopes, legacy compact audit body refs,
-or `qbit.prism.audit-bundle.v2` proof bodies; the tool follows envelope
-`body_uri` pointers and reads `bundle_without_shares` from compact bodies
-because CTV backfill does not need share rows. For a local candidate/final
-audit bundle whose filename does not include the block hash, pass
-`--path-block-hash <hash>`. The tool runs schema init by default before
-backfilling and then calls the same fenced
-`persist_ctv_fanout_manifest_set` path as the coordinator. Stop the active
-coordinator or otherwise ensure the repair process can acquire the ledger
-writer lease before running a backfill.
+Run `import-audits` first for historical file-backed bodies. Backfill verifies
+the trusted ledger key, canonical digest, and recorded coinbase before repairing
+rows; matching existing artifacts are idempotent. It processes stored audits,
+replacing the former Python tool's individual-path and block-filter CLI.
 
-## Compaction and Archive Contract
+To process a single batch using the normal broadcaster policy:
 
-The ledger is append-only for reward correctness. Compaction is allowed only as
-an archive-first operation, and only after proving it cannot change any future
-window, audit, maturity, or reorg answer.
+```sh
+qbit-prism-server broadcast-ctv
+```
 
-Before deleting any hot rows, an operator must:
+The integrated periodic worker uses `PRISM_CTV_BROADCASTER_ENABLED=1`. An optional
+CPFP wallet and fee configuration must be consistent with the intended operating
+policy. Durable claims coordinate work across instances; node RPCs may still
+receive an identical transaction more than once after a lost reply.
 
-1. Export the candidate `share_seq` prefix to durable archive storage.
-2. Record row count, first and last sequence, and a cryptographic hash of the
-   exported rows in canonical order.
-3. Prove no unresolved pool block, audit bundle, immature payout, or future 8x
-   PRISM reward window can reference the candidate rows.
-4. Re-run representative `qbit_prism_window`,
-   `qbit_audit_share_window`, and `qbit_shares_since_template_height` queries
-   before and after the dry run and verify identical results.
+Confirmed fanouts are observed every five seconds until 1,000 confirmations;
+afterward the latest deep checkpoint is checked every 60 seconds. A shallow
+fanout disconnect returns the transaction to broadcast work. Disconnection of a
+deep checkpoint halts the shared cluster for explicit reconciliation.
 
-No public harness currently deletes ledger rows. Until an archive proof exists,
-production deployments should retain the full canonical share log.
+Without transaction indexing, the broadcaster uses a durable block-scan cursor
+and chain anchor. `PRISM_CTV_SPEND_SCAN_BLOCKS` bounds each pass (default 32,
+range 1–256); a reorg resets the cursor. The node must retain the historical
+blocks needed by that scan. A pruned/unavailable block range cannot be treated
+as proof that a fanout is unspent.
 
-For operator disk planning and permanent-vs-ephemeral data categories, see
-[`docs/prism-storage-sizing.md`](prism-storage-sizing.md).
+For positive CPFP sponsorship, use a dedicated wallet. Broadcasters that create
+or recover unsigned packages must reach the same sponsorship wallet RPC service;
+unrelated wallets with the same name cannot sign each other's reserved inputs.
+Other nodes can replay an already signed package without opening that wallet.
+The database reserves
+funding before wallet locking and preserves the exact signed child before
+submission. A replacement process recovers the reservation and replays that
+same package rather than selecting fresh funding after a lost reply. Funding
+is not unlocked until the node observes it spent, including a mempool spend.
+Automatic replacement fee bumps and abandoned-reservation release are not
+implemented; retain and reconcile the durable reservation when handling those
+cases manually.
 
-## Throughput Evidence
+## HA database and shutdown
 
-`make test-prism-postgres-throughput` is an opt-in capacity harness. It creates
-a temporary Postgres container, bulk-inserts synthetic accepted shares through
-the canonical schema, records observed shares/sec, and stores
-`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` output for the audit-window query.
+Point every instance at the same writable primary endpoint. Do not route ledger
+queries to a lagging read replica or distribute writes among independent
+PostgreSQL primaries. Sum `PRISM_DATABASE_MAX_CONNECTIONS` across frontends and
+reserve capacity for migrations, monitoring, backup, and failover administration.
 
-Useful environment variables:
+The cluster records its highest observed cumulative chain work. A node that is
+still synchronizing, follows a lower-work tip, or disagrees at equal work cannot
+advance accounting. Share commits are fenced by the current revision as well.
+This prevents a lagging node from reversing another frontend's accepted blocks.
+For manual regtest invalidation/reconsideration, extend the intended branch past
+the previous work record before expecting the pool to resume; do not clear the
+record to accommodate a lagging production node.
 
-- `QBIT_PRISM_THROUGHPUT_SHARES`: number of synthetic rows to insert.
-- `QBIT_PRISM_MIN_SHARES_PER_SEC`: optional failing threshold.
-- `QBIT_PRISM_THROUGHPUT_REPORT`: JSON report path.
+Keep PostgreSQL `fsync=on`, `full_page_writes=on`, and
+`synchronous_commit=on`. A local durable commit protects against a coordinator
+crash. Zero acknowledged-share loss on database-primary failure additionally
+requires synchronous standby flush and a promotion policy restricted to a
+standby containing acknowledged commits. An HA endpoint does not establish this
+by itself. Test primary failure and client reconnection using the actual
+replication, proxy, and storage configuration.
 
-The throughput harness measures schema/query capacity. It is separate from the
-lab ledger adapter's execution backends described below.
+SIGTERM closes listener admission and asks tasks to drain before the database
+pool closes. The native server bounds shutdown drain to 30 seconds; unfinished
+candidate/CTV intents remain in PostgreSQL and become reclaimable after their
+claims expire. There is no legacy writer-lease release barrier. Observe each
+frontend's health before restoring traffic after a restart.
 
-## Hot-Path Execution Backends
+Backups require the database, signing-key recovery material, and any unimported
+external audit bodies/segments. Use independent base backups plus WAL archives
+for point-in-time recovery; replication is not a replacement for backups.
+Restore into isolation and verify share order, audit hashes, carry-forward
+integrity, CTV state, and API reads before declaring recovery complete.
 
-The lab ledger adapter (`PsqlShareLedger`) supports two interchangeable
-execution backends over the same SQL and the same durability contract:
+## Health, diagnostics, and validation
 
-- **`psycopg-pool` (production default):** a persistent pooled psycopg client.
-  The coordinator's share-writer group commits (`PRISM_SHARE_COMMIT_BATCH_SIZE`
-  / `PRISM_SHARE_COMMIT_LINGER_MILLISECONDS`) execute as one round trip on a
-  long-lived connection instead of one `psql` fork+connect per statement; the
-  batch statement's own `set_config('synchronous_commit', 'on', true)` keeps
-  the Stratum ACK boundary at the database commit. Reads share a pool bounded
-  by `PRISM_POSTGRES_READ_CONCURRENCY` plus one writer slot. Read-only
-  statements retry once after a lost connection; mutations do not re-execute
-  automatically because a lost response cannot prove that PostgreSQL did not
-  commit the first execution.
-- **`psql-subprocess` (fallback):** the legacy zero-Python-dependency backend
-  that shells out one `psql` per statement. It remains fully supported for
-  regtest portability and as the operational escape hatch.
+`/healthz` returns 200 only when the process has fresh work for its observed tip
+and current payout revision and job delivery can progress; otherwise it returns
+503. The HTTP handler reads a published snapshot and fails closed when that
+snapshot becomes stale. Database or node outages therefore cannot keep an old
+green response indefinitely.
 
-`PRISM_POSTGRES_NATIVE_CLIENT` selects the backend: `auto` (default) uses the
-pooled client when psycopg is importable and a `postgres://` DSN is available
-(from `PRISM_DATABASE_URL` or inside `PRISM_POSTGRES_PSQL_COMMAND`), `1`
-requires it, and `0` forces the subprocess fallback. The coordinator startup
-line reports the active backend as `ledger_execution=`.
+`/metrics` exports native process health, accepted/rejected share and block
+counters, runtime workers, connections, pending builds, current-work delivery
+coverage, and delivery outcomes. Scrape every instance with its own label;
+process counters reset after restart. Dashboard accounting is read
+from PostgreSQL across instances. Detailed Python queue, writer lease, watchdog,
+and incremental-refresh metrics no longer describe this runtime.
 
-Readiness and health counters (`accepted_share_stats`) are maintained
-incrementally by the single lease-holding writer and reconciled against the
-database once per `PRISM_ACCEPTED_STATS_CACHE_SECONDS` (default 60) instead of
-running `count(*) / count(DISTINCT miner_id)` aggregates every few seconds.
+Useful checks:
 
-`make test-prism-postgres-native-ledger` is the opt-in end-to-end validation
-for the pooled backend: it provisions a temporary Postgres container and
-exercises schema init, lease guards, concurrent batched appends, duplicate
-replay, cached stats, and cross-backend read consistency with the `psql`
-fallback. Run it on any docker host with `psycopg` installed before rolling
-the pooled backend into an environment.
+```sh
+qbit-prism-server check-config
+qbit-prism-server healthcheck --url http://127.0.0.1:3341/healthz
+qbit-prism-server self-check
+bash test/prism-native-tests.sh
+QBITD_BIN=/path/to/qbitd bash test/prism-native-tests.sh live
+```
 
-It does not simulate live Stratum miner swarms, reconnect storms, malformed
-client messages, or stale-share bursts across job changes. Those remain separate
-operator-load concerns if production needs coverage beyond ledger/query
-capacity.
+The database test wrapper starts a private local cluster unless
+`PRISM_TEST_DATABASE_URL` is supplied. Live tests add actual qbitd regtest and
+bounded CPU mining. Use an isolated database for tests. The native builder
+benchmark measures CPU build/verify work, not end-to-end accepted-share capacity;
+see [measurement](prism-payout-artifact-measurement.md) and
+[optional qualification](prism-capacity-readiness.md).
 
-## Operator Readiness
+The physical failover test uses disposable PostgreSQL primary/synchronous
+standby processes and two ledger clients through a stable TCP endpoint. It
+checks survival of acknowledged IDs, deduplication, and resumed writes after
+immediate primary loss and promotion:
 
-Optional capacity qualification and its versioned evidence contract are
-documented in [PRISM capacity qualification](prism-capacity-readiness.md).
+```sh
+PRISM_TEST_PG_BIN_DIR=/usr/lib/postgresql/16/bin \
+  cargo test --locked -p qbit-prism-server --test postgres_failover -- --nocapture
+```
 
-`make prism-self-check` is the PRISM operator readiness probe. It resolves the
-same Compose environment as `make up-prism-pool`, then emits PASS/WARN/FAIL
-rows for:
-
-- qbit RPC reachability, chain identity, IBD state, and peer count.
-- the configured genesis hash against `getblockhash 0` when
-  `QBIT_EXPECTED_GENESIS_HASH` is set.
-- PRISM coordinator `/healthz` from inside the coordinator container.
-- miner-facing Stratum TCP reachability.
-- Postgres readiness for the canonical ledger.
-- PRISM signing/key environment and forbidden production bypass flags.
-- audit/archive path writability.
-- basic mining configuration such as share difficulty, vardiff bounds, pool
-  fee configuration, CTV fanout fee sourcing, and minimum ready miners.
-
-The command is safe to run repeatedly. It exits non-zero when any FAIL row is
-present. Use `python3 scripts/prism-self-check.py --skip-live` to validate only
-static configuration before the profile is running.
-
-On mainnet, an explicit
-`QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0` keeps the probe useful before
-launch: `qbit.ibd`, a missing initial `stratum.highdiff_floor` difficulty
-notification, and a below-threshold `coordinator.ready_miners` result are WARN
-rows, while all other checks remain active and fatal. Set the flag to `1` for
-launch; an omitted flag is also strict, and a malformed value fails closed.
-
-For operator runs, `make up-prism-pool` requires Postgres plus
-`PRISM_MANIFEST_SIGNING_SEED_HEX`,
-`PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX`, and the trusted
-`PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX`. The two seed values are 32-byte hex
-Ed25519 signing seeds. The ledger public key is the verifying key derived from
-the ledger attestation seed and must be distributed through an operator-trusted
-channel, not copied from the bundle being verified. Keep
-`PRISM_ALLOW_MEMORY_LEDGER`, `PRISM_ALLOW_TEST_SIGNING_SEEDS`,
-`PRISM_ALLOW_BUNDLE_EMBEDDED_LEDGER_KEY`, and
-`PRISM_ALLOW_FIXED_LEDGER_SESSION_TOKEN` disabled outside local tests.
-
-Mainnet configuration is always treated as production configuration, even when
-the separate production toggle is omitted. It must select the chain explicitly
-with `QBIT_CHAIN_FLAG=-chain=main` and pin the final release genesis hash in
-`QBIT_EXPECTED_GENESIS_HASH`. The live readiness probe normalizes the configured
-`mainnet` name to the `main` name returned by qbit RPC, then verifies height zero
-against the pin.
-
-Production builds using the git source provider must set `QBIT_GIT_COMMIT` to a
-full 40-character object ID. The environment doctor verifies that the resolved
-checkout is at that exact commit instead of trusting a mutable branch or tag.
-Production also requires `PRISM_STRATUM_STALE_GRACE_SECONDS=0`; stale-credit
-grace should be enabled only after the deployed verifier and accounting release
-have an explicit compatibility proof for it.
-
-The parent-chain selector is checked independently: `BITCOIN_CHAIN` and
-`BITCOIN_CHAIN_FLAG` must be an exact pair, including `mainnet` with
-`-chain=main`. When a production configuration selects a non-regtest parent for
-AuxPoW, both `QBIT_MINER_ADDRESS` and `BITCOIN_MINER_ADDRESS` must be explicit;
-automatic wallet-derived payout addresses are rejected.
-
-Mainnet CTV settlement requires an operator-reviewed positive
-`PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT`. On non-mainnet networks,
-if it is omitted, the live readiness probe requires `estimatesmartfee` to return
-a positive rate before the pool is considered ready. A new chain, or a chain
-producing only empty blocks, does not have the confirmed transaction history
-needed for empirical fee estimation. A wallet fallback fee does not populate
-that history and is not a substitute for the explicit CTV fanout rate.
+The test skips unless that server-tool directory is provided. Its test proxy
+and promotion sequence do not replace validation of a production HA manager.

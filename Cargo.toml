@@ -3,4 +3,9 @@ resolver = "2"
 members = [
     "crates/qbit-pool-builder",
     "crates/qbit-prism",
+    "crates/qbit-prism-server",
 ]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -8,8 +8,8 @@ The contract is source-of-truth for both sides:
 - `../public-dashboard-api-v1.openapi.yaml` defines `/public/v1` endpoints.
 - `fixtures/*.json` are mock responses the dashboard can render before a live
   backend exists.
-- `tests/test_public_dashboard_api_contract.py` keeps the fixtures and public
-  naming conventions from drifting.
+- `crates/qbit-prism-server/tests/api_contract.rs` and `api_database.rs` check
+  the fixture naming, response contracts, and shared PostgreSQL read models.
 
 ## Architecture
 
@@ -64,10 +64,10 @@ Operators can tune the defaults with:
 The coordinator also keeps a small in-process origin cache keyed by normalized
 path and query string, and coalesces concurrent misses for the same key. Error
 responses use `Cache-Control: no-store` and are not cached by that origin cache.
-Miner pages additionally share one briefly cached pool-wide reward-window
-aggregate (`PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS`, default 30 seconds, 0
-disables), so requests for different miners reuse a single recursive
-reward-window scan instead of each re-running it.
+Each native instance owns its response cache; durable accounting reads come
+from the common PostgreSQL database. The Python-specific shared reward-window
+aggregate cache and its `PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS` knob were
+removed. Cache headers and public response contracts remain compatible.
 
 ## Conventions
 

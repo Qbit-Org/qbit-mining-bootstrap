@@ -1,791 +1,258 @@
 # PRISM
 
 PRISM means **Payouts, Rewards, and Integrity Settlement Manifest**. It is the
-direct qbit pool path in this repository: a Stratum-facing coordinator, a
-single ordered share ledger, deterministic reward accounting, reproducible
-coinbase construction, non-custodial settlement, and public audit artifacts that
-let miners verify their payout independently.
+non-custodial qbit pool in this repository: native Rust Stratum, a canonical
+PostgreSQL share ledger, deterministic payouts, direct coinbase or CTV
+settlement, and independently verifiable audit bundles.
 
-PRISM is not qbit consensus code. qbit core owns block validation, RPC, chain
-parameters, P2MR, CTV, maturity, and reorg semantics. This repository owns the
-operator stack around those rules: Compose profiles, Stratum glue, share
-accounting, payout manifests, audit bundles, public dashboard read models, and
-end-to-end mining tests.
+The runtime is [`qbit-prism-server`](crates/qbit-prism-server/README.md).
+Accounting and verification live in [`qbit-prism`](crates/qbit-prism/README.md),
+and transaction construction uses `qbit-pool-builder`. qbit core continues to
+own consensus, P2MR, CTV, block validation, and chain state.
 
-## What PRISM Optimizes For
+## Native architecture
 
-PRISM is built around four constraints:
-
-- **One canonical share ledger.** Every accepted share enters one ordered log.
-  Reward windows are derived from that order, not from per-frontend summaries.
-- **Transparent reward math.** A miner can recompute the share window, payout
-  split, carry-forward state, and final coinbase from published artifacts.
-- **Non-custodial settlement.** Whenever possible, miners are paid directly in
-  the generation transaction. When that is not practical, CTV fanout outputs
-  precommit the later payout transaction instead of sending funds to a pool
-  custody address.
-- **qbit-specific policy.** PRISM accounts for qbit P2MR outputs, 1000-block
-  coinbase maturity, no witness discount, fast block cadence, carry-forward
-  balances, and immature reorg reversal.
-
-Operator-facing docs use **bits** for the smallest qbit unit. Some Rust and
-Python internals still use Bitcoin-derived `*_sats` names. Treat those as the
-same integer unit in this codebase.
-
-## OCEAN And TIDES Inspiration
-
-PRISM's reward model is inspired by OCEAN's TIDES payout documentation, not by
-OCEAN's implementation. OCEAN defines TIDES as "Transparent Index of Distinct
-Extended Shares" and describes a pool reward system where proofs are tracked
-individually, kept in order, paid over an extended window, and auditable by
-miners. See OCEAN's TIDES writeup:
-
-- <https://ocean.xyz/docs/tides>
-- <https://ocean.xyz/>
-
-The design ideas PRISM carries over are:
-
-- **Transparent:** miners should be able to calculate their expected split.
-- **Index:** accepted shares retain their order.
-- **Distinct:** shares are not collapsed into shifts or coarse buckets before
-  payout calculation.
-- **Extended:** the active reward window is large enough to reduce variance.
-- **Shares:** each valid proof contributes work weight to the window.
-
-Like OCEAN's public description of TIDES, PRISM uses the latest
-`8 * network_difficulty` units of accepted share work when a pool block is
-found. The block reward, including fees, is split pro-rata by counted work.
-
-PRISM differs because it is qbit pool software. It uses qbit P2MR payout
-programs, qbit's 1000-block coinbase maturity, qbit transaction policy, and the
-qbit-specific settlement/audit artifacts in this repo. It also explicitly
-models carry-forward balances and CTV fanout settlement.
-
-## CTV Inspiration
-
-CTV is shorthand for `OP_CHECKTEMPLATEVERIFY`. In Bitcoin, BIP-119 proposes CTV
-as a covenant opcode that checks a hash commitment to fields of the spending
-transaction. Bitcoin Optech summarizes CTV as a proposed opcode that commits an
-output to a specific future spending template:
-
-- <https://bitcoinops.org/en/topics/op_checktemplateverify/>
-- <https://github.com/bitcoin/bips/blob/master/bip-0119.mediawiki>
-
-PRISM uses that covenant shape for qbit settlement fanouts. A coinbase output
-can commit to a later transaction that pays many miners. Once the coinbase is
-mature, anyone can broadcast the committed fanout transaction. The operator does
-not hold a spend key that can redirect miner funds.
-
-Do not read this file as a claim about Bitcoin mainnet CTV activation. This
-repo's CTV path is about qbit PRISM settlement.
-
-## System Architecture
-
-The PRISM profile is the `prism` Docker Compose profile. In operator mode it
-starts:
-
-- `qbitd`: qbit node and mining RPC provider.
-- `prism-postgres`: canonical share ledger, payout state, audit bundle index,
-  and CTV fanout state.
-- `prism-coordinator`: direct qbit Stratum server, ledger writer, reward
-  engine caller, block submitter, audit HTTP server, public dashboard API, and
-  optional CTV broadcaster loop.
-
-The main implementation files are:
-
-- [lab/prism/prism_coordinator.py](lab/prism/prism_coordinator.py): live
-  Stratum coordinator and audit/public HTTP server.
-- [lab/prism/direct_stratum.py](lab/prism/direct_stratum.py): qbit
-  `getblocktemplate` to Stratum job assembly.
-- [lab/prism/share_ledger.py](lab/prism/share_ledger.py): in-memory and
-  Postgres-backed ledger adapters plus audit artifact persistence.
-- [crates/qbit-prism](crates/qbit-prism): reward windows, payout policy,
-  maturity/reorg state, CTV manifests, audit bundles, and verifier CLIs.
-- [crates/qbit-pool-builder](crates/qbit-pool-builder): deterministic qbit P2MR
-  coinbase and signed payout manifest builder.
-- [crates/qbit-prism/sql/001_share_ledger.sql](crates/qbit-prism/sql/001_share_ledger.sql):
-  canonical Postgres schema and reward-window queries.
-
-Current PRISM is single-log and single-writer. Stratum ingress can be split and
-scaled later, but all accepted shares must still converge through one logical
-ledger writer before rewards are computed. Active-active independent ledgers are
-not compatible with the audit model.
-
-## Stratum Difficulty And The High-Diff Port
-
-Each PRISM Stratum listener carries its own difficulty policy. The default
-listener (`PRISM_STRATUM_PORT`, 3340) runs per-connection vardiff tuned for
-small miners. An optional second listener serves rental-scale hashrate
-(marketplaces such as NiceHash require a share difficulty of at least 500,000
-for SHA-256 from the first `mining.set_difficulty` a connection sees, so a
-vardiff ramp from a small-miner start can never satisfy their pool
-verification). This mirrors the two-port pattern used by solo.ckpool.org
-(3333 plus the high-diff rental port 4334), except both PRISM listeners feed
-the same coordinator, share ledger, and settlement path. Because the reward
-window is difficulty-weighted, shares from either port earn proportional
-credit with no settlement changes.
-
-### Reconnect backpressure
-
-PRISM applies one global admission ceiling across the default and high-diff
-listeners before it allocates `ClientState` or starts a handler thread.
-`PRISM_STRATUM_MAX_CONNECTIONS` defaults to 384, above the normal 200-250
-production population. An environment that explicitly overrides it to `0`
-remains unlimited in local/regtest mode and must remove that override to receive
-containment; production startup rejects the unlimited override.
-
-After subscribe and authorize, clients awaiting first current-tip work enter a
-single priority delivery lane. `PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS`
-(default 128) bounds that population, and
-`PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS` (default 30) expires requests that
-cannot be served. A zero timeout is supported for focused local tests, but the
-pending bound stays active. Initial delivery outranks new-tip replacement,
-same-tip/Vardiff refresh, and routine maintenance; duplicate authorization work
-is coalesced by connection and authorization generation.
-
-A first-job request that already has a usable cached bundle is served
-immediately, even while a publication-critical build is running. On a cache
-miss behind such a build, the request subscribes to that build's result and
-consumes it at completion instead of polling out the priority window and
-rebuilding. Transient payout-gate non-admission (a publication in flight, or a
-bundle generation going stale at the gate) retries within the request's own
-deadline rather than disconnecting the client.
-
-`/healthz` reports connection and pending capacity, current-tip job coverage,
-delivery progress, and overload state. It uses
-`PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS` (default 30) before persistent
-delivery failure can make health non-green. A full connection cap alone does
-not fail health while admitted miners retain current work and delivery is
-progressing.
-
-The high-diff listener is disabled unless `PRISM_STRATUM_HIGHDIFF_PORT` is
-set:
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `PRISM_STRATUM_HIGHDIFF_PORT` | unset (disabled) | enable the listener on this container port (conventionally 4334) |
-| `PRISM_STRATUM_HIGHDIFF_PORT_HOST` | ephemeral loopback | compose host publish mapping; set (e.g. `4334`) when enabling the listener |
-| `PRISM_PUBLIC_STRATUM_HIGHDIFF_URL` | derived from primary public URL or host and high-diff port | optional external URL shown by `/public/v1/mining-configuration` |
-| `PRISM_STRATUM_HIGHDIFF_BIND` | `PRISM_STRATUM_BIND` | bind address |
-| `PRISM_STRATUM_HIGHDIFF_START_DIFF` | `500000` | first advertised difficulty |
-| `PRISM_STRATUM_HIGHDIFF_MIN_DIFF` | `500000` | floor; never advertised below, even while qbit network difficulty is under it |
-| `PRISM_STRATUM_HIGHDIFF_MAX_DIFF` | `4294967296` | vardiff ceiling |
-| `PRISM_STRATUM_HIGHDIFF_SHARE_DIFF` | `PRISM_STRATUM_HIGHDIFF_START_DIFF` | fixed difficulty when vardiff is disabled; must stay within the min/max bounds |
-
-All other vardiff knobs (target share interval, retarget cadence, step
-bounds, smoothing) inherit the `PRISM_STRATUM_VARDIFF_*` configuration.
-Startup fails loudly when the bounds are inconsistent (floor above start, or
-start above ceiling).
-
-The floor is a wire guarantee, not just a vardiff bound. On the default
-listener the advertised difficulty is capped at the qbit network difficulty
-(a share is never required to be harder than a block), but on the high-diff
-listener the floor overrides that cap: while qbit network difficulty sits
-below the floor -- a young chain, or any test network -- the listener still
-advertises the floor from the first `mining.set_difficulty`, because that
-first value is what marketplace verification judges. Two consequences while
-the chain is below the floor: rigs only surface hashes at or above the floor
-(rented hashrate overshoots young blocks; that is the marketplace's minimum,
-not a pool choice), and a submission that solves a block while missing the
-share target is still submitted as a block rather than rejected as a
-low-difficulty share. `scripts/prism-self-check.py` verifies the guarantee
-live: it performs a real subscribe/authorize handshake against the published
-high-diff port and fails `stratum.highdiff_floor` unless the first advertised
-difficulty meets the configured floor.
-
-Clients can also steer their own difficulty on either listener, always
-clamped to that listener's bounds so a high-diff floor cannot be undercut:
-
-- Password options `d=N` (requested difficulty) and `md=N` (personal floor),
-  the common pool convention, e.g. password `d=500000,md=500000`. Unknown
-  or malformed password content is ignored.
-- `mining.suggest_difficulty` is honored the same way; an explicit password
-  `d=` outranks a suggestion.
-
-On the high-diff listener an `md=` above the listener floor raises the wire
-guarantee with it; on the default listener `d=`/`md=` steer vardiff within
-its bounds but stay subject to the network-difficulty cap.
-
-Sizing intuition: shares/second = hashrate / (difficulty x 2^32). At
-difficulty 500,000 a 1 PH/s connection submits roughly one share every two
-seconds, while a 500 GH/s device would find one share every ~72 minutes --
-which is why the floor lives on a dedicated port instead of the default
-listener.
-
-Operational knobs shared by the PRISM listeners:
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `PRISM_BLOCKPOLL_SECONDS` | `2` | fallback qbit tip/template poll interval |
-| `PRISM_BLOCKWAIT_ENABLED` | `1` | enables a `waitfornewblock` thread so new tips trigger immediate clean-job refreshes |
-| `PRISM_BLOCKWAIT_TIMEOUT_SECONDS` | `5` | server-side timeout for each `waitfornewblock` call |
-| `PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS` | `60` | fail-closed timeout for one signed shared-bundle subprocess |
-| `PRISM_COORDINATION_BLOCKED_EXIT_SECONDS` | `900` | maximum continuous age of coordination-only template-refresh deferrals before the publication watchdog restarts the coordinator |
-| `PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS` | `15` | maximum monotonic age of a known tip/template/payout refresh before `/healthz` returns HTTP 503 |
-| `PRISM_INITIAL_JOB_MAX_WORKERS` | `4` | dedicated first-job delivery workers; raise under sustained reconnect churn so first notifies do not queue behind each other; explicit values above `PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS` are rejected, while the implicit default caps itself to that bound |
-| `PRISM_JOB_BUILD_EXECUTOR_WORKERS` | `2` | shared job-build executor threads; the scheduler admits at most two concurrent flights, so values above `2` are rejected — lower to `1` to serialize builds on constrained hosts |
-| `PRISM_OBSERVED_TIP_ACCEPT_WINDOW_SECONDS` | `300` | how long an own-hash tip observation (blockwait/blockpoll seeing a pool block candidate as the chain tip) keeps protecting that candidate from terminal abandonment while fresh chain probes cannot prove it active; expired windows restore terminal stale abandons |
-| `PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS` | `15` | maximum monotonic age of the last coherent qbit tip/template poll before `/healthz` returns HTTP 503 |
-| `PRISM_TIP_REFRESH_FAILURE_HOLDOFF_SECONDS` | `1` | minimum spacing (plus up to 25% jitter) between failed tip-refresh attempts while the observed tip is unchanged; success or a new tip re-arms immediately; set `0` for unspaced retries |
-| `PRISM_TIP_REFRESH_EPOCH_FANOUT` | `0` | enables latest-wins refresh epochs; leave disabled for legacy abort-and-retry behavior, enable gradually, and set back to `0` to roll back |
-| `PRISM_STRATUM_STALE_GRACE_SECONDS` | `3` | after a tip flip, credits same-connection prior-tip shares until this long after that connection receives new-tip work (shares stay creditable while delivery is still pending); set `0` to reject all prior-tip shares |
-| `PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS` | `15` | cadence for checking zero-submitted, zero-accepted vardiff windows so over-diffed idle miners can step down; set `0` to disable |
-| `PRISM_WORKER_METRICS_LIMIT` | `100` | maximum distinct worker labels in private metrics before new workers aggregate into `_other` |
-
-`/healthz` remains healthy across arbitrarily long periods without a new block
-when the observed template and payout generation are unchanged. It returns HTTP
-503 only when tip polling is stale, an active bundle build is stuck, or known
-new work is not published (and, when eligible miners exist, delivered) within
-the configured bounds. The response and Prometheus metrics expose only bounded
-generation, age, client-count, and reason fields; miner identities and work
-payloads are never included.
-
-The Compose healthcheck samples `/healthz` every five seconds and marks the
-container unhealthy after three consecutive failures. This is an alerting
-signal only: Compose `restart: on-failure` restarts coordinator process exits,
-not containers whose health status alone becomes unhealthy. Use `/healthz` or
-the `qbit_prism_health_state` metrics for alerting and automation.
-
-Stale-grace crediting never submits a block candidate. The submitted header must
-still satisfy the assigned share target, is marked with `credit_policy:
-stale-grace` in the accepted-share record, and participates in vardiff and the
-PRISM reward window like any other accepted share.
-
-Block-worthy submissions are acknowledged like any other share and the block
-candidate is landed by a dedicated submitter thread (audit build, verify,
-persist, `submitblock`, confirm), so no miner's share acknowledgement ever
-waits on block submission. A share that met its assigned target keeps its
-credit even when its block candidate loses the tip race; block-path failures
-are still counted under the existing rejection reason IDs. The one exception
-is a hash that solves a block while missing the share target (possible while
-the listener floor sits above network difficulty): its share credit lands only
-when qbitd accepts the block, as before. Audit bundles containing any
-`credit_policy` row use `qbit.prism.audit-bundle.v1.1`; upgrade mirrors and
-verifiers before enabling a non-zero stale-grace window in production.
-
-## How Reward Accounting Works
-
-1. A miner connects to direct PRISM Stratum and authorizes with
-   `<qbit-payout-address>[.<worker>]`.
-2. The coordinator validates the payout identity, builds qbit work from
-   `getblocktemplate`, negotiates version rolling, and applies fixed difficulty
-   or vardiff.
-3. Valid submitted shares are appended to `qbit_share_ledger` with a monotonic
-   `share_seq`, unique `share_id`, miner identity, P2MR payout program, share
-   difficulty, template height, job issue time, and acceptance time.
-4. When a submitted share solves a block, PRISM freezes the block view at that
-   job's issue time.
-5. PRISM walks backward through eligible shares by `share_seq` until it counts
-   `8 * network_difficulty` units of share work. The oldest included share is
-   partially counted if it crosses the boundary.
-6. Counted share weights are aggregated by payout program and converted into a
-   `qbit.prism.reward-manifest.v1`.
-7. The payout policy combines current gross reward with each recipient's prior
-   carry-forward balance, applies payout floors and optional pool fees, and
-   emits `qbit.prism.payout-policy.v1`.
-8. The builder emits a deterministic P2MR coinbase and signed payout manifest.
-9. The coordinator submits the block to qbit and persists the block, payout
-   rows, audit bundle, and settlement artifacts.
-
-The `8 * network_difficulty` rule defines a work window, not a fixed wall-clock
-period. qbit's permissionless lane targets one block every 75 seconds, so eight
-network-difficulty units correspond to a nominal 600 seconds (10 minutes) when
-the pool has all permissionless hashrate. If the pool has fraction `p` of that
-hashrate, the expected span is `600 / p` seconds, equivalently eight times the
-pool's expected permissionless block time. The observed span can be shorter or
-longer as pool hashrate, vardiff, and share timing change. It is separate from
-the coinbase-maturity delay.
-
-The public live reward leaderboard anchors at its snapshot time and uses the
-current permissionless difficulty, making it a prospective next-block view.
-Every found block instead freezes its own window at that job's issue time and
-difficulty; its audit bundle is the authoritative historical record. Startup
-collection jobs remain the exception described below.
-
-Eligibility is intentionally strict. A share can enter the found block's window
-only when both `job_issued_at <= anchor_job_issued_at` and
-`accepted_at <= anchor_job_issued_at`. That prevents a delayed old-job share
-from appearing after the found-block anchor and changing the published split.
-
-Before the ledger has accepted shares from `PRISM_MIN_READY_MINERS` distinct
-miners, jobs run in collection mode: the audit bundle's window is a single
-synthetic bootstrap share for the connecting worker, so its signed coinbase
-manifest pays that worker the whole reward. A block solved on a collection job
-is submitted like any other and settles solver-pays-all (counted by
-`qbit_prism_collection_block_submissions_total`); the shares collected
-meanwhile stay ledgered and enter the window of the next ready block. Once the
-pool crosses the readiness threshold, the template poller replaces outstanding
-collection jobs with windowed work on its next pass.
-
-## Payout Policy
-
-PRISM separates three concepts that are easy to conflate:
-
-- **Reward entitlement:** the pro-rata gross amount produced by the share
-  window.
-- **Spendability floor:** the minimum output size considered economic for qbit
-  P2MR spends.
-- **Settlement shape:** whether an owed recipient is paid directly in the
-  coinbase, through a CTV fanout, or carried forward.
-
-The default spendability floor is:
-
-```text
-3,680 bytes/input * 1 bit/byte * 4x safety = 14,720 bits
+```mermaid
+flowchart LR
+    M[Miners] --> A[Rust Prism instance A]
+    M --> B[Rust Prism instance B]
+    A --> DB[(HA PostgreSQL writer endpoint)]
+    B --> DB
+    A --> QA[qbitd]
+    B --> QB[qbitd]
+    DB --> API[Shared accounting and audit history]
 ```
 
-Override it with `PRISM_PAYOUT_MIN_OUTPUT_BITS`, or tune the formula with
-`PRISM_PAYOUT_P2MR_SPEND_INPUT_BYTES`,
-`PRISM_PAYOUT_TARGET_FEERATE_BITS_PER_BYTE`, and
-`PRISM_PAYOUT_SAFETY_MULTIPLIER`. Legacy `_SATS` aliases are still accepted by
-some code paths.
+Each process uses a multithreaded Tokio runtime for network and database work,
+with bounded CPU workers for in-process payout and audit construction. Stratum,
+job refresh, block submission, CTV broadcasting, and HTTP service run in the
+same native executable. There is no Python runtime or builder subprocess in the
+mining path.
 
-Sub-floor balances are not discarded. The payout manifest records gross amount,
-prior balance, candidate balance, on-chain amount, settlement fee, and
-carry-forward balance per account. Current owed balances are recomputed by
-replaying active carry-forward deltas.
+Multiple physical servers can serve miners simultaneously against the same
+PostgreSQL database. Short transaction locks give accepted shares one global
+`share_seq` order and freeze consistent payout snapshots. Each server can write;
+there is no elected application writer. Database constraints deduplicate proof
+replays across connections and instances. Durable, expiring claims coordinate
+block candidates and CTV broadcasts.
 
-Pool fees are optional. When enabled, configure `PRISM_POOL_FEE_ENABLED`,
-`PRISM_POOL_FEE_BPS`, and either `PRISM_POOL_FEE_ADDRESS` or
-`PRISM_POOL_FEE_P2MR_PROGRAM_HEX`.
+Use one PostgreSQL **writer endpoint**, including when the database itself is
+HA. A successful ordinary share ACK follows its durable commit. Keep `fsync`,
+`full_page_writes`, and `synchronous_commit` enabled. Preserving acknowledged
+shares after primary loss also requires synchronous replication and a failover
+policy that promotes a standby containing those durable commits. An
+asynchronous replica alone does not provide that guarantee.
 
-### Coinbase Output Ordering
+Instances share chain identity, payout policy, signing keys, and accounting
+state; a database fingerprint rejects conflicting configurations. Assign a
+unique `PRISM_INSTANCE_ID` on each server, or allow a generated UUID. Local
+ports, database connection limits, and CPU counts may differ. Session
+extranonces come from a database sequence to avoid overlap across instances.
 
-Coinbase payout outputs are ordered lexicographically by
-`(order_key, recipient_id, p2mr_program_hex)`, with the zero-value witness
-commitment always last. Miner outputs use the payout address as `order_key`,
-and CTV covenant outputs use synthetic `ctv-fanout-<index>` keys, so the pool
-fee lands wherever its `order_key` happens to sort and can even route through a
-CTV fanout chunk. `PRISM_COINBASE_OUTPUT_POLICY` makes the ordering rule
-explicit:
+See [ledger operations](docs/prism-ledger-ops.md) for the transaction and recovery
+contract, and [Rust migration](docs/prism-rust-migration.md) before upgrading an
+existing deployment. Python and Rust coordinators must not run together.
 
-```text
-PRISM_COINBASE_OUTPUT_POLICY=canonical|pool-fee-first
-```
+## Reward accounting
 
-- **`canonical`** (default) preserves the historical ordering exactly.
-- **`pool-fee-first`** requires an enabled pool fee and, whenever the fee
-  output is positive, reserves one direct coinbase settlement slot for it,
-  never routes the fee through CTV fanout, and emits the fee at coinbase
-  `vout 0`. Direct miner and CTV covenant outputs keep canonical ordering
-  after it, and the witness commitment stays last. A sub-floor fee is still
-  settled directly, and job construction fails instead of demoting the fee
-  when the settlement output budget cannot hold the reserved slot.
+PRISM follows the ordered-share reward model described by
+[OCEAN's TIDES documentation](https://ocean.xyz/docs/tides), adapted to qbit
+settlement. An accepted proof keeps its individual identity and work weight.
+The reward window includes the newest eligible shares until it reaches
+`8 × network_difficulty`; only the needed fraction of the oldest share counts.
+A shorter historical log contributes all eligible work.
 
-Unknown values are rejected at startup. The selected policy is committed in
-the payout policy manifest (and therefore in the on-chain audit commitment and
-signed audit bundle), so independent verifiers and downstream indexers can
-determine the intended ordering without operator-local environment
-configuration; `qbit-prism-audit-verify` enforces it and reports it as
-`coinbase_output_policy`.
+A found block uses the snapshot committed into its issued job. Both job issue
+time and acceptance time must be no later than the snapshot anchor, so shares
+arriving later cannot change an already published split. The canonical ledger
+clock and transaction boundary make this rule consistent across servers.
 
-Switching policies changes the coinbase txid, manifest hashes, and CTV parent
-vouts prospectively, at job-construction time only. Blocks and persisted CTV
-artifacts built under the previous policy continue to verify under their
-original ordering.
+When the pool has no historical shares, bootstrap work pays its solver, subject
+to the configured payout and fee policy. There is no minimum miner-count gate.
+Once historical shares exist, jobs use the shared reward window. A hash meeting
+the network target but falling below its assigned share target is preserved as
+a durable candidate; it earns network-difficulty credit only after confirmation
+that its block is on the active chain.
 
-## Direct Coinbase Settlement
+Normal shares receive the difficulty assigned to their job. Vardiff adjusts each
+connection within configured bounds. The optional high-difficulty listener
+serves the same ledger and payout universe. Accepted stale-grace shares carry
+an explicit audit credit policy; mainnet requires
+`PRISM_STRATUM_STALE_GRACE_SECONDS=0`.
 
-Without CTV settlement, PRISM pays selected accounts directly from the coinbase
-and carries the rest forward. This is simple and non-custodial, but it is bound
-by practical coinbase-output limits. qbit can accept large P2MR coinbases in
-tests, but one public Stratum template must remain compatible with miner
-firmware and operator policy.
+## Payouts and settlement
 
-The current non-DATUM-style launch defaults are:
+Operator-facing amounts are integer **bits**, the smallest qbit unit. Legacy
+`*_sats` names in accounting types, audit JSON, and verifier flags mean the same
+unit and remain compatible.
 
-```text
-max settlement coinbase outputs: 16
-max direct recipient outputs:    12
-```
-
-Those are policy defaults, not qbit consensus limits.
-
-## CTV Fanout Settlement
-
-CTV settlement lets PRISM keep the coinbase small while still assigning every
-recipient to a non-custodial settlement path.
-
-When `PRISM_CTV_SETTLEMENT_ENABLED=1`, PRISM partitions recipients into:
-
-- **direct coinbase recipients:** usually the largest eligible balances, paid
-  directly in the generation transaction;
-- **CTV fanout chunks:** bounded groups of recipients paid by later
-  precommitted fanout transactions.
-
-Each fanout chunk becomes one covenant output in the coinbase. That output is a
-qbit P2MR script-path output committing to `<ctv_hash> OP_CHECKTEMPLATEVERIFY`.
-The `ctv_hash` is computed from the exact fanout transaction template. The
-fanout transaction pays the miners' P2MR outputs and cannot be changed without
-breaking the covenant.
-
-Important properties:
-
-- There is no pool custody address.
-- There is no pool spend key for the fanout funds.
-- After coinbase maturity, anyone with the artifact can broadcast the fanout.
-- The manifest is an audit artifact, not by itself proof that a real block was
-  mined. Verifiers must check the chain, block height, maturity, parent
-  coinbase output, and audit commitment.
-
-Current CTV policy defaults:
+PRISM combines each miner's gross reward with prior carry-forward balances,
+including balances for miners with no current shares. Its default economic
+output floor is:
 
 ```text
-PRISM_DIRECT_COINBASE_PAYOUT_FLOOR_BITS=10485760
-PRISM_MAX_COINBASE_SETTLEMENT_OUTPUTS=16
-PRISM_MAX_DIRECT_COINBASE_OUTPUTS=12
-PRISM_MAX_CTV_FANOUT_RECIPIENTS_PER_TRANSACTION=1000
-PRISM_CTV_FANOUT_FEE_PREMIUM_BPS=12000
+3,680 input bytes × 1 bit/byte × 4 safety multiplier = 14,720 bits
 ```
 
-The direct coinbase floor uses OCEAN's public on-chain payout threshold as a
-reference point and raises it for qbit launch policy. Balances below the direct
-floor can route through CTV fanout instead of consuming scarce coinbase output
-slots.
+Set `PRISM_PAYOUT_MIN_OUTPUT_BITS` for an explicit floor or configure the
+`PRISM_PAYOUT_*` formula inputs. Positive amounts that cannot be paid remain
+visible as carry-forward balances. Construction fails if the selected
+recipients cannot fund a valid exact-value coinbase; it does not silently drop
+entitlements or create an overpayment.
 
-Fanout fees are fixed by the committed transaction. PRISM supports two fee
-shapes:
+Direct settlement pays miners in P2MR coinbase outputs. With
+`PRISM_CTV_SETTLEMENT_ENABLED=1`, overflow or smaller eligible payments can use
+CTV outputs committing to later fanout transactions. The operator cannot
+redirect those committed payments. Conservative defaults are:
 
-- **Built-in-fee fanout:** the fanout reserves its parent fee up front and has
-  no CPFP anchor.
-- **CPFP-anchor fanout:** the parent pays zero fee and includes a keyless P2A
-  anchor so any broadcaster can attach a fee-paying child package later.
+| Setting | Default |
+| --- | ---: |
+| Direct coinbase payout floor | 10,485,760 bits |
+| Total settlement coinbase output cap | 16 |
+| Direct recipient output cap | 12 |
+| Recipients per CTV fanout | 1,000 |
+| CTV fee premium | 12,000 basis points, or 120% of the market rate |
 
-The broadcaster is not a custodian. It cannot change fanout outputs; it can
-only pay or bump package fees from its own funding input when configured.
+These are pool/miner compatibility policies. The hard settlement ceiling is
+500 outputs. Configure them with `PRISM_DIRECT_COINBASE_PAYOUT_FLOOR_BITS`,
+`PRISM_MAX_COINBASE_SETTLEMENT_OUTPUTS`, `PRISM_MAX_DIRECT_COINBASE_OUTPUTS`,
+`PRISM_MAX_CTV_FANOUT_RECIPIENTS_PER_TRANSACTION`, and
+`PRISM_CTV_FANOUT_FEE_PREMIUM_BPS`.
 
-## Maturity And Reorgs
+An optional explicit pool fee is governed by `PRISM_POOL_FEE_*`. Output order is
+`canonical` by default; `PRISM_COINBASE_OUTPUT_POLICY=pool-fee-first` requires a
+configured pool fee. Fee policy and output order are part of the shared cluster
+fingerprint and signed audit evidence.
 
-qbit coinbase maturity is 1000 blocks. PRISM payout entries begin as
-`immature`, become `mature` only when the active tip reaches
-`block_height + 1000`, and can be reversed while immature if the block is
-disconnected.
+Coinbase maturity is 1,000 blocks. Immature disconnected blocks stop
+contributing to current balances and can reactivate. Terminal reversal retains
+the historical records. A mature disconnect stops normal accounting for
+operator investigation. The carry-forward integrity endpoint replays active
+rows and exposes a deterministic `audit_head_sha256` that operators can mirror.
 
-The coordinator keeps block and payout state in Postgres:
+CTV broadcasting can run on several instances: database claims coordinate
+work, and the parent must be mature and active. Fee-bearing committed fanouts
+can be broadcast without a wallet. Optional positive CPFP sponsorship needs a
+configured wallet. On mainnet, configure a reviewed positive
+`PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT`; a new chain cannot
+provide a useful market estimate from absent transaction history.
 
-- accepted blocks and candidates in `qbit_pool_blocks`;
-- direct and carry-forward payout entries in `qbit_pool_payout_entries`;
-- current carry-forward deltas in `qbit_payout_carry_forward`;
-- audit bundle rows in `qbit_pool_audit_bundles`;
-- CTV fanout artifacts and broadcast attempts in CTV-specific tables.
+## Audit bundles and HTTP compatibility
 
-Immature reorg handling does not mutate historical shares. It marks affected
-block/payout/carry rows inactive or reversed, then owed balances are recomputed
-from active rows. Mature disconnects are treated as exceptional and must not be
-silently rewritten.
+A logical audit bundle includes the eligible shares, found-block anchor, prior
+balances, payout policies, signed ledger attestation, reward and coinbase
+manifests, and any CTV fanout manifests. Ordinary bundles use
+`qbit.prism.audit-bundle.v1`; explicit credit-policy rows use v1.1.
 
-## Audit Bundles And Verification
+New database records retain the non-share body plus an immutable reference to a
+canonical ledger range. Reconstruction verifies the share digest and canonical
+bundle hash before serving the full logical bundle. Overlapping block windows
+therefore reuse share rows instead of copying the same arrays into every audit.
+Existing inline bundles and imported filesystem artifacts retain their canonical
+hashes. See [storage sizing](docs/prism-storage-sizing.md).
 
-The main per-block public artifact is `qbit.prism.audit-bundle.v1` for ordinary
-share windows and `qbit.prism.audit-bundle.v1.1` when the window contains
-`credit_policy` rows such as stale-grace shares. It contains:
+Verify against an independently trusted ledger public key and on-chain coinbase:
 
-- accepted shares in the reward window;
-- found-block anchor data;
-- prior carry-forward balances;
-- payout policy inputs;
-- ledger-window attestation;
-- reward manifest;
-- payout-policy manifest;
-- optional settlement-mode and CTV fanout manifests;
-- signed deterministic coinbase manifest.
-
-The verifier recomputes:
-
-```text
-shares + found block
-  -> reward manifest
-  -> payout policy manifest
-  -> coinbase manifest
-  -> full coinbase transaction match
-```
-
-Use:
-
-```bash
-cargo run -p qbit-prism --bin qbit-prism-audit-verify -- audit-bundle.json \
+```sh
+cargo run --locked -p qbit-prism --bin qbit-prism-audit-verify -- audit-bundle.json \
   --coinbase-tx-hex "$COINBASE_TX_HEX" \
   --ledger-writer-public-key-hex "$LEDGER_WRITER_PUBLIC_KEY_HEX" \
   --expected-coinbase-value-sats "$EXPECTED_COINBASE_VALUE_SATS"
 ```
 
-`LEDGER_WRITER_PUBLIC_KEY_HEX` must come from trusted operator distribution, not
-from the bundle being verified. The bundle can prove consistency with that key;
-it cannot prove the key itself is the right one.
+Do not obtain the trusted key solely from the artifact being verified.
 
-For storage efficiency, the coordinator can store compact audit bodies and share
-segments while preserving the same logical v1 bundle for verifiers and public
-API readers.
+The public dashboard contract remains under `/public/v1`, including pool
+summary, hashrate series, reward/3h leaderboards, blocks, settlement artifacts,
+fanouts, mining configuration, and miner earnings, payouts, and workers.
+Amounts, decimal string conventions, error envelopes, CORS, ETags, and aliases
+are retained. See the [API guide](docs/public-dashboard-api/README.md) and
+[OpenAPI schema](docs/public-dashboard-api-v1.openapi.yaml).
 
-## HTTP Surfaces
+Operational routes include `/healthz`, `/metrics`, `/audit/latest`,
+`/owed-balances`, `/audit/share-window`, `/audit/carry-forward-integrity`, block
+payout/bundle/CTV routes, and fanout status routes. They share the audit listener;
+expose only `/public/v1` through a public reverse proxy. Health and Prometheus
+counters describe the individual process; dashboard accounting reads the shared
+database. The old Python scheduler's detailed metric series are replaced by
+native process health and counters.
 
-The coordinator exposes a private audit/ops listener and a dashboard-safe public
-API from the same process.
+## Run and operate
 
-Private/internal endpoints include:
+Build native binaries:
 
-- `/healthz`
-- `/metrics`
-- `/audit/latest`
-- `/owed-balances`
-- `/audit/share-window`
-- `/audit/blocks/{block_hash}/payouts`
-- `/audit/blocks/{block_hash}/bundle`
-- `/audit/blocks/{block_hash}/ctv-fanouts`
-- `/audit/fanouts/pending`
-- `/audit/fanouts/{fanout_txid}/status`
-- `/audit/carry-forward-integrity`
-
-Do not expose `/audit/*`, `/metrics`, `/healthz`, Postgres, qbit RPC, or Docker
-volumes directly to the internet.
-
-Dashboard-safe endpoints live under `/public/v1`. The public API contract is:
-
-- [docs/public-dashboard-api/README.md](docs/public-dashboard-api/README.md)
-- [docs/public-dashboard-api-v1.openapi.yaml](docs/public-dashboard-api-v1.openapi.yaml)
-
-Operators can expose only `/public/v1` through a reverse proxy or dashboard
-frontend.
-
-## Run PRISM Locally
-
-Prerequisites:
-
-- Docker with the Compose plugin and a running Docker daemon.
-- `make`, `bash`, `git`, `rsync`, and Python 3.
-- Rust/Cargo for key derivation and verifier tooling.
-
-Create and review environment:
-
-```bash
-cp .env.example .env
-$EDITOR .env
+```sh
+cargo build --locked --release -p qbit-prism-server -p qbit-prism --bins
 ```
 
-For the default `QBIT_PROVIDER=git` flow, the stack clones qbit from
-`QBIT_GIT_URL`/`QBIT_GIT_REF`. To use a local qbit checkout, set
-`QBIT_PROVIDER=source` and `QBIT_SRC_DIR=/absolute/path/to/qbit`.
+Configure `.env` from [.env.example](.env.example). Retain existing signing keys
+when migrating. For a new pool, generate separate manifest and ledger seeds and
+derive the ledger public key using the builder's `--print-public-key-hex` option
+as shown in the repository [quick start](README.md#run-prism-pool).
 
-Generate PRISM signing material:
+The local Compose profile starts qbitd, PostgreSQL, and the Rust coordinator:
 
-```bash
-PRISM_MANIFEST_SIGNING_SEED_HEX="$(openssl rand -hex 32)"
-PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX="$(openssl rand -hex 32)"
-PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX="$(
-  cargo run -q -p qbit-pool-builder -- \
-    --signing-key-seed-hex "$PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX" \
-    --print-public-key-hex
-)"
-```
-
-Store those three values in `.env`. Keep these disabled outside local test
-harnesses:
-
-```text
-PRISM_ALLOW_MEMORY_LEDGER=0
-PRISM_ALLOW_TEST_SIGNING_SEEDS=0
-PRISM_ALLOW_BUNDLE_EMBEDDED_LEDGER_KEY=0
-PRISM_ALLOW_FIXED_LEDGER_SESSION_TOKEN=0
-```
-
-For non-regtest deployments, also set `QBIT_PRODUCTION=1`, non-default qbit RPC
-credentials, non-default Postgres credentials, chain-specific qbit settings,
-and explicit reviewed production values for `PRISM_STRATUM_SHARE_DIFF`,
-`PRISM_STRATUM_VARDIFF_MIN_DIFF`, `PRISM_STRATUM_VARDIFF_START_DIFF`, and
-`PRISM_STRATUM_VARDIFF_MAX_DIFF`. Production rejects the local-lab `1e-9`
-profile and requires `minimum <= start <= maximum`. Capacity qualification is
-optional and external to startup; see
-[docs/prism-capacity-readiness.md](docs/prism-capacity-readiness.md).
-
-Start the pool:
-
-```bash
+```sh
 make up-prism-pool
-```
-
-The target prints the Stratum URL. Miners should use:
-
-```text
-URL:      stratum+tcp://<host>:3340
-username: <qbit-payout-address>[.<worker>]
-password: x
-```
-
-Run readiness checks:
-
-```bash
 make prism-self-check
 ```
 
-Static-only checks, before the stack is live:
+Default Stratum is port 3340; the audit listener is port 3341. Compose keeps HTTP
+inside the coordinator namespace. Usernames are
+`<qbit-payout-address>[.<worker>]`.
 
-```bash
-python3 scripts/prism-self-check.py --skip-live
+For an external database shared by multiple hosts:
+
+```sh
+docker compose -f compose.yaml -f compose.prism-external-db.yaml \
+  --profile prism up -d qbitd prism-coordinator
 ```
 
-For an explicitly authorized mainnet prelaunch, set `QBIT_CHAIN=mainnet`,
-`QBIT_CHAIN_FLAG=-chain=main`, both production flags to `1`,
-`CKPOOL_NON_TEST_READINESS_GATE=0`, and the launch-readiness flag to `0`. Only
-then does
-`QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0` change three expected
-launch-dependent conditions from FAIL to WARN: qbitd still being in IBD, the
-high-diff listener not yet advertising its first `mining.set_difficulty`, and
-the coordinator having fewer than `PRISM_MIN_READY_MINERS` ready miners. An
-incomplete combination fails the static self-check and keeps live checks
-strict. Chain identity (including the normal `QBIT_CHAIN=mainnet` / RPC
-`chain=main` naming), secrets, Postgres, fee policy, listener reachability, and
-every other check remain active and fatal. Set the flag to `1` at launch to make
-all three strict again. An unset flag keeps the legacy strict behavior;
-malformed values fail the self-check rather than authorizing prelaunch.
+Set the same `PRISM_DATABASE_URL` on all hosts. `QBIT_RPC_HOST` is overridable;
+each instance may use its own fully synchronized qbitd. See the migration guide
+for production image/storage overlays and external-node startup.
 
-When a stale genesis is itself keeping qbitd in IBD and preventing the first
-template, an operator may also set the reviewed, positive
-`QBIT_MAINNET_PRELAUNCH_MAX_TIP_AGE_SECONDS` duration. The qbitd wrapper turns
-that value into one `-maxtipage=<seconds>` argument only when the complete
-five-value mainnet prelaunch authorization above is present. Review it against
-genesis age and the planned launch window. After the first-block bootstrap, set
-the launch flag to `1` and restart; the wrapper then omits the argument and
-restores qbitd's normal tip-age policy even if the duration remains in the
-environment. Caller-provided `-maxtipage` and `--maxtipage` daemon arguments
-are rejected in every mode.
-Static self-checks validate a configured duration before attempting live
-checks, using the same positive signed-64-bit range and production-mainnet
-requirements as the qbitd wrapper.
+Common commands, with the operator environment exported:
 
-Stop services with normal Docker Compose controls or `make down`. The normal
-target stops PRISM but preserves its Postgres and audit volumes because the
-ledger is operator state. The explicitly destructive
-`make purge-local-volumes` target is restricted to confirmed, non-production,
-non-main-chain cleanup.
-
-## Run On Signet
-
-The stack defaults to regtest. To point PRISM at a qbit signet, set the normal
-qbit signet overrides in `.env`:
-
-```text
-QBIT_CHAIN=signet
-QBIT_CHAIN_FLAG=-signet
-QBIT_NODE_EXTRA_ARG=-signetchallenge=<your_signet_challenge_hex>
-QBIT_LISTEN=0
-QBIT_RPC_PORT=38352
-QBIT_P2P_PORT=38355
-QBIT_RPC_PORT_HOST=127.0.0.1:38352
-QBIT_P2P_PORT_HOST=127.0.0.1:38355
-QBIT_MINER_ADDRESS=auto
+```sh
+qbit-prism-server check-config
+qbit-prism-server migrate
+qbit-prism-server run
+qbit-prism-server healthcheck --url http://127.0.0.1:3341/healthz
+qbit-prism-server self-check
+qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
+qbit-prism-server backfill-ctv
+qbit-prism-server broadcast-ctv
 ```
 
-Keep RPC loopback-only unless the deployment has explicit firewalling and
-deployment-specific authentication.
+`check-config` validates configuration without listeners. `self-check` checks a
+live deployment, including node identity, database integrity/durability, and
+HTTP readiness. Migration/import commands and native defaults are documented
+in the [server README](crates/qbit-prism-server/README.md).
 
-## Enable CTV Settlement
+Tune `PRISM_RUNTIME_WORKERS`, `PRISM_JOB_BUILD_EXECUTOR_WORKERS`, and
+`PRISM_DATABASE_MAX_CONNECTIONS` against measured load. Size database connections
+across all instances. The former Python batch-writer, writer-lease, subprocess,
+and incremental-refresh scheduler settings no longer configure the runtime.
 
-CTV settlement is off by default. Enable it only on qbit networks/nodes where
-the relevant CTV, P2MR, TRUC, and P2A policy paths are supported by the node
-you are mining against.
+## Validation and further reading
 
-Minimal environment:
-
-```text
-PRISM_CTV_SETTLEMENT_ENABLED=1
-PRISM_DIRECT_COINBASE_PAYOUT_FLOOR_BITS=10485760
-PRISM_MAX_COINBASE_SETTLEMENT_OUTPUTS=16
-PRISM_MAX_DIRECT_COINBASE_OUTPUTS=12
-PRISM_MAX_CTV_FANOUT_RECIPIENTS_PER_TRANSACTION=1000
-PRISM_CTV_FANOUT_FEE_PREMIUM_BPS=12000
+```sh
+cargo test --locked -p qbit-prism
+bash test/prism-native-tests.sh
+QBITD_BIN=/path/to/qbitd bash test/prism-native-tests.sh live
+cargo run --locked --release -p qbit-prism-server -- benchmark \
+  --shares 100000 --miners 100 --iterations 10 --output-json /tmp/prism-builder.json
 ```
 
-Fee-rate selection:
+The native test wrapper uses a supplied `PRISM_TEST_DATABASE_URL` or starts an
+isolated local PostgreSQL cluster. Live tests use real qbitd regtest and bounded
+CPU mining. The builder benchmark measures synthetic build-and-verify work;
+complete Stratum-to-durable-commit capacity requires separate load evidence.
 
-- Mainnet requires an explicit, reviewed, positive
-  `PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT`.
-- On non-mainnet networks, leaving it empty uses the node fee estimate path.
-
-Broadcaster:
-
-```text
-PRISM_CTV_BROADCASTER_ENABLED=1
-PRISM_CTV_BROADCASTER_LIMIT=100
-PRISM_CTV_BROADCASTER_CHUNK_SIZE=5
-PRISM_CTV_BROADCASTER_INTERVAL_SECONDS=30
-PRISM_CTV_BROADCASTER_FEE_BITS=0
-```
-
-If `PRISM_CTV_BROADCASTER_FEE_BITS` is positive, configure
-`PRISM_CTV_BROADCASTER_WALLET` so the broadcaster can fund and sign the CPFP
-child. Built-in-fee fanouts do not require a wallet for normal parent
-broadcast.
-
-## Useful Tests
-
-Fast sanity:
-
-```bash
-make test-compose-prism-config
-python3 scripts/prism-self-check.py --skip-live
-```
-
-Rust accounting, settlement, verifier, and CTV tests:
-
-```bash
-cargo test --locked --workspace --all-targets
-```
-
-PRISM end-to-end and ledger tests:
-
-```bash
-make test-prism-regtest
-make test-prism-postgres-ledger
-make test-prism-stratum-regtest-live
-make test-prism-stratum-postgres-regtest-live
-make test-prism-combined-regtest
-```
-
-Capacity harness:
-
-```bash
-make test-prism-postgres-throughput
-```
-
-The throughput harness measures schema/query capacity. It does not replace a
-live miner-swarm load test.
-
-## Operational Notes
-
-- Use Postgres in production. The memory ledger is for local/regtest proof runs
-  only.
-- Distribute the trusted ledger writer public key out of band.
-- Keep manifest signing and ledger attestation signing seeds distinct.
-- Back up Postgres and audit artifacts together. Hashes prove artifact
-  integrity; backups prove availability.
-- Do not compact `qbit_share_ledger` until an archive proof exists.
-- Mirror or pin `/audit/carry-forward-integrity` after payout-affecting blocks.
-- Keep qbit RPC private and authenticated.
-- Expose `/public/v1` through a dashboard or reverse proxy; keep audit and
-  metrics private.
-
-For storage and VM sizing, see
-[docs/prism-storage-sizing.md](docs/prism-storage-sizing.md). For the formal
-ledger operations contract, see
-[docs/prism-ledger-ops.md](docs/prism-ledger-ops.md).
-
-## Public Documentation Map
-
-Start here:
-
-- [README.md](README.md): repository overview and quick starts.
-- [PRISM.md](PRISM.md): PRISM concept, runbook, and settlement model.
-- [doc/mining.md](doc/mining.md): qbit mining operator guide.
-
-Then use the focused docs:
-
-- [docs/public-dashboard-api/README.md](docs/public-dashboard-api/README.md):
-  public dashboard API boundary.
-- [docs/prism-storage-sizing.md](docs/prism-storage-sizing.md): storage and VM
-  sizing.
-- [docs/prism-rejections.md](docs/prism-rejections.md): stable Stratum/API
-  rejection reason IDs.
-- [docs/router-integration-notes.md](docs/router-integration-notes.md): router
-  guidance for the ckpool comparison path.
-
-For the broader docs cleanup map, see [docs/README.md](docs/README.md).
+- [Migration and multi-instance deployment](docs/prism-rust-migration.md)
+- [Ledger operations and recovery](docs/prism-ledger-ops.md)
+- [Mainnet deployment](docs/mainnet-deployment.md)
+- [Storage and resource planning](docs/prism-storage-sizing.md)
+- [Native performance measurement](docs/prism-payout-artifact-measurement.md)
+- [Optional capacity qualification](docs/prism-capacity-readiness.md)

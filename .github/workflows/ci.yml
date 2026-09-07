@@ -44,12 +44,6 @@ jobs:
       - name: Run Python unit tests
         run: python -m unittest discover -s tests -p 'test_*.py'
 
-      - name: Run Postgres ledger integration tests
-        run: make test-prism-postgres-ledger
-
-      - name: Run Postgres production-scale fixture tests
-        run: make test-prism-postgres-scale
-
       - name: Validate mainnet Compose contract
         run: python -m unittest tests.test_mainnet_compose_contract
 
@@ -69,6 +63,8 @@ jobs:
               --profile "$profile" \
               config --quiet
           done
+          docker compose --env-file config/upstream.env.example --env-file .env.example \
+            -f compose.yaml -f compose.prism-external-db.yaml --profile prism config --quiet
 
   ckpool-rejects-observability:
     name: ckpool rejects observability live suite
@@ -94,28 +90,50 @@ jobs:
       - name: Build patched ckpool and run live regression and load tests
         run: make test-ckpool-rejects-observability
 
-  postgres-native-client:
-    name: PostgreSQL ledger API with production psycopg
+  prism-native-postgres:
+    name: Rust PRISM PostgreSQL and multi-instance contracts
     runs-on: blacksmith-2vcpu-ubuntu-2404
-    timeout-minutes: 10
-
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: prism_test
+          POSTGRES_USER: prism_test
+          POSTGRES_PASSWORD: prism_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U prism_test -d prism_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      PRISM_TEST_DATABASE_URL: postgresql://prism_test:prism_test@127.0.0.1:5432/prism_test
+      PRISM_TEST_PG_BIN_DIR: /usr/lib/postgresql/16/bin
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Install production PostgreSQL client dependency
-        run: python -m pip install "psycopg[binary]==3.2.*"
-
-      - name: Run complete share-ledger API suite with psycopg installed
-        run: python -m unittest tests.test_prism_share_ledger
-
-      - name: Run native PostgreSQL ledger integration tests
-        run: make test-prism-postgres-native-ledger
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install tools for disposable primary and standby failover test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-16
+      - name: Install pinned qbit for native mining and CTV integration
+        run: |
+          set -euo pipefail
+          prism_qbit_dir="${RUNNER_TEMP}/prism-qbit"
+          mkdir -p "${prism_qbit_dir}"
+          cd "${prism_qbit_dir}"
+          curl --fail --location --retry 3 \
+            --output qbit-1.0.0-x86_64-linux-gnu.tar.gz \
+            https://github.com/Qbit-Org/qbit/releases/download/v1.0.0/qbit-1.0.0-x86_64-linux-gnu.tar.gz
+          printf '%s  %s\n' \
+            ae121af03263b55d530e3f3e8719a71362d0950cba82f54a2bc2d6c437a029b5 \
+            qbit-1.0.0-x86_64-linux-gnu.tar.gz | sha256sum --check
+          tar -xzf qbit-1.0.0-x86_64-linux-gnu.tar.gz
+          printf 'QBITD_BIN=%s/qbit-1.0.0/bin/qbitd\n' "${prism_qbit_dir}" >> "${GITHUB_ENV}"
+      - name: Run native ledger, API, and Stratum tests
+        run: cargo test --locked -p qbit-prism-server --all-targets
 
   docker-builds:
     name: Build lightweight Docker images
