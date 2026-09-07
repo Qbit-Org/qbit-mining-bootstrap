@@ -180,6 +180,52 @@ async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
     assert_eq!(pending["rows"][0]["cpfp_anchor_spendable"], true);
     assert_eq!(pending["rows"][0]["broadcastable_at_height"], 1011);
     assert_eq!(pending["rows"][0]["fanout_tx_sha256"], fanout_hash);
+    // The router has caching disabled so every request observes the committed
+    // retry deadline. A transient failure remains discoverable once due, while
+    // delayed retries and terminal states stay outside both pending feeds.
+    for (settlement_status, delay_seconds, expected_count) in [
+        ("failed", Some(-3600i64), 1usize),
+        ("failed", Some(3600), 0),
+        ("failed", None, 1),
+        ("confirmed", None, 0),
+        ("reorged", None, 0),
+        ("broadcastable", None, 1),
+    ] {
+        sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET settlement_status=$2,next_broadcast_attempt_at=clock_timestamp()+$3::bigint*interval '1 second' WHERE fanout_txid=$1")
+            .bind(&fanout_hash)
+            .bind(settlement_status)
+            .bind(delay_seconds)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for path in ["/public/v1/fanouts/pending", "/audit/fanouts/pending"] {
+            let (status, pending) = get(&app, path).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {pending}");
+            assert_eq!(
+                pending["rows"].as_array().unwrap().len(),
+                expected_count,
+                "{path}: status={settlement_status}, retry delay={delay_seconds:?}"
+            );
+            let public = path.starts_with("/public/");
+            let reported_count = if public {
+                &pending["pagination"]["total_count"]
+            } else {
+                &pending["count"]
+            };
+            assert_eq!(reported_count, &json!(expected_count));
+            if expected_count > 0 {
+                assert_eq!(pending["rows"][0]["fanout_txid"], fanout_hash);
+                assert_eq!(
+                    pending["rows"][0][if public {
+                        "status"
+                    } else {
+                        "settlement_status"
+                    }],
+                    settlement_status
+                );
+            }
+        }
+    }
     let (status, empty) = get(&app, "/public/v1/miners/alice/payouts?page=2&limit=1").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(empty["pagination"]["total_count"], 1);
