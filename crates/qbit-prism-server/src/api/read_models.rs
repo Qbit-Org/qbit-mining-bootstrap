@@ -259,7 +259,7 @@ pub(super) async fn fanout(state: &ApiState, hash: &str) -> ApiResult<Value> {
     }
 }
 pub(super) async fn pending_fanouts(state: &ApiState, page: i64, limit: i64) -> ApiResult<Value> {
-    let value:Value=sqlx::query_scalar("WITH eligible AS (SELECT a.fanout_txid,a.chunk_index,b.block_height FROM qbit_ctv_fanout_artifacts a JOIN qbit_pool_blocks b USING(block_hash) WHERE a.settlement_status NOT IN ('confirmed','reorged') AND (a.next_broadcast_attempt_at IS NULL OR a.next_broadcast_attempt_at <= clock_timestamp())), page AS (SELECT * FROM eligible ORDER BY block_height,chunk_index,fanout_txid LIMIT $1 OFFSET $2) SELECT jsonb_build_object('total_count',(SELECT count(*) FROM eligible),'rows',COALESCE((SELECT jsonb_agg(qbit_fanout_status(fanout_txid) ORDER BY block_height,chunk_index,fanout_txid) FROM page),'[]'::jsonb))").bind(limit).bind((page-1)*limit).fetch_one(&state.pool).await?;
+    let value:Value=sqlx::query_scalar("WITH eligible AS (SELECT a.fanout_txid,a.chunk_index,b.block_height FROM qbit_ctv_fanout_artifacts a JOIN qbit_pool_blocks b USING(block_hash) WHERE b.chain_state='confirmed' AND a.settlement_status NOT IN ('confirmed','reorged') AND (a.next_broadcast_attempt_at IS NULL OR a.next_broadcast_attempt_at <= clock_timestamp())), page AS (SELECT * FROM eligible ORDER BY block_height,chunk_index,fanout_txid LIMIT $1 OFFSET $2) SELECT jsonb_build_object('total_count',(SELECT count(*) FROM eligible),'rows',COALESCE((SELECT jsonb_agg(qbit_fanout_status(fanout_txid) ORDER BY block_height,chunk_index,fanout_txid) FROM page),'[]'::jsonb))").bind(limit).bind((page-1)*limit).fetch_one(&state.pool).await?;
     Ok(page_payload(value, page, limit))
 }
 pub(super) async fn artifact(state: &ApiState, hash: &str) -> ApiResult<Value> {

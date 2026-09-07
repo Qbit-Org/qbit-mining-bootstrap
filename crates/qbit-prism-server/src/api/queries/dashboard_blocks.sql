@@ -3,7 +3,7 @@
 WITH total AS (
     SELECT count(*) AS total_count
     FROM qbit_pool_blocks
-    WHERE chain_state <> 'reversed'
+    WHERE chain_state = 'confirmed'
 ),
 page_blocks AS (
     SELECT
@@ -12,7 +12,7 @@ page_blocks AS (
         block.found_at,
         block.payout_manifest_sha256
     FROM qbit_pool_blocks block
-    WHERE block.chain_state <> 'reversed'
+    WHERE block.chain_state = 'confirmed'
     ORDER BY block.block_height DESC, block.found_at DESC
     LIMIT $1 OFFSET $2
 ),

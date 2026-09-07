@@ -10,7 +10,7 @@ latest_block_row AS (
         block.found_at,
         block.payout_manifest_sha256
     FROM qbit_pool_blocks block
-    WHERE block.chain_state <> 'reversed'
+    WHERE block.chain_state = 'confirmed'
     ORDER BY block.block_height DESC, block.found_at DESC
     LIMIT 1
 ),
@@ -64,8 +64,8 @@ SELECT json_build_object(
     'h3_difficulty', (SELECT h3_difficulty FROM rollups),
     'h24_difficulty', (SELECT h24_difficulty FROM rollups),
     'participants_3h', (SELECT participants_3h FROM rollups),
-    'blocks_found_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state <> 'reversed'),
-    'prism_blocks_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state <> 'reversed'),
+    'blocks_found_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'confirmed'),
+    'prism_blocks_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'confirmed'),
     'total_mined_bits', COALESCE((
         SELECT sum(carry.gross_amount_sats)
         FROM qbit_payout_carry_forward carry

@@ -23,7 +23,7 @@ WITH filtered AS (
       ON block.block_hash = carry.block_hash
     WHERE carry.miner_id = $1
       AND carry.maturity_state <> 'reversed'
-      AND block.chain_state <> 'reversed'
+      AND block.chain_state = 'confirmed'
       AND block.maturity_state <> 'reversed'
 ),
 page_base AS (

@@ -20,7 +20,7 @@ WITH filtered AS (
       ON block.block_hash = payout.block_hash
     WHERE payout.miner_id = $1
       AND payout.maturity_state <> 'reversed'
-      AND block.chain_state <> 'reversed'
+      AND block.chain_state = 'confirmed'
       AND block.maturity_state <> 'reversed'
 ),
 page_rows AS (

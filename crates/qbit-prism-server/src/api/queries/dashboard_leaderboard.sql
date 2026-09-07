@@ -39,7 +39,7 @@ blocks AS (
         ORDER BY share.accepted_at DESC, share.share_seq DESC
         LIMIT 1
     ) solver ON true
-    WHERE block.chain_state <> 'reversed'
+    WHERE block.chain_state = 'confirmed'
     GROUP BY solver.miner_id
 ),
 totals AS (

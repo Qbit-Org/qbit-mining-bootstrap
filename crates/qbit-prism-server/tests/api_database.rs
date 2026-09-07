@@ -226,6 +226,34 @@ async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
             }
         }
     }
+    for (chain_state, maturity_state, expected_count) in [
+        ("prepared", "immature", 0usize),
+        ("inactive", "immature", 0),
+        ("confirmed", "immature", 1),
+        ("confirmed", "mature", 1),
+    ] {
+        sqlx::query("UPDATE qbit_pool_blocks SET chain_state=$2,maturity_state=$3,matured_at=CASE WHEN $3='mature' THEN clock_timestamp() ELSE NULL END WHERE block_hash=$1")
+            .bind(&ctv_hash)
+            .bind(chain_state)
+            .bind(maturity_state)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for path in ["/public/v1/fanouts/pending", "/audit/fanouts/pending"] {
+            let (status, pending) = get(&app, path).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {pending}");
+            assert_eq!(
+                pending["rows"].as_array().unwrap().len(),
+                expected_count,
+                "{path}: parent {chain_state}/{maturity_state}"
+            );
+        }
+        // Discovery excludes candidates, but the explicit status remains
+        // available to explain the stored artifact's parent chain state.
+        let (status, audit) = get(&app, &format!("/audit/fanouts/{fanout_hash}/status")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(audit["chain_state"], chain_state);
+    }
     let (status, empty) = get(&app, "/public/v1/miners/alice/payouts?page=2&limit=1").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(empty["pagination"]["total_count"], 1);
@@ -295,6 +323,192 @@ async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(corrupt["error"]["message"], "internal server error");
     ledger.pool.close().await;
+    server.abort();
+    pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+}
+
+#[tokio::test]
+async fn accepted_public_blocks_and_earnings_follow_confirmed_chain_state() {
+    let Ok(url) = std::env::var("PRISM_TEST_DATABASE_URL") else {
+        eprintln!("PRISM_TEST_DATABASE_URL not set; accepted-block contract test skipped");
+        return;
+    };
+    let admin = PgPool::connect(&url).await.unwrap();
+    let schema = format!("api_states_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let options = PgConnectOptions::from_str(&url)
+        .unwrap()
+        .options([("search_path", schema.as_str())]);
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../../qbit-prism/sql/001_share_ledger.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../migrations/002_multi_instance.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, Router::new().route("/", post(rpc)))
+            .await
+            .unwrap()
+    });
+    let app = router(ApiState::new(
+        pool.clone(),
+        ApiConfig {
+            rpc_url: format!("http://{address}/"),
+            cache_enabled: false,
+            ..ApiConfig::default()
+        },
+    ));
+    let mut hashes = Vec::new();
+    // Unaccepted candidates have greater heights and distinct values, so accidentally
+    // treating them as accepted changes latest-block and reward estimates too.
+    for (index, (chain_state, height, maturity, reward)) in [
+        ("prepared", 20i64, "immature", 1_000_000i64),
+        ("inactive", 21, "immature", 2_000_000),
+        ("confirmed", 11, "immature", 3_000_000),
+        ("confirmed", 10, "mature", 4_000_000),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let hash = format!("{:064x}", index + 1);
+        let coinbase = format!("{:064x}", index + 10);
+        let manifest = format!("{:064x}", index + 100);
+        sqlx::query("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256,chain_state,maturity_state,matured_at) VALUES($1,$2,$1,$3,$4,$5,$6,CASE WHEN $6='mature' THEN clock_timestamp() ELSE NULL END)")
+            .bind(&hash).bind(height).bind(&coinbase).bind(&manifest).bind(chain_state).bind(maturity).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO qbit_pool_audit_bundles(block_hash,audit_bundle,audit_bundle_sha256,coinbase_tx_hex,found_block_bits,found_block_network_difficulty,found_block_coinbase_value_sats) VALUES($1,'{}',$2,'00','207fffff',1000000,$3)")
+            .bind(&hash).bind(format!("{:064x}", index + 200)).bind(reward).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO qbit_share_ledger(share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,writer_id,writer_epoch) VALUES($1,'alice','alice',decode(repeat('1',64),'hex'),1000000,1000000,$2,$3,clock_timestamp()-interval '20 seconds',0,clock_timestamp()-interval '10 seconds','api-lifecycle',1)")
+            .bind(format!("alice.lifecycle:{hash}")).bind(height - 1).bind(&hash).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO qbit_payout_carry_forward(block_height,block_hash,miner_id,payout_order_key,p2mr_program,gross_amount_sats,prior_balance_sats,candidate_balance_sats,onchain_amount_sats,carry_forward_balance_sats,action,maturity_state) VALUES($1,$2,'alice','alice',decode(repeat('1',64),'hex'),$3,0,$3,$3,0,'onchain',$4)")
+            .bind(height).bind(&hash).bind(reward).bind(maturity).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO qbit_pool_payout_entries(block_hash,block_height,miner_id,payout_order_key,p2mr_program,onchain_amount_sats,carry_forward_balance_sats,action,maturity_state) VALUES($1,$2,'alice','alice',decode(repeat('1',64),'hex'),$3,0,'onchain',$4)")
+            .bind(&hash).bind(height).bind(reward).bind(maturity).execute(&pool).await.unwrap();
+        hashes.push(hash);
+    }
+    for stage in 0..3 {
+        if stage > 0 {
+            let hash = if stage == 1 { &hashes[0] } else { &hashes[2] };
+            sqlx::query("UPDATE qbit_pool_blocks SET chain_state='inactive' WHERE block_hash=$1")
+                .bind(hash)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let expected_hashes = if stage < 2 {
+            vec![hashes[2].clone(), hashes[3].clone()]
+        } else {
+            vec![hashes[3].clone()]
+        };
+        let expected_count = expected_hashes.len();
+        let earnings = if stage < 2 { 7_000_000 } else { 4_000_000 };
+        let pending = if stage < 2 { 3_000_000 } else { 0 };
+        let next_reward = if stage < 2 { 3_000_000 } else { 4_000_000 };
+        let (status, blocks) = get(&app, "/public/v1/blocks").await;
+        assert_eq!(status, StatusCode::OK, "{blocks}");
+        assert_eq!(
+            blocks["pagination"]["total_count"], expected_count,
+            "stage {stage}"
+        );
+        assert_eq!(
+            blocks["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["hash"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected_hashes
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+        let (_, page) = get(&app, "/public/v1/blocks?page=2&limit=1").await;
+        assert_eq!(page["pagination"]["total_count"], expected_count);
+        assert_eq!(page["rows"].as_array().unwrap().len(), expected_count - 1);
+        let (status, summary) = get(&app, "/public/v1/pool-summary").await;
+        assert_eq!(status, StatusCode::OK, "{summary}");
+        assert_eq!(summary["pool"]["blocks_found_total"], expected_count);
+        assert_eq!(summary["pool"]["prism_blocks_total"], expected_count);
+        assert_eq!(summary["pool"]["total_mined_bits"], earnings);
+        assert_eq!(summary["pool"]["latest_block"]["hash"], expected_hashes[0]);
+        for (path, count_field) in [
+            ("/public/v1/leaderboard", "blocks_found"),
+            ("/public/v1/leaderboard?window=reward", "blocks_found_total"),
+        ] {
+            let (status, board) = get(&app, path).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {board}");
+            assert_eq!(board["rows"][0]["recipient_id"], "alice");
+            assert_eq!(
+                board["rows"][0][count_field], expected_count,
+                "{path}: stage {stage}"
+            );
+        }
+        let (status, miner) = get(&app, "/public/v1/miners/alice").await;
+        assert_eq!(status, StatusCode::OK, "{miner}");
+        assert_eq!(miner["lifetime_earnings_bits"], earnings);
+        assert_eq!(miner["pending_maturity_bits"], pending);
+        assert_eq!(
+            miner["estimated_next_block"]["estimated_reward_bits"],
+            next_reward
+        );
+        assert_eq!(
+            miner["recent_payouts"].as_array().unwrap().len(),
+            expected_count
+        );
+        for path in [
+            "/public/v1/miners/alice/earnings",
+            "/public/v1/miners/alice/payouts",
+        ] {
+            let (status, rows) = get(&app, path).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {rows}");
+            assert_eq!(
+                rows["pagination"]["total_count"], expected_count,
+                "{path}: stage {stage}"
+            );
+            assert_eq!(
+                rows["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["block_hash"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                expected_hashes
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+            );
+        }
+        for index in [0usize, 1] {
+            let (status, audit) =
+                get(&app, &format!("/audit/blocks/{}/payouts", hashes[index])).await;
+            assert_eq!(status, StatusCode::OK, "{audit}");
+            assert_eq!(audit["rows"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                audit["rows"][0]["chain_state"],
+                if index == 0 && stage == 0 {
+                    "prepared"
+                } else {
+                    "inactive"
+                }
+            );
+        }
+    }
     server.abort();
     pool.close().await;
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
