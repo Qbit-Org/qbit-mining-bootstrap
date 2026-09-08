@@ -40,7 +40,14 @@ paths:
     get:
       tags: [dashboard]
       operationId: getHashrateSeries
-      summary: Get chart-ready pool or miner hashrate time series.
+      summary: Get chart-ready pool or miner credited hashrate time series.
+      description: >
+        Every rate is credited hashrate, derived from the accepted share
+        difficulty the pool credited to the subject in each bucket. It is not
+        physical router telemetry: while the assigned share target and the
+        router's own share filtering disagree, neither the raw nor the smoothed
+        series reproduces what the router reports. Buckets with no credited
+        shares are omitted; consumers synthesize gaps.
       parameters:
         - name: subject
           in: query
@@ -60,13 +67,37 @@ paths:
         - name: bucket
           in: query
           required: false
+          description: >
+            Each range admits a fixed set of buckets: 1w allows 5m, 1h, and
+            1d; 1m allows 1h and 1d; 6m and all allow only 1d. `auto` always
+            resolves inside the allowed set. A combination outside that
+            vocabulary is rejected with `400 bad_request` naming the allowed
+            buckets.
           schema:
             allOf:
               - $ref: "#/components/schemas/HashrateBucket"
             default: auto
+        - name: view
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [both]
+          description: >
+            Omit for the `prism.dashboard.hashrate-series.v1` response, whose
+            `hashrate_ths` is the smoothed credited rate. `both` returns
+            `prism.dashboard.hashrate-series.v2` carrying the raw and the
+            smoothed credited rate for every bucket. Any other non-empty value
+            is rejected with `400 bad_request`. The view is part of the cache
+            key, so the two responses never share a cache entry. `bucket=auto`
+            resolves to 1h for 1w/1m and 1d for 6m/all; with the default 30m
+            smoothing window those coarse series have `method=none`. Request
+            `bucket=5m` to compare raw buckets with the 30m trailing rate.
       responses:
         "200":
-          description: Hashrate series.
+          description: >
+            Hashrate series. `prism.dashboard.hashrate-series.v1` without
+            `view`; `prism.dashboard.hashrate-series.v2` for `view=both`.
           headers:
             Cache-Control:
               $ref: "#/components/headers/BrowserCacheControl"
@@ -79,7 +110,59 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HashrateSeriesResponse"
+                oneOf:
+                  - $ref: "#/components/schemas/HashrateSeriesResponse"
+                  - $ref: "#/components/schemas/HashrateSeriesDualRateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+  /block-markers:
+    get:
+      tags: [dashboard]
+      operationId: getBlockMarkers
+      summary: Get found-block markers pre-bucketed onto the hashrate chart grid.
+      description: >
+        Serves the found-block markers the dashboard draws over the hashrate
+        series. Bucket epochs use the identical floor arithmetic the hashrate
+        buckets use, and bounded ranges keep only fully covered buckets, so
+        markers land in the same buckets as the hashrate points on every
+        timeframe. Buckets with no found blocks are omitted. Each bucket lists
+        at most its 3 most recent blocks and reports the full count, so long
+        ranges stay bounded without paging `/blocks`. Finer buckets than a
+        range's chart renders are rejected with `400 bad_request`: 1w allows
+        5m/1h/1d, 1m allows 1h/1d, 6m and all allow 1d only.
+      parameters:
+        - name: range
+          in: query
+          required: false
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/HashrateRange"
+            default: 1m
+        - name: bucket
+          in: query
+          required: false
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/HashrateBucket"
+            default: auto
+      responses:
+        "200":
+          description: Found-block marker series.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/BrowserCacheControl"
+            CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Vercel-CDN-Cache-Control:
+              $ref: "#/components/headers/SharedCacheControl"
+            Age:
+              $ref: "#/components/headers/Age"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BlockMarkersResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "503":
@@ -149,9 +232,31 @@ paths:
       parameters:
         - $ref: "#/components/parameters/Page"
         - $ref: "#/components/parameters/Limit"
+        - name: chain_state
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [active, all, reversed]
+            default: active
+          description: >
+            Omit or pass `active` for the `prism.dashboard.blocks.v1` response,
+            which hides reorged-out blocks exactly as before this parameter
+            existed. `all` includes every recorded pool block and `reversed`
+            returns only blocks the pool once landed that a chain
+            reorganization later disconnected; both return
+            `prism.dashboard.blocks.v2` rows carrying `chain_state` and
+            `disconnected_at`. Pagination `total_count`/`total_pages` always
+            describe the filtered set. Any other value is rejected with
+            `400 bad_request`. The filter is part of the cache key, so the
+            views never share a cache entry.
       responses:
         "200":
-          description: Recent block rows.
+          description: >
+            Recent block rows. `prism.dashboard.blocks.v1` without
+            `chain_state` (or with `chain_state=active`);
+            `prism.dashboard.blocks.v2` for `chain_state=all` and
+            `chain_state=reversed`.
           headers:
             Cache-Control:
               $ref: "#/components/headers/BrowserCacheControl"
@@ -164,7 +269,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/BlocksResponse"
+                oneOf:
+                  - $ref: "#/components/schemas/BlocksResponse"
+                  - $ref: "#/components/schemas/BlocksChainStateResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "503":
@@ -278,8 +385,13 @@ paths:
         Serves exact canonical public artifacts such as audit bundles, CTV
         manifest sets, per-fanout manifests, or raw fanout transaction data.
         These artifacts are verified by their path SHA-256 and may use their own
-        `qbit.prism.*` schemas. Dashboard-facing wrapper responses link here
-        rather than inlining large canonical artifacts.
+        `qbit.prism.*` schemas. For audit bundles, CTV fanout manifests, and
+        manifest sets the response body is the exact canonical byte sequence
+        the hash was computed over, so `sha256(response body)` equals the path
+        SHA-256. Audit bundles written before canonical-byte persistence retain
+        the legacy reconstructed response until verified backfill.
+        Dashboard-facing wrapper responses link here rather than inlining large
+        canonical artifacts.
       parameters:
         - name: sha256
           in: path
@@ -548,7 +660,9 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
     UpstreamUnavailable:
-      description: Required pool or node data source is unavailable.
+      description: >
+        Required pool or node data source is unavailable, or the read exceeded
+        its statement deadline (error code `read_timeout`).
       content:
         application/json:
           schema:
@@ -619,6 +733,7 @@ components:
         - tip_hash
         - bits
         - network_difficulty
+        - hashrate_ths
         - initial_block_download
         - peers
       properties:
@@ -633,6 +748,19 @@ components:
           $ref: "#/components/schemas/CompactBits"
         network_difficulty:
           $ref: "#/components/schemas/DecimalString"
+        hashrate_ths:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalString"
+            - type: "null"
+          description: >
+            Estimated network hashrate in TH/s for the permissionless lane the
+            pool mines, from the node's own recent-blocks estimate. Additive
+            field on `prism.dashboard.pool-summary.v1` (2.x). Divide a pool
+            `hashrate_ths` window (`h1`/`h3`) by this value for an approximate
+            pool share-of-network: pool hashrate is credited work from
+            accepted shares while this is a chain-derived estimate, so the
+            ratio is approximate by construction. `null` when the node cannot
+            answer; that failure never turns into a 503.
         initial_block_download:
           type: boolean
         peers:
@@ -705,6 +833,8 @@ components:
         - participants_3h
         - blocks_found_total
         - prism_blocks_total
+        - blocks_reversed_total
+        - blocks_inactive_total
         - total_mined_bits
         - expected_time_to_block_seconds
         - latest_block
@@ -720,9 +850,28 @@ components:
         blocks_found_total:
           type: integer
           minimum: 0
+          description: >
+            Every pool block not reversed by a chain reorganization. Excludes
+            `reversed` blocks by design; it is not the sum of the per-state
+            counters below.
         prism_blocks_total:
           type: integer
           minimum: 0
+        blocks_reversed_total:
+          type: integer
+          minimum: 0
+          description: >
+            Pool blocks a chain reorganization disconnected from the active
+            chain. Additive field on `prism.dashboard.pool-summary.v1` (2.x);
+            list the affected blocks with
+            `GET /public/v1/blocks?chain_state=reversed`.
+        blocks_inactive_total:
+          type: integer
+          minimum: 0
+          description: >
+            Pool blocks currently off the active chain but not yet resolved as
+            reversed. Additive field on `prism.dashboard.pool-summary.v1`
+            (2.x).
         total_mined_bits:
           $ref: "#/components/schemas/Bits"
         expected_time_to_block_seconds:
@@ -783,7 +932,11 @@ components:
         timestamp:
           $ref: "#/components/schemas/IsoTimestamp"
         hashrate_ths:
-          $ref: "#/components/schemas/DecimalString"
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: >
+            Trailing-smoothed credited hashrate estimated from accepted share
+            difficulty. This is not router-side physical telemetry.
         accepted_share_count:
           type: integer
           minimum: 0
@@ -812,6 +965,179 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/HashratePoint"
+    HashrateSmoothing:
+      type: object
+      additionalProperties: false
+      required: [method, window_seconds]
+      description: >
+        How `smoothed_hashrate_ths` was produced. `trailing` averages credited
+        difficulty over the trailing `window_seconds` ending at each bucket,
+        with buckets missing from the series counting as zero. `none` means
+        smoothing is disabled or configured shorter than two buckets: the
+        window is then the bucket itself and the smoothed rate equals the raw
+        rate.
+      properties:
+        method:
+          type: string
+          enum: [trailing, none]
+        window_seconds:
+          type: integer
+          minimum: 1
+    DualRateHashratePoint:
+      type: object
+      additionalProperties: false
+      required:
+        - timestamp
+        - raw_hashrate_ths
+        - smoothed_hashrate_ths
+        - accepted_share_count
+        - accepted_share_difficulty
+        - complete
+      properties:
+        timestamp:
+          $ref: "#/components/schemas/IsoTimestamp"
+        raw_hashrate_ths:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: >
+            Credited difficulty in this bucket divided by the full
+            `bucket_seconds`, even when the bucket is not yet complete. This
+            is a credited-work estimate, not router telemetry; sparse
+            high-difficulty shares can make an individual bucket over-read the
+            delivered physical rate.
+        smoothed_hashrate_ths:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: >
+            Trailing-window credited rate, the same estimate v1 serves as
+            `hashrate_ths`. Equals `raw_hashrate_ths` when the smoothing
+            method is `none`.
+        accepted_share_count:
+          type: integer
+          minimum: 0
+        accepted_share_difficulty:
+          $ref: "#/components/schemas/DecimalString"
+        complete:
+          type: boolean
+          description: >
+            False when `generated_at` falls before the bucket's end; the
+            bucket is still accumulating credit and its raw rate under-reads.
+    HashrateSeriesDualRateResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - schema
+        - generated_at
+        - subject
+        - range
+        - bucket
+        - bucket_seconds
+        - unit
+        - rate_basis
+        - smoothing
+        - points
+      properties:
+        schema:
+          type: string
+          const: prism.dashboard.hashrate-series.v2
+        generated_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        subject:
+          $ref: "#/components/schemas/HashrateSubject"
+        range:
+          $ref: "#/components/schemas/HashrateRange"
+        bucket:
+          $ref: "#/components/schemas/HashrateBucket"
+        bucket_seconds:
+          type: integer
+          enum: [300, 3600, 86400]
+          description: Duration of every bucket, and the divisor behind each raw rate.
+        unit:
+          type: string
+          const: ths
+        rate_basis:
+          type: string
+          const: accepted_share_difficulty
+        smoothing:
+          $ref: "#/components/schemas/HashrateSmoothing"
+        points:
+          type: array
+          items:
+            $ref: "#/components/schemas/DualRateHashratePoint"
+    BlockMarkerBlock:
+      type: object
+      additionalProperties: false
+      required: [height, hash, found_at]
+      properties:
+        height:
+          type: integer
+          minimum: 0
+        hash:
+          $ref: "#/components/schemas/HexHash"
+        found_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+    BlockMarkerPoint:
+      type: object
+      additionalProperties: false
+      required: [timestamp, block_count, blocks, truncated]
+      properties:
+        timestamp:
+          allOf:
+            - $ref: "#/components/schemas/IsoTimestamp"
+          description: >
+            Bucket start, on the same floor-aligned grid as the hashrate
+            series buckets for the identical range and bucket.
+        block_count:
+          type: integer
+          minimum: 1
+          description: Every non-reversed block found in the bucket, listed or not.
+        blocks:
+          type: array
+          maxItems: 3
+          items:
+            $ref: "#/components/schemas/BlockMarkerBlock"
+          description: >
+            At most the 3 most recent blocks in the bucket, ordered by
+            found_at descending with height breaking ties.
+        truncated:
+          type: boolean
+          description: True when block_count exceeds the 3 blocks listed.
+    BlockMarkersResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - schema
+        - generated_at
+        - range
+        - bucket
+        - bucket_seconds
+        - total_blocks
+        - points
+      properties:
+        schema:
+          type: string
+          const: prism.dashboard.block-markers.v1
+        generated_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        range:
+          $ref: "#/components/schemas/HashrateRange"
+        bucket:
+          $ref: "#/components/schemas/HashrateBucket"
+        bucket_seconds:
+          type: integer
+          enum: [300, 3600, 86400]
+          description: Duration of every bucket, matching the hashrate series.
+        total_blocks:
+          type: integer
+          minimum: 0
+          description: All non-reversed found blocks inside the range.
+        points:
+          type: array
+          items:
+            $ref: "#/components/schemas/BlockMarkerPoint"
+          description: >
+            Only buckets containing found blocks, ascending by timestamp;
+            consumers synthesize gaps.
     WindowInfo:
       type: object
       additionalProperties: false
@@ -833,7 +1159,12 @@ components:
         - participant_count
       properties:
         pool_hashrate_ths:
-          $ref: "#/components/schemas/DecimalString"
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: >
+            Pool credited hashrate over the fixed 3h leaderboard window,
+            estimated from accepted share difficulty rather than router
+            telemetry.
         pool_accepted_share_difficulty:
           $ref: "#/components/schemas/DecimalString"
         participant_count:
@@ -860,7 +1191,12 @@ components:
         display_name:
           $ref: "#/components/schemas/NullableString"
         hashrate_ths_3h:
-          $ref: "#/components/schemas/DecimalString"
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: >
+            Recipient credited hashrate over the fixed 3h leaderboard window,
+            estimated from accepted share difficulty rather than router
+            telemetry.
         share_percent:
           oneOf:
             - $ref: "#/components/schemas/DecimalString"
@@ -1092,6 +1428,105 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/BlockRow"
+    ChainState:
+      type: string
+      enum:
+        - prepared
+        - confirmed
+        - inactive
+        - rejected
+        - reversed
+      description: >
+        The pool's ledger view of where a found block stands against the
+        active chain. `prepared` blocks are still being landed, `confirmed`
+        blocks are on the active chain, `inactive` blocks are temporarily off
+        it, `rejected` blocks never activated, and `reversed` blocks were
+        disconnected by a chain reorganization after the pool landed them.
+    ChainStateBlockRow:
+      type: object
+      additionalProperties: false
+      required:
+        - height
+        - hash
+        - found_at
+        - network_difficulty
+        - bits
+        - solver_recipient_id
+        - solver_worker_name
+        - solver_share_difficulty
+        - reward_window_weight
+        - coinbase_value_bits
+        - audit_bundle_sha256
+        - payout_manifest_sha256
+        - explorer_url
+        - chain_state
+        - disconnected_at
+      properties:
+        height:
+          type: integer
+          minimum: 0
+        hash:
+          $ref: "#/components/schemas/HexHash"
+        found_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        network_difficulty:
+          $ref: "#/components/schemas/DecimalString"
+        bits:
+          $ref: "#/components/schemas/CompactBits"
+        solver_recipient_id:
+          type: string
+        solver_worker_name:
+          $ref: "#/components/schemas/NullableString"
+        solver_share_difficulty:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalString"
+            - type: "null"
+        reward_window_weight:
+          oneOf:
+            - $ref: "#/components/schemas/DecimalString"
+            - type: "null"
+        coinbase_value_bits:
+          $ref: "#/components/schemas/Bits"
+        audit_bundle_sha256:
+          oneOf:
+            - $ref: "#/components/schemas/HexHash"
+            - type: "null"
+        payout_manifest_sha256:
+          oneOf:
+            - $ref: "#/components/schemas/HexHash"
+            - type: "null"
+        explorer_url:
+          oneOf:
+            - type: string
+              format: uri
+            - type: "null"
+        chain_state:
+          $ref: "#/components/schemas/ChainState"
+        disconnected_at:
+          allOf:
+            - $ref: "#/components/schemas/NullableTimestamp"
+          description: >
+            When a chain reorganization disconnected this block from the
+            active chain; `null` for blocks that have not been reversed.
+    BlocksChainStateResponse:
+      type: object
+      additionalProperties: false
+      required: [schema, generated_at, pagination, rows]
+      description: >
+        The `chain_state=all` / `chain_state=reversed` view of the block
+        history: the v1 rows plus reorg visibility fields.
+      properties:
+        schema:
+          type: string
+          const: prism.dashboard.blocks.v2
+        generated_at:
+          $ref: "#/components/schemas/IsoTimestamp"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChainStateBlockRow"
     SettlementStatus:
       type: string
       enum:
@@ -1664,6 +2099,7 @@ components:
             - rate_limited
             - internal_error
             - upstream_unavailable
+            - read_timeout
         message:
           type: string
         request_id:

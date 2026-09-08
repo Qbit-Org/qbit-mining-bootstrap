@@ -12,12 +12,14 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from lab.prism import prism_coordinator
-from lab.prism.prism_coordinator import (
+from lab.prism.coordinator_shutdown import (
     CoordinatorShutdownController,
+    ShutdownInProgress,
+)
+from lab.prism.prism_coordinator import (
     PendingShareAppend,
     PRISM_REJECTION_POOL_CLOSED,
     PrismCoordinator,
-    ShutdownInProgress,
     StratumError,
     WriterLeaseRenewalDeferred,
 )
@@ -176,7 +178,112 @@ def coordinator(
     return server
 
 
+class CoordinatorShutdownControllerTests(unittest.TestCase):
+    def test_compatibility_reexports_reference_shutdown_owner(self) -> None:
+        self.assertIs(
+            prism_coordinator.CoordinatorShutdownController,
+            CoordinatorShutdownController,
+        )
+        self.assertIs(prism_coordinator.ShutdownInProgress, ShutdownInProgress)
+
+    def test_nested_writer_inherits_admission_after_shutdown_request(self) -> None:
+        controller = CoordinatorShutdownController(0.5)
+        outer = controller.enter_writer("outer")
+        controller.request_shutdown(signal.SIGTERM)
+        inner = controller.enter_writer("inner")
+
+        controller.exit_writer(inner)
+        controller.exit_writer(outer)
+
+        self.assertEqual(controller.snapshot()["active_writers"], {})
+        with self.assertRaisesRegex(ShutdownInProgress, "coordinator is shutting down"):
+            controller.enter_writer("late")
+
+    def test_transferable_writer_token_finishes_idempotently_on_another_thread(
+        self,
+    ) -> None:
+        controller = CoordinatorShutdownController(0.5)
+        token = controller.reserve_writer("share_persistence")
+
+        finisher = threading.Thread(target=lambda: (token.finish(), token.finish()))
+        finisher.start()
+        finisher.join(1)
+
+        self.assertFalse(finisher.is_alive())
+        self.assertTrue(token.finished)
+        self.assertEqual(controller.snapshot()["active_writers"], {})
+
+
 class PrismCoordinatorShutdownTests(unittest.TestCase):
+    def test_refresh_timeout_still_drains_build_executors(self) -> None:
+        server = coordinator()
+        calls: list[str] = []
+        server.shutdown_initial_job_executor = (  # type: ignore[method-assign]
+            lambda: calls.append("initial")
+        )
+        server.shutdown_job_build_executor = (  # type: ignore[method-assign]
+            lambda: calls.append("job_build")
+        )
+        server.shutdown_payout_artifact_executor = (  # type: ignore[method-assign]
+            lambda: calls.append("payout_artifact")
+        )
+        server.shutdown_reconcile_prefetch_executor = (  # type: ignore[method-assign]
+            lambda: calls.append("reconcile_prefetch")
+        )
+        server.retire_share_window_spool = (  # type: ignore[method-assign]
+            lambda: calls.append("spool")
+        )
+        server.shutdown_serve_builder = (  # type: ignore[method-assign]
+            lambda: calls.append("serve_builder")
+        )
+
+        server.shutdown_tip_refresh_executor()
+
+        self.assertEqual(
+            calls,
+            [
+                "initial",
+                "job_build",
+                "payout_artifact",
+                "reconcile_prefetch",
+                "spool",
+                "serve_builder",
+            ],
+        )
+
+    def test_startup_replay_shutdown_stops_cleanly_and_releases_lease_once(
+        self,
+    ) -> None:
+        ledger = RecordingLeaseLedger()
+        server = coordinator(ledger)
+
+        def rejected_replay() -> int:
+            server.request_shutdown(signal.SIGTERM)
+            raise ShutdownInProgress("PRISM coordinator is shutting down")
+
+        started = time.monotonic()
+        with patch("builtins.print"):
+            self.assertFalse(
+                server._run_startup_writer_replay(
+                    rejected_replay,
+                    drain_threads=[],
+                )
+            )
+        elapsed = time.monotonic() - started
+
+        # No writer is active, so the replay exit never waits out the
+        # quiescence budget before releasing the lease exactly once.
+        self.assertLess(elapsed, 0.45)
+        self.assertEqual(ledger.release_calls, 1)
+        snapshot = server._ensure_shutdown_controller().snapshot()
+        self.assertEqual(snapshot["active_writers"], {})
+        self.assertFalse(snapshot["lease_release_withheld"])
+        self.assertEqual(snapshot["release_withheld_total"], 0)
+        self.assertEqual(snapshot["lease_release_outcomes"]["success"], 1)
+        with patch("builtins.print"):
+            server.shutdown(reason="main_finally")
+        self.assertEqual(ledger.release_calls, 1)
+
     def test_lease_heartbeat_start_without_ledger_is_noop(self) -> None:
         server = PrismCoordinator.__new__(PrismCoordinator)
 
@@ -732,6 +839,11 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
                 return {"backend": "recording", "renewed_count": 1}
 
         server = coordinator(BlockingHeartbeatLedger())
+        # A scaled-down but internally coherent policy: the interval stays
+        # below the failure budget and the budget plus the exit envelope
+        # stays inside the adoption silence, so the heartbeat starts and the
+        # stall — not a refused configuration — is what fires the exit.
+        server.ledger_lease_heartbeat_seconds = 0.005
         server.ledger_lease_heartbeat_failure_seconds = 0.03
         server.ledger_lease_heartbeat_monitor_seconds = 0.005
         server.ledger_lease_heartbeat_exit_timeout_seconds = 0.01
@@ -887,7 +999,7 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
         death + interval + budget — past a replacement's CAS eligibility
         when interval + budget reaches the adoption silence. The
         server-proven cap measures from completed round trips, which
-        cannot postdate the death, and must fire first (cap 0.265s here
+        cannot postdate the death, and must fire first (cap 0.26s here
         versus interval + budget = 0.30s).
         """
         first_done = threading.Event()
@@ -921,6 +1033,11 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
         server.ledger_lease_heartbeat_failure_seconds = 0.25
         server.ledger_lease_heartbeat_monitor_seconds = 0.005
         server.ledger_lease_heartbeat_exit_timeout_seconds = 0.005
+        # The scheduler slack is a term of the safety inequality, so a
+        # scaled-down policy has to scale it too: left at the production
+        # value it would not fit inside this 0.28s silence and the
+        # heartbeat would (correctly) refuse to start.
+        server.ledger_lease_heartbeat_scheduler_slack_seconds = 0.005
         thread: threading.Thread | None = None
 
         try:
@@ -962,7 +1079,17 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
             if thread is not None:
                 thread.join(0.5)
 
-    def test_heartbeat_warning_honors_private_silence_attribute(self) -> None:
+    def test_heartbeat_rejection_honors_private_silence_attribute(self) -> None:
+        """An operator silence override reaches the safety inequality.
+
+        PsqlShareLedger keeps the adoption silence on a private attribute
+        with no public alias. The policy must read it: a 0.5s silence
+        cannot contain the default 1.25s failure budget plus the exit
+        envelope, so this is a real double-writer hazard, not a tuning
+        preference, and the heartbeat must refuse to start rather than
+        run with a broken exit-before-adoption argument.
+        """
+
         class ShortSilenceLedger(GuardVerifyLeaseLedger):
             _lease_adoption_silence_seconds = 0.5
 
@@ -970,40 +1097,106 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
         server = coordinator(ledger)
         server.ledger_lease_heartbeat_seconds = 0.01
 
-        with patch("builtins.print") as printed:
-            thread = server._start_ledger_lease_heartbeat()
-            self.assertIsNotNone(thread)
-            self.assertTrue(server._stop_ledger_lease_heartbeat())
-        assert thread is not None
-        thread.join(0.2)
-        warnings = [
-            call.args[0]
-            for call in printed.call_args_list
-            if call.args
-            and "heartbeat timing is misconfigured" in str(call.args[0])
-        ]
-        # The default 0.75s budget leaves no envelope headroom under a
-        # 0.5s operator silence override stored on the ledger's private
-        # attribute; the warning must see it rather than the 1.0s default.
-        self.assertEqual(len(warnings), 1)
+        with patch.object(
+            server,
+            "_ledger_lease_heartbeat_hard_exit",
+        ) as hard_exit:
+            self.assertIsNone(server._start_ledger_lease_heartbeat())
 
-    def test_heartbeat_timing_misconfiguration_warns_at_start(self) -> None:
+        hard_exit.assert_called_once()
+        message = str(hard_exit.call_args.args[0])
+        self.assertIn("refusing to start the ledger lease heartbeat", message)
+        self.assertIn("adoption silence 0.5s", message)
+        # No thread may exist: refusing means refusing to run, not
+        # starting and then complaining.
+        self.assertIsNone(server._ledger_lease_heartbeat_thread)
+        self.assertEqual(ledger.verify_calls, 0)
+
+    def test_heartbeat_unsafe_timing_is_refused_at_start(self) -> None:
+        """A failure budget that overruns the adoption silence is refused.
+
+        The budget the monitor enforces has to fit inside the silence
+        window alongside the exit envelope, or a coordinator that lost its
+        guarded session can still be running when a replacement becomes
+        adoption-eligible. Before issue #212 this printed a warning and
+        started anyway.
+        """
         ledger = GuardVerifyLeaseLedger()
         server = coordinator(ledger)
         server.ledger_lease_heartbeat_seconds = 0.01
-        server.ledger_lease_heartbeat_failure_seconds = 1.5
+        server.ledger_lease_heartbeat_failure_seconds = 2.5
 
-        with patch("builtins.print") as printed:
+        with patch.object(
+            server,
+            "_ledger_lease_heartbeat_hard_exit",
+        ) as hard_exit:
+            self.assertIsNone(server._start_ledger_lease_heartbeat())
+
+        hard_exit.assert_called_once()
+        message = str(hard_exit.call_args.args[0])
+        self.assertIn("refusing to start the ledger lease heartbeat", message)
+        self.assertIn("failure budget 2.5s", message)
+        self.assertIsNone(server._ledger_lease_heartbeat_thread)
+
+    def test_heartbeat_interval_at_or_above_budget_is_refused(self) -> None:
+        """One idle wait must not be able to exhaust the liveness budget."""
+        ledger = GuardVerifyLeaseLedger()
+        server = coordinator(ledger)
+        server.ledger_lease_heartbeat_seconds = 1.25
+        server.ledger_lease_heartbeat_failure_seconds = 1.25
+
+        with patch.object(
+            server,
+            "_ledger_lease_heartbeat_hard_exit",
+        ) as hard_exit:
+            self.assertIsNone(server._start_ledger_lease_heartbeat())
+
+        hard_exit.assert_called_once()
+        self.assertIn(
+            "must exceed the heartbeat interval",
+            str(hard_exit.call_args.args[0]),
+        )
+
+    def test_heartbeat_warns_without_tail_latency_headroom(self) -> None:
+        """Safe but unstable timing warns instead of refusing.
+
+        A silence window that still satisfies the exit-before-adoption
+        inequality but leaves the server-proven cap below the largest gap a
+        healthy coordinator can produce permits no double writer — it just
+        guarantees issue #212's false exits. Labs and tests deliberately
+        run tiny policies, so this stays a warning.
+        """
+
+        class TightSilenceLedger(GuardVerifyLeaseLedger):
+            _lease_adoption_silence_seconds = 0.5
+
+        ledger = TightSilenceLedger()
+        server = coordinator(ledger)
+        server.ledger_lease_heartbeat_seconds = 0.01
+        server.ledger_lease_heartbeat_failure_seconds = 0.2
+        server.ledger_lease_heartbeat_monitor_seconds = 0.005
+        server.ledger_lease_heartbeat_exit_timeout_seconds = 0.01
+        # Scaled with the rest of the policy so this stays the safe-but-tight
+        # case: the guard's own statement timeout is not scaled, so the
+        # staleness cap still lands below the healthy-gap bound and the
+        # advisory fires.
+        server.ledger_lease_heartbeat_scheduler_slack_seconds = 0.005
+
+        with patch("builtins.print") as printed, patch.object(
+            server,
+            "_ledger_lease_heartbeat_hard_exit",
+        ) as hard_exit:
             thread = server._start_ledger_lease_heartbeat()
             self.assertIsNotNone(thread)
             self.assertTrue(server._stop_ledger_lease_heartbeat())
         assert thread is not None
         thread.join(0.2)
+
+        hard_exit.assert_not_called()
         warnings = [
             call.args[0]
             for call in printed.call_args_list
-            if call.args
-            and "heartbeat timing is misconfigured" in str(call.args[0])
+            if call.args and "no tail-latency headroom" in str(call.args[0])
         ]
         self.assertEqual(len(warnings), 1)
 
@@ -1020,6 +1213,10 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
         thread.join(0.2)
         for call in printed.call_args_list:
             if call.args:
+                self.assertNotIn(
+                    "no tail-latency headroom",
+                    str(call.args[0]),
+                )
                 self.assertNotIn(
                     "heartbeat timing is misconfigured",
                     str(call.args[0]),
@@ -1445,6 +1642,50 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
             drain_thread.join(1)
         self.assertFalse(drain_thread.is_alive())
 
+    def test_audit_listener_stops_during_non_writer_drain_after_lease_release(
+        self,
+    ) -> None:
+        ledger = RecordingLeaseLedger()
+        server = coordinator(ledger)
+        stop_saw_release: list[bool] = []
+        server._audit_http_facade = SimpleNamespace(
+            stop=lambda: stop_saw_release.append(ledger.released.is_set()) or True
+        )
+        server._background_services = SimpleNamespace(
+            threads_to_drain=lambda: (),
+        )
+        server.shutdown_vardiff_idle_executor = lambda: None  # type: ignore[method-assign]
+        server.shutdown_tip_refresh_executor = lambda: None  # type: ignore[method-assign]
+
+        with patch("builtins.print"):
+            self.assertTrue(server.shutdown())
+            server.drain_non_writer_components()
+
+        self.assertEqual(stop_saw_release, [True])
+
+    def test_audit_listener_stop_timeout_is_logged_during_drain(self) -> None:
+        # The facade's bounded stop() reports False on a stop_timeout; the
+        # drain must surface that as an audit_http_stop shutdown log line
+        # instead of blocking or swallowing it.
+        ledger = RecordingLeaseLedger()
+        server = coordinator(ledger)
+        shutdown_events: list[tuple[str, dict[str, object]]] = []
+        server._shutdown_log = (  # type: ignore[method-assign]
+            lambda event, **fields: shutdown_events.append((event, fields))
+        )
+        server._audit_http_facade = SimpleNamespace(stop=lambda: False)
+        server._background_services = SimpleNamespace(
+            threads_to_drain=lambda: (),
+        )
+        server.shutdown_vardiff_idle_executor = lambda: None  # type: ignore[method-assign]
+        server.shutdown_tip_refresh_executor = lambda: None  # type: ignore[method-assign]
+
+        with patch("builtins.print"):
+            self.assertTrue(server.shutdown())
+            server.drain_non_writer_components()
+
+        self.assertIn(("audit_http_stop", {"outcome": "timeout"}), shutdown_events)
+
     def test_pending_share_batch_flushes_before_release(self) -> None:
         append_started = threading.Event()
         allow_flush = threading.Event()
@@ -1553,6 +1794,9 @@ class PrismCoordinatorShutdownTests(unittest.TestCase):
             writer_thread.join(1)
             shutdown_thread.join(1)
 
+        self.assertFalse(producer_thread.is_alive(), "producer thread leaked")
+        self.assertFalse(writer_thread.is_alive(), "share writer thread leaked")
+        self.assertFalse(shutdown_thread.is_alive(), "shutdown thread leaked")
         self.assertTrue(entry.committed.is_set())
         self.assertEqual(ledger.release_calls, 1)
 

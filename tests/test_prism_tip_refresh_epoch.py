@@ -18,17 +18,19 @@ from lab.prism.prism_coordinator import (
     PendingInitialJob,
     PrismCoordinator,
     TipRefreshValidationToken,
-    _PayoutStatePublicationBlocked,
     _TipRefreshFanoutSuperseded,
     _TipRefreshTrustBlocked,
 )
-from tests.test_prism_coordinator_job_cache import (
+from lab.prism.payout_state import (
+    PayoutStatePublicationBlocked as _PayoutStatePublicationBlocked,
+)
+from tests.prism_coordinator_test_support import (
     base_template,
     client,
     coordinator,
     install_fake_bundle_builder,
 )
-from tests.test_prism_coordinator_vardiff import RecordingLedger
+from tests.prism_vardiff_test_support import RecordingLedger
 
 
 TIP_A = "11" * 32
@@ -933,7 +935,7 @@ class TipRefreshEpochTests(unittest.TestCase):
             connection_id=state.connection_id,
             difficulty_generation=0,
         )
-        server.pending_initial_jobs[state] = request
+        server.pending_initial_jobs = {state: request}
 
         self.assertIs(
             server._deliver_initial_bundle(request, artifacts, bundle),

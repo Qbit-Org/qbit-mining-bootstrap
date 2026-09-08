@@ -81,6 +81,10 @@ mod audit_body_ref;
 pub use audit_body_ref::*;
 
 mod settlement;
+
+/// Payout-window fold, canonical digest, and incremental advance for the
+/// --serve daemon's prepare_window request (#131 window-pipeline slice).
+pub mod window;
 pub use settlement::*;
 
 pub const PRISM_WINDOW_MULTIPLIER: u128 = 8;
@@ -165,6 +169,17 @@ pub enum PrismError {
     SettlementModeSelection { reason: String },
 }
 
+/// One accepted share as the payout pipeline sees it.
+///
+/// The integer field types are the declared integer widths of the Rust
+/// window pipeline -- `share_seq` u64, `share_difficulty` u128,
+/// `network_difficulty` u128, `template_height` u64, `ntime` u32,
+/// `job_issued_at_ms`/`accepted_at_ms` i64 -- and are a deliberately
+/// narrower domain than the ledger's `numeric(78,0)`/`bigint` columns and
+/// the coordinator's unbounded Python integers. A value outside these widths
+/// is declined by the --serve daemon as `out_of_range` and folded
+/// in-process instead; see the `window` module docs for the reasoning and
+/// the wire classifier.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AcceptedShare {
     pub share_seq: u64,

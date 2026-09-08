@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 import unittest
 from decimal import Decimal
+from unittest import mock
 
 from lab.auxpow import stratum_codec
 from lab.prism import direct_stratum
@@ -232,6 +234,7 @@ class PrismDirectStratumTests(unittest.TestCase):
             direct_stratum.strip_witness_transaction(submission.coinbase_tx_hex).hex(),
             submission.coinbase_txid_preimage_hex,
         )
+        self.assertTrue(submission.block_pass)
         self.assertEqual(submission.block_hex, submission.header_hex + "01" + submission.coinbase_tx_hex)
         self.assertEqual(len(bytes.fromhex(submission.header_hex)), 80)
 
@@ -270,6 +273,7 @@ class PrismDirectStratumTests(unittest.TestCase):
         )
 
         self.assertEqual(submission.header_hex, expected_header.hex())
+        self.assertTrue(submission.block_pass)
         self.assertTrue(submission.block_hex.endswith(submission.coinbase_tx_hex + extra_tx))
 
     def test_witness_commitment_uses_template_wtxids_for_serialized_block(self) -> None:
@@ -299,12 +303,16 @@ class PrismDirectStratumTests(unittest.TestCase):
             [direct_stratum.transaction_wtxid_internal(witness_tx).hex()],
         )
 
+        # Nonce 1 rather than 0: bits 207fffff put the network target at
+        # roughly half the hash space, and only a hash that solved the block
+        # serializes one to inspect.
         submission = direct_stratum.assemble_submission(
             job,
             extranonce2_hex="0102030405060708",
             ntime_hex=job.ntime,
-            nonce_hex="00000000",
+            nonce_hex="00000001",
         )
+        self.assertTrue(submission.block_pass)
         block_txs = block_transaction_hexes(submission.block_hex)
         self.assertEqual(block_txs, [submission.coinbase_tx_hex, witness_tx])
         self.assertIn(witness_commitment_script(block_txs[1:]), block_txs[0])
@@ -493,6 +501,183 @@ class PrismDirectStratumTests(unittest.TestCase):
             direct_stratum.select_version_rolling_mask(
                 {"versionrollingmask": "not-hex"},
                 direct_stratum.QBIT_VERSION_ROLLING_MASK,
+            )
+
+
+class DeferredBlockSerializationTests(unittest.TestCase):
+    """The block is serialized only for a hash that actually solved it.
+
+    ``block_hex`` costs O(block bytes) of GIL-held decode, concatenate and
+    re-encode, and only the block-landing path ever reads it, so an ordinary
+    accepted share must not pay for it (#143). These tests pin both halves of
+    that bargain: the share path never builds the bytes, and the block path
+    always has them before a candidate can exist.
+    """
+
+    # qbit_target == 1, so no hash solves the block.
+    UNSOLVABLE_BITS = "03000001"
+    # Difficulty this low clamps the share target to 2**256-1, so every hash
+    # passes the share target while missing the (unsolvable) network target.
+    ALWAYS_SHARE_DIFFICULTY = Decimal("1e-40")
+
+    def job(
+        self,
+        *,
+        bits: str | None = None,
+        transactions: list[str] | None = None,
+        desired_share_difficulty: Decimal = Decimal("1"),
+    ) -> direct_stratum.DirectQbitStratumJob:
+        coinbase_tx_hex = synthetic_coinbase_template()
+        built_template = template(transactions)
+        if bits is not None:
+            built_template["bits"] = bits
+        return direct_stratum.make_job_from_builder_manifest(
+            job_id="job-serialization",
+            template=built_template,
+            manifest=manifest_for(coinbase_tx_hex),
+            extranonce1_hex=EXTRANONCE1,
+            extranonce2_size=EXTRANONCE2_SIZE,
+            desired_share_difficulty=desired_share_difficulty,
+        )
+
+    def assemble(
+        self,
+        job: direct_stratum.DirectQbitStratumJob,
+    ) -> direct_stratum.DirectQbitSubmission:
+        return direct_stratum.assemble_submission(
+            job,
+            extranonce2_hex="cafebabe00000001",
+            ntime_hex=job.ntime,
+            nonce_hex="0000002a",
+        )
+
+    def test_ordinary_share_never_serializes_the_block(self) -> None:
+        job = self.job(
+            bits=self.UNSOLVABLE_BITS,
+            transactions=[synthetic_transaction("22")],
+            desired_share_difficulty=self.ALWAYS_SHARE_DIFFICULTY,
+        )
+
+        with mock.patch.object(
+            direct_stratum,
+            "serialize_block",
+            side_effect=AssertionError("serialize_block ran on the share path"),
+        ) as serialize:
+            submission = self.assemble(job)
+
+        serialize.assert_not_called()
+        self.assertTrue(submission.share_pass)
+        self.assertFalse(submission.block_pass)
+        self.assertEqual(submission.block_hex, "")
+
+    def test_block_worthy_share_materializes_the_block_in_assembly(self) -> None:
+        extra_tx = synthetic_transaction("22")
+        job = self.job(transactions=[extra_tx])
+
+        submission = self.assemble(job)
+
+        self.assertTrue(submission.block_pass)
+        # Byte-identical to what the unconditional call produced before the
+        # share path stopped paying for it.
+        self.assertEqual(
+            submission.block_hex,
+            direct_stratum.serialize_block(
+                bytes.fromhex(submission.header_hex),
+                submission.coinbase_tx_hex,
+                job.transaction_hexes,
+            ).hex(),
+        )
+        self.assertEqual(
+            block_transaction_hexes(submission.block_hex),
+            [submission.coinbase_tx_hex, extra_tx],
+        )
+
+    def test_block_hex_attribute_exists_on_every_submission(self) -> None:
+        """The landing path's duck-typed guard must stay meaningful.
+
+        ``block_candidates`` probes ``hasattr(submission, "block_hex")`` to
+        tell a real submission from an embedder that retains no block bytes.
+        Skipping the work must not skip the attribute, or every ordinary share
+        would start looking like such an embedder.
+        """
+        share_only = self.job(
+            bits=self.UNSOLVABLE_BITS,
+            desired_share_difficulty=self.ALWAYS_SHARE_DIFFICULTY,
+        )
+
+        submission = self.assemble(share_only)
+
+        self.assertTrue(hasattr(submission, "block_hex"))
+        self.assertIsInstance(submission.block_hex, str)
+
+    def test_coinbase_validation_still_runs_on_a_share_that_missed_the_block(
+        self,
+    ) -> None:
+        """Deferring the block bytes must not defer coinbase validation.
+
+        ``serialize_block`` used to decode the full coinbase on every share as
+        a side effect. The explicit txid-preimage check is what actually
+        guards that value, and it has to keep firing at assembly time -- not
+        at block landing, which is the worst possible moment to discover it.
+        """
+        job = self.job(
+            bits=self.UNSOLVABLE_BITS,
+            desired_share_difficulty=self.ALWAYS_SHARE_DIFFICULTY,
+        )
+        # Move the full coinbase's locktime without moving the Stratum txid
+        # preimage's: the witness strip no longer reproduces the preimage.
+        tampered = dataclasses.replace(
+            job,
+            full_coinbase_suffix=job.full_coinbase_suffix[:-8] + "01000000",
+        )
+
+        with self.assertRaisesRegex(ValueError, "does not match Stratum txid preimage"):
+            self.assemble(tampered)
+
+    def test_template_transactions_are_validated_once_at_job_build(self) -> None:
+        """Per-template validation amortizes across every share of that job.
+
+        ``serialize_block`` re-validated the hex of every transaction on every
+        share. The values are immutable and were already validated here, at
+        build, so dropping the per-share pass moves no detection anywhere.
+        """
+        malformed = template(["zz"])
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"template transaction\[0\] data must be hexadecimal",
+        ):
+            direct_stratum.make_job_from_builder_manifest(
+                job_id="job-malformed",
+                template=malformed,
+                manifest=manifest_for(synthetic_coinbase_template()),
+                extranonce1_hex=EXTRANONCE1,
+                extranonce2_size=EXTRANONCE2_SIZE,
+                desired_share_difficulty=Decimal("1"),
+            )
+
+        # A well-formed template is validated and normalized at build, so the
+        # tuple every later share reads is already known good.
+        extra_tx = synthetic_transaction("22")
+        job = self.job(transactions=[extra_tx.upper()])
+        self.assertEqual(job.transaction_hexes, (extra_tx,))
+
+    def test_explicit_transaction_hexes_are_validated_at_job_build(self) -> None:
+        """The bundle path passes transactions in directly; it validates too."""
+        coinbase_tx_hex = synthetic_coinbase_template()
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"transaction_hexes\[0\] must be hexadecimal",
+        ):
+            direct_stratum.make_job_from_builder_manifest(
+                job_id="job-malformed-explicit",
+                template=template(),
+                manifest=manifest_for(coinbase_tx_hex),
+                extranonce1_hex=EXTRANONCE1,
+                extranonce2_size=EXTRANONCE2_SIZE,
+                desired_share_difficulty=Decimal("1"),
+                transaction_hexes=("zz",),
             )
 
 

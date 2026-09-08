@@ -6,13 +6,15 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
+from lab.prism.payout_state import AcceptedParentPayoutPreviewPending
 from lab.prism.prism_coordinator import (
     PendingInitialJob,
     PRISM_JOB_EXTRANONCE1_PLACEHOLDER_HEX,
     TemplateRefreshBlocked,
 )
-from tests.test_prism_coordinator_job_cache import (
+from tests.prism_coordinator_test_support import (
     EXTRANONCE2_SIZE,
     ObservedRLock,
     base_template,
@@ -102,7 +104,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
             connection_id=state.connection_id,
             difficulty_generation=0,
         )
-        server.pending_initial_jobs[state] = request
+        server.pending_initial_jobs = {state: request}
         results: list[bool | None] = []
 
         with vardiff_lock:
@@ -155,7 +157,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
             connection_id=state.connection_id,
             difficulty_generation=0,
         )
-        server.pending_initial_jobs[state] = request
+        server.pending_initial_jobs = {state: request}
         results: list[bool | None] = []
 
         with vardiff_lock:
@@ -211,7 +213,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
             connection_id=state.connection_id,
             difficulty_generation=0,
         )
-        server.pending_initial_jobs[state] = request
+        server.pending_initial_jobs = {state: request}
         results: list[bool | None] = []
 
         with vardiff_lock:
@@ -298,6 +300,62 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
             0,
         )
 
+    def test_initial_delivery_retries_preview_pending_without_counting_it(
+        self,
+    ) -> None:
+        # Boundary 1 (#182): the initial-job loop coalesces accepted-parent
+        # preview backpressure onto its ordinary bounded retry. The client
+        # stays connected, the job still lands, and the benign wait never
+        # reaches the generic job_build_failure_count accounting reserved for
+        # real build failures.
+        server, _rpc = coordinator()
+        install_fake_bundle_builder(server)
+        server.prewarm_current_tip_ready_bundle()
+        state = client(1)
+        state.authorization_generation = 1
+        state.authorized_monotonic = time.monotonic()
+        state.send = lambda _payload: None  # type: ignore[method-assign]
+        server.clients = {state}
+
+        bundle_attempts = 0
+        original_shared_job_bundle = server.shared_job_bundle
+
+        def blocked_then_ready(*args: object, **kwargs: object) -> object:
+            nonlocal bundle_attempts
+            bundle_attempts += 1
+            if bundle_attempts == 1:
+                raise AcceptedParentPayoutPreviewPending(
+                    "accepted parent payout preview is not ready yet",
+                    parent_hash="cc" * 32,
+                    waited_seconds=0.25,
+                    timeout_count=1,
+                )
+            return original_shared_job_bundle(*args, **kwargs)  # type: ignore[operator]
+
+        server.shared_job_bundle = blocked_then_ready  # type: ignore[method-assign]
+
+        with patch("builtins.print") as logged:
+            try:
+                server.request_initial_job_delivery(state)
+                wait_until(lambda: state.active_job is not None)
+            finally:
+                server.shutdown_tip_refresh_executor()
+            log_lines = [
+                str(call.args[0]) for call in logged.call_args_list if call.args
+            ]
+
+        self.assertEqual(bundle_attempts, 2)
+        # Retried, not counted: the benign wait stays out of the generic
+        # build-failure budget.
+        self.assertEqual(server.job_build_failure_count, 0)
+        self.assertIn(state, server.clients)
+        self.assertIsNotNone(state.active_job)
+        # The retry carries an explicit reason instead of a failure traceback.
+        self.assertTrue(
+            any("accepted_parent_preview_pending" in line for line in log_lines),
+            log_lines,
+        )
+
     def test_initial_delivery_backs_off_after_superseded_work(self) -> None:
         server, rpc = coordinator()
         install_fake_bundle_builder(server)
@@ -326,7 +384,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
             connection_id=state.connection_id,
             difficulty_generation=0,
         )
-        server.pending_initial_jobs[state] = request
+        server.pending_initial_jobs = {state: request}
         artifacts = server.current_template_artifacts()
         waits: list[float] = []
         request.cancelled.wait = (  # type: ignore[method-assign]
@@ -377,7 +435,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
             connection_id=state.connection_id,
             difficulty_generation=0,
         )
-        server.pending_initial_jobs[state] = request
+        server.pending_initial_jobs = {state: request}
         artifacts = server.current_template_artifacts()
         waits: list[float] = []
         request.cancelled.wait = (  # type: ignore[method-assign]
@@ -615,7 +673,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         self.assertNotEqual(state.active_job.payout_state_generation, 0)
 
     def test_collection_mode_initial_bundles_remain_identity_specific(self) -> None:
-        from tests.test_prism_coordinator_job_cache import FakeLedger
+        from tests.prism_coordinator_test_support import FakeLedger
 
         server, _rpc = coordinator(ledger=FakeLedger(miners=["solo"]))
         install_fake_bundle_builder(server)
@@ -726,7 +784,7 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         self.assertEqual(payload["clients_with_current_tip_job"], 0)
 
         server.clients.clear()
-        server._health_snapshot = None
+        server._ensure_observability_service().clear_health_snapshot_for_test()
         status, payload = server.cached_health_payload()
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
@@ -769,7 +827,9 @@ class PrismInitialJobDeliveryTests(unittest.TestCase):
         server.started_monotonic = old
         server.mining_health_startup_grace_seconds = 5
         server.stratum_initial_job_timeout_seconds = 5
-        server._mining_delivery_failure_started_monotonic = time.monotonic() - 5
+        server._ensure_observability_service().set_delivery_failure_started_monotonic_for_test(
+            time.monotonic() - 5
+        )
 
         status, payload = server.cached_health_payload()
 

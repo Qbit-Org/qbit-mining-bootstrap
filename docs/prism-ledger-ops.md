@@ -86,6 +86,183 @@ path through `qbit_prism_shutdowns_total`,
 `qbit_prism_shutdown_non_writer_drain_seconds`, and
 `qbit_prism_shutdown_release_withheld_total`.
 
+### Heartbeat Monitor Lateness and In-Process Stalls
+
+The writer-lease heartbeat's timing policy (`lab/prism/writer_lease_timing.py`)
+guarantees that a coordinator whose guard session has died hard-exits before a
+replacement may adopt the lease, *provided* the monitor thread that takes that
+decision wakes no later than `scheduler_slack + monitor_interval` after its
+poll is due (0.55 s at the shipped numbers; the module docstring derives this
+as inequality (4)). That proviso is an assumption about the process, not a
+property of the policy. Issue #227 recorded a 0.648 s monitor wake delay on
+`union-mainnet` with the host idle: the stall was in-process, an interpreter
+held by a multi-second payout-window rescan.
+
+Two consequences are exported and one is decided.
+
+**Attribution that survives GIL stalls.** Every guard statement returns its own
+server-side execution time, so `guard_sql` in
+`qbit_prism_lease_heartbeat_phase_seconds{phase}` and its `worst_` twin is now
+server execution, the new `guard_client_resume` phase is the part of the round
+trip during which PostgreSQL had already answered and this process had not
+resumed, and `scheduler_delay` is the whole process-side residual
+(`guard_slot_wait + guard_sql + scheduler_delay = total`; `guard_client_resume`
+is the in-round-trip share of `scheduler_delay`). `guard_sql` is now bounded by the
+server rather than by the client: each statement can run for at most the 0.5 s
+server-enforced statement timeout, and a renewing verification may lawfully run
+two statements inside one guard slot (the attribution recheck), so `guard_sql`
+sums both and can legitimately reach about 1.0 s on a two-statement attempt
+(`WRITER_LEASE_VERIFICATION_MAX_STATEMENTS` × 0.5 s) and cannot exceed that; the
+`(N stmt)` count in the attempt summary says which case applies. Read a large
+`guard_client_resume` as "this process, not PostgreSQL".
+
+**The monitor's lateness as re-armable signals.**
+`qbit_prism_lease_heartbeat_monitor_wake_delay_seconds` stays the lifetime
+high-water mark for dashboard continuity. Alert on the new families instead,
+all fixed-cardinality:
+
+- `qbit_prism_lease_heartbeat_monitor_wake_lateness_seconds` (histogram; every
+  poll's lateness, closed bucket set);
+- `qbit_prism_lease_heartbeat_monitor_late_wakes_total{slack_fraction}` with
+  `slack_fraction` in `0.5`, `0.8`, `1.0` (wakes at least that fraction of
+  `scheduler_slack` late; a counter, so `increase(...[5m]) > 0` on the `1.0`
+  series re-expresses the wake-delay alert without a never-resetting gauge);
+- `qbit_prism_lease_heartbeat_monitor_wake_delay_window_max_seconds` (the worst
+  lateness in the trailing 300 s; falls back to zero once a stall ages out);
+- `qbit_prism_lease_heartbeat_monitor_wake_delay_record_age_seconds` (how old
+  the lifetime record is, so an exit message's figure can be dated);
+- `qbit_prism_lease_heartbeat_monitor_exit_guarantee_breaches_total` and
+  `qbit_prism_lease_heartbeat_monitor_worst_exit_guarantee_overrun_seconds`
+  (wakes later than `max_guaranteed_monitor_lateness`, and the worst amount
+  by which the exit could have landed after the adoption edge);
+- `qbit_prism_lease_heartbeat_policy_seconds{term="max_guaranteed_monitor_lateness"}`
+  (the bound itself, for alert expressions);
+- `qbit_prism_lease_heartbeat_stall_probe_samples_total` and
+  `..._stall_probe_suppressed_total` (stack samples the stall probe took, and
+  triggers it refused under its rate limit);
+- `qbit_prism_process_gc_pause_seconds{generation}` (histogram),
+  `qbit_prism_process_gc_last_pause_seconds{generation}` and
+  `qbit_prism_process_gc_max_pause_seconds{generation}`: cyclic-collector
+  pause *durations* from `gc.callbacks`. These complement, and do not replace,
+  the `qbit_prism_process_gc_*` count families from issue #226, which report
+  how many passes ran and what they freed but not how long any pass held the
+  interpreter.
+
+**What a breach means and the decided response.** A wake later than
+`scheduler_slack` (0.50 s) is a *lateness-beyond-slack breach*: the assumption
+the policy budgets was exceeded. A wake later than
+`max_guaranteed_monitor_lateness` (0.55 s) is an *exit-guarantee breach*: on
+that beat, had the guard session died, this process could have outlived the
+successor's adoption edge by the overrun. The monitor does **not** tighten its
+cap or hard-exit on a breach (that would restart healthy coordinators under a
+transient stall, issue #212's failure mode, without moving the exit earlier on
+the beat that breached). It accepts the residual because every effect that
+could escape is fenced: every ledger write joins the exact-session lease CTE
+and matches nothing once adoption rewrites the session token, and every
+external effect runs behind a synchronous exact-session verification that
+hard-exits the moment the row names another session. A breach is therefore
+counted, its overrun kept, and one structured warning is logged
+(`prism coordinator: WARNING ledger lease heartbeat monitor wake delay ... exceeded
+the ... scheduler slack`), rate-limited to at most 3 per 60 s and never from a
+blocking write. A wake at least half a slack late additionally takes a stack
+sample of the running threads, under the same 3-per-60 s limit
+(`LEASE_MONITOR_STALL_PROBE_MAX_SAMPLES_PER_WINDOW` /
+`LEASE_MONITOR_STALL_PROBE_WINDOW_SECONDS` in `writer_lease_timing.py`), so the
+instrument cannot turn a stall into a stall storm.
+
+**Operator action on a lateness-beyond-slack warning.**
+
+1. Read the warning: it states whether exit-before-adoption still held, the
+   overrun if not, the phase attribution of the last and worst attempts, the
+   worst GC pause and its generation, and the sampled thread stacks. The
+   stacks name the frame that held the interpreter; a payout-window rescan
+   (`reconcile_invalidation`) or a large collection are the known causes.
+2. Confirm it was in-process rather than host contention: PSI, steal, and
+   cgroup throttling on the host should be quiet. If they are not, the host is
+   the problem and the policy's slack is not the lever.
+3. Check `qbit_prism_lease_heartbeat_monitor_exit_guarantee_breaches_total`.
+   An isolated breach with no coincident guard loss changed nothing; the
+   fences carried it. Repeated breaches mean the workload has outgrown the
+   interpreter's ability to schedule the monitor, and the durable fix is the
+   out-of-process watchdog tracked in issue #130 — not a larger slack, which
+   only lengthens failover, and not a shorter cap, which manufactures issue
+   #212.
+4. Reduce the stall source: if the rescan attribution
+   (`qbit_prism_payout_window_full_rescan_seconds`) shows multi-second full
+   rescans, that is the workload to bound. If the worst GC pause is the stall,
+   the heap growth tracked by the issue #226 families is the lead.
+5. Do not disable the heartbeat, do not raise only the failure budget, and do
+   not weaken PostgreSQL durability.
+
+### Orphaned Locks and Bounded Startup Acquisition
+
+A coordinator that vanishes without closing its sockets — network partition,
+`SIGSTOP`, VM pause — can leave a Postgres backend idle in transaction, still
+holding the `qbit_ledger_writer_lease` row lock its landing CTE took. Without
+countermeasures the successor's startup lease upsert queues behind that lock,
+inside ledger construction and before the watchdog arms, until kernel TCP
+keepalive teardown (hours at OS defaults): a full-pool availability outage.
+Settlement correctness is unaffected — the outbox row stays pending and
+replays — only availability is at stake.
+
+Two independent layers bound this. First, every Postgres session the
+coordinator opens (the pooled native client, the dedicated lease-guard
+session, and the psql subprocess backend) carries session guards:
+`idle_in_transaction_session_timeout`
+(`PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS`, default 15) makes the
+server abort an orphaned transaction and release its locks, and the
+server-side keepalive GUCs (`PRISM_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS`,
+`PRISM_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS`,
+`PRISM_POSTGRES_TCP_KEEPALIVES_COUNT`, defaults 30/10/3) bound the server's
+teardown of a socket toward a vanished client at 30 + 3x10 = 60 seconds, the
+backstop where the idle-in-transaction timer does not apply.
+
+Second, the startup lease upsert and adoption CAS each run under a bounded
+lock deadline (`PRISM_LEDGER_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS`, default 5)
+with a bounded retry (`PRISM_LEDGER_LEASE_ACQUIRE_ATTEMPTS`, default 5). Each
+timed-out attempt is logged with its attempt number and the underlying error.
+The retry budget (5x5s = 25s) is sized to outlast the idle-in-transaction
+timeout — which runs on the blocking backend's own clock, from when its
+transaction went idle rather than from when the successor started retrying —
+so an orphaned lock is normally reaped mid-budget and startup self-heals
+without operator action. An acquisition that never completes within the budget
+fails construction with a `RuntimeError`, exiting the process visibly for the
+supervisor to restart. That error names the lock conflict as the likeliest
+cause but does not assert it: a connect timeout, an exhausted connection-pool
+slot, and a server that is merely overloaded all expire the same deadline, so
+read the chained cause it quotes before assuming a stuck transaction. Waiting
+for a *live* holder's lease TTL to expire is unchanged — that outer wait is
+intended failover behaviour; only the per-statement lock wait is bounded.
+
+Arming that deadline widens the orphan shape slightly, and the trade is
+deliberate. A deadline is what makes the native client wrap a statement in an
+explicit transaction whose `COMMIT` is a separate client message, so the
+startup acquire is now transaction-scoped where it used to be plain
+autocommit. A coordinator that vanishes mid-acquire can therefore orphan the
+lease-row lock itself — on a path that previously could not produce one,
+because autocommit leaves no transaction for the server to hold open. The two
+orphans are not comparable in cost: the one this fix removes was bounded only
+by TCP keepalive teardown, hours at OS defaults, while the one it introduces
+is bounded by `PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS` (default
+15) and delays a successor by at most that. It is also why the session guard
+is not optional and why disarming it is rejected at construction: without it
+the acquisition deadline would trade an unbounded wait for an unbounded wait
+of its own making.
+
+The session guards carry three deployment caveats. The guards travel as
+libpq startup options, so native connections now always set the `options`
+connect parameter: a deployment routing `PRISM_DATABASE_URL` through a
+connection pooler that rejects startup options (older PgBouncer builds) will
+fail at connect rather than silently drop them, visibly at coordinator
+startup. The default compose topology connects directly to `prism-postgres`
+and is unaffected. The psql-subprocess backend delivers the same guards
+through `PGOPTIONS`, so a wrapper script standing in for `psql`
+(`PRISM_POSTGRES_PSQL_COMMAND`) that does not forward its environment drops
+them without any error. On a Unix-socket DSN the `tcp_keepalives_*` GUCs are
+ignored — accepted and inert — leaving
+`PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS` as the guard that still
+applies; it is the one that covers the orphaned lease-row lock in any case.
+
 ## Block Candidate Outbox
 
 A block-worthy share transaction also inserts an immutable intent into
@@ -136,6 +313,45 @@ Landing-path observability lives on `/metrics`:
 `qbit_prism_accepted_parent_preview_wait_timeouts_total`,
 `qbit_prism_prior_balances_reads_total` / `_read_last_seconds` /
 `_read_max_seconds`, and `qbit_prism_startup_phase_seconds{phase=...}`.
+
+Read-slot ledger operations additionally split local admission from server
+execution, labelled by `operation`:
+`qbit_prism_ledger_read_calls_total`,
+`qbit_prism_ledger_read_gate_wait_seconds_total` / `_max` and
+`qbit_prism_ledger_read_gate_timeouts_total` (coordinator-local admission —
+waiting for `PRISM_POSTGRES_READ_CONCURRENCY`; a gate timeout means no
+statement was ever sent), against
+`qbit_prism_ledger_read_execute_seconds_total` / `_max` and
+`qbit_prism_ledger_read_execute_timeouts_total` (PostgreSQL, including the
+tail a cancelled statement spends returning). One duration covering both is
+what made the #211 exhaustion unattributable from a scrape: the replay
+enumeration reported `exceeded 5s` while its statement deadline was barely
+touched and the database showed no blocked backends. Read the two halves
+before widening any budget — a rising gate series is contention in this
+process, a rising execute series is the database.
+
+Since #224 the same split covers the payout-window and prior-balances reads
+under fixed operation names: `payout_window_snapshot`,
+`payout_window_delta` and `prior_balances_after_pool_block` on the read
+slot, and `current_prior_balances` on the **writer lock**, where the
+landing's prior-balances check has always taken it. The `operation` label
+is closed (`PRISM_LEDGER_READ_OPERATIONS` in
+`lab/prism/accepted_preview_telemetry.py`); any other name folds into
+`other`. The operator validation contract for these series, the landing
+phase / reconcile caller / full-rescan families, and the 4 s and 5 s
+accepted-preview boundaries is in `docs/prism-overload-alerts.md`,
+"Issue #224".
+
+Pending block-candidate enumeration
+(`pending_block_candidate_rows`, the `replay-outbox-query` phase) is a
+read-only single-snapshot statement and takes the bounded read slot, not the
+writer lock (#211). It is therefore unaffected by an accounting write holding
+the writer gate. The page it returns is advisory: a candidate can land or be
+terminalized between the snapshot and the caller's decision, so every terminal
+transition re-checks under the writer lease — `mark_block_candidates_abandoned`
+re-asks `qbit_pool_blocks` inside its fenced `UPDATE`, and the single-hash
+terminal updates additionally require `state = 'pending'`.
+
 Alert before the landing deadline is exhausted, not after: page when
 `qbit_prism_prior_balances_read_max_seconds` exceeds ~20% of the
 landing budget or the poll budget, when any
@@ -198,6 +414,11 @@ if cleanup fails, the candidate remains pending and can still converge to
 submitted on later chain evidence. Replay carries the database row's block hash
 separately from candidate JSON, so malformed payloads can be quarantined using
 the authoritative outbox key instead of replaying forever.
+If qbit has already returned the candidate outcome but durable outbox
+finalization fails, replay resumes only that finalization step with the same
+bounded pacing. It does not call `submitblock` again, recount an accepted block,
+rebuild or republish audit evidence, or reacquire a share-writer floor already
+released after the known outcome.
 
 The block submitter heartbeat carries its current phase, including replay
 query, node RPC, lock admission, audit, persistence, and finalization. A stale
@@ -237,13 +458,77 @@ empty; `stale-grace` marks a prior-tip share credited by the coordinator's short
 stale-grace policy. Reward-window queries still count these rows because they
 are accepted shares, while audits can distinguish them from normal current-tip
 shares. Audit bundles containing a credited row use
-`qbit.prism.audit-bundle.v1.1`; external auditors must upgrade before operators
-enable stale-grace crediting.
+the logical `qbit.prism.audit-bundle.v1.1` schema, and the window is enabled by
+default on every chain, so external auditors must run a release that accepts it.
 
 Deployments that run with `PRISM_POSTGRES_INIT_SCHEMA=0` must apply
-`crates/qbit-prism/sql/001_share_ledger.sql` before starting upgraded
-coordinators. Otherwise share inserts will fail because the `credit_policy`
-column and updated window function signatures are missing.
+`crates/qbit-prism/sql/001_share_ledger.sql` before starting any upgraded
+coordinator. The file is the cumulative, idempotent schema initializer and
+migration path, despite its `001` name. Skipping it can break share inserts,
+reward-window calls, pool-block confirmation/reactivation, and audit evidence
+publication because required columns, functions, and the durable publication
+ordinal will be missing.
+
+Apply the file in a single transaction and stop the PRISM share writer
+first. The script enforces this itself with a `BEGIN`/`COMMIT` wrapper, so
+even a plain autocommit `psql -f` runs as one transaction — but pass
+`--single-transaction` (or `-1`) anyway, together with `ON_ERROR_STOP`, so
+the intent is explicit and a failure cannot strand an open transaction:
+
+```sh
+psql "$PRISM_DATABASE_URL" --single-transaction -v ON_ERROR_STOP=1 \
+  -f crates/qbit-prism/sql/001_share_ledger.sql
+```
+
+Before that wrapper existed, a per-statement autocommit apply could commit
+the carry-forward summary triggers before the summary seeding block later in
+the file ran. If the apply was interrupted in that gap, or a still-running
+writer confirmed or reversed a block in it, the summary received only those
+post-trigger deltas: every miner's balance was silently under-reported by
+their full pre-upgrade carry, and the seed's emptiness guard locked that
+partial state in permanently. The schema's seed guard now compares the
+summary against the carry history it summarizes and repairs a partial
+summary on the next apply. The writer must still be stopped during the
+apply: concurrent mutations block on the apply's table locks and then fire
+the freshly (re)created triggers after it commits, which invites long
+lock waits and deadlocks even though the apply itself is atomic. Note that
+combining `--single-transaction` with the script's own `BEGIN`/`COMMIT`
+wrapper makes psql print two harmless warnings ("there is already a
+transaction in progress" / "there is no transaction in progress"); the apply
+is still exactly one transaction.
+
+### Audit publication ordering migration
+
+Existing databases must receive the new `audit_publication_sequence` migration.
+It creates and validates a bigint sequence, adds the nullable pool-block column,
+deterministically backfills confirmed and inactive rows by `found_at` and
+`block_hash`, adds a unique index and state constraint, advances the allocator
+beyond every retained ordinal, and replaces confirmation/reactivation functions
+so each new durable confirmation receives an ordinal. Exact confirmation replay
+preserves its prior ordinal. Historical inactive rows are backfilled so later
+reactivation can retain that already-published ordinal without allocating a new
+audit publication.
+
+The migration includes `ALTER TABLE` operations that require PostgreSQL's
+`ACCESS EXCLUSIVE` table lock. They wait for existing readers and writers and
+can interrupt new reads as well as writes while held. A serialized phase takes
+a transaction-scoped advisory lock and a `SHARE ROW EXCLUSIVE` lock on
+`qbit_pool_blocks`, and the unique index is built non-concurrently. Treat the
+whole migration as read-impacting: stop the old coordinator or use a reviewed
+maintenance window, take the normal database backup, and apply the file with
+`ON_ERROR_STOP` inside a single transaction (see the apply requirements above),
+using the same database role and schema search path as PRISM. For example:
+
+```sh
+psql "$PRISM_DATABASE_URL" --single-transaction -v ON_ERROR_STOP=1 \
+  -f crates/qbit-prism/sql/001_share_ledger.sql
+```
+
+With `PRISM_POSTGRES_INIT_SCHEMA=1`, coordinator construction applies the same
+script before listeners open. The migration is rerunnable and tested across
+fresh, legacy, partial, concurrent, malformed, and bigint-boundary states; it
+fails closed instead of accepting a conflicting sequence, column, index, or
+constraint definition.
 
 `qbit_shares_since_template_height(min_template_height)` supports operational
 replay and frontend recovery. It returns accepted shares at or above the
@@ -269,6 +554,78 @@ carried balances as reversed. Mature rows, and rows already height-mature at the
 supplied active tip, must not be reversed by that path. qbit coinbase maturity
 is 1000 blocks, so operators must not mark pool payouts mature before
 `block_height + 1000`.
+
+## Publication Ordinal Rollback And Schema Revert
+
+Schema initialization adds a durable publication ordinal to accepted pool
+blocks: `qbit_pool_blocks.audit_publication_sequence`, allocated from
+`qbit_audit_publication_sequence_seq` at the durable prepared -> confirmed
+boundary, unique across the table, and required by a validated CHECK
+constraint on every confirmed row. Historical confirmed and inactive rows are
+backfilled deterministically in `(found_at, block_hash)` order the first time
+the migration runs.
+
+Rolling back coordinator code does not require reverting this schema. The
+`qbit_pool_blocks_assign_publication_ordinal` BEFORE trigger assigns the next
+ordinal to any confirming write that omits it, so a pre-ordinal coordinator
+that confirms with a plain `chain_state` UPDATE keeps satisfying the
+constraint. That trigger is the primary rollback path; prefer it.
+
+`crates/qbit-prism/sql/001_share_ledger_revert_audit_publication_sequence.sql`
+is the second path, for the cases the trigger cannot cover: rolling back more
+than one release, or aligning a live ledger with a restored pre-migration
+base backup. It returns `qbit_pool_blocks` to its pre-ordinal shape by
+dropping, in order, the CHECK constraint, the assignment trigger and its
+function, the unique index, the column, and the sequence, then restores the
+pre-ordinal `qbit_confirm_pool_block` body. The file is one transaction
+serialized behind the same advisory lock as the forward migration: any
+failure aborts the whole revert, and re-running it after the failure is
+resolved -- or on an already-reverted or never-migrated schema -- is safe. An
+object the migration did not create, such as an operator view over the
+ordinal column, fails the revert loudly instead of being dropped.
+
+Before applying the revert:
+
+1. Stop the coordinator and anything else writing to the ledger. The revert
+   takes an ACCESS EXCLUSIVE lock on `qbit_pool_blocks`, so it stalls behind
+   a live writer. Worse, a post-migration coordinator left running (or
+   restarted afterwards) confirms blocks by assigning the ordinal explicitly:
+   every such confirmation fails with `column "audit_publication_sequence"
+   does not exist` the moment the revert commits, and a post-migration
+   coordinator restarted with schema initialization enabled immediately
+   re-applies the forward migration, silently undoing the revert.
+2. Take a base backup, or verify the continuous WAL archive covers this
+   point. The revert discards every assigned publication ordinal; nothing can
+   recover them afterwards except that backup.
+
+What is permanently lost: the recorded confirmed-publication order. The
+ordinal is allocated when a block durably reaches `confirmed` and is reused
+across exact replay and inactive -> confirmed reactivation, so it is the only
+record of the order in which blocks were actually published. After the
+revert, publication currency falls back to what pre-ordinal code used to
+select current evidence -- `found_at`/`block_height` read order -- which is
+not that durable publication order. Re-applying `001_share_ledger.sql` later
+re-adds the column and backfills deterministically by
+`(found_at, block_hash)`, but that is a fresh assignment: it does not
+reproduce the ordinals observed before the revert, and external consumers
+that recorded pre-revert ordinals will see the sequence renumbered.
+
+Apply the revert with the ledger role whose `search_path` selects the PRISM
+schema, inside a single transaction, and stop on the first error (the revert
+script wraps itself in one `BEGIN`/`COMMIT` and relies on it, matching the
+forward script):
+
+```sh
+psql "$PRISM_DATABASE_URL" \
+  --single-transaction \
+  --set ON_ERROR_STOP=1 \
+  -f crates/qbit-prism/sql/001_share_ledger_revert_audit_publication_sequence.sql
+```
+
+The full round trip -- migrate, revert, confirm pre-ordinal-style, re-apply,
+re-backfill without double assignment -- is exercised by
+`tests/prism_postgres_a1_revert_gate.py` inside
+`test/test-prism-postgres-ledger.sh`.
 
 ## CTV Fanout Artifact Repair
 
@@ -437,9 +794,10 @@ against the pin.
 Production builds using the git source provider must set `QBIT_GIT_COMMIT` to a
 full 40-character object ID. The environment doctor verifies that the resolved
 checkout is at that exact commit instead of trusting a mutable branch or tag.
-Production also requires `PRISM_STRATUM_STALE_GRACE_SECONDS=0`; stale-credit
-grace should be enabled only after the deployed verifier and accounting release
-have an explicit compatibility proof for it.
+Stale-credit grace (`PRISM_STRATUM_STALE_GRACE_SECONDS`, default 3) stays
+enabled in production, mainnet included; reward windows that contain a credited
+prior-tip share publish the logical `qbit.prism.audit-bundle.v1.1` schema, so
+keep the deployed verifier and accounting release on a version that accepts it.
 
 The parent-chain selector is checked independently: `BITCOIN_CHAIN` and
 `BITCOIN_CHAIN_FLAG` must be an exact pair, including `mainnet` with

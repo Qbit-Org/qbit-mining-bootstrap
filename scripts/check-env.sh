@@ -744,9 +744,6 @@ check_production_gate() {
         fail "production mode rejects ${name}=1"
       fi
     done
-    if [[ "${QBIT_CHAIN:-regtest}" == "mainnet" ]]; then
-      [[ "${PRISM_STRATUM_STALE_GRACE_SECONDS:-3}" == "0" ]] || fail "mainnet requires PRISM_STRATUM_STALE_GRACE_SECONDS=0"
-    fi
     [[ -n "${PRISM_DATABASE_URL:-}" || -n "${PRISM_POSTGRES_PSQL_COMMAND:-}" ]] || fail "production mode requires PRISM_DATABASE_URL or PRISM_POSTGRES_PSQL_COMMAND"
     [[ "${PRISM_POSTGRES_PASSWORD:-}" != "change-this" ]] || fail "production mode requires a non-default PRISM_POSTGRES_PASSWORD"
     [[ "${PRISM_DATABASE_URL:-}" != *"change-this"* ]] || fail "production mode requires a non-default PRISM_DATABASE_URL"
@@ -900,6 +897,35 @@ check_bitcoin_chain_selection() {
   esac
 }
 
+check_prism_stale_grace() {
+  mining_lane_enabled prism || return 0
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    # Production already requires python3 (check_prism_production_difficulty);
+    # lab bring-up does not, so skip rather than add a prerequisite there.
+    if production_mode_enabled; then
+      fail "python3 is required to validate PRISM_STRATUM_STALE_GRACE_SECONDS"
+    fi
+    printf 'doctor: python3 not found; skipping PRISM_STRATUM_STALE_GRACE_SECONDS validation\n'
+    return 0
+  fi
+  # Mirror the coordinator's env_nonnegative_float(): the runtime's float
+  # syntax and range, finite and non-negative.
+  if ! python3 - "${PRISM_STRATUM_STALE_GRACE_SECONDS:-3}" >/dev/null 2>&1 <<'PY'
+import math
+import sys
+
+try:
+    value = float(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if math.isfinite(value) and value >= 0 else 1)
+PY
+  then
+    fail "PRISM_STRATUM_STALE_GRACE_SECONDS must be a finite non-negative number"
+  fi
+}
+
 check_ctv_fee_config() {
   mining_lane_enabled prism || return 0
   is_true_env "${PRISM_CTV_SETTLEMENT_ENABLED:-0}" || return 0
@@ -965,6 +991,7 @@ if mining_lane_enabled auxpow; then
   check_bool_env BITCOIN_DNSSEED
   check_bool_env BITCOIN_DISCOVER
 fi
+check_prism_stale_grace
 check_ctv_fee_config
 
 check_production_gate
