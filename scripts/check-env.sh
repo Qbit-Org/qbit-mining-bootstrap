@@ -884,29 +884,18 @@ check_bitcoin_chain_selection() {
 check_prism_stale_grace() {
   mining_lane_enabled prism || return 0
 
-  if ! command -v python3 >/dev/null 2>&1; then
-    # Production already requires python3 (check_prism_production_difficulty);
-    # lab bring-up does not, so skip rather than add a prerequisite there.
-    if production_mode_enabled; then
-      fail "python3 is required to validate PRISM_STRATUM_STALE_GRACE_SECONDS"
-    fi
-    printf 'doctor: python3 not found; skipping PRISM_STRATUM_STALE_GRACE_SECONDS validation\n'
-    return 0
-  fi
-  # Mirror the coordinator's env_nonnegative_float(): the runtime's float
-  # syntax and range, finite and non-negative.
-  if ! python3 - "${PRISM_STRATUM_STALE_GRACE_SECONDS:-3}" >/dev/null 2>&1 <<'PY'
-import math
-import sys
-
-try:
-    value = float(sys.argv[1])
-except ValueError:
-    raise SystemExit(1)
-raise SystemExit(0 if math.isfinite(value) and value >= 0 else 1)
-PY
+  # Match Rust's decimal f64 parser and Duration::try_from_secs_f64: finite,
+  # non-negative and strictly below 2^64 seconds after float conversion.
+  # ENVIRON preserves literal backslashes that awk -v would interpret.
+  if ! PRISM_CHECK_STALE_GRACE="${PRISM_STRATUM_STALE_GRACE_SECONDS:-3}" LC_ALL=C awk 'BEGIN {
+    value=ENVIRON["PRISM_CHECK_STALE_GRACE"];
+    if (value ~ /^[[:space:]]*$/) exit 0;
+    if (value !~ /^[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$/) exit 1;
+    n=value+0;
+    exit !(n>=0 && n<18446744073709551616);
+  }'
   then
-    fail "PRISM_STRATUM_STALE_GRACE_SECONDS must be a finite non-negative number"
+    fail "PRISM_STRATUM_STALE_GRACE_SECONDS must be a finite non-negative number below 18446744073709551616 seconds"
   fi
 }
 
