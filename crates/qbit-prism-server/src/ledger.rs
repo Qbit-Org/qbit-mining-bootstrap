@@ -162,6 +162,14 @@ impl Ledger {
                     .execute(&mut *tx)
                     .await?;
             }
+            if version.unwrap_or(0) < 4 {
+                sqlx::raw_sql(include_str!("../migrations/004_cpfp_retired_funding.sql"))
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(4)")
+                    .execute(&mut *tx)
+                    .await?;
+            }
             tx.commit().await?;
         }
         let ledger = Self { pool, instance_id };

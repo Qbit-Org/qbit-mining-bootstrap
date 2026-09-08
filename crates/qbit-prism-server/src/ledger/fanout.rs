@@ -1,5 +1,9 @@
 use super::*;
 
+// Allocation and retirement span two tables; this short lock makes their
+// combined outpoint exclusion atomic across independently claimed fanouts.
+const CPFP_FUNDING_LOCK: i64 = 0x505249534d000006;
+
 impl Ledger {
     /// Renew only a still-live token. An expired worker must not revive itself
     /// before wallet or network mutations after another instance takes over.
@@ -93,10 +97,70 @@ impl Ledger {
         let mut tx = self.pool.begin().await?;
         writable(&mut tx).await?;
         require_fanout(&mut tx, claim).await?;
-        let inserted=sqlx::query("INSERT INTO qbit_prism_cpfp_packages(fanout_txid,funding_txid,funding_vout,funding_value_sats,wallet_name) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING")
+        lock(&mut tx, CPFP_FUNDING_LOCK).await?;
+        let inserted=sqlx::query("INSERT INTO qbit_prism_cpfp_packages(fanout_txid,funding_txid,funding_vout,funding_value_sats,wallet_name) SELECT $1,$2,$3,$4,$5 WHERE NOT EXISTS(SELECT 1 FROM qbit_prism_cpfp_retired_funding WHERE funding_txid=$2 AND funding_vout=$3) ON CONFLICT DO NOTHING")
             .bind(&claim.fanout_txid).bind(txid).bind(i32::try_from(vout)?).bind(i64::try_from(value)?).bind(wallet).execute(&mut *tx).await?.rows_affected();
         tx.commit().await?;
         Ok(inserted == 1)
+    }
+
+    pub async fn retire_unsigned_cpfp_funding(
+        &self,
+        claim: &FanoutClaim,
+        txid: &str,
+        vout: u32,
+        reason: &str,
+    ) -> Result<()> {
+        ensure!(
+            !reason.is_empty() && reason.len() <= 1024,
+            "invalid funding retirement reason"
+        );
+        let mut tx = self.pool.begin().await?;
+        writable(&mut tx).await?;
+        require_fanout(&mut tx, claim).await?;
+        lock(&mut tx, CPFP_FUNDING_LOCK).await?;
+        // Never drop even a supposedly released lock's cleanup record without
+        // checking the wallet: the previous owner could have crashed at an RPC.
+        let moved = sqlx::query("WITH retired AS (DELETE FROM qbit_prism_cpfp_packages WHERE fanout_txid=$1 AND funding_txid=$2 AND funding_vout=$3 AND signed_child_hex IS NULL AND child_txid IS NULL RETURNING *) INSERT INTO qbit_prism_cpfp_retired_funding(fanout_txid,funding_txid,funding_vout,funding_value_sats,wallet_name,retirement_reason) SELECT fanout_txid,funding_txid,funding_vout,funding_value_sats,wallet_name,$4 FROM retired")
+            .bind(&claim.fanout_txid).bind(txid).bind(i32::try_from(vout)?).bind(reason).execute(&mut *tx).await?.rows_affected();
+        ensure!(
+            moved == 1,
+            "unsigned CPFP reservation changed or signed package is immutable"
+        );
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn retired_cpfp_funding(&self, fanout_txid: &str) -> Result<Vec<Value>> {
+        Ok(sqlx::query_scalar("SELECT to_jsonb(r) FROM qbit_prism_cpfp_retired_funding r WHERE fanout_txid=$1 AND NOT wallet_lock_released ORDER BY updated_at,funding_txid,funding_vout LIMIT 16")
+            .bind(fanout_txid).fetch_all(&self.pool).await?)
+    }
+
+    pub async fn record_retired_cpfp_wallet_cleanup(
+        &self,
+        claim: &FanoutClaim,
+        txid: &str,
+        vout: u32,
+        unlocked: bool,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        writable(&mut tx).await?;
+        require_fanout(&mut tx, claim).await?;
+        let updated = sqlx::query("UPDATE qbit_prism_cpfp_retired_funding SET wallet_lock_released=$4,updated_at=clock_timestamp() WHERE fanout_txid=$1 AND funding_txid=$2 AND funding_vout=$3 AND NOT wallet_lock_released")
+            .bind(&claim.fanout_txid).bind(txid).bind(i32::try_from(vout)?).bind(unlocked).execute(&mut *tx).await?.rows_affected();
+        ensure!(updated == 1, "retired CPFP cleanup reservation changed");
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn mark_retired_cpfp_wallet_unlocked(
+        &self,
+        claim: &FanoutClaim,
+        txid: &str,
+        vout: u32,
+    ) -> Result<()> {
+        self.record_retired_cpfp_wallet_cleanup(claim, txid, vout, true)
+            .await
     }
 
     pub async fn save_cpfp_package(

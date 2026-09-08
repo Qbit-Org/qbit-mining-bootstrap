@@ -138,6 +138,9 @@ configured wallet. Sponsorship funding remains reserved until the signed child
 confirms. Persistent wallet locks and the wallet's recorded child transaction
 protect funding across mempool eviction and restart, so the package can reuse
 its exact saved bytes.
+An unsigned reservation whose funding disappears is retired and replaced;
+retired outpoints remain recorded for targeted wallet-lock cleanup and cannot
+be assigned to another payout. Saved signed packages remain immutable.
 If qbit cannot unlock a spent coin after repairing an abandoned child, cleanup
 remains pending for that outpoint; unrelated wallet locks stay intact.
 On mainnet, configure a reviewed positive

@@ -52,7 +52,7 @@ async fn legacy_2x_upgrade_repairs_partial_carry_seed_and_preserves_shared_state
         sqlx::query_scalar::<_, i32>("SELECT max(version) FROM qbit_prism_schema_migrations")
             .fetch_one(&pool)
             .await?,
-        3
+        4
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT last_share_seq FROM qbit_hashrate_rollup_progress")

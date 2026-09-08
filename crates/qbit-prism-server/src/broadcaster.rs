@@ -341,43 +341,26 @@ async fn build_child(
         .anchor_vout
         .context("fanout has no CPFP anchor")?;
     let mut package = coordinator.ledger.cpfp_package(&claim.fanout_txid).await?;
-    if package.is_none() {
-        let wallet_name = config::optional("PRISM_CTV_BROADCASTER_WALLET")
-            .context("CPFP requires PRISM_CTV_BROADCASTER_WALLET")?;
-        let wallet = coordinator.rpc.wallet(&wallet_name)?;
-        let utxos = wallet
-            .call("listunspent", json!([1, 9_999_999, [], true]))
-            .await?;
-        let mut eligible = Vec::new();
-        for utxo in utxos
-            .as_array()
-            .context("listunspent did not return an array")?
-        {
-            if utxo["spendable"] == true {
-                let amount = amount_bits(&utxo["amount"])?;
-                if amount > fee {
-                    eligible.push((amount, utxo));
-                }
-            }
+    for _ in 0..3 {
+        if package.is_none() {
+            package = select_cpfp_funding(coordinator, claim, fee).await?;
         }
-        eligible.sort_by_key(|(amount, _)| std::cmp::Reverse(*amount));
-        for (amount, utxo) in eligible {
-            let txid = utxo["txid"].as_str().context("funding txid missing")?;
-            let vout = utxo["vout"]
-                .as_u64()
-                .context("funding vout missing")?
-                .try_into()?;
-            if coordinator
-                .ledger
-                .reserve_cpfp_funding(claim, &wallet_name, txid, vout, amount)
-                .await?
-            {
-                package = coordinator.ledger.cpfp_package(&claim.fanout_txid).await?;
-                break;
+        let current = package
+            .as_ref()
+            .context("sponsorship wallet has no unreserved suitable UTXO")?;
+        if current["signed_child_hex"].is_string() {
+            break;
+        }
+        match unsigned_funding_invalid_reason(coordinator, current, fee).await? {
+            None => break,
+            Some(reason) => {
+                retire_unsigned_funding(coordinator, claim, current, reason).await?;
+                package = None;
             }
         }
     }
-    let package = package.context("sponsorship wallet has no unreserved suitable UTXO")?;
+    let package =
+        package.context("sponsorship funding changed during selection; retry required")?;
     // A committed package can be relayed by any node. Requiring the original
     // wallet here would prevent recovery after mempool loss or node failover.
     if let Some(raw) = package["signed_child_hex"].as_str() {
@@ -449,6 +432,10 @@ async fn build_child(
         stripped == codec::strip_witness_transaction(&hex::decode(&child.unsigned_child_tx_hex)?)?,
         "wallet changed the CPFP transaction"
     );
+    if let Some(reason) = unsigned_funding_invalid_reason(coordinator, &package, fee).await? {
+        retire_unsigned_funding(coordinator, claim, &package, reason).await?;
+        bail!("CPFP funding changed before signed package persistence");
+    }
     let txid = codec::hash_display(&codec::double_sha256(&stripped));
     coordinator
         .ledger
@@ -457,10 +444,268 @@ async fn build_child(
     Ok(raw)
 }
 
+async fn select_cpfp_funding(
+    coordinator: &Coordinator,
+    claim: &FanoutClaim,
+    fee: u64,
+) -> Result<Option<Value>> {
+    let wallet_name = config::optional("PRISM_CTV_BROADCASTER_WALLET")
+        .context("CPFP requires PRISM_CTV_BROADCASTER_WALLET")?;
+    let wallet = coordinator.rpc.wallet(&wallet_name)?;
+    let utxos = wallet
+        .call("listunspent", json!([1, 9_999_999, [], true]))
+        .await?;
+    let mut eligible = Vec::new();
+    for utxo in utxos
+        .as_array()
+        .context("listunspent did not return an array")?
+    {
+        if utxo["spendable"] == true {
+            let amount = amount_bits(&utxo["amount"])?;
+            if amount > fee {
+                eligible.push((amount, utxo));
+            }
+        }
+    }
+    eligible.sort_by_key(|(amount, _)| std::cmp::Reverse(*amount));
+    for (amount, utxo) in eligible {
+        let txid = utxo["txid"].as_str().context("funding txid missing")?;
+        let vout = utxo["vout"]
+            .as_u64()
+            .context("funding vout missing")?
+            .try_into()?;
+        if coordinator
+            .ledger
+            .reserve_cpfp_funding(claim, &wallet_name, txid, vout, amount)
+            .await?
+        {
+            return coordinator.ledger.cpfp_package(&claim.fanout_txid).await;
+        }
+    }
+    Ok(None)
+}
+
+/// A failed RPC is uncertainty, not evidence that a reservation is unusable.
+/// Signed packages never enter this replacement path.
+async fn unsigned_funding_invalid_reason(
+    coordinator: &Coordinator,
+    package: &Value,
+    fee: u64,
+) -> Result<Option<&'static str>> {
+    ensure!(
+        package["signed_child_hex"].is_null(),
+        "signed CPFP package is immutable"
+    );
+    let tip = coordinator.rpc.call("getbestblockhash", json!([])).await?;
+    let coin = coordinator
+        .rpc
+        .call(
+            "gettxout",
+            json!([package["funding_txid"], package["funding_vout"], true]),
+        )
+        .await?;
+    ensure!(
+        coordinator.rpc.call("getbestblockhash", json!([])).await? == tip,
+        "chain changed while validating unsigned CPFP funding"
+    );
+    if coin.is_null() {
+        return Ok(Some(
+            "funding output is spent, missing, or spent in the mempool",
+        ));
+    }
+    let confirmations = coin["confirmations"]
+        .as_u64()
+        .context("funding confirmation count missing")?;
+    if confirmations == 0
+        || (coin["coinbase"] == true && confirmations < qbit_prism::QBIT_COINBASE_MATURITY_BLOCKS)
+    {
+        return Ok(Some("funding output is no longer confirmed and mature"));
+    }
+    let amount = amount_bits(&coin["value"])?;
+    if Some(amount) != package["funding_value_sats"].as_u64() || amount <= fee {
+        return Ok(Some("funding output value cannot fund the current fee"));
+    }
+    let wallet = coordinator.rpc.wallet(
+        package["wallet_name"]
+            .as_str()
+            .context("reserved wallet missing")?,
+    )?;
+    // A wallet that cannot identify its original transaction may simply be
+    // unavailable on this server. Preserve the reservation and retry there.
+    let known = wallet
+        .call("gettransaction", json!([package["funding_txid"]]))
+        .await?;
+    if known["confirmations"]
+        .as_i64()
+        .context("wallet funding confirmations missing")?
+        <= 0
+    {
+        return Ok(Some("wallet funding transaction is no longer active"));
+    }
+    let available = wallet
+        .call("listunspent", json!([1, 9_999_999, [], true]))
+        .await?;
+    if available
+        .as_array()
+        .context("wallet UTXO list missing")?
+        .iter()
+        .any(|coin| {
+            coin["txid"] == package["funding_txid"]
+                && coin["vout"] == package["funding_vout"]
+                && coin["spendable"] == true
+        })
+    {
+        return Ok(None);
+    }
+    let outpoint = json!({"txid":package["funding_txid"],"vout":package["funding_vout"]});
+    let locked = wallet.call("listlockunspent", json!([])).await?;
+    if locked
+        .as_array()
+        .context("wallet locked UTXO list missing")?
+        .contains(&outpoint)
+    {
+        // listunspent excludes our existing lock. Confirm control of its
+        // actual script rather than replacing valid crash-recovered funding.
+        let address = coin["scriptPubKey"]["address"]
+            .as_str()
+            .context("locked funding address missing")?;
+        let info = wallet.call("getaddressinfo", json!([address])).await?;
+        if info["ismine"] == true && info["solvable"] == true {
+            return Ok(None);
+        }
+    }
+    Ok(Some("wallet funding output is no longer spendable"))
+}
+
+async fn retire_unsigned_funding(
+    coordinator: &Coordinator,
+    claim: &FanoutClaim,
+    package: &Value,
+    reason: &str,
+) -> Result<()> {
+    coordinator
+        .ledger
+        .retire_unsigned_cpfp_funding(
+            claim,
+            package["funding_txid"]
+                .as_str()
+                .context("reserved funding txid missing")?,
+            package["funding_vout"]
+                .as_u64()
+                .context("reserved funding vout missing")?
+                .try_into()?,
+            reason,
+        )
+        .await
+}
+
+async fn require_retired_funding_wallet_control(
+    rpc: &crate::rpc::Rpc,
+    wallet: &crate::rpc::Rpc,
+    txid: &str,
+    vout: u32,
+) -> Result<()> {
+    let known = wallet.call("gettransaction", json!([txid])).await?;
+    ensure!(
+        known["txid"] == txid,
+        "retired funding wallet did not identify its transaction"
+    );
+    // A transaction can pay two independently hosted wallets. Knowing
+    // its txid is insufficient to discharge the other wallet's lock.
+    let decoded = rpc
+        .call(
+            "decoderawtransaction",
+            json!([known["hex"]
+                .as_str()
+                .context("retired funding transaction bytes missing")?]),
+        )
+        .await?;
+    let output = decoded["vout"]
+        .as_array()
+        .context("retired funding outputs missing")?
+        .iter()
+        .find(|output| output["n"].as_u64() == Some(u64::from(vout)))
+        .context("retired funding output missing")?;
+    let address = output["scriptPubKey"]["address"]
+        .as_str()
+        .context("retired funding address missing")?;
+    let info = wallet.call("getaddressinfo", json!([address])).await?;
+    ensure!(
+        info["ismine"] == true && info["solvable"] == true,
+        "retired funding output is not controlled by this wallet"
+    );
+    Ok(())
+}
+
+async fn cleanup_retired_funding(coordinator: &Coordinator, claim: &FanoutClaim) -> Result<()> {
+    for package in coordinator
+        .ledger
+        .retired_cpfp_funding(&claim.fanout_txid)
+        .await?
+    {
+        let txid = package["funding_txid"]
+            .as_str()
+            .context("retired funding txid missing")?;
+        let vout: u32 = package["funding_vout"]
+            .as_u64()
+            .context("retired funding vout missing")?
+            .try_into()?;
+        // Rotate the attempt before RPC so one unavailable wallet or Qbit's
+        // unremovable spent lock cannot starve subsequent cleanup records.
+        coordinator
+            .ledger
+            .record_retired_cpfp_wallet_cleanup(claim, txid, vout, false)
+            .await?;
+        let cleanup = async {
+            let wallet = coordinator.rpc.wallet(
+                package["wallet_name"]
+                    .as_str()
+                    .context("retired wallet missing")?,
+            )?;
+            require_retired_funding_wallet_control(&coordinator.rpc, &wallet, txid, vout).await?;
+            let outpoint = json!({"txid":txid,"vout":vout});
+            let locked = wallet.call("listlockunspent", json!([])).await?;
+            if locked
+                .as_array()
+                .context("wallet locked UTXO list missing")?
+                .contains(&outpoint)
+            {
+                coordinator.ledger.renew_fanout_claim(claim, 120).await?;
+                ensure!(
+                    wallet
+                        .call("lockunspent", json!([true, [outpoint]]))
+                        .await?
+                        == true,
+                    "retired funding UTXO unlock failed"
+                );
+            }
+            coordinator
+                .ledger
+                .mark_retired_cpfp_wallet_unlocked(claim, txid, vout)
+                .await
+        }
+        .await;
+        if let Err(error) = cleanup {
+            tracing::warn!(%error,fanout=%claim.fanout_txid,funding=%txid,"retired funding wallet cleanup deferred");
+        }
+    }
+    Ok(())
+}
+
 async fn maintain_funding_reservation(
     coordinator: &Coordinator,
     claim: &FanoutClaim,
 ) -> Result<()> {
+    if !matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            cleanup_retired_funding(coordinator, claim)
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        tracing::warn!(fanout=%claim.fanout_txid,"retired funding cleanup deferred");
+    }
     match tokio::time::timeout(
         std::time::Duration::from_secs(5),
         maintain_funding_reservation_inner(coordinator, claim),
@@ -485,6 +730,9 @@ async fn maintain_funding_reservation_inner(
     let Some(package) = coordinator.ledger.cpfp_package(&claim.fanout_txid).await? else {
         return Ok(());
     };
+    if package["signed_child_hex"].is_null() {
+        return Ok(());
+    }
     let wallet = coordinator.rpc.wallet(
         package["wallet_name"]
             .as_str()
@@ -666,6 +914,69 @@ pub fn amount_bits(value: &Value) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn retired_cleanup_requires_control_of_the_reserved_output() {
+        use axum::{extract::OriginalUri, Json, Router};
+        async fn reply(OriginalUri(uri): OriginalUri, Json(request): Json<Value>) -> Json<Value> {
+            let result = match request["method"].as_str().unwrap() {
+                "gettransaction" => {
+                    // Both wallets know this batched funding transaction, but
+                    // they control different outputs in it.
+                    assert_eq!(request["params"], json!(["funding"]));
+                    json!({"txid":"funding","hex":"shared-transaction"})
+                }
+                "decoderawtransaction" => {
+                    assert_eq!(request["params"], json!(["shared-transaction"]));
+                    json!({"vout":[
+                        {"n":0,"scriptPubKey":{"address":"recipient-a"}},
+                        {"n":1,"scriptPubKey":{"address":"recipient-b"}}
+                    ]})
+                }
+                "getaddressinfo" => {
+                    let owned = (uri.path() == "/wallet/a"
+                        && request["params"][0] == "recipient-a")
+                        || (uri.path() == "/wallet/b" && request["params"][0] == "recipient-b");
+                    // Being able to solve a public script alone is not control.
+                    json!({"ismine":owned,"solvable":true})
+                }
+                _ => panic!("unexpected wallet mutation or cleanup before ownership proof"),
+            };
+            Json(json!({"id":request["id"],"error":null,"result":result}))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc = crate::rpc::Rpc::new(
+            format!("http://{}/", listener.local_addr().unwrap()),
+            "test".into(),
+            "test".into(),
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        let server = tokio::spawn(async {
+            axum::serve(listener, Router::new().fallback(reply))
+                .await
+                .unwrap()
+        });
+        let a = rpc.wallet("a").unwrap();
+        let b = rpc.wallet("b").unwrap();
+        require_retired_funding_wallet_control(&rpc, &a, "funding", 0)
+            .await
+            .unwrap();
+        let error = require_retired_funding_wallet_control(&rpc, &b, "funding", 0)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not controlled by this wallet"));
+        require_retired_funding_wallet_control(&rpc, &b, "funding", 1)
+            .await
+            .unwrap();
+        assert!(
+            require_retired_funding_wallet_control(&rpc, &a, "funding", 2)
+                .await
+                .is_err()
+        );
+        server.abort();
+    }
+
     #[test]
     fn amount_is_exact() {
         assert_eq!(amount_bits(&json!("0.00000001")).unwrap(), 1);

@@ -951,3 +951,248 @@ async fn ctv_artifacts_wait_for_maturity_and_claims_are_fenced() -> Result<()> {
     assert_eq!(stats["current_drift_count"], json!(0));
     db.close(vec![a, b]).await
 }
+
+async fn prepare_mature_cpfp_fanouts(ledger: &Ledger, count: u8) -> Result<()> {
+    for n in 1..=count {
+        let mut accepted = share(u64::from(n));
+        accepted.miner_id = format!("miner-{n}");
+        accepted.order_key = accepted.miner_id.clone();
+        accepted.p2mr_program_hex = format!("{n:02x}").repeat(32);
+        ledger.append(accepted, None).await?;
+    }
+    let snapshot = ledger.snapshot(100).await?;
+    let (coinbase_key, ledger_key) = keys();
+    let bundle = qbit_prism::build_audit_bundle_with_ctv_settlement_options(
+        snapshot.shares.clone(),
+        FoundBlock {
+            block_height: 101,
+            coinbase_value_sats: 500_000_000,
+            network_difficulty: 100,
+            anchor_job_issued_at_ms: snapshot.anchor_ms,
+        },
+        vec![],
+        PayoutPolicy::day_one_default(),
+        u64::MAX,
+        qbit_prism::SettlementModeConfig {
+            max_fanout_recipients_per_transaction: 1,
+            ..Default::default()
+        },
+        Some(qbit_prism::FanoutFeeRatePolicy::new(1000, 12000)),
+        None,
+        vec![],
+        &coinbase_key,
+        &ledger_key,
+    )?;
+    assert_eq!(
+        bundle
+            .ctv_fanout_manifest_set
+            .as_ref()
+            .unwrap()
+            .fanout_count,
+        u32::from(count)
+    );
+    let block = candidate_with_bundle(bundle, snapshot.payout_revision, 31)?;
+    let hash = block.block_hash.clone();
+    ledger.enqueue_candidate(block).await?;
+    let claim = ledger.claim_candidate(60).await?.unwrap();
+    ledger
+        .land_candidate(&claim, &ledger_key.public_key_hex())
+        .await?;
+    ledger.finish_candidate(&claim, true, None).await?;
+    ledger
+        .reconcile_blocks_at_revision(
+            &[BlockObservation {
+                block_hash: hash,
+                active: true,
+            }],
+            1101,
+            ledger.payout_revision().await?,
+        )
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cpfp_retirement_requires_current_claim_and_preserves_signed_packages() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let a = db.ledger("cpfp-a").await?;
+    let b = db.ledger("cpfp-b").await?;
+    prepare_mature_cpfp_fanouts(&a, 2).await?;
+    let signed = a.claim_fanout(60).await?.unwrap();
+    let old = b.claim_fanout(60).await?.unwrap();
+    let signed_funding = "55".repeat(32);
+    let unsigned_funding = "66".repeat(32);
+    assert!(
+        a.reserve_cpfp_funding(&signed, "signing-wallet", &signed_funding, 0, 100_000)
+            .await?
+    );
+    a.save_cpfp_package(&signed, "aabb", &"77".repeat(32))
+        .await?;
+    let signed_before = a.cpfp_package(&signed.fanout_txid).await?.unwrap();
+    assert!(
+        a.retire_unsigned_cpfp_funding(&signed, &signed_funding, 0, "spent")
+            .await
+            .is_err(),
+        "signed package retirement was accepted"
+    );
+    assert_eq!(
+        a.cpfp_package(&signed.fanout_txid).await?.unwrap(),
+        signed_before
+    );
+    assert!(a
+        .retired_cpfp_funding(&signed.fanout_txid)
+        .await?
+        .is_empty());
+    assert!(
+        b.reserve_cpfp_funding(&old, "original-wallet", &unsigned_funding, 2, 200_000)
+            .await?
+    );
+    let unsigned_before = b.cpfp_package(&old.fanout_txid).await?.unwrap();
+    assert!(b
+        .retire_unsigned_cpfp_funding(&old, &unsigned_funding, 3, "wrong outpoint")
+        .await
+        .is_err());
+    assert_eq!(
+        b.cpfp_package(&old.fanout_txid).await?.unwrap(),
+        unsigned_before
+    );
+    sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE fanout_txid=$1").bind(&old.fanout_txid).execute(&a.pool).await?;
+    assert!(
+        b.retire_unsigned_cpfp_funding(&old, &unsigned_funding, 2, "spent")
+            .await
+            .is_err(),
+        "expired claim retired funding"
+    );
+    let current = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(claim) = a.claim_fanout(60).await? {
+                break Ok::<_, anyhow::Error>(claim);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    assert_eq!(current.fanout_txid, old.fanout_txid);
+    a.retire_unsigned_cpfp_funding(
+        &current,
+        &unsigned_funding,
+        2,
+        "funding spent before signing",
+    )
+    .await?;
+    assert!(a.cpfp_package(&current.fanout_txid).await?.is_none());
+    let pending = a.retired_cpfp_funding(&current.fanout_txid).await?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0]["funding_txid"], unsigned_funding);
+    assert_eq!(pending[0]["funding_vout"], 2);
+    assert_eq!(pending[0]["wallet_name"], "original-wallet");
+    assert_eq!(pending[0]["funding_value_sats"], 200_000);
+    assert_eq!(
+        pending[0]["retirement_reason"],
+        "funding spent before signing"
+    );
+    assert_eq!(pending[0]["wallet_lock_released"], false);
+    assert!(
+        b.mark_retired_cpfp_wallet_unlocked(&old, &unsigned_funding, 2)
+            .await
+            .is_err(),
+        "stale claim acknowledged cleanup"
+    );
+    let replacement = "88".repeat(32);
+    assert!(
+        a.reserve_cpfp_funding(&current, "replacement-wallet", &replacement, 1, 300_000)
+            .await?
+    );
+    a.mark_retired_cpfp_wallet_unlocked(&current, &unsigned_funding, 2)
+        .await?;
+    assert!(a
+        .retired_cpfp_funding(&current.fanout_txid)
+        .await?
+        .is_empty());
+    let archived:serde_json::Value=sqlx::query_scalar("SELECT to_jsonb(r) FROM qbit_prism_cpfp_retired_funding r WHERE funding_txid=$1 AND funding_vout=2").bind(&unsigned_funding).fetch_one(&a.pool).await?;
+    assert_eq!(archived["wallet_lock_released"], true);
+    assert_eq!(archived["wallet_name"], "original-wallet");
+    assert_eq!(
+        archived["retirement_reason"],
+        "funding spent before signing"
+    );
+    let active = a.cpfp_package(&current.fanout_txid).await?.unwrap();
+    assert_eq!(active["funding_txid"], replacement);
+    assert_eq!(
+        active["wallet_lock_released"], false,
+        "retired cleanup changed the active package"
+    );
+    db.close(vec![a, b]).await
+}
+
+#[tokio::test]
+async fn concurrent_cpfp_allocations_exclude_active_and_retired_outpoints() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let a = db.ledger("allocator-a").await?;
+    let b = db.ledger("allocator-b").await?;
+    prepare_mature_cpfp_fanouts(&a, 2).await?;
+    let first = a.claim_fanout(60).await?.unwrap();
+    let second = b.claim_fanout(60).await?.unwrap();
+    let retired = "91".repeat(32);
+    assert!(
+        a.reserve_cpfp_funding(&first, "wallet", &retired, 0, 100_000)
+            .await?
+    );
+    assert!(
+        !b.reserve_cpfp_funding(&second, "wallet", &retired, 0, 100_000)
+            .await?
+    );
+    let (retirement, allocation) = tokio::join!(
+        a.retire_unsigned_cpfp_funding(&first, &retired, 0, "stale external spend"),
+        b.reserve_cpfp_funding(&second, "wallet", &retired, 0, 100_000),
+    );
+    retirement?;
+    assert!(
+        !allocation?,
+        "allocation slipped between retirement and archived exclusion"
+    );
+    assert!(a.cpfp_package(&first.fanout_txid).await?.is_none());
+    assert!(b.cpfp_package(&second.fanout_txid).await?.is_none());
+    a.mark_retired_cpfp_wallet_unlocked(&first, &retired, 0)
+        .await?;
+    let (again_first, again_second) = tokio::join!(
+        a.reserve_cpfp_funding(&first, "wallet", &retired, 0, 100_000),
+        b.reserve_cpfp_funding(&second, "wallet", &retired, 0, 100_000),
+    );
+    assert!(
+        !again_first? && !again_second?,
+        "cleaned retired funding became allocatable again"
+    );
+    let fresh = "92".repeat(32);
+    let (first_won, second_won) = tokio::join!(
+        a.reserve_cpfp_funding(&first, "wallet", &fresh, 1, 200_000),
+        b.reserve_cpfp_funding(&second, "wallet", &fresh, 1, 200_000),
+    );
+    let first_won = first_won?;
+    let second_won = second_won?;
+    assert_ne!(
+        first_won, second_won,
+        "concurrent frontends must allocate the fresh outpoint once"
+    );
+    let (loser, claim) = if first_won {
+        (&b, &second)
+    } else {
+        (&a, &first)
+    };
+    assert!(
+        loser
+            .reserve_cpfp_funding(claim, "wallet", &"93".repeat(32), 2, 300_000)
+            .await?
+    );
+    let active: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_cpfp_packages")
+        .fetch_one(&a.pool)
+        .await?;
+    let archived:i64=sqlx::query_scalar("SELECT count(*) FROM qbit_prism_cpfp_retired_funding WHERE funding_txid=$1 AND wallet_lock_released").bind(&retired).fetch_one(&a.pool).await?;
+    assert_eq!(active, 2);
+    assert_eq!(archived, 1, "replacement lost durable cleanup history");
+    db.close(vec![a, b]).await
+}

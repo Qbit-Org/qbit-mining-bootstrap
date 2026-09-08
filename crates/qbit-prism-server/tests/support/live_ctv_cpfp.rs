@@ -9,15 +9,30 @@ use qbit_prism_server::{
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_cpfp_recovers_reserved_funding_after_owner_crash() -> Result<()> {
-    cpfp_recovery_case(false).await
+    cpfp_recovery_case(RecoveryCase::Locked).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_cpfp_abandoned_child_repair_retains_unremovable_spent_lock() -> Result<()> {
-    cpfp_recovery_case(true).await
+    cpfp_recovery_case(RecoveryCase::Abandoned).await
 }
 
-async fn cpfp_recovery_case(repair_abandoned: bool) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_cpfp_replaces_unsigned_funding_spent_after_reservation_before_wallet_lock(
+) -> Result<()> {
+    cpfp_recovery_case(RecoveryCase::SpentBeforeLock).await
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryCase {
+    Locked,
+    Abandoned,
+    SpentBeforeLock,
+}
+
+async fn cpfp_recovery_case(case: RecoveryCase) -> Result<()> {
+    let repair_abandoned = matches!(case, RecoveryCase::Abandoned);
+    let replace_unsigned = matches!(case, RecoveryCase::SpentBeforeLock);
     let Some(mut fixture) = Fixture::open(true).await? else {
         return Ok(());
     };
@@ -70,9 +85,18 @@ async fn cpfp_recovery_case(repair_abandoned: bool) -> Result<()> {
         let amount=qbit_prism_server::broadcaster::amount_bits(&funding["amount"])?;
         ensure!(ledger.reserve_cpfp_funding(&abandoned,"prism",funding_txid,funding_vout,amount).await?,"funding reservation failed");
         let outpoint=json!({"txid":funding_txid,"vout":funding_vout});
-        ensure!(fixture.rpc("lockunspent",json!([false,[outpoint],true])).await?==true,"simulated owner's wallet lock failed");
-        // The owner dies after locking the wallet but before signing. Its
-        // successor must find this same reservation and complete the package.
+        if replace_unsigned {
+            // The process dies after committing the reservation, before its
+            // external wallet lock. A wallet user can still spend this input.
+            let reserved=ledger.cpfp_package(&fanout_txid).await?.context("reservation missing")?;
+            ensure!(reserved["signed_child_hex"].is_null(),"fixture already signed a child");
+            spend_reserved_funding(&fixture,&outpoint,amount).await?;
+            ensure!(fixture.rpc("gettxout",json!([funding_txid,funding_vout,false])).await?.is_null(),"reserved input was not spent on the active chain");
+        } else {
+            ensure!(fixture.rpc("lockunspent",json!([false,[outpoint],true])).await?==true,"simulated owner's wallet lock failed");
+        }
+        // The owner dies before signing. Two successors must recover either
+        // the still-protected reservation or replacement spendable funding.
         sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE fanout_txid=$1").bind(&fanout_txid).execute(&fixture.pool).await?;
         for index in 0..2 {fixture.servers[index]=fixture.start_server_with_sponsorship(index,Some(100_000))?;}
         until("recovered CPFP package in mempool",40,||async {
@@ -83,7 +107,31 @@ async fn cpfp_recovery_case(repair_abandoned: bool) -> Result<()> {
             Ok(mempool.as_array().is_some_and(|rows|rows.contains(&json!(fanout_txid))&&rows.contains(&json!(child))))
         }).await?;
         let package=ledger.cpfp_package(&fanout_txid).await?.context("signed package not durable")?;
-        ensure!(package["funding_txid"]==funding_txid && package["funding_vout"]==funding_vout,"recovery changed funding outpoint");
+        if replace_unsigned {
+            ensure!(package["funding_txid"]!=funding_txid || package["funding_vout"]!=funding_vout,"takeover kept the confirmed-spent unsigned input");
+            let archived:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_prism_cpfp_retired_funding WHERE fanout_txid=$1 AND funding_txid=$2 AND funding_vout=$3)")
+                .bind(&fanout_txid).bind(funding_txid).bind(i64::from(funding_vout)).fetch_one(&fixture.pool).await?;
+            ensure!(archived,"invalid reservation lost cleanup history");
+            ensure!(ledger.reserve_cpfp_funding(&abandoned,"prism",funding_txid,funding_vout,amount).await.is_err(),"expired owner replaced successor funding");
+            ensure!(ledger.save_cpfp_package(&abandoned,"00",&"ff".repeat(32)).await.is_err(),"expired owner overwrote signed package");
+            let replacement_txid=package["funding_txid"].as_str().context("replacement txid missing")?;
+            let replacement_vout:u32=package["funding_vout"].as_u64().context("replacement vout missing")?.try_into()?;
+            ensure_funding_excluded(&fixture,replacement_txid,replacement_vout).await?;
+            ensure!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM qbit_prism_cpfp_packages").fetch_one(&fixture.pool).await?==1,"takeover duplicated the active signed package");
+            fixture.rpc("generatetoaddress",json!([1,fixture.address])).await?;
+            until("replacement-funded CPFP fanout confirmed",40,||async {Ok(sqlx::query_scalar::<_,String>("SELECT settlement_status FROM qbit_ctv_fanout_artifacts WHERE fanout_txid=$1").bind(&fanout_txid).fetch_one(&fixture.pool).await?=="confirmed")}).await?;
+            ensure!(fixture.rpc("gettransaction",json!([package["child_txid"]])).await?["confirmations"].as_u64().unwrap_or(0)>0,"replacement child did not confirm");
+            until("retired spent reservation cleanup acknowledged",15,||async {
+                Ok(sqlx::query_scalar::<_,bool>("SELECT wallet_lock_released FROM qbit_prism_cpfp_retired_funding WHERE fanout_txid=$1 AND funding_txid=$2 AND funding_vout=$3")
+                    .bind(&fanout_txid).bind(funding_txid).bind(i64::from(funding_vout)).fetch_one(&fixture.pool).await?)
+            }).await?;
+            ensure!(ledger.cpfp_package(&fanout_txid).await?.context("signed package disappeared")?["signed_child_hex"]==package["signed_child_hex"],"confirmation rewrote signed replacement bytes");
+            fixture.integrity().await?;
+            eprintln!("live CPFP regtest: database-only unsigned reservation became confirmed-spent; two broadcasters archived it, fenced the expired owner, funded one immutable replacement package and confirmed the payout");
+            ledger.pool.close().await;
+            return Ok(());
+        }
+        ensure!(package["funding_txid"]==funding_txid && package["funding_vout"]==funding_vout,"recovery changed protected funding outpoint");
         ensure!(package["wallet_lock_released"]==false,"mempool acceptance released unconfirmed funding reservation");
         ensure_funding_excluded(&fixture,funding_txid,funding_vout).await?;
         ensure!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM qbit_prism_cpfp_packages").fetch_one(&fixture.pool).await?==1,"concurrent broadcasters duplicated the package");
@@ -149,6 +197,38 @@ async fn cpfp_recovery_case(repair_abandoned: bool) -> Result<()> {
     }
     let cleanup = fixture.cleanup().await;
     result.and(cleanup)
+}
+
+async fn spend_reserved_funding(fixture: &Fixture, outpoint: &Value, amount: u64) -> Result<()> {
+    let output = amount
+        .checked_sub(100_000)
+        .context("funding cannot cover fixture spend fee")?;
+    let mut outputs = serde_json::Map::new();
+    outputs.insert(
+        fixture.address.clone(),
+        serde_json::from_str(&format!(
+            "{}.{:08}",
+            output / 100_000_000,
+            output % 100_000_000
+        ))?,
+    );
+    let unsigned = fixture
+        .rpc("createrawtransaction", json!([[outpoint], outputs]))
+        .await?;
+    let signed = fixture
+        .rpc("signrawtransactionwithwallet", json!([unsigned]))
+        .await?;
+    ensure!(
+        signed["complete"] == true,
+        "wallet did not sign the competing funding spend"
+    );
+    fixture
+        .rpc("sendrawtransaction", json!([signed["hex"]]))
+        .await?;
+    fixture
+        .rpc("generatetoaddress", json!([1, fixture.address]))
+        .await?;
+    Ok(())
 }
 
 async fn stop_broadcasters(fixture: &mut Fixture, fanout: &str) -> Result<()> {
