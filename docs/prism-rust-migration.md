@@ -179,6 +179,19 @@ vardiff and high-difficulty listeners, the payout/CTV policy variables, public
 `*_SATS` monetary aliases. Keep explicit mainnet share/vardiff bounds and
 `PRISM_STRATUM_STALE_GRACE_SECONDS=0`.
 
+Mainnet `check-config` and `run` require `QBIT_EXPECTED_GENESIS_HASH` to contain
+the trusted 64-hex genesis hash. Startup compares it to the connected node;
+production flags reject regtest. Public-chain readiness also requires completed
+initial block download, matching block/header heights, and at least
+`PRISM_MIN_PEERS` connected peers (default 1). Templates must satisfy
+`PRISM_TEMPLATE_MAX_AGE_SECONDS` (default 120). A failed readiness observation
+closes mining readiness until a fresh valid poll succeeds.
+
+CTV fee policies, including explicit rates, are checked against the node's live
+`minrelaytxfee` and `mempoolminfee` before building payout artifacts. A configured
+rate or discounted premium below these floors fails the build; correct the fee
+policy before admitting mining work.
+
 Removed implementation settings include Python writer IDs/epochs/session leases,
 share batch/linger queues, psql/native-client selection, subprocess builders,
 incremental window schedulers, refresh rollout gates, and their watchdog knobs.

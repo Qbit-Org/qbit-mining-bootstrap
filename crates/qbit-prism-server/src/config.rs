@@ -14,6 +14,9 @@ pub struct Config {
     pub database_connections: u32,
     pub initialize_schema: bool,
     pub chain: String,
+    pub expected_genesis_hash: Option<String>,
+    pub min_peers: u64,
+    pub template_max_age: Duration,
     pub rpc_url: String,
     pub rpc_user: String,
     pub rpc_password: String,
@@ -81,6 +84,20 @@ fn positive(name: &str, default: u64) -> Result<u64> {
     ensure!(n > 0, "{name} must be positive");
     Ok(n)
 }
+fn genesis_pin(chain: &str, pin: Option<String>) -> Result<Option<String>> {
+    ensure!(
+        !matches!(chain, "main" | "mainnet") || pin.is_some(),
+        "QBIT_EXPECTED_GENESIS_HASH is required on mainnet"
+    );
+    pin.map(|pin| {
+        ensure!(
+            pin.len() == 64 && pin.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "QBIT_EXPECTED_GENESIS_HASH must be exactly 64 hexadecimal characters"
+        );
+        Ok(pin.to_ascii_lowercase())
+    })
+    .transpose()
+}
 fn bounded_usize(name: &str, default: usize, minimum: usize, maximum: usize) -> Result<usize> {
     let value = number::<u64>(
         name,
@@ -126,6 +143,10 @@ impl Config {
             || flag("QBIT_PRODUCTION", false)?
             || flag("QBIT_TOOLS_PRODUCTION", false)?;
         if production {
+            ensure!(
+                chain != "regtest",
+                "production mode rejects regtest QBIT_CHAIN"
+            );
             for name in [
                 "PRISM_ALLOW_MEMORY_LEDGER",
                 "PRISM_ALLOW_TEST_SIGNING_SEEDS",
@@ -164,6 +185,13 @@ impl Config {
                 "mainnet requires PRISM_STRATUM_STALE_GRACE_SECONDS=0"
             );
         }
+        let expected_genesis_hash = genesis_pin(&chain, optional("QBIT_EXPECTED_GENESIS_HASH"))?;
+        let min_peers = positive("PRISM_MIN_PEERS", 1)?;
+        let template_max_age_seconds = number("PRISM_TEMPLATE_MAX_AGE_SECONDS", 120u64)?;
+        ensure!(
+            template_max_age_seconds <= 86400,
+            "PRISM_TEMPLATE_MAX_AGE_SECONDS must be 0..86400"
+        );
         ensure!(
             !flag("PRISM_ALLOW_MEMORY_LEDGER", false)?,
             "PRISM_ALLOW_MEMORY_LEDGER is retired; Rust PRISM requires PostgreSQL"
@@ -387,6 +415,9 @@ impl Config {
             database_connections,
             initialize_schema: flag("PRISM_POSTGRES_INIT_SCHEMA", false)?,
             chain: chain.clone(),
+            expected_genesis_hash,
+            min_peers,
+            template_max_age: Duration::from_secs(template_max_age_seconds),
             rpc_url,
             rpc_user,
             rpc_password,
@@ -429,6 +460,16 @@ impl Config {
         })
     }
 
+    pub(crate) fn verify_genesis(&self, actual: &str) -> Result<()> {
+        if let Some(expected) = genesis_pin(&self.chain, self.expected_genesis_hash.clone())? {
+            ensure!(
+                actual.eq_ignore_ascii_case(&expected),
+                "qbit genesis hash differs from QBIT_EXPECTED_GENESIS_HASH"
+            );
+        }
+        Ok(())
+    }
+
     /// Every node in a cluster must construct the same payouts and attestations.
     /// Credentials and local resource limits are intentionally absent.
     pub fn fingerprint(&self, genesis: &str) -> Result<String> {
@@ -460,6 +501,9 @@ mod tests {
             database_connections: 4,
             initialize_schema: false,
             chain: "regtest".into(),
+            expected_genesis_hash: None,
+            min_peers: 1,
+            template_max_age: Duration::from_secs(120),
             rpc_url: "http://127.0.0.1:18452/".into(),
             rpc_user: "operator".into(),
             rpc_password: "test-only".into(),
@@ -513,6 +557,34 @@ mod tests {
             second.fingerprint("genesis").unwrap(),
             "automatic fee premiums change immutable payouts"
         );
+    }
+
+    #[test]
+    fn mainnet_genesis_pin_is_required_and_matches_the_node() {
+        let mut config = automatic_ctv_config();
+        config.chain = "mainnet".into();
+        let actual = "ab".repeat(32);
+        assert!(config
+            .verify_genesis(&actual)
+            .unwrap_err()
+            .to_string()
+            .contains("required on mainnet"));
+        config.expected_genesis_hash = Some("ab".repeat(31));
+        assert!(config.verify_genesis(&actual).is_err());
+        config.expected_genesis_hash = Some("AB".repeat(32));
+        config.verify_genesis(&actual).unwrap();
+        assert!(config
+            .verify_genesis(&"cd".repeat(32))
+            .unwrap_err()
+            .to_string()
+            .contains("differs"));
+        config.chain = "regtest".into();
+        assert!(
+            config.verify_genesis(&"cd".repeat(32)).is_err(),
+            "optional pins still protect non-mainnet chains"
+        );
+        config.expected_genesis_hash = None;
+        config.verify_genesis(&actual).unwrap();
     }
 
     #[test]

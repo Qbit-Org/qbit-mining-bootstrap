@@ -31,6 +31,9 @@ async fn check(production: bool, settings: &[(&str, &str)]) -> Output {
             .public_key_hex();
         command
             .env("QBIT_PRODUCTION", "1")
+            .env("QBIT_CHAIN", "mainnet")
+            .env("QBIT_EXPECTED_GENESIS_HASH", "ab".repeat(32))
+            .env("PRISM_STRATUM_STALE_GRACE_SECONDS", "0")
             .env("PRISM_ALLOW_TEST_SIGNING_SEEDS", "0")
             .env("PRISM_MANIFEST_SIGNING_SEED_HEX", "93".repeat(32))
             .env("PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX", seed)
@@ -175,6 +178,74 @@ async fn mainnet_aliases_enforce_stale_grace_and_production_rules() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[tokio::test]
+async fn mainnet_requires_a_valid_genesis_pin_before_startup() {
+    for chain in ["main", "mainnet"] {
+        for pin in ["", "abc", &"g".repeat(64), &"a".repeat(63), &"a".repeat(65)] {
+            rejects(
+                true,
+                &[("QBIT_CHAIN", chain), ("QBIT_EXPECTED_GENESIS_HASH", pin)],
+                "QBIT_EXPECTED_GENESIS_HASH",
+            )
+            .await;
+        }
+        let output = check(
+            true,
+            &[
+                ("QBIT_CHAIN", chain),
+                ("QBIT_EXPECTED_GENESIS_HASH", &"AB".repeat(32)),
+            ],
+        )
+        .await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    rejects(
+        false,
+        &[("QBIT_EXPECTED_GENESIS_HASH", "invalid")],
+        "QBIT_EXPECTED_GENESIS_HASH",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn production_flags_reject_regtest_and_readiness_budgets_are_validated() {
+    for flag in ["QBIT_PRODUCTION", "QBIT_TOOLS_PRODUCTION"] {
+        rejects(
+            false,
+            &[(flag, "1")],
+            "production mode rejects regtest QBIT_CHAIN",
+        )
+        .await;
+    }
+    for (name, value) in [
+        ("PRISM_MIN_PEERS", "0"),
+        ("PRISM_MIN_PEERS", "-1"),
+        ("PRISM_MIN_PEERS", "18446744073709551616"),
+        ("PRISM_TEMPLATE_MAX_AGE_SECONDS", "-1"),
+        ("PRISM_TEMPLATE_MAX_AGE_SECONDS", "0.5"),
+        ("PRISM_TEMPLATE_MAX_AGE_SECONDS", "86401"),
+    ] {
+        rejects(false, &[(name, value)], name).await;
+    }
+    let output = check(
+        false,
+        &[
+            ("PRISM_MIN_PEERS", "2"),
+            ("PRISM_TEMPLATE_MAX_AGE_SECONDS", "0"),
+        ],
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test]

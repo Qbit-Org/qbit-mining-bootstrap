@@ -76,13 +76,20 @@ pub struct Coordinator {
     pub accepted: AtomicU64,
     pub rejected: AtomicU64,
     pub blocks: AtomicU64,
-    pub last_poll: RwLock<Option<Instant>>,
+    readiness: RwLock<ReadinessState>,
     pub observed_tip: RwLock<Option<String>>,
     pub last_error: RwLock<Option<String>>,
     build_slots: Arc<Semaphore>,
     refresh_lock: Mutex<()>,
     identities: Mutex<HashMap<String, (Worker, Instant)>>,
     chain_cache: Mutex<Option<ChainCache>>,
+}
+
+#[derive(Default)]
+struct ReadinessState {
+    last_poll: Option<Instant>,
+    generation: u64,
+    ctv_fee_floor: Option<u64>,
 }
 
 struct ChainCache {
@@ -169,6 +176,58 @@ fn fee_estimate_bits(value: &Value) -> Result<u64> {
     amount.to_u64().context("CTV fee rate overflow")
 }
 
+#[derive(Debug)]
+struct ValidatedFeePolicy {
+    policy: FanoutFeeRatePolicy,
+    floor: u64,
+}
+
+async fn validated_ctv_fee_policy(
+    rpc: &Rpc,
+    configured: Option<FanoutFeeRatePolicy>,
+    premium_bps: u64,
+) -> Result<ValidatedFeePolicy> {
+    let policy = if let Some(policy) = configured {
+        policy
+    } else {
+        let estimate = rpc.call("estimatesmartfee", json!([2])).await?;
+        let bits = fee_estimate_bits(&estimate["feerate"]).context("CTV fee estimate unavailable; configure PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT")?;
+        FanoutFeeRatePolicy::new(bits, premium_bps)
+    };
+    let mempool = rpc.call("getmempoolinfo", json!([])).await?;
+    ensure!(mempool.is_object(), "getmempoolinfo returned non-object");
+    let mut required_rate = None;
+    for name in ["minrelaytxfee", "mempoolminfee"] {
+        if let Some(value) = mempool.get(name).filter(|value| !value.is_null()) {
+            let floor = fee_estimate_bits(value)
+                .with_context(|| format!("invalid getmempoolinfo.{name} fee floor"))?;
+            required_rate = Some(required_rate.map_or(floor, |current: u64| current.max(floor)));
+        }
+    }
+    let required_rate = required_rate.context("getmempoolinfo did not report a relay fee floor")?;
+    validate_fee_floor(policy, required_rate)?;
+    Ok(ValidatedFeePolicy {
+        policy,
+        floor: required_rate,
+    })
+}
+
+fn validate_fee_floor(policy: FanoutFeeRatePolicy, required_rate: u64) -> Result<()> {
+    ensure!(
+        policy.market_fee_rate_sats_per_1000_weight >= required_rate,
+        "PRISM CTV fanout fee rate is below the connected node relay floor: configured={} required={required_rate} bits/1000 weight",
+        policy.market_fee_rate_sats_per_1000_weight
+    );
+    // The configured premium is a multiplier, and can be less than 1x. Check
+    // its exact effective rate as well, without rounding a discounted rate up.
+    ensure!(
+        u128::from(policy.market_fee_rate_sats_per_1000_weight) * u128::from(policy.premium_bps)
+            >= u128::from(required_rate) * 10_000,
+        "PRISM CTV fanout fee premium reduces the effective fee below the connected node relay floor"
+    );
+    Ok(())
+}
+
 impl Coordinator {
     pub async fn new(mut config: Config) -> Result<Arc<Self>> {
         let rpc = Rpc::new(
@@ -196,14 +255,7 @@ impl Coordinator {
                 .p2mr_program_hex = script[4..].into();
         }
         let genesis = rpc.call("getblockhash", json!([0])).await?;
-        if let Some(expected) = crate::config::optional("QBIT_EXPECTED_GENESIS_HASH") {
-            ensure!(
-                genesis
-                    .as_str()
-                    .is_some_and(|actual| actual.eq_ignore_ascii_case(&expected)),
-                "qbit genesis hash differs from QBIT_EXPECTED_GENESIS_HASH"
-            );
-        }
+        config.verify_genesis(genesis.as_str().context("qbit genesis hash missing")?)?;
         let info = rpc.call("getblockchaininfo", json!([])).await?;
         let configured_chain = match config.chain.as_str() {
             "mainnet" => "main",
@@ -242,7 +294,7 @@ impl Coordinator {
             accepted: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             blocks: AtomicU64::new(0),
-            last_poll: RwLock::new(None),
+            readiness: RwLock::new(ReadinessState::default()),
             observed_tip: RwLock::new(None),
             last_error: RwLock::new(None),
             refresh_lock: Mutex::new(()),
@@ -255,15 +307,83 @@ impl Coordinator {
         if !self.config.ctv_enabled {
             return Ok(None);
         }
-        if let Some(fee) = &self.config.ctv_fee {
-            return Ok(Some(*fee));
-        }
-        let estimate = self.rpc.call("estimatesmartfee", json!([2])).await?;
-        let bits = fee_estimate_bits(&estimate["feerate"]).context("CTV fee estimate unavailable; configure PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT")?;
-        Ok(Some(FanoutFeeRatePolicy::new(
-            bits,
+        match validated_ctv_fee_policy(
+            &self.rpc,
+            self.config.ctv_fee,
             self.config.ctv_fee_premium_bps,
-        )))
+        )
+        .await
+        {
+            Ok(validated) => {
+                // Admission uses the latest observed floor even while a new
+                // bundle is being built. Replaced jobs retain their own fee.
+                self.readiness.write().await.ctv_fee_floor = Some(validated.floor);
+                Ok(Some(validated.policy))
+            }
+            Err(error) => {
+                self.invalidate_readiness().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn ensure_job_fee_current(&self, fee: Option<FanoutFeeRatePolicy>) -> Result<()> {
+        if self.config.ctv_enabled {
+            let floor = self
+                .readiness
+                .read()
+                .await
+                .ctv_fee_floor
+                .context("live CTV relay floor is unavailable")?;
+            validate_fee_floor(fee.context("job CTV fee policy missing")?, floor)?;
+        }
+        Ok(())
+    }
+
+    async fn ready_chain_info(&self) -> Result<Value> {
+        let result =
+            crate::readiness::chain_info(&self.rpc, &self.config.chain, self.config.min_peers)
+                .await;
+        match result {
+            Ok(info) => {
+                *self.observed_tip.write().await =
+                    info["bestblockhash"].as_str().map(str::to_owned);
+                Ok(info)
+            }
+            Err(error) => {
+                // An observed unsafe node state closes admission immediately;
+                // a previous successful poll must not keep work trusted.
+                self.invalidate_readiness().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn invalidate_readiness(&self) {
+        let mut state = self.readiness.write().await;
+        state.last_poll = None;
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .expect("readiness generation exhausted");
+    }
+
+    async fn ensure_template_fresh(&self, template: &Value) -> Result<()> {
+        let result =
+            crate::readiness::validate_template_age(template, self.config.template_max_age);
+        if result.is_err() {
+            self.invalidate_readiness().await;
+        }
+        result
+    }
+
+    async fn ready_tip(&self, tip: &str) -> Result<Value> {
+        let info = self.ready_chain_info().await?;
+        ensure!(
+            info["bestblockhash"].as_str() == Some(tip),
+            "tip changed during node readiness proof"
+        );
+        Ok(info)
     }
 
     /// Reconcile against one coherent tip. Every frontend observes prepared
@@ -317,6 +437,7 @@ impl Coordinator {
             self.rpc.call("getbestblockhash", json!([])).await?.as_str() == Some(tip),
             "tip changed during reconciliation"
         );
+        self.ready_tip(tip).await?;
         self.ledger
             .reconcile_blocks_at_revision(&observations, tip_height, revision)
             .await?;
@@ -333,12 +454,11 @@ impl Coordinator {
 
     pub async fn refresh_once(&self) -> Result<()> {
         let _flight = self.refresh_lock.lock().await;
-        let info = self.rpc.call("getblockchaininfo", json!([])).await?;
-        *self.observed_tip.write().await = info["bestblockhash"].as_str().map(str::to_owned);
-        if info["initialblockdownload"] != false {
-            *self.last_poll.write().await = None;
-            anyhow::bail!("qbit is still synchronizing");
-        }
+        // Concurrent candidate observations can revoke trust while this
+        // refresh waits for RPC or database work. Their later failure must
+        // survive an older successful proof completing afterwards.
+        let readiness_generation = self.readiness.read().await.generation;
+        let info = self.ready_chain_info().await?;
         let chainwork = info["chainwork"]
             .as_str()
             .context("node chainwork missing")?;
@@ -351,6 +471,7 @@ impl Coordinator {
             .rpc
             .call("getblocktemplate", json!([{"rules":rules}]))
             .await?;
+        self.ensure_template_fresh(&template).await?;
         let selected_mask = codec::version_mask_from_template(&template, self.config.version_mask)?;
         template["versionrollingmask"] = json!(format!("{selected_mask:08x}"));
         let parent = template["previousblockhash"]
@@ -388,18 +509,37 @@ impl Coordinator {
         }
         let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&stable)?));
         let revision = self.ledger.payout_revision().await?;
+        // Relay floors can change without changing the template or ledger.
+        // Validate them on every refresh, including the cached-work path.
+        let fee = self.fee_policy().await?;
         if let Some(current) = self.prepared.read().await.as_ref() {
             if current.bundle.is_some()
+                && current.fee == fee
                 && current.fingerprint == fingerprint
                 && current.snapshot.payout_revision == revision
                 && current.created.elapsed() < self.config.snapshot_interval
+                && crate::readiness::validate_template_age(
+                    &current.template,
+                    self.config.template_max_age,
+                )
+                .is_ok()
             {
-                *self.last_poll.write().await = Some(Instant::now());
+                self.ready_tip(parent).await?;
+                self.ensure_template_fresh(&template).await?;
+                ensure!(
+                    self.ledger.payout_revision().await? == current.snapshot.payout_revision,
+                    "payout revision changed during work reuse"
+                );
+                let mut readiness = self.readiness.write().await;
+                ensure!(
+                    readiness.generation == readiness_generation,
+                    "node readiness changed during work reuse"
+                );
+                readiness.last_poll = Some(Instant::now());
                 return Ok(());
             }
         }
         let snapshot = Arc::new(self.ledger.snapshot(network).await?);
-        let fee = self.fee_policy().await?;
         let bundle = if snapshot.shares.is_empty() {
             None
         } else {
@@ -499,7 +639,30 @@ impl Coordinator {
                 shared_ttl,
             )
             .await?;
-        *self.prepared.write().await = Some(Arc::new(Prepared {
+        // Persisting a large bundle can outlive the original node observation.
+        // Recheck immediately before making this prepared work available.
+        let published_info = self.ready_tip(parent).await?;
+        self.ensure_template_fresh(&template).await?;
+        ensure!(
+            self.ledger
+                .observe_chain_view(
+                    parent,
+                    height - 1,
+                    published_info["chainwork"]
+                        .as_str()
+                        .context("node chainwork missing")?,
+                )
+                .await?
+                == snapshot.payout_revision,
+            "payout revision changed before job publication"
+        );
+        let mut prepared = self.prepared.write().await;
+        let mut readiness = self.readiness.write().await;
+        ensure!(
+            readiness.generation == readiness_generation,
+            "node readiness changed before job publication"
+        );
+        *prepared = Some(Arc::new(Prepared {
             template,
             snapshot,
             bundle,
@@ -511,7 +674,7 @@ impl Coordinator {
             created: Instant::now(),
             parent_of_tip,
         }));
-        *self.last_poll.write().await = Some(Instant::now());
+        readiness.last_poll = Some(Instant::now());
         self.refresh.send_replace(generation);
         Ok(())
     }
@@ -627,11 +790,7 @@ impl Coordinator {
 
     async fn observe_candidate(&self, claim: &CandidateClaim) -> Result<(bool, i64, String)> {
         let height = claim.candidate.bundle.found_block.block_height;
-        let info = self.rpc.call("getblockchaininfo", json!([])).await?;
-        ensure!(
-            info["initialblockdownload"] == false,
-            "qbit is still synchronizing"
-        );
+        let info = self.ready_chain_info().await?;
         let tip_height = info["blocks"].as_u64().context("invalid tip height")?;
         let tip = info["bestblockhash"]
             .as_str()
@@ -659,6 +818,7 @@ impl Coordinator {
             self.rpc.call("getbestblockhash", json!([])).await?.as_str() == Some(&tip),
             "tip changed while observing candidate"
         );
+        self.ready_tip(&tip).await?;
         Ok((active, revision, tip))
     }
 
@@ -800,17 +960,24 @@ impl Coordinator {
     }
 
     pub async fn health(&self) -> Value {
-        let poll_age = self
-            .last_poll
-            .read()
-            .await
-            .map(|time| time.elapsed().as_secs_f64());
+        let (poll_age, fee_floor) = {
+            let readiness = self.readiness.read().await;
+            (
+                readiness.last_poll.map(|time| time.elapsed().as_secs_f64()),
+                readiness.ctv_fee_floor,
+            )
+        };
         let prepared = self.prepared.read().await.clone();
         let observed = self.observed_tip.read().await.clone();
         let revision = self.ledger.payout_revision().await.ok();
         let ready = prepared.as_ref().is_some_and(|work| {
             work.template["previousblockhash"].as_str() == observed.as_deref()
                 && Some(work.snapshot.payout_revision) == revision
+                && (!self.config.ctv_enabled
+                    || work
+                        .fee
+                        .zip(fee_floor)
+                        .is_some_and(|(fee, floor)| validate_fee_floor(fee, floor).is_ok()))
         }) && poll_age
             .is_some_and(|age| age < self.config.health_timeout.as_secs_f64());
         json!({"schema":"qbit.prism.audit-health.v1","ok":ready,"ready":ready,"status":if ready {"ok"} else {"unavailable"},"backend":"postgres","instance_id":self.config.instance_id,"runtime_workers":self.config.runtime_workers,"tip_poll_age_seconds":poll_age,"accepted_share_count":self.accepted.load(Ordering::Relaxed),"found_block_count":self.blocks.load(Ordering::Relaxed),"template_generation":prepared.as_ref().map(|p|p.generation),"template_age_seconds":prepared.as_ref().map(|p|p.created.elapsed().as_secs_f64()),"observed_tip":observed,"payout_state_generation":prepared.as_ref().map(|p|p.snapshot.payout_revision)})
@@ -910,12 +1077,14 @@ impl MiningBackend for Coordinator {
                 "new tip work is pending"
             );
             ensure!(
-                self.last_poll
+                self.readiness
                     .read()
                     .await
+                    .last_poll
                     .is_some_and(|at| at.elapsed() < self.config.health_timeout),
                 "tip polling stale"
             );
+            self.ensure_job_fee_current(prepared.fee).await?;
             ensure!(
                 self.ledger.payout_revision().await? == prepared.snapshot.payout_revision,
                 "payout snapshot stale"
@@ -1062,12 +1231,14 @@ impl MiningBackend for Coordinator {
                 return Ok(None);
             }
             ensure!(
-                self.last_poll
+                self.readiness
                     .read()
                     .await
+                    .last_poll
                     .is_some_and(|at| at.elapsed() < self.config.health_timeout),
                 "tip polling stale"
             );
+            self.ensure_job_fee_current(prepared.fee).await?;
             let bundle = match prepared.bundle.as_ref() {
                 Some(bundle) => bundle.clone(),
                 None => Arc::new(
@@ -1166,9 +1337,10 @@ impl MiningBackend for Coordinator {
         stale_grace_eligible: bool,
     ) -> Result<(), StratumError> {
         if !self
-            .last_poll
+            .readiness
             .read()
             .await
+            .last_poll
             .is_some_and(|at| at.elapsed() < self.config.health_timeout)
         {
             return Err(protocol_error(
@@ -1188,6 +1360,11 @@ impl MiningBackend for Coordinator {
             return Err(protocol_error("stale-job", "new tip work is pending"));
         }
         let context = &job.context;
+        self.ensure_job_fee_current(context.prepared.fee)
+            .await
+            .map_err(|_| {
+                protocol_error("stale-job", "job CTV fee is below the current relay floor")
+            })?;
         let stale =
             current.template["previousblockhash"] != context.prepared.template["previousblockhash"];
         if stale && !(stale_grace_eligible && current.parent_of_tip == job.wire.previousblockhash) {
@@ -1416,3 +1593,6 @@ mod fee_estimate_tests {
         assert!(fee_estimate_bits(&Value::String("1".repeat(4097))).is_err());
     }
 }
+
+#[cfg(test)]
+mod fee_policy_tests;

@@ -21,11 +21,12 @@ pub async fn run(coordinator: Arc<Coordinator>, mut shutdown: watch::Receiver<bo
 
 pub async fn run_once(coordinator: &Coordinator) -> Result<usize> {
     // A node behind its peers must leave their settlement claims available.
-    let chain = coordinator.rpc.call("getblockchaininfo", json!([])).await?;
-    ensure!(
-        chain["initialblockdownload"] != true,
-        "CTV node is still synchronizing"
-    );
+    let chain = crate::readiness::chain_info(
+        &coordinator.rpc,
+        &coordinator.config.chain,
+        coordinator.config.min_peers,
+    )
+    .await?;
     coordinator
         .ledger
         .observe_chain_view(
@@ -98,11 +99,12 @@ fn confirmed(hash: &str, height: u64, tip: u64) -> Result<(&'static str, Value)>
 
 async fn process(coordinator: &Coordinator, claim: &FanoutClaim) -> Result<(&'static str, Value)> {
     coordinator.ledger.renew_fanout_claim(claim, 120).await?;
-    let chain = coordinator.rpc.call("getblockchaininfo", json!([])).await?;
-    ensure!(
-        chain["initialblockdownload"] != true,
-        "CTV node is still synchronizing"
-    );
+    let chain = crate::readiness::chain_info(
+        &coordinator.rpc,
+        &coordinator.config.chain,
+        coordinator.config.min_peers,
+    )
+    .await?;
     let revision = coordinator
         .ledger
         .observe_chain_view(
