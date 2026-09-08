@@ -1235,22 +1235,52 @@ impl MiningBackend for Coordinator {
                 (address, Some(worker.to_string()))
             });
         let resolve = |address: String| async move {
-            let validation = self.rpc.call("validateaddress", json!([address])).await?;
+            let validation = self
+                .rpc
+                .call("validateaddress", json!([address]))
+                .await
+                .map_err(|_| StratumError::backend("payout address validation unavailable"))?;
+            match validation["isvalid"].as_bool() {
+                Some(false) => return Ok(None),
+                Some(true) => {}
+                None => return Err(StratumError::backend("invalid address validation response")),
+            }
             let script = validation["scriptPubKey"]
                 .as_str()
-                .context("address has no script")?;
-            ensure!(
-                validation["isvalid"] == true
-                    && script.starts_with("5220")
-                    && hex::decode(script)?.len() == 34,
-                "address must be P2MR"
-            );
-            Ok::<_, anyhow::Error>((address, script[4..].to_lowercase()))
+                .ok_or_else(|| StratumError::backend("address validation has no payout script"))?;
+            let script = hex::decode(script).map_err(|_| {
+                StratumError::backend("address validation has an invalid payout script")
+            })?;
+            if script.len() == 34 && script.starts_with(&[0x52, 0x20]) {
+                return Ok(Some((address, hex::encode(&script[2..]))));
+            }
+            // Preserve fallback for complete standard address scripts that
+            // Prism cannot pay, but not malformed or unrecognized RPC output.
+            let unsupported = (script.len() == 25
+                && script.starts_with(&[0x76, 0xa9, 0x14])
+                && script.ends_with(&[0x88, 0xac]))
+                || (script.len() == 23
+                    && script.starts_with(&[0xa9, 0x14])
+                    && script.ends_with(&[0x87]))
+                || (script.len() == 22 && script.starts_with(&[0x00, 0x14]))
+                || (script.len() == 34 && script.starts_with(&[0x00, 0x20]))
+                || ((4..=42).contains(&script.len())
+                    && (0x51..=0x60).contains(&script[0])
+                    && usize::from(script[1]) == script.len() - 2);
+            if unsupported {
+                Ok(None)
+            } else {
+                Err(StratumError::backend(
+                    "address validation has an unrecognized payout script",
+                ))
+            }
         };
-        let (payout_address, p2mr_program_hex) = match resolve(address.into()).await {
-            Ok(identity) => identity,
-            Err(_) => match &self.config.username_fallback {
-                Some(fallback) => resolve(fallback.clone()).await.map_err(|_| {
+        let (payout_address, p2mr_program_hex) = match resolve(address.into()).await? {
+            Some(identity) => identity,
+            // Only a definitive invalid/unsupported address uses alias fallback.
+            // RPC failures must never redirect or cache a miner's payout identity.
+            None => match &self.config.username_fallback {
+                Some(fallback) => resolve(fallback.clone()).await?.ok_or_else(|| {
                     protocol_error("unauthorized-worker", "invalid P2MR payout address")
                 })?,
                 None => {

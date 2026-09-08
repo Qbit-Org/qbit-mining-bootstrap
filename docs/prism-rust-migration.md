@@ -199,6 +199,11 @@ The grace interval starts when that client receives replacement work; stale
 blocks are never submitted. Retained vardiff hints are shared by listener and
 exact username, with accepted-work evidence controlling their expiry.
 
+`PRISM_USERNAME_FALLBACK_ADDRESS` applies when validation explicitly identifies
+an invalid address or a recognized address type that Prism cannot pay. RPC
+failures and malformed validation responses reject authorization without
+substituting another payout recipient.
+
 Mainnet `check-config` and `run` require `QBIT_EXPECTED_GENESIS_HASH` to contain
 the trusted 64-hex genesis hash. Startup compares it to the connected node;
 production flags reject regtest. Public-chain readiness also requires completed
