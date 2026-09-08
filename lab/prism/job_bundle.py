@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from concurrent.futures import (
     FIRST_COMPLETED,
+    CancelledError,
     Future,
     InvalidStateError,
     ThreadPoolExecutor,
@@ -36,6 +37,7 @@ from typing import Any, Callable, Protocol
 
 from lab.prism import direct_stratum
 from lab.prism.bundle_compiler import _ShareWindowSerialization
+from lab.prism.future_callbacks import add_releasing_done_callback
 from lab.prism.share_json_stream import share_array_json_view
 from lab.prism.share_ledger import DaemonShareJsonSequence
 from lab.prism.coordinator_config import (
@@ -756,11 +758,9 @@ class JobBundleService:
         runtime = self._runtime
         future = flight.future
         assert future is not None
-        future.add_done_callback(
-            lambda completed, build_flight=flight: runtime._job_build_done(
-                build_flight,
-                completed,
-            )
+        add_releasing_done_callback(
+            future,
+            lambda completed: runtime._job_build_done(flight, completed),
         )
 
     def _execute_job_build_request(
@@ -1247,21 +1247,24 @@ class JobBundleService:
     ) -> tuple[CachedJobBundle | None, BaseException | None]:
         """Map a finished executor future onto the shared promise outcome."""
 
-        result: CachedJobBundle | None = None
-        error: BaseException | None = None
-        try:
-            result = future.result()
-            if request.cancellation.is_set():
-                if request.cancellation.reason == "timeout":
-                    error = JobBuildCancelled(
-                        "job build completed after its timeout"
-                    )
-                else:
-                    error = JobBuildSuperseded(
-                        "obsolete job build completed after cancellation"
-                    )
-        except BaseException as exc:  # noqa: BLE001 - delivered to all waiters
-            error = exc
+        # Inspect the terminal error without re-raising it here: this frame
+        # owns both the request and future, so adding it to a stored error's
+        # traceback would retain the completed build until cyclic GC.
+        if future.cancelled():
+            return None, CancelledError()
+        error = future.exception()
+        if error is not None:
+            return None, error
+        result = future.result()
+        if request.cancellation.is_set():
+            if request.cancellation.reason == "timeout":
+                error = JobBuildCancelled(
+                    "job build completed after its timeout"
+                )
+            else:
+                error = JobBuildSuperseded(
+                    "obsolete job build completed after cancellation"
+                )
         return result, error
 
     def _evict_orphaned_job_build_flights_locked(self) -> list[str]:
