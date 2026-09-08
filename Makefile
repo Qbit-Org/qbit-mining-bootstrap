@@ -275,14 +275,15 @@ up-prism-pool:
 	@$(WITH_RESOLVED_QBIT) \
 	$(COMPOSE_ENV_HELPERS) \
 	missing=0; \
-	for name in PRISM_MANIFEST_SIGNING_SEED_HEX PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX; do \
-		if [ -z "$$(compose_env_value "$$name")" ]; then \
+	for name in PRISM_MANIFEST_SIGNING_SEED_HEX PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX PRISM_PUBLIC_STRATUM_URL; do \
+		value="$$(compose_env_value "$$name")"; \
+		if [[ -z "$${value//[[:space:]]/}" ]]; then \
 			printf 'prism operator env: %s is required\n' "$$name" >&2; \
 			missing=1; \
 		fi; \
 	done; \
 	if [ "$${missing}" -ne 0 ]; then \
-		printf 'prism operator env: set real PRISM signing keys in .env before running make up-prism-pool\n' >&2; \
+		printf 'prism operator env: set PRISM signing keys and PRISM_PUBLIC_STRATUM_URL in .env or DEPLOY_ENV_FILE before running make up-prism-pool\n' >&2; \
 		printf 'prism operator env: keep PRISM_ALLOW_TEST_SIGNING_SEEDS=0 and PRISM_ALLOW_BUNDLE_EMBEDDED_LEDGER_KEY=0 for deploys\n' >&2; \
 		exit 1; \
 	fi; \

@@ -89,9 +89,9 @@ configuration. It exits non-zero on hard failures.
 
 ### Run PRISM Pool
 
-Direct PRISM Stratum requires Postgres and three key values before
-`make up-prism-pool` starts. Generate unique deployment seeds and derive the
-trusted ledger public key from the ledger attestation seed:
+Direct PRISM Stratum requires Postgres, three key values, and an advertised
+Stratum URL before `make up-prism-pool` starts. Generate unique deployment
+seeds and derive the trusted ledger public key from the ledger attestation seed:
 
 ```bash
 PRISM_MANIFEST_SIGNING_SEED_HEX="$(openssl rand -hex 32)"
@@ -112,7 +112,15 @@ rejected, and the vardiff bounds must satisfy `minimum <= start <= maximum`.
 The public ledger key must be distributed to verifiers out of band; do not ask
 verifiers to trust a key copied from the audit bundle they are checking.
 
-Then start and validate the pool:
+Also set `PRISM_PUBLIC_STRATUM_URL` in the same environment file to the endpoint
+miners can reach. Replace the example hostname and port with your pool's:
+
+```dotenv
+PRISM_PUBLIC_STRATUM_URL=stratum+tcp://pool.example:3340
+```
+
+The target rejects a missing or blank URL before starting services. Then start
+and validate the pool:
 
 ```bash
 make up-prism-pool
@@ -120,8 +128,8 @@ make prism-self-check
 ```
 
 `make up-prism-pool` prints the Stratum URL. Miners authorize with
-`<qbit-payout-address>[.<worker>]` usernames. The coordinator serves `/public/v1`
-from its audit HTTP listener for dashboard-safe read models. Keep `/audit/*`,
+`<qbit-payout-address>[.<worker>]` usernames. The separate `prism-public-api`
+service serves `/public/v1` on port `3342` by default. Keep `/audit/*`,
 `/metrics`, `/healthz`, Postgres, qbit RPC, ckpool command sockets, and Docker
 volumes private unless you intentionally proxy them with access controls. See
 [`docs/prism-storage-sizing.md`](docs/prism-storage-sizing.md) for PRISM

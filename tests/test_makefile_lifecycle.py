@@ -211,6 +211,7 @@ class MakefileLifecycleTests(unittest.TestCase):
         bitcoin_node_extra_args: str = "",
         compose_config_fails: bool = False,
         confirm: bool = False,
+        prism_public_stratum_url: str | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -229,6 +230,12 @@ class MakefileLifecycleTests(unittest.TestCase):
                       printf 'QBIT_CHAIN_FLAG=%s\\n' "$FAKE_QBIT_CHAIN_FLAG"
                       printf 'BITCOIN_CHAIN=%s\\n' "$FAKE_BITCOIN_CHAIN"
                       printf 'BITCOIN_CHAIN_FLAG=%s\\n' "$FAKE_BITCOIN_CHAIN_FLAG"
+                      for key in PRISM_MANIFEST_SIGNING_SEED_HEX PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX; do
+                        printf '%s=%s\\n' "$key" "$FAKE_PRISM_SIGNING_KEY"
+                      done
+                      if [ "${FAKE_PRISM_PUBLIC_STRATUM_URL+x}" = x ]; then
+                        printf 'PRISM_PUBLIC_STRATUM_URL=%s\\n' "$FAKE_PRISM_PUBLIC_STRATUM_URL"
+                      fi
                       exit 0
                     fi
                     printf '%s\\n' "$*" >> "$FAKE_COMPOSE_CALL_LOG"
@@ -254,8 +261,12 @@ class MakefileLifecycleTests(unittest.TestCase):
                     "BITCOIN_CHAIN_FLAG": bitcoin_chain_flag,
                     "QBIT_NODE_EXTRA_ARG": qbit_node_extra_arg,
                     "BITCOIN_NODE_EXTRA_ARGS": bitcoin_node_extra_args,
+                    "FAKE_PRISM_SIGNING_KEY": "11" * 32,
                 }
             )
+            env.pop("FAKE_PRISM_PUBLIC_STRATUM_URL", None)
+            if prism_public_stratum_url is not None:
+                env["FAKE_PRISM_PUBLIC_STRATUM_URL"] = prism_public_stratum_url
             if confirm:
                 env["PURGE_CONFIRM"] = "delete-all-local-mining-data"
             else:
@@ -269,6 +280,10 @@ class MakefileLifecycleTests(unittest.TestCase):
                     target,
                     f"COMPOSE={fake_compose}",
                     f"COMPOSE_ALL_PROFILES={fake_compose}",
+                    f"PRODUCTION_COMPOSE={fake_compose}",
+                    # Source staging is covered separately; exercise the
+                    # target's own preflight before any service can start.
+                    "WITH_RESOLVED_QBIT=set -euo pipefail;",
                 ],
                 cwd=ROOT,
                 env=env,
@@ -278,6 +293,36 @@ class MakefileLifecycleTests(unittest.TestCase):
             )
             calls = call_log.read_text(encoding="utf-8").splitlines() if call_log.exists() else []
             return result, calls
+
+    def test_prism_start_rejects_missing_or_blank_public_stratum_url(self) -> None:
+        for production in ("0", "1"):
+            for url in (None, "", " \t "):
+                with self.subTest(production=production, url=url):
+                    result, calls = self.run_target(
+                        "up-prism-pool",
+                        qbit_production=production,
+                        prism_public_stratum_url=url,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("PRISM_PUBLIC_STRATUM_URL is required", result.stderr)
+                    self.assertEqual(calls, [])
+
+    def test_prism_start_with_public_stratum_url_launches_both_services(self) -> None:
+        for production, launch_flags in (
+            ("0", "up --build"),
+            ("1", "up -d --no-build --pull never"),
+        ):
+            with self.subTest(production=production):
+                result, calls = self.run_target(
+                    "up-prism-pool",
+                    qbit_production=production,
+                    prism_public_stratum_url="stratum+tcp://pool.example:3340",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    calls,
+                    [f"--profile prism {launch_flags} qbitd prism-postgres prism-coordinator prism-public-api"],
+                )
 
     def test_down_stops_all_profiles_without_deleting_volumes(self) -> None:
         result, calls = self.run_target("down")

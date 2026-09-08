@@ -33,10 +33,13 @@ class MiningComposeProfileTests(unittest.TestCase):
             raise unittest.SkipTest(f"docker compose is unavailable: {version.stderr.strip()}")
         cls.docker = docker
 
-    def render_profile(self, profile: str) -> dict[str, Any]:
+    def render_profile(
+        self, profile: str, overrides: dict[str, str] | None = None
+    ) -> dict[str, Any]:
         inherited_keys = ("PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "XDG_CONFIG_HOME")
         env = {key: os.environ[key] for key in inherited_keys if key in os.environ}
         env["QBIT_SRC_DIR"] = str(ROOT)
+        env.update(overrides or {})
         completed = subprocess.run(
             [
                 self.docker,
@@ -69,6 +72,19 @@ class MiningComposeProfileTests(unittest.TestCase):
                 f"stderr:\n{completed.stderr}"
             )
         return json.loads(completed.stdout)
+
+    def test_replica_retry_controls_reach_the_container(self) -> None:
+        attempts = "PRISM_POSTGRES_REPLICA_BASEBACKUP_ATTEMPTS"
+        retry_seconds = "PRISM_POSTGRES_REPLICA_BASEBACKUP_RETRY_SECONDS"
+        for overrides, expected in (
+            ({}, {attempts: "60", retry_seconds: "5"}),
+            ({attempts: "120", retry_seconds: "2"}, {attempts: "120", retry_seconds: "2"}),
+        ):
+            with self.subTest(overrides=overrides):
+                config = self.render_profile("prism", overrides)
+                env = config["services"]["prism-postgres-replica"]["environment"]
+                for key, value in expected.items():
+                    self.assertEqual(env.get(key), value, key)
 
     def test_each_mining_profile_has_an_exact_service_graph(self) -> None:
         expected = {

@@ -640,6 +640,11 @@ profile and requires `minimum <= start <= maximum`. Capacity qualification is
 optional and external to startup; see
 [docs/prism-capacity-readiness.md](docs/prism-capacity-readiness.md).
 
+Set `PRISM_PUBLIC_STRATUM_URL` in the same environment file to your pool's
+miner-facing endpoint, for example `stratum+tcp://pool.example:3340` with your
+actual hostname and port. The public API advertises this URL, and
+`make up-prism-pool` rejects a missing or blank value before starting services.
+
 Start the pool:
 
 ```bash
