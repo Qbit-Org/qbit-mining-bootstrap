@@ -997,31 +997,41 @@ class StallProbe:
         """
         current = threading.get_ident()
         names = {thread.ident: thread.name for thread in threading.enumerate()}
+        frame = walker = None
         frames = sys._current_frames()
-        lines: list[str] = []
-        listed = 0
-        for ident, frame in frames.items():
-            if ident == current:
-                continue
-            if listed >= self._max_threads:
+        try:
+            lines: list[str] = []
+            listed = 0
+            for ident, frame in frames.items():
+                if ident == current:
+                    continue
+                if listed >= self._max_threads:
+                    lines.append(
+                        f"... {len(frames) - 1 - listed} more threads not listed"
+                    )
+                    break
+                listed += 1
+                entries: list[str] = []
+                walker = frame
+                while walker is not None and len(entries) < self._max_frames:
+                    code = walker.f_code
+                    entries.append(
+                        f"{code.co_name}@{os.path.basename(code.co_filename)}"
+                        f":{walker.f_lineno}"
+                    )
+                    walker = walker.f_back
                 lines.append(
-                    f"... {len(frames) - 1 - listed} more threads not listed"
+                    f"thread {names.get(ident, '?')} ({ident}): " + " <- ".join(entries)
                 )
-                break
-            listed += 1
-            entries: list[str] = []
-            walker = frame
-            while walker is not None and len(entries) < self._max_frames:
-                code = walker.f_code
-                entries.append(
-                    f"{code.co_name}@{os.path.basename(code.co_filename)}"
-                    f":{walker.f_lineno}"
-                )
-                walker = walker.f_back
-            lines.append(
-                f"thread {names.get(ident, '?')} ({ident}): " + " <- ".join(entries)
-            )
-        return "\n".join(lines)
+            return "\n".join(lines)
+        finally:
+            # The snapshot includes this frame: keeping it forms a cycle
+            # retaining every sampled thread's locals until cyclic GC. Drop
+            # both the snapshot and traversal references, even on an error or
+            # a sampling cap. The loop can bind frame to this frame even when
+            # skipping the current thread. Never clear live frames themselves.
+            frames.clear()
+            frame = walker = None
 
 
 def _default_monotonic() -> float:
