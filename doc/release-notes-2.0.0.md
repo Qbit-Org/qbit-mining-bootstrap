@@ -140,8 +140,8 @@ have their own version tags.
 
 ## Changes Since v1.1.0
 
-This release includes the 70 commits on `2.x.x` after `v1.1.0`, through
-`700fae0` (#243).
+This release includes the `2.x.x` changes after `v1.1.0` through
+`d7f6280` (#248), along with release-promotion fixes in #246.
 
 ### Coordinator ownership and concurrency validation
 
@@ -223,6 +223,9 @@ This release includes the 70 commits on `2.x.x` after `v1.1.0`, through
 - Add always-on heap and component-cardinality telemetry (#232), bounded heap
   census and allocator controls, and a documented resident-memory soak bound
   (#234).
+- Release sampled thread-frame references after each stall-probe sample,
+  including sampling caps and formatting errors, so completed workers' locals
+  are not retained until cyclic garbage collection (#248).
 - Make the interpreter switch interval tunable (#179), move service images
   and CI to Python 3.14 (#201), and shard lint, compile, Python, Postgres, and
   Rust CI checks while preserving the aggregate required check name (#243).

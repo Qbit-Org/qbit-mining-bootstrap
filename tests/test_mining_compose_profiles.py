@@ -7,13 +7,16 @@ import os
 import shlex
 import shutil
 import subprocess
+import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from lab.prism import public_api, public_read_service
 from lab.prism.coordinator_config import CoordinatorConfig, load_coordinator_config
+from lab.prism.prism_coordinator import JsonRpc, PrismCoordinator
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -181,6 +184,77 @@ class MiningComposeProfileTests(unittest.TestCase):
                 self.assertEqual(config.jobs.window_pipeline_rust_enabled, expected)
         with self.assertRaisesRegex(SystemExit, "PRISM_WINDOW_PIPELINE_RUST"):
             self.coordinator_config({"PRISM_WINDOW_PIPELINE_RUST": "invalid"})
+
+    def test_hashrate_rollup_controls_reach_coordinator(self) -> None:
+        for overrides, expected in (
+            ({}, (True, 15.0, 50000)),
+            ({
+                "PRISM_HASHRATE_ROLLUP_ENABLED": "0",
+                "PRISM_HASHRATE_ROLLUP_INTERVAL_SECONDS": "42.5",
+                "PRISM_HASHRATE_ROLLUP_BATCH_SHARES": "1000",
+            }, (False, 42.5, 1000)),
+        ):
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as root:
+                services = self.render_profile("prism", overrides)["services"]
+                env = services["prism-coordinator"]["environment"]
+                env = {key: value for key, value in env.items() if value is not None}
+                # The constructor reads these controls from the process
+                # environment. Keep its unrelated storage and RPC local.
+                config = load_coordinator_config({
+                    "QBIT_RPC_HOST": "qbit.example",
+                    "QBIT_RPC_USER": "rpc-user",
+                    "QBIT_RPC_PASSWORD": "rpc-password",
+                    "PRISM_ALLOW_MEMORY_LEDGER": "1",
+                    "PRISM_ALLOW_TEST_SIGNING_SEEDS": "1",
+                    "PRISM_ALLOW_BUNDLE_EMBEDDED_LEDGER_KEY": "1",
+                    "PRISM_AUDIT_DIR": root,
+                    "PRISM_EVIDENCE_PATH": str(Path(root) / "evidence.json"),
+                })
+                with patch.dict(os.environ, env, clear=True), patch.object(
+                    JsonRpc, "call", side_effect=RuntimeError("offline")
+                ):
+                    coordinator = PrismCoordinator(config)
+                self.assertEqual((
+                    coordinator.hashrate_rollup_enabled,
+                    coordinator.hashrate_rollup_interval_seconds,
+                    coordinator.hashrate_rollup_batch_shares,
+                ), expected)
+
+    def test_public_read_deadline_reaches_origin_dispatch(self) -> None:
+        for overrides, expected in (
+            ({}, 20),
+            ({"PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS": "7"}, 7),
+            ({"PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS": "0"}, 0),
+        ):
+            with self.subTest(overrides=overrides):
+                services = self.render_profile("prism", overrides)["services"]
+                env = services["prism-public-api"]["environment"]
+                env = {key: value for key, value in env.items() if value is not None}
+                coordinator = Mock()
+                timeout = coordinator.ledger.operation_timeout
+                timeout.return_value = nullcontext()
+                with patch.dict(os.environ, env, clear=True), patch.object(
+                    public_api, "dispatch", return_value=(200, {"ok": True})
+                ) as dispatch:
+                    result = public_read_service.bounded_public_dispatch(
+                        coordinator, "/public/v1/pool", {}, occupies_read_slot=True
+                    )
+                self.assertEqual(result, (200, {"ok": True}))
+                dispatch.assert_called_once_with(coordinator, "/public/v1/pool", {})
+                if expected:
+                    timeout.assert_called_once_with(float(expected))
+                else:
+                    timeout.assert_not_called()
+
+    def test_candidate_cleanup_backlog_limit_reaches_runtime_config(self) -> None:
+        key = "PRISM_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX"
+        for overrides, expected in (({}, 4096), ({key: "128"}, 128), ({key: "8192"}, 8192)):
+            with self.subTest(overrides=overrides):
+                config = self.coordinator_config(overrides)
+                self.assertEqual(config.block.candidate_cleanup_retry_backlog_max, expected)
+        for invalid in ("0", "8193"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(SystemExit, key):
+                self.coordinator_config({key: invalid})
 
     def test_each_mining_profile_has_an_exact_service_graph(self) -> None:
         expected = {
