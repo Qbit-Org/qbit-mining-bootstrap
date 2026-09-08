@@ -39,6 +39,10 @@ What is proved here
     Repeated over-half-slack wakes produce at most the configured number
     of stack samples per window — a count, never a duration.
 
+``StallProbeFrameOwnershipTests``
+    Completed samples, sampling caps, and formatting errors release sampled
+    workers' locals without waiting for cyclic GC (issue #247).
+
 ``LatenessBeyondSlackResponseTests``
     The decided response (option (b) in the ``writer_lease_timing``
     docstring): the monitor does not hard-exit a healthy coordinator, the
@@ -54,6 +58,7 @@ import re
 import threading
 import unittest
 from unittest import mock
+import weakref
 
 from lab.prism.background_services import (
     GcPauseTelemetry,
@@ -509,6 +514,84 @@ class StallProbeTests(unittest.TestCase):
         self.assertEqual(len(logged), LEASE_MONITOR_STALL_PROBE_MAX_SAMPLES_PER_WINDOW)
         self.assertEqual(exits, [])
         self.assertEqual(service.exit_guarantee_breaches, 0)
+
+
+class StallProbeFrameOwnershipTests(unittest.TestCase):
+    """A diagnostic must not keep finished workers alive until cyclic GC (#247)."""
+
+    def _assert_worker_released(
+        self, probe: StallProbe, *, fail_formatting: bool = False
+    ) -> None:
+        class Payload:
+            pass
+
+        parked = threading.Event()
+        release = threading.Event()
+        payload_refs: list[weakref.ReferenceType[Payload]] = []
+
+        def park() -> None:
+            payload = Payload()
+            payload_refs.append(weakref.ref(payload))
+            parked.set()
+            release.wait(10.0)
+
+        worker = threading.Thread(target=park, name="stall-probe-owner", daemon=True)
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        failure = None
+        try:
+            worker.start()
+            try:
+                self.assertTrue(parked.wait(5.0))
+                if fail_formatting:
+                    expected = RuntimeError("stack formatting failed")
+                    with mock.patch(
+                        "lab.prism.background_services.os.path.basename",
+                        side_effect=expected,
+                    ):
+                        try:
+                            probe.capture(now=100.0, wake_delay_seconds=0.3)
+                        except RuntimeError as error:
+                            # Keep the traceback alive too: its capture_stacks
+                            # frame must no longer own the sampled frames.
+                            failure = error
+                    self.assertIs(failure, expected)
+                else:
+                    stacks = probe.capture(now=100.0, wake_delay_seconds=0.3)
+                    self.assertEqual(probe.last_sample["stacks"], stacks)
+            finally:
+                release.set()
+                worker.join(5.0)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(payload_refs), 1)
+            # No gc.collect() before this assertion. Keeping the probe, its
+            # last_sample, and any formatting traceback must retain only text.
+            self.assertIsNone(payload_refs[0]())
+        finally:
+            failure = None
+            gc.collect()
+            if gc_was_enabled:
+                gc.enable()
+
+    def test_completed_sample_releases_worker_without_cyclic_gc(self) -> None:
+        self._assert_worker_released(StallProbe())
+
+    def test_sampling_limits_release_worker_without_cyclic_gc(self) -> None:
+        for limits in (
+            {"max_threads": 0},
+            {"max_threads": 1},
+            {"max_frames_per_thread": 0},
+            {"max_frames_per_thread": 1},
+        ):
+            with self.subTest(**limits):
+                self._assert_worker_released(StallProbe(**limits))
+
+    def test_formatting_error_releases_worker_with_traceback_alive(self) -> None:
+        self._assert_worker_released(StallProbe(), fail_formatting=True)
+
+    def test_empty_snapshot(self) -> None:
+        with mock.patch("lab.prism.background_services.sys._current_frames", return_value={}):
+            self.assertEqual(StallProbe().capture_stacks(), "")
 
 
 def _service_with_fake_ports(

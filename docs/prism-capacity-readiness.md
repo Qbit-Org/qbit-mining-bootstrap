@@ -278,6 +278,31 @@ the rollup maintenance loop folds shares in PostgreSQL through
 Every gauge here is a scrape-time snapshot of the same process; read the
 `X-Prism-Metrics-State` header before trusting a stale document.
 
+### Stack-sample frame ownership
+
+The stall probe retains formatted text only. `sys._current_frames()` includes
+the sampler's own frame, so leaving its dictionary in a local variable creates
+a cycle that can retain every sampled thread's locals until cyclic GC. This
+includes completed payout-window workers and their share data; limiting the
+number of printed threads or frames does not bound that retained heap (#247).
+`StallProbe.capture_stacks()` releases the snapshot and traversal references in
+`finally`, including when formatting fails or a sampling limit is reached. It
+does not clear another thread's live execution frame.
+
+`StallProbeFrameOwnershipTests` in `tests/test_prism_lease_monitor_stalls.py`
+checks this with real worker threads and weak references while cyclic GC is
+disabled for the test. Payloads must disappear after workers finish, even while
+the probe's last sample or a formatting-error traceback remains alive. GC stays
+enabled according to the application's existing policy in production.
+
+Passing that ownership regression does not establish that the remaining #236
+stalls are resolved. After deployment, compare the native-ledger/window/job
+pipeline at 350k–400k shares under concurrent work and a sustained soak. Record
+coordinator RSS, per-generation GC-pause histogram deltas, late-wake counter
+deltas, restart count, and mining-work availability; measure the Rust builder's
+memory separately. Lifetime maximum pauses and a stack captured after the
+monitor resumes cannot attribute an individual late wake to a collection.
+
 ## Heap Census, Allocator Control, and the Resident-Set Bound
 
 Issue #226's second part. The always-on families above say *whether* the
