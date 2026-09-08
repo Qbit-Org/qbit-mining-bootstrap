@@ -38,6 +38,10 @@ sessions, never migrates schema, and does not claim a writer identity. It keeps
 serving across mining coordinator restarts. Set its `PRISM_DATABASE_URL` to the
 public read database and explicitly set `PRISM_PUBLIC_STRATUM_URL`, because the
 read service has no mining listener from which to infer that address.
+Its node RPC settings use the same defaults as the coordinator:
+`http://127.0.0.1:18452/`, username `qbit`, and password `change-this`.
+Configure `QBIT_RPC_HOST` and `QBIT_RPC_PORT`, or set `QBIT_RPC_URL` to override
+the complete endpoint. `QBIT_RPC_USER` and `QBIT_RPC_PASSWORD` set credentials.
 Both readiness modes verify the required native read schema before allowing
 database-backed reads. Apply migrations on the writer and let them replay to
 the standby before starting the public service. Hashrate rollups remain

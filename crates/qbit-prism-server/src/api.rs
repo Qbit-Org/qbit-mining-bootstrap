@@ -45,12 +45,11 @@ pub struct ApiConfig {
 }
 impl ApiConfig {
     pub fn from_env() -> Self {
-        let rpc_host = env("QBIT_RPC_HOST", "qbit-node");
-        let rpc_port = env("QBIT_RPC_PORT", "18443");
+        let (rpc_url, rpc_user, rpc_password) = crate::config::rpc_connection_from_env();
         Self {
-            rpc_url: env("QBIT_RPC_URL", &format!("http://{rpc_host}:{rpc_port}")),
-            rpc_user: env("QBIT_RPC_USER", "qbit"),
-            rpc_password: env("QBIT_RPC_PASSWORD", "qbit"),
+            rpc_url,
+            rpc_user,
+            rpc_password,
             stratum_host: std::env::var("PRISM_PUBLIC_STRATUM_HOST")
                 .ok()
                 .filter(|v| !v.is_empty())

@@ -61,6 +61,22 @@ pub(crate) fn authority_host(host: &str) -> String {
         host.into()
     }
 }
+/// Keep the independent public reader and mining coordinator on the same
+/// node unless the operator explicitly overrides their process environment.
+pub(crate) fn rpc_connection_from_env() -> (String, String, String) {
+    let endpoint = optional("QBIT_RPC_URL").unwrap_or_else(|| {
+        format!(
+            "http://{}:{}/",
+            authority_host(&value("QBIT_RPC_HOST", "127.0.0.1")),
+            value("QBIT_RPC_PORT", "18452")
+        )
+    });
+    (
+        endpoint,
+        value("QBIT_RPC_USER", "qbit"),
+        value("QBIT_RPC_PASSWORD", "change-this"),
+    )
+}
 pub fn flag(name: &str, default: bool) -> Result<bool> {
     match optional(name)
         .as_deref()
@@ -323,8 +339,7 @@ impl Config {
             !(ctv_enabled && matches!(chain.as_str(), "main" | "mainnet") && ctv_fee.is_none()),
             "mainnet CTV requires an explicit market fee rate"
         );
-        let rpc_user = value("QBIT_RPC_USER", "qbit");
-        let rpc_password = value("QBIT_RPC_PASSWORD", "change-this");
+        let (rpc_url, rpc_user, rpc_password) = rpc_connection_from_env();
         if production {
             ensure!(
                 !database_url.contains("change-this")
@@ -385,13 +400,6 @@ impl Config {
         let instance_id =
             optional("PRISM_INSTANCE_ID").unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         ensure!(instance_id.len()<=128 && !instance_id.chars().any(char::is_control) && !instance_id.starts_with("prepared:"),"PRISM_INSTANCE_ID must be at most 128 characters, without controls or the reserved prepared: prefix");
-        let rpc_url = optional("QBIT_RPC_URL").unwrap_or_else(|| {
-            format!(
-                "http://{}:{}/",
-                authority_host(&value("QBIT_RPC_HOST", "127.0.0.1")),
-                value("QBIT_RPC_PORT", "18452")
-            )
-        });
         let parsed_rpc = url::Url::parse(&rpc_url)
             .context("invalid QBIT_RPC_URL or QBIT_RPC_HOST/QBIT_RPC_PORT")?;
         ensure!(
