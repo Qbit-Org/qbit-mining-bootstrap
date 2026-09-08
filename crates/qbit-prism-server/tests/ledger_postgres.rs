@@ -12,6 +12,9 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+#[path = "support/ledger_2x.rs"]
+mod two_x;
+
 struct Database {
     admin: PgPool,
     schema: String,

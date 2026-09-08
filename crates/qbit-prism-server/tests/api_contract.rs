@@ -65,6 +65,30 @@ async fn validation_preserves_public_and_operator_error_shapes() {
             "artifact sha256 must be 64 hex characters",
         ),
         ("/public/v1/miners/%20", "recipient_id is required"),
+        (
+            "/public/v1/blocks?chain_state=unknown",
+            "chain_state must be one of active, all, reversed",
+        ),
+        (
+            "/public/v1/hashrate-series?view=raw",
+            "view must be both or omitted",
+        ),
+        (
+            "/public/v1/hashrate-series?range=1m&bucket=5m",
+            "bucket 5m is not allowed for range 1m; allowed: 1h, 1d",
+        ),
+        (
+            "/public/v1/hashrate-series?range=all&bucket=1h",
+            "bucket 1h is not allowed for range all; allowed: 1d",
+        ),
+        (
+            "/public/v1/block-markers?range=6m&bucket=5m",
+            "bucket 5m is not allowed for range 6m; allowed: 1d",
+        ),
+        (
+            "/public/v1/block-markers?range=3h",
+            "range must be one of 1w, 1m, 6m, all",
+        ),
     ];
     for (path, message) in cases {
         let (status, headers, body) = get(app(), path).await;
@@ -143,4 +167,50 @@ async fn health_reads_runtime_snapshot_without_database_access() {
     assert_eq!(body["state"], "starting");
     *state.health.write().unwrap() = json!({"schema":"qbit.prism.audit-health.v1","ok":true});
     assert_eq!(get(router(state), "/healthz").await.0, StatusCode::OK);
+}
+
+#[test]
+fn two_x_fixtures_preserve_versioned_row_shapes_and_chart_counts() {
+    let blocks: Value = serde_json::from_str(include_str!(
+        "../../../docs/public-dashboard-api/fixtures/blocks-chain-states.json"
+    ))
+    .unwrap();
+    assert_eq!(blocks["schema"], "prism.dashboard.blocks.v2");
+    for row in blocks["rows"].as_array().unwrap() {
+        assert!(row["chain_state"].is_string());
+        assert_eq!(
+            row["disconnected_at"].is_null(),
+            row["chain_state"] != "reversed"
+        );
+    }
+    let markers: Value = serde_json::from_str(include_str!(
+        "../../../docs/public-dashboard-api/fixtures/block-markers.json"
+    ))
+    .unwrap();
+    assert_eq!(markers["schema"], "prism.dashboard.block-markers.v1");
+    let mut total = 0;
+    for point in markers["points"].as_array().unwrap() {
+        let count = point["block_count"].as_u64().unwrap();
+        total += count;
+        assert_eq!(
+            point["blocks"].as_array().unwrap().len(),
+            count.min(3) as usize
+        );
+        assert_eq!(point["truncated"], count > 3);
+    }
+    assert_eq!(markers["total_blocks"], total);
+    let series: Value = serde_json::from_str(include_str!(
+        "../../../docs/public-dashboard-api/fixtures/hashrate-series-dual-rate.json"
+    ))
+    .unwrap();
+    assert_eq!(series["schema"], "prism.dashboard.hashrate-series.v2");
+    assert_eq!(series["rate_basis"], "accepted_share_difficulty");
+    for point in series["points"].as_array().unwrap() {
+        assert!(
+            point["raw_hashrate_ths"].is_string()
+                && point["smoothed_hashrate_ths"].is_string()
+                && point["complete"].is_boolean()
+        );
+        assert!(point.get("hashrate_ths").is_none());
+    }
 }

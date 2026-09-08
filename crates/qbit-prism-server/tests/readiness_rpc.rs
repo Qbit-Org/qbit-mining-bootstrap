@@ -258,6 +258,18 @@ async fn observed_readiness_failure_closes_cached_work_and_candidate_settlement(
             .await?;
         coordinator.refresh_once().await?;
         ensure!(coordinator.health().await["ready"] == true);
+        let semantic_generation = coordinator.health().await["template_generation"].clone();
+        {
+            let mut prepared = coordinator.prepared.write().await;
+            Arc::get_mut(prepared.as_mut().unwrap()).unwrap().created =
+                std::time::Instant::now() - Duration::from_secs(61);
+        }
+        node.state.lock().await.template["curtime"] = json!(chrono::Utc::now().timestamp() + 1);
+        coordinator.refresh_once().await?;
+        ensure!(
+            coordinator.health().await["template_generation"] == semantic_generation,
+            "equivalent timer reanchor reset semantic delivery coverage"
+        );
         let worker = coordinator.authorize("miner.test").await?;
         let extra = format!("{:08x}", coordinator.new_session_id().await?);
         let job = coordinator.build_job(&worker, &extra, 1e-9, 0.0).await?;

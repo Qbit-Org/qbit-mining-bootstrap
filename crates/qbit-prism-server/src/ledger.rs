@@ -19,9 +19,11 @@ use uuid::Uuid;
 mod blocks;
 pub use blocks::{BlockObservation, FanoutClaim, PoolBlock};
 mod audit;
-pub use audit::materialize_audit_row;
+pub use audit::{audit_canonical_bytes, materialize_audit_row};
+mod difficulty;
 mod fanout;
 mod migration;
+pub use difficulty::WorkerDifficulty;
 
 const MIGRATION_LOCK: i64 = 0x505249534d000001;
 const ORDER_LOCK: i64 = 0x505249534d000002;
@@ -113,7 +115,11 @@ impl Ledger {
                 sqlx::query_scalar("SELECT max(version) FROM qbit_prism_schema_migrations")
                     .fetch_one(&mut *tx)
                     .await?;
-            if version.unwrap_or(0) < 2 {
+            if version.unwrap_or(0) < 3 {
+                // Existing native writers use this same lock order. Keep the
+                // schema repair and cutover atomic with their accounting.
+                lock(&mut tx, SETTLEMENT_LOCK).await?;
+                lock(&mut tx, ORDER_LOCK).await?;
                 let lease_exists: bool = sqlx::query_scalar(
                     "SELECT to_regclass('qbit_ledger_writer_lease') IS NOT NULL",
                 )
@@ -137,13 +143,22 @@ impl Ledger {
                     let legacy_pending:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_block_candidate_outbox WHERE state='pending' AND NOT(candidate ?& ARRAY['payout_revision','bundle','block_hash']))").fetch_one(&mut *tx).await?;
                     ensure!(!legacy_pending,"legacy Python block outbox is not drained; restart the legacy submitter and finish pending candidates before Rust migration");
                 }
-                sqlx::raw_sql(include_str!("../../qbit-prism/sql/001_share_ledger.sql"))
+                let base_schema = migration::base_schema_transaction_body(include_str!(
+                    "../../qbit-prism/sql/001_share_ledger.sql"
+                ))?;
+                sqlx::raw_sql(&base_schema).execute(&mut *tx).await?;
+                if version.unwrap_or(0) < 2 {
+                    sqlx::raw_sql(include_str!("../migrations/002_multi_instance.sql"))
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)")
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                sqlx::raw_sql(include_str!("../migrations/003_2x_compatibility.sql"))
                     .execute(&mut *tx)
                     .await?;
-                sqlx::raw_sql(include_str!("../migrations/002_multi_instance.sql"))
-                    .execute(&mut *tx)
-                    .await?;
-                sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)")
+                sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(3)")
                     .execute(&mut *tx)
                     .await?;
             }

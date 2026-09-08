@@ -12,6 +12,7 @@ use std::{
 use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 
 pub async fn run(config: Config) -> Result<()> {
+    let rollup_settings = crate::rollups::settings_from_env()?;
     let stratum_config = StratumConfig::from_env()?;
     let stats = stratum_config.stats.clone();
     let highdiff = stratum_config.highdiff_config()?;
@@ -102,6 +103,13 @@ pub async fn run(config: Config) -> Result<()> {
     if config.ctv_broadcast {
         tasks.spawn(crate::broadcaster::run(
             coordinator.clone(),
+            shutdown_rx.clone(),
+        ));
+    }
+    if let Some(settings) = rollup_settings {
+        tasks.spawn(crate::rollups::run(
+            coordinator.ledger.pool.clone(),
+            settings,
             shutdown_rx.clone(),
         ));
     }
@@ -197,7 +205,7 @@ async fn publish_health(
     Ok(())
 }
 
-async fn signal() -> Result<()> {
+pub(crate) async fn signal() -> Result<()> {
     #[cfg(unix)]
     {
         let mut terminate =

@@ -9,7 +9,17 @@ pub(super) async fn dispatch(state: &ApiState, path: &str, q: &Query) -> ApiResu
         "/public/v1/mining-configuration" => return Ok(mining_configuration(&state.config)),
         "/public/v1/blocks" => {
             let (p, l) = q.page()?;
-            return Ok(wrap("blocks", blocks(state, p, l).await?));
+            let filter = q.get("chain_state").unwrap_or("active");
+            if !matches!(filter, "active" | "all" | "reversed") {
+                return Err(ApiError::bad(
+                    "chain_state must be one of active, all, reversed",
+                ));
+            }
+            let mut value = wrap("blocks", blocks(state, p, l, filter).await?);
+            if filter != "active" {
+                value["schema"] = json!("prism.dashboard.blocks.v2");
+            }
+            return Ok(value);
         }
         "/public/v1/leaderboard" => {
             let (p, l) = q.page()?;
@@ -44,21 +54,7 @@ pub(super) async fn dispatch(state: &ApiState, path: &str, q: &Query) -> ApiResu
             }
         }
         "/public/v1/hashrate-series" => {
-            let range = q.get("range").unwrap_or("1m");
-            if !matches!(range, "1w" | "1m" | "6m" | "all") {
-                return Err(ApiError::bad("range must be one of 1w, 1m, 6m, all"));
-            }
-            let bucket = match q.get("bucket").unwrap_or("auto") {
-                "auto" => {
-                    if matches!(range, "1w" | "1m") {
-                        "1h"
-                    } else {
-                        "1d"
-                    }
-                }
-                b @ ("5m" | "1h" | "1d") => b,
-                _ => return Err(ApiError::bad("bucket must be one of auto, 5m, 1h, 1d")),
-            };
+            let (range, bucket) = chart_range(q)?;
             let subject = match q.get("subject").unwrap_or("pool") {
                 "pool" => None,
                 s => Some(
@@ -69,7 +65,16 @@ pub(super) async fn dispatch(state: &ApiState, path: &str, q: &Query) -> ApiResu
                         })?,
                 ),
             };
-            return hashrate_series(state, subject, range, bucket).await;
+            let dual = match q.get("view") {
+                None => false,
+                Some("both") => true,
+                _ => return Err(ApiError::bad("view must be both or omitted")),
+            };
+            return hashrate_series(state, subject, range, bucket, dual).await;
+        }
+        "/public/v1/block-markers" => {
+            let (range, bucket) = chart_range(q)?;
+            return block_markers(state, range, bucket).await;
         }
         "/public/v1/fanouts/pending" => {
             let (p, l) = q.page()?;
@@ -135,6 +140,36 @@ pub(super) async fn dispatch(state: &ApiState, path: &str, q: &Query) -> ApiResu
     }
     Err(ApiError::missing("unknown public dashboard endpoint"))
 }
+fn chart_range(q: &Query) -> ApiResult<(&str, &str)> {
+    let range = q.get("range").unwrap_or("1m");
+    if !matches!(range, "1w" | "1m" | "6m" | "all") {
+        return Err(ApiError::bad("range must be one of 1w, 1m, 6m, all"));
+    }
+    let bucket = match q.get("bucket").unwrap_or("auto") {
+        "auto" => {
+            if matches!(range, "1w" | "1m") {
+                "1h"
+            } else {
+                "1d"
+            }
+        }
+        b @ ("5m" | "1h" | "1d") => b,
+        _ => return Err(ApiError::bad("bucket must be one of auto, 5m, 1h, 1d")),
+    };
+    let allowed: &[&str] = match range {
+        "1w" => &["5m", "1h", "1d"],
+        "1m" => &["1h", "1d"],
+        _ => &["1d"],
+    };
+    if !allowed.contains(&bucket) {
+        return Err(ApiError::bad(format!(
+            "bucket {bucket} is not allowed for range {range}; allowed: {}",
+            allowed.join(", ")
+        )));
+    }
+    Ok((range, bucket))
+}
+
 fn wrap(kind: &str, mut value: Value) -> Value {
     value["schema"] = json!(format!("prism.dashboard.{kind}.v1"));
     value["generated_at"] = json!(now());
@@ -202,7 +237,13 @@ async fn network(state: &ApiState) -> ApiResult<(Value, Value)> {
     ))
 }
 async fn pool_summary(state: &ApiState) -> ApiResult<Value> {
-    let (network, _) = network(state).await?;
+    let (mut network, _) = network(state).await?;
+    network["hashrate_ths"] = state
+        .rpc("getnetworkhashps", json!([120, -1, "permissionless"]))
+        .await
+        .ok()
+        .and_then(|value| network_hashrate(&value))
+        .map_or(Value::Null, Value::String);
     let value: Value = sqlx::query_scalar(include_str!("queries/dashboard_pool_snapshot.sql"))
         .bind(network["network_difficulty"].as_str().unwrap())
         .fetch_one(&state.pool)
@@ -210,7 +251,7 @@ async fn pool_summary(state: &ApiState) -> ApiResult<Value> {
     let h3 = hashrate(&value["h3_difficulty"], 10800);
     Ok(wrap(
         "pool-summary",
-        json!({"network":network,"pool":{"name":state.config.pool_name,"hashrate_ths":{"h1":hashrate(&value["h1_difficulty"],3600),"h3":h3,"h24":hashrate(&value["h24_difficulty"],86400)},"participants_3h":value["participants_3h"],"blocks_found_total":value["blocks_found_total"],"prism_blocks_total":value["prism_blocks_total"],"total_mined_bits":value["total_mined_bits"],"expected_time_to_block_seconds":eta(&h3,&network["network_difficulty"]),"latest_block":value["latest_block"],"reward_window":{"window_multiplier":8,"requested_window_weight":(big(&network["network_difficulty"])*8u8).to_string(),"oldest_share_accepted_at":value["oldest_share_accepted_at"],"newest_share_accepted_at":value["newest_share_accepted_at"],"included_share_count":value["included_share_count"]}}}),
+        json!({"network":network,"pool":{"name":state.config.pool_name,"hashrate_ths":{"h1":hashrate(&value["h1_difficulty"],3600),"h3":h3,"h24":hashrate(&value["h24_difficulty"],86400)},"participants_3h":value["participants_3h"],"blocks_found_total":value["blocks_found_total"],"prism_blocks_total":value["prism_blocks_total"],"blocks_reversed_total":value["blocks_reversed_total"],"blocks_inactive_total":value["blocks_inactive_total"],"total_mined_bits":value["total_mined_bits"],"expected_time_to_block_seconds":eta(&h3,&network["network_difficulty"]),"latest_block":value["latest_block"],"reward_window":{"window_multiplier":8,"requested_window_weight":(big(&network["network_difficulty"])*8u8).to_string(),"oldest_share_accepted_at":value["oldest_share_accepted_at"],"newest_share_accepted_at":value["newest_share_accepted_at"],"included_share_count":value["included_share_count"]}}}),
     ))
 }
 fn mining_configuration(config: &ApiConfig) -> Value {

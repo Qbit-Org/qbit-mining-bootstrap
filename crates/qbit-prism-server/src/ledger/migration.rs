@@ -1,7 +1,28 @@
 //! Explicit one-time migration of Python filesystem artifacts. Validation is
 //! performed before any write; operator files and historical rows are retained.
 use super::*;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+/// The standalone 2.x SQL remains atomic under plain psql. SQLx already owns
+/// the encompassing transaction, which must also retain its migration/lease
+/// locks through the native migrations that follow it.
+pub(super) fn base_schema_transaction_body(schema: &str) -> Result<String> {
+    let (comments, body) = schema
+        .split_once("\nBEGIN;\n")
+        .context("base schema transaction opening is missing")?;
+    ensure!(
+        comments
+            .lines()
+            .all(|line| line.trim().is_empty() || line.trim_start().starts_with("--")),
+        "base schema has statements before its transaction opening"
+    );
+    let body = body
+        .trim_end()
+        .strip_suffix("\nCOMMIT;")
+        .context("base schema transaction closing is missing")?;
+    Ok(format!("{comments}\n{body}\n"))
+}
 
 impl Ledger {
     pub async fn import_legacy_audits(
@@ -9,28 +30,83 @@ impl Ledger {
         root_dir: Option<&Path>,
         ledger_key: &str,
     ) -> Result<usize> {
-        let rows = sqlx::query("SELECT block_hash,body_uri,audit_bundle_sha256,coinbase_tx_hex FROM qbit_pool_audit_bundles WHERE audit_bundle IS NULL AND body_uri IS NOT NULL ORDER BY created_at,block_hash").fetch_all(&self.pool).await?;
         let mut imported = 0;
-        for row in rows {
+        let mut cursor = String::new();
+        loop {
+            // Decode only one historical window at a time, even when importing
+            // years of inline JSON and canonical sidecars.
+            let row = sqlx::query("SELECT block_hash,body_uri,audit_bundle,audit_bundle_sha256,coinbase_tx_hex FROM qbit_pool_audit_bundles WHERE canonical_audit_bytes IS NULL AND share_snapshot_sha256 IS NULL AND block_hash>$1 ORDER BY block_hash LIMIT 1")
+                .bind(&cursor).fetch_optional(&self.pool).await?;
+            let Some(row) = row else { break };
             let hash: String = row.try_get("block_hash")?;
-            let uri: String = row.try_get("body_uri")?;
+            cursor = hash.clone();
+            let uri: Option<String> = row.try_get("body_uri")?;
+            let inline: Option<Value> = row.try_get("audit_bundle")?;
             let expected_digest: String = row.try_get("audit_bundle_sha256")?;
             let coinbase: String = row.try_get("coinbase_tx_hex")?;
-            let path = resolve_import_path(root_dir, &uri)?;
+            let root = root_dir.map(Path::to_path_buf);
+            let source_uri = uri.clone();
+            let source_hash = hash.clone();
+            let source_digest = expected_digest.clone();
             let key = ledger_key.to_owned();
-            let bundle = tokio::task::spawn_blocking(move || -> Result<AuditBundle> {
-                let bundle = qbit_prism::load_audit_bundle_from_path(&path)?;
-                let report = qbit_prism::verify_audit_bundle_against_coinbase_tx_hex(
-                    &bundle, &coinbase, &key,
-                )?;
-                ensure!(
-                    report.audit_bundle_sha256_hex == expected_digest,
-                    "legacy audit digest mismatch at {}",
-                    path.display()
-                );
-                Ok(bundle)
-            })
-            .await??;
+            let (bundle, canonical_bytes) =
+                tokio::task::spawn_blocking(move || -> Result<(AuditBundle, Vec<u8>)> {
+                    let sidecar = legacy_canonical_sidecar(
+                        root.as_deref(),
+                        source_uri.as_deref(),
+                        &source_hash,
+                        &source_digest,
+                    )?;
+                    let (bundle, exact) = if let Some(path) = sidecar {
+                        let mut exact = Vec::new();
+                        flate2::read::GzDecoder::new(std::fs::File::open(&path)?)
+                            .read_to_end(&mut exact)
+                            .with_context(|| {
+                                format!(
+                                    "canonical audit sidecar cannot decompress: {}",
+                                    path.display()
+                                )
+                            })?;
+                        ensure!(
+                            hex::encode(Sha256::digest(&exact)) == source_digest,
+                            "canonical audit sidecar digest mismatch: {}",
+                            path.display()
+                        );
+                        let bundle = qbit_prism::parse_audit_bundle_value(
+                            serde_json::from_slice(&exact)?,
+                            None,
+                        )?;
+                        (bundle, Some(exact))
+                    } else if let Some(inline) = inline {
+                        (
+                            qbit_prism::parse_audit_bundle_value(inline, root.as_deref())?,
+                            None,
+                        )
+                    } else {
+                        let uri = source_uri
+                            .as_deref()
+                            .context("legacy audit has neither body nor canonical sidecar")?;
+                        let path = resolve_import_path(root.as_deref(), uri)?;
+                        (qbit_prism::load_audit_bundle_from_path(&path)?, None)
+                    };
+                    let report = qbit_prism::verify_audit_bundle_against_coinbase_tx_hex(
+                        &bundle, &coinbase, &key,
+                    )?;
+                    ensure!(
+                        report.audit_bundle_sha256_hex == source_digest,
+                        "legacy audit digest mismatch for {source_hash}"
+                    );
+                    let canonical_bytes = match exact {
+                        Some(bytes) => bytes,
+                        None => qbit_prism::canonical_audit_bundle_bytes(&bundle)?,
+                    };
+                    ensure!(
+                        hex::encode(Sha256::digest(&canonical_bytes)) == source_digest,
+                        "legacy canonical audit bytes mismatch"
+                    );
+                    Ok((bundle, canonical_bytes))
+                })
+                .await??;
             let value = serde_json::to_value(&bundle)?;
             let mut tx = self.pool.begin().await?;
             lock(&mut tx, SETTLEMENT_LOCK).await?;
@@ -38,9 +114,9 @@ impl Ledger {
             // Retain legacy inline shape on import, including valid historical
             // snapshots whose ledger history was archived before Rust cutover.
             // Newly mined bodies use the normalized range-backed representation.
-            let updated = sqlx::query("UPDATE qbit_pool_audit_bundles SET audit_bundle=$2,schema_version=$3,found_block_network_difficulty=$4::text::numeric,found_block_coinbase_value_sats=$5,audit_commitment_leaves_hex=$6,witness_merkle_leaves_hex=$7 WHERE block_hash=$1 AND audit_bundle IS NULL AND body_uri=$8 AND audit_bundle_sha256=$9")
+            let updated = sqlx::query("UPDATE qbit_pool_audit_bundles SET audit_bundle=$2,schema_version=$3,found_block_network_difficulty=$4::text::numeric,found_block_coinbase_value_sats=$5,audit_commitment_leaves_hex=$6,witness_merkle_leaves_hex=$7,canonical_audit_bytes=$10 WHERE block_hash=$1 AND canonical_audit_bytes IS NULL AND body_uri IS NOT DISTINCT FROM $8 AND audit_bundle_sha256=$9")
                 .bind(&hash).bind(value).bind(&bundle.schema).bind(bundle.found_block.network_difficulty.to_string()).bind(i64::try_from(bundle.found_block.coinbase_value_sats)?)
-                .bind(serde_json::to_value(&bundle.audit_commitment_leaves_hex)?).bind(serde_json::to_value(&bundle.witness_merkle_leaves_hex)?).bind(&uri).bind(row.try_get::<String,_>("audit_bundle_sha256")?).execute(&mut *tx).await?.rows_affected();
+                .bind(serde_json::to_value(&bundle.audit_commitment_leaves_hex)?).bind(serde_json::to_value(&bundle.witness_merkle_leaves_hex)?).bind(&uri).bind(expected_digest).bind(canonical_bytes).execute(&mut *tx).await?.rows_affected();
             tx.commit().await?;
             imported += usize::try_from(updated)?;
         }
@@ -101,6 +177,52 @@ impl Ledger {
         }
         Ok(repaired)
     }
+}
+
+fn legacy_canonical_sidecar(
+    root: Option<&Path>,
+    uri: Option<&str>,
+    hash: &str,
+    digest: &str,
+) -> Result<Option<PathBuf>> {
+    ensure!(
+        hash.len() == 64
+            && digest.len() == 64
+            && hash
+                .bytes()
+                .chain(digest.bytes())
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "invalid legacy audit hash identity"
+    );
+    let directory = root.map(Path::to_path_buf).or_else(|| {
+        uri.and_then(|uri| {
+            Path::new(uri.strip_prefix("file://").unwrap_or(uri))
+                .parent()
+                .map(Path::to_path_buf)
+        })
+    });
+    let Some(directory) = directory else {
+        return Ok(None);
+    };
+    let directory = if directory.is_absolute() {
+        directory
+    } else {
+        std::env::current_dir()?.join(directory)
+    };
+    let path = directory.join(format!(
+        "prism-audit-bundle-canonical-{hash}-{digest}.json.gz"
+    ));
+    match path.symlink_metadata() {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    // Present-but-corrupt/unreadable canonical files never silently fall back
+    // to a logical reconstruction with different bytes.
+    Ok(Some(resolve_import_path(
+        root,
+        path.to_str().context("legacy audit path is not UTF-8")?,
+    )?))
 }
 
 fn resolve_import_path(root_dir: Option<&Path>, uri: &str) -> Result<PathBuf> {

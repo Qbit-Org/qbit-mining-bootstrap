@@ -64,6 +64,10 @@ async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::raw_sql(include_str!("../migrations/003_2x_compatibility.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
     for (id, miner, worker, difficulty, writer, seconds) in [
         ("1", "alice", "rig-a", 6000000i64, "server-a", 30i32),
         ("2", "bob", "rig-b", 4000000, "server-b", 20),
@@ -127,7 +131,7 @@ async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
         "/public/v1/blocks".into(),
         "/public/v1/leaderboard".into(),
         "/public/v1/leaderboard?search=alice".into(),
-        "/public/v1/hashrate-series?bucket=5m".into(),
+        "/public/v1/hashrate-series?range=1w&bucket=5m".into(),
         "/public/v1/hashrate-series?subject=miner:alice&range=all".into(),
         "/public/v1/mining-configuration".into(),
         "/public/v1/miners/alice/earnings".into(),
@@ -157,11 +161,11 @@ async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
     }
     let ctv_hash = "9".repeat(64);
     let fanout_hash = "8".repeat(64);
-    let manifest_hash = "7".repeat(64);
-    let set_hash = "6".repeat(64);
+    let manifest_hash = hex::encode(sha2::Sha256::digest(b"{\"z\":1,\"a\":2}"));
+    let set_hash = hex::encode(sha2::Sha256::digest(b"{\"z\":2,\"a\":1}"));
     sqlx::query("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256,chain_state) VALUES($1,11,$2,$3,$4,'confirmed')").bind(&ctv_hash).bind(&hash).bind("5".repeat(64)).bind("4".repeat(64)).execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO qbit_ctv_fanout_sets(block_hash,manifest_set_json,manifest_set,manifest_set_sha256,settlement_mode,parent_coinbase_txid,parent_coinbase_tx_hex,fanout_count,fanout_output_sum_sats,covenant_output_value_sats) VALUES($1,'{}','{}',$2,'ctv_fanout',$3,'00',1,100,100)").bind(&ctv_hash).bind(&set_hash).bind("5".repeat(64)).execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO qbit_ctv_fanout_artifacts(fanout_txid,block_hash,manifest_set_sha256,manifest_json,manifest,manifest_sha256,precommitment_sha256,ctv_hash,commitment_witness_leaf_hex,chunk_index,chunk_count,parent_coinbase_txid,parent_coinbase_vout,fanout_tx_template_hex,fanout_tx_hex,anchor_vout,covenant_output_value_sats,fanout_output_sum_sats,settlement_status) VALUES($1,$2,$3,'{}','{}',$4,$4,$4,$4,0,1,$5,0,'00','00',1,100,100,'broadcastable')").bind(&fanout_hash).bind(&ctv_hash).bind(&set_hash).bind(&manifest_hash).bind("5".repeat(64)).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO qbit_ctv_fanout_sets(block_hash,manifest_set_json,manifest_set,manifest_set_sha256,settlement_mode,parent_coinbase_txid,parent_coinbase_tx_hex,fanout_count,fanout_output_sum_sats,covenant_output_value_sats) VALUES($1,'{\"z\":2,\"a\":1}','{\"z\":2,\"a\":1}',$2,'ctv_fanout',$3,'00',1,100,100)").bind(&ctv_hash).bind(&set_hash).bind("5".repeat(64)).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO qbit_ctv_fanout_artifacts(fanout_txid,block_hash,manifest_set_sha256,manifest_json,manifest,manifest_sha256,precommitment_sha256,ctv_hash,commitment_witness_leaf_hex,chunk_index,chunk_count,parent_coinbase_txid,parent_coinbase_vout,fanout_tx_template_hex,fanout_tx_hex,anchor_vout,covenant_output_value_sats,fanout_output_sum_sats,settlement_status) VALUES($1,$2,$3,'{\"z\":1,\"a\":2}','{\"z\":1,\"a\":2}',$4,$4,$4,$4,0,1,$5,0,'00','00',1,100,100,'broadcastable')").bind(&fanout_hash).bind(&ctv_hash).bind(&set_hash).bind(&manifest_hash).bind("5".repeat(64)).execute(&pool).await.unwrap();
     for path in [
         format!("/public/v1/fanouts/{fanout_hash}"),
         format!("/public/v1/blocks/{ctv_hash}/settlement-artifacts"),
@@ -307,6 +311,23 @@ async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
     let (status, restored) = get(&app, &format!("/public/v1/artifacts/{digest}")).await;
     assert_eq!(status, StatusCode::OK, "{restored}");
     assert_eq!(restored, logical);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/public/v1/artifacts/{digest}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = to_bytes(response.into_body(), 10_000_000).await.unwrap();
+    assert_eq!(
+        bytes.as_ref(),
+        canonical.as_slice(),
+        "native HTTP body must retain canonical field ordering"
+    );
+    assert_eq!(hex::encode(Sha256::digest(&bytes)), digest);
     sqlx::query("UPDATE qbit_pool_audit_bundles SET audit_bundle=jsonb_set(audit_bundle,'{found_block,coinbase_value_sats}','1') WHERE block_hash=$1").bind(&native_hash).execute(&pool).await.unwrap();
     let (status, corrupt) = get(&app, &format!("/public/v1/artifacts/{digest}")).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -357,6 +378,10 @@ async fn accepted_public_blocks_and_earnings_follow_confirmed_chain_state() {
         .await
         .unwrap();
     sqlx::raw_sql(include_str!("../migrations/002_multi_instance.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../migrations/003_2x_compatibility.sql"))
         .execute(&pool)
         .await
         .unwrap();

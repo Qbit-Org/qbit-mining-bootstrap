@@ -179,12 +179,6 @@ impl Config {
                 "production requires initial-job timeout"
             );
         }
-        if matches!(chain.as_str(), "main" | "mainnet") {
-            ensure!(
-                number("PRISM_STRATUM_STALE_GRACE_SECONDS", 3f64)? == 0.0,
-                "mainnet requires PRISM_STRATUM_STALE_GRACE_SECONDS=0"
-            );
-        }
         let expected_genesis_hash = genesis_pin(&chain, optional("QBIT_EXPECTED_GENESIS_HASH"))?;
         let min_peers = positive("PRISM_MIN_PEERS", 1)?;
         let template_max_age_seconds = number("PRISM_TEMPLATE_MAX_AGE_SECONDS", 120u64)?;

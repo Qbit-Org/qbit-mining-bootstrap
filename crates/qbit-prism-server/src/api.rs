@@ -1,9 +1,12 @@
 //! Compatibility HTTP API. Every accounting read uses the shared PostgreSQL ledger.
+mod charts;
 mod public;
+pub mod public_service;
 mod read_models;
+mod response_cache;
 
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{OriginalUri, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
@@ -38,6 +41,7 @@ pub struct ApiConfig {
     pub cache_enabled: bool,
     pub cache_max_entries: usize,
     pub cache_max_bytes: usize,
+    pub read_timeout: Duration,
 }
 impl ApiConfig {
     pub fn from_env() -> Self {
@@ -69,6 +73,10 @@ impl ApiConfig {
             explorer_tx_url: std::env::var("PRISM_PUBLIC_EXPLORER_TX_URL_PREFIX")
                 .ok()
                 .filter(|v| !v.is_empty()),
+            read_timeout: Duration::from_secs(env_num(
+                "PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS",
+                20,
+            )),
             cache_enabled: env_bool("PRISM_PUBLIC_CACHE_ENABLED", true),
             cache_max_entries: env_num("PRISM_PUBLIC_CACHE_MAX_ENTRIES", 1024).max(1) as usize,
             cache_max_bytes: env_num(
@@ -84,7 +92,7 @@ impl Default for ApiConfig {
     }
 }
 
-type ResponseCache = Arc<Mutex<BTreeMap<String, Arc<Mutex<Option<CacheEntry>>>>>>;
+type ResponseCache = Arc<Mutex<BTreeMap<String, Arc<response_cache::CacheSlot>>>>;
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -97,16 +105,38 @@ pub struct ApiState {
     health_published_at: Arc<RwLock<Instant>>,
     client: reqwest::Client,
     cache: ResponseCache,
+    public_pool: PgPool,
+    public_service: Option<Arc<public_service::ServiceState>>,
 }
-#[derive(Clone)]
-struct CacheEntry {
-    payload: Value,
-    created: Instant,
+#[derive(Clone, Debug)]
+struct Payload {
+    bytes: Bytes,
+    canonical_fallback: Option<String>,
+}
+impl Payload {
+    fn json(value: Value) -> Self {
+        Self {
+            bytes: Bytes::from(serde_json::to_vec(&value).expect("JSON value")),
+            canonical_fallback: None,
+        }
+    }
+    fn raw(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: bytes.into(),
+            canonical_fallback: None,
+        }
+    }
 }
 impl ApiState {
     pub fn new(pool: PgPool, config: ApiConfig) -> Self {
+        let public_pool = public_service::read_pool(
+            pool.connect_options().as_ref().clone(),
+            env_num("PRISM_POSTGRES_READ_CONCURRENCY", 4).clamp(1, 1024) as u32,
+        );
         Self {
             pool,
+            public_pool,
+            public_service: None,
             config: Arc::new(config),
             health: Arc::new(RwLock::new(
                 json!({"schema":"qbit.prism.audit-health.v1","ok":false,"state":"starting","error":"health snapshot warm-up has not completed yet"}),
@@ -156,7 +186,7 @@ pub fn router(state: ApiState) -> Router {
     Router::new().fallback(any(handle)).with_state(state)
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ApiError {
     status: StatusCode,
     code: &'static str,
@@ -185,6 +215,13 @@ impl ApiError {
             message: message.into(),
         }
     }
+    fn read_timeout() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "read_timeout",
+            message: "the read timed out; try again shortly".into(),
+        }
+    }
     fn internal() -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -196,11 +233,31 @@ impl ApiError {
 impl From<sqlx::Error> for ApiError {
     fn from(error: sqlx::Error) -> Self {
         tracing::warn!(%error,"public ledger read failed");
-        Self::internal()
+        if error
+            .as_database_error()
+            .is_some_and(|e| e.code().as_deref() == Some("57014"))
+            || matches!(error, sqlx::Error::PoolTimedOut)
+        {
+            Self::read_timeout()
+        } else {
+            Self::internal()
+        }
     }
 }
 
 async fn handle(
+    State(state): State<ApiState>,
+    uri: OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    let response = handle_inner(State(state.clone()), uri, method, headers).await;
+    if let Some(service) = &state.public_service {
+        service.record_response(response.status());
+    }
+    response
+}
+async fn handle_inner(
     State(state): State<ApiState>,
     OriginalUri(uri): OriginalUri,
     method: Method,
@@ -208,6 +265,17 @@ async fn handle(
 ) -> Response {
     let path = uri.path().trim_end_matches('/');
     let is_public = path == "/public/v1" || path.starts_with("/public/v1/");
+    if let Some(service) = &state.public_service {
+        service
+            .requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if state.public_service.is_some() && !is_public && !matches!(path, "/healthz" | "/metrics") {
+        return finish(
+            json_response(StatusCode::NOT_FOUND, json!({"error":"unknown endpoint"})),
+            &method,
+        );
+    }
     if method == Method::OPTIONS {
         let mut response = StatusCode::NO_CONTENT.into_response();
         cors(response.headers_mut());
@@ -236,6 +304,9 @@ async fn handle(
         return response;
     }
     if path == "/healthz" {
+        if let Some(service) = &state.public_service {
+            return finish(service.health_response(), &method);
+        }
         let mut payload = state
             .health
             .read()
@@ -270,6 +341,9 @@ async fn handle(
         );
     }
     if path == "/metrics" {
+        if let Some(service) = &state.public_service {
+            return finish(service.metrics_response(), &method);
+        }
         let body = state
             .metrics
             .read()
@@ -281,89 +355,27 @@ async fn handle(
         );
     }
     let query = Query::parse(uri.query().unwrap_or(""));
-    let (result, cache_status, age, policy) = if is_public {
-        let policy = CachePolicy::for_path(path, &state.config);
-        if policy.ttl == 0 {
-            (
-                public::dispatch(&state, path, &query).await,
-                "bypass",
-                0,
-                policy,
-            )
-        } else {
-            let key = cache_key(path, &query);
-            let slot = {
-                let mut cache = state.cache.lock().await;
-                if cache.len() >= state.config.cache_max_entries && !cache.contains_key(&key) {
-                    // Keep active computations pinned, evict only idle entries.
-                    if let Some(key) = cache
-                        .iter()
-                        .find(|(_, v)| Arc::strong_count(v) == 1)
-                        .map(|(k, _)| k.clone())
-                    {
-                        cache.remove(&key);
-                    }
-                }
-                if cache.len() >= state.config.cache_max_entries && !cache.contains_key(&key) {
-                    None
-                } else {
-                    Some(
-                        cache
-                            .entry(key.clone())
-                            .or_insert_with(|| Arc::new(Mutex::new(None)))
-                            .clone(),
-                    )
-                }
-            };
-            if let Some(slot) = slot {
-                let mut entry = slot.lock().await;
-                if let Some(cached) = entry
-                    .as_ref()
-                    .filter(|v| v.created.elapsed().as_secs() < policy.ttl)
-                {
-                    (
-                        Ok(cached.payload.clone()),
-                        "hit",
-                        cached.created.elapsed().as_secs(),
-                        policy,
-                    )
-                } else {
-                    let result = public::dispatch(&state, path, &query).await;
-                    *entry = None;
-                    if let Ok(payload) = &result {
-                        *entry = Some(CacheEntry {
-                            payload: payload.clone(),
-                            created: Instant::now(),
-                        });
-                        if !serde_json::to_vec(payload)
-                            .is_ok_and(|v| v.len() <= state.config.cache_max_bytes)
-                        {
-                            state.cache.lock().await.remove(&key);
-                        }
-                    }
-                    (result, "miss", 0, policy)
-                }
-            } else {
-                (
-                    public::dispatch(&state, path, &query).await,
-                    "bypass",
-                    0,
-                    policy,
-                )
-            }
-        }
+    let policy = if is_public {
+        CachePolicy::for_path(path, &state.config)
+    } else {
+        CachePolicy::default()
+    };
+    let service_view = state.public_service.as_ref().map(|service| service.view());
+    let (result, cache_status, age) = if is_public {
+        response_cache::public_response(&state, path, &query, &policy, service_view.as_ref()).await
     } else {
         (
-            audit(&state, path, &query).await,
-            "bypass",
+            audit(&state, path, &query).await.map(Payload::json),
+            "BYPASS",
             0,
-            CachePolicy::default(),
         )
     };
+    if let (Some(service), Some(view)) = (&state.public_service, &service_view) {
+        service.record_cache(path, cache_status, age, &result, view);
+    }
     let response = match result {
         Ok(payload) => {
-            let bytes = serde_json::to_vec(&payload).expect("JSON value");
-            let etag = format!("\"{}\"", hex::encode(Sha256::digest(&bytes)));
+            let etag = format!("\"{}\"", hex::encode(Sha256::digest(&payload.bytes)));
             let matched = headers
                 .get("if-none-match")
                 .and_then(|v| v.to_str().ok())
@@ -376,13 +388,27 @@ async fn handle(
             let mut response = if matched {
                 StatusCode::NOT_MODIFIED.into_response()
             } else {
-                json_response(StatusCode::OK, payload)
+                (
+                    [("content-type", "application/json")],
+                    payload.bytes.clone(),
+                )
+                    .into_response()
             };
             response
                 .headers_mut()
                 .insert("etag", HeaderValue::from_str(&etag).expect("hash header"));
             if is_public {
-                policy.headers(response.headers_mut(), cache_status, age);
+                if let Some(reason) = &payload.canonical_fallback {
+                    response
+                        .headers_mut()
+                        .insert("cache-control", HeaderValue::from_static("no-store"));
+                    response.headers_mut().insert(
+                        "x-prism-artifact-canonical-state",
+                        HeaderValue::from_str(reason).unwrap(),
+                    );
+                } else {
+                    policy.headers(response.headers_mut(), cache_status, age);
+                }
             }
             response
         }
@@ -395,6 +421,12 @@ async fn handle(
             },
         ),
     };
+    let mut response = response;
+    if is_public {
+        if let Some(view) = service_view {
+            public_service::decorate(&mut response, path, &policy, &view, age, cache_status);
+        }
+    }
     finish(response, &method)
 }
 fn operational_error(path: &str, error: &ApiError) -> Value {
@@ -436,7 +468,7 @@ fn cors(headers: &mut HeaderMap) {
     headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
     headers.insert(
         "access-control-expose-headers",
-        HeaderValue::from_static("ETag, Age, X-Prism-Public-Cache"),
+        HeaderValue::from_static("ETag, Age, X-Prism-Public-Cache, X-Prism-Staleness-Budget-Seconds, X-Prism-Database-State, X-Prism-Replica-Lag-Seconds, X-Prism-Artifact-Canonical-State, Warning"),
     );
 }
 fn json_response(status: StatusCode, payload: Value) -> Response {
@@ -494,7 +526,7 @@ impl Query {
         Ok(s)
     }
 }
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct CachePolicy {
     ttl: u64,
     stale: u64,

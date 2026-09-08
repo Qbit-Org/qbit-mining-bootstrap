@@ -40,10 +40,7 @@ parent-node release pins.
 Validation runs in two tiers. The behavioral production checks (non-default
 credentials, explicit payout addresses, strict difficulty and readiness
 policies, commit-pinned sources) apply whenever `QBIT_PRODUCTION=1`,
-`QBIT_TOOLS_PRODUCTION=1`, or `QBIT_CHAIN=mainnet`; zero stale grace
-(`PRISM_STRATUM_STALE_GRACE_SECONDS=0`) is pinned only on mainnet, so a public
-test-chain pool may credit shares that raced a block within a bounded grace
-window. The
+`QBIT_TOOLS_PRODUCTION=1`, or `QBIT_CHAIN=mainnet`. The
 release-provenance checks (digest-qualified `*_IMAGE` references and absolute
 `*_DATA_SOURCE` host paths) are enforced unconditionally on mainnet — no
 environment variable can disable them there — and on other chains only with
@@ -137,7 +134,7 @@ docker compose \
   --profile permissionless \
   --profile auxpow \
   --profile prism \
-  config --quiet qbitd ckpool bitcoind auxpow-stratum prism-postgres prism-coordinator
+  config --quiet qbitd ckpool bitcoind auxpow-stratum prism-postgres prism-coordinator prism-public-api
 ```
 
 Pull reviewed artifacts before stopping the prior release. Start operator
@@ -151,7 +148,7 @@ docker compose \
   --env-file "$DEPLOY_ENV_FILE" \
   -f compose.yaml \
   -f compose.production.yaml \
-  pull qbitd ckpool bitcoind auxpow-stratum prism-postgres prism-coordinator
+  pull qbitd ckpool bitcoind auxpow-stratum prism-postgres prism-coordinator prism-public-api
 
 docker compose \
   --project-name "$COMPOSE_PROJECT_NAME" \
@@ -186,7 +183,7 @@ docker compose \
   --env-file "$DEPLOY_ENV_FILE" \
   -f compose.yaml \
   -f compose.production.yaml \
-  up -d --no-build --pull never ckpool auxpow-stratum prism-coordinator
+  up -d --no-build --pull never ckpool auxpow-stratum prism-coordinator prism-public-api
 ```
 
 Remove services for lanes that are not enabled. The `make
@@ -234,7 +231,7 @@ Compose contract:
 | Lane | Operator services |
 | --- | --- |
 | CKPool solo | `qbitd ckpool` |
-| PRISM | `qbitd prism-postgres prism-coordinator` |
+| PRISM | `qbitd prism-postgres prism-coordinator prism-public-api` |
 | AuxPoW Stratum | `qbitd bitcoind auxpow-stratum` |
 
 `permissionless-miner`, `real-miner`, `auxpow-real-miner`, and the one-shot
@@ -327,8 +324,9 @@ Before startup, set `PRISM_STRATUM_SHARE_DIFF`,
 `PRISM_STRATUM_VARDIFF_MIN_DIFF`, `PRISM_STRATUM_VARDIFF_START_DIFF`, and
 `PRISM_STRATUM_VARDIFF_MAX_DIFF` to explicit, reviewed, positive values.
 Production rejects missing values, the local-lab `1e-9` profile, and bounds that
-do not satisfy `minimum <= start <= maximum`. Mainnet requires
-`PRISM_STRATUM_STALE_GRACE_SECONDS=0`. These direct checks do not require an
+do not satisfy `minimum <= start <= maximum`. Mainnet supports the same bounded
+one-parent `PRISM_STRATUM_STALE_GRACE_SECONDS` window as `2.x.x` (default 3).
+These direct checks do not require an
 optional capacity artifact.
 
 Keep PostgreSQL `fsync`, `full_page_writes`, and `synchronous_commit` enabled.

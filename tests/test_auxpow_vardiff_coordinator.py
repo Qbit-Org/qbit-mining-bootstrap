@@ -658,6 +658,18 @@ class AuxPowVardiffCoordinatorTests(unittest.TestCase):
         self.assertEqual(config.ewma_alpha, Decimal("0.4"))
         self.assertEqual(config.retarget_tolerance, Decimal("0.25"))
         self.assertEqual(config.startup_difficulty, Decimal("8192"))
+        self.assertFalse(config.initial_convergence_enabled)
+
+    def test_load_vardiff_config_accepts_legacy_step_factor_above_prism_cap(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"AUXPOW_STRATUM_VARDIFF_MAX_STEP_FACTOR": "128"},
+        ):
+            config = coordinator.load_vardiff_config()
+
+        self.assertEqual(config.max_step_factor, Decimal("128"))
+        self.assertEqual(config.initial_max_step_factor, Decimal("128"))
+        self.assertFalse(config.initial_convergence_enabled)
 
     def test_vardiff_minimum_sets_advertised_floor_even_below_qbit_difficulty(self) -> None:
         server = self.server()

@@ -172,7 +172,7 @@ impl Ledger {
         );
         require_claim(&mut tx, claim).await?;
         if submitted {
-            let changed = sqlx::query("UPDATE qbit_pool_blocks SET chain_state='confirmed' WHERE block_hash=$1 AND chain_state IN ('prepared','inactive') AND maturity_state='immature'").bind(&claim.candidate.block_hash).execute(&mut *tx).await?.rows_affected();
+            let changed = sqlx::query("UPDATE qbit_pool_blocks SET chain_state='confirmed',inactive_since=NULL WHERE block_hash=$1 AND chain_state IN ('prepared','inactive') AND maturity_state='immature'").bind(&claim.candidate.block_hash).execute(&mut *tx).await?.rows_affected();
             let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_pool_blocks WHERE block_hash=$1 AND chain_state='confirmed')").bind(&claim.candidate.block_hash).fetch_one(&mut *tx).await?;
             ensure!(
                 exists,
@@ -186,7 +186,7 @@ impl Ledger {
         } else {
             let mature:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_pool_blocks WHERE block_hash=$1 AND maturity_state='mature')").bind(&claim.candidate.block_hash).fetch_one(&mut *tx).await?;
             ensure!(!mature, "cannot abandon a mature candidate");
-            let changed = sqlx::query("UPDATE qbit_pool_blocks SET chain_state='inactive' WHERE block_hash=$1 AND chain_state IN ('prepared','confirmed') AND maturity_state='immature'").bind(&claim.candidate.block_hash).execute(&mut *tx).await?.rows_affected();
+            let changed = sqlx::query("UPDATE qbit_pool_blocks SET chain_state='inactive',inactive_since=CASE WHEN chain_state='confirmed' THEN clock_timestamp() ELSE inactive_since END WHERE block_hash=$1 AND chain_state IN ('prepared','confirmed') AND maturity_state='immature'").bind(&claim.candidate.block_hash).execute(&mut *tx).await?.rows_affected();
             if changed > 0 {
                 sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET settlement_status='reorged',claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,updated_at=clock_timestamp() WHERE block_hash=$1").bind(&claim.candidate.block_hash).execute(&mut *tx).await?;
                 bump_revision(&mut tx).await?;
@@ -265,7 +265,7 @@ impl Ledger {
             }
             if active && state != "confirmed" {
                 sqlx::query(
-                    "UPDATE qbit_pool_blocks SET chain_state='confirmed' WHERE block_hash=$1",
+                    "UPDATE qbit_pool_blocks SET chain_state='confirmed',inactive_since=NULL WHERE block_hash=$1",
                 )
                 .bind(&hash)
                 .execute(&mut *tx)
@@ -278,7 +278,7 @@ impl Ledger {
                 changed = true;
             } else if !active && state == "confirmed" {
                 sqlx::query(
-                    "UPDATE qbit_pool_blocks SET chain_state='inactive' WHERE block_hash=$1",
+                    "UPDATE qbit_pool_blocks SET chain_state='inactive',inactive_since=clock_timestamp() WHERE block_hash=$1",
                 )
                 .bind(&hash)
                 .execute(&mut *tx)

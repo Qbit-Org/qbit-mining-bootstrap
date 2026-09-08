@@ -14,10 +14,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+prism_pg_bin="${PRISM_TEST_PG_BIN_DIR:-}"
+if [[ -z "${prism_pg_bin}" ]] && command -v pg_config >/dev/null 2>&1; then
+  prism_pg_bin="$(pg_config --bindir)"
+fi
+if [[ -x "${prism_pg_bin}/initdb" && -x "${prism_pg_bin}/pg_ctl" ]]; then
+  export PRISM_TEST_PG_BIN_DIR="${prism_pg_bin}"
+elif [[ "${mode}" == replica ]]; then
+  echo 'Install PostgreSQL server tools and set PRISM_TEST_PG_BIN_DIR for physical replica tests.' >&2
+  exit 1
+fi
+
 if [[ -z "${PRISM_TEST_DATABASE_URL:-}" ]]; then
-  if command -v pg_config >/dev/null 2>&1; then
-    prism_pg_bin="$(pg_config --bindir)"
-  fi
   [[ -x "${prism_pg_bin}/initdb" && -x "${prism_pg_bin}/pg_ctl" ]] || {
     echo 'Set PRISM_TEST_DATABASE_URL or install PostgreSQL server tools for isolated native tests.' >&2
     exit 1
@@ -45,6 +53,8 @@ if [[ "${mode}" == live ]]; then
   if [[ -z "${QBITD_BIN}" ]]; then QBITD_BIN="$(command -v qbitd || true)"; fi
   [[ -x "${QBITD_BIN}" ]] || { echo 'Set QBITD_BIN to a qbitd executable for native regtest integration.' >&2; exit 1; }
   cargo test --locked -p qbit-prism-server --test live_regtest -- --nocapture
+elif [[ "${mode}" == replica ]]; then
+  cargo test --locked -p qbit-prism-server --test postgres_failover -- --nocapture
 else
   cargo test --locked -p qbit-prism-server --all-targets
 fi

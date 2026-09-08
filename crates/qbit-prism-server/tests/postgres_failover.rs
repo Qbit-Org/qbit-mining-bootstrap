@@ -18,6 +18,9 @@ use tokio::{
     time::{sleep, timeout},
 };
 
+#[path = "support/public_replica.rs"]
+mod public_replica;
+
 struct Cluster {
     bin: PathBuf,
     data: PathBuf,

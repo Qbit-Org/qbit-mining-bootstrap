@@ -591,7 +591,16 @@ impl Coordinator {
             self.rpc.call("getbestblockhash", json!([])).await?.as_str() == Some(parent),
             "tip changed during job build"
         );
-        let generation = *self.refresh.borrow() + 1;
+        // Timer reanchors may refresh ntime without changing payable work.
+        // Keep semantic coverage stable for that case; new accepted shares,
+        // payout state, fee policy or template content require fresh delivery.
+        let equivalent = self.prepared.read().await.as_ref().is_some_and(|current| {
+            current.fingerprint == fingerprint
+                && current.snapshot.share_seq == snapshot.share_seq
+                && current.snapshot.payout_revision == snapshot.payout_revision
+                && current.fee == fee
+        });
+        let generation = *self.refresh.borrow() + u64::from(!equivalent);
         let tip_header = self.rpc.call("getblockheader", json!([parent])).await?;
         let parent_of_tip = tip_header["previousblockhash"]
             .as_str()
@@ -763,6 +772,7 @@ impl Coordinator {
     pub async fn refresh_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
         let mut tick = tokio::time::interval(self.config.poll_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_hint_prune = Instant::now();
         loop {
             tokio::select! { _=tick.tick()=>{},_=self.wake.notified()=>{},_=shutdown.changed()=>break }
             match self.refresh_once().await {
@@ -772,6 +782,20 @@ impl Coordinator {
                 Err(error) => {
                     tracing::warn!(%error,"template refresh deferred");
                     *self.last_error.write().await = Some(error.to_string());
+                }
+            }
+            if last_hint_prune.elapsed() >= Duration::from_secs(300) {
+                last_hint_prune = Instant::now();
+                if let Ok(ttl) =
+                    crate::config::number("PRISM_STRATUM_VARDIFF_RESUME_TTL_SECONDS", 900u64)
+                {
+                    if ttl > 0 {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            self.ledger.prune_worker_difficulties(ttl, 1024),
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -991,6 +1015,49 @@ fn header_parent(block_hex: &str) -> Result<String> {
 
 impl MiningBackend for Coordinator {
     type Context = JobContext;
+
+    async fn health_ready(&self) -> bool {
+        self.health().await["ready"] == true
+    }
+
+    async fn worker_difficulty(
+        &self,
+        listener: &str,
+        worker: &Worker,
+        ttl_seconds: u64,
+    ) -> Result<Option<(f64, Duration)>> {
+        let hint = self
+            .ledger
+            .worker_difficulty(listener, &worker.username, ttl_seconds)
+            .await?;
+        Ok(hint.map(|hint| (hint.difficulty, Duration::from_millis(hint.age_ms))))
+    }
+
+    async fn remember_worker_difficulty(
+        &self,
+        listener: &str,
+        worker: &Worker,
+        difficulty: f64,
+        share_id: Option<&str>,
+        downward_only: bool,
+    ) -> Result<()> {
+        if downward_only {
+            self.ledger
+                .lower_worker_difficulty(listener, &worker.username, difficulty)
+                .await?;
+        } else if let Some(share_id) = share_id {
+            ensure!(
+                share_id.starts_with(&format!("{}:", worker.username)),
+                "difficulty evidence belongs to another worker"
+            );
+            if let Some(evidence) = self.ledger.share_accepted_at_ms(share_id).await? {
+                self.ledger
+                    .record_worker_difficulty(listener, &worker.username, difficulty, evidence)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
 
     async fn new_session_id(&self) -> Result<u32, StratumError> {
         self.ledger

@@ -11,7 +11,7 @@
 	    FROM qbit_share_ledger ledger, bounds
 	    WHERE ledger.accepted
 	      AND ledger.accepted_at <= bounds.ended_at
-	      AND ($2::bigint IS NULL OR ledger.accepted_at >= to_timestamp($3::double precision) - make_interval(secs => $2::double precision))
+	      AND ($2::bigint IS NULL OR ledger.accepted_at >= COALESCE(to_timestamp($3::double precision), bounds.ended_at) - make_interval(secs => $2::double precision))
 	      AND ($4::text IS NULL OR ledger.miner_id = $4)
 	    GROUP BY bucket_epoch
 	)

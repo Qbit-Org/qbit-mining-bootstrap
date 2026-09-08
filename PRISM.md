@@ -77,8 +77,9 @@ that its block is on the active chain.
 Normal shares receive the difficulty assigned to their job. Vardiff adjusts each
 connection within configured bounds. The optional high-difficulty listener
 serves the same ledger and payout universe. Accepted stale-grace shares carry
-an explicit audit credit policy; mainnet requires
-`PRISM_STRATUM_STALE_GRACE_SECONDS=0`.
+an explicit audit credit policy. Mainnet permits the same bounded one-parent
+grace as other chains (`PRISM_STRATUM_STALE_GRACE_SECONDS`, default 3 seconds).
+Retained accepted-work evidence restores vardiff hints across reconnects and hosts.
 
 ## Payouts and settlement
 
@@ -190,7 +191,8 @@ when migrating. For a new pool, generate separate manifest and ledger seeds and
 derive the ledger public key using the builder's `--print-public-key-hex` option
 as shown in the repository [quick start](README.md#run-prism-pool).
 
-The local Compose profile starts qbitd, PostgreSQL, and the Rust coordinator:
+The local Compose profile starts qbitd, the PostgreSQL primary and public read
+replica, the Rust coordinator, and the native public API service:
 
 ```sh
 make up-prism-pool

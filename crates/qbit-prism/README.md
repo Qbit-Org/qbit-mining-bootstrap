@@ -23,12 +23,19 @@ defines:
   partial oldest-share weighting
 
 The native [`qbit-prism-server`](../qbit-prism-server/README.md) applies the
-additive [multi-instance migration](../qbit-prism-server/migrations/002_multi_instance.sql).
+additive [multi-instance migration](../qbit-prism-server/migrations/002_multi_instance.sql)
+and [2.x compatibility migration](../qbit-prism-server/migrations/003_2x_compatibility.sql).
 All instances append through short PostgreSQL transactions sharing an ordering
 lock, and successful ordinary share ACKs follow commit. A single global share
 order gives all miners the same reward universe without electing one frontend
 as writer. The migration prevents a legacy Python writer from restarting
 against the upgraded database.
+
+[`sql/001_share_ledger_revert_audit_publication_sequence.sql`](sql/001_share_ledger_revert_audit_publication_sequence.sql)
+is retained only for legacy Python databases and refuses native databases.
+It discards assigned ordinals. Native rollback requires stopping all writers
+and restoring the pre-migration backup, as described in the
+[cutover and rollback guide](../../docs/prism-rust-migration.md).
 
 ## Reward Rule
 

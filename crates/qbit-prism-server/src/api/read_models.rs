@@ -1,3 +1,4 @@
+pub(super) use super::charts::{block_markers, hashrate_series, network_hashrate};
 use super::*;
 use chrono::DateTime;
 use num_bigint::BigUint;
@@ -171,7 +172,7 @@ pub(super) async fn bundle(state: &ApiState, id: &str, commitment: bool) -> ApiR
         .await
         .map_err(|error| {
             tracing::warn!(%error,"audit snapshot reconstruction failed");
-            ApiError::internal()
+            audit_read_error(error)
         })?;
     if !value["share_snapshot_sha256"].is_null() {
         let body = value["audit_bundle"].clone();
@@ -262,6 +263,42 @@ pub(super) async fn pending_fanouts(state: &ApiState, page: i64, limit: i64) -> 
     let value:Value=sqlx::query_scalar("WITH eligible AS (SELECT a.fanout_txid,a.chunk_index,b.block_height FROM qbit_ctv_fanout_artifacts a JOIN qbit_pool_blocks b USING(block_hash) WHERE b.chain_state='confirmed' AND a.settlement_status NOT IN ('confirmed','reorged') AND (a.next_broadcast_attempt_at IS NULL OR a.next_broadcast_attempt_at <= clock_timestamp())), page AS (SELECT * FROM eligible ORDER BY block_height,chunk_index,fanout_txid LIMIT $1 OFFSET $2) SELECT jsonb_build_object('total_count',(SELECT count(*) FROM eligible),'rows',COALESCE((SELECT jsonb_agg(qbit_fanout_status(fanout_txid) ORDER BY block_height,chunk_index,fanout_txid) FROM page),'[]'::jsonb))").bind(limit).bind((page-1)*limit).fetch_one(&state.pool).await?;
     Ok(page_payload(value, page, limit))
 }
+pub(super) async fn artifact_document(state: &ApiState, hash: &str) -> ApiResult<Payload> {
+    let canonical: Option<String> = sqlx::query_scalar("SELECT canonical_json FROM (SELECT manifest_set_json AS canonical_json FROM qbit_ctv_fanout_sets WHERE manifest_set_sha256=$1 UNION ALL SELECT manifest_json FROM qbit_ctv_fanout_artifacts WHERE manifest_sha256=$1) rows LIMIT 1")
+        .bind(hash).fetch_optional(&state.pool).await?;
+    if let Some(canonical) = canonical {
+        if hex::encode(Sha256::digest(canonical.as_bytes())) != hash {
+            return Err(ApiError::internal());
+        }
+        return Ok(Payload::raw(canonical.into_bytes()));
+    }
+    let block_hash: Option<String> = sqlx::query_scalar(
+        "SELECT block_hash FROM qbit_pool_audit_bundles WHERE audit_bundle_sha256=$1 LIMIT 1",
+    )
+    .bind(hash)
+    .fetch_optional(&state.pool)
+    .await?;
+    let block_hash =
+        block_hash.ok_or_else(|| ApiError::missing("unknown public PRISM artifact"))?;
+    let canonical = crate::ledger::audit_canonical_bytes(&state.pool, &block_hash)
+        .await
+        .map_err(audit_read_error)?;
+    if let Some(canonical) = canonical {
+        if hex::encode(Sha256::digest(&canonical)) != hash {
+            return Err(ApiError::internal());
+        }
+        return Ok(Payload::raw(canonical));
+    }
+    let mut payload = Payload::json(
+        bundle(state, &block_hash, false)
+            .await
+            .map_err(artifact_fallback_error)?["audit_bundle"]
+            .take(),
+    );
+    payload.canonical_fallback = Some("missing".into());
+    Ok(payload)
+}
+
 pub(super) async fn artifact(state: &ApiState, hash: &str) -> ApiResult<Value> {
     let v:Option<Value>=sqlx::query_scalar("SELECT artifact FROM (SELECT manifest_set AS artifact FROM qbit_ctv_fanout_sets WHERE manifest_set_sha256=$1 UNION ALL SELECT manifest FROM qbit_ctv_fanout_artifacts WHERE manifest_sha256=$1) t LIMIT 1").bind(hash).fetch_optional(&state.pool).await?;
     if let Some(value) = v {
@@ -276,15 +313,34 @@ pub(super) async fn artifact(state: &ApiState, hash: &str) -> ApiResult<Value> {
     if let Some(hash) = hash {
         return Ok(bundle(state, &hash, false)
             .await
-            .map_err(|_| ApiError::internal())?["audit_bundle"]
+            .map_err(artifact_fallback_error)?["audit_bundle"]
             .take());
     }
     Err(ApiError::missing("unknown public PRISM artifact"))
 }
-pub(super) async fn blocks(state: &ApiState, page: i64, limit: i64) -> ApiResult<Value> {
+fn audit_read_error(error: anyhow::Error) -> ApiError {
+    match error.downcast::<sqlx::Error>() {
+        Ok(error) => ApiError::from(error),
+        Err(_) => ApiError::internal(),
+    }
+}
+fn artifact_fallback_error(error: ApiError) -> ApiError {
+    if error.code == "read_timeout" {
+        error
+    } else {
+        ApiError::internal()
+    }
+}
+pub(super) async fn blocks(
+    state: &ApiState,
+    page: i64,
+    limit: i64,
+    filter: &str,
+) -> ApiResult<Value> {
     let mut value: Value = sqlx::query_scalar(include_str!("queries/dashboard_blocks.sql"))
         .bind(limit)
         .bind((page - 1) * limit)
+        .bind(filter)
         .fetch_one(&state.pool)
         .await?;
     for row in value["rows"].as_array_mut().unwrap() {
@@ -420,73 +476,6 @@ pub(super) async fn leaderboard(
         json!({"schema":"prism.dashboard.leaderboard.v1","generated_at":now(),"window":{"id":"3h","started_at":value["started_at"],"ended_at":value["ended_at"]},"totals":{"pool_hashrate_ths":hashrate(&value["total_difficulty"],10800),"pool_accepted_share_difficulty":value["total_difficulty"],"participant_count":value["participant_count"]},"pagination":pagination(page,limit,value["participant_count"].as_i64().unwrap_or(0)),"rows":rows}),
     )
 }
-pub(super) async fn hashrate_series(
-    state: &ApiState,
-    subject: Option<&str>,
-    range: &str,
-    bucket: &str,
-) -> ApiResult<Value> {
-    let seconds = match bucket {
-        "5m" => 300,
-        "1h" => 3600,
-        _ => 86400,
-    };
-    let range_seconds = match range {
-        "1w" => Some(7 * 86400),
-        "1m" => Some(30 * 86400),
-        "6m" => Some(180 * 86400),
-        _ => None,
-    };
-    let smoothing = std::env::var("PRISM_PUBLIC_HASHRATE_SMOOTHING_SECONDS")
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(1800)
-        .clamp(0, 86400);
-    let context = if smoothing / seconds >= 2 {
-        (smoothing / seconds) * seconds
-    } else {
-        0
-    };
-    let epoch = Utc::now().timestamp();
-    let value: Value = sqlx::query_scalar(include_str!("queries/dashboard_hashrate_series.sql"))
-        .bind(seconds)
-        .bind(range_seconds.map(|n: i64| n + context))
-        .bind(epoch as f64)
-        .bind(subject)
-        .fetch_one(&state.pool)
-        .await?;
-    let mut points = Vec::new();
-    let mut history = std::collections::VecDeque::<(i64, BigUint)>::new();
-    let mut total = BigUint::zero();
-    for mut row in value.as_array().cloned().unwrap_or_default() {
-        let Some(at) = row["timestamp"]
-            .as_str()
-            .and_then(|v| DateTime::parse_from_rfc3339(v).ok())
-            .map(|v| v.timestamp())
-        else {
-            continue;
-        };
-        let difficulty = big(&row["accepted_share_difficulty"]);
-        total += &difficulty;
-        history.push_back((at, difficulty));
-        while history.front().is_some_and(|(old, _)| *old <= at - context) {
-            let (_, d) = history.pop_front().unwrap();
-            total -= d;
-        }
-        row["hashrate_ths"] = if context > 0 {
-            hashrate(&json!(total.to_string()), context as u64)
-        } else {
-            hashrate(&row["accepted_share_difficulty"], seconds as u64)
-        };
-        if range_seconds.is_none_or(|n| at >= ((epoch - n + seconds - 1) / seconds) * seconds) {
-            points.push(row);
-        }
-    }
-    Ok(
-        json!({"schema":"prism.dashboard.hashrate-series.v1","generated_at":now(),"subject":{"type":if subject.is_some(){"miner"}else{"pool"},"id":subject},"range":range,"bucket":bucket,"unit":"ths","points":points}),
-    )
-}
-
 pub(super) async fn latest_evidence(state: &ApiState) -> ApiResult<Value> {
     let hash:Option<String>=sqlx::query_scalar("SELECT a.block_hash FROM qbit_pool_audit_bundles a JOIN qbit_pool_blocks b USING(block_hash) WHERE b.chain_state='confirmed' ORDER BY b.block_height DESC,a.created_at DESC LIMIT 1").fetch_optional(&state.pool).await?;
     let hash = hash.ok_or_else(|| ApiError::missing("no PRISM evidence has been produced"))?;

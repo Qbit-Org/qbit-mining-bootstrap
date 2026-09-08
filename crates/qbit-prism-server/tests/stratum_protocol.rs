@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -23,6 +23,7 @@ use tokio::{
 };
 
 type StoredMockJob = (MiningJob<()>, Worker, u32, Instant);
+type MockDifficulties = Mutex<HashMap<(String, String), (f64, Instant)>>;
 
 #[derive(Default)]
 struct Backend {
@@ -33,10 +34,55 @@ struct Backend {
     credited_workers: Mutex<Vec<String>>,
     grace: Mutex<Vec<bool>>,
     stored: Mutex<HashMap<String, StoredMockJob>>,
+    hints: MockDifficulties,
+    ready: AtomicBool,
+    network_bits: AtomicU32,
+    fail_builds: AtomicU32,
+    hint_reads_unavailable: AtomicBool,
 }
 
 impl MiningBackend for Backend {
     type Context = ();
+    async fn health_ready(&self) -> bool {
+        self.ready.load(Ordering::Relaxed)
+    }
+    async fn worker_difficulty(
+        &self,
+        listener: &str,
+        worker: &Worker,
+        ttl: u64,
+    ) -> anyhow::Result<Option<(f64, Duration)>> {
+        anyhow::ensure!(
+            !self.hint_reads_unavailable.load(Ordering::Relaxed),
+            "hint store unavailable"
+        );
+        Ok(self
+            .hints
+            .lock()
+            .unwrap()
+            .get(&(listener.into(), worker.username.clone()))
+            .filter(|(_, at)| at.elapsed() <= Duration::from_secs(ttl))
+            .map(|(difficulty, at)| (*difficulty, at.elapsed())))
+    }
+    async fn remember_worker_difficulty(
+        &self,
+        listener: &str,
+        worker: &Worker,
+        difficulty: f64,
+        evidence: Option<&str>,
+        downward: bool,
+    ) -> anyhow::Result<()> {
+        let mut hints = self.hints.lock().unwrap();
+        let key = (listener.into(), worker.username.clone());
+        if downward {
+            if let Some((old, _)) = hints.get_mut(&key) {
+                *old = old.min(difficulty);
+            }
+        } else if evidence.is_some() {
+            hints.insert(key, (difficulty, Instant::now()));
+        }
+        Ok(())
+    }
     async fn new_session_id(&self) -> Result<u32, StratumError> {
         Ok(self.sessions.fetch_add(1, Ordering::Relaxed) + 1)
     }
@@ -62,8 +108,19 @@ impl MiningBackend for Backend {
         difficulty: f64,
         minimum: f64,
     ) -> Result<MiningJob<()>, StratumError> {
+        if self
+            .fail_builds
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(StratumError::backend("temporary builder failure"));
+        }
         let generation = self.generation.load(Ordering::SeqCst);
-        let template = json!({"version":0x20000000u32,"bits":"207fffff","curtime":1_700_000_000u32,"previousblockhash":format!("{generation:064x}"),"transactions":[]});
+        let bits = self.network_bits.load(Ordering::Relaxed);
+        let bits = if bits == 0 { 0x207fffff } else { bits };
+        let template = json!({"version":0x20000000u32,"bits":format!("{bits:08x}"),"curtime":1_700_000_000u32,"previousblockhash":format!("{generation:064x}"),"transactions":[]});
         let manifest = build_manifest(CoinbaseBuildRequest {
             block_height: 1 + generation,
             coinbase_value_sats: 5_000_000_000,
@@ -170,6 +227,7 @@ struct Client {
     writer: OwnedWriteHalf,
     extranonce1: String,
     notify: Value,
+    difficulty: f64,
 }
 impl Client {
     async fn connect(address: std::net::SocketAddr) -> Self {
@@ -179,6 +237,7 @@ impl Client {
             writer,
             extranonce1: String::new(),
             notify: Value::Null,
+            difficulty: 0.0,
         }
     }
     async fn send(&mut self, value: Value) {
@@ -196,7 +255,11 @@ impl Client {
                 .unwrap()
                 > 0
         );
-        serde_json::from_str(&line).unwrap()
+        let value: Value = serde_json::from_str(&line).unwrap();
+        if value["method"] == "mining.set_difficulty" {
+            self.difficulty = value["params"][0].as_f64().unwrap();
+        }
+        value
     }
     async fn response(&mut self, id: u64) -> Value {
         loop {
@@ -226,6 +289,48 @@ impl Client {
     }
     fn solved_submit(&self, id: u64, username: &str, nonce_start: u32) -> Value {
         self.solved_submit_version(id, username, nonce_start, None)
+    }
+    fn solved_share(&self, id: u64, username: &str, nonce_start: u32) -> Value {
+        let p = self.notify["params"].as_array().unwrap();
+        let coinbase = hex::decode(format!(
+            "{}{}0000000000000000{}",
+            p[2].as_str().unwrap(),
+            self.extranonce1,
+            p[3].as_str().unwrap()
+        ))
+        .unwrap();
+        let merkle = qbit_prism_server::codec::double_sha256(&coinbase);
+        let mut previous = hex::decode(p[1].as_str().unwrap()).unwrap();
+        for word in previous.chunks_exact_mut(4) {
+            word.reverse();
+        }
+        let target = qbit_prism_server::codec::difficulty_target(self.difficulty).unwrap();
+        for nonce in nonce_start..nonce_start + 100_000 {
+            let header = [
+                u32::from_str_radix(p[5].as_str().unwrap(), 16)
+                    .unwrap()
+                    .to_le_bytes()
+                    .as_slice(),
+                previous.as_slice(),
+                merkle.as_slice(),
+                u32::from_str_radix(p[7].as_str().unwrap(), 16)
+                    .unwrap()
+                    .to_le_bytes()
+                    .as_slice(),
+                u32::from_str_radix(p[6].as_str().unwrap(), 16)
+                    .unwrap()
+                    .to_le_bytes()
+                    .as_slice(),
+                nonce.to_le_bytes().as_slice(),
+            ]
+            .concat();
+            if num_bigint::BigUint::from_bytes_le(&qbit_prism_server::codec::double_sha256(&header))
+                <= target
+            {
+                return json!({"id":id,"method":"mining.submit","params":[username,p[0],"0000000000000000",p[7],format!("{nonce:08x}")]});
+            }
+        }
+        panic!("constrained share proof not found");
     }
     fn solved_submit_version(
         &self,
@@ -302,6 +407,224 @@ async fn start(
         })
     };
     (address, backend, refresh, shutdown, task)
+}
+
+#[tokio::test]
+async fn identity_free_health_probe_reports_readiness_without_creating_jobs() {
+    let config = StratumConfig::default();
+    let stats = config.stats.clone();
+    let (address, backend, _refresh, shutdown, task) = start(config).await;
+    let mut client = Client::connect(address).await;
+    for (id, ready) in [(1, false), (2, true)] {
+        backend.ready.store(ready, Ordering::Relaxed);
+        client
+            .send(json!({"id":id,"method":"mining.get_health","params":[]}))
+            .await;
+        let response = client.response(id).await;
+        assert_eq!(response["result"], json!({"ready":ready}));
+        assert!(response["error"].is_null());
+    }
+    client
+        .send(json!({"id":3,"method":"mining.get_health","params":["miner.secret"]}))
+        .await;
+    assert!(!client.response(3).await["error"].is_null());
+    assert_eq!(backend.jobs.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.snapshot(0).authorized, 0);
+    assert_eq!(stats.snapshot(0).accepted_submissions, 0);
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fast_arrival_retries_failed_paired_delivery_and_only_proven_difficulty_resumes() {
+    let mut config = StratumConfig {
+        startup_difficulty: 1e-8,
+        ..Default::default()
+    };
+    config.vardiff.minimum = 1e-8;
+    config.vardiff.initial_min_seconds = 0.05;
+    let (address, backend, _refresh, shutdown, task) = start(config).await;
+    backend.network_bits.store(0x1d00ffff, Ordering::Relaxed);
+    let mut client = Client::connect(address).await;
+    client.login("miner.fast").await;
+    let start_difficulty = client.difficulty;
+    for index in 0..8u32 {
+        if index == 7 {
+            backend.fail_builds.store(1, Ordering::Relaxed);
+        }
+        client
+            .send(client.solved_share(u64::from(index) + 10, "miner.fast", index * 100_000))
+            .await;
+        assert_eq!(client.response(u64::from(index) + 10).await["result"], true);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    client.next_job().await;
+    assert!(
+        client.difficulty >= start_difficulty * 4.0
+            && client.difficulty <= start_difficulty * 64.000001
+    );
+    assert_eq!(backend.fail_builds.load(Ordering::Relaxed), 0);
+    let retained = backend.hints.lock().unwrap()[&("default".into(), "miner.fast".into())].0;
+    assert!(
+        (retained - start_difficulty).abs() < 1e-16,
+        "unproven early jump was durably retained"
+    );
+    let advertised = client.difficulty;
+    client
+        .send(client.solved_share(99, "miner.fast", 1_000_000))
+        .await;
+    assert_eq!(client.response(99).await["result"], true);
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if backend.hints.lock().unwrap()[&("default".into(), "miner.fast".into())].0
+                == advertised
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut reconnect = Client::connect(address).await;
+    reconnect.login("miner.fast").await;
+    assert!(
+        (reconnect.difficulty - advertised).abs() < 1e-15,
+        "share-backed retarget did not survive reconnect"
+    );
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn idle_retarget_lowers_reconnect_difficulty_without_renewing_evidence() {
+    let mut config = StratumConfig {
+        startup_difficulty: 0.004,
+        resume_ttl_seconds: 60,
+        ..Default::default()
+    };
+    config.vardiff.minimum = 0.001;
+    config.vardiff.retarget_seconds = 0.05;
+    let cache = config.retained_difficulties.clone();
+    let (address, backend, _refresh, shutdown, task) = start(config).await;
+    backend.network_bits.store(0x1d00ffff, Ordering::Relaxed);
+    let key = ("default".into(), "miner.idle".into());
+    let evidence = Instant::now() - Duration::from_secs(10);
+    backend
+        .hints
+        .lock()
+        .unwrap()
+        .insert(key.clone(), (0.004, evidence));
+    let mut client = Client::connect(address).await;
+    client.login("miner.idle").await;
+    assert_eq!(client.difficulty, 0.004);
+    let cached_evidence = cache.lock().unwrap()[&key].1;
+    client.next_job().await;
+    assert_eq!(client.difficulty, 0.001);
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if cache.lock().unwrap()[&key].0 == 0.001 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(backend.hints.lock().unwrap()[&key].1, evidence);
+    assert_eq!(cache.lock().unwrap()[&key].1, cached_evidence);
+    backend
+        .hint_reads_unavailable
+        .store(true, Ordering::Relaxed);
+    let mut reconnect = Client::connect(address).await;
+    reconnect.login("miner.idle").await;
+    assert_eq!(reconnect.difficulty, 0.001);
+    cache.lock().unwrap().get_mut(&key).unwrap().1 = Instant::now() - Duration::from_secs(61);
+    let mut expired = Client::connect(address).await;
+    expired.login("miner.idle").await;
+    assert_eq!(
+        expired.difficulty, 0.004,
+        "outage fallback revived expired evidence"
+    );
+    assert!(backend.shares.lock().unwrap().is_empty());
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn resumed_difficulty_is_lane_scoped_ttl_bounded_and_explicit_requests_win() {
+    let mut config = StratumConfig {
+        startup_difficulty: 0.001,
+        resume_max_start_factor: 4.0,
+        resume_ttl_seconds: 1,
+        ..Default::default()
+    };
+    config.vardiff.minimum = 0.001;
+    config.vardiff.maximum = 1.0;
+    let (address, backend, refresh, shutdown, task) = start(config.clone()).await;
+    backend.network_bits.store(0x1d00ffff, Ordering::Relaxed);
+    backend.hints.lock().unwrap().insert(
+        ("default".into(), "miner.retained".into()),
+        (0.1, Instant::now()),
+    );
+    let mut first = Client::connect(address).await;
+    first.login("miner.retained").await;
+    assert!(
+        (first.difficulty - 0.004).abs() < 1e-12,
+        "resume did not obey startup-factor cap"
+    );
+    first
+        .send(json!({"id":4,"method":"mining.authorize","params":["miner.retained","d=0.02"]}))
+        .await;
+    assert_eq!(first.response(4).await["result"], true);
+    first.next_job().await;
+    assert!((first.difficulty - 0.02).abs() < 1e-12);
+    first
+        .send(json!({"id":5,"method":"mining.authorize","params":["miner.retained","md=0.03"]}))
+        .await;
+    assert_eq!(first.response(5).await["result"], true);
+    first.next_job().await;
+    assert!(
+        (first.difficulty - 0.03).abs() < 1e-12,
+        "md should clamp the live converged value"
+    );
+    let evidence_before =
+        backend.hints.lock().unwrap()[&("default".into(), "miner.retained".into())].1;
+    drop(first);
+    assert_eq!(
+        backend.hints.lock().unwrap()[&("default".into(), "miner.retained".into())].1,
+        evidence_before,
+        "unproven password request renewed durable evidence"
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let high_address = listener.local_addr().unwrap();
+    config.listener_name = "highdiff".into();
+    let high_task = tokio::spawn(run_listener(
+        listener,
+        config,
+        backend.clone(),
+        refresh.subscribe(),
+        shutdown.subscribe(),
+    ));
+    let mut other_lane = Client::connect(high_address).await;
+    other_lane.login("miner.retained").await;
+    assert!(
+        (other_lane.difficulty - 0.001).abs() < 1e-12,
+        "other listener inherited the default lane hint"
+    );
+    backend.hints.lock().unwrap().insert(
+        ("default".into(), "miner.retained".into()),
+        (0.1, Instant::now() - Duration::from_secs(2)),
+    );
+    let mut expired = Client::connect(address).await;
+    expired.login("miner.retained").await;
+    assert!(
+        (expired.difficulty - 0.001).abs() < 1e-12,
+        "expired evidence resumed"
+    );
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+    high_task.await.unwrap().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

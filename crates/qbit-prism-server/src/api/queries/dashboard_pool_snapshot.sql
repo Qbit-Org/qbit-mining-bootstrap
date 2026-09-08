@@ -66,6 +66,8 @@ SELECT json_build_object(
     'participants_3h', (SELECT participants_3h FROM rollups),
     'blocks_found_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'confirmed'),
     'prism_blocks_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'confirmed'),
+    'blocks_reversed_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'reversed' OR (chain_state='inactive' AND audit_publication_sequence IS NOT NULL)),
+    'blocks_inactive_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'inactive' AND audit_publication_sequence IS NULL),
     'total_mined_bits', COALESCE((
         SELECT sum(carry.gross_amount_sats)
         FROM qbit_payout_carry_forward carry

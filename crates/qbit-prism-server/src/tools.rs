@@ -24,15 +24,24 @@ struct Cli {
 enum Command {
     /// Serve Stratum, audit and dashboard APIs, and settlement workers.
     Run,
+    /// Serve the public read API using a separate database pool or replica.
+    PublicApi,
     /// Validate local configuration and key pairing without starting listeners.
     CheckConfig,
-    /// Probe local HTTP health (does not require signing keys or database access).
+    /// Probe HTTP or Stratum readiness without signing keys or database access.
     Healthcheck {
         #[arg(long)]
         url: Option<String>,
+        #[arg(long)]
+        public_api: bool,
     },
     /// Check node identity, database integrity, API readiness and cluster settings.
     SelfCheck,
+    /// Validate compact target bits and print Prism's exact scaled difficulty.
+    HeaderDifficulty {
+        #[arg(long)]
+        bits: String,
+    },
     /// Apply the additive PostgreSQL migration after stopping Python writers.
     Migrate,
     /// Import legacy filesystem audit bodies into shared PostgreSQL storage.
@@ -62,8 +71,23 @@ enum Command {
 pub async fn run() -> Result<()> {
     match Cli::parse().command.unwrap_or(Command::Run) {
         Command::Run => crate::server::run(Config::from_env()?).await,
+        Command::PublicApi => {
+            let (shutdown, receiver) = tokio::sync::watch::channel(false);
+            let service = crate::api::public_service::run_from_env(receiver);
+            tokio::pin!(service);
+            tokio::select! {
+                result = &mut service => result,
+                result = crate::server::signal() => {
+                    result?;
+                    shutdown.send_replace(true);
+                    tokio::time::timeout(Duration::from_secs(30), service)
+                        .await.context("public API shutdown timed out")?
+                }
+            }
+        }
         Command::CheckConfig => {
             let config = Config::from_env()?;
+            crate::rollups::settings_from_env()?;
             crate::stratum::StratumConfig::from_env()?.highdiff_config()?;
             println!(
                 "PRISM configuration valid; {} runtime workers",
@@ -71,8 +95,14 @@ pub async fn run() -> Result<()> {
             );
             Ok(())
         }
-        Command::Healthcheck { url } => healthcheck(url).await,
+        Command::Healthcheck { url, public_api } => healthcheck(url, public_api).await,
         Command::SelfCheck => self_check().await,
+        Command::HeaderDifficulty { bits } => {
+            let compact = crate::codec::parse_u32_hex(&bits)?;
+            let target = crate::codec::target_from_compact(compact)?;
+            println!("{}", crate::codec::scaled_target_difficulty(&target)?);
+            Ok(())
+        }
         Command::Migrate => {
             let config = Config::from_env()?;
             let ledger = crate::ledger::Ledger::connect(
@@ -149,14 +179,18 @@ fn diagnostic_host(bind: &str) -> String {
     config::authority_host(host)
 }
 
-async fn healthcheck(url: Option<String>) -> Result<()> {
-    let host = diagnostic_host(&config::value("PRISM_AUDIT_BIND", "127.0.0.1"));
-    let url = url.unwrap_or_else(|| {
-        format!(
-            "http://{host}:{}/healthz",
-            config::value("PRISM_AUDIT_PORT", "3341")
-        )
-    });
+async fn healthcheck(url: Option<String>, public_api: bool) -> Result<()> {
+    let (bind_name, port_name, default_port) = if public_api {
+        ("PRISM_PUBLIC_API_BIND", "PRISM_PUBLIC_API_PORT", 3342u16)
+    } else {
+        ("PRISM_AUDIT_BIND", "PRISM_AUDIT_PORT", 3341u16)
+    };
+    let port = config::number(port_name, default_port)?;
+    if url.is_none() && port == 0 && !public_api {
+        return stratum_healthcheck().await;
+    }
+    let host = diagnostic_host(&config::value(bind_name, "127.0.0.1"));
+    let url = url.unwrap_or_else(|| format!("http://{host}:{port}/healthz"));
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()?
@@ -171,6 +205,43 @@ async fn healthcheck(url: Option<String>) -> Result<()> {
     let value: Value = response.json().await?;
     ensure!(value["ok"] == true, "PRISM health is not ready");
     Ok(())
+}
+
+async fn stratum_healthcheck() -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let mut port = config::number("PRISM_STRATUM_PORT", 3340u16)?;
+    let mut bind = config::value("PRISM_STRATUM_BIND", "127.0.0.1");
+    if port == 0 {
+        port = config::number("PRISM_STRATUM_HIGHDIFF_PORT", 0u16)?;
+        bind = config::optional("PRISM_STRATUM_HIGHDIFF_BIND").unwrap_or(bind);
+    }
+    ensure!(port > 0, "no configured listener for PRISM health probe");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut socket =
+            tokio::net::TcpStream::connect(format!("{}:{port}", diagnostic_host(&bind)))
+                .await
+                .context("connect Stratum health probe")?;
+        socket
+            .write_all(b"{\"id\":1,\"method\":\"mining.get_health\",\"params\":[]}\n")
+            .await?;
+        let mut reader = BufReader::new(socket).take(4097);
+        let mut line = Vec::new();
+        reader.read_until(b'\n', &mut line).await?;
+        ensure!(
+            line.len() <= 4096 && line.last() == Some(&b'\n'),
+            "invalid Stratum health response frame"
+        );
+        let response: Value = serde_json::from_slice(&line)?;
+        ensure!(
+            response["id"] == 1
+                && response["error"].is_null()
+                && response["result"]["ready"] == true,
+            "PRISM Stratum health is not ready"
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("Stratum health probe timed out")?
 }
 
 async fn self_check() -> Result<()> {
@@ -189,7 +260,7 @@ async fn self_check() -> Result<()> {
     for (name, value) in &durability {
         ensure!(value != "off", "PostgreSQL {name} is disabled");
     }
-    healthcheck(None).await?;
+    healthcheck(None, false).await?;
     let stratum = crate::stratum::StratumConfig::from_env()?;
     if let Some(highdiff) = stratum.highdiff_config()? {
         let recent: Option<String> = sqlx::query_scalar(

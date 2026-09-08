@@ -7,6 +7,7 @@ pub mod config;
 pub mod coordinator;
 pub mod ledger;
 pub mod readiness;
+pub mod rollups;
 pub mod rpc;
 pub mod server;
 pub mod stratum;

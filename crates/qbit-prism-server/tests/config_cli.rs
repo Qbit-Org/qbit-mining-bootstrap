@@ -108,9 +108,73 @@ async fn large_resource_budgets_fail_instead_of_truncating_or_panicking() {
             "18446744073709551615",
         ),
         ("PRISM_MAX_CTV_FANOUT_RECIPIENTS_PER_TRANSACTION", "1161"),
+        ("PRISM_HASHRATE_ROLLUP_BATCH_SHARES", "0"),
+        ("PRISM_HASHRATE_ROLLUP_BATCH_SHARES", "100001"),
+        ("PRISM_HASHRATE_ROLLUP_INTERVAL_SECONDS", "1e-300"),
     ] {
         rejects(false, &[(name, value)], name).await;
     }
+}
+
+#[tokio::test]
+async fn reconnect_and_initial_convergence_settings_are_bounded_and_optional() {
+    for (name, value, message) in [
+        (
+            "PRISM_STRATUM_VARDIFF_RESUME_TTL_SECONDS",
+            "86401",
+            "resume retention",
+        ),
+        (
+            "PRISM_STRATUM_VARDIFF_RESUME_MAX_ENTRIES",
+            "1000001",
+            "resume retention",
+        ),
+        (
+            "PRISM_STRATUM_VARDIFF_RESUME_MAX_START_FACTOR",
+            "NaN",
+            "PRISM_STRATUM_VARDIFF_RESUME_MAX_START_FACTOR",
+        ),
+        (
+            "PRISM_STRATUM_VARDIFF_INITIAL_MAX_STEP_UP",
+            "3",
+            "initial vardiff convergence",
+        ),
+        (
+            "PRISM_STRATUM_VARDIFF_INITIAL_MIN_STEP_UP",
+            "0.5",
+            "initial vardiff convergence",
+        ),
+        (
+            "PRISM_STRATUM_VARDIFF_INITIAL_MIN_SHARES",
+            "0",
+            "initial vardiff convergence",
+        ),
+        (
+            "PRISM_STRATUM_VARDIFF_INITIAL_MIN_SECONDS",
+            "inf",
+            "finite and positive",
+        ),
+    ] {
+        rejects(false, &[(name, value)], message).await;
+    }
+    let output = check(
+        false,
+        &[
+            ("PRISM_STRATUM_VARDIFF_RESUME_TTL_SECONDS", "0"),
+            ("PRISM_STRATUM_VARDIFF_RESUME_MAX_ENTRIES", "0"),
+            ("PRISM_STRATUM_VARDIFF_INITIAL_CONVERGENCE", "0"),
+            ("PRISM_STRATUM_VARDIFF_INITIAL_MAX_STEP_UP", "ignored"),
+            ("PRISM_STRATUM_VARDIFF_INITIAL_MIN_SHARES", "ignored"),
+            ("PRISM_STRATUM_VARDIFF_INITIAL_MIN_SECONDS", "ignored"),
+            ("PRISM_STRATUM_VARDIFF_INITIAL_MIN_STEP_UP", "ignored"),
+        ],
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test]
@@ -145,16 +209,20 @@ async fn production_rejects_test_seeds_and_reused_or_mismatched_trust_keys() {
 }
 
 #[tokio::test]
-async fn mainnet_aliases_enforce_stale_grace_and_production_rules() {
-    rejects(
+async fn mainnet_aliases_allow_bounded_stale_grace_and_enforce_production_rules() {
+    let output = check(
         true,
         &[
             ("QBIT_CHAIN", "mainnet"),
             ("PRISM_STRATUM_STALE_GRACE_SECONDS", "3"),
         ],
-        "mainnet requires PRISM_STRATUM_STALE_GRACE_SECONDS=0",
     )
     .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     rejects(
         false,
         &[

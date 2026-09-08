@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  checks:
-    name: Lint, compile, and test
+  lint-compile-compose:
+    name: Lint, compile, and Compose validation
     runs-on: blacksmith-2vcpu-ubuntu-2404
 
     steps:
@@ -20,10 +20,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+          python-version: "3.14"
 
       - name: Install lint tools
         run: |
@@ -31,7 +28,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends shellcheck
 
       - name: Check shell syntax
-        run: git ls-files '*.sh' | xargs bash -n
+        run: git ls-files -z '*.sh' | xargs -0 -n 1 bash -n
 
       - name: ShellCheck shell scripts
         run: |
@@ -41,14 +38,8 @@ jobs:
       - name: Compile Python sources
         run: python -m compileall -q docker lab tests examples scripts
 
-      - name: Run Python unit tests
-        run: python -m unittest discover -s tests -p 'test_*.py'
-
       - name: Validate mainnet Compose contract
         run: python -m unittest tests.test_mainnet_compose_contract
-
-      - name: Run Rust tests
-        run: cargo test --locked --workspace --all-targets
 
       - name: Validate Docker Compose files
         run: |
@@ -66,6 +57,61 @@ jobs:
           docker compose --env-file config/upstream.env.example --env-file .env.example \
             -f compose.yaml -f compose.prism-external-db.yaml --profile prism config --quiet
 
+  python-tests:
+    name: Python unit tests (shard ${{ matrix.shard }})
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Python unit test shard
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_COUNT: ${{ strategy.job-total }}
+        run: GIT_CONFIG_GLOBAL=/dev/null python scripts/run_python_test_shard.py --shard-index "$SHARD_INDEX" --shard-count "$SHARD_COUNT"
+
+  rust-tests:
+    name: Rust tests
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Rust tests
+        run: cargo test --locked --workspace --all-targets
+
+  checks:
+    # Preserve the existing check name for branch protection and consumers.
+    name: Lint, compile, and test
+    if: ${{ always() }}
+    needs: [lint-compile-compose, python-tests, rust-tests, prism-native-postgres]
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+
+    steps:
+      - name: Require every check to pass
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS"
+          echo "$RESULTS" | jq -e 'all(.[]; .result == "success")'
+
   ckpool-rejects-observability:
     name: ckpool rejects observability live suite
     runs-on: blacksmith-2vcpu-ubuntu-2404
@@ -78,7 +124,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Install ckpool build dependencies
         run: |
@@ -189,8 +235,22 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build native target-difficulty probe
+        run: cargo build --locked -p qbit-prism-server --bin qbit-prism-server
+
       - name: Set up Blacksmith Docker builder
         uses: useblacksmith/setup-docker-builder@v1
+
+      # The runtime smoke derives its header-bits assertion from PRISM's own
+      # difficulty helpers, so this job needs the same interpreter the unit
+      # tests run under rather than whatever the runner image happens to ship.
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
 
       - name: Stage pinned qbit source
         run: |

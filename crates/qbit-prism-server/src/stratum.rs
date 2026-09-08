@@ -83,6 +83,27 @@ impl std::error::Error for StratumError {}
 
 pub trait MiningBackend: Send + Sync + 'static {
     type Context: Send + Sync + 'static;
+    fn health_ready(&self) -> impl Future<Output = bool> + Send {
+        async { true }
+    }
+    fn worker_difficulty(
+        &self,
+        _listener: &str,
+        _worker: &Worker,
+        _ttl_seconds: u64,
+    ) -> impl Future<Output = Result<Option<(f64, Duration)>>> + Send {
+        async { Ok(None) }
+    }
+    fn remember_worker_difficulty(
+        &self,
+        _listener: &str,
+        _worker: &Worker,
+        _difficulty: f64,
+        _share_id: Option<&str>,
+        _downward_only: bool,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
     fn new_session_id(&self)
         -> impl Future<Output = std::result::Result<u32, StratumError>> + Send;
     fn authorize(
@@ -122,8 +143,16 @@ pub trait MiningBackend: Send + Sync + 'static {
     ) -> impl Future<Output = std::result::Result<(), StratumError>> + Send;
 }
 
+pub type RetainedDifficulties = Arc<Mutex<HashMap<(String, String), (f64, Instant)>>>;
+
 #[derive(Clone, Debug)]
 pub struct StratumConfig {
+    pub listener_name: String,
+    pub resume_enabled: bool,
+    pub resume_ttl_seconds: u64,
+    pub resume_max_entries: usize,
+    pub resume_max_start_factor: f64,
+    pub retained_difficulties: RetainedDifficulties,
     pub startup_difficulty: f64,
     pub minimum_difficulty: f64,
     pub vardiff: VardiffConfig,
@@ -145,6 +174,12 @@ pub struct StratumConfig {
 impl Default for StratumConfig {
     fn default() -> Self {
         Self {
+            listener_name: "default".into(),
+            resume_enabled: true,
+            resume_ttl_seconds: 900,
+            resume_max_entries: 8192,
+            resume_max_start_factor: 1024.0,
+            retained_difficulties: Arc::new(Mutex::new(HashMap::new())),
             startup_difficulty: 0.000000001,
             minimum_difficulty: 0.0,
             vardiff: VardiffConfig::default(),
@@ -239,12 +274,24 @@ impl SessionObservation {
         }
     }
     fn authorize(&mut self) {
+        if let Some(previous) = self.generation.take() {
+            let mut generations = self.stats.delivered_generations.lock().unwrap();
+            if let Some(count) = generations.get_mut(&previous) {
+                *count -= 1;
+                if *count == 0 {
+                    generations.remove(&previous);
+                }
+            }
+        }
         if !self.authorized {
             self.stats.authorized.fetch_add(1, Ordering::Relaxed);
             self.authorized = true;
         }
     }
     fn delivered(&mut self, generation: u64) {
+        if self.generation == Some(generation) {
+            return;
+        }
         let mut generations = self.stats.delivered_generations.lock().unwrap();
         if let Some(previous) = self.generation {
             if let Some(count) = generations.get_mut(&previous) {
@@ -319,6 +366,19 @@ impl StratumConfig {
             }
         }
         let mut config = Self::default();
+        config.resume_enabled = crate::config::flag("PRISM_STRATUM_VARDIFF_RESUME", true)?;
+        config.resume_ttl_seconds = value(
+            "PRISM_STRATUM_VARDIFF_RESUME_TTL_SECONDS",
+            config.resume_ttl_seconds,
+        )?;
+        config.resume_max_entries = value(
+            "PRISM_STRATUM_VARDIFF_RESUME_MAX_ENTRIES",
+            config.resume_max_entries,
+        )?;
+        config.resume_max_start_factor = value(
+            "PRISM_STRATUM_VARDIFF_RESUME_MAX_START_FACTOR",
+            config.resume_max_start_factor,
+        )?;
         let share = value("PRISM_STRATUM_SHARE_DIFF", config.startup_difficulty)?;
         config.vardiff.enabled = match std::env::var("PRISM_STRATUM_VARDIFF").as_deref() {
             Ok("0" | "false" | "no" | "off") => false,
@@ -356,6 +416,21 @@ impl StratumConfig {
             "PRISM_STRATUM_VARDIFF_RETARGET_TOLERANCE",
             config.vardiff.tolerance,
         )?;
+        config.vardiff.initial_enabled =
+            crate::config::flag("PRISM_STRATUM_VARDIFF_INITIAL_CONVERGENCE", true)?;
+        config.vardiff.initial_max_step_up = 64.0f64.max(config.vardiff.max_step_up);
+        if config.vardiff.initial_enabled {
+            config.vardiff.initial_max_step_up = value(
+                "PRISM_STRATUM_VARDIFF_INITIAL_MAX_STEP_UP",
+                config.vardiff.initial_max_step_up,
+            )?;
+            config.vardiff.initial_min_shares =
+                value("PRISM_STRATUM_VARDIFF_INITIAL_MIN_SHARES", 8)?;
+            config.vardiff.initial_min_step_up =
+                value("PRISM_STRATUM_VARDIFF_INITIAL_MIN_STEP_UP", 4.0)?;
+            config.vardiff.initial_min_seconds =
+                value("PRISM_STRATUM_VARDIFF_INITIAL_MIN_SECONDS", 1.0)?;
+        }
         config.extranonce2_size = value("PRISM_STRATUM_EXTRANONCE2_SIZE", config.extranonce2_size)?;
         config.max_message_bytes =
             value("PRISM_STRATUM_MAX_MESSAGE_BYTES", config.max_message_bytes)?;
@@ -420,6 +495,7 @@ impl StratumConfig {
             }
         }
         let mut config = self.clone();
+        config.listener_name = "highdiff".into();
         config.minimum_difficulty = difficulty("PRISM_STRATUM_HIGHDIFF_MIN_DIFF", 500_000.0)?;
         config.vardiff.minimum = config.minimum_difficulty;
         config.vardiff.maximum = difficulty("PRISM_STRATUM_HIGHDIFF_MAX_DIFF", 4_294_967_296.0)?;
@@ -440,6 +516,14 @@ impl StratumConfig {
 
     pub fn validate(&self) -> Result<()> {
         self.vardiff.validate()?;
+        ensure!(
+            self.resume_ttl_seconds <= 86400 && self.resume_max_entries <= 1_000_000,
+            "vardiff resume retention exceeds supported bounds"
+        );
+        ensure!(
+            self.resume_max_start_factor.is_finite() && self.resume_max_start_factor >= 1.0,
+            "PRISM_STRATUM_VARDIFF_RESUME_MAX_START_FACTOR must be finite and at least 1"
+        );
         ensure!(
             self.max_connections_per_username <= Semaphore::MAX_PERMITS,
             "per-username connection limit exceeds semaphore capacity"
@@ -515,6 +599,9 @@ struct Session<C> {
     retry_job: bool,
     authorization_permit: Option<OwnedSemaphorePermit>,
     observation: SessionObservation,
+    pending_retarget: Option<(f64, Vardiff)>,
+    last_accepted_share: Option<(String, f64)>,
+    last_hint: Option<(f64, Instant)>,
 }
 
 impl<C> Session<C> {
@@ -536,6 +623,9 @@ impl<C> Session<C> {
             retry_job: false,
             authorization_permit: None,
             observation,
+            pending_retarget: None,
+            last_accepted_share: None,
+            last_hint: None,
         }
     }
 
@@ -550,9 +640,116 @@ impl<C> Session<C> {
         self.difficulty = self
             .requested
             .or(self.suggested)
-            .unwrap_or(config.startup_difficulty)
+            .unwrap_or(self.difficulty)
             .clamp(floor, config.vardiff.maximum);
         self.vardiff.reset();
+        self.pending_retarget = None;
+    }
+
+    fn retarget(&mut self) {
+        if self.pending_retarget.is_some() {
+            return;
+        }
+        let previous = self.vardiff.clone();
+        if let Some(next) = self.vardiff.retarget(self.difficulty) {
+            self.pending_retarget = Some((self.difficulty, previous));
+            self.difficulty = next;
+            self.retry_job = self.worker.is_some() && self.subscribed;
+        }
+    }
+
+    fn restore_retarget(&mut self) {
+        if let Some((difficulty, vardiff)) = self.pending_retarget.take() {
+            self.difficulty = difficulty;
+            self.vardiff = vardiff;
+        }
+    }
+}
+
+fn retain_difficulty(
+    config: &StratumConfig,
+    worker: &Worker,
+    difficulty: f64,
+    age: Duration,
+    evidence: bool,
+) {
+    if !config.resume_enabled || config.resume_max_entries == 0 || config.resume_ttl_seconds == 0 {
+        return;
+    }
+    let now = Instant::now();
+    let Some(recorded) = now.checked_sub(age) else {
+        return;
+    };
+    let mut retained = config.retained_difficulties.lock().unwrap();
+    let key = (config.listener_name.clone(), worker.username.clone());
+    if let Some((old, at)) = retained.get_mut(&key) {
+        if evidence {
+            *at = recorded;
+            *old = difficulty;
+        } else {
+            *old = old.min(difficulty);
+        }
+        return;
+    }
+    if !evidence {
+        return;
+    }
+    if retained.len() >= config.resume_max_entries {
+        if let Some(oldest) = retained
+            .iter()
+            .min_by_key(|(_, (_, at))| *at)
+            .map(|(key, _)| key.clone())
+        {
+            retained.remove(&oldest);
+        }
+    }
+    retained.insert(key, (difficulty, recorded));
+}
+
+async fn remember_difficulty<B: MiningBackend>(
+    backend: &B,
+    config: &StratumConfig,
+    worker: &Worker,
+    difficulty: f64,
+    share_id: Option<&str>,
+    downward_only: bool,
+) {
+    if !config.resume_enabled || config.resume_ttl_seconds == 0 || config.resume_max_entries == 0 {
+        return;
+    }
+    if !downward_only && share_id.is_none() {
+        return;
+    }
+    let persisted = timeout(Duration::from_millis(500), async {
+        backend
+            .remember_worker_difficulty(
+                &config.listener_name,
+                worker,
+                difficulty,
+                share_id,
+                downward_only,
+            )
+            .await?;
+        // A different frontend may already have newer accepted evidence.
+        // Cache the canonical retained value and its database age, rather
+        // than treating this optional write as new evidence on this host.
+        backend
+            .worker_difficulty(&config.listener_name, worker, config.resume_ttl_seconds)
+            .await
+    })
+    .await;
+    match persisted {
+        Ok(Ok(Some((difficulty, age)))) => {
+            retain_difficulty(config, worker, difficulty, age, !downward_only);
+        }
+        Ok(Ok(None)) => {
+            config
+                .retained_difficulties
+                .lock()
+                .unwrap()
+                .remove(&(config.listener_name.clone(), worker.username.clone()));
+        }
+        _ => {}
     }
 }
 
@@ -670,6 +867,20 @@ async fn deliver_job<B: MiningBackend>(
     .await?;
     write_json(writer, job.wire.notify(), config).await?;
     session.observation.delivered(job.wire.refresh_generation);
+    let hint = session.pending_retarget.take().map(|(previous, _)| {
+        let difficulty = job.wire.share_difficulty;
+        let evidence = session
+            .last_accepted_share
+            .as_ref()
+            .filter(|(_, proved)| {
+                (!session.vardiff.proposed_initial && session.vardiff.proposed_share_backed)
+                    || *proved == difficulty
+            })
+            .map(|(share_id, _)| share_id.clone());
+        let downward_only = difficulty < previous && evidence.is_none();
+        session.vardiff.delivered_retarget();
+        (difficulty, evidence, downward_only)
+    });
     let now = Instant::now();
     for prior in &mut session.jobs {
         prior.retired_at.get_or_insert(now);
@@ -695,6 +906,17 @@ async fn deliver_job<B: MiningBackend>(
     });
     session.retry_job = false;
     observation.success = true;
+    if let Some((difficulty, evidence, downward_only)) = hint {
+        remember_difficulty(
+            backend,
+            config,
+            worker,
+            difficulty,
+            evidence.as_deref(),
+            downward_only,
+        )
+        .await;
+    }
     Ok(())
 }
 
@@ -720,6 +942,17 @@ async fn request<B: MiningBackend>(
                 .ok_or_else(|| StratumError::malformed("params must be an array"))?,
         };
         match method {
+            "mining.get_health" => {
+                if !params.is_empty() {
+                    return Err(
+                        StratumError::malformed("mining.get_health takes no parameters").into(),
+                    );
+                }
+                let ready = timeout(Duration::from_secs(3), backend.health_ready())
+                    .await
+                    .unwrap_or(false);
+                result(writer, id.clone(), json!({"ready":ready}), config).await?;
+            }
             "mining.subscribe" => {
                 session.subscribed = true;
                 result(
@@ -769,10 +1002,63 @@ async fn request<B: MiningBackend>(
                     None
                 };
                 let password = params.get(1).and_then(Value::as_str).unwrap_or("");
+                if session.worker.is_none()
+                    && config.resume_enabled
+                    && config.vardiff.enabled
+                    && config.resume_ttl_seconds > 0
+                    && config.resume_max_entries > 0
+                {
+                    let loaded = timeout(
+                        Duration::from_secs(1),
+                        backend.worker_difficulty(
+                            &config.listener_name,
+                            &worker,
+                            config.resume_ttl_seconds,
+                        ),
+                    )
+                    .await;
+                    let retained = match loaded {
+                        Ok(Ok(Some((difficulty, age)))) => {
+                            retain_difficulty(config, &worker, difficulty, age, true);
+                            Some(difficulty)
+                        }
+                        Ok(Ok(None)) => {
+                            config
+                                .retained_difficulties
+                                .lock()
+                                .unwrap()
+                                .remove(&(config.listener_name.clone(), worker.username.clone()));
+                            None
+                        }
+                        _ => config
+                            .retained_difficulties
+                            .lock()
+                            .unwrap()
+                            .get(&(config.listener_name.clone(), worker.username.clone()))
+                            .filter(|(_, at)| {
+                                at.elapsed() <= Duration::from_secs(config.resume_ttl_seconds)
+                            })
+                            .map(|(difficulty, _)| *difficulty),
+                    };
+                    if let Some(retained) =
+                        retained.filter(|difficulty| difficulty.is_finite() && *difficulty > 0.0)
+                    {
+                        session.difficulty = retained.clamp(
+                            config.vardiff.minimum,
+                            config
+                                .vardiff
+                                .maximum
+                                .min(config.startup_difficulty * config.resume_max_start_factor)
+                                .max(config.vardiff.minimum),
+                        );
+                    }
+                }
                 (session.requested, session.requested_minimum) = password_difficulties(password);
                 session.apply_requests(config);
                 if !same_username {
                     session.authorization_permit = new_permit;
+                    session.last_accepted_share = None;
+                    session.last_hint = None;
                 }
                 session.worker = Some(worker);
                 session.observation.authorize();
@@ -942,15 +1228,44 @@ async fn request<B: MiningBackend>(
                         issued.version_mask,
                     )
                     .map_err(|e| StratumError::malformed(format!("malformed submit: {e}")))?;
+                let share_id = format!("{}:{}", issued.worker.username, submission.block_hash_hex);
+                let proved_difficulty = if submission.share_pass {
+                    issued.job.wire.share_difficulty
+                } else {
+                    codec::target_difficulty(&issued.job.wire.network_target)
+                        .map_err(|error| StratumError::internal(error.to_string()))?
+                };
                 backend
                     .submit(&issued.worker, &issued.job, submission, grace)
                     .await?;
-                session.vardiff.accepted(issued.job.wire.share_difficulty);
+                session.vardiff.accepted(proved_difficulty);
+                session.last_accepted_share = Some((share_id.clone(), proved_difficulty));
                 config
                     .stats
                     .accepted_submissions
                     .fetch_add(1, Ordering::Relaxed);
                 result(writer, id.clone(), json!(true), config).await?;
+                if session
+                    .jobs
+                    .back()
+                    .is_some_and(|current| current.job.wire.share_difficulty == proved_difficulty)
+                    && session.last_hint.is_none_or(|(difficulty, at)| {
+                        difficulty != issued.job.wire.share_difficulty
+                            || at.elapsed() >= Duration::from_secs(30)
+                    })
+                {
+                    remember_difficulty(
+                        backend,
+                        config,
+                        &issued.worker,
+                        issued.job.wire.share_difficulty,
+                        Some(&share_id),
+                        false,
+                    )
+                    .await;
+                    session.last_hint = Some((issued.job.wire.share_difficulty, Instant::now()));
+                }
+                session.retarget();
             }
             _ => {
                 return Err(StratumError::malformed(format!("unsupported method {method}")).into())
@@ -1010,10 +1325,7 @@ async fn session<B: MiningBackend>(
             }
             _ = timer.tick() => {
                 if session.jobs.is_empty() && connected.elapsed().as_secs_f64() > config.initial_job_timeout_seconds { break; }
-                if let Some(next) = session.vardiff.retarget(session.difficulty) {
-                    session.difficulty = next;
-                    session.retry_job = session.worker.is_some() && session.subscribed;
-                }
+                session.retarget();
             }
             read = bounded_reader.read_until(b'\n',&mut buffer) => {
                 if read? == 0 { break; }
@@ -1033,6 +1345,7 @@ async fn session<B: MiningBackend>(
             if let Err(error) =
                 deliver_job(backend.as_ref(), &mut session, &mut writer, &config).await
             {
+                session.restore_retarget();
                 if error.downcast_ref::<StratumError>().is_none() {
                     return Err(error);
                 }
