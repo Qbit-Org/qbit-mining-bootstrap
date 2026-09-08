@@ -170,6 +170,14 @@ impl Ledger {
                     .execute(&mut *tx)
                     .await?;
             }
+            if version.unwrap_or(0) < 5 {
+                sqlx::raw_sql(include_str!("../migrations/005_candidate_dispatch.sql"))
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(5)")
+                    .execute(&mut *tx)
+                    .await?;
+            }
             tx.commit().await?;
         }
         let ledger = Self { pool, instance_id };
@@ -512,12 +520,30 @@ impl Ledger {
     }
 
     pub async fn claim_candidate(&self, lease_seconds: i64) -> Result<Option<CandidateClaim>> {
-        ensure!(lease_seconds > 0, "claim duration must be positive");
+        ensure!(
+            (1..=600).contains(&lease_seconds),
+            "invalid candidate lease duration"
+        );
         let token = Uuid::new_v4().to_string();
         let mut tx = self.pool.begin().await?;
         writable(&mut tx).await?;
-        let row = sqlx::query("WITH next AS (SELECT block_hash FROM qbit_block_candidate_outbox WHERE state='pending' AND next_attempt_at<=clock_timestamp() AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()) ORDER BY created_at,block_hash FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE qbit_block_candidate_outbox o SET claim_token=$1,claim_instance_id=$2,claim_expires_at=clock_timestamp()+$3*interval '1 second',attempt_count=attempt_count+1,updated_at=clock_timestamp() FROM next WHERE o.block_hash=next.block_hash RETURNING candidate,candidate_sha256")
-            .bind(&token).bind(&self.instance_id).bind(lease_seconds).fetch_optional(&mut *tx).await?;
+        // Empty polling does not use a scheduling slot. A racing SKIP LOCKED
+        // selection can still leave a gap; this weighting is deliberately an
+        // approximate service ratio rather than a global serialization point.
+        let slot: Option<i64> = sqlx::query_scalar("SELECT nextval('qbit_prism_candidate_dispatch_sequence') WHERE EXISTS(SELECT 1 FROM qbit_block_candidate_outbox WHERE state='pending' AND next_attempt_at<=clock_timestamp() AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()))")
+            .fetch_optional(&mut *tx).await?;
+        let mut row = None;
+        if let Some(slot) = slot {
+            if slot % 8 != 0 {
+                row = claim_candidate_lane(&mut tx, true, &token, &self.instance_id, lease_seconds)
+                    .await?;
+            }
+            if row.is_none() {
+                row =
+                    claim_candidate_lane(&mut tx, false, &token, &self.instance_id, lease_seconds)
+                        .await?;
+            }
+        }
         tx.commit().await?;
         row.map(|row| {
             let candidate: Candidate = serde_json::from_value(row.try_get("candidate")?)
@@ -535,10 +561,43 @@ impl Ledger {
         .transpose()
     }
 
+    /// Keep a live processing attempt owned while it waits for build capacity
+    /// or performs expensive verification. Expired tokens never revive.
+    pub async fn renew_candidate_claim(
+        &self,
+        claim: &CandidateClaim,
+        lease_seconds: i64,
+    ) -> Result<()> {
+        ensure!(
+            (1..=600).contains(&lease_seconds),
+            "invalid candidate lease duration"
+        );
+        let mut tx = self.pool.begin().await?;
+        writable(&mut tx).await?;
+        // Evaluate expiry after obtaining the row lock: a blocked UPDATE can
+        // otherwise have matched a live token before waiting past its expiry.
+        // NO KEY UPDATE is compatible with the processing transaction's KEY
+        // SHARE lock, so audit persistence cannot block its own heartbeat.
+        sqlx::query("SELECT block_hash FROM qbit_block_candidate_outbox WHERE block_hash=$1 FOR NO KEY UPDATE")
+            .bind(&claim.candidate.block_hash).fetch_optional(&mut *tx).await?;
+        let updated = sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()+$3*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='pending' AND claim_expires_at>clock_timestamp()")
+            .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(lease_seconds).execute(&mut *tx).await?.rows_affected();
+        ensure!(updated == 1, "candidate claim was lost or expired");
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn retry_candidate(&self, claim: &CandidateClaim, error: &str) -> Result<()> {
-        let result = sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,last_error=$3,next_attempt_at=clock_timestamp()+LEAST(60,attempt_count)*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='pending'")
-            .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(error).execute(&self.pool).await?;
-        ensure!(result.rows_affected() == 1, "candidate claim was lost");
+        let mut tx = self.pool.begin().await?;
+        writable(&mut tx).await?;
+        lock_candidate_row(&mut tx, claim).await?;
+        let result = sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,last_error=$3,next_attempt_at=clock_timestamp()+LEAST(60,attempt_count)*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='pending' AND claim_expires_at>clock_timestamp()")
+            .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(error).execute(&mut *tx).await?;
+        ensure!(
+            result.rows_affected() == 1,
+            "candidate claim was lost or expired"
+        );
+        tx.commit().await?;
         Ok(())
     }
 
@@ -549,6 +608,42 @@ impl Ledger {
     pub async fn prune_expired_jobs(&self) -> Result<u64> {
         Ok(sqlx::query("DELETE FROM qbit_prism_jobs WHERE job_id IN (SELECT job_id FROM qbit_prism_jobs WHERE expires_at < clock_timestamp() ORDER BY expires_at LIMIT 4096)").execute(&self.pool).await?.rows_affected())
     }
+}
+
+async fn lock_candidate_row(
+    tx: &mut Transaction<'_, Postgres>,
+    claim: &CandidateClaim,
+) -> Result<()> {
+    sqlx::query(
+        "SELECT block_hash FROM qbit_block_candidate_outbox WHERE block_hash=$1 FOR UPDATE",
+    )
+    .bind(&claim.candidate.block_hash)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn claim_candidate_lane(
+    tx: &mut Transaction<'_, Postgres>,
+    fresh: bool,
+    token: &str,
+    instance_id: &str,
+    lease_seconds: i64,
+) -> Result<Option<PgRow>> {
+    let ordering = if fresh {
+        "AND attempt_count=0 ORDER BY created_at DESC,block_hash"
+    } else {
+        // Includes never-attempted rows: continuous new work must not strand
+        // an older candidate that has not yet received its first attempt.
+        "ORDER BY next_attempt_at,created_at,block_hash"
+    };
+    let query = format!("WITH next AS (SELECT block_hash FROM qbit_block_candidate_outbox WHERE state='pending' AND next_attempt_at<=clock_timestamp() AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()) {ordering} FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE qbit_block_candidate_outbox o SET claim_token=$1,claim_instance_id=$2,claim_expires_at=clock_timestamp()+$3*interval '1 second',attempt_count=attempt_count+1,updated_at=clock_timestamp() FROM next WHERE o.block_hash=next.block_hash RETURNING candidate,candidate_sha256");
+    Ok(sqlx::query(&query)
+        .bind(token)
+        .bind(instance_id)
+        .bind(lease_seconds)
+        .fetch_optional(&mut **tx)
+        .await?)
 }
 
 async fn lock(tx: &mut Transaction<'_, Postgres>, key: i64) -> Result<()> {

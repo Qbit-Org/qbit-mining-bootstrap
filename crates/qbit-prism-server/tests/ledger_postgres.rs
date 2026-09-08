@@ -129,6 +129,243 @@ fn candidate_with_bundle(
     })
 }
 
+#[tokio::test]
+async fn candidate_renewal_requires_a_live_pending_token() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let a = db.ledger("a").await?;
+    let b = db.ledger("b").await?;
+    a.append(share(1), None).await?;
+    let block = candidate(&a.snapshot(100).await?, 401)?;
+    a.enqueue_candidate(block).await?;
+    let owner = a.claim_candidate(1).await?.context("candidate missing")?;
+    a.renew_candidate_claim(&owner, 60).await?;
+    let (remaining, attempts): (bool, i32) = sqlx::query_as("SELECT claim_expires_at>clock_timestamp()+interval '50 seconds',attempt_count FROM qbit_block_candidate_outbox")
+        .fetch_one(&a.pool).await?;
+    assert!(remaining);
+    assert_eq!(attempts, 1, "renewal counted as another processing attempt");
+    assert!(b.claim_candidate(60).await?.is_none());
+    assert!(a.renew_candidate_claim(&owner, 0).await.is_err());
+    assert!(a.renew_candidate_claim(&owner, 601).await.is_err());
+    let mut stranger = owner.clone();
+    stranger.claim_token = Uuid::new_v4().to_string();
+    assert!(b.renew_candidate_claim(&stranger, 60).await.is_err());
+    sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second'")
+        .execute(&a.pool).await?;
+    assert!(
+        a.renew_candidate_claim(&owner, 60).await.is_err(),
+        "expired claim revived"
+    );
+    let before: serde_json::Value =
+        sqlx::query_scalar("SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o")
+            .fetch_one(&a.pool)
+            .await?;
+    assert!(
+        a.retry_candidate(&owner, "expired worker").await.is_err(),
+        "expired owner delayed recovery"
+    );
+    let after: serde_json::Value =
+        sqlx::query_scalar("SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o")
+            .fetch_one(&a.pool)
+            .await?;
+    assert_eq!(
+        before, after,
+        "expired retry cleared ownership or changed its due time"
+    );
+    // Failed transactions can release their row locks asynchronously in SQLx.
+    let recovered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(claim) = b.claim_candidate(60).await? {
+                return Ok::<_, anyhow::Error>(claim);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    assert_ne!(owner.claim_token, recovered.claim_token);
+    assert!(
+        a.renew_candidate_claim(&owner, 60).await.is_err(),
+        "former owner renewed takeover token"
+    );
+    b.renew_candidate_claim(&recovered, 60).await?;
+    b.finish_candidate(&recovered, false, Some("test completed"))
+        .await?;
+    assert!(
+        b.renew_candidate_claim(&recovered, 60).await.is_err(),
+        "terminal claim revived"
+    );
+    db.close(vec![a, b]).await
+}
+
+#[tokio::test]
+async fn candidate_mutations_reject_a_token_expired_while_waiting_for_its_row() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let a = db.ledger("a").await?;
+    let b = db.ledger("b").await?;
+    a.append(share(1), None).await?;
+    let snapshot = a.snapshot(100).await?;
+    for (index, operation) in ["renew", "retry", "land", "finish"].into_iter().enumerate() {
+        let block = candidate(&snapshot, 402 + index as u32)?;
+        let hash = block.block_hash.clone();
+        a.enqueue_candidate(block).await?;
+        let claim = a.claim_candidate(60).await?.unwrap();
+        assert_eq!(claim.candidate.block_hash, hash);
+        sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()+interval '400 milliseconds' WHERE block_hash=$1")
+            .bind(&hash).execute(&a.pool).await?;
+        let before: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o WHERE block_hash=$1",
+        )
+        .bind(&hash)
+        .fetch_one(&a.pool)
+        .await?;
+        let mut blocker = a.pool.begin().await?;
+        sqlx::query(
+            "SELECT block_hash FROM qbit_block_candidate_outbox WHERE block_hash=$1 FOR UPDATE",
+        )
+        .bind(&hash)
+        .fetch_one(&mut *blocker)
+        .await?;
+        let acting = b.clone();
+        let public_key = keys().1.public_key_hex();
+        let attempt = tokio::spawn(async move {
+            match operation {
+                "renew" => acting.renew_candidate_claim(&claim, 60).await,
+                "retry" => acting.retry_candidate(&claim, "test retry").await,
+                "land" => acting.land_candidate(&claim, &public_key).await.map(|_| ()),
+                "finish" => acting.finish_candidate(&claim, false, None).await,
+                _ => unreachable!(),
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(
+            !attempt.is_finished(),
+            "{operation} did not wait for its row lock"
+        );
+        blocker.commit().await?;
+        assert!(
+            attempt.await?.is_err(),
+            "{operation} accepted a token expired during the lock wait"
+        );
+        let after: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o WHERE block_hash=$1",
+        )
+        .bind(&hash)
+        .fetch_one(&a.pool)
+        .await?;
+        assert_eq!(
+            before, after,
+            "{operation} changed expired ownership or disposition"
+        );
+    }
+    db.close(vec![a, b]).await
+}
+
+#[tokio::test]
+async fn candidate_processing_lock_allows_renewal_and_blocks_expired_takeover() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let a = db.ledger("a").await?;
+    let b = db.ledger("b").await?;
+    a.append(share(1), None).await?;
+    a.enqueue_candidate(candidate(&a.snapshot(100).await?, 403)?)
+        .await?;
+    let owner = a.claim_candidate(60).await?.unwrap();
+    let mut processing = a.pool.begin().await?;
+    // This is the lock held by land/finish while accounting is persisted.
+    sqlx::query("SELECT block_hash FROM qbit_block_candidate_outbox FOR KEY SHARE")
+        .fetch_one(&mut *processing)
+        .await?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        a.renew_candidate_claim(&owner, 60),
+    )
+    .await
+    .context("processing lock blocked its own renewal")??;
+    sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second'")
+        .execute(&a.pool).await?;
+    assert!(
+        b.claim_candidate(60).await?.is_none(),
+        "takeover bypassed the processing transaction"
+    );
+    processing.commit().await?;
+    let recovered = b
+        .claim_candidate(60)
+        .await?
+        .context("claim unavailable after processing lock released")?;
+    assert_ne!(owner.claim_token, recovered.claim_token);
+    assert!(a.renew_candidate_claim(&owner, 60).await.is_err());
+    b.finish_candidate(&recovered, false, None).await?;
+    db.close(vec![a, b]).await
+}
+
+#[tokio::test]
+async fn candidate_dispatch_prioritizes_fresh_work_and_services_oldest_due_fairly() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let a = db.ledger("a").await?;
+    let b = db.ledger("b").await?;
+    for _ in 0..5 {
+        assert!(a.claim_candidate(60).await?.is_none());
+    }
+    let consumed: bool =
+        sqlx::query_scalar("SELECT is_called FROM qbit_prism_candidate_dispatch_sequence")
+            .fetch_one(&a.pool)
+            .await?;
+    assert!(!consumed, "plainly empty polling consumed dispatch slots");
+    a.append(share(1), None).await?;
+    let snapshot = a.snapshot(100).await?;
+    let recovery = candidate(&snapshot, 410)?;
+    let old_unattempted = candidate(&snapshot, 411)?;
+    a.enqueue_candidate(recovery.clone()).await?;
+    a.enqueue_candidate(old_unattempted.clone()).await?;
+    sqlx::query("UPDATE qbit_block_candidate_outbox SET attempt_count=3,created_at=clock_timestamp()-interval '1 hour',next_attempt_at=clock_timestamp()-interval '1 hour' WHERE block_hash=$1")
+        .bind(&recovery.block_hash).execute(&a.pool).await?;
+    sqlx::query("UPDATE qbit_block_candidate_outbox SET created_at=clock_timestamp()-interval '2 hours',next_attempt_at=clock_timestamp()-interval '2 hours' WHERE block_hash=$1")
+        .bind(&old_unattempted.block_hash).execute(&a.pool).await?;
+    for slot in 1..=7 {
+        let fresh = candidate(&snapshot, 420 + slot)?;
+        a.enqueue_candidate(fresh.clone()).await?;
+        let ledger = if slot % 2 == 0 { &a } else { &b };
+        let claim = ledger.claim_candidate(60).await?.unwrap();
+        assert_eq!(
+            claim.candidate.block_hash, fresh.block_hash,
+            "old backlog delayed slot {slot}"
+        );
+        ledger.finish_candidate(&claim, false, None).await?;
+    }
+    let latest = candidate(&snapshot, 428)?;
+    a.enqueue_candidate(latest.clone()).await?;
+    let fair = b.claim_candidate(60).await?.unwrap();
+    assert_eq!(
+        fair.candidate.block_hash, old_unattempted.block_hash,
+        "old never-attempted work starved"
+    );
+    b.finish_candidate(&fair, false, None).await?;
+    let fresh = a.claim_candidate(60).await?.unwrap();
+    assert_eq!(fresh.candidate.block_hash, latest.block_hash);
+    a.finish_candidate(&fresh, false, None).await?;
+    for slot in 10..=15 {
+        let fresh = candidate(&snapshot, 420 + slot)?;
+        a.enqueue_candidate(fresh.clone()).await?;
+        let claim = a.claim_candidate(60).await?.unwrap();
+        assert_eq!(claim.candidate.block_hash, fresh.block_hash);
+        a.finish_candidate(&claim, false, None).await?;
+    }
+    a.enqueue_candidate(candidate(&snapshot, 436)?).await?;
+    let fair = b.claim_candidate(60).await?.unwrap();
+    assert_eq!(
+        fair.candidate.block_hash, recovery.block_hash,
+        "due recovery starved under new work"
+    );
+    b.finish_candidate(&fair, false, None).await?;
+    db.close(vec![a, b]).await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_instances_have_one_commit_order_and_stable_snapshots() -> Result<()> {
     let Some(db) = Database::open().await? else {

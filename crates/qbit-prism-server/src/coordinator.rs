@@ -98,6 +98,19 @@ struct ChainCache {
     observations: HashMap<String, bool>,
 }
 
+#[derive(Clone, Copy)]
+struct CandidateLease {
+    seconds: i64,
+    interval: Duration,
+    timeout: Duration,
+}
+
+const CANDIDATE_LEASE: CandidateLease = CandidateLease {
+    seconds: 120,
+    interval: Duration::from_secs(30),
+    timeout: Duration::from_secs(5),
+};
+
 fn protocol_error(reason: &'static str, message: &str) -> StratumError {
     let code = match reason {
         "stale-job" | "unknown-job" | "pool-closed" => 21,
@@ -847,6 +860,134 @@ impl Coordinator {
     }
 
     pub async fn process_candidate(&self, claim: &CandidateClaim) -> Result<()> {
+        self.process_candidate_with_lease(claim, CANDIDATE_LEASE)
+            .await
+    }
+
+    async fn renew_candidate(&self, claim: &CandidateClaim, lease: CandidateLease) -> Result<()> {
+        tokio::time::timeout(
+            lease.timeout,
+            self.ledger.renew_candidate_claim(claim, lease.seconds),
+        )
+        .await
+        .context("candidate lease renewal deadline exceeded")?
+        .context("candidate lease renewal failed")
+    }
+
+    async fn process_candidate_with_lease(
+        &self,
+        claim: &CandidateClaim,
+        lease: CandidateLease,
+    ) -> Result<()> {
+        // Establish ownership before even waiting for build capacity. Keep
+        // renewal and processing independently polled: processing may hold a
+        // database row lock while a renewal waits for that same transaction.
+        let initially_renewed = tokio::time::Instant::now();
+        self.renew_candidate(claim, lease).await?;
+        let heartbeat = async {
+            let mut valid_until = initially_renewed + Duration::from_secs(lease.seconds as u64);
+            let mut delay = lease.interval;
+            loop {
+                tokio::time::sleep(
+                    delay.min(valid_until.saturating_duration_since(tokio::time::Instant::now())),
+                )
+                .await;
+                let started = tokio::time::Instant::now();
+                ensure!(
+                    started < valid_until,
+                    "candidate lease expired before renewal"
+                );
+                let bounded = CandidateLease {
+                    timeout: lease.timeout.min(valid_until - started),
+                    ..lease
+                };
+                match self.renew_candidate(claim, bounded).await {
+                    Ok(()) => {
+                        valid_until = started + Duration::from_secs(lease.seconds as u64);
+                        delay = lease.interval;
+                    }
+                    Err(error) => {
+                        let contention = error
+                            .downcast_ref::<tokio::time::error::Elapsed>()
+                            .is_some()
+                            || error
+                                .downcast_ref::<sqlx::Error>()
+                                .and_then(sqlx::Error::as_database_error)
+                                .is_some_and(|database| {
+                                    database.code().as_deref() == Some("55P03")
+                                });
+                        if !contention {
+                            return Err(error);
+                        }
+                        // A brief terminal UPDATE can conflict with renewal.
+                        // Continue only after a read proves the exact token is
+                        // still live, and never run beyond that database expiry.
+                        let observed = tokio::time::Instant::now();
+                        let budget = lease
+                            .timeout
+                            .min(valid_until.saturating_duration_since(observed));
+                        let remaining = tokio::time::timeout(budget,sqlx::query_scalar::<_,Option<i64>>(
+                            "SELECT CASE WHEN state='pending' AND claim_token=$2 AND claim_expires_at>clock_timestamp() THEN floor(extract(epoch FROM claim_expires_at-clock_timestamp())*1000)::bigint END FROM qbit_block_candidate_outbox WHERE block_hash=$1"
+                        ).bind(&claim.candidate.block_hash).bind(&claim.claim_token).fetch_optional(&self.ledger.pool)).await;
+                        let Ok(Ok(Some(Some(remaining)))) = remaining else {
+                            return Err(error);
+                        };
+                        if remaining <= 0 {
+                            return Err(error);
+                        }
+                        let remaining = Duration::from_millis(remaining as u64);
+                        valid_until = observed + remaining;
+                        delay = lease
+                            .interval
+                            .min((remaining / 2).max(Duration::from_millis(1)));
+                    }
+                }
+            }
+        };
+        // Neither future is spawned. Completion, cancellation and lease loss
+        // all drop the other future; no orphan task can keep a lease alive.
+        let mut work = Box::pin(self.process_candidate_inner(claim, lease));
+        tokio::select! {
+            biased;
+            result = &mut work => result,
+            failure = heartbeat => {
+                drop(work);
+                // Finishing can commit its terminal state just before the
+                // processing future receives COMMIT's reply. The canceled
+                // work needs no retry when durable completion already won.
+                let terminal = tokio::time::timeout(lease.timeout, sqlx::query_scalar::<_, bool>(
+                    "SELECT state IN ('submitted','abandoned') FROM qbit_block_candidate_outbox WHERE block_hash=$1"
+                ).bind(&claim.candidate.block_hash).fetch_optional(&self.ledger.pool)).await;
+                if matches!(terminal, Ok(Ok(Some(true)))) { Ok(()) } else { failure }
+            },
+        }
+    }
+
+    async fn process_candidate_inner(
+        &self,
+        claim: &CandidateClaim,
+        lease: CandidateLease,
+    ) -> Result<()> {
+        let parent = header_parent(&claim.candidate.block_hex)?;
+        if self.observed_tip.read().await.as_deref() != Some(parent.as_str())
+            || self.ledger.payout_revision().await? != claim.candidate.payout_revision
+        {
+            // Backlogged work commonly becomes stale before reaching scarce
+            // build capacity. Cached hints only trigger this authoritative
+            // probe; an already-active block still needs its audit recovered.
+            let (active, revision, tip) = self.observe_candidate(claim).await?;
+            if !active && (revision != claim.candidate.payout_revision || tip != parent) {
+                self.ledger
+                    .finish_candidate_at_revision(
+                        claim,
+                        false,
+                        Some("payout revision or parent superseded"),
+                        revision,
+                    )
+                    .await?;
+                return Ok(());
+            }
+        }
         let finalized;
         let claim = if let Some(suffix) = &claim.candidate.coinbase_suffix_hex {
             let bundle = &claim.candidate.bundle;
@@ -854,37 +995,39 @@ impl Coordinator {
             let source = bundle.clone();
             let suffix = suffix.clone();
             let permit = self.build_slots.clone().acquire_owned().await?;
-            let rebuilt = tokio::task::spawn_blocking(move || -> Result<AuditBundle> {
-                let _permit = permit;
-                let manifest_key = ManifestSigningKey::from_seed_hex(&config.manifest_seed)?;
-                let ledger_key = ManifestSigningKey::from_seed_hex(&config.ledger_seed)?;
-                if config.ctv_enabled {
-                    Ok(qbit_prism::build_audit_bundle_with_ctv_settlement_options(
-                        source.shares,
-                        source.found_block,
-                        source.prior_balances,
-                        source.payout_policy,
-                        config.ctv_direct_floor,
-                        config.ctv_config,
-                        source.ctv_fanout_fee_policy,
-                        Some(suffix),
-                        source.witness_merkle_leaves_hex,
-                        &manifest_key,
-                        &ledger_key,
-                    )?)
-                } else {
-                    Ok(qbit_prism::build_audit_bundle_with_coinbase_options(
-                        source.shares,
-                        source.found_block,
-                        source.prior_balances,
-                        source.payout_policy,
-                        Some(suffix),
-                        source.witness_merkle_leaves_hex,
-                        &manifest_key,
-                        &ledger_key,
-                    )?)
-                }
-            })
+            let rebuilt = tokio_util::task::AbortOnDropHandle::new(tokio::task::spawn_blocking(
+                move || -> Result<AuditBundle> {
+                    let _permit = permit;
+                    let manifest_key = ManifestSigningKey::from_seed_hex(&config.manifest_seed)?;
+                    let ledger_key = ManifestSigningKey::from_seed_hex(&config.ledger_seed)?;
+                    if config.ctv_enabled {
+                        Ok(qbit_prism::build_audit_bundle_with_ctv_settlement_options(
+                            source.shares,
+                            source.found_block,
+                            source.prior_balances,
+                            source.payout_policy,
+                            config.ctv_direct_floor,
+                            config.ctv_config,
+                            source.ctv_fanout_fee_policy,
+                            Some(suffix),
+                            source.witness_merkle_leaves_hex,
+                            &manifest_key,
+                            &ledger_key,
+                        )?)
+                    } else {
+                        Ok(qbit_prism::build_audit_bundle_with_coinbase_options(
+                            source.shares,
+                            source.found_block,
+                            source.prior_balances,
+                            source.payout_policy,
+                            Some(suffix),
+                            source.witness_merkle_leaves_hex,
+                            &manifest_key,
+                            &ledger_key,
+                        )?)
+                    }
+                },
+            ))
             .await??;
             let mut updated = claim.clone();
             updated.candidate.bundle = rebuilt;
@@ -936,6 +1079,9 @@ impl Coordinator {
                 .await?;
             return Ok(());
         }
+        // Renewal failure cancels the attempt even between periodic ticks.
+        // Recheck the strictly-live token at the external mutation boundary.
+        self.renew_candidate(claim, lease).await?;
         let result = self
             .rpc
             .call_timeout(
@@ -968,9 +1114,13 @@ impl Coordinator {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {_=shutdown.changed()=>break,_=tick.tick()=>{}}
-            match self.ledger.claim_candidate(120).await {
+            match self.ledger.claim_candidate(CANDIDATE_LEASE.seconds).await {
                 Ok(Some(claim)) => {
-                    if let Err(error) = self.process_candidate(&claim).await {
+                    let result = tokio::select! {
+                        _ = shutdown.changed() => break,
+                        result = self.process_candidate(&claim) => result,
+                    };
+                    if let Err(error) = result {
                         tracing::warn!(%error,block=%claim.candidate.block_hash,"candidate remains recoverable");
                         if let Err(retry) = self
                             .ledger
@@ -1688,3 +1838,6 @@ mod fee_estimate_tests {
 
 #[cfg(test)]
 mod fee_policy_tests;
+
+#[cfg(test)]
+mod candidate_lease_tests;

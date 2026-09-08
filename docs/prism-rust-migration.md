@@ -210,6 +210,10 @@ closes mining readiness until a fresh valid poll succeeds.
 General node and wallet RPCs use `PRISM_RPC_TIMEOUT_SECONDS` (15 seconds).
 `PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS` (1 second) bounds only `submitblock`;
 ambiguous submission results retain the durable candidate for reconciliation.
+Candidate claims renew throughout processing, including waits for build workers.
+Losing the lease cancels the attempt; the durable row remains recoverable.
+Fresh candidates take priority over retries, with periodic oldest-due selection
+to keep older recovery work moving.
 Wallet selection preserves any configured `QBIT_RPC_URL` proxy path prefix.
 The independent public service retains its separate public read deadline.
 

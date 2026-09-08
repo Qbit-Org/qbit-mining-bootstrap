@@ -60,10 +60,11 @@ impl Ledger {
     ) -> Result<AuditVerificationReport> {
         let bundle = claim.candidate.bundle.clone();
         let public_key = ledger_public_key.to_owned();
-        let report = tokio::task::spawn_blocking(move || {
-            verify_audit_bundle_with_ledger_public_key(&bundle, &public_key)
-        })
-        .await??;
+        let report =
+            tokio_util::task::AbortOnDropHandle::new(tokio::task::spawn_blocking(move || {
+                verify_audit_bundle_with_ledger_public_key(&bundle, &public_key)
+            }))
+            .await??;
         let block = hex::decode(&claim.candidate.block_hex)?;
         ensure!(block.len() > 80, "candidate block is truncated");
         // The durable serialized candidate already authenticates its header.
@@ -410,7 +411,15 @@ impl Ledger {
 }
 
 async fn require_claim(tx: &mut Transaction<'_, Postgres>, claim: &CandidateClaim) -> Result<()> {
-    let valid: Option<bool> = sqlx::query_scalar("SELECT claim_token=$2 AND claim_expires_at>clock_timestamp() AND state='pending' FROM qbit_block_candidate_outbox WHERE block_hash=$1 FOR UPDATE")
+    // Block takeover (FOR UPDATE), while allowing the owner to renew the
+    // non-key lease columns throughout a long audit-persistence transaction.
+    sqlx::query(
+        "SELECT block_hash FROM qbit_block_candidate_outbox WHERE block_hash=$1 FOR KEY SHARE",
+    )
+    .bind(&claim.candidate.block_hash)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let valid: Option<bool> = sqlx::query_scalar("SELECT claim_token=$2 AND claim_expires_at>clock_timestamp() AND state='pending' FROM qbit_block_candidate_outbox WHERE block_hash=$1")
         .bind(&claim.candidate.block_hash).bind(&claim.claim_token).fetch_optional(&mut **tx).await?;
     ensure!(valid == Some(true), "candidate claim was lost or expired");
     Ok(())
