@@ -402,6 +402,12 @@ async fn accepted_public_blocks_and_earnings_follow_confirmed_chain_state() {
             .bind(&hash).bind(height).bind(reward).bind(maturity).execute(&pool).await.unwrap();
         hashes.push(hash);
     }
+    // These newer candidate payouts exceed the legacy status route's limit of
+    // 50. Filtering after LIMIT would hide both older confirmed payments.
+    sqlx::query("WITH candidates AS (INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256,chain_state) SELECT lpad(to_hex(1000+n),64,'0'),100+n,repeat('0',64),lpad(to_hex(2000+n),64,'0'),lpad(to_hex(3000+n),64,'0'),CASE n%3 WHEN 0 THEN 'prepared' WHEN 1 THEN 'inactive' ELSE 'rejected' END FROM generate_series(1,60) n RETURNING block_hash,block_height) INSERT INTO qbit_pool_payout_entries(block_hash,block_height,miner_id,payout_order_key,p2mr_program,onchain_amount_sats,carry_forward_balance_sats,action) SELECT block_hash,block_height,'alice','alice',decode(repeat('1',64),'hex'),9000000,0,'onchain' FROM candidates")
+        .execute(&pool)
+        .await
+        .unwrap();
     for stage in 0..3 {
         if stage > 0 {
             let hash = if stage == 1 { &hashes[0] } else { &hashes[2] };
@@ -492,6 +498,24 @@ async fn accepted_public_blocks_and_earnings_follow_confirmed_chain_state() {
                     .iter()
                     .map(String::as_str)
                     .collect::<Vec<_>>()
+            );
+        }
+        for path in ["/miners/alice/status", "/payouts/alice/status"] {
+            let (status, history) = get(&app, path).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {history}");
+            assert_eq!(history["owed_balance_sats"], 0);
+            assert_eq!(
+                history["recent_payouts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["block_hash"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                expected_hashes
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                "{path}: stage {stage}; newer candidate rows must not consume the history limit"
             );
         }
         for index in [0usize, 1] {
