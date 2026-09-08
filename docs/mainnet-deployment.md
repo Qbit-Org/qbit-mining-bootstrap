@@ -71,12 +71,18 @@ QBIT_DATA_SOURCE=/srv/qbit-mining-bootstrap/mainnet/qbit
 BITCOIN_DATA_SOURCE=/srv/qbit-mining-bootstrap/mainnet/bitcoin
 PRISM_POSTGRES_DATA_SOURCE=/srv/qbit-mining-bootstrap/mainnet/postgres/data
 PRISM_POSTGRES_WAL_SOURCE=/srv/qbit-mining-bootstrap/mainnet/postgres/wal
+PRISM_POSTGRES_REPLICA_DATA_SOURCE=/srv/qbit-mining-bootstrap/mainnet/postgres-replica/data
 PRISM_AUDIT_DATA_SOURCE=/srv/qbit-mining-bootstrap/mainnet/prism/audit
 ```
 
 Create each directory before rendering Compose, then grant only the corresponding
 runtime the required access. Compose refuses to create missing production bind
 paths.
+
+For the PRISM lane, release-provenance validation requires an absolute replica
+data path distinct from the primary data, WAL, audit, and other enabled state
+sources before contacting Docker. See [the replica runbook](prism-postgres-replica.md)
+for provisioning the public read standby.
 
 `PRISM_POSTGRES_WAL_SOURCE` is the primary's live WAL directory. Separating it
 from `PGDATA` permits an independent capacity and I/O boundary only when the two

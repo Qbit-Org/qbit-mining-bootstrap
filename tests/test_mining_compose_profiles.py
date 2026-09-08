@@ -126,6 +126,34 @@ class MiningComposeProfileTests(unittest.TestCase):
                 finally:
                     ledger.close()
 
+    def test_public_database_url_uses_configured_replica_credentials(self) -> None:
+        credentials = {
+            "PRISM_POSTGRES_USER": "pool_reader",
+            "PRISM_POSTGRES_PASSWORD": "synthetic-rotated-password",
+            "PRISM_POSTGRES_DB": "pool_ledger",
+            "PRISM_DATABASE_URL": "postgresql://writer@primary.internal/pool_ledger",
+        }
+        derived_url = (
+            "postgresql://pool_reader:synthetic-rotated-password"
+            "@prism-postgres-replica:5432/pool_ledger"
+        )
+        custom_url = "postgresql://reader@standby.internal/pool_ledger"
+        for overrides, expected in (
+            (credentials, derived_url),
+            ({**credentials, "PRISM_PUBLIC_DATABASE_URL": ""}, derived_url),
+            ({**credentials, "PRISM_PUBLIC_DATABASE_URL": custom_url}, custom_url),
+        ):
+            with self.subTest(overrides=overrides):
+                services = self.render_profile("prism", overrides)["services"]
+                self.assertEqual(
+                    services["prism-public-api"]["environment"]["PRISM_DATABASE_URL"],
+                    expected,
+                )
+                self.assertEqual(
+                    services["prism-coordinator"]["environment"]["PRISM_DATABASE_URL"],
+                    credentials["PRISM_DATABASE_URL"],
+                )
+
     def test_public_minimum_payout_preserves_pool_fallbacks(self) -> None:
         for overrides, expected in (
             ({}, 0),

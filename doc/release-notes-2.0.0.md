@@ -56,15 +56,19 @@ have their own version tags.
   and operator endpoints, private.
 - The shipped Compose profile adds `prism-postgres-replica` and reads through
   `PRISM_PUBLIC_DATABASE_URL`. Compose defaults
-  `PRISM_PUBLIC_REPLICA_MODE=require`; provision the standby and configure
-  the public DSN before cutover. The coordinator keeps its primary database
-  DSN. Direct launches outside Compose default replica enforcement to `off`.
+  `PRISM_PUBLIC_REPLICA_MODE=require`; provision the standby before cutover.
+  Leave the public DSN empty to derive the built-in standby URL from the
+  configured Postgres credentials, or set an explicit URL for a separate
+  standby. The coordinator keeps its primary database DSN. Direct launches
+  outside Compose default replica enforcement to `off`.
 - The public psql backend also uses the public DSN. If a wrapper or custom
   connection arguments are needed, set `PRISM_PUBLIC_PSQL_COMMAND` separately;
   the coordinator's `PRISM_POSTGRES_PSQL_COMMAND` is not inherited by the
   public service.
 - Production needs an explicit `PRISM_POSTGRES_REPLICA_DATA_SOURCE` directory
   and read-only access to the shared audit files from the public API service.
+  Release-provenance checks require the replica path to be absolute and
+  distinct from other enabled state sources before contacting Docker.
   Use a dedicated replication role and monitor the physical replication slot
   and retained WAL. The public standby is a read tier, not an automated
   failover target. Follow
