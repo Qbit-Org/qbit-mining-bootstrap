@@ -35,6 +35,7 @@ from typing import Any, Callable, Iterator, Protocol
 from lab.auxpow import vardiff
 from lab.prism import direct_stratum
 from lab.prism.bounded_executor import _BoundedPriorityExecutor, _DeliveryQueueFull
+from lab.prism.future_callbacks import add_releasing_done_callback
 from lab.prism.coordinator_config import (
     DEFAULT_PRISM_DISCONNECTED_JOB_RETENTION,
     DEFAULT_PRISM_INITIAL_JOB_MAX_WORKERS,  # noqa: F401 - compatibility re-export
@@ -1005,7 +1006,8 @@ class JobDeliveryService:
             # entry outside the admission lock; the done-callback installed
             # just below then fires immediately and hands the slot on.
             runtime._cancel_initial_job_future(orphan)
-        future.add_done_callback(
+        add_releasing_done_callback(
+            future,
             lambda completed: runtime._initial_job_future_finished(request, completed)
         )
         return True
@@ -1019,9 +1021,17 @@ class JobDeliveryService:
         runtime = self._runtime
         delivered = False
         if not future.cancelled():
-            try:
-                delivered = bool(future.result())
-            except Exception:
+            # Re-raising a stored task error here would add this request-owning
+            # frame to its traceback, retaining the client through the future.
+            error = future.exception()
+            if error is None:
+                try:
+                    delivered = bool(future.result())
+                except Exception as exc:
+                    error = exc
+            if error is not None:
+                if not isinstance(error, Exception):
+                    raise error
                 with runtime.lock:
                     runtime.job_build_failure_count = int(
                         getattr(runtime, "job_build_failure_count", 0)
@@ -1031,7 +1041,8 @@ class JobDeliveryService:
                     f"connection={request.client.connection_id}",
                     flush=True,
                 )
-                traceback.print_exc()
+                traceback.print_exception(error)
+                error = None
 
         # Coordinator-domain question, asked only on the delivered path and
         # only for as long as the constant-time read takes.
