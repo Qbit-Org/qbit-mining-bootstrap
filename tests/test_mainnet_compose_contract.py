@@ -166,6 +166,28 @@ class MainnetComposeContractTests(unittest.TestCase):
         self.assertEqual(env["PRISM_DATABASE_MAX_CONNECTIONS"], "16")
         self.assertEqual(env["PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS"], "15")
 
+    def test_prism_services_receive_the_complete_rpc_endpoint_override(self) -> None:
+        for service in ("prism-coordinator", "prism-public-api"):
+            with self.subTest(service=service):
+                self.assertEqual(
+                    self._environment(service)["QBIT_RPC_URL"],
+                    "https://rpc.example.invalid:8443/qbit/mainnet/rpc",
+                )
+
+    def test_prism_services_receive_configured_database_and_read_limits(self) -> None:
+        writer = self._environment("prism-coordinator")
+        self.assertEqual(writer["QBIT_TOOLS_PRODUCTION"], "1")
+        self.assertEqual(writer["PRISM_DATABASE_STATEMENT_TIMEOUT_MS"], "23000")
+        self.assertEqual(writer["PRISM_DATABASE_LOCK_TIMEOUT_MS"], "7000")
+        self.assertEqual(writer["PRISM_SHARE_COMMIT_TIMEOUT_SECONDS"], "19")
+        for service in ("prism-coordinator", "prism-public-api"):
+            with self.subTest(service=service):
+                env = self._environment(service)
+                self.assertEqual(env["PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS"], "9")
+                self.assertEqual(env["PRISM_POSTGRES_READ_CONCURRENCY"], "3")
+                self.assertEqual(env["PRISM_PAYOUT_MIN_OUTPUT_BITS"], "24576")
+                self.assertEqual(env["PRISM_PAYOUT_MIN_OUTPUT_SATS"], "24576")
+
     def test_prism_runtime_has_no_capacity_evidence_dependency(self) -> None:
         env = self._environment("prism-coordinator")
         volumes = self.config["services"]["prism-coordinator"]["volumes"]
