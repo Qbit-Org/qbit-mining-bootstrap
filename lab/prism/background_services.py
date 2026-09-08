@@ -1028,7 +1028,8 @@ class StallProbe:
             # The snapshot includes this frame: keeping it forms a cycle
             # retaining every sampled thread's locals until cyclic GC. Drop
             # both the snapshot and traversal references, even on an error or
-            # a sampling cap. Never clear the live frames themselves.
+            # a sampling cap. The loop can bind frame to this frame even when
+            # skipping the current thread. Never clear live frames themselves.
             frames.clear()
             frame = walker = None
 

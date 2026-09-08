@@ -546,9 +546,9 @@ class StallProbeFrameOwnershipTests(unittest.TestCase):
                 if fail_formatting:
                     expected = RuntimeError("stack formatting failed")
                     with mock.patch(
-                        "lab.prism.background_services.os.path.basename",
-                        side_effect=expected,
-                    ):
+                        "lab.prism.background_services.os",
+                    ) as probe_os:
+                        probe_os.path.basename.side_effect = expected
                         try:
                             probe.capture(now=100.0, wake_delay_seconds=0.3)
                         except RuntimeError as error:
