@@ -66,6 +66,13 @@ impl Ledger {
         .await??;
         let block = hex::decode(&claim.candidate.block_hex)?;
         ensure!(block.len() > 80, "candidate block is truncated");
+        // The durable serialized candidate already authenticates its header.
+        // Compact bits belong to block metadata; adding them to FoundBlock
+        // would change the signed canonical audit format and historical hashes.
+        let bits = format!(
+            "{:08x}",
+            u32::from_le_bytes(block[72..76].try_into().expect("validated header length"))
+        );
         let (tx_count, count_bytes) = compact_size(&block[80..])?;
         ensure!(tx_count > 0, "candidate has no coinbase");
         let coinbase = hex::decode(&report.coinbase_tx_hex)?;
@@ -84,17 +91,28 @@ impl Ledger {
         if let Some(expected) = expected_revision {
             require_revision(&mut tx, expected).await?;
         }
-        let existing: Option<String> = sqlx::query_scalar(
-            "SELECT audit_bundle_sha256 FROM qbit_pool_audit_bundles WHERE block_hash=$1",
+        let existing: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT audit_bundle_sha256,found_block_bits FROM qbit_pool_audit_bundles WHERE block_hash=$1",
         )
         .bind(&claim.candidate.block_hash)
         .fetch_optional(&mut *tx)
         .await?;
-        if let Some(digest) = existing {
+        if let Some((digest, stored_bits)) = existing {
             ensure!(
                 digest == report.audit_bundle_sha256_hex,
                 "existing block audit differs from candidate"
             );
+            if let Some(stored_bits) = stored_bits {
+                ensure!(
+                    stored_bits.eq_ignore_ascii_case(&bits),
+                    "existing block bits differ from candidate header"
+                );
+            } else {
+                // Older prepared rows can be recovered with their original
+                // serialized candidate even though no extra bits field existed.
+                sqlx::query("UPDATE qbit_pool_audit_bundles SET found_block_bits=$2 WHERE block_hash=$1 AND found_block_bits IS NULL")
+                    .bind(&claim.candidate.block_hash).bind(&bits).execute(&mut *tx).await?;
+            }
             tx.commit().await?;
             return Ok(report);
         }
@@ -119,11 +137,11 @@ impl Ledger {
             .as_object_mut()
             .context("audit bundle is not an object")?
             .remove("shares");
-        sqlx::query("INSERT INTO qbit_pool_audit_bundles(block_hash,audit_bundle,audit_bundle_sha256,coinbase_tx_hex,audit_body_byte_len,schema_version,found_block_network_difficulty,found_block_coinbase_value_sats,audit_commitment_leaves_hex,witness_merkle_leaves_hex,share_snapshot_sha256) VALUES($1,$2,$3,$4,$5,$6,$7::text::numeric,$8,$9,$10,$11)")
+        sqlx::query("INSERT INTO qbit_pool_audit_bundles(block_hash,audit_bundle,audit_bundle_sha256,coinbase_tx_hex,audit_body_byte_len,schema_version,found_block_network_difficulty,found_block_coinbase_value_sats,audit_commitment_leaves_hex,witness_merkle_leaves_hex,share_snapshot_sha256,found_block_bits) VALUES($1,$2,$3,$4,$5,$6,$7::text::numeric,$8,$9,$10,$11,$12)")
             .bind(&claim.candidate.block_hash).bind(&bundle_value).bind(&report.audit_bundle_sha256_hex).bind(&report.coinbase_tx_hex)
             .bind(i64::try_from(qbit_prism::canonical_audit_bundle_bytes(&claim.candidate.bundle)?.len())?).bind(&claim.candidate.bundle.schema)
             .bind(claim.candidate.bundle.found_block.network_difficulty.to_string()).bind(i64::try_from(report.coinbase_value_sats)?)
-            .bind(serde_json::to_value(&claim.candidate.bundle.audit_commitment_leaves_hex)?).bind(serde_json::to_value(&claim.candidate.bundle.witness_merkle_leaves_hex)?).bind(snapshot_digest).execute(&mut *tx).await?;
+            .bind(serde_json::to_value(&claim.candidate.bundle.audit_commitment_leaves_hex)?).bind(serde_json::to_value(&claim.candidate.bundle.witness_merkle_leaves_hex)?).bind(snapshot_digest).bind(&bits).execute(&mut *tx).await?;
         let accounts =
             serde_json::to_value(&claim.candidate.bundle.payout_policy_manifest.accounts)?;
         sqlx::query("INSERT INTO qbit_pool_payout_entries(block_hash,block_height,miner_id,payout_order_key,p2mr_program,onchain_amount_sats,carry_forward_balance_sats,action) SELECT $1,$2,a->>'recipient_id',a->>'order_key',decode(a->>'p2mr_program_hex','hex'),(a->>'onchain_amount_sats')::bigint,(a->>'carry_forward_balance_sats')::numeric,a->>'action' FROM jsonb_array_elements($3::jsonb) a")

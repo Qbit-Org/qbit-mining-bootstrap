@@ -446,3 +446,82 @@ async fn audit_range_query_uses_deadline_remaining_after_delayed_snapshot() -> R
     );
     db.close(vec![ledger]).await
 }
+
+#[tokio::test]
+async fn compact_bits_metadata_comes_from_durable_header_and_recovers_without_audit_changes(
+) -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let a = db.ledger("bits-a").await?;
+    let b = db.ledger("bits-b").await?;
+    a.append(share(9101), None).await?;
+    let mut block = candidate(&a.snapshot(100).await?, 9101)?;
+    let canonical = qbit_prism::canonical_audit_bundle_bytes(&block.bundle)?;
+    // Deliberately asymmetric compact bytes prove display endianness. Their
+    // value is independent of the audit's scaled network-difficulty integer.
+    let mut bytes = hex::decode(&block.block_hex)?;
+    bytes[72..76].copy_from_slice(&0x1d00ffffu32.to_le_bytes());
+    let mut hash = Sha256::digest(Sha256::digest(&bytes[..80])).to_vec();
+    hash.reverse();
+    block.block_hash = hex::encode(hash);
+    block.block_hex = hex::encode(bytes);
+    a.enqueue_candidate(block.clone()).await?;
+    let claim = a.claim_candidate(60).await?.unwrap();
+    let report = a.land_candidate(&claim, &keys().1.public_key_hex()).await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT found_block_bits FROM qbit_pool_audit_bundles WHERE block_hash=$1"
+        )
+        .bind(&block.block_hash)
+        .fetch_one(&a.pool)
+        .await?,
+        "1d00ffff"
+    );
+    assert_eq!(
+        report.audit_bundle_sha256_hex,
+        hex::encode(Sha256::digest(&canonical))
+    );
+    // Simulate a pre-fix prepared row and an owner crash. The next physical
+    // instance recovers the same old candidate format with its original header.
+    sqlx::query("UPDATE qbit_pool_audit_bundles SET found_block_bits=NULL WHERE block_hash=$1")
+        .bind(&block.block_hash)
+        .execute(&a.pool)
+        .await?;
+    sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE block_hash=$1").bind(&block.block_hash).execute(&a.pool).await?;
+    let recovered = b.claim_candidate(60).await?.unwrap();
+    assert_eq!(recovered.candidate.block_hex, block.block_hex);
+    let recovered_report = b
+        .land_candidate(&recovered, &keys().1.public_key_hex())
+        .await?;
+    assert_eq!(
+        recovered_report.audit_bundle_sha256_hex,
+        report.audit_bundle_sha256_hex
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT found_block_bits FROM qbit_pool_audit_bundles WHERE block_hash=$1"
+        )
+        .bind(&block.block_hash)
+        .fetch_one(&b.pool)
+        .await?,
+        "1d00ffff"
+    );
+    assert_eq!(
+        audit_canonical_bytes(&b.pool, &block.block_hash).await?,
+        Some(canonical)
+    );
+    sqlx::query(
+        "UPDATE qbit_pool_audit_bundles SET found_block_bits='207fffff' WHERE block_hash=$1",
+    )
+    .bind(&block.block_hash)
+    .execute(&b.pool)
+    .await?;
+    assert!(
+        b.land_candidate(&recovered, &keys().1.public_key_hex())
+            .await
+            .is_err(),
+        "idempotent landing accepted contradictory header metadata"
+    );
+    db.close(vec![a, b]).await
+}

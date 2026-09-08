@@ -342,6 +342,48 @@ impl Fixture {
         Ok(())
     }
 
+    async fn assert_public_block_bits(&self, hash: &str, expected: &Value) -> Result<()> {
+        ensure!(
+            expected
+                .as_str()
+                .is_some_and(|bits| bits.len() == 8 && bits != "00000000"),
+            "node did not provide valid compact bits"
+        );
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT found_block_bits FROM qbit_pool_audit_bundles WHERE block_hash=$1",
+        )
+        .bind(hash)
+        .fetch_one(&self.pool)
+        .await?;
+        ensure!(
+            stored.as_deref() == expected.as_str(),
+            "durable block bits differ from node"
+        );
+        for port in self.api {
+            let response: Value = self
+                .client
+                .get(format!(
+                    "http://127.0.0.1:{port}/public/v1/blocks?limit=100"
+                ))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let row = response["rows"]
+                .as_array()
+                .context("public block rows missing")?
+                .iter()
+                .find(|row| row["hash"] == hash)
+                .context("confirmed block missing from public response")?;
+            ensure!(
+                &row["bits"] == expected,
+                "public block bits differ from node: {row}"
+            );
+        }
+        Ok(())
+    }
+
     async fn cleanup(mut self) -> Result<()> {
         for miner in &mut self.miners {
             miner.stop();
@@ -404,6 +446,7 @@ async fn real_two_server_mining_failover_audit_and_reorg() -> Result<()> {
         let body:Value=fixture.client.get(format!("http://127.0.0.1:{}/audit/blocks/{hash}/bundle",fixture.api[1])).send().await?.error_for_status()?.json().await?;
         let bundle:AuditBundle=serde_json::from_value(body["audit_bundle"].clone())?;
         let block=fixture.rpc("getblock",json!([hash,2])).await?;
+        fixture.assert_public_block_bits(&hash,&block["bits"]).await?;
         let coinbase=fixture.rpc("getrawtransaction",json!([block["tx"][0]["txid"],false,hash])).await?;
         let key=ManifestSigningKey::from_seed_hex(&"22".repeat(32))?.public_key_hex();
         verify_audit_bundle_against_coinbase_tx_hex(&bundle,coinbase.as_str().context("node coinbase missing")?,&key)?;
@@ -417,6 +460,7 @@ async fn real_two_server_mining_failover_audit_and_reorg() -> Result<()> {
         let restoration_address=fixture.rpc("getnewaddress",json!(["","p2mr"])).await?;
         fixture.rpc("generatetoaddress",json!([2,restoration_address])).await?;
         until("pool block reconnection",20,||async {Ok(sqlx::query_scalar::<_,String>("SELECT chain_state FROM qbit_pool_blocks WHERE block_hash=$1").bind(&hash).fetch_one(&fixture.pool).await?=="confirmed")}).await?;
+        fixture.assert_public_block_bits(&hash,&block["bits"]).await?;
         fixture.integrity().await?;
         eprintln!("live regtest: {count} committed shares across two processes; failover/restart, unique extranonces, actual-coinbase audit and disconnect/reconnect verified");
         Ok::<_,anyhow::Error>(())
