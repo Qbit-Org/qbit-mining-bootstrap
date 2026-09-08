@@ -907,6 +907,196 @@ async fn per_username_capacity_preserves_prior_authorization_on_failed_reauthori
     task.await.unwrap();
 }
 
+async fn authorize_eventually(client: &mut Client, username: &str) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            client
+                .send(json!({"id":90,"method":"mining.authorize","params":[username,"x"]}))
+                .await;
+            let response = client.response(90).await;
+            if response["result"] == true {
+                break;
+            }
+            assert_eq!(response["error"][1], "too many connections for username");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("username capacity was not reclaimed");
+}
+
+async fn assert_username_full(client: &mut Client, username: &str) {
+    client
+        .send(json!({"id":91,"method":"mining.authorize","params":[username,"x"]}))
+        .await;
+    assert_eq!(
+        client.response(91).await["error"][1],
+        "too many connections for username"
+    );
+}
+
+#[tokio::test]
+async fn reauthorization_retains_original_username_capacity_until_timer_expiry() {
+    let mut config = StratumConfig {
+        max_connections_per_username: 1,
+        job_retention_seconds: 0.5,
+        stale_grace_seconds: 0.0,
+        ..Default::default()
+    };
+    config.vardiff.enabled = false;
+    let (address, backend, _refresh, shutdown, task) = start(config).await;
+    let mut first = Client::connect(address).await;
+    first.login("miner.A").await;
+    let mut old_submit = first.solved_submit(10, "miner.B", 0);
+    first
+        .send(json!({"id":3,"method":"mining.authorize","params":["miner.B","x"]}))
+        .await;
+    assert_eq!(first.response(3).await["result"], true);
+    first.next_job().await;
+    let mut second = Client::connect(address).await;
+    assert_username_full(&mut second, "miner.A").await;
+    first.send(old_submit.clone()).await;
+    assert_eq!(first.response(10).await["result"], true);
+    assert_eq!(backend.credited_workers.lock().unwrap()[0], "miner.A");
+
+    // Switching back must reuse the session's retained A slot, including when
+    // one is the entire limit. Both names still have exactly one occupied slot.
+    for (id, username) in [(4, "miner.A"), (5, "miner.B")] {
+        first
+            .send(json!({"id":id,"method":"mining.authorize","params":[username,"x"]}))
+            .await;
+        assert_eq!(first.response(id).await["result"], true);
+        first.next_job().await;
+    }
+    assert_username_full(&mut second, "miner.A").await;
+    assert_username_full(&mut second, "miner.B").await;
+
+    // The first connection receives no requests or new work while its timer
+    // releases expired A jobs. A second connection can then enter as A.
+    authorize_eventually(&mut second, "miner.A").await;
+    old_submit["id"] = json!(11);
+    first.send(old_submit).await;
+    assert_eq!(first.response(11).await["error"][0], 21);
+    first.send(first.solved_submit(12, "miner.B", 100)).await;
+    assert_eq!(first.response(12).await["result"], true);
+    assert_eq!(backend.credited_workers.lock().unwrap()[1], "miner.B");
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn reauthorization_disconnect_reclaims_current_and_retained_username_capacity() {
+    let (address, _backend, _refresh, shutdown, task) = start(StratumConfig {
+        max_connections_per_username: 1,
+        ..Default::default()
+    })
+    .await;
+    let mut first = Client::connect(address).await;
+    first.login("miner.A").await;
+    first
+        .send(json!({"id":3,"method":"mining.authorize","params":["miner.B","x"]}))
+        .await;
+    assert_eq!(first.response(3).await["result"], true);
+    first.next_job().await;
+    let mut second = Client::connect(address).await;
+    let mut third = Client::connect(address).await;
+    assert_username_full(&mut second, "miner.A").await;
+    assert_username_full(&mut third, "miner.B").await;
+    drop(first);
+    authorize_eventually(&mut second, "miner.A").await;
+    authorize_eventually(&mut third, "miner.B").await;
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn retained_username_capacity_reclaims_evicted_and_replaced_jobs() {
+    for max_jobs in [1, 64] {
+        let (address, backend, refresh, shutdown, task) = start(StratumConfig {
+            max_connections_per_username: 1,
+            max_jobs_per_connection: max_jobs,
+            ..Default::default()
+        })
+        .await;
+        let mut first = Client::connect(address).await;
+        first.login("miner.A").await;
+        let old_submit = first.solved_submit(10, "miner.B", 0);
+        first
+            .send(json!({"id":3,"method":"mining.authorize","params":["miner.B","x"]}))
+            .await;
+        assert_eq!(first.response(3).await["result"], true);
+        first.next_job().await;
+        let mut second = Client::connect(address).await;
+        if max_jobs > 1 {
+            assert_username_full(&mut second, "miner.A").await;
+            backend.payout_revision.store(1, Ordering::Relaxed);
+            refresh.send(1).unwrap();
+            first.next_job().await;
+            assert_eq!(first.notify["params"][8], true);
+        }
+        authorize_eventually(&mut second, "miner.A").await;
+        first.send(old_submit).await;
+        assert_eq!(first.response(10).await["error"][0], 21);
+        assert!(backend.credited_workers.lock().unwrap().is_empty());
+        shutdown.send(true).unwrap();
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn resumed_job_holds_username_capacity_until_absolute_expiry_during_build_failure() {
+    let mut config = StratumConfig {
+        max_connections_per_username: 1,
+        max_jobs_per_connection: 1,
+        job_retention_seconds: 30.0,
+        ..Default::default()
+    };
+    config.vardiff.enabled = false;
+    let (address, backend, _refresh, shutdown, task) = start(config).await;
+    let mut original = Client::connect(address).await;
+    original.login("miner.A").await;
+    let submit = original.solved_submit(10, "miner.A", 0);
+    drop(original);
+    let mut resumed = Client::connect(address).await;
+    authorize_eventually(&mut resumed, "miner.A").await;
+    resumed
+        .send(json!({"id":1,"method":"mining.subscribe","params":[]}))
+        .await;
+    resumed.extranonce1 = resumed.response(1).await["result"][1]
+        .as_str()
+        .unwrap()
+        .into();
+    resumed.next_job().await;
+    backend
+        .stored
+        .lock()
+        .unwrap()
+        .get_mut(submit["params"][1].as_str().unwrap())
+        .unwrap()
+        .3 = Instant::now() + Duration::from_millis(500);
+    // With one retained job, restoring the original evicts the new A job.
+    resumed.send(submit).await;
+    assert_eq!(resumed.response(10).await["result"], true);
+    backend.fail_builds.store(100, Ordering::Relaxed);
+    resumed
+        .send(json!({"id":3,"method":"mining.authorize","params":["miner.B","x"]}))
+        .await;
+    assert_eq!(resumed.response(3).await["result"], true);
+    let mut second = Client::connect(address).await;
+    assert_username_full(&mut second, "miner.A").await;
+    assert_username_full(&mut second, "miner.B").await;
+    // No B job can be delivered. Only the resumed job's absolute expiry can
+    // release A before the much longer ordinary retirement deadline.
+    authorize_eventually(&mut second, "miner.A").await;
+    assert_username_full(&mut second, "miner.B").await;
+    assert_eq!(
+        backend.credited_workers.lock().unwrap().as_slice(),
+        ["miner.A"]
+    );
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_cpu_miner_obeys_rate_budget_and_solves_real_headers() {
     let (address, backend, _refresh, shutdown, task) = start(StratumConfig::default()).await;

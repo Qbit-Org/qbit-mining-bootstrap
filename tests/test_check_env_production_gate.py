@@ -1265,6 +1265,43 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         )
         self.assertNotIn("docker is required", result.stderr)
 
+    def test_production_rejects_literal_difficulty_escapes_before_docker(self) -> None:
+        names = (
+            "PRISM_STRATUM_SHARE_DIFF",
+            "PRISM_STRATUM_VARDIFF_MIN_DIFF",
+            "PRISM_STRATUM_VARDIFF_START_DIFF",
+            "PRISM_STRATUM_VARDIFF_MAX_DIFF",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            checkout, commit = self.write_pinned_qbit_checkout(root)
+            fake_bin = self.write_fake_docker(root)
+            docker_calls = root / "docker-calls"
+            (fake_bin / "docker").write_text(
+                '#!/bin/sh\nprintf "called\\n" >> "$FAKE_DOCKER_CALLS"\n',
+                encoding="utf-8",
+            )
+            common = self.production_prism_env(root)
+            common.update({
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "FAKE_DOCKER_CALLS": str(docker_calls),
+                "QBIT_GIT_COMMIT": commit,
+                "QBIT_SRC_DIR": str(checkout),
+                "QBIT_SRC_DIR_OVERRIDE": str(checkout),
+                **dict.fromkeys(names, "1"),
+            })
+            valid = self.run_check_env(**common)
+            self.assertEqual(valid.returncode, 0, valid.stderr)
+            self.assertTrue(docker_calls.exists())
+            for name in names:
+                for value in (r"\x31", r"\061"):
+                    with self.subTest(name=name, value=value):
+                        docker_calls.unlink(missing_ok=True)
+                        result = self.run_check_env(**{**common, name: value})
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(f"{name} must be a decimal number", result.stderr)
+                        self.assertFalse(docker_calls.exists(), "invalid difficulty reached Docker")
+
     def test_production_rejects_unsafe_prism_difficulty_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

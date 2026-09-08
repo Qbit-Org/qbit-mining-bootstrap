@@ -663,11 +663,15 @@ check_prism_production_difficulty() {
 
   # The native server validates the same bounds on startup. Keep the host-side
   # Compose preflight independent of a Python interpreter or a host Rust build.
-  if ! output="$(awk \
-    -v share="${PRISM_STRATUM_SHARE_DIFF:-}" \
-    -v minimum="${PRISM_STRATUM_VARDIFF_MIN_DIFF:-}" \
-    -v start="${PRISM_STRATUM_VARDIFF_START_DIFF:-}" \
-    -v maximum="${PRISM_STRATUM_VARDIFF_MAX_DIFF:-}" 'BEGIN {
+  # ENVIRON preserves literal backslashes that awk -v would interpret.
+  if ! output="$(PRISM_CHECK_SHARE_DIFF="${PRISM_STRATUM_SHARE_DIFF:-}" \
+    PRISM_CHECK_MIN_DIFF="${PRISM_STRATUM_VARDIFF_MIN_DIFF:-}" \
+    PRISM_CHECK_START_DIFF="${PRISM_STRATUM_VARDIFF_START_DIFF:-}" \
+    PRISM_CHECK_MAX_DIFF="${PRISM_STRATUM_VARDIFF_MAX_DIFF:-}" LC_ALL=C awk 'BEGIN {
+      share=ENVIRON["PRISM_CHECK_SHARE_DIFF"];
+      minimum=ENVIRON["PRISM_CHECK_MIN_DIFF"];
+      start=ENVIRON["PRISM_CHECK_START_DIFF"];
+      maximum=ENVIRON["PRISM_CHECK_MAX_DIFF"];
       names[1]="PRISM_STRATUM_SHARE_DIFF"; values[1]=share;
       names[2]="PRISM_STRATUM_VARDIFF_MIN_DIFF"; values[2]=minimum;
       names[3]="PRISM_STRATUM_VARDIFF_START_DIFF"; values[3]=start;

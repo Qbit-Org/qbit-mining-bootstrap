@@ -226,6 +226,9 @@ Canonical payout changes retire prior jobs even when the parent tip is
 unchanged. Miners receive replacement work with `clean_jobs=true`; ordinary
 same-tip refreshes keep valid retained jobs, and previous-parent share grace
 remains bounded by each connection's notification time.
+Reauthorizing a connection preserves the original payout identity of retained
+work. When `PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME` is enabled, that work
+also keeps its original username's capacity slot until it expires or is discarded.
 
 CTV fee policies, including explicit rates, are checked against the node's live
 `minrelaytxfee` and `mempoolminfee` before building payout artifacts. A configured

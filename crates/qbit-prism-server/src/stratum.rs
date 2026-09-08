@@ -579,6 +579,7 @@ impl StratumConfig {
 struct IssuedJob<C> {
     job: MiningJob<C>,
     worker: Worker,
+    authorization_permit: Option<Arc<OwnedSemaphorePermit>>,
     version_mask: u32,
     retired_at: Option<Instant>,
     tip_replaced_at: Option<Instant>,
@@ -597,7 +598,7 @@ struct Session<C> {
     vardiff: Vardiff,
     jobs: VecDeque<IssuedJob<C>>,
     retry_job: bool,
-    authorization_permit: Option<OwnedSemaphorePermit>,
+    authorization_permit: Option<Arc<OwnedSemaphorePermit>>,
     observation: SessionObservation,
     pending_retarget: Option<(f64, Vardiff)>,
     last_accepted_share: Option<(String, f64)>,
@@ -627,6 +628,21 @@ impl<C> Session<C> {
             last_accepted_share: None,
             last_hint: None,
         }
+    }
+
+    fn prune_jobs(&mut self, config: &StratumConfig) {
+        let now = Instant::now();
+        self.jobs.retain(|issued| {
+            issued
+                .job
+                .wire
+                .resume_expires_at
+                .is_none_or(|expires| now < expires)
+                && issued.retired_at.is_none_or(|when| {
+                    now.duration_since(when).as_secs_f64()
+                        <= config.job_retention_seconds.max(config.stale_grace_seconds)
+                })
+        });
     }
 
     fn apply_requests(&mut self, config: &StratumConfig) {
@@ -904,6 +920,7 @@ async fn deliver_job<B: MiningBackend>(
     session.jobs.push_back(IssuedJob {
         job,
         worker: worker.clone(),
+        authorization_permit: session.authorization_permit.clone(),
         version_mask: mask,
         retired_at: None,
         tip_replaced_at: None,
@@ -931,6 +948,7 @@ async fn request<B: MiningBackend>(
     config: &StratumConfig,
     request: Value,
 ) -> Result<()> {
+    session.prune_jobs(config);
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let is_submit = request.get("method").and_then(Value::as_str) == Some("mining.submit");
     let dispatch = async {
@@ -981,27 +999,45 @@ async fn request<B: MiningBackend>(
                     .as_ref()
                     .is_some_and(|old| old.username == worker.username);
                 let new_permit = if config.max_connections_per_username > 0 && !same_username {
-                    let semaphore = {
-                        let mut registry = config.username_connections.lock().map_err(|_| {
-                            StratumError::internal("username admission unavailable")
-                        })?;
-                        registry.retain(|_, entry| entry.strong_count() > 0);
-                        match registry.get(&worker.username).and_then(Weak::upgrade) {
-                            Some(semaphore) => semaphore,
-                            None => {
-                                let semaphore =
-                                    Arc::new(Semaphore::new(config.max_connections_per_username));
-                                registry
-                                    .insert(worker.username.clone(), Arc::downgrade(&semaphore));
-                                semaphore
+                    // A retained job may still credit this username. Reuse its
+                    // permit when switching back, so the session cannot either
+                    // bypass admission or reject itself at a limit of one.
+                    let retained = session
+                        .jobs
+                        .iter()
+                        .find(|issued| issued.worker.username == worker.username)
+                        .and_then(|issued| issued.authorization_permit.clone());
+                    if let Some(permit) = retained {
+                        Some(permit)
+                    } else {
+                        let semaphore = {
+                            let mut registry =
+                                config.username_connections.lock().map_err(|_| {
+                                    StratumError::internal("username admission unavailable")
+                                })?;
+                            registry.retain(|_, entry| entry.strong_count() > 0);
+                            match registry.get(&worker.username).and_then(Weak::upgrade) {
+                                Some(semaphore) => semaphore,
+                                None => {
+                                    let semaphore = Arc::new(Semaphore::new(
+                                        config.max_connections_per_username,
+                                    ));
+                                    registry.insert(
+                                        worker.username.clone(),
+                                        Arc::downgrade(&semaphore),
+                                    );
+                                    semaphore
+                                }
                             }
-                        }
-                    };
-                    Some(semaphore.try_acquire_owned().map_err(|_| StratumError {
-                        code: 20,
-                        message: "too many connections for username".into(),
-                        reason_id: None,
-                    })?)
+                        };
+                        Some(Arc::new(semaphore.try_acquire_owned().map_err(|_| {
+                            StratumError {
+                                code: 20,
+                                message: "too many connections for username".into(),
+                                reason_id: None,
+                            }
+                        })?))
+                    }
                 } else {
                     None
                 };
@@ -1193,6 +1229,7 @@ async fn request<B: MiningBackend>(
                         session.jobs.push_front(IssuedJob {
                             job,
                             worker: worker.clone(),
+                            authorization_permit: session.authorization_permit.clone(),
                             version_mask: original_mask,
                             retired_at: Some(Instant::now()),
                             tip_replaced_at: None,
@@ -1329,6 +1366,7 @@ async fn session<B: MiningBackend>(
             }
             _ = timer.tick() => {
                 if session.jobs.is_empty() && connected.elapsed().as_secs_f64() > config.initial_job_timeout_seconds { break; }
+                session.prune_jobs(&config);
                 session.retarget();
             }
             read = bounded_reader.read_until(b'\n',&mut buffer) => {
