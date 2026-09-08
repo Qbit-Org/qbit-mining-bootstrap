@@ -72,6 +72,8 @@ cache budgets, schema readiness, and read-role configuration.
 | `PRISM_DATABASE_LOCK_TIMEOUT_MS` | 5000 | PostgreSQL lock wait timeout |
 | `PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS` | 60 | Periodic reward snapshot renewal |
 | `PRISM_BLOCKPOLL_SECONDS` | 2 | Template polling interval |
+| `PRISM_RPC_TIMEOUT_SECONDS` | 15 | General node and wallet RPC deadline |
+| `PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS` | 1 | `submitblock` deadline; ambiguous results retain the durable candidate for recovery |
 | `PRISM_MIN_PEERS` | 1 | Minimum connected peers for public-chain readiness |
 | `PRISM_TEMPLATE_MAX_AGE_SECONDS` | 120 | Maximum template age in integral seconds; 0..86400 |
 | `QBIT_EXPECTED_GENESIS_HASH` | absent | Required 64-hex mainnet genesis pin; optional pins on other chains are also checked |

@@ -300,6 +300,8 @@ pub struct Job {
     /// Absolute expiry of remotely restored work; reconnects never slide it.
     pub resume_expires_at: Option<Instant>,
     pub refresh_generation: u64,
+    /// Payout state is invalidated independently of the parent block hash.
+    pub payout_revision: i64,
 }
 
 impl Job {
@@ -388,6 +390,7 @@ impl Job {
             clean_jobs,
             resume_expires_at: None,
             refresh_generation: 0,
+            payout_revision: 0,
         })
     }
 

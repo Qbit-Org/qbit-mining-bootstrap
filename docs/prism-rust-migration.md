@@ -207,6 +207,17 @@ initial block download, matching block/header heights, and at least
 `PRISM_TEMPLATE_MAX_AGE_SECONDS` (default 120). A failed readiness observation
 closes mining readiness until a fresh valid poll succeeds.
 
+General node and wallet RPCs use `PRISM_RPC_TIMEOUT_SECONDS` (15 seconds).
+`PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS` (1 second) bounds only `submitblock`;
+ambiguous submission results retain the durable candidate for reconciliation.
+Wallet selection preserves any configured `QBIT_RPC_URL` proxy path prefix.
+The independent public service retains its separate public read deadline.
+
+Canonical payout changes retire prior jobs even when the parent tip is
+unchanged. Miners receive replacement work with `clean_jobs=true`; ordinary
+same-tip refreshes keep valid retained jobs, and previous-parent share grace
+remains bounded by each connection's notification time.
+
 CTV fee policies, including explicit rates, are checked against the node's live
 `minrelaytxfee` and `mempoolminfee` before building payout artifacts. A configured
 rate or discounted premium below these floors fails the build; correct the fee

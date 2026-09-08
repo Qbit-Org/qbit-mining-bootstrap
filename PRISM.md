@@ -134,7 +134,13 @@ rows and exposes a deterministic `audit_head_sha256` that operators can mirror.
 CTV broadcasting can run on several instances: database claims coordinate
 work, and the parent must be mature and active. Fee-bearing committed fanouts
 can be broadcast without a wallet. Optional positive CPFP sponsorship needs a
-configured wallet. On mainnet, configure a reviewed positive
+configured wallet. Sponsorship funding remains reserved until the signed child
+confirms. Persistent wallet locks and the wallet's recorded child transaction
+protect funding across mempool eviction and restart, so the package can reuse
+its exact saved bytes.
+If qbit cannot unlock a spent coin after repairing an abandoned child, cleanup
+remains pending for that outpoint; unrelated wallet locks stay intact.
+On mainnet, configure a reviewed positive
 `PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT`; a new chain cannot
 provide a useful market estimate from absent transaction history.
 

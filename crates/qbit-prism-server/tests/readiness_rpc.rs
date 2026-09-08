@@ -29,6 +29,7 @@ struct NodeState {
     network_calls: usize,
     drop_peers_after: Option<usize>,
     pause_network_after: Option<usize>,
+    tip_parent: String,
     network_reply_gate: Arc<NetworkReplyGate>,
 }
 struct Node {
@@ -55,6 +56,7 @@ impl Node {
             network_calls: 0,
             drop_peers_after: None,
             pause_network_after: None,
+            tip_parent: "cd".repeat(32),
             network_reply_gate: Arc::new(NetworkReplyGate::default()),
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -114,7 +116,7 @@ async fn answer(
         "getbestblockhash" => state.chain["bestblockhash"].clone(),
         "getblockhash" if request["params"][0] == 0 => json!("00".repeat(32)),
         "getblockhash" => state.chain["bestblockhash"].clone(),
-        "getblockheader" => json!({"previousblockhash":"cd".repeat(32)}),
+        "getblockheader" => json!({"previousblockhash":state.tip_parent}),
         "validateaddress" => {
             json!({"isvalid":true,"scriptPubKey":format!("5220{}","11".repeat(32))})
         }
@@ -190,6 +192,7 @@ fn coordinator_config(database_url: String, node: &Node) -> Result<Config> {
         rpc_user: "test".into(),
         rpc_password: "test".into(),
         rpc_timeout: Duration::from_secs(5),
+        block_submit_timeout: Duration::from_secs(1),
         poll_interval: Duration::from_secs(1),
         blockwait: false,
         build_workers: 2,
@@ -487,6 +490,119 @@ async fn observed_readiness_failure_closes_cached_work_and_candidate_settlement(
     }
     .await;
     coordinator.ledger.pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin)
+        .await?;
+    admin.close().await;
+    result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn another_frontend_payout_revision_retires_same_parent_work_and_preserves_parent_grace(
+) -> Result<()> {
+    let Ok(raw) = std::env::var("PRISM_TEST_DATABASE_URL") else {
+        eprintln!("set PRISM_TEST_DATABASE_URL for shared payout revision regression");
+        return Ok(());
+    };
+    let admin = sqlx::PgPool::connect(&raw).await?;
+    let schema = format!("prism_job_revision_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await?;
+    let mut url = url::Url::parse(&raw)?;
+    url.query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let node = Node::open().await?;
+    let first = Coordinator::new(coordinator_config(url.to_string(), &node)?).await?;
+    let mut config = coordinator_config(url.into(), &node)?;
+    config.instance_id = "readiness-second".into();
+    let second = Coordinator::new(config).await?;
+    let result = async {
+        first.ledger.append(AcceptedShare {
+            share_seq: 0, share_id: format!("miner:{}", "01".repeat(32)),
+            miner_id: "miner".into(), order_key: "miner".into(),
+            p2mr_program_hex: "11".repeat(32), share_difficulty: 1_000_000,
+            network_difficulty: 1_000_000, template_height: 100,
+            job_id: "seed".into(), job_issued_at_ms: 1, accepted_at_ms: 0,
+            ntime: 1, credit_policy: None,
+        }, None).await?;
+        first.refresh_once().await?;
+        second.refresh_once().await?;
+        let worker = first.authorize("miner.revision").await?;
+        let extra = format!("{:08x}", first.new_session_id().await?);
+        let old = first.build_job(&worker, &extra, 1e-12, 0.0).await?;
+        first.persist_issued_job(&worker, &old, 0, Duration::from_secs(60)).await?;
+        ensure!(second.resume_job(&worker, &old.wire.job_id).await?.is_some());
+        let solve = |job: &qbit_prism_server::stratum::MiningJob<qbit_prism_server::coordinator::JobContext>, start: u32| {
+            (start..start+10_000).find_map(|nonce| {
+                let proof = job.wire.assemble_submission(&"00".repeat(8),
+                    &format!("{:08x}",job.wire.ntime), &format!("{nonce:08x}"), None, 0).ok()?;
+                (proof.share_pass && proof.block_pass).then_some(proof)
+            }).context("constrained miner found no valid block proof")
+        };
+        let old_proof = solve(&old, 0)?;
+        // Reconciliation on another frontend commits a new payout revision
+        // without necessarily changing this node's already-observed parent.
+        // Isolate that durable revision transition from the independently
+        // covered block-observation/RPC path.
+        let revision: i64 = sqlx::query_scalar("UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1 WHERE singleton RETURNING payout_revision")
+            .fetch_one(&second.ledger.pool).await?;
+        ensure!(revision != old.context.prepared.snapshot.payout_revision);
+        for frontend in [&first, &second] {
+            ensure!(frontend.health().await["ready"] == false);
+            for grace in [false, true] {
+                let error = frontend.submit(&worker, &old, old_proof.clone(), grace).await.unwrap_err();
+                ensure!(error.reason_id.as_deref() == Some("stale-job"), "{error}");
+            }
+            ensure!(frontend.resume_job(&worker, &old.wire.job_id).await?.is_none());
+            frontend.refresh_once().await?;
+            ensure!(frontend.health().await["ready"] == true);
+            for grace in [false, true] {
+                let error = frontend.submit(&worker, &old, old_proof.clone(), grace).await.unwrap_err();
+                ensure!(error.reason_id.as_deref() == Some("stale-job"), "{error}");
+            }
+            ensure!(frontend.resume_job(&worker, &old.wire.job_id).await?.is_none());
+        }
+        let rejected: (i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM qbit_share_ledger),(SELECT count(*) FROM qbit_block_candidate_outbox)")
+            .fetch_one(&first.ledger.pool).await?;
+        ensure!(rejected == (1,0), "superseded work was ACKed or enqueued");
+
+        let fresh = first.build_job(&worker, &extra, 1e-12, 0.0).await?;
+        ensure!(fresh.wire.previousblockhash == old.wire.previousblockhash);
+        ensure!(fresh.wire.payout_revision == revision);
+        let proof = solve(&fresh, 0)?;
+        first.submit(&worker, &fresh, proof.clone(), false).await?;
+        let candidate: Value = sqlx::query_scalar("SELECT candidate FROM qbit_block_candidate_outbox WHERE block_hash=$1")
+            .bind(&proof.block_hash_hex).fetch_one(&first.ledger.pool).await?;
+        let candidate: Candidate = serde_json::from_value(candidate)?;
+        ensure!(candidate.payout_revision == revision);
+        ensure!(second.ledger.candidate_revision_valid(&candidate).await?);
+
+        // A real parent change still grants only the immediately previous
+        // parent's eligible shares. Even valid stale block proofs never enter
+        // the candidate queue.
+        {
+            let mut state = node.state.lock().await;
+            state.tip_parent = fresh.wire.previousblockhash.clone();
+            state.chain["bestblockhash"] = json!("ef".repeat(32));
+            state.chain["blocks"] = json!(101);
+            state.chain["headers"] = json!(101);
+            state.chain["chainwork"] = json!("02");
+            state.template["previousblockhash"] = json!("ef".repeat(32));
+            state.template["height"] = json!(102);
+        }
+        first.refresh_once().await?;
+        let grace_proof = solve(&fresh, 20_000)?;
+        ensure!(first.submit(&worker, &fresh, grace_proof.clone(), false).await.unwrap_err().reason_id.as_deref() == Some("stale-job"));
+        first.submit(&worker, &fresh, grace_proof.clone(), true).await?;
+        let credited: (String,bool) = sqlx::query_as("SELECT credit_policy,EXISTS(SELECT 1 FROM qbit_block_candidate_outbox WHERE block_hash=$2) FROM qbit_share_ledger WHERE share_id=$1")
+            .bind(format!("{}:{}", worker.username, grace_proof.block_hash_hex))
+            .bind(&grace_proof.block_hash_hex).fetch_one(&first.ledger.pool).await?;
+        ensure!(credited == ("stale-grace".into(),false));
+        Ok::<_,anyhow::Error>(())
+    }.await;
+    first.ledger.pool.close().await;
+    second.ledger.pool.close().await;
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
         .execute(&admin)
         .await?;

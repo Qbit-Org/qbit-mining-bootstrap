@@ -938,7 +938,11 @@ impl Coordinator {
         }
         let result = self
             .rpc
-            .call("submitblock", json!([claim.candidate.block_hex]))
+            .call_timeout(
+                "submitblock",
+                json!([claim.candidate.block_hex]),
+                Some(self.config.block_submit_timeout),
+            )
             .await?;
         // A null response can still describe a known side-chain block; use
         // active-chain evidence before advancing the shared payout state.
@@ -1202,6 +1206,7 @@ impl MiningBackend for Coordinator {
                 .await??
             };
             wire.refresh_generation = prepared.generation;
+            wire.payout_revision = prepared.snapshot.payout_revision;
             Ok::<_, anyhow::Error>(MiningJob {
                 wire,
                 context: Arc::new(JobContext {
@@ -1294,7 +1299,11 @@ impl MiningBackend for Coordinator {
                     == current.template["previousblockhash"].as_str(),
                 "new tip work is pending"
             );
-            if current.template["previousblockhash"] != prepared.template["previousblockhash"] {
+            let revision = self.ledger.payout_revision().await?;
+            if current.template["previousblockhash"] != prepared.template["previousblockhash"]
+                || current.snapshot.payout_revision != revision
+                || prepared.snapshot.payout_revision != revision
+            {
                 return Ok(None);
             }
             ensure!(
@@ -1356,6 +1365,8 @@ impl MiningBackend for Coordinator {
             wire.share_target = target;
             wire.share_difficulty = stored.share_difficulty;
             wire.version_mask = stored.version_mask;
+            wire.refresh_generation = prepared.generation;
+            wire.payout_revision = prepared.snapshot.payout_revision;
             let now_ms: i64 = sqlx::query_scalar(
                 "SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint",
             )
@@ -1432,9 +1443,23 @@ impl MiningBackend for Coordinator {
             .map_err(|_| {
                 protocol_error("stale-job", "job CTV fee is below the current relay floor")
             })?;
-        let stale =
+        let revision = self.ledger.payout_revision().await.map_err(|_| {
+            protocol_error(
+                "backend-rpc-unavailable",
+                "current payout state is unavailable",
+            )
+        })?;
+        if current.snapshot.payout_revision != revision {
+            return Err(protocol_error("stale-job", "new payout work is pending"));
+        }
+        let parent_stale =
             current.template["previousblockhash"] != context.prepared.template["previousblockhash"];
-        if stale && !(stale_grace_eligible && current.parent_of_tip == job.wire.previousblockhash) {
+        let stale = parent_stale || context.prepared.snapshot.payout_revision != revision;
+        if stale
+            && !(parent_stale
+                && stale_grace_eligible
+                && current.parent_of_tip == job.wire.previousblockhash)
+        {
             return Err(protocol_error("stale-job", "stale job"));
         }
         if !submission.share_pass && !(submission.block_pass && !stale) {
@@ -1498,7 +1523,7 @@ impl MiningBackend for Coordinator {
             if submission.share_pass {
                 let result = self
                     .ledger
-                    .append_at_revision(share, candidate, current.snapshot.payout_revision)
+                    .append_at_revision(share, candidate, revision)
                     .await?;
                 Ok::<bool, anyhow::Error>(result.inserted)
             } else {

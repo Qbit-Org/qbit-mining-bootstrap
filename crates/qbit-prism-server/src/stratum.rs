@@ -819,11 +819,11 @@ async fn deliver_job<B: MiningBackend>(
             return Err(StratumError::backend("initial job delivery timed out").into());
         }
     };
-    let tip_changed = session
-        .jobs
-        .back()
-        .is_none_or(|prior| prior.job.wire.previousblockhash != job.wire.previousblockhash);
-    job.wire.clean_jobs = tip_changed;
+    let work_invalidated = session.jobs.back().is_none_or(|prior| {
+        prior.job.wire.previousblockhash != job.wire.previousblockhash
+            || prior.job.wire.payout_revision != job.wire.payout_revision
+    });
+    job.wire.clean_jobs = work_invalidated;
     let mask = session.miner_version_mask.map_or(0, |miner| {
         miner & config.version_rolling_mask & job.wire.version_mask
     });
@@ -889,10 +889,14 @@ async fn deliver_job<B: MiningBackend>(
         }
     }
     session.jobs.retain(|prior| {
-        prior.retired_at.is_none_or(|when| {
-            when.elapsed().as_secs_f64()
-                <= config.job_retention_seconds.max(config.stale_grace_seconds)
-        })
+        // A same-parent payout replacement has no stale grace. Previous-parent
+        // jobs retain their separate, notification-anchored grace deadline.
+        (prior.job.wire.previousblockhash != job.wire.previousblockhash
+            || prior.job.wire.payout_revision == job.wire.payout_revision)
+            && prior.retired_at.is_none_or(|when| {
+                when.elapsed().as_secs_f64()
+                    <= config.job_retention_seconds.max(config.stale_grace_seconds)
+            })
     });
     while session.jobs.len() >= config.max_jobs_per_connection {
         session.jobs.pop_front();

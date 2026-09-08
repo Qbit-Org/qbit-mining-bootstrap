@@ -151,6 +151,7 @@ async fn process_view(
         .checked_add(qbit_prism::QBIT_COINBASE_MATURITY_BLOCKS)
         .context("coinbase height overflow")?;
     ensure!(tip >= mature_height, "fanout coinbase is immature");
+    maintain_funding_reservation(coordinator, claim).await?;
     if let (Some(hash), Some(height)) = (
         claim.progress["confirmed_block_hash"].as_str(),
         claim.progress["confirmed_block_height"].as_u64(),
@@ -162,7 +163,6 @@ async fn process_view(
             "tip changed during CTV confirmation check"
         );
         if active {
-            release_spent_funding(coordinator, claim).await?;
             return confirmed(hash, height, tip);
         }
         if claim.progress["confirmed_depth"].as_u64().unwrap_or(0) >= 1000 {
@@ -193,7 +193,6 @@ async fn process_view(
                 rpc.call("getbestblockhash", json!([])).await? == tip_hash,
                 "tip changed during CTV confirmation check"
             );
-            release_spent_funding(coordinator, claim).await?;
             return confirmed(hash, confirmed_height, tip);
         }
     }
@@ -223,7 +222,6 @@ async fn process_view(
         .await
         .is_ok()
     {
-        release_spent_funding(coordinator, claim).await?;
         return Ok(observation(
             "broadcast_submitted",
             json!({"already_in_mempool":true}),
@@ -262,7 +260,6 @@ async fn process_view(
             result["package_msg"] == "success",
             "CTV package rejected: {result}"
         );
-        release_spent_funding(coordinator, claim).await?;
         result
     };
     Ok(("broadcast_submitted", json!({"submit_result":result})))
@@ -312,7 +309,6 @@ async fn scan_spender(
                     tx["txid"] == manifest.fanout_txid,
                     "covenant spent by an unexpected transaction"
                 );
-                release_spent_funding(coordinator, claim).await?;
                 return confirmed(hash.as_str().context("block hash missing")?, number, tip);
             }
         }
@@ -385,6 +381,10 @@ async fn build_child(
     // A committed package can be relayed by any node. Requiring the original
     // wallet here would prevent recovery after mempool loss or node failover.
     if let Some(raw) = package["signed_child_hex"].as_str() {
+        ensure!(
+            package["wallet_lock_released"] != true,
+            "unconfirmed CPFP funding reservation must be repaired before replay"
+        );
         let stripped = codec::strip_witness_transaction(&hex::decode(raw)?)?;
         ensure!(
             package["child_txid"] == codec::hash_display(&codec::double_sha256(&stripped)),
@@ -398,25 +398,20 @@ async fn build_child(
             .context("reserved wallet missing")?,
     )?;
     let outpoint = json!({"txid":package["funding_txid"],"vout":package["funding_vout"]});
-    let locked = wallet.call("listlockunspent", json!([])).await?;
-    if !locked
-        .as_array()
-        .is_some_and(|rows| rows.contains(&outpoint))
-    {
-        // Record recovery responsibility before an external wallet mutation.
-        coordinator
-            .ledger
-            .mark_cpfp_wallet_lock_pending(claim)
-            .await?;
-        coordinator.ledger.renew_fanout_claim(claim, 120).await?;
-        ensure!(
-            wallet
-                .call("lockunspent", json!([false, [outpoint]]))
-                .await?
-                == true,
-            "failed to reserve funding wallet UTXO"
-        );
-    }
+    // Persisting an existing lock is idempotent and also upgrades reservations
+    // left by older processes that only held an in-memory wallet lock.
+    coordinator
+        .ledger
+        .mark_cpfp_wallet_lock_pending(claim)
+        .await?;
+    coordinator.ledger.renew_fanout_claim(claim, 120).await?;
+    ensure!(
+        wallet
+            .call("lockunspent", json!([false, [outpoint], true]))
+            .await?
+            == true,
+        "failed to reserve funding wallet UTXO"
+    );
     let address = wallet.call("getnewaddress", json!(["", "p2mr"])).await?;
     let info = wallet.call("getaddressinfo", json!([address])).await?;
     let child = qbit_prism::build_cpfp_child(&CpfpChildRequest {
@@ -462,52 +457,155 @@ async fn build_child(
     Ok(raw)
 }
 
-async fn release_spent_funding(coordinator: &Coordinator, claim: &FanoutClaim) -> Result<()> {
+async fn maintain_funding_reservation(
+    coordinator: &Coordinator,
+    claim: &FanoutClaim,
+) -> Result<()> {
     match tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        release_spent_funding_inner(coordinator, claim),
+        maintain_funding_reservation_inner(coordinator, claim),
     )
     .await
     {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            tracing::warn!(%error,fanout=%claim.fanout_txid,"spent sponsorship wallet reservation cleanup deferred")
+            tracing::warn!(%error,fanout=%claim.fanout_txid,"sponsorship wallet reservation maintenance deferred")
         }
         Err(_) => {
-            tracing::warn!(fanout=%claim.fanout_txid,"spent sponsorship wallet reservation cleanup deadline exceeded")
+            tracing::warn!(fanout=%claim.fanout_txid,"sponsorship wallet reservation maintenance deadline exceeded")
         }
     }
     Ok(())
 }
 
-async fn release_spent_funding_inner(coordinator: &Coordinator, claim: &FanoutClaim) -> Result<()> {
+async fn maintain_funding_reservation_inner(
+    coordinator: &Coordinator,
+    claim: &FanoutClaim,
+) -> Result<()> {
     let Some(package) = coordinator.ledger.cpfp_package(&claim.fanout_txid).await? else {
         return Ok(());
     };
-    if package["wallet_lock_released"] == true {
-        return Ok(());
-    }
-    let unspent = coordinator
-        .rpc
-        .call(
-            "gettxout",
-            json!([package["funding_txid"], package["funding_vout"], true]),
-        )
-        .await?;
-    if !unspent.is_null() {
-        return Ok(());
-    }
     let wallet = coordinator.rpc.wallet(
         package["wallet_name"]
             .as_str()
             .context("reserved wallet missing")?,
     )?;
     let outpoint = json!({"txid":package["funding_txid"],"vout":package["funding_vout"]});
+    // Excluding mempool spends is essential: an unconfirmed child may be
+    // evicted and its exact durable bytes must remain valid for rebroadcast.
+    let unspent = coordinator
+        .rpc
+        .call(
+            "gettxout",
+            json!([package["funding_txid"], package["funding_vout"], false]),
+        )
+        .await?;
+    if !unspent.is_null() {
+        // Qbit removes explicit locks when it learns a wallet spend. Its
+        // non-abandoned/non-conflicted pending transaction then excludes the
+        // input from coin selection, including after mempool eviction.
+        let mut protected = false;
+        if let Some(child_txid) = package["child_txid"].as_str() {
+            if let Ok(child) = wallet.call("gettransaction", json!([child_txid])).await {
+                let pending = child["txid"] == child_txid
+                    && child["confirmations"].as_i64() == Some(0)
+                    && child["walletconflicts"]
+                        .as_array()
+                        .is_some_and(Vec::is_empty)
+                    && child["mempoolconflicts"]
+                        .as_array()
+                        .is_some_and(Vec::is_empty)
+                    && child["details"].as_array().is_some_and(|details| {
+                        !details.is_empty()
+                            && details.iter().any(|detail| detail["abandoned"] == false)
+                            && details.iter().all(|detail| detail["abandoned"] != true)
+                    });
+                if pending {
+                    let available = wallet
+                        .call("listunspent", json!([0, 9_999_999, [], true]))
+                        .await?;
+                    protected = available
+                        .as_array()
+                        .context("wallet UTXO list missing")?
+                        .iter()
+                        .all(|coin| {
+                            coin["txid"] != package["funding_txid"]
+                                || coin["vout"] != package["funding_vout"]
+                        });
+                }
+            }
+        }
+        if !protected {
+            coordinator.ledger.renew_fanout_claim(claim, 120).await?;
+            ensure!(
+                wallet
+                    .call("lockunspent", json!([false, [outpoint], true]))
+                    .await?
+                    == true,
+                "failed to retain persistent funding wallet lock"
+            );
+        }
+        // Do not erase evidence of an older premature release until the
+        // wallet has proved or successfully restored its protection.
+        if package["wallet_lock_released"] == true {
+            coordinator
+                .ledger
+                .mark_cpfp_wallet_lock_pending(claim)
+                .await?;
+        }
+        return Ok(());
+    }
+    if package["wallet_lock_released"] == true {
+        return Ok(());
+    }
+    // A missing UTXO alone could also mean its funding transaction was
+    // disconnected. Require the signed child's actual active confirmation
+    // before releasing the wallet lock. A walletless relay can safely defer
+    // this cleanup until the sponsorship wallet becomes available again.
+    let tip = coordinator.rpc.call("getbestblockhash", json!([])).await?;
+    let child = wallet
+        .call(
+            "gettransaction",
+            json!([package["child_txid"]
+                .as_str()
+                .context("signed CPFP child missing")?]),
+        )
+        .await?;
+    if child["confirmations"].as_u64().unwrap_or(0) == 0 {
+        return Ok(());
+    }
+    let block_hash = child["blockhash"]
+        .as_str()
+        .context("confirmed child block missing")?;
+    let header = coordinator
+        .rpc
+        .call("getblockheader", json!([block_hash]))
+        .await?;
+    ensure!(
+        header["confirmations"].as_u64().unwrap_or(0) > 0,
+        "CPFP child confirmation is not active"
+    );
+    let height = header["height"]
+        .as_u64()
+        .context("CPFP child height missing")?;
+    ensure!(
+        coordinator
+            .rpc
+            .call("getblockhash", json!([height]))
+            .await?
+            == json!(block_hash)
+            && coordinator.rpc.call("getbestblockhash", json!([])).await? == tip,
+        "chain changed while checking CPFP child confirmation"
+    );
     let locked = wallet.call("listlockunspent", json!([])).await?;
     if locked
         .as_array()
         .is_some_and(|rows| rows.contains(&outpoint))
     {
+        // Qbit 1.0 can retain a restored lock for an already-known child, yet
+        // reject per-output unlock once that child spends it. Keep cleanup
+        // pending on that error; unlocking all coins would endanger other
+        // reservations in the sponsorship wallet.
         coordinator.ledger.renew_fanout_claim(claim, 120).await?;
         ensure!(
             wallet

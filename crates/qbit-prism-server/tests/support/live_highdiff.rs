@@ -361,6 +361,7 @@ fn direct_coordinator_config(fixture: &Fixture) -> Result<qbit_prism_server::con
         rpc_user: "prismtest".into(),
         rpc_password: "prismtest".into(),
         rpc_timeout: Duration::from_secs(10),
+        block_submit_timeout: Duration::from_secs(1),
         poll_interval: Duration::from_secs(1),
         blockwait: false,
         build_workers: 2,

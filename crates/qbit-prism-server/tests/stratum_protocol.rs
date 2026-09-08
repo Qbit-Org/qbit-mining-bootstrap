@@ -29,6 +29,7 @@ type MockDifficulties = Mutex<HashMap<(String, String), (f64, Instant)>>;
 struct Backend {
     sessions: AtomicU32,
     generation: AtomicU64,
+    payout_revision: AtomicU64,
     jobs: AtomicU64,
     shares: Mutex<HashSet<String>>,
     credited_workers: Mutex<Vec<String>>,
@@ -148,6 +149,7 @@ impl MiningBackend for Backend {
         )
         .unwrap();
         job.refresh_generation = generation;
+        job.payout_revision = self.payout_revision.load(Ordering::Relaxed) as i64;
         Ok(MiningJob {
             wire: job,
             context: Arc::new(()),
@@ -212,6 +214,7 @@ impl MiningBackend for Backend {
             || Instant::now() >= *expires
             || job.wire.previousblockhash
                 != format!("{:064x}", self.generation.load(Ordering::SeqCst))
+            || job.wire.payout_revision != self.payout_revision.load(Ordering::Relaxed) as i64
         {
             return Ok(None);
         }
@@ -734,6 +737,32 @@ async fn negotiation_reauthorization_retains_original_job_worker_and_grace_expir
     old_submit["id"] = json!(5);
     client.send(old_submit).await;
     assert_eq!(client.response(5).await["error"][0], 21);
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn same_parent_payout_replacement_clears_retained_work_but_equivalent_updates_do_not() {
+    let (address, backend, refresh, shutdown, task) = start(StratumConfig::default()).await;
+    let mut client = Client::connect(address).await;
+    client.login("miner.payout").await;
+    let old = client.solved_submit(10, "miner.payout", 0);
+    let parent = client.notify["params"][1].clone();
+    refresh.send(1).unwrap();
+    client.next_job().await;
+    assert_eq!(client.notify["params"][8], false);
+    backend.payout_revision.store(1, Ordering::Relaxed);
+    refresh.send(2).unwrap();
+    client.next_job().await;
+    assert_eq!(client.notify["params"][1], parent);
+    assert_eq!(client.notify["params"][8], true);
+    client.send(old).await;
+    assert_eq!(client.response(10).await["error"][0], 21);
+    assert!(backend.shares.lock().unwrap().is_empty());
+    client
+        .send(client.solved_submit(11, "miner.payout", 0))
+        .await;
+    assert_eq!(client.response(11).await["result"], true);
     shutdown.send(true).unwrap();
     task.await.unwrap();
 }

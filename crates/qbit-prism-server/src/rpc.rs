@@ -23,11 +23,29 @@ impl Rpc {
     pub fn wallet(&self, name: &str) -> Result<Self> {
         let mut rpc = self.clone();
         let mut url = url::Url::parse(&rpc.url)?;
-        url.path_segments_mut()
-            .map_err(|_| anyhow::anyhow!("invalid wallet RPC URL"))?
-            .clear()
-            .push("wallet")
-            .push(name);
+        // A reverse proxy may route this node below a path prefix. Retain
+        // that prefix and replace only an existing terminal wallet selection.
+        let segments: Vec<_> = url
+            .path_segments()
+            .context("invalid wallet RPC URL")?
+            .collect();
+        let trimmed = segments.strip_suffix(&[""]).unwrap_or(&segments);
+        let replace_wallet = trimmed.len() >= 2 && trimmed[trimmed.len() - 2] == "wallet";
+        let empty_wallet = segments.len() >= 2
+            && segments[segments.len() - 2] == "wallet"
+            && segments.last() == Some(&"");
+        {
+            let mut path = url
+                .path_segments_mut()
+                .map_err(|_| anyhow::anyhow!("invalid wallet RPC URL"))?;
+            path.pop_if_empty();
+            if replace_wallet {
+                path.pop().pop();
+            } else if empty_wallet {
+                path.pop();
+            }
+            path.push("wallet").push(name);
+        }
         rpc.url = url.into();
         Ok(rpc)
     }
