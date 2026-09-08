@@ -96,8 +96,15 @@ connection from host ...`.
 | `PRISM_POSTGRES_REPLICATION_SLOT` | `prism_public_replica` | Physical slot the standby creates and streams through. |
 | `PRISM_POSTGRES_REPLICA_DATA_SOURCE` | `prism-postgres-replica-data` | Volume or host path backing the standby's data directory. |
 | `PRISM_PUBLIC_DATABASE_URL` | `postgresql://qbit:change-this@prism-postgres-replica:5432/qbit` | Read-only DSN `prism-public-api` uses. Compose passes it into the container as `PRISM_DATABASE_URL`; it is a separate operator knob because `PRISM_DATABASE_URL` names the primary, which the coordinator needs it to. |
+| `PRISM_PUBLIC_PSQL_COMMAND` | Empty | Optional command for the public psql backend. Compose passes it as `PRISM_POSTGRES_PSQL_COMMAND` only to the public service; empty derives `psql` from `PRISM_PUBLIC_DATABASE_URL`. The coordinator keeps its own `PRISM_POSTGRES_PSQL_COMMAND`. |
 | `PRISM_PUBLIC_REPLICA_MODE` | `require` in compose, `off` in code | `require` refuses replica-backed routes unless the backing server is in recovery with a live replication stream. `off` serves whatever the DSN names — the behaviour before a standby existed. |
 | `PRISM_PUBLIC_REPLICA_MAX_LAG_SECONDS` | `60` | How long the standby's replication stream may be silent before its answers stop counting as current. |
+
+With `PRISM_POSTGRES_NATIVE_CLIENT=psql`, the public service must still connect
+to the standby. Leave `PRISM_PUBLIC_PSQL_COMMAND` empty to use the public DSN,
+or set a separate command that reaches the replica if a wrapper or extra psql
+arguments are required. The coordinator's primary command is never inherited
+by the public service.
 
 `PRISM_PUBLIC_REPLICA_MODE` defaults to `off` in the code and `require` in the
 shipped compose. That split is deliberate: merging the replica work must not

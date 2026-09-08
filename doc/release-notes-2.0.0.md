@@ -59,6 +59,10 @@ have their own version tags.
   `PRISM_PUBLIC_REPLICA_MODE=require`; provision the standby and configure
   the public DSN before cutover. The coordinator keeps its primary database
   DSN. Direct launches outside Compose default replica enforcement to `off`.
+- The public psql backend also uses the public DSN. If a wrapper or custom
+  connection arguments are needed, set `PRISM_PUBLIC_PSQL_COMMAND` separately;
+  the coordinator's `PRISM_POSTGRES_PSQL_COMMAND` is not inherited by the
+  public service.
 - Production needs an explicit `PRISM_POSTGRES_REPLICA_DATA_SOURCE` directory
   and read-only access to the shared audit files from the public API service.
   Use a dedicated replication role and monitor the physical replication slot
