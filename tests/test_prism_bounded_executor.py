@@ -3,14 +3,90 @@
 
 from __future__ import annotations
 
+import gc
+import queue
 import threading
 import unittest
+import weakref
 
 from lab.prism import prism_coordinator
 from lab.prism.bounded_executor import (
     _BoundedPriorityExecutor,
     _DeliveryQueueFull,
 )
+
+
+class _Payload:
+    pass
+
+
+class _Task:
+    def __init__(self, result: _Payload, *, fail: bool) -> None:
+        self.result = result
+        self.fail = fail
+
+    def __call__(self, argument: _Payload, *, keyword: _Payload) -> _Payload:
+        if self.fail:
+            raise RuntimeError("injected task failure")
+        return self.result
+
+
+class BoundedExecutorRetentionTests(unittest.TestCase):
+    def check_idle_worker_releases_task(self, outcome: str) -> None:
+        # Queue the task before starting a worker, so cancellation and the
+        # return to an idle get() are deterministic and require no sleeps.
+        waiting = threading.Semaphore(0)
+
+        class ObservedQueue(queue.PriorityQueue):
+            def get(self, *args, **kwargs):
+                waiting.release()
+                return super().get(*args, **kwargs)
+
+        gc.collect()
+        was_enabled = gc.isenabled()
+        gc.disable()
+        executor = _BoundedPriorityExecutor(max_workers=0, max_queue_size=1)
+        executor._queue = ObservedQueue(maxsize=1)
+        try:
+            argument, keyword, result = _Payload(), _Payload(), _Payload()
+            task = _Task(result, fail=outcome == "failed")
+            future = executor.submit(task, argument, keyword=keyword)
+            references = {
+                "argument": weakref.ref(argument),
+                "keyword": weakref.ref(keyword),
+                "result": weakref.ref(result),
+                "task": weakref.ref(task),
+                "future": weakref.ref(future),
+            }
+            if outcome == "cancelled":
+                self.assertTrue(future.cancel())
+            del argument, keyword, result, task, future
+            thread = threading.Thread(target=executor._worker, daemon=True)
+            executor._threads.append(thread)
+            thread.start()
+            self.assertTrue(waiting.acquire(timeout=5))
+            self.assertTrue(waiting.acquire(timeout=5))
+            self.assertEqual(executor.stats(), (0, 0))
+            self.assertEqual(executor._queue.unfinished_tasks, 0)
+            self.assertTrue(thread.is_alive())
+            self.assertEqual(
+                {name: ref() is not None for name, ref in references.items()},
+                dict.fromkeys(references, False),
+            )
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+            if was_enabled:
+                gc.enable()
+            gc.collect()
+
+    def test_idle_worker_releases_successful_task(self) -> None:
+        self.check_idle_worker_releases_task("succeeded")
+
+    def test_idle_worker_releases_failed_task(self) -> None:
+        self.check_idle_worker_releases_task("failed")
+
+    def test_idle_worker_releases_cancelled_task(self) -> None:
+        self.check_idle_worker_releases_task("cancelled")
 
 
 class BoundedPriorityExecutorTests(unittest.TestCase):

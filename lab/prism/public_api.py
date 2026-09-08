@@ -235,10 +235,24 @@ class PublicResponseCache:
             # may be a background refresh whose stale entry has since aged past
             # the revalidation window; waiting for it is the same bargain.
             inflight.event.wait()
-            if inflight.exception is not None:
-                raise inflight.exception
-            if inflight.result is not None:
-                return inflight.result
+            exception = inflight.exception
+            result = inflight.result
+            # Drop this frame's name for the flight before re-raising (#251).
+            # Raising prepends this frame to the shared exception's traceback,
+            # and a frame still naming the flight would close the cycle
+            # flight -> exception -> traceback -> frame -> flight, keeping the
+            # owner's failed compute frame and its locals alive until cyclic
+            # GC. The flight itself keeps the exception for later observers.
+            del inflight
+            if exception is not None:
+                try:
+                    raise exception
+                finally:
+                    # Unbind the local for the same reason: the traceback's
+                    # frame must not name the exception it belongs to.
+                    del exception
+            if result is not None:
+                return result
             # Owner finished without recording a result; recompute defensively.
             return self.get_or_compute(key=key, ttl_seconds=ttl_seconds, compute=compute)
 
@@ -263,6 +277,14 @@ class PublicResponseCache:
             with self._lock:
                 self._inflight.pop(key, None)
             inflight.event.set()
+            # Release the owner frame's reference last, after every waiter has
+            # been woken (#251). On failure the exception's traceback already
+            # holds this frame, so a frame that kept naming the flight would
+            # form flight -> exception -> traceback -> frame -> flight and pin
+            # the failed compute frame, with the origin call's locals, until
+            # cyclic GC. Waiters still hold the flight through their own
+            # frames until each has observed the recorded result or error.
+            del inflight
 
     def _store_entry(
         self,
@@ -338,6 +360,11 @@ class PublicResponseCache:
             with self._lock:
                 self._inflight.pop(key, None)
             inflight.event.set()
+            # Same ownership rule as the foreground owner (#251): the swallowed
+            # exception's traceback captured this frame on arrival, so the
+            # frame must not keep naming the flight that stores it, or the
+            # completed refresh pins its failed compute locals until cyclic GC.
+            del inflight
 
 
 def _is_hex64(value: str) -> bool:

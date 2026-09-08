@@ -581,6 +581,14 @@ class P2mrAddressValidator:
                 if self.inflight.get(address) is pending:
                     self.inflight.pop(address, None)
                 pending.event.set()
+            # Release the leader frame's reference after the waiters are woken
+            # (#251). On failure the stored error's traceback already holds
+            # this frame; keeping the flight named here would close
+            # flight -> error -> traceback -> frame -> flight and pin the
+            # failed RPC frame and its locals until cyclic GC. Waiters keep
+            # the flight alive through their own frames until each has read
+            # the recorded result or error.
+            del pending
 
     @staticmethod
     def _raise_shared_error(error: BaseException) -> None:

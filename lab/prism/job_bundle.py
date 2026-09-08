@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from concurrent.futures import (
     FIRST_COMPLETED,
+    CancelledError,
     Future,
     InvalidStateError,
     ThreadPoolExecutor,
@@ -31,11 +32,13 @@ import json
 import subprocess
 import threading
 import time
+from types import FrameType
 import weakref
 from typing import Any, Callable, Protocol
 
 from lab.prism import direct_stratum
 from lab.prism.bundle_compiler import _ShareWindowSerialization
+from lab.prism.future_callbacks import add_releasing_done_callback
 from lab.prism.share_json_stream import share_array_json_view
 from lab.prism.share_ledger import DaemonShareJsonSequence
 from lab.prism.coordinator_config import (
@@ -197,6 +200,128 @@ class JobBuildCancellation:
             )
         with self._lock:
             self.last_checkpoint_monotonic = time.monotonic()
+
+
+# The executor task a build flight submits. The coordinator facade and the
+# service method share this name, so a traceback carrying it belongs to a
+# build that ran on the job-build executor.
+_JOB_BUILD_EXECUTOR_ENTRY = "_execute_job_build_request"
+
+
+def _clear_finished_frame(frame: FrameType) -> None:
+    try:
+        frame.clear()
+    except RuntimeError:
+        # frame.clear() refuses an executing frame and leaves it intact. The
+        # frames selected below have all returned, so this only guards the
+        # promise resolution against a foreign frame spliced into a chained
+        # or re-raised exception by code outside the producer.
+        pass
+
+
+def _release_finished_job_build_frames(error: BaseException) -> None:
+    """Drop the locals of the finished producer frames a build error retains.
+
+    A build that observes its cancellation raises from deep inside the
+    executor task. The stored exception's traceback references every frame it
+    unwound through, from the executor's task plumbing and the entry point
+    down to the checkpoint, and those frames still own the request (as a
+    local and inside the task's argument tuple), its template artifacts, the
+    ledger snapshot, and the converted share rows. The request owns the
+    promise that stores the exception, so the whole graph is a cycle that
+    only cyclic GC reclaims.
+
+    The traceback's first entry is the executor's work-item frame that caught
+    the error and stored it on the future. That frame is still executing
+    while done callbacks run and is never touched. Every entry below it has
+    returned: the error could only reach the work item by propagating out of
+    all of them, including the executor context frame that unpacked the task
+    arguments. Those finished frames are cleared, and so are the finished
+    producer frames recorded by the error's ``__cause__`` and ``__context__``
+    chain (a compiler failure re-raised as supersession keeps the failure as
+    its cause, whose own traceback still reaches the request). A chained
+    entry is only cleared from the first frame the cancellation itself
+    unwound through, so a frame that belongs to some other execution is left
+    alone. Clearing a finished frame drops only its locals; formatted
+    tracebacks keep their files, line numbers, and source lines, and the
+    chain itself is preserved.
+    """
+
+    head = error.__traceback__
+    entry = head
+    while (
+        entry is not None
+        and entry.tb_frame.f_code.co_name != _JOB_BUILD_EXECUTOR_ENTRY
+    ):
+        entry = entry.tb_next
+    if head is None or entry is None:
+        return
+    finished: set[FrameType] = set()
+    node = head.tb_next
+    while node is not None:
+        finished.add(node.tb_frame)
+        _clear_finished_frame(node.tb_frame)
+        node = node.tb_next
+    seen = {id(error)}
+    pending = [error]
+    while pending:
+        current = pending.pop()
+        for chained in (current.__cause__, current.__context__):
+            if chained is None or id(chained) in seen:
+                continue
+            seen.add(id(chained))
+            pending.append(chained)
+            node = chained.__traceback__
+            while node is not None and node.tb_frame not in finished:
+                node = node.tb_next
+            while node is not None:
+                finished.add(node.tb_frame)
+                _clear_finished_frame(node.tb_frame)
+                node = node.tb_next
+
+
+def _job_build_error_for_waiter(error: JobBuildCancelled) -> JobBuildCancelled:
+    """Return one waiter's private copy of a promise's cancellation error.
+
+    The copy carries the same type, message, diagnostic attributes, notes,
+    and ``__cause__``/``__context__`` chain, and shares the producer
+    traceback entries, so a formatted traceback still shows where the build
+    observed its cancellation and why. Raising a private instance leaves the
+    stored exception's traceback untouched: no waiter frame is ever appended
+    to it, and concurrent waiters cannot interleave their frames in each
+    other's diagnostics.
+    """
+
+    private = type(error)(*error.args)
+    private.__dict__.update(error.__dict__)
+    notes = getattr(error, "__notes__", None)
+    if notes is not None:
+        private.__notes__ = list(notes)
+    private.__cause__ = error.__cause__
+    private.__context__ = error.__context__
+    private.__suppress_context__ = error.__suppress_context__
+    return private.with_traceback(error.__traceback__)
+
+
+def _await_job_build_promise(
+    promise: "Future[CachedJobBundle]",
+    timeout: float,
+) -> "CachedJobBundle":
+    """Wait for a shared build promise without re-raising its stored error.
+
+    ``Future.result`` re-raises the stored instance, which prepends the
+    waiter's frames to the exception's traceback. A waiter that owns the
+    request or promise while it unwinds -- the retrying bundle loop does --
+    thereby rebuilds the request -> promise -> exception -> traceback ->
+    request cycle for every cancelled build it observes. Cancellation
+    outcomes are raised as waiter-private copies instead; successful builds
+    and unexpected errors keep ``Future.result`` semantics exactly.
+    """
+
+    error = promise.exception(timeout=timeout)
+    if isinstance(error, JobBuildCancelled):
+        raise _job_build_error_for_waiter(error)
+    return promise.result()
 
 
 @dataclass(frozen=True)
@@ -756,11 +881,9 @@ class JobBundleService:
         runtime = self._runtime
         future = flight.future
         assert future is not None
-        future.add_done_callback(
-            lambda completed, build_flight=flight: runtime._job_build_done(
-                build_flight,
-                completed,
-            )
+        add_releasing_done_callback(
+            future,
+            lambda completed: runtime._job_build_done(flight, completed),
         )
 
     def _execute_job_build_request(
@@ -1247,21 +1370,30 @@ class JobBundleService:
     ) -> tuple[CachedJobBundle | None, BaseException | None]:
         """Map a finished executor future onto the shared promise outcome."""
 
-        result: CachedJobBundle | None = None
-        error: BaseException | None = None
-        try:
-            result = future.result()
-            if request.cancellation.is_set():
-                if request.cancellation.reason == "timeout":
-                    error = JobBuildCancelled(
-                        "job build completed after its timeout"
-                    )
-                else:
-                    error = JobBuildSuperseded(
-                        "obsolete job build completed after cancellation"
-                    )
-        except BaseException as exc:  # noqa: BLE001 - delivered to all waiters
-            error = exc
+        # Inspect the terminal error without re-raising it here: this frame
+        # owns both the request and future, so adding it to a stored error's
+        # traceback would retain the completed build until cyclic GC.
+        if future.cancelled():
+            return None, CancelledError()
+        error = future.exception()
+        if error is not None:
+            if isinstance(error, JobBuildCancelled):
+                # The finished producer frames still own the request and its
+                # payout window through this traceback. Release them before
+                # the error is published to waiters; unexpected failures keep
+                # their full traceback for post-mortem inspection.
+                _release_finished_job_build_frames(error)
+            return None, error
+        result = future.result()
+        if request.cancellation.is_set():
+            if request.cancellation.reason == "timeout":
+                error = JobBuildCancelled(
+                    "job build completed after its timeout"
+                )
+            else:
+                error = JobBuildSuperseded(
+                    "obsolete job build completed after cancellation"
+                )
         return result, error
 
     def _evict_orphaned_job_build_flights_locked(self) -> list[str]:
@@ -2769,11 +2901,12 @@ class JobBundleService:
                             "job bundle waiter was cancelled during preparation"
                         )
                     try:
-                        built = promise.result(
-                            timeout=min(
+                        built = _await_job_build_promise(
+                            promise,
+                            min(
                                 0.1,
                                 max(0.001, wait_deadline - time.monotonic()),
-                            )
+                            ),
                         )
                         break
                     except TimeoutError:

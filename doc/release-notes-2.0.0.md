@@ -145,7 +145,7 @@ have their own version tags.
 ## Changes Since v1.1.0
 
 This release includes the `2.x.x` changes after `v1.1.0` through
-`d7f6280` (#248), along with release-promotion fixes in #246.
+`d392800` (#253), along with release-promotion fixes in #246.
 
 ### Coordinator ownership and concurrency validation
 
@@ -200,6 +200,11 @@ This release includes the `2.x.x` changes after `v1.1.0` through
 - Replace builder pipe polling with readiness waits (#237), bound share
   serialization and lazy parsing across all paths (#239), bound database
   decoding (#238), and bound Rust window paging memory (#241).
+- Release completed executor work and callback captures, avoiding traceback
+  cycles that retain finished job builds and delivery requests (#250).
+- Release failed public-cache and address-validation requests (#252), and
+  clear finished cancellation frames while keeping each job-build waiter's
+  traceback separate (#253), without waiting for cyclic garbage collection.
 
 ### Stratum, vardiff, and delivery health
 

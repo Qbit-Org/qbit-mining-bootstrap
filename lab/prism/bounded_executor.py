@@ -77,26 +77,31 @@ class _BoundedPriorityExecutor:
     def _worker(self) -> None:
         while True:
             item = self._queue.get()
-            _, _, future, function, args, kwargs = item
-            if function is None:
-                self._queue.task_done()
-                return
-            assert isinstance(future, Future)
-            if not future.set_running_or_notify_cancel():
-                self._queue.task_done()
-                continue
-            with self._lock:
-                self._active_workers += 1
             try:
-                result = function(*args, **kwargs)
-            except BaseException as exc:
-                future.set_exception(exc)
-            else:
-                future.set_result(result)
-            finally:
+                _, _, future, function, args, kwargs = item
+                if function is None:
+                    return
+                assert isinstance(future, Future)
+                if not future.set_running_or_notify_cancel():
+                    continue
                 with self._lock:
-                    self._active_workers -= 1
+                    self._active_workers += 1
+                try:
+                    result = function(*args, **kwargs)
+                except BaseException as exc:
+                    future.set_exception(exc)
+                else:
+                    future.set_result(result)
+                finally:
+                    with self._lock:
+                        self._active_workers -= 1
+            finally:
                 self._queue.task_done()
+                # An idle worker's frame stays alive in queue.get(). Release
+                # the previous task outside all locks before waiting: delivery
+                # arguments can own an entire superseded payout window. Cover
+                # failed and cancelled tasks too, and drop any prior result.
+                item = future = function = args = kwargs = result = None
 
     def cancel(self, future: Future[Any]) -> bool:
         """Cancel ``future`` and immediately discard it when still queued.

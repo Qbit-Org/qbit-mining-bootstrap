@@ -614,15 +614,13 @@ class ReorgReconcilerService:
 
         The pass cannot be cancelled mid-ledger-mutation and already records
         its own outcome/error accounting; the serial pass for the current
-        tip re-surfaces any condition that still applies. Consuming the
-        result here only prevents an unretrieved-exception warning.
+        tip re-surfaces any condition that still applies. Observe its terminal
+        error without re-raising it into a callback frame that holds the future.
         """
 
         def _consume(done: Future[bool]) -> None:
-            try:
-                done.result()
-            except BaseException:
-                pass
+            if not done.cancelled():
+                done.exception()
 
         future.add_done_callback(_consume)
 
