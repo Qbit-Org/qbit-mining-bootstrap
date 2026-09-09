@@ -5,7 +5,10 @@ import itertools
 import os
 import shlex
 import shutil
+import threading
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 import weakref
 
 from lab.prism.candidate_window import (
@@ -121,6 +124,66 @@ class CandidateWindowTests(unittest.TestCase):
         finally:
             if enabled:
                 gc.enable()
+
+
+class PayoutMembershipPortTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from lab.prism.payout_state import PayoutStateService
+
+        self.covers = mock.Mock(return_value=True)
+        self.aggregate = mock.Mock(side_effect=AssertionError("aggregate window read"))
+        self.runtime = SimpleNamespace(
+            ledger=SimpleNamespace(
+                candidate_window_covers=self.covers, audit_share_window=self.aggregate,
+            ),
+            _job_cache_lock=threading.RLock(),
+            _record_payout_artifact_event=mock.Mock(),
+            _incremental_payout_artifact_window=object(),
+        )
+        self.service = PayoutStateService(
+            self.runtime, shutdown_error=RuntimeError, now_ms=lambda: 0,
+        )
+        # This object cannot be materialized or iterated by the payout caller.
+        self.shares = object()
+        self.context = SimpleNamespace(
+            found_block={"anchor_job_issued_at_ms": "2000", "network_difficulty": "1000000"},
+            shares_json=self.shares,
+        )
+
+    def test_bounded_port_receives_original_view_and_returns_omission_verdict(self) -> None:
+        for verdict in (True, False):
+            with self.subTest(verdict=verdict):
+                self.covers.return_value = verdict
+                self.assertIs(self.service._replayed_payout_window_reproducible(self.context), verdict)
+                self.covers.assert_called_with(
+                    self.shares, anchor_job_issued_at_ms=2000, network_difficulty=1000000,
+                )
+        self.aggregate.assert_not_called()
+
+    def test_missing_anchor_fails_closed_before_any_read(self) -> None:
+        self.context.found_block.pop("anchor_job_issued_at_ms")
+        self.assertFalse(self.service._replayed_payout_window_reproducible(self.context))
+        self.covers.assert_not_called()
+        self.aggregate.assert_not_called()
+
+    def test_bounded_port_divergence_invalidates_mirror_and_fails_closed(self) -> None:
+        from lab.prism.share_ledger import DaemonWindowMirrorDivergence
+
+        self.covers.side_effect = DaemonWindowMirrorDivergence("refuted mirror")
+        self.assertFalse(self.service._replayed_payout_window_reproducible(self.context))
+        self.runtime._record_payout_artifact_event.assert_called_once_with("window_mirror_divergence")
+        self.assertIsNone(self.runtime._incremental_payout_artifact_window)
+        self.aggregate.assert_not_called()
+
+    def test_bounded_port_timeout_propagates_for_retry_without_aggregate_fallback(self) -> None:
+        from lab.prism.share_ledger import LedgerOperationTimeout
+
+        error = LedgerOperationTimeout("expired")
+        self.covers.side_effect = error
+        with self.assertRaises(LedgerOperationTimeout) as raised:
+            self.service._replayed_payout_window_reproducible(self.context)
+        self.assertIs(raised.exception, error)
+        self.aggregate.assert_not_called()
 
 
 @unittest.skipUnless(os.environ.get("PRISM_TEST_DATABASE_URL"), "requires disposable PostgreSQL")
