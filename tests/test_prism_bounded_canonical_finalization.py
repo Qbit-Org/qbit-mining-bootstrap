@@ -910,6 +910,63 @@ class RemainingBoundaryTests(unittest.TestCase):
                         body_uri,
                     )
 
+    def test_owned_open_failures_retire_descriptors_before_the_exception_returns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_store(root, share_segment_size=4)
+            bundle = synthetic_bundle(6)
+            path, _raw, _view = self.write_view(root, bundle)
+            opened: list[int] = []
+            real_open = os.open
+
+            def recording_open(*args: Any, **kwargs: Any) -> int:
+                fd = real_open(*args, **kwargs)
+                if kwargs.get("dir_fd") == store._root_fd and args[0] == path.name:
+                    opened.append(fd)
+                return fd
+
+            gc_was_enabled = gc.isenabled()
+            gc.disable()
+            try:
+                for opener in (
+                    lambda: store._open_owned_artifact_source(path),
+                    lambda: store._scan_owned_artifact(path, lazy_paths=(("shares",),)),
+                ):
+                    opened.clear()
+                    checks = {"count": 0}
+                    real_validate = store._validate_owned_parent
+
+                    def failing_second_check(target: Path) -> None:
+                        checks["count"] += 1
+                        if checks["count"] == 2:
+                            raise RuntimeError("audit artifact root identity changed")
+                        real_validate(target)
+
+                    retained: BaseException | None = None
+                    with mock.patch("lab.prism.audit_artifacts.os.open", side_effect=recording_open), mock.patch.object(
+                        store,
+                        "_validate_owned_parent",
+                        side_effect=failing_second_check,
+                    ):
+                        try:
+                            opener()
+                        except RuntimeError as exc:
+                            retained = exc
+                    # The exception and its traceback frames (which reference
+                    # the view or source locals) are still retained here; the
+                    # descriptors must already be closed regardless.
+                    assert retained is not None
+                    self.assertIn("identity changed", str(retained))
+                    self.assertIsNotNone(retained.__traceback__)
+                    self.assertEqual(len(opened), 1)
+                    for fd in opened:
+                        with self.assertRaises(OSError):
+                            os.fstat(fd)
+                    del retained
+            finally:
+                if gc_was_enabled:
+                    gc.enable()
+
     def test_scratch_pressure_is_reported_not_classified_as_mismatch(self) -> None:
         from lab.prism.audit_bundle_view import ArtifactResourcePressure
 

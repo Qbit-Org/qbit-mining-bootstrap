@@ -3667,7 +3667,13 @@ class AuditArtifactStore:
         except CanonicalArtifactError as exc:
             raise OSError(str(exc)) from exc
         if parent_fd is not None:
-            self._validate_owned_parent(path)
+            try:
+                self._validate_owned_parent(path)
+            except BaseException:
+                # The descriptor is retired here, not by a finalizer that a
+                # retained traceback could postpone.
+                source.close()
+                raise
         return source
 
     def _scan_owned_artifact(
@@ -3690,7 +3696,13 @@ class AuditArtifactStore:
             lazy_paths=lazy_paths,
         )
         if parent_fd is not None:
-            self._validate_owned_parent(path)
+            try:
+                self._validate_owned_parent(path)
+            except BaseException:
+                # Retire the artifact and index descriptors now; a retained
+                # traceback must not keep them open until collection.
+                view.close()
+                raise
         return view
 
     def _require_logical_match(
