@@ -369,6 +369,44 @@ deploying with the setting, check enumeration logs for `limit=1`, completion
 of pending accepted-block accounting, and full subscribe/authorize/notify
 health on both Stratum listeners. Restore `1024` to undo the tuning.
 
+For already accepted blocks that still cannot complete during normal replay,
+`python3 -m lab.prism.recover_pending_blocks` provides a temporary offline
+recovery command. Run it from an image containing the command, using the
+managed coordinator's environment, signing keys, network and audit volumes.
+PostgreSQL and qbitd must remain available.
+
+1. Inspect the exact hashes with a metadata-only plan:
+   ```sh
+   python3 -m lab.prism.recover_pending_blocks \
+     --block-hash "$PARENT_HASH" --block-hash "$CHILD_HASH"
+   ```
+   This takes no writer lease and reads no candidate payloads. Every hash must
+   be on the active chain and have a pending outbox row, or already have
+   submitted/confirmed accounting and persisted audit evidence. Include any
+   pending parent; the command sorts the selection by height.
+2. Stop the normal coordinator and its restart supervisor. Launch a fresh
+   container with the same managed configuration, replacing its normal
+   coordinator command with the command above plus `--apply`. Recovery refuses
+   a live writer lease, acquires a fresh guarded session, and runs the normal
+   lease heartbeat and accepted-block accounting. It loads one selected
+   candidate at a time, verifies its stored identity and chain header, and
+   completes the outbox only after the normal finalizer succeeds. It starts
+   no Stratum listeners and makes no `submitblock` calls.
+3. Check for a final `success` event and exit status zero. Failure stops the
+   run; repeat the same allowlist to resume after investigating. Completed
+   blocks are verified and skipped. The processing and cleanup deadline is
+   600 seconds after construction (`--timeout-seconds`, range 1–3600).
+4. Restart the managed coordinator, verify the selected blocks' accounting
+   and audit evidence, and check full subscribe/authorize/notify health on
+   both Stratum listeners.
+
+Recovery uses Python's cooperative JSON codecs only in its fresh process to
+reduce long interpreter stalls while the heartbeat runs. This costs throughput
+and still holds one complete candidate in memory; it does not replace the
+bounded-payload work in #255. Lease timings, signing identity, and payout rules
+remain unchanged. Logs include JSON progress events with schema
+`qbit.prism.pending-block-recovery.v1` alongside normal coordinator logs.
+
 Alert before the landing deadline is exhausted, not after: page when
 `qbit_prism_prior_balances_read_max_seconds` exceeds ~20% of the
 landing budget or the poll budget, when any
