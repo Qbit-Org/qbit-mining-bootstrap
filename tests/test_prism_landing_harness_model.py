@@ -706,7 +706,7 @@ class LandingStatementClassificationTests(unittest.TestCase):
             page = _run(
                 harness,
                 harness.client,
-                lambda: ledger.pending_block_candidate_rows(limit=32),
+                lambda: ledger._legacy_pending_block_candidate_rows(limit=32),
                 "pending-page",
             ).value()
             self.assertEqual([row["block_hash"] for row in page], [BLOCK_C])

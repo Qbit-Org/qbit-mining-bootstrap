@@ -252,6 +252,9 @@ class StatementClassificationTests(unittest.TestCase):
 
             harness.server.execute = capturing_execute  # type: ignore[method-assign]
 
+            # Pin the historical ambiguous SQL discriminator. The v2 append
+            # has a distinct version-CAS shape and its own storage gate.
+            alpha.ledger._candidate_storage_version = 1
             with self.assertRaises(UnsupportedStatement) as caught:
                 alpha.call(
                     lambda: alpha.ledger.append_batch([(share, candidate)]),
@@ -261,8 +264,9 @@ class StatementClassificationTests(unittest.TestCase):
         # The statement really is ambiguous under the two original fragments;
         # if production stops emitting both, this test is no longer guarding
         # anything and should fail rather than quietly pass.
-        self.assertEqual(len(captured), 1)
-        sql = captured[0]
+        appends = [sql for sql in captured if "INSERT INTO qbit_share_ledger" in sql]
+        self.assertEqual(len(appends), 1)
+        sql = appends[0]
         self.assertIn("INSERT INTO qbit_block_candidate_outbox (", sql)
         self.assertIn("'block candidate payload mismatch'", sql)
         self.assertIn("INSERT INTO qbit_share_ledger", sql)
@@ -310,8 +314,8 @@ class StatementClassificationTests(unittest.TestCase):
         """Pin the fragment's uniqueness to production, not to this test.
 
         ``OUTBOX_RECORD`` is now identified by a conflict action. That is only
-        a valid identity while exactly one ledger method emits it, so if a
-        second writer starts inserting the candidate with ``DO NOTHING`` the
+        a valid identity for the two versioned intent writers; if another
+        writer starts inserting the candidate with ``DO NOTHING`` the
         classifier is ambiguous again and this fails at that moment rather
         than at the next confusing scenario failure.
         """
@@ -321,7 +325,7 @@ class StatementClassificationTests(unittest.TestCase):
             for name, member in vars(share_ledger_module.PsqlShareLedger).items()
             if discriminator in _source_of(member)
         )
-        self.assertEqual(emitters, ["persist_block_candidate_intent"])
+        self.assertEqual(emitters, ["_persist_block_candidate_intent_v1", "persist_block_candidate_intent"])
 
     def test_classifier_extracts_the_configured_ttl(self) -> None:
         with LeaseHarness(lease_ttl_seconds=17.5) as harness:

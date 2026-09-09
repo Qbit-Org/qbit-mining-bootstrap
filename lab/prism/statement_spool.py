@@ -1,0 +1,91 @@
+"""Execute streamed finalization statements with bounded coordinator memory.
+
+The existing atomic fenced SQL is unchanged. psql owns its unavoidable full
+statement buffer in an isolated process; the coordinator passes an open file,
+never the complete SQL string, and reads only a bounded result after success.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from collections.abc import Iterable
+from typing import Any
+
+
+STATEMENT_CHUNK_CHARS = 4096
+STATEMENT_SPOOL_BYTES = 4 * 1024 * 1024 * 1024
+STATEMENT_HELPER_MEMORY_BYTES = 4 * 1024 * 1024 * 1024
+STATEMENT_RESULT_BYTES = 64 * 1024
+STATEMENT_HELPER_TIMEOUT_SECONDS = 600.0
+_EXEC_LIMITED = """
+import os, resource, sys
+resource.setrlimit(resource.RLIMIT_AS, (int(sys.argv[1]), int(sys.argv[1])))
+resource.setrlimit(resource.RLIMIT_FSIZE, (int(sys.argv[2]), int(sys.argv[2])))
+os.execvp(sys.argv[3], sys.argv[3:])
+"""
+
+
+def run_fenced_statement(ledger: Any, pieces: Iterable[str]) -> Any:
+    from lab.prism.audit_bundle_view import ArtifactResourcePressure
+    from lab.prism.share_ledger import LedgerOperationTimeout, parse_single_json_value
+
+    with tempfile.TemporaryFile() as statement, tempfile.TemporaryFile() as result, tempfile.TemporaryFile() as errors:
+        size = 0
+        try:
+            for piece in pieces:
+                for offset in range(0, len(piece), STATEMENT_CHUNK_CHARS):
+                    ledger._remaining_operation_timeout()
+                    chunk = piece[offset:offset + STATEMENT_CHUNK_CHARS].encode("utf-8")
+                    size += len(chunk)
+                    if size > STATEMENT_SPOOL_BYTES:
+                        raise ArtifactResourcePressure("finalization statement spool reservation exhausted")
+                    statement.write(chunk)
+        except OSError as exc:
+            raise ArtifactResourcePressure("finalization statement spool unavailable") from exc
+        statement.seek(0)
+        with ledger._operation_gate(ledger._lock, "writer lock"):
+            command, kwargs, timeout = ledger._psql_invocation()
+            environment = dict(kwargs.get("env", os.environ))
+            native = getattr(ledger, "_native", None)
+            if native is not None:
+                # Preserve the exact native DSN, including private schemas,
+                # then append the same guards and deadlines as ordinary psql.
+                from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+                connection = conninfo_to_dict(native._conninfo)
+                options = " ".join(filter(None, (
+                    connection.get("options"), environment.get("PGOPTIONS"),
+                )))
+                command = ["psql", "--dbname", make_conninfo(native._conninfo, options=options),
+                           *command[len(ledger._command):]]
+            deadline = time.monotonic() + min(
+                STATEMENT_HELPER_TIMEOUT_SECONDS,
+                STATEMENT_HELPER_TIMEOUT_SECONDS if timeout is None else timeout,
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", _EXEC_LIMITED,
+                 str(STATEMENT_HELPER_MEMORY_BYTES), str(STATEMENT_RESULT_BYTES), *command],
+                stdin=statement, stdout=result, stderr=errors, env=environment,
+            )
+            try:
+                while process.poll() is None:
+                    ledger._remaining_operation_timeout()
+                    if time.monotonic() >= deadline:
+                        raise LedgerOperationTimeout("finalization statement helper exceeded its deadline")
+                    time.sleep(0.05)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+            errors.seek(0)
+            diagnostic = errors.read(STATEMENT_RESULT_BYTES).decode("utf-8", "replace")
+            ledger._check_psql_exit(process.returncode, diagnostic, timeout)
+            result.seek(0)
+            output = result.read(STATEMENT_RESULT_BYTES + 1)
+            if len(output) > STATEMENT_RESULT_BYTES:
+                raise RuntimeError("finalization statement result exceeds its byte limit")
+            return parse_single_json_value(output.decode("utf-8"))

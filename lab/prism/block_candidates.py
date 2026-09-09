@@ -29,6 +29,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Callable, Iterable, Iterator, Protocol
 
 from lab.prism import direct_stratum
+from lab.prism.audit_bundle_view import MappedSequence
 from lab.prism.accepted_preview_telemetry import (
     LANDING_PHASE_LANE_WAIT,
     LANDING_PHASE_PREVIEW_PREPARE,
@@ -1200,18 +1201,7 @@ def block_candidate_intent(candidate: PrismBlockCandidate) -> PreparedCandidateI
         "shares_json": context.shares_json,
         "prior_balances": context.prior_balances,
         "found_block": context.found_block,
-        "prospective_prior_balances": (
-            [
-                list(row)
-                for row in getattr(
-                    context,
-                    "prospective_prior_balances",
-                    (),
-                )
-            ]
-            if getattr(context, "prospective_prior_balances", None) is not None
-            else None
-        ),
+        "prospective_prior_balances": getattr(context, "prospective_prior_balances", None),
         "witness_merkle_leaves_hex": direct_stratum.witness_merkle_leaves_hex(
             getattr(context.job, "transaction_hexes", ())
         ),
@@ -1365,16 +1355,27 @@ def block_candidate_from_intent(intent: Mapping[str, Any]) -> PrismBlockCandidat
         block_pass=True,
         applied_version_hex="",
     )
+    prospective = intent.get("prospective_prior_balances")
+    if isinstance(prospective, Sequence) and not isinstance(prospective, (str, bytes)):
+        def normalized_balance(row: Any) -> tuple[str, str, str, int]:
+            return str(row[0]), str(row[1]), str(row[2]), int(row[3])
+
+        # Preserve eager validation without retaining a second collection.
+        for row in prospective:
+            normalized_balance(row)
+        prospective = MappedSequence(prospective, normalized_balance)
+    else:
+        prospective = None
     context = PrismJobContext(
         job=SimpleNamespace(
             transaction_hexes=(),
-            witness_merkle_leaves_hex=tuple(
+            witness_merkle_leaves_hex=_replayable_share_sequence(
                 intent.get("witness_merkle_leaves_hex", [])
             ),
         ),
         template=template,
         shares_json=_replayable_share_sequence(intent["shares_json"]),
-        prior_balances=list(intent["prior_balances"]),
+        prior_balances=_replayable_share_sequence(intent["prior_balances"]),
         found_block=dict(intent["found_block"]),
         share_weight=0,
         collection_only=bool(intent.get("collection_only", False)),
@@ -1386,14 +1387,7 @@ def block_candidate_from_intent(intent: Mapping[str, Any]) -> PrismBlockCandidat
             p2mr_program_hex="",
         ),
         issued_at_ms=0,
-        prospective_prior_balances=(
-            tuple(
-                (str(row[0]), str(row[1]), str(row[2]), int(row[3]))
-                for row in intent["prospective_prior_balances"]
-            )
-            if isinstance(intent.get("prospective_prior_balances"), list)
-            else None
-        ),
+        prospective_prior_balances=prospective,
         # Append-invalidation epochs are process-local counters, so a
         # stamp from the process that built this candidate is meaningless
         # after a restart. The negative sentinel tells the landing epoch

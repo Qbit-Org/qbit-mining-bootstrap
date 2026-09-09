@@ -5703,31 +5703,45 @@ END;
             helper = self._legacy_candidate_helper
             if cancelled is not None:
                 helper = helper.with_cancellation(cancelled)
-            path, index_path = self._candidate_spool.new_spool_paths(block_hash)
+            admission = self._candidate_spool.snapshot()
+            available = admission["limit_bytes"] - admission["reserved_bytes"]
+            if available <= 0:
+                raise CandidateStorageError("legacy candidate spool reservation exhausted")
+            release = self._candidate_spool.reserve(available)
+            paths: tuple[str, ...] = ()
+            body = None
             try:
-                converted = helper.convert(block_hash, path, index_path)
-                release = self._candidate_spool.reserve(converted.manifest.byte_count)
+                paths = self._candidate_spool.new_spool_paths(block_hash)
+                path, index_path = paths
+                converted = helper.convert(block_hash, path, index_path, spool_limit_bytes=available)
+                actual_bytes = converted.manifest.byte_count + converted.manifest.page_count * 16
+                release()
+                release = self._candidate_spool.reserve(actual_bytes)
                 index = SpoolFieldIndex.open_written(index_path, converted.spans)
-            except BaseException:
-                for target in (path, index_path):
-                    try:
-                        os.unlink(target)
-                    except OSError:
-                        pass
-                raise
-            if not converted.identity_matches_row:
-                print(
-                    "prism ledger: legacy block candidate identity re-encoded with a "
-                    f"different digest hash={block_hash} row={converted.row_candidate_sha256} "
-                    f"body={converted.manifest.candidate_sha256}",
-                    flush=True,
+                if not converted.identity_matches_row:
+                    print(
+                        "prism ledger: legacy block candidate identity re-encoded with a "
+                        f"different digest hash={block_hash} row={converted.row_candidate_sha256} "
+                        f"body={converted.manifest.candidate_sha256}",
+                        flush=True,
+                    )
+                body = SpoolCandidateBody(path, converted.manifest, index, release=release)
+                return prepared_intent_from_spool(
+                    body,
+                    accepted_at_present=converted.accepted_at_present,
+                    accepted_at_ms=converted.accepted_at_ms,
                 )
-            body = SpoolCandidateBody(path, converted.manifest, index, release=release)
-            return prepared_intent_from_spool(
-                body,
-                accepted_at_present=converted.accepted_at_present,
-                accepted_at_ms=converted.accepted_at_ms,
-            )
+            except BaseException:
+                if body is not None:
+                    body.close()
+                else:
+                    for path in paths:
+                        try:
+                            os.unlink(path)
+                        except FileNotFoundError:
+                            pass
+                release()
+                raise
 
     def retire_orphan_candidate_bodies(
         self,
@@ -5889,6 +5903,41 @@ END;
         ]
 
     def pending_block_candidate_rows(
+        self,
+        *,
+        limit: int = 32,
+        after_cursor: object | None = None,
+    ) -> list[dict[str, Any]]:
+        """Compatibility view with owned lazy payloads, never aggregate JSON.
+
+        New replay uses header descriptors directly. Callers of this older
+        interface still receive its four fields; each payload is hydrated
+        separately through the same bounded reader. Fill byte-truncated header
+        pages until the requested row limit or explicit exhaustion.
+        """
+        if (getattr(self._run_json, "__func__", None) is not PsqlShareLedger._run_json
+                or getattr(self._run_sql, "__func__", None) is not PsqlShareLedger._run_sql):
+            return self._legacy_pending_block_candidate_rows(limit=limit, after_cursor=after_cursor)
+        limit = max(1, min(int(limit), HEADER_PAGE_MAX_ROWS))
+        rows: list[dict[str, Any]] = []
+        cursor = after_cursor
+        while len(rows) < limit:
+            page = self.pending_block_candidate_headers(limit=limit - len(rows), after_cursor=cursor)
+            for row in page.rows:
+                rows.append({
+                    "block_hash": row["block_hash"],
+                    "candidate": self.hydrate_block_candidate_intent(row),
+                    "pool_block_exists": row["pool_block_exists"],
+                    "cursor": row["cursor"],
+                })
+            if page.exhausted:
+                break
+            if not page.rows or page.next_cursor == cursor:
+                raise CandidateStorageError("candidate header enumeration did not advance")
+            cursor = page.next_cursor
+        return rows
+
+    def _legacy_pending_block_candidate_rows(
         self,
         *,
         limit: int = 32,
@@ -7641,16 +7690,7 @@ SELECT COALESCE(
             "writer_epoch": self._writer_epoch,
             "writer_session_token": self._writer_session_token,
         }
-        # The manifest set and its per-manifest artifacts stream into the
-        # one fenced statement's literal exactly like the accepted-block
-        # payload (#255); the statement, its fields and atomicity are the
-        # same as before.
-        sql = "".join(
-            (
-                "\nWITH payload AS (\n    SELECT ",
-                *self._accepted_block_payload_literal_pieces(payload),
-                " AS data\n),\n",
-                f"""lease AS (
+        sql_body = f"""lease AS (
     UPDATE qbit_ledger_writer_lease
     SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
         updated_at = clock_timestamp()
@@ -7846,10 +7886,8 @@ SELECT CASE
                 + (SELECT count(*) FROM inserted_artifacts)
         )
 END;
-""",
-            )
-        )
-        result = self._run_fenced_json(sql)
+"""
+        result = self._run_candidate_payload_json(payload, sql_body)
         if "error" in result:
             raise RuntimeError(str(result["error"]))
         return {
@@ -10485,17 +10523,7 @@ SELECT CASE
         )
 END;
 """
-        # One join produces the single fenced statement; the payload
-        # literal arrives as bounded chunks rather than as a decoded graph.
-        sql = "".join(
-            (
-                "\nWITH payload AS (\n    SELECT ",
-                *self._accepted_block_payload_literal_pieces(payload),
-                " AS data\n),\n",
-                sql_body,
-            )
-        )
-        result = self._run_fenced_json(sql)
+        result = self._run_candidate_payload_json(payload, sql_body)
         if "error" in result:
             raise RuntimeError(str(result["error"]))
         return {
@@ -10853,6 +10881,24 @@ END;
         sql = "SELECT json_build_object('count', count(*)) FROM qbit_share_ledger WHERE accepted;"
         with self._operation_gate(self._lock, "writer lock"):
             return int(self._run_retry_safe_read_json(sql)["count"])
+
+    def _run_candidate_payload_json(self, payload: Mapping[str, Any], sql_body: str) -> Any:
+        def pieces() -> Iterator[str]:
+            yield "\nWITH payload AS (\n    SELECT "
+            yield from self._accepted_block_payload_literal_pieces(payload)
+            yield " AS data\n),\n"
+            yield sql_body
+
+        # Existing in-memory SQL test/embedding adapters explicitly replace
+        # execution; preserve their string-based seam. Real backends spool.
+        if (getattr(self._run_fenced_json, "__func__", None) is not PsqlShareLedger._run_fenced_json
+                or getattr(self._run_json, "__func__", None) is not PsqlShareLedger._run_json
+                or getattr(self._run_sql, "__func__", None) is not PsqlShareLedger._run_sql
+                or (getattr(self, "_native", None) is not None
+                    and not isinstance(self._native, _NativePostgresClient))):
+            return self._run_fenced_json("".join(pieces()))
+        from lab.prism.statement_spool import run_fenced_statement
+        return run_fenced_statement(self, pieces())
 
     def _run_fenced_json(self, sql: str) -> Any:
         with self._operation_gate(self._lock, "writer lock"):

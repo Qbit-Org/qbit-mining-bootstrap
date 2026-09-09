@@ -217,6 +217,8 @@ SET updated_at = clock_timestamp() - interval '6 minutes',
 psql = os.environ["PRISM_PSQL_COMMAND"]
 psql_with_env = os.environ["PRISM_PSQL_COMMAND_WITH_ENV"]
 ledger = PsqlShareLedger(
+    # This gate mutates legacy JSONB fixtures; the storage gate covers v2.
+    candidate_storage_version=1,
     psql_command=psql,
     writer_id="writer-a",
     writer_epoch=1,
@@ -527,6 +529,8 @@ WHERE table_name = 'qbit_ctv_fanout_artifacts'
 assert_equal(legacy_anchor_nullable, "NO", "old schema simulation makes anchor_vout not nullable")
 ledger.release_writer_lease()
 ledger = PsqlShareLedger(
+    # This gate mutates legacy JSONB fixtures; the storage gate covers v2.
+    candidate_storage_version=1,
     psql_command=psql,
     writer_id="writer-a",
     writer_epoch=1,

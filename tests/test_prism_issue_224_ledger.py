@@ -696,6 +696,12 @@ class LabelBoundednessTests(unittest.TestCase):
             literals,
             {
                 "pending_block_candidate_rows",
+                "observe_block_candidate_outbox_row",
+                "pending_block_candidate_headers",
+                "read_block_candidate_body_manifest",
+                "read_block_candidate_body_page",
+                "read_block_candidate_body_pages",
+                "read_block_candidate_body_spans",
                 "payout_window_snapshot",
                 "payout_window_delta",
                 "current_prior_balances",

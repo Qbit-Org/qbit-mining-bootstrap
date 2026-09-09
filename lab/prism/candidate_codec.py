@@ -703,81 +703,91 @@ def _canonical_share_pages(shares: Any) -> Iterator[tuple[bytes, int | None]] | 
     return None
 
 
-_RECORD_BOUNDARY = b"},{"
+_JSON_STRUCTURE = re.compile(rb'["\\{}\[\],]')
 
 
-def _scan_record_hints(
-    data: bytes,
-    base_offset: int,
-    first_record_index: int,
-    on_page: Callable[[int, int], None],
-    *,
-    every: int = CODEC_BATCH_RECORDS,
-) -> int:
-    """Emit page hints over a verbatim items stream; returns records seen.
+class _RecordPageScanner:
+    """Locate exact top-level separators using bounded byte scans.
 
-    ``},{`` at the top level separates two records; inside a string value it
-    would be a false boundary, which is why these are hints: a reader that
-    fails to decode a page from them takes the record walker for that page.
-    ``bytes.find`` is a C scan, so a 232 MB stream costs one pass.
+    Quoted text and nested arrays/objects cannot become page boundaries.
+    State persists across source chunks, including a split escape pair.
     """
-    count = 1 if data else 0
-    if data and first_record_index == 0:
-        on_page(base_offset, 0)
-    position = 0
-    while True:
-        boundary = data.find(_RECORD_BOUNDARY, position)
-        if boundary < 0:
-            break
-        record_index = first_record_index + count
-        if record_index % every == 0:
-            on_page(base_offset + boundary + 2, record_index)
-        count += 1
-        position = boundary + 2
-    return count
+
+    def __init__(self, on_page: Callable[[int, int], None]) -> None:
+        self.on_page = on_page
+        self.started = False
+        self.in_string = False
+        self.depth = 0
+        self.escape_at = -2
+        self.record_index = 0
+        self.page_index = 0
+        self.page_start = 0
+
+    def feed(self, data: bytes, base_offset: int) -> None:
+        if not data:
+            return
+        if not self.started:
+            self.started = True
+            self.page_start = base_offset
+            self.on_page(base_offset, 0)
+        for offset in range(0, len(data), SPOOL_READ_BYTES):
+            piece = data[offset:offset + SPOOL_READ_BYTES]
+            for match in _JSON_STRUCTURE.finditer(piece):
+                position = base_offset + offset + match.start()
+                token = match[0]
+                if self.in_string:
+                    if position == self.escape_at + 1:
+                        self.escape_at = -2
+                    elif token == b"\\":
+                        self.escape_at = position
+                    elif token == b'"':
+                        self.in_string = False
+                elif token == b'"':
+                    self.in_string = True
+                elif token in (b"{", b"["):
+                    self.depth += 1
+                elif token in (b"}", b"]"):
+                    self.depth -= 1
+                    if self.depth < 0:
+                        raise CandidateBodyIntegrityError("array source has unmatched delimiters")
+                elif token == b"," and self.depth == 0:
+                    self.record_index += 1
+                    if (self.record_index - self.page_index >= CODEC_BATCH_RECORDS
+                            or position + 1 - self.page_start >= CODEC_BATCH_TARGET_BYTES):
+                        self.page_start = position + 1
+                        self.page_index = self.record_index
+                        self.on_page(self.page_start, self.page_index)
+
+    def finish(self) -> int:
+        if self.in_string or self.depth:
+            raise CandidateBodyIntegrityError("array source ends inside a record")
+        return self.record_index + int(self.started)
 
 
 def _write_sequence(sequence: Any, sink: _ChunkSink, events: _IndexEvents) -> tuple[int, bool]:
-    """Write one JSON array field; returns ``(item count, pages exact)``.
-
-    Verbatim pages are used when the sequence supplies them (see
-    :func:`_canonical_share_pages`); otherwise the items are iterated and
-    batch-encoded. Page protocol: ``(data, record_count)`` with an integer
-    count is a complete page of that many records and is preceded by a
-    separator; ``None`` marks a raw continuation slice of the items stream
-    (a daemon mirror, a spool without an index) written verbatim with no
-    separator of its own, whose record boundaries are scanned as hints.
-    """
+    """Copy canonical items with exact page boundaries and no decoded mirror."""
     pages = _canonical_share_pages(sequence)
     if pages is None:
         return _write_array(iter(sequence), sink, on_page=events.page), True
-    pages_exact = True
     sink.write_text("[")
+    scanner = _RecordPageScanner(events.page)
     first = True
     raw_mode = False
-    record_index = 0
     for data, record_count in pages:
         if not data:
             continue
-        if record_count is None:
-            if not first and not raw_mode:
-                sink.write_text(",")
-            raw_mode = True
-            pages_exact = False
-            record_index += _scan_record_hints(data, sink.offset, record_index, events.page)
-        else:
-            if not first:
-                sink.write_text(",")
-            raw_mode = False
-            events.page(sink.offset, record_index)
-            record_index += int(record_count)
+        if not first and (record_count is not None or not raw_mode):
+            scanner.feed(b",", sink.offset)
+            sink.write_text(",")
+        raw_mode = record_count is None
         first = False
+        scanner.feed(data, sink.offset)
         sink.write_bytes(data)
-    count = len(sequence)
-    if pages_exact and record_index != count:
+    count = scanner.finish()
+    if count != len(sequence):
         raise CandidateBodyIntegrityError("array pages disagree with the sequence length")
     sink.write_text("]")
-    return count, pages_exact
+    return count, True
 
 
 def _write_shares(shares: Any, sink: _ChunkSink, events: _IndexEvents) -> tuple[int, int, int, bool]:
@@ -1967,6 +1977,7 @@ def legacy_json_to_spool(
     index_path: str,
     *,
     chunk_bytes: int = CANDIDATE_BODY_CHUNK_BYTES,
+    spool_limit_bytes: int | None = None,
 ) -> tuple[CandidateBodyManifest, list[FieldSpan], bool, Any]:
     """Normalize one legacy ``candidate`` JSON text into a spool body pair.
 
@@ -1983,21 +1994,34 @@ def legacy_json_to_spool(
     identity, present, stamp = neutralized_identity_facts(facts)
     index = SpoolFieldIndex.create(index_path)
     spans: list[FieldSpan] = []
+    written = 0
+
+    def admit(size: int) -> None:
+        nonlocal written
+        if spool_limit_bytes is not None and written + size > spool_limit_bytes:
+            raise OSError("legacy candidate spool reservation exhausted")
+        written += size
 
     def on_span(span: FieldSpan) -> None:
         index.begin_field(span)
         spans.append(span)
 
     with open(path, "wb") as handle:
+        def write_chunk(chunk: BodyChunk) -> None:
+            admit(len(chunk.data))
+            handle.write(chunk.data)
+
+        def write_pages(batch: list[PageEntry]) -> None:
+            admit(len(batch) * _INDEX_RECORD.size)
+            index.append_pages(batch[0].field, ((entry.offset, entry.record_index) for entry in batch))
+
         manifest = encode_identity_body(
             identity,
             shares,
             chunk_bytes=chunk_bytes,
-            on_chunk=lambda chunk: handle.write(chunk.data),
+            on_chunk=write_chunk,
             on_span=on_span,
-            on_page=lambda batch: index.append_pages(
-                batch[0].field, ((entry.offset, entry.record_index) for entry in batch)
-            ),
+            on_page=write_pages,
         )
     return manifest, spans, present, stamp
 

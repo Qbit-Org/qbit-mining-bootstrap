@@ -982,8 +982,12 @@ class SpoolAdmission:
         )
         os.close(handle)
         index_path = path[: -len(".body")] + ".idx"
-        with open(index_path, "wb"):
-            pass
+        try:
+            with open(index_path, "wb"):
+                pass
+        except BaseException:
+            os.unlink(path)
+            raise
         return path, index_path
 
 
@@ -1126,22 +1130,34 @@ class CandidateBodyHydrator:
             raise CandidateBodyIntegrityError("candidate body manifest digest differs from its outbox row")
         if manifest.byte_count != ref.byte_count or manifest.chunk_count != ref.chunk_count:
             raise CandidateBodyIntegrityError("candidate body manifest disagrees with its outbox row")
-        release = self._admission.reserve(manifest.byte_count)
-        path, index_path = self._admission.new_spool_paths(block_hash)
-        writer = SpoolWriter(path, index_path, manifest)
+        release = self._admission.reserve(manifest.byte_count + manifest.page_count * 16)
+        paths: tuple[str, str] = ()
+        writer = None
+        body = None
         try:
+            paths = self._admission.new_spool_paths(block_hash)
+            writer = SpoolWriter(*paths, manifest)
             self._spool_index(ref.body_id, manifest, writer)
             self._spool_chunks(ref.body_id, manifest, writer)
             body = writer.finish(release=release)
+            return prepared_intent_from_spool(
+                body,
+                accepted_at_present=accepted_at_present,
+                accepted_at_ms=accepted_at_ms,
+            )
         except BaseException:
-            writer.abort()
+            if body is not None:
+                body.close()
+            elif writer is not None:
+                writer.abort()
+            else:
+                for path in paths:
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass
             release()
             raise
-        return prepared_intent_from_spool(
-            body,
-            accepted_at_present=accepted_at_present,
-            accepted_at_ms=accepted_at_ms,
-        )
 
     def _check_state(self, state: str | None) -> None:
         if state != "sealed":
@@ -1375,7 +1391,7 @@ class LegacyCandidateHelper:
                         pipe.close()
             self._lock.release()
 
-    def convert(self, block_hash: str, spool_path: str, index_path: str) -> LegacyHelperResult:
+    def convert(self, block_hash: str, spool_path: str, index_path: str, *, spool_limit_bytes: int | None = None) -> LegacyHelperResult:
         result = self._run({
             "mode": "convert",
             "transport": self._transport.to_json(),
@@ -1383,6 +1399,7 @@ class LegacyCandidateHelper:
             "spool_path": spool_path,
             "index_path": index_path,
             "chunk_bytes": CANDIDATE_BODY_CHUNK_BYTES,
+            "spool_limit_bytes": spool_limit_bytes,
         })
         manifest = CandidateBodyManifest.from_json(result["manifest"])
         spans_json = result.get("spans")
@@ -1545,6 +1562,7 @@ def helper_main(stdin_stream: Any = None, stdout_stream: Any = None) -> int:
                 str(request["spool_path"]),
                 str(request["index_path"]),
                 chunk_bytes=int(request.get("chunk_bytes", CANDIDATE_BODY_CHUNK_BYTES)),
+                spool_limit_bytes=request.get("spool_limit_bytes"),
             )
             # The spans are a handful of rows (one per large field); the
             # page entries stay in the index file.

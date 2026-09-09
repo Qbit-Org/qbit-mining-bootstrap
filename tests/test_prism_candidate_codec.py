@@ -322,7 +322,7 @@ class CodecBoundednessTests(unittest.TestCase):
         got = bytearray()
         prepared.body.write_chunks(lambda chunk: got.extend(chunk.data))
         self.assertEqual(bytes(got), oracle_bytes(intent_for(0, shares_json=list(window))))
-        self.assertEqual(prepared.manifest.page_count, 3)
+        self.assertGreaterEqual(prepared.manifest.page_count, 5)
 
     def test_replay_header_is_bounded_and_defers_oversized_facts(self) -> None:
         bounded = codec.replay_header_from_fields(intent_for(1))
@@ -369,14 +369,15 @@ class SpoolRoundTripTests(unittest.TestCase):
                 spool.close()
                 self.assertFalse(any(os.path.exists(path) for path in paths))
 
-    def test_hint_pages_from_a_daemon_body_are_validated_and_corrected(self) -> None:
+    def test_daemon_pages_ignore_quoted_and_nested_boundary_traps(self) -> None:
         records = [share(index) for index in range(2000)]
         records[700]["share_id"] = 'trap},{"accepted_at_ms":1'
+        records[511]["nested"] = [{"a": 1}, {"b": "\\\"},{"}]
         items = b",".join(json.dumps(record, sort_keys=True, separators=(",", ":"), default=str).encode() for record in records)
         prepared = codec.prepare_candidate_intent(intent_for(0, shares_json=DaemonShareJsonSequence(items, 2000)), chunk_bytes=4096)
         spool = self._spool(prepared)
         span = spool.index.span("shares_json")
-        self.assertFalse(span.pages_exact)
+        self.assertTrue(span.pages_exact)
         sequence = codec.SpoolJsonArraySequence(spool, span)
         self.assertEqual(sequence[1999], records[1999])
         self.assertEqual(list(sequence), records)

@@ -274,6 +274,12 @@ LEDGER_READ_OPERATION_PRIOR_BALANCES_AFTER_POOL_BLOCK = (
 )
 LEDGER_READ_OPERATION_OTHER = "other"
 PRISM_LEDGER_READ_OPERATIONS = (
+    "observe_block_candidate_outbox_row",
+    "pending_block_candidate_headers",
+    "read_block_candidate_body_manifest",
+    "read_block_candidate_body_page",
+    "read_block_candidate_body_pages",
+    "read_block_candidate_body_spans",
     LEDGER_READ_OPERATION_PENDING_BLOCK_CANDIDATE_ROWS,
     LEDGER_READ_OPERATION_PAYOUT_WINDOW_SNAPSHOT,
     LEDGER_READ_OPERATION_PAYOUT_WINDOW_DELTA,
