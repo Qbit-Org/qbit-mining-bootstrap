@@ -3718,7 +3718,9 @@ with store.publication_order_guard():
                 results: dict[str, tuple[str, str]] = {}
                 errors: dict[str, BaseException] = {}
                 original_lock = store._lock
-                original_write_mutable_bytes = store._write_mutable_bytes
+                # The slot writer streams its chunks through the bounded
+                # mutable primitive (issue #255); gate that primitive.
+                original_write_mutable_chunks = store._write_mutable_chunks
 
                 class ObservedLock:
                     def __enter__(self) -> "ObservedLock":
@@ -3737,7 +3739,7 @@ with store.publication_order_guard():
                     ) -> None:
                         original_lock.release()
 
-                def gated_write(path: Path, payload: bytes) -> None:
+                def gated_write(path: Path, chunks_factory: object) -> None:
                     thread_name = threading.current_thread().name
                     with write_call_lock:
                         write_call_threads.append(thread_name)
@@ -3747,7 +3749,7 @@ with store.publication_order_guard():
                             raise AssertionError("first share-slot writer was not released")
                     elif thread_name == second_name:
                         second_at_write.set()
-                    original_write_mutable_bytes(path, payload)
+                    original_write_mutable_chunks(path, chunks_factory)
 
                 def write_range(label: str, shares: list[dict[str, object]]) -> None:
                     try:
@@ -3778,7 +3780,7 @@ with store.publication_order_guard():
                     ObservedLock(),
                 ), mock.patch.object(
                     store,
-                    "_write_mutable_bytes",
+                    "_write_mutable_chunks",
                     side_effect=gated_write,
                 ):
                     first_thread.start()

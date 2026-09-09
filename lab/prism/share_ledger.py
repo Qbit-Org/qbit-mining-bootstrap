@@ -16,7 +16,7 @@ import tempfile
 import time
 import traceback
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -31,6 +31,7 @@ from lab.prism.audit_artifacts import (
     CanonicalAuditBundleCorrupt,
     canonical_audit_bundle_bytes,
 )
+from lab.prism.audit_bundle_view import CanonicalAuditBundleView
 from lab.prism.share_json_stream import (
     canonical_share_items_bytes,
     iter_json_object_text_chunks,
@@ -43,6 +44,15 @@ from lab.prism.writer_lease_timing import (  # noqa: F401 - compatibility re-exp
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _statement_list(value: object) -> object:
+    """A JSON-encodable copy of a possibly lazy array member for one statement."""
+    if isinstance(value, (list, tuple, str, bytes, bytearray)) or value is None:
+        return value
+    if isinstance(value, Sequence):
+        return list(value)
+    return value
 
 
 def _default_bundle_canonicalizer() -> Callable[[dict[str, Any]], bytes]:
@@ -8312,12 +8322,12 @@ SELECT json_build_object(
             "audit bundle body is not retrievable: audit body store is not configured"
         )
 
-    def _externalize_audit_body(self, block_hash: str, audit_bundle_sha256: str, final_bundle: dict[str, Any]) -> str | None:
+    def _externalize_audit_body(self, block_hash: str, audit_bundle_sha256: str, final_bundle: Mapping[str, Any]) -> str | None:
         if self._audit_artifact_store is None:
             return None
         return self._audit_store().externalize_audit_body(block_hash, audit_bundle_sha256, final_bundle)
 
-    def _canonical_audit_body_bytes_for_sha(self, final_bundle: dict[str, Any], audit_bundle_sha256: str) -> bytes:
+    def _canonical_audit_body_bytes_for_sha(self, final_bundle: Mapping[str, Any], audit_bundle_sha256: str) -> bytes:
         return self._audit_store().canonical_audit_body_bytes_for_sha(final_bundle, audit_bundle_sha256)
 
     def _audit_body_ref(self, **kwargs: Any) -> dict[str, Any] | None:
@@ -8630,12 +8640,17 @@ END;
             )
         )
 
-    def _audit_body_byte_len(self, body_uri: object | None, final_bundle: dict[str, Any], canonical_bundle_path: Path | None = None) -> int:
+    def _audit_body_byte_len(self, body_uri: object | None, final_bundle: Mapping[str, Any], canonical_bundle_path: Path | None = None) -> int:
         if self._audit_artifact_store is None:
+            if isinstance(final_bundle, CanonicalAuditBundleView):
+                # The artifact's own length: no canonicalizer round trip and
+                # no whole-body copy for the inline compatibility lane.
+                final_bundle.verify_identity()
+                return final_bundle.byte_length
             return len(self._canonical_audit_bundle_bytes(final_bundle))
         return self._audit_store().audit_body_byte_len(body_uri, final_bundle, canonical_bundle_path)
 
-    def _prepare_external_audit_body(self, payload: dict[str, Any], final_bundle: dict[str, Any], *, canonical_bundle_path: Path | None = None) -> str | None:
+    def _prepare_external_audit_body(self, payload: dict[str, Any], final_bundle: Mapping[str, Any], *, canonical_bundle_path: Path | None = None) -> str | None:
         if self._audit_artifact_store is None:
             return None
         normalized = {
@@ -8718,16 +8733,61 @@ END;
         result["audit_bundle"] = body
         return result
 
+    def _accepted_block_payload_literal(
+        self,
+        payload: dict[str, Any],
+        inline_view: CanonicalAuditBundleView | None,
+    ) -> str:
+        """The accepted-block payload as one JSONB literal.
+
+        Externalized rows carry ``audit_bundle: null`` and take the ordinary
+        literal.  The legacy inline lane (no audit body store configured)
+        must embed the whole bundle in the statement -- the schema has no
+        other place for it -- so for a bounded artifact view the verified
+        canonical bytes are spliced verbatim into the literal instead of
+        being decoded into a dictionary and re-encoded (#255).  This remains
+        a compatibility lane: the statement still transports the whole
+        body, exactly as the historical ``json.dumps`` payload did, and it
+        is not the production configuration, which externalizes bodies.
+        """
+        if inline_view is None:
+            return self._jsonb_literal(payload)
+        marker = f"__qbit_prism_inline_audit_bundle_{os.urandom(16).hex()}__"
+        raw = json.dumps({**payload, "audit_bundle": marker}, separators=(",", ":"))
+        placeholder = json.dumps(marker)
+        if raw.count(placeholder) != 1:
+            raise RuntimeError("inline audit bundle placeholder is ambiguous")
+        inline_view.verify_identity()
+        head, tail = raw.split(placeholder, 1)
+        raw = head + b"".join(inline_view.iter_bytes()).decode("utf-8") + tail
+        tag = "qbit_prism_json"
+        while f"${tag}$" in raw:
+            tag += "_x"
+        return f"${tag}${raw}${tag}$::jsonb"
+
     def persist_accepted_block(
         self,
         *,
         block_hash: str,
         block_height: int,
         parent_hash: str,
-        final_bundle: dict[str, Any],
+        final_bundle: Mapping[str, Any],
         audit_report: dict[str, Any],
         canonical_bundle_path: Path | None = None,
     ) -> dict[str, int | str]:
+        """Persist one accepted block, its audit bundle and payout rows.
+
+        ``final_bundle`` is either a dictionary (compatibility builders and
+        the memory ledger's callers) or the bundle compiler's bounded view
+        of the canonical artifact.  Only header members are read here; the
+        external body publication streams the artifact and the row carries
+        the body pointer, so no window-sized structure enters the statement
+        on the production (externalized) path.  What the statement still
+        carries per accepted block, bounded by recipient and transaction
+        cardinality rather than by the share window: the payout accounts
+        array (one row per recipient), the audit-commitment leaves and the
+        witness merkle leaves (one per block transaction).
+        """
         manifest = final_bundle["signed_coinbase_manifest"]["manifest"]
         found_block = final_bundle.get("found_block") or {}
         audit_bundle_sha256 = canonical_hex(
@@ -8759,24 +8819,44 @@ END;
             final_bundle,
             canonical_bundle_path,
         )
+        # A bounded artifact view (the canonical build's result) has no
+        # dictionary form to embed; the legacy inline lane splices its
+        # canonical bytes into the statement literal instead (#255).
+        inline_view = (
+            final_bundle
+            if body_uri is None and isinstance(final_bundle, CanonicalAuditBundleView)
+            else None
+        )
         payload = {
             **payload,
             # Externalized rows store the body in body_uri and NULL here; legacy
             # rows (no body store configured) keep the inline body.
-            "audit_bundle": None if body_uri is not None else final_bundle,
+            "audit_bundle": (
+                None
+                if body_uri is not None or inline_view is not None
+                else final_bundle
+            ),
             "body_uri": body_uri,
             "audit_body_byte_len": audit_body_byte_len,
             "schema_version": str(final_bundle.get("schema") or "qbit.prism.audit-bundle.v1"),
             "found_block_network_difficulty": found_block.get("network_difficulty"),
             "found_block_bits": found_block.get("bits"),
             "found_block_coinbase_value_sats": found_block.get("coinbase_value_sats"),
-            "audit_commitment_leaves_hex": final_bundle.get("audit_commitment_leaves_hex"),
-            "witness_merkle_leaves_hex": final_bundle.get("witness_merkle_leaves_hex"),
+            # The leaf arrays are lazy on a bounded artifact view; the row
+            # stores them as JSONB columns, so they are materialized only for
+            # this statement (bounded by the block's transaction count).
+            "audit_commitment_leaves_hex": _statement_list(
+                final_bundle.get("audit_commitment_leaves_hex")
+            ),
+            "witness_merkle_leaves_hex": _statement_list(
+                final_bundle.get("witness_merkle_leaves_hex")
+            ),
             "accounts": final_bundle["payout_policy_manifest"]["accounts"],
         }
+        payload_literal = self._accepted_block_payload_literal(payload, inline_view)
         sql = f"""
 WITH payload AS (
-    SELECT {self._jsonb_literal(payload)} AS data
+    SELECT {payload_literal} AS data
 ),
 lease AS (
     UPDATE qbit_ledger_writer_lease
