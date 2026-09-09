@@ -2152,17 +2152,28 @@ class BlockCandidateService:
             traceback.print_exc()
             return
         if isinstance(outcome, dict) and (
-            outcome.get("deleted_chunks") or outcome.get("deleted_bodies")
+            outcome.get("deleted_chunks")
+            or outcome.get("deleted_pages")
+            or outcome.get("deleted_spans")
+            or outcome.get("deleted_bodies")
+            or outcome.get("pending")
         ):
-            # More may remain: let the next loop iteration step again.
+            # A retired body still has parts (or a manifest) to reclaim on
+            # a later step: let the next loop iteration step again.
             self._block_candidate_body_janitor_last_monotonic = 0.0
-            print(
-                "prism coordinator: candidate body janitor reclaimed "
-                f"chunks={outcome.get('deleted_chunks', 0)} "
-                f"bodies={outcome.get('deleted_bodies', 0)} "
-                f"body_id={outcome.get('body_id')}",
-                flush=True,
-            )
+            if any(
+                outcome.get(key)
+                for key in ("deleted_chunks", "deleted_pages", "deleted_spans", "deleted_bodies")
+            ):
+                print(
+                    "prism coordinator: candidate body janitor reclaimed "
+                    f"chunks={outcome.get('deleted_chunks', 0)} "
+                    f"pages={outcome.get('deleted_pages', 0)} "
+                    f"spans={outcome.get('deleted_spans', 0)} "
+                    f"bodies={outcome.get('deleted_bodies', 0)} "
+                    f"body_id={outcome.get('body_id')}",
+                    flush=True,
+                )
 
     # -- decided-height collapse (#183) ------------------------------------
 

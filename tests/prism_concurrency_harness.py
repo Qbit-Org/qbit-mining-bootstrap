@@ -2963,20 +2963,35 @@ class FakePostgres:
                 return {"body_id": None, "deleted_chunks": 0, "deleted_bodies": 0}
             target = self._stage_body(transaction, retired[0])
             max_chunks = max(1, int(payload.get("max_chunks", 1)))
-            victims = sorted(target.chunks)[:max_chunks]
-            for ordinal in victims:
+            # The production statement's snapshot decides which table this
+            # step works on: chunks first, then pages once no chunk was
+            # visible, then spans, then the manifest on a later step.
+            before = {
+                "chunks": bool(target.chunks),
+                "pages": bool(target.pages),
+                "spans": bool(target.spans),
+            }
+            chunk_victims = sorted(target.chunks)[:max_chunks]
+            for ordinal in chunk_victims:
                 del target.chunks[ordinal]
+            page_victims = [] if before["chunks"] else sorted(target.pages)[:max_chunks]
+            for key in page_victims:
+                del target.pages[key]
+            span_victims = [] if before["chunks"] or before["pages"] else sorted(target.spans)[:max_chunks]
+            for key in span_victims:
+                del target.spans[key]
             deleted_bodies = 0
-            if not target.chunks:
-                target.pages.clear()
-                target.spans.clear()
+            if not any(before.values()):
                 transaction.deleted_bodies.add(target.body_id)
                 transaction.staged_bodies.pop(target.body_id, None)
                 deleted_bodies = 1
             return {
                 "body_id": target.body_id,
-                "deleted_chunks": len(victims),
+                "deleted_chunks": len(chunk_victims),
+                "deleted_pages": len(page_victims),
+                "deleted_spans": len(span_victims),
                 "deleted_bodies": deleted_bodies,
+                "remaining": before,
             }
         raise UnsupportedStatement(f"unhandled body write {kind}")
 
@@ -3006,6 +3021,12 @@ class FakePostgres:
                 candidates.append(body)
         retired: list[str] = []
         for body in candidates[:1]:
+            # The manifest trigger's invariant: a referenced body is never
+            # retired by orphan cleanup.
+            if self._body_referenced(transaction, body.body_id, pending_only=False):
+                raise RuntimeError(
+                    f"candidate body {body.body_id} is referenced by a pending outbox row"
+                )
             staged = self._stage_body(transaction, body)
             staged.state = "retired"
             staged.retired_at = now

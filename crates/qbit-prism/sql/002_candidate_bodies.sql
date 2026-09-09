@@ -163,6 +163,18 @@ BEGIN
         RAISE EXCEPTION 'candidate body % is sealed', OLD.body_id
             USING ERRCODE = 'integrity_constraint_violation';
     END IF;
+    -- A body an outbox row references cannot be retired by anything but
+    -- the fenced terminal write that detaches it first. Evaluated here,
+    -- after any row-lock wait, with a fresh snapshot: a publication that
+    -- attached the body while this retirement waited for its FOR UPDATE
+    -- lock is visible now, and the retirement fails closed.
+    IF NEW.state = 'retired' AND EXISTS (
+        SELECT 1 FROM qbit_block_candidate_outbox outbox
+        WHERE outbox.body_id = OLD.body_id
+    ) THEN
+        RAISE EXCEPTION 'candidate body % is referenced by a pending outbox row', OLD.body_id
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
     IF NEW.state = 'sealed' AND OLD.state <> 'staging' THEN
         RAISE EXCEPTION 'candidate body % cannot be sealed from %', OLD.body_id, OLD.state
             USING ERRCODE = 'integrity_constraint_violation';
@@ -335,6 +347,12 @@ ALTER TABLE qbit_block_candidate_outbox
     ADD COLUMN IF NOT EXISTS storage_version integer NOT NULL DEFAULT 1;
 ALTER TABLE qbit_block_candidate_outbox
     ADD COLUMN IF NOT EXISTS body_id text REFERENCES qbit_block_candidate_body(body_id);
+-- Only pending v2 rows carry a body reference; the manifest trigger, the
+-- orphan retirement and the manifest reads all ask "does any outbox row
+-- reference this body", and none of them may scan the terminal history.
+CREATE INDEX IF NOT EXISTS qbit_block_candidate_outbox_body_idx
+    ON qbit_block_candidate_outbox (body_id)
+    WHERE body_id IS NOT NULL;
 ALTER TABLE qbit_block_candidate_outbox
     ADD COLUMN IF NOT EXISTS retired_body_id text;
 -- Small typed replay header: explicit projection written by the v2 writer.

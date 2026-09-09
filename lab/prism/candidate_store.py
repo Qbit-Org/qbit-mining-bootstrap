@@ -750,6 +750,15 @@ def retire_orphan_bodies_sql(payload: Mapping[str, Any], *, jsonb: JsonbLiteral)
     references. ``retired`` is permanent -- the manifest trigger permits no
     transition out of it -- and publication references only ``sealed``
     bodies, so a retired body can never be revived.
+
+    The race with a publication in flight is settled by the database, not
+    by this statement's snapshot: publication locks the body row ``FOR
+    SHARE`` while it checks the body is sealed, this statement locks it
+    ``FOR UPDATE``, and the manifest trigger refuses to retire a body any
+    outbox row references (its check runs with a fresh snapshot after the
+    lock wait). Whichever side loses the lock re-evaluates and fails
+    closed; in-process, both statements also serialize behind the ledger's
+    writer gate.
     """
     return f"""
 WITH input AS (
@@ -814,13 +823,19 @@ END;
 
 
 def reap_retired_chunks_sql(payload: Mapping[str, Any], *, jsonb: JsonbLiteral) -> str:
-    """Delete one bounded chunk page of one retired body; no lease touch.
+    """Delete one bounded page of one retired body's parts; no lease touch.
 
     Runs entirely outside the lease row: ``retired`` is a permanent state
     that nothing publishes from, so reclaiming its bytes needs no fence
-    and a deposed session doing it cannot harm anyone. The manifest row
-    (and its index rows) go only once no chunk is left, so a large body
-    drains across several steps instead of one cascading delete.
+    and a deposed session doing it cannot harm anyone.
+
+    Every step is bounded and every probe is an existence test, never a
+    count: at most ``max_chunks`` chunk rows go, then (once the statement's
+    snapshot shows no chunk left) at most ``max_chunks`` page rows, then
+    span rows, and the manifest itself only on a later step whose snapshot
+    finds every child table empty. The returned ``remaining`` flags let the
+    caller keep stepping until the body is gone, so a body with zero chunks
+    but many page rows never stalls.
     """
     return f"""
 WITH input AS (
@@ -833,6 +848,15 @@ target AS (
     ORDER BY body.retired_at, body.body_id
     LIMIT 1
 ),
+before AS (
+    SELECT
+        EXISTS (SELECT 1 FROM qbit_block_candidate_body_chunk chunk, target
+                WHERE chunk.body_id = target.body_id) AS chunks,
+        EXISTS (SELECT 1 FROM qbit_block_candidate_body_page page, target
+                WHERE page.body_id = target.body_id) AS pages,
+        EXISTS (SELECT 1 FROM qbit_block_candidate_body_span span, target
+                WHERE span.body_id = target.body_id) AS spans
+),
 deleted_chunks AS (
     DELETE FROM qbit_block_candidate_body_chunk
     WHERE ctid IN (
@@ -844,41 +868,47 @@ deleted_chunks AS (
     )
     RETURNING body_id
 ),
-remaining AS (
-    SELECT count(*) AS chunks
-    FROM qbit_block_candidate_body_chunk chunk, target
-    WHERE chunk.body_id = target.body_id
-      AND chunk.ctid NOT IN (
-          SELECT chunk2.ctid
-          FROM qbit_block_candidate_body_chunk chunk2, target
-          WHERE chunk2.body_id = target.body_id
-          ORDER BY chunk2.ordinal
-          LIMIT (SELECT (data->>'max_chunks')::integer FROM input)
-      )
-),
 deleted_pages AS (
     DELETE FROM qbit_block_candidate_body_page
-    WHERE body_id IN (SELECT body_id FROM target)
-      AND (SELECT chunks FROM remaining) = 0
+    WHERE NOT (SELECT chunks FROM before)
+      AND ctid IN (
+          SELECT page.ctid
+          FROM qbit_block_candidate_body_page page, target
+          WHERE page.body_id = target.body_id
+          ORDER BY page.field, page.page_ordinal
+          LIMIT (SELECT (data->>'max_chunks')::integer FROM input)
+      )
     RETURNING body_id
 ),
 deleted_spans AS (
     DELETE FROM qbit_block_candidate_body_span
-    WHERE body_id IN (SELECT body_id FROM target)
-      AND (SELECT chunks FROM remaining) = 0
+    WHERE NOT (SELECT chunks FROM before)
+      AND NOT (SELECT pages FROM before)
+      AND ctid IN (
+          SELECT span.ctid
+          FROM qbit_block_candidate_body_span span, target
+          WHERE span.body_id = target.body_id
+          ORDER BY span.field
+          LIMIT (SELECT (data->>'max_chunks')::integer FROM input)
+      )
     RETURNING body_id
 ),
 deleted_bodies AS (
     DELETE FROM qbit_block_candidate_body
     WHERE body_id IN (SELECT body_id FROM target)
       AND state = 'retired'
-      AND (SELECT chunks FROM remaining) = 0
+      AND NOT (SELECT chunks FROM before)
+      AND NOT (SELECT pages FROM before)
+      AND NOT (SELECT spans FROM before)
     RETURNING body_id
 )
 SELECT json_build_object(
     'body_id', (SELECT body_id FROM target),
     'deleted_chunks', (SELECT count(*) FROM deleted_chunks),
-    'deleted_bodies', (SELECT count(*) FROM deleted_bodies)
+    'deleted_pages', (SELECT count(*) FROM deleted_pages),
+    'deleted_spans', (SELECT count(*) FROM deleted_spans),
+    'deleted_bodies', (SELECT count(*) FROM deleted_bodies),
+    'remaining', (SELECT json_build_object('chunks', chunks, 'pages', pages, 'spans', spans) FROM before)
 );
 """
 

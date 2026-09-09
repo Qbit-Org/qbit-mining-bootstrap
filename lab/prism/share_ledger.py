@@ -5214,6 +5214,27 @@ candidate_mismatch AS (
           )
       )
 ),
+sealed_bodies AS (
+    -- The bodies this statement may reference, locked FOR SHARE so an
+    -- orphan retirement (FOR UPDATE) serializes against this publication
+    -- and whichever side loses the lock re-evaluates and fails closed.
+    SELECT body.body_id
+    FROM qbit_block_candidate_body body
+    WHERE body.body_id IN (
+        SELECT payload.candidate->>'body_id'
+        FROM payload
+        WHERE payload.candidate IS NOT NULL
+          AND NOT (payload.candidate->'expected'->>'found')::boolean
+    )
+      AND body.state = 'sealed'
+      AND EXISTS (
+          SELECT 1 FROM payload
+          WHERE payload.candidate->>'body_id' = body.body_id
+            AND body.candidate_sha256 = payload.candidate->>'candidate_sha256'
+            AND body.block_hash = payload.candidate->>'block_hash_hex'
+      )
+    FOR SHARE
+),
 candidate_unsealed AS (
     -- A new reference may point only at a complete sealed body with the
     -- same digest and block hash.
@@ -5222,12 +5243,8 @@ candidate_unsealed AS (
     WHERE payload.candidate IS NOT NULL
       AND NOT (payload.candidate->'expected'->>'found')::boolean
       AND NOT EXISTS (
-          SELECT 1
-          FROM qbit_block_candidate_body body
-          WHERE body.body_id = payload.candidate->>'body_id'
-            AND body.state = 'sealed'
-            AND body.candidate_sha256 = payload.candidate->>'candidate_sha256'
-            AND body.block_hash = payload.candidate->>'block_hash_hex'
+          SELECT 1 FROM sealed_bodies
+          WHERE sealed_bodies.body_id = payload.candidate->>'body_id'
       )
 ),
 candidate_states AS (
@@ -5494,12 +5511,15 @@ existing AS (
     WHERE block_hash = {self._text_literal(block_hash)}
 ),
 sealed_body AS (
+    -- Locked FOR SHARE: an orphan retirement's FOR UPDATE serializes
+    -- against this publication, and the loser re-evaluates and fails closed.
     SELECT body_id
     FROM qbit_block_candidate_body
     WHERE body_id = {self._text_literal(body_id)}
       AND state = 'sealed'
       AND candidate_sha256 = {self._text_literal(candidate_sha256)}
       AND block_hash = {self._text_literal(block_hash)}
+    FOR SHARE
 ),
 inserted AS (
     INSERT INTO qbit_block_candidate_outbox (
@@ -5730,10 +5750,21 @@ END;
             )
         if not isinstance(result, dict):
             raise RuntimeError("candidate body janitor returned no result")
+        remaining = result.get("remaining") if isinstance(result.get("remaining"), dict) else {}
         return {
             "body_id": result.get("body_id"),
             "deleted_chunks": int(result.get("deleted_chunks", 0)),
+            "deleted_pages": int(result.get("deleted_pages", 0)),
+            "deleted_spans": int(result.get("deleted_spans", 0)),
             "deleted_bodies": int(result.get("deleted_bodies", 0)),
+            # True while this body still has work for a later step.
+            "pending": result.get("body_id") is not None
+            and int(result.get("deleted_bodies", 0)) == 0,
+            "remaining": {
+                "chunks": bool(remaining.get("chunks")),
+                "pages": bool(remaining.get("pages")),
+                "spans": bool(remaining.get("spans")),
+            },
         }
 
     def reap_retired_candidate_bodies(
