@@ -35,6 +35,7 @@ from lab.prism.accepted_preview_telemetry import (
     LANDING_PHASE_RECONCILE,
 )
 from lab.prism.audit_artifacts import AuditArtifactStore, AuditPublicationIdentity
+from lab.prism.audit_bundle_view import streamed_sha256_json_hex
 from lab.prism.block_candidates import (
     PRISM_REJECTION_LEDGER_CONFIRMATION_SUPERSEDED,
     PrismBlockCandidate,
@@ -1348,6 +1349,8 @@ class BlockFinalizationService:
                         block_hash=block_hash,
                         block_height=expected_height,
                     ):
+                        # The preview walks the bundle's accounts row by
+                        # row; on a bounded view they stream from disk.
                         verified_preview = (
                             self.runtime._accepted_block_payout_preview_from_bundle(
                                 final_bundle,
@@ -2009,13 +2012,16 @@ class BlockFinalizationService:
         candidate = admission.candidate
         block_hash = admission.block_hash
         ctv_persistence = None
+        # On a bounded view the manifest set's fanout manifests stay lazy on
+        # disk; the digest streams the sorted canonical encoding and the
+        # ledger statement streams the set into its literal (#255).
         ctv_manifest_set = landed.final_bundle.get("ctv_fanout_manifest_set")
-        if isinstance(ctv_manifest_set, dict):
+        if isinstance(ctv_manifest_set, Mapping):
             self._record_block_candidate_progress("ctv-manifest-persist")
             ctv_persistence = self.runtime.ledger.persist_ctv_fanout_manifest_set(
                 block_hash=block_hash,
                 manifest_set=ctv_manifest_set,
-                manifest_set_sha256=sha256_json_hex(ctv_manifest_set),
+                manifest_set_sha256=streamed_sha256_json_hex(ctv_manifest_set),
             )
             self._record_block_candidate_progress("ctv-manifest-persist:complete")
         if candidate.credit_share_on_accept:

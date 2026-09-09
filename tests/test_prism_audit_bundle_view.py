@@ -26,15 +26,20 @@ import weakref
 
 from lab.prism.audit_bundle_view import (
     SCAN_CHUNK_BYTES,
+    ArtifactResourcePressure,
     ArtifactSource,
     CanonicalArtifactError,
     CanonicalArtifactSyntaxError,
     CanonicalAuditBundleView,
     LazyRecordSequence,
     LazyRecordSlice,
+    RawJsonDocument,
+    RawJsonRecord,
     iter_json_byte_chunks,
     iter_json_chunks,
     json_chunks_sha256_and_size,
+    materialize_json,
+    spool_json_document,
 )
 
 
@@ -541,7 +546,7 @@ class StressWindowTests(unittest.TestCase):
 class BoundedScanTests(unittest.TestCase):
     """The scan holds at most about two read chunks whatever a value's size."""
 
-    def test_checkpoint_index_lives_on_disk_and_falls_back_to_memory(self) -> None:
+    def test_checkpoint_index_lives_on_disk_and_pressure_is_recoverable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle = make_bundle(3000)
             raw = compact(bundle)
@@ -549,23 +554,28 @@ class BoundedScanTests(unittest.TestCase):
             view = scan(path, stride=16)
             try:
                 stats = view.scan_stats
-                self.assertFalse(stats.index_in_memory)
-                # 3000 shares and 3000 counted shares at a stride of 16, plus
-                # the two leaf arrays' single checkpoints.
-                self.assertEqual(stats.checkpoint_entries, 2 * 188)
-                self.assertFalse(view["shares"]._index.in_memory)
+                # 3000 shares and 3000 counted shares at a stride of 16, one
+                # checkpoint per recipient-scaled array (entitlements,
+                # accounts) and none for the empty prior balances.
+                self.assertEqual(stats.checkpoint_entries, 2 * 188 + 2)
                 self.assertEqual(view["shares"][2999], bundle["shares"][2999])
                 self.assertEqual(view["reward_manifest"]["shares"][1234], bundle["reward_manifest"]["shares"][1234])
+                self.assertIsInstance(view["prior_balances"], LazyRecordSequence)
+                self.assertIsInstance(view["payout_policy_manifest"]["accounts"], LazyRecordSequence)
+                self.assertIsInstance(view["reward_manifest"]["entitlements"], LazyRecordSequence)
+                self.assertEqual(view, bundle)
             finally:
                 view.close()
+            # Scratch pressure is neither a syntax error nor corruption: the
+            # artifact is intact and the caller retries later.
+            fd = os.open(path, os.O_RDONLY)
             with mock.patch("lab.prism.audit_bundle_view.tempfile.TemporaryFile", side_effect=OSError("no temp")):
-                fallback = scan(path, stride=16)
-            try:
-                self.assertTrue(fallback.scan_stats.index_in_memory)
-                self.assertEqual(fallback, bundle)
-                self.assertEqual(fallback["shares"][2999], bundle["shares"][2999])
-            finally:
-                fallback.close()
+                with self.assertRaises(ArtifactResourcePressure) as caught:
+                    CanonicalAuditBundleView.scan(fd, stride=16)
+            self.assertNotIsInstance(caught.exception, CanonicalArtifactError)
+            self.assertNotIsInstance(caught.exception, json.JSONDecodeError)
+            with self.assertRaises(OSError):
+                os.fstat(fd)
             # A closed view fails lazy reads closed rather than reading a
             # released index or descriptor.
             view = scan(path, stride=16)
@@ -573,6 +583,137 @@ class BoundedScanTests(unittest.TestCase):
             view.close()
             with self.assertRaises(CanonicalArtifactError):
                 lazy[5]
+
+    def test_oversized_records_are_normalized_by_the_isolated_helper(self) -> None:
+        limit = 8192
+        oversized = 3 * limit
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = make_bundle(40, oversized_index=7, oversized_bytes=oversized)
+            bundle["shares"][8]["nested"] = {"deep": [1, {"x": "é\"}"}], "big": "Q" * (2 * limit)}
+            bundle["witness_merkle_leaves_hex"] = ["ab" * 32, "W" * (2 * limit)]
+            raw = compact(bundle, ensure_ascii=False)
+            path = write_document(Path(tmp), "bundle.json", raw)
+            with mock.patch("lab.prism.audit_bundle_view.RECORD_DECODE_SOFT_LIMIT_BYTES", limit):
+                view = scan(path, chunk_bytes=1024)
+                try:
+                    records = list(view["shares"])
+                    self.assertEqual(view.scan_stats.isolated_records, 2)
+                    isolated = records[7]
+                    self.assertIsInstance(isolated, RawJsonRecord)
+                    self.assertTrue(isolated.is_object)
+                    self.assertEqual(isolated["share_seq"], 8)
+                    self.assertEqual(isolated["miner_id"], bundle["shares"][7]["miner_id"])
+                    self.assertIn("share_id", isolated.omitted_members)
+                    self.assertIn("share_id", isolated)
+                    with self.assertRaises(CanonicalArtifactError):
+                        isolated["share_id"]
+                    with self.assertRaises(KeyError):
+                        isolated["absent"]
+                    self.assertEqual(list(isolated), list(bundle["shares"][7]))
+                    # Equality streams the sorted encodings, both operand
+                    # orders, against dictionaries and other records.
+                    self.assertEqual(isolated, bundle["shares"][7])
+                    self.assertTrue(bundle["shares"][7] == isolated)
+                    self.assertNotEqual(isolated, bundle["shares"][8])
+                    self.assertNotEqual(isolated, {**bundle["shares"][7], "extra": 1})
+                    self.assertEqual(records[8], bundle["shares"][8])
+                    self.assertEqual(view["shares"][7], view["shares"][7])
+                    self.assertNotEqual(view["shares"][7], view["shares"][8])
+                    self.assertEqual(view, bundle)
+                    self.assertEqual(materialize_json(isolated), bundle["shares"][7])
+                    # The streaming encoder emits the record's own encoding
+                    # verbatim, byte-identical to json.dumps of the value.
+                    self.assertEqual(
+                        "".join(iter_json_chunks({"shares": view["shares"][6:9]})),
+                        json.dumps({"shares": bundle["shares"][6:9]}, separators=(",", ":")),
+                    )
+                    self.assertEqual(
+                        "".join(iter_json_chunks(isolated, sort_keys=True)),
+                        json.dumps(bundle["shares"][7], sort_keys=True, separators=(",", ":")),
+                    )
+                    # A non-object oversized value (a leaf string) is
+                    # normalized the same way.
+                    leaves = list(view["witness_merkle_leaves_hex"])
+                    self.assertEqual(leaves[0], "ab" * 32)
+                    self.assertIsInstance(leaves[1], RawJsonRecord)
+                    self.assertFalse(leaves[1].is_object)
+                    self.assertEqual(leaves[1], "W" * (2 * limit))
+                    self.assertEqual(materialize_json(view["witness_merkle_leaves_hex"]), bundle["witness_merkle_leaves_hex"])
+                finally:
+                    view.close()
+
+    def test_isolated_helper_failures_are_classified(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = b'{"shares":[{"a":"' + b"x" * 20000 + b'"}]}'
+            path = write_document(Path(tmp), "bundle.json", raw)
+            with mock.patch("lab.prism.audit_bundle_view.RECORD_DECODE_SOFT_LIMIT_BYTES", 1024):
+                view = scan(path)
+                try:
+                    self.assertEqual(view["shares"][0], {"a": "x" * 20000})
+                    with mock.patch(
+                        "lab.prism.audit_bundle_view.subprocess.Popen",
+                        side_effect=OSError("fork failed"),
+                    ):
+                        with self.assertRaises(ArtifactResourcePressure):
+                            view["shares"][0]
+                    real_temporary_file = tempfile.TemporaryFile
+                    calls = {"count": 0}
+
+                    def failing_spool(*args: object, **kwargs: object) -> object:
+                        calls["count"] += 1
+                        raise OSError("disk full")
+
+                    with mock.patch(
+                        "lab.prism.audit_bundle_view.tempfile.TemporaryFile",
+                        side_effect=failing_spool,
+                    ):
+                        with self.assertRaises(ArtifactResourcePressure):
+                            view["shares"][0]
+                    self.assertGreaterEqual(calls["count"], 1)
+                    self.assertIs(tempfile.TemporaryFile, real_temporary_file)
+                finally:
+                    view.close()
+            # A structurally valid but token-malformed oversized record is a
+            # syntax error from the helper, never resource pressure.
+            bad = b'{"shares":[{"a":tru' + b"e" * 0 + b',"b":"' + b"y" * 20000 + b'"}]}'
+            bad_path = write_document(Path(tmp), "bad.json", bad)
+            with mock.patch("lab.prism.audit_bundle_view.RECORD_DECODE_SOFT_LIMIT_BYTES", 1024):
+                view = scan(bad_path)
+                try:
+                    with self.assertRaises(json.JSONDecodeError):
+                        view["shares"][0]
+                finally:
+                    view.close()
+
+    def test_raw_document_and_spooled_documents_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = make_bundle(12)
+            raw = compact(bundle, ensure_ascii=False)
+            path = write_document(Path(tmp), "bundle.json", raw)
+            view = scan(path)
+            try:
+                document = RawJsonDocument(view.source)
+                self.assertEqual(document.byte_length, len(raw))
+                self.assertEqual(b"".join(document.iter_byte_chunks(chunk_bytes=7)), raw)
+                self.assertEqual("".join(document.iter_text_chunks(chunk_bytes=7)), raw.decode("utf-8"))
+                embedded = "".join(iter_json_chunks({"audit_bundle": document, "n": 1}))
+                self.assertEqual(json.loads(embedded), {"audit_bundle": bundle, "n": 1})
+                self.assertEqual(materialize_json(view), bundle)
+                spooled = spool_json_document(
+                    iter_json_byte_chunks({"share_parts": [{"kind": "x", "n": i} for i in range(700)]}),
+                    lazy_paths=(("share_parts",),),
+                    stride=8,
+                )
+                try:
+                    parts = spooled["share_parts"]
+                    self.assertIsInstance(parts, LazyRecordSequence)
+                    self.assertEqual(len(parts), 700)
+                    self.assertEqual(parts[699], {"kind": "x", "n": 699})
+                    self.assertEqual(list(parts)[:3], [{"kind": "x", "n": i} for i in range(3)])
+                finally:
+                    spooled.close()
+            finally:
+                view.close()
 
     def test_oversized_values_are_skipped_without_being_held(self) -> None:
         chunk = 4096

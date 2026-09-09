@@ -247,22 +247,80 @@ def _compact_share_tail_chunks(
     )
 
 
+PRISM_BUILDER_INPUT_ARRAY_KEYS = (
+    "shares",
+    "prior_balances",
+    "witness_merkle_leaves_hex",
+    "compact_share_identities",
+    "compact_shares",
+)
+
+
+def _iter_share_window_items(
+    value: Any,
+    *,
+    batch_records: int,
+    chunk_chars: int,
+) -> Iterator[str | bytes]:
+    """The ``shares`` array body from the cheapest exact source.
+
+    A daemon-mirror sequence carries the window already encoded as
+    ``canonical_items`` (sorted-key records with numeric difficulties, the
+    bytes the builder daemon itself parses); a page-backed window carries
+    one such fragment per page. Both are spliced in bounded slices without
+    parsing a record -- in particular without touching the mirror's parsed
+    tuple cache. Any other replayable sequence is walked record by record.
+    The builder deserializes by field name, so record key order is
+    irrelevant to the canonical output.
+    """
+    items = getattr(value, "canonical_items", None)
+    if isinstance(items, (bytes, bytearray, memoryview)):
+        view = memoryview(items)
+        for offset in range(0, len(view), chunk_chars):
+            yield bytes(view[offset : offset + chunk_chars])
+        return
+    pages = getattr(value, "pages", None)
+    if isinstance(pages, (list, tuple)) and pages and all(
+        isinstance(getattr(page, "canonical_json_items", None), (bytes, bytearray, memoryview))
+        for page in pages
+    ):
+        needs_separator = False
+        for page in pages:
+            page_items = memoryview(page.canonical_json_items)
+            if not len(page_items):
+                continue
+            if needs_separator:
+                yield b","
+            for offset in range(0, len(page_items), chunk_chars):
+                yield bytes(page_items[offset : offset + chunk_chars])
+            needs_separator = True
+        return
+    yield from iter_json_array_text_chunks(
+        value,
+        batch_records=batch_records,
+        chunk_chars=chunk_chars,
+    )
+
+
 def _iter_build_input_chunks(
     payload: Mapping[str, object],
     *,
-    array_keys: Iterable[str],
+    array_keys: Iterable[str] = PRISM_BUILDER_INPUT_ARRAY_KEYS,
     batch_records: int = SHARE_JSON_BATCH_RECORDS,
     chunk_chars: int = SHARE_JSON_CHUNK_BYTES,
-) -> Iterator[str]:
-    """The one-shot builder input in bounded chunks, any sequence streamed.
+) -> Iterator[str | bytes]:
+    """The one-shot builder input in bounded chunks, every array streamed.
 
-    Byte-identical to ``json.dumps(payload, separators=(",", ":"))``.
-    :func:`iter_json_object_text_chunks` streams only ``list``/``tuple``
-    members; a canonical build's ``shares`` may be the daemon mirror, a
-    page-backed window or any other replayable sequence, which this walks
-    record by record (each ``json.dumps`` covers at most ``batch_records``
-    records) instead of copying the window into a list first (#255). Every
-    other member is one ``json.dumps`` bounded by that member's own size.
+    Byte-identical to ``json.dumps(payload, separators=(",", ":"))`` for a
+    payload of plain lists. :func:`iter_json_object_text_chunks` streams
+    only ``list``/``tuple`` members; here every member named in
+    ``array_keys`` streams whatever replayable sequence it holds (each
+    ``json.dumps`` covers at most ``batch_records`` records), the ``shares``
+    member additionally splices pre-encoded window bytes when the sequence
+    carries them, and the remaining members (found block, policy, script
+    suffix, settlement configuration) are fixed-size and take one
+    ``json.dumps`` each. Chunks are ``str`` except spliced window bytes,
+    which are yielded as ``bytes`` (#255).
     """
     keys = list(payload)
     if any(not isinstance(key, str) for key in keys):
@@ -272,17 +330,22 @@ def _iter_build_input_chunks(
     pending: list[str] = []
     pending_chars = 0
 
-    def push(text: str) -> Iterator[str]:
+    def flush() -> Iterator[str]:
         nonlocal pending, pending_chars
+        if pending:
+            chunk = "".join(pending)
+            pending = []
+            pending_chars = 0
+            yield chunk
+
+    def push(text: str) -> Iterator[str]:
+        nonlocal pending_chars
         if not text:
             return
         pending.append(text)
         pending_chars += len(text)
         if pending_chars >= chunk_chars:
-            chunk = "".join(pending)
-            pending = []
-            pending_chars = 0
-            yield chunk
+            yield from flush()
 
     yield from push("{")
     first = True
@@ -296,18 +359,30 @@ def _iter_build_input_chunks(
             and isinstance(value, Iterable)
         ):
             yield from push(prefix + "[")
-            for piece in iter_json_array_text_chunks(
-                value,
-                batch_records=batch_records,
-                chunk_chars=chunk_chars,
-            ):
-                yield from push(piece)
+            pieces: Iterable[str | bytes]
+            if key == "shares":
+                pieces = _iter_share_window_items(
+                    value,
+                    batch_records=batch_records,
+                    chunk_chars=chunk_chars,
+                )
+            else:
+                pieces = iter_json_array_text_chunks(
+                    value,
+                    batch_records=batch_records,
+                    chunk_chars=chunk_chars,
+                )
+            for piece in pieces:
+                if isinstance(piece, (bytes, bytearray)):
+                    yield from flush()
+                    yield bytes(piece)
+                else:
+                    yield from push(piece)
             yield from push("]")
         else:
             yield from push(prefix + json.dumps(value, separators=(",", ":")))
     yield from push("}")
-    if pending:
-        yield "".join(pending)
+    yield from flush()
 
 
 def _iter_prepare_window_request_chunks(
@@ -2083,14 +2158,23 @@ class BundleCompiler:
                                 "qbit-prism-build-audit-bundle timed out"
                             )
 
-                    def write(self, value: str) -> int:
+                    def write(self, value: str | bytes) -> int:
                         nonlocal input_byte_count
                         self.check_cancelled()
                         if self.file_descriptor is None:
-                            written = int(self.stream.write(value))
-                            input_byte_count += len(value[:written].encode("utf-8"))
+                            text = (
+                                value.decode("utf-8")
+                                if isinstance(value, (bytes, bytearray))
+                                else value
+                            )
+                            written = int(self.stream.write(text))
+                            input_byte_count += len(text[:written].encode("utf-8"))
                             return written
-                        encoded = value.encode("utf-8")
+                        encoded = (
+                            bytes(value)
+                            if isinstance(value, (bytes, bytearray))
+                            else value.encode("utf-8")
+                        )
                         remaining = memoryview(encoded)
                         while remaining:
                             self.check_cancelled()
@@ -2201,14 +2285,7 @@ class BundleCompiler:
                         # walked here, so a refuted mirror is routed exactly
                         # as the retired list() copy was.
                         with self._routed_window_mirror_divergence():
-                            for chunk in _iter_build_input_chunks(
-                                payload,
-                                array_keys=(
-                                    "shares",
-                                    "compact_share_identities",
-                                    "compact_shares",
-                                ),
-                            ):
+                            for chunk in _iter_build_input_chunks(payload):
                                 sink.write(chunk)
                 except BrokenPipeError:
                     # Prefer the builder's diagnostic below.
@@ -2543,6 +2620,7 @@ __all__ = [
     "BundleCompilerRuntime",
     "CancellationPort",
     "PreparedWindowOutcome",
+    "PRISM_BUILDER_INPUT_ARRAY_KEYS",
     "PRISM_BUILDER_PHASE_METRICS_PREFIX",
     "PRISM_SERVE_BUILDER_PROTOCOL_VERSION",
     "PRISM_SERVE_BUILDER_WINDOW_CACHE_ENTRIES",
@@ -2551,6 +2629,8 @@ __all__ = [
     "_ServeBuilderClient",
     "_ServeBuilderUnavailable",
     "_ShareWindowSerialization",
+    "_iter_build_input_chunks",
+    "_iter_share_window_items",
     "_compact_share_payload",
     "_compact_share_tail_chunks",
     "_iter_prepare_window_request_chunks",

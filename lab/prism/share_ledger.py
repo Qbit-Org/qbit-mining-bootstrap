@@ -31,7 +31,16 @@ from lab.prism.audit_artifacts import (
     CanonicalAuditBundleCorrupt,
     canonical_audit_bundle_bytes,
 )
-from lab.prism.audit_bundle_view import CanonicalAuditBundleView
+from lab.prism.audit_bundle_view import (
+    CanonicalAuditBundleView,
+    MappedSequence,
+    RawJsonDocument,
+    RawJsonRecord,
+    StreamedJsonString,
+    iter_json_chunks,
+    materialize_json,
+    streamed_sha256_json_hex,
+)
 from lab.prism.share_json_stream import (
     canonical_share_items_bytes,
     iter_json_object_text_chunks,
@@ -46,13 +55,16 @@ from lab.prism.writer_lease_timing import (  # noqa: F401 - compatibility re-exp
 LOGGER = logging.getLogger(__name__)
 
 
-def _statement_list(value: object) -> object:
-    """A JSON-encodable copy of a possibly lazy array member for one statement."""
-    if isinstance(value, (list, tuple, str, bytes, bytearray)) or value is None:
-        return value
-    if isinstance(value, Sequence):
-        return list(value)
-    return value
+def _text_stream_contains(chunks: Iterable[str], marker: str) -> bool:
+    """``marker in "".join(chunks)`` without joining the chunks."""
+    keep = max(0, len(marker) - 1)
+    tail = ""
+    for chunk in chunks:
+        window = tail + chunk
+        if marker in window:
+            return True
+        tail = window[-keep:] if keep else ""
+    return False
 
 
 def _default_bundle_canonicalizer() -> Callable[[dict[str, Any]], bytes]:
@@ -1635,13 +1647,18 @@ class SingleWriterShareLedger:
         self,
         *,
         block_hash: str,
-        manifest_set: dict[str, Any],
+        manifest_set: Mapping[str, Any],
         manifest_set_sha256: str,
     ) -> dict[str, int | str]:
-        payload = ctv_fanout_recovery_payload(
-            block_hash=block_hash,
-            manifest_set=manifest_set,
-            manifest_set_sha256=manifest_set_sha256,
+        # The in-memory ledger holds its state as plain objects by design;
+        # a streamed payload (lazy manifests from a bounded artifact view)
+        # is materialized here, in this test-and-parity backend only.
+        payload = materialize_json(
+            ctv_fanout_recovery_payload(
+                block_hash=block_hash,
+                manifest_set=manifest_set,
+                manifest_set_sha256=manifest_set_sha256,
+            )
         )
         with self._lock:
             existing = self._ctv_fanout_sets.get(block_hash)
@@ -6281,7 +6298,7 @@ SELECT COALESCE(
         self,
         *,
         block_hash: str,
-        manifest_set: dict[str, Any],
+        manifest_set: Mapping[str, Any],
         manifest_set_sha256: str,
     ) -> dict[str, int | str]:
         payload = {
@@ -6294,11 +6311,16 @@ SELECT COALESCE(
             "writer_epoch": self._writer_epoch,
             "writer_session_token": self._writer_session_token,
         }
-        sql = f"""
-WITH payload AS (
-    SELECT {self._jsonb_literal(payload)} AS data
-),
-lease AS (
+        # The manifest set and its per-manifest artifacts stream into the
+        # one fenced statement's literal exactly like the accepted-block
+        # payload (#255); the statement, its fields and atomicity are the
+        # same as before.
+        sql = "".join(
+            (
+                "\nWITH payload AS (\n    SELECT ",
+                *self._accepted_block_payload_literal_pieces(payload),
+                " AS data\n),\n",
+                f"""lease AS (
     UPDATE qbit_ledger_writer_lease
     SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
         updated_at = clock_timestamp()
@@ -6494,7 +6516,9 @@ SELECT CASE
                 + (SELECT count(*) FROM inserted_artifacts)
         )
 END;
-"""
+""",
+            )
+        )
         result = self._run_fenced_json(sql)
         if "error" in result:
             raise RuntimeError(str(result["error"]))
@@ -8733,37 +8757,36 @@ END;
         result["audit_bundle"] = body
         return result
 
-    def _accepted_block_payload_literal(
-        self,
-        payload: dict[str, Any],
-        inline_view: CanonicalAuditBundleView | None,
-    ) -> str:
-        """The accepted-block payload as one JSONB literal.
+    @staticmethod
+    def _accepted_block_payload_literal_pieces(payload: Mapping[str, Any]) -> Iterator[str]:
+        """The accepted-block payload as a dollar-quoted JSONB literal, streamed.
 
-        Externalized rows carry ``audit_bundle: null`` and take the ordinary
-        literal.  The legacy inline lane (no audit body store configured)
-        must embed the whole bundle in the statement -- the schema has no
-        other place for it -- so for a bounded artifact view the verified
-        canonical bytes are spliced verbatim into the literal instead of
-        being decoded into a dictionary and re-encoded (#255).  This remains
-        a compatibility lane: the statement still transports the whole
-        body, exactly as the historical ``json.dumps`` payload did, and it
-        is not the production configuration, which externalizes bodies.
+        Equivalent to ``_jsonb_literal(payload)`` for a payload of plain
+        values, but built from bounded chunks: recipient-scaled members
+        (the payout accounts) and transaction-scaled members (the leaf
+        arrays) stream from their lazy views, and on the legacy inline lane
+        (no audit body store configured) the verified canonical artifact is
+        spliced verbatim from its descriptor rather than decoded and
+        re-encoded. The dollar-quote tag is chosen with the same collision
+        rule as ``_jsonb_literal``, checked by streaming. The statement text
+        itself still scales with those members: this method bounds the
+        Python object graph and the number of copies, not the size of the
+        one statement the schema requires (#255).
         """
-        if inline_view is None:
-            return self._jsonb_literal(payload)
-        marker = f"__qbit_prism_inline_audit_bundle_{os.urandom(16).hex()}__"
-        raw = json.dumps({**payload, "audit_bundle": marker}, separators=(",", ":"))
-        placeholder = json.dumps(marker)
-        if raw.count(placeholder) != 1:
-            raise RuntimeError("inline audit bundle placeholder is ambiguous")
-        inline_view.verify_identity()
-        head, tail = raw.split(placeholder, 1)
-        raw = head + b"".join(inline_view.iter_bytes()).decode("utf-8") + tail
+
+        def chunks() -> Iterator[str]:
+            return iter_json_chunks(payload)
+
         tag = "qbit_prism_json"
-        while f"${tag}$" in raw:
+        for _attempt in range(64):
+            if not _text_stream_contains(chunks(), f"${tag}$"):
+                break
             tag += "_x"
-        return f"${tag}${raw}${tag}$::jsonb"
+        else:
+            raise RuntimeError("accepted-block payload cannot be dollar-quoted")
+        yield f"${tag}$"
+        yield from chunks()
+        yield f"${tag}$::jsonb"
 
     def persist_accepted_block(
         self,
@@ -8822,43 +8845,32 @@ END;
         # A bounded artifact view (the canonical build's result) has no
         # dictionary form to embed; the legacy inline lane splices its
         # canonical bytes into the statement literal instead (#255).
-        inline_view = (
-            final_bundle
-            if body_uri is None and isinstance(final_bundle, CanonicalAuditBundleView)
-            else None
-        )
+        inline_bundle: object
+        if body_uri is not None:
+            inline_bundle = None
+        elif isinstance(final_bundle, CanonicalAuditBundleView):
+            final_bundle.verify_identity()
+            inline_bundle = RawJsonDocument(final_bundle.source)
+        else:
+            inline_bundle = final_bundle
         payload = {
             **payload,
             # Externalized rows store the body in body_uri and NULL here; legacy
             # rows (no body store configured) keep the inline body.
-            "audit_bundle": (
-                None
-                if body_uri is not None or inline_view is not None
-                else final_bundle
-            ),
+            "audit_bundle": inline_bundle,
             "body_uri": body_uri,
             "audit_body_byte_len": audit_body_byte_len,
             "schema_version": str(final_bundle.get("schema") or "qbit.prism.audit-bundle.v1"),
             "found_block_network_difficulty": found_block.get("network_difficulty"),
             "found_block_bits": found_block.get("bits"),
             "found_block_coinbase_value_sats": found_block.get("coinbase_value_sats"),
-            # The leaf arrays are lazy on a bounded artifact view; the row
-            # stores them as JSONB columns, so they are materialized only for
-            # this statement (bounded by the block's transaction count).
-            "audit_commitment_leaves_hex": _statement_list(
-                final_bundle.get("audit_commitment_leaves_hex")
-            ),
-            "witness_merkle_leaves_hex": _statement_list(
-                final_bundle.get("witness_merkle_leaves_hex")
-            ),
+            # The leaf arrays and the payout accounts stay lazy on a bounded
+            # artifact view; the statement literal streams them below.
+            "audit_commitment_leaves_hex": final_bundle.get("audit_commitment_leaves_hex"),
+            "witness_merkle_leaves_hex": final_bundle.get("witness_merkle_leaves_hex"),
             "accounts": final_bundle["payout_policy_manifest"]["accounts"],
         }
-        payload_literal = self._accepted_block_payload_literal(payload, inline_view)
-        sql = f"""
-WITH payload AS (
-    SELECT {payload_literal} AS data
-),
-lease AS (
+        sql_body = f"""lease AS (
     UPDATE qbit_ledger_writer_lease
     SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
         updated_at = clock_timestamp()
@@ -9143,6 +9155,16 @@ SELECT CASE
         )
 END;
 """
+        # One join produces the single fenced statement; the payload
+        # literal arrives as bounded chunks rather than as a decoded graph.
+        sql = "".join(
+            (
+                "\nWITH payload AS (\n    SELECT ",
+                *self._accepted_block_payload_literal_pieces(payload),
+                " AS data\n),\n",
+                sql_body,
+            )
+        )
         result = self._run_fenced_json(sql)
         if "error" in result:
             raise RuntimeError(str(result["error"]))
@@ -11398,14 +11420,26 @@ def ctv_fanout_recovery_payload(
         expected_bytes=32,
     )
     manifests_raw = manifest_set.get("manifests")
-    if not isinstance(manifests_raw, list) or not manifests_raw:
+    streamed = _is_lazy_manifest_sequence(manifests_raw)
+    if not streamed and (not isinstance(manifests_raw, list) or not manifests_raw):
+        raise ValueError("manifest_set.manifests must be a non-empty array")
+    if streamed and not len(manifests_raw):
         raise ValueError("manifest_set.manifests must be a non-empty array")
 
-    manifests = sorted(
-        (require_mapping(manifest, "manifest") for manifest in manifests_raw),
-        key=lambda item: int(require_mapping(item.get("precommitment"), "precommitment")["chunk_index"]),
-    )
-    first_precommitment = require_mapping(manifests[0].get("precommitment"), "precommitment")
+    if streamed:
+        # A bounded artifact view keeps the manifests on disk. They are
+        # walked once here in their canonical (chunk-ordered) sequence for
+        # validation and again, on demand, when the statement literal is
+        # streamed; the whole set is never sorted or copied (#255).
+        manifests: Sequence[Any] = MappedSequence(manifests_raw, _manifest_record)
+        first_manifest = manifests[0]
+    else:
+        manifests = sorted(
+            (require_mapping(manifest, "manifest") for manifest in manifests_raw),
+            key=lambda item: int(require_mapping(item.get("precommitment"), "precommitment")["chunk_index"]),
+        )
+        first_manifest = manifests[0]
+    first_precommitment = require_mapping(first_manifest.get("precommitment"), "precommitment")
     block_height_value = manifest_set.get("block_height", first_precommitment.get("block_height"))
     block_height = int(block_height_value) if block_height_value is not None else None
     fanout_count = int(manifest_set.get("fanout_count", len(manifests)))
@@ -11415,19 +11449,18 @@ def ctv_fanout_recovery_payload(
     if settlement_mode not in {"hybrid_coinbase_ctv_fanout", "ctv_fanout"}:
         raise ValueError("manifest_set.settlement_mode must be a CTV settlement mode")
     parent_coinbase_txid = canonical_hex(
-        str(manifest_set.get("parent_coinbase_txid", manifests[0].get("parent_coinbase_txid", ""))),
+        str(manifest_set.get("parent_coinbase_txid", first_manifest.get("parent_coinbase_txid", ""))),
         name="parent_coinbase_txid",
         expected_bytes=32,
     )
     parent_coinbase_tx_hex = canonical_hex(
-        str(manifests[0].get("parent_coinbase_tx_hex", "")),
+        str(first_manifest.get("parent_coinbase_tx_hex", "")),
         name="parent_coinbase_tx_hex",
     )
     fanout_output_sum_sats = int(manifest_set.get("fanout_output_sum_sats", 0))
     covenant_output_value_sats = int(manifest_set.get("covenant_output_value_sats", 0))
 
-    artifacts: list[dict[str, Any]] = []
-    for expected_index, manifest in enumerate(manifests):
+    def artifact_for(expected_index: int, manifest: Mapping[str, Any]) -> dict[str, Any]:
         precommitment = require_mapping(manifest.get("precommitment"), "precommitment")
         precommitment_block_height = precommitment.get("block_height")
         if block_height is not None and precommitment_block_height is not None and int(precommitment_block_height) != block_height:
@@ -11457,9 +11490,22 @@ def ctv_fanout_recovery_payload(
                 name="fanout_txid",
                 expected_bytes=32,
             ),
-            "manifest_json": canonical_json_text(manifest),
-            "manifest": copy.deepcopy(manifest),
-            "manifest_sha256": sha256_json_hex(manifest),
+            # One manifest is bounded by one fanout transaction (its
+            # recipients are capped per transaction by the settlement
+            # configuration), so its canonical text and digest are
+            # per-manifest allocations; a decoded record is used directly
+            # instead of being deep-copied.
+            "manifest_json": (
+                canonical_json_text(manifest)
+                if isinstance(manifest, dict) and not streamed
+                else "".join(iter_json_chunks(manifest, sort_keys=True))
+            ),
+            "manifest": copy.deepcopy(manifest) if not streamed else manifest,
+            "manifest_sha256": (
+                sha256_json_hex(manifest)
+                if isinstance(manifest, dict) and not streamed
+                else streamed_sha256_json_hex(manifest)
+            ),
             "precommitment_sha256": canonical_hex(
                 str(manifest["precommitment_sha256_hex"]),
                 name="precommitment_sha256_hex",
@@ -11490,25 +11536,47 @@ def ctv_fanout_recovery_payload(
         }
         if block_height is not None:
             artifact["block_height"] = block_height
-        artifacts.append(artifact)
+        return artifact
 
-    if sum(int(artifact["fanout_output_sum_sats"]) for artifact in artifacts) != fanout_output_sum_sats:
+    # One validating walk; the sums never hold the artifacts.
+    output_sum = 0
+    covenant_sum = 0
+    for expected_index, manifest in enumerate(manifests):
+        artifact = artifact_for(expected_index, manifest)
+        output_sum += int(artifact["fanout_output_sum_sats"])
+        covenant_sum += int(artifact["covenant_output_value_sats"])
+    if output_sum != fanout_output_sum_sats:
         raise ValueError("CTV fanout output sum mismatch")
-    if sum(int(artifact["covenant_output_value_sats"]) for artifact in artifacts) != covenant_output_value_sats:
+    if covenant_sum != covenant_output_value_sats:
         raise ValueError("CTV covenant output value sum mismatch")
+
+    artifacts: Sequence[Any]
+    if streamed:
+        artifacts = MappedSequence(
+            _EnumeratedSequence(manifests),
+            lambda item: artifact_for(item[0], item[1]),
+        )
+        manifest_set_json: object = StreamedJsonString(
+            lambda: iter_json_chunks(manifest_set, sort_keys=True)
+        )
+        manifest_set_member: object = manifest_set
+    else:
+        artifacts = [artifact_for(index, manifest) for index, manifest in enumerate(manifests)]
+        manifest_set_json = canonical_json_text(manifest_set)
+        manifest_set_member = copy.deepcopy(manifest_set)
 
     payload = {
         "schema": "qbit.prism.ctv-fanout-recovery.v1",
         "block_hash": block_hash,
         "manifest_set_sha256": manifest_set_sha256,
-        "manifest_set_json": canonical_json_text(manifest_set),
+        "manifest_set_json": manifest_set_json,
         "settlement_mode": settlement_mode,
         "parent_coinbase_txid": parent_coinbase_txid,
         "parent_coinbase_tx_hex": parent_coinbase_tx_hex,
         "fanout_count": fanout_count,
         "fanout_output_sum_sats": fanout_output_sum_sats,
         "covenant_output_value_sats": covenant_output_value_sats,
-        "manifest_set": copy.deepcopy(manifest_set),
+        "manifest_set": manifest_set_member,
         "artifacts": artifacts,
     }
     if block_height is not None:
@@ -11526,10 +11594,57 @@ def ctv_fanout_recovery_payload(
     return payload
 
 
+def _is_lazy_manifest_sequence(value: object) -> bool:
+    """A replayable, non-list manifest sequence (a bounded view member)."""
+    return isinstance(value, Sequence) and not isinstance(
+        value,
+        (list, tuple, str, bytes, bytearray),
+    )
+
+
+def _manifest_record(manifest: object) -> Mapping[str, Any]:
+    """One manifest as a mapping; an isolated record is decoded in-process.
+
+    A manifest is bounded by one fanout transaction, whose recipients are
+    capped per transaction by the settlement configuration, so it never
+    reaches the isolated-decode limit in practice; the fallback keeps an
+    unexpected one usable rather than refusing it.
+    """
+    if isinstance(manifest, RawJsonRecord):
+        manifest = materialize_json(manifest)
+    if not isinstance(manifest, Mapping):
+        raise ValueError("manifest must be an object")
+    return manifest
+
+
+class _EnumeratedSequence(Sequence):
+    """``enumerate`` as a replayable sequence of ``(index, item)`` pairs."""
+
+    __slots__ = ("_base",)
+
+    def __init__(self, base: Sequence[Any]) -> None:
+        self._base = base
+
+    def __len__(self) -> int:
+        return len(self._base)
+
+    def __iter__(self) -> Iterator[tuple[int, Any]]:
+        for index, item in enumerate(self._base):
+            yield index, item
+
+    def __getitem__(self, index: int | slice) -> Any:
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self._base))
+            return [(position, self._base[position]) for position in range(start, stop, step)]
+        if index < 0:
+            index += len(self._base)
+        return index, self._base[index]
+
+
 def require_mapping(value: object, name: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
+    if not isinstance(value, Mapping):
         raise ValueError(f"{name} must be an object")
-    return value
+    return value  # type: ignore[return-value]
 
 
 def sha256_json_hex(payload: object) -> str:

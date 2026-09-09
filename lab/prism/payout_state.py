@@ -35,7 +35,7 @@ import hashlib
 import json
 import threading
 import time
-from typing import Any, Callable, Iterator, Protocol, Sequence
+from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 
 from lab.prism.accepted_preview_telemetry import (
     FULL_RESCAN_PATH_DAEMON,
@@ -3540,10 +3540,20 @@ class PayoutStateService:
         *,
         prior_balances: list[dict[str, object]] | None = None,
     ) -> list[dict[str, object]]:
-        """Derive the confirmed carry-forward view from a verified bundle."""
+        """Derive the confirmed carry-forward view from a verified bundle.
+
+        The bundle may be a dictionary or a bounded artifact view whose
+        ``accounts`` member is a lazy on-disk sequence (issue #255); the
+        accounts are walked once, row by row, in either case.
+        """
         runtime = self._runtime
         manifest = final_bundle.get("payout_policy_manifest")
-        if not isinstance(manifest, dict) or not isinstance(manifest.get("accounts"), list):
+        accounts = manifest.get("accounts") if isinstance(manifest, Mapping) else None
+        if (
+            accounts is None
+            or isinstance(accounts, (str, bytes, bytearray))
+            or not isinstance(accounts, Sequence)
+        ):
             raise RuntimeError("accepted block payout manifest is missing accounts")
         prior_identities: dict[str, tuple[str, str]] = {}
         for balance in prior_balances or []:
@@ -3557,8 +3567,8 @@ class PayoutStateService:
                 prior_identities.get(program, identity),
             )
         balances: list[dict[str, object]] = []
-        for account in manifest["accounts"]:
-            if not isinstance(account, dict):
+        for account in accounts:
+            if not isinstance(account, Mapping):
                 continue
             if str(account.get("account_type", "miner")) == "pool_fee":
                 continue
