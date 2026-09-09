@@ -262,6 +262,120 @@ class ViewParityTests(unittest.TestCase):
                 view.close()
 
 
+class TokenBoundaryTests(unittest.TestCase):
+    """Number tokens cut by a read window must never decode as a prefix."""
+
+    DOCUMENTS = (
+        {"x": 1e300, "shares": []},
+        {"x": -1.5e-3, "shares": [1.25, -0.5e2, 3, 1e300, -7]},
+        {"x": 12345678901234567890, "shares": [0, -0, 10, 100000000000000000000]},
+        {"x": 0.000001, "y": 5e-324, "shares": [{"n": 1e+300}, {"n": -2.5E+10}]},
+        {"a": True, "b": None, "c": False, "x": -7, "shares": ["1e+", "-", "1."]},
+    )
+
+    def _raw(self, document: dict[str, object]) -> bytes:
+        text = json.dumps(document, separators=(",", ":"))
+        # Spell exponents the way serializers may: keep an explicit sign.
+        return text.replace("1e+300", "1e+300").encode()
+
+    def test_tiny_window_sweep_matches_json_loads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, document in enumerate(self.DOCUMENTS):
+                raw = self._raw(document)
+                # Also exercise an explicit plus sign the stdlib serializer
+                # never emits but valid documents may carry.
+                variants = [raw, raw.replace(b"1e+300", b"1E+300").replace(b"-7", b"-7.0e+0")]
+                for variant_index, variant in enumerate(variants):
+                    expected = json.loads(variant)
+                    path = write_document(Path(tmp), f"num-{index}-{variant_index}.json", variant)
+                    for chunk_bytes in (1, 2, 3, 4, 5, 7, 8, 16, 64):
+                        with self.subTest(document=index, variant=variant_index, chunk_bytes=chunk_bytes):
+                            view = scan(path, chunk_bytes=chunk_bytes, stride=2)
+                            try:
+                                self.assertEqual(view, expected)
+                                self.assertEqual(list(view["shares"]), expected["shares"])
+                                self.assertEqual(view["shares"][0:2], expected["shares"][0:2])
+                                if expected["shares"]:
+                                    self.assertEqual(view["shares"][-1], expected["shares"][-1])
+                            finally:
+                                view.close()
+
+    def test_default_window_alignment_sweep(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for pad in range(SCAN_CHUNK_BYTES - 40, SCAN_CHUNK_BYTES + 8):
+                raw = b'{"pad":"' + b"a" * pad + b'","x":1e+300,"y":-2.5e-7,"shares":[12,3.5e+1]}'
+                expected = json.loads(raw)
+                path = write_document(Path(tmp), "aligned.json", raw)
+                with self.subTest(pad=pad):
+                    view = scan(path)
+                    try:
+                        self.assertEqual(view, expected)
+                        self.assertEqual(view["shares"][1], 35.0)
+                    finally:
+                        view.close()
+
+    def test_malformed_tokens_are_rejected_at_scan_time(self) -> None:
+        """Every rejection the standard decoder makes, the scan makes too."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, raw in enumerate(
+                (
+                    b'{"x":1e+,"shares":[]}',
+                    b'{"x":1.,"shares":[]}',
+                    b'{"x":01,"shares":[]}',
+                    b'{"x":-,"shares":[]}',
+                    b'{"x":1e+300',
+                    b'{"shares":[1.]}',
+                    b'{"shares":[1 2]}',
+                    b'{"shares":[{"a":1,}]}',
+                    b'{"shares":[{"a" 1}]}',
+                    b'{"shares":["a\x01b"]}',
+                    b'{"shares":["\\q"]}',
+                    b'{"shares":["\\u12"]}',
+                    b'{"shares":[{"a":[1,]}]}',
+                    b'{"shares":[tru]}',
+                    b'{"shares":[{"a":-}]}',
+                    b'{"shares":[{"a":1}{"b":2}]}',
+                    b'{"shares":[[1,2}]}',
+                    b'{"shares":[{"a":1,"b":}]}',
+                    b'{"shares":[{,}]}',
+                    b'{"shares":[nul]}',
+                    b'{"shares":[1]',
+                )
+            ):
+                with self.subTest(document=raw):
+                    self.assertRaises(ValueError, json.loads, raw)
+                path = write_document(Path(tmp), f"bad-{index}.json", raw)
+                for chunk_bytes in (1, 3, 8, 4096):
+                    with self.subTest(document=raw, chunk_bytes=chunk_bytes):
+                        with self.assertRaises(json.JSONDecodeError):
+                            scan(path, chunk_bytes=chunk_bytes)
+
+    def test_nested_and_escaped_records_survive_tiny_windows(self) -> None:
+        document = {
+            "shares": [
+                {"a": [1, {"b": "é\n\"}\\", "c": ""}], "d": " x ", "e": [], "f": {}},
+                {"g": [[[]]], "h": "😀", "i": -0.0, "j": [True, False, None]},
+                "plain",
+                12,
+                [],
+            ],
+            "reward_manifest": {"shares": [{"n": 1}, {"n": [2, {"m": "é"}]}]},
+        }
+        raw = json.dumps(document, indent=2).encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_document(Path(tmp), "nested.json", raw)
+            for chunk_bytes in (1, 2, 5, 13, 64, SCAN_CHUNK_BYTES):
+                with self.subTest(chunk_bytes=chunk_bytes):
+                    view = scan(path, chunk_bytes=chunk_bytes, stride=2)
+                    try:
+                        self.assertEqual(view, document)
+                        self.assertEqual(list(view["shares"]), document["shares"])
+                        self.assertEqual(view["shares"][1]["h"], "😀")
+                        self.assertEqual(view["shares"][2:5], document["shares"][2:5])
+                    finally:
+                        view.close()
+
+
 class ViewRobustnessTests(unittest.TestCase):
     def test_malformed_documents_fail_as_json_decode_errors_and_release_fd(self) -> None:
         cases = [
@@ -673,17 +787,22 @@ class BoundedScanTests(unittest.TestCase):
                     self.assertIs(tempfile.TemporaryFile, real_temporary_file)
                 finally:
                     view.close()
-            # A structurally valid but token-malformed oversized record is a
-            # syntax error from the helper, never resource pressure.
-            bad = b'{"shares":[{"a":tru' + b"e" * 0 + b',"b":"' + b"y" * 20000 + b'"}]}'
+            # The scan rejects a token-malformed record before any helper
+            # runs; the helper classifies malformed input the same way when
+            # it is handed such bytes directly, never as resource pressure.
+            bad = b'{"shares":[{"a":tru,"b":"' + b"y" * 20000 + b'"}]}'
             bad_path = write_document(Path(tmp), "bad.json", bad)
-            with mock.patch("lab.prism.audit_bundle_view.RECORD_DECODE_SOFT_LIMIT_BYTES", 1024):
-                view = scan(bad_path)
-                try:
-                    with self.assertRaises(json.JSONDecodeError):
-                        view["shares"][0]
-                finally:
-                    view.close()
+            with self.assertRaises(json.JSONDecodeError):
+                scan(bad_path)
+            from lab.prism.audit_bundle_view import normalize_record_isolated
+
+            source = ArtifactSource(os.open(bad_path, os.O_RDONLY), path=bad_path)
+            try:
+                with self.assertRaises(json.JSONDecodeError) as caught:
+                    normalize_record_isolated(source, 11, len(bad) - 2)
+                self.assertIsInstance(caught.exception, CanonicalArtifactSyntaxError)
+            finally:
+                source.close()
 
     def test_raw_document_and_spooled_documents_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

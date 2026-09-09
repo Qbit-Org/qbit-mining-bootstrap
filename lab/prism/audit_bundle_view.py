@@ -107,19 +107,38 @@ RAW_RECORD_MEMBER_LIMIT_BYTES = 4096
 RAW_RECORD_HELPER_TIMEOUT_SECONDS = 300.0
 
 _WHITESPACE = re.compile(r"[ \t\n\r]*")
-# One complete JSON object with no nested containers: every share record
-# in a canonical bundle. Matching it skips a record at C speed without
-# building a dictionary; anything else is skipped by the bounded
-# structural walker below. The quantifiers are possessive: when a window
-# ends inside a long string the match must fail in one pass instead of
+# Strict JSON token grammar (RFC 8259 plus the standard decoder's NaN and
+# Infinity constants). The quantifiers are possessive: when a window ends
+# inside a long token the match must fail in one pass instead of
 # backtracking through every prefix, which would allocate a regex state
 # stack proportional to the window.
-_FLAT_OBJECT = re.compile(r'\{(?:"(?:[^"\\]|\\.)*+"|[^"{}\[\]])*+\}')
-# Characters that change structural state while walking a container or a
-# string window by window.
-_STRUCTURAL = re.compile(r'["\\{}\[\]]')
-_STRING_STRUCTURAL = re.compile(r'["\\]')
-_SCALAR_END = re.compile(r"[,\]} \t\n\r]")
+_WS = r"[ \t\n\r]*+"
+_STRING_TOKEN = r'"(?:[^"\\\x00-\x1f]++|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*+"'
+_NUMBER_TOKEN = r"-?(?:0|[1-9][0-9]*+)(?:\.[0-9]++)?+(?:[eE][+-]?[0-9]++)?+"
+_SCALAR_TOKEN = rf"(?:{_STRING_TOKEN}|{_NUMBER_TOKEN}|true|false|null|NaN|Infinity|-Infinity)"
+# One complete JSON object with no nested containers: every share record
+# in a canonical bundle. Matching it validates and skips the record at C
+# speed without building a dictionary; anything it does not match (a
+# record cut by the window, a nested value, or a malformed one) goes to
+# the streaming validator below, which reports malformed input.
+_FLAT_OBJECT = re.compile(
+    r"\{"
+    + _WS
+    + rf"(?:{_STRING_TOKEN}{_WS}:{_WS}{_SCALAR_TOKEN}"
+    + rf"(?:{_WS},{_WS}{_STRING_TOKEN}{_WS}:{_WS}{_SCALAR_TOKEN})*+)?+"
+    + _WS
+    + r"\}"
+)
+_NON_STRING_SCALAR = re.compile(
+    rf"(?:{_NUMBER_TOKEN}|true|false|null|NaN|Infinity|-Infinity)\Z"
+)
+# Characters that end a string's ordinary run: the closing quote, an
+# escape, or a control character the grammar forbids.
+_STRING_STRUCTURAL = re.compile(r'["\\\x00-\x1f]')
+_SCALAR_END = re.compile(r"[,\]}: \t\n\r\"{\[]")
+_ESCAPE_TOKEN = re.compile(r'["\\/bfnrt]|u[0-9a-fA-F]{4}')
+# Characters that can extend a JSON number token past a decoded prefix.
+_NUMBER_CONTINUATION = frozenset("0123456789.eE+-")
 _DECODER = json.JSONDecoder()
 _COMPACT_SEPARATORS = (",", ":")
 # Checkpoint entries buffered before they are written to the index file.
@@ -557,6 +576,14 @@ class _Cursor:
         A value cut by the window boundary extends the window until it fits;
         the growth is geometric so an oversized field costs a handful of
         reads, and nothing beyond that one value is retained.
+
+        Token completion is checked explicitly for numbers: ``raw_decode``
+        happily returns the prefix ``1`` of a window ending in ``1e+`` or
+        ``1.`` without touching the window end, so a number is complete
+        only when the character after it cannot continue a number (or the
+        file has ended). A continuation character with the whole file in
+        view is a malformed number, exactly as the standard decoder reports
+        for the complete document.
         """
         growth = self._chunk_bytes
         while True:
@@ -571,26 +598,40 @@ class _Cursor:
                 self.fill(len(self.text) - self.pos + growth)
                 growth *= 2
                 continue
-            if end >= len(self.text) and not self.eof:
-                # A number or literal may continue in the next chunk.
-                self.fill(len(self.text) - self.pos + growth)
-                growth *= 2
-                continue
+            if end >= len(self.text):
+                if not self.eof:
+                    # A number or literal may continue in the next chunk.
+                    self.fill(len(self.text) - self.pos + growth)
+                    growth *= 2
+                    continue
+            elif (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and self.text[end] in _NUMBER_CONTINUATION
+            ):
+                if not self.eof:
+                    self.fill(len(self.text) - self.pos + growth)
+                    growth *= 2
+                    continue
+                raise CanonicalArtifactSyntaxError(
+                    f"canonical audit artifact is malformed at byte {self.byte_pos}: "
+                    "invalid number"
+                )
             self.stats.note_value(end - self.pos)
             self.pos = end
             return value
 
     def skip_value(self) -> None:
-        """Advance past one JSON value without retaining or decoding it.
+        """Validate and advance past one JSON value without retaining it.
 
-        A flat record that fits the window is skipped by one regex match.
-        Anything else -- a record straddling the window, a nested value, a
-        string or scalar of any size -- is walked structurally window by
-        window, so the text held never exceeds about two read chunks even
-        for a value far larger than the chunk. Structure (containers,
-        strings, escapes, separators, end of file) is validated here; token
-        syntax inside a skipped value is validated whenever the value is
-        decoded by a consumer, and the artifact as a whole by the verifier.
+        A flat record that fits the window is validated and skipped by one
+        strict-grammar regex match. Anything else -- a record straddling
+        the window, a nested value, a string or scalar of any size -- is
+        walked by a streaming token validator window by window, so the text
+        held never exceeds about two read chunks even for a value far larger
+        than the chunk. The validation is the standard decoder's: token
+        syntax, escapes, control characters, separators, container balance
+        and termination all fail closed here, at scan time.
         """
         char = self.peek()
         if char == "{":
@@ -600,14 +641,13 @@ class _Cursor:
                 self.pos = match.end()
                 return
         start = self.byte_pos
-        if char in "{[":
-            self._skip_container()
-        elif char == '"':
-            self.pos += 1
-            self._skip_string_body()
-        else:
-            self._skip_scalar()
+        self._walk_value()
         self.stats.note_value(self.byte_pos - start)
+
+    def _malformed(self, detail: str) -> CanonicalArtifactSyntaxError:
+        return CanonicalArtifactSyntaxError(
+            f"canonical audit artifact is malformed at byte {self.byte_pos}: {detail}"
+        )
 
     def _advance_window(self) -> None:
         """Consume the whole window and read the next chunk."""
@@ -619,72 +659,130 @@ class _Cursor:
                 "canonical audit artifact is malformed: unterminated value"
             )
 
-    def _skip_escaped_char(self) -> None:
-        """Skip the character following a backslash inside a string."""
-        if self.pos >= len(self.text):
-            self._advance_window()
-        self.pos += 1
-
-    def _skip_string_body(self) -> None:
-        """Skip to just past the closing quote; ``pos`` is inside the string."""
+    def _walk_value(self) -> None:
+        """Streaming validator for one JSON value starting at ``pos``."""
+        stack: list[str] = []
+        state = "value"
         while True:
-            match = _STRING_STRUCTURAL.search(self.text, self.pos)
-            if match is None:
-                self._advance_window()
-                continue
-            self.pos = match.end()
-            if match.group() == "\\":
-                self._skip_escaped_char()
-            else:
-                return
+            self.skip_ws()
+            char = self.peek()
+            if state == "value":
+                if char == '"':
+                    self.pos += 1
+                    self._skip_string_body()
+                    state = "after"
+                elif char == "{":
+                    self.pos += 1
+                    stack.append("O")
+                    state = "key_or_end"
+                elif char == "[":
+                    self.pos += 1
+                    stack.append("A")
+                    state = "value_or_end"
+                else:
+                    self._skip_scalar()
+                    state = "after"
+            elif state == "value_or_end":
+                if char == "]":
+                    self.pos += 1
+                    stack.pop()
+                    state = "after"
+                else:
+                    state = "value"
+                    continue
+            elif state == "key_or_end":
+                if char == "}":
+                    self.pos += 1
+                    stack.pop()
+                    state = "after"
+                elif char == '"':
+                    self.pos += 1
+                    self._skip_string_body()
+                    state = "colon"
+                else:
+                    raise self._malformed("expected a member name or '}'")
+            elif state == "key":
+                if char != '"':
+                    raise self._malformed("expected a member name")
+                self.pos += 1
+                self._skip_string_body()
+                state = "colon"
+            elif state == "colon":
+                if char != ":":
+                    raise self._malformed("expected ':'")
+                self.pos += 1
+                state = "value"
+            else:  # after a complete value
+                if not stack:
+                    return
+                top = stack[-1]
+                if char == ",":
+                    self.pos += 1
+                    state = "key" if top == "O" else "value"
+                elif char == "]" and top == "A":
+                    self.pos += 1
+                    stack.pop()
+                elif char == "}" and top == "O":
+                    self.pos += 1
+                    stack.pop()
+                elif char == "":
+                    raise CanonicalArtifactSyntaxError(
+                        "canonical audit artifact is malformed: unterminated value"
+                    )
+                else:
+                    raise self._malformed("expected ',' or a closing bracket")
             if self.pos >= self._chunk_bytes:
                 self.trim()
 
-    def _skip_container(self) -> None:
-        depth = 0
+    def _skip_string_body(self) -> None:
+        """Validate to just past the closing quote; ``pos`` is inside the string."""
         while True:
-            match = _STRUCTURAL.search(self.text, self.pos)
+            match = _STRING_STRUCTURAL.search(self.text, self.pos)
             if match is None:
                 self._advance_window()
                 continue
             char = match.group()
             self.pos = match.end()
             if char == '"':
-                self._skip_string_body()
-            elif char == "\\":
-                raise CanonicalArtifactSyntaxError(
-                    f"canonical audit artifact is malformed at byte {self.byte_pos}: "
-                    "unexpected escape"
-                )
-            elif char in "{[":
-                depth += 1
-            else:
-                depth -= 1
-                if depth == 0:
-                    return
-                if depth < 0:
-                    raise CanonicalArtifactSyntaxError(
-                        f"canonical audit artifact is malformed at byte {self.byte_pos}: "
-                        "unbalanced container"
-                    )
+                return
+            if char != "\\":
+                self.pos -= 1
+                raise self._malformed("control character in string")
+            # An escape needs up to five more characters; make them visible
+            # before validating so a window boundary cannot split it.
+            self.fill(5)
+            escape = _ESCAPE_TOKEN.match(self.text, self.pos)
+            if escape is None:
+                raise self._malformed("invalid escape sequence")
+            self.pos = escape.end()
             if self.pos >= self._chunk_bytes:
                 self.trim()
 
     def _skip_scalar(self) -> None:
+        """Validate one number or literal token; it may span windows."""
         start = self.byte_pos
+        pieces: list[str] = []
         while True:
             match = _SCALAR_END.search(self.text, self.pos)
             if match is None:
                 if self.eof:
+                    pieces.append(self.text[self.pos :])
                     self.pos = len(self.text)
                     break
+                pieces.append(self.text[self.pos :])
                 self._advance_window()
                 continue
+            pieces.append(self.text[self.pos : match.start()])
             self.pos = match.start()
             break
-        if self.byte_pos == start:
+        token = "".join(pieces)
+        if not token:
             raise CanonicalArtifactSyntaxError(
                 f"canonical audit artifact is malformed at byte {start}: expected a value"
+            )
+        if _NON_STRING_SCALAR.match(token) is None:
+            raise CanonicalArtifactSyntaxError(
+                f"canonical audit artifact is malformed at byte {start}: invalid token {token[:32]!r}"
             )
 
 
