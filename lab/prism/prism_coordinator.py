@@ -3418,6 +3418,7 @@ class PrismCoordinator:
             ledger_config,
             writer_session_token,
             audit_store,
+            lease_retry_sleep=lease_retry_sleep,
         )
         try:
             # Issue #255 rollback floor: refuse a database whose candidate
@@ -3428,10 +3429,13 @@ class PrismCoordinator:
         except IncompatibleCandidateSchema as exc:
             ledger.close()
             raise SystemExit(f"prism coordinator: {exc}") from exc
-        except Exception:
-            # A transport failure here is not a verdict; the check runs
-            # again before the first candidate is staged.
-            pass
+        except Exception as exc:  # noqa: BLE001 - a transport failure is not a verdict
+            print(
+                "prism coordinator: candidate schema capability check could not "
+                f"run at boot ({type(exc).__name__}: {exc}); a version-2 candidate "
+                "write against an unmigrated database fails closed on its own",
+                flush=True,
+            )
         return ledger
 
     def _construct_psql_share_ledger(
@@ -3441,6 +3445,8 @@ class PrismCoordinator:
         ledger_config: Any,
         writer_session_token: str | None,
         audit_store: Any,
+        *,
+        lease_retry_sleep: Callable[[float], None] | None = None,
     ) -> PsqlShareLedger:
         config = getattr(self, "config", None)
         return PsqlShareLedger(

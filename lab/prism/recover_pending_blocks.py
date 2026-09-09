@@ -13,6 +13,7 @@ import hmac
 import json
 import signal
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Callable
 
@@ -110,10 +111,23 @@ class RecoveryReader:
         ).fetchone()
 
     def candidate(self, block_hash: str) -> dict[str, Any]:
+        """One pending row's payload facts, for either storage version.
+
+        Issue #255: a version-2 row carries no ``candidate`` jsonb. Its
+        body lives in ``qbit_block_candidate_body`` and is read back in
+        bounded pages by the ledger (``hydrate_block_candidate_intent``),
+        never through this read-only session. The columns below name the
+        version explicitly so a chunked candidate is decoded through that
+        route rather than mistaken for a missing or corrupt payload.
+        """
         row = self.connection.execute(
-            """SELECT candidate, candidate_sha256
-               FROM qbit_block_candidate_outbox
-               WHERE block_hash = %s AND state = 'pending'""",
+            """SELECT outbox.candidate, outbox.candidate_sha256,
+                      outbox.storage_version, outbox.body_id, outbox.replay_header,
+                      body.byte_count, body.chunk_count, body.chunk_bytes,
+                      body.share_count, body.state AS body_state
+               FROM qbit_block_candidate_outbox outbox
+               LEFT JOIN qbit_block_candidate_body body ON body.body_id = outbox.body_id
+               WHERE outbox.block_hash = %s AND outbox.state = 'pending'""",
             (block_hash,),
         ).fetchone()
         if row is None:
@@ -166,11 +180,53 @@ def plan_recovery(reader: RecoveryReader, rpc: Any, hashes: list[str]) -> list[R
     return sorted(blocks, key=lambda block: block.height)
 
 
+def load_intent(
+    coordinator: PrismCoordinator, block: RecoveryBlock, row: dict[str, Any]
+) -> Any:
+    """The intent mapping for one pending row, by storage version (#255).
+
+    Version 1 is the legacy whole-jsonb payload the read-only session
+    already decoded (cooperatively, in this standalone process). Version 2
+    is hydrated by the coordinator's ledger in bounded chunk pages into a
+    spool file, and its decoded facts are exposed through the same mapping
+    interface. Any other version is refused rather than skipped.
+    """
+    storage_version = int(row.get("storage_version") or 1)
+    if storage_version == 1:
+        return row["candidate"]
+    if storage_version != 2:
+        raise RecoveryError(
+            f"unsupported candidate storage version {storage_version}: {block.block_hash}"
+        )
+    if row.get("body_id") is None or row.get("body_state") != "sealed":
+        raise RecoveryError(f"chunked candidate body is not sealed: {block.block_hash}")
+    hydrate = getattr(coordinator.ledger, "hydrate_block_candidate_intent", None)
+    if not callable(hydrate):
+        raise RecoveryError("the ledger cannot hydrate chunked candidate bodies")
+    header_row = {
+        "block_hash": block.block_hash,
+        "storage_version": 2,
+        "candidate_sha256": str(row["candidate_sha256"]),
+        "header": row.get("replay_header") or {},
+        "body": {
+            "body_id": row["body_id"],
+            "storage_version": 2,
+            "candidate_sha256": str(row["candidate_sha256"]),
+            "byte_count": row["byte_count"],
+            "chunk_count": row["chunk_count"],
+            "chunk_bytes": row["chunk_bytes"],
+            "share_count": row["share_count"],
+            "state": row["body_state"],
+        },
+    }
+    return hydrate(header_row, cancelled=coordinator.stop_event.is_set)
+
+
 def decode_candidate(
     coordinator: PrismCoordinator, block: RecoveryBlock, row: dict[str, Any]
 ) -> Any:
-    intent = row["candidate"]
-    if not isinstance(intent, dict) or intent.get("block_hash_hex") != block.block_hash:
+    intent = load_intent(coordinator, block, row)
+    if not isinstance(intent, Mapping) or intent.get("block_hash_hex") != block.block_hash:
         raise RecoveryError("candidate payload does not match its outbox key")
     digest = block_candidate_identity_sha256(intent)
     if not hmac.compare_digest(digest, str(row["candidate_sha256"])):
