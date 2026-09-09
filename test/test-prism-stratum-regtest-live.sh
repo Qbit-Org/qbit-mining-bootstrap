@@ -586,12 +586,15 @@ if os.environ["POSTGRES_ENABLED"] == "1":
             SELECT json_build_object(
                 'state', o.state, 'digest', o.candidate_sha256,
                 'share_id', o.share_id, 'share_count',
-                (SELECT count(*) FROM qbit_share_ledger s WHERE s.share_id = o.share_id)
+                (SELECT count(*) FROM qbit_share_ledger s WHERE s.share_id = o.share_id),
+                'storage_version', COALESCE((to_jsonb(o)->>'storage_version')::integer, 1),
+                'body_id', to_jsonb(o)->>'body_id'
             ) FROM qbit_block_candidate_outbox o
             WHERE o.block_hash = '%s'
         """ % crashed["block_hash"])
         if replayed != {"state": "submitted", "digest": crashed["candidate_sha256"],
-                        "share_id": crashed["share_id"], "share_count": 1}:
+                        "share_id": crashed["share_id"], "share_count": 1,
+                        "storage_version": crashed["storage_version"], "body_id": None}:
             raise SystemExit(f"restart candidate identity or atomicity mismatch: {replayed}")
         print("native candidate crash/restart replay PASS", flush=True)
 
