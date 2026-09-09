@@ -200,7 +200,8 @@ start_coordinator() {
   if [[ "${PRIMED_WINDOW}" == "1" ]]; then
     # The template intentionally uses historical node mocktime. Ledger and
     # coordinator clocks stay real, and all lease budgets stay unchanged.
-    export PRISM_TEMPLATE_MAX_AGE_SECONDS=60000000
+    PRISM_TEMPLATE_MAX_AGE_SECONDS="$(python3 -c 'import time; print(max(120, int(time.time()) - 1738714602 + 120))')"
+    export PRISM_TEMPLATE_MAX_AGE_SECONDS
   fi
   export PRISM_STRATUM_SHARE_DIFF=0.000000001
   export PRISM_STOP_AFTER_BLOCK=1

@@ -7,12 +7,15 @@ Example (after applying the ledger schema to a disposable database):
 This replaces share rows in the supplied disposable database. It is a membership
 and codec experiment, not a valid mined-block fixture or production timing proof.
 The lease-guard actor is real; it records failures rather than terminating the
-harness on a late wake. Compare these measurements with the integrated lease and
+harness on a late wake. It reports scheduling delay separately from round-trip
+duration; a short round trip alone does not imply a timely wake. Compare these
+measurements with the integrated lease and
 regtest gates before deployment. Run measurements serially in Docker Python3.14.7.
 """
 import argparse
 import gc
 import json
+import os
 import platform
 import sys
 import threading
@@ -81,11 +84,13 @@ def measure(label: str, function, *, note: str | None = None):
     _reset_gc_pauses()
     before = [s["collections"] for s in gc.get_stats()]
     start = time.monotonic()
-    result = function()
-    elapsed = time.monotonic() - start
-    time.sleep(0.025)
-    stop.set()
-    thread.join()
+    try:
+        result = function()
+        elapsed = time.monotonic() - start
+        time.sleep(0.025)
+    finally:
+        stop.set()
+        thread.join()
     record = dict(
         operation=label,
         wall_seconds=round(elapsed, 6),
@@ -140,29 +145,41 @@ def main() -> None:
 
     stop = threading.Event()
     heartbeats: list[float] = []
+    heartbeat_wakes: list[float] = []
     failures: list[str] = []
 
     def heartbeat() -> None:
+        due = time.monotonic()
         while not stop.is_set():
             started = time.monotonic()
+            heartbeat_wakes.append(max(0.0, started - due))
             try:
                 ledger.prove_writer_lease_guard_session()
                 heartbeats.append(time.monotonic() - started)
             except Exception as exc:
                 failures.append(str(exc))
-            stop.wait(0.05)
+            due = time.monotonic() + 0.05
+            stop.wait(max(0.0, due - time.monotonic()))
 
     def report_proofs(phase: str, before: int) -> None:
         print(json.dumps({
             "phase": phase,
             "proof_count": len(heartbeats) - before,
             "max_proof_seconds": max(heartbeats[before:], default=0),
+            "max_heartbeat_wake_lateness_seconds": max(heartbeat_wakes[before:], default=0),
         }), flush=True)
 
     thread = threading.Thread(target=heartbeat, name="lease-proof")
     print(json.dumps({
         "python": sys.version, "machine": platform.machine(),
         "shares": args.shares, "gc": args.gc,
+        "psycopg": psycopg.__version__,
+        "libpq": psycopg.pq.version(),
+        "switch_interval_seconds": sys.getswitchinterval(),
+        "gc_thresholds": gc.get_threshold(),
+        "allocator": {name: os.environ.get(name) for name in (
+            "MALLOC_ARENA_MAX", "PYTHONMALLOC", "GLIBC_TUNABLES",
+        )},
     }), flush=True)
     gc.collect()
     if args.gc == "off":
@@ -188,11 +205,14 @@ def main() -> None:
         stop.set()
         thread.join()
         gc.callbacks.remove(_gc_callback)
-        ledger.release_writer_lease()
-        ledger.close()
+        try:
+            ledger.release_writer_lease()
+        finally:
+            ledger.close()
     print(json.dumps({
         "heartbeat_count": len(heartbeats),
         "heartbeat_max_seconds": max(heartbeats, default=0),
+        "heartbeat_max_wake_lateness_seconds": max(heartbeat_wakes, default=0),
         "heartbeat_errors": failures,
     }), flush=True)
 
