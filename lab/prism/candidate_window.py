@@ -50,6 +50,10 @@ def copy_text_chunks(
     for value in values:
         for offset in range(0, len(value), COPY_TEXT_CHARACTERS):
             part = value[offset:offset + COPY_TEXT_CHARACTERS]
+            if "\x00" in part:
+                # PostgreSQL text cannot contain NUL. In psql's COPY input,
+                # it can also truncate the stream without a useful diagnostic.
+                raise ValueError("candidate share ID contains a NUL character")
             part = part.replace("\\", "\\\\").replace("\t", "\\t")
             part = part.replace("\n", "\\n").replace("\r", "\\r")
             encoded = part.encode("utf-8")

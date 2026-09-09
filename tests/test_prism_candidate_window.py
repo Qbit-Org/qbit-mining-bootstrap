@@ -71,6 +71,14 @@ class CandidateWindowTests(unittest.TestCase):
                 pass
         self.assertEqual(calls, 3)
 
+    def test_copy_rejects_nul_after_a_bounded_prefix(self) -> None:
+        emitted = 0
+        with self.assertRaisesRegex(ValueError, "share ID contains a NUL"):
+            for chunk in copy_text_chunks(["x" * (3 * COPY_TEXT_MAX_BYTES) + "\x00"]):
+                self.assertLessEqual(len(chunk), COPY_TEXT_MAX_BYTES)
+                emitted += 1
+        self.assertGreater(emitted, 0)
+
     def test_tiny_records_still_have_a_work_bound(self) -> None:
         consumed = 0
         at_check = 0
@@ -189,6 +197,15 @@ class CandidateWindowPostgresTests(unittest.TestCase):
                 self.covers([{"share_id": "a"}])
         self.assertTrue(self.covers([{"share_id": "a"}]))
 
+    def test_native_nul_failure_rolls_back_and_can_retry(self) -> None:
+        self.insert("a")
+        with self.assertRaisesRegex(ValueError, "share ID contains a NUL"):
+            self.covers([
+                {"share_id": "a"},
+                {"share_id": "x" * (3 * COPY_TEXT_MAX_BYTES) + "\x00"},
+            ])
+        self.assertTrue(self.covers([{"share_id": "a"}]))
+
     @unittest.skipUnless(shutil.which("psql"), "requires PostgreSQL client")
     def test_psql_stream_roundtrip_and_failure(self) -> None:
         # Use the existing instance's guards/gates and an independent psql
@@ -204,6 +221,9 @@ class CandidateWindowPostgresTests(unittest.TestCase):
             self.insert(value)
             self.assertTrue(self.covers([{"share_id": value}, {"share_id": "extra"}]))
             self.assertFalse(self.covers([{"share_id": "extra"}]))
+            with self.assertRaisesRegex(ValueError, "share ID contains a NUL"):
+                self.covers([{"share_id": value + "\x00"}])
+            self.assertTrue(self.covers([{"share_id": value}]))
             self.assertEqual(self.connection.execute(
                 "SELECT count(*) FROM qbit_share_ledger"
             ).fetchone()[0], 1)
