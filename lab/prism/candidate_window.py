@@ -120,6 +120,22 @@ SELECT json_build_object('reproducible', NOT EXISTS (
 """
 
 
+def _flushing_copy_writer(cursor: Any) -> Any:
+    # Keep psycopg optional for the psql-only deployment. LibpqWriter's
+    # standard finish handles CopyDone/CopyFail and cancellation correctly.
+    from psycopg.copy import LibpqWriter
+    from psycopg.generators import copy_to
+
+    class FlushingWriter(LibpqWriter):
+        def write(self, data: bytes) -> None:
+            # On Linux the default writer can grow libpq's output buffer with
+            # the entire window while PostgreSQL is not consuming the socket.
+            # Our producer caps each write at 16 KiB; flush it before advancing.
+            self.connection.wait(copy_to(self._pgconn, data, flush=True))
+
+    return FlushingWriter(cursor)
+
+
 def postgres_window_covers(
     ledger: Any,
     shares: Iterable[Any],
@@ -162,7 +178,7 @@ def postgres_window_covers(
                         ledger._note_operation_progress()
                         with connection.cursor() as cursor:
                             arm_statement()
-                            with cursor.copy(_COPY) as copy:
+                            with cursor.copy(_COPY, writer=_flushing_copy_writer(cursor)) as copy:
                                 for chunk in copy_text_chunks(
                                     recorded_share_ids(shares),
                                     check=ledger._note_json_row_batch,

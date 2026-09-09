@@ -3,9 +3,11 @@ from __future__ import annotations
 import gc
 import itertools
 import os
+from pathlib import Path
 import shlex
 import shutil
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -289,6 +291,70 @@ class CandidateWindowPostgresTests(unittest.TestCase):
     def test_native_deadline_expires_while_streaming(self) -> None:
         self.insert("a")
         self.assert_streaming_timeout_and_retry("a")
+
+    def test_native_slow_consumer_applies_backpressure_and_rolls_back(self) -> None:
+        from lab.prism import candidate_window
+        from lab.prism.share_ledger import LedgerOperationTimeout
+
+        self.insert("a")
+        create = candidate_window._CREATE + """
+CREATE FUNCTION pg_temp.slow_candidate_copy() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN PERFORM pg_sleep(0.02); RETURN NEW; END $$;
+CREATE TRIGGER slow_candidate_copy BEFORE INSERT ON pg_temp.qbit_candidate_recorded_ids
+FOR EACH ROW EXECUTE FUNCTION pg_temp.slow_candidate_copy();
+"""
+        factory = candidate_window._flushing_copy_writer
+        longest_write = 0.0
+        maximum_rss = 0
+
+        def rss() -> int:
+            status = Path("/proc/self/status")
+            if not status.exists():
+                return 0
+            for line in status.read_text().splitlines():
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+            return 0
+
+        initial_rss = rss()
+
+        def instrument(cursor):
+            writer = factory(cursor)
+            write = writer.write
+
+            def measured(data):
+                nonlocal longest_write, maximum_rss
+                started = time.monotonic()
+                try:
+                    return write(data)
+                finally:
+                    longest_write = max(longest_write, time.monotonic() - started)
+                    maximum_rss = max(maximum_rss, rss())
+
+            writer.write = measured
+            return writer
+
+        # Reuse one record so the only potential window-sized allocation is
+        # inside the transport. The stock Linux writer buffers this 64 MiB
+        # stream without blocking when the trigger stalls the backend.
+        rows = itertools.repeat({"share_id": "x" * 4095}, 16384)
+        with mock.patch.object(candidate_window, "_CREATE", create), mock.patch.object(
+            candidate_window, "_flushing_copy_writer", instrument,
+        ), self.ledger.operation_timeout(1.5):
+            with self.assertRaises(LedgerOperationTimeout):
+                self.covers(rows)
+        self.assertGreater(longest_write, 0.1)
+        if initial_rss:
+            self.assertLess(maximum_rss - initial_rss, 32 * 1024 * 1024)
+        self.assertEqual(self.connection.execute("""
+            SELECT count(*) FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname LIKE 'pg_temp_%' AND c.relname = 'qbit_candidate_recorded_ids'
+        """).fetchone()[0], 0)
+        self.assertEqual(self.connection.execute("""
+            SELECT count(*) FROM pg_stat_activity
+            WHERE datname = current_database() AND state = 'idle in transaction'
+        """).fetchone()[0], 0)
+        self.assertTrue(self.covers([{"share_id": "a"}]))
 
     @unittest.skipUnless(shutil.which("psql"), "requires PostgreSQL client")
     def test_psql_stream_roundtrip_and_failure(self) -> None:
