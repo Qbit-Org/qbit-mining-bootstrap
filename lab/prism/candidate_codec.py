@@ -1014,6 +1014,9 @@ def replay_header_from_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(pending_share, Mapping):
         bounded_pending = {}
         for key, value in pending_share.items():
+            if not isinstance(key, str) or len(key) > 64 or len(key.encode("utf-8")) > 64:
+                oversized = True
+                continue
             if key in _PENDING_SHARE_NUMBER_FIELDS:
                 bounded_pending[str(key)] = number(value)
             elif key in _PENDING_SHARE_TEXT_FIELDS:
