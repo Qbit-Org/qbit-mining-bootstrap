@@ -161,12 +161,14 @@ def main() -> None:
             due = time.monotonic() + 0.05
             stop.wait(max(0.0, due - time.monotonic()))
 
-    def report_proofs(phase: str, before: int) -> None:
+    def report_proofs(phase: str, before: tuple[int, int, int]) -> None:
+        proof_start, wake_start, error_start = before
         print(json.dumps({
             "phase": phase,
-            "proof_count": len(heartbeats) - before,
-            "max_proof_seconds": max(heartbeats[before:], default=0),
-            "max_heartbeat_wake_lateness_seconds": max(heartbeat_wakes[before:], default=0),
+            "proof_count": len(heartbeats) - proof_start,
+            "proof_errors": failures[error_start:],
+            "max_proof_seconds": max(heartbeats[proof_start:], default=0),
+            "max_heartbeat_wake_lateness_seconds": max(heartbeat_wakes[wake_start:], default=0),
         }), flush=True)
 
     thread = threading.Thread(target=heartbeat, name="lease-proof")
@@ -187,14 +189,14 @@ def main() -> None:
     gc.callbacks.append(_gc_callback)
     thread.start()
     try:
-        before_proofs = len(heartbeats)
+        before_proofs = len(heartbeats), len(heartbeat_wakes), len(failures)
         result = measure("bounded-window-membership", lambda: ledger.candidate_window_covers(
             Rows(), anchor_job_issued_at_ms=2000, network_difficulty=1000000,
         ))
         assert result is True
         report_proofs("bounded-window-membership", before_proofs)
 
-        before_proofs = len(heartbeats)
+        before_proofs = len(heartbeats), len(heartbeat_wakes), len(failures)
         rows = measure("baseline-audit-window-aggregate", lambda: ledger.audit_share_window(
             anchor_job_issued_at_ms=2000, network_difficulty=1000000,
         ))
