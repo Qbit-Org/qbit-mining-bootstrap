@@ -18,7 +18,9 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 START_CKPOOL = ROOT_DIR / "docker" / "ckpool" / "start-ckpool.sh"
 FAKE_QBIT_RPC = ROOT_DIR / "tests" / "fake_qbit_rpc.py"
 PREFLIGHT = ROOT_DIR / "docker" / "ckpool" / "qbit-ckpool-preflight.py"
+VERSION_MASK = ROOT_DIR / "docker" / "ckpool" / "ckpool-version-mask.py"
 REGTEST_ADDRESS = "qbrt1staticqbitaddress"
+VERSION_MASK_PROBE_MARKER = "start-ckpool-test: version mask helper invoked"
 
 
 def free_port() -> int:
@@ -73,6 +75,8 @@ class CkpoolStartupTests(unittest.TestCase):
         self,
         tmpdir: Path,
         rpc: FakeRpcServer,
+        *,
+        real_version_mask: bool = False,
         **overrides: str,
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         config_file = tmpdir / "ckpool.conf"
@@ -80,11 +84,23 @@ class CkpoolStartupTests(unittest.TestCase):
         bin_dir = tmpdir / "bin"
         bin_dir.mkdir()
         version_mask_helper = bin_dir / "ckpool-version-mask"
-        version_mask_helper.write_text(
-            "#!/usr/bin/env bash\n"
-            "printf '%s\\n' \"${CKPOOL_VERSION_MASK_TEST_VALUE:-1fffe000}\"\n",
-            encoding="utf-8",
-        )
+        if real_version_mask:
+            shutil.copy(VERSION_MASK, version_mask_helper)
+        else:
+            # The stub records every invocation on stderr and in a marker file so
+            # tests can assert when the mask is resolved relative to the
+            # supervisor's readiness gate.
+            version_mask_helper.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"${1:-}\" == \"--validate-config\" ]]; then\n"
+                "  printf 'stub validate-config\\n' >&2\n"
+                "  exit 0\n"
+                "fi\n"
+                f"printf '{VERSION_MASK_PROBE_MARKER}\\n' >&2\n"
+                "printf 'probe\\n' >> \"${CKPOOL_VERSION_MASK_PROBE_LOG}\"\n"
+                "printf '%s\\n' \"${CKPOOL_VERSION_MASK_TEST_VALUE:-1fffe000}\"\n",
+                encoding="utf-8",
+            )
         version_mask_helper.chmod(0o755)
         preflight_helper = bin_dir / "qbit-ckpool-preflight"
         shutil.copy(PREFLIGHT, preflight_helper)
@@ -105,6 +121,9 @@ class CkpoolStartupTests(unittest.TestCase):
                 "CKPOOL_LOG_DIR": str(tmpdir / "logs"),
                 "CKPOOL_STATE_DIR": str(state_dir),
                 "QBIT_MINER_ADDRESS_FILE": str(state_dir / "miner-address.txt"),
+                "CKPOOL_VERSION_MASK_PROBE_LOG": str(tmpdir / "version-mask-probes.log"),
+                "CKPOOL_VERSION_MASK_PROBE_ATTEMPTS": "1",
+                "CKPOOL_VERSION_MASK_PROBE_RETRY_SECONDS": "0",
             }
         )
         env.update(overrides)
@@ -119,8 +138,17 @@ class CkpoolStartupTests(unittest.TestCase):
         )
         return result, config_file
 
-    def run_start_ckpool(self, tmpdir: Path, rpc: FakeRpcServer, **overrides: str) -> dict[str, object]:
-        result, config_file = self.run_start_ckpool_raw(tmpdir, rpc, **overrides)
+    def run_start_ckpool(
+        self,
+        tmpdir: Path,
+        rpc: FakeRpcServer,
+        *,
+        real_version_mask: bool = False,
+        **overrides: str,
+    ) -> dict[str, object]:
+        result, config_file = self.run_start_ckpool_raw(
+            tmpdir, rpc, real_version_mask=real_version_mask, **overrides
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         with config_file.open(encoding="utf-8") as handle:
             return json.load(handle)
@@ -274,6 +302,8 @@ class CkpoolStartupTests(unittest.TestCase):
             "CKPOOL_TEMPLATE_WATCHDOG_POLL_SECONDS": "5",
             "CKPOOL_TEMPLATE_FAILURE_EXIT_SECONDS": "120",
             "QBIT_EXPECTED_GENESIS_HASH": "",
+            "CKPOOL_VERSION_MASK_PROBE_ATTEMPTS": "3",
+            "CKPOOL_VERSION_MASK_PROBE_RETRY_SECONDS": "2",
         }
 
         for name, default in settings.items():
@@ -293,6 +323,8 @@ class CkpoolStartupTests(unittest.TestCase):
             result, config_file = self.run_start_ckpool_raw(
                 Path(tmp),
                 rpc,
+                real_version_mask=True,
+                CKPOOL_VERSION_MASK_MODE="static",
                 QBIT_CHAIN="mainnet",
                 QBIT_PRODUCTION="1",
                 QBIT_TOOLS_PRODUCTION="1",
@@ -374,6 +406,176 @@ class CkpoolStartupTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("CKPOOL_STARTDIFF must be finite", result.stderr)
         self.assertFalse(config_file.exists())
+
+    def test_version_mask_is_not_resolved_before_the_readiness_gate(self) -> None:
+        """A cold start must not freeze a mask chosen while qbit is unusable.
+
+        The node here rejects getblocktemplate during initial block download,
+        which is exactly the window a container restart lands in. Startup has to
+        fail on the supervisor's template validation without ever having asked for a mask.
+        """
+        with tempfile.TemporaryDirectory() as tmp, FakeRpcServer(
+            "--initialblockdownload",
+            "--reject-gbt-during-ibd",
+        ) as rpc:
+            tmpdir = Path(tmp)
+            result, config_file = self.run_start_ckpool_raw(tmpdir, rpc)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn(VERSION_MASK_PROBE_MARKER, result.stderr)
+            self.assertFalse((tmpdir / "version-mask-probes.log").exists())
+            self.assertFalse(config_file.exists())
+
+    def test_version_mask_is_resolved_after_supervisor_checks_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, FakeRpcServer() as rpc:
+            tmpdir = Path(tmp)
+            result, config_file = self.run_start_ckpool_raw(tmpdir, rpc)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            gate_index = result.stderr.index("initial supervisor checks: PASS")
+            probe_index = result.stderr.index(VERSION_MASK_PROBE_MARKER)
+            self.assertLess(gate_index, probe_index)
+            self.assertEqual(
+                (tmpdir / "version-mask-probes.log").read_text(encoding="utf-8").count("probe"),
+                1,
+            )
+            self.assertTrue(config_file.exists())
+
+    def test_cold_start_uses_the_mask_the_ready_node_advertises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, FakeRpcServer(
+            "--versionrollingmask", "00ffe000"
+        ) as rpc:
+            config = self.run_start_ckpool(
+                Path(tmp),
+                rpc,
+                real_version_mask=True,
+                CKPOOL_VERSION_MASK="1fffe000",
+                CKPOOL_VERSION_MASK_MODE="dynamic",
+            )
+
+        self.assertEqual(config["version_mask"], "00ffe000")
+
+    def test_cold_start_honours_an_advertised_zero_mask(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, FakeRpcServer(
+            "--versionrollingmask", "00000000"
+        ) as rpc:
+            config = self.run_start_ckpool(
+                Path(tmp),
+                rpc,
+                real_version_mask=True,
+                CKPOOL_VERSION_MASK="1fffe000",
+                CKPOOL_VERSION_MASK_MODE="dynamic",
+            )
+
+        self.assertEqual(config["version_mask"], "00000000")
+
+    def test_cold_start_keeps_configured_mask_when_node_omits_the_field(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, FakeRpcServer(
+            "--versionrollingmask", ""
+        ) as rpc:
+            config = self.run_start_ckpool(
+                Path(tmp),
+                rpc,
+                real_version_mask=True,
+                CKPOOL_VERSION_MASK="0000007f",
+                CKPOOL_VERSION_MASK_MODE="dynamic",
+            )
+
+        self.assertEqual(config["version_mask"], "0000007f")
+
+    def test_static_mode_renders_the_configured_mask_without_probing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, FakeRpcServer(
+            "--versionrollingmask", "00ffe000"
+        ) as rpc:
+            config = self.run_start_ckpool(
+                Path(tmp),
+                rpc,
+                real_version_mask=True,
+                CKPOOL_VERSION_MASK="0x7f",
+                CKPOOL_VERSION_MASK_MODE="static",
+            )
+
+        self.assertEqual(config["version_mask"], "0000007f")
+
+    def test_malformed_mask_configuration_fails_before_state_creation(self) -> None:
+        cases = {
+            "CKPOOL_VERSION_MASK": ("not-hex", "invalid fallback CKPOOL_VERSION_MASK"),
+            "CKPOOL_VERSION_MASK_MODE": (
+                "sometimes",
+                "CKPOOL_VERSION_MASK_MODE must be one of",
+            ),
+        }
+        for name, (value, expected_error) in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp, FakeRpcServer() as rpc:
+                tmpdir = Path(tmp)
+                result, config_file = self.run_start_ckpool_raw(
+                    tmpdir,
+                    rpc,
+                    real_version_mask=True,
+                    **{name: value},
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+                self.assertNotIn("initial supervisor checks: PASS", result.stderr)
+                self.assertFalse(config_file.exists())
+                self.assertFalse((tmpdir / "state").exists())
+
+    def test_mainnet_prelaunch_requires_static_mode_for_the_version_mask(self) -> None:
+        """Prelaunch keeps qbit in IBD, so dynamic resolution has to fail closed.
+
+        Operators who want CKPool to start in that window say so explicitly with
+        CKPOOL_VERSION_MASK_MODE=static rather than getting a silent fallback.
+        """
+        prelaunch = {
+            "QBIT_CHAIN": "mainnet",
+            "QBIT_PRODUCTION": "1",
+            "QBIT_TOOLS_PRODUCTION": "1",
+            "QBIT_RPC_PASSWORD": "not-default",
+            "QBIT_MINER_ADDRESS": "qb1staticqbitaddress",
+            "QBIT_EXPECTED_GENESIS_HASH": "00" * 32,
+            "CKPOOL_MINDIFF": "1024",
+            "CKPOOL_STARTDIFF": "65536",
+            "CKPOOL_NON_TEST_READINESS_GATE": "0",
+            "QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED": "0",
+            "CKPOOL_REQUIRE_P2MR_PAYOUT": "1",
+            "CKPOOL_VERSION_MASK": "1fffe000",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp, FakeRpcServer(
+            "--chain",
+            "main",
+            "--initialblockdownload",
+            "--reject-gbt-during-ibd",
+        ) as rpc:
+            result, config_file = self.run_start_ckpool_raw(
+                Path(tmp),
+                rpc,
+                real_version_mask=True,
+                CKPOOL_VERSION_MASK_MODE="dynamic",
+                **prelaunch,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("initial supervisor checks: PASS", result.stderr)
+            self.assertIn("getblocktemplate probe failed", result.stderr)
+            self.assertFalse(config_file.exists())
+
+        with tempfile.TemporaryDirectory() as tmp, FakeRpcServer(
+            "--chain",
+            "main",
+            "--initialblockdownload",
+            "--reject-gbt-during-ibd",
+        ) as rpc:
+            config = self.run_start_ckpool(
+                Path(tmp),
+                rpc,
+                real_version_mask=True,
+                CKPOOL_VERSION_MASK_MODE="static",
+                **prelaunch,
+            )
+
+        self.assertEqual(config["version_mask"], "1fffe000")
 
 
 if __name__ == "__main__":

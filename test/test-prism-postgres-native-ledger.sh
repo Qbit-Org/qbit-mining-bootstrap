@@ -598,4 +598,10 @@ print("prism postgres native ledger: OK read-only-session")
 PY
 )
 
+(
+  cd "${ROOT_DIR}"
+  PRISM_RECOVERY_TEST_DATABASE_URL="${DATABASE_URL}" \
+    python3 -m unittest tests.test_prism_pending_block_recovery.NativeRecoveryTests -v
+)
+
 echo "test-prism-postgres-native-ledger: PASS"

@@ -15,11 +15,14 @@ aggregator in front of the qbit permissionless ckpool path.
 
 ## Version Rolling
 
-The bootstrap ckpool image starts with `CKPOOL_VERSION_MASK_MODE=dynamic`. At
-startup it asks qbitd for `getblocktemplate` and uses
-`versionrollingmask` when the connected node exposes it. Older qbitd builds
-fall back to the configured `CKPOOL_VERSION_MASK`; the public sample env uses
-`1fffe000` to match current qbitd permissionless templates.
+The bootstrap ckpool image starts with `CKPOOL_VERSION_MASK_MODE=dynamic`. Once
+its startup readiness gate passes, it asks qbitd for `getblocktemplate` and uses
+the advertised `versionrollingmask`. Older qbitd builds that answer without the
+field fall back to the configured `CKPOOL_VERSION_MASK`; the public sample env
+uses `1fffe000` to match current qbitd permissionless templates. A node that
+cannot serve a template at all is a startup failure, not a fallback, so a running
+ckpool in dynamic mode has confirmed its mask against a live node. Explicit
+static mode uses the configured mask without that probe.
 
 Routers that negotiate BIP310 should only pass miner-controlled version bits
 inside the mask granted by ckpool. If a miner requests a mask, the effective

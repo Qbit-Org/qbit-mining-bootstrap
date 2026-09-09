@@ -17,7 +17,8 @@ ckpool is the cleanest open-source fit for qbit's permissionless mining path bec
 - Witness scale factor: `1`
 - Max block weight: `2000000`
 - Permissionless version mask: use `getblocktemplate.versionrollingmask` when
-  qbitd advertises it; fall back to `CKPOOL_VERSION_MASK=1fffe000`
+  qbitd advertises it; fall back to `CKPOOL_VERSION_MASK=1fffe000` only when a
+  reachable node omits the field
 
 ## Likely friction points
 
@@ -33,16 +34,38 @@ Do not leave maturity at Bitcoin defaults. qbit rewards stay immature for `1000`
 
 Keep miner-controlled version rolling inside the mask advertised by qbitd. The
 container defaults `CKPOOL_VERSION_MASK_MODE=dynamic`, so ckpool probes
-`getblocktemplate` at startup and writes the selected `version_mask` into
-`/etc/ckpool/ckpool.conf`. Older qbitd builds that do not return
-`versionrollingmask` fall back to `CKPOOL_VERSION_MASK=1fffe000`. If qbitd
-returns `versionrollingmask=00000000`, ckpool disables BIP310 version rolling.
-For normal production qbit, the node-advertised mask is the source of truth.
-During explicitly authorized mainnet prelaunch, the mask probe uses the
-configured fallback and preflight defers only its live GBT shape check. CKPool's
-generator then keeps retrying GBT every five seconds rather than exiting. Its
-Stratum listener remains bound, but it does not serve mining work until qbitd
-returns a valid template.
+`getblocktemplate` and writes the selected `version_mask` into
+`/etc/ckpool/ckpool.conf`.
+
+The probe runs inside the supervised child, after the startup supervisor's
+readiness gate and live-template checks have passed. That ordering matters on a
+cold start: a probe issued while qbitd is still in initial block download cannot
+learn the node's mask, and the value chosen there would stay frozen for the life
+of the process. Dynamic mode therefore fails closed. Transient RPC failures are
+retried `CKPOOL_VERSION_MASK_PROBE_ATTEMPTS` times, spaced by
+`CKPOOL_VERSION_MASK_PROBE_RETRY_SECONDS`; if none succeeds, startup aborts
+before CKPool config or state is written. Configuration faults - an unparseable
+`CKPOOL_VERSION_MASK_MODE` or `CKPOOL_VERSION_MASK`, missing RPC credentials, or
+a malformed advertised mask - fail immediately without retrying, and the mode and
+configured mask and dynamic probe settings are validated up front so a typo does not cost the readiness
+wait. Probe attempts must be between 1 and 10, the RPC timeout must be finite
+and positive, and the retry delay finite and nonnegative. Configured timeouts
+and delays across all attempts must total at most 60 seconds. These startup
+retries are separate from the supervisor's steady-state failure grace period.
+
+A reachable node that omits `versionrollingmask` is an older qbitd build, so the
+configured `CKPOOL_VERSION_MASK=1fffe000` applies. If qbitd returns
+`versionrollingmask=00000000`, ckpool disables BIP310 version rolling. For normal
+production qbit, the node-advertised mask is the source of truth.
+
+Explicitly authorized mainnet prelaunch keeps qbitd in initial block download on
+purpose, so `getblocktemplate` is unavailable and dynamic mode fails closed there
+too. Deployments that must start in that window set
+`CKPOOL_VERSION_MASK_MODE=static`, which uses `CKPOOL_VERSION_MASK` without
+probing. That keeps the choice to run on an unverified mask explicit and
+recorded in the deployment's configuration. CKPool's generator then keeps
+retrying GBT every five seconds rather than exiting. Its Stratum listener remains
+bound, but it does not serve mining work until qbitd returns a valid template.
 
 ### Preflight interfaces
 
