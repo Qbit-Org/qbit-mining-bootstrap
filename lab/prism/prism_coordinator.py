@@ -3350,7 +3350,11 @@ class PrismCoordinator:
             canonical_block_hash,
         )
 
-    def make_ledger(self) -> SingleWriterShareLedger | PsqlShareLedger:
+    def make_ledger(
+        self,
+        *,
+        lease_retry_sleep: Callable[[float], None] | None = None,
+    ) -> SingleWriterShareLedger | PsqlShareLedger:
         config = getattr(self, "config", None)
         ledger_config = config.ledger if config is not None else None
         psql_command = (
@@ -3409,6 +3413,7 @@ class PrismCoordinator:
         audit_store = self._ensure_audit_artifact_store()
         return PsqlShareLedger(
             psql_command=psql_command,
+            lease_retry_sleep=lease_retry_sleep,
             database_url=database_url or None,
             native_client_mode=(
                 ledger_config.native_client_mode
