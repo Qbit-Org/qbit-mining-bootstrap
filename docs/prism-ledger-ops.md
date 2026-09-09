@@ -352,6 +352,23 @@ transition re-checks under the writer lease — `mark_block_candidates_abandoned
 re-asks `qbit_pool_blocks` inside its fenced `UPDATE`, and the single-hash
 terminal updates additionally require `state = 'pending'`.
 
+`PRISM_BLOCK_REPLAY_PAGE_SIZE` controls the number of candidate payloads in
+each cursor page during startup and forced ancestor re-drive (default 1024,
+allowed range 1–1024). Set it to `1` to reduce combined JSON decoding pauses
+when pending candidates contain large payout windows (issue #255). The walk
+still visits every page and requires a short page, including an empty final
+page when necessary, before declaring enumeration complete. Timeouts, missing
+cursors, and cleanup backpressure still leave the job-build gate closed.
+
+This is an opt-in mitigation, not a byte or memory bound: one candidate can
+still exceed the lease timing envelope, and restored candidates remain queued
+for accounting. Smaller pages add database and chain-RPC round trips. Ordinary
+steady-state polls and the legacy cursorless fallback retain their existing
+batch limits. Neither lease protection nor accounting rules change. After
+deploying with the setting, check enumeration logs for `limit=1`, completion
+of pending accepted-block accounting, and full subscribe/authorize/notify
+health on both Stratum listeners. Restore `1024` to undo the tuning.
+
 Alert before the landing deadline is exhausted, not after: page when
 `qbit_prism_prior_balances_read_max_seconds` exceeds ~20% of the
 landing budget or the poll budget, when any
