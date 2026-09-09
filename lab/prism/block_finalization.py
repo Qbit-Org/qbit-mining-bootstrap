@@ -42,7 +42,7 @@ from lab.prism.block_candidates import (
     _BlockCandidateNodeSubmission,
 )
 from lab.prism.coordinator_shutdown import ShutdownInProgress
-from lab.prism.share_ledger import WriterLeaseRenewalDeferred, sha256_json_hex
+from lab.prism.share_ledger import WriterLeaseRenewalDeferred
 from lab.prism.share_submission import (
     PRISM_REJECTION_BACKEND_RPC_UNAVAILABLE,
     PRISM_REJECTION_POOL_CLOSED,
