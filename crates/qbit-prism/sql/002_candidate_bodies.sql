@@ -111,9 +111,10 @@ CREATE TABLE IF NOT EXISTS qbit_block_candidate_body_page (
 );
 
 -- Part tables (chunks, spans, pages): insert only while staging, no
--- updates, delete only once retired. FOR SHARE on the manifest serializes an
--- insert behind a concurrent seal, which then leaves the body sealed and
--- the insert refused.
+-- updates, delete only once retired. Touch the staging manifest for every
+-- insert. Besides serializing with a seal, the new row version makes a sealer
+-- using a repeatable-read snapshot fail serialization after a concurrent
+-- upload; row locks alone would not invalidate that older snapshot.
 CREATE OR REPLACE FUNCTION qbit_prism_candidate_body_part_guard() RETURNS trigger AS $$
 DECLARE
     body_state text;
@@ -123,10 +124,9 @@ BEGIN
             USING ERRCODE = 'integrity_constraint_violation';
     END IF;
     IF TG_OP = 'INSERT' THEN
-        SELECT state INTO body_state
-        FROM qbit_block_candidate_body
-        WHERE body_id = NEW.body_id
-        FOR SHARE;
+        UPDATE qbit_block_candidate_body SET state = state
+        WHERE body_id = NEW.body_id AND state = 'staging'
+        RETURNING state INTO body_state;
         IF body_state IS DISTINCT FROM 'staging' THEN
             RAISE EXCEPTION 'candidate body % is % and accepts no parts', NEW.body_id, COALESCE(body_state, 'missing')
                 USING ERRCODE = 'integrity_constraint_violation';
@@ -136,7 +136,9 @@ BEGIN
     SELECT state INTO body_state
     FROM qbit_block_candidate_body
     WHERE body_id = OLD.body_id;
-    IF body_state IS DISTINCT FROM 'retired' THEN
+    IF body_state IS DISTINCT FROM 'retired' OR EXISTS (
+        SELECT 1 FROM qbit_block_candidate_outbox WHERE body_id = OLD.body_id
+    ) THEN
         RAISE EXCEPTION 'candidate body % is % and its parts cannot be deleted', OLD.body_id, COALESCE(body_state, 'missing')
             USING ERRCODE = 'integrity_constraint_violation';
     END IF;
@@ -147,6 +149,8 @@ $$ LANGUAGE plpgsql;
 -- Manifest: staging -> sealed, staging -> retired, sealed -> retired only;
 -- every scalar is frozen; a retired manifest can only be deleted.
 CREATE OR REPLACE FUNCTION qbit_prism_candidate_body_guard() RETURNS trigger AS $$
+DECLARE
+    parts_complete boolean;
 BEGIN
     IF TG_OP = 'DELETE' THEN
         IF OLD.state <> 'retired' THEN
@@ -158,6 +162,12 @@ BEGIN
     IF OLD.state = 'retired' THEN
         RAISE EXCEPTION 'candidate body % is retired', OLD.body_id
             USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+    -- Publication touches the sealed manifest to invalidate older MVCC
+    -- snapshots. Its content remains identical; all actual changes still
+    -- pass through the immutable-state checks below.
+    IF OLD.state = 'sealed' AND NEW IS NOT DISTINCT FROM OLD THEN
+        RETURN NEW;
     END IF;
     IF OLD.state = 'sealed' AND NEW.state <> 'retired' THEN
         RAISE EXCEPTION 'candidate body % is sealed', OLD.body_id
@@ -178,6 +188,32 @@ BEGIN
     IF NEW.state = 'sealed' AND OLD.state <> 'staging' THEN
         RAISE EXCEPTION 'candidate body % cannot be sealed from %', OLD.body_id, OLD.state
             USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+    IF NEW.state = 'sealed' THEN
+        -- The caller's statement snapshot can predate a concurrent uploader
+        -- whose manifest lock this UPDATE waited behind. Recheck from this
+        -- volatile trigger, after acquiring the manifest lock, so that upload
+        -- is included. The outer seal CTE remains an early completeness check.
+        SELECT count(*) = NEW.chunk_count
+            AND COALESCE(sum(octet_length(chunk)), 0) = NEW.byte_count
+            AND COALESCE(min(ordinal), 0) = 0
+            AND COALESCE(max(ordinal), -1) = NEW.chunk_count - 1
+            AND COALESCE(bool_and(sha256(chunk) = decode(chunk_sha256, 'hex')), true)
+            AND COALESCE(bool_and(
+                octet_length(chunk) = NEW.chunk_bytes
+                OR ordinal = NEW.chunk_count - 1
+            ), true)
+        INTO parts_complete
+        FROM qbit_block_candidate_body_chunk
+        WHERE body_id = NEW.body_id;
+        IF NOT parts_complete
+           OR (SELECT count(*) FROM qbit_block_candidate_body_span
+               WHERE body_id = NEW.body_id) <> NEW.span_count
+           OR (SELECT count(*) FROM qbit_block_candidate_body_page
+               WHERE body_id = NEW.body_id) <> NEW.page_count THEN
+            RAISE EXCEPTION 'candidate body % is incomplete', NEW.body_id
+                USING ERRCODE = 'integrity_constraint_violation';
+        END IF;
     END IF;
     IF NEW.body_id <> OLD.body_id
        OR NEW.storage_version <> OLD.storage_version
@@ -362,6 +398,38 @@ ALTER TABLE qbit_block_candidate_outbox
     ADD COLUMN IF NOT EXISTS parent_hash text;
 ALTER TABLE qbit_block_candidate_outbox
     ADD COLUMN IF NOT EXISTS expected_height bigint;
+
+CREATE OR REPLACE FUNCTION qbit_prism_candidate_publication_guard() RETURNS trigger AS $$
+DECLARE
+    published_body text;
+BEGIN
+    IF NEW.body_id IS NULL THEN
+        RETURN NEW;
+    END IF;
+    IF TG_OP = 'UPDATE' AND NEW.body_id IS NOT DISTINCT FROM OLD.body_id
+       AND NEW.block_hash IS NOT DISTINCT FROM OLD.block_hash
+       AND NEW.candidate_sha256 IS NOT DISTINCT FROM OLD.candidate_sha256 THEN
+        RETURN NEW;
+    END IF;
+    -- The no-op UPDATE also creates a manifest version. A repeatable-read
+    -- retirement that began before this publication then fails serialization
+    -- rather than using its old outbox snapshot to retire the referenced body.
+    UPDATE qbit_block_candidate_body SET state = state
+    WHERE body_id = NEW.body_id AND state = 'sealed'
+      AND block_hash = NEW.block_hash AND candidate_sha256 = NEW.candidate_sha256
+    RETURNING body_id INTO published_body;
+    IF published_body IS NULL THEN
+        RAISE EXCEPTION 'candidate body % is not sealed with matching identity', NEW.body_id
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+    RETURN NEW;
+END
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS qbit_block_candidate_publication_guard ON qbit_block_candidate_outbox;
+CREATE TRIGGER qbit_block_candidate_publication_guard
+    BEFORE INSERT OR UPDATE ON qbit_block_candidate_outbox
+    FOR EACH ROW EXECUTE FUNCTION qbit_prism_candidate_publication_guard();
 
 DO $$
 BEGIN

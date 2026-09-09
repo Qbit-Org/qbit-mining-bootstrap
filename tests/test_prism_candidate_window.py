@@ -63,6 +63,26 @@ class CandidateWindowTests(unittest.TestCase):
         self.assertEqual(checks, count)
         self.assertGreater(checks, 30)
 
+    def test_lazy_identifier_is_streamed_and_compared_exactly_under_collision(self) -> None:
+        class Text:
+            def __init__(self, suffix):
+                self.suffix = suffix
+
+            def iter_text_chunks(self):
+                yield "🌐\n\\\té" * 30000
+                yield self.suffix
+
+            def __str__(self):
+                raise AssertionError("lazy identifier was materialized")
+
+        value = Text("a")
+        chunks = list(copy_text_chunks(recorded_share_ids([{"share_id": value}])))
+        self.assertTrue(all(len(chunk) <= COPY_TEXT_MAX_BYTES for chunk in chunks))
+        collision = SimpleNamespace(update=lambda data: None, digest=lambda: b"collision")
+        with mock.patch("lab.prism.candidate_window.hashlib.sha256", return_value=collision):
+            self.assertTrue(disk_window_covers([value], [{"share_id": Text("a")}]))
+            self.assertFalse(disk_window_covers([value], [{"share_id": Text("b")}]))
+
     def test_cancel_during_long_field_stops_consumption(self) -> None:
         calls = 0
 

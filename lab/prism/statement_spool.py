@@ -57,10 +57,21 @@ def run_fenced_statement(ledger: Any, pieces: Iterable[str]) -> Any:
                 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
                 connection = conninfo_to_dict(native._conninfo)
-                options = " ".join(filter(None, (
-                    connection.get("options"), environment.get("PGOPTIONS"),
-                )))
-                command = ["psql", "--dbname", make_conninfo(native._conninfo, options=options),
+                guards = getattr(ledger, "_session_guards", None)
+                fragments = [connection.get("options", "")]
+                if guards is not None:
+                    fragments.append(guards.options_fragment())
+                if timeout is not None:
+                    timeout_ms = max(1, int(timeout * 1000))
+                    fragments.append(f"-c statement_timeout={timeout_ms}ms -c lock_timeout={timeout_ms}ms")
+                connection["options"] = " ".join(filter(None, fragments))
+                connection["application_name"] = ledger._pool_application_name
+                password = connection.pop("password", None)
+                if password is not None:
+                    environment["PGPASSWORD"] = password
+                command = ["psql", "--dbname", make_conninfo(
+                    **connection,
+                ),
                            *command[len(ledger._command):]]
             deadline = time.monotonic() + min(
                 STATEMENT_HELPER_TIMEOUT_SECONDS,

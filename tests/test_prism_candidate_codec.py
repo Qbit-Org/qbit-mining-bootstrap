@@ -180,6 +180,17 @@ class CodecByteIdentityTests(unittest.TestCase):
         prepared = self.assert_body_matches_oracle(fields)
         self.assertEqual(list(prepared), list(fields))
 
+    def test_numeric_keys_and_oversized_nested_key_keep_bounded_encoding(self) -> None:
+        fields = intent_for(1, extension={1: "x" * 300_000, 2.5: ["y" * 300_000]},
+                            found_block={"z" * 300_000: True})
+        expected = oracle_bytes(fields)
+        observer = _Instrumented()
+        with mock.patch.object(codec.json, "dumps", observer.dumps):
+            prepared = codec.prepare_candidate_intent(fields)
+            prepared.body.write_chunks(observer.collect)
+        self.assertEqual(b"".join(chunk.data for chunk in observer.chunks), expected)
+        self.assertLessEqual(max(observer.dumps_outputs), codec.CODEC_BATCH_TARGET_BYTES)
+
     def test_absent_and_null_stamp_are_distinct(self) -> None:
         absent = intent_for(2)
         del absent["pending_share"]["accepted_at_ms"]
@@ -334,6 +345,14 @@ class CodecBoundednessTests(unittest.TestCase):
         self.assertIsNone(oversized["pending_share"]["share_id"])
         self.assertEqual(oversized["pending_share"]["accepted_at_ms"], 123)
         self.assertLess(len(json.dumps(oversized)), 4096)
+
+    def test_replay_header_rejects_giant_text_before_encoding_it(self) -> None:
+        observer = _Instrumented()
+        fields = intent_for(1, username="u" * (5 * 1024 * 1024))
+        with mock.patch.object(codec.json, "dumps", observer.dumps):
+            header = codec.replay_header_from_fields(fields)
+        self.assertIsNone(header["username"])
+        self.assertLessEqual(max(observer.dumps_outputs), 4096)
 
 
 class SpoolRoundTripTests(unittest.TestCase):

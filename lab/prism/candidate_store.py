@@ -851,6 +851,10 @@ target AS (
     SELECT body.body_id
     FROM qbit_block_candidate_body body
     WHERE body.state = 'retired'
+      AND NOT EXISTS (
+          SELECT 1 FROM qbit_block_candidate_outbox outbox
+          WHERE outbox.body_id = body.body_id
+      )
     ORDER BY body.retired_at, body.body_id
     LIMIT 1
 ),

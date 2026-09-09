@@ -9,7 +9,8 @@ ledger compatibility path uses an on-disk index instead of a Python set.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -29,15 +30,24 @@ SET LOCAL work_mem = '8MB';
 _COPY = "COPY pg_temp.qbit_candidate_recorded_ids (share_id) FROM STDIN"
 
 
-def recorded_share_ids(shares: Iterable[Any]) -> Iterator[str]:
+def recorded_share_ids(shares: Iterable[Any]) -> Iterator[Any]:
     """Keep the historical dictionary/type/string conversion semantics."""
     for row in shares:
-        if isinstance(row, dict):
-            yield str(row.get("share_id"))
+        if isinstance(row, Mapping):
+            value = row.get("share_id")
+            yield value if callable(getattr(value, "iter_text_chunks", None)) else str(value)
+
+
+def _text_pieces(value: Any) -> Iterator[str]:
+    streamed = getattr(value, "iter_text_chunks", None)
+    chunks = streamed() if callable(streamed) else (value,)
+    for chunk in chunks:
+        for offset in range(0, len(chunk), COPY_TEXT_CHARACTERS):
+            yield chunk[offset:offset + COPY_TEXT_CHARACTERS]
 
 
 def copy_text_chunks(
-    values: Iterable[str], *, check: Callable[[], Any] = lambda: None,
+    values: Iterable[Any], *, check: Callable[[], Any] = lambda: None,
 ) -> Iterator[bytes]:
     """Encode COPY text without encoding or escaping an entire field at once.
 
@@ -48,8 +58,7 @@ def copy_text_chunks(
     buffer = bytearray()
     records = 0
     for value in values:
-        for offset in range(0, len(value), COPY_TEXT_CHARACTERS):
-            part = value[offset:offset + COPY_TEXT_CHARACTERS]
+        for part in _text_pieces(value):
             if "\x00" in part:
                 # PostgreSQL text cannot contain NUL. In psql's COPY input,
                 # it can also truncate the stream without a useful diagnostic.
@@ -80,25 +89,48 @@ def copy_text_chunks(
         yield bytes(buffer)
 
 
-def disk_window_covers(recorded: Iterable[str], durable: Iterable[Any]) -> bool:
+def disk_window_covers(recorded: Iterable[Any], durable: Iterable[Any]) -> bool:
     """Compatibility path for in-memory ledgers; never retain the ID set."""
-    with tempfile.TemporaryDirectory(prefix="prism-candidate-membership-") as root:
+    with tempfile.TemporaryDirectory(prefix="prism-candidate-membership-") as root, tempfile.TemporaryFile() as values:
         connection = sqlite3.connect(Path(root) / "ids.sqlite")
         try:
             connection.execute("PRAGMA cache_size = -2048")
             connection.execute("PRAGMA temp_store = FILE")
             connection.execute(
-                "CREATE TABLE recorded (id TEXT PRIMARY KEY) WITHOUT ROWID"
+                "CREATE TABLE recorded (digest BLOB, start INTEGER, length INTEGER)"
             )
-            connection.executemany(
-                "INSERT OR IGNORE INTO recorded VALUES (?)",
-                ((value,) for value in recorded),
-            )
-            for row in durable:
-                if isinstance(row, dict) and connection.execute(
-                    "SELECT 1 FROM recorded WHERE id = ?",
-                    (str(row.get("share_id")),),
-                ).fetchone() is None:
+            connection.execute("CREATE INDEX recorded_digest ON recorded (digest)")
+            for value in recorded:
+                digest = hashlib.sha256()
+                start = values.tell()
+                for piece in _text_pieces(value):
+                    encoded = piece.encode("utf-8")
+                    digest.update(encoded)
+                    values.write(encoded)
+                connection.execute("INSERT INTO recorded VALUES (?, ?, ?)",
+                                   (digest.digest(), start, values.tell() - start))
+            for value in recorded_share_ids(durable):
+                digest = hashlib.sha256()
+                for piece in _text_pieces(value):
+                    digest.update(piece.encode("utf-8"))
+                matched = False
+                for start, length in connection.execute(
+                    "SELECT start, length FROM recorded WHERE digest = ?", (digest.digest(),),
+                ):
+                    # A digest only selects possible matches. Equality still
+                    # compares every byte, including under a hash collision.
+                    values.seek(start)
+                    remaining = length
+                    for piece in _text_pieces(value):
+                        encoded = piece.encode("utf-8")
+                        if len(encoded) > remaining or values.read(len(encoded)) != encoded:
+                            break
+                        remaining -= len(encoded)
+                    else:
+                        if remaining == 0:
+                            matched = True
+                            break
+                if not matched:
                     return False
             return True
         finally:

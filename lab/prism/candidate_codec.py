@@ -518,6 +518,11 @@ def _write_string(value: str, sink: _ChunkSink) -> None:
 
 def _write_value(value: Any, sink: _ChunkSink) -> None:
     """Write ``value`` exactly as ``json.dumps(value, sort_keys=True)`` would."""
+    encoded_chunks = getattr(value, "iter_byte_chunks", None)
+    if callable(encoded_chunks):
+        for chunk in encoded_chunks():
+            sink.write_bytes(chunk)
+        return
     if value is None or value is True or value is False:
         sink.write_text(_dumps_scalar(value))
         return
@@ -532,18 +537,23 @@ def _write_value(value: Any, sink: _ChunkSink) -> None:
         if not keys:
             sink.write_text("{}")
             return
-        if any(not isinstance(key, str) for key in keys):
-            # CPython coerces int/float/bool/None keys and refuses the rest,
-            # and ``sort_keys`` over mixed key types raises ``TypeError``.
-            # Encoding the mapping whole keeps every one of those rules; no
-            # candidate field has such keys, so the call stays bounded.
-            sink.write_text(_dumps_scalar(value))
-            return
+        # Sort before coercion, matching CPython's failure on incomparable
+        # key types. Even a numeric-key extension can contain a giant value;
+        # it must use the same streamed value encoder as ordinary fields.
         keys.sort()
         sink.write_text("{")
         first = True
         for key in keys:
-            sink.write_text(("" if first else ",") + _dumps_key(key) + ":")
+            if not first:
+                sink.write_text(",")
+            if isinstance(key, str):
+                encoded_key = key
+            elif key is None or isinstance(key, (bool, int, float)):
+                encoded_key = _dumps_scalar(key)
+            else:
+                raise TypeError(f"keys must be str, int, float, bool or None, not {type(key).__name__}")
+            _write_string(encoded_key, sink)
+            sink.write_text(":")
             first = False
             _write_value(value[key], sink)
         sink.write_text("}")
@@ -943,7 +953,7 @@ def restore_pending_stamp(
 
 def _bounded_text(value: Any, limit: int) -> Any:
     """A string fact within ``limit`` bytes of JSON text, else None."""
-    if not isinstance(value, str):
+    if not isinstance(value, str) or len(value) > limit:
         return None
     if len(json.dumps(value)) > limit:
         return None

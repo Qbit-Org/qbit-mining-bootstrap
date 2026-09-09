@@ -56,6 +56,10 @@ fi
   PRISM_TEST_PSQL_COMMAND="docker exec -i ${POSTGRES_CONTAINER} psql -U qbit -d qbit" \
   PRISM_TEST_DATABASE_URL="${DATABASE_URL}" \
     python3 -m tests.prism_postgres_candidate_gate
+  if [[ -n "${DATABASE_URL}" ]] && python3 -c 'import psycopg' >/dev/null 2>&1; then
+    PRISM_TEST_DATABASE_URL="${DATABASE_URL}" \
+      python3 -m unittest -v tests.test_prism_candidate_storage_races
+  fi
 )
 
 echo "test-prism-postgres-candidate-storage: PASS"

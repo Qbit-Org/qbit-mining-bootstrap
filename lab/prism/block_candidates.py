@@ -1348,7 +1348,8 @@ def block_candidate_from_intent(intent: Mapping[str, Any]) -> PrismBlockCandidat
         coinbase_tx_hex=str(intent["coinbase_tx_hex"]),
         coinbase_txid_preimage_hex="",
         header_hex="",
-        block_hex=str(intent["block_hex"]),
+        block_hex=(intent["block_hex"] if callable(getattr(intent["block_hex"], "iter_encoded_chunks", None))
+                   else str(intent["block_hex"])),
         block_hash_hex=block_hash,
         block_hash_int=int(block_hash, 16),
         share_pass=True,
@@ -2013,6 +2014,8 @@ class BlockCandidateService:
         block_hash = descriptor.block_hash
         coordinator._record_block_submitter_phase("replay-hydrate")
         hydrate = getattr(coordinator.ledger, "hydrate_block_candidate_intent", None)
+        intent = None
+        transferred = False
         try:
             if not callable(hydrate):
                 raise CandidateBodyUnavailable("ledger cannot hydrate durable candidates")
@@ -2035,7 +2038,9 @@ class BlockCandidateService:
                     holder = self._adopt_replay_descriptor_floor(descriptor)
                     self._take_replay_floor_holder(block_hash)
                 candidate = dataclass_replace(candidate, pending_share=holder)
-            return dataclass_replace(candidate, durable_replay=True)
+            candidate = dataclass_replace(candidate, durable_replay=True)
+            transferred = True
+            return candidate
         except ShutdownInProgress:
             self._requeue_replay_descriptor(descriptor)
             raise
@@ -2067,6 +2072,10 @@ class BlockCandidateService:
             traceback.print_exc()
             self._requeue_replay_descriptor(descriptor)
             return None
+
+        finally:
+            if not transferred and isinstance(intent, PreparedCandidateIntent):
+                intent.release()
 
     def _drop_replay_descriptor(self, descriptor: DurableCandidateDescriptor) -> None:
         block_hash = descriptor.block_hash
@@ -5842,7 +5851,7 @@ class BlockCandidateService:
         try:
             result = self._coordinator._run_submitblock_rpc_with_hard_deadline(
                 block_hash=block_hash,
-                block_hex=str(candidate.submission.block_hex),
+                block_hex=candidate.submission.block_hex,
                 timeout_seconds=timeout_seconds,
             )
         except BaseException as exc:

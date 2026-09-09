@@ -82,7 +82,11 @@ class JsonRpc:
         wallet: str | None = None,
         timeout: float = DEFAULT_QBIT_RPC_CALL_TIMEOUT_SECONDS,
     ) -> Any:
-        body = json.dumps(
+        streamed_block = (
+            params[0] if method == "submitblock" and params and len(params) == 1
+            and callable(getattr(params[0], "iter_byte_chunks", None)) else None
+        )
+        body = None if streamed_block is not None else json.dumps(
             {
                 "jsonrpc": "1.0",
                 "id": method,
@@ -98,6 +102,10 @@ class JsonRpc:
             "Content-Type": "application/json",
             "User-Agent": "qbit-prism-coordinator/0.1",
         }
+        if streamed_block is not None:
+            prefix = b'{"jsonrpc":"1.0","id":"submitblock","method":"submitblock","params":['
+            suffix = b']}'
+            headers["Content-Length"] = str(len(prefix) + streamed_block.byte_length + len(suffix))
         # Read-only calls retry once with a fresh connection after a transport
         # error, normally an idle keep-alive that qbitd closed. Mutating calls
         # never retry inside this method: their writer-lease fence applies to
@@ -186,7 +194,15 @@ class JsonRpc:
                         conn_connect()
                 if watchdog_fired.is_set() or time.monotonic() >= deadline:
                     raise TimeoutError(f"qbit RPC {method} timed out")
-                conn.request("POST", path, body=body, headers=headers)
+                def request_chunks():
+                    yield prefix
+                    for chunk in streamed_block.iter_byte_chunks():
+                        if watchdog_fired.is_set() or time.monotonic() >= deadline:
+                            raise TimeoutError(f"qbit RPC {method} timed out")
+                        yield chunk
+                    yield suffix
+
+                conn.request("POST", path, body=request_chunks() if streamed_block is not None else body, headers=headers)
                 response = conn.getresponse()
                 data = response.read()  # drain so the connection can be reused
             except (http.client.HTTPException, OSError) as exc:
@@ -196,6 +212,11 @@ class JsonRpc:
                 last_exc = exc
                 if attempt + 1 < attempt_count:
                     continue
+                raise
+            except BaseException:
+                # A streamed source can fail after sending a request prefix.
+                # That connection cannot carry a later RPC safely.
+                self._drop_connection()
                 raise
             finally:
                 attempt_finished.set()

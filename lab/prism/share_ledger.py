@@ -5435,7 +5435,7 @@ END;
             if "error" in result:
                 if result.get("error_kind") == "share_replay_conflict":
                     raise ShareReplayConflict(str(result["error"]))
-                if result.get("error_kind") == "candidate_version_changed":
+                if result.get("error_kind") in {"candidate_version_changed", "candidate_body_unsealed"}:
                     return None
                 raise RuntimeError(str(result["error"]))
             records = result.get("records")
