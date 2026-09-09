@@ -2558,6 +2558,26 @@ class LedgerSessionGuardConfigTests(unittest.TestCase):
             with self.subTest(field=field_name):
                 self.assertEqual(getattr(config.ledger, field_name), default)
 
+    def test_replay_page_size_defaults_and_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = self.minimal_environment(Path(temp_dir))
+            self.assertEqual(load_coordinator_config(source).block.replay_page_size, 1024)
+            for size in (1, 2, 32, 1024):
+                with self.subTest(size=size):
+                    config = load_coordinator_config(
+                        {**source, "PRISM_BLOCK_REPLAY_PAGE_SIZE": str(size)}
+                    )
+                    self.assertEqual(config.block.replay_page_size, size)
+
+    def test_invalid_replay_page_size_refuses_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = self.minimal_environment(Path(temp_dir))
+            for raw in ("", "0", "-1", "1025", "1.5", "invalid"):
+                with self.subTest(raw=raw), self.assertRaisesRegex(
+                    SystemExit, "PRISM_BLOCK_REPLAY_PAGE_SIZE"
+                ):
+                    load_coordinator_config({**source, "PRISM_BLOCK_REPLAY_PAGE_SIZE": raw})
+
     def test_session_guard_overrides_land_on_ledger_config(self) -> None:
         overrides = {
             "PRISM_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS": "7.5",
