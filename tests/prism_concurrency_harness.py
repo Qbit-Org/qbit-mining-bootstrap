@@ -92,7 +92,9 @@ that fragment set is where the model is extended.
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -112,6 +114,12 @@ if TYPE_CHECKING:
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from lab.prism.candidate_codec import (  # noqa: E402
+    INDEX_PAGE_ENTRIES,
+    INDEX_SPAN_ROWS,
+    replay_header_from_fields,
+)
+from lab.prism.candidate_store import BODY_READ_MAX_CHUNKS  # noqa: E402
 from lab.prism.share_ledger import (  # noqa: E402
     PAYOUT_WINDOW_ROW_BATCH_SIZE,
     WRITER_LEASE_HEARTBEAT_SESSION_PREFIX,
@@ -857,6 +865,24 @@ class LandingOp(str, Enum):
     OUTBOX_FINISH = "outbox_finish"
     OUTBOX_PENDING_PAGE = "outbox_pending_page"
     OUTBOX_BATCH_ABANDON = "outbox_batch_abandon"
+    # Issue #255: chunked candidate bodies. Reads first, then the staging
+    # writes (no lease CTE), then the fenced orphan retirement and the
+    # lease-free chunk reaping.
+    OUTBOX_OBSERVE = "outbox_observe"
+    OUTBOX_HEADER_PAGE = "outbox_header_page"
+    BODY_MANIFEST = "body_manifest"
+    BODY_SPANS = "body_spans"
+    BODY_PAGES = "body_pages"
+    BODY_PAGE = "body_page"
+    BODY_STAGE = "body_stage"
+    BODY_CHUNK = "body_chunk"
+    BODY_INDEX = "body_index"
+    BODY_SEAL = "body_seal"
+    BODY_RETIRE_STAGING = "body_retire_staging"
+    BODY_RETIRE_ORPHANS = "body_retire_orphans"
+    BODY_REAP = "body_reap"
+    SCHEMA_PRESENCE = "schema_presence"
+    SCHEMA_CAPABILITY = "schema_capability"
     ALL_SHARES = "all_shares"
     PRIOR_BALANCES = "prior_balances"
     PRIOR_BALANCES_AS_OF = "prior_balances_as_of"
@@ -986,6 +1012,12 @@ _LANDING_SIGNATURES: tuple[tuple[LandingOp, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        # Issue #255: the metadata-first page. Listed before the legacy page
+        # because it carries every fragment of that page plus its own.
+        LandingOp.OUTBOX_HEADER_PAGE,
+        ("'header_bytes', octet_length(page.header::text)",),
+    ),
+    (
         LandingOp.OUTBOX_PENDING_PAGE,
         (
             # The read-only replay enumeration (issue #211). Its fragments
@@ -998,6 +1030,26 @@ _LANDING_SIGNATURES: tuple[tuple[LandingOp, tuple[str, ...]], ...] = (
             "WHERE state = 'pending'",
         ),
     ),
+    (LandingOp.OUTBOX_OBSERVE, ("'body_state', (",)),
+    (LandingOp.SCHEMA_PRESENCE, ("to_regclass('qbit_block_candidate_body')",)),
+    (LandingOp.SCHEMA_CAPABILITY, ("FROM qbit_prism_schema_capabilities",)),
+    (LandingOp.BODY_STAGE, ("INSERT INTO qbit_block_candidate_body (",)),
+    (LandingOp.BODY_CHUNK, ("INSERT INTO qbit_block_candidate_body_chunk (",)),
+    (LandingOp.BODY_INDEX, ("INSERT INTO qbit_block_candidate_body_span (",)),
+    (LandingOp.BODY_SEAL, ("SET state = 'sealed', sealed_at = clock_timestamp()",)),
+    (
+        LandingOp.BODY_RETIRE_STAGING,
+        ("SET state = 'retired', retired_at = clock_timestamp()", "AND state = 'staging'"),
+    ),
+    (
+        LandingOp.BODY_RETIRE_ORPHANS,
+        ("SET state = 'retired', retired_at = clock_timestamp()", "FOR UPDATE OF body"),
+    ),
+    (LandingOp.BODY_REAP, ("deleted_chunks AS (",)),
+    (LandingOp.BODY_MANIFEST, ("'manifest', (", "'referenced', EXISTS (")),
+    (LandingOp.BODY_SPANS, ("'spans', (",)),
+    (LandingOp.BODY_PAGES, ("'pages', (",)),
+    (LandingOp.BODY_PAGE, ("encode(page.chunk, 'base64')",)),
     (
         LandingOp.OUTBOX_RECORD,
         (
@@ -1116,6 +1168,15 @@ _OUTBOX_BATCH_HASHES_RE = re.compile(
 )
 _OUTBOX_ERROR_RE = re.compile(r"last_error = (NULL|'(?:[^']|'')*')")
 _OUTBOX_SHA_RE = re.compile(r"candidate_sha256 <> '([0-9a-f]+)'")
+# Issue #255 literals: the body id a statement addresses, the chunk bytes a
+# chunk upload inlines, and the arguments of the index/page reads.
+_BODY_ID_RE = re.compile(r"body_id = '([0-9a-f]{32})'")
+_CHUNK_HEX_RE = re.compile(r"decode\(\$qbit_prism_chunk\$([0-9a-f]*)\$qbit_prism_chunk\$, 'hex'\)")
+_SPANS_AFTER_RE = re.compile(r"AND field > '((?:[^']|'')*)'")
+_PAGES_FIELD_RE = re.compile(r"AND field = '((?:[^']|'')*)'\s*AND page_ordinal >= (\d+)")
+_BODY_PAGE_ARGS_RE = re.compile(r"AND ordinal >= (\d+)\s*ORDER BY ordinal\s*LIMIT (\d+)")
+_HEADER_PAGE_LIMIT_RE = re.compile(r"LIMIT (\d+)\n\),\nmeasured AS")
+_HEADER_PAGE_BYTES_RE = re.compile(r"running_bytes <= (\d+)")
 
 
 #: Terminal-arm keys that name a lease column. Nothing is visible to report a
@@ -1384,11 +1445,89 @@ def _landing_payload(op: LandingOp, sql: str) -> dict[str, Any]:
             raise UnsupportedStatement(
                 "outbox record statement named no block hash or payload digest"
             )
+        body_match = _BODY_ID_RE.search(sql)
+        header_match = _PAYLOAD_RE.search(sql)
         return {
             "block_hash": hash_match.group(1),
             "candidate_sha256": sha_match.group(1),
+            "body_id": None if body_match is None else body_match.group(1),
+            "header": (
+                None if header_match is None else json.loads(header_match.group(2))
+            ),
             **_lease_identity(op, sql),
         }
+    if op in {
+        LandingOp.BODY_STAGE,
+        LandingOp.BODY_INDEX,
+        LandingOp.BODY_SEAL,
+        LandingOp.BODY_RETIRE_ORPHANS,
+        LandingOp.BODY_REAP,
+    }:
+        return _extract_payload(sql)
+    if op is LandingOp.BODY_CHUNK:
+        chunk_match = _CHUNK_HEX_RE.search(sql)
+        if chunk_match is None:
+            raise UnsupportedStatement("chunk upload statement carried no chunk bytes")
+        return {**_extract_payload(sql), "chunk": bytes.fromhex(chunk_match.group(1))}
+    if op in {
+        LandingOp.OUTBOX_OBSERVE,
+    }:
+        hash_match = _POOL_BLOCK_HASH_RE.search(sql)
+        if hash_match is None:
+            raise UnsupportedStatement(f"{op.value} statement named no block hash")
+        return {"block_hash": hash_match.group(1)}
+    if op in {LandingOp.BODY_MANIFEST, LandingOp.BODY_RETIRE_STAGING}:
+        body_match = _BODY_ID_RE.search(sql)
+        if body_match is None:
+            raise UnsupportedStatement(f"{op.value} statement named no body id")
+        return {"body_id": body_match.group(1)}
+    if op is LandingOp.BODY_SPANS:
+        body_match = _BODY_ID_RE.search(sql)
+        after_match = _SPANS_AFTER_RE.search(sql)
+        if body_match is None:
+            raise UnsupportedStatement("span page statement named no body id")
+        return {
+            "body_id": body_match.group(1),
+            "after_field": None if after_match is None else _unquote(after_match.group(1)),
+        }
+    if op is LandingOp.BODY_PAGES:
+        body_match = _BODY_ID_RE.search(sql)
+        args_match = _PAGES_FIELD_RE.search(sql)
+        if body_match is None or args_match is None:
+            raise UnsupportedStatement("page-index statement named no body, field or ordinal")
+        return {
+            "body_id": body_match.group(1),
+            "field": _unquote(args_match.group(1)),
+            "from_ordinal": int(args_match.group(2)),
+        }
+    if op is LandingOp.BODY_PAGE:
+        body_match = _BODY_ID_RE.search(sql)
+        args_match = _BODY_PAGE_ARGS_RE.search(sql)
+        if body_match is None or args_match is None:
+            raise UnsupportedStatement("chunk page statement named no body, ordinal or limit")
+        return {
+            "body_id": body_match.group(1),
+            "from_ordinal": int(args_match.group(1)),
+            "max_chunks": int(args_match.group(2)),
+        }
+    if op is LandingOp.OUTBOX_HEADER_PAGE:
+        limit_match = _HEADER_PAGE_LIMIT_RE.search(sql)
+        bytes_match = _HEADER_PAGE_BYTES_RE.search(sql)
+        if limit_match is None or bytes_match is None:
+            raise UnsupportedStatement("header page statement carried no bounded LIMIT or byte cap")
+        cursor_match = _PENDING_PAGE_CURSOR_RE.search(sql)
+        return {
+            # The statement fetches one row beyond the cap it returns.
+            "limit": int(limit_match.group(1)) - 1,
+            "max_bytes": int(bytes_match.group(1)),
+            "after_cursor": (
+                None
+                if cursor_match is None
+                else (_unquote(cursor_match.group(1)), _unquote(cursor_match.group(2)))
+            ),
+        }
+    if op in {LandingOp.SCHEMA_PRESENCE, LandingOp.SCHEMA_CAPABILITY}:
+        return {}
     if op is LandingOp.OUTBOX_BATCH_ABANDON:
         hashes_match = _OUTBOX_BATCH_HASHES_RE.search(sql)
         error_match = _OUTBOX_ERROR_RE.search(sql)
@@ -1536,6 +1675,53 @@ class OutboxRow:
     state: str = "pending"
     attempt_count: int = 0
     last_error: str | None = None
+    # Issue #255: a version-2 row references a sealed body and carries the
+    # bounded replay header; terminalization detaches the body.
+    storage_version: int = 1
+    body_id: str | None = None
+    retired_body_id: str | None = None
+    header: dict[str, Any] | None = None
+
+
+@dataclass
+class BodyRow:
+    """One ``qbit_block_candidate_body`` manifest with its parts (#255).
+
+    Chunks, spans and pages live on the manifest here for simplicity; the
+    model enforces the same rules the database triggers do: parts are
+    accepted only while ``staging``, never updated, and deleted only once
+    ``retired``.
+    """
+
+    body_id: str
+    block_hash: str
+    candidate_sha256: str
+    byte_count: int
+    chunk_count: int
+    chunk_bytes: int
+    share_count: int
+    shares_offset: int
+    shares_end: int
+    span_count: int
+    page_count: int
+    writer_id: str
+    writer_epoch: int
+    writer_session_token: str
+    created_at: datetime = CLOCK_ORIGIN
+    state: str = "staging"
+    sealed_at: datetime | None = None
+    retired_at: datetime | None = None
+    chunks: dict[int, tuple[bytes, str]] = field(default_factory=dict)
+    spans: dict[str, dict[str, Any]] = field(default_factory=dict)
+    pages: dict[tuple[str, int], tuple[int, int]] = field(default_factory=dict)
+
+    def copy(self) -> "BodyRow":
+        return replace(
+            self,
+            chunks=dict(self.chunks),
+            spans={key: dict(value) for key, value in self.spans.items()},
+            pages=dict(self.pages),
+        )
 
 
 @dataclass
@@ -1552,6 +1738,8 @@ class Transaction:
     # model that published the write at statement time could hide it.
     staged_pool_blocks: dict[str, PoolBlockRow] = field(default_factory=dict)
     staged_outbox: dict[str, OutboxRow] = field(default_factory=dict)
+    staged_bodies: dict[str, BodyRow] = field(default_factory=dict)
+    deleted_bodies: set[str] = field(default_factory=set)
     orphaned: bool = False
 
 
@@ -1602,6 +1790,8 @@ class FakePostgres:
         # assertion made against them has to be order-stable across runs.
         self.pool_blocks: dict[str, PoolBlockRow] = {}
         self.outbox: dict[str, OutboxRow] = {}
+        # Issue #255: chunked candidate bodies, keyed by body id.
+        self.bodies: dict[str, BodyRow] = {}
         self.shares: list[dict[str, Any]] = []
         self.carry_forward_balances: list[dict[str, Any]] = []
         self._lease_lock_holder: Transaction | None = None
@@ -1679,8 +1869,13 @@ class FakePostgres:
             transaction.staged_lease = None
         self.pool_blocks.update(transaction.staged_pool_blocks)
         self.outbox.update(transaction.staged_outbox)
+        self.bodies.update(transaction.staged_bodies)
+        for body_id in transaction.deleted_bodies:
+            self.bodies.pop(body_id, None)
         transaction.staged_pool_blocks.clear()
         transaction.staged_outbox.clear()
+        transaction.staged_bodies.clear()
+        transaction.deleted_bodies.clear()
         self._release_lease_lock(transaction)
         transaction.backend.transaction = None
 
@@ -1692,6 +1887,8 @@ class FakePostgres:
         # harmless.
         transaction.staged_pool_blocks.clear()
         transaction.staged_outbox.clear()
+        transaction.staged_bodies.clear()
+        transaction.deleted_bodies.clear()
         self._release_lease_lock(transaction)
         transaction.backend.transaction = None
 
@@ -2341,6 +2538,29 @@ class FakePostgres:
             return staged
         return self.outbox.get(block_hash)
 
+    def _visible_body(self, transaction: Transaction, body_id: str) -> BodyRow | None:
+        if body_id in transaction.deleted_bodies:
+            return None
+        staged = transaction.staged_bodies.get(body_id)
+        if staged is not None:
+            return staged
+        return self.bodies.get(body_id)
+
+    def _stage_body(self, transaction: Transaction, body: BodyRow) -> BodyRow:
+        staged = transaction.staged_bodies.get(body.body_id)
+        if staged is None:
+            staged = body.copy()
+            transaction.staged_bodies[body.body_id] = staged
+        return staged
+
+    def _body_referenced(self, transaction: Transaction, body_id: str, *, pending_only: bool) -> bool:
+        visible = dict(self.outbox)
+        visible.update(transaction.staged_outbox)
+        return any(
+            row.body_id == body_id and (not pending_only or row.state == "pending")
+            for row in visible.values()
+        )
+
     def _renew_lease_for_landing(
         self,
         statement: Statement,
@@ -2483,6 +2703,45 @@ class FakePostgres:
             # hide the very property issue #211 turns on, that enumeration
             # neither takes the writer gate nor touches the lease row.
             return self._pending_candidate_page(transaction, payload)
+        if kind is LandingOp.OUTBOX_HEADER_PAGE:
+            return self._header_page(transaction, payload)
+        if kind is LandingOp.OUTBOX_OBSERVE:
+            row = self._visible_outbox_row(transaction, str(payload["block_hash"]))
+            if row is None:
+                return {"found": False}
+            body = None if row.body_id is None else self._visible_body(transaction, row.body_id)
+            return {
+                "found": True,
+                "state": row.state,
+                "share_id": None,
+                "candidate_sha256": row.candidate_sha256,
+                "storage_version": row.storage_version,
+                "body_id": row.body_id,
+                "body_state": None if body is None else body.state,
+            }
+        if kind is LandingOp.SCHEMA_PRESENCE:
+            return {"has_body_table": True, "has_capabilities": True}
+        if kind is LandingOp.SCHEMA_CAPABILITY:
+            return {"declared": 2}
+        if kind in {
+            LandingOp.BODY_MANIFEST,
+            LandingOp.BODY_SPANS,
+            LandingOp.BODY_PAGES,
+            LandingOp.BODY_PAGE,
+        }:
+            return self._body_read(kind, transaction, payload)
+        if kind in {
+            LandingOp.BODY_STAGE,
+            LandingOp.BODY_CHUNK,
+            LandingOp.BODY_INDEX,
+            LandingOp.BODY_SEAL,
+            LandingOp.BODY_RETIRE_STAGING,
+            LandingOp.BODY_REAP,
+        }:
+            # Staging, sealing and reaping open no lease CTE: they are private
+            # preparation (or reclamation of a permanently retired body) and
+            # a model that renewed here would misreport a lease touch.
+            return self._body_write(kind, transaction, payload)
         if kind is LandingOp.CONFIRMED_SEQUENCE:
             row = self._visible_pool_block(transaction, str(payload["block_hash"]))
             confirmed = (
@@ -2531,6 +2790,8 @@ class FakePostgres:
             return self._persist_pool_block(statement, transaction)
         if kind is LandingOp.OUTBOX_RECORD:
             return self._record_outbox_row(statement, transaction)
+        if kind is LandingOp.BODY_RETIRE_ORPHANS:
+            return self._retire_orphan_bodies(transaction, payload)
         if kind is LandingOp.OUTBOX_BATCH_ABANDON:
             # The pool-block clause lives *inside* this fenced UPDATE for the
             # reason issue #211 depends on: the caller's page fact is advisory
@@ -2547,6 +2808,7 @@ class FakePostgres:
                 staged = replace(row)
                 staged.state = "abandoned"
                 staged.last_error = payload.get("last_error")
+                self._detach_body(transaction, staged)
                 transaction.staged_outbox[staged.block_hash] = staged
                 abandoned.append(staged.block_hash)
             return {"abandoned": sorted(abandoned)}
@@ -2560,9 +2822,314 @@ class FakePostgres:
             else:
                 staged.state = str(payload["state"])
                 staged.last_error = payload.get("last_error")
+                self._detach_body(transaction, staged)
             transaction.staged_outbox[staged.block_hash] = staged
             return {"updated": 1}
         raise UnsupportedStatement(f"unhandled landing operation {kind}")
+
+    # -- chunked candidate bodies (#255) ------------------------------------
+
+    def _detach_body(self, transaction: Transaction, row: OutboxRow) -> None:
+        """The terminal write detaches and retires the body; chunks stay."""
+        if row.body_id is None:
+            return
+        body = self._visible_body(transaction, row.body_id)
+        row.retired_body_id = row.body_id
+        row.body_id = None
+        if body is not None and body.state != "retired":
+            staged = self._stage_body(transaction, body)
+            staged.state = "retired"
+            staged.retired_at = self.clock.now()
+
+    def _body_owner_matches(self, body: BodyRow, payload: dict[str, Any]) -> bool:
+        return (
+            body.state == "staging"
+            and body.writer_id == payload.get("writer_id")
+            and body.writer_epoch == int(payload.get("writer_epoch", -1))
+            and body.writer_session_token == payload.get("writer_session_token")
+        )
+
+    def _body_write(
+        self,
+        kind: LandingOp,
+        transaction: Transaction,
+        payload: dict[str, Any],
+    ) -> Any:
+        if kind is LandingOp.BODY_STAGE:
+            body_id = str(payload["body_id"])
+            existing = self._visible_body(transaction, body_id)
+            if existing is not None:
+                return {"staged": 0, "state": existing.state}
+            transaction.staged_bodies[body_id] = BodyRow(
+                body_id=body_id,
+                block_hash=str(payload["block_hash"]),
+                candidate_sha256=str(payload["candidate_sha256"]),
+                byte_count=int(payload["byte_count"]),
+                chunk_count=int(payload["chunk_count"]),
+                chunk_bytes=int(payload["chunk_bytes"]),
+                share_count=int(payload["share_count"]),
+                shares_offset=int(payload["shares_offset"]),
+                shares_end=int(payload["shares_end"]),
+                span_count=int(payload.get("span_count", 0)),
+                page_count=int(payload.get("page_count", 0)),
+                writer_id=str(payload["writer_id"]),
+                writer_epoch=int(payload["writer_epoch"]),
+                writer_session_token=str(payload["writer_session_token"]),
+                created_at=self.clock.now(),
+            )
+            return {"staged": 1, "state": "staging"}
+        if kind in {LandingOp.BODY_CHUNK, LandingOp.BODY_INDEX}:
+            body = self._visible_body(transaction, str(payload["body_id"]))
+            if body is None or not self._body_owner_matches(body, payload):
+                return {"owned": False, "inserted": 0, "spans": 0, "pages": 0}
+            staged = self._stage_body(transaction, body)
+            if kind is LandingOp.BODY_CHUNK:
+                ordinal = int(payload["ordinal"])
+                if ordinal in staged.chunks:
+                    return {"owned": True, "inserted": 0}
+                staged.chunks[ordinal] = (bytes(payload["chunk"]), str(payload["chunk_sha256"]))
+                return {"owned": True, "inserted": 1}
+            spans = 0
+            pages = 0
+            for span in payload.get("spans") or []:
+                if span["field"] not in staged.spans:
+                    staged.spans[str(span["field"])] = dict(span)
+                    spans += 1
+            for page in payload.get("pages") or []:
+                key = (str(page[0]), int(page[1]))
+                if key not in staged.pages:
+                    staged.pages[key] = (int(page[2]), int(page[3]))
+                    pages += 1
+            return {"owned": True, "spans": spans, "pages": pages}
+        if kind is LandingOp.BODY_SEAL:
+            body = self._visible_body(transaction, str(payload["body_id"]))
+            if body is None:
+                return {"sealed": 0, "state": None}
+            ordinals = sorted(body.chunks)
+            byte_count = sum(len(data) for data, _ in body.chunks.values())
+            digests_ok = all(
+                hashlib.sha256(data).hexdigest() == digest for data, digest in body.chunks.values()
+            )
+            lengths_ok = all(
+                len(body.chunks[ordinal][0]) == body.chunk_bytes or ordinal == body.chunk_count - 1
+                for ordinal in ordinals
+            )
+            complete = (
+                self._body_owner_matches(body, payload)
+                and body.candidate_sha256 == payload.get("candidate_sha256")
+                and len(ordinals) == body.chunk_count
+                and byte_count == body.byte_count
+                and (body.chunk_count == 0 or ordinals[0] == 0)
+                and (ordinals[-1] if ordinals else -1) == body.chunk_count - 1
+                and digests_ok
+                and lengths_ok
+                and len(body.spans) == body.span_count
+                and len(body.pages) == body.page_count
+            )
+            if not complete:
+                return {
+                    "sealed": 0,
+                    "state": body.state,
+                    "observed_chunk_count": len(ordinals),
+                    "observed_byte_count": byte_count,
+                    "observed_span_count": len(body.spans),
+                    "observed_page_count": len(body.pages),
+                    "digests_ok": digests_ok,
+                    "lengths_ok": lengths_ok,
+                }
+            staged = self._stage_body(transaction, body)
+            staged.state = "sealed"
+            staged.sealed_at = self.clock.now()
+            return {"sealed": 1, "state": "staging"}
+        if kind is LandingOp.BODY_RETIRE_STAGING:
+            body = self._visible_body(transaction, str(payload["body_id"]))
+            if body is None or body.state != "staging":
+                return {"retired": 0}
+            staged = self._stage_body(transaction, body)
+            staged.state = "retired"
+            staged.retired_at = self.clock.now()
+            return {"retired": 1}
+        if kind is LandingOp.BODY_REAP:
+            visible = {
+                body_id: body
+                for body_id, body in {**self.bodies, **transaction.staged_bodies}.items()
+                if body_id not in transaction.deleted_bodies
+            }
+            retired = sorted(
+                (body for body in visible.values() if body.state == "retired"),
+                key=lambda body: (body.retired_at or CLOCK_ORIGIN, body.body_id),
+            )
+            if not retired:
+                return {"body_id": None, "deleted_chunks": 0, "deleted_bodies": 0}
+            target = self._stage_body(transaction, retired[0])
+            max_chunks = max(1, int(payload.get("max_chunks", 1)))
+            victims = sorted(target.chunks)[:max_chunks]
+            for ordinal in victims:
+                del target.chunks[ordinal]
+            deleted_bodies = 0
+            if not target.chunks:
+                target.pages.clear()
+                target.spans.clear()
+                transaction.deleted_bodies.add(target.body_id)
+                transaction.staged_bodies.pop(target.body_id, None)
+                deleted_bodies = 1
+            return {
+                "body_id": target.body_id,
+                "deleted_chunks": len(victims),
+                "deleted_bodies": deleted_bodies,
+            }
+        raise UnsupportedStatement(f"unhandled body write {kind}")
+
+    def _retire_orphan_bodies(
+        self,
+        transaction: Transaction,
+        payload: dict[str, Any],
+    ) -> Any:
+        stale = timedelta(seconds=float(payload.get("stale_staging_seconds", 0.0)))
+        now = self.clock.now()
+        visible = {
+            body_id: body
+            for body_id, body in {**self.bodies, **transaction.staged_bodies}.items()
+            if body_id not in transaction.deleted_bodies
+        }
+        candidates = []
+        for body in sorted(visible.values(), key=lambda body: (body.created_at, body.body_id)):
+            if self._body_referenced(transaction, body.body_id, pending_only=False):
+                continue
+            foreign = not (
+                body.writer_id == payload.get("writer_id")
+                and body.writer_session_token == payload.get("writer_session_token")
+            )
+            if body.state == "staging" and foreign and body.created_at < now - stale:
+                candidates.append(body)
+            elif body.state == "sealed" and body.sealed_at is not None and body.sealed_at < now - stale:
+                candidates.append(body)
+        retired: list[str] = []
+        for body in candidates[:1]:
+            staged = self._stage_body(transaction, body)
+            staged.state = "retired"
+            staged.retired_at = now
+            retired.append(body.body_id)
+        return {"retired": retired}
+
+    def _body_read(
+        self,
+        kind: LandingOp,
+        transaction: Transaction,
+        payload: dict[str, Any],
+    ) -> Any:
+        body = self._visible_body(transaction, str(payload["body_id"]))
+        if kind is LandingOp.BODY_MANIFEST:
+            if body is None:
+                return {"found": False, "manifest": None}
+            return {
+                "found": True,
+                "manifest": {
+                    "body_id": body.body_id,
+                    "storage_version": 2,
+                    "block_hash": body.block_hash,
+                    "candidate_sha256": body.candidate_sha256,
+                    "byte_count": body.byte_count,
+                    "chunk_count": body.chunk_count,
+                    "chunk_bytes": body.chunk_bytes,
+                    "share_count": body.share_count,
+                    "shares_offset": body.shares_offset,
+                    "shares_end": body.shares_end,
+                    "span_count": body.span_count,
+                    "page_count": body.page_count,
+                    "state": body.state,
+                    "referenced": self._body_referenced(transaction, body.body_id, pending_only=True),
+                },
+            }
+        state = None if body is None else body.state
+        if kind is LandingOp.BODY_SPANS:
+            after = payload.get("after_field")
+            spans = [] if body is None else sorted(body.spans.values(), key=lambda span: span["field"])
+            spans = [span for span in spans if after is None or span["field"] > after][:INDEX_SPAN_ROWS]
+            return {"state": state, "spans": spans}
+        if kind is LandingOp.BODY_PAGES:
+            field_name = str(payload["field"])
+            from_ordinal = int(payload["from_ordinal"])
+            entries = [] if body is None else sorted(
+                (
+                    [ordinal, offset, record_index]
+                    for (name, ordinal), (offset, record_index) in body.pages.items()
+                    if name == field_name and ordinal >= from_ordinal
+                ),
+            )
+            return {"state": state, "pages": entries[:INDEX_PAGE_ENTRIES]}
+        if kind is LandingOp.BODY_PAGE:
+            from_ordinal = int(payload["from_ordinal"])
+            max_chunks = max(1, min(int(payload["max_chunks"]), BODY_READ_MAX_CHUNKS))
+            chunks = [] if body is None else [
+                {
+                    "ordinal": ordinal,
+                    "sha256": body.chunks[ordinal][1],
+                    # PostgreSQL wraps base64 at 76 characters with newlines.
+                    "base64": base64.encodebytes(body.chunks[ordinal][0]).decode("ascii").rstrip("\n"),
+                }
+                for ordinal in sorted(body.chunks)
+                if ordinal >= from_ordinal
+            ][:max_chunks]
+            return {
+                "state": state,
+                "referenced": body is not None
+                and self._body_referenced(transaction, body.body_id, pending_only=True),
+                "chunks": chunks,
+            }
+        raise UnsupportedStatement(f"unhandled body read {kind}")
+
+    def _header_page(self, transaction: Transaction, payload: dict[str, Any]) -> Any:
+        """The metadata-first page (#255): bounded headers, explicit exhaustion."""
+        visible = dict(self.outbox)
+        visible.update(transaction.staged_outbox)
+        pool_blocks = self._visible_pool_blocks(transaction)
+        after = payload.get("after_cursor")
+        limit = max(1, int(payload["limit"]))
+        max_bytes = max(1, int(payload["max_bytes"]))
+        rows = sorted(
+            (row for row in visible.values() if row.state == "pending"),
+            key=lambda row: (row.created_at, row.block_hash),
+        )
+        fetched: list[OutboxRow] = []
+        for row in rows:
+            cursor_stamp = self._pending_cursor_stamp(row.created_at)
+            if after is not None and (cursor_stamp, row.block_hash) <= (str(after[0]), str(after[1])):
+                continue
+            fetched.append(row)
+            if len(fetched) > limit:
+                break
+        page: list[dict[str, Any]] = []
+        running = 0
+        for row in fetched[:limit]:
+            header = replay_header_from_fields(row.header or {"block_hash_hex": row.block_hash})
+            header_bytes = len(json.dumps(header, separators=(",", ":")))
+            if page and running + header_bytes > max_bytes:
+                break
+            running += header_bytes
+            body = None if row.body_id is None else self._visible_body(transaction, row.body_id)
+            page.append(
+                {
+                    "block_hash": row.block_hash,
+                    "storage_version": row.storage_version,
+                    "candidate_sha256": row.candidate_sha256,
+                    "header": header,
+                    "header_bytes": header_bytes,
+                    "body": None if body is None else {
+                        "body_id": body.body_id,
+                        "storage_version": 2,
+                        "candidate_sha256": body.candidate_sha256,
+                        "byte_count": body.byte_count,
+                        "chunk_count": body.chunk_count,
+                        "chunk_bytes": body.chunk_bytes,
+                        "share_count": body.share_count,
+                        "state": body.state,
+                    },
+                    "pool_block_exists": row.block_hash in pool_blocks,
+                    "cursor": [self._pending_cursor_stamp(row.created_at), row.block_hash],
+                }
+            )
+        return {"fetched": len(fetched), "returned": len(page), "rows": page}
 
     def _confirm_pool_block(
         self,
@@ -2704,6 +3271,8 @@ class FakePostgres:
                 {
                     "block_hash": row.block_hash,
                     "candidate": {"block_hash_hex": row.block_hash},
+                    "storage_version": row.storage_version,
+                    "candidate_sha256": row.candidate_sha256,
                     "pool_block_exists": row.block_hash in pool_blocks,
                     "cursor": [cursor_stamp, row.block_hash],
                 }
@@ -2735,10 +3304,25 @@ class FakePostgres:
         digest = str(payload["candidate_sha256"])
         existing = self._visible_outbox_row(transaction, block_hash)
         if existing is None:
+            body_id = payload.get("body_id")
+            if body_id is not None:
+                # A version-2 reference may point only at a sealed body with
+                # the same digest and block hash (#255).
+                body = self._visible_body(transaction, str(body_id))
+                if (
+                    body is None
+                    or body.state != "sealed"
+                    or body.candidate_sha256 != digest
+                    or body.block_hash != block_hash
+                ):
+                    return {"error": "block candidate body is not sealed"}
             transaction.staged_outbox[block_hash] = OutboxRow(
                 block_hash=block_hash,
                 candidate_sha256=digest,
                 created_at=self.clock.now(),
+                storage_version=1 if body_id is None else 2,
+                body_id=None if body_id is None else str(body_id),
+                header=payload.get("header"),
             )
             return {"inserted": 1, "state": "pending"}
         if existing.candidate_sha256 != digest:

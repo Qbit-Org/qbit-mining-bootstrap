@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lab.prism.share_ledger import LedgerOperationTimeout  # noqa: E402
 from tests.prism_concurrency_harness import (  # noqa: E402
+    LandingOp,
     LeaseHarness,
     assert_deterministic,
 )
@@ -100,7 +101,16 @@ def _park_a_fenced_write(harness: LeaseHarness, ledger: Any, block_hash: str) ->
             return ledger.persist_block_candidate_intent(_intent(block_hash))
 
     call = writer.submit(run, label=f"fenced-write:{block_hash[:4]}")
-    harness.run_until(writer, FENCED_WRITE_PRECOMMIT)
+    # Issue #255: the intent's body is staged and sealed first, in
+    # statements that hold no writer gate at all; only the final outbox
+    # insert is the fenced write this scenario parks. Run through the
+    # staging checkpoints until the parked statement is that insert.
+    for _ in range(64):
+        harness.run_until(writer, FENCED_WRITE_PRECOMMIT)
+        if harness.server.statements[-1].kind is LandingOp.OUTBOX_RECORD:
+            break
+    else:
+        raise AssertionError("the fenced outbox insert never reached its precommit")
     return writer, call
 
 

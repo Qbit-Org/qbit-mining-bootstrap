@@ -25,6 +25,54 @@ from pathlib import Path
 from threading import BoundedSemaphore, Lock, Thread, local
 from typing import Any, Callable, ClassVar, Iterator, Protocol, runtime_checkable
 
+from lab.prism.candidate_codec import (
+    CANDIDATE_BODY_STORAGE_VERSION,
+    INDEX_SPAN_ROWS,
+    LEGACY_CANDIDATE_STORAGE_VERSION,
+    CandidateBodyIntegrityError,
+    CandidateCodecError,
+    PreparedCandidateIntent,
+    SpoolCandidateBody,
+    SpoolFieldIndex,
+    prepare_candidate_intent,
+    prepared_intent_from_spool,
+    replay_header_from_fields,
+)
+from lab.prism.candidate_store import (
+    BODY_READ_MAX_CHUNKS,
+    DEFAULT_SPOOL_RESERVATION_BYTES,
+    HEADER_PAGE_MAX_BYTES,
+    HEADER_PAGE_MAX_ROWS,
+    JANITOR_CHUNKS_PER_STEP,
+    LEGACY_HELPER_MEMORY_BYTES,
+    LEGACY_HELPER_TIMEOUT_SECONDS,
+    STALE_STAGING_SECONDS,
+    CandidateBodyHydrator,
+    CandidateBodyRef,
+    CandidateBodyUnavailable,
+    CandidateHeaderPage,
+    CandidateStorageError,
+    IncompatibleCandidateSchema,
+    LegacyCandidateHelper,
+    LegacyTransport,
+    SpoolAdmission,
+    body_chunk_sql,
+    body_index_rows_sql,
+    body_manifest_sql,
+    body_page_sql,
+    body_pages_sql,
+    body_spans_sql,
+    header_page_sql,
+    parse_body_page,
+    parse_manifest_row,
+    new_body_id,
+    reap_retired_chunks_sql,
+    retire_orphan_bodies_sql,
+    retire_staging_body_sql,
+    schema_capability_sql,
+    seal_body_sql,
+    stage_body_sql,
+)
 from lab.prism.audit_artifacts import (
     AuditArtifactConfig,
     AuditArtifactStore,
@@ -1099,6 +1147,10 @@ class SingleWriterShareLedger:
     while moving storage to `qbit_share_ledger`.
     """
 
+    # Bodies live in memory here, so a replay header row is hydrated at
+    # registration; the PostgreSQL ledger defers hydration to dequeue (#255).
+    candidate_hydration_deferred: ClassVar[bool] = False
+
     def __init__(
         self,
         *,
@@ -1350,6 +1402,8 @@ class SingleWriterShareLedger:
             self._block_candidate_outbox[block_hash] = {
                 "block_hash": block_hash,
                 "share_id": None,
+                # Stored as handed in: a PreparedCandidateIntent keeps its
+                # immutable share sequence, never a list copy (#255).
                 "candidate": candidate,
                 "candidate_sha256": candidate_sha256,
                 "state": "pending",
@@ -1367,6 +1421,81 @@ class SingleWriterShareLedger:
             row["candidate"]
             for row in self.pending_block_candidate_rows(limit=limit)
         ]
+
+    def pending_block_candidate_headers(
+        self,
+        *,
+        limit: int = HEADER_PAGE_MAX_ROWS,
+        after_cursor: object | None = None,
+        max_bytes: int = HEADER_PAGE_MAX_BYTES,
+    ) -> CandidateHeaderPage:
+        """Metadata-first page over the in-memory outbox (#255).
+
+        Same total order, cursor and configured row limit as
+        ``pending_block_candidate_rows`` (so the query shape and the
+        short-page exhaustion proof match what a caller configured), but
+        each row carries only the bounded typed replay header. There is no
+        transport here, so the byte cap that bounds the PostgreSQL page's
+        native decode does not apply: an in-memory page is row-bounded only
+        and never reports a byte truncation.
+        """
+        limit = max(1, min(int(limit), HEADER_PAGE_MAX_ROWS))
+        if after_cursor is None:
+            fetched = self.pending_block_candidate_rows(limit=limit)
+        else:
+            fetched = self.pending_block_candidate_rows(
+                limit=limit,
+                after_cursor=after_cursor,
+            )
+        rows: list[dict[str, Any]] = []
+        truncated_by_bytes = False
+        for row in fetched[:limit]:
+            candidate = row["candidate"]
+            header = replay_header_from_fields(candidate)
+            header_bytes = len(json.dumps(header, separators=(",", ":"), default=str))
+            with self._lock:
+                stored = self._block_candidate_outbox.get(str(row["block_hash"]))
+            rows.append(
+                {
+                    "block_hash": str(row["block_hash"]),
+                    "storage_version": (
+                        CANDIDATE_BODY_STORAGE_VERSION
+                        if isinstance(candidate, PreparedCandidateIntent)
+                        else LEGACY_CANDIDATE_STORAGE_VERSION
+                    ),
+                    "candidate_sha256": (
+                        str(stored["candidate_sha256"]) if stored is not None else ""
+                    ),
+                    "header": header,
+                    "header_bytes": header_bytes,
+                    "body": None,
+                    "pool_block_exists": bool(row["pool_block_exists"]),
+                    "cursor": row["cursor"],
+                }
+            )
+        return CandidateHeaderPage(
+            rows=tuple(rows),
+            next_cursor=rows[-1]["cursor"] if rows else after_cursor,
+            exhausted=len(fetched) < limit and not truncated_by_bytes,
+            fetched=len(fetched),
+            truncated_by_bytes=truncated_by_bytes,
+        )
+
+    def hydrate_block_candidate_intent(
+        self,
+        row: dict[str, Any],
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> Any:
+        """Return the stored intent mapping for one still-pending header row."""
+        block_hash = str(row["block_hash"]).lower()
+        with self._lock:
+            stored = self._block_candidate_outbox.get(block_hash)
+            if stored is None or stored["state"] != "pending" or stored["candidate"] is None:
+                raise CandidateBodyUnavailable(
+                    f"block candidate {block_hash} is no longer pending"
+                )
+            return stored["candidate"]
 
     def pending_block_candidate_rows(
         self,
@@ -3416,9 +3545,23 @@ class PsqlShareLedger:
         audit_artifact_store: AuditArtifactStore | None = None,
         ctv_broadcast_attempt_detail_limit: int = DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT,
         ctv_broadcast_retry_backoff_seconds: int = DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS,
+        candidate_storage_version: int = CANDIDATE_BODY_STORAGE_VERSION,
+        candidate_spool_dir: str | Path | None = None,
+        candidate_spool_reservation_bytes: int = DEFAULT_SPOOL_RESERVATION_BYTES,
+        candidate_schema_path: Path | None = None,
+        legacy_candidate_helper_timeout_seconds: float = LEGACY_HELPER_TIMEOUT_SECONDS,
+        legacy_candidate_helper_memory_bytes: int = LEGACY_HELPER_MEMORY_BYTES,
     ):
         if writer_epoch < 0:
             raise ValueError("writer_epoch must be >= 0")
+        candidate_storage_version = int(candidate_storage_version)
+        if candidate_storage_version not in (
+            LEGACY_CANDIDATE_STORAGE_VERSION,
+            CANDIDATE_BODY_STORAGE_VERSION,
+        ):
+            raise ValueError(
+                f"unsupported candidate storage version {candidate_storage_version}"
+            )
         read_only = bool(read_only)
         if read_only and initialize_schema:
             raise ValueError("a read-only ledger cannot initialize the schema")
@@ -3565,6 +3708,24 @@ class PsqlShareLedger:
         # one: see _RefusingWriterGate. Read-slot traffic is unaffected.
         self._lock = _RefusingWriterGate() if read_only else Lock()
         self._read_semaphore = BoundedSemaphore(read_concurrency)
+        # Issue #255: chunked candidate bodies. Staging and hydration take
+        # this one-slot gate rather than the writer lock, because neither
+        # touches the lease row and both move body-sized data.
+        self._candidate_storage_version = candidate_storage_version
+        self._candidate_body_gate = BoundedSemaphore(1)
+        self._candidate_spool = SpoolAdmission(
+            candidate_spool_dir,
+            limit_bytes=int(candidate_spool_reservation_bytes),
+        )
+        self._candidate_schema_path = candidate_schema_path
+        self._legacy_candidate_helper = LegacyCandidateHelper(
+            LegacyTransport(
+                psql_command=psql_command,
+                database_url=database_url or database_url_from_psql_command(self._command),
+            ),
+            memory_limit_bytes=int(legacy_candidate_helper_memory_bytes),
+            timeout_seconds=float(legacy_candidate_helper_timeout_seconds),
+        )
         audit_share_segment_size = int(audit_share_segment_size)
         if audit_share_segment_size < 0:
             raise ValueError("audit_share_segment_size must be non-negative")
@@ -3634,6 +3795,14 @@ class PsqlShareLedger:
                 if initialize_schema:
                     path = schema_path or Path(__file__).resolve().parents[2] / "crates/qbit-prism/sql/001_share_ledger.sql"
                     self._run_script(path.read_text(encoding="utf-8"))
+                    # Additive #255 migration, applied after the base schema
+                    # on every start; every statement in it is idempotent.
+                    candidate_path = (
+                        candidate_schema_path
+                        or Path(__file__).resolve().parents[2]
+                        / "crates/qbit-prism/sql/002_candidate_bodies.sql"
+                    )
+                    self._run_script(candidate_path.read_text(encoding="utf-8"))
                 self._ensure_writer_lease()
         except BaseException:
             self.close()
@@ -4222,7 +4391,7 @@ END;
 
     def _append_batch_with_replay_outcomes(
         self,
-        entries: list[tuple[PendingShare, dict[str, Any] | None]],
+        entries: list[tuple[PendingShare, Any]],
     ) -> list[ShareReplayResult]:
         """Commit accepted shares and optional block intents in one transaction.
 
@@ -4233,9 +4402,28 @@ END;
         this method returns, which is the coordinator's Stratum ACK boundary.
         Each entry's outcome reports whether its row was ``inserted`` by this
         statement or was an ``exact_existing`` durable duplicate.
+
+        A batch with no candidate keeps the historical statement. A batch
+        carrying candidates takes the chunked-body route (#255) unless the
+        ledger was constructed in legacy storage mode, in which case the
+        candidate is materialized and written as the historical jsonb.
         """
         if not entries:
             return []
+        if any(candidate is not None for _, candidate in entries):
+            if self._candidate_storage_version_value() == CANDIDATE_BODY_STORAGE_VERSION:
+                return self._append_batch_with_replay_outcomes_v2(entries)
+            entries = [
+                (pending, self._legacy_candidate_document(candidate))
+                for pending, candidate in entries
+            ]
+        return self._append_batch_with_replay_outcomes_v1(entries)
+
+    def _append_batch_with_replay_outcomes_v1(
+        self,
+        entries: list[tuple[PendingShare, dict[str, Any] | None]],
+    ) -> list[ShareReplayResult]:
+        """The historical whole-jsonb batch statement (storage version 1)."""
         payloads: list[dict[str, Any]] = []
         share_ids: set[str] = set()
         block_hashes: set[str] = set()
@@ -4490,9 +4678,751 @@ END;
                 for payload, record in zip(records, parsed, strict=True)
             ]
 
+    # -- chunked candidate bodies (#255) -----------------------------------
+
+    def _candidate_storage_version_value(self) -> int:
+        return int(
+            getattr(self, "_candidate_storage_version", CANDIDATE_BODY_STORAGE_VERSION)
+        )
+
+    def _ensure_candidate_store_state(self) -> None:
+        """Backfill #255 state for ledgers built without ``__init__``."""
+        if not hasattr(self, "_candidate_body_gate"):
+            self._candidate_body_gate = BoundedSemaphore(1)
+        if not hasattr(self, "_candidate_spool"):
+            self._candidate_spool = SpoolAdmission()
+        if not hasattr(self, "_legacy_candidate_helper"):
+            command = getattr(self, "_command", None) or []
+            self._legacy_candidate_helper = LegacyCandidateHelper(
+                LegacyTransport(
+                    psql_command=" ".join(shlex.quote(part) for part in command) or None,
+                    database_url=database_url_from_psql_command(list(command)),
+                )
+            )
+
+    @staticmethod
+    def _legacy_candidate_document(candidate: Any) -> Any:
+        """Materialize an intent for the legacy whole-jsonb route only.
+
+        Storage version 1 is the compatibility/rollback mode; its statement
+        inlines the whole document, so the share sequence is copied here
+        and nowhere else.
+        """
+        if candidate is None or not isinstance(candidate, PreparedCandidateIntent):
+            return candidate
+        return {**candidate.facts, "shares_json": list(candidate.shares)}
+
+    def _writer_identity_payload(self) -> dict[str, Any]:
+        return {
+            "writer_id": self._writer_id,
+            "writer_epoch": int(self._writer_epoch),
+            "writer_session_token": self._writer_session_token,
+        }
+
+    def _observe_candidate_outbox_row(self, block_hash: str) -> dict[str, Any] | None:
+        """One read-slot snapshot of an outbox row's publication facts.
+
+        This is the version the precomparison binds to: ``state``,
+        ``share_id``, ``candidate_sha256``, ``storage_version`` and
+        ``body_id`` are re-asserted by the fenced statement, so any change
+        between this read and the commit fails that statement closed and
+        the caller redoes the comparison.
+        """
+        sql = f"""
+SELECT json_build_object(
+    'found', EXISTS (
+        SELECT 1 FROM qbit_block_candidate_outbox WHERE block_hash = {self._text_literal(block_hash)}
+    ),
+    'state', (SELECT state FROM qbit_block_candidate_outbox WHERE block_hash = {self._text_literal(block_hash)}),
+    'share_id', (SELECT share_id FROM qbit_block_candidate_outbox WHERE block_hash = {self._text_literal(block_hash)}),
+    'candidate_sha256', (SELECT candidate_sha256 FROM qbit_block_candidate_outbox WHERE block_hash = {self._text_literal(block_hash)}),
+    'storage_version', (SELECT storage_version FROM qbit_block_candidate_outbox WHERE block_hash = {self._text_literal(block_hash)}),
+    'body_id', (SELECT body_id FROM qbit_block_candidate_outbox WHERE block_hash = {self._text_literal(block_hash)}),
+    'body_state', (
+        SELECT body.state
+        FROM qbit_block_candidate_body body
+        JOIN qbit_block_candidate_outbox outbox ON outbox.body_id = body.body_id
+        WHERE outbox.block_hash = {self._text_literal(block_hash)}
+    )
+);
+"""
+        observed = self._run_attributed_read_json(
+            sql,
+            operation="observe_block_candidate_outbox_row",
+            gate=self._read_semaphore,
+            gate_name="read slot",
+        )
+        if not isinstance(observed, dict) or not observed.get("found"):
+            return None
+        return {
+            "state": str(observed.get("state")),
+            "share_id": (
+                None if observed.get("share_id") is None else str(observed["share_id"])
+            ),
+            "candidate_sha256": str(observed.get("candidate_sha256")),
+            "storage_version": int(observed.get("storage_version") or 1),
+            "body_id": (
+                None if observed.get("body_id") is None else str(observed["body_id"])
+            ),
+            "body_state": (
+                None if observed.get("body_state") is None else str(observed["body_state"])
+            ),
+        }
+
+    def verify_candidate_schema(self) -> dict[str, Any]:
+        """Refuse a database whose candidate storage is newer than this code.
+
+        Reads what the schema declares (``qbit_prism_schema_capabilities``)
+        and whether the chunked-body tables exist. A declared storage
+        version above the one this process understands raises
+        :class:`IncompatibleCandidateSchema`; a ledger configured for
+        version-2 writes against a database without the migration raises
+        too, before any candidate is staged. Cached after the first
+        successful check; the coordinator also calls it at boot.
+        """
+        cached = getattr(self, "_candidate_schema_verified", None)
+        if cached is not None:
+            return cached
+        presence = self._run_json(
+            """
+SELECT json_build_object(
+    'has_body_table', to_regclass('qbit_block_candidate_body') IS NOT NULL,
+    'has_capabilities', to_regclass('qbit_prism_schema_capabilities') IS NOT NULL
+);
+"""
+        )
+        has_body_table = bool(isinstance(presence, dict) and presence.get("has_body_table"))
+        declared: int | None = None
+        if isinstance(presence, dict) and presence.get("has_capabilities"):
+            capability = self._run_json(schema_capability_sql())
+            if isinstance(capability, dict) and capability.get("declared") is not None:
+                declared = int(capability["declared"])
+        if declared is not None and declared > CANDIDATE_BODY_STORAGE_VERSION:
+            raise IncompatibleCandidateSchema(
+                f"database declares candidate storage version {declared}; this "
+                f"process understands up to {CANDIDATE_BODY_STORAGE_VERSION} and "
+                "must not write to it (rollback floor)"
+            )
+        if (
+            self._candidate_storage_version_value() == CANDIDATE_BODY_STORAGE_VERSION
+            and not has_body_table
+        ):
+            raise IncompatibleCandidateSchema(
+                "candidate storage version 2 is configured but the database has "
+                "no qbit_block_candidate_body table; apply 002_candidate_bodies.sql "
+                "(PRISM_POSTGRES_INIT_SCHEMA=1) or run with "
+                "PRISM_CANDIDATE_STORAGE_VERSION=1"
+            )
+        verdict = {"declared": declared, "has_body_table": has_body_table}
+        self._candidate_schema_verified = verdict
+        return verdict
+
+    def stage_candidate_body(self, prepared: PreparedCandidateIntent) -> str:
+        """Upload and seal one immutable body; returns its ``body_id``.
+
+        Runs under the one-slot body gate, never the writer lock: staging
+        touches no lease row and grants no credit. One statement per chunk
+        (each bounded by the chunk size), index rows in batches of at most
+        256 pages / 64 spans, then one seal statement that locks the
+        manifest, proves completeness from the rows and re-hashes every
+        chunk on the server. A failure retires the staging manifest so the
+        janitor reclaims it. The schema-capability refusal runs at
+        coordinator boot (``verify_candidate_schema``), not here.
+        """
+        self._ensure_candidate_store_state()
+        manifest = prepared.manifest
+        body_id = new_body_id()
+        identity = self._writer_identity_payload()
+        with self._operation_gate(self._candidate_body_gate, "candidate body slot"):
+            staged = self._run_json(
+                stage_body_sql(
+                    {
+                        **manifest.to_json(),
+                        "body_id": body_id,
+                        "block_hash": prepared.block_hash,
+                        **identity,
+                    },
+                    jsonb=self._jsonb_literal,
+                )
+            )
+            if not isinstance(staged, dict) or staged.get("state") != "staging":
+                raise CandidateStorageError(
+                    f"candidate body staging was not created: {staged!r}"
+                )
+            try:
+                pending_spans: list[dict[str, Any]] = []
+
+                def flush_index(spans: list[dict[str, Any]], pages: list[list[Any]]) -> None:
+                    if not spans and not pages:
+                        return
+                    outcome = self._run_json(
+                        body_index_rows_sql(
+                            {"body_id": body_id, **identity, "spans": spans, "pages": pages},
+                            jsonb=self._jsonb_literal,
+                        )
+                    )
+                    if not isinstance(outcome, dict) or not outcome.get("owned"):
+                        raise CandidateStorageError(
+                            "candidate body staging lost its producer session"
+                        )
+
+                def upload(chunk: Any) -> None:
+                    outcome = self._run_json(
+                        body_chunk_sql(
+                            {
+                                "body_id": body_id,
+                                "ordinal": chunk.ordinal,
+                                "chunk_sha256": chunk.sha256,
+                                "length": len(chunk.data),
+                                **identity,
+                            },
+                            chunk.data,
+                            jsonb=self._jsonb_literal,
+                        )
+                    )
+                    if not isinstance(outcome, dict) or not outcome.get("owned"):
+                        raise CandidateStorageError(
+                            "candidate body staging lost its producer session"
+                        )
+
+                def on_span(span: Any) -> None:
+                    pending_spans.append(span.to_json())
+                    if len(pending_spans) >= INDEX_SPAN_ROWS:
+                        flush_index(list(pending_spans), [])
+                        pending_spans.clear()
+
+                def on_page(batch: Any) -> None:
+                    flush_index(
+                        [],
+                        [
+                            [entry.field, entry.ordinal, entry.offset, entry.record_index]
+                            for entry in batch
+                        ],
+                    )
+
+                prepared.body.write_chunks(upload, on_span=on_span, on_page=on_page)
+                flush_index(list(pending_spans), [])
+                pending_spans.clear()
+                sealed = self._run_json(
+                    seal_body_sql(
+                        {
+                            "body_id": body_id,
+                            "candidate_sha256": manifest.candidate_sha256,
+                            **identity,
+                        },
+                        jsonb=self._jsonb_literal,
+                    )
+                )
+                if not isinstance(sealed, dict) or int(sealed.get("sealed", 0)) != 1:
+                    raise CandidateStorageError(
+                        f"candidate body could not be sealed: {sealed!r}"
+                    )
+            except BaseException:
+                self._retire_staging_body(body_id)
+                raise
+        return body_id
+
+    def _retire_staging_body(self, body_id: str) -> None:
+        """Best-effort: hand a failed staging body to the janitor."""
+        try:
+            self._run_json(retire_staging_body_sql(body_id, text=self._text_literal))
+        except Exception:  # noqa: BLE001 - the janitor retires stale staging anyway
+            pass
+
+    def compare_candidate_body(
+        self,
+        body_id: str,
+        prepared: PreparedCandidateIntent,
+    ) -> bool:
+        """The historical content comparator for a stored chunked body.
+
+        Historically an existing row was accepted only when its identity
+        digest matched *and* its normalized jsonb equalled the new intent's.
+        The caller has already matched the digest; this is the second
+        check, kept as a comparison of content rather than of any digest:
+
+        1. the actual stored bytes are read back one bounded page at a time
+           (at most three chunks per statement) and compared with our
+           re-encoded bytes chunk by chunk, holding one page at a time;
+        2. if the bytes differ, the normalized jsonb-equivalence fallback
+           runs in the isolated helper (numeric and key-order differences
+           that jsonb treats as equal), exactly the equality PostgreSQL
+           applied to the two jsonb documents before.
+
+        A forced digest collision between distinct documents is therefore
+        rejected here, and a jsonb-equivalent retry with a different
+        encoding still passes. The result is bound to the body version the
+        fenced statement re-asserts (compare-and-swap).
+        """
+        self._ensure_candidate_store_state()
+        manifest_row = self.read_candidate_body_manifest(body_id)
+        try:
+            manifest, state, _referenced = parse_manifest_row(manifest_row)
+        except (CandidateBodyUnavailable, CandidateBodyIntegrityError):
+            return False
+        if state != "sealed":
+            return False
+        bytes_equal = (
+            manifest.byte_count == prepared.manifest.byte_count
+            and manifest.chunk_count == prepared.manifest.chunk_count
+        )
+        if bytes_equal:
+
+            class _Mismatch(Exception):
+                pass
+
+            page: dict[int, bytes] = {}
+
+            def consumer(chunk: Any) -> None:
+                if chunk.ordinal not in page:
+                    page.clear()
+                    page_state, _referenced, stored = parse_body_page(
+                        self.read_candidate_body_page(body_id, chunk.ordinal, BODY_READ_MAX_CHUNKS),
+                        max_chunks=BODY_READ_MAX_CHUNKS,
+                    )
+                    if page_state != "sealed":
+                        raise _Mismatch()
+                    for entry in stored:
+                        page[entry.ordinal] = entry.data
+                stored_bytes = page.get(chunk.ordinal)
+                if stored_bytes is None or stored_bytes != chunk.data:
+                    raise _Mismatch()
+
+            try:
+                prepared.body.write_chunks(consumer)
+            except _Mismatch:
+                bytes_equal = False
+        if bytes_equal:
+            return True
+        return bool(
+            self._legacy_candidate_helper.compare_stored_body(
+                body_id, prepared.block_hash, prepared.body
+            )
+        )
+
+    def read_candidate_body_manifest(self, body_id: str) -> Any:
+        return self._run_attributed_read_json(
+            body_manifest_sql(body_id, text=self._text_literal),
+            operation="read_block_candidate_body_manifest",
+            gate=self._read_semaphore,
+            gate_name="read slot",
+        )
+
+    def read_candidate_body_spans(self, body_id: str, after_field: str | None) -> Any:
+        return self._run_attributed_read_json(
+            body_spans_sql(body_id, after_field, text=self._text_literal),
+            operation="read_block_candidate_body_spans",
+            gate=self._read_semaphore,
+            gate_name="read slot",
+        )
+
+    def read_candidate_body_pages(self, body_id: str, field_name: str, from_ordinal: int) -> Any:
+        return self._run_attributed_read_json(
+            body_pages_sql(body_id, field_name, from_ordinal, text=self._text_literal),
+            operation="read_block_candidate_body_pages",
+            gate=self._read_semaphore,
+            gate_name="read slot",
+        )
+
+    def read_candidate_body_page(self, body_id: str, from_ordinal: int, max_chunks: int) -> Any:
+        return self._run_attributed_read_json(
+            body_page_sql(body_id, from_ordinal, max_chunks, text=self._text_literal),
+            operation="read_block_candidate_body_page",
+            gate=self._read_semaphore,
+            gate_name="read slot",
+        )
+
+    def _bind_candidate_publication(
+        self,
+        prepared: PreparedCandidateIntent,
+        share_id: str,
+    ) -> dict[str, Any]:
+        """Precompare and stage outside the lease-row critical section.
+
+        Returns the observed version the fenced statement must find
+        unchanged. A missing row means the body is staged and sealed now; an
+        existing row is compared exactly -- digest, share linkage, and for a
+        pending row the full body (server chunk re-hash for a chunked body,
+        the isolated compatibility helper for a legacy jsonb body). Terminal
+        rows compare on digest and linkage only, exactly as the historical
+        statement did once their payload had been deleted.
+        """
+        observed = self._observe_candidate_outbox_row(prepared.block_hash)
+        if observed is None:
+            return {
+                "found": False,
+                "state": None,
+                "share_id": None,
+                "storage_version": None,
+                "body_id": self.stage_candidate_body(prepared),
+            }
+        if observed["candidate_sha256"] != prepared.candidate_sha256:
+            raise RuntimeError("block candidate payload mismatch")
+        if observed["share_id"] is not None and observed["share_id"] != share_id:
+            raise RuntimeError("block candidate payload mismatch")
+        if observed["state"] == "pending":
+            if observed["storage_version"] == CANDIDATE_BODY_STORAGE_VERSION:
+                if observed["body_id"] is None or not self.compare_candidate_body(
+                    observed["body_id"], prepared
+                ):
+                    raise RuntimeError("block candidate payload mismatch")
+            else:
+                self._ensure_candidate_store_state()
+                if not self._legacy_candidate_helper.compare(
+                    prepared.block_hash, prepared.body
+                ):
+                    raise RuntimeError("block candidate payload mismatch")
+        return {
+            "found": True,
+            "state": observed["state"],
+            "share_id": observed["share_id"],
+            "storage_version": observed["storage_version"],
+            "body_id": observed["body_id"],
+        }
+
+    def _append_batch_with_replay_outcomes_v2(
+        self,
+        entries: list[tuple[PendingShare, Any]],
+    ) -> list[ShareReplayResult]:
+        """Chunked-body batch: stage outside the fence, publish inside it.
+
+        Same lease fence, durability setting, share comparator, ordering
+        and ACK boundary as the historical statement. The candidate half
+        differs only in *where* body-sized work happens: precomparison and
+        staging run before the writer gate is taken, and the fenced
+        statement re-asserts the observed row version (compare-and-swap)
+        and requires a sealed manifest carrying the same digest before it
+        publishes a reference. If the version moved, nothing is committed
+        and the whole bind/publish is redone under the same call.
+        """
+        prepared_entries: list[tuple[PendingShare, PreparedCandidateIntent | None]] = []
+        share_ids: set[str] = set()
+        block_hashes: set[str] = set()
+        for pending, candidate in entries:
+            if pending.share_difficulty <= 0:
+                raise ValueError("share_difficulty must be positive")
+            if pending.network_difficulty <= 0:
+                raise ValueError("network_difficulty must be positive")
+            if pending.share_id in share_ids:
+                raise ValueError("duplicate share_id in append batch")
+            share_ids.add(pending.share_id)
+            prepared: PreparedCandidateIntent | None = None
+            if candidate is not None:
+                prepared = prepare_candidate_intent(candidate)
+                if prepared.block_hash in block_hashes:
+                    raise ValueError("duplicate block candidate in append batch")
+                block_hashes.add(prepared.block_hash)
+            prepared_entries.append((pending, prepared))
+        attempts = 0
+        while True:
+            attempts += 1
+            payloads: list[dict[str, Any]] = []
+            for pending, prepared in prepared_entries:
+                candidate_payload: dict[str, Any] | None = None
+                if prepared is not None:
+                    candidate_payload = {
+                        "block_hash_hex": prepared.block_hash,
+                        "candidate_sha256": prepared.candidate_sha256,
+                        "header": prepared.replay_header(),
+                        "expected": self._bind_candidate_publication(
+                            prepared, pending.share_id
+                        ),
+                    }
+                    candidate_payload["body_id"] = candidate_payload["expected"]["body_id"]
+                payloads.append(
+                    {
+                        "share": {
+                            **pending.__dict__,
+                            "credit_policy": validate_credit_policy(pending.credit_policy),
+                        },
+                        "candidate": candidate_payload,
+                    }
+                )
+            outcome = self._publish_candidate_batch(payloads, len(prepared_entries))
+            if outcome is not None:
+                return outcome
+            if attempts >= 3:
+                raise RuntimeError(
+                    "block candidate outbox changed repeatedly during publication"
+                )
+
+    def _publish_candidate_batch(
+        self,
+        payloads: list[dict[str, Any]],
+        expected_count: int,
+    ) -> list[ShareReplayResult] | None:
+        payload = {"entries": payloads, **self._writer_identity_payload()}
+        sql = f"""
+WITH input AS (
+    SELECT
+        {self._jsonb_literal(payload)} AS root,
+        set_config('synchronous_commit', 'on', true) AS durability
+),
+payload AS (
+    SELECT
+        item->'share' AS data,
+        NULLIF(item->'candidate', 'null'::jsonb) AS candidate,
+        ordinality
+    FROM input,
+         jsonb_array_elements(root->'entries') WITH ORDINALITY AS rows(item, ordinality)
+),
+lease AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    FROM input
+    WHERE qbit_ledger_writer_lease.singleton
+      AND qbit_ledger_writer_lease.writer_id = root->>'writer_id'
+      AND qbit_ledger_writer_lease.writer_epoch = (root->>'writer_epoch')::bigint
+      AND qbit_ledger_writer_lease.writer_session_token = root->>'writer_session_token'
+    RETURNING qbit_ledger_writer_lease.writer_id
+),
+share_mismatch AS (
+    SELECT data->>'share_id' AS share_id
+    FROM payload
+    JOIN qbit_share_ledger ledger ON ledger.share_id = data->>'share_id'
+    WHERE ledger.miner_id IS DISTINCT FROM data->>'miner_id'
+       OR ledger.payout_order_key IS DISTINCT FROM data->>'order_key'
+       OR ledger.p2mr_program IS DISTINCT FROM decode(data->>'p2mr_program_hex', 'hex')
+       OR ledger.share_difficulty IS DISTINCT FROM (data->>'share_difficulty')::numeric
+       OR ledger.network_difficulty IS DISTINCT FROM (data->>'network_difficulty')::numeric
+       OR ledger.template_height IS DISTINCT FROM (data->>'template_height')::bigint
+       OR ledger.job_id IS DISTINCT FROM data->>'job_id'
+       OR ledger.job_issued_at IS DISTINCT FROM to_timestamp((data->>'job_issued_at_ms')::double precision / 1000.0)
+       OR ledger.ntime IS DISTINCT FROM (data->>'ntime')::bigint
+       OR ledger.credit_policy IS DISTINCT FROM data->>'credit_policy'
+),
+candidate_mismatch AS (
+    -- Compare-and-swap against the version the precomparison observed.
+    SELECT payload.candidate->>'block_hash_hex' AS block_hash
+    FROM payload
+    LEFT JOIN qbit_block_candidate_outbox outbox
+      ON outbox.block_hash = payload.candidate->>'block_hash_hex'
+    WHERE payload.candidate IS NOT NULL
+      AND (
+          (outbox.block_hash IS NOT NULL) IS DISTINCT FROM (payload.candidate->'expected'->>'found')::boolean
+          OR (
+              outbox.block_hash IS NOT NULL
+              AND (
+                  outbox.state IS DISTINCT FROM payload.candidate->'expected'->>'state'
+                  OR outbox.share_id IS DISTINCT FROM payload.candidate->'expected'->>'share_id'
+                  OR outbox.candidate_sha256 IS DISTINCT FROM payload.candidate->>'candidate_sha256'
+                  OR outbox.storage_version IS DISTINCT FROM (payload.candidate->'expected'->>'storage_version')::integer
+                  OR outbox.body_id IS DISTINCT FROM payload.candidate->'expected'->>'body_id'
+                  OR (outbox.share_id IS NOT NULL AND outbox.share_id IS DISTINCT FROM payload.data->>'share_id')
+              )
+          )
+      )
+),
+candidate_unsealed AS (
+    -- A new reference may point only at a complete sealed body with the
+    -- same digest and block hash.
+    SELECT payload.candidate->>'block_hash_hex' AS block_hash
+    FROM payload
+    WHERE payload.candidate IS NOT NULL
+      AND NOT (payload.candidate->'expected'->>'found')::boolean
+      AND NOT EXISTS (
+          SELECT 1
+          FROM qbit_block_candidate_body body
+          WHERE body.body_id = payload.candidate->>'body_id'
+            AND body.state = 'sealed'
+            AND body.candidate_sha256 = payload.candidate->>'candidate_sha256'
+            AND body.block_hash = payload.candidate->>'block_hash_hex'
+      )
+),
+candidate_states AS (
+    SELECT
+        payload.ordinality,
+        CASE
+            WHEN payload.candidate IS NULL THEN NULL
+            ELSE COALESCE(outbox.state, 'pending')
+        END AS candidate_outbox_state
+    FROM payload
+    LEFT JOIN qbit_block_candidate_outbox outbox
+      ON outbox.block_hash = payload.candidate->>'block_hash_hex'
+),
+batch_ok AS (
+    SELECT 1 AS ok
+    WHERE EXISTS (SELECT 1 FROM lease)
+      AND NOT EXISTS (SELECT 1 FROM share_mismatch)
+      AND NOT EXISTS (SELECT 1 FROM candidate_mismatch)
+      AND NOT EXISTS (SELECT 1 FROM candidate_unsealed)
+),
+inserted_shares AS (
+    INSERT INTO qbit_share_ledger (
+        share_id, miner_id, payout_order_key, p2mr_program,
+        share_difficulty, network_difficulty, template_height, job_id,
+        job_issued_at, ntime, accepted_at, credit_policy, accepted,
+        writer_id, writer_epoch
+    )
+    SELECT
+        data->>'share_id', data->>'miner_id', data->>'order_key',
+        decode(data->>'p2mr_program_hex', 'hex'),
+        (data->>'share_difficulty')::numeric,
+        (data->>'network_difficulty')::numeric,
+        (data->>'template_height')::bigint, data->>'job_id',
+        to_timestamp((data->>'job_issued_at_ms')::double precision / 1000.0),
+        (data->>'ntime')::bigint,
+        to_timestamp((data->>'accepted_at_ms')::double precision / 1000.0),
+        data->>'credit_policy', true, root->>'writer_id',
+        (root->>'writer_epoch')::bigint
+    FROM payload, input, batch_ok
+    WHERE NOT EXISTS (
+        SELECT 1 FROM qbit_share_ledger existing
+        WHERE existing.share_id = payload.data->>'share_id'
+    )
+    ORDER BY payload.ordinality
+    ON CONFLICT (share_id) DO NOTHING
+    RETURNING qbit_share_ledger.*
+),
+inserted_candidates AS (
+    INSERT INTO qbit_block_candidate_outbox (
+        block_hash, share_id, candidate, candidate_sha256,
+        storage_version, body_id, replay_header, parent_hash, expected_height
+    )
+    SELECT
+        payload.candidate->>'block_hash_hex', payload.data->>'share_id',
+        NULL, payload.candidate->>'candidate_sha256',
+        {CANDIDATE_BODY_STORAGE_VERSION}, payload.candidate->>'body_id',
+        payload.candidate->'header',
+        payload.candidate->'header'->>'parent_hash',
+        NULLIF(payload.candidate->'header'->>'expected_height', '')::bigint
+    FROM payload, batch_ok
+    WHERE payload.candidate IS NOT NULL
+      AND NOT (payload.candidate->'expected'->>'found')::boolean
+    ON CONFLICT (block_hash) DO UPDATE
+    SET share_id = EXCLUDED.share_id,
+        updated_at = clock_timestamp()
+    WHERE qbit_block_candidate_outbox.share_id IS NULL
+      AND qbit_block_candidate_outbox.state = 'pending'
+      AND qbit_block_candidate_outbox.candidate_sha256 = EXCLUDED.candidate_sha256
+    RETURNING block_hash
+),
+linked_candidates AS (
+    -- Credit-on-accept: the standalone intent already published this body;
+    -- the share joins the same identity without re-uploading anything.
+    UPDATE qbit_block_candidate_outbox
+    SET share_id = payload.data->>'share_id',
+        updated_at = clock_timestamp()
+    FROM payload, batch_ok
+    WHERE payload.candidate IS NOT NULL
+      AND (payload.candidate->'expected'->>'found')::boolean
+      AND qbit_block_candidate_outbox.block_hash = payload.candidate->>'block_hash_hex'
+      AND qbit_block_candidate_outbox.share_id IS NULL
+      AND qbit_block_candidate_outbox.state = 'pending'
+      AND qbit_block_candidate_outbox.candidate_sha256 = payload.candidate->>'candidate_sha256'
+    RETURNING qbit_block_candidate_outbox.block_hash
+),
+records AS (
+    SELECT
+        ledger.*, payload.ordinality, false AS newly_inserted,
+        false AS new_miner, candidate_states.candidate_outbox_state
+    FROM payload
+    JOIN qbit_share_ledger ledger ON ledger.share_id = payload.data->>'share_id'
+    JOIN candidate_states ON candidate_states.ordinality = payload.ordinality
+    UNION ALL
+    SELECT
+        inserted_shares.*, payload.ordinality, true AS newly_inserted,
+        NOT EXISTS (
+            SELECT 1
+            FROM qbit_share_ledger existing_miner
+            WHERE existing_miner.accepted
+              AND existing_miner.miner_id = inserted_shares.miner_id
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM inserted_shares earlier_insert
+            WHERE earlier_insert.miner_id = inserted_shares.miner_id
+              AND earlier_insert.share_seq < inserted_shares.share_seq
+        ) AS new_miner,
+        candidate_states.candidate_outbox_state
+    FROM inserted_shares
+    JOIN payload ON payload.data->>'share_id' = inserted_shares.share_id
+    JOIN candidate_states ON candidate_states.ordinality = payload.ordinality
+)
+SELECT CASE
+    WHEN NOT EXISTS (SELECT 1 FROM lease) THEN
+        json_build_object('error', 'writer lease is not active')
+    WHEN EXISTS (SELECT 1 FROM share_mismatch) THEN
+        json_build_object(
+            'error', 'duplicate share_id payload mismatch',
+            'error_kind', 'share_replay_conflict',
+            'share_ids', (SELECT json_agg(share_id ORDER BY share_id) FROM share_mismatch)
+        )
+    WHEN EXISTS (SELECT 1 FROM candidate_mismatch) THEN
+        json_build_object(
+            'error', 'block candidate outbox changed during publication',
+            'error_kind', 'candidate_version_changed',
+            'block_hashes', (SELECT json_agg(block_hash ORDER BY block_hash) FROM candidate_mismatch)
+        )
+    WHEN EXISTS (SELECT 1 FROM candidate_unsealed) THEN
+        json_build_object(
+            'error', 'block candidate body is not sealed',
+            'error_kind', 'candidate_body_unsealed',
+            'block_hashes', (SELECT json_agg(block_hash ORDER BY block_hash) FROM candidate_unsealed)
+        )
+    ELSE json_build_object(
+        'records', (
+            SELECT json_agg(json_build_object(
+                'share_seq', records.share_seq,
+                'share_id', records.share_id,
+                'miner_id', records.miner_id,
+                'order_key', records.payout_order_key,
+                'p2mr_program_hex', encode(records.p2mr_program, 'hex'),
+                'share_difficulty', records.share_difficulty::text,
+                'network_difficulty', records.network_difficulty::text,
+                'template_height', records.template_height,
+                'job_id', records.job_id,
+                'job_issued_at_ms', round(extract(epoch FROM records.job_issued_at) * 1000)::bigint,
+                'accepted_at_ms', round(extract(epoch FROM records.accepted_at) * 1000)::bigint,
+                'ntime', records.ntime,
+                'credit_policy', records.credit_policy,
+                'newly_inserted', records.newly_inserted,
+                'new_miner', records.new_miner,
+                'candidate_outbox_state', records.candidate_outbox_state
+            ) ORDER BY records.ordinality)
+            FROM records
+        )
+    )
+END;
+"""
+        with self._operation_gate(self._lock, "writer lock"):
+            result = self._run_json(sql)
+            if "error" in result:
+                if result.get("error_kind") == "share_replay_conflict":
+                    raise ShareReplayConflict(str(result["error"]))
+                if result.get("error_kind") == "candidate_version_changed":
+                    return None
+                raise RuntimeError(str(result["error"]))
+            records = result.get("records")
+            if not isinstance(records, list) or len(records) != expected_count:
+                raise RuntimeError("Postgres share batch returned an incomplete result")
+            parsed = [self._record_from_json(record) for record in records]
+            committed = sorted(
+                zip(records, parsed, strict=True),
+                key=lambda item: item[1].share_seq,
+            )
+            for record_payload, record in committed:
+                if bool(record_payload.get("newly_inserted", True)):
+                    self._note_appended_share(
+                        record,
+                        new_miner=bool(record_payload.get("new_miner", False)),
+                    )
+            return [
+                ShareReplayResult(
+                    (
+                        "inserted"
+                        if bool(record_payload.get("newly_inserted", True))
+                        else "exact_existing"
+                    ),
+                    record,
+                )
+                for record_payload, record in zip(records, parsed, strict=True)
+            ]
+
     def append_batch(
         self,
-        entries: list[tuple[PendingShare, dict[str, Any] | None]],
+        entries: list[tuple[PendingShare, Any]],
     ) -> list[AcceptedShareRecord]:
         return [
             outcome.record
@@ -4508,9 +5438,332 @@ END;
 
     def persist_block_candidate_intent(
         self,
+        candidate: Any,
+    ) -> BlockCandidateIntentPersistResult:
+        """Persist candidate work that is not yet eligible for share credit.
+
+        Historically only the identity digest is compared against an
+        existing row, and that is preserved. The chunked route stages and
+        seals the body outside the writer gate first; the fenced insert then
+        publishes a reference only when a sealed manifest with the same
+        digest and block hash exists, and leaves a colliding row alone.
+        """
+        if not isinstance(candidate, PreparedCandidateIntent):
+            if not isinstance(candidate, dict):
+                raise TypeError("block candidate intent must be an object")
+            if not str(candidate.get("block_hash_hex", "")).lower():
+                raise ValueError("block candidate is missing block_hash_hex")
+        if self._candidate_storage_version_value() != CANDIDATE_BODY_STORAGE_VERSION:
+            return self._persist_block_candidate_intent_v1(
+                self._legacy_candidate_document(candidate)
+            )
+        try:
+            prepared = prepare_candidate_intent(candidate)
+        except CandidateCodecError as exc:
+            raise ValueError(str(exc)) from exc
+        block_hash = prepared.block_hash
+        candidate_sha256 = prepared.candidate_sha256
+        observed = self._observe_candidate_outbox_row(block_hash)
+        if observed is not None:
+            if observed["candidate_sha256"] != candidate_sha256:
+                raise RuntimeError("block candidate payload mismatch")
+            return BlockCandidateIntentPersistResult(
+                inserted=False,
+                state=observed["state"],
+            )
+        body_id = self.stage_candidate_body(prepared)
+        header = prepared.replay_header()
+        sql = f"""
+WITH durability AS (
+    SELECT set_config('synchronous_commit', 'on', true)
+),
+lease AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    FROM durability
+    WHERE singleton
+      AND writer_id = {self._text_literal(self._writer_id)}
+      AND writer_epoch = {int(self._writer_epoch)}
+      AND writer_session_token = {self._text_literal(self._writer_session_token)}
+    RETURNING writer_id
+),
+existing AS (
+    SELECT candidate_sha256, state
+    FROM qbit_block_candidate_outbox
+    WHERE block_hash = {self._text_literal(block_hash)}
+),
+sealed_body AS (
+    SELECT body_id
+    FROM qbit_block_candidate_body
+    WHERE body_id = {self._text_literal(body_id)}
+      AND state = 'sealed'
+      AND candidate_sha256 = {self._text_literal(candidate_sha256)}
+      AND block_hash = {self._text_literal(block_hash)}
+),
+inserted AS (
+    INSERT INTO qbit_block_candidate_outbox (
+        block_hash, share_id, candidate, candidate_sha256,
+        storage_version, body_id, replay_header, parent_hash, expected_height
+    )
+    SELECT
+        {self._text_literal(block_hash)}, NULL, NULL,
+        {self._text_literal(candidate_sha256)},
+        {CANDIDATE_BODY_STORAGE_VERSION}, sealed_body.body_id,
+        {self._jsonb_literal(header)},
+        {self._jsonb_literal(header)}->>'parent_hash',
+        NULLIF({self._jsonb_literal(header)}->>'expected_height', '')::bigint
+    FROM lease, sealed_body
+    WHERE NOT EXISTS (SELECT 1 FROM existing)
+    ON CONFLICT (block_hash) DO NOTHING
+    RETURNING block_hash
+)
+SELECT CASE
+    WHEN NOT EXISTS (SELECT 1 FROM lease) THEN
+        json_build_object('error', 'writer lease is not active')
+    WHEN EXISTS (
+        SELECT 1 FROM existing
+        WHERE candidate_sha256 <> {self._text_literal(candidate_sha256)}
+    ) THEN
+        json_build_object('error', 'block candidate payload mismatch')
+    WHEN NOT EXISTS (SELECT 1 FROM existing) AND NOT EXISTS (SELECT 1 FROM sealed_body) THEN
+        json_build_object('error', 'block candidate body is not sealed')
+    ELSE
+        json_build_object(
+            'inserted', (SELECT count(*) FROM inserted),
+            'state', COALESCE((SELECT state FROM existing), 'pending')
+        )
+END;
+"""
+        result = self._run_fenced_json(sql)
+        if "error" in result:
+            raise RuntimeError(str(result["error"]))
+        return BlockCandidateIntentPersistResult(
+            inserted=int(result.get("inserted", 0)) > 0,
+            state=str(result.get("state", "pending")),
+        )
+
+    def pending_block_candidate_headers(
+        self,
+        *,
+        limit: int = HEADER_PAGE_MAX_ROWS,
+        after_cursor: object | None = None,
+        max_bytes: int = HEADER_PAGE_MAX_BYTES,
+    ) -> CandidateHeaderPage:
+        """Metadata-first pending page (#255): typed headers, explicit exhaustion.
+
+        Same keyset, order, cursor precision and read-slot gating as
+        ``pending_block_candidate_rows``; what differs is what one row
+        carries (a fixed projection of the replay header plus the body
+        reference, never the candidate) and what the page proves: the
+        statement fetches one row beyond the row cap, so ``exhausted`` is
+        answered by the outbox, and a page cut short by the byte cap is
+        reported as such rather than mistaken for the end.
+        """
+        limit = max(1, min(int(limit), HEADER_PAGE_MAX_ROWS))
+        cursor_parts: tuple[str, str] | None = None
+        if after_cursor is not None:
+            created_at_text, cursor_block_hash = _block_candidate_cursor_parts(after_cursor)
+            if not isinstance(created_at_text, str):
+                raise ValueError("pending block candidate cursor has no creation stamp")
+            cursor_parts = (created_at_text, cursor_block_hash)
+        sql = header_page_sql(limit, cursor_parts, max_bytes, text=self._text_literal)
+        read_gate = getattr(self, "_read_semaphore", None)
+        if read_gate is None:
+            # A ledger built without __init__ (focused tests) has no read
+            # slot; the statement itself is what those tests observe.
+            result = self._run_retry_safe_read_json(sql)
+        else:
+            result = self._run_attributed_read_json(
+                sql,
+                operation="pending_block_candidate_headers",
+                gate=read_gate,
+                gate_name="read slot",
+            )
+        if not isinstance(result, dict) or not isinstance(result.get("rows"), list):
+            raise RuntimeError("pending block candidate header page is malformed")
+        rows: list[dict[str, Any]] = []
+        for row in result["rows"]:
+            if not isinstance(row, dict) or "pool_block_exists" not in row:
+                raise RuntimeError(
+                    "pending block candidate header row is missing pool block existence"
+                )
+            row["pool_block_exists"] = bool(row["pool_block_exists"])
+            row["storage_version"] = int(row.get("storage_version") or 1)
+            rows.append(row)
+        fetched = int(result.get("fetched", len(rows)))
+        returned = int(result.get("returned", len(rows)))
+        truncated_by_bytes = returned < min(fetched, limit)
+        return CandidateHeaderPage(
+            rows=tuple(rows),
+            next_cursor=rows[-1]["cursor"] if rows else after_cursor,
+            exhausted=fetched <= limit and not truncated_by_bytes,
+            fetched=fetched,
+            truncated_by_bytes=truncated_by_bytes,
+        )
+
+    def hydrate_block_candidate_intent(
+        self,
+        row: dict[str, Any],
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> PreparedCandidateIntent:
+        """Materialize one header row's body to a spool and return the intent.
+
+        Storage version 2 reads bounded chunk pages through the read slot,
+        verifying manifest state, referencing outbox row and every chunk
+        digest as it goes. Storage version 1 delegates the unavoidable
+        whole-document decode to the isolated compatibility helper, which
+        writes the spool itself. Neither path holds the writer gate.
+        """
+        self._ensure_candidate_store_state()
+        block_hash = str(row["block_hash"]).lower()
+        header = row.get("header") if isinstance(row.get("header"), dict) else {}
+        pending_share = header.get("pending_share") if isinstance(header, dict) else None
+        accepted_at_present = bool(header.get("accepted_at_present")) if isinstance(header, dict) else False
+        accepted_at_ms = (
+            pending_share.get("accepted_at_ms")
+            if isinstance(pending_share, dict)
+            else None
+        )
+        storage_version = int(row.get("storage_version") or 1)
+        with self._operation_gate(self._candidate_body_gate, "candidate body slot"):
+            if storage_version == CANDIDATE_BODY_STORAGE_VERSION:
+                body_row = row.get("body")
+                if not isinstance(body_row, dict):
+                    raise CandidateBodyUnavailable(
+                        f"block candidate {block_hash} carries no body reference"
+                    )
+                ref = CandidateBodyRef.from_row(body_row)
+                hydrator = CandidateBodyHydrator(
+                    read_manifest=self.read_candidate_body_manifest,
+                    read_spans=self.read_candidate_body_spans,
+                    read_pages=self.read_candidate_body_pages,
+                    read_page=self.read_candidate_body_page,
+                    admission=self._candidate_spool,
+                    cancelled=cancelled,
+                )
+                return hydrator.hydrate(
+                    ref,
+                    block_hash=block_hash,
+                    accepted_at_present=accepted_at_present,
+                    accepted_at_ms=accepted_at_ms,
+                )
+            if storage_version != LEGACY_CANDIDATE_STORAGE_VERSION:
+                raise CandidateStorageError(
+                    f"unsupported candidate storage version {storage_version}"
+                )
+            helper = self._legacy_candidate_helper
+            if cancelled is not None:
+                helper = helper.with_cancellation(cancelled)
+            path, index_path = self._candidate_spool.new_spool_paths(block_hash)
+            try:
+                converted = helper.convert(block_hash, path, index_path)
+                release = self._candidate_spool.reserve(converted.manifest.byte_count)
+                index = SpoolFieldIndex.open_written(index_path, converted.spans)
+            except BaseException:
+                for target in (path, index_path):
+                    try:
+                        os.unlink(target)
+                    except OSError:
+                        pass
+                raise
+            if not converted.identity_matches_row:
+                print(
+                    "prism ledger: legacy block candidate identity re-encoded with a "
+                    f"different digest hash={block_hash} row={converted.row_candidate_sha256} "
+                    f"body={converted.manifest.candidate_sha256}",
+                    flush=True,
+                )
+            body = SpoolCandidateBody(path, converted.manifest, index, release=release)
+            return prepared_intent_from_spool(
+                body,
+                accepted_at_present=converted.accepted_at_present,
+                accepted_at_ms=converted.accepted_at_ms,
+            )
+
+    def retire_orphan_candidate_bodies(
+        self,
+        *,
+        stale_staging_seconds: float = STALE_STAGING_SECONDS,
+    ) -> tuple[str, ...]:
+        """Tiny fenced compare-and-swap: one orphaned body becomes ``retired``.
+
+        Under the writer fence so a deposed session retires nothing, but it
+        touches one manifest row and no chunk. ``retired`` is permanent and
+        publication references only sealed bodies, so nothing revives it.
+        """
+        result = self._run_fenced_json(
+            retire_orphan_bodies_sql(
+                {
+                    **self._writer_identity_payload(),
+                    "stale_staging_seconds": float(stale_staging_seconds),
+                },
+                jsonb=self._jsonb_literal,
+            )
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("candidate body orphan retirement returned no result")
+        if "error" in result:
+            raise RuntimeError(str(result["error"]))
+        return tuple(str(value) for value in result.get("retired", ()))
+
+    def reap_retired_candidate_chunks(
+        self,
+        *,
+        max_chunks: int = JANITOR_CHUNKS_PER_STEP,
+    ) -> dict[str, Any]:
+        """One lease-free bounded deletion of a retired body's chunks.
+
+        No lease row is read or written: reclaiming a permanently retired
+        body's bytes needs no fence, and a deposed session doing it harms
+        nobody. Takes the body gate so it never competes with a staging or
+        hydration for the same connection budget.
+        """
+        self._ensure_candidate_store_state()
+        with self._operation_gate(self._candidate_body_gate, "candidate body slot"):
+            result = self._run_json(
+                reap_retired_chunks_sql(
+                    {"max_chunks": max(1, int(max_chunks))},
+                    jsonb=self._jsonb_literal,
+                )
+            )
+        if not isinstance(result, dict):
+            raise RuntimeError("candidate body janitor returned no result")
+        return {
+            "body_id": result.get("body_id"),
+            "deleted_chunks": int(result.get("deleted_chunks", 0)),
+            "deleted_bodies": int(result.get("deleted_bodies", 0)),
+        }
+
+    def reap_retired_candidate_bodies(
+        self,
+        *,
+        max_chunks: int = JANITOR_CHUNKS_PER_STEP,
+        stale_staging_seconds: float = STALE_STAGING_SECONDS,
+    ) -> dict[str, Any]:
+        """One janitor step: retire one orphan (fenced), then reap one page.
+
+        Two statements by design (#255 review): the fenced transition is a
+        single-row compare-and-swap, and the body-sized deletion that
+        follows never holds the lease row.
+        """
+        retired = self.retire_orphan_candidate_bodies(
+            stale_staging_seconds=stale_staging_seconds
+        )
+        outcome = self.reap_retired_candidate_chunks(max_chunks=max_chunks)
+        outcome["retired"] = retired
+        return outcome
+
+    def candidate_spool_snapshot(self) -> dict[str, int]:
+        self._ensure_candidate_store_state()
+        return self._candidate_spool.snapshot()
+
+    def _persist_block_candidate_intent_v1(
+        self,
         candidate: dict[str, Any],
     ) -> BlockCandidateIntentPersistResult:
-        """Persist candidate work that is not yet eligible for share credit."""
+        """The historical whole-jsonb standalone persist (storage version 1)."""
         block_hash = str(candidate.get("block_hash_hex", "")).lower()
         if not block_hash:
             raise ValueError("block candidate is missing block_hash_hex")
@@ -4670,6 +5923,8 @@ SELECT COALESCE(
         json_build_object(
             'block_hash', pending.block_hash,
             'candidate', pending.candidate,
+            'storage_version', pending.storage_version,
+            'candidate_sha256', pending.candidate_sha256,
             'pool_block_exists', EXISTS (
                 SELECT 1
                 FROM qbit_pool_blocks pool
@@ -4687,6 +5942,8 @@ SELECT COALESCE(
 FROM (
     SELECT
         candidate,
+        storage_version,
+        candidate_sha256,
         created_at,
         to_char(
             created_at AT TIME ZONE 'UTC',
@@ -4841,7 +6098,9 @@ updated AS (
         last_error = {self._text_literal(error)},
         updated_at = clock_timestamp(),
         completed_at = clock_timestamp(),
-        candidate = NULL
+        candidate = NULL,
+        body_id = NULL,
+        retired_body_id = COALESCE(qbit_block_candidate_outbox.body_id, retired_body_id)
     FROM lease
     WHERE block_hash = ANY({self._text_array_literal(targets)})
       AND state = 'pending'
@@ -4850,7 +6109,15 @@ updated AS (
           FROM qbit_pool_blocks pool
           WHERE pool.block_hash = qbit_block_candidate_outbox.block_hash
       )
-    RETURNING block_hash
+    RETURNING block_hash, retired_body_id
+),
+retired_bodies AS (
+    -- Detach only: the chunks are reclaimed later by the bounded janitor.
+    UPDATE qbit_block_candidate_body
+    SET state = 'retired', retired_at = clock_timestamp()
+    WHERE body_id IN (SELECT retired_body_id FROM updated WHERE retired_body_id IS NOT NULL)
+      AND state <> 'retired'
+    RETURNING body_id
 )
 SELECT CASE
     WHEN NOT EXISTS (SELECT 1 FROM lease) THEN
@@ -4890,11 +6157,21 @@ updated AS (
         last_error = {self._text_literal(error) if error is not None else 'NULL'},
         updated_at = clock_timestamp(),
         completed_at = clock_timestamp(),
-        candidate = NULL
+        candidate = NULL,
+        body_id = NULL,
+        retired_body_id = COALESCE(qbit_block_candidate_outbox.body_id, retired_body_id)
     FROM lease
     WHERE block_hash = {self._text_literal(block_hash.lower())}
       AND state = 'pending'
-    RETURNING block_hash
+    RETURNING block_hash, retired_body_id
+),
+retired_bodies AS (
+    -- Detach only: the chunks are reclaimed later by the bounded janitor.
+    UPDATE qbit_block_candidate_body
+    SET state = 'retired', retired_at = clock_timestamp()
+    WHERE body_id IN (SELECT retired_body_id FROM updated WHERE retired_body_id IS NOT NULL)
+      AND state <> 'retired'
+    RETURNING body_id
 )
 SELECT CASE
     WHEN NOT EXISTS (SELECT 1 FROM lease) THEN
@@ -9709,6 +10986,11 @@ END;
     # test can shrink it to exercise batch boundaries with a handful of rows.
     _json_row_batch_size: int = PAYOUT_WINDOW_ROW_BATCH_SIZE
 
+    # Replay header rows describe bodies that live in storage; the block
+    # submitter hydrates them one at a time at dequeue, never during the
+    # startup enumeration (#255).
+    candidate_hydration_deferred: ClassVar[bool] = True
+
     def _run_retry_safe_read_json_rows(
         self,
         sql: str,
@@ -11475,7 +12757,7 @@ def block_candidate_identity(candidate: dict[str, Any]) -> dict[str, Any]:
     return candidate
 
 
-def block_candidate_identity_sha256(candidate: dict[str, Any]) -> str:
+def block_candidate_identity_sha256(candidate: Any) -> str:
     """``sha256_json_hex`` of the candidate identity, streamed.
 
     The candidate carries the whole payout window under ``shares_json``, so
@@ -11483,7 +12765,18 @@ def block_candidate_identity_sha256(candidate: dict[str, Any]) -> str:
     writer-lease monitor must never wait behind (#236). The digest is
     byte-identical to ``sha256_json_hex(block_candidate_identity(candidate))``;
     the share array feeds it batch by batch.
+
+    A :class:`PreparedCandidateIntent` already carries this digest (its
+    body *is* the identity JSON), and a mapping whose share sequence is not
+    a plain list (a page-backed window, a daemon mirror, a spool sequence)
+    is digested through the same bounded codec rather than materialized.
     """
+    if isinstance(candidate, PreparedCandidateIntent):
+        return prepare_candidate_intent(candidate).candidate_sha256
+    if isinstance(candidate, dict) and not isinstance(
+        candidate.get("shares_json"), (list, tuple)
+    ) and "shares_json" in candidate:
+        return prepare_candidate_intent(candidate).candidate_sha256
     identity = block_candidate_identity(candidate)
     if not isinstance(identity, dict):
         return sha256_json_hex(identity)
