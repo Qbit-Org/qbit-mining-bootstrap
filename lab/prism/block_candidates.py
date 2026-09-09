@@ -51,6 +51,7 @@ from lab.prism.coordinator_config import (
     DEFAULT_PRISM_OBSERVED_TIP_ACCEPT_WINDOW_SECONDS,
     DEFAULT_PRISM_WATCHDOG_TIMEOUT_SECONDS,
     MAX_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX,
+    MAX_BLOCK_REPLAY_PAGE_SIZE,
 )
 from lab.prism.coordinator_shutdown import ShutdownInProgress
 from lab.prism.job_bundle import PRISM_JOB_BUILD_SECONDS_BUCKETS
@@ -72,7 +73,7 @@ MAX_PENDING_BLOCK_CANDIDATES = 32
 # untruncated. This cap bounds one enumeration pass's memory; at the cap the
 # gate simply stays closed while the queued batch drains, and the submitter
 # loop re-enumerates the shrinking remainder.
-MAX_BLOCK_REPLAY_ENUMERATION_ROWS = 1024
+MAX_BLOCK_REPLAY_ENUMERATION_ROWS = MAX_BLOCK_REPLAY_PAGE_SIZE
 # Ancestor re-drive bookkeeping (issue #190) is keyed by block hash and
 # dropped the moment the blocking transition resolves; this bound only
 # guards against a pathological stream of distinct never-resolving
@@ -4058,6 +4059,19 @@ class BlockCandidateService:
         # pages costs the node what a single page does.
         collapse_probe_budget = _CollapseHeightProbeBudget()
         if forced_enumeration and fetch_durable_page is not None:
+            # A row can embed an entire payout window. Smaller pages reduce
+            # the uninterrupted JSON decode without weakening the complete
+            # cursor walk, the legacy window cap, or cleanup admission bounds.
+            block_config = getattr(
+                getattr(self._coordinator, "config", None), "block", None
+            )
+            configured_page_size = getattr(
+                block_config, "replay_page_size", MAX_BLOCK_REPLAY_ENUMERATION_ROWS
+            )
+            page_size = min(
+                MAX_BLOCK_REPLAY_ENUMERATION_ROWS,
+                max(1, int(configured_page_size)),
+            )
             # Pagination, not a widening window: the doubling loop below
             # fails closed once one page would have to hold the entire
             # backlog, so a backlog larger than the cap kept enumeration
@@ -4071,7 +4085,7 @@ class BlockCandidateService:
                 page += 1
                 try:
                     durable_rows = fetch_durable_page(
-                        MAX_BLOCK_REPLAY_ENUMERATION_ROWS,
+                        page_size,
                         page=page,
                         after_cursor=after_cursor,
                     )
@@ -4108,10 +4122,10 @@ class BlockCandidateService:
                 queued += self._adopt_durable_block_candidate_rows(retained_rows)
                 print(
                     "prism coordinator: pending block candidate enumeration "
-                    f"page={page} rows={len(durable_rows)}",
+                    f"page={page} rows={len(durable_rows)} limit={page_size}",
                     flush=True,
                 )
-                if len(durable_rows) < MAX_BLOCK_REPLAY_ENUMERATION_ROWS:
+                if len(durable_rows) < page_size:
                     # A short page proves no pending row followed it at query
                     # time, which is the completeness the job-build gate waits
                     # on.

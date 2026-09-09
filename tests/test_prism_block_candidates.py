@@ -9557,6 +9557,99 @@ class PrismCoordinatorReliabilityTests(unittest.TestCase):
             )
         return hashes
 
+    def test_configured_single_candidate_pages_preserve_complete_startup_replay(self) -> None:
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        server.config = SimpleNamespace(block=SimpleNamespace(replay_page_size=1))
+        hashes = self._pending_outbox_backlog(server, state, ledger, 2)
+        original_rows = ledger.pending_block_candidate_rows
+        queries = []
+
+        def recording_rows(*, limit=32, after_cursor=None):
+            # Even after adopting the first parent, later accepted work must
+            # remain discoverable before the job-build gate can open.
+            self.assertTrue(server._block_replay_enumeration_owed())
+            rows = original_rows(limit=limit, after_cursor=after_cursor)
+            queries.append((limit, after_cursor, len(rows)))
+            return rows
+
+        ledger.pending_block_candidate_rows = recording_rows
+        server._note_block_replay_enumeration_owed()
+        with patch("builtins.print"):
+            self.assertEqual(server.replay_pending_block_candidates(), 2)
+
+        self.assertEqual([query[0] for query in queries], [1, 1, 1])
+        self.assertEqual([query[2] for query in queries], [1, 1, 0])
+        self.assertIsNone(queries[0][1])
+        self.assertNotEqual(queries[1][1], queries[2][1])
+        self.assertEqual(
+            [
+                server._block_replay_candidate_queue.get_nowait().submission.block_hash_hex
+                for _ in hashes
+            ],
+            hashes,
+        )
+        self.assertEqual(set(server._accepted_block_payout_previews), set(hashes))
+        self.assertFalse(server._block_replay_enumeration_owed())
+        # Enumeration never marks accepted-but-unaccounted work terminal.
+        self.assertEqual(len(original_rows()), 2)
+
+    def test_single_candidate_page_failure_keeps_gate_closed_and_retry_deduplicates(self) -> None:
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        server.config = SimpleNamespace(block=SimpleNamespace(replay_page_size=1))
+        hashes = self._pending_outbox_backlog(server, state, ledger, 2)
+        original_rows = ledger.pending_block_candidate_rows
+
+        def failing_rows(*, limit=32, after_cursor=None):
+            if after_cursor is not None:
+                raise TimeoutError("second candidate unavailable")
+            return original_rows(limit=limit, after_cursor=after_cursor)
+
+        ledger.pending_block_candidate_rows = failing_rows
+        server._note_block_replay_enumeration_owed()
+        with patch("builtins.print"):
+            with self.assertRaisesRegex(TimeoutError, "second candidate unavailable"):
+                server.replay_pending_block_candidates()
+            self.assertTrue(server._block_replay_enumeration_owed())
+            self.assertEqual(server._block_replay_candidate_queue.qsize(), 1)
+            self.assertEqual(len(original_rows()), 2)
+            ledger.pending_block_candidate_rows = original_rows
+            self.assertEqual(server.replay_pending_block_candidates(), 1)
+
+        self.assertFalse(server._block_replay_enumeration_owed())
+        self.assertEqual(server._block_replay_candidate_queue.qsize(), 2)
+        self.assertEqual(set(server._accepted_block_payout_previews), set(hashes))
+
+    def test_configured_single_candidate_pages_apply_to_ancestor_redrive(self) -> None:
+        server, state, _recording = submit_coordinator()
+        ledger = SingleWriterShareLedger()
+        server.ledger = ledger
+        server.config = SimpleNamespace(block=SimpleNamespace(replay_page_size=1))
+        hashes = self._pending_outbox_backlog(server, state, ledger, 2)
+        service = server._ensure_block_candidate_service()
+        self.assertFalse(server._block_replay_enumeration_owed())
+
+        with patch.object(
+            service, "_consume_ancestor_redrive_requests", return_value=(hashes[1],)
+        ), patch.object(
+            server,
+            "_run_block_submitter_ledger_call",
+            wraps=server._run_block_submitter_ledger_call,
+        ) as calls, patch("builtins.print"):
+            self.assertEqual(server.replay_pending_block_candidates(), 2)
+
+        queries = [call for call in calls.call_args_list if call.args[1] == "replay-outbox-query"]
+        keys = [call.args[0] for call in queries]
+        self.assertEqual([key[1] for key in keys], [1, 1, 1])
+        self.assertEqual([key[2] for key in keys], [1, 2, 3])
+        self.assertEqual(len(set(keys)), 3)
+        self.assertTrue(all(call.kwargs["call_class"] == "landing" for call in queries))
+        self.assertEqual(server._block_replay_candidate_queue.qsize(), 2)
+        self.assertEqual(set(server._accepted_block_payout_previews), set(hashes))
+
     def test_startup_enumeration_pages_a_backlog_larger_than_one_window(
         self,
     ) -> None:
