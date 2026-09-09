@@ -53,6 +53,8 @@ import os
 from pathlib import Path
 import re
 import stat
+import struct
+import tempfile
 from typing import Any, Callable, Iterable, Iterator
 import weakref
 
@@ -90,10 +92,113 @@ RECORD_DECODE_SOFT_LIMIT_BYTES = 1024 * 1024
 _WHITESPACE = re.compile(r"[ \t\n\r]*")
 # One complete JSON object with no nested containers: every share record
 # in a canonical bundle. Matching it skips a record at C speed without
-# building a dictionary; anything else falls back to a real decode.
+# building a dictionary; anything else is skipped by the bounded
+# structural walker below.
 _FLAT_OBJECT = re.compile(r'\{(?:"(?:[^"\\]|\\.)*"|[^"{}\[\]])*\}')
+# Characters that change structural state while walking a container or a
+# string window by window.
+_STRUCTURAL = re.compile(r'["\\{}\[\]]')
+_STRING_STRUCTURAL = re.compile(r'["\\]')
+_SCALAR_END = re.compile(r"[,\]} \t\n\r]")
 _DECODER = json.JSONDecoder()
 _COMPACT_SEPARATORS = (",", ":")
+# Checkpoint entries buffered before they are written to the index file.
+_INDEX_FLUSH_BYTES = 4096
+
+
+def _close_fd(fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+class _CheckpointIndex:
+    """Fixed-width record-offset checkpoints for the lazy arrays of one scan.
+
+    Entries are 8-byte little-endian byte offsets appended while scanning
+    and read back with positional reads, so the index scales with the
+    window on disk, never in memory: an unlinked temporary file holds it
+    (the share-window spool's approach) and its descriptor closes with the
+    last owner. If no temporary file can be created the index degrades to
+    an in-memory array and reports that in the scan statistics.
+    """
+
+    __slots__ = (
+        "__weakref__",
+        "_count",
+        "_fd",
+        "_finalizer",
+        "_memory",
+        "_pending",
+        "_written",
+    )
+
+    ENTRY = struct.Struct("<Q")
+
+    def __init__(self) -> None:
+        self._count = 0
+        self._written = 0
+        self._pending = bytearray()
+        self._memory: array | None = None
+        self._fd: int | None = None
+        self._finalizer: Any = None
+        try:
+            handle = tempfile.TemporaryFile()
+            try:
+                self._fd = os.dup(handle.fileno())
+            finally:
+                handle.close()
+        except OSError:
+            self._memory = array("Q")
+        if self._fd is not None:
+            self._finalizer = weakref.finalize(self, _close_fd, self._fd)
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    @property
+    def in_memory(self) -> bool:
+        return self._memory is not None
+
+    def append(self, offset: int) -> None:
+        if self._memory is not None:
+            self._memory.append(int(offset))
+        else:
+            self._pending += self.ENTRY.pack(int(offset))
+            if len(self._pending) >= _INDEX_FLUSH_BYTES:
+                self.flush()
+        self._count += 1
+
+    def flush(self) -> None:
+        if not self._pending or self._fd is None:
+            return
+        data = bytes(self._pending)
+        offset = self._written * self.ENTRY.size
+        while data:
+            written = os.pwrite(self._fd, data, offset)
+            data = data[written:]
+            offset += written
+        self._written += len(self._pending) // self.ENTRY.size
+        self._pending = bytearray()
+
+    def get(self, index: int) -> int:
+        if not 0 <= index < self._count:
+            raise IndexError("checkpoint index out of range")
+        if self._memory is not None:
+            return int(self._memory[index])
+        self.flush()
+        if self._fd is None or (self._finalizer is not None and not self._finalizer.alive):
+            raise CanonicalArtifactError("canonical audit artifact index is closed")
+        entry = os.pread(self._fd, self.ENTRY.size, index * self.ENTRY.size)
+        if len(entry) != self.ENTRY.size:
+            raise CanonicalArtifactError("canonical audit artifact index is truncated")
+        return int(self.ENTRY.unpack(entry)[0])
+
+    def close(self) -> None:
+        if self._finalizer is not None:
+            self._finalizer()
 
 
 class CanonicalArtifactError(ValueError):
@@ -232,6 +337,8 @@ class ScanStats:
     """
 
     __slots__ = (
+        "checkpoint_entries",
+        "index_in_memory",
         "max_value_chars",
         "oversized_values",
         "values_decoded",
@@ -243,8 +350,12 @@ class ScanStats:
         self.oversized_values = 0
         self.values_decoded = 0
         self.window_high_water_chars = 0
+        self.checkpoint_entries = 0
+        self.index_in_memory = False
 
     def note_value(self, chars: int) -> None:
+        """Record one value's size: decoded text characters, or bytes when
+        the value was skipped structurally (equal for ASCII artifacts)."""
         self.values_decoded += 1
         if chars > self.max_value_chars:
             self.max_value_chars = chars
@@ -255,12 +366,14 @@ class ScanStats:
         if chars > self.window_high_water_chars:
             self.window_high_water_chars = chars
 
-    def as_dict(self) -> dict[str, int]:
+    def as_dict(self) -> dict[str, int | bool]:
         return {
             "max_value_chars": self.max_value_chars,
             "oversized_values": self.oversized_values,
             "values_decoded": self.values_decoded,
             "window_high_water_chars": self.window_high_water_chars,
+            "checkpoint_entries": self.checkpoint_entries,
+            "index_in_memory": self.index_in_memory,
         }
 
 
@@ -353,9 +466,11 @@ class _Cursor:
                     f"canonical audit artifact is not valid UTF-8: {exc}"
                 ) from exc
 
-    def trim(self) -> None:
+    def trim(self, *, force: bool = False) -> None:
         """Drop consumed text once it exceeds one chunk; keeps windows bounded."""
-        if self.pos < self._chunk_bytes:
+        if self.pos < self._chunk_bytes and not force:
+            return
+        if self.pos == 0:
             return
         self._window_start = self.byte_pos
         self.text = self.text[self.pos :]
@@ -415,14 +530,111 @@ class _Cursor:
             return value
 
     def skip_value(self) -> None:
-        """Advance past one JSON value without retaining it."""
-        if self.peek() == "{":
+        """Advance past one JSON value without retaining or decoding it.
+
+        A flat record that fits the window is skipped by one regex match.
+        Anything else -- a record straddling the window, a nested value, a
+        string or scalar of any size -- is walked structurally window by
+        window, so the text held never exceeds about two read chunks even
+        for a value far larger than the chunk. Structure (containers,
+        strings, escapes, separators, end of file) is validated here; token
+        syntax inside a skipped value is validated whenever the value is
+        decoded by a consumer, and the artifact as a whole by the verifier.
+        """
+        char = self.peek()
+        if char == "{":
             match = _FLAT_OBJECT.match(self.text, self.pos)
             if match is not None:
                 self.stats.note_value(match.end() - self.pos)
                 self.pos = match.end()
                 return
-        self.decode_value()
+        start = self.byte_pos
+        if char in "{[":
+            self._skip_container()
+        elif char == '"':
+            self.pos += 1
+            self._skip_string_body()
+        else:
+            self._skip_scalar()
+        self.stats.note_value(self.byte_pos - start)
+
+    def _advance_window(self) -> None:
+        """Consume the whole window and read the next chunk."""
+        self.pos = len(self.text)
+        self.trim(force=True)
+        self.fill(1)
+        if self.eof and self.pos >= len(self.text):
+            raise CanonicalArtifactSyntaxError(
+                "canonical audit artifact is malformed: unterminated value"
+            )
+
+    def _skip_escaped_char(self) -> None:
+        """Skip the character following a backslash inside a string."""
+        if self.pos >= len(self.text):
+            self._advance_window()
+        self.pos += 1
+
+    def _skip_string_body(self) -> None:
+        """Skip to just past the closing quote; ``pos`` is inside the string."""
+        while True:
+            match = _STRING_STRUCTURAL.search(self.text, self.pos)
+            if match is None:
+                self._advance_window()
+                continue
+            self.pos = match.end()
+            if match.group() == "\\":
+                self._skip_escaped_char()
+            else:
+                return
+            if self.pos >= self._chunk_bytes:
+                self.trim()
+
+    def _skip_container(self) -> None:
+        depth = 0
+        while True:
+            match = _STRUCTURAL.search(self.text, self.pos)
+            if match is None:
+                self._advance_window()
+                continue
+            char = match.group()
+            self.pos = match.end()
+            if char == '"':
+                self._skip_string_body()
+            elif char == "\\":
+                raise CanonicalArtifactSyntaxError(
+                    f"canonical audit artifact is malformed at byte {self.byte_pos}: "
+                    "unexpected escape"
+                )
+            elif char in "{[":
+                depth += 1
+            else:
+                depth -= 1
+                if depth == 0:
+                    return
+                if depth < 0:
+                    raise CanonicalArtifactSyntaxError(
+                        f"canonical audit artifact is malformed at byte {self.byte_pos}: "
+                        "unbalanced container"
+                    )
+            if self.pos >= self._chunk_bytes:
+                self.trim()
+
+    def _skip_scalar(self) -> None:
+        start = self.byte_pos
+        while True:
+            match = _SCALAR_END.search(self.text, self.pos)
+            if match is None:
+                if self.eof:
+                    self.pos = len(self.text)
+                    break
+                self._advance_window()
+                continue
+            self.pos = match.start()
+            break
+        if self.byte_pos == start:
+            raise CanonicalArtifactSyntaxError(
+                f"canonical audit artifact is malformed at byte {start}: expected a value"
+            )
 
 
 def _is_plain(value: Any, depth: int) -> bool:
@@ -603,10 +815,11 @@ class LazyRecordSequence(Sequence):
 
     __slots__ = (
         "__weakref__",
-        "_checkpoints",
         "_chunk_bytes",
         "_count",
         "_end",
+        "_index",
+        "_index_base",
         "_source",
         "_start",
         "_stride",
@@ -619,7 +832,8 @@ class LazyRecordSequence(Sequence):
         start: int,
         end: int,
         count: int,
-        checkpoints: array,
+        index: _CheckpointIndex,
+        index_base: int,
         stride: int = RECORD_INDEX_STRIDE,
         chunk_bytes: int = SCAN_CHUNK_BYTES,
     ) -> None:
@@ -627,7 +841,8 @@ class LazyRecordSequence(Sequence):
         self._start = int(start)
         self._end = int(end)
         self._count = int(count)
-        self._checkpoints = checkpoints
+        self._index = index
+        self._index_base = int(index_base)
         self._stride = max(1, int(stride))
         self._chunk_bytes = int(chunk_bytes)
 
@@ -656,7 +871,7 @@ class LazyRecordSequence(Sequence):
             return
         self._source.verify_identity()
         block = start // self._stride
-        cursor = self._cursor(int(self._checkpoints[block]))
+        cursor = self._cursor(self._index.get(self._index_base + block))
         index = block * self._stride
         while index < start:
             cursor.skip_ws()
@@ -777,6 +992,7 @@ def _scan_array(
     cursor: _Cursor,
     *,
     source: ArtifactSource,
+    index: _CheckpointIndex,
     stride: int,
     chunk_bytes: int,
 ) -> Any:
@@ -785,7 +1001,7 @@ def _scan_array(
         return cursor.decode_value()
     cursor.pos += 1
     start = cursor.byte_pos
-    checkpoints = array("Q")
+    index_base = index.count
     count = 0
     cursor.skip_ws()
     if cursor.peek() == "]":
@@ -795,14 +1011,15 @@ def _scan_array(
             start=start,
             end=cursor.byte_pos,
             count=0,
-            checkpoints=checkpoints,
+            index=index,
+            index_base=index_base,
             stride=stride,
             chunk_bytes=chunk_bytes,
         )
     while True:
         cursor.skip_ws()
         if count % stride == 0:
-            checkpoints.append(cursor.byte_pos)
+            index.append(cursor.byte_pos)
         cursor.skip_value()
         count += 1
         cursor.trim()
@@ -823,7 +1040,8 @@ def _scan_array(
         start=start,
         end=cursor.byte_pos,
         count=count,
-        checkpoints=checkpoints,
+        index=index,
+        index_base=index_base,
         stride=stride,
         chunk_bytes=chunk_bytes,
     )
@@ -835,6 +1053,7 @@ def _parse_object(
     *,
     lazy_paths: Sequence[tuple[str, ...]],
     source: ArtifactSource,
+    index: _CheckpointIndex,
     stride: int,
     chunk_bytes: int,
 ) -> dict[str, Any]:
@@ -860,6 +1079,7 @@ def _parse_object(
             value = _scan_array(
                 cursor,
                 source=source,
+                index=index,
                 stride=stride,
                 chunk_bytes=chunk_bytes,
             )
@@ -874,6 +1094,7 @@ def _parse_object(
                     member_path,
                     lazy_paths=lazy_paths,
                     source=source,
+                    index=index,
                     stride=stride,
                     chunk_bytes=chunk_bytes,
                 )
@@ -920,12 +1141,14 @@ class CanonicalAuditBundleView(Mapping):
         sha256_hex: str,
         lazy_paths: tuple[tuple[str, ...], ...],
         scan_stats: ScanStats | None = None,
+        index: _CheckpointIndex | None = None,
     ) -> None:
         self._source = source
         self._members = members
         self._sha256_hex = sha256_hex
         self._lazy_paths = lazy_paths
         self._scan_stats = scan_stats if scan_stats is not None else ScanStats()
+        self._index = index
 
     @classmethod
     def scan(
@@ -945,9 +1168,11 @@ class CanonicalAuditBundleView(Mapping):
         digest covers every byte, and trailing garbage is rejected.
         """
         source = ArtifactSource(fd, path=path)
+        index = _CheckpointIndex()
         try:
             hasher = hashlib.sha256()
             stats = ScanStats()
+            stats.index_in_memory = index.in_memory
             cursor = _Cursor(
                 source,
                 0,
@@ -962,6 +1187,7 @@ class CanonicalAuditBundleView(Mapping):
                 (),
                 lazy_paths=lazy,
                 source=source,
+                index=index,
                 stride=stride,
                 chunk_bytes=chunk_bytes,
             )
@@ -975,7 +1201,10 @@ class CanonicalAuditBundleView(Mapping):
                 raise CanonicalArtifactError(
                     "canonical audit artifact size does not match its scan"
                 )
+            index.flush()
+            stats.checkpoint_entries = index.count
         except BaseException:
+            index.close()
             source.close()
             raise
         return cls(
@@ -984,6 +1213,7 @@ class CanonicalAuditBundleView(Mapping):
             sha256_hex=hasher.hexdigest(),
             lazy_paths=lazy,
             scan_stats=stats,
+            index=index,
         )
 
     @classmethod
@@ -1096,6 +1326,13 @@ class CanonicalAuditBundleView(Mapping):
         }
 
     def close(self) -> None:
+        """Retire the artifact and index descriptors this view owns.
+
+        Lazy sequences handed out earlier keep their own references to the
+        source and index and fail closed once these are gone.
+        """
+        if self._index is not None:
+            self._index.close()
         self._source.close()
 
     @property

@@ -21,6 +21,7 @@ import tempfile
 import time
 import tracemalloc
 import unittest
+from unittest import mock
 import weakref
 
 from lab.prism.audit_bundle_view import (
@@ -535,6 +536,98 @@ class StressWindowTests(unittest.TestCase):
             reports.append(self._exercise(375_000, peak_limit=32 * 1024 * 1024))
         for report in reports:
             print(f"bounded-audit-stress {json.dumps(report)}", flush=True)
+
+
+class BoundedScanTests(unittest.TestCase):
+    """The scan holds at most about two read chunks whatever a value's size."""
+
+    def test_checkpoint_index_lives_on_disk_and_falls_back_to_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = make_bundle(3000)
+            raw = compact(bundle)
+            path = write_document(Path(tmp), "bundle.json", raw)
+            view = scan(path, stride=16)
+            try:
+                stats = view.scan_stats
+                self.assertFalse(stats.index_in_memory)
+                # 3000 shares and 3000 counted shares at a stride of 16, plus
+                # the two leaf arrays' single checkpoints.
+                self.assertEqual(stats.checkpoint_entries, 2 * 188)
+                self.assertFalse(view["shares"]._index.in_memory)
+                self.assertEqual(view["shares"][2999], bundle["shares"][2999])
+                self.assertEqual(view["reward_manifest"]["shares"][1234], bundle["reward_manifest"]["shares"][1234])
+            finally:
+                view.close()
+            with mock.patch("lab.prism.audit_bundle_view.tempfile.TemporaryFile", side_effect=OSError("no temp")):
+                fallback = scan(path, stride=16)
+            try:
+                self.assertTrue(fallback.scan_stats.index_in_memory)
+                self.assertEqual(fallback, bundle)
+                self.assertEqual(fallback["shares"][2999], bundle["shares"][2999])
+            finally:
+                fallback.close()
+            # A closed view fails lazy reads closed rather than reading a
+            # released index or descriptor.
+            view = scan(path, stride=16)
+            lazy = view["shares"]
+            view.close()
+            with self.assertRaises(CanonicalArtifactError):
+                lazy[5]
+
+    def test_oversized_values_are_skipped_without_being_held(self) -> None:
+        chunk = 4096
+        oversized = 6 * SCAN_CHUNK_BYTES + 11  # far above the soft limit
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = make_bundle(300, oversized_index=150, oversized_bytes=oversized)
+            bundle["shares"][151]["nested"] = {"deep": [1, {"x": '"}]{[\\'}], "s": "a\\\"b"}
+            bundle["shares"][152]["credit_policy"] = "quote\"in\\side" + "é" * 3000
+            bundle["reward_manifest"]["shares"][150]["blob"] = "Y" * (3 * chunk + 1)
+            bundle["witness_merkle_leaves_hex"] = ["ab" * 32] * 500
+            raw = compact(bundle, ensure_ascii=False)
+            path = write_document(Path(tmp), "bundle.json", raw)
+            tracemalloc.start()
+            try:
+                tracemalloc.reset_peak()
+                view = scan(path, chunk_bytes=chunk)
+                _current, scan_peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+            try:
+                stats = view.scan_stats
+                # The oversized record was walked structurally: the largest
+                # decoded window stayed a couple of chunks, not the record.
+                self.assertLess(stats.window_high_water_chars, 4 * chunk)
+                self.assertGreaterEqual(stats.max_value_chars, oversized)
+                self.assertEqual(stats.oversized_values, 1)
+                self.assertLess(scan_peak, oversized)
+                self.assertEqual(view.sha256_hex, hashlib.sha256(raw).hexdigest())
+                self.assertEqual(len(view["shares"]), 300)
+                self.assertEqual(len(view["witness_merkle_leaves_hex"]), 500)
+                # Consumers that need the record decode it whole; that
+                # decode is the remaining record-sized allocation.
+                self.assertEqual(view["shares"][150], bundle["shares"][150])
+                self.assertEqual(view["shares"][151], bundle["shares"][151])
+                self.assertEqual(view["shares"][152], bundle["shares"][152])
+                self.assertEqual(view, bundle)
+                self.assertEqual(list(view["shares"][149:153]), bundle["shares"][149:153])
+            finally:
+                view.close()
+
+    def test_structural_walk_rejects_unterminated_values(self) -> None:
+        cases = [
+            b'{"shares":[{"a":"' + b"x" * 5000,
+            b'{"shares":[{"a":[1,2}]}',
+            b'{"shares":[{"a":"\\' ,
+            b'{"shares":[,]}',
+            b'{"shares":[1,]}',
+            b'{"shares":["abc]}',
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, raw in enumerate(cases):
+                with self.subTest(document=raw[:24]):
+                    path = write_document(Path(tmp), f"bad-{index}.json", raw)
+                    with self.assertRaises(json.JSONDecodeError):
+                        scan(path, chunk_bytes=16)
 
 
 class ArtifactSourceTests(unittest.TestCase):
