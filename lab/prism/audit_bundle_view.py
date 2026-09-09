@@ -43,6 +43,8 @@ digest and is never derived from these views.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import codecs
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -109,7 +111,9 @@ RAW_RECORD_MEMBER_LIMIT_BYTES = 4096
 RAW_RECORD_HELPER_TIMEOUT_SECONDS = 300.0
 # Isolated helper processes admitted at once: each one may hold a whole
 # record (and two encodings of it), so the slots bound helper memory.
-RAW_RECORD_HELPER_SLOTS = 2
+RAW_RECORD_HELPER_SLOTS = 1
+RAW_RECORD_HELPER_MEMORY_BYTES = 4 * 1024 * 1024 * 1024
+RAW_RECORD_HELPER_HEADER_BYTES = 1024 * 1024
 # Supervisor poll interval while a helper runs or a slot is awaited.
 RAW_RECORD_HELPER_POLL_SECONDS = 0.05
 # Bytes of a helper's diagnostics retained (the tail) for the error report.
@@ -1075,6 +1079,9 @@ def _helper_main(argv: Sequence[str]) -> int:
     Runs in a child process so a record of any size is decoded outside the
     lease-bearing coordinator. Exit status 2 marks a malformed record.
     """
+    import resource
+
+    resource.setrlimit(resource.RLIMIT_AS, (RAW_RECORD_HELPER_MEMORY_BYTES, RAW_RECORD_HELPER_MEMORY_BYTES))
     member_limit = RAW_RECORD_MEMBER_LIMIT_BYTES
     if len(argv) >= 2 and argv[0] == "--normalize-record":
         member_limit = int(argv[1])
@@ -1147,6 +1154,15 @@ class HelperAdmission:
     def release(self) -> None:
         self._semaphore.release()
 
+    @contextmanager
+    def hold(self, check: Callable[[], None]) -> Iterator[None]:
+        self.acquire(check)
+        try:
+            check()
+            yield
+        finally:
+            self.release()
+
 
 RECORD_HELPER_ADMISSION = HelperAdmission()
 
@@ -1200,7 +1216,9 @@ class _HelperOutput:
 def _read_helper_output(stream: Any, output: _HelperOutput) -> None:
     """Read the header line, then stream both encodings into a scratch file."""
     try:
-        header_line = stream.readline()
+        header_line = stream.readline(RAW_RECORD_HELPER_HEADER_BYTES + 1)
+        if len(header_line) > RAW_RECORD_HELPER_HEADER_BYTES:
+            raise ArtifactResourcePressure("record helper metadata exceeds its byte limit")
         if not header_line:
             output.no_header = True
             return

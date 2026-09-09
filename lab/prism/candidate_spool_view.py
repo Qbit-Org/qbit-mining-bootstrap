@@ -634,10 +634,7 @@ class SpoolObjectView(_SpoolView, Mapping):
             return index
 
     def _decode_key(self, start: int, end: int) -> str:
-        key = _loads(read_body_span(self._body, start, end))
-        if not isinstance(key, str):
-            raise CandidateBodyIntegrityError("spool object member key is not a string")
-        return key
+        return decode_json_string(self._body, start, end)
 
     def _value_at(self, index: _OffsetIndex, ordinal: int) -> Any:
         _key_start, _key_end, value_start, value_end = index.get(ordinal)
@@ -650,7 +647,7 @@ class SpoolObjectView(_SpoolView, Mapping):
         found: int | None = None
         for ordinal in range(index.count):
             key_start, key_end, _value_start, _value_end = index.get(ordinal)
-            if self._decode_key(key_start, key_end) == key:
+            if SpoolStringView(self._body, key_start, key_end) == key:
                 found = ordinal
         return found
 
@@ -937,7 +934,7 @@ def decode_json_string(body: SpoolCandidateBody, start: int, end: int) -> str:
     """The whole text of the JSON string at ``[start, end)``.
 
     The explicit materialization boundary for callers that need the value
-    whole (a block to submit, a bounded field); every C call stays a slice.
+    whole (for example a bounded metadata field); every C call stays a slice.
     """
     return "".join(iter_json_string_text_chunks(body, start, end))
 

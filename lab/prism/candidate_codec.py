@@ -1721,7 +1721,8 @@ def decode_spool_small_fields(body: SpoolCandidateBody) -> dict[str, Any]:
 
     Builds a *skeleton* of the body in which every spanned (large) field is
     replaced by an empty placeholder and decodes it with one ``json.loads``
-    bounded by the number of small fields times the fast-path ceiling. Each
+    bounded by the view decode ceiling, falling back to per-member reads
+    if the aggregate metadata exceeds that ceiling. Each
     large field then follows the view module's policy: an array becomes a
     :class:`SpoolJsonArraySequence`; a string in
     :data:`~lab.prism.candidate_spool_view.SPOOL_DECODED_METADATA_FIELDS`
@@ -1732,17 +1733,39 @@ def decode_spool_small_fields(body: SpoolCandidateBody) -> dict[str, Any]:
     views = _views()
     manifest = body.manifest
     spans = sorted(body.index.spans().values(), key=lambda span: span.start)
-    skeleton = io.BytesIO()
-    cursor = 0
+    validated_end = 0
     for span in spans:
-        if span.start < cursor or span.end > manifest.byte_count:
+        if span.start < validated_end or span.end > manifest.byte_count:
             raise CandidateBodyIntegrityError("spool spans overlap or exceed the body")
-        _copy_span(body, cursor, span.start, skeleton)
-        skeleton.write(b"[]" if span.kind == "array" else b'""' if span.kind == "string" else b"null")
-        cursor = span.end
-    _copy_span(body, cursor, manifest.byte_count, skeleton)
+        validated_end = span.end
+
+    class SkeletonFull(Exception):
+        pass
+
+    class BoundedSkeleton(io.BytesIO):
+        def write(self, data: bytes) -> int:
+            if self.tell() + len(data) > views.SPOOL_VIEW_DECODE_BYTES:
+                raise SkeletonFull
+            return super().write(data)
+
+    skeleton = BoundedSkeleton()
+    cursor = 0
     try:
+        for span in spans:
+            _copy_span(body, cursor, span.start, skeleton)
+            skeleton.write(b"[]" if span.kind == "array" else b'""' if span.kind == "string" else b"null")
+            cursor = span.end
+        _copy_span(body, cursor, manifest.byte_count, skeleton)
         fields = json.loads(skeleton.getvalue())
+    except SkeletonFull:
+        # Many individually small metadata fields can exceed the aggregate
+        # fast-path budget. Decode those members separately through the same
+        # view policy instead of growing one native JSON call.
+        root = views.SpoolObjectView(body, 0, manifest.byte_count)
+        try:
+            fields = dict(root.items())
+        finally:
+            root.close()
     except ValueError as exc:
         raise CandidateBodyIntegrityError("spool body skeleton is not valid JSON") from exc
     if not isinstance(fields, dict):

@@ -1777,6 +1777,8 @@ class BlockCandidateService:
                             durable_row
                         ):
                             queued += 1
+                        if self._block_replay_backpressure_drain_pending:
+                            break
                         continue
                     intent = self._coordinator.ledger.hydrate_block_candidate_intent(
                         durable_row
@@ -1951,9 +1953,9 @@ class BlockCandidateService:
         has not been read: the same duplicate rules, the same payout-preview
         registration before the row is visible to the submitter, and the
         credit floor adopted from the header's pending share. When the
-        in-memory window is full the obligations are still registered --
-        that is what the job-build gate needs -- and the row stays in the
-        outbox for a later poll; nothing is discarded.
+        in-memory window is full enumeration pauses before adopting any
+        further obligations. The enumeration-owed gate protects job builds
+        until the queue drains and the remaining durable rows are adopted.
         """
         self._ensure_block_replay_state()
         self._ensure_replay_descriptor_state()
@@ -1974,6 +1976,12 @@ class BlockCandidateService:
                     self._block_replay_inflight_hashes.add(block_hash)
         if duplicate:
             return False
+        if overflow:
+            with self._coordinator.lock:
+                self._block_replay_descriptor_overflow_count += 1
+                self._block_replay_backpressure_drain_pending = True
+            self._coordinator._note_block_replay_enumeration_owed()
+            return False
         try:
             if descriptor.credit_share_on_accept:
                 self._adopt_replay_descriptor_floor(descriptor)
@@ -1981,10 +1989,6 @@ class BlockCandidateService:
                 block_hash,
                 block_height=descriptor.block_height,
             )
-            if overflow:
-                with self._coordinator.lock:
-                    self._block_replay_descriptor_overflow_count += 1
-                return False
             self._block_replay_candidate_queue.put_nowait(descriptor)
         except BaseException:
             with self._coordinator.lock:
@@ -4672,6 +4676,12 @@ class BlockCandidateService:
                     != backpressure_before
                 )
                 queued += self._adopt_durable_block_candidate_rows(retained_rows)
+                if self._block_replay_backpressure_drain_pending:
+                    # A descriptor was withheld before its floor/preview was
+                    # adopted. Even an exhausted SQL page is incomplete here.
+                    enumeration_truncated = True
+                    self._coordinator._note_block_replay_enumeration_owed()
+                    break
                 print(
                     "prism coordinator: pending block candidate enumeration "
                     f"page={page} rows={len(durable_rows)} "
@@ -4764,6 +4774,12 @@ class BlockCandidateService:
                     != backpressure_before
                 )
                 queued += self._adopt_durable_block_candidate_rows(retained_rows)
+                if self._block_replay_backpressure_drain_pending:
+                    # A descriptor was withheld before its floor/preview was
+                    # adopted. Even an exhausted SQL page is incomplete here.
+                    enumeration_truncated = True
+                    self._coordinator._note_block_replay_enumeration_owed()
+                    break
                 if len(durable_rows) < enumeration_limit or not forced_enumeration:
                     # A short page proves no further pending row existed at
                     # query time -- the completeness the re-drive's

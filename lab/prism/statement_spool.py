@@ -30,7 +30,7 @@ os.execvp(sys.argv[3], sys.argv[3:])
 
 
 def run_fenced_statement(ledger: Any, pieces: Iterable[str]) -> Any:
-    from lab.prism.audit_bundle_view import ArtifactResourcePressure
+    from lab.prism.audit_bundle_view import ArtifactResourcePressure, RECORD_HELPER_ADMISSION
     from lab.prism.share_ledger import LedgerOperationTimeout, parse_single_json_value
 
     with tempfile.TemporaryFile() as statement, tempfile.TemporaryFile() as result, tempfile.TemporaryFile() as errors:
@@ -47,7 +47,14 @@ def run_fenced_statement(ledger: Any, pieces: Iterable[str]) -> Any:
         except OSError as exc:
             raise ArtifactResourcePressure("finalization statement spool unavailable") from exc
         statement.seek(0)
-        with ledger._operation_gate(ledger._lock, "writer lock"):
+        deadline = time.monotonic() + STATEMENT_HELPER_TIMEOUT_SECONDS
+
+        def check() -> None:
+            ledger._remaining_operation_timeout()
+            if time.monotonic() >= deadline:
+                raise LedgerOperationTimeout("finalization statement helper exceeded its deadline")
+
+        with ledger._operation_gate(ledger._lock, "writer lock"), RECORD_HELPER_ADMISSION.hold(check):
             command, kwargs, timeout = ledger._psql_invocation()
             environment = dict(kwargs.get("env", os.environ))
             native = getattr(ledger, "_native", None)
@@ -73,10 +80,8 @@ def run_fenced_statement(ledger: Any, pieces: Iterable[str]) -> Any:
                     **connection,
                 ),
                            *command[len(ledger._command):]]
-            deadline = time.monotonic() + min(
-                STATEMENT_HELPER_TIMEOUT_SECONDS,
-                STATEMENT_HELPER_TIMEOUT_SECONDS if timeout is None else timeout,
-            )
+            if timeout is not None:
+                deadline = min(deadline, time.monotonic() + timeout)
             process = subprocess.Popen(
                 [sys.executable, "-c", _EXEC_LIMITED,
                  str(STATEMENT_HELPER_MEMORY_BYTES), str(STATEMENT_RESULT_BYTES), *command],
@@ -84,9 +89,7 @@ def run_fenced_statement(ledger: Any, pieces: Iterable[str]) -> Any:
             )
             try:
                 while process.poll() is None:
-                    ledger._remaining_operation_timeout()
-                    if time.monotonic() >= deadline:
-                        raise LedgerOperationTimeout("finalization statement helper exceeded its deadline")
+                    check()
                     time.sleep(0.05)
             finally:
                 if process.poll() is None:

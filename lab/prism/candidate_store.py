@@ -1307,7 +1307,12 @@ class LegacyCandidateHelper:
         errors = bytearray()
         io_errors: list[BaseException] = []
         limit = 64 * 1024
+        from lab.prism.audit_bundle_view import RECORD_HELPER_ADMISSION
+
+        admitted = False
         try:
+            RECORD_HELPER_ADMISSION.acquire(check_deadline)
+            admitted = True
             check_deadline()
             repo_root = Path(__file__).resolve().parents[2]
             env = dict(os.environ)
@@ -1393,6 +1398,8 @@ class LegacyCandidateHelper:
                 for pipe in (process.stdin, process.stdout, process.stderr):
                     if pipe is not None:
                         pipe.close()
+            if admitted:
+                RECORD_HELPER_ADMISSION.release()
             self._lock.release()
 
     def convert(self, block_hash: str, spool_path: str, index_path: str, *, spool_limit_bytes: int | None = None) -> LegacyHelperResult:
