@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import itertools
 import os
 import shlex
 import shutil
@@ -206,6 +207,26 @@ class CandidateWindowPostgresTests(unittest.TestCase):
             ])
         self.assertTrue(self.covers([{"share_id": "a"}]))
 
+    def assert_streaming_timeout_and_retry(self, share_id: str) -> None:
+        from lab.prism.share_ledger import LedgerOperationTimeout
+
+        with self.ledger.operation_timeout(0.1):
+            with self.assertRaises(LedgerOperationTimeout):
+                self.covers(itertools.repeat({"share_id": share_id}))
+        self.assertEqual(self.connection.execute("""
+            SELECT count(*) FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname LIKE 'pg_temp_%' AND c.relname = 'qbit_candidate_recorded_ids'
+        """).fetchone()[0], 0)
+        self.assertEqual(self.connection.execute("""
+            SELECT count(*) FROM pg_stat_activity
+            WHERE datname = current_database() AND state = 'idle in transaction'
+        """).fetchone()[0], 0)
+        self.assertTrue(self.covers([{"share_id": share_id}]))
+
+    def test_native_deadline_expires_while_streaming(self) -> None:
+        self.insert("a")
+        self.assert_streaming_timeout_and_retry("a")
+
     @unittest.skipUnless(shutil.which("psql"), "requires PostgreSQL client")
     def test_psql_stream_roundtrip_and_failure(self) -> None:
         # Use the existing instance's guards/gates and an independent psql
@@ -224,6 +245,7 @@ class CandidateWindowPostgresTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "share ID contains a NUL"):
                 self.covers([{"share_id": value + "\x00"}])
             self.assertTrue(self.covers([{"share_id": value}]))
+            self.assert_streaming_timeout_and_retry(value)
             self.assertEqual(self.connection.execute(
                 "SELECT count(*) FROM qbit_share_ledger"
             ).fetchone()[0], 1)

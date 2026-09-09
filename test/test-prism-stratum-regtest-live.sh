@@ -59,6 +59,10 @@ if [[ "${RESTART_REPLAY}" == "1" && ( "${PRIMED_WINDOW}" != "1" || "${NATIVE_POS
   echo "restart replay requires primed-window and native-Postgres fixture modes" >&2
   exit 1
 fi
+if [[ "${RESTART_REPLAY}" == "1" && -n "${EXTERNAL_PSQL}" && -z "${PRISM_DATABASE_URL:-}" ]]; then
+  echo "restart replay with external Postgres requires PRISM_DATABASE_URL" >&2
+  exit 1
+fi
 if [[ "${POWER_LAW_ENABLED}" == "1" && "${MINER_COUNT}" -lt 6 ]]; then
   echo "QBIT_PRISM_LIVE_POWER_LAW=1 requires at least 6 miners" >&2
   exit 1
