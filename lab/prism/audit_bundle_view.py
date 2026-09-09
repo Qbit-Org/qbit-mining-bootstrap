@@ -57,6 +57,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from typing import Any, Callable, Iterable, Iterator
 import weakref
 
@@ -103,8 +104,16 @@ RECORD_DECODE_SOFT_LIMIT_BYTES = 1024 * 1024
 # Members of an isolated record that are kept in the coordinator as plain
 # values: any member whose compact encoding is at most this many bytes.
 RAW_RECORD_MEMBER_LIMIT_BYTES = 4096
-# Wall-clock ceiling for one isolated record normalization.
+# Wall-clock ceiling for one isolated record normalization, admission wait
+# included.
 RAW_RECORD_HELPER_TIMEOUT_SECONDS = 300.0
+# Isolated helper processes admitted at once: each one may hold a whole
+# record (and two encodings of it), so the slots bound helper memory.
+RAW_RECORD_HELPER_SLOTS = 2
+# Supervisor poll interval while a helper runs or a slot is awaited.
+RAW_RECORD_HELPER_POLL_SECONDS = 0.05
+# Bytes of a helper's diagnostics retained (the tail) for the error report.
+RAW_RECORD_HELPER_DIAGNOSTIC_BYTES = 64 * 1024
 
 _WHITESPACE = re.compile(r"[ \t\n\r]*")
 # Strict JSON token grammar (RFC 8259 plus the standard decoder's NaN and
@@ -1110,6 +1119,38 @@ def _helper_main(argv: Sequence[str]) -> int:
     return 0
 
 
+class HelperAdmission:
+    """Bounded admission slots shared by isolated helper processes.
+
+    Every helper kind that decodes a whole document outside the coordinator
+    (the record normalizer here, the legacy candidate helper) can share one
+    instance so their combined memory stays bounded by the slot count.
+    Waiting is supervised by the caller's deadline/cancellation check.
+    """
+
+    __slots__ = ("_semaphore", "slots")
+
+    def __init__(self, slots: int = RAW_RECORD_HELPER_SLOTS) -> None:
+        self.slots = max(1, int(slots))
+        self._semaphore = threading.BoundedSemaphore(self.slots)
+
+    def acquire(
+        self,
+        check: Callable[[], None],
+        *,
+        poll_seconds: float = RAW_RECORD_HELPER_POLL_SECONDS,
+    ) -> None:
+        """Take a slot; ``check`` runs between polls and raises to give up."""
+        while not self._semaphore.acquire(timeout=max(0.001, float(poll_seconds))):
+            check()
+
+    def release(self) -> None:
+        self._semaphore.release()
+
+
+RECORD_HELPER_ADMISSION = HelperAdmission()
+
+
 def _feed_helper_stdin(process: subprocess.Popen[bytes], source: ArtifactSource, start: int, end: int) -> list[BaseException]:
     errors: list[BaseException] = []
     assert process.stdin is not None
@@ -1121,9 +1162,10 @@ def _feed_helper_stdin(process: subprocess.Popen[bytes], source: ArtifactSource,
                 raise CanonicalArtifactError("canonical audit artifact span is truncated")
             process.stdin.write(chunk)
             offset += len(chunk)
+        process.stdin.flush()
     except BrokenPipeError:
         pass
-    except BaseException as exc:  # pragma: no cover - surfaced by the caller
+    except BaseException as exc:  # surfaced by the supervisor
         errors.append(exc)
     finally:
         try:
@@ -1143,6 +1185,61 @@ def _read_exact(stream: Any, size: int) -> Iterator[bytes]:
         yield chunk
 
 
+class _HelperOutput:
+    """What the stdout reader thread collected: header facts and the spool."""
+
+    __slots__ = ("error", "header", "no_header", "spool_fd")
+
+    def __init__(self) -> None:
+        self.header: dict[str, Any] | None = None
+        self.no_header = False
+        self.spool_fd: int | None = None
+        self.error: BaseException | None = None
+
+
+def _read_helper_output(stream: Any, output: _HelperOutput) -> None:
+    """Read the header line, then stream both encodings into a scratch file."""
+    try:
+        header_line = stream.readline()
+        if not header_line:
+            output.no_header = True
+            return
+        try:
+            header = json.loads(header_line)
+            parsed = {
+                "ordered_size": int(header["ordered_size"]),
+                "sorted_size": int(header["sorted_size"]),
+                "keys": [str(key) for key in header["keys"]],
+                "members": dict(header["members"]),
+                "omitted": [str(key) for key in header["omitted"]],
+                "is_object": bool(header["is_object"]),
+            }
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ArtifactResourcePressure(f"record helper header is malformed: {exc}") from exc
+        output.spool_fd = _scratch_fd("record spool")
+        offset = 0
+        for chunk in _read_exact(stream, parsed["ordered_size"] + parsed["sorted_size"]):
+            _pwrite_all(output.spool_fd, chunk, offset, purpose="record spool")
+            offset += len(chunk)
+        output.header = parsed
+    except BaseException as exc:  # classified by the supervisor
+        output.error = exc
+
+
+def _drain_helper_stderr(stream: Any, tail: bytearray, limit: int) -> None:
+    """Drain diagnostics so a noisy child never blocks; keep only the tail."""
+    try:
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                return
+            tail.extend(chunk)
+            if len(tail) > limit:
+                del tail[:-limit]
+    except OSError:
+        return
+
+
 def normalize_record_isolated(
     source: ArtifactSource,
     start: int,
@@ -1150,16 +1247,52 @@ def normalize_record_isolated(
     *,
     member_limit: int = RAW_RECORD_MEMBER_LIMIT_BYTES,
     timeout_seconds: float = RAW_RECORD_HELPER_TIMEOUT_SECONDS,
+    cancellation: Callable[[], None] | None = None,
+    admission: HelperAdmission | None = None,
 ) -> RawJsonRecord:
     """Normalize the record at ``source[start:end)`` in a helper process.
 
     The record bytes stream to the helper through a pipe and its encodings
     stream back into an unlinked scratch file, so the coordinator holds at
-    most one read chunk of the record at any time. A malformed record is a
-    :class:`CanonicalArtifactSyntaxError`; a helper that cannot be spawned,
-    times out, or a scratch file that cannot be written is
-    :class:`ArtifactResourcePressure`.
+    most one read chunk of the record at any time. Every protocol step --
+    the wait for an admission slot, feeding stdin, reading the header and
+    the encodings, draining diagnostics -- runs under one deadline
+    (``timeout_seconds`` from the call) and the optional ``cancellation``
+    check, which raises to abandon the helper. On every exit the child is
+    killed if still alive, reaped, and its pipes closed; a scratch
+    descriptor not handed to the record is closed. No ``preexec_fn`` is
+    used: the coordinator is multithreaded.
+
+    A malformed record is a :class:`CanonicalArtifactSyntaxError`. A helper
+    that cannot be admitted or spawned in time, exits abnormally, times out,
+    or a scratch file that cannot be written is
+    :class:`ArtifactResourcePressure`: retryable, never corruption.
     """
+    deadline = time.monotonic() + float(timeout_seconds)
+
+    def check() -> None:
+        if cancellation is not None:
+            cancellation()
+        if time.monotonic() >= deadline:
+            raise ArtifactResourcePressure("record helper exceeded its deadline")
+
+    slots = admission if admission is not None else RECORD_HELPER_ADMISSION
+    slots.acquire(check)
+    try:
+        return _run_record_helper(source, start, end, member_limit=member_limit, check=check)
+    finally:
+        slots.release()
+
+
+def _run_record_helper(
+    source: ArtifactSource,
+    start: int,
+    end: int,
+    *,
+    member_limit: int,
+    check: Callable[[], None],
+) -> RawJsonRecord:
+    check()
     command = [sys.executable, "-m", __name__, "--normalize-record", str(int(member_limit))]
     try:
         process = subprocess.Popen(
@@ -1171,64 +1304,77 @@ def normalize_record_isolated(
         )
     except OSError as exc:
         raise ArtifactResourcePressure(f"cannot start the record helper: {exc}") from exc
-    spool_fd: int | None = None
+    assert process.stdin is not None and process.stdout is not None and process.stderr is not None
+    output = _HelperOutput()
     feeder_errors: list[BaseException] = []
-    feeder = threading.Thread(
-        target=lambda: feeder_errors.extend(_feed_helper_stdin(process, source, start, end)),
-        name="prism-audit-record-helper-feed",
-        daemon=True,
-    )
+    diagnostics = bytearray()
+    threads = [
+        threading.Thread(
+            target=lambda: feeder_errors.extend(_feed_helper_stdin(process, source, start, end)),
+            name="prism-audit-record-helper-feed",
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_read_helper_output,
+            args=(process.stdout, output),
+            name="prism-audit-record-helper-output",
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_drain_helper_stderr,
+            args=(process.stderr, diagnostics, RAW_RECORD_HELPER_DIAGNOSTIC_BYTES),
+            name="prism-audit-record-helper-stderr",
+            daemon=True,
+        ),
+    ]
     try:
-        feeder.start()
-        assert process.stdout is not None
-        header_line = process.stdout.readline()
-        if not header_line:
-            process.wait(timeout=timeout_seconds)
-            stderr = b""
-            if process.stderr is not None:
-                stderr = process.stderr.read()
-            if process.returncode == 2:
-                raise CanonicalArtifactSyntaxError(
-                    "canonical audit artifact record is malformed: "
-                    + stderr.decode(errors="replace").strip()
-                )
-            raise ArtifactResourcePressure(
-                "record helper produced no header: " + stderr.decode(errors="replace").strip()
+        for thread in threads:
+            thread.start()
+        while process.poll() is None:
+            check()
+            if output.error is not None or feeder_errors:
+                break
+            time.sleep(RAW_RECORD_HELPER_POLL_SECONDS)
+        if process.poll() is None:
+            # A transport error while the child still runs: stop it now so
+            # the pipe threads unblock, then report the error below.
+            process.kill()
+            process.wait()
+        for thread in threads:
+            while thread.is_alive():
+                check()
+                thread.join(RAW_RECORD_HELPER_POLL_SECONDS)
+        tail = diagnostics.decode("utf-8", "replace").strip()
+        if process.returncode == 2:
+            raise CanonicalArtifactSyntaxError(
+                "canonical audit artifact record is malformed: " + tail
             )
-        try:
-            header = json.loads(header_line)
-            ordered_size = int(header["ordered_size"])
-            sorted_size = int(header["sorted_size"])
-            keys = [str(key) for key in header["keys"]]
-            members = dict(header["members"])
-            omitted = [str(key) for key in header["omitted"]]
-            is_object = bool(header["is_object"])
-        except (ValueError, KeyError, TypeError) as exc:
-            raise ArtifactResourcePressure(f"record helper header is malformed: {exc}") from exc
-        spool_fd = _scratch_fd("record spool")
-        offset = 0
-        for chunk in _read_exact(process.stdout, ordered_size + sorted_size):
-            _pwrite_all(spool_fd, chunk, offset, purpose="record spool")
-            offset += len(chunk)
-        try:
-            process.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired as exc:
-            raise ArtifactResourcePressure("record helper timed out") from exc
         if process.returncode != 0:
-            raise ArtifactResourcePressure(f"record helper exited with status {process.returncode}")
-        feeder.join(timeout=timeout_seconds)
+            raise ArtifactResourcePressure(
+                f"record helper exited with status {process.returncode}: {tail}"
+            )
         if feeder_errors:
             raise feeder_errors[0]
-        spool = ArtifactSource(spool_fd, path=None)
-        spool_fd = None
+        if output.error is not None:
+            raise output.error
+        if output.no_header or output.header is None or output.spool_fd is None:
+            raise ArtifactResourcePressure("record helper produced no header: " + tail)
+        header = output.header
+        spool_fd = output.spool_fd
+        output.spool_fd = None
+        try:
+            spool = ArtifactSource(spool_fd, path=None)
+        except BaseException:
+            _close_fd(spool_fd)
+            raise
         return RawJsonRecord(
             spool,
-            ordered=(0, ordered_size),
-            sorted_span=(ordered_size, ordered_size + sorted_size),
-            keys=keys,
-            members=members,
-            omitted=omitted,
-            is_object=is_object,
+            ordered=(0, header["ordered_size"]),
+            sorted_span=(header["ordered_size"], header["ordered_size"] + header["sorted_size"]),
+            keys=header["keys"],
+            members=header["members"],
+            omitted=header["omitted"],
+            is_object=header["is_object"],
         )
     finally:
         if process.poll() is None:
@@ -1236,19 +1382,19 @@ def normalize_record_isolated(
                 process.kill()
             except OSError:
                 pass
+        try:
+            process.wait()
+        except OSError:
+            pass
+        for stream in (process.stdin, process.stdout, process.stderr):
             try:
-                process.wait(timeout=5.0)
-            except (subprocess.TimeoutExpired, OSError):
+                stream.close()
+            except OSError:
                 pass
-        for stream in (process.stdout, process.stderr):
-            if stream is not None:
-                try:
-                    stream.close()
-                except OSError:
-                    pass
-        feeder.join(timeout=5.0)
-        if spool_fd is not None:
-            _close_fd(spool_fd)
+        for thread in threads:
+            thread.join(timeout=5.0)
+        if output.spool_fd is not None:
+            _close_fd(output.spool_fd)
 
 
 def streamed_sha256_json_hex(value: Any) -> str:
@@ -1278,6 +1424,13 @@ def materialize_json(value: Any) -> Any:
         return json.loads("".join(value.iter_text_chunks()))
     if isinstance(value, StreamedJsonString):
         return "".join(value.iter_text_chunks())
+    if not isinstance(value, (Mapping, Sequence)):
+        # A streamed scalar from another bounded view family (a candidate
+        # spool string or raw token): text when it has some, else its JSON.
+        if callable(getattr(value, "iter_text_chunks", None)):
+            return "".join(value.iter_text_chunks())
+        if callable(getattr(value, "iter_encoded_chunks", None)):
+            return json.loads("".join(value.iter_encoded_chunks()))
     if isinstance(value, Mapping):
         return {str(key): materialize_json(item) for key, item in value.items()}
     if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
@@ -1380,6 +1533,15 @@ def _encode_pieces(
         yield from value.iter_text_chunks()
         return
     if isinstance(value, StreamedJsonString):
+        yield from value.iter_encoded_chunks()
+        return
+    if not isinstance(value, (Mapping, Sequence)) and callable(
+        getattr(value, "iter_encoded_chunks", None)
+    ):
+        # A streamed scalar from another bounded view family (a candidate
+        # spool string or raw token) is emitted verbatim; its encoding does
+        # not depend on key order. Lazy containers take the generic Mapping
+        # and Sequence routes below, member by member.
         yield from value.iter_encoded_chunks()
         return
     if isinstance(value, Mapping):
@@ -1531,6 +1693,7 @@ class LazyRecordSequence(Sequence):
 
     __slots__ = (
         "__weakref__",
+        "_cancellation",
         "_chunk_bytes",
         "_count",
         "_end",
@@ -1554,6 +1717,7 @@ class LazyRecordSequence(Sequence):
         stride: int = RECORD_INDEX_STRIDE,
         chunk_bytes: int = SCAN_CHUNK_BYTES,
         stats: ScanStats | None = None,
+        cancellation: Callable[[], None] | None = None,
     ) -> None:
         self._source = source
         self._start = int(start)
@@ -1564,6 +1728,9 @@ class LazyRecordSequence(Sequence):
         self._stride = max(1, int(stride))
         self._chunk_bytes = int(chunk_bytes)
         self._stats = stats if stats is not None else ScanStats()
+        # Runs once per read chunk of every lazy read and before each
+        # isolated-helper step; raises to abandon the work.
+        self._cancellation = cancellation
 
     def _decode_record(self, cursor: _Cursor) -> Any:
         """Decode the record at the cursor, isolating an oversized one.
@@ -1593,7 +1760,9 @@ class LazyRecordSequence(Sequence):
                     f"canonical audit artifact record is malformed: {exc}"
                 ) from exc
         self._stats.isolated_records += 1
-        return normalize_record_isolated(self._source, start, end)
+        return normalize_record_isolated(
+            self._source, start, end, cancellation=self._cancellation
+        )
 
     @property
     def source(self) -> ArtifactSource:
@@ -1610,7 +1779,12 @@ class LazyRecordSequence(Sequence):
         return f"LazyRecordSequence(count={self._count}, bytes={self._end - self._start})"
 
     def _cursor(self, offset: int) -> _Cursor:
-        return _Cursor(self._source, offset, chunk_bytes=self._chunk_bytes)
+        return _Cursor(
+            self._source,
+            offset,
+            chunk_bytes=self._chunk_bytes,
+            checkpoint=self._cancellation,
+        )
 
     def iter_range(self, start: int, stop: int) -> Iterator[Any]:
         """Records ``start`` (inclusive) to ``stop`` (exclusive), streamed."""
@@ -1743,6 +1917,7 @@ def _scan_array(
     index: _CheckpointIndex,
     stride: int,
     chunk_bytes: int,
+    cancellation: Callable[[], None] | None = None,
 ) -> Any:
     cursor.skip_ws()
     if cursor.peek() != "[":
@@ -1764,6 +1939,7 @@ def _scan_array(
             stride=stride,
             chunk_bytes=chunk_bytes,
             stats=cursor.stats,
+            cancellation=cancellation,
         )
     while True:
         cursor.skip_ws()
@@ -1794,6 +1970,7 @@ def _scan_array(
         stride=stride,
         chunk_bytes=chunk_bytes,
         stats=cursor.stats,
+        cancellation=cancellation,
     )
 
 
@@ -1806,6 +1983,7 @@ def _parse_object(
     index: _CheckpointIndex,
     stride: int,
     chunk_bytes: int,
+    cancellation: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     cursor.skip_ws()
     cursor.expect("{")
@@ -1832,6 +2010,7 @@ def _parse_object(
                 index=index,
                 stride=stride,
                 chunk_bytes=chunk_bytes,
+                cancellation=cancellation,
             )
         elif any(
             len(lazy) > len(member_path) and lazy[: len(member_path)] == member_path
@@ -1847,6 +2026,7 @@ def _parse_object(
                     index=index,
                     stride=stride,
                     chunk_bytes=chunk_bytes,
+                    cancellation=cancellation,
                 )
             else:
                 value = cursor.decode_value()
@@ -1914,8 +2094,10 @@ class CanonicalAuditBundleView(Mapping):
         """Scan the artifact behind ``fd``; the view takes ownership of ``fd``.
 
         ``cancellation`` runs once per read chunk so a cancelled build stops
-        within one bounded read. The whole file is consumed so the returned
-        digest covers every byte, and trailing garbage is rejected.
+        within one bounded read; the lazy sequences the view hands out keep
+        it, so later lazy reads and isolated-helper runs honour it as well.
+        The whole file is consumed so the returned digest covers every
+        byte, and trailing garbage is rejected.
         """
         source = ArtifactSource(fd, path=path)
         try:
@@ -1943,6 +2125,7 @@ class CanonicalAuditBundleView(Mapping):
                 index=index,
                 stride=stride,
                 chunk_bytes=chunk_bytes,
+                cancellation=cancellation,
             )
             cursor.skip_ws()
             if not cursor.at_eof():
@@ -2130,14 +2313,19 @@ __all__ = [
     "CanonicalArtifactError",
     "CanonicalArtifactSyntaxError",
     "CanonicalAuditBundleView",
+    "HelperAdmission",
     "JSON_BATCH_RECORDS",
     "JSON_CHUNK_CHARS",
     "LazyRecordSequence",
     "LazyRecordSlice",
     "MappedSequence",
+    "RAW_RECORD_HELPER_DIAGNOSTIC_BYTES",
+    "RAW_RECORD_HELPER_POLL_SECONDS",
+    "RAW_RECORD_HELPER_SLOTS",
     "RAW_RECORD_HELPER_TIMEOUT_SECONDS",
     "RAW_RECORD_MEMBER_LIMIT_BYTES",
     "RECORD_DECODE_SOFT_LIMIT_BYTES",
+    "RECORD_HELPER_ADMISSION",
     "RECORD_INDEX_STRIDE",
     "RawJsonDocument",
     "RawJsonRecord",

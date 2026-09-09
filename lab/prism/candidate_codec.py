@@ -81,11 +81,11 @@ CODEC_BATCH_OVERSIZED_BYTES = 4 * 1024 * 1024
 # Nothing is rejected for size alone.
 CODEC_STRING_SLICE_CHARS = 4096
 CODEC_FAST_PATH_BYTES = 64 * 1024
-# A decoded page above this size takes the record walker instead of one
-# ``json.loads`` (only reachable through an oversized record).
+# Historical reader ceilings, retained for callers that import them. The
+# reader no longer decodes a page or a record whole above
+# ``candidate_spool_view.SPOOL_VIEW_DECODE_BYTES``: an oversized record is a
+# lazy view, and no record size is rejected.
 CODEC_PAGE_DECODE_BYTES = 16 * 1024 * 1024
-# The record walker grows its buffer geometrically until one record fits;
-# this is the ceiling on one record's encoded size in that fallback path.
 CODEC_WALK_RECORD_MAX_BYTES = 256 * 1024 * 1024
 # Records decoded per page when a body carries no page index for a span.
 SPOOL_WALK_BATCH_RECORDS = 256
@@ -1365,12 +1365,47 @@ def _unlink_spool(path: str, index_path: str, release: Callable[[], None] | None
 # --------------------------------------------------------------------------
 
 
-def _ascii_text(data: bytes) -> str:
-    """The body is ASCII by construction; anything else is corruption."""
-    try:
-        return data.decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise CandidateBodyIntegrityError("spool body is not ASCII") from exc
+def _views() -> Any:
+    """The lazy-view module (``candidate_spool_view``), imported on first use.
+
+    That module builds on this one and on the audit adapters' retryable
+    resource-pressure class, so the import is deferred to keep this module
+    a standard-library leaf at import time.
+    """
+    from lab.prism import candidate_spool_view
+
+    return candidate_spool_view
+
+
+def _walk_record_batches(
+    body: SpoolCandidateBody,
+    start: int,
+    end: int,
+    *,
+    batch_records: int = SPOOL_WALK_BATCH_RECORDS,
+) -> Iterator[tuple[int, int, tuple[Any, ...]]]:
+    """``(batch_start, batch_end, records)`` over ``body[start:end]``.
+
+    The range holds records joined by ``,``. Record boundaries come from the
+    structural byte scanner, so no record is decoded to find its end, and
+    each record follows the view module's decode policy: one bounded
+    ``json.loads`` when it fits :data:`~lab.prism.candidate_spool_view.SPOOL_VIEW_DECODE_BYTES`,
+    a lazy view when it does not. There is no per-record size ceiling.
+    """
+    views = _views()
+    batch: list[Any] = []
+    batch_start = start
+    batch_end = start
+    for item_start, item_end in views.iter_item_spans(body, start, end):
+        if not batch:
+            batch_start = item_start
+        batch.append(views.decode_body_span(body, item_start, item_end))
+        batch_end = item_end
+        if len(batch) >= batch_records:
+            yield batch_start, batch_end, tuple(batch)
+            batch = []
+    if batch:
+        yield batch_start, batch_end, tuple(batch)
 
 
 def _walk_records(
@@ -1380,68 +1415,28 @@ def _walk_records(
     *,
     batch_records: int = SPOOL_WALK_BATCH_RECORDS,
 ) -> Iterator[tuple[Any, ...]]:
-    """Decode ``body[start:end]`` (records joined by ``,``) record by record.
-
-    The buffer holds at most one record plus one refill; it grows
-    geometrically only while a single record does not fit, up to
-    :data:`CODEC_WALK_RECORD_MAX_BYTES`. Offsets are bytes and characters
-    alike because the body is ASCII.
-    """
-    decoder = json.JSONDecoder()
-    if end <= start:
-        return
-    position = start
-    buffer = ""
-    buffer_start = start
-    read_size = SPOOL_READ_BYTES
-    batch: list[Any] = []
-    while position < end:
-        relative = position - buffer_start
-        try:
-            record, consumed = decoder.raw_decode(buffer, relative)
-            complete = buffer_start + consumed < end or buffer_start + len(buffer) >= end
-        except ValueError:
-            record = None
-            consumed = -1
-            complete = False
-        if not complete or (consumed >= len(buffer) and buffer_start + len(buffer) < end):
-            loaded_to = buffer_start + len(buffer)
-            if loaded_to >= end:
-                raise CandidateBodyIntegrityError("spool span ended inside a record")
-            if len(buffer) - relative > CODEC_WALK_RECORD_MAX_BYTES:
-                raise CandidateBodyIntegrityError("spool record exceeds the walker ceiling")
-            read_to = min(end, loaded_to + read_size)
-            buffer = buffer[relative:] + _ascii_text(body.read_span(loaded_to, read_to))
-            buffer_start = position
-            read_size = min(read_size * 2, CODEC_WALK_RECORD_MAX_BYTES)
-            continue
-        read_size = SPOOL_READ_BYTES
-        batch.append(record)
-        position = buffer_start + consumed
-        if position < end:
-            if buffer[consumed : consumed + 1] != ",":
-                raise CandidateBodyIntegrityError("spool records are not comma separated")
-            position += 1
-        if len(batch) >= batch_records:
-            yield tuple(batch)
-            batch = []
-    if batch:
-        yield tuple(batch)
+    """Decode ``body[start:end]`` (records joined by ``,``) in bounded batches."""
+    for _batch_start, _batch_end, records in _walk_record_batches(
+        body, start, end, batch_records=batch_records
+    ):
+        yield records
 
 
 class SpoolJsonArraySequence(Sequence):
     """One large JSON array field decoded page by page from a spool body.
 
-    Iteration decodes one bounded page per ``json.loads`` from the on-disk
-    page index (validated by size before the read), falling back to the
-    record walker for a page that does not decode as a whole -- the only
-    route for a page whose boundaries were scanned hints. Random access
-    bisects the index with ``pread``; a body whose hints are not yet exact
-    decodes sequentially once, correcting the index as it goes, and is
-    exact from then on. Only the page last decoded is cached.
+    Iteration decodes one page per ``json.loads`` from the on-disk page
+    index while the page fits the view module's decode threshold; a larger
+    page (one holding an oversized record) is split by the structural
+    scanner and each record follows the decode policy, so an oversized
+    record is a lazy view rather than a whole decode or a rejection. Random
+    access bisects the index with ``pread``. A span whose page entries are
+    not exact (legacy scanned hints) is walked sequentially once, ignoring
+    the hints, and the exact page starts recovered by that walk serve random
+    access from then on. Only the page last decoded is cached.
     """
 
-    __slots__ = ("_body", "_span", "_lock", "_cached_page", "_cached_records")
+    __slots__ = ("_body", "_span", "_lock", "_cached_page", "_cached_records", "_walk_index")
 
     def __init__(self, body: SpoolCandidateBody, span: FieldSpan) -> None:
         self._body = body
@@ -1449,6 +1444,7 @@ class SpoolJsonArraySequence(Sequence):
         self._lock = threading.Lock()
         self._cached_page = -1
         self._cached_records: tuple[Any, ...] = ()
+        self._walk_index: Any = None
 
     @property
     def body(self) -> SpoolCandidateBody:
@@ -1458,72 +1454,119 @@ class SpoolJsonArraySequence(Sequence):
     def span(self) -> FieldSpan:
         return self._body.index.span(self._span.field) or self._span
 
+    @property
+    def byte_range(self) -> tuple[int, int]:
+        return self._span.start, self._span.end
+
+    @property
+    def byte_length(self) -> int:
+        return self._span.end - self._span.start
+
     def __len__(self) -> int:
         return self._span.item_count
 
     # -- pages ------------------------------------------------------------------
 
+    def _indexed(self) -> bool:
+        """True when the on-disk page index can serve random access."""
+        span = self.span
+        return span.page_count > 0 and span.pages_exact
+
+    def _index_entry(self, ordinal: int) -> tuple[int, int]:
+        try:
+            return self._body.index.entry(self._span.field, ordinal)
+        except OSError as exc:
+            raise CandidateBodyIntegrityError(f"spool page index is unreadable: {exc}") from exc
+
     def _page_span(self, page: int) -> tuple[int, int, int]:
         """(start, end, record_index) of one page; ``end`` excludes the separator."""
-        index = self._body.index
-        field_name = self._span.field
-        start, record_index = index.entry(field_name, page)
+        start, record_index = self._index_entry(page)
         if page + 1 < self._span.page_count:
-            end = index.entry(field_name, page + 1)[0] - 1
+            end = self._index_entry(page + 1)[0] - 1
         else:
             end = self._span.end - 1
+        if not (self._span.start < start <= end < self._span.end):
+            raise CandidateBodyIntegrityError("spool page index points outside its span")
         return start, end, record_index
+
+    def _decode_records(self, start: int, end: int) -> tuple[Any, ...]:
+        """Records in ``body[start:end]``: one bounded call, or the walk."""
+        views = _views()
+        if end <= start:
+            return ()
+        if end - start <= views.SPOOL_VIEW_DECODE_BYTES:
+            data = views.read_body_span(self._body, start, end)
+            try:
+                records = json.loads(b"[" + data + b"]")
+            except ValueError as exc:
+                raise CandidateBodyIntegrityError("spool page is not valid JSON") from exc
+            return tuple(records)
+        return tuple(
+            record
+            for _batch_start, _batch_end, batch in _walk_record_batches(self._body, start, end)
+            for record in batch
+        )
 
     def _decode_page(self, page: int) -> tuple[Any, ...]:
         with self._lock:
             if page == self._cached_page:
                 return self._cached_records
         start, end, _ = self._page_span(page)
-        decoded: tuple[Any, ...] | None = None
-        if end - start <= CODEC_PAGE_DECODE_BYTES:
-            text = _ascii_text(self._body.read_span(start, end))
-            try:
-                records = json.loads("[" + text + "]")
-            except ValueError:
-                records = None
-            if isinstance(records, list):
-                decoded = tuple(records)
-            elif records is not None:
-                raise CandidateBodyIntegrityError("spool page is not an array")
-        if decoded is None:
-            if self.span.pages_exact:
-                raise CandidateBodyIntegrityError("spool page is not valid JSON")
-            # A scanned hint split a record: walk this page's bytes instead.
-            decoded = tuple(
-                record
-                for batch in _walk_records(self._body, start, end)
-                for record in batch
-            )
+        decoded = self._decode_records(start, end)
         with self._lock:
             self._cached_page = page
             self._cached_records = decoded
         return decoded
 
+    def _walk_pages(self, span: FieldSpan) -> Iterator[tuple[Any, ...]]:
+        """Sequential walk of a span without a usable page index.
+
+        Records the exact batch starts in a private bounded index so later
+        random access bisects instead of walking again.
+        """
+        views = _views()
+        with self._lock:
+            index = None if self._walk_index is not None else views._OffsetIndex(2)
+        running = 0
+        try:
+            for batch_start, _batch_end, records in _walk_record_batches(
+                self._body, span.start + 1, span.end - 1
+            ):
+                if index is not None:
+                    index.append(batch_start, running)
+                running += len(records)
+                yield records
+            if running != span.item_count:
+                raise CandidateBodyIntegrityError(
+                    f"spool array holds {running} records where {span.item_count} were declared"
+                )
+        except BaseException:
+            if index is not None:
+                index.close()
+            raise
+        if index is not None:
+            with self._lock:
+                if self._walk_index is None:
+                    self._walk_index = index
+                    index = None
+            if index is not None:
+                index.close()
+
     def iter_pages(self) -> Iterator[tuple[Any, ...]]:
         """Decoded pages in order; each one bounded C call (or a walk)."""
         span = self.span
-        if span.page_count == 0:
-            yield from _walk_records(self._body, span.start + 1, span.end - 1)
+        if not self._indexed():
+            yield from self._walk_pages(span)
             return
-        exact = span.pages_exact
         running = 0
         for page in range(span.page_count):
             records = self._decode_page(page)
-            if not exact:
-                self._body.index.set_record_index(self._span.field, page, running)
             running += len(records)
             yield records
         if running != span.item_count:
             raise CandidateBodyIntegrityError(
                 f"spool array holds {running} records where {span.item_count} were declared"
             )
-        if not exact:
-            self._body.index.mark_exact(self._span.field)
 
     # -- Sequence protocol ----------------------------------------------------------
 
@@ -1535,114 +1578,145 @@ class SpoolJsonArraySequence(Sequence):
         if isinstance(index, slice):
             start, stop, step = index.indices(len(self))
             return tuple(self[position] for position in range(start, stop, step))
-        resolved = int(index)
-        if resolved < 0:
-            resolved += len(self)
-        if resolved < 0 or resolved >= len(self):
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise TypeError("spool array indices must be integers or slices")
+        resolved = index + len(self) if index < 0 else index
+        if not 0 <= resolved < len(self):
             raise IndexError(index)
         span = self.span
-        if span.page_count == 0 or not span.pages_exact:
-            for page in self.iter_pages():
-                if resolved < len(page):
-                    return page[resolved]
-                resolved -= len(page)
-            raise IndexError(index)
-        page = self._body.index.bisect_record(self._span.field, resolved)
-        records = self._decode_page(page)
-        first = self._body.index.entry(self._span.field, page)[1]
+        if self._indexed():
+            try:
+                page = self._body.index.bisect_record(self._span.field, resolved)
+            except OSError as exc:
+                raise CandidateBodyIntegrityError(f"spool page index is unreadable: {exc}") from exc
+            records = self._decode_page(page)
+            first = self._index_entry(page)[1]
+            return records[resolved - first]
+        walk = self._walk_index
+        if walk is None:
+            for _page in self.iter_pages():
+                pass
+            walk = self._walk_index
+            if walk is None:
+                raise IndexError(index)
+        low, high = 0, walk.count
+        while high - low > 1:
+            middle = (low + high) // 2
+            if walk.get(middle)[1] <= resolved:
+                low = middle
+            else:
+                high = middle
+        batch_start, first = walk.get(low)
+        batch_end = walk.get(low + 1)[0] - 1 if low + 1 < walk.count else span.end - 1
+        records = self._decode_records(batch_start, batch_end)
         return records[resolved - first]
+
+    def __eq__(self, other: object) -> bool:
+        if other is self:
+            return True
+        if isinstance(other, (str, bytes, bytearray)) or not isinstance(other, Sequence):
+            return NotImplemented
+        if len(self) != len(other):
+            return False
+        other_iter = iter(other)
+        for item in self:
+            try:
+                candidate = next(other_iter)
+            except StopIteration:
+                return False
+            if item != candidate:
+                return False
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return not result
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __repr__(self) -> str:
+        return f"SpoolJsonArraySequence(field={self._span.field!r}, items={len(self)}, bytes={self.byte_length})"
+
+    # -- verbatim bytes --------------------------------------------------------------
+
+    def iter_byte_chunks(self, *, chunk_bytes: int | None = None) -> Iterator[bytes]:
+        """The array's exact encoding as stored, brackets included."""
+        return _views().iter_body_bytes(self._body, self._span.start, self._span.end, chunk_bytes=chunk_bytes)
+
+    def iter_encoded_chunks(self) -> Iterator[str]:
+        return _views().iter_body_text(self._body, self._span.start, self._span.end)
 
     def canonical_json_sha256(self) -> str:
         digest = hashlib.sha256()
-        start = self._span.start
-        end = self._span.end
-        while start < end:
-            stop = min(end, start + SPOOL_READ_BYTES)
-            digest.update(self._body.read_span(start, stop))
-            start = stop
+        for chunk in self.iter_byte_chunks():
+            digest.update(chunk)
         return digest.hexdigest()
 
     def canonical_share_pages(self) -> Iterator[tuple[bytes, int | None]]:
-        """The encoded pages, verbatim, for re-staging this body."""
+        """The encoded pages, verbatim, for re-staging this body.
+
+        A page within the read size is one complete page with its record
+        count; a larger page (an oversized record) and a span without a
+        usable index stream as raw continuation pieces, which the encoder's
+        structural scanner re-pages exactly. Nothing page-sized is held.
+        """
+        views = _views()
         span = self.span
-        if span.page_count == 0 or not span.pages_exact:
-            start = span.start + 1
-            end = span.end - 1
-            while start < end:
-                stop = min(end, start + SPOOL_READ_BYTES)
-                yield self._body.read_span(start, stop), None
-                start = stop
+        if not self._indexed():
+            for chunk in views.iter_body_bytes(self._body, span.start + 1, span.end - 1):
+                yield chunk, None
             return
         for page in range(span.page_count):
             start, end, record_index = self._page_span(page)
+            if end - start > views.SPOOL_VIEW_READ_BYTES:
+                for chunk in views.iter_body_bytes(self._body, start, end):
+                    yield chunk, None
+                continue
             next_index = (
-                self._body.index.entry(self._span.field, page + 1)[1]
+                self._index_entry(page + 1)[1]
                 if page + 1 < span.page_count
                 else span.item_count
             )
-            yield self._body.read_span(start, end), next_index - record_index
+            yield views.read_body_span(self._body, start, end), next_index - record_index
+
+    def close(self) -> None:
+        """Release the private walk index, if one was built; the body is untouched."""
+        with self._lock:
+            walk = self._walk_index
+        if walk is not None:
+            walk.close()
 
 
 # Historical name kept for the share array.
 SpoolShareJsonSequence = SpoolJsonArraySequence
 
 
-_STRING_ESCAPE_TAIL_RE = re.compile(r"(\\+)$")
-
-
 def decode_json_string_span(body: SpoolCandidateBody, span: FieldSpan) -> str:
-    """Decode one large JSON string field in bounded slices.
+    """The whole text of one large JSON string field, decoded in slices.
 
-    Each slice is cut at a point that does not split an escape sequence
-    (an even backslash run before the cut, and never inside ``\\uXXXX``),
-    then decoded with one small ``json.loads``. The pieces are joined into
-    the field's value: one Python string the size of the field, built
-    without a single C call larger than a slice.
+    Every C call is one slice; the join is bounded only by the field, which
+    is why hydration uses this for the consensus-bounded metadata fields
+    alone and hands any other oversized string out as a streamed view.
     """
-    start = span.start + 1
-    end = span.end - 1
-    pieces: list[str] = []
-    position = start
-    carry = ""
-    while position < end:
-        stop = min(end, position + CODEC_STRING_SLICE_CHARS)
-        text = carry + _ascii_text(body.read_span(position, stop))
-        position = stop
-        if stop < end:
-            # Do not end on a backslash run of odd length or inside \uXXXX.
-            cut = len(text)
-            tail = _STRING_ESCAPE_TAIL_RE.search(text)
-            if tail is not None and len(tail.group(1)) % 2 == 1:
-                cut = tail.start()
-            else:
-                unicode_at = text.rfind("\\u", max(0, len(text) - 6))
-                if unicode_at >= 0 and len(text) - unicode_at < 6:
-                    backslashes = len(text) - len(text[:unicode_at].rstrip("\\"))
-                    if backslashes % 2 == 0:
-                        cut = unicode_at
-            carry = text[cut:]
-            text = text[:cut]
-        else:
-            carry = ""
-        if text:
-            pieces.append(json.loads('"' + text + '"'))
-    if carry:
-        raise CandidateBodyIntegrityError("spool string field ends inside an escape")
-    return "".join(pieces)
+    return _views().decode_json_string(body, span.start, span.end)
 
 
 def decode_spool_small_fields(body: SpoolCandidateBody) -> dict[str, Any]:
     """The body's fields other than the share array, bounded per field.
 
     Builds a *skeleton* of the body in which every spanned (large) field is
-    replaced by an empty placeholder, decodes that with one ``json.loads``
-    bounded by the number of small fields times the fast-path ceiling, and
-    then attaches each large field as a bounded adapter: an array becomes a
-    :class:`SpoolJsonArraySequence`, a string is decoded slice by slice,
-    and any other large value is decoded in one call bounded by that
-    field's own size (no v1 intent field has that shape; it is reported,
-    not assumed away).
+    replaced by an empty placeholder and decodes it with one ``json.loads``
+    bounded by the number of small fields times the fast-path ceiling. Each
+    large field then follows the view module's policy: an array becomes a
+    :class:`SpoolJsonArraySequence`; a string in
+    :data:`~lab.prism.candidate_spool_view.SPOOL_DECODED_METADATA_FIELDS`
+    is decoded whole in slices (its size is bounded by consensus and its
+    consumers need the text); any other value is a plain value within the
+    decode threshold and a lazy view above it. Nothing is rejected for size.
     """
+    views = _views()
     manifest = body.manifest
     spans = sorted(body.index.spans().values(), key=lambda span: span.start)
     skeleton = io.BytesIO()
@@ -1665,19 +1739,17 @@ def decode_spool_small_fields(body: SpoolCandidateBody) -> dict[str, Any]:
             continue
         if span.kind == "array":
             fields[span.field] = SpoolJsonArraySequence(body, span)
-        elif span.kind == "string":
-            fields[span.field] = decode_json_string_span(body, span)
+        elif span.kind == "string" and span.field in views.SPOOL_DECODED_METADATA_FIELDS:
+            fields[span.field] = views.decode_json_string(body, span.start, span.end)
         else:
-            fields[span.field] = json.loads(_ascii_text(body.read_span(span.start, span.end)))
+            fields[span.field] = views.decode_body_span(body, span.start, span.end)
     fields.pop(CANDIDATE_SHARES_KEY, None)
     return fields
 
 
 def _copy_span(body: SpoolCandidateBody, start: int, end: int, sink: io.BytesIO) -> None:
-    while start < end:
-        stop = min(end, start + SPOOL_READ_BYTES)
-        sink.write(body.read_span(start, stop))
-        start = stop
+    for chunk in _views().iter_body_bytes(body, start, end):
+        sink.write(chunk)
 
 
 # --------------------------------------------------------------------------
@@ -1848,8 +1920,28 @@ def prepared_intent_from_spool(
     accepted_at_present: bool,
     accepted_at_ms: Any,
 ) -> PreparedCandidateIntent:
-    """Rebuild the mapping view of a hydrated body."""
+    """Rebuild the mapping view of a hydrated body.
+
+    Facts stay a plain dict; each value follows the view module's decode
+    policy. ``pending_share`` alone is shallow-copied into a dict when it
+    hydrates as a lazy object, so the acknowledgment stamp is restored the
+    historical way (its members keep the policy: an oversized ``share_id``
+    is a streamed string).
+    """
     identity = decode_spool_small_fields(body)
+    pending_share = identity.get("pending_share")
+    if (
+        accepted_at_present
+        and isinstance(pending_share, Mapping)
+        and not isinstance(pending_share, dict)
+    ):
+        try:
+            identity["pending_share"] = dict(pending_share.items())
+        except BaseException:
+            # The view's scratch index must not outlive this failure even
+            # while a retained traceback keeps the view itself reachable.
+            pending_share.close()
+            raise
     facts = restore_pending_stamp(
         identity,
         present=accepted_at_present,
