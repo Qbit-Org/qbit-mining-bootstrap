@@ -304,9 +304,15 @@ inserted AS (
 )
 SELECT json_build_object(
     'staged', (SELECT count(*) FROM inserted),
-    'state', (
-        SELECT state FROM qbit_block_candidate_body body, input
-        WHERE body.body_id = input.data->>'body_id'
+    -- A row this statement inserted is invisible to its own final SELECT
+    -- (one snapshot per statement), so the fresh case is answered from the
+    -- RETURNING CTE.
+    'state', COALESCE(
+        (
+            SELECT state FROM qbit_block_candidate_body body, input
+            WHERE body.body_id = input.data->>'body_id'
+        ),
+        CASE WHEN EXISTS (SELECT 1 FROM inserted) THEN 'staging' END
     )
 );
 """
@@ -733,8 +739,8 @@ SELECT json_build_object(
             ),
             'pool_block_exists', page.pool_block_exists,
             'cursor', json_build_array(page.cursor_created_at, page.block_hash)
-        ) ORDER BY page.created_at, page.block_hash)
-        FROM page), '[]'::json
+        ) ORDER BY page.created_at, page.block_hash), '[]'::json)
+        FROM page
     )
 );
 """
