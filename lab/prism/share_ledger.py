@@ -5547,6 +5547,28 @@ FROM (
             "audit_head_sha256": previous.hex() if rows else "00" * 32,
         }
 
+    def candidate_window_covers(
+        self,
+        shares: Iterable[Any],
+        *,
+        anchor_job_issued_at_ms: int,
+        network_difficulty: int,
+    ) -> bool:
+        """Check replay omissions without returning or retaining a full window.
+
+        This coordinator-only read uses connection-private temporary storage;
+        it is deliberately unavailable to the enforced read-only API ledger.
+        """
+        from lab.prism.candidate_window import postgres_window_covers
+
+        if self._read_only:
+            raise ReadOnlyLedgerError("candidate window checks require temporary storage")
+        return postgres_window_covers(
+            self, shares,
+            anchor_job_issued_at_ms=anchor_job_issued_at_ms,
+            network_difficulty=network_difficulty,
+        )
+
     def audit_share_window(
         self,
         *,
