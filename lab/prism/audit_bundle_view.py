@@ -43,7 +43,6 @@ digest and is never derived from these views.
 
 from __future__ import annotations
 
-from array import array
 import codecs
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -54,7 +53,10 @@ from pathlib import Path
 import re
 import stat
 import struct
+import subprocess
+import sys
 import tempfile
+import threading
 from typing import Any, Callable, Iterable, Iterator
 import weakref
 
@@ -72,34 +74,71 @@ RECORD_INDEX_STRIDE = 256
 JSON_BATCH_RECORDS = 256
 # Target size of one yielded encoder chunk.
 JSON_CHUNK_CHARS = 64 * 1024
-# Member paths of a canonical audit bundle that are window-sized (one entry
-# per accepted or counted share) or transaction-sized (one entry per block
-# transaction). Everything else is bounded by recipient cardinality or is a
-# fixed-size manifest and is parsed eagerly.
+# Member paths of a canonical audit bundle whose length scales with the
+# window (one entry per accepted or counted share), with the block's
+# transactions (one leaf per transaction) or with recipient cardinality
+# (balances, accounts, entitlements, settlement recipients and fanout
+# manifests). Recipient cardinality is itself bounded only by the window,
+# so none of these is a byte bound; every one stays on disk. What remains
+# eager is fixed-size: the found block, policy, attestation, digests and
+# the signed coinbase manifest, whose outputs are capped by configuration.
 CANONICAL_BUNDLE_LAZY_PATHS: tuple[tuple[str, ...], ...] = (
     ("shares",),
     ("reward_manifest", "shares"),
+    ("reward_manifest", "entitlements"),
     ("witness_merkle_leaves_hex",),
     ("audit_commitment_leaves_hex",),
+    ("prior_balances",),
+    ("payout_policy_manifest", "accounts"),
+    ("payout_policy_manifest", "onchain_entitlements"),
+    ("settlement_mode_decision", "direct_recipients"),
+    ("settlement_mode_decision", "fanout_chunks"),
+    ("ctv_fanout_manifest_set", "manifests"),
 )
-# One JSON value (a record of a lazy array or an eagerly parsed member) is
-# always decoded by one ``raw_decode`` call: that is the unit the standard
-# decoder offers, so a value's own size is the decoder-argument maximum.
-# Values above this size are counted in the scan statistics so an oversized
-# record is observable; they are never rejected.
+# Largest single JSON value the coordinator decodes in-process with one
+# ``raw_decode`` call. A record above this limit is normalized by an
+# isolated helper process instead (see RawJsonRecord); it is never
+# rejected. Values above the limit are also counted in the scan statistics.
 RECORD_DECODE_SOFT_LIMIT_BYTES = 1024 * 1024
+# Members of an isolated record that are kept in the coordinator as plain
+# values: any member whose compact encoding is at most this many bytes.
+RAW_RECORD_MEMBER_LIMIT_BYTES = 4096
+# Wall-clock ceiling for one isolated record normalization.
+RAW_RECORD_HELPER_TIMEOUT_SECONDS = 300.0
 
 _WHITESPACE = re.compile(r"[ \t\n\r]*")
+# Strict JSON token grammar (RFC 8259 plus the standard decoder's NaN and
+# Infinity constants). The quantifiers are possessive: when a window ends
+# inside a long token the match must fail in one pass instead of
+# backtracking through every prefix, which would allocate a regex state
+# stack proportional to the window.
+_WS = r"[ \t\n\r]*+"
+_STRING_TOKEN = r'"(?:[^"\\\x00-\x1f]++|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*+"'
+_NUMBER_TOKEN = r"-?(?:0|[1-9][0-9]*+)(?:\.[0-9]++)?+(?:[eE][+-]?[0-9]++)?+"
+_SCALAR_TOKEN = rf"(?:{_STRING_TOKEN}|{_NUMBER_TOKEN}|true|false|null|NaN|Infinity|-Infinity)"
 # One complete JSON object with no nested containers: every share record
-# in a canonical bundle. Matching it skips a record at C speed without
-# building a dictionary; anything else is skipped by the bounded
-# structural walker below.
-_FLAT_OBJECT = re.compile(r'\{(?:"(?:[^"\\]|\\.)*"|[^"{}\[\]])*\}')
-# Characters that change structural state while walking a container or a
-# string window by window.
-_STRUCTURAL = re.compile(r'["\\{}\[\]]')
-_STRING_STRUCTURAL = re.compile(r'["\\]')
-_SCALAR_END = re.compile(r"[,\]} \t\n\r]")
+# in a canonical bundle. Matching it validates and skips the record at C
+# speed without building a dictionary; anything it does not match (a
+# record cut by the window, a nested value, or a malformed one) goes to
+# the streaming validator below, which reports malformed input.
+_FLAT_OBJECT = re.compile(
+    r"\{"
+    + _WS
+    + rf"(?:{_STRING_TOKEN}{_WS}:{_WS}{_SCALAR_TOKEN}"
+    + rf"(?:{_WS},{_WS}{_STRING_TOKEN}{_WS}:{_WS}{_SCALAR_TOKEN})*+)?+"
+    + _WS
+    + r"\}"
+)
+_NON_STRING_SCALAR = re.compile(
+    rf"(?:{_NUMBER_TOKEN}|true|false|null|NaN|Infinity|-Infinity)\Z"
+)
+# Characters that end a string's ordinary run: the closing quote, an
+# escape, or a control character the grammar forbids.
+_STRING_STRUCTURAL = re.compile(r'["\\\x00-\x1f]')
+_SCALAR_END = re.compile(r"[,\]}: \t\n\r\"{\[]")
+_ESCAPE_TOKEN = re.compile(r'["\\/bfnrt]|u[0-9a-fA-F]{4}')
+# Characters that can extend a JSON number token past a decoded prefix.
+_NUMBER_CONTINUATION = frozenset("0123456789.eE+-")
 _DECODER = json.JSONDecoder()
 _COMPACT_SEPARATORS = (",", ":")
 # Checkpoint entries buffered before they are written to the index file.
@@ -113,6 +152,39 @@ def _close_fd(fd: int) -> None:
         pass
 
 
+def _scratch_fd(purpose: str) -> int:
+    """An unlinked temporary file's descriptor, or resource pressure."""
+    try:
+        handle = tempfile.TemporaryFile()
+    except OSError as exc:
+        raise ArtifactResourcePressure(
+            f"cannot create the {purpose} scratch file: {exc}"
+        ) from exc
+    try:
+        return os.dup(handle.fileno())
+    except OSError as exc:
+        raise ArtifactResourcePressure(
+            f"cannot duplicate the {purpose} scratch descriptor: {exc}"
+        ) from exc
+    finally:
+        handle.close()
+
+
+def _pwrite_all(fd: int, data: bytes, offset: int, *, purpose: str) -> None:
+    view = memoryview(data)
+    while view:
+        try:
+            written = os.pwrite(fd, view, offset)
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            raise ArtifactResourcePressure(
+                f"cannot write the {purpose} scratch file: {exc}"
+            ) from exc
+        view = view[written:]
+        offset += written
+
+
 class _CheckpointIndex:
     """Fixed-width record-offset checkpoints for the lazy arrays of one scan.
 
@@ -120,8 +192,9 @@ class _CheckpointIndex:
     and read back with positional reads, so the index scales with the
     window on disk, never in memory: an unlinked temporary file holds it
     (the share-window spool's approach) and its descriptor closes with the
-    last owner. If no temporary file can be created the index degrades to
-    an in-memory array and reports that in the scan statistics.
+    last owner. There is no in-memory fallback: when the scratch file
+    cannot be created or written, :class:`ArtifactResourcePressure` is
+    raised so the caller retries later rather than growing the process.
     """
 
     __slots__ = (
@@ -129,7 +202,6 @@ class _CheckpointIndex:
         "_count",
         "_fd",
         "_finalizer",
-        "_memory",
         "_pending",
         "_written",
     )
@@ -140,56 +212,38 @@ class _CheckpointIndex:
         self._count = 0
         self._written = 0
         self._pending = bytearray()
-        self._memory: array | None = None
-        self._fd: int | None = None
-        self._finalizer: Any = None
-        try:
-            handle = tempfile.TemporaryFile()
-            try:
-                self._fd = os.dup(handle.fileno())
-            finally:
-                handle.close()
-        except OSError:
-            self._memory = array("Q")
-        if self._fd is not None:
-            self._finalizer = weakref.finalize(self, _close_fd, self._fd)
+        self._fd = _scratch_fd("checkpoint index")
+        self._finalizer = weakref.finalize(self, _close_fd, self._fd)
 
     @property
     def count(self) -> int:
         return self._count
 
-    @property
-    def in_memory(self) -> bool:
-        return self._memory is not None
-
     def append(self, offset: int) -> None:
-        if self._memory is not None:
-            self._memory.append(int(offset))
-        else:
-            self._pending += self.ENTRY.pack(int(offset))
-            if len(self._pending) >= _INDEX_FLUSH_BYTES:
-                self.flush()
+        self._pending += self.ENTRY.pack(int(offset))
+        if len(self._pending) >= _INDEX_FLUSH_BYTES:
+            self.flush()
         self._count += 1
 
     def flush(self) -> None:
-        if not self._pending or self._fd is None:
+        if not self._pending:
             return
-        data = bytes(self._pending)
-        offset = self._written * self.ENTRY.size
-        while data:
-            written = os.pwrite(self._fd, data, offset)
-            data = data[written:]
-            offset += written
+        if not self._finalizer.alive:
+            raise CanonicalArtifactError("canonical audit artifact index is closed")
+        _pwrite_all(
+            self._fd,
+            bytes(self._pending),
+            self._written * self.ENTRY.size,
+            purpose="checkpoint index",
+        )
         self._written += len(self._pending) // self.ENTRY.size
         self._pending = bytearray()
 
     def get(self, index: int) -> int:
         if not 0 <= index < self._count:
             raise IndexError("checkpoint index out of range")
-        if self._memory is not None:
-            return int(self._memory[index])
         self.flush()
-        if self._fd is None or (self._finalizer is not None and not self._finalizer.alive):
+        if not self._finalizer.alive:
             raise CanonicalArtifactError("canonical audit artifact index is closed")
         entry = os.pread(self._fd, self.ENTRY.size, index * self.ENTRY.size)
         if len(entry) != self.ENTRY.size:
@@ -197,8 +251,18 @@ class _CheckpointIndex:
         return int(self.ENTRY.unpack(entry)[0])
 
     def close(self) -> None:
-        if self._finalizer is not None:
-            self._finalizer()
+        self._finalizer()
+
+
+class ArtifactResourcePressure(Exception):
+    """A scratch resource (checkpoint index, record spool, helper) is unavailable.
+
+    Raised instead of degrading to an unbounded in-memory structure. The
+    artifact itself is intact, so this is deliberately neither a
+    :class:`CanonicalArtifactError` nor a :class:`json.JSONDecodeError`:
+    callers must not classify it as corruption or mismatch, and the
+    operation is retry-safe once the pressure passes.
+    """
 
 
 class CanonicalArtifactError(ValueError):
@@ -338,7 +402,7 @@ class ScanStats:
 
     __slots__ = (
         "checkpoint_entries",
-        "index_in_memory",
+        "isolated_records",
         "max_value_chars",
         "oversized_values",
         "values_decoded",
@@ -351,7 +415,8 @@ class ScanStats:
         self.values_decoded = 0
         self.window_high_water_chars = 0
         self.checkpoint_entries = 0
-        self.index_in_memory = False
+        # Records normalized by the isolated helper instead of in-process.
+        self.isolated_records = 0
 
     def note_value(self, chars: int) -> None:
         """Record one value's size: decoded text characters, or bytes when
@@ -366,14 +431,14 @@ class ScanStats:
         if chars > self.window_high_water_chars:
             self.window_high_water_chars = chars
 
-    def as_dict(self) -> dict[str, int | bool]:
+    def as_dict(self) -> dict[str, int]:
         return {
             "max_value_chars": self.max_value_chars,
             "oversized_values": self.oversized_values,
             "values_decoded": self.values_decoded,
             "window_high_water_chars": self.window_high_water_chars,
             "checkpoint_entries": self.checkpoint_entries,
-            "index_in_memory": self.index_in_memory,
+            "isolated_records": self.isolated_records,
         }
 
 
@@ -397,6 +462,7 @@ class _Cursor:
         "_source",
         "_window_start",
         "eof",
+        "generation",
         "pos",
         "stats",
         "text",
@@ -423,6 +489,9 @@ class _Cursor:
         self.text = ""
         self.pos = 0
         self.eof = False
+        # Bumped whenever consumed text is dropped, so a caller can tell
+        # whether a slice of ``text`` taken before a skip is still valid.
+        self.generation = 0
         self.stats = stats if stats is not None else ScanStats()
 
     @property
@@ -476,6 +545,7 @@ class _Cursor:
         self.text = self.text[self.pos :]
         self.pos = 0
         self._ascii = self.text.isascii()
+        self.generation += 1
 
     def skip_ws(self) -> None:
         while True:
@@ -506,6 +576,14 @@ class _Cursor:
         A value cut by the window boundary extends the window until it fits;
         the growth is geometric so an oversized field costs a handful of
         reads, and nothing beyond that one value is retained.
+
+        Token completion is checked explicitly for numbers: ``raw_decode``
+        happily returns the prefix ``1`` of a window ending in ``1e+`` or
+        ``1.`` without touching the window end, so a number is complete
+        only when the character after it cannot continue a number (or the
+        file has ended). A continuation character with the whole file in
+        view is a malformed number, exactly as the standard decoder reports
+        for the complete document.
         """
         growth = self._chunk_bytes
         while True:
@@ -520,26 +598,40 @@ class _Cursor:
                 self.fill(len(self.text) - self.pos + growth)
                 growth *= 2
                 continue
-            if end >= len(self.text) and not self.eof:
-                # A number or literal may continue in the next chunk.
-                self.fill(len(self.text) - self.pos + growth)
-                growth *= 2
-                continue
+            if end >= len(self.text):
+                if not self.eof:
+                    # A number or literal may continue in the next chunk.
+                    self.fill(len(self.text) - self.pos + growth)
+                    growth *= 2
+                    continue
+            elif (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and self.text[end] in _NUMBER_CONTINUATION
+            ):
+                if not self.eof:
+                    self.fill(len(self.text) - self.pos + growth)
+                    growth *= 2
+                    continue
+                raise CanonicalArtifactSyntaxError(
+                    f"canonical audit artifact is malformed at byte {self.byte_pos}: "
+                    "invalid number"
+                )
             self.stats.note_value(end - self.pos)
             self.pos = end
             return value
 
     def skip_value(self) -> None:
-        """Advance past one JSON value without retaining or decoding it.
+        """Validate and advance past one JSON value without retaining it.
 
-        A flat record that fits the window is skipped by one regex match.
-        Anything else -- a record straddling the window, a nested value, a
-        string or scalar of any size -- is walked structurally window by
-        window, so the text held never exceeds about two read chunks even
-        for a value far larger than the chunk. Structure (containers,
-        strings, escapes, separators, end of file) is validated here; token
-        syntax inside a skipped value is validated whenever the value is
-        decoded by a consumer, and the artifact as a whole by the verifier.
+        A flat record that fits the window is validated and skipped by one
+        strict-grammar regex match. Anything else -- a record straddling
+        the window, a nested value, a string or scalar of any size -- is
+        walked by a streaming token validator window by window, so the text
+        held never exceeds about two read chunks even for a value far larger
+        than the chunk. The validation is the standard decoder's: token
+        syntax, escapes, control characters, separators, container balance
+        and termination all fail closed here, at scan time.
         """
         char = self.peek()
         if char == "{":
@@ -549,14 +641,13 @@ class _Cursor:
                 self.pos = match.end()
                 return
         start = self.byte_pos
-        if char in "{[":
-            self._skip_container()
-        elif char == '"':
-            self.pos += 1
-            self._skip_string_body()
-        else:
-            self._skip_scalar()
+        self._walk_value()
         self.stats.note_value(self.byte_pos - start)
+
+    def _malformed(self, detail: str) -> CanonicalArtifactSyntaxError:
+        return CanonicalArtifactSyntaxError(
+            f"canonical audit artifact is malformed at byte {self.byte_pos}: {detail}"
+        )
 
     def _advance_window(self) -> None:
         """Consume the whole window and read the next chunk."""
@@ -568,72 +659,130 @@ class _Cursor:
                 "canonical audit artifact is malformed: unterminated value"
             )
 
-    def _skip_escaped_char(self) -> None:
-        """Skip the character following a backslash inside a string."""
-        if self.pos >= len(self.text):
-            self._advance_window()
-        self.pos += 1
-
-    def _skip_string_body(self) -> None:
-        """Skip to just past the closing quote; ``pos`` is inside the string."""
+    def _walk_value(self) -> None:
+        """Streaming validator for one JSON value starting at ``pos``."""
+        stack: list[str] = []
+        state = "value"
         while True:
-            match = _STRING_STRUCTURAL.search(self.text, self.pos)
-            if match is None:
-                self._advance_window()
-                continue
-            self.pos = match.end()
-            if match.group() == "\\":
-                self._skip_escaped_char()
-            else:
-                return
+            self.skip_ws()
+            char = self.peek()
+            if state == "value":
+                if char == '"':
+                    self.pos += 1
+                    self._skip_string_body()
+                    state = "after"
+                elif char == "{":
+                    self.pos += 1
+                    stack.append("O")
+                    state = "key_or_end"
+                elif char == "[":
+                    self.pos += 1
+                    stack.append("A")
+                    state = "value_or_end"
+                else:
+                    self._skip_scalar()
+                    state = "after"
+            elif state == "value_or_end":
+                if char == "]":
+                    self.pos += 1
+                    stack.pop()
+                    state = "after"
+                else:
+                    state = "value"
+                    continue
+            elif state == "key_or_end":
+                if char == "}":
+                    self.pos += 1
+                    stack.pop()
+                    state = "after"
+                elif char == '"':
+                    self.pos += 1
+                    self._skip_string_body()
+                    state = "colon"
+                else:
+                    raise self._malformed("expected a member name or '}'")
+            elif state == "key":
+                if char != '"':
+                    raise self._malformed("expected a member name")
+                self.pos += 1
+                self._skip_string_body()
+                state = "colon"
+            elif state == "colon":
+                if char != ":":
+                    raise self._malformed("expected ':'")
+                self.pos += 1
+                state = "value"
+            else:  # after a complete value
+                if not stack:
+                    return
+                top = stack[-1]
+                if char == ",":
+                    self.pos += 1
+                    state = "key" if top == "O" else "value"
+                elif char == "]" and top == "A":
+                    self.pos += 1
+                    stack.pop()
+                elif char == "}" and top == "O":
+                    self.pos += 1
+                    stack.pop()
+                elif char == "":
+                    raise CanonicalArtifactSyntaxError(
+                        "canonical audit artifact is malformed: unterminated value"
+                    )
+                else:
+                    raise self._malformed("expected ',' or a closing bracket")
             if self.pos >= self._chunk_bytes:
                 self.trim()
 
-    def _skip_container(self) -> None:
-        depth = 0
+    def _skip_string_body(self) -> None:
+        """Validate to just past the closing quote; ``pos`` is inside the string."""
         while True:
-            match = _STRUCTURAL.search(self.text, self.pos)
+            match = _STRING_STRUCTURAL.search(self.text, self.pos)
             if match is None:
                 self._advance_window()
                 continue
             char = match.group()
             self.pos = match.end()
             if char == '"':
-                self._skip_string_body()
-            elif char == "\\":
-                raise CanonicalArtifactSyntaxError(
-                    f"canonical audit artifact is malformed at byte {self.byte_pos}: "
-                    "unexpected escape"
-                )
-            elif char in "{[":
-                depth += 1
-            else:
-                depth -= 1
-                if depth == 0:
-                    return
-                if depth < 0:
-                    raise CanonicalArtifactSyntaxError(
-                        f"canonical audit artifact is malformed at byte {self.byte_pos}: "
-                        "unbalanced container"
-                    )
+                return
+            if char != "\\":
+                self.pos -= 1
+                raise self._malformed("control character in string")
+            # An escape needs up to five more characters; make them visible
+            # before validating so a window boundary cannot split it.
+            self.fill(5)
+            escape = _ESCAPE_TOKEN.match(self.text, self.pos)
+            if escape is None:
+                raise self._malformed("invalid escape sequence")
+            self.pos = escape.end()
             if self.pos >= self._chunk_bytes:
                 self.trim()
 
     def _skip_scalar(self) -> None:
+        """Validate one number or literal token; it may span windows."""
         start = self.byte_pos
+        pieces: list[str] = []
         while True:
             match = _SCALAR_END.search(self.text, self.pos)
             if match is None:
                 if self.eof:
+                    pieces.append(self.text[self.pos :])
                     self.pos = len(self.text)
                     break
+                pieces.append(self.text[self.pos :])
                 self._advance_window()
                 continue
+            pieces.append(self.text[self.pos : match.start()])
             self.pos = match.start()
             break
-        if self.byte_pos == start:
+        token = "".join(pieces)
+        if not token:
             raise CanonicalArtifactSyntaxError(
                 f"canonical audit artifact is malformed at byte {start}: expected a value"
+            )
+        if _NON_STRING_SCALAR.match(token) is None:
+            raise CanonicalArtifactSyntaxError(
+                f"canonical audit artifact is malformed at byte {start}: invalid token {token[:32]!r}"
             )
 
 
@@ -648,6 +797,492 @@ def _is_plain(value: Any, depth: int) -> bool:
     if isinstance(value, (list, tuple)):
         return all(_is_plain(item, depth - 1) for item in value)
     return False
+
+
+class RawJsonDocument:
+    """A pre-encoded JSON value: a byte span of a source emitted verbatim.
+
+    The streaming encoder copies its bytes chunk by chunk, so a whole
+    canonical artifact can be embedded in a larger JSON document (the
+    legacy inline persistence lane) without decoding or re-encoding it.
+    """
+
+    __slots__ = ("_end", "_source", "_start")
+
+    def __init__(self, source: ArtifactSource, *, start: int = 0, end: int | None = None) -> None:
+        self._source = source
+        self._start = int(start)
+        self._end = int(source.identity.size if end is None else end)
+
+    @property
+    def byte_length(self) -> int:
+        return self._end - self._start
+
+    def iter_byte_chunks(self, *, chunk_bytes: int = SCAN_CHUNK_BYTES) -> Iterator[bytes]:
+        self._source.verify_identity()
+        offset = self._start
+        while offset < self._end:
+            chunk = self._source.pread(offset, min(chunk_bytes, self._end - offset))
+            if not chunk:
+                raise CanonicalArtifactError("canonical audit artifact span is truncated")
+            offset += len(chunk)
+            yield chunk
+        self._source.verify_identity()
+
+    def iter_text_chunks(self, *, chunk_bytes: int = SCAN_CHUNK_BYTES) -> Iterator[str]:
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        try:
+            for chunk in self.iter_byte_chunks(chunk_bytes=chunk_bytes):
+                text = decoder.decode(chunk)
+                if text:
+                    yield text
+            tail = decoder.decode(b"", final=True)
+        except UnicodeDecodeError as exc:
+            raise CanonicalArtifactSyntaxError(
+                f"canonical audit artifact is not valid UTF-8: {exc}"
+            ) from exc
+        if tail:
+            yield tail
+
+
+class StreamedJsonString:
+    """A JSON string value whose text is produced chunk by chunk.
+
+    The streaming encoder escapes each chunk as it goes, so a canonical
+    encoding of a recipient-scaled member can be embedded as a *string*
+    member of a larger document (the CTV recovery payload's
+    ``manifest_set_json``) without ever holding the text whole. Chunks are
+    Python text, so a boundary never splits a code point and chunk-wise
+    escaping concatenates exactly.
+    """
+
+    __slots__ = ("_chunks_factory",)
+
+    def __init__(self, chunks_factory: Callable[[], Iterable[str]]) -> None:
+        self._chunks_factory = chunks_factory
+
+    def iter_text_chunks(self) -> Iterator[str]:
+        return iter(self._chunks_factory())
+
+    def iter_encoded_chunks(self) -> Iterator[str]:
+        yield '"'
+        for chunk in self._chunks_factory():
+            if chunk:
+                yield json.dumps(chunk)[1:-1]
+        yield '"'
+
+
+class MappedSequence(Sequence):
+    """A replayable sequence applying ``transform`` to another sequence's items.
+
+    Iteration and indexing apply the transform on demand, so a derived
+    per-item structure (the CTV recovery artifacts derived from lazy
+    manifests) never exists as a whole list.
+    """
+
+    __slots__ = ("_base", "_transform")
+
+    def __init__(self, base: Sequence[Any], transform: Callable[[Any], Any]) -> None:
+        self._base = base
+        self._transform = transform
+
+    def __len__(self) -> int:
+        return len(self._base)
+
+    def __iter__(self) -> Iterator[Any]:
+        for item in self._base:
+            yield self._transform(item)
+
+    def __getitem__(self, index: int | slice) -> Any:
+        if isinstance(index, slice):
+            return MappedSequence(self._base[index], self._transform)
+        return self._transform(self._base[index])
+
+    def __eq__(self, other: object) -> bool:
+        if other is self:
+            return True
+        return _sequences_equal(self, other)
+
+    def __ne__(self, other: object) -> bool:
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return not result
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+class RawJsonRecord(Mapping):
+    """One JSON value normalized outside the coordinator's decoder.
+
+    Built for records above :data:`RECORD_DECODE_SOFT_LIMIT_BYTES`: an
+    isolated helper process decodes the record and returns its compact
+    encodings (original key order, and sorted keys for equality) plus the
+    members small enough to keep, which are spooled to an unlinked
+    temporary file. The coordinator never calls ``json.loads`` on the
+    record. Small members read like a mapping; a member above
+    :data:`RAW_RECORD_MEMBER_LIMIT_BYTES` is reachable only through the
+    streamed encodings and raises :class:`CanonicalArtifactError` when
+    indexed. Equality with a mapping or another record compares the
+    sorted-key encodings record by record; the streaming encoder emits the
+    original-order encoding verbatim.
+    """
+
+    __slots__ = (
+        "__weakref__",
+        "_is_object",
+        "_keys",
+        "_members",
+        "_omitted",
+        "_ordered",
+        "_sorted",
+        "_spool",
+    )
+
+    def __init__(
+        self,
+        spool: ArtifactSource,
+        *,
+        ordered: tuple[int, int],
+        sorted_span: tuple[int, int],
+        keys: Sequence[str],
+        members: Mapping[str, Any],
+        omitted: Iterable[str],
+        is_object: bool,
+    ) -> None:
+        self._spool = spool
+        self._ordered = ordered
+        self._sorted = sorted_span
+        self._keys = tuple(keys)
+        self._members = dict(members)
+        self._omitted = frozenset(omitted)
+        self._is_object = bool(is_object)
+
+    @property
+    def is_object(self) -> bool:
+        return self._is_object
+
+    @property
+    def omitted_members(self) -> frozenset[str]:
+        return self._omitted
+
+    @property
+    def encoded_length(self) -> int:
+        return self._ordered[1] - self._ordered[0]
+
+    def __getitem__(self, key: str) -> Any:
+        if key in self._members:
+            return self._members[key]
+        if key in self._omitted:
+            raise CanonicalArtifactError(
+                f"record member {key!r} exceeds the in-process decode limit; "
+                "it is available only through the streamed encodings"
+            )
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._keys)
+
+    def __len__(self) -> int:
+        return len(self._keys)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._members or key in self._omitted
+
+    def __repr__(self) -> str:
+        return f"RawJsonRecord(members={list(self._keys)}, bytes={self.encoded_length})"
+
+    def ordered_text_chunks(self) -> Iterator[str]:
+        return RawJsonDocument(
+            self._spool,
+            start=self._ordered[0],
+            end=self._ordered[1],
+        ).iter_text_chunks()
+
+    def sorted_text_chunks(self) -> Iterator[str]:
+        return RawJsonDocument(
+            self._spool,
+            start=self._sorted[0],
+            end=self._sorted[1],
+        ).iter_text_chunks()
+
+    def __eq__(self, other: object) -> bool:
+        if other is self:
+            return True
+        if isinstance(other, RawJsonRecord):
+            return _text_streams_equal(self.sorted_text_chunks(), other.sorted_text_chunks())
+        if isinstance(other, Mapping) or (
+            isinstance(other, Sequence) and not isinstance(other, (str, bytes, bytearray))
+        ) or other is None or isinstance(other, (str, int, float, bool)):
+            try:
+                other_chunks = iter_json_chunks(other, sort_keys=True)
+            except (TypeError, ValueError):
+                return False
+            return _text_streams_equal(self.sorted_text_chunks(), other_chunks)
+        return NotImplemented
+
+    def __ne__(self, other: object) -> bool:
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return not result
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def close(self) -> None:
+        self._spool.close()
+
+
+def _text_streams_equal(left: Iterable[str], right: Iterable[str]) -> bool:
+    """Compare two text streams without joining either."""
+    left_iter = iter(left)
+    right_iter = iter(right)
+    left_buffer = ""
+    right_buffer = ""
+    left_done = right_done = False
+    while True:
+        while not left_buffer and not left_done:
+            try:
+                left_buffer = next(left_iter)
+            except StopIteration:
+                left_done = True
+        while not right_buffer and not right_done:
+            try:
+                right_buffer = next(right_iter)
+            except StopIteration:
+                right_done = True
+        if left_done or right_done:
+            return left_done and right_done and not left_buffer and not right_buffer
+        size = min(len(left_buffer), len(right_buffer))
+        if left_buffer[:size] != right_buffer[:size]:
+            return False
+        left_buffer = left_buffer[size:]
+        right_buffer = right_buffer[size:]
+
+
+def _helper_main(argv: Sequence[str]) -> int:
+    """Isolated record normalization: stdin record -> header + encodings.
+
+    Runs in a child process so a record of any size is decoded outside the
+    lease-bearing coordinator. Exit status 2 marks a malformed record.
+    """
+    member_limit = RAW_RECORD_MEMBER_LIMIT_BYTES
+    if len(argv) >= 2 and argv[0] == "--normalize-record":
+        member_limit = int(argv[1])
+    elif argv != ["--normalize-record"]:
+        sys.stderr.write("usage: --normalize-record [member-limit-bytes]\n")
+        return 64
+    raw = sys.stdin.buffer.read()
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, ValueError) as exc:
+        sys.stderr.write(f"malformed record: {exc}\n")
+        return 2
+    ordered = json.dumps(value, separators=_COMPACT_SEPARATORS).encode("utf-8")
+    sorted_text = json.dumps(value, sort_keys=True, separators=_COMPACT_SEPARATORS).encode("utf-8")
+    keys: list[str] = []
+    members: dict[str, Any] = {}
+    omitted: list[str] = []
+    is_object = isinstance(value, dict)
+    if is_object:
+        for key, item in value.items():
+            keys.append(str(key))
+            if len(json.dumps(item, separators=_COMPACT_SEPARATORS)) <= member_limit:
+                members[str(key)] = item
+            else:
+                omitted.append(str(key))
+    header = json.dumps(
+        {
+            "is_object": is_object,
+            "keys": keys,
+            "members": members,
+            "omitted": omitted,
+            "ordered_size": len(ordered),
+            "sorted_size": len(sorted_text),
+        },
+        separators=_COMPACT_SEPARATORS,
+    ).encode("utf-8")
+    out = sys.stdout.buffer
+    out.write(header + b"\n")
+    out.write(ordered)
+    out.write(sorted_text)
+    out.flush()
+    return 0
+
+
+def _feed_helper_stdin(process: subprocess.Popen[bytes], source: ArtifactSource, start: int, end: int) -> list[BaseException]:
+    errors: list[BaseException] = []
+    assert process.stdin is not None
+    try:
+        offset = start
+        while offset < end:
+            chunk = source.pread(offset, min(SCAN_CHUNK_BYTES, end - offset))
+            if not chunk:
+                raise CanonicalArtifactError("canonical audit artifact span is truncated")
+            process.stdin.write(chunk)
+            offset += len(chunk)
+    except BrokenPipeError:
+        pass
+    except BaseException as exc:  # pragma: no cover - surfaced by the caller
+        errors.append(exc)
+    finally:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+    return errors
+
+
+def _read_exact(stream: Any, size: int) -> Iterator[bytes]:
+    remaining = size
+    while remaining > 0:
+        chunk = stream.read(min(SCAN_CHUNK_BYTES, remaining))
+        if not chunk:
+            raise ArtifactResourcePressure("record helper output ended early")
+        remaining -= len(chunk)
+        yield chunk
+
+
+def normalize_record_isolated(
+    source: ArtifactSource,
+    start: int,
+    end: int,
+    *,
+    member_limit: int = RAW_RECORD_MEMBER_LIMIT_BYTES,
+    timeout_seconds: float = RAW_RECORD_HELPER_TIMEOUT_SECONDS,
+) -> RawJsonRecord:
+    """Normalize the record at ``source[start:end)`` in a helper process.
+
+    The record bytes stream to the helper through a pipe and its encodings
+    stream back into an unlinked scratch file, so the coordinator holds at
+    most one read chunk of the record at any time. A malformed record is a
+    :class:`CanonicalArtifactSyntaxError`; a helper that cannot be spawned,
+    times out, or a scratch file that cannot be written is
+    :class:`ArtifactResourcePressure`.
+    """
+    command = [sys.executable, "-m", __name__, "--normalize-record", str(int(member_limit))]
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+        )
+    except OSError as exc:
+        raise ArtifactResourcePressure(f"cannot start the record helper: {exc}") from exc
+    spool_fd: int | None = None
+    feeder_errors: list[BaseException] = []
+    feeder = threading.Thread(
+        target=lambda: feeder_errors.extend(_feed_helper_stdin(process, source, start, end)),
+        name="prism-audit-record-helper-feed",
+        daemon=True,
+    )
+    try:
+        feeder.start()
+        assert process.stdout is not None
+        header_line = process.stdout.readline()
+        if not header_line:
+            process.wait(timeout=timeout_seconds)
+            stderr = b""
+            if process.stderr is not None:
+                stderr = process.stderr.read()
+            if process.returncode == 2:
+                raise CanonicalArtifactSyntaxError(
+                    "canonical audit artifact record is malformed: "
+                    + stderr.decode(errors="replace").strip()
+                )
+            raise ArtifactResourcePressure(
+                "record helper produced no header: " + stderr.decode(errors="replace").strip()
+            )
+        try:
+            header = json.loads(header_line)
+            ordered_size = int(header["ordered_size"])
+            sorted_size = int(header["sorted_size"])
+            keys = [str(key) for key in header["keys"]]
+            members = dict(header["members"])
+            omitted = [str(key) for key in header["omitted"]]
+            is_object = bool(header["is_object"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ArtifactResourcePressure(f"record helper header is malformed: {exc}") from exc
+        spool_fd = _scratch_fd("record spool")
+        offset = 0
+        for chunk in _read_exact(process.stdout, ordered_size + sorted_size):
+            _pwrite_all(spool_fd, chunk, offset, purpose="record spool")
+            offset += len(chunk)
+        try:
+            process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            raise ArtifactResourcePressure("record helper timed out") from exc
+        if process.returncode != 0:
+            raise ArtifactResourcePressure(f"record helper exited with status {process.returncode}")
+        feeder.join(timeout=timeout_seconds)
+        if feeder_errors:
+            raise feeder_errors[0]
+        spool = ArtifactSource(spool_fd, path=None)
+        spool_fd = None
+        return RawJsonRecord(
+            spool,
+            ordered=(0, ordered_size),
+            sorted_span=(ordered_size, ordered_size + sorted_size),
+            keys=keys,
+            members=members,
+            omitted=omitted,
+            is_object=is_object,
+        )
+    finally:
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=5.0)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        feeder.join(timeout=5.0)
+        if spool_fd is not None:
+            _close_fd(spool_fd)
+
+
+def streamed_sha256_json_hex(value: Any) -> str:
+    """``sha256(json.dumps(value, sort_keys=True, separators=(",", ":")))``, streamed.
+
+    The ledger's ``sha256_json_hex`` over a value that may embed lazy
+    sequences or isolated records, without building the encoding whole.
+    """
+    digest = hashlib.sha256()
+    for chunk in iter_json_byte_chunks(value, sort_keys=True):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def materialize_json(value: Any) -> Any:
+    """A plain JSON object graph for consumers that need one.
+
+    Lazy sequences become lists, views become dictionaries, and an isolated
+    record is decoded in-process from its ordered encoding. This is the
+    explicit boundary for statement builders that must embed a whole
+    recipient-scaled member; it is never applied to a window-sized member
+    on the finalization path.
+    """
+    if isinstance(value, RawJsonRecord):
+        return json.loads("".join(value.ordered_text_chunks()))
+    if isinstance(value, RawJsonDocument):
+        return json.loads("".join(value.iter_text_chunks()))
+    if isinstance(value, StreamedJsonString):
+        return "".join(value.iter_text_chunks())
+    if isinstance(value, Mapping):
+        return {str(key): materialize_json(item) for key, item in value.items()}
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+        return value
+    return [materialize_json(item) for item in value]
 
 
 class _Coalescer:
@@ -676,20 +1311,88 @@ class _Coalescer:
         return chunk
 
 
-def _encode_pieces(
-    value: Any,
+def _encode_record_batches(
+    records: Iterable[Any],
     *,
+    sort_keys: bool,
     batch_records: int,
     chunk_chars: int,
 ) -> Iterator[str]:
+    """Array body (no brackets) of a record stream, isolated records verbatim.
+
+    Plain records are encoded ``batch_records`` at a time through one
+    ``json.dumps``; an isolated :class:`RawJsonRecord` streams its own
+    encoding between batches.
+    """
+    batch: list[Any] = []
+    first = True
+
+    def flush() -> Iterator[str]:
+        nonlocal batch, first
+        if not batch:
+            return
+        text = json.dumps(batch, sort_keys=sort_keys, separators=_COMPACT_SEPARATORS)[1:-1]
+        batch = []
+        if not first:
+            text = "," + text
+        first = False
+        yield text
+
+    for record in records:
+        if isinstance(record, RawJsonRecord):
+            yield from flush()
+            if not first:
+                yield ","
+            first = False
+            yield from (record.sorted_text_chunks() if sort_keys else record.ordered_text_chunks())
+            continue
+        if not _is_plain(record, 2):
+            yield from flush()
+            if not first:
+                yield ","
+            first = False
+            yield from _encode_pieces(
+                record,
+                sort_keys=sort_keys,
+                batch_records=batch_records,
+                chunk_chars=chunk_chars,
+            )
+            continue
+        batch.append(record)
+        if len(batch) >= batch_records:
+            yield from flush()
+    yield from flush()
+
+
+def _encode_pieces(
+    value: Any,
+    *,
+    sort_keys: bool,
+    batch_records: int,
+    chunk_chars: int,
+) -> Iterator[str]:
+    if isinstance(value, RawJsonRecord):
+        yield from (value.sorted_text_chunks() if sort_keys else value.ordered_text_chunks())
+        return
+    if isinstance(value, RawJsonDocument):
+        if sort_keys:
+            raise TypeError("a pre-encoded document cannot be re-sorted")
+        yield from value.iter_text_chunks()
+        return
+    if isinstance(value, StreamedJsonString):
+        yield from value.iter_encoded_chunks()
+        return
     if isinstance(value, Mapping):
         keys = list(value)
         if any(not isinstance(key, str) for key in keys):
             yield json.dumps(
                 value if isinstance(value, dict) else dict(value),
+                sort_keys=sort_keys,
                 separators=_COMPACT_SEPARATORS,
             )
             return
+        if sort_keys:
+            keys.sort()
         yield "{"
         first = True
         for key in keys:
@@ -697,20 +1400,27 @@ def _encode_pieces(
             first = False
             yield from _encode_pieces(
                 value[key],
+                sort_keys=sort_keys,
                 batch_records=batch_records,
                 chunk_chars=chunk_chars,
             )
         yield "}"
         return
     if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
-        yield json.dumps(value, separators=_COMPACT_SEPARATORS)
+        yield json.dumps(value, sort_keys=sort_keys, separators=_COMPACT_SEPARATORS)
         return
     yield "["
-    if isinstance(value, (LazyRecordSequence, LazyRecordSlice)) or (
-        isinstance(value, (list, tuple)) and _is_plain(value, 2)
-    ):
+    if isinstance(value, (LazyRecordSequence, LazyRecordSlice, MappedSequence)):
+        yield from _encode_record_batches(
+            value,
+            sort_keys=sort_keys,
+            batch_records=batch_records,
+            chunk_chars=chunk_chars,
+        )
+    elif isinstance(value, (list, tuple)) and _is_plain(value, 2):
         yield from iter_json_array_text_chunks(
             value,
+            sort_keys=sort_keys,
             batch_records=batch_records,
             chunk_chars=chunk_chars,
         )
@@ -722,6 +1432,7 @@ def _encode_pieces(
             first = False
             yield from _encode_pieces(
                 item,
+                sort_keys=sort_keys,
                 batch_records=batch_records,
                 chunk_chars=chunk_chars,
             )
@@ -731,21 +1442,24 @@ def _encode_pieces(
 def iter_json_chunks(
     value: Any,
     *,
+    sort_keys: bool = False,
     batch_records: int = JSON_BATCH_RECORDS,
     chunk_chars: int = JSON_CHUNK_CHARS,
 ) -> Iterator[str]:
-    """``json.dumps(value, separators=(",", ":"))`` in bounded text chunks.
+    """``json.dumps(value, separators=(",", ":"), sort_keys=...)`` in bounded text chunks.
 
     Mappings are encoded member by member, lazy record sequences and plain
     lists batch by batch (each ``json.dumps`` covers at most
-    ``batch_records`` items), and every other value through one
+    ``batch_records`` items), isolated records and pre-encoded documents
+    verbatim from their scratch files, and every other value through one
     ``json.dumps`` bounded by that value's own size. Concatenating the
     chunks reproduces the compact encoding byte for byte; every chunk is
-    ASCII, so its character count is its byte count.
+    ASCII unless a pre-encoded document carries raw UTF-8.
     """
     coalescer = _Coalescer(chunk_chars)
     for piece in _encode_pieces(
         value,
+        sort_keys=sort_keys,
         batch_records=batch_records,
         chunk_chars=chunk_chars,
     ):
@@ -760,12 +1474,14 @@ def iter_json_chunks(
 def iter_json_byte_chunks(
     value: Any,
     *,
+    sort_keys: bool = False,
     batch_records: int = JSON_BATCH_RECORDS,
     chunk_chars: int = JSON_CHUNK_CHARS,
 ) -> Iterator[bytes]:
     """:func:`iter_json_chunks`, UTF-8 encoded chunk by chunk."""
     for chunk in iter_json_chunks(
         value,
+        sort_keys=sort_keys,
         batch_records=batch_records,
         chunk_chars=chunk_chars,
     ):
@@ -822,6 +1538,7 @@ class LazyRecordSequence(Sequence):
         "_index_base",
         "_source",
         "_start",
+        "_stats",
         "_stride",
     )
 
@@ -836,6 +1553,7 @@ class LazyRecordSequence(Sequence):
         index_base: int,
         stride: int = RECORD_INDEX_STRIDE,
         chunk_bytes: int = SCAN_CHUNK_BYTES,
+        stats: ScanStats | None = None,
     ) -> None:
         self._source = source
         self._start = int(start)
@@ -845,6 +1563,37 @@ class LazyRecordSequence(Sequence):
         self._index_base = int(index_base)
         self._stride = max(1, int(stride))
         self._chunk_bytes = int(chunk_bytes)
+        self._stats = stats if stats is not None else ScanStats()
+
+    def _decode_record(self, cursor: _Cursor) -> Any:
+        """Decode the record at the cursor, isolating an oversized one.
+
+        The record is first skipped structurally (bounded), which yields its
+        byte span. A record within the in-process limit is decoded from the
+        window text when it is still held, otherwise from one positional
+        read of exactly that span; a larger record goes to the isolated
+        helper and comes back as a :class:`RawJsonRecord`.
+        """
+        cursor.skip_ws()
+        text_start = cursor.pos
+        generation = cursor.generation
+        start = cursor.byte_pos
+        cursor.skip_value()
+        end = cursor.byte_pos
+        size = end - start
+        if size <= RECORD_DECODE_SOFT_LIMIT_BYTES:
+            if cursor.generation == generation:
+                text = cursor.text[text_start : cursor.pos]
+            else:
+                text = self._source.pread(start, size).decode("utf-8")
+            try:
+                return json.loads(text)
+            except ValueError as exc:
+                raise CanonicalArtifactSyntaxError(
+                    f"canonical audit artifact record is malformed: {exc}"
+                ) from exc
+        self._stats.isolated_records += 1
+        return normalize_record_isolated(self._source, start, end)
 
     @property
     def source(self) -> ArtifactSource:
@@ -881,8 +1630,7 @@ class LazyRecordSequence(Sequence):
             cursor.trim()
             index += 1
         while index < stop:
-            cursor.skip_ws()
-            yield cursor.decode_value()
+            yield self._decode_record(cursor)
             index += 1
             cursor.trim()
             if index < self._count:
@@ -1015,6 +1763,7 @@ def _scan_array(
             index_base=index_base,
             stride=stride,
             chunk_bytes=chunk_bytes,
+            stats=cursor.stats,
         )
     while True:
         cursor.skip_ws()
@@ -1044,6 +1793,7 @@ def _scan_array(
         index_base=index_base,
         stride=stride,
         chunk_bytes=chunk_bytes,
+        stats=cursor.stats,
     )
 
 
@@ -1168,11 +1918,14 @@ class CanonicalAuditBundleView(Mapping):
         digest covers every byte, and trailing garbage is rejected.
         """
         source = ArtifactSource(fd, path=path)
-        index = _CheckpointIndex()
+        try:
+            index = _CheckpointIndex()
+        except BaseException:
+            source.close()
+            raise
         try:
             hasher = hashlib.sha256()
             stats = ScanStats()
-            stats.index_in_memory = index.in_memory
             cursor = _Cursor(
                 source,
                 0,
@@ -1345,8 +2098,33 @@ def compare_streaming(left: Any, right: Any) -> bool:
     return bool(left == right)
 
 
+def spool_json_document(
+    chunks: Iterable[bytes],
+    *,
+    lazy_paths: Sequence[tuple[str, ...]],
+    stride: int = RECORD_INDEX_STRIDE,
+) -> CanonicalAuditBundleView:
+    """Write a JSON document to an unlinked scratch file and scan it lazily.
+
+    Used for derived metadata that would otherwise become a window-scaled
+    list -- the compact body's share-part index -- so it stays replayable
+    on disk with the same bounded readers as the artifact itself.
+    """
+    fd = _scratch_fd("json spool")
+    try:
+        offset = 0
+        for chunk in chunks:
+            _pwrite_all(fd, chunk, offset, purpose="json spool")
+            offset += len(chunk)
+    except BaseException:
+        _close_fd(fd)
+        raise
+    return CanonicalAuditBundleView.scan(fd, lazy_paths=lazy_paths, stride=stride)
+
+
 __all__ = [
     "ArtifactIdentity",
+    "ArtifactResourcePressure",
     "ArtifactSource",
     "CANONICAL_BUNDLE_LAZY_PATHS",
     "CanonicalArtifactError",
@@ -1356,13 +2134,27 @@ __all__ = [
     "JSON_CHUNK_CHARS",
     "LazyRecordSequence",
     "LazyRecordSlice",
+    "MappedSequence",
+    "RAW_RECORD_HELPER_TIMEOUT_SECONDS",
+    "RAW_RECORD_MEMBER_LIMIT_BYTES",
     "RECORD_DECODE_SOFT_LIMIT_BYTES",
     "RECORD_INDEX_STRIDE",
+    "RawJsonDocument",
+    "RawJsonRecord",
     "SCAN_CHUNK_BYTES",
     "ScanStats",
+    "StreamedJsonString",
     "compare_streaming",
     "is_lazy_sequence",
     "iter_json_byte_chunks",
     "iter_json_chunks",
     "json_chunks_sha256_and_size",
+    "materialize_json",
+    "normalize_record_isolated",
+    "spool_json_document",
+    "streamed_sha256_json_hex",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(_helper_main(sys.argv[1:]))

@@ -26,15 +26,20 @@ import weakref
 
 from lab.prism.audit_bundle_view import (
     SCAN_CHUNK_BYTES,
+    ArtifactResourcePressure,
     ArtifactSource,
     CanonicalArtifactError,
     CanonicalArtifactSyntaxError,
     CanonicalAuditBundleView,
     LazyRecordSequence,
     LazyRecordSlice,
+    RawJsonDocument,
+    RawJsonRecord,
     iter_json_byte_chunks,
     iter_json_chunks,
     json_chunks_sha256_and_size,
+    materialize_json,
+    spool_json_document,
 )
 
 
@@ -255,6 +260,120 @@ class ViewParityTests(unittest.TestCase):
                 self.assertEqual(view["shares"][10:20], list(view["shares"])[10:20])
             finally:
                 view.close()
+
+
+class TokenBoundaryTests(unittest.TestCase):
+    """Number tokens cut by a read window must never decode as a prefix."""
+
+    DOCUMENTS = (
+        {"x": 1e300, "shares": []},
+        {"x": -1.5e-3, "shares": [1.25, -0.5e2, 3, 1e300, -7]},
+        {"x": 12345678901234567890, "shares": [0, -0, 10, 100000000000000000000]},
+        {"x": 0.000001, "y": 5e-324, "shares": [{"n": 1e+300}, {"n": -2.5E+10}]},
+        {"a": True, "b": None, "c": False, "x": -7, "shares": ["1e+", "-", "1."]},
+    )
+
+    def _raw(self, document: dict[str, object]) -> bytes:
+        text = json.dumps(document, separators=(",", ":"))
+        # Spell exponents the way serializers may: keep an explicit sign.
+        return text.replace("1e+300", "1e+300").encode()
+
+    def test_tiny_window_sweep_matches_json_loads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, document in enumerate(self.DOCUMENTS):
+                raw = self._raw(document)
+                # Also exercise an explicit plus sign the stdlib serializer
+                # never emits but valid documents may carry.
+                variants = [raw, raw.replace(b"1e+300", b"1E+300").replace(b"-7", b"-7.0e+0")]
+                for variant_index, variant in enumerate(variants):
+                    expected = json.loads(variant)
+                    path = write_document(Path(tmp), f"num-{index}-{variant_index}.json", variant)
+                    for chunk_bytes in (1, 2, 3, 4, 5, 7, 8, 16, 64):
+                        with self.subTest(document=index, variant=variant_index, chunk_bytes=chunk_bytes):
+                            view = scan(path, chunk_bytes=chunk_bytes, stride=2)
+                            try:
+                                self.assertEqual(view, expected)
+                                self.assertEqual(list(view["shares"]), expected["shares"])
+                                self.assertEqual(view["shares"][0:2], expected["shares"][0:2])
+                                if expected["shares"]:
+                                    self.assertEqual(view["shares"][-1], expected["shares"][-1])
+                            finally:
+                                view.close()
+
+    def test_default_window_alignment_sweep(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for pad in range(SCAN_CHUNK_BYTES - 40, SCAN_CHUNK_BYTES + 8):
+                raw = b'{"pad":"' + b"a" * pad + b'","x":1e+300,"y":-2.5e-7,"shares":[12,3.5e+1]}'
+                expected = json.loads(raw)
+                path = write_document(Path(tmp), "aligned.json", raw)
+                with self.subTest(pad=pad):
+                    view = scan(path)
+                    try:
+                        self.assertEqual(view, expected)
+                        self.assertEqual(view["shares"][1], 35.0)
+                    finally:
+                        view.close()
+
+    def test_malformed_tokens_are_rejected_at_scan_time(self) -> None:
+        """Every rejection the standard decoder makes, the scan makes too."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, raw in enumerate(
+                (
+                    b'{"x":1e+,"shares":[]}',
+                    b'{"x":1.,"shares":[]}',
+                    b'{"x":01,"shares":[]}',
+                    b'{"x":-,"shares":[]}',
+                    b'{"x":1e+300',
+                    b'{"shares":[1.]}',
+                    b'{"shares":[1 2]}',
+                    b'{"shares":[{"a":1,}]}',
+                    b'{"shares":[{"a" 1}]}',
+                    b'{"shares":["a\x01b"]}',
+                    b'{"shares":["\\q"]}',
+                    b'{"shares":["\\u12"]}',
+                    b'{"shares":[{"a":[1,]}]}',
+                    b'{"shares":[tru]}',
+                    b'{"shares":[{"a":-}]}',
+                    b'{"shares":[{"a":1}{"b":2}]}',
+                    b'{"shares":[[1,2}]}',
+                    b'{"shares":[{"a":1,"b":}]}',
+                    b'{"shares":[{,}]}',
+                    b'{"shares":[nul]}',
+                    b'{"shares":[1]',
+                )
+            ):
+                with self.subTest(document=raw):
+                    self.assertRaises(ValueError, json.loads, raw)
+                path = write_document(Path(tmp), f"bad-{index}.json", raw)
+                for chunk_bytes in (1, 3, 8, 4096):
+                    with self.subTest(document=raw, chunk_bytes=chunk_bytes):
+                        with self.assertRaises(json.JSONDecodeError):
+                            scan(path, chunk_bytes=chunk_bytes)
+
+    def test_nested_and_escaped_records_survive_tiny_windows(self) -> None:
+        document = {
+            "shares": [
+                {"a": [1, {"b": "é\n\"}\\", "c": ""}], "d": " x ", "e": [], "f": {}},
+                {"g": [[[]]], "h": "😀", "i": -0.0, "j": [True, False, None]},
+                "plain",
+                12,
+                [],
+            ],
+            "reward_manifest": {"shares": [{"n": 1}, {"n": [2, {"m": "é"}]}]},
+        }
+        raw = json.dumps(document, indent=2).encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_document(Path(tmp), "nested.json", raw)
+            for chunk_bytes in (1, 2, 5, 13, 64, SCAN_CHUNK_BYTES):
+                with self.subTest(chunk_bytes=chunk_bytes):
+                    view = scan(path, chunk_bytes=chunk_bytes, stride=2)
+                    try:
+                        self.assertEqual(view, document)
+                        self.assertEqual(list(view["shares"]), document["shares"])
+                        self.assertEqual(view["shares"][1]["h"], "😀")
+                        self.assertEqual(view["shares"][2:5], document["shares"][2:5])
+                    finally:
+                        view.close()
 
 
 class ViewRobustnessTests(unittest.TestCase):
@@ -541,7 +660,7 @@ class StressWindowTests(unittest.TestCase):
 class BoundedScanTests(unittest.TestCase):
     """The scan holds at most about two read chunks whatever a value's size."""
 
-    def test_checkpoint_index_lives_on_disk_and_falls_back_to_memory(self) -> None:
+    def test_checkpoint_index_lives_on_disk_and_pressure_is_recoverable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle = make_bundle(3000)
             raw = compact(bundle)
@@ -549,23 +668,28 @@ class BoundedScanTests(unittest.TestCase):
             view = scan(path, stride=16)
             try:
                 stats = view.scan_stats
-                self.assertFalse(stats.index_in_memory)
-                # 3000 shares and 3000 counted shares at a stride of 16, plus
-                # the two leaf arrays' single checkpoints.
-                self.assertEqual(stats.checkpoint_entries, 2 * 188)
-                self.assertFalse(view["shares"]._index.in_memory)
+                # 3000 shares and 3000 counted shares at a stride of 16, one
+                # checkpoint per recipient-scaled array (entitlements,
+                # accounts) and none for the empty prior balances.
+                self.assertEqual(stats.checkpoint_entries, 2 * 188 + 2)
                 self.assertEqual(view["shares"][2999], bundle["shares"][2999])
                 self.assertEqual(view["reward_manifest"]["shares"][1234], bundle["reward_manifest"]["shares"][1234])
+                self.assertIsInstance(view["prior_balances"], LazyRecordSequence)
+                self.assertIsInstance(view["payout_policy_manifest"]["accounts"], LazyRecordSequence)
+                self.assertIsInstance(view["reward_manifest"]["entitlements"], LazyRecordSequence)
+                self.assertEqual(view, bundle)
             finally:
                 view.close()
+            # Scratch pressure is neither a syntax error nor corruption: the
+            # artifact is intact and the caller retries later.
+            fd = os.open(path, os.O_RDONLY)
             with mock.patch("lab.prism.audit_bundle_view.tempfile.TemporaryFile", side_effect=OSError("no temp")):
-                fallback = scan(path, stride=16)
-            try:
-                self.assertTrue(fallback.scan_stats.index_in_memory)
-                self.assertEqual(fallback, bundle)
-                self.assertEqual(fallback["shares"][2999], bundle["shares"][2999])
-            finally:
-                fallback.close()
+                with self.assertRaises(ArtifactResourcePressure) as caught:
+                    CanonicalAuditBundleView.scan(fd, stride=16)
+            self.assertNotIsInstance(caught.exception, CanonicalArtifactError)
+            self.assertNotIsInstance(caught.exception, json.JSONDecodeError)
+            with self.assertRaises(OSError):
+                os.fstat(fd)
             # A closed view fails lazy reads closed rather than reading a
             # released index or descriptor.
             view = scan(path, stride=16)
@@ -573,6 +697,142 @@ class BoundedScanTests(unittest.TestCase):
             view.close()
             with self.assertRaises(CanonicalArtifactError):
                 lazy[5]
+
+    def test_oversized_records_are_normalized_by_the_isolated_helper(self) -> None:
+        limit = 8192
+        oversized = 3 * limit
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = make_bundle(40, oversized_index=7, oversized_bytes=oversized)
+            bundle["shares"][8]["nested"] = {"deep": [1, {"x": "é\"}"}], "big": "Q" * (2 * limit)}
+            bundle["witness_merkle_leaves_hex"] = ["ab" * 32, "W" * (2 * limit)]
+            raw = compact(bundle, ensure_ascii=False)
+            path = write_document(Path(tmp), "bundle.json", raw)
+            with mock.patch("lab.prism.audit_bundle_view.RECORD_DECODE_SOFT_LIMIT_BYTES", limit):
+                view = scan(path, chunk_bytes=1024)
+                try:
+                    records = list(view["shares"])
+                    self.assertEqual(view.scan_stats.isolated_records, 2)
+                    isolated = records[7]
+                    self.assertIsInstance(isolated, RawJsonRecord)
+                    self.assertTrue(isolated.is_object)
+                    self.assertEqual(isolated["share_seq"], 8)
+                    self.assertEqual(isolated["miner_id"], bundle["shares"][7]["miner_id"])
+                    self.assertIn("share_id", isolated.omitted_members)
+                    self.assertIn("share_id", isolated)
+                    with self.assertRaises(CanonicalArtifactError):
+                        isolated["share_id"]
+                    with self.assertRaises(KeyError):
+                        isolated["absent"]
+                    self.assertEqual(list(isolated), list(bundle["shares"][7]))
+                    # Equality streams the sorted encodings, both operand
+                    # orders, against dictionaries and other records.
+                    self.assertEqual(isolated, bundle["shares"][7])
+                    self.assertTrue(bundle["shares"][7] == isolated)
+                    self.assertNotEqual(isolated, bundle["shares"][8])
+                    self.assertNotEqual(isolated, {**bundle["shares"][7], "extra": 1})
+                    self.assertEqual(records[8], bundle["shares"][8])
+                    self.assertEqual(view["shares"][7], view["shares"][7])
+                    self.assertNotEqual(view["shares"][7], view["shares"][8])
+                    self.assertEqual(view, bundle)
+                    self.assertEqual(materialize_json(isolated), bundle["shares"][7])
+                    # The streaming encoder emits the record's own encoding
+                    # verbatim, byte-identical to json.dumps of the value.
+                    self.assertEqual(
+                        "".join(iter_json_chunks({"shares": view["shares"][6:9]})),
+                        json.dumps({"shares": bundle["shares"][6:9]}, separators=(",", ":")),
+                    )
+                    self.assertEqual(
+                        "".join(iter_json_chunks(isolated, sort_keys=True)),
+                        json.dumps(bundle["shares"][7], sort_keys=True, separators=(",", ":")),
+                    )
+                    # A non-object oversized value (a leaf string) is
+                    # normalized the same way.
+                    leaves = list(view["witness_merkle_leaves_hex"])
+                    self.assertEqual(leaves[0], "ab" * 32)
+                    self.assertIsInstance(leaves[1], RawJsonRecord)
+                    self.assertFalse(leaves[1].is_object)
+                    self.assertEqual(leaves[1], "W" * (2 * limit))
+                    self.assertEqual(materialize_json(view["witness_merkle_leaves_hex"]), bundle["witness_merkle_leaves_hex"])
+                finally:
+                    view.close()
+
+    def test_isolated_helper_failures_are_classified(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = b'{"shares":[{"a":"' + b"x" * 20000 + b'"}]}'
+            path = write_document(Path(tmp), "bundle.json", raw)
+            with mock.patch("lab.prism.audit_bundle_view.RECORD_DECODE_SOFT_LIMIT_BYTES", 1024):
+                view = scan(path)
+                try:
+                    self.assertEqual(view["shares"][0], {"a": "x" * 20000})
+                    with mock.patch(
+                        "lab.prism.audit_bundle_view.subprocess.Popen",
+                        side_effect=OSError("fork failed"),
+                    ):
+                        with self.assertRaises(ArtifactResourcePressure):
+                            view["shares"][0]
+                    real_temporary_file = tempfile.TemporaryFile
+                    calls = {"count": 0}
+
+                    def failing_spool(*args: object, **kwargs: object) -> object:
+                        calls["count"] += 1
+                        raise OSError("disk full")
+
+                    with mock.patch(
+                        "lab.prism.audit_bundle_view.tempfile.TemporaryFile",
+                        side_effect=failing_spool,
+                    ):
+                        with self.assertRaises(ArtifactResourcePressure):
+                            view["shares"][0]
+                    self.assertGreaterEqual(calls["count"], 1)
+                    self.assertIs(tempfile.TemporaryFile, real_temporary_file)
+                finally:
+                    view.close()
+            # The scan rejects a token-malformed record before any helper
+            # runs; the helper classifies malformed input the same way when
+            # it is handed such bytes directly, never as resource pressure.
+            bad = b'{"shares":[{"a":tru,"b":"' + b"y" * 20000 + b'"}]}'
+            bad_path = write_document(Path(tmp), "bad.json", bad)
+            with self.assertRaises(json.JSONDecodeError):
+                scan(bad_path)
+            from lab.prism.audit_bundle_view import normalize_record_isolated
+
+            source = ArtifactSource(os.open(bad_path, os.O_RDONLY), path=bad_path)
+            try:
+                with self.assertRaises(json.JSONDecodeError) as caught:
+                    normalize_record_isolated(source, 11, len(bad) - 2)
+                self.assertIsInstance(caught.exception, CanonicalArtifactSyntaxError)
+            finally:
+                source.close()
+
+    def test_raw_document_and_spooled_documents_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = make_bundle(12)
+            raw = compact(bundle, ensure_ascii=False)
+            path = write_document(Path(tmp), "bundle.json", raw)
+            view = scan(path)
+            try:
+                document = RawJsonDocument(view.source)
+                self.assertEqual(document.byte_length, len(raw))
+                self.assertEqual(b"".join(document.iter_byte_chunks(chunk_bytes=7)), raw)
+                self.assertEqual("".join(document.iter_text_chunks(chunk_bytes=7)), raw.decode("utf-8"))
+                embedded = "".join(iter_json_chunks({"audit_bundle": document, "n": 1}))
+                self.assertEqual(json.loads(embedded), {"audit_bundle": bundle, "n": 1})
+                self.assertEqual(materialize_json(view), bundle)
+                spooled = spool_json_document(
+                    iter_json_byte_chunks({"share_parts": [{"kind": "x", "n": i} for i in range(700)]}),
+                    lazy_paths=(("share_parts",),),
+                    stride=8,
+                )
+                try:
+                    parts = spooled["share_parts"]
+                    self.assertIsInstance(parts, LazyRecordSequence)
+                    self.assertEqual(len(parts), 700)
+                    self.assertEqual(parts[699], {"kind": "x", "n": 699})
+                    self.assertEqual(list(parts)[:3], [{"kind": "x", "n": i} for i in range(3)])
+                finally:
+                    spooled.close()
+            finally:
+                view.close()
 
     def test_oversized_values_are_skipped_without_being_held(self) -> None:
         chunk = 4096

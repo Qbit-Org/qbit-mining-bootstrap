@@ -36,8 +36,11 @@ from lab.prism.audit_bundle_view import (
     ArtifactSource,
     CanonicalArtifactError,
     CanonicalAuditBundleView,
+    RawJsonRecord,
     iter_json_byte_chunks,
     json_chunks_sha256_and_size,
+    materialize_json,
+    spool_json_document,
 )
 from lab.prism.prism_tools import prism_tool_command
 
@@ -3664,7 +3667,13 @@ class AuditArtifactStore:
         except CanonicalArtifactError as exc:
             raise OSError(str(exc)) from exc
         if parent_fd is not None:
-            self._validate_owned_parent(path)
+            try:
+                self._validate_owned_parent(path)
+            except BaseException:
+                # The descriptor is retired here, not by a finalizer that a
+                # retained traceback could postpone.
+                source.close()
+                raise
         return source
 
     def _scan_owned_artifact(
@@ -3687,7 +3696,13 @@ class AuditArtifactStore:
             lazy_paths=lazy_paths,
         )
         if parent_fd is not None:
-            self._validate_owned_parent(path)
+            try:
+                self._validate_owned_parent(path)
+            except BaseException:
+                # Retire the artifact and index descriptors now; a retained
+                # traceback must not keep them open until collection.
+                view.close()
+                raise
         return view
 
     def _require_logical_match(
@@ -4552,28 +4567,51 @@ class AuditArtifactStore:
             )
         return by_seq
 
-    def audit_share_range_parts(
+    @staticmethod
+    def _spool_share_parts(
+        parts: Iterable[Mapping[str, Any]],
+        scratch: list[CanonicalAuditBundleView] | None,
+    ) -> Sequence[Any]:
+        """The share-part index as a replayable on-disk sequence.
+
+        Parts are written to an unlinked scratch document as they are
+        produced -- an inline part's lazy slice streams batch by batch --
+        and read back lazily, so a small configured segment size cannot
+        turn the index into a window-scaled list. The scratch view is
+        appended to ``scratch`` for the caller to close; without a scratch
+        list it retires with the last reference to the sequence.
+        """
+
+        def chunks() -> Iterator[bytes]:
+            yield b'{"share_parts":['
+            first = True
+            for part in parts:
+                if not first:
+                    yield b","
+                first = False
+                yield from iter_json_byte_chunks(part)
+            yield b"]}"
+
+        view = spool_json_document(chunks(), lazy_paths=(("share_parts",),))
+        if scratch is not None:
+            scratch.append(view)
+        return view["share_parts"]
+
+    @staticmethod
+    def share_parts_digest_hex(parts: Sequence[Any]) -> str:
+        """``sha256(storage_json_bytes({"share_parts": parts}))``, streamed."""
+        digest, _size = json_chunks_sha256_and_size(
+            iter_json_byte_chunks({"share_parts": parts})
+        )
+        return digest
+
+    def _iter_share_range_parts(
         self,
         shares: Sequence[Any],
+        first_seq: int,
         *,
-        load_missing_range: Callable[..., list[Any]] | None = None,
-    ) -> list[dict[str, Any]] | None:
-        """Slot-range parts for a contiguous window, one bounded slice each.
-
-        Accepts a list or a lazy artifact sequence.  The window is walked
-        once to prove contiguity, then each slot's records are handed to the
-        segment writer as a slice bounded by the configured segment size;
-        no list of sequence numbers or of records spanning the whole window
-        is built.
-        """
-        if self._share_segment_size <= 0:
-            return None
-        if not self._is_share_sequence(shares):
-            return None
-        first_seq = self._contiguous_share_start(shares)
-        if first_seq is None:
-            return None
-        parts: list[dict[str, Any]] = []
+        load_missing_range: Callable[..., list[Any]] | None,
+    ) -> Iterator[dict[str, Any]]:
         segment_size = self._share_segment_size
         for index, end, segment_start, segment_end in self._iter_segment_slots(
             first_seq,
@@ -4591,21 +4629,33 @@ class AuditArtifactStore:
                 shares=chunk,
                 load_missing_range=load_missing_range,
             )
-            parts.append(
-                {
-                    "kind": "segment_range",
-                    "segment_first_share_seq": segment_start,
-                    "segment_last_share_seq": segment_end,
-                    "first_share_seq": chunk_first,
-                    "last_share_seq": chunk_last,
-                    "share_count": end - index,
-                    "range_sha256": digest,
-                    "body_uri": uri,
-                }
-            )
-        return parts
+            yield {
+                "kind": "segment_range",
+                "segment_first_share_seq": segment_start,
+                "segment_last_share_seq": segment_end,
+                "first_share_seq": chunk_first,
+                "last_share_seq": chunk_last,
+                "share_count": end - index,
+                "range_sha256": digest,
+                "body_uri": uri,
+            }
 
-    def audit_share_parts(self, shares: Sequence[Any]) -> list[dict[str, Any]] | None:
+    def audit_share_range_parts(
+        self,
+        shares: Sequence[Any],
+        *,
+        load_missing_range: Callable[..., list[Any]] | None = None,
+        scratch: list[CanonicalAuditBundleView] | None = None,
+    ) -> Sequence[Any] | None:
+        """Slot-range parts for a contiguous window, one bounded slice each.
+
+        Accepts a list or a lazy artifact sequence.  The window is walked
+        once to prove contiguity, then each slot's records are handed to the
+        segment writer as a slice bounded by the configured segment size;
+        no list of sequence numbers or of records spanning the whole window
+        is built, and the parts themselves are spooled to disk as they are
+        produced and returned as a replayable sequence.
+        """
         if self._share_segment_size <= 0:
             return None
         if not self._is_share_sequence(shares):
@@ -4613,7 +4663,20 @@ class AuditArtifactStore:
         first_seq = self._contiguous_share_start(shares)
         if first_seq is None:
             return None
-        parts: list[dict[str, Any]] = []
+        return self._spool_share_parts(
+            self._iter_share_range_parts(
+                shares,
+                first_seq,
+                load_missing_range=load_missing_range,
+            ),
+            scratch,
+        )
+
+    def _iter_share_parts(
+        self,
+        shares: Sequence[Any],
+        first_seq: int,
+    ) -> Iterator[dict[str, Any]]:
         segment_size = self._share_segment_size
         for index, end, segment_start, segment_end in self._iter_segment_slots(
             first_seq,
@@ -4633,29 +4696,39 @@ class AuditArtifactStore:
                     last_share_seq=segment_end,
                     shares=chunk,
                 )
-                parts.append(
-                    {
-                        "kind": "segment",
-                        "first_share_seq": segment_start,
-                        "last_share_seq": segment_end,
-                        "share_count": end - index,
-                        "sha256": digest,
-                        "body_uri": uri,
-                    }
-                )
+                yield {
+                    "kind": "segment",
+                    "first_share_seq": segment_start,
+                    "last_share_seq": segment_end,
+                    "share_count": end - index,
+                    "sha256": digest,
+                    "body_uri": uri,
+                }
             else:
-                parts.append(
-                    {
-                        "kind": "inline",
-                        "first_share_seq": chunk_first,
-                        "last_share_seq": chunk_last,
-                        "share_count": end - index,
-                        # A lazy slice stays lazy here; the streaming body
-                        # encoder materializes it batch by batch.
-                        "shares": chunk,
-                    }
-                )
-        return parts
+                yield {
+                    "kind": "inline",
+                    "first_share_seq": chunk_first,
+                    "last_share_seq": chunk_last,
+                    "share_count": end - index,
+                    # A lazy slice stays lazy here; the spool encoder
+                    # materializes it batch by batch.
+                    "shares": chunk,
+                }
+
+    def audit_share_parts(
+        self,
+        shares: Sequence[Any],
+        *,
+        scratch: list[CanonicalAuditBundleView] | None = None,
+    ) -> Sequence[Any] | None:
+        if self._share_segment_size <= 0:
+            return None
+        if not self._is_share_sequence(shares):
+            return None
+        first_seq = self._contiguous_share_start(shares)
+        if first_seq is None:
+            return None
+        return self._spool_share_parts(self._iter_share_parts(shares, first_seq), scratch)
 
     def audit_body_ref(
         self,
@@ -4663,13 +4736,14 @@ class AuditArtifactStore:
         block_hash: str,
         audit_bundle_sha256: str,
         final_bundle: Mapping[str, Any],
+        scratch: list[CanonicalAuditBundleView] | None = None,
     ) -> dict[str, Any] | None:
         if self._share_segment_size <= 0:
             return None
         shares = final_bundle.get("shares")
         if not self._is_share_sequence(shares) or not shares:
             return None
-        parts = self.audit_share_parts(shares)
+        parts = self.audit_share_parts(shares, scratch=scratch)
         if parts is None or not any(part.get("kind") == "segment" for part in parts):
             return None
         without_shares = {key: value for key, value in final_bundle.items() if key != "shares"}
@@ -4692,6 +4766,7 @@ class AuditArtifactStore:
         audit_bundle_sha256: str,
         final_bundle: Mapping[str, Any],
         load_missing_range: Callable[..., list[Any]] | None = None,
+        scratch: list[CanonicalAuditBundleView] | None = None,
     ) -> dict[str, Any] | None:
         if self._share_segment_size <= 0:
             return None
@@ -4701,6 +4776,7 @@ class AuditArtifactStore:
         parts = self.audit_share_range_parts(
             shares,
             load_missing_range=load_missing_range,
+            scratch=scratch,
         )
         if parts is None:
             return None
@@ -4710,9 +4786,9 @@ class AuditArtifactStore:
             "first_share_seq": int(shares[0]["share_seq"]),
             "last_share_seq": int(shares[-1]["share_seq"]),
             "share_count": len(shares),
-            "share_parts_digest_hex": _sha256_bytes(
-                self.storage_json_bytes({"share_parts": parts})
-            ),
+            # The parts serialization is hashed incrementally from the
+            # on-disk index; it equals the reader's whole-encoding digest.
+            "share_parts_digest_hex": self.share_parts_digest_hex(parts),
             "share_parts": parts,
         }
         reward = final_bundle.get("reward_manifest")
@@ -4812,6 +4888,8 @@ class AuditArtifactStore:
         owned_canonical = False
         canonical_bytes: bytes | None = None
         source_identity: _FileIdentity | None = None
+        # Scratch views (the on-disk share-part index) retire with this call.
+        scratch: list[CanonicalAuditBundleView] = []
         try:
             if canonical_bundle_path is not None:
                 source_path = Path(canonical_bundle_path)
@@ -4871,12 +4949,14 @@ class AuditArtifactStore:
                 audit_bundle_sha256=expected,
                 final_bundle=final_bundle,
                 load_missing_range=load_missing_range,
+                scratch=scratch,
             )
             if storage is None:
                 storage = self.audit_body_ref(
                     block_hash=block_hash,
                     audit_bundle_sha256=expected,
                     final_bundle=final_bundle,
+                    scratch=scratch,
                 )
             body_size: int | None
             if storage is not None:
@@ -4954,6 +5034,8 @@ class AuditArtifactStore:
             self._validate_root_identity()
             return str(body_path)
         finally:
+            for view in scratch:
+                view.close()
             if owned_canonical and canonical is not None:
                 canonical.close()
 
@@ -4991,9 +5073,23 @@ class AuditArtifactStore:
             return True
         return self._literal_body_matches_sha(body_path, expected)
 
+    # Every window-, transaction- or recipient-scaled member of a compact
+    # body stays lazy: the header mirrors the artifact's lazy paths and the
+    # share-part index scales with the window over the segment size.
     _BODY_LAZY_PATHS: tuple[tuple[str, ...], ...] = (
         ("bundle_without_shares", "shares"),
         ("bundle_without_shares", "reward_manifest", "shares"),
+        ("bundle_without_shares", "reward_manifest", "entitlements"),
+        ("bundle_without_shares", "witness_merkle_leaves_hex"),
+        ("bundle_without_shares", "audit_commitment_leaves_hex"),
+        ("bundle_without_shares", "prior_balances"),
+        ("bundle_without_shares", "payout_policy_manifest", "accounts"),
+        ("bundle_without_shares", "payout_policy_manifest", "onchain_entitlements"),
+        ("bundle_without_shares", "settlement_mode_decision", "direct_recipients"),
+        ("bundle_without_shares", "settlement_mode_decision", "fanout_chunks"),
+        ("bundle_without_shares", "ctv_fanout_manifest_set", "manifests"),
+        ("share_window_proof", "share_parts"),
+        ("share_parts",),
     )
 
     def _compact_body_reconstructs_to(
@@ -5087,7 +5183,11 @@ class AuditArtifactStore:
         last_seq: int | None = None
         previous_last_share_seq: int | None = None
         for part in parts:
-            if not isinstance(part, dict):
+            if isinstance(part, RawJsonRecord):
+                # An inline part above the in-process limit: the part is
+                # the unit here, so it is decoded whole (documented).
+                part = materialize_json(part)
+            if not isinstance(part, Mapping):
                 return None
             kind = part.get("kind")
             segment_view: CanonicalAuditBundleView | None = None
@@ -5162,7 +5262,7 @@ class AuditArtifactStore:
         if not hmac.compare_digest(declared, expected):
             return False
         parts = body.get("share_parts")
-        if not isinstance(parts, list) or not self._header_matches(body, final_bundle):
+        if not self._is_share_sequence(parts) or not self._header_matches(body, final_bundle):
             return False
         matched = self._parts_match_window(
             parts,
@@ -5197,12 +5297,10 @@ class AuditArtifactStore:
         if int(body.get("share_count") or 0) != int(proof.get("share_count") or 0):
             return False
         parts = proof.get("share_parts")
-        if not isinstance(parts, list):
+        if not self._is_share_sequence(parts):
             return False
         expected_parts_digest = str(proof.get("share_parts_digest_hex") or "").lower()
-        actual_parts_digest = _sha256_bytes(
-            self.storage_json_bytes({"share_parts": parts})
-        )
+        actual_parts_digest = self.share_parts_digest_hex(parts)
         if expected_parts_digest != actual_parts_digest:
             return False
         if not self._header_matches(body, final_bundle):

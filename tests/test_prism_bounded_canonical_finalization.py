@@ -716,6 +716,445 @@ class RealBuilderBoundedFinalizationTests(_RealBuildMixin, unittest.TestCase):
                 store.discard_candidate(candidate)
 
 
+def ctv_manifest_set() -> dict[str, Any]:
+    """A two-chunk CTV fanout manifest set shaped for the recovery payload."""
+
+    def manifest(index: int, output_sum: int, covenant: int) -> dict[str, Any]:
+        return {
+            "schema": "qbit.prism.ctv-fanout-manifest.v1",
+            "precommitment": {
+                "chunk_index": index,
+                "chunk_count": 2,
+                "fanout_fee_sats": 0,
+                "anchor_vout": 1,
+                "ctv_hash_hex": ("e%x" % index) * 32,
+                "fanout_tx_template_hex": ("0a%02x" % index) * 40,
+                "fanout_output_sum_sats": output_sum,
+                "block_height": 10,
+            },
+            "precommitment_sha256_hex": ("f%x" % index) * 32,
+            "commitment_witness_leaf_hex": ("a%x" % index) * 32,
+            "parent_coinbase_txid": "cc" * 32,
+            "parent_coinbase_tx_hex": "0102",
+            "parent_coinbase_vout": 1,
+            "covenant_output_value_sats": covenant,
+            "fanout_tx_hex": ("0b%02x" % index) * 60,
+            "fanout_txid": ("d%x" % index) * 32,
+        }
+
+    return {
+        "schema": "qbit.prism.ctv-fanout-manifest-set.v1",
+        "block_height": 10,
+        "settlement_mode": "ctv_fanout",
+        "parent_coinbase_txid": "cc" * 32,
+        "fanout_count": 2,
+        "fanout_output_sum_sats": 30,
+        "covenant_output_value_sats": 40,
+        "manifests": [manifest(0, 10, 15), manifest(1, 20, 25)],
+    }
+
+
+def synthetic_bundle(share_count: int, *, recipients: int = 3) -> dict[str, Any]:
+    """A canonical-shaped bundle with recipient-scaled members for the store tests."""
+    shares = [share_record(index) for index in range(share_count)]
+    accounts = [
+        {
+            "recipient_id": f"miner-{index}",
+            "order_key": f"o{index}",
+            "p2mr_program_hex": ("%02x" % (index % 251)) * 32,
+            "gross_amount_sats": 1000 + index,
+            "prior_balance_sats": 0,
+            "candidate_balance_sats": 1000 + index,
+            "onchain_amount_sats": 0,
+            "carry_forward_balance_sats": 1000 + index,
+            "action": "accrued",
+        }
+        for index in range(recipients)
+    ]
+    return {
+        "schema": "qbit.prism.audit-bundle.v1",
+        "shares": shares,
+        "found_block": found_block(),
+        "prior_balances": [
+            {"recipient_id": f"miner-{index}", "order_key": f"o{index}", "p2mr_program_hex": ("%02x" % (index % 251)) * 32, "balance_sats": index}
+            for index in range(recipients)
+        ],
+        "payout_policy": {"p2mr_spend_input_bytes": 1},
+        "witness_merkle_leaves_hex": ["ab" * 32],
+        "audit_commitment_leaves_hex": ["cd" * 32],
+        "ledger_window_attestation": {"signature": {"public_key_hex": "44" * 32}},
+        "reward_manifest": {
+            "schema": "qbit.prism.reward-manifest.v1",
+            "included_share_count": share_count,
+            "shares": [{"share_seq": index + 1, "counted_difficulty": 1} for index in range(share_count)],
+            "entitlements": [{"recipient_id": f"miner-{index}", "weight": 1} for index in range(recipients)],
+        },
+        "payout_policy_manifest": {"accounts": accounts, "onchain_entitlements": []},
+        "ctv_fanout_manifest_set": ctv_manifest_set(),
+        "signed_coinbase_manifest": {"manifest": {"coinbase_tx_hex": "00", "payout_count": 0}},
+    }
+
+
+def bounded_json_guards(module_path: str, limit: int, *, guard_loads: bool = True) -> Any:
+    """Refuse json.dumps/json.loads calls above ``limit`` while active.
+
+    The patch lands on the shared ``json`` module, so it covers every
+    caller in the process; tests whose fakes legitimately decode a whole
+    captured payload pass ``guard_loads=False``.
+    """
+    real_dumps = json.dumps
+    real_loads = json.loads
+
+    def guarded_dumps(value: Any, *args: Any, **kwargs: Any) -> str:
+        encoded = real_dumps(value, *args, **kwargs)
+        if len(encoded) > limit:
+            raise AssertionError(f"{module_path} encoded {len(encoded)} bytes in one call")
+        return encoded
+
+    def guarded_loads(text: Any, *args: Any, **kwargs: Any) -> Any:
+        if len(text) > limit:
+            raise AssertionError(f"{module_path} decoded {len(text)} bytes in one call")
+        return real_loads(text, *args, **kwargs)
+
+    class Guards:
+        def __enter__(self) -> "Guards":
+            self._patches = [
+                mock.patch(f"{module_path}.json.dumps", side_effect=guarded_dumps),
+            ]
+            if guard_loads:
+                self._patches.append(
+                    mock.patch(f"{module_path}.json.loads", side_effect=guarded_loads)
+                )
+            for patch in self._patches:
+                patch.start()
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            for patch in reversed(self._patches):
+                patch.stop()
+
+    return Guards()
+
+
+class RemainingBoundaryTests(unittest.TestCase):
+    """The follow-up closures: parts index, pressure, persistence and CTV."""
+
+    def make_store(self, root: Path, *, share_segment_size: int) -> AuditArtifactStore:
+        store = AuditArtifactStore(
+            AuditArtifactConfig(
+                root=root,
+                evidence_path=root / "evidence.json",
+                share_segment_size=share_segment_size,
+            ),
+            canonicalizer=lambda bundle: json.dumps(bundle, separators=(",", ":")).encode(),
+        )
+        self.addCleanup(store.close)
+        return store
+
+    def write_view(self, root: Path, bundle: dict[str, Any]) -> tuple[Path, bytes, CanonicalAuditBundleView]:
+        raw = json.dumps(bundle, separators=(",", ":")).encode()
+        path = root / f".prism-live-audit-bundle-candidate-{BLOCK_HASH}-{'0' * 32}.json.tmp"
+        path.write_bytes(raw)
+        view = CanonicalAuditBundleView.scan_path(path)
+        self.addCleanup(view.close)
+        return path, raw, view
+
+    def test_small_segment_size_keeps_the_part_index_on_disk(self) -> None:
+        from lab.prism.audit_bundle_view import LazyRecordSequence as Lazy
+
+        # segment_size=1 is the stress (one part per share); 250 the control.
+        for segment_size, expected_parts in ((1, 1500), (7, 215), (250, 6)):
+            with self.subTest(segment_size=segment_size), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = self.make_store(root, share_segment_size=segment_size)
+                bundle = synthetic_bundle(1500)
+                path, raw, view = self.write_view(root, bundle)
+                expected = hashlib.sha256(raw).hexdigest()
+                body_uri = str(store.body_path(BLOCK_HASH, expected))
+                with bounded_json_guards("lab.prism.audit_artifacts", 256 * 1024):
+                    scratch: list[Any] = []
+                    parts = store.audit_share_range_parts(view["shares"], scratch=scratch)
+                    assert parts is not None
+                    self.assertIsInstance(parts, Lazy)
+                    self.assertEqual(len(parts), expected_parts)
+                    self.assertEqual(parts[0]["first_share_seq"], 1)
+                    self.assertEqual(parts[-1]["last_share_seq"], 1500)
+                    for scratch_view in scratch:
+                        scratch_view.close()
+                    published = store.prepare_external_audit_body(
+                        {"block_hash": BLOCK_HASH, "audit_bundle_sha256": expected},
+                        view,
+                        body_uri=body_uri,
+                        canonical_bundle_path=path,
+                    )
+                self.assertEqual(published, body_uri)
+                body = json.loads(Path(body_uri).read_bytes())
+                proof = body["share_window_proof"]
+                self.assertEqual(len(proof["share_parts"]), expected_parts)
+                # The incremental parts digest equals the reader's whole
+                # encoding, and the compact body reconstructs exactly.
+                self.assertEqual(
+                    proof["share_parts_digest_hex"],
+                    hashlib.sha256(store.storage_json_bytes({"share_parts": proof["share_parts"]})).hexdigest(),
+                )
+                self.assertEqual(store.read_external_body(body_uri, expected_sha256=expected), bundle)
+                # A retry verifies through the lazily parsed part index.
+                with bounded_json_guards("lab.prism.audit_artifacts", 256 * 1024):
+                    self.assertEqual(
+                        store.prepare_external_audit_body(
+                            {"block_hash": BLOCK_HASH, "audit_bundle_sha256": expected},
+                            view,
+                            body_uri=body_uri,
+                            canonical_bundle_path=path,
+                        ),
+                        body_uri,
+                    )
+
+    def test_owned_open_failures_retire_descriptors_before_the_exception_returns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_store(root, share_segment_size=4)
+            bundle = synthetic_bundle(6)
+            path, _raw, _view = self.write_view(root, bundle)
+            opened: list[int] = []
+            real_open = os.open
+
+            def recording_open(*args: Any, **kwargs: Any) -> int:
+                fd = real_open(*args, **kwargs)
+                if kwargs.get("dir_fd") == store._root_fd and args[0] == path.name:
+                    opened.append(fd)
+                return fd
+
+            gc_was_enabled = gc.isenabled()
+            gc.disable()
+            try:
+                for opener in (
+                    lambda: store._open_owned_artifact_source(path),
+                    lambda: store._scan_owned_artifact(path, lazy_paths=(("shares",),)),
+                ):
+                    opened.clear()
+                    checks = {"count": 0}
+                    real_validate = store._validate_owned_parent
+
+                    def failing_second_check(target: Path) -> None:
+                        checks["count"] += 1
+                        if checks["count"] == 2:
+                            raise RuntimeError("audit artifact root identity changed")
+                        real_validate(target)
+
+                    retained: BaseException | None = None
+                    with mock.patch("lab.prism.audit_artifacts.os.open", side_effect=recording_open), mock.patch.object(
+                        store,
+                        "_validate_owned_parent",
+                        side_effect=failing_second_check,
+                    ):
+                        try:
+                            opener()
+                        except RuntimeError as exc:
+                            retained = exc
+                    # The exception and its traceback frames (which reference
+                    # the view or source locals) are still retained here; the
+                    # descriptors must already be closed regardless.
+                    assert retained is not None
+                    self.assertIn("identity changed", str(retained))
+                    self.assertIsNotNone(retained.__traceback__)
+                    self.assertEqual(len(opened), 1)
+                    for fd in opened:
+                        with self.assertRaises(OSError):
+                            os.fstat(fd)
+                    del retained
+            finally:
+                if gc_was_enabled:
+                    gc.enable()
+
+    def test_scratch_pressure_is_reported_not_classified_as_mismatch(self) -> None:
+        from lab.prism.audit_bundle_view import ArtifactResourcePressure
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_store(root, share_segment_size=100)
+            bundle = synthetic_bundle(500)
+            path, raw, view = self.write_view(root, bundle)
+            expected = hashlib.sha256(raw).hexdigest()
+            body_uri = str(store.body_path(BLOCK_HASH, expected))
+            real_temporary_file = tempfile.TemporaryFile
+            calls = {"count": 0}
+
+            def failing_after_first(*args: Any, **kwargs: Any) -> Any:
+                calls["count"] += 1
+                if calls["count"] > 1:
+                    raise OSError("no scratch space")
+                return real_temporary_file(*args, **kwargs)
+
+            with mock.patch("lab.prism.audit_bundle_view.tempfile.TemporaryFile", side_effect=failing_after_first):
+                with self.assertRaises(ArtifactResourcePressure):
+                    store.prepare_external_audit_body(
+                        {"block_hash": BLOCK_HASH, "audit_bundle_sha256": expected},
+                        view,
+                        body_uri=body_uri,
+                        canonical_bundle_path=path,
+                    )
+            self.assertFalse(Path(body_uri).exists())
+            # Once the pressure passes the same call publishes normally.
+            self.assertEqual(
+                store.prepare_external_audit_body(
+                    {"block_hash": BLOCK_HASH, "audit_bundle_sha256": expected},
+                    view,
+                    body_uri=body_uri,
+                    canonical_bundle_path=path,
+                ),
+                body_uri,
+            )
+
+    def test_persistence_streams_lazy_accounts_and_the_inline_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = synthetic_bundle(1200, recipients=900)
+            path, raw, view = self.write_view(root, bundle)
+            expected = hashlib.sha256(raw).hexdigest()
+            report = {
+                "coinbase_txid": "11" * 32,
+                "coinbase_manifest_sha256_hex": "22" * 32,
+                "audit_bundle_sha256_hex": expected,
+                "coinbase_tx_hex": "00",
+            }
+            # Inline lane: no body store; the artifact bytes are spliced.
+            inline = FakeLeasePsqlShareLedger([acquired_lease(), persist_result()])
+            with bounded_json_guards("lab.prism.share_ledger", 256 * 1024):
+                persistence = inline.persist_accepted_block(
+                    block_hash=BLOCK_HASH,
+                    block_height=10,
+                    parent_hash=PARENT_HASH,
+                    final_bundle=view,
+                    audit_report=report,
+                )
+            self.assertEqual(persistence["audit_body_byte_len"], len(raw))
+            sql = inline.lease_queries[-1]
+            self.assertEqual(sql.count(raw.decode("utf-8")), 1)
+            payload = payload_from_sql(sql)
+            self.assertEqual(payload["audit_bundle"], bundle)
+            self.assertEqual(payload["accounts"], bundle["payout_policy_manifest"]["accounts"])
+            self.assertEqual(payload["witness_merkle_leaves_hex"], bundle["witness_merkle_leaves_hex"])
+            # External lane: the body pointer replaces the inline body and the
+            # recipient-scaled accounts stream from the view.
+            external = FakeLeasePsqlShareLedger(
+                [acquired_lease(), {"existing_block": False, "existing_body_uri": None}, persist_result()],
+                audit_body_dir=root,
+                audit_bundle_canonicalizer=mock.Mock(side_effect=AssertionError("must not canonicalize")),
+                audit_share_segment_size=100,
+            )
+            with bounded_json_guards("lab.prism.share_ledger", 256 * 1024):
+                persistence = external.persist_accepted_block(
+                    block_hash=BLOCK_HASH,
+                    block_height=10,
+                    parent_hash=PARENT_HASH,
+                    final_bundle=view,
+                    audit_report=report,
+                    canonical_bundle_path=path,
+                )
+            payload = payload_from_sql(external.lease_queries[-1])
+            self.assertIsNone(payload["audit_bundle"])
+            self.assertEqual(payload["body_uri"], persistence["body_uri"])
+            self.assertEqual(payload["accounts"], bundle["payout_policy_manifest"]["accounts"])
+
+    def test_ctv_manifest_set_persists_and_digests_through_the_view(self) -> None:
+        from lab.prism.audit_bundle_view import LazyRecordSequence as Lazy, streamed_sha256_json_hex
+        from lab.prism.share_ledger import ctv_fanout_recovery_payload, sha256_json_hex
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = synthetic_bundle(20)
+            _path, _raw, view = self.write_view(root, bundle)
+            manifest_set = view["ctv_fanout_manifest_set"]
+            self.assertIsInstance(manifest_set["manifests"], Lazy)
+            digest = streamed_sha256_json_hex(manifest_set)
+            self.assertEqual(digest, sha256_json_hex(bundle["ctv_fanout_manifest_set"]))
+            reference = ctv_fanout_recovery_payload(
+                block_hash=BLOCK_HASH,
+                manifest_set=bundle["ctv_fanout_manifest_set"],
+                manifest_set_sha256=digest,
+            )
+            ledger = FakeLeasePsqlShareLedger(
+                [acquired_lease(), {"backend": "postgres-psql", "fanout_set_count": 1, "fanout_artifact_count": 2}],
+            )
+            with bounded_json_guards("lab.prism.share_ledger", 256 * 1024):
+                ledger.persist_ctv_fanout_manifest_set(
+                    block_hash=BLOCK_HASH,
+                    manifest_set=manifest_set,
+                    manifest_set_sha256=digest,
+                )
+            payload = payload_from_sql(ledger.lease_queries[-1])
+            for key in ("writer_id", "writer_epoch", "writer_session_token"):
+                payload.pop(key)
+            self.assertEqual(payload, reference)
+            # The in-memory ledger keeps plain state from the same payload.
+            from lab.prism.share_ledger import SingleWriterShareLedger
+
+            memory = SingleWriterShareLedger()
+            memory.persist_ctv_fanout_manifest_set(
+                block_hash=BLOCK_HASH,
+                manifest_set=manifest_set,
+                manifest_set_sha256=digest,
+            )
+            self.assertEqual(memory._ctv_fanout_sets[BLOCK_HASH], reference)
+
+    def test_finalization_passes_lazy_members_to_its_consumers(self) -> None:
+        from types import SimpleNamespace
+
+        from lab.prism.audit_bundle_view import streamed_sha256_json_hex
+        from lab.prism.block_finalization import BlockFinalizationService, FinalizationAdmission, LandedCandidate
+        from lab.prism.share_ledger import sha256_json_hex
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = synthetic_bundle(20)
+            _path, _raw, view = self.write_view(root, bundle)
+            recorded: dict[str, Any] = {}
+
+            def persist(**kwargs: Any) -> dict[str, Any]:
+                recorded.update(kwargs)
+                return {"backend": "memory"}
+
+            runtime = SimpleNamespace(ledger=SimpleNamespace(persist_ctv_fanout_manifest_set=persist))
+            service = BlockFinalizationService(runtime)  # type: ignore[arg-type]
+            service._record_block_candidate_progress = lambda *args, **kwargs: None  # type: ignore[method-assign]
+            admission = SimpleNamespace(
+                candidate=SimpleNamespace(credit_share_on_accept=False),
+                block_hash=BLOCK_HASH,
+                context=None,
+                submission=None,
+            )
+            landed = LandedCandidate(
+                final_bundle=view,
+                report={},
+                persistence={},
+                confirmation={},
+                audit_publication_identity=None,  # type: ignore[arg-type]
+                audit_verification_identity={},
+            )
+            result = service._persist_ctv_and_credit(admission, landed)  # type: ignore[arg-type]
+            self.assertEqual(result, {"backend": "memory"})
+            self.assertIs(recorded["manifest_set"], view["ctv_fanout_manifest_set"])
+            self.assertEqual(recorded["manifest_set_sha256"], sha256_json_hex(bundle["ctv_fanout_manifest_set"]))
+            self.assertEqual(recorded["manifest_set_sha256"], streamed_sha256_json_hex(view["ctv_fanout_manifest_set"]))
+            del FinalizationAdmission
+
+    def test_payout_preview_walks_lazy_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = synthetic_bundle(20, recipients=40)
+            _path, _raw, view = self.write_view(root, bundle)
+            server = coordinator_server()
+            self.assertEqual(
+                server._accepted_block_payout_preview_from_bundle(view, prior_balances=[]),
+                server._accepted_block_payout_preview_from_bundle(bundle, prior_balances=[]),
+            )
+            self.assertEqual(
+                len(server._accepted_block_payout_preview_from_bundle(view, prior_balances=[])),
+                40,
+            )
+
+
 class CompilerInputStreamingTests(unittest.TestCase):
     def test_build_input_chunks_match_json_dumps_for_lists_and_sequences(self) -> None:
         records = [share_record(index) for index in range(700)]
@@ -772,6 +1211,79 @@ class CompilerInputStreamingTests(unittest.TestCase):
                 self.assertEqual(bundle, json.loads(canonical))
                 self.assertIsInstance(bundle["shares"], LazyRecordSequence)
                 self.assertEqual(output_path.read_bytes(), canonical.encode())
+            finally:
+                bundle.close()
+
+    def test_compiler_splices_pre_encoded_windows_without_parsing(self) -> None:
+        from lab.prism.bundle_compiler import _iter_share_window_items
+        from lab.prism.share_json_stream import canonical_share_items_bytes
+
+        records = [share_record(index) for index in range(1500)]
+        items = canonical_share_items_bytes(records)
+
+        class MirrorLike(Sequence):
+            def __init__(self) -> None:
+                self.canonical_items = items
+                self.record_count = len(records)
+
+            def __len__(self) -> int:
+                return self.record_count
+
+            def __iter__(self):  # type: ignore[no-untyped-def]
+                raise AssertionError("a pre-encoded window must not be parsed")
+
+            def __getitem__(self, index: int | slice) -> Any:
+                raise AssertionError("a pre-encoded window must not be parsed")
+
+        class PageLike:
+            def __init__(self, records_slice: list[dict[str, object]]) -> None:
+                self.canonical_json_items = canonical_share_items_bytes(records_slice)
+
+        class PagedLike(Sequence):
+            def __init__(self) -> None:
+                self.pages = (PageLike(records[:700]), PageLike([]), PageLike(records[700:]))
+
+            def __len__(self) -> int:
+                return len(records)
+
+            def __iter__(self):  # type: ignore[no-untyped-def]
+                raise AssertionError("a page-backed window must not be parsed")
+
+            def __getitem__(self, index: int | slice) -> Any:
+                raise AssertionError("a page-backed window must not be parsed")
+
+        for window in (MirrorLike(), PagedLike()):
+            with self.subTest(kind=type(window).__name__):
+                spliced = b"".join(
+                    piece if isinstance(piece, bytes) else piece.encode()
+                    for piece in _iter_share_window_items(window, batch_records=64, chunk_chars=4096)
+                )
+                self.assertEqual(spliced, items)
+                self.assertEqual(json.loads(b"[" + spliced + b"]"), json.loads(b"[" + items + b"]"))
+        # Through the compiler: the builder receives those exact records and
+        # the recipient-scaled balances stream in batches.
+        server = coordinator_server()
+        captured: dict[str, object] = {}
+        balances = [
+            {"recipient_id": f"m{index}", "order_key": f"o{index}", "p2mr_program_hex": "aa" * 32, "balance_sats": index}
+            for index in range(5000)
+        ]
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "lab.prism.bundle_compiler.subprocess.Popen",
+            fake_audit_bundle_popen(captured, output_text='{"ok":true}'),
+        ), bounded_json_guards("lab.prism.bundle_compiler", 256 * 1024, guard_loads=False):
+            bundle = server.build_audit_bundle(
+                shares=MirrorLike(),
+                found_block=found_block(),
+                prior_balances=balances,
+                coinbase_script_sig_suffix_hex="00",
+                witness_merkle_leaves_hex=["ab" * 32] * 3000,
+                canonical_output_path=Path(tmp) / "candidate.audit.json",
+            )
+            try:
+                self.assertEqual(captured["payload"]["shares"], json.loads(b"[" + items + b"]"))
+                self.assertEqual(captured["payload"]["prior_balances"], balances)
+                self.assertEqual(len(captured["payload"]["witness_merkle_leaves_hex"]), 3000)
             finally:
                 bundle.close()
 
