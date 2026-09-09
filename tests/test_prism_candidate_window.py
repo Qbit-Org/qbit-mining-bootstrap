@@ -356,16 +356,20 @@ FOR EACH ROW EXECUTE FUNCTION pg_temp.slow_candidate_copy();
         """).fetchone()[0], 0)
         self.assertTrue(self.covers([{"share_id": "a"}]))
 
-    @unittest.skipUnless(shutil.which("psql"), "requires PostgreSQL client")
+    @unittest.skipUnless(
+        shutil.which("psql") or os.environ.get("PRISM_TEST_PSQL_COMMAND_WITH_ENV"),
+        "requires PostgreSQL client",
+    )
     def test_psql_stream_roundtrip_and_failure(self) -> None:
         # Use the existing instance's guards/gates and an independent psql
         # connection. The writer lease is not read or updated by this call.
         native = self.ledger._native
         old_command = self.ledger._command
         self.ledger._native = None
-        self.ledger._command = shlex.split(
-            "psql " + shlex.quote(os.environ["PRISM_TEST_DATABASE_URL"])
-        )
+        self.ledger._command = shlex.split(os.environ.get(
+            "PRISM_TEST_PSQL_COMMAND_WITH_ENV",
+            "psql " + shlex.quote(os.environ["PRISM_TEST_DATABASE_URL"]),
+        ))
         try:
             value = "\\.\nSELECT 1;🌐\t\\N"
             self.insert(value)

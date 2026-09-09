@@ -602,6 +602,9 @@ PY
   cd "${ROOT_DIR}"
   PRISM_RECOVERY_TEST_DATABASE_URL="${DATABASE_URL}" \
     python3 -m unittest tests.test_prism_pending_block_recovery.NativeRecoveryTests -v
+  PRISM_TEST_DATABASE_URL="${DATABASE_URL}" \
+  PRISM_TEST_PSQL_COMMAND_WITH_ENV="docker exec -i -e PGOPTIONS ${POSTGRES_CONTAINER} psql -U qbit -d qbit" \
+    python3 -m unittest tests.test_prism_candidate_window -v
 )
 
 echo "test-prism-postgres-native-ledger: PASS"
