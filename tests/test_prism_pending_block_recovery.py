@@ -256,7 +256,9 @@ class NativeRecoveryTests(unittest.TestCase):
         cls.admin.execute(f'CREATE SCHEMA "{cls.schema}"')
         cls.url = make_conninfo(
             os.environ["PRISM_RECOVERY_TEST_DATABASE_URL"],
-            options=f"-csearch_path={cls.schema},public",
+            # Migration DROP FUNCTION statements must not fall through to
+            # public before their replacement exists in this private schema.
+            options=f"-csearch_path={cls.schema}",
         )
         with psycopg.connect(cls.url, autocommit=True) as connection:
             connection.execute(Path("crates/qbit-prism/sql/001_share_ledger.sql").read_text())
