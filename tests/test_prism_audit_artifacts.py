@@ -413,7 +413,11 @@ class AuditArtifactStoreTest(unittest.TestCase):
             real_listdir = os.listdir
 
             def pause_before_scan(fd: int) -> list[str]:
-                if fd == store._root_fd:
+                # Scans enumerate through a fresh directory description of
+                # the pinned root inode (issue #255), never the pinned
+                # descriptor itself; recognize the scan by that identity.
+                value = os.fstat(fd)
+                if (value.st_dev, value.st_ino) == store._root_identity:
                     scan_waiting.set()
                     if not release_scan.wait(5):
                         raise AssertionError("timed out waiting to release prune scan")

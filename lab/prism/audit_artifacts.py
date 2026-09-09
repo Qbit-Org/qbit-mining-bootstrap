@@ -862,6 +862,36 @@ class AuditArtifactStore:
             self._validate_root_identity()
             return os.dup(self._root_fd)
 
+    def _scan_root_names(self) -> list[str]:
+        """Enumerate the audit root through a fresh directory description.
+
+        ``os.listdir(self._root_fd)`` reads through the long-lived pinned
+        descriptor. Some kernels and overlay filesystems serve a stale or
+        truncated enumeration through a directory description that has
+        already been read once and mutated since: on an aarch64 Docker host
+        a conflict snapshot written moments earlier was absent from the next
+        scan, so quarantine deduplication wrote a second copy and metrics
+        and retention saw an empty root. Reopening ``.`` relative to the
+        pinned descriptor yields a fresh description of the very same inode
+        -- authority still flows from ``_root_fd``, never from a pathname --
+        and the identity is re-verified before and after the enumeration.
+        """
+        self._validate_root_identity()
+        fd = os.open(
+            ".",
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            dir_fd=self._root_fd,
+        )
+        try:
+            value = os.fstat(fd)
+            if (value.st_dev, value.st_ino) != self._root_identity:
+                raise RuntimeError("audit artifact root authority is invalid")
+            names = os.listdir(fd)
+        finally:
+            os.close(fd)
+        self._validate_root_identity()
+        return names
+
     def _owned_lstat(self, path: Path) -> os.stat_result:
         fd = self._owned_parent_fd(path)
         if fd is None:
@@ -1292,7 +1322,7 @@ class AuditArtifactStore:
         metrics["scan_error"] = 0
         try:
             self._validate_root_identity()
-            paths = [self._root / name for name in os.listdir(self._root_fd)]
+            paths = [self._root / name for name in self._scan_root_names()]
         except (OSError, RuntimeError):
             metrics["scan_error"] = 1
             return metrics
@@ -3046,7 +3076,7 @@ class AuditArtifactStore:
         try:
             self._validate_root_identity()
             entries = sorted(
-                (self._root / name for name in os.listdir(self._root_fd)),
+                (self._root / name for name in self._scan_root_names()),
                 key=lambda value: value.name,
             )
         except (OSError, RuntimeError):
@@ -4088,7 +4118,7 @@ class AuditArtifactStore:
         with self._lock:
             self._validate_root_identity()
             conflict_prefix = f"{segment_path.name}.conflict-"
-            for name in sorted(os.listdir(self._root_fd)):
+            for name in sorted(self._scan_root_names()):
                 if not name.startswith(conflict_prefix):
                     continue
                 if self.file_matches_bytes(self._root / name, expected_bytes):
