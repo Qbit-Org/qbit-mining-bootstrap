@@ -110,7 +110,12 @@ class LandedCandidate:
     audit publication identity and the verifier's identity evidence.
     """
 
-    final_bundle: dict[str, Any]
+    # For a canonical build this is the bounded artifact view returned by
+    # the bundle compiler: its small members are parsed, its window-sized
+    # share arrays stay on disk. The later phases read only header members
+    # (coinbase manifest, CTV manifest set), and the view is closed once the
+    # ordered phases finish (issue #255).
+    final_bundle: Mapping[str, Any]
     report: dict[str, Any]
     persistence: dict[str, Any]
     confirmation: dict[str, Any]
@@ -169,7 +174,7 @@ class BlockFinalizationPort(Protocol):
 
     def _accepted_block_payout_preview_from_bundle(
         self,
-        final_bundle: dict[str, Any],
+        final_bundle: Mapping[str, Any],
         *,
         prior_balances: list[dict[str, object]] | None = None,
     ) -> list[dict[str, object]]: ...
@@ -417,7 +422,7 @@ class BlockFinalizationPort(Protocol):
         canonical_output_path: Path | None = None,
         canonical_output_parent_fd: int | None = None,
         canonical_output_adopter: Callable[[Path, os.stat_result], None] | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> Mapping[str, Any]: ...
 
     def coinbase_script_sig_suffix_hex(
         self,
@@ -467,7 +472,7 @@ class BlockFinalizationPort(Protocol):
 
     def trusted_ledger_writer_public_key_hex(
         self,
-        bundle: dict[str, Any],
+        bundle: Mapping[str, Any],
     ) -> str: ...
 
 
@@ -681,7 +686,7 @@ class BlockFinalizationService:
         node_submission: _BlockCandidateNodeSubmission,
         revalidated_append_epoch: int | None = None,
     ) -> tuple[
-        dict[str, Any],
+        Mapping[str, Any],
         dict[str, Any],
         dict[str, Any],
         dict[str, Any],
@@ -1249,6 +1254,11 @@ class BlockFinalizationService:
                     raise
                 finally:
                     os.close(compiler_parent_fd)
+                # A real build returns the bundle compiler's bounded view of
+                # the canonical artifact it just wrote: header members are
+                # parsed, the window-sized share arrays remain on disk, and
+                # every consumer below (coinbase check, trusted key, payout
+                # preview, persistence) reads it as a mapping (#255).
                 # Compatibility builders used by tests and older integrations
                 # may ignore canonical_output_path. Persist their logical
                 # bundle via the normal canonicalization fallback without
@@ -2266,32 +2276,47 @@ class BlockFinalizationService:
             landed = self._land_candidate(admission)
         if landed is None:
             return False
-        self._record_block_candidate_progress("durable-accounting:complete")
-        if self._candidate_already_accounted(admission.block_hash):
-            # The previous attempt completed every success side effect but its
-            # durable outbox terminal update failed. submit_next will retry that
-            # update after this exact-idempotent confirmation without double
-            # counting the block or replacing newer evidence/work.
-            return True
-        with self._phase("ctv_credit"):
-            ctv_persistence = self._persist_ctv_and_credit(admission, landed)
-        with self._phase("evidence"):
-            prepared = self._build_finalization_evidence(
-                admission,
-                landed,
-                ctv_persistence,
+        try:
+            self._record_block_candidate_progress("durable-accounting:complete")
+            if self._candidate_already_accounted(admission.block_hash):
+                # The previous attempt completed every success side effect
+                # but its durable outbox terminal update failed. submit_next
+                # will retry that update after this exact-idempotent
+                # confirmation without double counting the block or
+                # replacing newer evidence/work.
+                return True
+            with self._phase("ctv_credit"):
+                ctv_persistence = self._persist_ctv_and_credit(admission, landed)
+            with self._phase("evidence"):
+                prepared = self._build_finalization_evidence(
+                    admission,
+                    landed,
+                    ctv_persistence,
+                )
+            with self._phase("audit_publish"):
+                published_evidence = self._publish_finalization_evidence(
+                    landed,
+                    prepared,
+                )
+            with self._phase("accounting"):
+                return self._account_finalized_candidate(
+                    admission,
+                    landed,
+                    published_evidence,
+                )
+        finally:
+            # The landed bundle is the last legitimate owner of the bounded
+            # artifact view; retire its descriptor on every exit so neither
+            # a failed phase nor a completed one leaves the candidate file
+            # pinned (#255). Compatibility dictionaries have nothing to
+            # close.
+            close_view = getattr(
+                getattr(landed, "final_bundle", None),
+                "close",
+                None,
             )
-        with self._phase("audit_publish"):
-            published_evidence = self._publish_finalization_evidence(
-                landed,
-                prepared,
-            )
-        with self._phase("accounting"):
-            return self._account_finalized_candidate(
-                admission,
-                landed,
-                published_evidence,
-            )
+            if callable(close_view):
+                close_view()
 
     def submit_block_candidate(
         self,
