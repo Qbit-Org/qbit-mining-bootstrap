@@ -79,7 +79,7 @@ CODEC_BATCH_OVERSIZED_BYTES = 4 * 1024 * 1024
 # strings are escaped and decoded slice by slice; a top-level field whose
 # encoding is larger than this becomes a *large field* with its own span.
 # Nothing is rejected for size alone.
-CODEC_STRING_SLICE_CHARS = 64 * 1024
+CODEC_STRING_SLICE_CHARS = 4096
 CODEC_FAST_PATH_BYTES = 64 * 1024
 # A decoded page above this size takes the record walker instead of one
 # ``json.loads`` (only reachable through an oversized record).
@@ -496,16 +496,23 @@ def _dumps_key(key: str) -> str:
 
 
 def _write_string(value: str, sink: _ChunkSink) -> None:
-    _reject_jsonb_incompatible_str(value)
     if len(value) <= CODEC_STRING_SLICE_CHARS:
+        _reject_jsonb_incompatible_str(value)
         sink.write_text(json.dumps(value))
         return
     # ``ensure_ascii`` escapes code point by code point (a non-BMP character
     # is one code point and becomes one surrogate pair), so slicing by code
     # point and escaping each slice reproduces the whole-string escape.
     sink.write_text('"')
-    for start in range(0, len(value), CODEC_STRING_SLICE_CHARS):
-        sink.write_text(json.dumps(value[start : start + CODEC_STRING_SLICE_CHARS])[1:-1])
+    start = 0
+    while start < len(value):
+        end = min(len(value), start + CODEC_STRING_SLICE_CHARS)
+        if end < len(value) and "\ud800" <= value[end - 1] <= "\udbff" and "\udc00" <= value[end] <= "\udfff":
+            end += 1
+        piece = value[start:end]
+        _reject_jsonb_incompatible_str(piece)
+        sink.write_text(json.dumps(piece)[1:-1])
+        start = end
     sink.write_text('"')
 
 
@@ -553,6 +560,45 @@ def _batch_text(batch: list[Any]) -> str:
     return _dumps_scalar(batch)[1:-1]
 
 
+def _encoded_size_bound(value: Any, budget: int) -> int | None:
+    """Conservatively bound an ordinary value *before* calling the C codec.
+
+    Stop inspecting once the byte budget is spent. In particular, an oversized
+    string needs only its length checked; measuring it must not encode it first.
+    Twelve ASCII bytes per code point covers ensure_ascii's surrogate pairs.
+    """
+    if budget < 2:
+        return None
+    if isinstance(value, str):
+        size = 2 + 12 * len(value)
+    elif value is None or isinstance(value, bool):
+        size = 5
+    elif isinstance(value, int):
+        size = 2 + value.bit_length() // 3
+    elif isinstance(value, float):
+        size = 32
+    elif isinstance(value, (dict, list, tuple)):
+        size = 2
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    return None
+                key_size = 2 + 12 * len(key)
+                item_size = _encoded_size_bound(item, budget - size - key_size - 2)
+                if item_size is None:
+                    return None
+                size += key_size + item_size + 2
+        else:
+            for item in value:
+                item_size = _encoded_size_bound(item, budget - size - 1)
+                if item_size is None:
+                    return None
+                size += item_size + 1
+    else:
+        return None
+    return size if size <= budget else None
+
+
 def _write_array(
     items: Iterable[Any],
     sink: _ChunkSink,
@@ -565,44 +611,42 @@ def _write_array(
     """
     sink.write_text("[")
     batch: list[Any] = []
-    batch_records = CODEC_BATCH_RECORDS
+    batch_bytes = 0
     first = True
     record_index = 0
 
     def flush(batch: list[Any]) -> None:
-        nonlocal first, batch_records, record_index
+        nonlocal first, record_index
         if not first:
             sink.write_text(",")
         first = False
         if on_page is not None:
             on_page(sink.offset, record_index)
         text = _batch_text(batch)
-        if len(text) > CODEC_BATCH_OVERSIZED_BYTES:
-            # A giant field inside one record made this batch's C call large.
-            # The bytes are still exact; what changes is the next batch's
-            # size and the route: re-emit item by item through the
-            # incremental writer, which slices oversized strings.
-            del text
-            inner_first = True
-            for item in batch:
-                if not inner_first:
-                    sink.write_text(",")
-                inner_first = False
-                _write_value(item, sink)
-            batch_records = 1
-        else:
-            sink.write_text(text)
-            if len(text) > CODEC_BATCH_TARGET_BYTES:
-                batch_records = max(1, batch_records // 2)
-            elif len(text) < CODEC_BATCH_TARGET_BYTES // 2:
-                batch_records = min(CODEC_BATCH_RECORDS, batch_records * 2)
+        sink.write_text(text)
         record_index += len(batch)
 
     for item in items:
-        batch.append(item)
-        if len(batch) >= batch_records:
+        size = _encoded_size_bound(item, CODEC_BATCH_TARGET_BYTES - 2)
+        if batch and (size is None or batch_bytes + size + 1 > CODEC_BATCH_TARGET_BYTES - 2):
             flush(batch)
             batch = []
+            batch_bytes = 0
+        if size is None:
+            if not first:
+                sink.write_text(",")
+            first = False
+            if on_page is not None:
+                on_page(sink.offset, record_index)
+            _write_value(item, sink)
+            record_index += 1
+            continue
+        batch.append(item)
+        batch_bytes += size + 1
+        if len(batch) >= CODEC_BATCH_RECORDS:
+            flush(batch)
+            batch = []
+            batch_bytes = 0
     if batch:
         flush(batch)
     sink.write_text("]")

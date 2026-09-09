@@ -1248,112 +1248,142 @@ class LegacyCandidateHelper:
         self._lock = threading.Lock()  # admit at most one conversion
 
     def with_cancellation(self, cancelled: Callable[[], bool]) -> LegacyCandidateHelper:
-        return LegacyCandidateHelper(
+        helper = LegacyCandidateHelper(
             self._transport,
             python=self._python,
             memory_limit_bytes=self._memory_limit,
             timeout_seconds=self._timeout,
             cancelled=cancelled,
         )
+        # Cancellation wrappers share the same admission slot.
+        helper._lock = self._lock
+        return helper
 
-    def _spawn(self, request: Mapping[str, Any]) -> subprocess.Popen[bytes]:
-        repo_root = Path(__file__).resolve().parents[2]
-        env = dict(os.environ)
-        env["PYTHONPATH"] = str(repo_root) + (
-            os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
-        )
-        memory_limit = self._memory_limit
+    def _run(
+        self,
+        request: Mapping[str, Any],
+        body: CandidateBody | None = None,
+    ) -> dict[str, Any]:
+        """Supervise input, output, cancellation and retirement together.
 
-        def limit_memory() -> None:
-            try:
-                import resource
-            except ImportError:  # pragma: no cover - non-POSIX
-                return
-            limit = getattr(resource, "RLIMIT_AS", None)
-            if limit is None:
-                return
-            try:
-                resource.setrlimit(limit, (memory_limit, memory_limit))
-            except (ValueError, OSError):
-                pass
-
-        process = subprocess.Popen(
-            [self._python, "-m", "lab.prism.candidate_store"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=str(repo_root),
-            env=env,
-            preexec_fn=limit_memory if os.name == "posix" else None,
-        )
-        assert process.stdin is not None
-        process.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
-        process.stdin.flush()
-        return process
-
-    def _wait(self, process: subprocess.Popen[bytes]) -> dict[str, Any]:
+        A helper may wait on PostgreSQL before reading stdin. The deadline
+        therefore starts before sending body bytes, and a blocked pipe writer
+        runs alongside the supervisor. Diagnostic pipes are drained with fixed
+        retention limits so a failed child cannot deadlock or grow the parent.
+        """
         deadline = time.monotonic() + self._timeout
-        stdout_chunks: list[bytes] = []
-        reader_error: list[BaseException] = []
 
-        def drain() -> None:
-            try:
-                assert process.stdout is not None
-                stdout_chunks.append(process.stdout.read())
-            except BaseException as exc:  # noqa: BLE001 - surfaced below
-                reader_error.append(exc)
+        def check_deadline() -> None:
+            if self._cancelled():
+                raise CandidateStorageError("legacy candidate helper cancelled")
+            if time.monotonic() >= deadline:
+                raise CandidateStorageError("legacy candidate helper exceeded its deadline")
 
-        reader = threading.Thread(target=drain, name="prism-legacy-helper-stdout", daemon=True)
-        reader.start()
-        while True:
-            if process.poll() is not None:
-                break
-            if self._cancelled() or time.monotonic() >= deadline:
-                process.kill()
-                process.wait(timeout=30.0)
-                reader.join(timeout=5.0)
-                raise CandidateStorageError(
-                    "legacy candidate helper cancelled"
-                    if self._cancelled()
-                    else "legacy candidate helper exceeded its deadline"
-                )
-            time.sleep(LEGACY_HELPER_POLL_SECONDS)
-        reader.join(timeout=30.0)
-        stderr = b""
-        if process.stderr is not None:
-            stderr = process.stderr.read()
-        if process.returncode != 0:
-            raise CandidateStorageError(
-                "legacy candidate helper failed: "
-                + stderr.decode("utf-8", "replace")[-2000:]
-            )
-        if reader_error:
-            raise CandidateStorageError("legacy candidate helper output unreadable")
+        while not self._lock.acquire(timeout=LEGACY_HELPER_POLL_SECONDS):
+            check_deadline()
+        process = None
+        threads: list[threading.Thread] = []
+        output = bytearray()
+        errors = bytearray()
+        io_errors: list[BaseException] = []
+        limit = 64 * 1024
         try:
-            result = json.loads(b"".join(stdout_chunks).decode("utf-8").strip().splitlines()[-1])
-        except (ValueError, IndexError) as exc:
-            raise CandidateStorageError("legacy candidate helper returned no verdict") from exc
-        if not isinstance(result, dict):
-            raise CandidateStorageError("legacy candidate helper verdict is malformed")
-        if "error" in result:
-            raise CandidateStorageError(f"legacy candidate helper: {result['error']}")
-        return result
+            check_deadline()
+            repo_root = Path(__file__).resolve().parents[2]
+            env = dict(os.environ)
+            env["PYTHONPATH"] = str(repo_root) + (
+                os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+            )
+            # Apply limits in the freshly exec'd child. preexec_fn is unsafe
+            # in this multithreaded process, before Python locks are reset.
+            process = subprocess.Popen(
+                [self._python, "-m", "lab.prism.candidate_store"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, cwd=str(repo_root), env=env,
+            )
+            assert process.stdin and process.stdout and process.stderr
+
+            def drain(pipe: Any, target: bytearray) -> None:
+                try:
+                    while chunk := pipe.read(8192):
+                        target.extend(chunk)
+                        if len(target) > limit:
+                            del target[:-limit]
+                except BaseException as exc:
+                    io_errors.append(exc)
+
+            def produce() -> None:
+                try:
+                    assert process is not None and process.stdin is not None
+                    process.stdin.write((json.dumps({
+                        **request, "memory_limit_bytes": self._memory_limit,
+                    }) + "\n").encode("utf-8"))
+                    process.stdin.flush()
+                    if body is not None:
+                        def write_chunk(chunk: BodyChunk) -> None:
+                            check_deadline()
+                            process.stdin.write(chunk.data)
+                        body.write_chunks(write_chunk)
+                    process.stdin.flush()
+                except BaseException as exc:
+                    io_errors.append(exc)
+                finally:
+                    try:
+                        process.stdin.close()
+                    except OSError:
+                        pass
+
+            for target, args, name in (
+                (drain, (process.stdout, output), "stdout"),
+                (drain, (process.stderr, errors), "stderr"),
+                (produce, (), "input"),
+            ):
+                thread = threading.Thread(target=target, args=args, name=f"prism-legacy-helper-{name}")
+                threads.append(thread)
+                thread.start()
+            while process.poll() is None:
+                check_deadline()
+                if io_errors:
+                    raise CandidateStorageError("legacy candidate helper transport failed") from io_errors[0]
+                time.sleep(LEGACY_HELPER_POLL_SECONDS)
+            for thread in threads:
+                thread.join()
+            if process.returncode != 0:
+                raise CandidateStorageError(
+                    "legacy candidate helper failed: " + errors.decode("utf-8", "replace")[-2000:]
+                )
+            if io_errors:
+                raise CandidateStorageError("legacy candidate helper transport failed") from io_errors[0]
+            try:
+                result = json.loads(output.decode("utf-8").strip().splitlines()[-1])
+            except (ValueError, IndexError) as exc:
+                raise CandidateStorageError("legacy candidate helper returned no verdict") from exc
+            if not isinstance(result, dict):
+                raise CandidateStorageError("legacy candidate helper verdict is malformed")
+            if "error" in result:
+                raise CandidateStorageError(f"legacy candidate helper: {result['error']}")
+            return result
+        finally:
+            if process is not None:
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+                for thread in threads:
+                    thread.join()
+                for pipe in (process.stdin, process.stdout, process.stderr):
+                    if pipe is not None:
+                        pipe.close()
+            self._lock.release()
 
     def convert(self, block_hash: str, spool_path: str, index_path: str) -> LegacyHelperResult:
-        with self._lock:
-            process = self._spawn(
-                {
-                    "mode": "convert",
-                    "transport": self._transport.to_json(),
-                    "block_hash": block_hash,
-                    "spool_path": spool_path,
-                    "index_path": index_path,
-                    "chunk_bytes": CANDIDATE_BODY_CHUNK_BYTES,
-                }
-            )
-            assert process.stdin is not None
-            process.stdin.close()
-            result = self._wait(process)
+        result = self._run({
+            "mode": "convert",
+            "transport": self._transport.to_json(),
+            "block_hash": block_hash,
+            "spool_path": spool_path,
+            "index_path": index_path,
+            "chunk_bytes": CANDIDATE_BODY_CHUNK_BYTES,
+        })
         manifest = CandidateBodyManifest.from_json(result["manifest"])
         spans_json = result.get("spans")
         if not isinstance(spans_json, list) or len(spans_json) > INDEX_SPAN_ROWS * 64:
@@ -1390,29 +1420,13 @@ class LegacyCandidateHelper:
         *,
         body_id: str | None,
     ) -> bool:
-        with self._lock:
-            process = self._spawn(
-                {
-                    "mode": mode,
-                    "transport": self._transport.to_json(),
-                    "block_hash": block_hash,
-                    "body_id": body_id,
-                    "body_bytes": body.manifest.byte_count,
-                }
-            )
-            assert process.stdin is not None
-            stdin = process.stdin
-            try:
-                body.write_chunks(lambda chunk: stdin.write(chunk.data))
-                stdin.flush()
-            except BrokenPipeError:
-                pass
-            finally:
-                try:
-                    stdin.close()
-                except OSError:
-                    pass
-            result = self._wait(process)
+        result = self._run({
+            "mode": mode,
+            "transport": self._transport.to_json(),
+            "block_hash": block_hash,
+            "body_id": body_id,
+            "body_bytes": body.manifest.byte_count,
+        }, body)
         return bool(result.get("equal"))
 
 
@@ -1502,6 +1516,10 @@ def helper_main(stdin_stream: Any = None, stdout_stream: Any = None) -> int:
     header = stdin_buffer.readline()
     try:
         request = json.loads(header.decode("utf-8"))
+        if os.name == "posix":
+            import resource
+            memory_limit = int(request.get("memory_limit_bytes", LEGACY_HELPER_MEMORY_BYTES))
+            resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
         mode = request["mode"]
         transport = request["transport"]
         block_hash = str(request["block_hash"]).lower()

@@ -158,6 +158,18 @@ class CodecByteIdentityTests(unittest.TestCase):
         fields["shares_json"][300]["share_id"] = "y" * (5 * 1024 * 1024)
         self.assert_body_matches_oracle(fields, chunk_bytes=codec.CANDIDATE_BODY_CHUNK_BYTES)
 
+    def test_first_oversized_record_is_bounded_before_encoding(self) -> None:
+        fields = intent_for(260)
+        fields["shares_json"][0]["share_id"] = "😀" * 100_000
+        fields["shares_json"][257]["share_id"] = "x" * (5 * 1024 * 1024)
+        expected = oracle_bytes(fields)
+        observer = _Instrumented()
+        with mock.patch.object(codec.json, "dumps", observer.dumps):
+            prepared = codec.prepare_candidate_intent(fields)
+            prepared.body.write_chunks(observer.collect)
+        self.assertEqual(b"".join(chunk.data for chunk in observer.chunks), expected)
+        self.assertLessEqual(max(observer.dumps_outputs), codec.CODEC_BATCH_TARGET_BYTES)
+
     def test_large_integers_floats_nulls_and_field_order(self) -> None:
         fields = intent_for(
             2,
@@ -243,6 +255,7 @@ class CodecRejectionTests(unittest.TestCase):
             "adjacent lone units forming a pair": intent_for(1, username=high + low),
             "escaped backslash-u text": intent_for(1, username="\\u0000", shares_json=[{"a": "\\u0000", "b": "\\\\ud83d"}]),
             "pair at slice edge": intent_for(1, block_hex="y" * 65535 + "\U0001F600" + "z"),
+            "literal surrogate pair at slice edge": intent_for(1, block_hex="y" * (codec.CODEC_STRING_SLICE_CHARS - 1) + high + low + "z"),
         }.items():
             with self.subTest(label=label):
                 prepared = codec.prepare_candidate_intent(fields)
