@@ -1739,6 +1739,9 @@ class PrismShareLedgerTests(unittest.TestCase):
         ledger = FakeLeasePsqlShareLedger(
             [acquired_lease(), {"records": [record]}]
         )
+        # This pins the legacy whole-jsonb statement (storage version 1);
+        # the chunked-body statement is covered by the #255 suites.
+        ledger._candidate_storage_version = 1
         intent = {
             "schema": "qbit.prism.block-candidate-intent.v1",
             "block_hash_hex": "ab" * 32,
@@ -1801,6 +1804,9 @@ class PrismShareLedgerTests(unittest.TestCase):
         ledger = FakeLeasePsqlShareLedger(
             [acquired_lease(), {"inserted": 1}]
         )
+        # Legacy whole-jsonb statement (storage version 1); see #255 suites
+        # for the chunked-body route.
+        ledger._candidate_storage_version = 1
         intent = {
             "schema": "qbit.prism.block-candidate-intent.v1",
             "block_hash_hex": "cd" * 32,

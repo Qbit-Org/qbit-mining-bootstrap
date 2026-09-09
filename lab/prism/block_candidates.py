@@ -25,6 +25,7 @@ import traceback
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field, replace as dataclass_replace
 from types import SimpleNamespace
+from collections.abc import Mapping, Sequence
 from typing import Any, Callable, Iterable, Iterator, Protocol
 
 from lab.prism import direct_stratum
@@ -53,6 +54,19 @@ from lab.prism.coordinator_config import (
     MAX_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX,
     MAX_BLOCK_REPLAY_PAGE_SIZE,
 )
+from lab.prism.candidate_codec import (
+    CandidateBodyIntegrityError,
+    CandidateCodecError,
+    PreparedCandidateIntent,
+    prepare_candidate_intent,
+)
+from lab.prism.candidate_store import (
+    HEADER_PAGE_MAX_BYTES,
+    HEADER_PAGE_MAX_ROWS,
+    CandidateBodyRef,
+    CandidateBodyUnavailable,
+    DurableCandidateDescriptor,
+)
 from lab.prism.coordinator_shutdown import ShutdownInProgress
 from lab.prism.job_bundle import PRISM_JOB_BUILD_SECONDS_BUCKETS
 from lab.prism.job_delivery import PrismJobContext
@@ -74,6 +88,17 @@ MAX_PENDING_BLOCK_CANDIDATES = 32
 # gate simply stays closed while the queued batch drains, and the submitter
 # loop re-enumerates the shrinking remainder.
 MAX_BLOCK_REPLAY_ENUMERATION_ROWS = MAX_BLOCK_REPLAY_PAGE_SIZE
+# Issue #255. Metadata-first replay keeps at most this many small durable
+# descriptors in memory; rows beyond it register their accepted-parent and
+# credit-floor obligations and stay in the outbox, which a later poll
+# re-reads once the window drains. A descriptor is a few hundred bytes, so
+# the window is well inside the 4 MiB header/queue budget.
+MAX_BLOCK_REPLAY_DESCRIPTORS_IN_MEMORY = 1024
+# Rows per metadata-first replay page: the configured replay page size is
+# additionally clamped to the #255 header page cap.
+BLOCK_REPLAY_HEADER_PAGE_ROWS = min(MAX_BLOCK_REPLAY_ENUMERATION_ROWS, HEADER_PAGE_MAX_ROWS)
+# Minimum spacing between two janitor steps on the submitter loop.
+BLOCK_CANDIDATE_BODY_JANITOR_INTERVAL_SECONDS = 5.0
 # Ancestor re-drive bookkeeping (issue #190) is keyed by block hash and
 # dropped the moment the blocking transition resolves; this bound only
 # guards against a pathological stream of distinct never-resolving
@@ -514,7 +539,7 @@ def _collapse_row_height(durable_row: object) -> int | None:
     if not isinstance(durable_row, dict):
         return None
     intent = durable_row.get("candidate")
-    if not isinstance(intent, dict):
+    if not isinstance(intent, Mapping):
         return None
     return _collapse_height(intent.get("expected_height"))
 
@@ -1143,8 +1168,19 @@ def _candidate_block_hex(candidate: PrismBlockCandidate) -> str:
     return block_hex
 
 
-def block_candidate_intent(candidate: PrismBlockCandidate) -> dict[str, Any]:
-    """Return the immutable JSON needed to resume a candidate after restart."""
+def block_candidate_intent(candidate: PrismBlockCandidate) -> PreparedCandidateIntent:
+    """Return the immutable intent needed to resume a candidate after restart.
+
+    Issue #255. The result is a :class:`PreparedCandidateIntent`: a mapping
+    with the historical keys, whose ``shares_json`` is the job's immutable
+    share sequence itself (a page-backed window, a daemon mirror or a plain
+    list) rather than a list copy, and whose body streams the v1 identity
+    JSON in bounded chunks. Preparation validates every field synchronously
+    on the calling thread -- the client thread, before any share credit --
+    exactly where the historical whole-document ``json.dumps`` did, but in
+    bounded C calls, and it refuses what PostgreSQL's jsonb parser used to
+    refuse (NaN/Infinity, ``\\u0000``, unpaired surrogates).
+    """
     context = candidate.context
     submission = candidate.submission
     intent = {
@@ -1159,9 +1195,9 @@ def block_candidate_intent(candidate: PrismBlockCandidate) -> dict[str, Any]:
             "height": int(context.template["height"]),
             "coinbasevalue": int(context.template["coinbasevalue"]),
         },
-        # Materialized to a plain list: a daemon-mirror share sequence parses
-        # its dicts lazily, and the durable JSON boundary needs real objects.
-        "shares_json": list(context.shares_json),
+        # The immutable source sequence, never ``list(...)``: the codec
+        # streams it (verbatim page bytes where the sequence carries them).
+        "shares_json": context.shares_json,
         "prior_balances": context.prior_balances,
         "found_block": context.found_block,
         "prospective_prior_balances": (
@@ -1186,10 +1222,70 @@ def block_candidate_intent(candidate: PrismBlockCandidate) -> dict[str, Any]:
         "credit_share_on_accept": candidate.credit_share_on_accept,
         "collection_only": bool(context.collection_only),
     }
-    # Fail on the client thread before committing a share if a future field
-    # introduces a value that cannot survive the durable JSON boundary.
-    json.dumps(intent, separators=(",", ":"), sort_keys=True)
-    return intent
+    # Fail on the client thread before committing a share if a field carries
+    # a value that cannot survive the durable boundary. One bounded encode
+    # pass replaces the historical whole-document ``json.dumps``; the bytes
+    # are discarded and only the manifest (digest, chunk digests, share
+    # span) is kept until storage asks for the chunks.
+    return prepare_candidate_intent(intent)
+
+
+def _replayable_share_sequence(shares: Any) -> Any:
+    """The share sequence a decoded intent adopts, without a list copy.
+
+    A plain list or tuple is adopted as is (the durable decode owns it), and
+    any other sequence -- a page-backed window, a daemon mirror, a spool
+    sequence -- is adopted as the immutable, replayable object it already
+    is. Anything that is not a sequence at all fails exactly as ``list()``
+    used to.
+    """
+    if isinstance(shares, (str, bytes)) or not isinstance(shares, Sequence):
+        raise TypeError("block candidate intent shares_json is not a sequence")
+    return shares
+
+
+def _collapse_row_from_header(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Shape one metadata-first header row as the page row predicate S reads.
+
+    The collapse selector (``_superseded_candidate_row``) validates a page
+    row's ``candidate`` facts strictly and fails its page closed on any
+    malformed one; the header carries exactly those facts as an explicit
+    projection, so they are restated here under the same keys and nothing
+    else. The header row itself is preserved on the result so descriptor
+    registration reads the same object the collapse decided on.
+    """
+    header = row.get("header")
+    if not isinstance(header, Mapping):
+        header = {}
+    template = header.get("template")
+    found_block = header.get("found_block")
+    pending_share = header.get("pending_share")
+    return {
+        **row,
+        "candidate": {
+            "block_hash_hex": header.get("block_hash_hex"),
+            "parent_hash": header.get("parent_hash"),
+            "expected_height": header.get("expected_height"),
+            "template": (
+                {
+                    "previousblockhash": template.get("previousblockhash"),
+                    "height": template.get("height"),
+                }
+                if isinstance(template, Mapping)
+                else template
+            ),
+            "found_block": (
+                {"network_difficulty": found_block.get("network_difficulty")}
+                if isinstance(found_block, Mapping)
+                else found_block
+            ),
+            "pending_share": (
+                {"job_id": pending_share.get("job_id", "")}
+                if isinstance(pending_share, Mapping)
+                else pending_share
+            ),
+        },
+    }
 
 
 def _dequeued_candidate_collapse_row(
@@ -1240,9 +1336,15 @@ def _dequeued_candidate_collapse_row(
     }
 
 
-def block_candidate_from_intent(intent: dict[str, Any]) -> PrismBlockCandidate:
-    """Decode and validate a durable candidate intent without side effects."""
-    if not isinstance(intent, dict):
+def block_candidate_from_intent(intent: Mapping[str, Any]) -> PrismBlockCandidate:
+    """Decode and validate a durable candidate intent without side effects.
+
+    Accepts the historical dict and the prepared/hydrated mapping alike.
+    ``shares_json`` is adopted as the sequence the intent carries -- a spool
+    sequence decodes page by page on demand -- and is never copied into a
+    second list (#255).
+    """
+    if not isinstance(intent, Mapping):
         raise TypeError("block candidate intent must be an object")
     if intent.get("schema") != BLOCK_CANDIDATE_INTENT_SCHEMA:
         raise ValueError("unsupported block candidate intent schema")
@@ -1271,7 +1373,7 @@ def block_candidate_from_intent(intent: dict[str, Any]) -> PrismBlockCandidate:
             ),
         ),
         template=template,
-        shares_json=list(intent["shares_json"]),
+        shares_json=_replayable_share_sequence(intent["shares_json"]),
         prior_balances=list(intent["prior_balances"]),
         found_block=dict(intent["found_block"]),
         share_weight=0,
@@ -1668,8 +1770,25 @@ class BlockCandidateService:
                 if not isinstance(durable_row, dict):
                     raise ValueError("durable block candidate row is not an object")
                 durable_block_hash = str(durable_row["block_hash"]).lower()
-                intent = durable_row["candidate"]
-                if not isinstance(intent, dict):
+                if "header" in durable_row:
+                    # Metadata-first row (#255). A ledger whose bodies live
+                    # in storage registers a small descriptor now (its
+                    # accepted-parent and credit-floor obligations included)
+                    # and hydrates the body only when the descriptor is
+                    # dequeued; an in-memory ledger hands the intent back
+                    # immediately and takes the classic decode below.
+                    if self._replay_hydration_deferred():
+                        if self._register_durable_block_candidate_header_row(
+                            durable_row
+                        ):
+                            queued += 1
+                        continue
+                    intent = self._coordinator.ledger.hydrate_block_candidate_intent(
+                        durable_row
+                    )
+                else:
+                    intent = durable_row["candidate"]
+                if not isinstance(intent, Mapping):
                     raise ValueError("durable block candidate intent is not an object")
                 intent_block_hash = str(intent.get("block_hash_hex", "")).lower()
                 if not durable_block_hash or intent_block_hash != durable_block_hash:
@@ -1699,6 +1818,362 @@ class BlockCandidateService:
                     ),
                 )
         return queued
+
+    # -- metadata-first descriptors and bounded hydration (#255) -----------
+
+    def _replay_hydration_deferred(self) -> bool:
+        """Whether this ledger's bodies must be hydrated at dequeue time."""
+        return bool(
+            getattr(self._coordinator.ledger, "candidate_hydration_deferred", False)
+        )
+
+    def _ensure_replay_descriptor_state(self) -> None:
+        with _STATE_BACKFILL_LOCK:
+            if not hasattr(self, "_block_replay_floor_holders"):
+                self._block_replay_floor_holders: dict[str, PendingShare] = {}
+            if not hasattr(self, "_block_replay_descriptor_overflow_count"):
+                self._block_replay_descriptor_overflow_count = 0
+
+    def _durable_candidate_descriptor(
+        self,
+        row: Mapping[str, Any],
+    ) -> DurableCandidateDescriptor:
+        """Strictly type one header row; any malformed fact raises.
+
+        The same facts the collapse selector validates, plus the ones
+        registration and hydration need: a decodable ``PendingShare``, the
+        credit flag, and for a chunked body a sealed reference whose digest
+        agrees with the row. A row that fails here enters the existing
+        quarantine path exactly as a malformed intent did.
+        """
+        block_hash = _collapse_block_hash(row.get("block_hash"))
+        header = row.get("header")
+        if block_hash is None or not isinstance(header, Mapping):
+            raise ValueError("durable block candidate header is not an object")
+        if _collapse_block_hash(header.get("block_hash_hex")) != block_hash:
+            raise ValueError("durable block candidate row key does not match its header")
+        parent_hash = _collapse_block_hash(header.get("parent_hash"))
+        height = _collapse_height(header.get("expected_height"))
+        if parent_hash is None or height is None or height < 0:
+            raise ValueError(
+                "durable block candidate header carries no usable parent or height"
+            )
+        template = header.get("template")
+        if not isinstance(template, Mapping):
+            raise ValueError("durable block candidate header carries no template")
+        if _collapse_block_hash(template.get("previousblockhash")) != parent_hash:
+            raise ValueError("durable block candidate header template parent disagrees")
+        if _collapse_height(template.get("height")) != height:
+            raise ValueError("durable block candidate header template height disagrees")
+        pending_share = header.get("pending_share")
+        if not isinstance(pending_share, Mapping):
+            raise ValueError("durable block candidate header carries no pending share")
+        # Validates the field set exactly as the historical decode did.
+        PendingShare(**dict(pending_share))
+        credit = header.get("credit_share_on_accept")
+        if not isinstance(credit, bool):
+            raise ValueError("durable block candidate header carries no credit flag")
+        username = header.get("username")
+        if not isinstance(username, str):
+            raise ValueError("durable block candidate header carries no username")
+        storage_version = int(row.get("storage_version") or 1)
+        candidate_sha256 = str(row.get("candidate_sha256") or "")
+        body: CandidateBodyRef | None = None
+        if storage_version == 2:
+            body_row = row.get("body")
+            if not isinstance(body_row, Mapping):
+                raise ValueError("durable block candidate row carries no body reference")
+            if body_row.get("state") != "sealed":
+                raise ValueError("durable block candidate body is not sealed")
+            body = CandidateBodyRef.from_row(body_row)
+            if body.candidate_sha256 != candidate_sha256:
+                raise ValueError("durable block candidate body digest disagrees with its row")
+        elif storage_version != 1:
+            raise ValueError(f"unsupported candidate storage version {storage_version}")
+        return DurableCandidateDescriptor(
+            block_hash=block_hash,
+            block_height=int(height),
+            parent_hash=parent_hash,
+            candidate_sha256=candidate_sha256,
+            storage_version=storage_version,
+            credit_share_on_accept=credit,
+            collection_only=bool(header.get("collection_only", False)),
+            username=username,
+            pending_share=dict(pending_share),
+            accepted_at_present=bool(header.get("accepted_at_present")),
+            accepted_at_ms=pending_share.get("accepted_at_ms"),
+            body=body,
+            cursor=row.get("cursor"),
+            row=dict(row),
+        )
+
+    def _register_durable_block_candidate_header_row(
+        self,
+        row: Mapping[str, Any],
+    ) -> bool:
+        return self._register_replayed_block_candidate_descriptor(
+            self._durable_candidate_descriptor(row)
+        )
+
+    def _adopt_replay_descriptor_floor(
+        self,
+        descriptor: DurableCandidateDescriptor,
+    ) -> PendingShare:
+        """Hold the credit-bearing stamp's snapshot floor for one hash.
+
+        One holder per hash for as long as the row is pending and owned
+        here; a descriptor re-registered after an overflow or a paced retry
+        reuses it rather than stacking a second holder under the first.
+        """
+        self._ensure_replay_descriptor_state()
+        with self._coordinator.lock:
+            existing = self._block_replay_floor_holders.get(descriptor.block_hash)
+            if existing is not None:
+                return existing
+            holder = PendingShare(**descriptor.pending_share)
+            self._block_replay_floor_holders[descriptor.block_hash] = holder
+        self.ports.share_writer().adopt_pending_share(holder)
+        return holder
+
+    def _take_replay_floor_holder(self, block_hash: str) -> PendingShare | None:
+        """Hand the holder to the object that will release it; no release."""
+        self._ensure_replay_descriptor_state()
+        with self._coordinator.lock:
+            return self._block_replay_floor_holders.pop(block_hash, None)
+
+    def _release_replay_floor_holder(self, block_hash: str) -> None:
+        holder = self._take_replay_floor_holder(block_hash)
+        if holder is not None:
+            self._coordinator._finish_pending_share_candidate(holder)
+
+    def _register_replayed_block_candidate_descriptor(
+        self,
+        descriptor: DurableCandidateDescriptor,
+    ) -> bool:
+        """Register one durable row's obligations and queue its descriptor.
+
+        Mirrors ``_enqueue_replayed_block_candidate`` for a row whose body
+        has not been read: the same duplicate rules, the same payout-preview
+        registration before the row is visible to the submitter, and the
+        credit floor adopted from the header's pending share. When the
+        in-memory window is full the obligations are still registered --
+        that is what the job-build gate needs -- and the row stays in the
+        outbox for a later poll; nothing is discarded.
+        """
+        self._ensure_block_replay_state()
+        self._ensure_replay_descriptor_state()
+        block_hash = descriptor.block_hash
+        overflow = False
+        with self._coordinator.lock:
+            duplicate = (
+                block_hash in self._block_replay_inflight_hashes
+                or block_hash in getattr(self, "_block_candidate_terminal_outcomes", {})
+                or block_hash in self._held_block_candidate_retry_hashes()
+            )
+            if not duplicate:
+                overflow = (
+                    self._block_replay_candidate_queue.qsize()
+                    >= MAX_BLOCK_REPLAY_DESCRIPTORS_IN_MEMORY
+                )
+                if not overflow:
+                    self._block_replay_inflight_hashes.add(block_hash)
+        if duplicate:
+            return False
+        try:
+            if descriptor.credit_share_on_accept:
+                self._adopt_replay_descriptor_floor(descriptor)
+            self._coordinator._begin_accepted_block_payout_preview(
+                block_hash,
+                block_height=descriptor.block_height,
+            )
+            if overflow:
+                with self._coordinator.lock:
+                    self._block_replay_descriptor_overflow_count += 1
+                return False
+            self._block_replay_candidate_queue.put_nowait(descriptor)
+        except BaseException:
+            with self._coordinator.lock:
+                self._block_replay_inflight_hashes.discard(block_hash)
+            raise
+        return True
+
+    @staticmethod
+    def _replay_descriptor_ready(descriptor: DurableCandidateDescriptor) -> bool:
+        return time.monotonic() >= float(descriptor.not_before_monotonic)
+
+    def _hydrate_replay_descriptor(
+        self,
+        descriptor: DurableCandidateDescriptor,
+    ) -> PrismBlockCandidate | None:
+        """Read one descriptor's body and decode it, off every lock.
+
+        At most one hydration runs at a time (this is the submitter thread),
+        through the bounded ledger call so a wedged read stays registered
+        under a key that names the body rather than reusing another page's
+        call. Outcomes: a candidate; ``None`` after the descriptor was
+        dropped (its row is no longer pending), quarantined (malformed
+        durable content) or requeued for a paced retry (transport failure,
+        spool backpressure, deadline).
+        """
+        coordinator = self._coordinator
+        block_hash = descriptor.block_hash
+        coordinator._record_block_submitter_phase("replay-hydrate")
+        hydrate = getattr(coordinator.ledger, "hydrate_block_candidate_intent", None)
+        try:
+            if not callable(hydrate):
+                raise CandidateBodyUnavailable("ledger cannot hydrate durable candidates")
+            intent = coordinator._run_block_submitter_ledger_call(
+                ("replay-hydrate", block_hash, descriptor.body_key),
+                "replay-hydrate",
+                lambda: hydrate(
+                    descriptor.row,
+                    cancelled=coordinator.stop_event.is_set,
+                ),
+                timeout_seconds=coordinator._block_landing_db_timeout(),
+                call_class="landing",
+            )
+            candidate = block_candidate_from_intent(intent)
+            if str(candidate.submission.block_hash_hex).lower() != block_hash:
+                raise ValueError("hydrated block candidate does not match its row")
+            if candidate.credit_share_on_accept:
+                holder = self._take_replay_floor_holder(block_hash)
+                if holder is None:
+                    holder = self._adopt_replay_descriptor_floor(descriptor)
+                    self._take_replay_floor_holder(block_hash)
+                candidate = dataclass_replace(candidate, pending_share=holder)
+            return dataclass_replace(candidate, durable_replay=True)
+        except ShutdownInProgress:
+            self._requeue_replay_descriptor(descriptor)
+            raise
+        except CandidateBodyUnavailable as exc:
+            print(
+                "prism coordinator: durable block candidate is no longer pending; "
+                f"dropping its replay descriptor hash={block_hash} ({exc})",
+                flush=True,
+            )
+            self._drop_replay_descriptor(descriptor)
+            return None
+        except (
+            CandidateBodyIntegrityError,
+            CandidateCodecError,
+            ValueError,
+            TypeError,
+            KeyError,
+        ):
+            print("prism coordinator: invalid durable block candidate body", flush=True)
+            traceback.print_exc()
+            self._quarantine_replay_descriptor(descriptor)
+            return None
+        except Exception:
+            print(
+                "prism coordinator: durable block candidate hydration failed "
+                f"hash={block_hash}; the row stays pending and is retried",
+                flush=True,
+            )
+            traceback.print_exc()
+            self._requeue_replay_descriptor(descriptor)
+            return None
+
+    def _drop_replay_descriptor(self, descriptor: DurableCandidateDescriptor) -> None:
+        block_hash = descriptor.block_hash
+        with self._coordinator.lock:
+            self._block_replay_inflight_hashes.discard(block_hash)
+        self._release_replay_floor_holder(block_hash)
+        self._coordinator._clear_accepted_block_payout_preview(block_hash)
+
+    def _quarantine_replay_descriptor(
+        self,
+        descriptor: DurableCandidateDescriptor,
+    ) -> None:
+        block_hash = descriptor.block_hash
+        with self._coordinator.lock:
+            self._block_replay_inflight_hashes.discard(block_hash)
+        # The quarantine step releases the holder after the row is terminal.
+        holder = self._take_replay_floor_holder(block_hash)
+        self._coordinator._queue_invalid_block_candidate_for_quarantine(
+            block_hash,
+            "invalid durable candidate intent",
+            pending_share=holder,
+        )
+
+    def _requeue_replay_descriptor(self, descriptor: DurableCandidateDescriptor) -> None:
+        """Park the descriptor at the back of the window with backoff."""
+        attempts = int(descriptor.attempts) + 1
+        delay = min(
+            float(self.retry_initial_seconds) * (2 ** min(attempts, 16)),
+            float(self.retry_max_seconds),
+        )
+        self._block_replay_candidate_queue.put_nowait(
+            dataclass_replace(
+                descriptor,
+                attempts=attempts,
+                not_before_monotonic=time.monotonic() + delay,
+            )
+        )
+
+    def replay_descriptor_snapshot(self) -> dict[str, int]:
+        """Bounded gauges for the metadata-first replay window."""
+        self._ensure_block_replay_state()
+        self._ensure_replay_descriptor_state()
+        with self._coordinator.lock:
+            return {
+                "queued": int(self._block_replay_candidate_queue.qsize()),
+                "floor_holders": len(self._block_replay_floor_holders),
+                "overflow": int(self._block_replay_descriptor_overflow_count),
+            }
+
+    def _run_block_candidate_body_janitor_step(self) -> None:
+        """One bounded chunk-page reclaim of a retired body, rate limited.
+
+        Separate from every terminalization statement and never under
+        ``coordinator.lock``: the fenced terminal write only detaches and
+        retires a manifest, and this step drains its chunks a page at a
+        time. A failure is logged and the loop moves on.
+        """
+        coordinator = self._coordinator
+        reap = getattr(coordinator.ledger, "reap_retired_candidate_bodies", None)
+        if not callable(reap):
+            return
+        now = time.monotonic()
+        last = float(getattr(self, "_block_candidate_body_janitor_last_monotonic", 0.0))
+        if now - last < BLOCK_CANDIDATE_BODY_JANITOR_INTERVAL_SECONDS:
+            return
+        self._block_candidate_body_janitor_last_monotonic = now
+        try:
+            outcome = coordinator._run_block_submitter_ledger_call(
+                ("candidate-body-janitor",),
+                "candidate-body-janitor",
+                lambda: reap(),
+            )
+        except ShutdownInProgress:
+            raise
+        except Exception:
+            print("prism coordinator: candidate body janitor step failed", flush=True)
+            traceback.print_exc()
+            return
+        if isinstance(outcome, dict) and (
+            outcome.get("deleted_chunks")
+            or outcome.get("deleted_pages")
+            or outcome.get("deleted_spans")
+            or outcome.get("deleted_bodies")
+            or outcome.get("pending")
+        ):
+            # A retired body still has parts (or a manifest) to reclaim on
+            # a later step: let the next loop iteration step again.
+            self._block_candidate_body_janitor_last_monotonic = 0.0
+            if any(
+                outcome.get(key)
+                for key in ("deleted_chunks", "deleted_pages", "deleted_spans", "deleted_bodies")
+            ):
+                print(
+                    "prism coordinator: candidate body janitor reclaimed "
+                    f"chunks={outcome.get('deleted_chunks', 0)} "
+                    f"pages={outcome.get('deleted_pages', 0)} "
+                    f"spans={outcome.get('deleted_spans', 0)} "
+                    f"bodies={outcome.get('deleted_bodies', 0)} "
+                    f"body_id={outcome.get('body_id')}",
+                    flush=True,
+                )
 
     # -- decided-height collapse (#183) ------------------------------------
 
@@ -1898,7 +2373,7 @@ class BlockCandidateService:
             )
         block_hash = _collapse_block_hash(durable_row.get("block_hash"))
         intent = durable_row.get("candidate")
-        if block_hash is None or not isinstance(intent, dict):
+        if block_hash is None or not isinstance(intent, Mapping):
             raise _BlockCandidateCollapseFailedClosed(
                 "durable candidate row carries no usable hash or intent"
             )
@@ -3977,7 +4452,62 @@ class BlockCandidateService:
             None,
         )
         fetch_durable_page: Callable[..., list[Any]] | None = None
-        if callable(pending_rows):
+        # Issue #255: a ledger that can answer metadata-first pages is
+        # enumerated through them -- typed headers only, a hard row and byte
+        # cap per page, and exhaustion answered by the outbox rather than
+        # inferred from a short page. Bodies are hydrated one at a time when
+        # a descriptor is dequeued, never during enumeration.
+        pending_headers = getattr(
+            self._coordinator.ledger,
+            "pending_block_candidate_headers",
+            None,
+        )
+        fetch_header_page: Callable[..., Any] | None = None
+        # A ledger whose row query was replaced by a cursorless double keeps
+        # exactly the windowed semantics its replacement models.
+        if callable(pending_headers) and (
+            not callable(pending_rows) or _pending_rows_accepts_cursor(pending_rows)
+        ):
+
+            def fetch_header_page(
+                limit: int,
+                *,
+                page: int,
+                after_cursor: object | None,
+            ) -> Any:
+                return self._coordinator._run_block_submitter_ledger_call(
+                    (
+                        "replay-outbox-query",
+                        limit,
+                        page,
+                        _block_replay_cursor_key(after_cursor),
+                    ),
+                    "replay-outbox-query",
+                    lambda: pending_headers(
+                        limit=limit,
+                        after_cursor=after_cursor,
+                        max_bytes=HEADER_PAGE_MAX_BYTES,
+                    ),
+                    timeout_seconds=replay_query_timeout,
+                    call_class=replay_query_call_class,
+                )
+
+            def fetch_durable_rows(limit: int) -> list[Any]:
+                header_limit = min(int(limit), HEADER_PAGE_MAX_ROWS)
+                header_page = self._coordinator._run_block_submitter_ledger_call(
+                    ("replay-outbox-query", header_limit),
+                    "replay-outbox-query",
+                    lambda: pending_headers(
+                        limit=header_limit,
+                        after_cursor=None,
+                        max_bytes=HEADER_PAGE_MAX_BYTES,
+                    ),
+                    timeout_seconds=replay_query_timeout,
+                    call_class=replay_query_call_class,
+                )
+                return [_collapse_row_from_header(row) for row in header_page.rows]
+
+        elif callable(pending_rows):
 
             def fetch_durable_rows(limit: int) -> list[Any]:
                 return self._coordinator._run_block_submitter_ledger_call(
@@ -4043,7 +4573,7 @@ class BlockCandidateService:
                     {
                         "block_hash": (
                             intent.get("block_hash_hex", "")
-                            if isinstance(intent, dict)
+                            if isinstance(intent, Mapping)
                             else ""
                         ),
                         "candidate": intent,
@@ -4058,7 +4588,9 @@ class BlockCandidateService:
         # probes and the reads they bought -- so a backlog split across fifty
         # pages costs the node what a single page does.
         collapse_probe_budget = _CollapseHeightProbeBudget()
-        if forced_enumeration and fetch_durable_page is not None:
+        if forced_enumeration and (
+            fetch_header_page is not None or fetch_durable_page is not None
+        ):
             # A row can embed an entire payout window. Smaller pages reduce
             # the uninterrupted JSON decode without weakening the complete
             # cursor walk, the legacy window cap, or cleanup admission bounds.
@@ -4072,6 +4604,12 @@ class BlockCandidateService:
                 MAX_BLOCK_REPLAY_ENUMERATION_ROWS,
                 max(1, int(configured_page_size)),
             )
+            # Header pages honour the configured size and, on top of it,
+            # the hard #255 row cap; the byte cap is enforced by the ledger.
+            # Neither bound weakens the completeness proof: the page reports
+            # exhaustion explicitly, so a page cut short by either cap is
+            # never mistaken for the end of the backlog.
+            header_page_size = min(page_size, HEADER_PAGE_MAX_ROWS)
             # Pagination, not a widening window: the doubling loop below
             # fails closed once one page would have to hold the entire
             # backlog, so a backlog larger than the cap kept enumeration
@@ -4083,22 +4621,33 @@ class BlockCandidateService:
             after_cursor: object | None = None
             while True:
                 page += 1
-                try:
-                    durable_rows = fetch_durable_page(
-                        page_size,
+                header_page: Any = None
+                if fetch_header_page is not None:
+                    header_page = fetch_header_page(
+                        header_page_size,
                         page=page,
                         after_cursor=after_cursor,
                     )
-                except TypeError:
-                    if page > 1:
-                        # Cursor support was already proven by an earlier
-                        # page, so this is a real fault and not a legacy
-                        # ledger; adopted rows must not be re-adopted by a
-                        # fallback pass that starts over from the top.
-                        raise
-                    # A ledger without cursor support keeps exactly today's
-                    # windowed semantics, fail-closed truncation included.
-                    break
+                    durable_rows = [
+                        _collapse_row_from_header(row) for row in header_page.rows
+                    ]
+                else:
+                    try:
+                        durable_rows = fetch_durable_page(
+                            page_size,
+                            page=page,
+                            after_cursor=after_cursor,
+                        )
+                    except TypeError:
+                        if page > 1:
+                            # Cursor support was already proven by an earlier
+                            # page, so this is a real fault and not a legacy
+                            # ledger; adopted rows must not be re-adopted by a
+                            # fallback pass that starts over from the top.
+                            raise
+                        # A ledger without cursor support keeps exactly today's
+                        # windowed semantics, fail-closed truncation included.
+                        break
                 enumeration_paginated = True
                 # Collapse this page's decided-height siblings before any of
                 # it is adopted, so a row this apply terminalizes is never
@@ -4122,10 +4671,18 @@ class BlockCandidateService:
                 queued += self._adopt_durable_block_candidate_rows(retained_rows)
                 print(
                     "prism coordinator: pending block candidate enumeration "
-                    f"page={page} rows={len(durable_rows)} limit={page_size}",
+                    f"page={page} rows={len(durable_rows)} "
+                    f"limit={header_page_size if header_page is not None else page_size}",
                     flush=True,
                 )
-                if len(durable_rows) < page_size:
+                if header_page is not None:
+                    if header_page.exhausted:
+                        # The outbox answered that no pending row followed
+                        # this page, which is the completeness the job-build
+                        # gate waits on. A short byte-capped page does not
+                        # say that, and does not end the walk.
+                        break
+                elif len(durable_rows) < page_size:
                     # A short page proves no pending row followed it at query
                     # time, which is the completeness the job-build gate waits
                     # on.
@@ -4158,11 +4715,14 @@ class BlockCandidateService:
                         flush=True,
                     )
                     break
-                next_cursor = (
-                    durable_rows[-1].get("cursor")
-                    if isinstance(durable_rows[-1], dict)
-                    else None
-                )
+                if header_page is not None:
+                    next_cursor = header_page.next_cursor
+                else:
+                    next_cursor = (
+                        durable_rows[-1].get("cursor")
+                        if durable_rows and isinstance(durable_rows[-1], dict)
+                        else None
+                    )
                 if next_cursor is None or next_cursor == after_cursor:
                     # Either the ledger accepted the keyword without keying
                     # its rows, or it accepted the cursor without honouring
@@ -6502,6 +7062,7 @@ class BlockCandidateService:
                     # `continue` every pass is exactly how the wedge starved
                     # the one path that resolves a stuck ancestor.
                 self.ports.replay_entrypoint()
+                self._run_block_candidate_body_janitor_step()
                 self._coordinator.submit_next_block_candidate(
                     timeout=1.0,
                     defer_accounting=True,
@@ -6572,6 +7133,7 @@ class BlockCandidateService:
             )
             while candidate is None:
                 coordinator._record_block_submitter_phase("dequeue-queue")
+                descriptor: DurableCandidateDescriptor | None = None
                 with coordinator.lock:
                     # Live discoveries always outrank durable restart replay.
                     # The non-blocking get takes the queue's own mutex under
@@ -6582,11 +7144,20 @@ class BlockCandidateService:
                         if candidate_queue is None:
                             continue
                         try:
-                            candidate = candidate_queue.get_nowait()
+                            item = candidate_queue.get_nowait()
                         except queue.Empty:
                             continue
+                        if isinstance(item, DurableCandidateDescriptor):
+                            if not self._replay_descriptor_ready(item):
+                                # Parked by a paced hydration retry: rotate
+                                # it to the back and look at the next lane.
+                                candidate_queue.put_nowait(item)
+                                continue
+                            descriptor = item
+                        else:
+                            candidate = item
                         break
-                    if candidate is None:
+                    if candidate is None and descriptor is None:
                         waiting = self._block_disposition_waiting_retries
                         ready_hashes = [
                             key
@@ -6604,6 +7175,18 @@ class BlockCandidateService:
                             )
                             candidate = waiting.pop(waiting_hash)
                     if candidate is not None:
+                        block_hash = self._pin_dequeued_block_candidate_locked(
+                            candidate
+                        )
+                if descriptor is not None:
+                    # Body-sized work: hydrate outside coordinator.lock, one
+                    # descriptor at a time. The hash stays named by the
+                    # replay-inflight registry throughout, so the terminal
+                    # outcome fence it will read cannot be evicted meanwhile.
+                    candidate = self._hydrate_replay_descriptor(descriptor)
+                    if candidate is None:
+                        return BlockCandidateRunResult(True)
+                    with coordinator.lock:
                         block_hash = self._pin_dequeued_block_candidate_locked(
                             candidate
                         )

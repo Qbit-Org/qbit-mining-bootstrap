@@ -65,7 +65,11 @@ class PendingShareAppend:
     block_hash_hex: str
     collection_only: bool
     credit_policy: str | None
-    candidate_intent: dict[str, Any] | None = None
+    # The prepared candidate intent (#255), a mapping whose share sequence
+    # is the job's immutable window. Released by the writer the moment the
+    # entry reaches its terminal outcome so an idle writer local or a
+    # finished batch never pins a payout window.
+    candidate_intent: Any | None = None
     committed: threading.Event = field(default_factory=threading.Event)
     record: Any | None = None
     error: BaseException | None = None
@@ -492,6 +496,10 @@ class ShareWriter:
         finally:
             for entry in batch:
                 runtime._finish_pending_share_commit(entry.pending_share)
+                # Terminal for this entry either way (committed, or failed
+                # and reported to the miner): drop the intent's hold on its
+                # window before waking the submitter.
+                entry.candidate_intent = None
                 entry.committed.set()
                 if entry.writer_token is not None:
                     entry.writer_token.finish()
@@ -758,9 +766,11 @@ class ShareWriter:
                     # already-acked, already-counted share -- recover it to
                     # disk for replay on the next start.
                     runtime._recover_share_to_disk(entry, "ledger unavailable at shutdown")
+                    entry.candidate_intent = None
                     return False
                 backoff_seconds = min(backoff_seconds * 2, 5.0)
                 runtime._record_heartbeat("share_writer")
+        entry.candidate_intent = None
         if invalidation_epoch is not None:
             runtime._retire_payout_windows_for_late_append(
                 entry.pending_share, invalidation_epoch
