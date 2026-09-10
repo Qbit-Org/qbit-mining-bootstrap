@@ -385,7 +385,16 @@ pub enum PayoutMaturityState {
     Reversed,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+/// A complete audit bundle: the payout window (`shares`) and everything
+/// derived from it.
+///
+/// `Serialize` is hand-written and delegates to the private `AuditBundleRef`
+/// view, the single definition of the canonical audit bytes that the borrowed
+/// parts API ([`AuditBody`] plus `&[AcceptedShare]`) shares. The
+/// `skip_serializing_if` attributes below document the wire format and are
+/// mirrored on `AuditBundleRef`, which is what actually serializes; keep the
+/// two in step. `Deserialize` stays derived.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct AuditBundle {
     pub schema: String,
     pub shares: Vec<AcceptedShare>,
@@ -410,6 +419,274 @@ pub struct AuditBundle {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ctv_fanout_manifest_set: Option<CtvFanoutManifestSet>,
     pub signed_coinbase_manifest: SignedPayoutManifest,
+}
+
+impl Serialize for AuditBundle {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        AuditBundleRef::from_bundle(self).serialize(serializer)
+    }
+}
+
+impl AuditBundle {
+    /// Split the bundle into its body and its payout window. Both halves are
+    /// moved out; no share is copied.
+    pub fn into_parts(self) -> (AuditBody, Vec<AcceptedShare>) {
+        let AuditBundle {
+            schema,
+            shares,
+            found_block,
+            prior_balances,
+            payout_policy,
+            coinbase_script_sig_suffix_hex,
+            witness_merkle_leaves_hex,
+            audit_commitment_leaves_hex,
+            audit_commitment_root_hex,
+            ledger_window_attestation,
+            reward_manifest,
+            payout_policy_manifest,
+            settlement_mode_decision,
+            ctv_fanout_fee_policy,
+            ctv_fanout_manifest_set,
+            signed_coinbase_manifest,
+        } = self;
+        let body = AuditBody {
+            schema,
+            found_block,
+            prior_balances,
+            payout_policy,
+            coinbase_script_sig_suffix_hex,
+            witness_merkle_leaves_hex,
+            audit_commitment_leaves_hex,
+            audit_commitment_root_hex,
+            ledger_window_attestation,
+            reward_manifest,
+            payout_policy_manifest,
+            settlement_mode_decision,
+            ctv_fanout_fee_policy,
+            ctv_fanout_manifest_set,
+            signed_coinbase_manifest,
+        };
+        (body, shares)
+    }
+}
+
+/// Every [`AuditBundle`] field except the top-level `shares` payout window.
+///
+/// The parts API ([`build_audit_body`] and its siblings,
+/// [`verify_audit_parts`], [`canonical_audit_bundle_bytes_from_parts`]) lets
+/// a caller that owns the window keep it and lend it as `&[AcceptedShare]`
+/// instead of handing a `Vec`, usually a clone, to the builder.
+/// [`AuditBody::into_bundle`] and [`AuditBundle::into_parts`] convert between
+/// the two forms by moving the window, never copying it.
+///
+/// `reward_manifest` still carries its own `Vec<CountedShare>`, the counted
+/// records derived from the window; normalizing that copy away is a separate
+/// change (#267).
+///
+/// The body's own serde form is not an audit artifact. It omits `shares`, so
+/// it has no canonical bytes and no published sha256. Produce those with
+/// [`canonical_audit_bundle_bytes_from_parts`].
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AuditBody {
+    pub schema: String,
+    pub found_block: FoundBlock,
+    pub prior_balances: Vec<CarryForwardBalance>,
+    pub payout_policy: PayoutPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coinbase_script_sig_suffix_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub witness_merkle_leaves_hex: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audit_commitment_leaves_hex: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_commitment_root_hex: Option<String>,
+    pub ledger_window_attestation: LedgerWindowAttestation,
+    pub reward_manifest: PrismRewardManifest,
+    pub payout_policy_manifest: PayoutPolicyManifest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_mode_decision: Option<SettlementModeDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctv_fanout_fee_policy: Option<FanoutFeeRatePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctv_fanout_manifest_set: Option<CtvFanoutManifestSet>,
+    pub signed_coinbase_manifest: SignedPayoutManifest,
+}
+
+impl AuditBody {
+    /// Assemble a bundle that owns `shares`. The window is moved in, not
+    /// copied. Pass the window the body was built from; this does not check
+    /// it, and [`verify_audit_bundle`] rejects a mismatched pair.
+    pub fn into_bundle(self, shares: Vec<AcceptedShare>) -> AuditBundle {
+        let AuditBody {
+            schema,
+            found_block,
+            prior_balances,
+            payout_policy,
+            coinbase_script_sig_suffix_hex,
+            witness_merkle_leaves_hex,
+            audit_commitment_leaves_hex,
+            audit_commitment_root_hex,
+            ledger_window_attestation,
+            reward_manifest,
+            payout_policy_manifest,
+            settlement_mode_decision,
+            ctv_fanout_fee_policy,
+            ctv_fanout_manifest_set,
+            signed_coinbase_manifest,
+        } = self;
+        AuditBundle {
+            schema,
+            shares,
+            found_block,
+            prior_balances,
+            payout_policy,
+            coinbase_script_sig_suffix_hex,
+            witness_merkle_leaves_hex,
+            audit_commitment_leaves_hex,
+            audit_commitment_root_hex,
+            ledger_window_attestation,
+            reward_manifest,
+            payout_policy_manifest,
+            settlement_mode_decision,
+            ctv_fanout_fee_policy,
+            ctv_fanout_manifest_set,
+            signed_coinbase_manifest,
+        }
+    }
+}
+
+/// Borrowed view of an audit bundle and the single definition of its
+/// canonical JSON. Field order and `skip_serializing_if` rules match
+/// [`AuditBundle`]'s declaration exactly. The owned bundle and
+/// `(&AuditBody, &[AcceptedShare])` both serialize through this view, so the
+/// two forms produce identical bytes.
+///
+/// Never `#[serde(flatten)]` a body into this struct: flatten would move
+/// `shares` out of second position and buffer through serde's `Content`,
+/// which cannot carry `arbitrary_precision` `u128` values.
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename = "AuditBundle")]
+struct AuditBundleRef<'a> {
+    schema: &'a String,
+    shares: &'a [AcceptedShare],
+    found_block: &'a FoundBlock,
+    prior_balances: &'a Vec<CarryForwardBalance>,
+    payout_policy: &'a PayoutPolicy,
+    #[serde(skip_serializing_if = "ref_option_is_none")]
+    coinbase_script_sig_suffix_hex: &'a Option<String>,
+    #[serde(skip_serializing_if = "ref_vec_is_empty")]
+    witness_merkle_leaves_hex: &'a Vec<String>,
+    #[serde(skip_serializing_if = "ref_vec_is_empty")]
+    audit_commitment_leaves_hex: &'a Vec<String>,
+    #[serde(skip_serializing_if = "ref_option_is_none")]
+    audit_commitment_root_hex: &'a Option<String>,
+    ledger_window_attestation: &'a LedgerWindowAttestation,
+    reward_manifest: &'a PrismRewardManifest,
+    payout_policy_manifest: &'a PayoutPolicyManifest,
+    #[serde(skip_serializing_if = "ref_option_is_none")]
+    settlement_mode_decision: &'a Option<SettlementModeDecision>,
+    #[serde(skip_serializing_if = "ref_option_is_none")]
+    ctv_fanout_fee_policy: &'a Option<FanoutFeeRatePolicy>,
+    #[serde(skip_serializing_if = "ref_option_is_none")]
+    ctv_fanout_manifest_set: &'a Option<CtvFanoutManifestSet>,
+    signed_coinbase_manifest: &'a SignedPayoutManifest,
+}
+
+impl<'a> AuditBundleRef<'a> {
+    fn from_bundle(bundle: &'a AuditBundle) -> Self {
+        let AuditBundle {
+            schema,
+            shares,
+            found_block,
+            prior_balances,
+            payout_policy,
+            coinbase_script_sig_suffix_hex,
+            witness_merkle_leaves_hex,
+            audit_commitment_leaves_hex,
+            audit_commitment_root_hex,
+            ledger_window_attestation,
+            reward_manifest,
+            payout_policy_manifest,
+            settlement_mode_decision,
+            ctv_fanout_fee_policy,
+            ctv_fanout_manifest_set,
+            signed_coinbase_manifest,
+        } = bundle;
+        Self {
+            schema,
+            shares,
+            found_block,
+            prior_balances,
+            payout_policy,
+            coinbase_script_sig_suffix_hex,
+            witness_merkle_leaves_hex,
+            audit_commitment_leaves_hex,
+            audit_commitment_root_hex,
+            ledger_window_attestation,
+            reward_manifest,
+            payout_policy_manifest,
+            settlement_mode_decision,
+            ctv_fanout_fee_policy,
+            ctv_fanout_manifest_set,
+            signed_coinbase_manifest,
+        }
+    }
+
+    fn from_parts(body: &'a AuditBody, shares: &'a [AcceptedShare]) -> Self {
+        let AuditBody {
+            schema,
+            found_block,
+            prior_balances,
+            payout_policy,
+            coinbase_script_sig_suffix_hex,
+            witness_merkle_leaves_hex,
+            audit_commitment_leaves_hex,
+            audit_commitment_root_hex,
+            ledger_window_attestation,
+            reward_manifest,
+            payout_policy_manifest,
+            settlement_mode_decision,
+            ctv_fanout_fee_policy,
+            ctv_fanout_manifest_set,
+            signed_coinbase_manifest,
+        } = body;
+        Self {
+            schema,
+            shares,
+            found_block,
+            prior_balances,
+            payout_policy,
+            coinbase_script_sig_suffix_hex,
+            witness_merkle_leaves_hex,
+            audit_commitment_leaves_hex,
+            audit_commitment_root_hex,
+            ledger_window_attestation,
+            reward_manifest,
+            payout_policy_manifest,
+            settlement_mode_decision,
+            ctv_fanout_fee_policy,
+            ctv_fanout_manifest_set,
+            signed_coinbase_manifest,
+        }
+    }
+
+    fn write_canonical<W: std::io::Write>(&self, writer: W) -> Result<(), serde_json::Error> {
+        serde_json::to_writer(writer, self)
+    }
+
+    fn canonical_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        let mut bytes = Vec::new();
+        self.write_canonical(&mut bytes)?;
+        Ok(bytes)
+    }
+}
+
+fn ref_option_is_none<T>(value: &&Option<T>) -> bool {
+    value.is_none()
+}
+
+fn ref_vec_is_empty<T>(value: &&Vec<T>) -> bool {
+    value.is_empty()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -648,7 +925,30 @@ pub fn canonical_payout_policy_manifest_bytes(
 }
 
 pub fn canonical_audit_bundle_bytes(bundle: &AuditBundle) -> Result<Vec<u8>, serde_json::Error> {
-    serde_json::to_vec(bundle)
+    AuditBundleRef::from_bundle(bundle).canonical_bytes()
+}
+
+/// Canonical audit bundle bytes for `body` with `shares` as its window. The
+/// bytes are identical to [`canonical_audit_bundle_bytes`] of
+/// `body.into_bundle(shares)`, and so is their sha256, but no bundle is
+/// assembled: the caller keeps ownership of the window and no copy of it is
+/// made outside the returned bytes.
+pub fn canonical_audit_bundle_bytes_from_parts(
+    body: &AuditBody,
+    shares: &[AcceptedShare],
+) -> Result<Vec<u8>, serde_json::Error> {
+    AuditBundleRef::from_parts(body, shares).canonical_bytes()
+}
+
+/// Streaming form of [`canonical_audit_bundle_bytes_from_parts`]: writes the
+/// same bytes to `writer` without buffering them. The caller keeps ownership
+/// of the window and no copy of it is made.
+pub fn write_canonical_audit_bundle_from_parts<W: std::io::Write>(
+    writer: W,
+    body: &AuditBody,
+    shares: &[AcceptedShare],
+) -> Result<(), serde_json::Error> {
+    AuditBundleRef::from_parts(body, shares).write_canonical(writer)
 }
 
 pub fn prism_audit_commitment_leaf_hex(
@@ -1255,6 +1555,9 @@ fn audit_bundle_schema_for_shares(shares: &[AcceptedShare]) -> &'static str {
     }
 }
 
+/// Build an audit bundle that owns `shares`. The window moves into
+/// [`AuditBundle::shares`] unchanged and in input order; it is not copied.
+/// A caller that must keep the window uses [`build_audit_body`] instead.
 pub fn build_audit_bundle(
     shares: Vec<AcceptedShare>,
     found_block: FoundBlock,
@@ -1263,7 +1566,30 @@ pub fn build_audit_bundle(
     coinbase_signing_key: &ManifestSigningKey,
     ledger_signing_key: &ManifestSigningKey,
 ) -> Result<AuditBundle, PrismError> {
-    build_audit_bundle_with_coinbase_script_sig_suffix(
+    Ok(build_audit_body(
+        &shares,
+        found_block,
+        prior_balances,
+        payout_policy,
+        coinbase_signing_key,
+        ledger_signing_key,
+    )?
+    .into_bundle(shares))
+}
+
+/// Borrowing form of [`build_audit_bundle`]. The caller keeps ownership of
+/// the payout window: the builder only reads `shares` and makes no copy of
+/// it. Pair the body with the same window through [`AuditBody::into_bundle`],
+/// [`canonical_audit_bundle_bytes_from_parts`] or [`verify_audit_parts`].
+pub fn build_audit_body(
+    shares: &[AcceptedShare],
+    found_block: FoundBlock,
+    prior_balances: Vec<CarryForwardBalance>,
+    payout_policy: PayoutPolicy,
+    coinbase_signing_key: &ManifestSigningKey,
+    ledger_signing_key: &ManifestSigningKey,
+) -> Result<AuditBody, PrismError> {
+    build_audit_body_with_coinbase_script_sig_suffix(
         shares,
         found_block,
         prior_balances,
@@ -1274,6 +1600,8 @@ pub fn build_audit_bundle(
     )
 }
 
+/// Owning form of [`build_audit_body_with_coinbase_script_sig_suffix`]. The
+/// window moves into the bundle unchanged; it is not copied.
 pub fn build_audit_bundle_with_coinbase_script_sig_suffix(
     shares: Vec<AcceptedShare>,
     found_block: FoundBlock,
@@ -1283,7 +1611,31 @@ pub fn build_audit_bundle_with_coinbase_script_sig_suffix(
     coinbase_signing_key: &ManifestSigningKey,
     ledger_signing_key: &ManifestSigningKey,
 ) -> Result<AuditBundle, PrismError> {
-    build_audit_bundle_with_coinbase_options(
+    Ok(build_audit_body_with_coinbase_script_sig_suffix(
+        &shares,
+        found_block,
+        prior_balances,
+        payout_policy,
+        coinbase_script_sig_suffix_hex,
+        coinbase_signing_key,
+        ledger_signing_key,
+    )?
+    .into_bundle(shares))
+}
+
+/// Borrowing form of [`build_audit_bundle_with_coinbase_script_sig_suffix`].
+/// The caller keeps ownership of the payout window: the builder only reads
+/// `shares` and makes no copy of it.
+pub fn build_audit_body_with_coinbase_script_sig_suffix(
+    shares: &[AcceptedShare],
+    found_block: FoundBlock,
+    prior_balances: Vec<CarryForwardBalance>,
+    payout_policy: PayoutPolicy,
+    coinbase_script_sig_suffix_hex: Option<String>,
+    coinbase_signing_key: &ManifestSigningKey,
+    ledger_signing_key: &ManifestSigningKey,
+) -> Result<AuditBody, PrismError> {
+    build_audit_body_with_coinbase_options(
         shares,
         found_block,
         prior_balances,
@@ -1295,6 +1647,8 @@ pub fn build_audit_bundle_with_coinbase_script_sig_suffix(
     )
 }
 
+/// Owning form of [`build_audit_body_with_coinbase_options`]. The window
+/// moves into the bundle unchanged; it is not copied.
 pub fn build_audit_bundle_with_coinbase_options(
     shares: Vec<AcceptedShare>,
     found_block: FoundBlock,
@@ -1305,6 +1659,33 @@ pub fn build_audit_bundle_with_coinbase_options(
     coinbase_signing_key: &ManifestSigningKey,
     ledger_signing_key: &ManifestSigningKey,
 ) -> Result<AuditBundle, PrismError> {
+    Ok(build_audit_body_with_coinbase_options(
+        &shares,
+        found_block,
+        prior_balances,
+        payout_policy,
+        coinbase_script_sig_suffix_hex,
+        witness_merkle_leaves_hex,
+        coinbase_signing_key,
+        ledger_signing_key,
+    )?
+    .into_bundle(shares))
+}
+
+/// Borrowing form of [`build_audit_bundle_with_coinbase_options`]. The
+/// caller keeps ownership of the payout window: the builder only reads
+/// `shares` and makes no copy of it.
+#[allow(clippy::too_many_arguments)]
+pub fn build_audit_body_with_coinbase_options(
+    shares: &[AcceptedShare],
+    found_block: FoundBlock,
+    prior_balances: Vec<CarryForwardBalance>,
+    payout_policy: PayoutPolicy,
+    coinbase_script_sig_suffix_hex: Option<String>,
+    witness_merkle_leaves_hex: Vec<String>,
+    coinbase_signing_key: &ManifestSigningKey,
+    ledger_signing_key: &ManifestSigningKey,
+) -> Result<AuditBody, PrismError> {
     if coinbase_signing_key
         .public_key_hex()
         .eq_ignore_ascii_case(&ledger_signing_key.public_key_hex())
@@ -1312,7 +1693,7 @@ pub fn build_audit_bundle_with_coinbase_options(
         return Err(PrismError::LedgerAttestationKeyReuse);
     }
     let reward_manifest = profile_audit_build_phase(AUDIT_BUILD_PAYOUT_DERIVATION_PHASE, || {
-        build_prism_reward_manifest(&shares, &found_block)
+        build_prism_reward_manifest(shares, &found_block)
     })?;
     let ledger_window_attestation = profile_audit_build_phase(AUDIT_BUILD_SIGNING_PHASE, || {
         build_ledger_window_attestation(&reward_manifest, &prior_balances, ledger_signing_key)
@@ -1342,9 +1723,8 @@ pub fn build_audit_bundle_with_coinbase_options(
     let signed_coinbase_manifest =
         build_profiled_signed_manifest(coinbase_request, coinbase_signing_key)?;
 
-    Ok(AuditBundle {
-        schema: audit_bundle_schema_for_shares(&shares).to_string(),
-        shares,
+    Ok(AuditBody {
+        schema: audit_bundle_schema_for_shares(shares).to_string(),
         found_block,
         prior_balances,
         payout_policy,
@@ -1362,6 +1742,8 @@ pub fn build_audit_bundle_with_coinbase_options(
     })
 }
 
+/// Owning form of [`build_audit_body_with_ctv_settlement_options`]. The
+/// window moves into the bundle unchanged; it is not copied.
 pub fn build_audit_bundle_with_ctv_settlement_options(
     shares: Vec<AcceptedShare>,
     found_block: FoundBlock,
@@ -1375,6 +1757,39 @@ pub fn build_audit_bundle_with_ctv_settlement_options(
     coinbase_signing_key: &ManifestSigningKey,
     ledger_signing_key: &ManifestSigningKey,
 ) -> Result<AuditBundle, PrismError> {
+    Ok(build_audit_body_with_ctv_settlement_options(
+        &shares,
+        found_block,
+        prior_balances,
+        payout_policy,
+        direct_floor_sats,
+        settlement_config,
+        ctv_fanout_fee_policy,
+        coinbase_script_sig_suffix_hex,
+        witness_merkle_leaves_hex,
+        coinbase_signing_key,
+        ledger_signing_key,
+    )?
+    .into_bundle(shares))
+}
+
+/// Borrowing form of [`build_audit_bundle_with_ctv_settlement_options`]. The
+/// caller keeps ownership of the payout window: the builder only reads
+/// `shares` and makes no copy of it.
+#[allow(clippy::too_many_arguments)]
+pub fn build_audit_body_with_ctv_settlement_options(
+    shares: &[AcceptedShare],
+    found_block: FoundBlock,
+    prior_balances: Vec<CarryForwardBalance>,
+    payout_policy: PayoutPolicy,
+    direct_floor_sats: u64,
+    settlement_config: SettlementModeConfig,
+    ctv_fanout_fee_policy: Option<FanoutFeeRatePolicy>,
+    coinbase_script_sig_suffix_hex: Option<String>,
+    witness_merkle_leaves_hex: Vec<String>,
+    coinbase_signing_key: &ManifestSigningKey,
+    ledger_signing_key: &ManifestSigningKey,
+) -> Result<AuditBody, PrismError> {
     if coinbase_signing_key
         .public_key_hex()
         .eq_ignore_ascii_case(&ledger_signing_key.public_key_hex())
@@ -1382,7 +1797,7 @@ pub fn build_audit_bundle_with_ctv_settlement_options(
         return Err(PrismError::LedgerAttestationKeyReuse);
     }
     let reward_manifest = profile_audit_build_phase(AUDIT_BUILD_PAYOUT_DERIVATION_PHASE, || {
-        build_prism_reward_manifest(&shares, &found_block)
+        build_prism_reward_manifest(shares, &found_block)
     })?;
     let ledger_window_attestation = profile_audit_build_phase(AUDIT_BUILD_SIGNING_PHASE, || {
         build_ledger_window_attestation(&reward_manifest, &prior_balances, ledger_signing_key)
@@ -1526,9 +1941,8 @@ pub fn build_audit_bundle_with_ctv_settlement_options(
         )?)
     };
 
-    Ok(AuditBundle {
-        schema: audit_bundle_schema_for_shares(&shares).to_string(),
-        shares,
+    Ok(AuditBody {
+        schema: audit_bundle_schema_for_shares(shares).to_string(),
         found_block,
         prior_balances,
         payout_policy,
@@ -1836,15 +2250,39 @@ pub fn verify_audit_bundle(
     bundle: &AuditBundle,
     ledger_writer_public_key_hex: &str,
 ) -> Result<AuditVerificationReport, PrismError> {
-    if bundle.schema != audit_bundle_schema_for_shares(&bundle.shares) {
+    verify_audit_view(
+        AuditBundleRef::from_bundle(bundle),
+        ledger_writer_public_key_hex,
+    )
+}
+
+/// Verify `body` against the payout window `shares` it was built from. The
+/// caller keeps ownership of the window and no copy of it is made. The
+/// report equals [`verify_audit_bundle`]'s for the assembled bundle,
+/// including `audit_bundle_sha256_hex`, which covers the bytes with shares.
+pub fn verify_audit_parts(
+    body: &AuditBody,
+    shares: &[AcceptedShare],
+    ledger_writer_public_key_hex: &str,
+) -> Result<AuditVerificationReport, PrismError> {
+    verify_audit_view(
+        AuditBundleRef::from_parts(body, shares),
+        ledger_writer_public_key_hex,
+    )
+}
+
+fn verify_audit_view(
+    bundle: AuditBundleRef<'_>,
+    ledger_writer_public_key_hex: &str,
+) -> Result<AuditVerificationReport, PrismError> {
+    if *bundle.schema != audit_bundle_schema_for_shares(bundle.shares) {
         return Err(PrismError::AuditMismatch { artifact: "schema" });
     }
     verify_ledger_window_attestation(bundle, ledger_writer_public_key_hex)?;
-    verify_signed_manifest(&bundle.signed_coinbase_manifest)?;
+    verify_signed_manifest(bundle.signed_coinbase_manifest)?;
 
-    let expected_reward_manifest =
-        build_prism_reward_manifest(&bundle.shares, &bundle.found_block)?;
-    if expected_reward_manifest != bundle.reward_manifest {
+    let expected_reward_manifest = build_prism_reward_manifest(bundle.shares, bundle.found_block)?;
+    if expected_reward_manifest != *bundle.reward_manifest {
         return Err(PrismError::AuditMismatch {
             artifact: "reward_manifest",
         });
@@ -1852,8 +2290,8 @@ pub fn verify_audit_bundle(
 
     let mut expected_policy_manifest = apply_payout_policy(
         &expected_reward_manifest,
-        &bundle.prior_balances,
-        &bundle.payout_policy,
+        bundle.prior_balances,
+        bundle.payout_policy,
     )?;
     if let (Some(decision), Some(fee_policy)) = (
         bundle.settlement_mode_decision.as_ref(),
@@ -1861,7 +2299,7 @@ pub fn verify_audit_bundle(
     ) {
         apply_ctv_fanout_fee_accounting(&mut expected_policy_manifest, decision, fee_policy)?;
     }
-    if expected_policy_manifest != bundle.payout_policy_manifest {
+    if expected_policy_manifest != *bundle.payout_policy_manifest {
         return Err(PrismError::AuditMismatch {
             artifact: "payout_policy_manifest",
         });
@@ -1881,7 +2319,7 @@ pub fn verify_audit_bundle(
             bundle.ctv_fanout_manifest_set.as_ref(),
             &expected_policy_manifest,
             &bundle.signed_coinbase_manifest.manifest,
-            &bundle.audit_commitment_leaves_hex,
+            bundle.audit_commitment_leaves_hex,
         )?;
         if let Some(fanout_set) = &bundle.ctv_fanout_manifest_set {
             expected_audit_commitment_leaves.extend(
@@ -1896,7 +2334,7 @@ pub fn verify_audit_bundle(
         expected_policy_manifest.onchain_entitlements.clone()
     };
     if !hex_vec_eq_ignore_ascii_case(
-        &bundle.audit_commitment_leaves_hex,
+        bundle.audit_commitment_leaves_hex,
         &expected_audit_commitment_leaves,
     ) {
         return Err(PrismError::AuditMismatch {
@@ -1946,7 +2384,34 @@ pub fn verify_audit_bundle_against_coinbase_tx_hex(
     onchain_coinbase_tx_hex: &str,
     ledger_writer_public_key_hex: &str,
 ) -> Result<AuditVerificationReport, PrismError> {
-    let report = verify_audit_bundle(bundle, ledger_writer_public_key_hex)?;
+    verify_audit_view_against_coinbase_tx_hex(
+        AuditBundleRef::from_bundle(bundle),
+        onchain_coinbase_tx_hex,
+        ledger_writer_public_key_hex,
+    )
+}
+
+/// Parts form of [`verify_audit_bundle_against_coinbase_tx_hex`]. The caller
+/// keeps ownership of the window and no copy of it is made.
+pub fn verify_audit_parts_against_coinbase_tx_hex(
+    body: &AuditBody,
+    shares: &[AcceptedShare],
+    onchain_coinbase_tx_hex: &str,
+    ledger_writer_public_key_hex: &str,
+) -> Result<AuditVerificationReport, PrismError> {
+    verify_audit_view_against_coinbase_tx_hex(
+        AuditBundleRef::from_parts(body, shares),
+        onchain_coinbase_tx_hex,
+        ledger_writer_public_key_hex,
+    )
+}
+
+fn verify_audit_view_against_coinbase_tx_hex(
+    bundle: AuditBundleRef<'_>,
+    onchain_coinbase_tx_hex: &str,
+    ledger_writer_public_key_hex: &str,
+) -> Result<AuditVerificationReport, PrismError> {
+    let report = verify_audit_view(bundle, ledger_writer_public_key_hex)?;
     if !report
         .coinbase_tx_hex
         .eq_ignore_ascii_case(onchain_coinbase_tx_hex.trim())
@@ -1962,7 +2427,39 @@ pub fn verify_audit_bundle_against_coinbase_tx_hex_and_expected_coinbase_value(
     ledger_writer_public_key_hex: &str,
     expected_coinbase_value_sats: u64,
 ) -> Result<AuditVerificationReport, PrismError> {
-    let report = verify_audit_bundle_against_coinbase_tx_hex(
+    verify_audit_view_against_coinbase_tx_hex_and_expected_coinbase_value(
+        AuditBundleRef::from_bundle(bundle),
+        onchain_coinbase_tx_hex,
+        ledger_writer_public_key_hex,
+        expected_coinbase_value_sats,
+    )
+}
+
+/// Parts form of
+/// [`verify_audit_bundle_against_coinbase_tx_hex_and_expected_coinbase_value`].
+/// The caller keeps ownership of the window and no copy of it is made.
+pub fn verify_audit_parts_against_coinbase_tx_hex_and_expected_coinbase_value(
+    body: &AuditBody,
+    shares: &[AcceptedShare],
+    onchain_coinbase_tx_hex: &str,
+    ledger_writer_public_key_hex: &str,
+    expected_coinbase_value_sats: u64,
+) -> Result<AuditVerificationReport, PrismError> {
+    verify_audit_view_against_coinbase_tx_hex_and_expected_coinbase_value(
+        AuditBundleRef::from_parts(body, shares),
+        onchain_coinbase_tx_hex,
+        ledger_writer_public_key_hex,
+        expected_coinbase_value_sats,
+    )
+}
+
+fn verify_audit_view_against_coinbase_tx_hex_and_expected_coinbase_value(
+    bundle: AuditBundleRef<'_>,
+    onchain_coinbase_tx_hex: &str,
+    ledger_writer_public_key_hex: &str,
+    expected_coinbase_value_sats: u64,
+) -> Result<AuditVerificationReport, PrismError> {
+    let report = verify_audit_view_against_coinbase_tx_hex(
         bundle,
         onchain_coinbase_tx_hex,
         ledger_writer_public_key_hex,
@@ -1977,17 +2474,17 @@ pub fn verify_audit_bundle_against_coinbase_tx_hex_and_expected_coinbase_value(
 }
 
 fn audit_verification_report(
-    bundle: &AuditBundle,
+    bundle: AuditBundleRef<'_>,
     coinbase_manifest: &PayoutManifest,
 ) -> Result<AuditVerificationReport, PrismError> {
     let reward_manifest_sha256_hex =
-        sha256_hex(&canonical_reward_manifest_bytes(&bundle.reward_manifest)?);
+        sha256_hex(&canonical_reward_manifest_bytes(bundle.reward_manifest)?);
     let payout_policy_manifest_sha256_hex = sha256_hex(&canonical_payout_policy_manifest_bytes(
-        &bundle.payout_policy_manifest,
+        bundle.payout_policy_manifest,
     )?);
     let prism_audit_commitment_leaf_hex =
-        prism_audit_commitment_leaf_hex(&bundle.reward_manifest, &bundle.payout_policy_manifest)?;
-    let audit_commitment_root_hex = audit_commitment_root_hex(&bundle.audit_commitment_leaves_hex)?;
+        prism_audit_commitment_leaf_hex(bundle.reward_manifest, bundle.payout_policy_manifest)?;
+    let audit_commitment_root_hex = audit_commitment_root_hex(bundle.audit_commitment_leaves_hex)?;
     Ok(AuditVerificationReport {
         schema: "qbit.prism.audit-verification-report.v1".to_string(),
         block_height: bundle.found_block.block_height,
@@ -1997,7 +2494,7 @@ fn audit_verification_report(
         prism_audit_commitment_leaf_hex,
         audit_commitment_root_hex,
         coinbase_manifest_sha256_hex: sha256_hex(&serde_json::to_vec(coinbase_manifest)?),
-        audit_bundle_sha256_hex: sha256_hex(&canonical_audit_bundle_bytes(bundle)?),
+        audit_bundle_sha256_hex: sha256_hex(&bundle.canonical_bytes()?),
         coinbase_txid: coinbase_manifest.coinbase_txid.clone(),
         coinbase_wtxid: coinbase_manifest.coinbase_wtxid.clone(),
         coinbase_tx_hex: coinbase_manifest.coinbase_tx_hex.clone(),
@@ -2056,10 +2553,10 @@ fn is_zero_u64(value: &u64) -> bool {
 }
 
 fn verify_ledger_window_attestation(
-    bundle: &AuditBundle,
+    bundle: AuditBundleRef<'_>,
     writer_public_key_hex: &str,
 ) -> Result<(), PrismError> {
-    let attestation = &bundle.ledger_window_attestation;
+    let attestation = bundle.ledger_window_attestation;
     if attestation.schema != "qbit.prism.ledger-window-attestation.v1" {
         return Err(PrismError::AuditMismatch {
             artifact: "ledger_attestation_schema",
@@ -2079,7 +2576,7 @@ fn verify_ledger_window_attestation(
             artifact: "ledger_attestation_share_digest",
         });
     }
-    if attestation.prior_balances_digest_hex != prior_balances_digest_hex(&bundle.prior_balances) {
+    if attestation.prior_balances_digest_hex != prior_balances_digest_hex(bundle.prior_balances) {
         return Err(PrismError::AuditMismatch {
             artifact: "ledger_attestation_prior_digest",
         });
