@@ -110,16 +110,19 @@ Changing RPC targets does not remove the inherited `depends_on: qbitd`; the
 bundled node still starts in these stacks. Operators deploying independently
 managed nodes can override dependencies in their placement configuration.
 
-Safe configuration verification (use fixture values, never log real secrets):
+Safe configuration verification (use fixture values, never log real secrets).
+Both fixture URLs are explicit so inherited credentialed RPC URLs cannot appear
+in the projection:
 
 ```sh
 PRISM_HA_INSTANCE_ID_1=verify-east PRISM_HA_INSTANCE_ID_2=verify-west \
-PRISM_HA_RPC_HOST_1=node-east.internal \
+PRISM_HA_RPC_HOST_1=node-east.internal PRISM_HA_RPC_HOST_2=node-west.internal \
+PRISM_HA_RPC_URL_1=http://node-east.internal:19452/ \
 PRISM_HA_RPC_URL_2=http://node-west.internal:19452/ \
 docker compose -f compose.yaml -f compose.prism-ha.yaml --profile prism config \
   --format json | jq '.services | with_entries(select(.key | startswith("prism-coordinator"))) |
     map_values({ports, environment: (.environment |
-      {PRISM_INSTANCE_ID, PRISM_AUDIT_BIND, PRISM_AUDIT_PORT})})'
+      {PRISM_INSTANCE_ID, QBIT_RPC_HOST, QBIT_RPC_URL, PRISM_AUDIT_BIND, PRISM_AUDIT_PORT})})'
 
 docker compose -f compose.yaml -f compose.prism-ha.yaml --profile prism \
   exec prism-coordinator qbit-prism-server check-config
