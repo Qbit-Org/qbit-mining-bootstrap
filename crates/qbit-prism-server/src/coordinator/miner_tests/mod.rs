@@ -9,6 +9,7 @@ use std::sync::{
     Mutex as StdMutex,
 };
 
+mod admission_races;
 mod config;
 mod credit;
 mod interleavings;
@@ -117,6 +118,7 @@ async fn reply(State(node): State<Arc<StdMutex<Node>>>, Json(request): Json<Valu
             "getblockchaininfo" => {
                 json!({"chain":"regtest","initialblockdownload":false,"blocks":100,"headers":100,"bestblockhash":node.tip,"chainwork":"01"})
             }
+            "getmempoolinfo" => json!({"minrelaytxfee":0.00001,"mempoolminfee":0.00001}),
             _ => panic!("unexpected node RPC {method}"),
         };
         (result, node.fail.as_deref() == Some(method), gate)

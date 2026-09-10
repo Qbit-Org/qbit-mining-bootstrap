@@ -2,6 +2,11 @@
 use super::*;
 use tokio::time::Instant as MonotonicInstant;
 
+pub(super) struct SubmitAdmission {
+    pub current: Arc<Prepared>,
+    pub tip: TipView,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct TipView {
     pub hash: String,
@@ -191,19 +196,23 @@ impl Coordinator {
         Ok((prepared.snapshot.payout_revision == revision || leased).then_some(revision))
     }
 
-    pub(super) async fn submit_tip_view(&self) -> Result<TipView, StratumError> {
-        // Hash, age, predecessor and publication provenance are selected under
-        // ONE lock. Later I/O cannot tear the selected point-in-time view.
-        let published = {
+    pub(super) async fn submit_admission(&self) -> Result<SubmitAdmission, StratumError> {
+        // Match publication order. A tip's lease belongs to the payout selected
+        // with it, never a prepared snapshot captured before an awaited lookup.
+        // Readiness is checked separately; never take it after observed_tip.
+        {
+            let prepared = self.prepared.read().await;
+            let current = prepared
+                .clone()
+                .ok_or_else(|| protocol_error("pool-closed", "no current work"))?;
             let state = self.observed_tip.read().await;
             if let Some(tip) = state.authority(
                 self.config.submit_tip_max_age,
                 self.config.template_refresh_failure_exit,
             ) {
-                return Ok(tip);
+                return Ok(SubmitAdmission { current, tip });
             }
-            state.published.clone()
-        };
+        }
         let result = self
             .rpc
             .call("getbestblockhash", json!([]))
@@ -223,8 +232,17 @@ impl Coordinator {
                     "current chain state is unavailable",
                 )
             })?;
-        // Submit RPC cannot publish authority or open refresh-anchored grace.
-        Ok(published
+        // Work may have published during the RPC. Select that complete pair
+        // now, but only a publication matching the answer supplies provenance.
+        // RPC itself cannot publish a transition or restore a disabled lease.
+        let prepared = self.prepared.read().await;
+        let current = prepared
+            .clone()
+            .ok_or_else(|| protocol_error("pool-closed", "no current work"))?;
+        let state = self.observed_tip.read().await;
+        let mut tip = state
+            .published
+            .clone()
             .filter(|tip| tip.hash == hash)
             .unwrap_or_else(|| TipView {
                 hash: hash.into(),
@@ -233,7 +251,14 @@ impl Coordinator {
                 share_lease: false,
                 observed_at: MonotonicInstant::now(),
                 sequence: 0,
-            }))
+            });
+        tip.share_lease = false;
+        Ok(SubmitAdmission { current, tip })
+    }
+
+    #[cfg(test)]
+    pub(super) async fn submit_tip_view(&self) -> Result<TipView, StratumError> {
+        Ok(self.submit_admission().await?.tip)
     }
 
     pub(super) async fn tip_parent(&self, selected: &TipView) -> Result<String> {

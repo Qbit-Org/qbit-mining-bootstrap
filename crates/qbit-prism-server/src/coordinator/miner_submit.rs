@@ -19,19 +19,16 @@ impl Coordinator {
             })?;
             (last_poll, readiness.generation)
         };
-        let current = self
-            .prepared
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| protocol_error("pool-closed", "no current work"))?;
         let context = &job.context;
         self.ensure_job_fee_current(context.prepared.fee)
             .await
             .map_err(|_| {
                 protocol_error("stale-job", "job CTV fee is below the current relay floor")
             })?;
-        let selected = self.submit_tip_view().await?;
+        let tip_observation::SubmitAdmission {
+            current,
+            tip: selected,
+        } = self.submit_admission().await?;
         if last_poll.elapsed() >= self.config.health_timeout && !selected.share_lease {
             return Err(protocol_error(
                 "backend-rpc-unavailable",
@@ -61,7 +58,9 @@ impl Coordinator {
             || (context.prepared.snapshot.payout_revision != revision
                 && !(selected.share_lease
                     && context.prepared.snapshot.payout_revision
-                        == current.snapshot.payout_revision))
+                        == current.snapshot.payout_revision
+                    && current.template["previousblockhash"].as_str()
+                        == Some(job.wire.previousblockhash.as_str())))
             || (current.snapshot.payout_revision != revision && !selected.share_lease)
         {
             return Err(protocol_error("stale-job", "stale job"));
