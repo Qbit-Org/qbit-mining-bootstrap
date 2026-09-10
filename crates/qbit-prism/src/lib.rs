@@ -390,10 +390,10 @@ pub enum PayoutMaturityState {
 ///
 /// `Serialize` is hand-written and delegates to the private `AuditBundleRef`
 /// view, the single definition of the canonical audit bytes that the borrowed
-/// parts API ([`AuditBody`] plus `&[AcceptedShare]`) shares. The
-/// `skip_serializing_if` attributes below document the wire format and are
-/// mirrored on `AuditBundleRef`, which is what actually serializes; keep the
-/// two in step. `Deserialize` stays derived.
+/// parts API ([`AuditBody`] plus `&[AcceptedShare]`) shares. That view alone
+/// decides field order and which absent optional fields are omitted, so the
+/// fields below carry no serialization attributes; `#[serde(default)]` is for
+/// the derived `Deserialize`, which accepts a bundle that omits them.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct AuditBundle {
     pub schema: String,
@@ -401,22 +401,22 @@ pub struct AuditBundle {
     pub found_block: FoundBlock,
     pub prior_balances: Vec<CarryForwardBalance>,
     pub payout_policy: PayoutPolicy,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub coinbase_script_sig_suffix_hex: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub witness_merkle_leaves_hex: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub audit_commitment_leaves_hex: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub audit_commitment_root_hex: Option<String>,
     pub ledger_window_attestation: LedgerWindowAttestation,
     pub reward_manifest: PrismRewardManifest,
     pub payout_policy_manifest: PayoutPolicyManifest,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub settlement_mode_decision: Option<SettlementModeDecision>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub ctv_fanout_fee_policy: Option<FanoutFeeRatePolicy>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub ctv_fanout_manifest_set: Option<CtvFanoutManifestSet>,
     pub signed_coinbase_manifest: SignedPayoutManifest,
 }
@@ -485,8 +485,12 @@ impl AuditBundle {
 ///
 /// The body's own serde form is not an audit artifact. It omits `shares`, so
 /// it has no canonical bytes and no published sha256. Produce those with
-/// [`canonical_audit_bundle_bytes_from_parts`].
+/// [`canonical_audit_bundle_bytes_from_parts`]. Decoding rejects unknown
+/// fields, so a full bundle (which has `shares`) cannot be read as a body and
+/// silently lose its window; decode it as [`AuditBundle`] and call
+/// [`AuditBundle::into_parts`].
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AuditBody {
     pub schema: String,
     pub found_block: FoundBlock,
@@ -2627,8 +2631,23 @@ fn share_slice_digest_hex(shares: &[CountedShare]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn prior_balances_digest_hex(balances: &[CarryForwardBalance]) -> String {
-    let mut ordered = balances.to_vec();
+/// The sha256 digest a ledger window attestation commits to for the prior
+/// carry-forward balances. It equals
+/// `ledger_window_attestation.prior_balances_digest_hex` decoded from hex.
+///
+/// The balances are sorted by `(order_key, recipient_id, p2mr_program_hex)`,
+/// so the digest does not depend on input order. Each balance then feeds the
+/// hash, in order, with:
+///
+/// - `recipient_id`, `order_key` and `p2mr_program_hex`, each as its UTF-8
+///   byte length (`u64`, big-endian) followed by its bytes;
+/// - `balance_sats` as a 16-byte big-endian two's-complement `i128`.
+///
+/// No count or separator is added, so an empty slice hashes to sha256 of the
+/// empty string. The digest is part of a signed, persisted attestation and
+/// must not change for any input.
+pub fn prior_balances_digest(balances: &[CarryForwardBalance]) -> [u8; 32] {
+    let mut ordered = balances.iter().collect::<Vec<_>>();
     ordered.sort_by(|left, right| {
         left.order_key
             .cmp(&right.order_key)
@@ -2643,7 +2662,11 @@ fn prior_balances_digest_hex(balances: &[CarryForwardBalance]) -> String {
         update_string(&mut hasher, &balance.p2mr_program_hex);
         update_i128(&mut hasher, balance.balance_sats);
     }
-    hex::encode(hasher.finalize())
+    hasher.finalize().into()
+}
+
+fn prior_balances_digest_hex(balances: &[CarryForwardBalance]) -> String {
+    hex::encode(prior_balances_digest(balances))
 }
 
 fn update_string(hasher: &mut Sha256, value: &str) {

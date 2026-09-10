@@ -11,7 +11,7 @@ use qbit_prism::{
     build_audit_bundle, build_audit_bundle_with_coinbase_options,
     build_audit_bundle_with_coinbase_script_sig_suffix,
     build_audit_bundle_with_ctv_settlement_options, canonical_audit_bundle_bytes,
-    canonical_audit_bundle_bytes_from_parts, verify_audit_bundle,
+    canonical_audit_bundle_bytes_from_parts, prior_balances_digest, verify_audit_bundle,
     verify_audit_bundle_against_coinbase_tx_hex,
     verify_audit_bundle_against_coinbase_tx_hex_and_expected_coinbase_value, verify_audit_parts,
     verify_audit_parts_against_coinbase_tx_hex,
@@ -28,6 +28,12 @@ const MINERS: u64 = 7;
 /// sha256 and length of each case's canonical bytes, recorded from the owned
 /// builders at 3.x.x 1398bbc1 (before the parts API existed). Both paths must
 /// still produce exactly these bytes.
+///
+/// These constants are the real guard against byte drift: the owned wrappers
+/// now build through the parts API, so owned-equals-parts assertions are
+/// tautological by construction. They were built by these fixtures against
+/// 1398bbc1's owned builders; never re-record from a build that contains the
+/// parts API.
 const BASE_CANONICAL: [(&str, &str, usize); 6] = [
     (
         "build_audit_bundle/v1",
@@ -542,6 +548,119 @@ fn parts_verifier_reads_the_lent_window() {
         verify_audit_parts(&body, &stripped, &ledger_key),
         Err(PrismError::AuditMismatch { artifact: "schema" })
     ));
+}
+
+/// sha256 and length of the canonical bytes of the `build_audit_bundle/v1`
+/// case with every optional top-level field absent: after building,
+/// `audit_commitment_leaves_hex` is cleared and `audit_commitment_root_hex`
+/// set to `None` (the builder already leaves the suffix, witness leaves,
+/// settlement decision and CTV fields absent). Recorded by running this exact
+/// fixture and mutation as a test in a `git archive` copy of 3.x.x 1398bbc1,
+/// where `AuditBundle` still derived `Serialize` with its own
+/// `skip_serializing_if` rules. Never re-record from a build that contains the
+/// parts API.
+const BASE_ALL_OPTIONAL_ABSENT: (&str, usize) = (
+    "c3cf29fd48b638ce5fc26b6aacd90bf1251995f0a443e5a216ff00cc99361196",
+    240_513,
+);
+
+/// `ledger_window_attestation.prior_balances_digest_hex` of every case (they
+/// share `prior_balances()`), recorded from 1398bbc1 alongside
+/// [`BASE_ALL_OPTIONAL_ABSENT`].
+const BASE_PRIOR_BALANCES_DIGEST_HEX: &str =
+    "25d51842a8bb7447861eae9fdd5e4b7730cf4fea67fe945cb99dc824f4ec0b81";
+
+const OPTIONAL_BUNDLE_KEYS: [&str; 7] = [
+    "coinbase_script_sig_suffix_hex",
+    "witness_merkle_leaves_hex",
+    "audit_commitment_leaves_hex",
+    "audit_commitment_root_hex",
+    "settlement_mode_decision",
+    "ctv_fanout_fee_policy",
+    "ctv_fanout_manifest_set",
+];
+
+/// The `AuditBundleRef` view alone decides which absent fields are omitted;
+/// with all of them absent, owned and parts bytes still match the base.
+#[test]
+fn all_optional_fields_absent_matches_base() {
+    let case = cases().remove(0);
+    assert_eq!(case.name, "build_audit_bundle/v1");
+    let mut bundle = build_owned(case);
+    bundle.audit_commitment_leaves_hex.clear();
+    bundle.audit_commitment_root_hex = None;
+    assert_eq!(bundle.schema, AUDIT_BUNDLE_SCHEMA_V1);
+    assert!(bundle.coinbase_script_sig_suffix_hex.is_none());
+    assert!(bundle.witness_merkle_leaves_hex.is_empty());
+    assert!(bundle.settlement_mode_decision.is_none());
+    assert!(bundle.ctv_fanout_fee_policy.is_none());
+    assert!(bundle.ctv_fanout_manifest_set.is_none());
+
+    let (base_sha256, base_len) = BASE_ALL_OPTIONAL_ABSENT;
+    let bytes = canonical_audit_bundle_bytes(&bundle).unwrap();
+    assert_eq!(bytes.len(), base_len);
+    assert_eq!(sha256_hex(&bytes), base_sha256);
+
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let keys = json.as_object().unwrap();
+    for key in OPTIONAL_BUNDLE_KEYS {
+        assert!(!keys.contains_key(key), "{key} serialized while absent");
+    }
+
+    let (body, shares) = bundle.clone().into_parts();
+    assert_eq!(
+        canonical_audit_bundle_bytes_from_parts(&body, &shares).unwrap(),
+        bytes
+    );
+    let decoded: AuditBundle = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(decoded, bundle);
+}
+
+/// The exported digest is the one the ledger window attestation signs, for
+/// bundles built by the existing owned builders, and ignores input order.
+#[test]
+fn prior_balances_digest_matches_the_attestation() {
+    for case in cases() {
+        assert_eq!(case.prior_balances, prior_balances(), "{}", case.name);
+        let name = case.name;
+        let bundle = build_owned(case);
+        let digest = prior_balances_digest(&bundle.prior_balances);
+        assert_eq!(
+            hex::encode(digest),
+            bundle.ledger_window_attestation.prior_balances_digest_hex,
+            "{name}"
+        );
+        assert_eq!(
+            hex::encode(digest),
+            BASE_PRIOR_BALANCES_DIGEST_HEX,
+            "{name}"
+        );
+        let mut reversed = bundle.prior_balances.clone();
+        reversed.reverse();
+        assert_ne!(reversed, bundle.prior_balances, "{name}: fixture order");
+        assert_eq!(prior_balances_digest(&reversed), digest, "{name}");
+    }
+}
+
+/// A full bundle carries `shares`, which `AuditBody` has no field for;
+/// decoding one as a body must fail rather than silently drop the window.
+#[test]
+fn audit_body_rejects_a_full_bundle() {
+    let case = cases().remove(0);
+    let body = build_borrowed(&case, &case.shares);
+    let bundle_bytes = canonical_audit_bundle_bytes_from_parts(&body, &case.shares).unwrap();
+
+    let error = serde_json::from_slice::<AuditBody>(&bundle_bytes).unwrap_err();
+    assert!(
+        error.to_string().contains("unknown field `shares`"),
+        "{error}"
+    );
+
+    let body_json = serde_json::to_vec(&body).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<AuditBody>(&body_json).unwrap(),
+        body
+    );
 }
 
 /// A clone of the window would need a second allocation while the first is
