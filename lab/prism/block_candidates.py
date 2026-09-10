@@ -1870,8 +1870,14 @@ class BlockCandidateService:
         credit = header.get("credit_share_on_accept")
         if not isinstance(credit, bool):
             raise ValueError("durable block candidate header carries no credit flag")
+        # An oversized header replaces an over-bound fact with None and defers
+        # it to the body (``replay_header_from_fields``); a long worker name
+        # does this to ``username`` and ``pending_share.share_id``. That
+        # placeholder is not corruption: hydration reads the real value and
+        # the identity digest verifies it.
+        oversized = header.get("oversized") is True
         username = header.get("username")
-        if not isinstance(username, str):
+        if not isinstance(username, str) and not (oversized and username is None):
             raise ValueError("durable block candidate header carries no username")
         storage_version = int(row.get("storage_version") or 1)
         candidate_sha256 = str(row.get("candidate_sha256") or "")
@@ -1902,6 +1908,7 @@ class BlockCandidateService:
             body=body,
             cursor=row.get("cursor"),
             row=dict(row),
+            header_oversized=oversized,
         )
 
     def _register_durable_block_candidate_header_row(
@@ -2041,6 +2048,16 @@ class BlockCandidateService:
                 if holder is None:
                     holder = self._adopt_replay_descriptor_floor(descriptor)
                     self._take_replay_floor_holder(block_hash)
+                body_share = candidate.pending_share
+                if body_share is not None and body_share != holder:
+                    # The header's copy held the floor until the body was
+                    # read, but an oversized header carries None
+                    # placeholders. The digest-verified body is
+                    # authoritative: adopt it before releasing the stand-in
+                    # so the floor never lapses.
+                    self.ports.share_writer().adopt_pending_share(body_share)
+                    self._coordinator._finish_pending_share_candidate(holder)
+                    holder = body_share
                 candidate = dataclass_replace(candidate, pending_share=holder)
             candidate = dataclass_replace(candidate, durable_replay=True)
             transferred = True

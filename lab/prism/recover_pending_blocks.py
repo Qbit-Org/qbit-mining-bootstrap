@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 from lab.auxpow.stratum_codec import header_hash_hex
 from lab.prism.block_candidates import _BlockCandidateNodeSubmission
+from lab.prism.candidate_store import CANDIDATE_SCHEMA_CAPABILITY, candidate_schema_refusal
 from lab.prism.coordinator_config import CoordinatorConfig, load_coordinator_config
 from lab.prism.prism_coordinator import PrismCoordinator
 from lab.prism.recovery_json import cooperative_json
@@ -98,6 +99,30 @@ class RecoveryReader:
     def close(self) -> None:
         self.connection.close()
 
+    def require_candidate_schema(self) -> None:
+        """Refuse a database this release cannot finalize against (#255).
+
+        The coordinator's ledger applies the same rule when --apply builds
+        it; checking here lets the read-only plan report an unmigrated
+        database before any writer lease is requested.
+        """
+        presence = self.connection.execute(
+            """SELECT to_regclass('qbit_block_candidate_body') IS NOT NULL AS has_body_table,
+                      to_regclass('qbit_prism_schema_capabilities') IS NOT NULL AS has_capabilities"""
+        ).fetchone()
+        declared = None
+        if presence["has_capabilities"]:
+            capability = self.connection.execute(
+                """SELECT capability_value FROM qbit_prism_schema_capabilities
+                   WHERE capability = %s""",
+                (CANDIDATE_SCHEMA_CAPABILITY,),
+            ).fetchone()
+            if capability is not None:
+                declared = int(capability["capability_value"])
+        refusal = candidate_schema_refusal(declared, bool(presence["has_body_table"]))
+        if refusal is not None:
+            raise RecoveryError(refusal)
+
     def metadata(self, block_hash: str) -> dict[str, Any] | None:
         return self.connection.execute(
             """SELECT outbox.block_hash, outbox.state, outbox.candidate_sha256,
@@ -160,10 +185,11 @@ def require_completed(row: dict[str, Any] | None, block: RecoveryBlock) -> None:
 
 
 def plan_recovery(reader: RecoveryReader, rpc: Any, hashes: list[str]) -> list[RecoveryBlock]:
-    """Validate the entire allowlist before the first writer lease is acquired."""
+    """Validate the schema and entire allowlist before the first writer lease."""
     hashes = [canonical_hex(value, name="block_hash", expected_bytes=32) for value in hashes]
     if not hashes or len(hashes) > MAX_RECOVERY_BLOCKS or len(set(hashes)) != len(hashes):
         raise RecoveryError(f"specify 1–{MAX_RECOVERY_BLOCKS} distinct block hashes")
+    reader.require_candidate_schema()
     blocks = []
     for block_hash in hashes:
         row = reader.metadata(block_hash)

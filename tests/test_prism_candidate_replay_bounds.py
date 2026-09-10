@@ -68,3 +68,52 @@ class ReplayDescriptorBoundsTests(unittest.TestCase):
                         self.assertEqual(previews, set())
                 self.assertEqual(seen, [row["block_hash"] for row in rows])
                 self.assertEqual(server._finish_pending_share_candidate.call_count, len(rows))
+
+    def test_oversized_header_is_registered_and_hydrates_the_body_pending_share(self):
+        # share_id is "<username>:<block hash>": at 200 bytes only share_id
+        # exceeds the header bound, at 300 bytes username does too.
+        for username_bytes in (200, 300):
+            with self.subTest(username_bytes=username_bytes):
+                server, _state, _recording = submit_coordinator()
+                service = server._ensure_block_candidate_service()
+                fields = intent("ab" * 32, 0, credit=True)
+                fields["username"] = "q" * username_bytes
+                fields["pending_share"]["share_id"] = f"{fields['username']}:{fields['block_hash_hex']}"
+                header = replay_header_from_fields(fields)
+                self.assertTrue(header["oversized"])
+                self.assertIsNone(header["pending_share"]["share_id"])
+                row = {"block_hash": fields["block_hash_hex"], "storage_version": 1,
+                       "candidate_sha256": "ab" * 32, "cursor": 1, "header": header}
+
+                def headers(*, limit, after_cursor, max_bytes):
+                    page = (row,) if after_cursor is None else ()
+                    return CandidateHeaderPage(page, 1, True, len(page), False)
+
+                server.ledger = SimpleNamespace(
+                    candidate_hydration_deferred=True,
+                    pending_block_candidate_headers=headers,
+                    hydrate_block_candidate_intent=lambda _row, **_kwargs: fields,
+                )
+                server.config = SimpleNamespace(block=SimpleNamespace(replay_page_size=8))
+                server._run_block_submitter_ledger_call = lambda _key, _phase, call, **_kwargs: call()
+                server._block_landing_db_timeout = lambda: 5.0
+                service._collapse_superseded_block_candidates = lambda rows, **_kwargs: rows
+                server._begin_accepted_block_payout_preview = mock.Mock()
+                server._queue_invalid_block_candidate_for_quarantine = mock.Mock()
+                server._finish_pending_share_candidate = mock.Mock()
+                server._note_block_replay_enumeration_owed()
+                writer = service.ports.share_writer()
+                with mock.patch.object(writer, "adopt_pending_share") as adopt, \
+                        mock.patch("builtins.print"):
+                    self.assertEqual(server.replay_pending_block_candidates(), 1)
+                    descriptor = service._block_replay_candidate_queue.get_nowait()
+                    self.assertTrue(descriptor.header_oversized)
+                    stand_in = service._block_replay_floor_holders[descriptor.block_hash]
+                    candidate = service._hydrate_replay_descriptor(descriptor)
+                server._queue_invalid_block_candidate_for_quarantine.assert_not_called()
+                self.assertEqual(candidate.pending_share.share_id, fields["pending_share"]["share_id"])
+                # The body's share takes the floor before the stand-in leaves it.
+                self.assertEqual([call.args[0] for call in adopt.call_args_list],
+                                 [stand_in, candidate.pending_share])
+                server._finish_pending_share_candidate.assert_called_once_with(stand_in)
+                self.assertEqual(service._block_replay_floor_holders, {})

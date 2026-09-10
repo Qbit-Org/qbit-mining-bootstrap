@@ -128,7 +128,7 @@ class SpoolAdmissionExhausted(CandidateStorageError):
 
 
 class IncompatibleCandidateSchema(CandidateStorageError):
-    """The database declares candidate storage newer than this process."""
+    """The database's candidate schema is newer than this process, or unmigrated."""
 
 
 def new_body_id() -> str:
@@ -215,7 +215,9 @@ class DurableCandidateDescriptor:
     storage_version: int
     credit_share_on_accept: bool
     collection_only: bool
-    username: str
+    # None only when the header is oversized: the fact was deferred to the
+    # body, which hydration reads (``replay_header_from_fields``).
+    username: str | None
     pending_share: dict[str, Any]
     accepted_at_present: bool
     accepted_at_ms: Any
@@ -264,6 +266,35 @@ SELECT json_build_object(
     )
 );
 """
+
+
+def candidate_schema_refusal(declared: int | None, has_body_table: bool) -> str | None:
+    """Why this process must not use the database's candidate schema, or None.
+
+    Every storage version needs the 002 migration: replay projects headers
+    through its function and the terminal outbox statements retire body
+    references in its columns, so ``PRISM_CANDIDATE_STORAGE_VERSION=1``
+    stops version-2 writes but never makes an unmigrated database usable.
+    The capability row is declared last, so its absence also marks a
+    partially applied migration. A declared version above this process's
+    is the rollback floor. Shared by the coordinator boot check and the
+    offline recovery reader.
+    """
+    if declared is not None and declared > CANDIDATE_BODY_STORAGE_VERSION:
+        return (
+            f"database declares candidate storage version {declared}; this "
+            f"process understands up to {CANDIDATE_BODY_STORAGE_VERSION} and "
+            "must not write to it (rollback floor)"
+        )
+    if not has_body_table or declared is None or declared < CANDIDATE_BODY_STORAGE_VERSION:
+        return (
+            "the database lacks the 002_candidate_bodies.sql migration; apply it "
+            "(PRISM_POSTGRES_INIT_SCHEMA=1 does so at startup) before starting "
+            "this release. PRISM_CANDIDATE_STORAGE_VERSION=1 only stops "
+            "version-2 writes: replay and terminal outbox statements use the "
+            "migrated schema for every storage version"
+        )
+    return None
 
 
 def stage_body_sql(
@@ -1638,6 +1669,7 @@ __all__ = [
     "body_page_sql",
     "body_pages_sql",
     "body_spans_sql",
+    "candidate_schema_refusal",
     "chunk_hex_literal",
     "header_page_sql",
     "helper_main",

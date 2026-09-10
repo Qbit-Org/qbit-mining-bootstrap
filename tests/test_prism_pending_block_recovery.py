@@ -380,6 +380,36 @@ class NativeRecoveryTests(unittest.TestCase):
             finally:
                 reader.close()
 
+    def test_legacy_only_schema_is_refused_by_the_reader_and_the_ledger(self):
+        # A 001-only database: the staged-upgrade case with
+        # PRISM_POSTGRES_INIT_SCHEMA=0, which storage version 1 cannot rescue.
+        import psycopg
+        from psycopg.conninfo import make_conninfo
+
+        from lab.prism.candidate_store import IncompatibleCandidateSchema
+
+        schema = "recovery_legacy_" + uuid.uuid4().hex
+        self.admin.execute(f'CREATE SCHEMA "{schema}"')
+        self.addCleanup(self.admin.execute, f'DROP SCHEMA "{schema}" CASCADE')
+        url = make_conninfo(
+            os.environ["PRISM_RECOVERY_TEST_DATABASE_URL"], options=f"-csearch_path={schema}"
+        )
+        with psycopg.connect(url, autocommit=True) as connection:
+            connection.execute(Path("crates/qbit-prism/sql/001_share_ledger.sql").read_text())
+        reader = recovery.RecoveryReader(url)
+        self.addCleanup(reader.close)
+        with self.assertRaisesRegex(recovery.RecoveryError, "002_candidate_bodies.sql"):
+            reader.require_candidate_schema()
+        ledger = PsqlShareLedger(
+            psql_command="psql",
+            database_url=url,
+            native_client_mode="on",
+            candidate_storage_version=1,
+        )
+        self.addCleanup(ledger.close)
+        with self.assertRaisesRegex(IncompatibleCandidateSchema, "002_candidate_bodies.sql"):
+            ledger.verify_candidate_schema()
+
     def test_real_finalizer_persists_confirms_publishes_and_completes_outbox(self):
         # Real coordinator, PostgreSQL, lease heartbeat, finalizer and audit
         # publication. Only the node and cryptographic builder/verifier use

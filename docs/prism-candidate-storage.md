@@ -8,8 +8,13 @@ offline accepted-pending recovery command introduced by PR #259.
 ## Storage and resource settings
 
 Apply `001_share_ledger.sql` followed by `002_candidate_bodies.sql` before
-enabling version 2 writes. `PRISM_POSTGRES_INIT_SCHEMA=1` performs this at startup;
-the migrations are idempotent. Existing version 1 JSONB outbox rows remain intact
+starting this release, whichever storage version it writes.
+`PRISM_POSTGRES_INIT_SCHEMA=1` performs this at startup; the migrations are
+idempotent. Replay headers and terminal outbox statements use the migrated
+columns for both storage versions, so the coordinator and the offline recovery
+command refuse a database without `002`; `PRISM_CANDIDATE_STORAGE_VERSION=1`
+stops version 2 writes but does not make an unmigrated database usable.
+Existing version 1 JSONB outbox rows remain intact
 and readable. New version 2 rows reference a sealed body and carry a small replay
 header; the old `candidate` column is null for those rows.
 

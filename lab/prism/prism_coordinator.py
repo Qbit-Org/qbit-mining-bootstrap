@@ -3422,8 +3422,8 @@ class PrismCoordinator:
         )
         try:
             # Issue #255 rollback floor: refuse a database whose candidate
-            # storage is newer than this process, or version-2 writes
-            # against a database without the migration, before any share
+            # storage is newer than this process, or one without the 002
+            # migration (every storage version needs it), before any share
             # or candidate is written.
             ledger.verify_candidate_schema()
         except IncompatibleCandidateSchema as exc:

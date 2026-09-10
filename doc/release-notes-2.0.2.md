@@ -25,7 +25,10 @@ the production exits reported in #255.
 ## Upgrade and rollback
 
 Follow the schema, capacity, rollout and rollback procedure in
-[the candidate storage guide](../docs/prism-candidate-storage.md). Qualify a
+[the candidate storage guide](../docs/prism-candidate-storage.md). Apply
+`002_candidate_bodies.sql` (or start with `PRISM_POSTGRES_INIT_SCHEMA=1`) before
+starting this release: the coordinator and the offline recovery command refuse
+an unmigrated database for either storage version. Qualify a
 compatible reader before enabling the new body representation. Keep the additive
 schema during rollback. Once a new-format pending candidate exists, rolling back
 to a reader that cannot hydrate it is unsafe; use the compatible reader with

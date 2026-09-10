@@ -62,6 +62,7 @@ from lab.prism.candidate_store import (
     body_page_sql,
     body_pages_sql,
     body_spans_sql,
+    candidate_schema_refusal,
     header_page_sql,
     parse_body_page,
     parse_manifest_row,
@@ -4802,10 +4803,11 @@ SELECT json_build_object(
         Reads what the schema declares (``qbit_prism_schema_capabilities``)
         and whether the chunked-body tables exist. A declared storage
         version above the one this process understands raises
-        :class:`IncompatibleCandidateSchema`; a ledger configured for
-        version-2 writes against a database without the migration raises
-        too, before any candidate is staged. Cached after the first
-        successful check; the coordinator also calls it at boot.
+        :class:`IncompatibleCandidateSchema`; so does a database without
+        the 002 migration, whichever storage version is configured (replay
+        and the terminal outbox statements use its columns), before any
+        candidate is staged. Cached after the first successful check; the
+        coordinator also calls it at boot.
         """
         cached = getattr(self, "_candidate_schema_verified", None)
         if cached is not None:
@@ -4824,22 +4826,9 @@ SELECT json_build_object(
             capability = self._run_json(schema_capability_sql())
             if isinstance(capability, dict) and capability.get("declared") is not None:
                 declared = int(capability["declared"])
-        if declared is not None and declared > CANDIDATE_BODY_STORAGE_VERSION:
-            raise IncompatibleCandidateSchema(
-                f"database declares candidate storage version {declared}; this "
-                f"process understands up to {CANDIDATE_BODY_STORAGE_VERSION} and "
-                "must not write to it (rollback floor)"
-            )
-        if (
-            self._candidate_storage_version_value() == CANDIDATE_BODY_STORAGE_VERSION
-            and not has_body_table
-        ):
-            raise IncompatibleCandidateSchema(
-                "candidate storage version 2 is configured but the database has "
-                "no qbit_block_candidate_body table; apply 002_candidate_bodies.sql "
-                "(PRISM_POSTGRES_INIT_SCHEMA=1) or run with "
-                "PRISM_CANDIDATE_STORAGE_VERSION=1"
-            )
+        refusal = candidate_schema_refusal(declared, has_body_table)
+        if refusal is not None:
+            raise IncompatibleCandidateSchema(refusal)
         verdict = {"declared": declared, "has_body_table": has_body_table}
         self._candidate_schema_verified = verdict
         return verdict
