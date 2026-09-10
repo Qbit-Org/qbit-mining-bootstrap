@@ -587,8 +587,7 @@ struct IssuedJob<C> {
 
 struct Session<C> {
     worker: Option<Worker>,
-    subscribed: bool,
-    extranonce1: String,
+    extranonce1: Option<String>,
     miner_version_mask: Option<u32>,
     advertised_version_mask: u32,
     difficulty: f64,
@@ -606,11 +605,10 @@ struct Session<C> {
 }
 
 impl<C> Session<C> {
-    fn new(id: u32, config: &StratumConfig, observation: SessionObservation) -> Self {
+    fn new(config: &StratumConfig, observation: SessionObservation) -> Self {
         Self {
             worker: None,
-            subscribed: false,
-            extranonce1: format!("{id:08x}"),
+            extranonce1: None,
             miner_version_mask: None,
             advertised_version_mask: 0,
             difficulty: config
@@ -670,7 +668,7 @@ impl<C> Session<C> {
         if let Some(next) = self.vardiff.retarget(self.difficulty) {
             self.pending_retarget = Some((self.difficulty, previous));
             self.difficulty = next;
-            self.retry_job = self.worker.is_some() && self.subscribed;
+            self.retry_job = self.worker.is_some() && self.extranonce1.is_some();
         }
     }
 
@@ -800,7 +798,10 @@ async fn deliver_job<B: MiningBackend>(
     writer: &mut OwnedWriteHalf,
     config: &StratumConfig,
 ) -> Result<()> {
-    let Some(worker) = session.worker.as_ref().filter(|_| session.subscribed) else {
+    let Some(extranonce1) = session.extranonce1.as_deref() else {
+        return Ok(());
+    };
+    let Some(worker) = session.worker.as_ref() else {
         return Ok(());
     };
     let mut observation = DeliveryObservation::new(config.stats.clone());
@@ -813,7 +814,7 @@ async fn deliver_job<B: MiningBackend>(
         backend
             .build_job(
                 worker,
-                &session.extranonce1,
+                extranonce1,
                 session.difficulty,
                 config.minimum_difficulty,
             )
@@ -976,7 +977,17 @@ async fn request<B: MiningBackend>(
                 result(writer, id.clone(), json!({"ready":ready}), config).await?;
             }
             "mining.subscribe" => {
-                session.subscribed = true;
+                if session.extranonce1.is_none() {
+                    let id = timeout(
+                        Duration::from_secs_f64(config.initial_job_timeout_seconds),
+                        backend.new_session_id(),
+                    )
+                    .await
+                    .map_err(|_| StratumError::backend("session allocation timed out"))??;
+                    // Requests are serial within a session. Publish only a
+                    // successful allocation; later subscribes reuse this ID.
+                    session.extranonce1 = Some(format!("{id:08x}"));
+                }
                 result(
                     writer,
                     id.clone(),
@@ -1102,7 +1113,7 @@ async fn request<B: MiningBackend>(
                 }
                 session.worker = Some(worker);
                 session.observation.authorize();
-                session.retry_job = session.subscribed;
+                session.retry_job = session.extranonce1.is_some();
                 result(writer, id.clone(), json!(true), config).await?;
             }
             "mining.configure" => {
@@ -1139,7 +1150,8 @@ async fn request<B: MiningBackend>(
                                 "version-rolling.mask".into(),
                                 json!(format!("{mask:08x}")),
                             );
-                            session.retry_job = session.worker.is_some() && session.subscribed;
+                            session.retry_job =
+                                session.worker.is_some() && session.extranonce1.is_some();
                         } else {
                             response.insert(extension.into(), json!(false));
                         }
@@ -1161,7 +1173,7 @@ async fn request<B: MiningBackend>(
                 if let Some(suggestion) = suggestion {
                     session.suggested = Some(suggestion);
                     session.apply_requests(config);
-                    session.retry_job = session.worker.is_some() && session.subscribed;
+                    session.retry_job = session.worker.is_some() && session.extranonce1.is_some();
                 }
                 result(writer, id.clone(), json!(true), config).await?;
             }
@@ -1169,7 +1181,7 @@ async fn request<B: MiningBackend>(
                 let worker = session
                     .worker
                     .as_ref()
-                    .filter(|_| session.subscribed)
+                    .filter(|_| session.extranonce1.is_some())
                     .ok_or_else(|| {
                         StratumError::new(
                             20,
@@ -1339,12 +1351,7 @@ async fn session<B: MiningBackend>(
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     let observation = SessionObservation::new(config.stats.clone());
-    let id = timeout(
-        Duration::from_secs_f64(config.initial_job_timeout_seconds),
-        backend.new_session_id(),
-    )
-    .await??;
-    let mut session = Session::new(id, &config, observation);
+    let mut session = Session::new(&config, observation);
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut buffer = Vec::new();
@@ -1362,7 +1369,7 @@ async fn session<B: MiningBackend>(
             changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow() { break; } }
             changed = refresh.changed() => {
                 if changed.is_err() { break; }
-                session.retry_job = session.worker.is_some() && session.subscribed;
+                session.retry_job = session.worker.is_some() && session.extranonce1.is_some();
             }
             _ = timer.tick() => {
                 if session.jobs.is_empty() && connected.elapsed().as_secs_f64() > config.initial_job_timeout_seconds { break; }
@@ -1423,7 +1430,7 @@ pub async fn run_listener<B: MiningBackend>(
                 connections.spawn(async move {
                     let _permit = permit;
                     if let Err(error) = session(stream,backend,config,refresh,shutdown).await {
-                        eprintln!("Stratum connection ended: {error:#}");
+                        tracing::warn!(error = %format_args!("{error:#}"), "Stratum connection ended");
                     }
                 });
             }
