@@ -1334,6 +1334,18 @@ def _dequeued_candidate_collapse_row(
     }
 
 
+def _joined_intent_text(value: Any) -> str:
+    """A hydrated string fact the consumer needs whole, joined explicitly.
+
+    Only the fixed-metadata fields are always decoded as ``str``; any other
+    string above the view threshold stays a streamed ``SpoolStringView``,
+    which refuses ``str()`` (#255). Everything else keeps ``str()``.
+    """
+    if callable(getattr(value, "iter_text_chunks", None)):
+        return "".join(value.iter_text_chunks())
+    return str(value)
+
+
 def block_candidate_from_intent(intent: Mapping[str, Any]) -> PrismBlockCandidate:
     """Decode and validate a durable candidate intent without side effects.
 
@@ -1347,6 +1359,9 @@ def block_candidate_from_intent(intent: Mapping[str, Any]) -> PrismBlockCandidat
     if intent.get("schema") != BLOCK_CANDIDATE_INTENT_SCHEMA:
         raise ValueError("unsupported block candidate intent schema")
     block_hash = str(intent["block_hash_hex"]).lower()
+    # Not fixed metadata: a username with a JSON encoding over 1 MiB is
+    # hydrated as a streamed view, and the worker identity needs it whole.
+    username = _joined_intent_text(intent["username"])
     template = dict(intent["template"])
     if str(template.get("previousblockhash", "")).lower() != str(intent["parent_hash"]).lower():
         raise ValueError("block candidate parent hash does not match template")
@@ -1389,7 +1404,7 @@ def block_candidate_from_intent(intent: Mapping[str, Any]) -> PrismBlockCandidat
         share_weight=0,
         collection_only=bool(intent.get("collection_only", False)),
         worker=WorkerIdentity(
-            username=str(intent["username"]),
+            username=username,
             payout_address="",
             worker_name=None,
             script_pubkey_hex="",
@@ -1412,7 +1427,7 @@ def block_candidate_from_intent(intent: Mapping[str, Any]) -> PrismBlockCandidat
         extranonce1_hex=str(intent["extranonce1_hex"]),
         extranonce2_hex=str(intent["extranonce2_hex"]),
         pending_share=PendingShare(**dict(intent["pending_share"])),
-        client=SimpleNamespace(username=str(intent["username"])),
+        client=SimpleNamespace(username=username),
         credit_share_on_accept=bool(intent.get("credit_share_on_accept", False)),
     )
 

@@ -1,4 +1,4 @@
-"""A streamed block hex from a hydrated body survives every consumer (#255)."""
+"""Streamed strings from a hydrated body survive every replay consumer (#255)."""
 
 from dataclasses import replace
 import json
@@ -51,6 +51,20 @@ class StreamedBlockHexConsumerTests(SpoolFixture):
             hydrated, _body = self.hydrate(fields)
             self.assertIsInstance(hydrated["block_hex"], views.SpoolStringView)
             replayed = replace(block_candidate_from_intent(hydrated), durable_replay=True)
+            plain = replace(block_candidate_from_intent(fields), durable_replay=True)
+            self.assertEqual(
+                block_candidate_intent(replayed).candidate_sha256,
+                block_candidate_intent(plain).candidate_sha256,
+            )
+
+    def test_streamed_username_is_decoded_for_the_worker_identity(self):
+        fields = {**credited_fields(), "username": "q" * 40_000 + ".worker"}
+        with self.bounded(THRESHOLD):
+            hydrated, _body = self.hydrate(fields)
+            self.assertIsInstance(hydrated["username"], views.SpoolStringView)
+            replayed = replace(block_candidate_from_intent(hydrated), durable_replay=True)
+            self.assertEqual(replayed.context.worker.username, fields["username"])
+            self.assertEqual(replayed.client.username, fields["username"])
             plain = replace(block_candidate_from_intent(fields), durable_replay=True)
             self.assertEqual(
                 block_candidate_intent(replayed).candidate_sha256,
