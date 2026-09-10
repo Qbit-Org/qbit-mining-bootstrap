@@ -2,8 +2,8 @@
 //!
 //! This is the Rust side of the #131 window-pipeline migration: a
 //! byte-identical reimplementation of the coordinator's
-//! `IncrementalShareWindow` (`lab/prism/share_ledger.py`) proven against the
-//! differential parity oracle in `tests/window_pipeline_parity.py`. Every
+//! legacy `IncrementalShareWindow`, previously checked against a Python
+//! differential parity oracle and retained here with native regression coverage. Every
 //! rule here mirrors a named invariant of the Python fold: eligibility on
 //! both timestamps, ascending `share_seq` with duplicate detection, duplicate
 //! `share_id` detection, non-positive difficulty rejection, the exact
@@ -50,7 +50,7 @@
 //! request -- and the coordinator folds that window in-process, where
 //! Python's unbounded integers produce the right answer; the daemon keeps
 //! its state and is never retired for it. [`prepare_window_out_of_range`]
-//! is the classifier, and the parity oracle (`tests/window_pipeline_parity.py`)
+//! is the classifier, and the historical differential parity oracle
 //! mirrors the same table as the `rust-daemon` adapter's declared domain.
 
 use crate::AcceptedShare;
@@ -102,9 +102,7 @@ impl fmt::Display for WindowFoldError {
         let message = match self {
             WindowFoldError::NonPositiveWindowWeight => "window_weight must be positive",
             WindowFoldError::NonPositivePageSize => "page_size must be positive",
-            WindowFoldError::DuplicateShareSeq => {
-                "full payout window contains duplicate share_seq"
-            }
+            WindowFoldError::DuplicateShareSeq => "full payout window contains duplicate share_seq",
             WindowFoldError::DuplicateShareId => "full payout window contains duplicate share_id",
             WindowFoldError::NonPositiveDifficulty => {
                 "full payout window contains non-positive difficulty"
@@ -755,8 +753,7 @@ impl PayoutWindow {
         let mut expired_rows: usize = 0;
         let mut first_retained_page: usize = 0;
         while first_retained_page < pages.len()
-            && total_difficulty - pages[first_retained_page].total_difficulty
-                >= self.window_weight
+            && total_difficulty - pages[first_retained_page].total_difficulty >= self.window_weight
         {
             let page = &pages[first_retained_page];
             total_difficulty -= page.total_difficulty;
@@ -909,11 +906,7 @@ mod tests {
     fn crossing_row_is_retained() {
         // Difficulties (2, 3, 8) at weight 10: the final whole share crossing
         // window_weight (seq 2) is retained, total 11 > 10.
-        let records = vec![
-            share(1, 2, 6, 7),
-            share(2, 3, 8, 9),
-            share(3, 8, 10, 10),
-        ];
+        let records = vec![share(1, 2, 6, 7), share(2, 3, 8, 9), share(3, 8, 10, 10)];
         let window = PayoutWindow::from_full_snapshot(records, 10, 10, 512).expect("fold");
         assert_eq!(window.record_count(), 2);
         assert_eq!(window.total_difficulty, 11);
@@ -963,14 +956,19 @@ mod tests {
     #[test]
     fn advance_matches_full_rebuild_and_reports_byte_surgery() {
         let snapshot: Vec<AcceptedShare> = (1..=7)
-            .map(|seq| share(seq, [5, 1, 1, 2, 1, 3, 1][usize::try_from(seq).unwrap() - 1], 100 - i64::try_from(seq).unwrap(), 100 - i64::try_from(seq).unwrap()))
+            .map(|seq| {
+                share(
+                    seq,
+                    [5, 1, 1, 2, 1, 3, 1][usize::try_from(seq).unwrap() - 1],
+                    100 - i64::try_from(seq).unwrap(),
+                    100 - i64::try_from(seq).unwrap(),
+                )
+            })
             .collect();
-        let window =
-            PayoutWindow::from_full_snapshot(snapshot.clone(), 100, 9, 3).expect("fold");
+        let window = PayoutWindow::from_full_snapshot(snapshot.clone(), 100, 9, 3).expect("fold");
         let old_items = window.canonical_items_bytes();
         let delta = vec![share(9, 2, 101, 99), share(10, 4, 90, 101)];
-        let (advanced, stats, byte_delta) =
-            window.advance(delta.clone(), 101).expect("advance");
+        let (advanced, stats, byte_delta) = window.advance(delta.clone(), 101).expect("advance");
 
         let mut union = snapshot;
         union.extend(delta);
@@ -1505,8 +1503,12 @@ mod tests {
 
         let mut union = uniform_shares(4, 1);
         union.extend(delta);
-        let rebuilt = PayoutWindow::from_full_snapshot(union, 11, 1_000, page_size).expect("rebuild");
-        assert_eq!(advanced.canonical_digest_hex(), rebuilt.canonical_digest_hex());
+        let rebuilt =
+            PayoutWindow::from_full_snapshot(union, 11, 1_000, page_size).expect("rebuild");
+        assert_eq!(
+            advanced.canonical_digest_hex(),
+            rebuilt.canonical_digest_hex()
+        );
         let mut mirrored = old_items[byte_delta.retained_drop_bytes..].to_vec();
         mirrored.extend_from_slice(&byte_delta.appended_items);
         assert_eq!(mirrored, advanced.canonical_items_bytes());

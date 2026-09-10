@@ -14,9 +14,9 @@
 -- base backup.
 --
 -- DATA LOSS: dropping the column discards every assigned publication
--- ordinal. Read "Publication Ordinal Rollback And Schema Revert" in
--- docs/prism-ledger-ops.md first; it states what is lost and the required
--- procedure (stop the coordinator, take a backup).
+-- ordinal. This is a legacy Python-only tool: stop every writer and take a
+-- backup first. Native deployments must restore their pre-migration backup;
+-- see docs/prism-rust-migration.md. The guard below refuses native schemas.
 --
 -- The revert is one transaction serialized behind the same advisory lock as
 -- the forward migration. Any failing step aborts the whole file, so the
@@ -29,6 +29,16 @@ BEGIN;
 SELECT pg_advisory_xact_lock(
     hashtext('qbit_audit_publication_sequence_migration')
 );
+
+DO $$
+BEGIN
+    IF to_regclass(format('%I.qbit_prism_schema_migrations', current_schema()))
+       IS NOT NULL THEN
+        RAISE EXCEPTION
+            'legacy ordinal revert cannot run against native Prism; restore the pre-migration backup';
+    END IF;
+END;
+$$;
 
 -- Fail before touching anything if the pool-block table is missing, then
 -- take the table lock every later step relies on. ACCESS EXCLUSIVE is what

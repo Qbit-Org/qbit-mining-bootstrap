@@ -207,7 +207,9 @@ fn canonicalizer_restores_typed_bytes_for_reordered_unicode_and_optional_input()
     let unicode_canonical = canonical_audit_bundle_bytes(&unicode_bundle).unwrap();
     let unicode_output = canonicalize_cli_value(&reordered, "unicode");
     assert_eq!(unicode_output, unicode_canonical);
-    assert!(unicode_output.windows("miner-é".len()).any(|window| window == "miner-é".as_bytes()));
+    assert!(unicode_output
+        .windows("miner-é".len())
+        .any(|window| window == "miner-é".as_bytes()));
 }
 
 #[test]
@@ -1208,8 +1210,7 @@ fn build_audit_bundle_serve_mode_caches_parsed_windows() {
     let one_shot_input = {
         let mut input = build_fields.clone();
         input["shares"] = serde_json::json!([]);
-        input["compact_share_identities"] =
-            serde_json::Value::Array(compact_identities.clone());
+        input["compact_share_identities"] = serde_json::Value::Array(compact_identities.clone());
         input["compact_shares"] = serde_json::Value::Array(compact_shares.clone());
         input
     };
@@ -1234,8 +1235,7 @@ fn build_audit_bundle_serve_mode_caches_parsed_windows() {
         "stderr: {}",
         String::from_utf8_lossy(&one_shot.stderr)
     );
-    let expected_summary: serde_json::Value =
-        serde_json::from_slice(&one_shot.stdout).unwrap();
+    let expected_summary: serde_json::Value = serde_json::from_slice(&one_shot.stdout).unwrap();
 
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_qbit-prism-build-audit-bundle"))
         .arg("--serve")
@@ -1260,8 +1260,7 @@ fn build_audit_bundle_serve_mode_caches_parsed_windows() {
     assert_eq!(handshake["tool"], "qbit-prism-build-audit-bundle");
 
     let mut request_with_window = build_fields.clone();
-    request_with_window["window_key"] =
-        serde_json::json!({"share_snapshot_sha256": "window-a"});
+    request_with_window["window_key"] = serde_json::json!({"share_snapshot_sha256": "window-a"});
     request_with_window["compact_share_identities"] =
         serde_json::Value::Array(compact_identities.clone());
     request_with_window["compact_shares"] = serde_json::Value::Array(compact_shares.clone());
@@ -1299,9 +1298,13 @@ fn build_audit_bundle_serve_mode_caches_parsed_windows() {
     assert_eq!(hit["window_cache"]["hits"], 1);
 
     let mut request_unknown = build_fields.clone();
-    request_unknown["window_key"] =
-        serde_json::json!({"share_snapshot_sha256": "window-unknown"});
-    writeln!(stdin, "{}", serde_json::to_string(&request_unknown).unwrap()).unwrap();
+    request_unknown["window_key"] = serde_json::json!({"share_snapshot_sha256": "window-unknown"});
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::to_string(&request_unknown).unwrap()
+    )
+    .unwrap();
     line.clear();
     stdout.read_line(&mut line).unwrap();
     let missing: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -1661,7 +1664,10 @@ fn prepare_window_advance_ignores_the_append_invalidation_epoch_tag() {
     assert_eq!(full["ok"], true, "full response: {line}");
     assert_eq!(full["record_count"], 3);
     let base_digest = full["share_snapshot_sha256"].as_str().unwrap().to_string();
-    drain_section(&mut stdout, full["window_items_len"].as_u64().unwrap() as usize);
+    drain_section(
+        &mut stdout,
+        full["window_items_len"].as_u64().unwrap() as usize,
+    );
 
     // A build at a newer epoch must not evict the prepared window either.
     let build = serde_json::json!({

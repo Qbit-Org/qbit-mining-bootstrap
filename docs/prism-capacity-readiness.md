@@ -7,7 +7,8 @@ and the coordinator do not consume an artifact or any `PRISM_CAPACITY_*`
 environment variables.
 
 The bootstrap repository ships the strict
-`qbit-prism-capacity-evidence/v2` validator, but it does not ship a production
+native `qbit-prism-server capacity-evidence` command for the strict
+`qbit-prism-capacity-evidence/v2` format, but it does not ship a production
 qualification runner. An operator may use the format after capturing the
 complete miner-facing path: valid Stratum submission, share validation, ACK,
 and durable Postgres commit. Process health and a schema-only database benchmark
@@ -37,6 +38,20 @@ Do not improve benchmark numbers by weakening durability.
 
 ## Bound PRISM Configuration
 
+The v2 format is retained for compatibility with existing qualification records.
+Its batch/linger/timeout and idle-sweep fields describe the historical Python
+profile; those variables do not configure the native Rust server. Keep their
+declared legacy metadata separate from the actual native environment. The
+validator still requires the exact v2 keys and bindings and does not reinterpret
+them as native tuning controls.
+
+A pre-rewrite artifact does not qualify the new binary. For a native run, retain
+the complete measured environment and frontend/resource topology alongside the
+image/revision, database profile, raw miner output, and reconciliation results.
+The v2 validator alone does not bind newly introduced CPU/connection settings or
+prove multi-instance scaling. Measure those explicitly and include them in the
+reviewed release evidence.
+
 Qualification schema `qbit-prism-capacity-evidence/v2` binds:
 
 - share difficulty and vardiff enablement
@@ -45,9 +60,9 @@ Qualification schema `qbit-prism-capacity-evidence/v2` binds:
 - share commit batch size, linger, and timeout
 - Stratum send timeout
 
-The validator enforces `minimum <= start <= maximum`. Changing any bound value
-requires a new qualification run. The exact `1e-9` local-lab difficulty is
-rejected.
+The validator enforces `minimum <= start <= maximum`. Changing a bound value or
+the measured native environment requires a new qualification run. The exact
+`1e-9` local-lab difficulty is rejected.
 
 ## Load-Run Contract
 
@@ -85,7 +100,7 @@ by normal standalone validation. The CLI test-only override exists solely so aut
 tests can validate the example's structure:
 
 ```bash
-python3 scripts/prism_capacity_evidence.py \
+qbit-prism-server capacity-evidence \
   tests/fixtures/prism-capacity-evidence.json \
   --allow-example-evidence-for-tests
 ```
@@ -95,11 +110,12 @@ Never use that override in a deployment command or runtime environment.
 ## Validate Qualification Evidence
 
 Pass the independently configured policy and subject together with every bound
-runtime value. The shell names below are local validator inputs, not coordinator
-environment variables:
+profile value. The shell names below are local validator inputs. In particular,
+the `QUALIFICATION_LEGACY_*` values must come from independently reviewed v2
+metadata; they are not coordinator environment settings:
 
 ```bash
-python3 scripts/prism_capacity_evidence.py /path/to/capacity-evidence.json \
+qbit-prism-server capacity-evidence /path/to/capacity-evidence.json \
   --forecast-peak-shares-per-second "$CAPACITY_FORECAST_SHARES_PER_SECOND" \
   --ack-p99-limit-milliseconds "$CAPACITY_ACK_P99_LIMIT_MILLISECONDS" \
   --max-age-seconds "$CAPACITY_EVIDENCE_MAX_AGE_SECONDS" \
@@ -118,10 +134,10 @@ python3 scripts/prism_capacity_evidence.py /path/to/capacity-evidence.json \
   --expect PRISM_STRATUM_VARDIFF_MAX_STEP_DOWN="$PRISM_STRATUM_VARDIFF_MAX_STEP_DOWN" \
   --expect PRISM_STRATUM_VARDIFF_EWMA_ALPHA="$PRISM_STRATUM_VARDIFF_EWMA_ALPHA" \
   --expect PRISM_STRATUM_VARDIFF_RETARGET_TOLERANCE="$PRISM_STRATUM_VARDIFF_RETARGET_TOLERANCE" \
-  --expect PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS="$PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS" \
-  --expect PRISM_SHARE_COMMIT_BATCH_SIZE="$PRISM_SHARE_COMMIT_BATCH_SIZE" \
-  --expect PRISM_SHARE_COMMIT_LINGER_MILLISECONDS="$PRISM_SHARE_COMMIT_LINGER_MILLISECONDS" \
-  --expect PRISM_SHARE_COMMIT_TIMEOUT_SECONDS="$PRISM_SHARE_COMMIT_TIMEOUT_SECONDS" \
+  --expect PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS="$QUALIFICATION_LEGACY_IDLE_SWEEP_SECONDS" \
+  --expect PRISM_SHARE_COMMIT_BATCH_SIZE="$QUALIFICATION_LEGACY_COMMIT_BATCH_SIZE" \
+  --expect PRISM_SHARE_COMMIT_LINGER_MILLISECONDS="$QUALIFICATION_LEGACY_COMMIT_LINGER_MILLISECONDS" \
+  --expect PRISM_SHARE_COMMIT_TIMEOUT_SECONDS="$QUALIFICATION_LEGACY_COMMIT_TIMEOUT_SECONDS" \
   --expect PRISM_STRATUM_SEND_TIMEOUT_SECONDS="$PRISM_STRATUM_SEND_TIMEOUT_SECONDS"
 ```
 

@@ -661,40 +661,32 @@ require_lab_mode() {
 check_prism_production_difficulty() {
   local output
 
-  command -v python3 >/dev/null 2>&1 || fail "python3 is required to validate production PRISM difficulty"
-  if ! output="$(python3 - \
-    "${PRISM_STRATUM_SHARE_DIFF:-}" \
-    "${PRISM_STRATUM_VARDIFF_MIN_DIFF:-}" \
-    "${PRISM_STRATUM_VARDIFF_START_DIFF:-}" \
-    "${PRISM_STRATUM_VARDIFF_MAX_DIFF:-}" 2>&1 <<'PY'
-from decimal import Decimal, InvalidOperation
-import sys
-
-names = (
-    "PRISM_STRATUM_SHARE_DIFF",
-    "PRISM_STRATUM_VARDIFF_MIN_DIFF",
-    "PRISM_STRATUM_VARDIFF_START_DIFF",
-    "PRISM_STRATUM_VARDIFF_MAX_DIFF",
-)
-values = {}
-for name, raw_value in zip(names, sys.argv[1:]):
-    if not raw_value:
-        raise SystemExit(f"production mode requires an explicit {name}")
-    try:
-        value = Decimal(raw_value)
-    except InvalidOperation:
-        raise SystemExit(f"{name} must be a decimal number")
-    if not value.is_finite() or value <= 0:
-        raise SystemExit(f"{name} must be positive")
-    if value == Decimal("0.000000001"):
-        raise SystemExit(f"{name} cannot use the lab-only 1e-9 difficulty")
-    values[name] = value
-if values["PRISM_STRATUM_VARDIFF_MIN_DIFF"] > values["PRISM_STRATUM_VARDIFF_START_DIFF"]:
-    raise SystemExit("production vardiff minimum exceeds its start difficulty")
-if values["PRISM_STRATUM_VARDIFF_START_DIFF"] > values["PRISM_STRATUM_VARDIFF_MAX_DIFF"]:
-    raise SystemExit("production vardiff start exceeds its maximum difficulty")
-PY
-  )"; then
+  # The native server validates the same bounds on startup. Keep the host-side
+  # Compose preflight independent of a Python interpreter or a host Rust build.
+  # ENVIRON preserves literal backslashes that awk -v would interpret.
+  if ! output="$(PRISM_CHECK_SHARE_DIFF="${PRISM_STRATUM_SHARE_DIFF:-}" \
+    PRISM_CHECK_MIN_DIFF="${PRISM_STRATUM_VARDIFF_MIN_DIFF:-}" \
+    PRISM_CHECK_START_DIFF="${PRISM_STRATUM_VARDIFF_START_DIFF:-}" \
+    PRISM_CHECK_MAX_DIFF="${PRISM_STRATUM_VARDIFF_MAX_DIFF:-}" LC_ALL=C awk 'BEGIN {
+      share=ENVIRON["PRISM_CHECK_SHARE_DIFF"];
+      minimum=ENVIRON["PRISM_CHECK_MIN_DIFF"];
+      start=ENVIRON["PRISM_CHECK_START_DIFF"];
+      maximum=ENVIRON["PRISM_CHECK_MAX_DIFF"];
+      names[1]="PRISM_STRATUM_SHARE_DIFF"; values[1]=share;
+      names[2]="PRISM_STRATUM_VARDIFF_MIN_DIFF"; values[2]=minimum;
+      names[3]="PRISM_STRATUM_VARDIFF_START_DIFF"; values[3]=start;
+      names[4]="PRISM_STRATUM_VARDIFF_MAX_DIFF"; values[4]=maximum;
+      for (i=1;i<=4;i++) {
+        if (values[i]=="") {print "production mode requires an explicit " names[i];exit 1}
+        if (values[i] ~ /^-/ || tolower(values[i]) ~ /^(nan|inf|infinity)$/) {print names[i] " must be positive";exit 1}
+        if (values[i] !~ /^[+]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$/) {print names[i] " must be a decimal number";exit 1}
+        n=values[i]+0;
+        if (n<=0 || n>1.7976931348623157e308) {print names[i] " must be positive and finite";exit 1}
+        if (n==1e-9) {print names[i] " cannot use the lab-only 1e-9 difficulty";exit 1}
+      }
+      if (minimum+0>start+0) {print "production vardiff minimum exceeds its start difficulty";exit 1}
+      if (start+0>maximum+0) {print "production vardiff start exceeds its maximum difficulty";exit 1}
+    }')"; then
     fail "${output}"
   fi
 }
@@ -744,17 +736,13 @@ check_production_gate() {
         fail "production mode rejects ${name}=1"
       fi
     done
-    [[ -n "${PRISM_DATABASE_URL:-}" || -n "${PRISM_POSTGRES_PSQL_COMMAND:-}" ]] || fail "production mode requires PRISM_DATABASE_URL or PRISM_POSTGRES_PSQL_COMMAND"
+    [[ -n "${PRISM_DATABASE_URL:-}" ]] || fail "production mode requires PRISM_DATABASE_URL"
     [[ "${PRISM_POSTGRES_PASSWORD:-}" != "change-this" ]] || fail "production mode requires a non-default PRISM_POSTGRES_PASSWORD"
     [[ "${PRISM_DATABASE_URL:-}" != *"change-this"* ]] || fail "production mode requires a non-default PRISM_DATABASE_URL"
     [[ -n "${PRISM_MANIFEST_SIGNING_SEED_HEX:-}" ]] || fail "production mode requires PRISM_MANIFEST_SIGNING_SEED_HEX"
     [[ -n "${PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX:-}" ]] || fail "production mode requires PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX"
     [[ -n "${PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX:-}" ]] || fail "production mode requires PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX"
-    [[ -n "${PRISM_LEDGER_WRITER_ID:-}" ]] || fail "production mode requires PRISM_LEDGER_WRITER_ID"
-    [[ -n "${PRISM_LEDGER_WRITER_EPOCH:-}" ]] || fail "production mode requires PRISM_LEDGER_WRITER_EPOCH"
-    [[ -z "${PRISM_LEDGER_WRITER_SESSION_TOKEN:-}" ]] || fail "production mode requires managed ledger session tokens; unset PRISM_LEDGER_WRITER_SESSION_TOKEN"
-    [[ -n "${PRISM_AUDIT_DIR:-}" ]] || fail "production mode requires PRISM_AUDIT_DIR"
-    [[ -n "${PRISM_EVIDENCE_PATH:-}" ]] || fail "production mode requires PRISM_EVIDENCE_PATH"
+    [[ -z "${PRISM_LEDGER_WRITER_SESSION_TOKEN:-}" ]] || fail "Rust PRISM manages database claims; unset PRISM_LEDGER_WRITER_SESSION_TOKEN"
   fi
 
   if mining_lane_enabled ckpool; then
@@ -900,29 +888,18 @@ check_bitcoin_chain_selection() {
 check_prism_stale_grace() {
   mining_lane_enabled prism || return 0
 
-  if ! command -v python3 >/dev/null 2>&1; then
-    # Production already requires python3 (check_prism_production_difficulty);
-    # lab bring-up does not, so skip rather than add a prerequisite there.
-    if production_mode_enabled; then
-      fail "python3 is required to validate PRISM_STRATUM_STALE_GRACE_SECONDS"
-    fi
-    printf 'doctor: python3 not found; skipping PRISM_STRATUM_STALE_GRACE_SECONDS validation\n'
-    return 0
-  fi
-  # Mirror the coordinator's env_nonnegative_float(): the runtime's float
-  # syntax and range, finite and non-negative.
-  if ! python3 - "${PRISM_STRATUM_STALE_GRACE_SECONDS:-3}" >/dev/null 2>&1 <<'PY'
-import math
-import sys
-
-try:
-    value = float(sys.argv[1])
-except ValueError:
-    raise SystemExit(1)
-raise SystemExit(0 if math.isfinite(value) and value >= 0 else 1)
-PY
+  # Match Rust's decimal f64 parser and Duration::try_from_secs_f64: finite,
+  # non-negative and strictly below 2^64 seconds after float conversion.
+  # ENVIRON preserves literal backslashes that awk -v would interpret.
+  if ! PRISM_CHECK_STALE_GRACE="${PRISM_STRATUM_STALE_GRACE_SECONDS:-3}" LC_ALL=C awk 'BEGIN {
+    value=ENVIRON["PRISM_CHECK_STALE_GRACE"];
+    if (value ~ /^[[:space:]]*$/) exit 0;
+    if (value !~ /^[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$/) exit 1;
+    n=value+0;
+    exit !(n>=0 && n<18446744073709551616);
+  }'
   then
-    fail "PRISM_STRATUM_STALE_GRACE_SECONDS must be a finite non-negative number"
+    fail "PRISM_STRATUM_STALE_GRACE_SECONDS must be a finite non-negative number below 18446744073709551616 seconds"
   fi
 }
 

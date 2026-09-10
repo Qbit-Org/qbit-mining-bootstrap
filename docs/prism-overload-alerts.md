@@ -1,5 +1,10 @@
 # PRISM Overload and Backlog Alert Specification
 
+Historical specification for the removed Python coordinator. Its scheduler,
+delivery, and backlog metric names do not describe the native runtime. Use the
+current metric inventory in [PRISM.md](../PRISM.md) when adapting deployment
+alerts for Rust. The remaining document records the original rationale.
+
 Issue #188. This document specifies the alerting rules for PRISM's
 landing-path, delivery, and backlog overload classes. It is a
 specification only.

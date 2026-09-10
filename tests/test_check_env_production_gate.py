@@ -1012,20 +1012,23 @@ class CheckEnvProductionGateTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertNotIn("PRISM_STRATUM_STALE_GRACE_SECONDS", result.stderr)
 
-    def test_prism_stale_grace_python3_requirement_matches_prior_prerequisites(self) -> None:
-        # python3 was already required in production (production difficulty), but
-        # never for lab bring-up. Validating stale grace must not change that:
-        # production still fails loudly, lab skips the check instead.
+    def test_prism_stale_grace_validates_without_python_in_lab_and_production(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
+            root, script = self.isolated_check_env_root(Path(temp_dir))
+            (root / "docker" / "qbit").mkdir(parents=True)
+            shutil.copyfile(
+                ROOT_DIR / "docker" / "qbit" / "qbit-entrypoint.sh",
+                root / "docker" / "qbit" / "qbit-entrypoint.sh",
+            )
+            checkout, commit = self.write_pinned_qbit_checkout(root)
             minimal_bin = root / "no-python-bin"
             minimal_bin.mkdir()
             for tool in (
+                "awk",
                 "bash",
                 "sh",
                 "cat",
                 "dirname",
-                "docker",
                 "env",
                 "git",
                 "rm",
@@ -1034,43 +1037,65 @@ class CheckEnvProductionGateTests(unittest.TestCase):
                 "uname",
             ):
                 resolved = shutil.which(tool)
-                if resolved is not None:
-                    (minimal_bin / tool).symlink_to(resolved)
+                self.assertIsNotNone(resolved, f"test needs {tool}")
+                (minimal_bin / tool).symlink_to(resolved)
+            docker_calls = root / "docker-calls"
+            docker = minimal_bin / "docker"
+            docker.write_text(
+                '#!/bin/sh\nprintf "called\\n" >> "$FAKE_DOCKER_CALLS"\n',
+                encoding="utf-8",
+            )
+            docker.chmod(0o755)
             self.assertIsNone(
                 shutil.which("python3", path=str(minimal_bin)),
                 "the minimal PATH must not expose python3",
             )
-
-            lab = self.run_check_env(
-                PATH=str(minimal_bin),
-                MINING_LANES="prism",
-                PRISM_STRATUM_STALE_GRACE_SECONDS="not-a-number",
-            )
-            self.assertNotIn("PRISM_STRATUM_STALE_GRACE_SECONDS", lab.stderr)
-            self.assertIn(
-                "python3 not found; skipping PRISM_STRATUM_STALE_GRACE_SECONDS validation",
-                lab.stdout,
-            )
-
-            production = self.run_check_env(
-                PATH=str(minimal_bin),
-                MINING_LANES="prism",
-                QBIT_PRODUCTION="1",
-                QBIT_CHAIN="signet",
-                QBIT_CHAIN_FLAG="-signet",
-                PRISM_STRATUM_STALE_GRACE_SECONDS="not-a-number",
-            )
-            self.assertNotEqual(production.returncode, 0)
-            self.assertIn(
-                "python3 is required to validate PRISM_STRATUM_STALE_GRACE_SECONDS",
-                production.stderr,
-            )
+            common = self.production_prism_env(root)
+            common.update({
+                "PATH": str(minimal_bin),
+                "FAKE_DOCKER_CALLS": str(docker_calls),
+                "QBIT_GIT_COMMIT": commit,
+                "QBIT_SRC_DIR": str(checkout),
+                "QBIT_SRC_DIR_OVERRIDE": str(checkout),
+            })
+            for production in (False, True):
+                mode = {} if production else {
+                    "QBIT_PRODUCTION": "0",
+                    "QBIT_TOOLS_PRODUCTION": "0",
+                    "QBIT_REQUIRE_RELEASE_PROVENANCE": "0",
+                    "QBIT_CHAIN": "regtest",
+                    "QBIT_CHAIN_FLAG": "-regtest",
+                }
+                for grace, valid in (
+                    ("3", True), ("0", True), ("+.5", True),
+                    ("18446744073709549568", True),
+                    ("not-a-number", False), ("-1", False),
+                    ("18446744073709551616", False), (r"\063", False),
+                ):
+                    with self.subTest(production=production, grace=grace):
+                        docker_calls.unlink(missing_ok=True)
+                        result = self.run_check_env(
+                            script=script, cwd=root,
+                            **{**common, **mode, "PRISM_STRATUM_STALE_GRACE_SECONDS": grace},
+                        )
+                        if valid:
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertTrue(docker_calls.exists(), result.stdout)
+                        else:
+                            self.assertNotEqual(result.returncode, 0)
+                            self.assertIn("PRISM_STRATUM_STALE_GRACE_SECONDS", result.stderr)
+                            self.assertFalse(docker_calls.exists(), "invalid grace reached Docker")
+                        self.assertNotIn("python", result.stderr + result.stdout)
 
     def test_prism_rejects_invalid_stale_grace_before_docker_check(self) -> None:
         # The exported value is what Compose hands the coordinator, so the
         # doctor validates it (not the .env.example default) in every mode,
         # with the coordinator's own float syntax and range.
-        for grace in ("-1", "not-a-number", "nan", "inf", "1" + "0" * 400):
+        for grace in (
+            "-1", "not-a-number", "nan", "inf", "1" + "0" * 400,
+            "1e20", "18446744073709551615", "18446744073709550592",
+            " 3 ", "1_0", "0x3", "3\\n", "1,5",
+        ):
             with self.subTest(grace=grace):
                 result = self.run_check_env(
                     MINING_LANES="prism",
@@ -1085,7 +1110,10 @@ class CheckEnvProductionGateTests(unittest.TestCase):
                 self.assertNotIn("docker is required", result.stderr)
 
     def test_prism_accepts_runtime_float_stale_grace_syntax(self) -> None:
-        for grace in ("0", "3", "0.5", "1e-1", ".5", "3."):
+        for grace in (
+            "0", "-0", "+0", "3", "0.5", "1e-1", ".5", "3.",
+            "+.5", "3E+0", "1e-999", "-1e-999", "18446744073709550591", " \t ",
+        ):
             with self.subTest(grace=grace):
                 result = self.run_check_env(
                     MINING_LANES="prism",
@@ -1236,6 +1264,43 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             result.stderr,
         )
         self.assertNotIn("docker is required", result.stderr)
+
+    def test_production_rejects_literal_difficulty_escapes_before_docker(self) -> None:
+        names = (
+            "PRISM_STRATUM_SHARE_DIFF",
+            "PRISM_STRATUM_VARDIFF_MIN_DIFF",
+            "PRISM_STRATUM_VARDIFF_START_DIFF",
+            "PRISM_STRATUM_VARDIFF_MAX_DIFF",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            checkout, commit = self.write_pinned_qbit_checkout(root)
+            fake_bin = self.write_fake_docker(root)
+            docker_calls = root / "docker-calls"
+            (fake_bin / "docker").write_text(
+                '#!/bin/sh\nprintf "called\\n" >> "$FAKE_DOCKER_CALLS"\n',
+                encoding="utf-8",
+            )
+            common = self.production_prism_env(root)
+            common.update({
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "FAKE_DOCKER_CALLS": str(docker_calls),
+                "QBIT_GIT_COMMIT": commit,
+                "QBIT_SRC_DIR": str(checkout),
+                "QBIT_SRC_DIR_OVERRIDE": str(checkout),
+                **dict.fromkeys(names, "1"),
+            })
+            valid = self.run_check_env(**common)
+            self.assertEqual(valid.returncode, 0, valid.stderr)
+            self.assertTrue(docker_calls.exists())
+            for name in names:
+                for value in (r"\x31", r"\061"):
+                    with self.subTest(name=name, value=value):
+                        docker_calls.unlink(missing_ok=True)
+                        result = self.run_check_env(**{**common, name: value})
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(f"{name} must be a decimal number", result.stderr)
+                        self.assertFalse(docker_calls.exists(), "invalid difficulty reached Docker")
 
     def test_production_rejects_unsafe_prism_difficulty_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

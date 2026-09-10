@@ -163,8 +163,32 @@ class MainnetComposeContractTests(unittest.TestCase):
         self.assertEqual(env["PRISM_STRATUM_VARDIFF_MIN_DIFF"], "1024")
         self.assertEqual(env["PRISM_STRATUM_VARDIFF_START_DIFF"], "4096")
         self.assertEqual(env["PRISM_STRATUM_VARDIFF_MAX_DIFF"], "65536")
-        self.assertEqual(env["PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS"], "120")
-        self.assertEqual(env["PRISM_COORDINATION_BLOCKED_EXIT_SECONDS"], "900")
+        self.assertEqual(env["PRISM_DATABASE_MAX_CONNECTIONS"], "16")
+        self.assertEqual(env["PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS"], "15")
+
+    def test_prism_services_receive_the_complete_rpc_endpoint_override(self) -> None:
+        for service in ("prism-coordinator", "prism-public-api"):
+            with self.subTest(service=service):
+                self.assertEqual(
+                    self._environment(service)["QBIT_RPC_URL"],
+                    "https://rpc.example.invalid:8443/qbit/mainnet/rpc",
+                )
+
+    def test_prism_services_receive_configured_database_and_read_limits(self) -> None:
+        writer = self._environment("prism-coordinator")
+        self.assertEqual(writer["QBIT_TOOLS_PRODUCTION"], "1")
+        self.assertEqual(writer["PRISM_DATABASE_STATEMENT_TIMEOUT_MS"], "23000")
+        self.assertEqual(writer["PRISM_DATABASE_LOCK_TIMEOUT_MS"], "7000")
+        self.assertEqual(writer["PRISM_SHARE_COMMIT_TIMEOUT_SECONDS"], "19")
+        self.assertEqual(writer["PRISM_RPC_TIMEOUT_SECONDS"], "21")
+        self.assertEqual(writer["PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS"], "2")
+        for service in ("prism-coordinator", "prism-public-api"):
+            with self.subTest(service=service):
+                env = self._environment(service)
+                self.assertEqual(env["PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS"], "9")
+                self.assertEqual(env["PRISM_POSTGRES_READ_CONCURRENCY"], "3")
+                self.assertEqual(env["PRISM_PAYOUT_MIN_OUTPUT_BITS"], "24576")
+                self.assertEqual(env["PRISM_PAYOUT_MIN_OUTPUT_SATS"], "24576")
 
     def test_prism_runtime_has_no_capacity_evidence_dependency(self) -> None:
         env = self._environment("prism-coordinator")
@@ -207,9 +231,6 @@ class MainnetComposeContractTests(unittest.TestCase):
             ("prism-postgres-replica", "/var/lib/postgresql/data"): (
                 "/srv/qbit-mining-bootstrap/mainnet/postgres-replica/data"
             ),
-            ("prism-public-api", "/var/lib/qbit-prism/audit"): (
-                "/srv/qbit-mining-bootstrap/mainnet/prism/audit"
-            ),
         }
 
         for (service, target), source in expected.items():
@@ -226,6 +247,10 @@ class MainnetComposeContractTests(unittest.TestCase):
                 self.assertFalse(
                     mounts[0].get("bind", {}).get("create_host_path", False)
                 )
+
+        public = self.config["services"]["prism-public-api"]
+        self.assertEqual(public["command"], ["qbit-prism-server", "public-api"])
+        self.assertFalse(public.get("volumes"), "native public audits come from PostgreSQL")
 
     def test_postgres_wal_has_a_separate_storage_boundary(self) -> None:
         postgres = self.config["services"]["prism-postgres"]
@@ -359,7 +384,7 @@ class MainnetComposeContractTests(unittest.TestCase):
         self.assertNotIn("-rpcpassword=change-this", bitcoin_command)
         self.assertNotEqual(postgres_env["POSTGRES_PASSWORD"], "change-this")
         self.assertNotIn("change-this", prism_env["PRISM_DATABASE_URL"])
-        self.assertEqual(prism_env["PRISM_LEDGER_WRITER_SESSION_TOKEN"], "")
+        self.assertNotIn("PRISM_LEDGER_WRITER_SESSION_TOKEN", prism_env)
         self.assertEqual(len(prism_env["PRISM_MANIFEST_SIGNING_SEED_HEX"]), 64)
         self.assertEqual(len(prism_env["PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX"]), 64)
         self.assertNotEqual(

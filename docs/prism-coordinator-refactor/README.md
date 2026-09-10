@@ -1,5 +1,10 @@
 # PRISM Coordinator Refactor
 
+Historical record of the Python coordinator. The Rust rewrite replaces the
+modules and validation commands described below; see the
+[native server](../../crates/qbit-prism-server/README.md) and
+[migration guide](../prism-rust-migration.md) for the current implementation.
+
 Status: **complete** and organized as a nine-PR review stack. No required
 roadmap item remains.
 

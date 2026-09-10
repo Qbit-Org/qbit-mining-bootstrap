@@ -306,290 +306,73 @@ before exposing the listener.
 
 ## PRISM Gate
 
-Production PRISM uses Postgres and sends a successful share response only after
-the share transaction commits. A block-worthy share commits its complete block
-intent in the same transaction. The in-memory candidate queue is only a wakeup;
-pending work is replayed from Postgres after a restart.
+Production Prism runs as the native `qbit-prism-server` executable. Several
+physical frontends can write to the same PostgreSQL database through a shared
+HA writer endpoint. The same canonical ledger and transaction ordering govern
+all instances; there is no application writer election. A normal successful
+share ACK follows a durable database commit, with block-worthy candidate intent
+persisted atomically so another instance can recover it after a restart.
+
+For an existing Python deployment, complete the coordinated
+[Rust cutover](prism-rust-migration.md) before admitting native traffic: drain and
+stop every old writer/broadcaster, back up PostgreSQL and external audit
+bodies/segments, run native `migrate`, `import-audits`, and `backfill-ctv`, then
+verify preserved balances and audit hashes. Keep the same signing keys. Do not
+run Python and Rust against the same database together.
 
 Before startup, set `PRISM_STRATUM_SHARE_DIFF`,
 `PRISM_STRATUM_VARDIFF_MIN_DIFF`, `PRISM_STRATUM_VARDIFF_START_DIFF`, and
 `PRISM_STRATUM_VARDIFF_MAX_DIFF` to explicit, reviewed, positive values.
 Production rejects missing values, the local-lab `1e-9` profile, and bounds that
-do not satisfy `minimum <= start <= maximum`. This direct safety check does not
-require a capacity artifact.
+do not satisfy `minimum <= start <= maximum`. Mainnet supports the same bounded
+one-parent `PRISM_STRATUM_STALE_GRACE_SECONDS` window as `2.x.x` (default 3).
+These direct checks do not require an
+optional capacity artifact.
 
-Set the group-commit policy explicitly if the defaults are not appropriate:
+Keep PostgreSQL `fsync`, `full_page_writes`, and `synchronous_commit` enabled.
+To preserve acknowledged shares across primary loss, also configure synchronous
+replication and a failover policy promoting only a standby holding those durable
+commits. An asynchronous replica alone can lose acknowledged work. Test the
+actual HA endpoint, replication/storage policy, and miner retry behavior before
+relying on that guarantee.
 
-```dotenv
-PRISM_SHARE_COMMIT_BATCH_SIZE=64
-PRISM_SHARE_COMMIT_LINGER_MILLISECONDS=5
-PRISM_SHARE_COMMIT_TIMEOUT_SECONDS=15
-```
-
-Keep Postgres `fsync`, `full_page_writes`, and `synchronous_commit` enabled.
-Measure acknowledgment latency under representative accepted-share load rather
-than weakening database durability.
-
-Keep `PRISM_STRATUM_STALE_GRACE_SECONDS` at its bounded default (3 seconds)
-on every chain, mainnet included. At zero, every in-flight prior-tip share is
-rejected with Stratum error 21 at each block, which miners read as pool
-failure rather than as stale work. Reward windows that contain a credited
-prior-tip share publish the logical `qbit.prism.audit-bundle.v1.1` schema;
-this release's verifier accepts it, so keep external mirrors and verifiers on
-a release that does too.
-
-`PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS` bounds a persistent
-PRISM template-refresh outage; it must be shorter than the operator alert and
-response window. Coordination-only refresh deferrals remain outside that
-ordinary failure budget, but only for
-`PRISM_COORDINATION_BLOCKED_EXIT_SECONDS` (default 900 seconds). A continuous
-streak beyond that separate bound fires the publication-progress watchdog and
-restarts the coordinator. Alert on
-`qbit_prism_template_refresh_coordination_blocked_age_seconds` before it
-approaches the configured bound.
-
-`PRISM_TIP_REFRESH_EPOCH_FANOUT` is a staged rollout gate and defaults to `0`.
-Leave it disabled for legacy refresh behavior. Enable it deliberately to make
-each refresh wave converge on the latest observed tip epoch; payout and trust
-publication fences remain authoritative. Monitor refresh-wave outcomes and
-delivery coverage during rollout, and return the setting to `0` to roll back.
-
-PRISM's fast same-identity restart path requires the default native PostgreSQL
-client (`PRISM_POSTGRES_NATIVE_CLIENT=auto` or `1`). Each coordinator holds a
-dedicated PostgreSQL advisory guard for its writer ID and epoch and
-periodically proves that isolated session live with a non-blocking check (the
-session answers, still holds the advisory lock, and the committed lease row
-still names it). Most beats run only that cheap read-only ownership proof: one
-statement, no row lock and no `pg_stat_activity` scan. The full renewing
-verification runs on the first beat and thereafter on any beat whose proof
-reports the committed lease row inside the own-write authority margin (at or
-above half the lease TTL), escalating on that same beat. So renewal is never
-later than it was before the split, and for the whole of a long own fenced
-write — when renewals are actually being skipped — every beat runs the same
-fail-closed verification as before. The heartbeat never waits on the lease
-tuple's row lock: fenced writes hold it for entire transactions, and
-accepted-block persistence can legitimately exceed the guard's statement
-timeout. It renews the lease TTL only while that tuple is uncontended
-(`SKIP LOCKED`), so an idle coordinator — no fenced writes and the CTV
-broadcaster disabled — still keeps its lease from expiring under a different
-writer identity's expiry claim. If the committed row
-is already expired and the renewal was lock-blocked, verification fails closed:
-the skipped lock may be an in-flight expiry claim, and a stale committed token
-read is not proof of liveness. The one exemption is a lock `pg_stat_activity`
-attributes to this coordinator's own pooled backends — a fenced write
-outlasting the TTL — because its exclusive tuple lock means no claim can be in
-flight and its commit refreshes the lease before any queued claimant
-re-evaluates its expiry CAS; hard-exiting there would roll back a valid write
-and restart-loop on every similarly slow block. That exemption keeps only the
-heartbeat alive: it assumes the write commits, so the external-side-effect
-fence refuses guarded RPCs (without fencing the process) while renewal is
-deferred behind the writer's own write — a rollback would hand the expired row
-to a queued claimant — and broadcast passes or candidate-outbox replays simply
-retry once the commit lands a renewal. A
-replacement must acquire the guard and then wait one full silence interval
-measured both from the lease row's last update and from its own guard
-acquisition before its exact-session CAS, so a predecessor that just lost its
-guard always has time to self-fence even when a long transaction left its
-lease row looking stale. This prevents a live or paused twin from being fenced
-merely because it is idle. A psql-only deployment cannot retain a session
-guard, logs that fast adoption is disabled, and conservatively falls back to
-the configured lease TTL. Keep generated session tokens in production; fixed
-tokens remain a local test-only facility.
-
-#### Heartbeat timing is one validated policy
-
-The adoption silence, heartbeat interval, failure budget, monitor interval and
-exit margin are terms of a single inequality — the old coordinator must be gone
-before a replacement may compare-and-swap the lease row — owned by
-`lab/prism/writer_lease_timing.py`. The defaults are derived from measurable
-phase budgets rather than tuned individually:
-
-| term | value | where it comes from |
-| --- | --- | --- |
-| guard statement timeout | 0.50s | the guard session's server-side `statement_timeout` |
-| heartbeat interval | 0.25s | idle gap between ownership proofs |
-| scheduler slack | 0.50s | process-side scheduling delay, applied to both the heartbeat's stamping path and the monitor's own poll |
-| failure budget | 1.25s | interval + statement timeout + slack |
-| monitor interval | 0.05s | staleness poll |
-| exit margin | 0.10s | hard-exit budget |
-| exit envelope | 0.70s | exit margin + 2 x monitor interval + scheduler slack |
-| adoption silence | 2.00s | must exceed 1.25 + 0.70 = 1.95s |
-| server-proven cap | 1.30s | adoption silence - exit envelope |
-
-The exit envelope reserves the monitor's *own* lateness, not just its poll
-granularity. The monitor is a Python thread in the same process, behind the
-same GIL, as the heartbeat whose stalls the policy explicitly budgets for, so
-it cannot be assumed to wake on time when the heartbeat does not. At the
-shipped numbers, with a maximally late monitor:
-
-```
-1.30 (cap) + 0.05 (poll) + 0.50 (monitor lateness) + 0.10 (exit) = 1.95 < 2.00
-```
-
-leaving one monitor poll of strict reserve before a successor may
-compare-and-swap.
-
-Genuine writer failover therefore costs 2.0 seconds of adoption silence rather
-than 1.0. That is the price of the guard session's own statement timeout: the
-monitor can only trust completed round trips, so the envelope has to contain
-one whole statement plus one idle interval plus process scheduling — and then,
-separately, room for the monitor itself to be that late in noticing. It
-replaces the temporary downstream 4.0-second pin.
-
-A combination that breaks the safety inequality is now **refused at startup**:
-the coordinator hard-exits with the failing term named instead of printing a
-warning and running with no exit-before-adoption guarantee. A combination that
-is safe but leaves the staleness cap below the largest gap a healthy
-coordinator can produce logs a `no tail-latency headroom` warning and starts —
-that state cannot produce two writers, it only produces avoidable restarts.
-
-#### Reading a heartbeat exit
-
-Every heartbeat hard exit names which bound tripped (`Tripped: activity ... >=
-failure budget` or `... >= adoption envelope cap`), the phase breakdown of the
-last and worst verification attempts (`slot_wait` / `guard_sql` / `scheduler`
-/ `total`), the monitor's own worst wake delay, and every term of the policy
-that produced the decision. Guard-slot queueing, database round trips and
-Python scheduling stalls are attributed separately, so an exit says whether to
-look at PostgreSQL or at the coordinator process.
-
-The same attribution is exported with fixed metric cardinality:
-`qbit_prism_lease_heartbeat_attempts_total{mode}` (`proof`, `renew`, `fence`),
-`qbit_prism_lease_heartbeat_outcomes_total{outcome}`,
-`qbit_prism_lease_heartbeat_phase_seconds{phase}` and its
-`worst_phase_seconds` companion,
-`qbit_prism_lease_heartbeat_activity_age_seconds`,
-`qbit_prism_lease_heartbeat_server_proven_age_seconds`,
-`qbit_prism_lease_heartbeat_monitor_wake_delay_seconds`, and
-`qbit_prism_lease_heartbeat_policy_seconds{term}`. Alert on
-`qbit_prism_lease_heartbeat_server_proven_age_seconds` approaching
-`qbit_prism_lease_heartbeat_policy_seconds{term="server_proven_cap"}`, and on
-`qbit_prism_lease_heartbeat_policy_seconds{term="stability_surplus"}` falling
-to or below zero.
-
-Before each mutating qbitd or wallet RPC, the coordinator performs the same
-bounded non-blocking exact-session verification on that advisory-guard
-connection, so the fence never contends with an in-flight accepted-block
-transaction on the lease tuple. This makes a lost
-session or a host suspend/resume fail closed before the usual RPC path. It is a
-preflight fence, not an atomic transaction across PostgreSQL and qbitd: a
-process paused after verification and resumed after its database session was
-lost could still reach the independent RPC target. Mutating RPCs do not use the
-JSON-RPC client's transparent transport retry; durable block/CTV retry starts a
-new fenced operation instead. Broadcast and block-submit RPCs deduplicate
-identical payloads, which limits the effect, but separately built CTV fee
-children can still conflict. Operators must not manually start a replacement
-with the same writer identity when predecessor termination is uncertain,
-especially during a PostgreSQL restart or network partition. Strict elimination
-of that residual window requires qbitd/wallet RPCs to validate a fencing
-generation supplied by the coordinator.
-
-### PRISM Allocator Settings
-
-The PRISM image sets `MALLOC_ARENA_MAX=2` (issue #226). This is a deliberate
-allocator decision, recorded here so that a future change to it is a decision
-too; `tests/test_prism_heap_census.py` pins the image's allocator environment.
-
-Why: on `union-mainnet` at pin `9c41894` the coordinator's resident set grew by
-roughly 390 MB per hour across 45 hours of uptime with no restart, while the
-process ran about 64 threads and its memory map was 943 anonymous regions, 658
-of them between 4 and 64 MiB. That band is the glibc per-thread malloc arena
-signature (each arena grows in 64 MiB heaps), and glibc's default arena limit is
-eight times the core count, 256 on the 32-core host, so every thread that ever
-allocates keeps its own arena and its own retained free lists. Two arenas bound
-that multiplication. The storm instrument reproduces the mechanism on any host
-(`docs/prism-capacity-readiness.md`, "Allocator settings"): at the default a
-64-thread probe creates 64 arenas and the 4-64 MiB region count climbs to the
-mainnet shape; at `MALLOC_ARENA_MAX=2` the arena count stays at 2, and
-`malloc_trim` can return the freed memory, which with 64 arenas it cannot,
-because a per-thread heap's top is not something `malloc_trim` shrinks.
-
-Why it is safe before the testnet soak decides between 2 and 4: under the GIL
-at most one Python thread allocates at a time, so arena-lock contention can only
-come from native code that runs with the GIL released, which in this process is
-libpq I/O on a handful of pooled connections; the audit-builder daemon the
-coordinator spawns inherits the variable but is single-threaded; and the
-failure mode of too few arenas is a measurable wait on share-ack latency
-(`qbit_prism_share_ack_seconds`), whereas the failure mode of too many is the
-17.7 GB resident set. The local storm drain ran at the same wall-clock under
-the default, 2, and 4 on the development host.
-
-Override it per deployment rather than editing the image:
+Assign each instance a unique `PRISM_INSTANCE_ID` or use generated UUIDs. Payout,
+CTV, chain, and signing configuration must agree; startup checks a shared
+fingerprint. CPU and database limits can differ by host:
 
 ```dotenv
-MALLOC_ARENA_MAX=4
+PRISM_RUNTIME_WORKERS=4
+PRISM_JOB_BUILD_EXECUTOR_WORKERS=2
+PRISM_DATABASE_MAX_CONNECTIONS=16
+PRISM_DATABASE_STATEMENT_TIMEOUT_MS=15000
+PRISM_DATABASE_LOCK_TIMEOUT_MS=5000
 ```
 
-How that value reaches the process: the `prism-coordinator` service in
-`compose.yaml` passes it through as `MALLOC_ARENA_MAX: ${MALLOC_ARENA_MAX:-2}`.
-Compose has no `env_file:` for this service, so a dotenv value reaches the
-container only through that line; the image's `ENV` is what applies when the
-dotenv leaves the variable unset, and the passthrough's default is pinned equal
-to the image default by `tests/test_prism_heap_census.py` so the two cannot
-drift. A deployment that sets the coordinator's environment by some other
-means must set the variable there. The public read service
-(`prism-public-api`) runs from the same image and keeps the image default; it
-is not part of the experiment. At build time `--build-arg MALLOC_ARENA_MAX=4`
-changes the image default. Do not set it to `1`: that forces every thread onto
-the main arena, whose `brk` heap shrinks only from its end. Confirm the
-setting actually applied before reading any arena gauge: a census report's
-`process.malloc_arena_count` cannot exceed the cap, and
-`docker exec <prism-coordinator-container> sh -c 'echo $MALLOC_ARENA_MAX'`
-shows what the process started with.
+These values are an example resource allocation, not a capacity qualification.
+Budget database connections for all frontends together and measure ACK latency,
+job delivery, and build/refresh work under representative load. The old Python
+batch-writer, lease, subprocess, and refresh-scheduler variables were removed.
 
-Do not set any other `MALLOC_*` variable, `GLIBC_TUNABLES`, or `PYTHONMALLOC`
-in production without a soak. In particular never set an allocator variable to
-an empty value: glibc reads `""` as `0`, and `MALLOC_MMAP_THRESHOLD_=0` would
-route every allocation through `mmap`. `PYTHONMALLOC` stays unset so pymalloc
-keeps objects of 512 bytes and under out of glibc; routing them through glibc
-would enlarge the arenas this setting bounds.
+Use `compose.prism-external-db.yaml` last in the Compose file list for a managed
+shared database, set `PRISM_DATABASE_URL` on each host, and render the effective
+service graph before starting. `QBIT_RPC_HOST` is overridable; each frontend may
+use a local synchronized qbitd or an explicitly configured external node. The
+external database overlay removes the local Postgres dependency. With an
+external qbitd, start the coordinator using `--no-deps` as described in the
+migration guide.
 
-The heap census (`PRISM_HEAP_CENSUS`), its `tracemalloc` tracing
-(`PRISM_HEAP_CENSUS_TRACEMALLOC`), the `malloc_trim` signal
-(`PRISM_MALLOC_TRIM_SIGNAL`) and the periodic trim
-(`PRISM_MALLOC_TRIM_INTERVAL_SECONDS`) are all off in production by default and
-stay off unless an operator turns one on for a diagnosis window. Each is a
-strict boolean or a floored interval validated at startup, each passes through
-`compose.yaml` to the coordinator service (so a dotenv value reaches the
-process), and `.env.example` lists them; the census writes under
-`PRISM_AUDIT_DIR/heap-census` by default. Read
-`docs/prism-capacity-readiness.md`, "Heap census, allocator control, and the
-resident-set bound", before enabling any of them: the census holds the GIL for
-the duration of one `gc.get_objects()` call, and `tracemalloc` costs every
-allocation for as long as it traces.
+### Native process health and shutdown
 
-### PRISM Watchdog Exit Forensics
+The image starts `qbit-prism-server` directly as PID 1. SIGTERM closes admission
+and initiates a bounded task drain; durable candidate/CTV intents remain
+recoverable if the process exits before completing them. `/healthz` fails when
+published work is stale, its payout revision is obsolete, or job delivery cannot
+progress. Scrape each instance's native `/metrics` separately. Replace alerts
+that depended on removed Python writer-lease or scheduler metrics.
 
-The PRISM image has no entrypoint or init wrapper: its exec-form Dockerfile
-command starts `python3 -m lab.prism.prism_coordinator` directly as container
-PID 1, and neither Compose file overrides that command. Consequently a
-watchdog `os._exit(1)` is delivered to Docker as status 1; there is no
-repository wrapper that can translate it to zero. The development profile's
-`restart: on-failure` depends on that status, while the production override's
-`restart: unless-stopped` restarts unexpected status-0 and status-1 exits.
-
-Do not use a post-restart `.State.ExitCode` value as the prior watchdog exit
-status. `docker inspect` exposes the container's current execution state, not
-an invocation history, and can show zero after the replacement process is
-already running. Capture the daemon's `die` event for the failing invocation
-instead, and retain it with the incident record:
-
-```sh
-docker events \
-  --since '<incident-start-rfc3339>' \
-  --until '<incident-end-rfc3339>' \
-  --filter type=container \
-  --filter container='<prism-container-name-or-id>' \
-  --filter event=die \
-  --format '{{json .Actor.Attributes}}'
-```
-
-The event attributes contain the invocation's `exitCode`. The hard-exit path
-does not flush stdout/stderr before arming termination because a full container
-log pipe could otherwise suppress the watchdog itself. If no historical `die`
-event was retained, a later running-state `ExitCode=0` cannot establish the
-prior invocation's status; record the discrepancy as missing event-time
-evidence.
+The production restart policy remains `unless-stopped`. For exit forensics,
+retain Docker's `die` event at incident time: a running replacement's current
+`.State.ExitCode` is not the previous process's exit status.
 
 ### CTV At Genesis
 
@@ -627,12 +410,18 @@ A wallet is only required for optional positive CPFP sponsorship.
 
    ```sh
    MINING_LANES=ckpool,auxpow,prism make doctor
-   MINING_LANES=prism python3 scripts/prism-self-check.py --skip-live
    ```
 
-4. Pull immutable images. Start qbit and, when AuxPoW is enabled, Bitcoin without
-   the pool runtimes. Wait for exact chain, genesis, peer, header, IBD, and
-   template checks to pass.
+4. Pull immutable images and validate the native Prism environment before
+   starting its listeners:
+
+   ```sh
+   docker compose --env-file "$DEPLOY_ENV_FILE" -f compose.yaml -f compose.production.yaml \
+     --profile prism run --rm --no-deps prism-coordinator qbit-prism-server check-config
+   ```
+
+   Start qbit and, when AuxPoW is enabled, Bitcoin without the pool runtimes.
+   Wait for exact chain, genesis, peer, header, IBD, and template checks to pass.
 5. Initialize the fresh Postgres cluster with its separate live WAL path, then
    configure base backups, off-host WAL archiving, and any synchronous standby.
 6. Start only the intended pool runtimes. Run `make prism-self-check` after
@@ -640,7 +429,7 @@ A wallet is only required for optional positive CPFP sponsorship.
 7. Connect controlled miners to each selected lane. Confirm subscribe,
    authorize, initial difficulty, fresh jobs, accepted work, reconnect behavior,
    and accounting visibility.
-8. Exercise one child-process restart at a time and verify readiness and miner
+8. Exercise one service restart at a time and verify readiness and miner
    recovery before admitting public traffic.
 
 ## Go-Live Checks

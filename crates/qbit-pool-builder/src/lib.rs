@@ -461,14 +461,17 @@ fn pinned_entitlement_index(
     entitlements: &[WeightedEntitlement],
     pinned: &PinnedFirstOutput,
 ) -> Result<usize, BuilderError> {
-    let mut matches = entitlements.iter().enumerate().filter_map(|(index, entitlement)| {
-        let is_match = entitlement.recipient_id == pinned.recipient_id
-            && entitlement.order_key == pinned.order_key
-            && entitlement
-                .p2mr_program_hex
-                .eq_ignore_ascii_case(&pinned.p2mr_program_hex);
-        is_match.then_some(index)
-    });
+    let mut matches = entitlements
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entitlement)| {
+            let is_match = entitlement.recipient_id == pinned.recipient_id
+                && entitlement.order_key == pinned.order_key
+                && entitlement
+                    .p2mr_program_hex
+                    .eq_ignore_ascii_case(&pinned.p2mr_program_hex);
+            is_match.then_some(index)
+        });
     let pinned_index = matches
         .next()
         .ok_or_else(|| BuilderError::PinnedFirstOutputMissing {
@@ -987,7 +990,12 @@ mod tests {
                 .iter()
                 .map(|out| (out.vout, out.recipient_id.as_str()))
                 .collect::<Vec<_>>(),
-            vec![(0, "pool-fee"), (1, "miner-a"), (2, "miner-b"), (3, "miner-c")]
+            vec![
+                (0, "pool-fee"),
+                (1, "miner-a"),
+                (2, "miner-b"),
+                (3, "miner-c")
+            ]
         );
         assert!(manifest
             .witness_commitment_script_hex
@@ -1048,7 +1056,10 @@ mod tests {
         pinned_amounts.sort();
         assert_eq!(canonical_amounts, pinned_amounts);
         assert_eq!(pinned_manifest.outputs[0].recipient_id, "pool-fee");
-        assert_ne!(canonical_manifest.coinbase_txid, pinned_manifest.coinbase_txid);
+        assert_ne!(
+            canonical_manifest.coinbase_txid,
+            pinned_manifest.coinbase_txid
+        );
     }
 
     #[test]
@@ -1104,8 +1115,8 @@ mod tests {
 
     #[test]
     fn build_request_json_without_pinned_first_output_defaults_to_none() {
-        let serialized = serde_json::to_value(request(vec![entitlement("miner-a", "01", 1, 1)]))
-            .unwrap();
+        let serialized =
+            serde_json::to_value(request(vec![entitlement("miner-a", "01", 1, 1)])).unwrap();
         assert!(serialized.get("pinned_first_output").is_none());
         let decoded: CoinbaseBuildRequest = serde_json::from_value(serialized).unwrap();
         assert_eq!(decoded.pinned_first_output, None);

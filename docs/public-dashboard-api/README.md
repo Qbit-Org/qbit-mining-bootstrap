@@ -8,7 +8,7 @@ The contract is source-of-truth for both sides:
 - `../public-dashboard-api-v1.openapi.yaml` defines `/public/v1` endpoints.
 - `fixtures/*.json` are mock responses the dashboard can render before a live
   backend exists.
-- `tests/test_public_dashboard_api_contract.py` keeps the fixtures and public
+- `crates/qbit-prism-server/tests/api_contract.rs` and the PostgreSQL API tests keeps the fixtures and public
   naming conventions from drifting.
 
 ## Architecture
@@ -27,20 +27,25 @@ The dashboard app must not query Postgres, qbit RPC, private command sockets, or
 internal audit endpoints directly. Its only stable data dependency should be the
 sanitized `/public/v1` API described by this contract.
 
-In deployment, `/public/v1` is served by its own process — the
-`prism-public-api` service (`python3 -m lab.prism.public_read_service`), on
-`PRISM_PUBLIC_API_PORT` (default `3342`). It is no longer served by the
-`prism-coordinator` audit HTTP listener, which now answers only `/audit/*`,
-`/healthz`, `/metrics`, `/owed*`, and the operator miner/payout status routes; a
-`/public/v1` request to the coordinator returns its ordinary
-`{"error": "unknown endpoint"}` 404.
+In deployment, run `qbit-prism-server public-api` as the independent
+`prism-public-api` service on `PRISM_PUBLIC_API_PORT` (default `3342`). It serves
+only `/public/v1`, its own `/healthz`, and `/metrics`. The combined Rust `serve`
+role also retains the public routes alongside the operator API for existing
+integrations; production proxies should use the independent public service.
 
-The split exists because public read traffic scales with public interest rather
-than with hashrate. Served in-process it shared the GIL that acknowledges shares
-and lands blocks, and the primary Postgres connection the lease-holding writer
-commits through. The extracted tier reads through bounded read slots only, never
-acquires a writer lease, and depends on Postgres rather than on the coordinator,
-so it keeps serving across coordinator restarts.
+The public service has its own bounded PostgreSQL read pool, sets read-only
+sessions, never migrates schema, and does not claim a writer identity. It keeps
+serving across mining coordinator restarts. Set its `PRISM_DATABASE_URL` to the
+public read database and explicitly set `PRISM_PUBLIC_STRATUM_URL`, because the
+read service has no mining listener from which to infer that address.
+Its node RPC settings use the same defaults as the coordinator:
+`http://127.0.0.1:18452/`, username `qbit`, and password `change-this`.
+Configure `QBIT_RPC_HOST` and `QBIT_RPC_PORT`, or set `QBIT_RPC_URL` to override
+the complete endpoint. `QBIT_RPC_USER` and `QBIT_RPC_PASSWORD` set credentials.
+Both readiness modes verify the required native read schema before allowing
+database-backed reads. Apply migrations on the writer and let them replay to
+the standby before starting the public service. Hashrate rollups remain
+optional because charts can read the canonical share ledger directly.
 
 Operators can expose only that path from the pool service, or place a
 dashboard/web proxy in front of it. The ownership boundary stays the same: pool
@@ -92,10 +97,9 @@ servable until the window ends. The in-process window is clamped so a
 stale-served `Age` never exceeds the route's staleness budget (below); past
 the window the next request blocks and recomputes as before. Error responses
 use `Cache-Control: no-store` and are not cached by that origin cache.
-Miner pages additionally share one briefly cached pool-wide reward-window
-aggregate (`PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS`, default 30 seconds, 0
-disables), so requests for different miners reuse a single recursive
-reward-window scan instead of each re-running it.
+Miner pages calculate reward-window aggregates directly in PostgreSQL and
+share the same response cache as the other public routes. The former Python
+`PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS` inner-cache setting is obsolete.
 
 Every origin computation that takes a ledger read slot — the immutable
 artifact route included, on a cold request — runs under one per-request
@@ -119,12 +123,10 @@ worse than an honest one.
   sha256 is correct at any age and this route never refuses for staleness.
 - `Age` — the observed age of the response actually served, as before.
 
-When the observed age exceeds the budget, the service returns **503** with
-`Cache-Control: no-store` and an ordinary `prism.dashboard.error.v1` body whose
-message names both the budget and the observed age. Clients should treat this
-as "the data behind this route is too old to answer with", not as a new error
-schema — the error code is `upstream_unavailable`, already in the documented
-enum.
+When a cached response exceeds the budget, a healthy service discards it and
+recomputes before answering. During a database outage it returns **503** with
+`Cache-Control: no-store` and an ordinary `prism.dashboard.error.v1` body with
+error code `upstream_unavailable`.
 
 Budgets are derived from the caches that sit under each route rather than
 hand-picked:
@@ -134,11 +136,10 @@ budget = max(3 * (cache_ttl_seconds + underlying_cache_seconds), 15)
 ```
 
 `cache_ttl_seconds` is the route's own shared-response TTL and
-`underlying_cache_seconds` is any second cache stacked beneath it — today only
-the pool reward-window aggregate (`PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS`,
-default 30s) under `/public/v1/miners/{recipient_id}`. The factor of three and
-the 15-second floor match the existing precedent for PRISM's cached `/metrics`
-endpoint. At the documented defaults this yields:
+`underlying_cache_seconds` retains the historical 30-second allowance for
+`/public/v1/miners/{recipient_id}` to preserve the 2.x header contract, even
+though Rust computes that aggregate directly in PostgreSQL. The factor of
+three and 15-second floor retain the existing budgets:
 
 | Route | Budget |
 | --- | --- |
@@ -158,15 +159,13 @@ endpoint. At the documented defaults this yields:
 | `/public/v1/artifacts/{sha256}` | unbounded |
 
 The budgets are constants derived from the documented cache defaults — the
-`max_staleness_seconds` values in `lab/prism/endpoint_registry.py` — and there
+`staleness_budget` function in `crates/qbit-prism-server/src/api/public_service.rs` — and there
 is no environment knob that raises a budget. An operator who raises one of the
 cache TTL knobs that do exist (`PRISM_PUBLIC_CACHE_TTL_SECONDS`,
 `PRISM_PUBLIC_AGGREGATE_CACHE_TTL_SECONDS`,
-`PRISM_PUBLIC_CONFIG_CACHE_TTL_SECONDS`, or
-`PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS`) above its route's budget will see
-that route begin refusing with 503 rather than quietly serving older data.
-Raising a TTL past its budget therefore also requires changing the registry
-constant in the same change; otherwise leave the defaults alone. The
+`PRISM_PUBLIC_CONFIG_CACHE_TTL_SECONDS`) above its route's budget will see
+the origin refresh at the budget boundary rather than serve older data.
+The
 `PRISM_PUBLIC_ARTIFACT_CACHE_*` TTLs are exempt: the artifact route is
 content-addressed and never refuses for staleness.
 
@@ -261,10 +260,9 @@ Chain reorganizations happen, and hiding them entirely made the pool's block
 history look cleaner than the chain it mines. `GET /public/v1/blocks` therefore
 takes a `chain_state` filter:
 
-- Omitted or `chain_state=active` — exactly the pre-filter behavior and the
-  `prism.dashboard.blocks.v1` schema tag: every recorded pool block except
-  those a reorganization reversed. Existing consumers see a byte-compatible
-  response.
+- Omitted or `chain_state=active` — confirmed blocks only, using the
+  `prism.dashboard.blocks.v1` row shape. Prepared and never-accepted native
+  candidate records are excluded.
 - `chain_state=all` — every recorded pool block, including reversed ones.
 - `chain_state=reversed` — only blocks the pool once landed that a chain
   reorganization later disconnected.
@@ -283,7 +281,7 @@ response with a reversed block.
 `GET /public/v1/pool-summary` surfaces the same information in aggregate:
 `pool.blocks_reversed_total` and `pool.blocks_inactive_total` count the
 reversed and currently-inactive pool blocks. `blocks_found_total` is
-unchanged and keeps excluding reversed blocks, so it is not the sum of the
+the count of currently confirmed blocks, so it is not the sum of the
 per-state counters. These are **additive fields on
 `prism.dashboard.pool-summary.v1`** (added in 2.x): pool-summary takes no
 request parameter, so the repo's param-gated versioning precedent does not
@@ -326,7 +324,7 @@ range's chart renders are rejected with `400 bad_request`: 1w allows 5m/1h/1d,
 1m allows 1h/1d, 6m and all allow 1d only.
 
 The response (`prism.dashboard.block-markers.v1`) reports `total_blocks` — all
-non-reversed found blocks in range — and `points` containing only buckets with
+confirmed found blocks in range — and `points` containing only buckets with
 at least one found block, ascending by timestamp. Each point carries the
 bucket's full `block_count`, at most its 3 most recent blocks (`found_at`
 descending, height breaking ties) with `height`, `hash`, and `found_at`, and
@@ -398,43 +396,19 @@ re-serialization step. Audit bundles written before canonical-byte persistence
 was introduced retain the legacy reconstructed response until the verified
 backfill publishes their canonical artifact.
 
-Operators can verify the historical range while the coordinator is live:
+For migration, drain the Python coordinator, preserve its database and audit
+artifacts, then run the native migration and `import-legacy-audits` commands described
+in [the migration guide](../prism-rust-migration.md). Imported canonical bytes
+are stored in PostgreSQL so physical replicas and every frontend receive the
+same artifact identity. Native audits reconstruct exact bytes from immutable
+share ranges rather than storing overlapping full share windows repeatedly.
 
-```sh
-python3 -m lab.prism.backfill_audit_bundle_canonical --dry-run
-```
-
-Before publishing, stop the coordinator and confirm it no longer owns the
-PostgreSQL writer lease. Publish mode requires exclusive lease ownership and
-fails instead of waiting behind a live same-identity coordinator. Schema repair
-is unrelated to this filesystem-only rollout, so the recommended publish
-command disables it explicitly:
-
-```sh
-python3 -m lab.prism.backfill_audit_bundle_canonical --no-init-schema
-```
-
-The command releases its exact writer lease and closes its database and
-artifact-store resources on success or failure, so the coordinator can restart
-without waiting for the backfill lease TTL. It pages in stable block-hash order
-and reports `last_checkpoint`; pass that value to `--start-after` to resume a
-bounded rollout. The checkpoint advances over failed rows. Their block hashes,
-advertised digests, failure kinds, and reasons remain in the JSON
-`failed_rows` array, but resuming after the checkpoint will skip them. After
-correcting a failure, retry from before its block hash or rerun from the
-beginning; already published rows are idempotent no-ops.
-
-On a read-replica deployment, the ledger row remains the visibility authority.
-If the row has replayed but the canonical file is absent, the service uses the
-legacy reconstructed response with `Cache-Control: no-store` and
-`X-Prism-Artifact-Canonical-State: missing`; it is never admitted to the origin
-cache or an immutable CDN cache. A corrupt canonical file fails closed rather
-than being disguised as legacy history. If shared storage receives the file
-before the replica replays its row, the artifact returns a non-cacheable `404`
-until replay catches up; the file alone never exposes an uncommitted artifact.
-This immutable route remains exempt from the ordinary freshness refusal.
-Replica readiness is bounded by the existing WAL-receiver heartbeat contract,
-not by replay-lag position.
+If canonical bytes for a legacy row are unavailable, its reconstructed response
+uses `Cache-Control: no-store` and `X-Prism-Artifact-Canonical-State: missing`.
+It never enters the origin or immutable CDN cache. Corrupt present bytes fail
+closed. The database row remains the visibility authority: an artifact whose
+row has not replayed returns a non-cacheable `404`. Immutable artifacts remain
+exempt from ordinary replica freshness refusals.
 
 Direct-coinbase blocks return the same settlement-artifacts wrapper with
 `settlement_mode: direct_coinbase` and `fanouts: []`. A `404` means no public
@@ -474,3 +448,17 @@ for its own frontend. Those are not required public API surfaces for PRISM
 dashboard v1. Template fragments are an Ocean implementation detail, and CSV
 exports can be generated from the paginated JSON read models or added later as a
 thin convenience layer without changing the core dashboard contract.
+
+## Rust candidate-state compatibility
+
+The Rust coordinator persists candidate records before the node accepts them.
+For this reason, the default block list, block markers, and found-block counters
+include only confirmed blocks; earnings and balances likewise require active
+chain confirmation. This deliberately tightens the older Python non-reversed
+predicate so rejected work cannot appear as a successful found block.
+
+`chain_state=all` remains the complete recorded history. A previously confirmed
+block that is disconnected appears publicly as `reversed`, with its disconnect
+time; the ledger can still reactivate it if that branch becomes active again.
+Never-confirmed inactive candidates remain `inactive`, with no disconnect time.
+The reversed and inactive summary counters follow these same public states.

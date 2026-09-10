@@ -2,8 +2,7 @@
 set -euo pipefail
 
 QBIT_IMAGE="${QBIT_IMAGE:-${QBIT_CI_IMAGE:-}}"
-# Resolved from this script's own location so the PRISM difficulty helpers
-# are importable regardless of the caller's working directory.
+# Locate the native Prism binary independently of the caller's working directory.
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 TIP_AGE_SECONDS=123456789
 CONTAINER_PREFIX="qbit-runtime-smoke-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-$$"
@@ -133,51 +132,11 @@ assert_no_tip_age_arg() {
 }
 
 scaled_difficulty_from_bits() {
-  # Derive one compact-bits value's PRISM-scaled difficulty by calling the
-  # production helpers themselves rather than restating their arithmetic.
-  # Collapse converts an occupying block's ``getblockheader.bits`` with
-  # ``block_candidates._collapse_scaled_difficulty`` and compares the result
-  # against a candidate row stamped by
-  # ``template_artifacts.scaled_network_difficulty``; a smoke that carried its
-  # own copy of that formula could keep passing while either side drifted, so
-  # both are invoked here and required to agree. Both import closures are
-  # standard-library only, so this needs nothing but the checked out tree and
-  # the runner's python3.
+  # Exercise the same checked integer target conversion as the mining runtime.
   local bits="$1"
-
-  python3 - "${REPO_ROOT}" "${bits}" <<'PYTHON'
-import sys
-
-repo_root, bits = sys.argv[1], sys.argv[2]
-sys.path.insert(0, repo_root)
-
-try:
-    from lab.prism.block_candidates import _collapse_scaled_difficulty
-    from lab.prism.template_artifacts import scaled_network_difficulty
-except Exception as exc:
-    raise SystemExit(f"PRISM difficulty helpers are unimportable: {exc!r}")
-
-collapse = _collapse_scaled_difficulty(bits)
-if collapse is None:
-    raise SystemExit(
-        f"collapse rejected the compact bits the node reported: {bits!r}"
-    )
-try:
-    template = scaled_network_difficulty(bits)
-except Exception as exc:
-    raise SystemExit(
-        "template scaling rejected the compact bits the node reported: "
-        f"{bits!r} ({exc!r})"
-    )
-if collapse != template:
-    raise SystemExit(
-        "collapse and template scaled difficulty disagree for "
-        f"{bits!r}: {collapse} != {template}"
-    )
-if collapse <= 0:
-    raise SystemExit(f"scaled difficulty for {bits!r} is not positive: {collapse}")
-print(collapse)
-PYTHON
+  local prism_binary="${PRISM_SERVER_BIN:-${REPO_ROOT}/target/debug/qbit-prism-server}"
+  [[ -x "${prism_binary}" ]] || fail 'build the native Prism server or set PRISM_SERVER_BIN'
+  PRISM_RUNTIME_WORKERS=2 "${prism_binary}" header-difficulty --bits "${bits}"
 }
 
 assert_header_bits_contract() {

@@ -1,0 +1,17 @@
+# Use with compose.yaml for a shared HA PostgreSQL writer endpoint:
+# docker compose -f compose.yaml -f compose.prism-external-db.yaml --profile prism up -d
+# Set PRISM_DATABASE_URL to the same database on every server and unique instance IDs.
+services:
+  prism-postgres:
+    profiles: !override ["local-database"]
+  prism-postgres-replica:
+    profiles: !override ["local-database"]
+  prism-coordinator:
+    depends_on: !override
+      qbitd:
+        condition: service_healthy
+  prism-public-api:
+    depends_on: !override {}
+    environment:
+      PRISM_DATABASE_URL: ${PRISM_PUBLIC_DATABASE_URL:-${PRISM_DATABASE_URL}}
+      PRISM_PUBLIC_REPLICA_MODE: ${PRISM_PUBLIC_REPLICA_MODE:-off}

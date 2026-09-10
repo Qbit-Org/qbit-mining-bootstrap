@@ -4254,12 +4254,7 @@ mod tests {
             vec!["pool-fee", "ctv-fanout-0"]
         );
         assert_eq!(
-            bundle
-                .ctv_fanout_manifest_set
-                .as_ref()
-                .unwrap()
-                .manifests[0]
-                .parent_coinbase_vout,
+            bundle.ctv_fanout_manifest_set.as_ref().unwrap().manifests[0].parent_coinbase_vout,
             1
         );
 

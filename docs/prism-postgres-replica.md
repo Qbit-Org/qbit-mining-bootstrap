@@ -1,8 +1,9 @@
 # PRISM Postgres read replica
 
-`prism-public-api` — the public dashboard and audit read tier extracted from
-the coordinator in issue #145 — answers from a hot standby, not from the
-coordinator's primary. This document covers how that standby is provisioned in
+`prism-public-api` runs `qbit-prism-server public-api` and serves public reads
+from a hot standby in the default Compose topology. The native process uses a
+separate SQL pool, requires no signing keys, and serves canonical audit bytes
+from PostgreSQL without an artifact filesystem mount. This document covers how that standby is provisioned in
 compose, what a production deployment has to do by hand instead, and how to
 operate the replication slot it depends on.
 
@@ -132,8 +133,8 @@ rather than an indefinite 200.
 Routes that read no replica state are not gated — today that is
 `/public/v1/mining-configuration`, assembled from environment, and the
 content-addressed `/public/v1/artifacts/{sha256}`, whose body either hashes to
-the requested digest or does not. The classification comes from
-`lab/prism/endpoint_registry.py`, not a hand-kept list.
+the requested digest or does not. The native route classification preserves these two freshness-independent
+responses; artifact bytes still undergo content-hash verification.
 | `PRISM_POSTGRES_REPLICA_BASEBACKUP_ATTEMPTS` | `60` | Bootstrap retry budget. |
 | `PRISM_POSTGRES_REPLICA_BASEBACKUP_RETRY_SECONDS` | `5` | Delay between bootstrap attempts. |
 
@@ -221,18 +222,19 @@ path for a slot invalidated with `wal_status = 'lost'`.
 
 ## Failover semantics
 
-The replica is a **read scaling tier, not a failover target**.
+The supplied public replica provides read scaling. Its default asynchronous
+replication does not guarantee preservation of acknowledged shares after loss
+of the primary. No cluster manager or automatic promotion is configured by
+these Compose files.
 
-- It is read-only. Writes fail with `cannot execute INSERT in a read-only
-  transaction`.
-- There is **no automated promotion anywhere in this repository** — no
-  `pg_promote` call, no `promote_trigger_file`, no cluster manager. A standby
-  only becomes writable if an operator promotes it by hand.
-- Promotion is not a supported operation for this standby. The coordinator's
-  writer lease, ledger attestation, and audit invariants are all defined
-  against the primary; promoting the read replica does not produce a valid
-  PRISM primary. Losing the primary is a primary-restore problem, and
-  `docs/prism-ledger-ops.md` is the relevant runbook.
-- Because promotion is out of scope, the standby's healthcheck fails when
-  `pg_is_in_recovery()` stops returning `t`. A promoted standby is a
-  misconfiguration, and it is meant to be loud.
+Native mining frontends can recover through a stable HA writer endpoint after
+promotion of a suitable synchronous standby. Configure and validate that
+replication and promotion policy using the [HA migration guide](prism-rust-migration.md).
+The database retains the same accounting history and signing configuration;
+there is no application writer lease to elect.
+
+A public process configured with `PRISM_PUBLIC_REPLICA_MODE=require` refuses a
+server after it is promoted: it is now a writer rather than the required
+standby. Repoint the public read endpoint at the replacement standby, or
+explicitly use `off` to serve bounded reads from the new primary. Keep mining
+and settlement connections on the authoritative writer endpoint.
