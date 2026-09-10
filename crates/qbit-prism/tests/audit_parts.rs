@@ -1,14 +1,14 @@
 //! Equivalence between the owned `build_audit_bundle*` entry points and the
-//! borrowed parts API (`build_audit_body*`, `verify_audit_parts*`,
+//! borrowed parts API (`build_audit_bundle_body*`, `verify_audit_parts*`,
 //! `canonical_audit_bundle_bytes_from_parts`).
 
 use std::sync::Arc;
 
 use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::{
-    build_audit_body, build_audit_body_with_coinbase_options,
-    build_audit_body_with_coinbase_script_sig_suffix, build_audit_body_with_ctv_settlement_options,
-    build_audit_bundle, build_audit_bundle_with_coinbase_options,
+    build_audit_bundle, build_audit_bundle_body, build_audit_bundle_body_with_coinbase_options,
+    build_audit_bundle_body_with_coinbase_script_sig_suffix,
+    build_audit_bundle_body_with_ctv_settlement_options, build_audit_bundle_with_coinbase_options,
     build_audit_bundle_with_coinbase_script_sig_suffix,
     build_audit_bundle_with_ctv_settlement_options, canonical_audit_bundle_bytes,
     canonical_audit_bundle_bytes_from_parts, prior_balances_digest, verify_audit_bundle,
@@ -16,7 +16,7 @@ use qbit_prism::{
     verify_audit_bundle_against_coinbase_tx_hex_and_expected_coinbase_value, verify_audit_parts,
     verify_audit_parts_against_coinbase_tx_hex,
     verify_audit_parts_against_coinbase_tx_hex_and_expected_coinbase_value,
-    write_canonical_audit_bundle_from_parts, AcceptedShare, AuditBody, AuditBundle,
+    write_canonical_audit_bundle_from_parts, AcceptedShare, AuditBundle, AuditBundleBody,
     CarryForwardBalance, FanoutFeeRatePolicy, FoundBlock, PayoutPolicy, PoolFeePolicy, PrismError,
     SettlementModeConfig, AUDIT_BUNDLE_SCHEMA_V1, AUDIT_BUNDLE_SCHEMA_V1_1,
 };
@@ -320,13 +320,13 @@ fn build_owned(case: Case) -> AuditBundle {
 }
 
 /// The borrowing entry point for the same shape, lending `shares`.
-fn build_borrowed(case: &Case, shares: &[AcceptedShare]) -> AuditBody {
+fn build_borrowed(case: &Case, shares: &[AcceptedShare]) -> AuditBundleBody {
     let coinbase_key = manifest_signing_key();
     let ledger_key = ledger_signing_key();
     let prior_balances = case.prior_balances.clone();
     let payout_policy = case.payout_policy.clone();
     match case.shape.clone() {
-        Shape::Plain => build_audit_body(
+        Shape::Plain => build_audit_bundle_body(
             shares,
             found_block(),
             prior_balances,
@@ -334,32 +334,34 @@ fn build_borrowed(case: &Case, shares: &[AcceptedShare]) -> AuditBody {
             &coinbase_key,
             &ledger_key,
         ),
-        Shape::ScriptSigSuffix(suffix) => build_audit_body_with_coinbase_script_sig_suffix(
-            shares,
-            found_block(),
-            prior_balances,
-            payout_policy,
-            suffix,
-            &coinbase_key,
-            &ledger_key,
-        ),
-        Shape::CoinbaseOptions { suffix, witness } => build_audit_body_with_coinbase_options(
+        Shape::ScriptSigSuffix(suffix) => build_audit_bundle_body_with_coinbase_script_sig_suffix(
             shares,
             found_block(),
             prior_balances,
             payout_policy,
             suffix,
-            witness,
             &coinbase_key,
             &ledger_key,
         ),
+        Shape::CoinbaseOptions { suffix, witness } => {
+            build_audit_bundle_body_with_coinbase_options(
+                shares,
+                found_block(),
+                prior_balances,
+                payout_policy,
+                suffix,
+                witness,
+                &coinbase_key,
+                &ledger_key,
+            )
+        }
         Shape::CtvSettlement {
             direct_floor_sats,
             config,
             fee_policy,
             suffix,
             witness,
-        } => build_audit_body_with_ctv_settlement_options(
+        } => build_audit_bundle_body_with_ctv_settlement_options(
             shares,
             found_block(),
             prior_balances,
@@ -642,15 +644,15 @@ fn prior_balances_digest_matches_the_attestation() {
     }
 }
 
-/// A full bundle carries `shares`, which `AuditBody` has no field for;
+/// A full bundle carries `shares`, which `AuditBundleBody` has no field for;
 /// decoding one as a body must fail rather than silently drop the window.
 #[test]
-fn audit_body_rejects_a_full_bundle() {
+fn audit_bundle_body_rejects_a_full_bundle() {
     let case = cases().remove(0);
     let body = build_borrowed(&case, &case.shares);
     let bundle_bytes = canonical_audit_bundle_bytes_from_parts(&body, &case.shares).unwrap();
 
-    let error = serde_json::from_slice::<AuditBody>(&bundle_bytes).unwrap_err();
+    let error = serde_json::from_slice::<AuditBundleBody>(&bundle_bytes).unwrap_err();
     assert!(
         error.to_string().contains("unknown field `shares`"),
         "{error}"
@@ -658,7 +660,7 @@ fn audit_body_rejects_a_full_bundle() {
 
     let body_json = serde_json::to_vec(&body).unwrap();
     assert_eq!(
-        serde_json::from_slice::<AuditBody>(&body_json).unwrap(),
+        serde_json::from_slice::<AuditBundleBody>(&body_json).unwrap(),
         body
     );
 }

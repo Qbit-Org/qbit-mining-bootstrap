@@ -390,7 +390,7 @@ pub enum PayoutMaturityState {
 ///
 /// `Serialize` is hand-written and delegates to the private `AuditBundleRef`
 /// view, the single definition of the canonical audit bytes that the borrowed
-/// parts API ([`AuditBody`] plus `&[AcceptedShare]`) shares. That view alone
+/// parts API ([`AuditBundleBody`] plus `&[AcceptedShare]`) shares. That view alone
 /// decides field order and which absent optional fields are omitted, so the
 /// fields below carry no serialization attributes; `#[serde(default)]` is for
 /// the derived `Deserialize`, which accepts a bundle that omits them.
@@ -430,7 +430,7 @@ impl Serialize for AuditBundle {
 impl AuditBundle {
     /// Split the bundle into its body and its payout window. Both halves are
     /// moved out; no share is copied.
-    pub fn into_parts(self) -> (AuditBody, Vec<AcceptedShare>) {
+    pub fn into_parts(self) -> (AuditBundleBody, Vec<AcceptedShare>) {
         let AuditBundle {
             schema,
             shares,
@@ -449,7 +449,7 @@ impl AuditBundle {
             ctv_fanout_manifest_set,
             signed_coinbase_manifest,
         } = self;
-        let body = AuditBody {
+        let body = AuditBundleBody {
             schema,
             found_block,
             prior_balances,
@@ -471,13 +471,15 @@ impl AuditBundle {
 }
 
 /// Every [`AuditBundle`] field except the top-level `shares` payout window.
+/// It is the in-memory body of a native bundle, not the Python-era
+/// `AuditBodyRef` envelope.
 ///
-/// The parts API ([`build_audit_body`] and its siblings,
+/// The parts API ([`build_audit_bundle_body`] and its siblings,
 /// [`verify_audit_parts`], [`canonical_audit_bundle_bytes_from_parts`]) lets
 /// a caller that owns the window keep it and lend it as `&[AcceptedShare]`
 /// instead of handing a `Vec`, usually a clone, to the builder.
-/// [`AuditBody::into_bundle`] and [`AuditBundle::into_parts`] convert between
-/// the two forms by moving the window, never copying it.
+/// [`AuditBundleBody::into_bundle`] and [`AuditBundle::into_parts`] convert
+/// between the two forms by moving the window, never copying it.
 ///
 /// `reward_manifest` still carries its own `Vec<CountedShare>`, the counted
 /// records derived from the window; normalizing that copy away is a separate
@@ -491,7 +493,7 @@ impl AuditBundle {
 /// [`AuditBundle::into_parts`].
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct AuditBody {
+pub struct AuditBundleBody {
     pub schema: String,
     pub found_block: FoundBlock,
     pub prior_balances: Vec<CarryForwardBalance>,
@@ -516,12 +518,12 @@ pub struct AuditBody {
     pub signed_coinbase_manifest: SignedPayoutManifest,
 }
 
-impl AuditBody {
+impl AuditBundleBody {
     /// Assemble a bundle that owns `shares`. The window is moved in, not
     /// copied. Pass the window the body was built from; this does not check
     /// it, and [`verify_audit_bundle`] rejects a mismatched pair.
     pub fn into_bundle(self, shares: Vec<AcceptedShare>) -> AuditBundle {
-        let AuditBody {
+        let AuditBundleBody {
             schema,
             found_block,
             prior_balances,
@@ -562,7 +564,7 @@ impl AuditBody {
 /// Borrowed view of an audit bundle and the single definition of its
 /// canonical JSON. Field order and `skip_serializing_if` rules match
 /// [`AuditBundle`]'s declaration exactly. The owned bundle and
-/// `(&AuditBody, &[AcceptedShare])` both serialize through this view, so the
+/// `(&AuditBundleBody, &[AcceptedShare])` both serialize through this view, so the
 /// two forms produce identical bytes.
 ///
 /// Never `#[serde(flatten)]` a body into this struct: flatten would move
@@ -636,8 +638,8 @@ impl<'a> AuditBundleRef<'a> {
         }
     }
 
-    fn from_parts(body: &'a AuditBody, shares: &'a [AcceptedShare]) -> Self {
-        let AuditBody {
+    fn from_parts(body: &'a AuditBundleBody, shares: &'a [AcceptedShare]) -> Self {
+        let AuditBundleBody {
             schema,
             found_block,
             prior_balances,
@@ -938,7 +940,7 @@ pub fn canonical_audit_bundle_bytes(bundle: &AuditBundle) -> Result<Vec<u8>, ser
 /// assembled: the caller keeps ownership of the window and no copy of it is
 /// made outside the returned bytes.
 pub fn canonical_audit_bundle_bytes_from_parts(
-    body: &AuditBody,
+    body: &AuditBundleBody,
     shares: &[AcceptedShare],
 ) -> Result<Vec<u8>, serde_json::Error> {
     AuditBundleRef::from_parts(body, shares).canonical_bytes()
@@ -949,7 +951,7 @@ pub fn canonical_audit_bundle_bytes_from_parts(
 /// of the window and no copy of it is made.
 pub fn write_canonical_audit_bundle_from_parts<W: std::io::Write>(
     writer: W,
-    body: &AuditBody,
+    body: &AuditBundleBody,
     shares: &[AcceptedShare],
 ) -> Result<(), serde_json::Error> {
     AuditBundleRef::from_parts(body, shares).write_canonical(writer)
@@ -1561,7 +1563,7 @@ fn audit_bundle_schema_for_shares(shares: &[AcceptedShare]) -> &'static str {
 
 /// Build an audit bundle that owns `shares`. The window moves into
 /// [`AuditBundle::shares`] unchanged and in input order; it is not copied.
-/// A caller that must keep the window uses [`build_audit_body`] instead.
+/// A caller that must keep the window uses [`build_audit_bundle_body`] instead.
 pub fn build_audit_bundle(
     shares: Vec<AcceptedShare>,
     found_block: FoundBlock,
@@ -1570,7 +1572,7 @@ pub fn build_audit_bundle(
     coinbase_signing_key: &ManifestSigningKey,
     ledger_signing_key: &ManifestSigningKey,
 ) -> Result<AuditBundle, PrismError> {
-    Ok(build_audit_body(
+    Ok(build_audit_bundle_body(
         &shares,
         found_block,
         prior_balances,
@@ -1583,17 +1585,17 @@ pub fn build_audit_bundle(
 
 /// Borrowing form of [`build_audit_bundle`]. The caller keeps ownership of
 /// the payout window: the builder only reads `shares` and makes no copy of
-/// it. Pair the body with the same window through [`AuditBody::into_bundle`],
+/// it. Pair the body with the same window through [`AuditBundleBody::into_bundle`],
 /// [`canonical_audit_bundle_bytes_from_parts`] or [`verify_audit_parts`].
-pub fn build_audit_body(
+pub fn build_audit_bundle_body(
     shares: &[AcceptedShare],
     found_block: FoundBlock,
     prior_balances: Vec<CarryForwardBalance>,
     payout_policy: PayoutPolicy,
     coinbase_signing_key: &ManifestSigningKey,
     ledger_signing_key: &ManifestSigningKey,
-) -> Result<AuditBody, PrismError> {
-    build_audit_body_with_coinbase_script_sig_suffix(
+) -> Result<AuditBundleBody, PrismError> {
+    build_audit_bundle_body_with_coinbase_script_sig_suffix(
         shares,
         found_block,
         prior_balances,
@@ -1604,7 +1606,7 @@ pub fn build_audit_body(
     )
 }
 
-/// Owning form of [`build_audit_body_with_coinbase_script_sig_suffix`]. The
+/// Owning form of [`build_audit_bundle_body_with_coinbase_script_sig_suffix`]. The
 /// window moves into the bundle unchanged; it is not copied.
 pub fn build_audit_bundle_with_coinbase_script_sig_suffix(
     shares: Vec<AcceptedShare>,
@@ -1615,7 +1617,7 @@ pub fn build_audit_bundle_with_coinbase_script_sig_suffix(
     coinbase_signing_key: &ManifestSigningKey,
     ledger_signing_key: &ManifestSigningKey,
 ) -> Result<AuditBundle, PrismError> {
-    Ok(build_audit_body_with_coinbase_script_sig_suffix(
+    Ok(build_audit_bundle_body_with_coinbase_script_sig_suffix(
         &shares,
         found_block,
         prior_balances,
@@ -1630,7 +1632,7 @@ pub fn build_audit_bundle_with_coinbase_script_sig_suffix(
 /// Borrowing form of [`build_audit_bundle_with_coinbase_script_sig_suffix`].
 /// The caller keeps ownership of the payout window: the builder only reads
 /// `shares` and makes no copy of it.
-pub fn build_audit_body_with_coinbase_script_sig_suffix(
+pub fn build_audit_bundle_body_with_coinbase_script_sig_suffix(
     shares: &[AcceptedShare],
     found_block: FoundBlock,
     prior_balances: Vec<CarryForwardBalance>,
@@ -1638,8 +1640,8 @@ pub fn build_audit_body_with_coinbase_script_sig_suffix(
     coinbase_script_sig_suffix_hex: Option<String>,
     coinbase_signing_key: &ManifestSigningKey,
     ledger_signing_key: &ManifestSigningKey,
-) -> Result<AuditBody, PrismError> {
-    build_audit_body_with_coinbase_options(
+) -> Result<AuditBundleBody, PrismError> {
+    build_audit_bundle_body_with_coinbase_options(
         shares,
         found_block,
         prior_balances,
@@ -1651,7 +1653,7 @@ pub fn build_audit_body_with_coinbase_script_sig_suffix(
     )
 }
 
-/// Owning form of [`build_audit_body_with_coinbase_options`]. The window
+/// Owning form of [`build_audit_bundle_body_with_coinbase_options`]. The window
 /// moves into the bundle unchanged; it is not copied.
 pub fn build_audit_bundle_with_coinbase_options(
     shares: Vec<AcceptedShare>,
@@ -1663,7 +1665,7 @@ pub fn build_audit_bundle_with_coinbase_options(
     coinbase_signing_key: &ManifestSigningKey,
     ledger_signing_key: &ManifestSigningKey,
 ) -> Result<AuditBundle, PrismError> {
-    Ok(build_audit_body_with_coinbase_options(
+    Ok(build_audit_bundle_body_with_coinbase_options(
         &shares,
         found_block,
         prior_balances,
@@ -1680,7 +1682,7 @@ pub fn build_audit_bundle_with_coinbase_options(
 /// caller keeps ownership of the payout window: the builder only reads
 /// `shares` and makes no copy of it.
 #[allow(clippy::too_many_arguments)]
-pub fn build_audit_body_with_coinbase_options(
+pub fn build_audit_bundle_body_with_coinbase_options(
     shares: &[AcceptedShare],
     found_block: FoundBlock,
     prior_balances: Vec<CarryForwardBalance>,
@@ -1689,7 +1691,7 @@ pub fn build_audit_body_with_coinbase_options(
     witness_merkle_leaves_hex: Vec<String>,
     coinbase_signing_key: &ManifestSigningKey,
     ledger_signing_key: &ManifestSigningKey,
-) -> Result<AuditBody, PrismError> {
+) -> Result<AuditBundleBody, PrismError> {
     if coinbase_signing_key
         .public_key_hex()
         .eq_ignore_ascii_case(&ledger_signing_key.public_key_hex())
@@ -1727,7 +1729,7 @@ pub fn build_audit_body_with_coinbase_options(
     let signed_coinbase_manifest =
         build_profiled_signed_manifest(coinbase_request, coinbase_signing_key)?;
 
-    Ok(AuditBody {
+    Ok(AuditBundleBody {
         schema: audit_bundle_schema_for_shares(shares).to_string(),
         found_block,
         prior_balances,
@@ -1746,7 +1748,7 @@ pub fn build_audit_body_with_coinbase_options(
     })
 }
 
-/// Owning form of [`build_audit_body_with_ctv_settlement_options`]. The
+/// Owning form of [`build_audit_bundle_body_with_ctv_settlement_options`]. The
 /// window moves into the bundle unchanged; it is not copied.
 pub fn build_audit_bundle_with_ctv_settlement_options(
     shares: Vec<AcceptedShare>,
@@ -1761,7 +1763,7 @@ pub fn build_audit_bundle_with_ctv_settlement_options(
     coinbase_signing_key: &ManifestSigningKey,
     ledger_signing_key: &ManifestSigningKey,
 ) -> Result<AuditBundle, PrismError> {
-    Ok(build_audit_body_with_ctv_settlement_options(
+    Ok(build_audit_bundle_body_with_ctv_settlement_options(
         &shares,
         found_block,
         prior_balances,
@@ -1781,7 +1783,7 @@ pub fn build_audit_bundle_with_ctv_settlement_options(
 /// caller keeps ownership of the payout window: the builder only reads
 /// `shares` and makes no copy of it.
 #[allow(clippy::too_many_arguments)]
-pub fn build_audit_body_with_ctv_settlement_options(
+pub fn build_audit_bundle_body_with_ctv_settlement_options(
     shares: &[AcceptedShare],
     found_block: FoundBlock,
     prior_balances: Vec<CarryForwardBalance>,
@@ -1793,7 +1795,7 @@ pub fn build_audit_body_with_ctv_settlement_options(
     witness_merkle_leaves_hex: Vec<String>,
     coinbase_signing_key: &ManifestSigningKey,
     ledger_signing_key: &ManifestSigningKey,
-) -> Result<AuditBody, PrismError> {
+) -> Result<AuditBundleBody, PrismError> {
     if coinbase_signing_key
         .public_key_hex()
         .eq_ignore_ascii_case(&ledger_signing_key.public_key_hex())
@@ -1945,7 +1947,7 @@ pub fn build_audit_body_with_ctv_settlement_options(
         )?)
     };
 
-    Ok(AuditBody {
+    Ok(AuditBundleBody {
         schema: audit_bundle_schema_for_shares(shares).to_string(),
         found_block,
         prior_balances,
@@ -2265,7 +2267,7 @@ pub fn verify_audit_bundle(
 /// report equals [`verify_audit_bundle`]'s for the assembled bundle,
 /// including `audit_bundle_sha256_hex`, which covers the bytes with shares.
 pub fn verify_audit_parts(
-    body: &AuditBody,
+    body: &AuditBundleBody,
     shares: &[AcceptedShare],
     ledger_writer_public_key_hex: &str,
 ) -> Result<AuditVerificationReport, PrismError> {
@@ -2398,7 +2400,7 @@ pub fn verify_audit_bundle_against_coinbase_tx_hex(
 /// Parts form of [`verify_audit_bundle_against_coinbase_tx_hex`]. The caller
 /// keeps ownership of the window and no copy of it is made.
 pub fn verify_audit_parts_against_coinbase_tx_hex(
-    body: &AuditBody,
+    body: &AuditBundleBody,
     shares: &[AcceptedShare],
     onchain_coinbase_tx_hex: &str,
     ledger_writer_public_key_hex: &str,
@@ -2443,7 +2445,7 @@ pub fn verify_audit_bundle_against_coinbase_tx_hex_and_expected_coinbase_value(
 /// [`verify_audit_bundle_against_coinbase_tx_hex_and_expected_coinbase_value`].
 /// The caller keeps ownership of the window and no copy of it is made.
 pub fn verify_audit_parts_against_coinbase_tx_hex_and_expected_coinbase_value(
-    body: &AuditBody,
+    body: &AuditBundleBody,
     shares: &[AcceptedShare],
     onchain_coinbase_tx_hex: &str,
     ledger_writer_public_key_hex: &str,
