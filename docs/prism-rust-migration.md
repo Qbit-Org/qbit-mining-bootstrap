@@ -268,7 +268,110 @@ Bootstrap now pays the solver only when there are no historical shares; there
 is no three-miner readiness gate. A network-valid proof below its assigned share
 target is credited at network difficulty only after its block is confirmed on
 the active chain. These deliberate accounting simplifications should be
-included in operator/miner rollout notes.
+included in operator/miner rollout notes. Their payout effect is recorded in
+[Payout differences from 2.x.x (decision D2)](#payout-differences-from-2xx).
+
+<a id="payout-differences-from-2xx"></a>
+
+## Payout differences from 2.x.x (decision D2)
+
+`crates/qbit-prism/fixtures/vectors/` holds money-path vectors exported from
+`2.x.x` at `504846cc0b72e8f86ed17f896d4ccbbe196a31dc`. They were computed by the `2.x.x` engine
+and rule code, not by hand. `crates/qbit-prism/tests/money_path_vectors.rs`
+replays every case through this engine. Window clipping, carry-only recipients,
+pool fees, dust recompute, remainder ties, and CTV chunking match `2.x.x`
+exactly. Every other difference is one of the entries below, under decision D2 of issue #260. Each
+differing case stores both the `2.x.x` and `3.x.x` payout and names its entry
+by anchor; the test fails if the anchor is removed. All amounts are in sats.
+All vectors use the day-one floor of 14720 sats.
+
+<a id="d2a-bootstrap-pooling"></a>
+
+### D2a: bootstrap pooling
+
+- **Vector:** `bootstrap_transition.json`, case
+  `below-gate-with-other-miners-shares`.
+  - miner-a has a 30-difficulty share and miner-b a 20-difficulty share in the ledger.
+  - miner-b solves a 500000000-sat block.
+- **2.x.x:** miner-b is paid 500000000.
+  - Two distinct miners is below the `PRISM_MIN_READY_MINERS` gate (default 3).
+  - So the job is a collection job: one synthetic solver share, and the solver
+    is paid the whole coinbase.
+- **3.x.x:** miner-a is paid 300000000 and miner-b 200000000.
+  - The window is proportional as soon as any share exists.
+- **Reason:** `crates/qbit-prism-server/src/coordinator.rs` (bundle selection
+  after the ledger snapshot) builds the solver-only bundle only when
+  `snapshot.shares` is empty. There is no readiness gate.
+- **Matching cases:** `at-readiness-gate` (three miners, prior balances kept on
+  both) and `empty-ledger` (the solver is paid everything on both) match `2.x.x`.
+- **D2 item:** bootstrap pooling.
+
+<a id="d2b-below-target-credit"></a>
+
+### D2b: below-target block credit
+
+- **Vector:** `below_target_credit.json`, cases `block-only-proof-accepted`,
+  `block-only-proof-confirmed-after-reconciliation`, and
+  `block-only-proof-reorged-after-acceptance`.
+  - The listener floor holds the share target at difficulty 4000000.
+  - Network difficulty is 1000000.
+  - miner-a submits a proof that meets the network target but not the share
+    target.
+- **Credited amount:**
+  - **2.x.x:** the assigned share difficulty, 4000000.
+  - **3.x.x:** network difficulty, 1000000.
+- **Next block's payout** (8000000 window; miner-b has 2000000 + 2000000, miner-c 1000000):
+  - **2.x.x:** miner-a 250000000, miner-b 187500000, miner-c 62500000.
+    - The 9000000 of credited work overfills the window.
+    - miner-b's oldest share counts only 1000000.
+  - **3.x.x:** miner-a 83333334, miner-b 333333333, miner-c 83333333.
+    - The window holds 6000000.
+- **Timing:**
+  - **2.x.x:** credits at node acceptance of the block.
+  - **3.x.x:** credits inside the transaction that marks the block confirmed on the
+    active chain.
+    - That is either after acceptance or during reconciliation.
+    - The Stratum acknowledgement waits for that credit row.
+    - A block that is abandoned instead fails the submission with "block-only
+      proof was not accepted on the active chain".
+  - On both versions a credited share survives a later reorg.
+- **Reason:**
+  - `crates/qbit-prism-server/src/coordinator.rs` credits `network` difficulty
+    when `share_pass` is false, and holds the share as the candidate's
+    `deferred_share` until the credit row exists.
+  - `crates/qbit-prism-server/src/ledger/blocks.rs` (`credit_deferred_share`)
+    appends it only on confirmation.
+- **Matching cases:** `block-only-proof-rejected` (no credit on either) and
+  `share-and-block-proof-control` (a share-passing proof is credited at the
+  assigned difficulty on both) match `2.x.x`.
+- **D2 item:** below-target credit.
+
+<a id="d2c-prior-balances-during-bootstrap"></a>
+
+### D2c: prior balances during bootstrap
+
+**Status:** pending explicit approval by the D2 umbrella owner. This entry is
+recorded separately from D2a so it can be approved on its own.
+
+- **Vector:** `bootstrap_transition.json`, case
+  `bootstrap-carry-only-account-at-or-above-floor`.
+  - The share window is empty.
+  - miner-old has a 20000-sat carry and no share.
+  - miner-b solves a 500000000-sat block.
+- **2.x.x:** miner-b is paid 500000000.
+  - miner-old is not in the payout manifest and is not paid in this block.
+  - Its 20000-sat balance waits for a later block.
+- **3.x.x:** miner-old is paid 19999, and carries 1.
+  - miner-b is paid 499980001, and carries 19999.
+  - The engine allocates the coinbase over both accounts' candidate balances.
+- **Reason:**
+  - The `2.x.x` collection bundle passes `prior_balances=[]`
+    (`lab/prism/job_bundle.py` `build_collection_bundle`).
+  - `crates/qbit-prism-server/src/coordinator.rs` `build_bundle` passes
+    `snapshot.prior_balances` in bootstrap too.
+  - So a carry-only account at or above the floor can be paid in a bootstrap
+    block.
+- **D2 item:** D2c, prior balances during bootstrap.
 
 ## Recovery and rollback
 

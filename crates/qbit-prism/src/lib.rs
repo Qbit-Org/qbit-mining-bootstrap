@@ -3318,6 +3318,35 @@ mod tests {
         assert_fixture(include_str!(
             "../fixtures/difficulty-change.prism-fixture.json"
         ));
+
+        let fixture = load_policy_fixture(include_str!(
+            "../fixtures/power-law-accrual.prism-fixture.json"
+        ));
+        let reward_manifest =
+            build_prism_reward_manifest(&fixture.shares, &fixture.found_block).unwrap();
+        let policy_manifest = apply_payout_policy(
+            &reward_manifest,
+            &power_law_prior_balances(),
+            &PayoutPolicy::day_one_default(),
+        )
+        .unwrap();
+        assert_eq!(
+            policy_manifest.min_output_sats,
+            fixture.expected_min_output_sats
+        );
+        assert_eq!(
+            policy_manifest.onchain_entitlements.len(),
+            fixture.expected_onchain_count
+        );
+        assert_eq!(
+            policy_manifest
+                .accounts
+                .iter()
+                .filter(|account| account.action == PayoutPolicyAction::Accrued)
+                .map(|account| account.recipient_id.clone())
+                .collect::<Vec<_>>(),
+            fixture.expected_accrued_recipients
+        );
     }
 
     #[test]

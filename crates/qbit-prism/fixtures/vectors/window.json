@@ -1,0 +1,802 @@
+{
+  "cases": [
+    {
+      "entry_point": "compute_prism_window",
+      "expected": {
+        "ok": {
+          "anchor_job_issued_at_ms": 1003,
+          "anchor_share_seq": 4,
+          "counted_window_weight": 80,
+          "entitlements": [
+            {
+              "order_key": "03",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "recipient_id": "miner-a",
+              "weight": 30
+            },
+            {
+              "order_key": "04",
+              "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+              "recipient_id": "miner-c",
+              "weight": 50
+            }
+          ],
+          "requested_window_weight": 80,
+          "shares": [
+            {
+              "accepted_at_ms": 1003,
+              "counted_difficulty": 50,
+              "job_issued_at_ms": 1003,
+              "miner_id": "miner-c",
+              "order_key": "04",
+              "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+              "share_difficulty": 50,
+              "share_id": "share-4",
+              "share_seq": 4
+            },
+            {
+              "accepted_at_ms": 1002,
+              "counted_difficulty": 30,
+              "job_issued_at_ms": 1002,
+              "miner_id": "miner-a",
+              "order_key": "03",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "share_difficulty": 30,
+              "share_id": "share-3",
+              "share_seq": 3
+            }
+          ]
+        }
+      },
+      "input": {
+        "found_block": {
+          "anchor_job_issued_at_ms": 1003,
+          "block_height": 101,
+          "coinbase_value_sats": 500000000,
+          "network_difficulty": 10
+        },
+        "shares": [
+          {
+            "accepted_at_ms": 1000,
+            "job_id": "job-1000",
+            "job_issued_at_ms": 1000,
+            "miner_id": "miner-old",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "share_difficulty": 999,
+            "share_id": "share-1",
+            "share_seq": 1,
+            "template_height": 100
+          },
+          {
+            "accepted_at_ms": 1001,
+            "job_id": "job-1001",
+            "job_issued_at_ms": 1001,
+            "miner_id": "miner-b",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "02",
+            "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+            "share_difficulty": 40,
+            "share_id": "share-2",
+            "share_seq": 2,
+            "template_height": 100
+          },
+          {
+            "accepted_at_ms": 1002,
+            "job_id": "job-1002",
+            "job_issued_at_ms": 1002,
+            "miner_id": "miner-a",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "03",
+            "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+            "share_difficulty": 30,
+            "share_id": "share-3",
+            "share_seq": 3,
+            "template_height": 100
+          },
+          {
+            "accepted_at_ms": 1003,
+            "job_id": "job-1003",
+            "job_issued_at_ms": 1003,
+            "miner_id": "miner-c",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "04",
+            "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+            "share_difficulty": 50,
+            "share_id": "share-4",
+            "share_seq": 4,
+            "template_height": 100
+          }
+        ]
+      },
+      "name": "exact-fit-boundary",
+      "topic": 1,
+      "why": "8 x 10 = 80 is filled exactly by the two newest shares (50 + 30); the older shares get nothing."
+    },
+    {
+      "entry_point": "compute_prism_window",
+      "expected": {
+        "ok": {
+          "anchor_job_issued_at_ms": 1003,
+          "anchor_share_seq": 4,
+          "counted_window_weight": 72,
+          "entitlements": [
+            {
+              "order_key": "03",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "recipient_id": "miner-a",
+              "weight": 22
+            },
+            {
+              "order_key": "04",
+              "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+              "recipient_id": "miner-c",
+              "weight": 50
+            }
+          ],
+          "requested_window_weight": 72,
+          "shares": [
+            {
+              "accepted_at_ms": 1003,
+              "counted_difficulty": 50,
+              "job_issued_at_ms": 1003,
+              "miner_id": "miner-c",
+              "order_key": "04",
+              "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+              "share_difficulty": 50,
+              "share_id": "share-4",
+              "share_seq": 4
+            },
+            {
+              "accepted_at_ms": 1002,
+              "counted_difficulty": 22,
+              "job_issued_at_ms": 1002,
+              "miner_id": "miner-a",
+              "order_key": "03",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "share_difficulty": 30,
+              "share_id": "share-3",
+              "share_seq": 3
+            }
+          ]
+        }
+      },
+      "input": {
+        "found_block": {
+          "anchor_job_issued_at_ms": 1003,
+          "block_height": 101,
+          "coinbase_value_sats": 500000000,
+          "network_difficulty": 9
+        },
+        "shares": [
+          {
+            "accepted_at_ms": 1000,
+            "job_id": "job-1000",
+            "job_issued_at_ms": 1000,
+            "miner_id": "miner-old",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "share_difficulty": 999,
+            "share_id": "share-1",
+            "share_seq": 1,
+            "template_height": 100
+          },
+          {
+            "accepted_at_ms": 1001,
+            "job_id": "job-1001",
+            "job_issued_at_ms": 1001,
+            "miner_id": "miner-b",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "02",
+            "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+            "share_difficulty": 40,
+            "share_id": "share-2",
+            "share_seq": 2,
+            "template_height": 100
+          },
+          {
+            "accepted_at_ms": 1002,
+            "job_id": "job-1002",
+            "job_issued_at_ms": 1002,
+            "miner_id": "miner-a",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "03",
+            "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+            "share_difficulty": 30,
+            "share_id": "share-3",
+            "share_seq": 3,
+            "template_height": 100
+          },
+          {
+            "accepted_at_ms": 1003,
+            "job_id": "job-1003",
+            "job_issued_at_ms": 1003,
+            "miner_id": "miner-c",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "04",
+            "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+            "share_difficulty": 50,
+            "share_id": "share-4",
+            "share_seq": 4,
+            "template_height": 100
+          }
+        ]
+      },
+      "name": "fractional-oldest-share",
+      "topic": 2,
+      "why": "The same shares with network difficulty 9: 72 = 50 + 22, so the oldest counted share counts 22 of its 30."
+    },
+    {
+      "entry_point": "compute_prism_window",
+      "expected": {
+        "ok": {
+          "anchor_job_issued_at_ms": 1001,
+          "anchor_share_seq": 2,
+          "counted_window_weight": 8,
+          "entitlements": [
+            {
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "miner-a",
+              "weight": 1
+            },
+            {
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "miner-b",
+              "weight": 7
+            }
+          ],
+          "requested_window_weight": 8,
+          "shares": [
+            {
+              "accepted_at_ms": 1001,
+              "counted_difficulty": 7,
+              "job_issued_at_ms": 1001,
+              "miner_id": "miner-b",
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 7,
+              "share_id": "share-2",
+              "share_seq": 2
+            },
+            {
+              "accepted_at_ms": 1000,
+              "counted_difficulty": 1,
+              "job_issued_at_ms": 1000,
+              "miner_id": "miner-a",
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "share_difficulty": 1000,
+              "share_id": "share-1",
+              "share_seq": 1
+            }
+          ]
+        }
+      },
+      "input": {
+        "found_block": {
+          "anchor_job_issued_at_ms": 1001,
+          "block_height": 101,
+          "coinbase_value_sats": 500000000,
+          "network_difficulty": 1
+        },
+        "shares": [
+          {
+            "accepted_at_ms": 1000,
+            "job_id": "job-1000",
+            "job_issued_at_ms": 1000,
+            "miner_id": "miner-a",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "share_difficulty": 1000,
+            "share_id": "share-1",
+            "share_seq": 1,
+            "template_height": 100
+          },
+          {
+            "accepted_at_ms": 1001,
+            "job_id": "job-1001",
+            "job_issued_at_ms": 1001,
+            "miner_id": "miner-b",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "02",
+            "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+            "share_difficulty": 7,
+            "share_id": "share-2",
+            "share_seq": 2,
+            "template_height": 100
+          }
+        ]
+      },
+      "name": "oldest-share-counts-one-unit",
+      "topic": 2,
+      "why": "Weight 8 after a 7-difficulty share leaves exactly one unit for a 1000-difficulty share."
+    },
+    {
+      "entry_point": "compute_prism_window",
+      "expected": {
+        "ok": {
+          "anchor_job_issued_at_ms": 1002,
+          "anchor_share_seq": 3,
+          "counted_window_weight": 60,
+          "entitlements": [
+            {
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "miner-a",
+              "weight": 40
+            },
+            {
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "miner-b",
+              "weight": 20
+            }
+          ],
+          "requested_window_weight": 800,
+          "shares": [
+            {
+              "accepted_at_ms": 1002,
+              "counted_difficulty": 30,
+              "job_issued_at_ms": 1002,
+              "miner_id": "miner-a",
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "share_difficulty": 30,
+              "share_id": "share-3",
+              "share_seq": 3
+            },
+            {
+              "accepted_at_ms": 1001,
+              "counted_difficulty": 20,
+              "job_issued_at_ms": 1001,
+              "miner_id": "miner-b",
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 20,
+              "share_id": "share-2",
+              "share_seq": 2
+            },
+            {
+              "accepted_at_ms": 1000,
+              "counted_difficulty": 10,
+              "job_issued_at_ms": 1000,
+              "miner_id": "miner-a",
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "share_difficulty": 10,
+              "share_id": "share-1",
+              "share_seq": 1
+            }
+          ]
+        }
+      },
+      "input": {
+        "found_block": {
+          "anchor_job_issued_at_ms": 1002,
+          "block_height": 101,
+          "coinbase_value_sats": 500000000,
+          "network_difficulty": 100
+        },
+        "shares": [
+          {
+            "accepted_at_ms": 1000,
+            "job_id": "job-1000",
+            "job_issued_at_ms": 1000,
+            "miner_id": "miner-a",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "share_difficulty": 10,
+            "share_id": "share-1",
+            "share_seq": 1,
+            "template_height": 100
+          },
+          {
+            "accepted_at_ms": 1001,
+            "job_id": "job-1001",
+            "job_issued_at_ms": 1001,
+            "miner_id": "miner-b",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "02",
+            "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+            "share_difficulty": 20,
+            "share_id": "share-2",
+            "share_seq": 2,
+            "template_height": 100
+          },
+          {
+            "accepted_at_ms": 1002,
+            "job_id": "job-1002",
+            "job_issued_at_ms": 1002,
+            "miner_id": "miner-a",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "share_difficulty": 30,
+            "share_id": "share-3",
+            "share_seq": 3,
+            "template_height": 100
+          }
+        ]
+      },
+      "name": "small-log-below-weight",
+      "topic": 1,
+      "why": "The whole eligible log (60) is below the requested weight (800), so every share counts in full."
+    },
+    {
+      "entry_point": "compute_prism_window",
+      "expected": {
+        "ok": {
+          "anchor_job_issued_at_ms": 1001,
+          "anchor_share_seq": 2,
+          "counted_window_weight": 30,
+          "entitlements": [
+            {
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "miner-a",
+              "weight": 10
+            },
+            {
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "miner-b",
+              "weight": 20
+            }
+          ],
+          "requested_window_weight": 80,
+          "shares": [
+            {
+              "accepted_at_ms": 1001,
+              "counted_difficulty": 20,
+              "job_issued_at_ms": 1001,
+              "miner_id": "miner-b",
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 20,
+              "share_id": "share-2",
+              "share_seq": 2
+            },
+            {
+              "accepted_at_ms": 1000,
+              "counted_difficulty": 10,
+              "job_issued_at_ms": 1000,
+              "miner_id": "miner-a",
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "share_difficulty": 10,
+              "share_id": "share-1",
+              "share_seq": 1
+            }
+          ]
+        }
+      },
+      "input": {
+        "found_block": {
+          "anchor_job_issued_at_ms": 1001,
+          "block_height": 101,
+          "coinbase_value_sats": 500000000,
+          "network_difficulty": 10
+        },
+        "shares": [
+          {
+            "accepted_at_ms": 1000,
+            "job_id": "job-1000",
+            "job_issued_at_ms": 1000,
+            "miner_id": "miner-a",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "share_difficulty": 10,
+            "share_id": "share-1",
+            "share_seq": 1,
+            "template_height": 100
+          },
+          {
+            "accepted_at_ms": 1001,
+            "job_id": "job-1001",
+            "job_issued_at_ms": 1001,
+            "miner_id": "miner-b",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "02",
+            "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+            "share_difficulty": 20,
+            "share_id": "share-2",
+            "share_seq": 2,
+            "template_height": 100
+          },
+          {
+            "accepted_at_ms": 1500,
+            "job_id": "job-2000",
+            "job_issued_at_ms": 2000,
+            "miner_id": "miner-late",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "03",
+            "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+            "share_difficulty": 1000,
+            "share_id": "share-3",
+            "share_seq": 3,
+            "template_height": 100
+          },
+          {
+            "accepted_at_ms": 1002,
+            "job_id": "job-1000",
+            "job_issued_at_ms": 1000,
+            "miner_id": "miner-slow",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "04",
+            "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+            "share_difficulty": 1000,
+            "share_id": "share-4",
+            "share_seq": 4,
+            "template_height": 100
+          }
+        ]
+      },
+      "name": "shares-after-anchor-excluded",
+      "topic": 1,
+      "why": "A share whose job was issued after the anchor, and one issued before it but accepted after it, are both excluded."
+    },
+    {
+      "entry_point": "compute_prism_window",
+      "expected": {
+        "ok": {
+          "anchor_job_issued_at_ms": 1003,
+          "anchor_share_seq": 4,
+          "counted_window_weight": 72,
+          "entitlements": [
+            {
+              "order_key": "03",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "recipient_id": "miner-a",
+              "weight": 22
+            },
+            {
+              "order_key": "04",
+              "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+              "recipient_id": "miner-c",
+              "weight": 50
+            }
+          ],
+          "requested_window_weight": 72,
+          "shares": [
+            {
+              "accepted_at_ms": 1003,
+              "counted_difficulty": 50,
+              "job_issued_at_ms": 1003,
+              "miner_id": "miner-c",
+              "order_key": "04",
+              "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+              "share_difficulty": 50,
+              "share_id": "share-4",
+              "share_seq": 4
+            },
+            {
+              "accepted_at_ms": 1002,
+              "counted_difficulty": 22,
+              "job_issued_at_ms": 1002,
+              "miner_id": "miner-a",
+              "order_key": "03",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "share_difficulty": 30,
+              "share_id": "share-3",
+              "share_seq": 3
+            }
+          ]
+        }
+      },
+      "input": {
+        "found_block": {
+          "anchor_job_issued_at_ms": 1003,
+          "block_height": 101,
+          "coinbase_value_sats": 500000000,
+          "network_difficulty": 9
+        },
+        "shares": [
+          {
+            "accepted_at_ms": 1002,
+            "job_id": "job-1002",
+            "job_issued_at_ms": 1002,
+            "miner_id": "miner-a",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "03",
+            "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+            "share_difficulty": 30,
+            "share_id": "share-3",
+            "share_seq": 3,
+            "template_height": 100
+          },
+          {
+            "accepted_at_ms": 1003,
+            "job_id": "job-1003",
+            "job_issued_at_ms": 1003,
+            "miner_id": "miner-c",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "04",
+            "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+            "share_difficulty": 50,
+            "share_id": "share-4",
+            "share_seq": 4,
+            "template_height": 100
+          },
+          {
+            "accepted_at_ms": 1000,
+            "job_id": "job-1000",
+            "job_issued_at_ms": 1000,
+            "miner_id": "miner-old",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "share_difficulty": 999,
+            "share_id": "share-1",
+            "share_seq": 1,
+            "template_height": 100
+          },
+          {
+            "accepted_at_ms": 1001,
+            "job_id": "job-1001",
+            "job_issued_at_ms": 1001,
+            "miner_id": "miner-b",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "02",
+            "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+            "share_difficulty": 40,
+            "share_id": "share-2",
+            "share_seq": 2,
+            "template_height": 100
+          }
+        ]
+      },
+      "name": "unsorted-input",
+      "topic": 1,
+      "why": "The boundary shares in scrambled sequence order give the same newest-first window as sorted input."
+    },
+    {
+      "entry_point": "compute_prism_window",
+      "expected": {
+        "error": "network difficulty must be positive"
+      },
+      "input": {
+        "found_block": {
+          "anchor_job_issued_at_ms": 1003,
+          "block_height": 101,
+          "coinbase_value_sats": 500000000,
+          "network_difficulty": 0
+        },
+        "shares": [
+          {
+            "accepted_at_ms": 1000,
+            "job_id": "job-1000",
+            "job_issued_at_ms": 1000,
+            "miner_id": "miner-old",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "share_difficulty": 999,
+            "share_id": "share-1",
+            "share_seq": 1,
+            "template_height": 100
+          },
+          {
+            "accepted_at_ms": 1001,
+            "job_id": "job-1001",
+            "job_issued_at_ms": 1001,
+            "miner_id": "miner-b",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "02",
+            "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+            "share_difficulty": 40,
+            "share_id": "share-2",
+            "share_seq": 2,
+            "template_height": 100
+          },
+          {
+            "accepted_at_ms": 1002,
+            "job_id": "job-1002",
+            "job_issued_at_ms": 1002,
+            "miner_id": "miner-a",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "03",
+            "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+            "share_difficulty": 30,
+            "share_id": "share-3",
+            "share_seq": 3,
+            "template_height": 100
+          },
+          {
+            "accepted_at_ms": 1003,
+            "job_id": "job-1003",
+            "job_issued_at_ms": 1003,
+            "miner_id": "miner-c",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "04",
+            "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+            "share_difficulty": 50,
+            "share_id": "share-4",
+            "share_seq": 4,
+            "template_height": 100
+          }
+        ]
+      },
+      "name": "zero-network-difficulty-is-an-error",
+      "topic": 1,
+      "why": "A found block with network difficulty 0 cannot define a window."
+    },
+    {
+      "entry_point": "compute_prism_window",
+      "expected": {
+        "error": "no eligible shares at or before job issue time 1000"
+      },
+      "input": {
+        "found_block": {
+          "anchor_job_issued_at_ms": 1000,
+          "block_height": 101,
+          "coinbase_value_sats": 500000000,
+          "network_difficulty": 10
+        },
+        "shares": [
+          {
+            "accepted_at_ms": 2000,
+            "job_id": "job-2000",
+            "job_issued_at_ms": 2000,
+            "miner_id": "miner-a",
+            "network_difficulty": 10,
+            "ntime": 1800000000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "share_difficulty": 10,
+            "share_id": "share-1",
+            "share_seq": 1,
+            "template_height": 100
+          }
+        ]
+      },
+      "name": "no-eligible-share-is-an-error",
+      "topic": 1,
+      "why": "Every share is after the anchor, so the window is empty."
+    }
+  ],
+  "produced_by": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 crates/qbit-prism/examples/export_rule_decisions.py | cargo run --locked -q -p qbit-prism --example export_money_path_vectors -- vectors-out",
+  "schema": "qbit.prism.money-path-vectors.v1",
+  "source_commit": "504846cc0b72e8f86ed17f896d4ccbbe196a31dc",
+  "topics": [
+    {
+      "id": 1,
+      "name": "window clipping and the oldest-share boundary"
+    },
+    {
+      "id": 2,
+      "name": "fractional oldest share"
+    }
+  ]
+}
