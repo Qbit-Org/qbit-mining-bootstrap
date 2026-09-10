@@ -355,9 +355,17 @@ resumes of the same `storage_key` behind one in-flight rebuild, for example a
 single-flight map next to the `Prepared` cache: later miners await the first
 rebuild's `Arc<Snapshot>` and `Arc<AuditBundle>` instead of reading the
 window again. For an empty window the entry carries `bundle: None`, and each
-resuming miner builds its own bootstrap bundle through `build_bundle` as
-today (`:1498-1510`), after the entry's permit is released; sharing one would
-put miner A's bootstrap share in miner B's job.
+resuming miner builds its own bootstrap bundle, because sharing one would put
+miner A's bootstrap share in miner B's job. It does so under its own
+`build_slots` permit, taken after the entry's permit is released, by calling
+the builders directly: the synthetic share is the one `build_bundle`
+fabricates from the worker today (`:727-745`, reached from `:1498-1510`), and
+every other input comes from `StoredPrepared` (template, anchor,
+`payout_policy`, `ctv`) and the balances and revision `read_window` returned.
+It never calls `build_bundle` itself, which reads `config.ctv_enabled`,
+`payout_policy`, `ctv_direct_floor` and `ctv_config` (`:755`, `:760-762`) and
+would reintroduce the drift [Stored bundle inputs](#stored-bundle-inputs)
+forbids.
 
 **Deadlines.** `read_window` takes no deadline of its own. Each statement,
 so each page, runs under the connection's `statement_timeout`, 15 s by
@@ -385,7 +393,7 @@ one `tokio::time::timeout` around `read_window` plus the rebuild:
 | `Database` (incl. 57014) | transient | propagate: `submit_loop` hands the error to `retry_candidate` (`srv/src/coordinator.rs:1123-1131`), which releases the claim and reschedules the row after `LEAST(60, attempt_count)` seconds (`srv/src/ledger.rs:594`); lease expiry recovers the row only if that write itself fails | propagate; the reconnect fails and retries | as above | propagate |
 | landing equality failure after a successful `read_window` (`srv/src/ledger/audit.rs:132-138`) | the landing transaction read a different range than the claim did, which immutability forbids | like `SnapshotDigestMismatch`: `retry_candidate` with an alert, never abandon; the error already reaches `submit_loop`'s retry path (`srv/src/coordinator.rs:1123-1131`) | n/a | the check stays | n/a |
 | caller deadline expired | `read_window` plus the rebuild outran the deadline in the table above | 60 s: `retry_candidate` with an alert | `outer − min(5 s, outer / 2)`: `Ok(None)`; the share is rejected as `unknown-job` | n/a | n/a |
-| empty window (`shares: None`) | not an error | rebuild from `vec![bootstrap_share]` | rebuild the bootstrap bundle per miner, as today | lands through `inline_shares` (`srv/src/ledger/audit.rs:124-131`), unchanged | n/a |
+| empty window (`shares: None`) | not an error | rebuild from `vec![bootstrap_share]` | rebuild the bootstrap bundle per miner with the builders directly, from the stored policy inputs, never `build_bundle` | lands through `inline_shares` (`srv/src/ledger/audit.rs:124-131`), unchanged | n/a |
 
 ## Revision fence and reorgs
 
@@ -690,9 +698,9 @@ not on every refresh.
 | read | claim decode (`srv/src/ledger.rs:549-555`) checks the digest and the columns | resume (`srv/src/coordinator.rs:1447-1470`) decodes the small payload inline; `:1469-1470` no longer needs `spawn_blocking` |
 | fence | `process_candidate_inner` (`srv/src/coordinator.rs:966`) keeps `:972-979`; `Window.payout_revision != candidate.payout_revision` is a second hint for the same `observe_candidate` probe and never a supersession by itself ([Revision fence and reorgs](#revision-fence-and-reorgs)) | `:1483-1488` stays, then `Window.payout_revision` against the row's `payout_revision`; any inequality is `Ok(None)` |
 | rebuild | under a `build_slots` permit (`:997`) and the 60 s whole-call deadline: if `qbit_pool_audit_bundles` already holds the block's audit, finish from it through `materialize_audit_row` without `read_window`; else await `read_window`, re-derive the witness leaves from `block_hex`, run `build_audit_bundle_body_*(&window.shares, …)` directly in `spawn_blocking` (`:998-1031`; never `build_bundle`, which takes a second permit at `:712`), and put `into_bundle(window.shares)` in `CandidateClaim` for landing | under one `build_slots` permit, the single-flight entry for the `storage_key` and the inner timeout: await `read_window`, rebuild `Prepared` through the borrowing builders called directly, never `build_bundle`, or use the local incremental window once #274 lands |
-| empty window | build over `&[bootstrap_share]` | the single-flight entry carries `bundle: None`; `build_bundle(…, Some(stored.worker.clone()), …)` per miner as today (`:1498-1510`), from the stored anchor and the returned balances and revision, after the entry's permit is released |
+| empty window | build over `&[bootstrap_share]` | the single-flight entry carries `bundle: None`; each miner gets its own bootstrap bundle, built with the builders directly under a fresh `build_slots` permit taken after the entry's permit is released, from the synthetic share `build_bundle` fabricates from the worker today (`:727-745`, reached from `:1498-1510`), the stored template, anchor, `payout_policy` and `ctv`, and the returned balances and revision; never `build_bundle`, which reads `config` for signed fields (`:755`, `:760-762`) |
 | import | `srv/src/ledger/migration.rs:117` stores `canonical_audit_bytes` plus non-share metadata and no inline body | n/a |
-| must not | serialize a share array into the outbox; hold `ORDER_LOCK` across `read_window`; decode inline candidates on a post-007 schema; read local configuration for any stored input; wrap `read_window` in `spawn_blocking`; call `build_bundle` under a held `build_slots` permit | write a share array into `payload`; wrap `read_window` in `spawn_blocking`; run whole-window serde on a runtime thread; call `build_bundle` under a held `build_slots` permit; change the `save_job` revision fence (`srv/src/ledger.rs:472-479`) or the cached-work reuse conditions (`srv/src/coordinator.rs:528-533`) |
+| must not | serialize a share array into the outbox; hold `ORDER_LOCK` across `read_window`; decode inline candidates on a post-007 schema; read local configuration for any stored input; wrap `read_window` in `spawn_blocking`; call `build_bundle` under a held `build_slots` permit | write a share array into `payload`; wrap `read_window` in `spawn_blocking`; run whole-window serde on a runtime thread; call `build_bundle` for any resume rebuild, empty window included (it takes a second permit and reads `config` for signed fields); change the `save_job` revision fence (`srv/src/ledger.rs:472-479`) or the cached-work reuse conditions (`srv/src/coordinator.rs:528-533`) |
 | text to amend on merge | "reconstructs … through `Ledger::read_window` in `spawn_blocking`": `read_window` is awaited, only the builder runs in `spawn_blocking`; the closed field list ("stores the `WindowRef` … plus … not the bundle"): it is the [Stored bundle inputs](#stored-bundle-inputs) table, `found_block`, `payout_policy`, `ctv`, `bootstrap_share` and the required `coinbase_suffix_hex`; and "outbox row under 1 MB", to be stated net of `block_hex` | the five-field reference list: it is `anchor_ms`, `prior_balances_digest` and an optional range of four (`first_share_seq`, `last_share_seq`, `share_count`, `snapshot_sha256`) |
 
 **#267, audit bodies.** Uses `AuditBundleBody`, `verify_audit_parts` and
