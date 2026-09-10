@@ -4,7 +4,9 @@ use crate::{
 };
 use anyhow::{ensure, Context, Result};
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 use serde_json::{json, Value};
+use sqlx::Connection;
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
@@ -244,26 +246,58 @@ async fn stratum_healthcheck() -> Result<()> {
     .context("Stratum health probe timed out")?
 }
 
+#[derive(Serialize)]
+struct SelfCheckReport {
+    schema: &'static str,
+    ok: bool,
+    instance_id: Option<String>,
+    health: Option<Value>,
+    carry_forward_integrity: Option<Value>,
+    durability: Option<Vec<(String, String)>>,
+    live_instances: LiveInstancesReport,
+}
+
 async fn self_check() -> Result<()> {
-    let config = Config::from_env()?;
-    // Snapshot before Coordinator::new: Ledger::connect writes a "starting"
-    // heartbeat, which must not manufacture an additional live frontend.
-    let live_instances = live_instances(&config.database_url).await;
-    if live_instances["status"] == "failed" {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "schema":"qbit.prism.self-check.v2", "ok":false,
-                "live_instances":live_instances
-            }))?
+    let mut report = SelfCheckReport {
+        schema: "qbit.prism.self-check.v2",
+        ok: false,
+        instance_id: None,
+        health: None,
+        carry_forward_integrity: None,
+        durability: None,
+        live_instances: unavailable_live_instances(
+            "unknown",
+            "Heartbeat not sampled because configuration is unavailable; HA is unknown",
+        ),
+    };
+    let result = async {
+        let config = Config::from_env()?;
+        report.instance_id = Some(config.instance_id.clone());
+        // Snapshot before Coordinator::new: Ledger::connect writes a "starting"
+        // heartbeat, which must not manufacture an additional live frontend.
+        report.live_instances = live_instances(&config.database_url).await;
+        // A failed heartbeat sample must not suppress the remaining local checks.
+        self_check_local(config, &mut report).await?;
+        ensure!(
+            report.live_instances.status != "failed",
+            "could not read cluster heartbeats"
         );
-        anyhow::bail!("could not read cluster heartbeats");
+        Ok(())
     }
+    .await;
+    report.ok = result.is_ok();
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    result
+}
+
+async fn self_check_local(config: Config, report: &mut SelfCheckReport) -> Result<()> {
     let coordinator = Coordinator::new(config).await?;
     coordinator.refresh_once().await?;
     let integrity: Value = sqlx::query_scalar("SELECT qbit_carry_forward_integrity_report()")
         .fetch_one(&coordinator.ledger.pool)
         .await?;
+    report.health = Some(coordinator.health().await);
+    report.carry_forward_integrity = Some(integrity.clone());
     for field in ["mismatch_count", "current_drift_count"] {
         ensure!(
             integrity[field].as_u64() == Some(0),
@@ -271,6 +305,7 @@ async fn self_check() -> Result<()> {
         );
     }
     let durability:Vec<(String,String)>=sqlx::query_as("SELECT name,setting FROM pg_settings WHERE name IN ('fsync','full_page_writes','synchronous_commit') ORDER BY name").fetch_all(&coordinator.ledger.pool).await?;
+    report.durability = Some(durability.clone());
     for (name, value) in &durability {
         ensure!(value != "off", "PostgreSQL {name} is disabled");
     }
@@ -298,12 +333,6 @@ async fn self_check() -> Result<()> {
             "highdiff listener advertised a difficulty below its floor"
         );
     }
-    println!(
-        "{}",
-        serde_json::to_string_pretty(
-            &json!({"schema":"qbit.prism.self-check.v2","ok":true,"instance_id":coordinator.config.instance_id,"health":coordinator.health().await,"carry_forward_integrity":integrity,"durability":durability,"live_instances":live_instances})
-        )?
-    );
     Ok(())
 }
 
@@ -321,40 +350,63 @@ SELECT observed_at::text, COALESCE((
 ), '[]'::jsonb) FROM sample
 "#;
 
-async fn live_instances(database_url: &str) -> Value {
+#[derive(Serialize)]
+struct LiveInstancesReport {
+    status: &'static str,
+    observed_at: Option<String>,
+    clock: &'static str,
+    freshness_seconds: f64,
+    count: Option<usize>,
+    instance_ids: Option<Vec<Value>>,
+    instances: Option<Vec<Value>>,
+    stale_instances: Option<Vec<Value>>,
+    inactive_instances: Option<Vec<Value>>,
+    unknown_instances: Option<Vec<Value>>,
+    single_instance: Option<bool>,
+    ha_warning: Option<&'static str>,
+}
+
+fn unavailable_live_instances(status: &'static str, warning: &'static str) -> LiveInstancesReport {
+    LiveInstancesReport {
+        status,
+        observed_at: None,
+        clock: "PostgreSQL clock_timestamp() via PRISM_DATABASE_URL",
+        freshness_seconds: INSTANCE_FRESHNESS_SECONDS,
+        count: None,
+        instance_ids: None,
+        instances: None,
+        stale_instances: None,
+        inactive_instances: None,
+        unknown_instances: None,
+        single_instance: None,
+        ha_warning: Some(warning),
+    }
+}
+
+async fn live_instances(database_url: &str) -> LiveInstancesReport {
     // A separate read-only connection avoids Ledger::connect's heartbeat write.
     // Config already resolved/validated the DSN; do not read environment again.
     let result = tokio::time::timeout(Duration::from_secs(5), async {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .after_connect(|connection, _| {
-                Box::pin(async move {
-                    sqlx::query("SET default_transaction_read_only = on")
-                        .execute(connection)
-                        .await?;
-                    Ok(())
-                })
-            })
-            .connect(database_url)
+        let mut connection = sqlx::PgConnection::connect(database_url).await?;
+        sqlx::query("SET default_transaction_read_only = on")
+            .execute(&mut connection)
             .await?;
-        let result = sqlx::query_as::<_, (String, Value)>(LIVE_INSTANCES_QUERY)
-            .fetch_one(&pool)
-            .await;
-        pool.close().await;
-        result
+        sqlx::query_as::<_, (String, Value)>(LIVE_INSTANCES_QUERY)
+            .fetch_one(&mut connection)
+            .await
     })
     .await;
     match result {
         Ok(Ok((observed_at, rows))) => summarize_live_instances(&observed_at, rows),
         // Do not print connection errors: they may contain a credentialed DSN.
-        _ => json!({"status":"failed", "count":null, "instances":null,
-            "observed_at":null, "clock":"PostgreSQL clock_timestamp() via PRISM_DATABASE_URL",
-            "freshness_seconds":INSTANCE_FRESHNESS_SECONDS, "single_instance":null,
-            "ha_warning":"Heartbeat read failed or exceeded 5 seconds; HA is unknown"}),
+        _ => unavailable_live_instances(
+            "failed",
+            "Heartbeat read failed or exceeded 5 seconds; HA is unknown",
+        ),
     }
 }
 
-fn summarize_live_instances(observed_at: &str, rows: Value) -> Value {
+fn summarize_live_instances(observed_at: &str, rows: Value) -> LiveInstancesReport {
     let mut live = Vec::new();
     let mut stale = Vec::new();
     let mut inactive = Vec::new();
@@ -390,18 +442,26 @@ fn summarize_live_instances(observed_at: &str, rows: Value) -> Value {
     } else {
         "empty"
     };
-    json!({"status":status, "observed_at":observed_at,
-        "clock":"PostgreSQL clock_timestamp() via PRISM_DATABASE_URL",
-        "freshness_seconds":INSTANCE_FRESHNESS_SECONDS,
-        "count":if unknown.is_empty() {json!(live.len())} else {Value::Null},
-        "instance_ids":live.iter().map(|row| &row["instance_id"]).collect::<Vec<_>>(),
-        "instances":live, "stale_instances":stale, "inactive_instances":inactive,
-        "unknown_instances":unknown,
-        "single_instance":if unknown.is_empty() {json!(live.len() == 1)} else {Value::Null},
-        "ha_warning":if !unknown.is_empty() {Some("Unrecognized or future-dated heartbeats; HA is unknown")}
-            else if live.len() < 2 {Some("Fewer than two live frontends observed; do not present this deployment as HA")}
-            else {None}
-    })
+    LiveInstancesReport {
+        status,
+        observed_at: Some(observed_at.to_owned()),
+        clock: "PostgreSQL clock_timestamp() via PRISM_DATABASE_URL",
+        freshness_seconds: INSTANCE_FRESHNESS_SECONDS,
+        count: unknown.is_empty().then_some(live.len()),
+        instance_ids: Some(live.iter().map(|row| row["instance_id"].clone()).collect()),
+        single_instance: (unknown.is_empty() && !live.is_empty()).then_some(live.len() == 1),
+        ha_warning: if !unknown.is_empty() {
+            Some("Unrecognized or future-dated heartbeats; HA is unknown")
+        } else if live.len() < 2 {
+            Some("Fewer than two live frontends observed; do not present this deployment as HA")
+        } else {
+            None
+        },
+        instances: Some(live),
+        stale_instances: Some(stale),
+        inactive_instances: Some(inactive),
+        unknown_instances: Some(unknown),
+    }
 }
 
 #[cfg(test)]
@@ -412,40 +472,74 @@ mod live_instance_tests {
         json!({"instance_id":id, "age_seconds":age, "status":status})
     }
 
+    fn health() -> Value {
+        json!({"schema":"qbit.prism.audit-health.v1", "ready":false})
+    }
+
     #[test]
-    fn heartbeat_states_are_distinct_and_readiness_is_not_liveness() {
-        let health = json!({"schema":"qbit.prism.audit-health.v1", "ready":false});
-        let empty = summarize_live_instances("db-time", json!([]));
-        assert_eq!(empty["status"], "empty");
-        assert_eq!(empty["count"], 0);
-        let stale = summarize_live_instances("db-time", json!([row("old", 16.0, health.clone())]));
-        assert_eq!(stale["status"], "stale");
-        assert_eq!(stale["count"], 0);
-        let live = summarize_live_instances(
+    fn empty_table_is_not_live() {
+        let report = summarize_live_instances("db-time", json!([]));
+        assert_eq!(report.status, "empty");
+        assert_eq!(report.count, Some(0));
+        assert_eq!(report.single_instance, None);
+    }
+
+    #[test]
+    fn stale_rows_do_not_count() {
+        let report = summarize_live_instances("db-time", json!([row("old", 16.0, health())]));
+        assert_eq!(report.status, "stale");
+        assert_eq!(report.count, Some(0));
+        assert_eq!(report.single_instance, None);
+    }
+
+    #[test]
+    fn startup_rows_are_inactive_not_live() {
+        let report = summarize_live_instances(
             "db-time",
             json!([
-                row("a", 15.0, health.clone()),
-                row("b", 0.0, health.clone()),
-                row("diagnostic", 0.0, json!({"state":"starting"}))
+                row("starting", 0.0, json!({"state":"starting"})),
+                row("stopped", 0.0, json!({"state":"stopped"}))
             ]),
         );
-        assert_eq!(live["count"], 2);
-        assert_eq!(live["instance_ids"], json!(["a", "b"]));
-        assert_eq!(live["inactive_instances"].as_array().unwrap().len(), 1);
-        let single = summarize_live_instances("db-time", json!([row("a", 1.0, health.clone())]));
-        assert_eq!(single["single_instance"], true);
-        assert!(single["ha_warning"].is_string());
-        let future = summarize_live_instances("db-time", json!([row("a", -1.0, health)]));
-        assert_eq!(future["status"], "unknown");
-        assert!(future["count"].is_null());
+        assert_eq!(report.status, "inactive");
+        assert_eq!(report.count, Some(0));
+        assert_eq!(report.inactive_instances.unwrap().len(), 2);
+        assert_eq!(report.single_instance, None);
+    }
+
+    #[test]
+    fn inclusive_freshness_boundary_and_unready_servers_are_live() {
+        let report = summarize_live_instances(
+            "db-time",
+            json!([row("a", 15.0, health()), row("b", 0.0, health())]),
+        );
+        assert_eq!(report.status, "observed");
+        assert_eq!(report.count, Some(2));
+        assert_eq!(report.instance_ids, Some(vec![json!("a"), json!("b")]));
+        assert_eq!(report.single_instance, Some(false));
+    }
+
+    #[test]
+    fn single_live_instance_warns() {
+        let report = summarize_live_instances("db-time", json!([row("a", 1.0, health())]));
+        assert_eq!(report.single_instance, Some(true));
+        assert!(report.ha_warning.is_some());
+    }
+
+    #[test]
+    fn future_dated_row_is_unknown() {
+        let report = summarize_live_instances("db-time", json!([row("a", -1.0, health())]));
+        assert_eq!(report.status, "unknown");
+        assert_eq!(report.count, None);
+        assert_eq!(report.single_instance, None);
     }
 
     #[tokio::test]
     async fn failed_heartbeat_connection_is_not_zero_or_healthy() {
         let report = live_instances("postgresql://127.0.0.1:0/unavailable").await;
-        assert_eq!(report["status"], "failed");
-        assert!(report["count"].is_null());
-        assert!(report["observed_at"].is_null());
+        assert_eq!(report.status, "failed");
+        assert_eq!(report.count, None);
+        assert_eq!(report.observed_at, None);
     }
 
     #[tokio::test]
@@ -466,8 +560,8 @@ mod live_instance_tests {
             .fetch_one(&mut *connection)
             .await?;
         let report = summarize_live_instances(&at, rows);
-        assert_eq!(report["status"], "empty");
-        assert_eq!(report["count"], 0);
+        assert_eq!(report.status, "empty");
+        assert_eq!(report.count, Some(0));
         sqlx::query("INSERT INTO qbit_prism_instances VALUES ('old', clock_timestamp() - interval '1 minute', $1)")
             .bind(json!({"schema":"qbit.prism.audit-health.v1", "ready":true}))
             .execute(&mut *connection).await?;
@@ -475,9 +569,9 @@ mod live_instance_tests {
             .fetch_one(&mut *connection)
             .await?;
         let report = summarize_live_instances(&at, rows);
-        assert_eq!(report["status"], "stale");
-        assert_eq!(report["count"], 0);
-        assert_eq!(report["stale_instances"][0]["instance_id"], "old");
+        assert_eq!(report.status, "stale");
+        assert_eq!(report.count, Some(0));
+        assert_eq!(report.stale_instances.unwrap()[0]["instance_id"], "old");
         sqlx::query("DROP TABLE qbit_prism_instances")
             .execute(&mut *connection)
             .await?;
