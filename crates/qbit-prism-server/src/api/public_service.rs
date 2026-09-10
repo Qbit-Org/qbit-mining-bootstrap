@@ -1,5 +1,8 @@
 //! Independent, read-only public dashboard process. No writer lease or schema
 //! mutation is available through this role.
+#[cfg(test)]
+mod metrics_tests;
+
 use super::*;
 use anyhow::{ensure, Context, Result};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -140,6 +143,7 @@ pub(super) struct ServiceView {
     pub replica_error: Option<String>,
     replay_lag: Option<f64>,
     payload: Value,
+    metrics_freshness: metrics_snapshot::Freshness,
 }
 impl ServiceState {
     pub async fn probe_once(&self) {
@@ -252,6 +256,7 @@ impl ServiceState {
             replica_error,
             replay_lag,
             payload,
+            metrics_freshness: metrics_snapshot::Freshness::new(age, stale_after),
         }
     }
     pub(super) fn health_response(&self) -> Response {
@@ -328,7 +333,7 @@ impl ServiceState {
                 ));
             }
         }
-        ([("content-type", "text/plain; version=0.0.4")], body).into_response()
+        view.metrics_freshness.response(body)
     }
 }
 fn numeric(value: &Value) -> Option<f64> {
