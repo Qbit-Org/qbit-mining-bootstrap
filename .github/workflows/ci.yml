@@ -2,7 +2,15 @@ name: CI
 
 on:
   pull_request:
+  # Pull requests are tested as their merge result; a push to a PR branch
+  # would run the same jobs a second time. Push runs cover direct commits
+  # to the long-lived branches only.
   push:
+    branches:
+      - main
+      - 1.x.x
+      - 2.x.x
+      - 3.x.x
   workflow_dispatch:
 
 permissions:
