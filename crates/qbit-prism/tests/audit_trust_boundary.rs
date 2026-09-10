@@ -217,9 +217,11 @@ fn insolvent_dust_block_is_rejected() {
     ));
 }
 
-// Rust window selection matches the Python/SQL job+accept contract.
+// Shares issued or accepted after the anchor are excluded from the window. The real Python and
+// SQL differentials are the frozen corpus replay, the daemon gate and the server's SQL window
+// oracle.
 #[test]
-fn window_converges_with_python_sql() {
+fn window_excludes_shares_after_the_anchor() {
     let anchor = 1001i64;
     let nd = 10u128;
     let shares = vec![
