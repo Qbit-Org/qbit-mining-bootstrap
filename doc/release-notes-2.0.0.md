@@ -77,7 +77,8 @@ have their own version tags.
 - Production needs an explicit `PRISM_POSTGRES_REPLICA_DATA_SOURCE` directory
   and read-only access to the shared audit files from the public API service.
   Release-provenance checks require the replica path to be absolute and
-  distinct from other enabled state sources before contacting Docker.
+  non-overlapping with other enabled state sources before contacting Docker,
+  including normalized paths and filesystem aliases.
   Use a dedicated replication role and monitor the physical replication slot
   and retained WAL. The public standby is a read tier, not an automated
   failover target. Follow
@@ -87,6 +88,14 @@ have their own version tags.
   with a default limit of 60 seconds; replay lag is reported separately.
   Outage responses may serve eligible cached data only within the documented
   staleness bounds, after which the service refuses the read with 503.
+- The public HTTP server defaults to 64 active connections, a 10-second total
+  request-header deadline and a 10-second socket I/O idle timeout. Excess
+  connections close immediately; each response closes its connection.
+  `PRISM_PUBLIC_HTTP_MAX_CONNECTIONS` and `PRISM_PUBLIC_HTTP_TIMEOUT_SECONDS`
+  control these bounds. Review proxy upstream connection settings.
+- The advertised Stratum URL must use `stratum+tcp` or `stratum+ssl`, include a
+  valid hostname and explicit port, and contain no credentials, path, query,
+  fragment or whitespace. Invalid endpoints now refuse startup.
 
 ### Ledger migration and audit history
 

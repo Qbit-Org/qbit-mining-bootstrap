@@ -790,6 +790,34 @@ class CheckEnvProductionGateTests(unittest.TestCase):
                     self.assertIn(error, result.stderr)
                     self.assertFalse(docker_log.exists(), "validation called Docker")
 
+    def test_replica_storage_rejects_overlap_and_aliases_before_docker(self) -> None:
+        key = "PRISM_POSTGRES_REPLICA_DATA_SOURCE"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env = self.production_prism_env(root)
+            primary = Path(env["PRISM_POSTGRES_DATA_SOURCE"])
+            primary.mkdir(parents=True)
+            marker = primary / "PG_VERSION"
+            marker.write_text("16")
+            alias = root / "primary-alias"
+            alias.symlink_to(primary, target_is_directory=True)
+            cases = [
+                str(primary.parent), str(primary / "replica"),
+                str(primary) + "/../" + primary.name + "//",
+                str(alias), str(alias / "new-replica"),
+            ]
+            for value in cases:
+                with self.subTest(value=value):
+                    result = self.run_check_env(**{**env, key: value})
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("non-overlapping", result.stderr)
+                    self.assertNotIn("docker daemon", result.stderr)
+                    self.assertEqual(marker.read_text(), "16")
+            # Component boundaries matter: primary and primary-copy are siblings.
+            result = self.run_check_env(**{**env, key: str(primary) + "-copy"})
+            self.assertNotIn("non-overlapping", result.stderr)
+            self.assertIn("docker daemon", result.stderr)
+
     def test_production_replica_storage_honors_configuration_precedence(self) -> None:
         key = "PRISM_POSTGRES_REPLICA_DATA_SOURCE"
         with tempfile.TemporaryDirectory() as temp_dir:

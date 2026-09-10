@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import urllib.parse
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -127,32 +128,77 @@ class MiningComposeProfileTests(unittest.TestCase):
                     ledger.close()
 
     def test_public_database_url_uses_configured_replica_credentials(self) -> None:
-        credentials = {
-            "PRISM_POSTGRES_USER": "pool_reader",
-            "PRISM_POSTGRES_PASSWORD": "synthetic-rotated-password",
-            "PRISM_POSTGRES_DB": "pool_ledger",
-            "PRISM_DATABASE_URL": "postgresql://writer@primary.internal/pool_ledger",
-        }
-        derived_url = (
-            "postgresql://pool_reader:synthetic-rotated-password"
-            "@prism-postgres-replica:5432/pool_ledger"
-        )
-        custom_url = "postgresql://reader@standby.internal/pool_ledger"
-        for overrides, expected in (
-            (credentials, derived_url),
-            ({**credentials, "PRISM_PUBLIC_DATABASE_URL": ""}, derived_url),
-            ({**credentials, "PRISM_PUBLIC_DATABASE_URL": custom_url}, custom_url),
+        for user, password, database in (
+            ("pool_reader", "synthetic-rotated-password", "pool_ledger"),
+            ("reader/@?#%: ü", "synthetic/@?#%:' ü", "ledger/@?#% ü"),
         ):
-            with self.subTest(overrides=overrides):
-                services = self.render_profile("prism", overrides)["services"]
-                self.assertEqual(
-                    services["prism-public-api"]["environment"]["PRISM_DATABASE_URL"],
-                    expected,
-                )
-                self.assertEqual(
-                    services["prism-coordinator"]["environment"]["PRISM_DATABASE_URL"],
-                    credentials["PRISM_DATABASE_URL"],
-                )
+            credentials = {
+                "PRISM_POSTGRES_USER": user,
+                "PRISM_POSTGRES_PASSWORD": password,
+                "PRISM_POSTGRES_DB": database,
+                "PRISM_POSTGRES_NATIVE_CLIENT": "psql",
+                "PRISM_DATABASE_URL": "postgresql://writer@primary.internal/pool_ledger",
+            }
+            quote = lambda value: urllib.parse.quote(value, safe="")
+            derived_url = (f"postgresql://{quote(user)}:{quote(password)}"
+                           f"@prism-postgres-replica:5432/{quote(database)}")
+            custom_url = "postgresql://reader@standby.internal/pool_ledger"
+            for overrides, expected in (
+                (credentials, derived_url),
+                ({**credentials, "PRISM_PUBLIC_DATABASE_URL": ""}, derived_url),
+                ({**credentials, "PRISM_PUBLIC_DATABASE_URL": custom_url}, custom_url),
+            ):
+                with self.subTest(user=user, explicit=overrides.get("PRISM_PUBLIC_DATABASE_URL")):
+                    services = self.render_profile("prism", overrides)["services"]
+                    env = {k: v for k, v in services["prism-public-api"]["environment"].items()
+                           if v is not None}
+                    with patch.dict(os.environ, env, clear=True), patch.object(
+                        public_read_service, "build_audit_artifact_store", return_value=None
+                    ):
+                        ledger = public_read_service.build_ledger_from_env(env)
+                    try:
+                        self.assertEqual(ledger._command, ["psql", expected])
+                        if expected == derived_url:
+                            parsed = urllib.parse.urlsplit(ledger._command[1])
+                            self.assertEqual(urllib.parse.unquote(parsed.username), user)
+                            self.assertEqual(urllib.parse.unquote(parsed.password), password)
+                            self.assertEqual(urllib.parse.unquote(parsed.path[1:]), database)
+                    finally:
+                        ledger.close()
+                    self.assertEqual(
+                        services["prism-coordinator"]["environment"]["PRISM_DATABASE_URL"],
+                        credentials["PRISM_DATABASE_URL"],
+                    )
+
+    def test_public_http_limits_reach_the_running_server(self) -> None:
+        services = self.render_profile("prism", {
+            "PRISM_PUBLIC_HTTP_MAX_CONNECTIONS": "7",
+            "PRISM_PUBLIC_HTTP_TIMEOUT_SECONDS": "1.25",
+            "PRISM_PUBLIC_API_BIND": "127.0.0.1",
+        })["services"]
+        env = {k: v for k, v in services["prism-public-api"]["environment"].items()
+               if v is not None}
+        # The test listener uses an ephemeral port; Compose needs a real target.
+        env["PRISM_PUBLIC_API_PORT"] = "0"
+        observed = []
+
+        def inspect_server(server):
+            self.assertEqual(server.connection_timeout, 1.25)
+            for _ in range(7):
+                self.assertTrue(server._connection_slots.acquire(blocking=False))
+            self.assertFalse(server._connection_slots.acquire(blocking=False))
+            for _ in range(7):
+                server._connection_slots.release()
+            observed.append(server)
+
+        with patch.dict(os.environ, env, clear=True), patch.object(
+            public_read_service, "build_service",
+            return_value=(object(), Mock(), public_read_service.ServiceMetrics(), None),
+        ), patch.object(public_read_service.signal, "signal"), patch.object(
+            public_read_service.BoundedPublicHTTPServer, "serve_forever", inspect_server,
+        ):
+            self.assertEqual(public_read_service.main(), 0)
+        self.assertEqual(len(observed), 1)
 
     def test_public_minimum_payout_preserves_pool_fallbacks(self) -> None:
         for overrides, expected in (

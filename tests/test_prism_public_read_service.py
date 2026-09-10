@@ -39,7 +39,6 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterator
 from unittest.mock import patch
@@ -149,7 +148,7 @@ class ServiceHarness:
             replica=replica,  # type: ignore[arg-type]
         )
         handler = public_read_service.make_handler(self.service)
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.server = public_read_service.BoundedPublicHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
@@ -1758,6 +1757,30 @@ class FailClosedStartupTests(unittest.TestCase):
             {"PRISM_PUBLIC_STRATUM_URL": "stratum+tcp://pool.example:3340"}
         )
         self.assertEqual("stratum+tcp://pool.example:3340", value)
+
+    def test_invalid_stratum_urls_refuse_before_database_construction(self) -> None:
+        for url in (
+            "pool.example:3340", "https://pool.example:3340",
+            "stratum+tcp://pool.example", "stratum+tcp://pool.example:not-a-port",
+            "stratum+tcp://pool.example:0", "stratum+tcp://pool.example:65536",
+            "stratum+tcp://:3340", "stratum+tcp://[broken:3340",
+            "stratum+tcp://user:password@pool.example:3340",
+            "stratum+tcp://pool.example:3340/path", "stratum+tcp://pool.example:3340?q=1",
+            "stratum+tcp://pool.example:3340#fragment", "stratum+tcp://bad host:3340",
+            "stratum+tcp://pool.example:33\t40", " stratum+tcp://pool.example:3340 ",
+            "stratum+tcp://bad%host:3340", "stratum+tcp://bad\\host:3340",
+        ):
+            with self.subTest(url=url), patch.object(
+                public_read_service, "build_ledger_from_env"
+            ) as ledger:
+                with self.assertRaises(public_read_service.PublicReadConfigurationError):
+                    public_read_service.build_service({"PRISM_PUBLIC_STRATUM_URL": url})
+                ledger.assert_not_called()
+
+    def test_ipv6_and_tls_stratum_urls_are_accepted(self) -> None:
+        for url in ("stratum+tcp://[2001:db8::1]:3340", "stratum+ssl://pool.example:443"):
+            self.assertEqual(public_read_service.require_public_stratum_url(
+                {"PRISM_PUBLIC_STRATUM_URL": url}), url)
 
     def test_memory_ledger_is_refused(self) -> None:
         with self.assertRaises(

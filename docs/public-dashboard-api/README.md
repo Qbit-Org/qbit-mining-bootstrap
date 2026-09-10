@@ -48,6 +48,19 @@ read models live here; dashboard rendering lives outside the pool process.
 `prism-public-api` also serves its own `/healthz` and `/metrics` for that
 process; those are operator surfaces and must not be exposed publicly.
 
+The HTTP server admits up to `PRISM_PUBLIC_HTTP_MAX_CONNECTIONS` connections
+(default 64, range 1–1,024); it immediately closes excess connections without
+queuing workers. `PRISM_PUBLIC_HTTP_TIMEOUT_SECONDS` (default 10, finite and
+positive) bounds the complete request-line/header phase and socket I/O idle
+time. Each response closes its connection, including requests asking for
+HTTP/1.1 keep-alive. Size proxy upstream connections accordingly. Database and
+public dispatch deadlines remain separate from this network timeout.
+
+Startup requires `PRISM_PUBLIC_STRATUM_URL` to contain a `stratum+tcp` or
+`stratum+ssl` scheme, a valid hostname (or bracketed IPv6 address), and an
+explicit port from 1 to 65,535. Credentials, paths, queries, fragments and
+whitespace are refused before opening the database or HTTP listener.
+
 ## Caching
 
 Successful `GET /public/v1` responses are safe to cache briefly. The service

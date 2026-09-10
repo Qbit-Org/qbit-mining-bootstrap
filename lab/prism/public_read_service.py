@@ -59,10 +59,14 @@ Entry point: ``python3 -m lab.prism.public_read_service``.
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import math
 import os
+import re
 import shlex
 import signal
+import socket
 import sys
 import threading
 import time
@@ -812,6 +816,38 @@ class PublicReadService:
         self.replica = replica
 
 
+class BoundedPublicHTTPServer(ThreadingHTTPServer):
+    """Admit a fixed number of connections without a waiting worker queue."""
+
+    daemon_threads = True
+
+    def __init__(self, address, handler, *, max_connections=64, timeout_seconds=10.0):
+        if not 1 <= max_connections <= 1024:
+            raise PublicReadConfigurationError("PRISM_PUBLIC_HTTP_MAX_CONNECTIONS must be 1-1024")
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise PublicReadConfigurationError("PRISM_PUBLIC_HTTP_TIMEOUT_SECONDS must be finite and positive")
+        self.connection_timeout = timeout_seconds
+        self._connection_slots = threading.BoundedSemaphore(max_connections)
+        super().__init__(address, handler)
+
+    def process_request(self, request, client_address):
+        if not self._connection_slots.acquire(blocking=False):
+            # Do not block the accept loop writing a refusal to an idle peer.
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._connection_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._connection_slots.release()
+
+
 def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
     """Build the request handler for one public read service instance.
 
@@ -830,6 +866,57 @@ def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
     class PublicReadHandler(BaseHTTPRequestHandler):
         server_version = "PrismPublicRead/1"
         protocol_version = "HTTP/1.1"
+
+        def setup(self) -> None:
+            self.connection_timeout = getattr(self.server, "connection_timeout", 10.0)
+            self.request.settimeout(self.connection_timeout)
+            super().setup()
+
+        def handle_one_request(self) -> None:
+            # An idle socket timeout alone allows a slow drip to retain a slot.
+            # One timer per admitted worker bounds the entire request line and
+            # header phase, then is retired before application dispatch.
+            self._headers_expired = threading.Event()
+
+            def expire_headers() -> None:
+                self._headers_expired.set()
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+            self._header_timer = threading.Timer(self.connection_timeout, expire_headers)
+            self._header_timer.daemon = True
+            self._header_timer.start()
+            try:
+                super().handle_one_request()
+            finally:
+                self._finish_headers()
+                self.close_connection = True
+
+        def _finish_headers(self) -> None:
+            timer = self._header_timer
+            if timer is not None:
+                timer.cancel()
+                timer.join()
+                # The callback captures this handler. Break that ownership
+                # cycle so completed connections retire without cyclic GC.
+                self._header_timer = None
+
+        def parse_request(self) -> bool:
+            try:
+                parsed = super().parse_request()
+            finally:
+                self._finish_headers()
+            # The stdlib parser can accept EOF as the end of headers. A timer
+            # shutdown must not turn an incomplete request into application work.
+            return parsed and not self._headers_expired.is_set()
+
+        def end_headers(self) -> None:
+            # One response per connection prevents idle keep-alive clients
+            # from reserving the bounded worker pool between requests.
+            self.send_header("Connection", "close")
+            super().end_headers()
 
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
             parsed = urllib.parse.urlparse(self.path)
@@ -1074,7 +1161,7 @@ def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(body)
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, TimeoutError):
                 return
 
         def write_json(
@@ -1104,7 +1191,7 @@ def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
                     self.send_header(key, value)
                 self.end_headers()
                 self.wfile.write(body)
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, TimeoutError):
                 # A client with a short timeout hung up before the response was
                 # written; nothing to salvage.
                 return
@@ -1155,6 +1242,33 @@ def require_public_stratum_url(environ: dict[str, str] | None = None) -> str:
             "no Stratum listener, so it cannot infer the pool's endpoint, and "
             "the fallback would advertise 127.0.0.1 to miners"
         )
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        hostname = parsed.hostname or ""
+        if ":" in hostname:
+            ipaddress.IPv6Address(hostname)
+            valid_host = True
+        else:
+            ascii_host = hostname.encode("idna").decode("ascii").rstrip(".")
+            valid_host = bool(ascii_host) and len(ascii_host) <= 253 and all(
+                re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                for label in ascii_host.split(".")
+            )
+        valid = (
+            valid_host and value == source.get("PRISM_PUBLIC_STRATUM_URL")
+            and parsed.scheme in {"stratum+tcp", "stratum+ssl"}
+            and parsed.hostname and parsed.port is not None and 1 <= parsed.port <= 65535
+            and parsed.username is None and parsed.password is None
+            and not parsed.path and not parsed.query and not parsed.fragment
+            and not any(c.isspace() or ord(c) < 32 for c in value)
+        )
+    except (ValueError, UnicodeError):
+        valid = False
+    if not valid:
+        raise PublicReadConfigurationError(
+            "PRISM_PUBLIC_STRATUM_URL must be a stratum+tcp or stratum+ssl URL "
+            "with a hostname and port (1-65535), without credentials, path, query or fragment"
+        )
     return value
 
 
@@ -1183,6 +1297,14 @@ def build_ledger_from_env(environ: dict[str, str] | None = None) -> PsqlShareLed
         )
     psql_command = source.get("PRISM_POSTGRES_PSQL_COMMAND", "")
     database_url = source.get("PRISM_DATABASE_URL", "")
+    if not database_url and source.get("PRISM_PUBLIC_DATABASE_HOST"):
+        # Compose supplies separate literal components; an explicit URL wins.
+        quote = lambda value: urllib.parse.quote(value, safe="")
+        user = quote(source.get("PRISM_POSTGRES_USER", "qbit"))
+        password = quote(source.get("PRISM_POSTGRES_PASSWORD", "change-this"))
+        database = quote(source.get("PRISM_POSTGRES_DB", "qbit"))
+        host = source["PRISM_PUBLIC_DATABASE_HOST"]
+        database_url = f"postgresql://{user}:{password}@{host}:5432/{database}"
     if not psql_command and database_url:
         psql_command = f"psql {shlex.quote(database_url)}"
     if not psql_command:
@@ -1349,22 +1471,21 @@ def main(argv: list[str] | None = None) -> int:
     bind = os.environ.get("PRISM_PUBLIC_API_BIND") or DEFAULT_PUBLIC_API_BIND
     port = env_int("PRISM_PUBLIC_API_PORT", DEFAULT_PUBLIC_API_PORT)
     try:
+        max_connections = env_positive_int("PRISM_PUBLIC_HTTP_MAX_CONNECTIONS", 64)
+        connection_timeout = env_positive_float("PRISM_PUBLIC_HTTP_TIMEOUT_SECONDS", 10.0)
         coordinator, readiness, metrics, replica = build_service()
-    except PublicReadConfigurationError as exc:
+        handler = make_handler(PublicReadService(
+            coordinator, metrics=metrics, readiness=readiness, replica=replica,
+        ))
+        server = BoundedPublicHTTPServer(
+            (bind, port), handler, max_connections=max_connections,
+            timeout_seconds=connection_timeout,
+        )
+    except (PublicReadConfigurationError, ValueError) as exc:
         print(f"prism-public-read: {exc}", file=sys.stderr, flush=True)
         return 2
 
     readiness.start()
-    handler = make_handler(
-        PublicReadService(
-            coordinator,
-            metrics=metrics,
-            readiness=readiness,
-            replica=replica,
-        )
-    )
-    server = ThreadingHTTPServer((bind, port), handler)
-    server.daemon_threads = True
 
     def request_shutdown(signum: int, _frame: object) -> None:
         # shutdown() blocks until serve_forever() returns and must not be called
