@@ -1,3 +1,10 @@
+> **WARNING: `3.x.x` is a development line and is not production-ready.**
+> The production line is `2.x.x`. This branch carries the Rust PRISM server
+> rewrite ([#244](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/244)),
+> which has not been through a production release. Do not deploy it and do not
+> point a production database at it. See
+> [#283](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/283).
+
 # qbit-mining-bootstrap
 
 `qbit-mining-bootstrap` is the runnable mining lab for qbit. It stays outside qbit core on purpose: qbit owns node, RPC, and validation behavior; this repo owns operator workflows, Docker Compose, pool configs, helper services, runbooks, and end-to-end mining validation.
