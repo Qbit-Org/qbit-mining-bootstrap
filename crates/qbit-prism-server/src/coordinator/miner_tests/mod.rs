@@ -10,6 +10,7 @@ use std::sync::{
 };
 
 mod admission_races;
+mod blockwait;
 mod config;
 mod credit;
 mod interleavings;
@@ -108,6 +109,7 @@ async fn reply(State(node): State<Arc<StdMutex<Node>>>, Json(request): Json<Valu
             None
         };
         let result = match method {
+            "waitfornewblock" => json!({"hash":node.tip,"height":100}),
             "getbestblockhash" | "getblockhash" => json!(node.tip),
             "getblocktemplate" => json!({"version":0x20000000u32,"bits":"207fffff",
                 "curtime":chrono::Utc::now().timestamp(),"previousblockhash":node.tip,
@@ -126,6 +128,10 @@ async fn reply(State(node): State<Arc<StdMutex<Node>>>, Json(request): Json<Valu
     if let Some(gate) = gate {
         gate.entered.notify_one();
         gate.release.notified().await;
+    } else if method == "waitfornewblock" {
+        // Model the real idle long-poll instead of allowing a mock hot loop to
+        // repair a discarded notification with an immediate second response.
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
     Json(
         json!({"id":request["id"],"result":if failed {Value::Null} else {result},

@@ -2,6 +2,12 @@
 use super::*;
 use tokio::time::Instant as MonotonicInstant;
 
+pub(super) fn tip_hash(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .filter(|hash| hash.len() == 64 && hex::decode(hash).is_ok())
+}
+
 pub(super) struct SubmitAdmission {
     pub current: Arc<Prepared>,
     pub tip: TipView,
@@ -223,15 +229,12 @@ impl Coordinator {
                     "current chain state is unavailable",
                 )
             })?;
-        let hash = result
-            .as_str()
-            .filter(|hash| hash.len() == 64 && hex::decode(hash).is_ok())
-            .ok_or_else(|| {
-                protocol_error(
-                    "backend-rpc-unavailable",
-                    "current chain state is unavailable",
-                )
-            })?;
+        let hash = tip_hash(&result).ok_or_else(|| {
+            protocol_error(
+                "backend-rpc-unavailable",
+                "current chain state is unavailable",
+            )
+        })?;
         // Work may have published during the RPC. Select that complete pair
         // now, but only a publication matching the answer supplies provenance.
         // RPC itself cannot publish a transition or restore a disabled lease.
