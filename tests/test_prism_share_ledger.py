@@ -3734,6 +3734,10 @@ class PrismShareLedgerTests(unittest.TestCase):
         self.assertIn("'broadcast_attempt_summary'", query)
         self.assertIn("broadcast_attempt_count", query)
         self.assertIn("qbit_ctv_fanout_broadcast_attempts", query)
+        # Unqualified, the outer fanout_txid resolves to attempt itself and every
+        # row would carry every attempt in the table.
+        self.assertIn("WHERE attempt.fanout_txid = page_rows.fanout_txid", query)
+        self.assertNotIn("WHERE attempt.fanout_txid = fanout_txid", query)
         self.assertIn("settlement_status NOT IN ('confirmed', 'reorged', 'failed')", query)
         self.assertIn("artifact.next_broadcast_attempt_at IS NULL", query)
         self.assertIn("artifact.next_broadcast_attempt_at <= clock_timestamp()", query)
