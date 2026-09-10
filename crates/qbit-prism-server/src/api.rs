@@ -1,5 +1,6 @@
 //! Compatibility HTTP API. Every accounting read uses the shared PostgreSQL ledger.
 mod charts;
+mod metrics_snapshot;
 mod public;
 pub mod public_service;
 mod read_models;
@@ -14,6 +15,7 @@ use axum::{
     Router,
 };
 use chrono::{SecondsFormat, Utc};
+use metrics_snapshot::{health_stale_after, MetricsSnapshot};
 use percent_encoding::percent_decode_str;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -99,7 +101,7 @@ pub struct ApiState {
     pub config: Arc<ApiConfig>,
     /// Published by the runtime; health handlers never wait on database queries.
     pub health: Arc<RwLock<Value>>,
-    pub metrics: Arc<RwLock<String>>,
+    metrics: Arc<RwLock<MetricsSnapshot>>,
     pub latest_evidence: Arc<RwLock<Option<Value>>>,
     health_published_at: Arc<RwLock<Instant>>,
     client: reqwest::Client,
@@ -140,7 +142,7 @@ impl ApiState {
             health: Arc::new(RwLock::new(
                 json!({"schema":"qbit.prism.audit-health.v1","ok":false,"state":"starting","error":"health snapshot warm-up has not completed yet"}),
             )),
-            metrics: Arc::new(RwLock::new(String::new())),
+            metrics: Arc::new(RwLock::new(MetricsSnapshot::default())),
             latest_evidence: Arc::new(RwLock::new(None)),
             health_published_at: Arc::new(RwLock::new(Instant::now())),
             client: reqwest::Client::builder()
@@ -157,6 +159,15 @@ impl ApiState {
             .health_published_at
             .write()
             .unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+    /// Replace the complete metrics body and its publication instant together.
+    pub fn publish_metrics(&self, body: String) -> anyhow::Result<()> {
+        let mut snapshot = self
+            .metrics
+            .write()
+            .map_err(|_| anyhow::anyhow!("metrics lock poisoned"))?;
+        *snapshot = MetricsSnapshot::published(body);
+        Ok(())
     }
     async fn rpc(&self, method: &str, params: Value) -> ApiResult<Value> {
         let response = self
@@ -317,13 +328,7 @@ async fn handle_inner(
             .unwrap_or_else(|e| e.into_inner())
             .elapsed();
         payload["snapshot_age_seconds"] = json!(age.as_secs_f64());
-        if age
-            > Duration::from_secs(
-                env_num("PRISM_HEALTH_REFRESH_SECONDS", 2)
-                    .saturating_mul(3)
-                    .max(15),
-            )
-        {
+        if age > health_stale_after() {
             payload["ok"] = json!(false);
             payload["error"] = json!("health snapshot is stale");
         }
@@ -343,13 +348,13 @@ async fn handle_inner(
         if let Some(service) = &state.public_service {
             return finish(service.metrics_response(), &method);
         }
-        let body = state
+        let snapshot = state
             .metrics
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         return finish(
-            ([("content-type", "text/plain; version=0.0.4")], body).into_response(),
+            snapshot.response(Instant::now(), health_stale_after()),
             &method,
         );
     }

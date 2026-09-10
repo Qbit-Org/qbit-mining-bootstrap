@@ -3,16 +3,19 @@ use axum::{
     http::{Request, StatusCode},
     Router,
 };
-use qbit_prism_server::api::{router, ApiConfig, ApiState};
+use qbit_prism_server::api::{public_service, router, ApiConfig, ApiState};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
 
 fn app() -> Router {
+    router(state())
+}
+fn state() -> ApiState {
     let pool = PgPoolOptions::new()
         .connect_lazy("postgres://invalid:invalid@127.0.0.1:1/invalid")
         .unwrap();
-    router(ApiState::new(pool, ApiConfig::default()))
+    ApiState::new(pool, ApiConfig::default())
 }
 async fn get(app: Router, path: &str) -> (StatusCode, axum::http::HeaderMap, Value) {
     let response = app
@@ -167,6 +170,81 @@ async fn health_reads_runtime_snapshot_without_database_access() {
     assert_eq!(body["state"], "starting");
     *state.health.write().unwrap() = json!({"schema":"qbit.prism.audit-health.v1","ok":true});
     assert_eq!(get(router(state), "/healthz").await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn metrics_freshness_headers_cover_both_roles_before_publication() {
+    let (public_app, _) = public_service::router(state(), public_service::ServiceConfig::default());
+    for app in [app(), public_app] {
+        for method in ["GET", "HEAD"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/metrics")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()["content-type"],
+                "text/plain; version=0.0.4"
+            );
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            assert_eq!(response.headers()["x-prism-metrics-state"], "unavailable");
+            assert!(!response.headers().contains_key("age"));
+            assert!(!response.headers().contains_key("warning"));
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            if method == "HEAD" {
+                assert!(bytes.is_empty());
+            } else {
+                assert!(!bytes.is_empty());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn metrics_publication_preserves_samples_and_restores_fresh_headers() {
+    let state = state();
+    state
+        .publish_metrics("qbit_prism_health_state 1\nqbit_prism_connections 0\n".into())
+        .unwrap();
+    let app = router(state);
+    for method in ["GET", "HEAD"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.headers()["x-prism-metrics-state"], "fresh");
+        assert!(response.headers()["age"]
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .is_ok());
+        assert!(!response.headers().contains_key("warning"));
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        if method == "HEAD" {
+            assert!(bytes.is_empty());
+        } else {
+            let body = std::str::from_utf8(&bytes).unwrap();
+            assert!(body.starts_with("qbit_prism_health_state 1\nqbit_prism_connections 0\n"));
+            assert!(body.contains("qbit_prism_metrics_snapshot_available 1\n"));
+            assert!(body.contains("qbit_prism_metrics_snapshot_stale 0\n"));
+        }
+    }
 }
 
 #[test]

@@ -187,6 +187,11 @@ counters describe the individual process; dashboard accounting reads the shared
 database. The old Python scheduler's detailed metric series are replaced by
 native process health and counters.
 
+Both runtime roles serve `/metrics` with HTTP 200 and freshness headers, even
+before the first observation or when it is stale. Read `X-Prism-Metrics-State`
+alongside readiness from `/healthz`; see the [metrics freshness contract and
+inspection command](docs/prism-ledger-ops.md#health-diagnostics-and-validation).
+
 ## Run and operate
 
 Build native binaries:

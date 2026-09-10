@@ -228,11 +228,46 @@ process counters reset after restart. Dashboard accounting is read
 from PostgreSQL across instances. Detailed Python queue, writer lease, watchdog,
 and incremental-refresh metrics no longer describe this runtime.
 
+The coordinator (`run`) serves the last complete metrics publication and adds
+three gauges at scrape time:
+
+| Gauge | Meaning |
+| --- | --- |
+| `qbit_prism_metrics_snapshot_available` | `0` before the first publication; `1` afterward, including when stale |
+| `qbit_prism_metrics_snapshot_stale` | `1` when missing or older than the freshness budget; otherwise `0` |
+| `qbit_prism_metrics_snapshot_age_seconds` | Monotonic age in seconds; `-1` before the first publication |
+
+The coordinator uses the same budget as `/healthz`:
+`max(3 * PRISM_HEALTH_REFRESH_SECONDS, 15)` seconds. The setting defaults to
+2 seconds, giving a 15-second budget. Once the age exceeds that budget, a scrape
+sets `qbit_prism_health_state` to `0` while retaining the other cached samples.
+Scraping neither renews the publication age nor queries the database.
+
+Both `run` and `public-api` return HTTP 200 for `/metrics`, including missing
+and stale observations. Inspect the freshness signals and `/healthz` rather
+than treating a successful scrape as readiness. GET and HEAD responses carry:
+
+- `Cache-Control: no-store`.
+- `X-Prism-Metrics-State: fresh`, `stale`, or `unavailable`.
+- `Age`: elapsed whole seconds, rounded down, including `0`; omitted when unknown.
+- `Warning: 110 qbit-prism "metrics snapshot is stale; serving last complete payload"`
+  only when the state is `stale`.
+
+The public role derives these headers from its existing readiness probe age,
+also exported as `qbit_prism_public_ledger_probe_age_seconds`. Its budget is
+`max(3 * PRISM_PUBLIC_READINESS_PROBE_INTERVAL_SECONDS, 15)` seconds; the probe
+interval defaults to 5 seconds. Before the first completed probe the state is
+`unavailable`. A recent failed probe is still `fresh`, with
+`qbit_prism_public_ledger_ready 0`; freshness does not mean the database is ready.
+The public role keeps its existing metrics body, without the coordinator's
+three snapshot gauges.
+
 Useful checks:
 
 ```sh
 qbit-prism-server check-config
 qbit-prism-server healthcheck --url http://127.0.0.1:3341/healthz
+curl --silent --show-error --include --max-time 5 http://127.0.0.1:3341/metrics
 qbit-prism-server self-check
 bash test/prism-native-tests.sh
 QBITD_BIN=/path/to/qbitd bash test/prism-native-tests.sh live
