@@ -582,25 +582,32 @@ the window size".
   cutover, and leftovers are refused twice: by the `version < 3` gate
   (`srv/src/ledger.rs:143-144`) on the first native connect and by #285's
   006; #265's migration test covers "a 2.x.x schema with only terminal
-  rows". The order, with the 2.x.x submitter doing step 1 in that case, is:
+  rows". The order, with the 2.x.x frontends doing step 1 and any repeat in
+  that case, is:
   1. With the pre-007 frontends **running**, drain the outbox. `submit_loop`
      (`srv/src/coordinator.rs:1112-1135`) polls every 100 ms and claims each
      pending row; a row whose revision or parent is superseded is finished by
      `finish_candidate_at_revision` (`:979-988`); a failed attempt is retried
-     after `LEAST(60, attempt_count)` seconds (`srv/src/ledger.rs:594`). No
-     switch stops candidate production while keeping `submit_loop`, and none
-     is needed: a block found during the drain is a pending row like any
-     other and drains the same way. A row that keeps failing is #268's escape
-     hatch; the procedure never abandons it.
-  2. Verify `SELECT count(*) FROM qbit_block_candidate_outbox WHERE
-     state='pending'` is 0.
-  3. Stop every frontend.
+     after `LEAST(60, attempt_count)` seconds (`srv/src/ledger.rs:594`). A row
+     that keeps failing is #268's escape hatch; the procedure never abandons
+     it. No switch stops candidate production while keeping `submit_loop`, so
+     a block can be found at any moment until the frontends stop, and a zero
+     count taken while they run proves nothing.
+  2. Stop every frontend. From here nothing creates, claims or finishes a
+     candidate.
+  3. Only now verify `SELECT count(*) FROM qbit_block_candidate_outbox WHERE
+     state='pending'` is 0. If it is not, a block was found between the drain
+     and the stop: start the pre-007 frontends again, let `submit_loop` drain
+     it, and repeat from step 2.
   4. Start one post-008 frontend. `Ledger::connect` applies migrations in one
      transaction (the base schema at `srv/src/ledger.rs:146-149`, versioned
      steps after it), so it applies 006 (#285), then 007, then 008, each
      refusal predicate running in that transaction and naming the rows it
      found. Then start the rest; #285's startup gate keeps a pre-007/008
-     frontend from joining.
+     frontend from joining. 007's refusal is the backstop: if a pending
+     inline row is present anyway, the migration transaction fails naming it,
+     nothing is applied, and the operator returns to step 1 with the pre-007
+     frontends.
 - **Refusal predicates compose.** 006 (#285) refuses on its own pending
   shape (#258's storage-version-2); 007 refuses on `EXISTS(SELECT 1 FROM
   qbit_block_candidate_outbox WHERE state='pending' AND candidate ? 'bundle')`.
@@ -699,8 +706,8 @@ not on every refresh.
 | fence | `process_candidate_inner` (`srv/src/coordinator.rs:966`) keeps `:972-979`; `Window.payout_revision != candidate.payout_revision` is a second hint for the same `observe_candidate` probe and never a supersession by itself ([Revision fence and reorgs](#revision-fence-and-reorgs)) | `:1483-1488` stays, then `Window.payout_revision` against the row's `payout_revision`; any inequality is `Ok(None)` |
 | rebuild | under a `build_slots` permit (`:997`) and the 60 s whole-call deadline: if `qbit_pool_audit_bundles` already holds the block's audit, finish from it through `materialize_audit_row` without `read_window`; else await `read_window`, re-derive the witness leaves from `block_hex`, run `build_audit_bundle_body_*(&window.shares, …)` directly in `spawn_blocking` (`:998-1031`; never `build_bundle`, which takes a second permit at `:712`), and put `into_bundle(window.shares)` in `CandidateClaim` for landing | under one `build_slots` permit, the single-flight entry for the `storage_key` and the inner timeout: await `read_window`, rebuild `Prepared` through the borrowing builders called directly, never `build_bundle`, or use the local incremental window once #274 lands |
 | empty window | build over `&[bootstrap_share]` | the single-flight entry carries `bundle: None`; each miner gets its own bootstrap bundle, built with the builders directly under a fresh `build_slots` permit taken after the entry's permit is released, from the synthetic share `build_bundle` fabricates from the worker today (`:727-745`, reached from `:1498-1510`), the stored template, anchor, `payout_policy` and `ctv`, and the returned balances and revision; never `build_bundle`, which reads `config` for signed fields (`:755`, `:760-762`) |
-| import | `srv/src/ledger/migration.rs:117` stores `canonical_audit_bytes` plus non-share metadata and no inline body | n/a |
-| must not | serialize a share array into the outbox; hold `ORDER_LOCK` across `read_window`; decode inline candidates on a post-007 schema; read local configuration for any stored input; wrap `read_window` in `spawn_blocking`; call `build_bundle` under a held `build_slots` permit | write a share array into `payload`; wrap `read_window` in `spawn_blocking`; run whole-window serde on a runtime thread; call `build_bundle` for any resume rebuild, empty window included (it takes a second permit and reads `config` for signed fields); change the `save_job` revision fence (`srv/src/ledger.rs:472-479`) or the cached-work reuse conditions (`srv/src/coordinator.rs:528-533`) |
+| import | `srv/src/ledger/migration.rs:117` stores `canonical_audit_bytes` plus non-share metadata and no inline body. The same PR makes both readers decode `canonical_audit_bytes`, digest-checked against `audit_bundle_sha256` and under `spawn_blocking` (a two-copy body is about 470 MB at 400k), before any `body_uri` fallback, as `audit_canonical_bytes` already does (`srv/src/ledger/audit.rs:12-23`): `Ledger::audit_bundle` (`:92-107`), which today returns only the JSON column, so `backfill-ctv` would stop on imported rows with "import legacy audits first" (`srv/src/ledger/migration.rs:133-136`); and the bundle endpoint's fallback (`srv/src/api/read_models.rs:196-231`), which today reads only `body_uri`, so every frontend would still need the legacy filesystem. Keeping the inline body instead would bring back the two-copy JSONB document this design removes | n/a |
+| must not | serialize a share array into the outbox; hold `ORDER_LOCK` across `read_window`; decode inline candidates on a post-007 schema; read local configuration for any stored input; wrap `read_window` in `spawn_blocking`; call `build_bundle` under a held `build_slots` permit; leave an imported audit readable only through `body_uri` | write a share array into `payload`; wrap `read_window` in `spawn_blocking`; run whole-window serde on a runtime thread; call `build_bundle` for any resume rebuild, empty window included (it takes a second permit and reads `config` for signed fields); change the `save_job` revision fence (`srv/src/ledger.rs:472-479`) or the cached-work reuse conditions (`srv/src/coordinator.rs:528-533`) |
 | text to amend on merge | "reconstructs … through `Ledger::read_window` in `spawn_blocking`": `read_window` is awaited, only the builder runs in `spawn_blocking`; the closed field list ("stores the `WindowRef` … plus … not the bundle"): it is the [Stored bundle inputs](#stored-bundle-inputs) table, `found_block`, `payout_policy`, `ctv`, `bootstrap_share` and the required `coinbase_suffix_hex`; and "outbox row under 1 MB", to be stated net of `block_hex` | the five-field reference list: it is `anchor_ms`, `prior_balances_digest` and an optional range of four (`first_share_seq`, `last_share_seq`, `share_count`, `snapshot_sha256`) |
 
 **#267, audit bodies.** Uses `AuditBundleBody`, `verify_audit_parts` and
