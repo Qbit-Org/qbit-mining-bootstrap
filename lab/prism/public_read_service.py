@@ -1249,6 +1249,14 @@ def require_public_stratum_url(environ: dict[str, str] | None = None) -> str:
             "no Stratum listener, so it cannot infer the pool's endpoint, and "
             "the fallback would advertise 127.0.0.1 to miners"
         )
+    validate_advertised_stratum_url(source["PRISM_PUBLIC_STRATUM_URL"], "PRISM_PUBLIC_STRATUM_URL")
+    highdiff_url = source.get("PRISM_PUBLIC_STRATUM_HIGHDIFF_URL")
+    if public_api.optional_tcp_port(source.get("PRISM_STRATUM_HIGHDIFF_PORT")) is not None and highdiff_url:
+        validate_advertised_stratum_url(highdiff_url, "PRISM_PUBLIC_STRATUM_HIGHDIFF_URL")
+    return value
+
+
+def validate_advertised_stratum_url(value: str, setting: str) -> None:
     try:
         parsed = urllib.parse.urlsplit(value)
         hostname = parsed.hostname or ""
@@ -1262,8 +1270,7 @@ def require_public_stratum_url(environ: dict[str, str] | None = None) -> str:
                 for label in ascii_host.split(".")
             )
         valid = (
-            valid_host and value == source.get("PRISM_PUBLIC_STRATUM_URL")
-            and parsed.scheme in {"stratum+tcp", "stratum+ssl"}
+            valid_host and parsed.scheme in {"stratum+tcp", "stratum+ssl"}
             and parsed.hostname and parsed.port is not None and 1 <= parsed.port <= 65535
             and parsed.username is None and parsed.password is None
             and not parsed.path and not parsed.query and not parsed.fragment
@@ -1273,10 +1280,9 @@ def require_public_stratum_url(environ: dict[str, str] | None = None) -> str:
         valid = False
     if not valid:
         raise PublicReadConfigurationError(
-            "PRISM_PUBLIC_STRATUM_URL must be a stratum+tcp or stratum+ssl URL "
+            f"{setting} must be a stratum+tcp or stratum+ssl URL "
             "with a hostname and port (1-65535), without credentials, path, query or fragment"
         )
-    return value
 
 
 def build_ledger_from_env(environ: dict[str, str] | None = None) -> PsqlShareLedger:

@@ -59,7 +59,10 @@ public dispatch deadlines remain separate from this network timeout.
 Startup requires `PRISM_PUBLIC_STRATUM_URL` to contain a `stratum+tcp` or
 `stratum+ssl` scheme, a valid hostname (or bracketed IPv6 address), and an
 explicit port from 1 to 65,535. Credentials, paths, queries, fragments and
-whitespace are refused before opening the database or HTTP listener.
+whitespace are refused before opening the database or HTTP listener. The same
+validation applies to an explicit `PRISM_PUBLIC_STRATUM_HIGHDIFF_URL` when
+`PRISM_STRATUM_HIGHDIFF_PORT` enables that advertised endpoint; an empty override
+continues to derive its URL from the primary endpoint.
 
 ## Caching
 

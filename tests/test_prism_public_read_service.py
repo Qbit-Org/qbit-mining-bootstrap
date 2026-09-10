@@ -152,11 +152,13 @@ class ServiceHarness:
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        # Loopback fixtures must never inherit a cached process-wide proxy.
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def get(self, path_and_query: str) -> ServedResponse:
         url = self.base_url + path_and_query
         try:
-            with urllib.request.urlopen(url, timeout=5) as response:
+            with self.opener.open(url, timeout=5) as response:
                 return ServedResponse(
                     response.status,
                     response.read(),
@@ -291,6 +293,13 @@ class ContractEqualityTests(unittest.TestCase):
             endpoints[1]["url"],
         )
         self.assertEqual(4334, endpoints[1]["default_port"])
+
+    def test_harness_bypasses_a_cached_proxy_with_no_proxy_environment_cleared(self) -> None:
+        proxy_opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": "http://127.0.0.1:9"})
+        )
+        with patch.object(urllib.request, "_opener", proxy_opener), patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(self.harness.get("/public/v1/blocks").status, 200)
 
     def test_content_type_is_unchanged(self) -> None:
         for route in EXTRACTED_ROUTES:
@@ -1799,6 +1808,19 @@ class FailClosedStartupTests(unittest.TestCase):
                 with self.assertRaises(public_read_service.PublicReadConfigurationError):
                     public_read_service.build_service({"PRISM_PUBLIC_STRATUM_URL": url})
                 ledger.assert_not_called()
+
+    def test_highdiff_url_is_validated_only_when_advertised(self) -> None:
+        base = {"PRISM_PUBLIC_STRATUM_URL": "stratum+tcp://pool.example:3340"}
+        for bad in ("https://host/path", "stratum+tcp://host:not-a-port", " "):
+            with self.subTest(url=bad), patch.object(public_read_service, "build_ledger_from_env") as ledger:
+                with self.assertRaisesRegex(public_read_service.PublicReadConfigurationError, "PRISM_PUBLIC_STRATUM_HIGHDIFF_URL"):
+                    public_read_service.build_service({**base, "PRISM_STRATUM_HIGHDIFF_PORT": "4334", "PRISM_PUBLIC_STRATUM_HIGHDIFF_URL": bad})
+                ledger.assert_not_called()
+            self.assertEqual(public_read_service.require_public_stratum_url(
+                {**base, "PRISM_PUBLIC_STRATUM_HIGHDIFF_URL": bad}), base["PRISM_PUBLIC_STRATUM_URL"])
+        for explicit in ("", "stratum+ssl://[2001:db8::1]:443"):
+            self.assertEqual(public_read_service.require_public_stratum_url(
+                {**base, "PRISM_STRATUM_HIGHDIFF_PORT": "4334", "PRISM_PUBLIC_STRATUM_HIGHDIFF_URL": explicit}), base["PRISM_PUBLIC_STRATUM_URL"])
 
     def test_ipv6_and_tls_stratum_urls_are_accepted(self) -> None:
         for url in ("stratum+tcp://[2001:db8::1]:3340", "stratum+ssl://pool.example:443"):
