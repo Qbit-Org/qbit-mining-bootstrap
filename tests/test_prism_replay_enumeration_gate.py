@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lab.prism.share_ledger import LedgerOperationTimeout  # noqa: E402
 from tests.prism_concurrency_harness import (  # noqa: E402
+    LandingOp,
     LeaseHarness,
     assert_deterministic,
 )
@@ -54,7 +55,7 @@ WRITER_HOLD_SECONDS = 12.0
 
 # Statement checkpoints FakePostgres offers, tagged with the coordinator name.
 FENCED_WRITE_PRECOMMIT = "writer.precommit"
-PAGE_STATEMENT_BEGIN = "writer.begin:outbox_pending_page"
+PAGE_STATEMENT_BEGIN = "writer.begin:outbox_header_page"
 
 
 def _intent(block_hash: str) -> dict[str, Any]:
@@ -100,14 +101,23 @@ def _park_a_fenced_write(harness: LeaseHarness, ledger: Any, block_hash: str) ->
             return ledger.persist_block_candidate_intent(_intent(block_hash))
 
     call = writer.submit(run, label=f"fenced-write:{block_hash[:4]}")
-    harness.run_until(writer, FENCED_WRITE_PRECOMMIT)
+    # Issue #255: the intent's body is staged and sealed first, in
+    # statements that hold no writer gate at all; only the final outbox
+    # insert is the fenced write this scenario parks. Run through the
+    # staging checkpoints until the parked statement is that insert.
+    for _ in range(64):
+        harness.run_until(writer, FENCED_WRITE_PRECOMMIT)
+        if harness.server.statements[-1].kind is LandingOp.OUTBOX_RECORD:
+            break
+    else:
+        raise AssertionError("the fenced outbox insert never reached its precommit")
     return writer, call
 
 
 def _enumerate(ledger: Any) -> list[dict[str, Any]]:
     """One replay enumeration under the incident's own fast-call budget."""
     with ledger.operation_timeout(FAST_CALL_BUDGET_SECONDS):
-        return ledger.pending_block_candidate_rows(limit=32)
+        return list(ledger.pending_block_candidate_headers(limit=32).rows)
 
 
 def _take_writer_gate(ledger: Any) -> None:
@@ -213,7 +223,9 @@ class EnumerationOutsideTheWriterConvoyTests(unittest.TestCase):
 
         harness.drain([long_write, contender, replay])
         return {
-            "page": page_call.value(),
+            # Random durable body IDs are irrelevant to this scheduler proof.
+            "page": [{key: value for key, value in row.items() if key != "body"}
+                     for row in page_call.value()],
             "gate_held_during_read": gate_held_during_read,
             "gate_held_at_statement": gate_held_at_statement,
             "admission_error": type(admission_call.error).__name__,
@@ -224,7 +236,7 @@ class EnumerationOutsideTheWriterConvoyTests(unittest.TestCase):
                 else str(long_call.value())
             ),
             "stats": ledger.ledger_read_gate_stats()[
-                "pending_block_candidate_rows"
+                "pending_block_candidate_headers"
             ],
         }
 
@@ -333,7 +345,7 @@ class EnumerationOutsideTheWriterConvoyTests(unittest.TestCase):
             # An admission expiry is counted as one, and never as a statement
             # that PostgreSQL was slow to answer.
             stats = ledger.ledger_read_gate_stats()[
-                "pending_block_candidate_rows"
+                "pending_block_candidate_headers"
             ]
             self.assertEqual(stats["calls_total"], 2)
             self.assertEqual(stats["gate_timeouts_total"], 1)

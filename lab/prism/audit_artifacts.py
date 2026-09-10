@@ -29,8 +29,19 @@ import uuid
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping
+from collections.abc import Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
+from lab.prism.audit_bundle_view import (
+    ArtifactSource,
+    CanonicalArtifactError,
+    CanonicalAuditBundleView,
+    RawJsonRecord,
+    iter_json_byte_chunks,
+    json_chunks_sha256_and_size,
+    materialize_json,
+    spool_json_document,
+)
 from lab.prism.prism_tools import prism_tool_command
 
 
@@ -862,6 +873,36 @@ class AuditArtifactStore:
             self._validate_root_identity()
             return os.dup(self._root_fd)
 
+    def _scan_root_names(self) -> list[str]:
+        """Enumerate the audit root through a fresh directory description.
+
+        ``os.listdir(self._root_fd)`` reads through the long-lived pinned
+        descriptor. Some kernels and overlay filesystems serve a stale or
+        truncated enumeration through a directory description that has
+        already been read once and mutated since: on an aarch64 Docker host
+        a conflict snapshot written moments earlier was absent from the next
+        scan, so quarantine deduplication wrote a second copy and metrics
+        and retention saw an empty root. Reopening ``.`` relative to the
+        pinned descriptor yields a fresh description of the very same inode
+        -- authority still flows from ``_root_fd``, never from a pathname --
+        and the identity is re-verified before and after the enumeration.
+        """
+        self._validate_root_identity()
+        fd = os.open(
+            ".",
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            dir_fd=self._root_fd,
+        )
+        try:
+            value = os.fstat(fd)
+            if (value.st_dev, value.st_ino) != self._root_identity:
+                raise RuntimeError("audit artifact root authority is invalid")
+            names = os.listdir(fd)
+        finally:
+            os.close(fd)
+        self._validate_root_identity()
+        return names
+
     def _owned_lstat(self, path: Path) -> os.stat_result:
         fd = self._owned_parent_fd(path)
         if fd is None:
@@ -1292,7 +1333,7 @@ class AuditArtifactStore:
         metrics["scan_error"] = 0
         try:
             self._validate_root_identity()
-            paths = [self._root / name for name in os.listdir(self._root_fd)]
+            paths = [self._root / name for name in self._scan_root_names()]
         except (OSError, RuntimeError):
             metrics["scan_error"] = 1
             return metrics
@@ -3046,7 +3087,7 @@ class AuditArtifactStore:
         try:
             self._validate_root_identity()
             entries = sorted(
-                (self._root / name for name in os.listdir(self._root_fd)),
+                (self._root / name for name in self._scan_root_names()),
                 key=lambda value: value.name,
             )
         except (OSError, RuntimeError):
@@ -3202,6 +3243,20 @@ class AuditArtifactStore:
         return self._write_mutable_bytes(path, body)
 
     def _write_mutable_bytes(self, path: Path, payload: bytes) -> _FileIdentity:
+        return self._write_mutable_chunks(path, lambda: (payload,))
+
+    def _write_mutable_chunks(
+        self,
+        path: Path,
+        chunks_factory: Callable[[], Iterable[bytes]],
+    ) -> _FileIdentity:
+        """Replace a mutable owned file with a chunk stream, atomically.
+
+        ``chunks_factory`` returns a fresh bounded iterator each call, so a
+        whole-window payload is never held as one bytes object; the prior
+        bytes are still captured for rollback (bounded by the existing
+        file: a share slot or an evidence document).
+        """
         path = Path(path).absolute()
         resolved_parent = path.parent.resolve(strict=True)
         if not (
@@ -3231,7 +3286,8 @@ class AuditArtifactStore:
                 temp_identity = _FileIdentity.from_stat(os.fstat(fd))
                 with os.fdopen(fd, "wb") as handle:
                     try:
-                        handle.write(payload)
+                        for chunk in chunks_factory():
+                            handle.write(chunk)
                         handle.flush()
                         os.fsync(handle.fileno())
                     finally:
@@ -3322,6 +3378,22 @@ class AuditArtifactStore:
                 )
 
     def _write_immutable_bytes(self, path: Path, payload: bytes) -> None:
+        self._write_immutable_chunks(path, lambda: (payload,), len(payload))
+
+    def _write_immutable_chunks(
+        self,
+        path: Path,
+        chunks_factory: Callable[[], Iterable[bytes]],
+        size: int | None,
+    ) -> None:
+        """Publish an immutable owned artifact from a replayable chunk stream.
+
+        ``chunks_factory`` must return the same bounded chunks on every call:
+        the stream is consumed once to write the temporary inode and again,
+        chunk by chunk against the existing file, whenever an equal artifact
+        may already be published. ``size`` is the stream's total byte count
+        when known in advance (None derives it from the stream).
+        """
         if getattr(self, "_read_only", False):
             raise RuntimeError(
                 "audit artifact store is read-only: publication is not available"
@@ -3343,9 +3415,10 @@ class AuditArtifactStore:
             except FileNotFoundError:
                 existing = None
             if existing is not None:
-                if not stat.S_ISREG(existing.st_mode) or not self.file_matches_bytes(
+                if not stat.S_ISREG(existing.st_mode) or not self._file_matches_chunks(
                     path,
-                    payload,
+                    chunks_factory,
+                    size,
                 ):
                     raise RuntimeError(
                         f"existing audit artifact does not match payload at {path}"
@@ -3367,18 +3440,25 @@ class AuditArtifactStore:
                 temp_identity = _FileIdentity.from_stat(os.fstat(fd))
                 with os.fdopen(fd, "wb") as handle:
                     try:
-                        handle.write(payload)
+                        written = 0
+                        for chunk in chunks_factory():
+                            handle.write(chunk)
+                            written += len(chunk)
                         handle.flush()
                         os.fsync(handle.fileno())
                     finally:
                         temp_identity = _FileIdentity.from_stat(
                             os.fstat(handle.fileno())
                         )
+                if size is not None and written != size:
+                    raise RuntimeError(
+                        f"audit artifact stream size changed while publishing {path}"
+                    )
                 try:
                     self._owned_link(tmp_path, path)
                     linked_by_this_call = True
                 except FileExistsError:
-                    if not self.file_matches_bytes(path, payload):
+                    if not self._file_matches_chunks(path, chunks_factory, size):
                         raise RuntimeError(
                             f"existing audit artifact does not match payload at {path}"
                         )
@@ -3434,13 +3514,63 @@ class AuditArtifactStore:
         raise RuntimeError("audit fsync target has no pinned authority")
 
     def file_matches_bytes(self, path: Path, expected: bytes) -> bool:
+        return self._file_matches_chunks(path, lambda: (expected,), len(expected))
+
+    def _file_matches_chunks(
+        self,
+        path: Path,
+        chunks_factory: Callable[[], Iterable[bytes]],
+        size: int | None,
+    ) -> bool:
+        """Compare an owned file with a chunk stream without reading it whole.
+
+        Bounded by one chunk at a time; the descriptor identity is checked
+        before and after the comparison exactly as the whole-file reader
+        does, so a file mutated mid-compare reports a mismatch.
+        """
         try:
-            payload, value = self._read_owned_regular_bytes(path)
-            if value.st_size != len(expected):
-                return False
-            return hmac.compare_digest(payload, expected)
+            parent_fd = self._owned_parent_fd(path)
+            if parent_fd is not None:
+                self._validate_owned_parent(path)
+            fd = self._owned_open(
+                path,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
         except OSError:
             return False
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode):
+                return False
+            if size is not None and before.st_size != size:
+                return False
+            offset = 0
+            equal = True
+            for chunk in chunks_factory():
+                if not equal:
+                    break
+                actual = _pread_exact(fd, offset, len(chunk))
+                if not hmac.compare_digest(actual, chunk):
+                    equal = False
+                offset += len(chunk)
+            if equal and offset != before.st_size:
+                equal = False
+            after = os.fstat(fd)
+            if (
+                before.st_dev != after.st_dev
+                or before.st_ino != after.st_ino
+                or before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+                or before.st_ctime_ns != after.st_ctime_ns
+            ):
+                return False
+            if parent_fd is not None:
+                self._validate_owned_parent(path)
+            return equal
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
 
     @staticmethod
     def file_sha256_hex(path: Path) -> str:
@@ -3483,18 +3613,32 @@ class AuditArtifactStore:
     # External body and share-segment capability used by the ledger.  Database
     # lease checks remain in the ledger; paths, encodings, and bytes stay here.
 
-    def canonical_audit_bundle_bytes(self, final_bundle: dict[str, Any]) -> bytes:
+    def canonical_audit_bundle_bytes(self, final_bundle: Mapping[str, Any]) -> bytes:
+        if isinstance(final_bundle, CanonicalAuditBundleView):
+            # The view *is* the canonical artifact, so its bytes are the
+            # canonical bytes by definition.  This whole-body copy is the
+            # compatibility lane for callers that still want one bytes
+            # object; the bounded publication path streams
+            # ``final_bundle.iter_bytes()`` instead.
+            return b"".join(final_bundle.iter_bytes())
         return canonical_audit_bundle_bytes(final_bundle, self._canonicalizer)
 
     def canonical_audit_body_bytes_for_sha(
         self,
-        final_bundle: dict[str, Any],
+        final_bundle: Mapping[str, Any],
         audit_bundle_sha256: str,
     ) -> bytes:
         expected = _canonical_hex(
             audit_bundle_sha256,
             name="audit_bundle_sha256",
         )
+        if isinstance(final_bundle, CanonicalAuditBundleView):
+            actual = final_bundle.sha256_hex
+            if not hmac.compare_digest(actual, expected):
+                raise RuntimeError(
+                    f"audit bundle sha256 mismatch: expected {expected}, got {actual}"
+                )
+            return b"".join(final_bundle.iter_bytes())
         body = self.canonical_audit_bundle_bytes(final_bundle)
         actual = _sha256_bytes(body)
         if not hmac.compare_digest(actual, expected):
@@ -3502,6 +3646,206 @@ class AuditArtifactStore:
                 f"audit bundle sha256 mismatch: expected {expected}, got {actual}"
             )
         return body
+
+    # Bounded canonical-source helpers (issue #255).  The verified candidate
+    # artifact is the authority; these open it under the store's directory
+    # authority and expose it as a positional-read source so digests, gzip
+    # publication and logical comparison stream through bounded chunks.
+
+    def _open_owned_artifact_source(self, path: Path) -> ArtifactSource:
+        """Open an owned regular file as a bounded positional-read source."""
+        path = Path(path)
+        parent_fd = self._owned_parent_fd(path)
+        if parent_fd is not None:
+            self._validate_owned_parent(path)
+        fd = self._owned_open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            source = ArtifactSource(fd, path=path)
+        except CanonicalArtifactError as exc:
+            raise OSError(str(exc)) from exc
+        if parent_fd is not None:
+            try:
+                self._validate_owned_parent(path)
+            except BaseException:
+                # The descriptor is retired here, not by a finalizer that a
+                # retained traceback could postpone.
+                source.close()
+                raise
+        return source
+
+    def _scan_owned_artifact(
+        self,
+        path: Path,
+        *,
+        lazy_paths: Sequence[tuple[str, ...]],
+    ) -> CanonicalAuditBundleView:
+        """Scan an owned JSON artifact into a bounded view (closed by caller)."""
+        parent_fd = self._owned_parent_fd(path)
+        if parent_fd is not None:
+            self._validate_owned_parent(path)
+        fd = self._owned_open(
+            Path(path),
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        view = CanonicalAuditBundleView.scan(
+            fd,
+            path=Path(path),
+            lazy_paths=lazy_paths,
+        )
+        if parent_fd is not None:
+            try:
+                self._validate_owned_parent(path)
+            except BaseException:
+                # Retire the artifact and index descriptors now; a retained
+                # traceback must not keep them open until collection.
+                view.close()
+                raise
+        return view
+
+    def _require_logical_match(
+        self,
+        source: ArtifactSource,
+        final_bundle: Mapping[str, Any],
+    ) -> None:
+        """Full logical comparison of a canonical source with ``final_bundle``.
+
+        A view scanned from this very inode (same identity and digest) is
+        the artifact by construction.  Any other bundle -- a dictionary from
+        a compatibility builder, or a view over a different file -- is
+        compared member by member against a bounded scan of the source, with
+        the window-sized arrays streamed record by record, which preserves
+        the whole-document equality check without ``json.loads`` of the
+        candidate.
+        """
+        if (
+            isinstance(final_bundle, CanonicalAuditBundleView)
+            and final_bundle.identity == source.identity
+            and hmac.compare_digest(final_bundle.sha256_hex, source.sha256_hex())
+        ):
+            return
+        fd = os.dup(source.fileno())
+        try:
+            scanned = CanonicalAuditBundleView.scan(fd, path=source.path)
+        except CanonicalArtifactError as exc:
+            raise RuntimeError("canonical audit candidate is not valid JSON") from exc
+        try:
+            if scanned != final_bundle:
+                raise RuntimeError(
+                    "canonical audit candidate does not match logical bundle"
+                )
+        finally:
+            scanned.close()
+
+    def stored_canonical_bundle_sha256(
+        self,
+        block_hash: str,
+        audit_bundle_sha256: str,
+    ) -> str | None:
+        """Verify a stored canonical bundle by streaming, without its bytes.
+
+        Returns the verified uncompressed digest, None when nothing is
+        stored, and raises :class:`CanonicalAuditBundleCorrupt` for damage,
+        exactly like :meth:`read_canonical_audit_bundle` -- but the artifact
+        is decompressed and hashed one bounded chunk at a time.
+        """
+
+        block_hash = _canonical_hex(block_hash, name="block_hash")
+        digest = _canonical_hex(
+            audit_bundle_sha256,
+            name="audit_bundle_sha256",
+        )
+        path = self.canonical_bundle_path(block_hash, digest)
+        try:
+            source = self._open_owned_artifact_source(path)
+        except FileNotFoundError:
+            self._validate_root_identity()
+            return None
+        except OSError as exc:
+            raise CanonicalAuditBundleCorrupt(
+                f"canonical audit bundle is not retrievable at {path}: {exc}"
+            ) from exc
+        try:
+            hasher = hashlib.sha256()
+            try:
+                with gzip.GzipFile(
+                    fileobj=_ChunkReader(source),
+                    mode="rb",
+                ) as handle:
+                    while True:
+                        piece = handle.read(SCAN_CHUNK_BYTES_LOCAL)
+                        if not piece:
+                            break
+                        hasher.update(piece)
+                source.verify_identity()
+            except (OSError, EOFError, zlib.error, CanonicalArtifactError) as exc:
+                raise CanonicalAuditBundleCorrupt(
+                    f"canonical audit bundle does not decompress at {path}: {exc}"
+                ) from exc
+            actual = hasher.hexdigest()
+            if not hmac.compare_digest(actual, digest):
+                raise CanonicalAuditBundleCorrupt(
+                    f"canonical audit bundle hash mismatch at {path}: "
+                    f"expected {digest}, got {actual}"
+                )
+        finally:
+            source.close()
+        self._validate_root_identity()
+        return actual
+
+    def write_canonical_audit_bundle_from_source(
+        self,
+        block_hash: str,
+        audit_bundle_sha256: str,
+        source: ArtifactSource,
+    ) -> Path:
+        """Publish the canonical bundle behind ``source`` by streaming it.
+
+        Same contract as :meth:`write_canonical_audit_bundle` -- verified
+        digest before any store side effect, reproducible compression,
+        immutable publication, and a post-publication re-verification --
+        without ever holding the uncompressed or compressed body as one
+        bytes object.  Republishing is a durable no-op when the stored
+        artifact decompresses to the advertised digest.
+        """
+
+        block_hash = _canonical_hex(block_hash, name="block_hash")
+        digest = _canonical_hex(
+            audit_bundle_sha256,
+            name="audit_bundle_sha256",
+        )
+        actual = source.sha256_hex()
+        if not hmac.compare_digest(actual, digest):
+            raise RuntimeError(
+                f"audit bundle sha256 mismatch: expected {digest}, got {actual}"
+            )
+        path = self.canonical_bundle_path(block_hash, digest)
+        with self._lock:
+            try:
+                stored = self.stored_canonical_bundle_sha256(block_hash, digest)
+            except CanonicalAuditBundleCorrupt:
+                # Preserve the immutable writer's existing conflict behavior
+                # for damaged files.  It will refuse to replace their bytes.
+                stored = None
+            if stored is not None:
+                self._fsync_directory(path.parent)
+                self._validate_root_identity()
+                return path
+            self._write_immutable_chunks(
+                path,
+                lambda: _gzip_canonical_chunks(source.iter_bytes()),
+                None,
+            )
+            self._fsync_directory(path.parent)
+            published = self.stored_canonical_bundle_sha256(block_hash, digest)
+            if published is None:
+                raise RuntimeError(
+                    f"canonical audit bundle is absent after publication at {path}"
+                )
+            self._validate_root_identity()
+            return path
 
     # Canonical bundle persistence.  The public digest of a publication is the
     # SHA-256 of these uncompressed bytes; keeping them on disk means a reader
@@ -3821,7 +4165,7 @@ class AuditArtifactStore:
         *,
         first_share_seq: int,
         last_share_seq: int,
-        shares: list[Any],
+        shares: Sequence[Any],
     ) -> dict[str, Any]:
         return {
             "schema": AUDIT_SHARE_SEGMENT_SCHEMA,
@@ -3831,12 +4175,23 @@ class AuditArtifactStore:
             "shares": shares,
         }
 
+    @staticmethod
+    def _storage_json_chunks(payload: Mapping[str, Any]) -> Callable[[], Iterator[bytes]]:
+        """A replayable factory of :meth:`storage_json_bytes` in bounded chunks.
+
+        The stream reproduces ``storage_json_bytes(payload)`` exactly while
+        any lazy share sequence inside ``payload`` is encoded batch by batch
+        instead of being materialized; a plain list of records encodes the
+        same way.
+        """
+        return lambda: iter_json_byte_chunks(payload)
+
     def write_audit_share_segment(
         self,
         *,
         first_share_seq: int,
         last_share_seq: int,
-        shares: list[Any],
+        shares: Sequence[Any],
     ) -> tuple[str, str]:
         self._validate_share_range(first_share_seq, last_share_seq, shares)
         segment = self.audit_share_segment_payload(
@@ -3844,14 +4199,14 @@ class AuditArtifactStore:
             last_share_seq=last_share_seq,
             shares=shares,
         )
-        payload = self.storage_json_bytes(segment)
-        digest = _sha256_bytes(payload)
+        chunks = self._storage_json_chunks(segment)
+        digest, size = json_chunks_sha256_and_size(chunks())
         path = self._root / (
             f"prism-audit-share-segment-{first_share_seq}-{last_share_seq}-{digest}.json"
         )
         if not _SHARE_CONTENT_RE.fullmatch(path.name):
             raise RuntimeError("invalid audit share segment bounds")
-        self._write_immutable_bytes(path, payload)
+        self._write_immutable_chunks(path, chunks, size)
         self._validate_root_identity()
         return str(path), digest
 
@@ -3862,7 +4217,7 @@ class AuditArtifactStore:
         segment_last_share_seq: int,
         first_share_seq: int,
         last_share_seq: int,
-        shares: list[Any],
+        shares: Sequence[Any],
         load_missing_range: Callable[..., list[Any]] | None = None,
     ) -> tuple[str, str]:
         if not shares:
@@ -3886,14 +4241,15 @@ class AuditArtifactStore:
             last_share_seq=last_share_seq,
             shares=shares,
         )
-        # Encode the incoming range once.  Completed 10k slots dominate normal
-        # block persistence; byte equality lets them return without parsing,
-        # merging, deep-copying, or serializing the existing slot tree.
-        incoming_bytes = self.storage_json_bytes(incoming)
-        range_digest = _sha256_bytes(incoming_bytes)
+        # Digest the incoming range in bounded chunks.  Completed 10k slots
+        # dominate normal block persistence; byte equality lets them return
+        # without parsing, merging, deep-copying, or serializing the existing
+        # slot tree, and the chunk stream is replayed rather than held whole.
+        incoming_chunks = self._storage_json_chunks(incoming)
+        range_digest, incoming_size = json_chunks_sha256_and_size(incoming_chunks())
         with self._lock:
             self._validate_root_identity()
-            if self.file_matches_bytes(path, incoming_bytes):
+            if self._file_matches_chunks(path, incoming_chunks, incoming_size):
                 self._fsync_directory(path.parent)
                 return str(path), range_digest
             existing_bytes: bytes | None = None
@@ -3969,16 +4325,21 @@ class AuditArtifactStore:
                 and segment_last == last_share_seq
                 and len(merged) == len(shares)
             ):
-                segment_bytes = incoming_bytes
+                segment_chunks = incoming_chunks
             else:
                 segment = self.audit_share_segment_payload(
                     first_share_seq=segment_first,
                     last_share_seq=segment_last,
                     shares=merged,
                 )
-                segment_bytes = self.storage_json_bytes(segment)
-            if existing_bytes != segment_bytes:
-                self._write_mutable_bytes(path, segment_bytes)
+                segment_chunks = self._storage_json_chunks(segment)
+            if existing_bytes is None or not _bytes_equal_chunks(
+                existing_bytes,
+                segment_chunks(),
+            ):
+                # Streamed chunk by chunk: a slot never becomes one bytes
+                # object here, whatever a single record's size.
+                self._write_mutable_chunks(path, segment_chunks)
             else:
                 self._fsync_directory(path.parent)
         self._validate_root_identity()
@@ -3988,20 +4349,79 @@ class AuditArtifactStore:
     def _validate_share_range(
         first_share_seq: int,
         last_share_seq: int,
-        shares: list[Any],
+        shares: Sequence[Any],
     ) -> None:
         if first_share_seq <= 0 or last_share_seq < first_share_seq or not shares:
             raise RuntimeError("audit share range bounds are invalid")
+        # Walked once, record by record: a lazy slice streams from the
+        # artifact and never becomes a list of sequence numbers.
+        previous: int | None = None
+        first: int | None = None
         try:
-            sequences = [int(share["share_seq"]) for share in shares]
+            for share in shares:
+                share_seq = int(share["share_seq"])
+                if first is None:
+                    first = share_seq
+                elif previous is not None and previous + 1 != share_seq:
+                    raise RuntimeError("audit share range is not exactly contiguous")
+                previous = share_seq
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError("audit share range has invalid share_seq") from exc
-        if (
-            sequences[0] != first_share_seq
-            or sequences[-1] != last_share_seq
-            or any(current + 1 != nxt for current, nxt in zip(sequences, sequences[1:]))
-        ):
+        if first != first_share_seq or previous != last_share_seq:
             raise RuntimeError("audit share range is not exactly contiguous")
+
+    @staticmethod
+    def _is_share_sequence(value: object) -> bool:
+        """True for a list or any other replayable sequence of records."""
+        return isinstance(value, Sequence) and not isinstance(
+            value,
+            (str, bytes, bytearray),
+        )
+
+    @staticmethod
+    def _contiguous_share_start(shares: Sequence[Any]) -> int | None:
+        """First share_seq when every record is a dict in strict +1 order.
+
+        One streaming pass; None reproduces the historical "fall back to the
+        inline body-ref layout" verdict for a window that is not a
+        contiguous dictionary sequence.
+        """
+        first: int | None = None
+        previous: int | None = None
+        for share in shares:
+            if not isinstance(share, dict):
+                return None
+            try:
+                share_seq = int(share["share_seq"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            if first is None:
+                first = share_seq
+            elif previous is not None and previous + 1 != share_seq:
+                return None
+            previous = share_seq
+        return first
+
+    @staticmethod
+    def _iter_segment_slots(
+        first_seq: int,
+        count: int,
+        segment_size: int,
+    ) -> Iterator[tuple[int, int, int, int]]:
+        """(index, end_index, slot_start, slot_end) for a contiguous window.
+
+        Because contiguity has been verified, record ``i`` carries sequence
+        ``first_seq + i``; the slot boundaries follow arithmetically without
+        a second pass over the records.
+        """
+        index = 0
+        while index < count:
+            seq = first_seq + index
+            slot_start = ((seq - 1) // segment_size) * segment_size + 1
+            slot_end = slot_start + segment_size - 1
+            end = min(count, index + (slot_end - seq + 1))
+            yield index, end, slot_start, slot_end
+            index = end
 
     def merge_audit_share_ranges(
         self,
@@ -4088,7 +4508,7 @@ class AuditArtifactStore:
         with self._lock:
             self._validate_root_identity()
             conflict_prefix = f"{segment_path.name}.conflict-"
-            for name in sorted(os.listdir(self._root_fd)):
+            for name in sorted(self._scan_root_names()):
                 if not name.startswith(conflict_prefix):
                     continue
                 if self.file_matches_bytes(self._root / name, expected_bytes):
@@ -4147,132 +4567,183 @@ class AuditArtifactStore:
             )
         return by_seq
 
-    def audit_share_range_parts(
+    @staticmethod
+    def _spool_share_parts(
+        parts: Iterable[Mapping[str, Any]],
+        scratch: list[CanonicalAuditBundleView] | None,
+    ) -> Sequence[Any]:
+        """The share-part index as a replayable on-disk sequence.
+
+        Parts are written to an unlinked scratch document as they are
+        produced -- an inline part's lazy slice streams batch by batch --
+        and read back lazily, so a small configured segment size cannot
+        turn the index into a window-scaled list. The scratch view is
+        appended to ``scratch`` for the caller to close; without a scratch
+        list it retires with the last reference to the sequence.
+        """
+
+        def chunks() -> Iterator[bytes]:
+            yield b'{"share_parts":['
+            first = True
+            for part in parts:
+                if not first:
+                    yield b","
+                first = False
+                yield from iter_json_byte_chunks(part)
+            yield b"]}"
+
+        view = spool_json_document(chunks(), lazy_paths=(("share_parts",),))
+        if scratch is not None:
+            scratch.append(view)
+        return view["share_parts"]
+
+    @staticmethod
+    def share_parts_digest_hex(parts: Sequence[Any]) -> str:
+        """``sha256(storage_json_bytes({"share_parts": parts}))``, streamed."""
+        digest, _size = json_chunks_sha256_and_size(
+            iter_json_byte_chunks({"share_parts": parts})
+        )
+        return digest
+
+    def _iter_share_range_parts(
         self,
-        shares: list[Any],
+        shares: Sequence[Any],
+        first_seq: int,
         *,
-        load_missing_range: Callable[..., list[Any]] | None = None,
-    ) -> list[dict[str, Any]] | None:
-        if self._share_segment_size <= 0:
-            return None
-        share_seqs: list[int] = []
-        for share in shares:
-            if not isinstance(share, dict):
-                return None
-            try:
-                share_seq = int(share["share_seq"])
-            except (KeyError, TypeError, ValueError):
-                return None
-            share_seqs.append(share_seq)
-        if any(current + 1 != nxt for current, nxt in zip(share_seqs, share_seqs[1:])):
-            return None
-        parts: list[dict[str, Any]] = []
-        index = 0
+        load_missing_range: Callable[..., list[Any]] | None,
+    ) -> Iterator[dict[str, Any]]:
         segment_size = self._share_segment_size
-        while index < len(shares):
-            first_seq = share_seqs[index]
-            segment_start = ((first_seq - 1) // segment_size) * segment_size + 1
-            segment_end = segment_start + segment_size - 1
-            end = index
-            while end < len(shares) and share_seqs[end] <= segment_end:
-                end += 1
+        for index, end, segment_start, segment_end in self._iter_segment_slots(
+            first_seq,
+            len(shares),
+            segment_size,
+        ):
             chunk = shares[index:end]
-            chunk_seqs = share_seqs[index:end]
+            chunk_first = first_seq + index
+            chunk_last = first_seq + end - 1
             uri, digest = self.write_audit_share_segment_range(
                 segment_first_share_seq=segment_start,
                 segment_last_share_seq=segment_end,
-                first_share_seq=chunk_seqs[0],
-                last_share_seq=chunk_seqs[-1],
+                first_share_seq=chunk_first,
+                last_share_seq=chunk_last,
                 shares=chunk,
                 load_missing_range=load_missing_range,
             )
-            parts.append(
-                {
-                    "kind": "segment_range",
-                    "segment_first_share_seq": segment_start,
-                    "segment_last_share_seq": segment_end,
-                    "first_share_seq": chunk_seqs[0],
-                    "last_share_seq": chunk_seqs[-1],
-                    "share_count": len(chunk),
-                    "range_sha256": digest,
-                    "body_uri": uri,
-                }
-            )
-            index = end
-        return parts
+            yield {
+                "kind": "segment_range",
+                "segment_first_share_seq": segment_start,
+                "segment_last_share_seq": segment_end,
+                "first_share_seq": chunk_first,
+                "last_share_seq": chunk_last,
+                "share_count": end - index,
+                "range_sha256": digest,
+                "body_uri": uri,
+            }
 
-    def audit_share_parts(self, shares: list[Any]) -> list[dict[str, Any]] | None:
+    def audit_share_range_parts(
+        self,
+        shares: Sequence[Any],
+        *,
+        load_missing_range: Callable[..., list[Any]] | None = None,
+        scratch: list[CanonicalAuditBundleView] | None = None,
+    ) -> Sequence[Any] | None:
+        """Slot-range parts for a contiguous window, one bounded slice each.
+
+        Accepts a list or a lazy artifact sequence.  The window is walked
+        once to prove contiguity, then each slot's records are handed to the
+        segment writer as a slice bounded by the configured segment size;
+        no list of sequence numbers or of records spanning the whole window
+        is built, and the parts themselves are spooled to disk as they are
+        produced and returned as a replayable sequence.
+        """
         if self._share_segment_size <= 0:
             return None
-        share_seqs: list[int] = []
-        for share in shares:
-            if not isinstance(share, dict):
-                return None
-            try:
-                share_seq = int(share["share_seq"])
-            except (KeyError, TypeError, ValueError):
-                return None
-            share_seqs.append(share_seq)
-        if any(current + 1 != nxt for current, nxt in zip(share_seqs, share_seqs[1:])):
+        if not self._is_share_sequence(shares):
             return None
-        parts: list[dict[str, Any]] = []
-        index = 0
+        first_seq = self._contiguous_share_start(shares)
+        if first_seq is None:
+            return None
+        return self._spool_share_parts(
+            self._iter_share_range_parts(
+                shares,
+                first_seq,
+                load_missing_range=load_missing_range,
+            ),
+            scratch,
+        )
+
+    def _iter_share_parts(
+        self,
+        shares: Sequence[Any],
+        first_seq: int,
+    ) -> Iterator[dict[str, Any]]:
         segment_size = self._share_segment_size
-        while index < len(shares):
-            first_seq = share_seqs[index]
-            segment_start = ((first_seq - 1) // segment_size) * segment_size + 1
-            segment_end = segment_start + segment_size - 1
-            end = index
-            while end < len(shares) and share_seqs[end] <= segment_end:
-                end += 1
+        for index, end, segment_start, segment_end in self._iter_segment_slots(
+            first_seq,
+            len(shares),
+            segment_size,
+        ):
             chunk = shares[index:end]
-            chunk_seqs = share_seqs[index:end]
+            chunk_first = first_seq + index
+            chunk_last = first_seq + end - 1
             if (
-                len(chunk) == segment_size
-                and chunk_seqs[0] == segment_start
-                and chunk_seqs[-1] == segment_end
+                end - index == segment_size
+                and chunk_first == segment_start
+                and chunk_last == segment_end
             ):
                 uri, digest = self.write_audit_share_segment(
                     first_share_seq=segment_start,
                     last_share_seq=segment_end,
                     shares=chunk,
                 )
-                parts.append(
-                    {
-                        "kind": "segment",
-                        "first_share_seq": segment_start,
-                        "last_share_seq": segment_end,
-                        "share_count": len(chunk),
-                        "sha256": digest,
-                        "body_uri": uri,
-                    }
-                )
+                yield {
+                    "kind": "segment",
+                    "first_share_seq": segment_start,
+                    "last_share_seq": segment_end,
+                    "share_count": end - index,
+                    "sha256": digest,
+                    "body_uri": uri,
+                }
             else:
-                parts.append(
-                    {
-                        "kind": "inline",
-                        "first_share_seq": chunk_seqs[0],
-                        "last_share_seq": chunk_seqs[-1],
-                        "share_count": len(chunk),
-                        "shares": chunk,
-                    }
-                )
-            index = end
-        return parts
+                yield {
+                    "kind": "inline",
+                    "first_share_seq": chunk_first,
+                    "last_share_seq": chunk_last,
+                    "share_count": end - index,
+                    # A lazy slice stays lazy here; the spool encoder
+                    # materializes it batch by batch.
+                    "shares": chunk,
+                }
+
+    def audit_share_parts(
+        self,
+        shares: Sequence[Any],
+        *,
+        scratch: list[CanonicalAuditBundleView] | None = None,
+    ) -> Sequence[Any] | None:
+        if self._share_segment_size <= 0:
+            return None
+        if not self._is_share_sequence(shares):
+            return None
+        first_seq = self._contiguous_share_start(shares)
+        if first_seq is None:
+            return None
+        return self._spool_share_parts(self._iter_share_parts(shares, first_seq), scratch)
 
     def audit_body_ref(
         self,
         *,
         block_hash: str,
         audit_bundle_sha256: str,
-        final_bundle: dict[str, Any],
+        final_bundle: Mapping[str, Any],
+        scratch: list[CanonicalAuditBundleView] | None = None,
     ) -> dict[str, Any] | None:
         if self._share_segment_size <= 0:
             return None
         shares = final_bundle.get("shares")
-        if not isinstance(shares, list) or not shares:
+        if not self._is_share_sequence(shares) or not shares:
             return None
-        parts = self.audit_share_parts(shares)
+        parts = self.audit_share_parts(shares, scratch=scratch)
         if parts is None or not any(part.get("kind") == "segment" for part in parts):
             return None
         without_shares = {key: value for key, value in final_bundle.items() if key != "shares"}
@@ -4293,17 +4764,19 @@ class AuditArtifactStore:
         *,
         block_hash: str,
         audit_bundle_sha256: str,
-        final_bundle: dict[str, Any],
+        final_bundle: Mapping[str, Any],
         load_missing_range: Callable[..., list[Any]] | None = None,
+        scratch: list[CanonicalAuditBundleView] | None = None,
     ) -> dict[str, Any] | None:
         if self._share_segment_size <= 0:
             return None
         shares = final_bundle.get("shares")
-        if not isinstance(shares, list) or not shares:
+        if not self._is_share_sequence(shares) or not shares:
             return None
         parts = self.audit_share_range_parts(
             shares,
             load_missing_range=load_missing_range,
+            scratch=scratch,
         )
         if parts is None:
             return None
@@ -4313,9 +4786,9 @@ class AuditArtifactStore:
             "first_share_seq": int(shares[0]["share_seq"]),
             "last_share_seq": int(shares[-1]["share_seq"]),
             "share_count": len(shares),
-            "share_parts_digest_hex": _sha256_bytes(
-                self.storage_json_bytes({"share_parts": parts})
-            ),
+            # The parts serialization is hashed incrementally from the
+            # on-disk index; it equals the reader's whole-encoding digest.
+            "share_parts_digest_hex": self.share_parts_digest_hex(parts),
             "share_parts": parts,
         }
         reward = final_bundle.get("reward_manifest")
@@ -4349,28 +4822,54 @@ class AuditArtifactStore:
         self,
         block_hash: str,
         audit_bundle_sha256: str,
-        final_bundle: dict[str, Any],
+        final_bundle: Mapping[str, Any],
     ) -> str:
         block_hash = _canonical_hex(block_hash, name="block_hash")
         digest = _canonical_hex(
             audit_bundle_sha256,
             name="audit_bundle_sha256",
         )
-        body = self.canonical_audit_body_bytes_for_sha(final_bundle, digest)
         path = self.body_path(block_hash, digest)
-        self._write_immutable_bytes(path, body)
+        if isinstance(final_bundle, CanonicalAuditBundleView):
+            if not hmac.compare_digest(final_bundle.sha256_hex, digest):
+                raise RuntimeError(
+                    "audit bundle sha256 mismatch: "
+                    f"expected {digest}, got {final_bundle.sha256_hex}"
+                )
+            final_bundle.verify_identity()
+            self._write_immutable_chunks(
+                path,
+                final_bundle.iter_bytes,
+                final_bundle.byte_length,
+            )
+        else:
+            body = self.canonical_audit_body_bytes_for_sha(final_bundle, digest)
+            self._write_immutable_bytes(path, body)
         self._validate_root_identity()
         return str(path)
 
     def prepare_external_audit_body(
         self,
         payload: Mapping[str, Any],
-        final_bundle: dict[str, Any],
+        final_bundle: Mapping[str, Any],
         *,
         body_uri: str | None,
         canonical_bundle_path: Path | None = None,
         load_missing_range: Callable[..., list[Any]] | None = None,
     ) -> str | None:
+        """Publish the canonical bundle and its external body for one block.
+
+        Bounded end to end (issue #255): the canonical candidate is opened
+        under the store's directory authority and digested, compared and
+        compressed through bounded chunks; a :class:`CanonicalAuditBundleView`
+        scanned from that very inode is accepted by identity, any other
+        logical bundle is compared member by member with the window arrays
+        streamed; compact share segments are cut from bounded slices; the
+        body document is encoded chunk by chunk; and every verification of
+        an existing or freshly published body streams the same way.  The
+        digest, signature and coinbase checks, exact inode identity binding
+        and immutable-publication semantics are unchanged.
+        """
         block_hash = _canonical_hex(payload["block_hash"], name="block_hash")
         expected = _canonical_hex(
             payload["audit_bundle_sha256"],
@@ -4385,117 +4884,213 @@ class AuditArtifactStore:
                 "existing audit bundle body pointer does not match canonical external path: "
                 f"{body_uri}"
             )
-        literal: bytes | None = None
+        canonical: ArtifactSource | None = None
+        owned_canonical = False
+        canonical_bytes: bytes | None = None
         source_identity: _FileIdentity | None = None
-        if canonical_bundle_path is not None:
-            source = Path(canonical_bundle_path)
-            try:
-                literal, before = self._read_owned_regular_bytes(source)
-            except OSError as exc:
-                raise RuntimeError(
-                    f"canonical audit bundle is not retrievable at {source}: {exc}"
-                ) from exc
-            source_identity = _FileIdentity.from_stat(before)
-            actual = _sha256_bytes(literal)
-            if not hmac.compare_digest(actual, expected):
-                raise RuntimeError(
-                    f"audit bundle sha256 mismatch: expected {expected}, got {actual}"
+        # Scratch views (the on-disk share-part index) retire with this call.
+        scratch: list[CanonicalAuditBundleView] = []
+        try:
+            if canonical_bundle_path is not None:
+                source_path = Path(canonical_bundle_path)
+                try:
+                    canonical = self._open_owned_artifact_source(source_path)
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"canonical audit bundle is not retrievable at {source_path}: {exc}"
+                    ) from exc
+                owned_canonical = True
+                source_identity = _FileIdentity(
+                    canonical.identity.device,
+                    canonical.identity.inode,
+                    canonical.identity.mode,
+                    canonical.identity.size,
+                    canonical.identity.mtime_ns,
                 )
-        # Compact storage is derived from final_bundle, not necessarily from the
-        # supplied canonical path. Bind those logical inputs independently.
-        if literal is not None:
-            try:
-                canonical_logical = json.loads(literal)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise RuntimeError("canonical audit candidate is not valid JSON") from exc
-            if canonical_logical != final_bundle:
-                raise RuntimeError(
-                    "canonical audit candidate does not match logical bundle"
+                actual = canonical.sha256_hex()
+                if not hmac.compare_digest(actual, expected):
+                    raise RuntimeError(
+                        f"audit bundle sha256 mismatch: expected {expected}, got {actual}"
+                    )
+                # Compact storage is derived from final_bundle, not necessarily
+                # from the supplied canonical path.  Bind those logical inputs
+                # independently -- by identity for a view of this inode,
+                # otherwise by a streamed member-by-member comparison.
+                self._require_logical_match(canonical, final_bundle)
+            elif isinstance(final_bundle, CanonicalAuditBundleView):
+                if not hmac.compare_digest(final_bundle.sha256_hex, expected):
+                    raise RuntimeError(
+                        "audit bundle sha256 mismatch: "
+                        f"expected {expected}, got {final_bundle.sha256_hex}"
+                    )
+                final_bundle.verify_identity()
+                canonical = final_bundle.source
+            else:
+                canonical_bytes = self.canonical_audit_body_bytes_for_sha(
+                    final_bundle,
+                    expected,
                 )
-            canonical_bytes = literal
-        else:
-            canonical_bytes = self.canonical_audit_body_bytes_for_sha(
-                final_bundle,
-                expected,
-            )
-        # Persist the exact bytes the public digest is taken over, reusing the
-        # ones already in hand.  This runs before the compact body so every
-        # path through this call publishes it, including the ones that return
-        # early on an existing body.  The caller's lease preflight has already
-        # completed, so this is still a fenced write.
-        self.write_canonical_audit_bundle(block_hash, expected, canonical_bytes)
-        storage = self.audit_bundle_v2(
-            block_hash=block_hash,
-            audit_bundle_sha256=expected,
-            final_bundle=final_bundle,
-            load_missing_range=load_missing_range,
-        )
-        if storage is None:
-            storage = self.audit_body_ref(
+            # Persist the exact bytes the public digest is taken over, reusing
+            # the source already in hand.  This runs before the compact body so
+            # every path through this call publishes it, including the ones
+            # that return early on an existing body.  The caller's lease
+            # preflight has already completed, so this is still a fenced write.
+            if canonical is not None:
+                self.write_canonical_audit_bundle_from_source(
+                    block_hash,
+                    expected,
+                    canonical,
+                )
+            else:
+                assert canonical_bytes is not None
+                self.write_canonical_audit_bundle(block_hash, expected, canonical_bytes)
+            storage = self.audit_bundle_v2(
                 block_hash=block_hash,
                 audit_bundle_sha256=expected,
                 final_bundle=final_bundle,
+                load_missing_range=load_missing_range,
+                scratch=scratch,
             )
-        if storage is not None:
-            body_bytes = self.storage_json_bytes(storage)
-        elif literal is not None:
-            body_bytes = literal
-        else:
-            body_bytes = self.canonical_audit_body_bytes_for_sha(
-                final_bundle,
-                expected,
-            )
-        try:
-            existing = self._owned_lstat(body_path)
-        except FileNotFoundError:
-            existing = None
-        if existing is not None:
-            if not stat.S_ISREG(existing.st_mode):
-                raise RuntimeError(
-                    f"existing audit bundle body is not regular at {body_path}"
+            if storage is None:
+                storage = self.audit_body_ref(
+                    block_hash=block_hash,
+                    audit_bundle_sha256=expected,
+                    final_bundle=final_bundle,
+                    scratch=scratch,
                 )
-            if storage is not None and self.file_matches_bytes(body_path, body_bytes):
-                if self._compact_body_reconstructs_to(
+            body_size: int | None
+            if storage is not None:
+                body_chunks = self._storage_json_chunks(storage)
+                body_size = None
+            elif canonical is not None:
+                body_chunks = canonical.iter_bytes
+                body_size = canonical.identity.size
+            else:
+                assert canonical_bytes is not None
+                literal = canonical_bytes
+                body_chunks = lambda: (literal,)  # noqa: E731 - replayable single chunk
+                body_size = len(literal)
+            try:
+                existing = self._owned_lstat(body_path)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None:
+                if not stat.S_ISREG(existing.st_mode):
+                    raise RuntimeError(
+                        f"existing audit bundle body is not regular at {body_path}"
+                    )
+                if storage is not None and self._file_matches_chunks(
+                    body_path,
+                    body_chunks,
+                    body_size,
+                ):
+                    if self._compact_body_reconstructs_to(
+                        body_path,
+                        expected=expected,
+                        final_bundle=final_bundle,
+                    ):
+                        self._fsync_directory(body_path.parent)
+                        return str(body_path)
+                    raise RuntimeError(
+                        f"existing audit bundle body does not match payload at {body_path}"
+                    )
+                if storage is None and self._literal_body_matches_sha(body_path, expected):
+                    self._fsync_directory(body_path.parent)
+                    return str(body_path)
+                # Layout upgrades may represent the same canonical logical
+                # bundle with different storage bytes.  Verify by a streamed
+                # comparison against the logical bundle (a compact body) or by
+                # digest (a literal body).
+                if not self._existing_body_matches(
                     body_path,
                     expected=expected,
                     final_bundle=final_bundle,
                 ):
-                    self._fsync_directory(body_path.parent)
-                    return str(body_path)
-                raise RuntimeError(
-                    f"existing audit bundle body does not match payload at {body_path}"
-                )
-            if storage is None and self.external_body_matches_sha(body_path, expected):
+                    raise RuntimeError(
+                        f"existing audit bundle body does not match payload at {body_path}"
+                    )
                 self._fsync_directory(body_path.parent)
                 return str(body_path)
-            # Layout upgrades may represent the same canonical logical bundle
-            # with different storage bytes.  Verify by reconstruction.
-            if not self.external_body_matches_sha(body_path, expected):
-                raise RuntimeError(
-                    f"existing audit bundle body does not match payload at {body_path}"
+            self._write_immutable_chunks(body_path, body_chunks, body_size)
+            if canonical_bundle_path is not None and source_identity is not None:
+                source_after = self._owned_lstat(Path(canonical_bundle_path))
+                if not source_identity.matches(source_after):
+                    raise RuntimeError(
+                        "canonical audit bundle identity changed after publication"
+                    )
+            # The compact storage bytes were derived from the already verified
+            # logical bundle.  Validate the exact destination here, streaming
+            # the segments against the logical window.
+            if storage is not None:
+                valid = self._compact_body_reconstructs_to(
+                    body_path,
+                    expected=expected,
+                    final_bundle=final_bundle,
                 )
-            self._fsync_directory(body_path.parent)
+            else:
+                valid = self._literal_body_matches_sha(body_path, expected)
+            if not valid:
+                raise RuntimeError("published audit bundle body failed digest verification")
+            self._validate_root_identity()
             return str(body_path)
-        self._write_immutable_bytes(body_path, body_bytes)
-        if canonical_bundle_path is not None and source_identity is not None:
-            source_after = self._owned_lstat(Path(canonical_bundle_path))
-            if not source_identity.matches(source_after):
-                raise RuntimeError("canonical audit bundle identity changed after publication")
-        # The compact storage bytes were derived from the already verified
-        # logical bundle.  Validate exact destination bytes here; expensive
-        # reconstruction remains only the cross-version mismatch path.
-        if storage is not None:
-            valid = self._compact_body_reconstructs_to(
-                body_path,
-                expected=expected,
-                final_bundle=final_bundle,
-            )
-        else:
-            valid = self.external_body_matches_sha(body_path, expected)
-        if not valid:
-            raise RuntimeError("published audit bundle body failed digest verification")
-        self._validate_root_identity()
-        return str(body_path)
+        finally:
+            for view in scratch:
+                view.close()
+            if owned_canonical and canonical is not None:
+                canonical.close()
+
+    def _literal_body_matches_sha(self, body_path: Path, expected: str) -> bool:
+        """True when the owned body file digests to ``expected``, streamed."""
+        try:
+            source = self._open_owned_artifact_source(body_path)
+        except OSError:
+            return False
+        try:
+            return hmac.compare_digest(source.sha256_hex(), expected)
+        except (OSError, CanonicalArtifactError):
+            return False
+        finally:
+            source.close()
+
+    def _existing_body_matches(
+        self,
+        body_path: Path,
+        *,
+        expected: str,
+        final_bundle: Mapping[str, Any],
+    ) -> bool:
+        """A published body of any layout represents ``final_bundle``.
+
+        Compact layouts are compared record by record through their
+        segments; a literal body is verified by its digest.  Nothing is
+        reconstructed into a whole-window object graph.
+        """
+        if self._compact_body_reconstructs_to(
+            body_path,
+            expected=expected,
+            final_bundle=final_bundle,
+        ):
+            return True
+        return self._literal_body_matches_sha(body_path, expected)
+
+    # Every window-, transaction- or recipient-scaled member of a compact
+    # body stays lazy: the header mirrors the artifact's lazy paths and the
+    # share-part index scales with the window over the segment size.
+    _BODY_LAZY_PATHS: tuple[tuple[str, ...], ...] = (
+        ("bundle_without_shares", "shares"),
+        ("bundle_without_shares", "reward_manifest", "shares"),
+        ("bundle_without_shares", "reward_manifest", "entitlements"),
+        ("bundle_without_shares", "witness_merkle_leaves_hex"),
+        ("bundle_without_shares", "audit_commitment_leaves_hex"),
+        ("bundle_without_shares", "prior_balances"),
+        ("bundle_without_shares", "payout_policy_manifest", "accounts"),
+        ("bundle_without_shares", "payout_policy_manifest", "onchain_entitlements"),
+        ("bundle_without_shares", "settlement_mode_decision", "direct_recipients"),
+        ("bundle_without_shares", "settlement_mode_decision", "fanout_chunks"),
+        ("bundle_without_shares", "ctv_fanout_manifest_set", "manifests"),
+        ("share_window_proof", "share_parts"),
+        ("share_parts",),
+    )
 
     def _compact_body_reconstructs_to(
         self,
@@ -4504,28 +5099,38 @@ class AuditArtifactStore:
         expected: str,
         final_bundle: Mapping[str, Any],
     ) -> bool:
+        """The compact body at ``body_path`` reconstructs exactly to ``final_bundle``.
+
+        Streams instead of reconstructing: the body is scanned with its
+        window-sized members left lazy, the header is compared member by
+        member (the reward manifest's counted shares record by record), and
+        every share part is read one bounded segment at a time and matched
+        against the corresponding records of the logical window.  The same
+        wrapper identity, proof and part validations apply as in the
+        reconstruction readers; no recovery callback is consulted, so a
+        segment missing from disk is a mismatch exactly as before.
+        """
         try:
-            body_bytes, _value = self._read_owned_regular_bytes(body_path)
-            body = json.loads(body_bytes)
-            if not isinstance(body, dict):
-                return False
-            if body.get("schema") == AUDIT_BODY_REF_SCHEMA:
-                reconstructed = self.resolve_audit_body_ref(
+            body = self._scan_owned_artifact(body_path, lazy_paths=self._BODY_LAZY_PATHS)
+        except (OSError, RuntimeError, CanonicalArtifactError):
+            return False
+        try:
+            schema = body.get("schema")
+            if schema == AUDIT_BODY_REF_SCHEMA:
+                return self._body_ref_matches(
                     body,
-                    expected_sha256=expected,
-                    body_uri=str(body_path),
-                    verify_digest=False,
+                    body_path=body_path,
+                    expected=expected,
+                    final_bundle=final_bundle,
                 )
-            elif body.get("schema") == AUDIT_BUNDLE_V2_SCHEMA:
-                reconstructed = self.resolve_audit_bundle_v2(
+            if schema == AUDIT_BUNDLE_V2_SCHEMA:
+                return self._bundle_v2_matches(
                     body,
-                    expected_sha256=expected,
-                    body_uri=str(body_path),
-                    verify_digest=False,
+                    body_path=body_path,
+                    expected=expected,
+                    final_bundle=final_bundle,
                 )
-            else:
-                return False
-            return reconstructed == final_bundle
+            return False
         except (
             OSError,
             RuntimeError,
@@ -4535,6 +5140,207 @@ class AuditArtifactStore:
             json.JSONDecodeError,
         ):
             return False
+        finally:
+            body.close()
+
+    def _header_matches(
+        self,
+        body: Mapping[str, Any],
+        final_bundle: Mapping[str, Any],
+    ) -> bool:
+        without_shares = body.get("bundle_without_shares")
+        if not isinstance(without_shares, Mapping):
+            return False
+        expected_without = {
+            key: value for key, value in final_bundle.items() if key != "shares"
+        }
+        if without_shares != expected_without:
+            return False
+        keys = list(final_bundle)
+        expected_index = keys.index("shares") if "shares" in keys else len(keys)
+        return int(body.get("shares_key_index", len(without_shares))) == expected_index
+
+    def _parts_match_window(
+        self,
+        parts: Sequence[Any],
+        *,
+        body_path: Path,
+        final_bundle: Mapping[str, Any],
+        allow_inline: bool,
+    ) -> tuple[int, int | None, int | None] | None:
+        """Match ordered share parts against the logical window, streaming.
+
+        Returns (count, first_share_seq, last_share_seq) of the matched
+        records, or None on any mismatch.  Each segment part is read
+        bounded by the segment size; inline parts are bounded by the body.
+        """
+        expected_shares = final_bundle.get("shares")
+        if not self._is_share_sequence(expected_shares):
+            return None
+        expected_iter = iter(expected_shares)
+        count = 0
+        first_seq: int | None = None
+        last_seq: int | None = None
+        previous_last_share_seq: int | None = None
+        for part in parts:
+            if isinstance(part, RawJsonRecord):
+                # An inline part above the in-process limit: the part is
+                # the unit here, so it is decoded whole (documented).
+                part = materialize_json(part)
+            if not isinstance(part, Mapping):
+                return None
+            kind = part.get("kind")
+            segment_view: CanonicalAuditBundleView | None = None
+            if kind in {"segment", "segment_range", "segment_prefix"}:
+                segment_view, part_shares = self._open_share_segment_slice(
+                    part,
+                    parent_body_uri=str(body_path),
+                )
+            elif (
+                allow_inline
+                and kind == "inline"
+                and self._is_share_sequence(part.get("shares"))
+            ):
+                inline = part["shares"]
+                if len(inline) != int(part.get("share_count") or 0):
+                    return None
+                self._validate_share_range(
+                    int(part.get("first_share_seq") or 0),
+                    int(part.get("last_share_seq") or 0),
+                    inline,
+                )
+                part_shares = inline
+            else:
+                return None
+            try:
+                first_share_seq = int(part.get("first_share_seq") or 0)
+                last_share_seq = int(part.get("last_share_seq") or 0)
+                if (
+                    previous_last_share_seq is not None
+                    and first_share_seq <= previous_last_share_seq
+                ):
+                    return None
+                previous_last_share_seq = last_share_seq
+                for record in part_shares:
+                    try:
+                        expected_record = next(expected_iter)
+                    except StopIteration:
+                        return None
+                    if record != expected_record:
+                        return None
+                    if isinstance(record, dict):
+                        try:
+                            seq = int(record.get("share_seq") or 0)
+                        except (TypeError, ValueError):
+                            seq = 0
+                        if first_seq is None:
+                            first_seq = seq
+                        last_seq = seq
+                    count += 1
+            finally:
+                if segment_view is not None:
+                    segment_view.close()
+        try:
+            next(expected_iter)
+        except StopIteration:
+            return count, first_seq, last_seq
+        return None
+
+    def _body_ref_matches(
+        self,
+        body: Mapping[str, Any],
+        *,
+        body_path: Path,
+        expected: str,
+        final_bundle: Mapping[str, Any],
+    ) -> bool:
+        declared = _canonical_hex(
+            body.get("audit_bundle_sha256"),
+            name="audit_bundle_sha256",
+        )
+        self._validate_body_wrapper_identity(body, str(body_path), declared)
+        if not hmac.compare_digest(declared, expected):
+            return False
+        parts = body.get("share_parts")
+        if not self._is_share_sequence(parts) or not self._header_matches(body, final_bundle):
+            return False
+        matched = self._parts_match_window(
+            parts,
+            body_path=body_path,
+            final_bundle=final_bundle,
+            allow_inline=True,
+        )
+        if matched is None:
+            return False
+        return matched[0] == int(body.get("share_count") or 0)
+
+    def _bundle_v2_matches(
+        self,
+        body: Mapping[str, Any],
+        *,
+        body_path: Path,
+        expected: str,
+        final_bundle: Mapping[str, Any],
+    ) -> bool:
+        declared = _canonical_hex(
+            body.get("audit_bundle_sha256"),
+            name="audit_bundle_sha256",
+        )
+        self._validate_body_wrapper_identity(body, str(body_path), declared)
+        if not hmac.compare_digest(declared, expected):
+            return False
+        proof = body.get("share_window_proof")
+        if not isinstance(proof, dict):
+            return False
+        if proof.get("schema") != AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA:
+            return False
+        if int(body.get("share_count") or 0) != int(proof.get("share_count") or 0):
+            return False
+        parts = proof.get("share_parts")
+        if not self._is_share_sequence(parts):
+            return False
+        expected_parts_digest = str(proof.get("share_parts_digest_hex") or "").lower()
+        actual_parts_digest = self.share_parts_digest_hex(parts)
+        if expected_parts_digest != actual_parts_digest:
+            return False
+        if not self._header_matches(body, final_bundle):
+            return False
+        matched = self._parts_match_window(
+            parts,
+            body_path=body_path,
+            final_bundle=final_bundle,
+            allow_inline=False,
+        )
+        if matched is None:
+            return False
+        count, first_seq, last_seq = matched
+        if count != int(proof.get("share_count") or 0):
+            return False
+        if count and (
+            (first_seq or 0) != int(proof.get("first_share_seq") or 0)
+            or (last_seq or 0) != int(proof.get("last_share_seq") or 0)
+        ):
+            return False
+        reward_manifest = final_bundle.get("reward_manifest")
+        copied_proof_fields = (
+            "anchor_job_issued_at_ms",
+            "anchor_share_seq",
+            "newest_share_seq",
+            "oldest_share_seq",
+            "included_share_count",
+            "requested_window_weight",
+            "counted_window_weight",
+            "share_slice_digest_hex",
+        )
+        if isinstance(reward_manifest, Mapping):
+            for field in copied_proof_fields:
+                if (field in proof) != (field in reward_manifest) or proof.get(
+                    field
+                ) != reward_manifest.get(field):
+                    return False
+        elif any(field in proof for field in copied_proof_fields):
+            return False
+        return True
 
     def validate_canonical_source(
         self,
@@ -4547,46 +5353,52 @@ class AuditArtifactStore:
             name="audit_bundle_sha256",
         )
         try:
-            payload, _value = self._read_owned_regular_bytes(Path(path))
+            source = self._open_owned_artifact_source(Path(path))
         except OSError as exc:
             raise RuntimeError(
                 f"canonical audit bundle is not retrievable at {path}: {exc}"
             ) from exc
-        actual = _sha256_bytes(payload)
-        if not hmac.compare_digest(actual, expected):
-            raise RuntimeError(
-                f"audit bundle sha256 mismatch: expected {expected}, got {actual}"
-            )
-        if final_bundle is not None:
-            try:
-                logical = json.loads(payload)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise RuntimeError("canonical audit candidate is not valid JSON") from exc
-            if logical != final_bundle:
+        try:
+            actual = source.sha256_hex()
+            if not hmac.compare_digest(actual, expected):
                 raise RuntimeError(
-                    "canonical audit candidate does not match logical bundle"
+                    f"audit bundle sha256 mismatch: expected {expected}, got {actual}"
                 )
+            if final_bundle is not None:
+                self._require_logical_match(source, final_bundle)
+        finally:
+            source.close()
         self._validate_root_identity()
 
     def audit_body_byte_len(
         self,
         body_uri: object | None,
-        final_bundle: dict[str, Any],
+        final_bundle: Mapping[str, Any],
         canonical_bundle_path: Path | None = None,
     ) -> int:
         if body_uri:
-            _payload, value = self._read_owned_regular_bytes(
-                self.resolve_owned_path(body_uri)
-            )
+            value = self._owned_regular_size(self.resolve_owned_path(body_uri))
             self._validate_root_identity()
-            return value.st_size
+            return value
         if canonical_bundle_path is not None:
-            _payload, value = self._read_owned_regular_bytes(Path(canonical_bundle_path))
+            value = self._owned_regular_size(Path(canonical_bundle_path))
             self._validate_root_identity()
-            return value.st_size
-        value = len(self.canonical_audit_bundle_bytes(final_bundle))
+            return value
+        if isinstance(final_bundle, CanonicalAuditBundleView):
+            final_bundle.verify_identity()
+            value = final_bundle.byte_length
+        else:
+            value = len(self.canonical_audit_bundle_bytes(final_bundle))
         self._validate_root_identity()
         return value
+
+    def _owned_regular_size(self, path: Path) -> int:
+        """Byte length of an owned regular file from its descriptor, unread."""
+        source = self._open_owned_artifact_source(path)
+        try:
+            return source.identity.size
+        finally:
+            source.close()
 
     def read_external_body(
         self,
@@ -4918,6 +5730,187 @@ class AuditArtifactStore:
             bundle["shares"] = shares
         return bundle
 
+    def _resolve_share_segment_path(
+        self,
+        part: Mapping[str, Any],
+    ) -> tuple[Path, str, re.Match[str]]:
+        """Validate a share part's kind, owned path and filename bounds."""
+        body_uri = part.get("body_uri")
+        kind = str(part.get("kind") or "")
+        path = self.resolve_owned_path(body_uri)
+        if self.artifact_kind(path.name) != "share_segment":
+            raise RuntimeError("not an owned share segment")
+        if kind == "segment":
+            match = _SHARE_CONTENT_RE.fullmatch(path.name)
+            if match is None:
+                raise RuntimeError("immutable share segment path is invalid")
+            if (
+                int(match.group("first")) != int(part.get("first_share_seq") or 0)
+                or int(match.group("last")) != int(part.get("last_share_seq") or 0)
+            ):
+                raise RuntimeError("immutable share segment path bounds mismatch")
+        elif kind in {"segment_range", "segment_prefix"}:
+            match = _SHARE_SLOT_RE.fullmatch(path.name)
+            if match is None:
+                # An irreparable stable-slot merge publishes the incoming
+                # range at an immutable content-addressed URI instead of
+                # rewriting the slot; its filename bounds are the exact
+                # declared range.
+                content_match = _SHARE_CONTENT_RE.fullmatch(path.name)
+                if content_match is None:
+                    raise RuntimeError("share segment slot path is invalid")
+                if (
+                    int(content_match.group("first"))
+                    != int(part.get("first_share_seq") or 0)
+                    or int(content_match.group("last"))
+                    != int(part.get("last_share_seq") or 0)
+                ):
+                    raise RuntimeError(
+                        "immutable share segment range path bounds mismatch"
+                    )
+                match = content_match
+            else:
+                declared_slot_first = int(
+                    part.get("segment_first_share_seq")
+                    or match.group("first")
+                )
+                declared_slot_last = int(
+                    part.get("segment_last_share_seq")
+                    or match.group("last")
+                )
+                if (
+                    declared_slot_first != int(match.group("first"))
+                    or declared_slot_last != int(match.group("last"))
+                ):
+                    raise RuntimeError("share segment slot path bounds mismatch")
+        else:
+            raise RuntimeError("invalid share part kind")
+        return path, kind, match
+
+    def _open_share_segment_slice(
+        self,
+        part: Mapping[str, Any],
+        *,
+        parent_body_uri: object,
+    ) -> tuple[CanonicalAuditBundleView, Sequence[Any]]:
+        """:meth:`read_audit_share_segment` with the segment left on disk.
+
+        Performs the same path, digest, header, contiguity, count and range
+        checks, but the segment is scanned into a bounded view whose share
+        array stays lazy, and the selected range comes back as a slice of
+        that array.  The caller closes the returned view.  Used by the
+        publication-time reconstruction check so no segment -- and no single
+        oversized record inside one -- is loaded whole (#255).
+        """
+        body_uri = part.get("body_uri")
+        kind = str(part.get("kind") or "")
+        if kind not in {"segment", "segment_range", "segment_prefix"}:
+            raise RuntimeError(
+                f"audit bundle body is not valid JSON at {parent_body_uri}: "
+                "invalid share part kind"
+            )
+        try:
+            path, kind, match = self._resolve_share_segment_path(part)
+            view = self._scan_owned_artifact(path, lazy_paths=(("shares",),))
+        except (OSError, RuntimeError, CanonicalArtifactError) as exc:
+            raise RuntimeError(
+                f"audit bundle body is not retrievable at {parent_body_uri}: "
+                f"share segment {body_uri}: {exc}"
+            ) from exc
+        try:
+            if kind == "segment":
+                expected = str(part.get("sha256") or "").lower()
+                actual = view.sha256_hex
+                if not hmac.compare_digest(actual, expected):
+                    raise RuntimeError(
+                        f"audit bundle body hash mismatch at {parent_body_uri}: "
+                        f"share segment {body_uri} expected {expected}, got {actual}"
+                    )
+            segment_shares = view.get("shares")
+            if (
+                view.get("schema") != AUDIT_SHARE_SEGMENT_SCHEMA
+                or not self._is_share_sequence(segment_shares)
+            ):
+                raise RuntimeError(
+                    f"audit bundle body is not valid JSON at {parent_body_uri}: "
+                    f"invalid share segment {body_uri}"
+                )
+            try:
+                segment_first = int(view.get("first_share_seq"))
+                segment_last = int(view.get("last_share_seq"))
+                segment_count = int(view.get("share_count"))
+                self._validate_share_range(
+                    segment_first,
+                    segment_last,
+                    segment_shares,
+                )
+            except (TypeError, ValueError, RuntimeError) as exc:
+                raise RuntimeError(
+                    f"audit bundle body is not valid JSON at {parent_body_uri}: "
+                    f"share segment {body_uri} header mismatch"
+                ) from exc
+            if segment_count != len(segment_shares):
+                raise RuntimeError(
+                    f"audit bundle body is not valid JSON at {parent_body_uri}: "
+                    f"share segment {body_uri} share count mismatch"
+                )
+            if kind == "segment":
+                if (
+                    segment_first != int(match.group("first"))
+                    or segment_last != int(match.group("last"))
+                ):
+                    raise RuntimeError("immutable share segment header bounds mismatch")
+            elif (
+                segment_first < int(match.group("first"))
+                or segment_last > int(match.group("last"))
+            ):
+                raise RuntimeError("share segment header escapes slot bounds")
+            first_share_seq = int(part.get("first_share_seq") or 0)
+            last_share_seq = int(part.get("last_share_seq") or 0)
+            # The header check above proved strict +1 contiguity from
+            # segment_first, so the requested range is an index range.
+            if first_share_seq > last_share_seq:
+                selected: Sequence[Any] = []
+            elif (
+                first_share_seq < segment_first
+                or last_share_seq > segment_last
+            ):
+                raise RuntimeError(
+                    f"audit bundle body is not valid JSON at {parent_body_uri}: "
+                    f"share segment {body_uri} does not contain requested range"
+                )
+            else:
+                selected = segment_shares[
+                    first_share_seq - segment_first : last_share_seq - segment_first + 1
+                ]
+            if len(selected) != int(part.get("share_count") or 0):
+                raise RuntimeError(
+                    f"audit bundle body is not valid JSON at {parent_body_uri}: "
+                    f"share segment {body_uri} share count mismatch"
+                )
+            if kind in {"segment_range", "segment_prefix"}:
+                key = "range_sha256" if kind == "segment_range" else "prefix_sha256"
+                actual, _size = json_chunks_sha256_and_size(
+                    iter_json_byte_chunks(
+                        self.audit_share_segment_payload(
+                            first_share_seq=first_share_seq,
+                            last_share_seq=last_share_seq,
+                            shares=selected,
+                        )
+                    )
+                )
+                expected = str(part.get(key) or "").lower()
+                if not hmac.compare_digest(actual, expected):
+                    raise RuntimeError(
+                        f"audit bundle body hash mismatch at {parent_body_uri}: "
+                        f"share segment range {body_uri} expected {expected}, got {actual}"
+                    )
+            self._validate_root_identity()
+            return view, selected
+        except BaseException:
+            view.close()
+            raise
+
     def read_audit_share_segment(
         self,
         part: Mapping[str, Any],
@@ -4932,52 +5925,7 @@ class AuditArtifactStore:
                 "invalid share part kind"
             )
         try:
-            path = self.resolve_owned_path(body_uri)
-            if self.artifact_kind(path.name) != "share_segment":
-                raise RuntimeError("not an owned share segment")
-            if kind == "segment":
-                match = _SHARE_CONTENT_RE.fullmatch(path.name)
-                if match is None:
-                    raise RuntimeError("immutable share segment path is invalid")
-                if (
-                    int(match.group("first")) != int(part.get("first_share_seq") or 0)
-                    or int(match.group("last")) != int(part.get("last_share_seq") or 0)
-                ):
-                    raise RuntimeError("immutable share segment path bounds mismatch")
-            elif kind in {"segment_range", "segment_prefix"}:
-                match = _SHARE_SLOT_RE.fullmatch(path.name)
-                if match is None:
-                    # An irreparable stable-slot merge publishes the incoming
-                    # range at an immutable content-addressed URI instead of
-                    # rewriting the slot; its filename bounds are the exact
-                    # declared range.
-                    content_match = _SHARE_CONTENT_RE.fullmatch(path.name)
-                    if content_match is None:
-                        raise RuntimeError("share segment slot path is invalid")
-                    if (
-                        int(content_match.group("first"))
-                        != int(part.get("first_share_seq") or 0)
-                        or int(content_match.group("last"))
-                        != int(part.get("last_share_seq") or 0)
-                    ):
-                        raise RuntimeError(
-                            "immutable share segment range path bounds mismatch"
-                        )
-                    match = content_match
-                else:
-                    declared_slot_first = int(
-                        part.get("segment_first_share_seq")
-                        or match.group("first")
-                    )
-                    declared_slot_last = int(
-                        part.get("segment_last_share_seq")
-                        or match.group("last")
-                    )
-                    if (
-                        declared_slot_first != int(match.group("first"))
-                        or declared_slot_last != int(match.group("last"))
-                    ):
-                        raise RuntimeError("share segment slot path bounds mismatch")
+            path, kind, match = self._resolve_share_segment_path(part)
             segment_bytes, _value = self._read_owned_regular_bytes(path)
         except (OSError, RuntimeError) as exc:
             raise RuntimeError(
@@ -5115,6 +6063,84 @@ class AuditArtifactStore:
                 f"share segment {body_uri} does not contain requested range"
             )
         return selected
+
+
+SCAN_CHUNK_BYTES_LOCAL = 256 * 1024
+
+
+class _ChunkReader(io.RawIOBase):
+    """Sequential read adapter over an :class:`ArtifactSource`."""
+
+    def __init__(self, source: ArtifactSource) -> None:
+        super().__init__()
+        self._source = source
+        self._offset = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        view = memoryview(buffer)
+        chunk = self._source.pread(self._offset, len(view))
+        view[: len(chunk)] = chunk
+        self._offset += len(chunk)
+        return len(chunk)
+
+
+def _gzip_canonical_chunks(chunks: Iterable[bytes]) -> Iterator[bytes]:
+    """:func:`gzip_canonical_bundle_bytes` over a chunk stream, chunk by chunk.
+
+    Same compressor, level, header and (absent) mtime, so equal inputs give
+    the same compressed bytes as the whole-body helper; deflate output does
+    not depend on how the input was split.
+    """
+
+    sink = io.BytesIO()
+    with gzip.GzipFile(
+        fileobj=sink,
+        mode="wb",
+        compresslevel=CANONICAL_BUNDLE_GZIP_LEVEL,
+        mtime=0,
+    ) as handle:
+        for chunk in chunks:
+            handle.write(chunk)
+            if sink.tell():
+                piece = sink.getvalue()
+                sink.seek(0)
+                sink.truncate()
+                yield piece
+    piece = sink.getvalue()
+    if piece:
+        yield piece
+
+
+def _bytes_equal_chunks(expected: bytes, chunks: Iterable[bytes]) -> bool:
+    """``expected == b"".join(chunks)`` without joining the chunks."""
+    offset = 0
+    view = memoryview(expected)
+    for chunk in chunks:
+        end = offset + len(chunk)
+        if end > len(view) or not hmac.compare_digest(bytes(view[offset:end]), chunk):
+            return False
+        offset = end
+    return offset == len(view)
+
+
+def _pread_exact(fd: int, offset: int, size: int) -> bytes:
+    """Read exactly ``size`` bytes at ``offset``; short at end of file."""
+    pieces: list[bytes] = []
+    remaining = size
+    while remaining > 0:
+        try:
+            chunk = os.pread(fd, remaining, offset)
+        except InterruptedError:
+            continue
+        if not chunk:
+            break
+        pieces.append(chunk)
+        offset += len(chunk)
+        remaining -= len(chunk)
+    return b"".join(pieces) if len(pieces) != 1 else pieces[0]
 
 
 def _canonical_hex_bytes(value: object, *, name: str) -> str:

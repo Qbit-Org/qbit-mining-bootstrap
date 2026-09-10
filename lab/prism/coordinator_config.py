@@ -26,7 +26,6 @@ from lab.prism.share_ledger import (
     DEFAULT_POSTGRES_TCP_KEEPALIVES_COUNT,
     DEFAULT_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS,
     DEFAULT_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS,
-    DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
 )
 from lab.prism.writer_lease_timing import DEFAULT_WRITER_LEASE_HEARTBEAT_POLICY
 
@@ -402,6 +401,9 @@ DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX = 4096
 # here rather than imported because ``block_candidates`` imports this module;
 # a block-candidate test pins the two equal.
 MAX_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX = 8192
+# Maximum payload rows in a forced replay query. Operators may reduce this
+# independently of the cleanup bounds when candidate JSON is very large.
+MAX_BLOCK_REPLAY_PAGE_SIZE = 1024
 DEFAULT_HIGHDIFF_DIFFICULTY = "500000"
 DEFAULT_HIGHDIFF_MAX_DIFFICULTY = "4294967296"
 # Coinbase output ordering policies accepted by PRISM_COINBASE_OUTPUT_POLICY.
@@ -1408,6 +1410,7 @@ class BlockConfig:
     candidate_cleanup_retry_backlog_max: int = (
         DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX
     )
+    replay_page_size: int = MAX_BLOCK_REPLAY_PAGE_SIZE
 
 
 @dataclass(frozen=True)
@@ -1437,6 +1440,12 @@ class LedgerConfig:
     share_commit_linger_seconds: float
     share_commit_timeout_seconds: float
     share_recovery_path: Path
+    # Issue #255: chunked candidate bodies. Version 2 writes bounded chunk
+    # bodies; version 1 keeps the legacy whole-jsonb write for the
+    # compatibility/rollback release. The reader handles both.
+    candidate_storage_version: int = 2
+    candidate_spool_dir: str | None = None
+    candidate_spool_reservation_bytes: int = 4 * 1024 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -1851,6 +1860,9 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
     )
 
     block = BlockConfig(
+        replay_page_size=env_positive_int(
+            "PRISM_BLOCK_REPLAY_PAGE_SIZE", MAX_BLOCK_REPLAY_PAGE_SIZE, environ=source
+        ),
         submit_rpc_timeout_seconds=env_positive_float(
             "PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS",
             DEFAULT_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS,
@@ -1911,6 +1923,12 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
             )
         ),
     )
+
+    if block.replay_page_size > MAX_BLOCK_REPLAY_PAGE_SIZE:
+        raise SystemExit(
+            "PRISM_BLOCK_REPLAY_PAGE_SIZE cannot exceed "
+            f"{MAX_BLOCK_REPLAY_PAGE_SIZE}"
+        )
 
     evidence_path = Path(env("PRISM_EVIDENCE_PATH", "prism-live-evidence.json", environ=source))
     audit_dir = Path(env("PRISM_AUDIT_DIR", str(evidence_path.parent), environ=source))
@@ -2054,6 +2072,15 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
         / 1000.0,
         share_commit_timeout_seconds=env_positive_float(
             "PRISM_SHARE_COMMIT_TIMEOUT_SECONDS", DEFAULT_SHARE_COMMIT_TIMEOUT_SECONDS, environ=source
+        ),
+        candidate_storage_version=env_positive_int(
+            "PRISM_CANDIDATE_STORAGE_VERSION", 2, environ=source
+        ),
+        candidate_spool_dir=env_optional("PRISM_CANDIDATE_SPOOL_DIR", environ=source) or None,
+        candidate_spool_reservation_bytes=env_positive_int(
+            "PRISM_CANDIDATE_SPOOL_RESERVATION_BYTES",
+            4 * 1024 * 1024 * 1024,
+            environ=source,
         ),
         share_recovery_path=Path(
             env(

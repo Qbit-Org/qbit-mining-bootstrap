@@ -346,7 +346,7 @@ if holder_error:
 
 # The attribution the next budget exhaustion will be read from: no time on
 # local admission, real time in PostgreSQL, and neither timeout counter armed.
-read_gate_stats = ledger.ledger_read_gate_stats()["pending_block_candidate_rows"]
+read_gate_stats = ledger.ledger_read_gate_stats()["pending_block_candidate_headers"]
 assert_equal(int(read_gate_stats["calls_total"]), 3, "read-slot calls counted")
 assert_equal(int(read_gate_stats["gate_timeouts_total"]), 0, "no admission expiry")
 assert_equal(int(read_gate_stats["execute_timeouts_total"]), 0, "no statement expiry")
@@ -591,6 +591,15 @@ control_writer.close()
 
 print("prism postgres native ledger: OK read-only-session")
 PY
+)
+
+(
+  cd "${ROOT_DIR}"
+  PRISM_RECOVERY_TEST_DATABASE_URL="${DATABASE_URL}" \
+    python3 -m unittest tests.test_prism_pending_block_recovery.NativeRecoveryTests -v
+  PRISM_TEST_DATABASE_URL="${DATABASE_URL}" \
+  PRISM_TEST_PSQL_COMMAND_WITH_ENV="docker exec -i -e PGOPTIONS ${POSTGRES_CONTAINER} psql -U qbit -d qbit" \
+    python3 -m unittest tests.test_prism_candidate_window tests.test_prism_statement_spool -v
 )
 
 echo "test-prism-postgres-native-ledger: PASS"

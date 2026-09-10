@@ -234,7 +234,9 @@ class ShareSubmissionPorts:
     ]
     note_retained_submit: Callable[[str | None, bool], None]
     note_collection_candidate: Callable[[PrismJobContext, Any], None]
-    candidate_intent: Callable[[PrismBlockCandidate], dict[str, Any]]
+    # Returns the prepared intent (#255): a mapping over the historical
+    # keys whose share sequence is the job's immutable window, not a copy.
+    candidate_intent: Callable[[PrismBlockCandidate], Any]
     finish_pending_commit: Callable[[PendingShare], None]
     record_terminal_outcome: Callable[[str, bool], None]
     submit_synchronous_candidate: Callable[

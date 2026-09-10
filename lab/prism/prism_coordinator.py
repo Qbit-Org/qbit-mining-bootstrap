@@ -379,6 +379,7 @@ from lab.prism.rpc import (
     JsonRpc,
     _QBIT_RPC_NO_TRANSPORT_RETRY_METHODS,  # noqa: F401 - compatibility re-export
 )
+from lab.prism.candidate_store import IncompatibleCandidateSchema
 from lab.prism.share_ledger import (
     DEFAULT_AUDIT_SHARE_SEGMENT_SIZE,
     DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT,
@@ -3350,7 +3351,11 @@ class PrismCoordinator:
             canonical_block_hash,
         )
 
-    def make_ledger(self) -> SingleWriterShareLedger | PsqlShareLedger:
+    def make_ledger(
+        self,
+        *,
+        lease_retry_sleep: Callable[[float], None] | None = None,
+    ) -> SingleWriterShareLedger | PsqlShareLedger:
         config = getattr(self, "config", None)
         ledger_config = config.ledger if config is not None else None
         psql_command = (
@@ -3407,8 +3412,46 @@ class PrismCoordinator:
                 f"{WRITER_LEASE_HEARTBEAT_SESSION_PREFIX}{uuid.uuid4().hex}"
             )
         audit_store = self._ensure_audit_artifact_store()
+        ledger = self._construct_psql_share_ledger(
+            psql_command,
+            database_url,
+            ledger_config,
+            writer_session_token,
+            audit_store,
+            lease_retry_sleep=lease_retry_sleep,
+        )
+        try:
+            # Issue #255 rollback floor: refuse a database whose candidate
+            # storage is newer than this process, or one without the 002
+            # migration (every storage version needs it), before any share
+            # or candidate is written.
+            ledger.verify_candidate_schema()
+        except IncompatibleCandidateSchema as exc:
+            ledger.close()
+            raise SystemExit(f"prism coordinator: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001 - a transport failure is not a verdict
+            print(
+                "prism coordinator: candidate schema capability check could not "
+                f"run at boot ({type(exc).__name__}: {exc}); a version-2 candidate "
+                "write against an unmigrated database fails closed on its own",
+                flush=True,
+            )
+        return ledger
+
+    def _construct_psql_share_ledger(
+        self,
+        psql_command: str,
+        database_url: str,
+        ledger_config: Any,
+        writer_session_token: str | None,
+        audit_store: Any,
+        *,
+        lease_retry_sleep: Callable[[float], None] | None = None,
+    ) -> PsqlShareLedger:
+        config = getattr(self, "config", None)
         return PsqlShareLedger(
             psql_command=psql_command,
+            lease_retry_sleep=lease_retry_sleep,
             database_url=database_url or None,
             native_client_mode=(
                 ledger_config.native_client_mode
@@ -3512,6 +3555,24 @@ class PrismCoordinator:
                 ledger_config.read_concurrency
                 if ledger_config is not None
                 else env_positive_int("PRISM_POSTGRES_READ_CONCURRENCY", 4)
+            ),
+            candidate_storage_version=(
+                ledger_config.candidate_storage_version
+                if ledger_config is not None
+                else env_positive_int("PRISM_CANDIDATE_STORAGE_VERSION", 2)
+            ),
+            candidate_spool_dir=(
+                ledger_config.candidate_spool_dir
+                if ledger_config is not None
+                else (env_optional("PRISM_CANDIDATE_SPOOL_DIR") or None)
+            ),
+            candidate_spool_reservation_bytes=(
+                ledger_config.candidate_spool_reservation_bytes
+                if ledger_config is not None
+                else env_positive_int(
+                    "PRISM_CANDIDATE_SPOOL_RESERVATION_BYTES",
+                    4 * 1024 * 1024 * 1024,
+                )
             ),
             accepted_stats_cache_seconds=(
                 ledger_config.accepted_stats_cache_seconds
@@ -8175,15 +8236,17 @@ class PrismCoordinator:
             )
         return False
 
-    def block_candidate_intent(self, candidate: PrismBlockCandidate) -> dict[str, Any]:
-        """Return the immutable JSON needed to resume a candidate after restart.
+    def block_candidate_intent(self, candidate: PrismBlockCandidate) -> Any:
+        """Return the immutable intent needed to resume a candidate after restart.
 
-        The durable JSON boundary is where a daemon-mirror share sequence is
-        forced to real dicts, so it is also where a refuted mirror would
-        first be seen on the landing path. Route it before it propagates:
-        the candidate cannot be persisted from a window the coordinator no
-        longer trusts, and the next build must not resume from that window
-        either.
+        The durable boundary is where a daemon-mirror share sequence used to
+        be forced to real dicts, so it is also where a refuted mirror would
+        first be seen on the landing path. The prepared intent (#255) now
+        streams the mirror's canonical bytes without parsing them, but the
+        route stays in place: a divergence raised while preparing must not
+        propagate, because the candidate cannot be persisted from a window
+        the coordinator no longer trusts, and the next build must not resume
+        from that window either.
         """
         try:
             return encode_block_candidate_intent(candidate)
@@ -8193,14 +8256,14 @@ class PrismCoordinator:
 
     def block_candidate_from_intent(
         self,
-        intent: dict[str, Any] | None = None,
+        intent: Mapping[str, Any] | None = None,
     ) -> PrismBlockCandidate:
         # This helper was historically a static method. Preserve class-level
         # decode calls while instance calls additionally adopt S3's durable
         # credit-candidate holder before the reconstructed value is published.
         coordinator: PrismCoordinator | None
         if intent is None:
-            if not isinstance(self, dict):
+            if not isinstance(self, Mapping):
                 raise TypeError("block candidate intent must be an object")
             intent = self
             coordinator = None

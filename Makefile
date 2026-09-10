@@ -99,6 +99,9 @@ test-prism-postgres-scale:
 test-prism-postgres-native-ledger:
 	bash test/test-prism-postgres-native-ledger.sh
 
+test-prism-postgres-candidate-storage:
+	bash test/test-prism-postgres-candidate-storage.sh
+
 test-prism-postgres-seed-guard:
 	bash test/test-prism-postgres-seed-guard.sh
 

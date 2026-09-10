@@ -207,6 +207,8 @@ SET updated_at = clock_timestamp() - interval '6 minutes',
 psql = os.environ["PRISM_PSQL_COMMAND"]
 psql_with_env = os.environ["PRISM_PSQL_COMMAND_WITH_ENV"]
 ledger = PsqlShareLedger(
+    # This gate mutates legacy JSONB fixtures; the storage gate covers v2.
+    candidate_storage_version=1,
     psql_command=psql,
     writer_id="writer-a",
     writer_epoch=1,
@@ -517,6 +519,8 @@ WHERE table_name = 'qbit_ctv_fanout_artifacts'
 assert_equal(legacy_anchor_nullable, "NO", "old schema simulation makes anchor_vout not nullable")
 ledger.release_writer_lease()
 ledger = PsqlShareLedger(
+    # This gate mutates legacy JSONB fixtures; the storage gate covers v2.
+    candidate_storage_version=1,
     psql_command=psql,
     writer_id="writer-a",
     writer_epoch=1,
@@ -943,6 +947,86 @@ assert_equal(
     [attempt["attempt_status"] for attempt in fanout_status["broadcast_attempts"]],
     ["submitted"],
     "CTV broadcast attempt is journaled",
+)
+# A second pending fanout on the same block, with its own attempts, proves the
+# public pending-fanout page scopes broadcast_attempts to each row's fanout.
+# The persisted manifest set is immutable, so the sibling is a row copy; it is
+# removed again so later block-level checks see the original single fanout.
+replacement._run_sql(
+    """
+INSERT INTO qbit_ctv_fanout_artifacts (
+    fanout_txid,
+    block_hash,
+    manifest_set_sha256,
+    manifest_json,
+    manifest,
+    manifest_sha256,
+    precommitment_sha256,
+    ctv_hash,
+    commitment_witness_leaf_hex,
+    chunk_index,
+    chunk_count,
+    parent_coinbase_txid,
+    parent_coinbase_vout,
+    fanout_tx_template_hex,
+    fanout_tx_hex,
+    anchor_vout,
+    covenant_output_value_sats,
+    fanout_output_sum_sats,
+    settlement_status
+)
+SELECT
+    '""" + "17" * 32 + """',
+    block_hash,
+    manifest_set_sha256,
+    manifest_json,
+    manifest,
+    manifest_sha256,
+    precommitment_sha256,
+    ctv_hash,
+    commitment_witness_leaf_hex,
+    1,
+    2,
+    parent_coinbase_txid,
+    parent_coinbase_vout,
+    fanout_tx_template_hex,
+    fanout_tx_hex,
+    anchor_vout,
+    covenant_output_value_sats,
+    fanout_output_sum_sats,
+    'broadcastable'
+FROM qbit_ctv_fanout_artifacts
+WHERE fanout_txid = '""" + "12" * 32 + """';
+"""
+)
+for sibling_package_txid in ("18" * 32, "19" * 32):
+    replacement.record_ctv_fanout_broadcast_attempt(
+        fanout_txid="17" * 32,
+        attempt_status="submitted",
+        package_tx_hexes=["02"],
+        package_txids=[sibling_package_txid],
+        submit_result={"accepted": True},
+    )
+pending_fanout_page = replacement.dashboard_pending_fanout_rows(page=1, limit=15)
+assert_equal(
+    [
+        [
+            row["fanout_txid"],
+            [attempt["package_txids"] for attempt in row["broadcast_attempts"]],
+        ]
+        for row in pending_fanout_page["rows"]
+    ],
+    [
+        ["12" * 32, [["16" * 32]]],
+        ["17" * 32, [["18" * 32], ["19" * 32]]],
+    ],
+    "pending fanout rows carry only their own broadcast attempts, in order",
+)
+sibling_attempt_seqs = [attempt["attempt_seq"] for attempt in pending_fanout_page["rows"][1]["broadcast_attempts"]]
+assert_equal(sibling_attempt_seqs, sorted(sibling_attempt_seqs), "pending fanout broadcast attempts ascend by attempt_seq")
+replacement._run_sql(
+    "DELETE FROM qbit_ctv_fanout_broadcast_attempts WHERE fanout_txid = '" + "17" * 32 + "';\n"
+    "DELETE FROM qbit_ctv_fanout_artifacts WHERE fanout_txid = '" + "17" * 32 + "';"
 )
 duplicate_persist = replacement.persist_accepted_block(
     block_hash="44" * 32,

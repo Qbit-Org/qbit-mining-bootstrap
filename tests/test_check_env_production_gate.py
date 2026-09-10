@@ -14,6 +14,12 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[1]
 CHECK_ENV = ROOT_DIR / "scripts" / "check-env.sh"
 class CheckEnvProductionGateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        # Policy tests stop at a predictable Docker boundary. The runner's
+        # daemon may still be starting, or may not be installed at all.
+        self.docker_bin = self.write_fake_docker(root, exit_code=1)
+
     def production_prism_env(self, root: Path) -> dict[str, str]:
         return {
             "MINING_LANES": "prism",
@@ -95,11 +101,11 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         ).strip()
         return checkout, commit
 
-    def write_fake_docker(self, root: Path) -> Path:
+    def write_fake_docker(self, root: Path, *, exit_code: int = 0) -> Path:
         fake_bin = root / "bin"
         fake_bin.mkdir()
         docker = fake_bin / "docker"
-        docker.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        docker.write_text(f"#!/bin/sh\nexit {exit_code}\n", encoding="utf-8")
         docker.chmod(0o755)
         return fake_bin
 
@@ -155,6 +161,9 @@ class CheckEnvProductionGateTests(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.pop("QBIT_GIT_COMMIT", None)
+        env["PATH"] = f"{self.docker_bin}:{env['PATH']}"
+        # Tests exercising successful Docker checks or a minimal PATH supply
+        # their own controlled tool fixtures through overrides.
         env.update(overrides)
         return subprocess.run(
             ["/bin/bash", str(script), *arguments],
@@ -289,6 +298,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         self.assertNotIn("BITCOIN_CHAIN must", result.stderr)
         self.assertNotIn("BITCOIN_DNSSEED must", result.stderr)
         self.assertNotIn("BITCOIN_DISCOVER must", result.stderr)
+        self.assertIn("docker daemon is not reachable", result.stderr)
 
     def test_production_mode_rejects_regtest_before_docker_check(self) -> None:
         result = self.run_check_env(QBIT_PRODUCTION="1")
@@ -329,6 +339,8 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         self.assertNotIn("rejects CKPOOL_PUBLIC_DIFF_POLICY=permissive", result.stderr)
         self.assertNotIn("rejects PRISM_ALLOW_MEMORY_LEDGER=1", result.stderr)
         self.assertNotIn("rejects PRISM_ALLOW_TEST_SIGNING_SEEDS=1", result.stderr)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("docker daemon is not reachable", result.stderr)
 
     def test_production_mainnet_prelaunch_accepts_explicit_authorization(self) -> None:
         result = self.run_check_env(
@@ -1108,7 +1120,11 @@ class CheckEnvProductionGateTests(unittest.TestCase):
                 "tr",
                 "uname",
             ):
-                resolved = shutil.which(tool)
+                resolved = (
+                    str(self.docker_bin / "docker")
+                    if tool == "docker"
+                    else shutil.which(tool)
+                )
                 if resolved is not None:
                     (minimal_bin / tool).symlink_to(resolved)
             self.assertIsNone(
@@ -1168,6 +1184,9 @@ class CheckEnvProductionGateTests(unittest.TestCase):
                 )
 
                 self.assertNotIn("PRISM_STRATUM_STALE_GRACE_SECONDS", result.stderr)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("docker daemon is not reachable", result.stderr)
 
     def test_non_mainnet_production_accepts_bounded_stale_grace(self) -> None:
         # A public-chain production pool may credit shares that raced a block

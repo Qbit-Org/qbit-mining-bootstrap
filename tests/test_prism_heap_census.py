@@ -909,14 +909,23 @@ class MallocTrimTests(unittest.TestCase):
             self.skipTest("mallinfo2 unavailable on this platform")
         # Fragment the main arena a little: allocate and free medium chunks
         # that stay under the mmap threshold, so glibc keeps them.
-        junk = [bytes(48 * 1024) for _ in range(512)]
+        junk = [bytes([index % 251]) * (48 * 1024) for index in range(512)]
         held = junk[::2]
         del junk
         result = MallocTrimmer(telemetry, log=lambda _line: None).trim_once("test")
         self.assertIsNotNone(result)
         assert result is not None
         self.assertIsInstance(result.released, bool)
-        self.assertEqual(result.in_use_delta, 0)
+        # Reading RSS and sampling mallinfo2 allocate Python/ctypes objects
+        # between the two samples. Their exact net allocation varies across
+        # Python builds, even though malloc_trim preserves every live chunk.
+        # Check the live allocation and its contents instead of requiring the
+        # sampling machinery itself to have a zero-byte delta.
+        live_bytes = sum(map(len, held))
+        self.assertGreaterEqual(result.before.malloc_in_use_bytes, live_bytes)
+        self.assertGreaterEqual(result.after.malloc_in_use_bytes, live_bytes)
+        for index, chunk in enumerate(held):
+            self.assertEqual(chunk, bytes([(index * 2) % 251]) * (48 * 1024))
         self.assertLessEqual(result.free_delta, 0)
         self.assertLessEqual(result.arena_delta, 0)
         self.assertGreaterEqual(result.seconds, 0.0)

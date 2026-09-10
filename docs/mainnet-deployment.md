@@ -272,7 +272,7 @@ seconds, and the default maximum future template time is 30 seconds.
 so CKPool cannot publish one job beyond that freshness bound.
 
 The only relaxed mode is explicitly authorized mainnet prelaunch. It requires
-all five values below; any missing, invalid, or mismatched value fails closed:
+the authorization values and mask policy below; any missing, invalid, or mismatched value fails closed:
 
 ```bash
 QBIT_CHAIN=mainnet
@@ -280,12 +280,16 @@ QBIT_PRODUCTION=1
 QBIT_TOOLS_PRODUCTION=1
 CKPOOL_NON_TEST_READINESS_GATE=0
 QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0
+CKPOOL_VERSION_MASK_MODE=static
+CKPOOL_VERSION_MASK=1fffe000
 ```
 
 Prelaunch still checks static policy, chain and mandatory genesis identity, and
 the explicit payout address. It defers IBD, peer, GBT, freshness, and active-tip
-checks so CKPool can bind its listener and retry GBT while qbitd starts. At
-launch, set both readiness flags to `1` and restart or redeploy CKPool. A running
+checks so CKPool can bind its listener and retry GBT while qbitd starts, using
+the explicitly configured static mask. Dynamic mode requires a successful
+template even with these prelaunch flags. At launch, set both readiness flags
+to `1`, restore `CKPOOL_VERSION_MASK_MODE=dynamic`, and restart or redeploy CKPool. A running
 supervisor does not hot-reload environment changes.
 
 ## AuxPoW Gate
