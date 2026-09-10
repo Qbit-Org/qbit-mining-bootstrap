@@ -220,6 +220,66 @@ impl ShareSpec {
     }
 }
 
+/// A share for the public append path. `accepted_at_ms` is left at zero
+/// because `Ledger::append` stamps it from the ledger clock.
+fn writer_share(index: u64, job_issued_at_ms: i64) -> AcceptedShare {
+    AcceptedShare {
+        share_seq: 0,
+        share_id: format!("writer:{index:064x}"),
+        miner_id: format!("miner-{}", index % 5),
+        order_key: format!("order-{}", index % 3),
+        p2mr_program_hex: format!("{:02x}", index % 251).repeat(32),
+        share_difficulty: 8,
+        network_difficulty: 1_000_000,
+        template_height: 900_000 + index,
+        job_id: format!("job-{index}"),
+        job_issued_at_ms,
+        accepted_at_ms: 0,
+        ntime: 1_800_000_000 + u32::try_from(index % 97).unwrap_or(0),
+        credit_policy: None,
+    }
+}
+
+/// Places two shares on the anchor through the public append path, and
+/// returns their sequences as `(on the anchor, one millisecond after it)`.
+///
+/// `Ledger::append` stamps `accepted_at` with
+/// `GREATEST(ledger_clock_ms, floor(now))` -- no `+1`, unlike the read's
+/// anchor bump -- and stores both timestamps through the writer's own
+/// conversion, requiring only that `job_issued_at_ms <= accepted_at_ms`. So
+/// pinning the ledger clock chooses the acceptance millisecond exactly, and
+/// the public API alone can put a real share on either side of an anchor: one
+/// accepted at the anchor on both timestamps, and one accepted a millisecond
+/// past it. The credited window must contain the first and not the second.
+async fn append_anchor_pair(ledger: &Ledger, anchor_ms: i64, index: u64) -> Result<(u64, u64)> {
+    set_ledger_clock(&ledger.pool, anchor_ms + 1).await?;
+    let after = ledger
+        .append(writer_share(index, anchor_ms), None)
+        .await
+        .context("appending the share accepted after the anchor")?
+        .share;
+    set_ledger_clock(&ledger.pool, anchor_ms).await?;
+    let on = ledger
+        .append(writer_share(index + 1, anchor_ms), None)
+        .await
+        .context("appending the share accepted on the anchor")?
+        .share;
+    ensure!(
+        on.accepted_at_ms == anchor_ms && on.job_issued_at_ms == anchor_ms,
+        "the append path was expected to accept a share exactly on anchor {anchor_ms}, got \
+         accepted_at_ms={} job_issued_at_ms={}",
+        on.accepted_at_ms,
+        on.job_issued_at_ms
+    );
+    ensure!(
+        after.accepted_at_ms == anchor_ms + 1,
+        "the append path was expected to accept a share one millisecond after anchor \
+         {anchor_ms}, got accepted_at_ms={}",
+        after.accepted_at_ms
+    );
+    Ok((on.share_seq, after.share_seq))
+}
+
 /// Inserts one fixture row and returns the sequence PostgreSQL assigned it.
 async fn insert_share(pool: &PgPool, spec: &ShareSpec) -> Result<i64> {
     let sql = format!(
@@ -281,15 +341,13 @@ async fn insert_run(pool: &PgPool, count: i64, last_accepted_us: i64) -> Result<
     Ok(())
 }
 
-/// Pins the anchor `Ledger::snapshot` will capture.
+/// Pins the anchor `Ledger::snapshot` will capture, and the millisecond
+/// `Ledger::append` will stamp on the next share it accepts.
 ///
-/// The read takes `anchor_ms = GREATEST(ledger_clock_ms, floor(now))`, so any
-/// value above the wall clock becomes the anchor exactly.
+/// Both take `GREATEST(ledger_clock_ms, floor(now))`, so any value above the
+/// wall clock becomes that millisecond exactly.
 async fn set_ledger_clock(pool: &PgPool, anchor_ms: i64) -> Result<()> {
-    let now_ms: i64 =
-        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint")
-            .fetch_one(pool)
-            .await?;
+    let now_ms = wall_clock_ms(pool).await?;
     ensure!(
         anchor_ms > now_ms,
         "fixture anchor {anchor_ms} must sit above the wall clock {now_ms} to pin the snapshot"
@@ -299,6 +357,67 @@ async fn set_ledger_clock(pool: &PgPool, anchor_ms: i64) -> Result<()> {
         .execute(pool)
         .await?;
     Ok(())
+}
+
+async fn wall_clock_ms(pool: &PgPool) -> Result<i64> {
+    Ok(
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint")
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+/// Margin between the wall clock and a derived anchor. A day is far more than
+/// a test run needs, and it keeps a derived anchor legible in a failure
+/// message as "tomorrow" rather than "a few seconds from now".
+const ANCHOR_MARGIN_MS: i64 = 86_400_000;
+
+/// Derived anchors land on a round millisecond boundary so a scenario can add
+/// its own suffix -- `999`, `1_000`, `1_001` -- without disturbing the
+/// magnitude.
+const ANCHOR_GRANULARITY_MS: i64 = 1_000_000;
+
+/// An anchor at an ordinary magnitude, derived from the database clock.
+///
+/// A pinned anchor has to sit above the wall clock, so a hard-coded ordinary
+/// anchor is a dated fuse: the suite would start failing on the day the clock
+/// passed it, for no reason in the code. Deriving it at run time removes the
+/// date from the fixture while keeping the millisecond suffix, which is the
+/// part the boundary scenarios actually exercise.
+async fn derived_anchor(pool: &PgPool, suffix_ms: i64) -> Result<i64> {
+    let now_ms = wall_clock_ms(pool).await?;
+    let floor = now_ms
+        .checked_add(ANCHOR_MARGIN_MS)
+        .context("derived anchor margin overflow")?;
+    // Round strictly up, so the anchor clears the margin even when the wall
+    // clock already sits on a granularity boundary.
+    let base = floor
+        .div_euclid(ANCHOR_GRANULARITY_MS)
+        .checked_add(1)
+        .and_then(|units| units.checked_mul(ANCHOR_GRANULARITY_MS))
+        .context("derived anchor rounding overflow")?;
+    base.checked_add(suffix_ms)
+        .context("derived anchor suffix overflow")
+}
+
+/// How a scenario chooses its anchor.
+///
+/// No fixed anchor may ever fall below the wall clock, so fixed anchors are
+/// used only for the far-future magnitude cases; everything at an ordinary
+/// magnitude is derived from the database clock at run time.
+#[derive(Clone, Copy, Debug)]
+enum Anchor {
+    Derived(i64),
+    Fixed(i64),
+}
+
+impl Anchor {
+    async fn resolve(self, pool: &PgPool) -> Result<i64> {
+        match self {
+            Anchor::Derived(suffix_ms) => derived_anchor(pool, suffix_ms).await,
+            Anchor::Fixed(anchor_ms) => Ok(anchor_ms),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -553,9 +672,9 @@ fn assert_window_matches(
 /// non-termination into a named failure instead of a hung test run.
 const SNAPSHOT_CEILING: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Runs the read, runs the oracle, and asserts they agree on the anchor, the
-/// cutoff and the window. Prints the row counts the acceptance run reports.
-async fn check_scenario(
+/// Pins the anchor, runs the read under the ceiling, and confirms the read
+/// captured the anchor that was pinned.
+async fn pinned_snapshot(
     scenario: &str,
     ledger: &Ledger,
     anchor_ms: i64,
@@ -575,6 +694,18 @@ async fn check_scenario(
         "{scenario}: expected the pinned anchor {anchor_ms}, got {}",
         snapshot.anchor_ms
     );
+    Ok(snapshot)
+}
+
+/// Runs the read, runs the oracle, and asserts they agree on the anchor, the
+/// cutoff and the window. Prints the row counts the acceptance run reports.
+async fn check_scenario(
+    scenario: &str,
+    ledger: &Ledger,
+    anchor_ms: i64,
+    network_difficulty: u128,
+) -> Result<Snapshot> {
+    let snapshot = pinned_snapshot(scenario, ledger, anchor_ms, network_difficulty).await?;
     let weight = network_difficulty
         .checked_mul(8)
         .context("window weight overflow")?;
@@ -619,7 +750,7 @@ async fn window_matches_the_oracle_across_page_boundaries() -> Result<()> {
         return Ok(());
     };
     let ledger = db.ledger().await?;
-    let anchor_ms = 1_893_456_000_000_i64;
+    let anchor_ms = derived_anchor(&ledger.pool, 0).await?;
     // 12000 rows one millisecond apart, the newest a minute before the anchor.
     insert_run(&ledger.pool, 12_000, anchor_ms * 1_000 - 60_000_000).await?;
 
@@ -659,7 +790,7 @@ async fn the_row_that_crosses_the_weight_boundary_is_credited() -> Result<()> {
         return Ok(());
     };
     let ledger = db.ledger().await?;
-    let anchor_ms = 1_893_456_100_000_i64;
+    let anchor_ms = derived_anchor(&ledger.pool, 0).await?;
     let base_us = anchor_ms * 1_000 - 60_000_000;
     // Newest first the difficulties are 3, 7, 5, 1, 1. A weight of 8 leaves 5
     // after the newest row, and the difficulty-7 row overshoots that.
@@ -691,7 +822,7 @@ async fn a_u128_maximum_difficulty_is_decoded_and_closes_the_window() -> Result<
         return Ok(());
     };
     let ledger = db.ledger().await?;
-    let anchor_ms = 1_893_456_200_000_i64;
+    let anchor_ms = derived_anchor(&ledger.pool, 0).await?;
     let base_us = anchor_ms * 1_000 - 60_000_000;
     insert_share(&ledger.pool, &ShareSpec::new(1, base_us)).await?;
     let crossing = insert_share(
@@ -721,21 +852,67 @@ async fn a_u128_maximum_difficulty_is_decoded_and_closes_the_window() -> Result<
 /// places rows. `0` means exactly on the anchor.
 const BOUNDARY_OFFSETS_US: &[i64] = &[-1_000, -400, 0, 400, 1_000];
 
-/// The same offsets without the exactly-on-the-anchor row.
+/// Asserts the anchor's millisecond survives the read's own
+/// `to_timestamp(double precision/1000)` conversion unchanged.
 ///
-/// `ledger.rs` builds its barrier with `to_timestamp($anchor::double
-/// precision/1000)`. Past roughly 2^43 epoch-milliseconds a `double precision`
-/// no longer resolves a microsecond, so that barrier can land one microsecond
-/// to either side of the true millisecond. Measured on PostgreSQL 16, every
-/// anchor in the 2^43 region whose millisecond ends in `001` converts one
-/// microsecond low. The production writer stores `accepted_at` and
-/// `job_issued_at` through the very same conversion, so a real share accepted
-/// at the anchor still lands exactly on the barrier and is credited: the slack
-/// is unreachable through the public API. It is reachable only by a fixture
-/// that stores timestamps more precisely than the writer can, so those anchors
-/// drop the exactly-on-the-anchor row rather than manufacture a disagreement
-/// no share can hit.
-const BOUNDARY_OFFSETS_US_NO_EXACT: &[i64] = &[-1_000, -400, 400, 1_000];
+/// This is a precondition on the fixture, not part of the oracle. The oracle
+/// compares stored timestamps against an exact integer-millisecond barrier
+/// while the read compares them against the converted one. Where the
+/// conversion is exact those are the same instant and every row kind agrees.
+/// Where it is not, the two barriers sit a microsecond apart, and a row placed
+/// on the anchor falls on one side or the other purely according to how it was
+/// written: a fixture storing the exact millisecond and a share written through
+/// `Ledger::append` land on opposite sides. Past roughly 2^43 epoch-
+/// milliseconds -- the year 2248 -- a `double precision` no longer resolves a
+/// microsecond, and that is where the inexact anchors live. Measured on
+/// PostgreSQL 16 in that region, every millisecond ending in `999` converts one
+/// microsecond high, every one ending in `001` converts one microsecond low,
+/// and `000` is exact; at 2^42 and at every realistic epoch millisecond all
+/// three suffixes are exact. These scenarios therefore stay below 2^43, and
+/// this guard stops the fixture silently picking an anchor that does not.
+/// Millisecond behaviour past 2^43 is asserted separately, in
+/// `writer_rows_follow_integer_milliseconds_past_2_43`, in the integer
+/// milliseconds `AcceptedShare` actually carries.
+async fn ensure_anchor_converts_exactly(
+    pool: &PgPool,
+    scenario: &str,
+    anchor_ms: i64,
+) -> Result<()> {
+    ensure!(
+        converts_exactly(pool, anchor_ms).await?,
+        "{scenario}: anchor {anchor_ms} does not survive the read's double-precision \
+         conversion, so the exact-time oracle and the read would disagree on any row placed \
+         exactly on it; pick an anchor below 2^43 epoch-milliseconds"
+    );
+    Ok(())
+}
+
+/// Whether `ms` is representable exactly by the writer's and the read's shared
+/// `to_timestamp(double precision/1000)` conversion.
+///
+/// Classification only: it decides which assertion a millisecond is held to,
+/// never what the payout window should contain.
+async fn converts_exactly(pool: &PgPool, ms: i64) -> Result<bool> {
+    compare_conversion(pool, ms, "=").await
+}
+
+/// Whether the conversion of `ms` lands *below* the exact millisecond.
+///
+/// This is the direction that matters for the read-back. `share_from_row`
+/// floors, so a conversion one microsecond high still floors to the same
+/// millisecond and round-trips cleanly; only a conversion below the
+/// millisecond loses one.
+async fn converts_below(pool: &PgPool, ms: i64) -> Result<bool> {
+    compare_conversion(pool, ms, "<").await
+}
+
+async fn compare_conversion(pool: &PgPool, ms: i64, operator: &str) -> Result<bool> {
+    let sql = format!(
+        "SELECT to_timestamp($1::double precision/1000) {operator} {}",
+        timestamp_from_millis("$1")
+    );
+    Ok(sqlx::query_scalar(&sql).bind(ms).fetch_one(pool).await?)
+}
 
 /// Builds a fixture that brackets `anchor_ms` on both timestamp predicates and
 /// checks the window against the oracle.
@@ -746,16 +923,22 @@ const BOUNDARY_OFFSETS_US_NO_EXACT: &[i64] = &[-1_000, -400, 400, 1_000];
 /// the share was accepted, which no real writer does, because that is the only
 /// way to isolate the `job_issued_at` predicate from the `accepted_at` one.
 ///
+/// On top of those, one pair goes in through the public append path, so the
+/// barrier is asserted against a share the writer could really have produced
+/// and not only against fixtures.
+///
 /// The weight far exceeds the fixture's total difficulty, so the anchor
 /// barrier -- not the weight cut -- decides membership.
 async fn check_anchor_boundary(
     scenario: &str,
     raw_url: &str,
-    anchor_ms: i64,
+    anchor: Anchor,
     offsets: &[i64],
 ) -> Result<()> {
     let db = Database::create(raw_url).await?;
     let ledger = db.ledger().await?;
+    let anchor_ms = anchor.resolve(&ledger.pool).await?;
+    ensure_anchor_converts_exactly(&ledger.pool, scenario, anchor_ms).await?;
     let anchor_us = anchor_ms
         .checked_mul(1_000)
         .context("anchor microseconds overflow")?;
@@ -775,17 +958,34 @@ async fn check_anchor_boundary(
         )
         .await?;
     }
+    let (writer_on_anchor, writer_after_anchor) =
+        append_anchor_pair(&ledger, anchor_ms, WRITER_INDEX_BASE).await?;
 
     let snapshot = check_scenario(scenario, &ledger, anchor_ms, 1_000_000).await?;
-    // Two rows per non-positive offset, one from each predicate family.
-    let expected = offsets.iter().filter(|offset| **offset <= 0).count() * 2;
+    // Two rows per non-positive offset, one from each predicate family, plus
+    // the appended share accepted on the anchor.
+    let expected = offsets.iter().filter(|offset| **offset <= 0).count() * 2 + 1;
     ensure!(
         snapshot.shares.len() == expected,
         "{scenario}: expected {expected} rows at or before the anchor, got {}",
         snapshot.shares.len()
     );
+    let credited = credited_sequences(&snapshot)?;
+    ensure!(
+        credited.contains(&i64::try_from(writer_on_anchor)?),
+        "{scenario}: writer-on-anchor share {writer_on_anchor}, accepted by the public append \
+         path at exactly the anchor, was not credited; window {credited:?}"
+    );
+    ensure!(
+        !credited.contains(&i64::try_from(writer_after_anchor)?),
+        "{scenario}: writer-after-anchor share {writer_after_anchor}, accepted one millisecond \
+         past the anchor, was credited; window {credited:?}"
+    );
     db.close(ledger).await
 }
+
+/// Where the appended share indices start, clear of the direct-insert rows.
+const WRITER_INDEX_BASE: u64 = 1_000;
 
 /// Rows sitting exactly on the anchor are credited on either timestamp; rows a
 /// millisecond past it are not.
@@ -798,7 +998,7 @@ async fn rows_on_the_anchor_are_credited_and_rows_after_it_are_not() -> Result<(
     check_anchor_boundary(
         "c:anchor-barrier",
         &url,
-        1_893_456_300_000,
+        Anchor::Derived(0),
         BOUNDARY_OFFSETS_US,
     )
     .await
@@ -806,24 +1006,172 @@ async fn rows_on_the_anchor_are_credited_and_rows_after_it_are_not() -> Result<(
 
 /// The same barrier at millisecond values that stress the read's
 /// floating-point conversion: anchors ending in `999`, `000` and `001`, at an
-/// ordinary magnitude, near 2^41 milliseconds and near 2^43 milliseconds.
+/// ordinary magnitude and near 2^42 milliseconds (the year 2109).
+///
+/// The large magnitude is fixed because that is the whole point of the case,
+/// and it sits centuries ahead of any wall clock this suite will meet. The
+/// ordinary magnitude is derived, so it can never become a dated fuse. Every
+/// anchor here converts exactly, which `ensure_anchor_converts_exactly`
+/// enforces, so all three row kinds -- direct inserts on the anchor and 400
+/// microseconds either side of it, and the appended pair -- must agree with the
+/// oracle. Past 2^43 the conversion stops being exact, and that region is
+/// covered by `writer_rows_follow_integer_milliseconds_past_2_43` instead.
 #[tokio::test]
 async fn the_anchor_barrier_holds_at_large_millisecond_values() -> Result<()> {
     let Some(url) = database_url("the_anchor_barrier_holds_at_large_millisecond_values")? else {
         return Ok(());
     };
-    for (label, anchor_ms, offsets) in [
-        ("ordinary-999", 1_893_456_000_999_i64, BOUNDARY_OFFSETS_US),
-        ("ordinary-000", 1_893_456_001_000, BOUNDARY_OFFSETS_US),
-        ("ordinary-001", 1_893_456_001_001, BOUNDARY_OFFSETS_US),
-        ("pow41-999", 2_199_023_254_999, BOUNDARY_OFFSETS_US),
-        ("pow41-000", 2_199_023_255_000, BOUNDARY_OFFSETS_US),
-        ("pow41-001", 2_199_023_255_001, BOUNDARY_OFFSETS_US),
-        ("pow43-999", 8_796_093_022_999, BOUNDARY_OFFSETS_US),
-        ("pow43-000", 8_796_093_023_000, BOUNDARY_OFFSETS_US),
-        ("pow43-001", 8_796_093_023_001, BOUNDARY_OFFSETS_US_NO_EXACT),
+    for (label, anchor) in [
+        ("ordinary-999", Anchor::Derived(999)),
+        ("ordinary-000", Anchor::Derived(1_000)),
+        ("ordinary-001", Anchor::Derived(1_001)),
+        ("pow42-999", Anchor::Fixed(4_398_046_510_999)),
+        ("pow42-000", Anchor::Fixed(4_398_046_511_000)),
+        ("pow42-001", Anchor::Fixed(4_398_046_511_001)),
     ] {
-        check_anchor_boundary(&format!("e:{label}"), &url, anchor_ms, offsets).await?;
+        check_anchor_boundary(&format!("e:{label}"), &url, anchor, BOUNDARY_OFFSETS_US).await?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// (g) writer-only milliseconds past 2^43
+// ---------------------------------------------------------------------------
+
+/// Past roughly 2^43 epoch-milliseconds the read's
+/// `to_timestamp(double precision/1000)` no longer resolves a microsecond, so
+/// a stored timestamp can sit a microsecond either side of its millisecond and
+/// the exact-time oracle stops being the right yardstick. The contract
+/// `AcceptedShare` carries is integer milliseconds, so that is what this test
+/// asserts, and it does so without the oracle and without a single direct
+/// insert: every row goes in through `Ledger::append`, exactly as the
+/// production writer writes it.
+///
+/// A row is credited if and only if the `accepted_at_ms` that `append`
+/// returned is at or before the anchor. That holds at all three anchors: the
+/// barrier and the stored value are converted the same way, so they shift
+/// together and the credited set stays right.
+///
+/// The read-back of that millisecond does not hold. `share_from_row` converts
+/// `accepted_at` with chrono's `timestamp_millis()`, which floors, so a value
+/// stored a microsecond low reads back a whole millisecond early, and the
+/// millisecond the audit bundle carries is off by one. This is a real defect,
+/// reported separately; it is confined to dates past about the year 2248 and
+/// is unreachable at a realistic epoch millisecond.
+///
+/// The defect follows the individual millisecond, not the anchor's suffix: the
+/// rows a millisecond either side of an anchor have their own suffixes and
+/// their own conversions. Measured on PostgreSQL 16 over two seconds of
+/// milliseconds around 2^43, 480000 of 2000001 -- 24% -- read back one
+/// millisecond early and the rest are exact; over a comparable span at 2^42,
+/// none are. Of the nine milliseconds this test writes, 8796093022998 and
+/// 8796093023001 read back early and the other seven are exact.
+///
+/// Only a conversion that lands *below* its millisecond loses one: flooring a
+/// value a microsecond high returns the same millisecond, so those round-trip
+/// cleanly. So rather than skip the read-back where it is known to be wrong,
+/// this test pins it from both sides: a millisecond whose conversion is at or
+/// above it must round-trip unchanged, and one whose conversion is below it
+/// must read back early by exactly one millisecond and no more. Nothing
+/// known-wrong is asserted as right, nothing is hidden, and a regression in
+/// either direction fails.
+#[tokio::test]
+async fn writer_rows_follow_integer_milliseconds_past_2_43() -> Result<()> {
+    let Some(url) = database_url("writer_rows_follow_integer_milliseconds_past_2_43")? else {
+        return Ok(());
+    };
+    for (label, anchor_ms) in [
+        ("pow43-999", 8_796_093_022_999_i64),
+        ("pow43-000", 8_796_093_023_000),
+        ("pow43-001", 8_796_093_023_001),
+    ] {
+        let scenario = format!("g:{label}");
+        let db = Database::create(&url).await?;
+        let ledger = db.ledger().await?;
+
+        // One share a millisecond before the anchor, one on it, one after.
+        let mut appended = Vec::new();
+        for (position, offset) in [("before", -1_i64), ("on", 0), ("after", 1)] {
+            let accepted_ms = anchor_ms
+                .checked_add(offset)
+                .context("writer anchor offset overflow")?;
+            set_ledger_clock(&ledger.pool, accepted_ms).await?;
+            let index = WRITER_INDEX_BASE + u64::try_from(appended.len())?;
+            let share = ledger
+                .append(writer_share(index, accepted_ms), None)
+                .await
+                .with_context(|| format!("{scenario}: appending the {position} share"))?
+                .share;
+            ensure!(
+                share.accepted_at_ms == accepted_ms && share.job_issued_at_ms == accepted_ms,
+                "{scenario}: expected the {position} share at {accepted_ms}, got \
+                 accepted_at_ms={} job_issued_at_ms={}",
+                share.accepted_at_ms,
+                share.job_issued_at_ms
+            );
+            appended.push((position, share));
+        }
+
+        let snapshot = pinned_snapshot(&scenario, &ledger, anchor_ms, 1_000_000).await?;
+        let mut read_back_early = Vec::new();
+        for (position, share) in &appended {
+            // The contract: credited exactly when the accepted millisecond is
+            // at or before the anchor millisecond.
+            let expected = share.accepted_at_ms <= anchor_ms;
+            let credited = snapshot
+                .shares
+                .iter()
+                .find(|candidate| candidate.share_id == share.share_id);
+            ensure!(
+                credited.is_some() == expected,
+                "{scenario}: the {position} share, accepted at {} against anchor {anchor_ms}, \
+                 should {} been credited",
+                share.accepted_at_ms,
+                if expected { "have" } else { "not have" }
+            );
+            let Some(credited) = credited else {
+                continue;
+            };
+            let drift = credited.accepted_at_ms - share.accepted_at_ms;
+            ensure!(
+                credited.job_issued_at_ms - share.job_issued_at_ms == drift,
+                "{scenario}: the {position} share's two timestamps drifted apart on read-back: \
+                 appended accepted_at_ms={} job_issued_at_ms={}, read back accepted_at_ms={} \
+                 job_issued_at_ms={}",
+                share.accepted_at_ms,
+                share.job_issued_at_ms,
+                credited.accepted_at_ms,
+                credited.job_issued_at_ms
+            );
+            if converts_below(&ledger.pool, share.accepted_at_ms).await? {
+                ensure!(
+                    drift == -1,
+                    "{scenario}: millisecond {} converts below its own millisecond, so the \
+                     {position} share was expected to read back exactly one millisecond early; \
+                     it read back {} ({drift} ms)",
+                    share.accepted_at_ms,
+                    credited.accepted_at_ms
+                );
+                read_back_early.push(share.accepted_at_ms);
+            } else {
+                ensure!(
+                    drift == 0,
+                    "{scenario}: millisecond {} converts at or above its own millisecond, so \
+                     the {position} share had to round-trip unchanged, but it read back {} \
+                     ({drift} ms)",
+                    share.accepted_at_ms,
+                    credited.accepted_at_ms
+                );
+            }
+        }
+        println!(
+            "scenario {scenario}: rows={} window={} anchor_ms={anchor_ms} cutoff={} \
+             read_back_early={read_back_early:?}",
+            total_rows(&ledger.pool).await?,
+            snapshot.shares.len(),
+            snapshot.share_seq
+        );
+        db.close(ledger).await?;
     }
     Ok(())
 }
@@ -841,7 +1189,7 @@ async fn rejected_rows_are_excluded_and_consume_no_weight() -> Result<()> {
         return Ok(());
     };
     let ledger = db.ledger().await?;
-    let anchor_ms = 1_893_456_400_000_i64;
+    let anchor_ms = derived_anchor(&ledger.pool, 0).await?;
     let base_us = anchor_ms * 1_000 - 60_000_000;
     let huge = 1_000_000_000_000_000_000_000_000_000_000_u128;
     let mut accepted_seqs = Vec::new();
@@ -901,7 +1249,7 @@ async fn empty_windows_return_no_shares() -> Result<()> {
         return Ok(());
     };
     let ledger = db.ledger().await?;
-    let anchor_ms = 1_893_456_500_000_i64;
+    let anchor_ms = derived_anchor(&ledger.pool, 0).await?;
 
     let snapshot = check_scenario("f:no-rows", &ledger, anchor_ms, 1_000).await?;
     ensure!(
