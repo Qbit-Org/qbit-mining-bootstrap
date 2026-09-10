@@ -256,7 +256,19 @@ that disagrees with the balances. In order:
 2. The balances, through the `read_prior_balances` statement
    `Ledger::snapshot` uses (`srv/src/ledger.rs:715-723`), then the
    prior-balances digest, else `PriorBalancesChanged`. It costs microseconds,
-   so a reference whose balances moved never pays for the window.
+   so a reference whose balances moved never pays for the window. The digest
+   sorts internally (`prior_balances_digest`, `crates/qbit-prism/src/lib.rs`),
+   but `AuditBundle.prior_balances` serializes in vector order, and the query
+   has no outer `ORDER BY`. The function orders its own rows
+   (`crates/qbit-prism/sql/001_share_ledger.sql:1544`), but SQL doesn't
+   guarantee that order through a table expression. So `read_prior_balances`
+   itself sorts the vector with the digest's comparator: `order_key`, then
+   `recipient_id`, then `p2mr_program_hex`, compared as bytes. Refresh and
+   every rebuild share that function, so both hand the builder the same
+   vector. An outer SQL `ORDER BY` alone wouldn't do, because it follows the
+   database collation, not the byte order the digest uses. A #265 unit test
+   requires any permutation of the same balances to give identical canonical
+   bytes after that sort.
 3. If `window.shares` is `None`: commit and return `Window { shares: vec![],
    prior_balances, payout_revision }` without touching `qbit_share_ledger`.
 4. Otherwise an existence probe on `first_share_seq` and `last_share_seq`,
@@ -520,7 +532,7 @@ every builder input except the window:
 | --- | --- | --- | --- | --- |
 | `shares` | `snapshot.shares` (`:747`) or the bootstrap share (`:727-745`) | `source.shares` | `read_window`, or `vec![bootstrap_share]` | the window, never stored |
 | `found_block` | from the template (`:719-726`) | `source.found_block` | **stored verbatim** in the candidate JSON | 4 scalars |
-| `prior_balances` | `snapshot.prior_balances` (`:759`) | `source.prior_balances` | `read_window`, digest-checked | per recipient with a balance; read, not stored |
+| `prior_balances` | `snapshot.prior_balances` (`:759`) | `source.prior_balances` | `read_window`, digest-checked and sorted with the digest's comparator ([Read](#read)) | per recipient with a balance; read, not stored |
 | `payout_policy` | `config.payout_policy` (`:760`) | `source.payout_policy` | **stored verbatim** | O(1) |
 | `direct_floor_sats`, `settlement_config`, `ctv_fanout_fee_policy` | `config.ctv_direct_floor`, `config.ctv_config`, `fee` (`:761-763`) | `config.*` (`:1009-1010`), the drift, and `source.ctv_fanout_fee_policy` | **stored verbatim** as one nested `ctv: Option<{ direct_floor_sats, settlement_config, fanout_fee_policy }>`, whose presence also selects the CTV builder in place of `config.ctv_enabled` (`:755`, `:1003`) | O(1) |
 | `coinbase_script_sig_suffix_hex` | `Some(suffix)` (`:764`) | `claim.candidate.coinbase_suffix_hex` (`:992`) | already stored, **required after 007**: submit always writes `Some` (`:1697`); the `Option` with `serde(default)` (`srv/src/ledger.rs:45-46`) exists for pre-007 rows, so post-007 decode rejects `None`, and the `else` branch that lands the stored bundle when the suffix is absent (`:1036-1038`) is removed with the bundle | O(1) |
