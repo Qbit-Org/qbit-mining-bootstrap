@@ -220,6 +220,8 @@ published-work credit and stale-grace credit still commit under the current
 transactional payout revision. These are restorations of miner behavior, with
 ungated real-coordinator decision and socket/session regression tests; they do
 not relax current-chain candidate submission checks.
+See the [miner decision parity reference](prism-b8-miner-parity.md) for retained
+work bounds, the regression coverage map and disposable qualification commands.
 
 `PRISM_USERNAME_FALLBACK_ADDRESS` applies when validation explicitly identifies
 an invalid address or a recognized address type that Prism cannot pay. RPC
