@@ -243,7 +243,10 @@ fn validate_fee_floor(policy: FanoutFeeRatePolicy, required_rate: u64) -> Result
 }
 
 impl Coordinator {
-    pub async fn new(mut config: Config) -> Result<Arc<Self>> {
+    pub async fn new(
+        mut config: Config,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) -> Result<Arc<Self>> {
         let rpc = Rpc::new(
             config.rpc_url.clone(),
             config.rpc_user.clone(),
@@ -298,7 +301,7 @@ impl Coordinator {
             .await?;
         let (refresh, _) = watch::channel(0);
         Ok(Arc::new(Self {
-            metrics: Arc::new(crate::metrics::Metrics::default()),
+            metrics,
             build_slots: Arc::new(Semaphore::new(config.build_workers)),
             config: Arc::new(config),
             ledger,
@@ -1754,7 +1757,9 @@ impl MiningBackend for Coordinator {
         match save {
             Ok(true) => {
                 self.accepted.fetch_add(1, Ordering::Relaxed);
-                self.metrics.record_share_accepted(stale);
+                if stale {
+                    self.metrics.record_grace_credit();
+                }
                 if current.bundle.is_none() {
                     self.wake.notify_one();
                 }

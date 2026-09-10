@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 pub const BUCKETS: &[f64] = &[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1., 2.5, 5., 10., 30.];
+const BUCKET_COUNT: usize = BUCKETS.len();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
@@ -59,7 +60,7 @@ families! {
     Grace: Counter, "grace_credited_shares_total", "Durably accepted shares credited by stale grace.";
     InitialPending: Gauge, "stratum_pending_initial_jobs", "Authorized clients awaiting first usable work, or -1 before observation.";
     InitialAge: Gauge, "stratum_oldest_pending_initial_job_seconds", "Oldest first usable work wait, or -1 before observation.";
-    CoverageGap: Gauge, "stratum_current_tip_coverage_gap_seconds", "Continuous current-tip coverage gap age, or -1 before observation.";
+    CoverageGap: Gauge, "stratum_current_tip_coverage_gap_seconds", "Continuous age of native current-generation coverage below 95 percent, or -1 before observation.";
     Coverage: Gauge, "stratum_semantic_current_work_ratio", "Fraction of authorized connections with current semantic work; one when no clients are authorized.";
     FirstOffer: Histogram, "block_submit_seconds", "Locally validated block proof to first node offer; requires the offer owner's timestamp boundary.";
     Candidates: Gauge, "block_candidates_pending", "Cluster-wide nonterminal candidate count, or -1 when unknown.";
@@ -70,7 +71,7 @@ families! {
     CollectorSuccess: Gauge, "collector_success", "Whether the latest collector attempt succeeded, or -1 before an attempt.";
     CollectorAge: Gauge, "collector_age_seconds", "Monotonic age of the last successful collector observation, or -1 before success.";
     Rss: Gauge, "process_resident_memory_bytes", "Process resident memory bytes from procfs, or -1 when unknown.";
-    RuntimeLag: Gauge, "runtime_lag_seconds", "Latest observed runtime sampler wake lateness.";
+    RuntimeLag: Gauge, "runtime_lag_seconds", "Latest observed runtime sampler wake lateness, or -1 before the first observation.";
     PollLag: Gauge, "runtime_poll_lag_seconds", "Maximum active poll duration or completed poll duration retained for 60 to 61 seconds, by task.";
     ProgressAge: Gauge, "runtime_progress_age_seconds", "Oldest active operation time since progress; zero when idle.";
     TaskStalled: Gauge, "runtime_task_stalled", "Whether an active poll or operation exceeds its progress budget.";
@@ -79,11 +80,35 @@ families! {
     SnapshotAge: Gauge, "metrics_snapshot_age_seconds", "Monotonic age of the metrics snapshot, or -1 before the first publication.";
 }
 
+impl Family {
+    pub(super) fn is_collection(self) -> bool {
+        matches!(
+            self,
+            Self::Candidates
+                | Self::CandidateAge
+                | Self::Rss
+                | Self::CollectorAvailable
+                | Self::CollectorSuccess
+                | Self::CollectorAge
+        )
+    }
+}
+pub(super) fn is_collection_line(line: &str) -> bool {
+    let line = line
+        .strip_prefix("# HELP ")
+        .or_else(|| line.strip_prefix("# TYPE "))
+        .unwrap_or(line);
+    let name = line.split([' ', '{']).next().unwrap_or_default();
+    Family::ALL
+        .iter()
+        .any(|family| family.is_collection() && family.descriptor().name == name)
+}
+
 #[derive(Clone)]
 enum Sample {
     Scalar(f64),
     Histogram {
-        buckets: [u64; 11],
+        buckets: [u64; BUCKET_COUNT],
         count: u64,
         sum: f64,
     },
@@ -104,7 +129,7 @@ impl Registry {
         self.samples.entry((family, labels)).or_insert_with(|| {
             if family.descriptor().kind == Kind::Histogram {
                 Sample::Histogram {
-                    buckets: [0; 11],
+                    buckets: [0; BUCKET_COUNT],
                     count: 0,
                     sum: 0.,
                 }
@@ -114,17 +139,32 @@ impl Registry {
         });
     }
     pub(super) fn set(&mut self, family: Family, labels: Labels, value: f64) {
+        assert_ne!(
+            family.descriptor().kind,
+            Kind::Histogram,
+            "cannot set a histogram scalar"
+        );
         assert!(value.is_finite());
         self.declare(family);
         self.samples.insert((family, labels), Sample::Scalar(value));
     }
     pub(super) fn increment(&mut self, family: Family, labels: Labels) {
+        assert_eq!(
+            family.descriptor().kind,
+            Kind::Counter,
+            "only counters may increment"
+        );
         self.register(family, labels.clone(), 0.);
         if let Sample::Scalar(value) = self.samples.get_mut(&(family, labels)).unwrap() {
             *value += 1.;
         }
     }
     pub(super) fn observe(&mut self, family: Family, labels: Labels, seconds: f64) {
+        assert_eq!(
+            family.descriptor().kind,
+            Kind::Histogram,
+            "only histograms accept observations"
+        );
         self.register(family, labels.clone(), 0.);
         if let Sample::Histogram {
             buckets,
@@ -142,8 +182,14 @@ impl Registry {
         }
     }
     pub(super) fn render(&self) -> String {
+        self.render_filtered(|_| true)
+    }
+    pub(super) fn render_filtered(&self, include: impl Fn(Family) -> bool) -> String {
         let mut body = String::new();
         for family in &self.declared {
+            if !include(*family) {
+                continue;
+            }
             let d = family.descriptor();
             writeln!(
                 body,
@@ -200,4 +246,28 @@ fn line(body: &mut String, name: &str, suffix: &str, labels: &Labels, value: f64
 
 pub fn descriptors() -> impl Iterator<Item = Descriptor> {
     Family::ALL.iter().map(|f| f.descriptor())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrong_family_operations_fail_before_corrupting_exposition() {
+        let mut registry = Registry::default();
+        registry.register(Family::ShareAck, vec![], 0.);
+        for operation in 0..3 {
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match operation {
+                    0 => registry.set(Family::ShareAck, vec![], 1.),
+                    1 => registry.increment(Family::ShareAck, vec![]),
+                    _ => registry.observe(Family::Accepted, vec![], 1.),
+                }
+            }))
+            .is_err());
+        }
+        let body = registry.render();
+        assert!(body.contains("qbit_prism_share_ack_seconds_count 0\n"));
+        assert!(!body.contains("qbit_prism_accepted_shares_total"));
+    }
 }

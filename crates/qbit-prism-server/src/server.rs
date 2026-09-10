@@ -14,11 +14,10 @@ use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 
 pub async fn run(config: Config) -> Result<()> {
     let rollup_settings = crate::rollups::settings_from_env()?;
-    let mut stratum_config = StratumConfig::from_env()?;
+    let stratum_config = StratumConfig::from_env()?;
     let stats = stratum_config.stats.clone();
-    let coordinator = Coordinator::new(config).await?;
-    let registry = coordinator.metrics.clone();
-    stratum_config.metrics = registry.clone();
+    let registry = Arc::new(metrics::Metrics::default());
+    let coordinator = Coordinator::new(config, registry.clone()).await?;
     let highdiff = stratum_config.highdiff_config()?;
     let config = &coordinator.config;
     let (shutdown, shutdown_rx) = watch::channel(false);
@@ -50,8 +49,11 @@ pub async fn run(config: Config) -> Result<()> {
     if api_config.minimum_payout_bits == 0 {
         api_config.minimum_payout_bits = config.payout_policy.min_output_sats()?;
     }
-    let api_state =
-        ApiState::new(coordinator.ledger.pool.clone(), api_config).with_metrics(registry);
+    let api_state = ApiState::new(
+        coordinator.ledger.pool.clone(),
+        api_config,
+        registry.clone(),
+    );
     let metrics = api_state.metrics();
     let runtime = metrics.runtime();
     let api_listener = if config.audit_port > 0 {
@@ -72,6 +74,7 @@ pub async fn run(config: Config) -> Result<()> {
             coordinator.clone(),
             coordinator.refresh.subscribe(),
             shutdown_rx.clone(),
+            registry.clone(),
         ),
     ));
     if let (Some(listener), Some(highdiff)) = (high_listener, highdiff) {
@@ -83,6 +86,7 @@ pub async fn run(config: Config) -> Result<()> {
                 coordinator.clone(),
                 coordinator.refresh.subscribe(),
                 shutdown_rx.clone(),
+                registry.clone(),
             ),
         ));
     }
@@ -226,9 +230,7 @@ async fn publish_health(
             coordinator.config.runtime_workers,
             coordinator.blocks.load(Ordering::Relaxed),
         );
-        registry.publish_delivery(
-            stats.delivery_metrics(missing_since.map_or(Duration::ZERO, |at| at.elapsed())),
-        );
+        registry.publish_delivery(stats.delivery_metrics());
         state.publish_metrics(registry.render())?;
         if let Err(error) = coordinator.ledger.heartbeat(health).await {
             tracing::warn!(%error,"cluster heartbeat failed");

@@ -26,14 +26,28 @@ async fn blocked_critical_poll_degrades_real_http_while_another_worker_remains_h
     );
     let runtime = metrics.runtime();
     let (started, start) = tokio::sync::oneshot::channel();
-    let blocking = tokio::spawn(runtime.track(TaskKind::Refresh, async {
+    struct ReleaseOnDrop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let released = ReleaseOnDrop(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let release = released.0.clone();
+    let blocking = tokio::spawn(runtime.track(TaskKind::Refresh, async move {
         started.send(()).unwrap();
         std::thread::sleep(Duration::from_secs(3));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !release.load(std::sync::atomic::Ordering::Acquire)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }));
     start.await.unwrap();
     let (stop_monitor, monitor_rx) = tokio::sync::watch::channel(false);
     let sampler = tokio::spawn(runtime.clone().run(monitor_rx));
-    tokio::time::sleep(Duration::from_millis(2200)).await;
+    tokio::time::sleep(Duration::from_millis(3100)).await;
     let response = reqwest::Client::new()
         .get(format!("http://{address}/healthz"))
         .timeout(Duration::from_millis(500))
@@ -45,6 +59,7 @@ async fn blocked_critical_poll_degrades_real_http_while_another_worker_remains_h
     assert_eq!(health["status"], "runtime-stalled");
     assert!(health["snapshot_age_seconds"].as_f64().unwrap() < 15.);
     let body = scrape(&state).await;
+    assert!(sample(&body, "qbit_prism_runtime_lag_seconds") >= 0.);
     assert_eq!(sample(&body, "qbit_prism_health_state"), 0.);
     assert_eq!(
         sample(&body, "qbit_prism_runtime_task_stalled{task=\"refresh\"}"),
@@ -56,6 +71,7 @@ async fn blocked_critical_poll_degrades_real_http_while_another_worker_remains_h
             "qbit_prism_runtime_poll_lag_seconds{task=\"refresh\"}"
         ) >= 2.
     );
+    drop(released);
     blocking.await.unwrap();
     assert!(!runtime.snapshot().stalled());
     assert!(
@@ -83,6 +99,13 @@ async fn idle_slow_async_work_and_cancelled_operations_do_not_leave_false_stalls
         Duration::from_millis(10),
     ));
     assert!(!runtime.snapshot().stalled());
+    assert_eq!(
+        sample(
+            &runtime.snapshot().render(),
+            "qbit_prism_runtime_lag_seconds"
+        ),
+        -1.
+    );
     let (started, start) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(runtime.track(TaskKind::Submit, async {
         started.send(()).unwrap();

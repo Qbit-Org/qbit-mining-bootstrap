@@ -147,7 +147,11 @@ pub async fn run() -> Result<()> {
             Ok(())
         }
         Command::BroadcastCtv => {
-            let coordinator = Coordinator::new(Config::from_env()?).await?;
+            let coordinator = Coordinator::new(
+                Config::from_env()?,
+                std::sync::Arc::new(crate::metrics::Metrics::default()),
+            )
+            .await?;
             coordinator.refresh_once().await?;
             let count = crate::broadcaster::run_once(&coordinator).await?;
             println!("Processed {count} CTV fanouts");
@@ -291,7 +295,11 @@ async fn self_check() -> Result<()> {
 }
 
 async fn self_check_local(config: Config, report: &mut SelfCheckReport) -> Result<()> {
-    let coordinator = Coordinator::new(config).await?;
+    let coordinator = Coordinator::new(
+        config,
+        std::sync::Arc::new(crate::metrics::Metrics::default()),
+    )
+    .await?;
     coordinator.refresh_once().await?;
     let integrity: Value = sqlx::query_scalar("SELECT qbit_carry_forward_integrity_report()")
         .fetch_one(&coordinator.ledger.pool)

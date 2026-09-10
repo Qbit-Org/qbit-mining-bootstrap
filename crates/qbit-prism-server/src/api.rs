@@ -130,7 +130,7 @@ impl Payload {
     }
 }
 impl ApiState {
-    pub fn new(pool: PgPool, config: ApiConfig) -> Self {
+    pub fn new(pool: PgPool, config: ApiConfig, registry: Arc<crate::metrics::Metrics>) -> Self {
         let public_pool = public_service::read_pool(
             pool.connect_options().as_ref().clone(),
             env_num("PRISM_POSTGRES_READ_CONCURRENCY", 4).clamp(1, 1024) as u32,
@@ -144,7 +144,7 @@ impl ApiState {
                 json!({"schema":"qbit.prism.audit-health.v1","ok":false,"state":"starting","error":"health snapshot warm-up has not completed yet"}),
             )),
             metrics: Arc::new(RwLock::new(MetricsSnapshot::default())),
-            registry: Arc::new(crate::metrics::Metrics::default()),
+            registry,
             latest_evidence: Arc::new(RwLock::new(None)),
             health_published_at: Arc::new(RwLock::new(Instant::now())),
             client: reqwest::Client::builder()
@@ -153,10 +153,6 @@ impl ApiState {
                 .expect("HTTP client"),
             cache: Arc::new(Mutex::new(BTreeMap::new())),
         }
-    }
-    pub fn with_metrics(mut self, registry: Arc<crate::metrics::Metrics>) -> Self {
-        self.registry = registry;
-        self
     }
     pub fn metrics(&self) -> Arc<crate::metrics::Metrics> {
         self.registry.clone()
@@ -373,6 +369,7 @@ async fn handle_inner(
                 Instant::now(),
                 health_stale_after(),
                 Some(state.registry.runtime().snapshot()),
+                Some(&state.registry),
             ),
             &method,
         );
@@ -818,7 +815,11 @@ mod health_tests {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://invalid@127.0.0.1:1/invalid")
             .unwrap();
-        let state = ApiState::new(pool, ApiConfig::default());
+        let state = ApiState::new(
+            pool,
+            ApiConfig::default(),
+            std::sync::Arc::new(crate::metrics::Metrics::default()),
+        );
         state.publish_health(json!({"ok":true,"schema":"qbit.prism.audit-health.v1"}));
         *state.health_published_at.write().unwrap() = Instant::now() - Duration::from_secs(3600);
         let response = router(state)

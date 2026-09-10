@@ -29,14 +29,15 @@ pub struct Metrics {
     inner: Mutex<Registry>,
     collections: Mutex<BTreeMap<Collector, CollectionState>>,
     runtime: Arc<runtime::RuntimeMonitor>,
+    coverage_gap_since: Mutex<Option<Instant>>,
 }
 impl Default for Metrics {
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(runtime::RuntimeMonitor::default()))
     }
 }
 impl Metrics {
-    pub fn new() -> Self {
+    pub fn new(runtime: Arc<runtime::RuntimeMonitor>) -> Self {
         let mut registry = Registry::default();
         for family in [
             Family::Health,
@@ -75,8 +76,11 @@ impl Metrics {
         for value in RejectReason::ALL {
             registry.register(Family::Rejections, label("reason_id", value.as_str()), 0.);
         }
+        for result in Outcome::ALL {
+            registry.register(Family::PoolAcquire, label("result", result.as_str()), 0.);
+        }
         // Owner-dependent hooks are declared without inventing observations.
-        for family in [Family::FirstOffer, Family::PoolAcquire, Family::LockWait] {
+        for family in [Family::FirstOffer, Family::LockWait] {
             registry.declare(family);
         }
         for collector in Collector::ALL {
@@ -99,7 +103,8 @@ impl Metrics {
         Self {
             inner: Mutex::new(registry),
             collections: Mutex::new(BTreeMap::new()),
-            runtime: Arc::new(runtime::RuntimeMonitor::default()),
+            runtime,
+            coverage_gap_since: Mutex::new(None),
         }
     }
     pub fn runtime(&self) -> Arc<runtime::RuntimeMonitor> {
@@ -108,6 +113,22 @@ impl Metrics {
     /// Registry rendering does not query the database, node, or filesystem.
     /// Runtime/freshness are appended at HTTP request time by the snapshot owner.
     pub fn render(&self) -> String {
+        self.current_registry().render()
+    }
+    pub(crate) fn overlay_collections(&self, body: &mut String) {
+        let current = self.current_registry();
+        let mut refreshed = String::new();
+        for line in body
+            .lines()
+            .filter(|line| !registry::is_collection_line(line))
+        {
+            refreshed.push_str(line);
+            refreshed.push('\n');
+        }
+        refreshed.push_str(&current.render_filtered(Family::is_collection));
+        *body = refreshed;
+    }
+    fn current_registry(&self) -> Registry {
         let stored = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let collections = self.collections.lock().unwrap_or_else(|e| e.into_inner());
         let mut registry = stored.clone();
@@ -127,7 +148,7 @@ impl Metrics {
         }
         drop(collections);
         drop(stored);
-        registry.render()
+        registry
     }
 }
 

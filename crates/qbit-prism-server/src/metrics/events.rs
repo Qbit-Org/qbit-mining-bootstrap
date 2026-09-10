@@ -5,22 +5,18 @@ impl Metrics {
     pub fn observe_share_ack(&self, result: AckResult, elapsed: Duration) {
         self.observe(Family::ShareAck, label("result", result.as_str()), elapsed);
     }
-    /// Record only after durable acceptance; the grace decision belongs to the coordinator.
-    pub fn record_share_accepted(&self, grace: bool) {
-        if grace {
-            self.inner
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .increment(Family::Grace, vec![]);
-        }
+    /// Record stale-grace credit only after durable acceptance.
+    pub fn record_grace_credit(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .increment(Family::Grace, vec![]);
     }
     pub fn record_rejection(&self, reason: RejectReason) {
         let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         registry.increment(Family::Rejections, label("reason_id", reason.as_str()));
         let aggregate = match reason {
-            RejectReason::StaleJob | RejectReason::UnknownJob | RejectReason::BlockStale => {
-                Some(Family::Stale)
-            }
+            RejectReason::StaleJob | RejectReason::UnknownJob => Some(Family::Stale),
             RejectReason::DuplicateShare => Some(Family::Duplicate),
             RejectReason::LowDifficulty => Some(Family::LowDifficulty),
             _ => None,

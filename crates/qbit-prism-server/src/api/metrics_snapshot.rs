@@ -26,7 +26,7 @@ impl MetricsSnapshot {
 
     #[cfg(test)]
     pub(super) fn response(self, now: Instant, stale_after: Duration) -> Response {
-        self.response_with_runtime(now, stale_after, None)
+        self.response_with_runtime(now, stale_after, None, None)
     }
 
     pub(super) fn response_with_runtime(
@@ -34,6 +34,7 @@ impl MetricsSnapshot {
         now: Instant,
         stale_after: Duration,
         runtime: Option<crate::metrics::runtime::RuntimeSnapshot>,
+        collections: Option<&crate::metrics::Metrics>,
     ) -> Response {
         let freshness = Freshness::new(
             self.published_at
@@ -59,6 +60,9 @@ impl MetricsSnapshot {
         } else {
             self.body
         };
+        if let Some(collections) = collections {
+            collections.overlay_collections(&mut body);
+        }
         body.push_str(&crate::metrics::render_freshness(
             freshness.age_seconds,
             freshness.stale(),

@@ -411,6 +411,23 @@ async fn start(
     watch::Sender<bool>,
     tokio::task::JoinHandle<()>,
 ) {
+    start_with_metrics(
+        config,
+        Arc::new(qbit_prism_server::metrics::Metrics::default()),
+    )
+    .await
+}
+
+async fn start_with_metrics(
+    config: StratumConfig,
+    metrics: Arc<qbit_prism_server::metrics::Metrics>,
+) -> (
+    std::net::SocketAddr,
+    Arc<Backend>,
+    watch::Sender<u64>,
+    watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let backend = Arc::new(Backend::default());
@@ -419,7 +436,7 @@ async fn start(
     let task = {
         let backend = backend.clone();
         tokio::spawn(async move {
-            run_listener(listener, config, backend, refresh_rx, shutdown_rx)
+            run_listener(listener, config, backend, refresh_rx, shutdown_rx, metrics)
                 .await
                 .unwrap();
         })
@@ -623,6 +640,7 @@ async fn resumed_difficulty_is_lane_scoped_ttl_bounded_and_explicit_requests_win
         backend.clone(),
         refresh.subscribe(),
         shutdown.subscribe(),
+        std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
     ));
     let mut other_lane = Client::connect(high_address).await;
     other_lane.login("miner.retained").await;
@@ -861,9 +879,16 @@ async fn reconnect_on_another_listener_preserves_original_entropy_mask_and_expir
         let refresh = refresh.subscribe();
         let shutdown = shutdown.subscribe();
         tokio::spawn(async move {
-            run_listener(listener, config, backend, refresh, shutdown)
-                .await
-                .unwrap();
+            run_listener(
+                listener,
+                config,
+                backend,
+                refresh,
+                shutdown,
+                std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
+            )
+            .await
+            .unwrap();
         })
     };
     let mut original = Client::connect(first).await;

@@ -236,7 +236,11 @@ async fn observed_readiness_failure_closes_cached_work_and_candidate_settlement(
     url.query_pairs_mut()
         .append_pair("options", &format!("-csearch_path={schema}"));
     let node = Node::open().await?;
-    let coordinator = Coordinator::new(coordinator_config(url.into(), &node)?).await?;
+    let coordinator = Coordinator::new(
+        coordinator_config(url.into(), &node)?,
+        std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
+    )
+    .await?;
     let result = async {
         coordinator
             .ledger
@@ -513,10 +517,18 @@ async fn another_frontend_payout_revision_retires_same_parent_work_and_preserves
     url.query_pairs_mut()
         .append_pair("options", &format!("-csearch_path={schema}"));
     let node = Node::open().await?;
-    let first = Coordinator::new(coordinator_config(url.to_string(), &node)?).await?;
+    let first = Coordinator::new(
+        coordinator_config(url.to_string(), &node)?,
+        std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
+    )
+    .await?;
     let mut config = coordinator_config(url.into(), &node)?;
     config.instance_id = "readiness-second".into();
-    let second = Coordinator::new(config).await?;
+    let second = Coordinator::new(
+        config,
+        std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
+    )
+    .await?;
     let result = async {
         first.ledger.append(AcceptedShare {
             share_seq: 0, share_id: format!("miner:{}", "01".repeat(32)),
@@ -630,7 +642,11 @@ async fn cached_ctv_work_revalidates_live_floors_and_fences_old_underfunded_jobs
         config.ctv_enabled = true;
         config.ctv_config.max_direct_coinbase_outputs = 0;
         config.ctv_fee = explicit.then(|| qbit_prism::FanoutFeeRatePolicy::new(1000, 12000));
-        let coordinator = Coordinator::new(config).await?;
+        let coordinator = Coordinator::new(
+            config,
+            std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
+        )
+        .await?;
         let result = async {
             coordinator
                 .ledger

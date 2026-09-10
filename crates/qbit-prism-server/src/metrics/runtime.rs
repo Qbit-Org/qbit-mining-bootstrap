@@ -73,7 +73,7 @@ struct State {
     next_id: u64,
     entries: BTreeMap<u64, Entry>,
     recent: BTreeMap<TaskKind, RecentPolls>,
-    wake_lag: Duration,
+    wake_lag: Option<Duration>,
 }
 impl State {
     fn record_completed_poll(&mut self, task: TaskKind, now: Instant, elapsed: Duration) {
@@ -170,7 +170,7 @@ impl RuntimeMonitor {
         }
         RuntimeSnapshot {
             tasks,
-            wake_lag: state.wake_lag.as_secs_f64(),
+            wake_lag: state.wake_lag.map_or(-1., |lag| lag.as_secs_f64()),
         }
     }
     /// This measures scheduling delay; critical-future poll observation above
@@ -186,7 +186,7 @@ impl RuntimeMonitor {
                 _ = shutdown.changed() => break,
                 scheduled = interval.tick() => {
                     self.state.lock().unwrap_or_else(|e| e.into_inner()).wake_lag =
-                        Instant::now().saturating_duration_since(scheduled.into_std());
+                        Some(Instant::now().saturating_duration_since(scheduled.into_std()));
                 }
             }
         }

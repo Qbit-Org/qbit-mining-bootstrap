@@ -108,7 +108,11 @@ async fn expired_publication_fails_closed_through_the_router_and_recovers() {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect_lazy("postgres://invalid@127.0.0.1:1/invalid")
         .unwrap();
-    let state = ApiState::new(pool, ApiConfig::default());
+    let state = ApiState::new(
+        pool,
+        ApiConfig::default(),
+        std::sync::Arc::new(crate::metrics::Metrics::default()),
+    );
     state.publish_health(json!({"ok":true}));
     state.publish_metrics(HEALTHY.into()).unwrap();
     let expired_at = Instant::now() - health_stale_after() - Duration::from_secs(1);

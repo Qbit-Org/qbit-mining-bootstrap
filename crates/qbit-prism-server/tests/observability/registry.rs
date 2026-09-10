@@ -18,7 +18,7 @@ pub(super) fn state(metrics: Arc<Metrics>) -> ApiState {
     let pool = PgPoolOptions::new()
         .connect_lazy("postgres://invalid@127.0.0.1:1/invalid")
         .unwrap();
-    ApiState::new(pool, ApiConfig::default()).with_metrics(metrics)
+    ApiState::new(pool, ApiConfig::default(), metrics)
 }
 pub(super) async fn scrape(state: &ApiState) -> String {
     let response = router(state.clone())
@@ -96,6 +96,9 @@ fn histogram_buckets_are_cumulative_and_rejects_are_closed() {
         RejectReason::InternalError
     );
     let body = metrics.render();
+    assert_eq!(sample(&body, "qbit_prism_stale_shares_total"), 2.);
+    assert_eq!(sample(&body, "qbit_prism_duplicate_shares_total"), 1.);
+    assert_eq!(sample(&body, "qbit_prism_low_difficulty_shares_total"), 1.);
     let prefix = "qbit_prism_share_ack_seconds";
     assert_eq!(
         sample(&body, &format!("{prefix}_count{{result=\"accepted\"}}")),

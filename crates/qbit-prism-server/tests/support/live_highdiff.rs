@@ -276,7 +276,11 @@ async fn real_share_height_queries_use_template_parent_height() -> Result<()> {
         return Ok(());
     };
     let result = async {
-        let coordinator = Coordinator::new(direct_coordinator_config(&fixture)?).await?;
+        let coordinator = Coordinator::new(
+            direct_coordinator_config(&fixture)?,
+            std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
+        )
+        .await?;
         coordinator.refresh_once().await?;
         let worker = coordinator
             .authorize(&format!("{}.height", fixture.address))
@@ -397,7 +401,7 @@ async fn observed_tip_advance_fences_old_prepared_jobs_and_health() -> Result<()
         return Ok(());
     };
     let result=async {
-        let coordinator=Coordinator::new(direct_coordinator_config(&fixture)?).await?;
+        let coordinator=Coordinator::new(direct_coordinator_config(&fixture)?, std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default())).await?;
         coordinator.refresh_once().await?;
         ensure!(coordinator.health().await["ready"]==true,"initial published template is not healthy");
         let worker=coordinator.authorize(&format!("{}.fence",fixture.address)).await?;
@@ -431,4 +435,94 @@ async fn observed_tip_advance_fences_old_prepared_jobs_and_health() -> Result<()
     }
     let cleanup = fixture.cleanup().await;
     result.and(cleanup)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn observability_grace_counter_moves_only_after_real_durable_credit() -> Result<()> {
+    use qbit_prism_server::{coordinator::Coordinator, metrics::Metrics, stratum::MiningBackend};
+    let Some(fixture) = Fixture::open(false).await? else {
+        return Ok(());
+    };
+    let result = async {
+        let metrics = std::sync::Arc::new(Metrics::default());
+        let coordinator =
+            Coordinator::new(direct_coordinator_config(&fixture)?, metrics.clone()).await?;
+        coordinator.refresh_once().await?;
+        let worker = coordinator
+            .authorize(&format!("{}.metrics", fixture.address))
+            .await?;
+        let session = coordinator.new_session_id().await?;
+        let job = coordinator
+            .build_job(&worker, &format!("{session:08x}"), 1e-12, 0.0)
+            .await?;
+        let mut proofs = (0..10_000u32).filter_map(|nonce| {
+            let proof = job
+                .wire
+                .assemble_submission(
+                    &"00".repeat(job.wire.extranonce2_size),
+                    &format!("{:08x}", job.wire.ntime),
+                    &format!("{nonce:08x}"),
+                    None,
+                    0,
+                )
+                .ok()?;
+            (proof.share_pass && !proof.block_pass).then_some(proof)
+        });
+        let normal = proofs.next().context("no normal regtest proof")?;
+        let grace = proofs.next().context("no grace regtest proof")?;
+        coordinator.submit(&worker, &job, normal, false).await?;
+        ensure!(
+            metrics
+                .render()
+                .lines()
+                .any(|l| l == "qbit_prism_grace_credited_shares_total 0"),
+            "normal acceptance counted as grace"
+        );
+        fixture
+            .rpc("generatetoaddress", json!([1, fixture.address]))
+            .await?;
+        coordinator.refresh_once().await?;
+        let share_id = format!("{}:{}", worker.username, grace.block_hash_hex);
+        coordinator
+            .submit(&worker, &job, grace.clone(), true)
+            .await?;
+        let policy: Option<String> =
+            sqlx::query_scalar("SELECT credit_policy FROM qbit_share_ledger WHERE share_id=$1")
+                .bind(&share_id)
+                .fetch_one(&coordinator.ledger.pool)
+                .await?;
+        ensure!(
+            policy.as_deref() == Some("stale-grace"),
+            "expected real durable grace policy"
+        );
+        ensure!(
+            metrics
+                .render()
+                .lines()
+                .any(|l| l == "qbit_prism_grace_credited_shares_total 1"),
+            "durable grace hook did not move"
+        );
+        let duplicate = coordinator
+            .submit(&worker, &job, grace, true)
+            .await
+            .unwrap_err();
+        ensure!(
+            duplicate.reason_id.as_deref() == Some("duplicate-share"),
+            "unexpected duplicate outcome"
+        );
+        ensure!(
+            metrics
+                .render()
+                .lines()
+                .any(|l| l == "qbit_prism_grace_credited_shares_total 1"),
+            "duplicate double-counted grace"
+        );
+        coordinator.ledger.pool.close().await;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if result.is_err() {
+        eprintln!("{}", fixture.diagnostics());
+    }
+    result.and(fixture.cleanup().await)
 }

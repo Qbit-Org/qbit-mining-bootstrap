@@ -376,7 +376,14 @@ pub async fn run_from_env(mut shutdown: watch::Receiver<bool>) -> Result<()> {
         .context("PRISM_DATABASE_URL is required by the public service")?;
     let options = PgConnectOptions::from_str(&database)?.application_name("prism-public-read");
     let pool = read_pool(options, config.read_concurrency);
-    let (app, service) = router(ApiState::new(pool, ApiConfig::from_env()), config.clone());
+    let (app, service) = router(
+        ApiState::new(
+            pool,
+            ApiConfig::from_env(),
+            std::sync::Arc::new(crate::metrics::Metrics::default()),
+        ),
+        config.clone(),
+    );
     service.probe_once().await;
     let listener = tokio::net::TcpListener::bind((config.bind.as_str(), config.port)).await?;
     let mut probe_shutdown = shutdown.clone();

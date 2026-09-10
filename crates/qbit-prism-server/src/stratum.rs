@@ -171,7 +171,6 @@ pub struct StratumConfig {
     pub max_connections_per_username: usize,
     pub username_connections: Arc<Mutex<HashMap<String, Weak<Semaphore>>>>,
     pub stats: Arc<StratumStats>,
-    pub metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl Default for StratumConfig {
@@ -199,7 +198,6 @@ impl Default for StratumConfig {
             max_connections_per_username: 0,
             username_connections: Arc::new(Mutex::new(HashMap::new())),
             stats: Arc::new(StratumStats::default()),
-            metrics: Arc::new(crate::metrics::Metrics::default()),
         }
     }
 }
@@ -235,12 +233,11 @@ pub struct StratumStatsSnapshot {
 }
 
 impl StratumStats {
-    pub fn delivery_metrics(&self, coverage_gap: Duration) -> crate::metrics::DeliveryMetrics {
+    pub fn delivery_metrics(&self) -> crate::metrics::DeliveryMetrics {
         let jobs = self.initial_jobs.lock().unwrap();
         crate::metrics::DeliveryMetrics {
             pending_initial_jobs: Some(jobs.len() as u64),
             oldest_initial_job: Some(jobs.values().min().map_or(Duration::ZERO, Instant::elapsed)),
-            coverage_gap: Some(coverage_gap),
         }
     }
 
@@ -983,12 +980,13 @@ async fn request<B: MiningBackend>(
     config: &StratumConfig,
     request: Value,
     received_at: tokio::time::Instant,
+    metrics: &crate::metrics::Metrics,
 ) -> Result<()> {
+    let is_submit = request.get("method").and_then(Value::as_str) == Some("mining.submit");
     let share_observation =
-        share_observation::ShareObservation::begin(&config.metrics, &request, received_at);
+        share_observation::ShareObservation::begin(metrics, is_submit, received_at);
     session.prune_jobs(config);
     let id = request.get("id").cloned().unwrap_or(Value::Null);
-    let is_submit = request.get("method").and_then(Value::as_str) == Some("mining.submit");
     let dispatch = async {
         let method = request
             .get("method")
@@ -1335,9 +1333,7 @@ async fn request<B: MiningBackend>(
                     .accepted_submissions
                     .fetch_add(1, Ordering::Relaxed);
                 result(writer, id.clone(), json!(true), config).await?;
-                if let Some(observation) = &share_observation {
-                    observation.acknowledged(crate::metrics::AckResult::Accepted);
-                }
+                share_observation.acknowledged(crate::metrics::AckResult::Accepted);
                 if session
                     .jobs
                     .back()
@@ -1376,14 +1372,10 @@ async fn request<B: MiningBackend>(
                 .stats
                 .rejected_submissions
                 .fetch_add(1, Ordering::Relaxed);
-            if let Some(observation) = &share_observation {
-                observation.rejected(error);
-            }
+            share_observation.rejected(error);
         }
         write_json(writer, error.response(id), config).await?;
-        if let Some(observation) = &share_observation {
-            observation.acknowledged(crate::metrics::AckResult::Rejected);
-        }
+        share_observation.acknowledged(crate::metrics::AckResult::Rejected);
     }
     Ok(())
 }
@@ -1394,6 +1386,7 @@ async fn session<B: MiningBackend>(
     config: StratumConfig,
     mut refresh: watch::Receiver<u64>,
     mut shutdown: watch::Receiver<bool>,
+    metrics: Arc<crate::metrics::Metrics>,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     let observation = SessionObservation::new(config.stats.clone());
@@ -1432,7 +1425,7 @@ async fn session<B: MiningBackend>(
                 let received_at = tokio::time::Instant::now();
                 let frame = std::mem::take(&mut buffer);
                 match serde_json::from_slice::<Value>(&frame) {
-                    Ok(value) if value.is_object() => request(backend.as_ref(),&mut session,&mut writer,&config,value,received_at).await?,
+                    Ok(value) if value.is_object() => request(backend.as_ref(),&mut session,&mut writer,&config,value,received_at,&metrics).await?,
                     _ => write_json(&mut writer,StratumError::malformed("invalid JSON request").response(Value::Null),&config).await?,
                 }
             }
@@ -1460,6 +1453,7 @@ pub async fn run_listener<B: MiningBackend>(
     backend: Arc<B>,
     refresh: watch::Receiver<u64>,
     mut shutdown: watch::Receiver<bool>,
+    metrics: Arc<crate::metrics::Metrics>,
 ) -> Result<()> {
     config.validate()?;
     let mut connections = JoinSet::new();
@@ -1474,10 +1468,11 @@ pub async fn run_listener<B: MiningBackend>(
                 let (stream,_) = accepted?;
                 let Ok(permit) = config.connection_limit.clone().try_acquire_owned() else { drop(stream); continue; };
                 let (backend,config,refresh,shutdown) = (backend.clone(),config.clone(),refresh.clone(),shutdown.clone());
-                let runtime = config.metrics.runtime();
+                let metrics = metrics.clone();
+                let runtime = metrics.runtime();
                 connections.spawn(runtime.track(crate::metrics::TaskKind::StratumSession, async move {
                     let _permit = permit;
-                    if let Err(error) = session(stream,backend,config,refresh,shutdown).await {
+                    if let Err(error) = session(stream,backend,config,refresh,shutdown,metrics).await {
                         tracing::warn!(error = %format_args!("{error:#}"), "Stratum connection ended");
                     }
                 }));

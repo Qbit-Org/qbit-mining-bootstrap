@@ -26,11 +26,10 @@ labels!(RejectReason {
     StaleJob => "stale-job", DuplicateShare => "duplicate-share", LowDifficulty => "low-difficulty",
     MalformedSubmit => "malformed-submit", UnauthorizedWorker => "unauthorized-worker",
     UnknownJob => "unknown-job", InvalidExtranonce => "invalid-extranonce",
-    InvalidNtimeOrNonce => "invalid-ntime-or-nonce", CandidateAuditMismatch => "candidate-audit-mismatch",
-    SubmitblockRejected => "submitblock-rejected", BackendRpcUnavailable => "backend-rpc-unavailable",
-    InternalError => "internal-error", PoolClosed => "pool-closed", BlockStale => "block-stale",
-    LedgerConfirmationFailed => "ledger-confirmation-failed",
-    LedgerConfirmationSuperseded => "ledger-confirmation-superseded"
+    InvalidNtimeOrNonce => "invalid-ntime-or-nonce",
+    BackendRpcUnavailable => "backend-rpc-unavailable",
+    InternalError => "internal-error", PoolClosed => "pool-closed",
+    LedgerConfirmationFailed => "ledger-confirmation-failed"
 });
 
 impl RejectReason {

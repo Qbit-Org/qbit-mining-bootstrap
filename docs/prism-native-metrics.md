@@ -2,7 +2,7 @@
 
 The coordinator (`run`) owns one process-local registry shared by Stratum,
 background collectors, and the runtime monitor. `/metrics` renders cached
-observations, with #277 freshness and runtime state evaluated at scrape time.
+observations, with #277 freshness, collector age/availability, and runtime state evaluated at scrape time.
 Scraping performs no database, node, or filesystem I/O. Public-api metrics retain
 their existing contract.
 
@@ -17,13 +17,13 @@ Histograms also export `_sum` and `_count`.
 | --- | --- | --- | --- |
 | `share_ack_seconds` | histogram | `result=accepted,rejected` | Complete `mining.submit` frame receipt to successful response write, using Tokio's monotonic clock; partial-frame waiting and post-ACK hints excluded |
 | `rejections_total` | counter | `reason_id` | Stratum rejection decision; includes failed rejection-response writes |
-| `stale_shares_total` | counter | none | Stale-job, unknown-job, and block-stale rejections |
+| `stale_shares_total` | counter | none | Stale-job and unknown-job rejections |
 | `duplicate_shares_total` | counter | none | Duplicate rejection decisions |
 | `low_difficulty_shares_total` | counter | none | Low-difficulty rejection decisions |
 | `grace_credited_shares_total` | counter | none | Coordinator's actual stale decision, only after durable `Ok(true)` acceptance |
 | `stratum_pending_initial_jobs` | gauge | none | Authorized local sessions awaiting usable work, including reauthorization |
 | `stratum_oldest_pending_initial_job_seconds` | gauge | none | Oldest such wait, from authorization to successful job notification; zero when none wait |
-| `stratum_current_tip_coverage_gap_seconds` | gauge | none | Continuous missing-current-work interval observed by the health publisher |
+| `stratum_current_tip_coverage_gap_seconds` | gauge | none | Continuous native generation coverage below 95%, reset at or above 95%; unknown before the first snapshot |
 | `stratum_semantic_current_work_ratio` | gauge | none | Existing generation coverage divided by authorized sessions; one with no authorized sessions |
 | `block_submit_seconds` | histogram | none | **Declared, not yet populated**; A/#266 owns locally validated proof to first node-offer timestamp transport |
 | `block_candidates_pending` | gauge | none | PostgreSQL count of outbox rows with `state='pending'`, including claimed/retry-delayed rows |
@@ -34,7 +34,7 @@ Histograms also export `_sum` and `_count`.
 | `collector_success` | gauge | `collector=database,process` | Latest attempt succeeded (1), failed/cancelled (0), or no attempt completed (-1) |
 | `collector_age_seconds` | gauge | `collector=database,process` | Monotonic age of last success; -1 before success; failure does not refresh it |
 | `process_resident_memory_bytes` | gauge | none | Linux `/proc/self/status` VmRSS in bytes; -1 when unsupported, failed, or stale |
-| `runtime_lag_seconds` | gauge | none | Runtime sampler wake lateness |
+| `runtime_lag_seconds` | gauge | none | Runtime sampler wake lateness; -1 before its first observation |
 | `runtime_poll_lag_seconds` | gauge | `task` | Largest active poll or completed poll retained for 60 to 61 seconds |
 | `runtime_progress_age_seconds` | gauge | `task` | Oldest active explicit operation's time since progress; zero when idle |
 | `runtime_task_stalled` | gauge | `task` | Active poll beyond two seconds or explicit operation beyond its budget |
@@ -42,9 +42,8 @@ Histograms also export `_sum` and `_count`.
 Reject labels are the closed `RejectReason` enum: `stale-job`,
 `duplicate-share`, `low-difficulty`, `malformed-submit`, `unauthorized-worker`,
 `unknown-job`, `invalid-extranonce`, `invalid-ntime-or-nonce`,
-`candidate-audit-mismatch`, `submitblock-rejected`, `backend-rpc-unavailable`,
-`internal-error`, `pool-closed`, `block-stale`, `ledger-confirmation-failed`,
-and `ledger-confirmation-superseded`. Unknown internal reason IDs map to
+`backend-rpc-unavailable`,
+`internal-error`, `pool-closed`, and `ledger-confirmation-failed`. Unknown internal reason IDs map to
 `internal-error`; protocol responses are unchanged.
 
 Task labels are `refresh`, `submit`, `block_wait`, `broadcast`, `rollup`,
@@ -73,8 +72,9 @@ new attempt finishes. A newer collection attempt supersedes an older result;
 late completion or cancellation cannot replace the newer publication. A real
 zero count, age, or RSS remains valid after successful collection.
 
-Pool timing has samples only for acquisition attempts that complete, including
-completed acquisition errors. Overall collector cancellation during acquisition
+Pool timing pre-registers both result labels at count zero and records
+observations only for acquisition attempts that complete, including completed
+acquisition errors. Overall collector cancellation during acquisition
 does not invent a completed wait. The collector status records that failure.
 Candidate count and age describe database time; this is not a monotonic latency
 measurement. A/#266 must update the pending predicate if outbox states change.
@@ -106,3 +106,29 @@ frame time, rejection decision, and successful write) and the durable
 `MiningBackend::submit` branch in `coordinator.rs`; its extracted
 `coordinator/miner_submit.rs` inherits the latter. No metric family is waiting
 for #280 to become populated.
+
+The coverage-gap threshold preserves the strict `< 0.95` boundary of the
+[2.x producer](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/504846cc0b72e8f86ed17f896d4ccbbe196a31dc/lab/prism/observability.py#L317).
+Its native observed boundary is authorized clients holding current-generation
+work (semantic coverage); it is a metrics-only timer and does not change health
+readiness decisions. This preserves the legacy alert threshold/reset semantics.
+
+Collector gauges are refreshed together from their in-memory measurements at
+scrape time, including when the health publisher stalls. This does not renew
+#277's cached-body publication timestamp or the collector's last-success time.
+
+Registry injection is required by `ApiState::new`, `Coordinator::new`, and
+`run_listener`. Primary and high-difficulty listeners explicitly receive the same
+registry; listener configuration no longer creates its own telemetry state.
+Four legacy block-processing rejection labels (`candidate-audit-mismatch`,
+`submitblock-rejected`, `block-stale`, `ledger-confirmation-superseded`) have no
+producer in this slice and are excluded until their owning follow-up wires them.
+
+The ACK clock starts when this session reads a complete frame from its buffered
+socket, not when bytes first reach the kernel. A pipelined second submit queued
+behind earlier request work is therefore not a measure of the miner's full wait.
+`runtime_lag_seconds` reports only the latest sampler tick, which can return to
+near zero within 100 ms after recovery; completed tracked polls retain their
+maximum separately in `runtime_poll_lag_seconds`. The health `ledger_backend`
+alias uses `postgres-native`, matching the other native API responses, while the
+existing `backend` field retains its storage-engine value `postgres`.

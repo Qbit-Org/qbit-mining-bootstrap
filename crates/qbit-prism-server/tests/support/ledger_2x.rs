@@ -381,6 +381,7 @@ async fn audit_range_query_uses_deadline_remaining_after_delayed_snapshot() -> R
             read_timeout: Duration::from_millis(800),
             ..Default::default()
         },
+        std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
     ));
     let path = format!("/public/v1/artifacts/{}", report.audit_bundle_sha256_hex);
     let mut snapshot_lock = ledger.pool.begin().await?;
