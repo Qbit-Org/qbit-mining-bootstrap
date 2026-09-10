@@ -238,9 +238,10 @@ three gauges at scrape time:
 | `qbit_prism_metrics_snapshot_age_seconds` | Monotonic age in seconds; `-1` before the first publication |
 
 The coordinator uses the same budget as `/healthz`:
-`max(3 * PRISM_HEALTH_REFRESH_SECONDS, 15)` seconds. The setting defaults to
-2 seconds, giving a 15-second budget. Once the age exceeds that budget, a scrape
-sets `qbit_prism_health_state` to `0` while retaining the other cached samples.
+`max(3 * PRISM_HEALTH_REFRESH_SECONDS, 15)` seconds. The native binary defaults
+to 2 seconds; Compose sets 5 seconds. Both defaults give a 15-second budget.
+Once the age exceeds that budget, a scrape sets `qbit_prism_health_state` to `0`
+while retaining the other cached samples.
 Scraping neither renews the publication age nor queries the database.
 
 Both `run` and `public-api` return HTTP 200 for `/metrics`, including missing
