@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 from lab.auxpow.stratum_codec import header_hash_hex
 from lab.prism.block_candidates import _BlockCandidateNodeSubmission
+from lab.prism.candidate_spool_view import iter_string_text_chunks
 from lab.prism.candidate_store import CANDIDATE_SCHEMA_CAPABILITY, candidate_schema_refusal
 from lab.prism.coordinator_config import CoordinatorConfig, load_coordinator_config
 from lab.prism.prism_coordinator import PrismCoordinator
@@ -248,6 +249,20 @@ def load_intent(
     return hydrate(header_row, cancelled=coordinator.stop_event.is_set)
 
 
+def block_hex_prefix(block_hex: Any, length: int) -> str:
+    """The first ``length`` characters of a plain or streamed block hex.
+
+    A hydrated version-2 body keeps a large ``block_hex`` as a streamed
+    view that refuses ``str()``; only the header prefix is needed here.
+    """
+    prefix = ""
+    for chunk in iter_string_text_chunks(block_hex):
+        prefix += chunk
+        if len(prefix) >= length:
+            break
+    return prefix[:length]
+
+
 def decode_candidate(
     coordinator: PrismCoordinator, block: RecoveryBlock, row: dict[str, Any]
 ) -> Any:
@@ -262,7 +277,7 @@ def decode_candidate(
         or intent.get("parent_hash") != block.parent_hash
     ):
         raise RecoveryError(f"candidate does not match its active-chain header: {block.block_hash}")
-    header = bytes.fromhex(str(intent["block_hex"])[:160])
+    header = bytes.fromhex(block_hex_prefix(intent["block_hex"], 160))
     if len(header) != 80 or header_hash_hex(header) != block.block_hash:
         raise RecoveryError(f"candidate block bytes do not match its hash: {block.block_hash}")
     return replace(coordinator.block_candidate_from_intent(intent), durable_replay=True)

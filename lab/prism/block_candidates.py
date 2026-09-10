@@ -1134,7 +1134,7 @@ class BlockCandidatePorts:
     log: Callable[[str], None]
 
 
-def _candidate_block_hex(candidate: PrismBlockCandidate) -> str:
+def _candidate_block_hex(candidate: PrismBlockCandidate) -> Any:
     """Return the candidate's serialized block, never an unmaterialized one.
 
     ``assemble_submission`` materializes ``block_hex`` only for a hash that
@@ -1157,9 +1157,17 @@ def _candidate_block_hex(candidate: PrismBlockCandidate) -> str:
     a credit for a block already in the chain, which is strictly worse than
     re-persisting the same empty value the row already holds. Re-persisting an
     existing intent is not the write this guard exists to stop.
+
+    A hydrated replay can carry the block as a streamed ``SpoolStringView``
+    (a raw block of roughly 512 KiB or more). It is returned as is:
+    ``str()`` refuses it, and the codec writes its stored encoding verbatim,
+    byte-identical to the plain string (#255).
     """
     submission = candidate.submission
-    block_hex = str(getattr(submission, "block_hex", ""))
+    block_hex = getattr(submission, "block_hex", "")
+    if callable(getattr(block_hex, "iter_encoded_chunks", None)):
+        return block_hex
+    block_hex = str(block_hex)
     if (
         not block_hex
         and not candidate.durable_replay

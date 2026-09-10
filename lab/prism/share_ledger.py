@@ -38,6 +38,7 @@ from lab.prism.candidate_codec import (
     prepared_intent_from_spool,
     replay_header_from_fields,
 )
+from lab.prism.candidate_spool_view import is_spool_view, materialize_spool_views
 from lab.prism.candidate_store import (
     BODY_READ_MAX_CHUNKS,
     DEFAULT_SPOOL_RESERVATION_BYTES,
@@ -4734,11 +4735,20 @@ END;
 
         Storage version 1 is the compatibility/rollback mode; its statement
         inlines the whole document, so the share sequence is copied here
-        and nowhere else.
+        and nowhere else. A candidate-only intent keeps no share member,
+        and a hydrated replay (the rollback floor re-persisting a version-2
+        row) has its streamed views decoded, because this route writes
+        plain JSON.
         """
         if candidate is None or not isinstance(candidate, PreparedCandidateIntent):
             return candidate
-        return {**candidate.facts, "shares_json": list(candidate.shares)}
+        document = materialize_spool_views(candidate.facts)
+        if candidate.has_shares:
+            document["shares_json"] = [
+                materialize_spool_views(share) if is_spool_view(share) else share
+                for share in candidate.shares
+            ]
+        return document
 
     def _writer_identity_payload(self) -> dict[str, Any]:
         return {
