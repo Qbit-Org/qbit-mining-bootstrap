@@ -46,6 +46,14 @@ struct Backend {
 }
 
 impl MiningBackend for Backend {
+    async fn observed_tip_hint(&self) -> Option<RetentionTip> {
+        let generation = self.generation.load(Ordering::SeqCst);
+        Some(RetentionTip {
+            hash: format!("{generation:064x}"),
+            parent: None,
+            transitioned: generation > 0,
+        })
+    }
     type Context = ();
     async fn health_ready(&self) -> bool {
         self.ready.load(Ordering::Relaxed)
@@ -171,13 +179,14 @@ impl MiningBackend for Backend {
         worker: &Worker,
         job: &MiningJob<()>,
         submission: Submission,
-        grace: bool,
+        grace: StaleGrace,
     ) -> Result<(), StratumError> {
         let gate = self.submit_gate.lock().unwrap().take();
         if let Some(gate) = gate {
             gate.wait().await;
         }
         let tip = format!("{:064x}", self.generation.load(Ordering::SeqCst));
+        let grace = grace.eligible_for(&tip);
         if job.wire.previousblockhash != tip && !grace {
             return Err(StratumError::new(21, "stale job", "stale-job"));
         }
@@ -979,6 +988,7 @@ async fn assert_username_full(client: &mut Client, username: &str) {
 async fn reauthorization_retains_original_username_capacity_until_timer_expiry() {
     let mut config = StratumConfig {
         max_connections_per_username: 1,
+        max_jobs_per_connection: 1,
         job_retention_seconds: 0.5,
         stale_grace_seconds: 0.0,
         ..Default::default()
@@ -1028,6 +1038,7 @@ async fn reauthorization_retains_original_username_capacity_until_timer_expiry()
 async fn reauthorization_disconnect_reclaims_current_and_retained_username_capacity() {
     let (address, _backend, _refresh, shutdown, task) = start(StratumConfig {
         max_connections_per_username: 1,
+        max_jobs_per_connection: 1,
         ..Default::default()
     })
     .await;
@@ -1067,13 +1078,13 @@ async fn retained_username_capacity_reclaims_evicted_and_replaced_jobs() {
         assert_eq!(first.response(3).await["result"], true);
         first.next_job().await;
         let mut second = Client::connect(address).await;
-        if max_jobs > 1 {
-            assert_username_full(&mut second, "miner.A").await;
-            backend.payout_revision.store(1, Ordering::Relaxed);
-            refresh.send(1).unwrap();
-            first.next_job().await;
-            assert_eq!(first.notify["params"][8], true);
-        }
+        // Active eviction keeps original work creditable in this connection's
+        // graveyard, so it also keeps the original username reservation.
+        assert_username_full(&mut second, "miner.A").await;
+        backend.payout_revision.store(1, Ordering::Relaxed);
+        refresh.send(1).unwrap();
+        first.next_job().await;
+        assert_eq!(first.notify["params"][8], true);
         authorize_eventually(&mut second, "miner.A").await;
         first.send(old_submit).await;
         assert_eq!(first.response(10).await["error"][0], 21);
@@ -1084,7 +1095,7 @@ async fn retained_username_capacity_reclaims_evicted_and_replaced_jobs() {
 }
 
 #[tokio::test]
-async fn resumed_job_holds_username_capacity_until_absolute_expiry_during_build_failure() {
+async fn resumed_expiry_does_not_release_other_retained_work_during_build_failure() {
     let mut config = StratumConfig {
         max_connections_per_username: 1,
         max_jobs_per_connection: 1,
@@ -1092,7 +1103,7 @@ async fn resumed_job_holds_username_capacity_until_absolute_expiry_during_build_
         ..Default::default()
     };
     config.vardiff.enabled = false;
-    let (address, backend, _refresh, shutdown, task) = start(config).await;
+    let (address, backend, refresh, shutdown, task) = start(config).await;
     let mut original = Client::connect(address).await;
     original.login("miner.A").await;
     let submit = original.solved_submit(10, "miner.A", 0);
@@ -1125,8 +1136,14 @@ async fn resumed_job_holds_username_capacity_until_absolute_expiry_during_build_
     let mut second = Client::connect(address).await;
     assert_username_full(&mut second, "miner.A").await;
     assert_username_full(&mut second, "miner.B").await;
-    // No B job can be delivered. Only the resumed job's absolute expiry can
-    // release A before the much longer ordinary retirement deadline.
+    // The resumed job expires, but the newly issued A work it evicted still
+    // belongs to this connection's graveyard and can credit A.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_username_full(&mut second, "miner.A").await;
+    backend.fail_builds.store(0, Ordering::Relaxed);
+    backend.payout_revision.store(1, Ordering::Relaxed);
+    refresh.send(1).unwrap();
+    resumed.next_job().await;
     authorize_eventually(&mut second, "miner.A").await;
     assert_username_full(&mut second, "miner.B").await;
     assert_eq!(
