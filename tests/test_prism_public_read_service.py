@@ -220,6 +220,13 @@ class ContractEqualityTests(unittest.TestCase):
         parsed_query = urllib.parse.parse_qs(query)
         status, payload = public_api.dispatch(self.coordinator, path, parsed_query)
         policy = public_api.public_cache_policy(path)
+        budget = public_read_service.staleness_budget_for_path(path)
+        if budget is not None:
+            ttl = min(policy.ttl_seconds, int(budget))
+            policy = public_api.PublicCachePolicy(
+                ttl, max(0, min(policy.stale_while_revalidate_seconds, int(budget) - ttl)),
+                policy.immutable,
+            )
         # A fresh service cache serves the first request as a MISS at age 0,
         # which is exactly what the coordinator's handle_public did.
         headers = public_api.public_cache_headers(
@@ -834,6 +841,22 @@ class StaleServeTests(unittest.TestCase):
         self.assertEqual(200, served.status)
         self.assertEqual(warm.body, served.body)
         self.assertEqual("8", served.headers.get("Age"))
+
+    def test_cdn_policy_cannot_exceed_the_route_budget(self) -> None:
+        for ttl, swr, expected in (
+            (5, 30, "public, max-age=5, stale-while-revalidate=10"),
+            (60, 30, "public, max-age=15"),
+            (5, 0, "public, max-age=5"),
+        ):
+            with self.subTest(ttl=ttl, swr=swr), patch.object(
+                public_api, "public_cache_policy",
+                return_value=public_api.PublicCachePolicy(ttl, swr),
+            ):
+                served = self.harness.get(f"/public/v1/blocks?limit=1&case={ttl}-{swr}")
+                self.assertEqual(served.status, 200)
+                self.assertEqual(served.headers["X-Prism-Staleness-Budget-Seconds"], "15")
+                self.assertEqual(served.headers["CDN-Cache-Control"], expected)
+                self.assertEqual(served.headers["Vercel-CDN-Cache-Control"], expected)
 
     def test_stale_serves_are_counted_in_cache_metrics(self) -> None:
         self.harness.get("/public/v1/blocks")

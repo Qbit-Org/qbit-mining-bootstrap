@@ -67,7 +67,16 @@ Successful `GET /public/v1` responses are safe to cache briefly. The service
 emits conservative browser caching (`Cache-Control: public, max-age=0,
 must-revalidate`) plus shared-cache headers for CDNs such as Vercel. Dynamic
 dashboard read models default to a 5-second shared-cache TTL with 30 seconds of
-`stale-while-revalidate`. The pool-wide aggregate read models —
+`stale-while-revalidate` before applying the route limit. Both shared-cache TTL
+and stale-while-revalidate are clamped to the route's
+published staleness budget. For example, a default plain read uses a 5-second
+TTL and at most 10 additional stale seconds within its 15-second budget.
+Background refreshes share four worker slots across all response caches in the
+process. When they are busy, eligible stale responses remain available within
+their existing window; additional refresh work is not queued. A later request
+can retry after capacity returns.
+
+The pool-wide aggregate read models —
 `GET /public/v1/pool-summary`, `GET /public/v1/hashrate-series`, and
 `GET /public/v1/miners/{recipient_id}/workers` — are expensive to recompute and
 default to a 30-second shared-cache TTL instead.

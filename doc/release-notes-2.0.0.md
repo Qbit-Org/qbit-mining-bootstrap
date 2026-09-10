@@ -1,7 +1,5 @@
 # qbit-mining-bootstrap 2.0.0 Release Notes
 
-Release date: pending
-
 This is the first 2.x release. Changes temporarily labelled 2.0.1 and 2.0.2
 during development are included here; those versions were not tagged or
 published as GitHub releases.

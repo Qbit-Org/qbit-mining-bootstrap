@@ -2043,7 +2043,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertEqual(first_age, "0")
         self.assertEqual(second_age, "0")
         self.assertEqual(first_browser_cache, "public, max-age=0, must-revalidate")
-        self.assertEqual(first_cdn_cache, "public, max-age=30, stale-while-revalidate=30")
+        self.assertEqual(first_cdn_cache, "public, max-age=15")
         self.assertEqual(second_cdn_cache, first_cdn_cache)
         self.assertEqual(ledger.leaderboard_calls, 1)
 
@@ -2252,7 +2252,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
-        self.assertEqual(config_cache, "public, max-age=600, stale-while-revalidate=3600")
+        self.assertEqual(config_cache, "public, max-age=600, stale-while-revalidate=300")
         self.assertEqual(artifact_cache, "public, max-age=7200, stale-while-revalidate=86400, immutable")
 
     def test_public_api_errors_use_public_error_schema(self) -> None:

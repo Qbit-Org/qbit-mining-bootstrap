@@ -23,7 +23,7 @@ Their changes and migration requirements are consolidated in
 Merge the intended development cutoff into the promotion branch and retain
 fixes already made during promotion review. Check package versions together,
 run Docker lint and the relevant test gates, and review upgrade and rollback
-instructions. Keep `Release date: pending` until publication is scheduled;
+instructions. Leave the release date out while publication is unscheduled;
 set the actual release date in a reviewed commit before the final merge.
 
 ## Publish the reviewed main commit

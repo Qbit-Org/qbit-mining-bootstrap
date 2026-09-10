@@ -998,13 +998,20 @@ def make_handler(service: PublicReadService) -> type[BaseHTTPRequestHandler]:
             # the window is withdrawn entirely: the outage contract serves
             # only unexpired entries, and its refusal compute must not be
             # deferred to a background thread nobody answers.
+            ttl_seconds = cache_policy.ttl_seconds
             swr_seconds = cache_policy.stale_while_revalidate_seconds
             if budget_seconds is not None:
-                swr_seconds = max(
-                    0, min(swr_seconds, int(budget_seconds) - cache_policy.ttl_seconds)
-                )
+                ttl_seconds = max(0, min(ttl_seconds, int(budget_seconds)))
+                swr_seconds = max(0, min(swr_seconds, int(budget_seconds) - ttl_seconds))
             if degraded:
                 swr_seconds = 0
+            # Use the same effective policy for origin storage and CDN headers.
+            # Otherwise downstream stale serving can outlive this route's budget.
+            cache_policy = public_api.PublicCachePolicy(
+                ttl_seconds=ttl_seconds,
+                stale_while_revalidate_seconds=swr_seconds,
+                immutable=cache_policy.immutable,
+            )
             status, payload, cache_state, age_seconds = cache.get_or_compute(
                 key=public_api.public_cache_key(path, query),
                 ttl_seconds=cache_policy.ttl_seconds,
