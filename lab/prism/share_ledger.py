@@ -6730,7 +6730,7 @@ SELECT json_build_object(
                         'error', attempt.error
                     ) ORDER BY attempt.attempt_seq ASC)
                     FROM qbit_ctv_fanout_broadcast_attempts attempt
-                    WHERE attempt.fanout_txid = fanout_txid
+                    WHERE attempt.fanout_txid = page_rows.fanout_txid
                 ),
                 '[]'::json
             )
