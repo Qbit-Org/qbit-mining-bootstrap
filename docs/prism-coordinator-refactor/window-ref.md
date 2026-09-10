@@ -55,7 +55,8 @@ base, the window reaches three: `qbit_prism_jobs.payload` at refresh,
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowRef {
     pub anchor_ms: i64,                   // Snapshot.anchor_ms, the predicate's cutoff
-    pub prior_balances_digest: [u8; 32],  // qbit_prism::prior_balances_digest(&snapshot.prior_balances); lowercase hex in JSON
+    #[serde(with = "hex32")]              // lowercase 64-hex in JSON, not an integer array
+    pub prior_balances_digest: [u8; 32],  // qbit_prism::prior_balances_digest(&snapshot.prior_balances)
     pub shares: Option<ShareRange>,       // None: no ledger share falls inside the difficulty window
 }
 
@@ -64,6 +65,7 @@ pub struct ShareRange {
     pub first_share_seq: u64,             // inclusive, >= 1
     pub last_share_seq: u64,              // inclusive, >= first_share_seq
     pub share_count: u64,                 // rows matched by the window predicate, >= 1, <= last - first + 1
+    #[serde(with = "hex32")]              // lowercase 64-hex in JSON, not an integer array
     pub snapshot_sha256: [u8; 32],        // sha256(serde_json::to_vec(&shares)), same bytes as qbit_prism_audit_snapshots
 }
 ```
@@ -72,8 +74,16 @@ A reference is built from a `Snapshot` (`srv/src/ledger.rs:64-70`):
 `anchor_ms` is copied, the digests are computed as in [Digests](#digests),
 and `shares` is `None` when `snapshot.shares` is empty, otherwise the
 sequence numbers of its first and last share, `shares.len()` and the snapshot
-digest. Rust holds the digests as `[u8; 32]`; they serialize as lowercase hex
-and decoding validates them. `share_count` is added to the issue's fields
+digest. Rust holds the digests as `[u8; 32]`. A derived `Serialize` would
+write each as a JSON array of 32 integers, so both digest fields carry
+`#[serde(with = "hex32")]`, a small adapter module in `ledger/window.rs`
+(the server's `hex = "0.4"` is declared without its `serde` feature,
+`srv/Cargo.toml:18`). It serializes with `hex::encode`, which is lowercase,
+and deserializes only a string of exactly 64 characters from `[0-9a-f]`,
+rejecting uppercase, so the JSON form equals the column's CHECKed text byte
+for byte and the payload/column comparison below is exact. Whichever of #265
+and #273 lands first adds the module, with a round-trip test and rejection
+tests for uppercase, short, long and non-hex input. `share_count` is added to the issue's fields
 because a range can contain rejected rows and rows stamped after the anchor,
 so `last - first + 1` is not the count; it also turns a pruned range into a
 cheap typed error before any hashing, as `srv/src/ledger/audit.rs:63-66`
@@ -186,7 +196,7 @@ ALTER TABLE qbit_block_candidate_outbox ADD CONSTRAINT qbit_block_candidate_outb
 The reference lives in both places on both tables, uniformly:
 
 - The row's small JSON document embeds `window: WindowRef`, digests as
-  lowercase hex: the `Candidate` for 007 (`srv/src/ledger.rs:39-49`), the
+  lowercase hex through the `hex32` adapter ([`WindowRef`](#windowref)): the `Candidate` for 007 (`srv/src/ledger.rs:39-49`), the
   `StoredPrepared` for 008 (`srv/src/coordinator.rs:46-55`). For 007,
   `candidate_sha256` keeps covering the whole document including the
   reference, as it covers the candidate today (`srv/src/ledger.rs:695-696` at
@@ -362,7 +372,7 @@ one `tokio::time::timeout` around `read_window` plus the rebuild:
 | Caller | Deadline | On expiry |
 | --- | --- | --- |
 | claim (#265) | **60 s** for the whole call. The candidate lease is not a deadline: its heartbeat renews it every 30 s for as long as processing runs (`srv/src/coordinator.rs:887-907`), and only a failed renewal drops the work (`:950-963`). Against the estimate, 60 s is twelve times the 5 s upper bound and four statement timeouts at the 15 s default, so a rebuild that needs longer is a harness finding, not a reason to raise it | fail the attempt through `retry_candidate` (`srv/src/ledger.rs:590`) with an alert; the lease was renewed within the last 30 s of a 120 s term, so the `claim_expires_at > clock_timestamp()` condition holds and the row is rescheduled after `LEAST(60, attempt_count)` seconds (`:594`), never abandoned |
-| resume (#273) | strictly shorter than the caller's: `resume_job`'s only caller already wraps it in `timeout(initial_job_timeout_seconds, …)` and maps expiry to the backend error "job resume timed out" (`srv/src/stratum.rs:1215-1220`). Proposed `initial_job_timeout_seconds − 5 s`, 25 s at the 30 s default (`srv/src/config.rs:195`), tunable by #273 | cache miss: log and return `Ok(None)`; the share is then rejected as `unknown-job` (`srv/src/stratum.rs:1239-1243`), not answered with fresh work |
+| resume (#273) | strictly shorter than the caller's: `resume_job`'s only caller already wraps it in `timeout(initial_job_timeout_seconds, …)` and maps expiry to the backend error "job resume timed out" (`srv/src/stratum.rs:1215-1220`). Proposed: from the `Duration` the caller already builds, `outer = Duration::from_secs_f64(initial_job_timeout_seconds)`, the inner deadline is `outer - (outer / 2).min(Duration::from_secs(5))`, that is `outer − min(5 s, outer / 2)`: 25 s at the 30 s default (`srv/src/config.rs:195`), 2 s at a 4 s setting, always positive, strictly shorter than the outer timeout and free of `Duration` underflow, so it adds no failure mode the outer `from_secs_f64` does not already have. A plain `− 5 s` would be zero or negative for any setting at or below 5 s, which validation allows: production only requires `> 0.0` (`srv/src/config.rs:194-197`) and `srv/src/stratum.rs:449-452` parses the value without a range check. Tunable by #273 | cache miss: log and return `Ok(None)`; the share is then rejected as `unknown-job` (`srv/src/stratum.rs:1239-1243`), not answered with fresh work |
 
 ### Errors and callers
 
@@ -374,7 +384,7 @@ one `tokio::time::timeout` around `read_window` plus the rebuild:
 | `SnapshotDigestMismatch`, `Decode` | corruption, a reference built from different bytes, or payload/column disagreement | same as `Incomplete`, with an alert | same as `Incomplete` | as above | same as `Incomplete` |
 | `Database` (incl. 57014) | transient | propagate: `submit_loop` hands the error to `retry_candidate` (`srv/src/coordinator.rs:1123-1131`), which releases the claim and reschedules the row after `LEAST(60, attempt_count)` seconds (`srv/src/ledger.rs:594`); lease expiry recovers the row only if that write itself fails | propagate; the reconnect fails and retries | as above | propagate |
 | landing equality failure after a successful `read_window` (`srv/src/ledger/audit.rs:132-138`) | the landing transaction read a different range than the claim did, which immutability forbids | like `SnapshotDigestMismatch`: `retry_candidate` with an alert, never abandon; the error already reaches `submit_loop`'s retry path (`srv/src/coordinator.rs:1123-1131`) | n/a | the check stays | n/a |
-| caller deadline expired | `read_window` plus the rebuild outran the deadline in the table above | 60 s: `retry_candidate` with an alert | `initial_job_timeout_seconds − 5 s`: `Ok(None)`; the share is rejected as `unknown-job` | n/a | n/a |
+| caller deadline expired | `read_window` plus the rebuild outran the deadline in the table above | 60 s: `retry_candidate` with an alert | `outer − min(5 s, outer / 2)`: `Ok(None)`; the share is rejected as `unknown-job` | n/a | n/a |
 | empty window (`shares: None`) | not an error | rebuild from `vec![bootstrap_share]` | rebuild the bootstrap bundle per miner, as today | lands through `inline_shares` (`srv/src/ledger/audit.rs:124-131`), unchanged | n/a |
 
 ## Revision fence and reorgs
@@ -696,7 +706,7 @@ normalizes `reward_manifest.shares` out of the stored body; the
 - **djh58 (#273).** Whether `payout_revision` stays a row column rather than
   a `WindowRef` field; whether legacy inline prepared rows are a cache miss
   rather than migrated; the inner resume timeout of
-  `initial_job_timeout_seconds − 5 s` and the single-flight map; storing the
+  `outer − min(5 s, outer / 2)` and the single-flight map; storing the
   policy inputs in `StoredPrepared`; and whether 0.7 to 1.4 s of digest CPU
   per non-cached refresh is acceptable until #274.
 - **Anatolie (#283).** Confirm `ledger/window.rs` as the home of `WindowRef`,
