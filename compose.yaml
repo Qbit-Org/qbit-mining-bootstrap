@@ -686,6 +686,8 @@ services:
 
   # Inactive template for compose.prism-ha.yaml. Keep the full environment shared
   # here: Compose extends is resolved before file merging and loses overrides.
+  # The audit mount is deliberately shared for legacy compatibility; native
+  # Rust audit bodies are canonical in PostgreSQL, not written to this mount.
   prism-coordinator-2:
     <<: *prism-coordinator
     profiles: ["prism-ha-overlay-required"]

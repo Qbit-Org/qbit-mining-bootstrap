@@ -37,20 +37,20 @@ Apply HA last:
 
 ```sh
 # Bundled lab database, one bundled node, two frontends:
-docker compose -f compose.yaml -f compose.prism-ha.yaml --profile prism config
+docker compose -f compose.yaml -f compose.prism-ha.yaml --profile prism config --quiet
 docker compose -f compose.yaml -f compose.prism-ha.yaml --profile prism up -d
 
 # Production image/storage restrictions, bundled database:
 docker compose -f compose.yaml -f compose.production.yaml \
-  -f compose.prism-ha.yaml --profile prism config
+  -f compose.prism-ha.yaml --profile prism config --quiet
 
 # Operator database endpoint:
 docker compose -f compose.yaml -f compose.prism-external-db.yaml \
-  -f compose.prism-ha.yaml --profile prism config
+  -f compose.prism-ha.yaml --profile prism config --quiet
 
 # Production restrictions and operator database endpoint:
 docker compose -f compose.yaml -f compose.production.yaml \
-  -f compose.prism-external-db.yaml -f compose.prism-ha.yaml --profile prism config
+  -f compose.prism-external-db.yaml -f compose.prism-ha.yaml --profile prism config --quiet
 ```
 
 All four stacks are supported and validated in CI on pushes and PRs. Production
@@ -86,13 +86,19 @@ These are interpolation knobs, not new application environment readers:
 | Operator input | Default | Container/effective consumer |
 | --- | --- | --- |
 | `PRISM_HA_INSTANCE_ID_1`, `PRISM_HA_INSTANCE_ID_2` | `prism-frontend-1`, `prism-frontend-2` | `PRISM_INSTANCE_ID` → existing `Config::from_env().instance_id` → `Coordinator` / `Ledger` / health and heartbeat. HA supersedes the global `PRISM_INSTANCE_ID`. |
-| `PRISM_HA_RPC_HOST_1`, `PRISM_HA_RPC_HOST_2` | `qbitd`, `qbitd` | `QBIT_RPC_HOST` → existing `rpc_connection_from_env()` → `Config.rpc_url` → coordinator RPC client. HA supersedes global `QBIT_RPC_HOST`. |
-| `PRISM_HA_RPC_URL_1`, `PRISM_HA_RPC_URL_2` | empty, empty | `QBIT_RPC_URL` → same existing reader. A nonempty URL wins over host **and** `QBIT_RPC_PORT`; blank uses `http://<host>:<QBIT_RPC_PORT>/`. HA supersedes global `QBIT_RPC_URL`. `QBIT_RPC_USER/PASSWORD` and the fallback port remain shared; different node credentials require a service environment override. |
+| `PRISM_HA_RPC_HOST_1`, `PRISM_HA_RPC_HOST_2` | global `QBIT_RPC_HOST`, or `qbitd` | `QBIT_RPC_HOST` → existing `rpc_connection_from_env()` → `Config.rpc_url` → coordinator RPC client. A nonempty per-frontend setting wins; otherwise the global setting is preserved. |
+| `PRISM_HA_RPC_URL_1`, `PRISM_HA_RPC_URL_2` | global `QBIT_RPC_URL`, or empty | `QBIT_RPC_URL` → same existing reader. A nonempty URL wins over host **and** `QBIT_RPC_PORT`; blank uses `http://<host>:<QBIT_RPC_PORT>/`. A nonempty per-frontend setting wins; otherwise the global URL is preserved. To use a per-frontend host when a global URL exists, provide a complete per-frontend URL; a blank override falls back to the global URL. `QBIT_RPC_USER/PASSWORD` and the fallback port remain shared; different node credentials require a service environment override. |
 | `PRISM_DATABASE_URL` (existing) | bundled `prism-postgres:5432`, default DB/user `qbit` | Same full DSN on both services → `Config.database_url` validation → `Ledger::connect`; no HA-specific DSN or second environment reader. Database credentials are inherited from the base. |
-| `PRISM_STRATUM_PORT_HOST` (existing), `PRISM_HA_STRATUM_PORT_HOST_2` | `3340`, `3343` | Docker publishes to the common `PRISM_STRATUM_PORT` (default `3340`), read by existing `StratumConfig`. Host mappings do not alter the listener. |
-| `PRISM_STRATUM_HIGHDIFF_PORT_HOST` (existing), `PRISM_HA_HIGHDIFF_PORT_HOST_2` | both `127.0.0.1:0` | Docker allocates separate loopback host ports; target is `PRISM_STRATUM_HIGHDIFF_PORT` or `4334`. The actual listener remains disabled unless its existing runtime setting enables it. Choose distinct explicit host ports when enabling it. |
-| `PRISM_HA_HEALTH_PORT_HOST_1`, `PRISM_HA_HEALTH_PORT_HOST_2` | `127.0.0.1:3341`, `127.0.0.1:3344` | Docker publishes the common `PRISM_AUDIT_PORT` (default `3341`) used by existing API configuration and `healthcheck`. |
-| `PRISM_AUDIT_BIND` (existing, changed HA default) | `0.0.0.0` in HA | Existing API listener reader; both services bind inside the container so published probes work. An explicit loopback-only bind defeats host forwarding. Keep `PRISM_AUDIT_PORT` nonzero for HTTP probes. |
+| `PRISM_HA_STRATUM_PORT_HOST_1`, `PRISM_HA_STRATUM_PORT_HOST_2` | existing `PRISM_STRATUM_PORT_HOST` or `3340`; `3343` | Docker publishes to the common `PRISM_STRATUM_PORT` (default `3340`), read by existing `StratumConfig`. Host mappings do not alter the listener. |
+| `PRISM_HA_HIGHDIFF_PORT_HOST_1`, `PRISM_HA_HIGHDIFF_PORT_HOST_2` | existing `PRISM_STRATUM_HIGHDIFF_PORT_HOST` or `127.0.0.1:0`; `127.0.0.1:0` | Docker allocates separate loopback host ports; target is `PRISM_STRATUM_HIGHDIFF_PORT` or `4334`. The actual listener remains disabled unless its existing runtime setting enables it. Choose distinct explicit host ports when enabling it. |
+| `PRISM_HA_HEALTH_PORT_HOST_1`, `PRISM_HA_HEALTH_PORT_HOST_2` | `127.0.0.1:3341`, `127.0.0.1:3344` | Docker publishes the common `PRISM_HA_AUDIT_PORT` target; the effective `PRISM_AUDIT_PORT` is read by existing API configuration and `healthcheck`. |
+| `PRISM_HA_AUDIT_BIND` | `0.0.0.0` in HA | `PRISM_AUDIT_BIND` → existing API listener reader; this HA knob supersedes the base `PRISM_AUDIT_BIND`, including the loopback value in `.env.example`, so published probes work. An explicit loopback-only bind defeats host forwarding. Use a reachable bind for HTTP probes. |
+| `PRISM_HA_AUDIT_PORT` | `3341` | Supersedes base `PRISM_AUDIT_PORT` (including `0`) on both services and their published targets → existing `Config.audit_port` / API listener and `healthcheck`. Must be nonzero. |
+
+The HTTP health listener is required by this overlay's external LB contract.
+Audit-disabled deployments are unsupported with this overlay; they need an
+explicit operator override of both environment and port mappings, plus their own
+readiness contract. Set the HA port knob when migrating a custom audit port.
 
 Only health ports default to host loopback; Stratum defaults publish on all host
 interfaces. Permit the health ports only from the operator's management/LB
@@ -113,7 +119,7 @@ PRISM_HA_RPC_URL_2=http://node-west.internal:19452/ \
 docker compose -f compose.yaml -f compose.prism-ha.yaml --profile prism config \
   --format json | jq '.services | with_entries(select(.key | startswith("prism-coordinator"))) |
     map_values({ports, environment: (.environment |
-      {PRISM_INSTANCE_ID, QBIT_RPC_HOST, QBIT_RPC_URL, PRISM_AUDIT_BIND, PRISM_AUDIT_PORT})})'
+      {PRISM_INSTANCE_ID, PRISM_AUDIT_BIND, PRISM_AUDIT_PORT})})'
 
 docker compose -f compose.yaml -f compose.prism-ha.yaml --profile prism \
   exec prism-coordinator qbit-prism-server check-config
@@ -121,7 +127,7 @@ docker compose -f compose.yaml -f compose.prism-ha.yaml --profile prism \
   exec prism-coordinator-2 qbit-prism-server check-config
 ```
 
-For image qualification also render with `config --resolve-image-digests` using
+For image qualification also render with `config --resolve-image-digests --quiet` using
 available registry images, or start the built images and inspect health IDs,
 effective RPC targets and port mappings through the real startup path. A plain
 render alone does not demonstrate that a node answers RPC or that a coordinator
@@ -153,12 +159,12 @@ pool, so it observes the session value actually used, not just a server default.
 For `remote_apply`, set the writer role/database default before reconnecting all
 writer pools; existing connections do not retroactively receive a role default.
 
-| Decision for Dan | Exact policy | Standby-loss ACK contract | Recommendation / remaining gate |
-| --- | --- | --- | --- |
-| Strict replicated durability | `synchronous_commit=on`; `synchronous_standby_names='FIRST 1 (prism_standby_1)'` | Intended policy: stop positive ACKs until a standby can durably confirm. One standby means losing it consumes all redundancy. | **Recommended**, if preserving acknowledged shares after primary loss outranks continued ACK availability. Must qualify cancellation and timeout handling before claiming strict enforcement. |
-| Strict durability plus immediate read visibility | `remote_apply` with the same named standby | Intended policy: stop ACKs until replay confirmation. | Choose only if ACK-time standby visibility is required; extra replay latency couples public reads to mining. Same qualification gate. |
-| Asynchronous availability | `on`; `synchronous_standby_names=''` | Continue locally durable ACKs while the standby is absent; primary loss can lose the replication gap. | Explicit loss-risk choice; do not call it lossless accounting failover. This is the existing bundled **lab** default, not an approval of D3. |
-| Synchronous normally, explicitly degraded during outage | `on` + named standby normally; an authorized operator changes names to `''` and reloads during the outage | ACKs continue locally after degradation; pending waits can be released. New ACKs have no replica guarantee until synchronization is restored. | Requires Dan to approve who may degrade, for how long, and how the risk interval is recorded. No automatic fallback is supplied or recommended by this change. |
+| Decision for Dan | Exact policy | Where to set it | Standby-loss ACK contract | Recommendation / remaining gate |
+| --- | --- | --- | --- | --- |
+| Strict replicated durability | `synchronous_commit=on`; `synchronous_standby_names='FIRST 1 (prism_standby_1)'` | Set names in primary `postgresql.conf`, then `SELECT pg_reload_conf();`; PRISM's pool `after_connect` sets `on` unless the role selects `remote_apply`. | Intended policy: stop positive ACKs until a standby can durably confirm. One standby means losing it consumes all redundancy. | **Recommended**, if preserving acknowledged shares after primary loss outranks continued ACK availability. Must qualify cancellation and timeout handling before claiming strict enforcement. |
+| Strict durability plus immediate read visibility | `remote_apply` with the same named standby | Set names in primary `postgresql.conf` and reload; run `ALTER ROLE prism_writer IN DATABASE qbit SET synchronous_commit = 'remote_apply';` and reconnect **all** writer pools. The pool preserves this value. | Intended policy: stop ACKs until replay confirmation. | Choose only if ACK-time standby visibility is required; extra replay latency couples public reads to mining. Same qualification gate. |
+| Asynchronous availability | `on`; `synchronous_standby_names=''` | Clear names in primary `postgresql.conf` and reload; PRISM's pool selects `on` (or preserves `remote_apply`, which also only waits locally with no names). | Continue locally durable ACKs while the standby is absent; primary loss can lose the replication gap. | Explicit loss-risk choice; do not call it lossless accounting failover. This is the existing bundled **lab** default, not an approval of D3. |
+| Synchronous normally, explicitly degraded during outage | `on` + named standby normally; an authorized operator changes names to `''` and reloads during the outage | Change names in primary `postgresql.conf` and run `SELECT pg_reload_conf();` at each policy transition; PRISM keeps `on` in its writer sessions. | ACKs continue locally after degradation; pending waits can be released. New ACKs have no replica guarantee until synchronization is restored. | Requires Dan to approve who may degrade, for how long, and how the risk interval is recorded. No automatic fallback is supplied or recommended by this change. |
 
 No timeout, missing heartbeat, load-balancer state or Compose restart authorizes
 changing that policy. After promotion there is temporarily **no standby** until
@@ -369,6 +375,10 @@ describe that instant, before the rest of self-check runs. Ages and the fixed
 `ready=false` during a rebuild. This is process liveness, not mining readiness
 or a proof of distinct failure domains. Startup/stopped rows are listed as
 inactive; they do not manufacture redundancy. Old rows remain listed as stale.
+After a frontend has been stopped and its ID permanently retired, an operator
+may run `DELETE FROM qbit_prism_instances WHERE instance_id = '<retired-id>';`
+against the writer. Retirement is manual, never automatic; do not remove a
+running frontend's row to hide a liveness problem.
 
 | Observation | `status` / `count` | Meaning |
 | --- | --- | --- |
@@ -379,6 +389,14 @@ inactive; they do not manufacture redundancy. Old rows remain listed as stale.
 | Two fresh server rows | `observed` / `2` | IDs and rows listed; inspect readiness separately. |
 | Future-dated or unrecognized fresh rows | `unknown` / `null` | Count is not asserted; inspect `unknown_instances`. |
 | Failed query/connect, or 5-second read deadline exceeded | `failed` / `null` | No sample timestamp or instance list; self-check emits `ok=false` and exits unsuccessfully, without logging a credentialed DSN. |
+
+The report always uses the same `qbit.prism.self-check.v2` shape. A heartbeat
+read failure does not skip the remaining local checks: the command completes
+its report with `ok=false`, null unavailable fields, and a nonzero exit. Local
+check failures also produce that shape and a nonzero exit; successful local
+checks cannot mask a failed heartbeat read. `single_instance` is null when no
+live rows are known (or the observation is unknown/failed), true for exactly one,
+and false for two or more.
 
 Successful observations include `instance_ids`, `instances`, `stale_instances`,
 `inactive_instances` and `unknown_instances`. Fewer than two known live rows
