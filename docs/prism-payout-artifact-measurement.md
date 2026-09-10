@@ -149,6 +149,10 @@ test/prism-native-tests.sh cargo-args \
 Always name the test: `--ignored` without a filter also starts
 `jsonb_ceiling_baseline_sweep` in the same process, against the same cluster.
 
+The full-size run measures the reduced pair first, then 400,000 shares. It needs
+the reduced pair's projections to attribute the writes PostgreSQL refuses at
+full size, so budget its wall clock on top.
+
 Full size against a PostgreSQL you already have:
 
 ```sh
@@ -157,7 +161,9 @@ PRISM_TEST_DATABASE_URL=postgresql://user@127.0.0.1:5432/postgres \
   -- --ignored --nocapture jsonb_ceiling_ratchet_at_full_size
 ```
 
-The baseline sweep that produced the table below:
+The baseline sweep that produced the table below. It also runs the reduced pair,
+5,000 and 20,000, for the CI projection it checks its own sizes against, and
+skips a size the list already contains:
 
 ```sh
 PRISM_JSONB_GATE_BASELINE_SIZES=50000,100000,200000 \
@@ -227,6 +233,21 @@ between the two sizes, and a straight line would understate it. The measured
 window-carrying writes sit under 0.3%. A positive intercept, up to the `n1` size
 itself for a constant-size write, is a fixed per-write overhead and is allowed.
 The full-size run compares the measured size directly.
+
+A refusal is a result rather than a crash, but PostgreSQL's ceiling error names
+neither the table nor the column, and the server adds no context that would.
+The gate therefore attributes every refusal by projection: among the columns the
+refused phase writes, exactly one has to project past 90% of the hard limit at
+the refused share count, and it has to be the write the gate expected there. No
+candidate, two candidates, or a single candidate that is not the expected write
+each fail the gate, naming what was found and what was expected, so a second
+oversized write in the same phase can never be recorded as the one already
+known. The projections come from the reduced pair, which is why the full-size
+run and the baseline sweep both run that pair first; at the reduced sizes
+themselves a refusal at `n2` is attributed from the `n1` measurement, and a
+refusal at `n1` fails the gate, since nothing smaller was accepted to attribute
+it from. The ratchet row says how: `refused at n=400000 (attributed by
+projection)`, and never a byte count.
 
 The gate passes only when the set of crossing writes equals `KNOWN_VIOLATIONS`
 exactly. An unlisted write that crosses fails it as a new violation. A listed
@@ -370,7 +391,8 @@ size because the import that would write it is refused first.
 
 Two notes on reading the 400,000-share table. The enqueue write is refused, and
 the gate reports it only as refused: `rejected` in its size columns,
-`refused at n=400000` in the ratchet, and PostgreSQL's error text underneath.
+`refused at n=400000 (attributed by projection)` in the ratchet, and
+PostgreSQL's error text underneath.
 After the refusal the gate writes a window-free **substitute** outbox row itself,
 so that the claim, landing and import writes stay measurable instead of being
 reported as unreached. The substitute is not the enqueue write and never enters
@@ -406,9 +428,22 @@ the `prism-native-postgres` job, a 2 vCPU runner with `timeout-minutes: 20`
 not a CI runner, so treat the sum as an estimate of the headroom, not a
 measurement of it.
 
-Fit stability. Projecting to 400,000 shares from the CI pair (5,000 and 20,000)
-and from the largest pair at which all four writes were accepted (50,000 and
-100,000; refresh is refused at 200,000) agrees to well inside 5%:
+Fit stability. The baseline sweep computes and checks this itself, per write. It
+runs the reduced CI pair (5,000 and 20,000) alongside its own sizes, projects
+every write to 400,000 shares from that pair and again from the largest pair of
+sweep sizes at which **that write** was accepted, and fails when the two differ
+by more than 5% of the larger-pair projection. The pair has to be chosen per
+write because the writes are refused at different sizes - refresh is already
+refused at 200,000 while the other three are not - so no single pair fits all
+four. A write accepted at fewer than two sweep sizes fails the sweep by name
+rather than going unchecked, and a CI projection below 1 MiB is reported as not
+compared, because a relative difference that small is fixed per-write overhead
+and not the window's growth. The table below was recorded before the check was
+per write, against 50,000 and 100,000 - the largest pair at which all four
+writes were accepted - and the two projections agree to well inside the
+tolerance. Re-running the same sweep now pairs enqueue, import and landing at
+100,000 and 200,000, where the measurements above show them still accepted;
+refresh, refused at 200,000, keeps 50,000 and 100,000:
 
 | Path | From 5,000 and 20,000 | From 50,000 and 100,000 | Difference |
 | --- | ---: | ---: | ---: |

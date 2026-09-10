@@ -107,6 +107,30 @@ const BYTEA_REPORT_THRESHOLD: i64 = 1_073_741_824 / 4;
 /// 5% is growth faster than linear, which a straight line under-projects.
 const MAX_NEGATIVE_INTERCEPT: f64 = 0.05;
 
+/// How close to the hard ceiling a phase's projected write has to be before a
+/// refusal in that phase can be attributed to it: 90% of the limit.
+/// PostgreSQL's ceiling error names neither the table nor the column, so the
+/// gate names the refused write from the projections instead, and the floor has
+/// to absorb the projection error. Measured fits agree to within 1.4%
+/// (`docs/prism-payout-artifact-measurement.md`), so a 10% margin is seven
+/// times the largest disagreement observed, while still excluding every write
+/// that is nowhere near the ceiling.
+const ATTRIBUTION_FLOOR: f64 = JSONB_ELEMENT_LIMIT as f64 * 0.9;
+
+/// Printed against a refused write to say how the gate decided which column
+/// PostgreSQL refused. Projection is the only method it has.
+const ATTRIBUTED_BY_PROJECTION: &str = "attributed by projection";
+
+/// The largest relative disagreement the baseline sweep accepts between a
+/// write's projection from the reduced CI pair and its projection from the
+/// largest pair of sweep sizes at which that write was accepted.
+const FIT_STABILITY_TOLERANCE: f64 = 0.05;
+
+/// A CI projection below 1 MiB is not compared for fit stability: at that size
+/// fixed per-write overhead dominates, so a large relative difference is noise
+/// rather than a statement about how the window grows.
+const FIT_STABILITY_FLOOR: f64 = 1_048_576.0;
+
 const PHASE_REFRESH: &str = "refresh";
 const PHASE_ENQUEUE: &str = "enqueue";
 const PHASE_CLAIM: &str = "claim";
@@ -836,11 +860,33 @@ struct PhaseStat {
     note: String,
 }
 
+/// A production write PostgreSQL refused, and how the gate decided which
+/// column that refusal belongs to. The ceiling error names neither the table
+/// nor the column, so `attributed` stays `None` until `attribute_refusals` has
+/// checked the projections; an unattributed refusal is never printed as if the
+/// gate knew which write it was.
+#[derive(Clone, Debug)]
+struct Refusal {
+    /// PostgreSQL's error text for this write, taken where it was raised.
+    text: String,
+    /// How the gate attributed this refusal, once it has.
+    attributed: Option<&'static str>,
+}
+
+impl Refusal {
+    fn unattributed(text: String) -> Self {
+        Self {
+            text,
+            attributed: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Pipeline {
     n: u64,
     writes: BTreeMap<WriteKey, PhaseWrite>,
-    rejections: BTreeMap<WriteKey, String>,
+    rejections: BTreeMap<WriteKey, Refusal>,
     /// Rows the gate wrote itself in place of a rejected production write.
     /// Reported under their own label and never fed to the ratchet.
     substitutes: BTreeMap<WriteKey, PhaseWrite>,
@@ -1090,7 +1136,7 @@ async fn pipeline_body(
     inventory.observe(&pool, Observe::Baseline).await?;
 
     let mut writes: BTreeMap<WriteKey, PhaseWrite> = BTreeMap::new();
-    let mut rejections: BTreeMap<WriteKey, String> = BTreeMap::new();
+    let mut rejections: BTreeMap<WriteKey, Refusal> = BTreeMap::new();
     let mut phases: Vec<PhaseStat> = Vec::new();
 
     // --- phase: refresh --------------------------------------------------
@@ -1113,7 +1159,7 @@ async fn pipeline_body(
                         column: "payload".into(),
                         phase: PHASE_REFRESH,
                     },
-                    text.clone(),
+                    Refusal::unattributed(text.clone()),
                 );
                 Some(text)
             }
@@ -1197,7 +1243,7 @@ async fn pipeline_body(
                         column: "candidate".into(),
                         phase: PHASE_ENQUEUE,
                     },
-                    text,
+                    Refusal::unattributed(text),
                 );
                 PhaseStatus::Rejected
             }
@@ -1314,7 +1360,7 @@ async fn pipeline_body(
                         column: "audit_bundle".into(),
                         phase: PHASE_LANDING,
                     },
-                    text,
+                    Refusal::unattributed(text),
                 );
                 PhaseStatus::Rejected
             }
@@ -1373,7 +1419,7 @@ async fn pipeline_body(
                         column: "audit_bundle".into(),
                         phase: PHASE_IMPORT,
                     },
-                    text,
+                    Refusal::unattributed(text),
                 );
                 PhaseStatus::Rejected
             }
@@ -1565,7 +1611,13 @@ enum Size {
 #[derive(Clone, Debug)]
 enum Verdict {
     /// PostgreSQL refused the write at `n` shares; that crosses on its own.
-    Rejected { n: u64, text: String },
+    /// `attributed` says how the gate decided the refusal belongs to this
+    /// column, since PostgreSQL's error does not name it.
+    Rejected {
+        n: u64,
+        text: String,
+        attributed: Option<&'static str>,
+    },
     /// Reduced mode: projected linearly to the target from two measured sizes.
     Projected {
         slope: f64,
@@ -1600,7 +1652,7 @@ impl FitRow {
 struct Sample<'a> {
     n: u64,
     writes: &'a BTreeMap<WriteKey, PhaseWrite>,
-    rejections: &'a BTreeMap<WriteKey, String>,
+    rejections: &'a BTreeMap<WriteKey, Refusal>,
 }
 
 impl Sample<'_> {
@@ -1639,12 +1691,44 @@ fn label(key: &WriteKey) -> String {
     format!("{}.{} @ {}", key.table, key.column, key.phase)
 }
 
+/// Fit `size(n) = intercept + slope*n` through two accepted measurements of one
+/// write. The degenerate pairs are refused rather than projected: a write that
+/// shrank, and one that grew faster than linearly between the two sizes.
+fn straight_line(key: &WriteKey, low: (u64, i64), high: (u64, i64)) -> Result<(f64, f64)> {
+    let ((n1, s1), (n2, s2)) = (low, high);
+    ensure!(
+        n1 < n2,
+        "cannot fit {}: n={n1} is not smaller than n={n2}",
+        label(key)
+    );
+    ensure!(
+        s2 >= s1,
+        "degenerate fit for {}: {s1} B at n={n1} but {s2} B at n={n2} is a negative slope",
+        label(key)
+    );
+    let slope = (s2 - s1) as f64 / (n2 - n1) as f64;
+    let intercept = s1 as f64 - slope * n1 as f64;
+    // With a non-negative slope the intercept can never exceed `s1`; a positive
+    // one up to `s1` is a fixed per-write overhead (a constant-size write has
+    // intercept == s1). Only a large negative one is degenerate: the write grew
+    // faster than linearly between the two sizes, so the projection would
+    // understate it.
+    ensure!(
+        intercept >= -(s1 as f64) * MAX_NEGATIVE_INTERCEPT,
+        "degenerate fit for {}: intercept {intercept:.0} B is more negative than {:.0}% \
+         of the n={n1} measurement of {s1} B, so the write grows faster than linearly and \
+         a linear projection would understate it",
+        label(key),
+        MAX_NEGATIVE_INTERCEPT * 100.0
+    );
+    Ok((slope, intercept))
+}
+
 /// Fit `size(n) = a + b*n` through the two reduced sizes and project to the
 /// target. A rejection at either size counts as crossing on its own.
 fn fit(reduced: [Sample<'_>; 2], target: u64) -> Result<Vec<FitRow>> {
     let [low, high] = reduced;
     ensure!(low.n < high.n, "n1 must be smaller than n2");
-    let span = (high.n - low.n) as f64;
     let mut keys = low.keys();
     keys.extend(high.keys());
     let mut rows = Vec::new();
@@ -1653,10 +1737,14 @@ fn fit(reduced: [Sample<'_>; 2], target: u64) -> Result<Vec<FitRow>> {
         // sizes that were actually written, and report the refusal instead.
         let sizes = vec![low.size(&key), high.size(&key)];
         let rejected = [low, high].into_iter().find_map(|sample| {
-            sample.rejections.get(&key).map(|text| Verdict::Rejected {
-                n: sample.n,
-                text: text.clone(),
-            })
+            sample
+                .rejections
+                .get(&key)
+                .map(|refusal| Verdict::Rejected {
+                    n: sample.n,
+                    text: refusal.text.clone(),
+                    attributed: refusal.attributed,
+                })
         });
         if let Some(verdict) = rejected {
             rows.push(FitRow {
@@ -1678,29 +1766,7 @@ fn fit(reduced: [Sample<'_>; 2], target: u64) -> Result<Vec<FitRow>> {
                 if low_measured { high.n } else { low.n }
             );
         };
-        ensure!(
-            s2 >= s1,
-            "degenerate fit for {}: {s1} B at n={} but {s2} B at n={} is a negative slope",
-            label(&key),
-            low.n,
-            high.n
-        );
-        let slope = (s2 - s1) as f64 / span;
-        let intercept = s1 as f64 - slope * low.n as f64;
-        // With a non-negative slope the intercept can never exceed `s1`; a
-        // positive one up to `s1` is a fixed per-write overhead (a
-        // constant-size write has intercept == s1). Only a large negative one
-        // is degenerate: the write grew faster than linearly between the two
-        // sizes, so the projection would understate it.
-        ensure!(
-            intercept >= -(s1 as f64) * MAX_NEGATIVE_INTERCEPT,
-            "degenerate fit for {}: intercept {intercept:.0} B is more negative than {:.0}% \
-             of the n={} measurement of {s1} B, so the write grows faster than linearly and \
-             a linear projection would understate it",
-            label(&key),
-            MAX_NEGATIVE_INTERCEPT * 100.0,
-            low.n
-        );
+        let (slope, intercept) = straight_line(&key, (low.n, s1), (high.n, s2))?;
         rows.push(FitRow {
             key,
             sizes,
@@ -1725,9 +1791,10 @@ fn absolute(sample: Sample<'_>) -> Vec<FitRow> {
             // left a small unrelated value in the same column.
             let size = sample.size(&key);
             let verdict = match (sample.rejections.get(&key), size) {
-                (Some(text), _) => Verdict::Rejected {
+                (Some(refusal), _) => Verdict::Rejected {
                     n: sample.n,
-                    text: text.clone(),
+                    text: refusal.text.clone(),
+                    attributed: refusal.attributed,
                 },
                 (None, Size::Bytes(bytes)) => Verdict::Measured(bytes),
                 (None, _) => unreachable!("every key comes from writes or rejections"),
@@ -1739,6 +1806,303 @@ fn absolute(sample: Sample<'_>) -> Vec<FitRow> {
             }
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Refusal attribution
+// ---------------------------------------------------------------------------
+
+/// Name the column PostgreSQL refused. Its ceiling error carries neither a
+/// table nor a column, and the server adds no context naming the write, so the
+/// call site's own expectation is an assumption: if a phase ever wrote a second
+/// oversized JSONB value, the refusal would be blamed on the expected column
+/// and the new offender would never be seen. Every refusal is attributed here
+/// instead, from `projections` - what that phase's *accepted* measurements
+/// project for each of its columns at the refused size `n`. Exactly one of them
+/// must reach `ATTRIBUTION_FLOOR`, and it must be the write the call site
+/// expects; anything else fails the gate rather than guessing.
+fn attribute_refusal(
+    phase: &'static str,
+    n: u64,
+    projections: &[(WriteKey, f64)],
+    expected: &WriteKey,
+) -> Result<WriteKey> {
+    // Only this phase's own columns: a write of another phase can sit at the
+    // ceiling without having any part in this refusal.
+    let candidates: Vec<&WriteKey> = projections
+        .iter()
+        .filter(|(key, bytes)| key.phase == phase && *bytes > ATTRIBUTION_FLOOR)
+        .map(|(key, _)| key)
+        .collect();
+    match candidates.as_slice() {
+        [] => bail!(
+            "refusal at {phase}, n={n}, is not explained by any projected write: no {phase} \
+             column projects past {ATTRIBUTION_FLOOR:.0} B ({:.0}% of PostgreSQL's \
+             {JSONB_ELEMENT_LIMIT} B jsonb container limit) at n={n}, so the gate cannot say \
+             which write PostgreSQL refused",
+            ATTRIBUTION_FLOOR / JSONB_ELEMENT_LIMIT as f64 * 100.0
+        ),
+        [only] => {
+            let only = (*only).clone();
+            ensure!(
+                only == *expected,
+                "refusal at {phase}, n={n}, is attributed to {} by projection, but the {phase} \
+                 call site records it against {}; PostgreSQL does not name the refused column, \
+                 so the projection decides. Point the call site at the write that actually \
+                 grew, or shrink it",
+                label(&only),
+                label(expected)
+            );
+            Ok(only)
+        }
+        _ => {
+            let mut named: Vec<String> = candidates.iter().map(|key| label(key)).collect();
+            named.sort();
+            bail!(
+                "ambiguous refusal at {phase}, n={n}: PostgreSQL does not name the column; \
+                 candidates: {}. More than one write of this phase projects at the ceiling, \
+                 so the gate cannot attribute the refusal to any one of them",
+                named.join(", ")
+            )
+        }
+    }
+}
+
+/// Attribute every refusal this pipeline recorded and note how, so the ratchet
+/// row can say it. The attributed key always equals the one the call site
+/// recorded - `attribute_refusal` fails otherwise - so this re-keys the map by
+/// what the projections found rather than by what the call site assumed.
+fn attribute_refusals(pipeline: &mut Pipeline, projections: &[(WriteKey, f64)]) -> Result<()> {
+    let n = pipeline.n;
+    let mut attributed = BTreeMap::new();
+    for (expected, refusal) in std::mem::take(&mut pipeline.rejections) {
+        let key = attribute_refusal(expected.phase, n, projections, &expected)?;
+        report!(
+            "[n={n}] refusal at {}: {ATTRIBUTED_BY_PROJECTION}",
+            label(&key)
+        );
+        attributed.insert(
+            key,
+            Refusal {
+                attributed: Some(ATTRIBUTED_BY_PROJECTION),
+                ..refusal
+            },
+        );
+    }
+    pipeline.rejections = attributed;
+    Ok(())
+}
+
+/// What a fitted set of rows projects at `n`, one entry per write the fit could
+/// project. A write the fit reported as refused has no projection and is left
+/// out rather than being given a value it never had.
+fn projections_at(rows: &[FitRow], n: u64) -> Vec<(WriteKey, f64)> {
+    rows.iter()
+        .filter_map(|row| match row.verdict {
+            Verdict::Projected {
+                slope, intercept, ..
+            } => Some((row.key.clone(), intercept + slope * n as f64)),
+            Verdict::Rejected { .. } | Verdict::Measured(_) => None,
+        })
+        .collect()
+}
+
+/// What one accepted sample projects at `n`, scaled linearly through the
+/// origin. The reduced run has no second accepted size below a refusal at `n2`,
+/// so its `n1` measurement scaled to `n2` is the projection that attributes it.
+fn projections_scaled(sample: Sample<'_>, n: u64) -> Result<Vec<(WriteKey, f64)>> {
+    ensure!(sample.n > 0, "cannot scale a projection from an n=0 sample");
+    let factor = n as f64 / sample.n as f64;
+    Ok(sample
+        .writes
+        .iter()
+        .map(|(key, write)| (key.clone(), write.uncompressed as f64 * factor))
+        .collect())
+}
+
+/// EP-VALIDATION: the smaller half of the reduced pair is the only accepted
+/// sample a refusal at `n2` can be attributed from, so a refusal at `n1` itself
+/// leaves the gate with nothing to attribute from at all.
+fn ensure_reduced_low_accepted(pipeline: &Pipeline) -> Result<()> {
+    // Named by phase, which the gate measured, and never by the column the
+    // call site assumed: that is exactly what it cannot establish here.
+    let refused: Vec<String> = pipeline
+        .rejections
+        .iter()
+        .map(|(key, refusal)| format!("{} phase: {}", key.phase, refusal.text))
+        .collect();
+    ensure!(
+        refused.is_empty(),
+        "PostgreSQL refused {} write(s) at n={} (PRISM_JSONB_GATE_N1). The ceiling error does \
+         not name the column and there is no smaller accepted measurement to attribute it \
+         from, so the gate cannot say which write was refused. Lower PRISM_JSONB_GATE_N1 \
+         until every phase's write is accepted. {}",
+        refused.len(),
+        pipeline.n,
+        refused.join("; ")
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Fit stability
+// ---------------------------------------------------------------------------
+
+/// One write's large pair and what it projects, against the CI pair.
+#[derive(Clone, Copy, Debug)]
+struct Comparison {
+    /// The two largest sweep sizes at which this write was accepted.
+    low: u64,
+    high: u64,
+    /// What that pair projects at the target.
+    large: f64,
+    /// `|large - ci| / large`.
+    difference: f64,
+}
+
+/// One row of the sweep's fit-stability table: what the reduced CI pair
+/// projects for a write at the target, what the write's own largest accepted
+/// sweep pair projects there, and how far apart the two are.
+#[derive(Clone, Debug)]
+struct StabilityRow {
+    key: WriteKey,
+    /// The reduced pair the CI gate fits, `n1` and `n2`.
+    ci_pair: (u64, u64),
+    /// What that pair projects at the target.
+    ci: f64,
+    /// `None` when the CI projection is below `FIT_STABILITY_FLOOR`: a relative
+    /// difference on a write that small is noise, not a stability signal.
+    compared: Option<Comparison>,
+}
+
+impl StabilityRow {
+    /// The failure this row is, when the two projections disagree by more than
+    /// the tolerance. A row that was not compared can never fail.
+    fn divergence(&self) -> Option<String> {
+        let comparison = self.compared?;
+        (comparison.difference > FIT_STABILITY_TOLERANCE).then(|| {
+            format!(
+                "fit stability: {} projects {:.0} B at the target from n={} and n={}, but \
+                 {:.0} B from n={} and n={}, a difference of {:.2}% over the {:.0}% tolerance. \
+                 One straight line does not describe this write across both pairs, so the \
+                 reduced-size gate's projection cannot be trusted for it",
+                label(&self.key),
+                self.ci,
+                self.ci_pair.0,
+                self.ci_pair.1,
+                comparison.large,
+                comparison.low,
+                comparison.high,
+                comparison.difference * 100.0,
+                FIT_STABILITY_TOLERANCE * 100.0
+            )
+        })
+    }
+}
+
+/// Build one row of the fit-stability table. `measured` is this write's size at
+/// each sweep size, in ascending order of size; its large pair is the two
+/// largest of those sizes at which the write was *accepted*, which is a
+/// per-write choice: a write PostgreSQL refused at the top of the sweep has no
+/// projection there, and borrowing another write's pair would hide that.
+fn fit_stability(
+    key: &WriteKey,
+    ci_pair: (u64, u64),
+    ci: f64,
+    measured: &[(u64, Size)],
+    target: u64,
+) -> Result<StabilityRow> {
+    let accepted: Vec<(u64, i64)> = measured
+        .iter()
+        .filter_map(|(n, size)| match size {
+            Size::Bytes(bytes) => Some((*n, *bytes)),
+            Size::Rejected | Size::NotWritten => None,
+        })
+        .collect();
+    let [.., low, high] = accepted[..] else {
+        bail!(
+            "cannot check fit stability for {}: accepted at fewer than two sweep sizes; add \
+             smaller sizes to {BASELINE_SIZES_VAR} until it is accepted at two of them",
+            label(key)
+        );
+    };
+    if ci < FIT_STABILITY_FLOOR {
+        return Ok(StabilityRow {
+            key: key.clone(),
+            ci_pair,
+            ci,
+            compared: None,
+        });
+    }
+    let (slope, intercept) = straight_line(key, low, high)?;
+    let large = intercept + slope * target as f64;
+    ensure!(
+        large > 0.0,
+        "cannot check fit stability for {}: n={} and n={} project {large:.0} B at {target} \
+         shares, which is not a size",
+        label(key),
+        low.0,
+        high.0
+    );
+    Ok(StabilityRow {
+        key: key.clone(),
+        ci_pair,
+        ci,
+        compared: Some(Comparison {
+            low: low.0,
+            high: high.0,
+            large,
+            difference: (large - ci).abs() / large,
+        }),
+    })
+}
+
+fn stability_row(row: &StabilityRow) -> String {
+    let (large, difference) = match row.compared {
+        Some(comparison) => (
+            format!(
+                "{:.0} B (n={} and n={})",
+                comparison.large, comparison.low, comparison.high
+            ),
+            format!("{:.2}%", comparison.difference * 100.0),
+        ),
+        None => (
+            "-".to_owned(),
+            format!(
+                "not compared (below {:.0} MiB)",
+                FIT_STABILITY_FLOOR / 1_048_576.0
+            ),
+        ),
+    };
+    format!(
+        "{:<62} {:>26} {:<38} {:>28}",
+        label(&row.key),
+        format!("{:.0} B", row.ci),
+        large,
+        difference
+    )
+}
+
+/// The fit-stability table: the columns of the table in
+/// `docs/prism-payout-artifact-measurement.md`, with the large pair named per
+/// write because each write has its own.
+fn stability_lines(rows: &[StabilityRow], target: u64, ci_pair: (u64, u64)) -> Vec<String> {
+    let mut lines = vec![
+        String::new(),
+        format!(
+            "--- fit stability: projections to {target} shares, tolerance {:.0}% ---",
+            FIT_STABILITY_TOLERANCE * 100.0
+        ),
+        format!(
+            "{:<62} {:>26} {:<38} {:>28}",
+            "path",
+            format!("from n={} and n={}", ci_pair.0, ci_pair.1),
+            "from the largest accepted pair",
+            "difference"
+        ),
+    ];
+    lines.extend(rows.iter().map(stability_row));
+    lines
 }
 
 /// How the ratchet table was produced, which decides its column headers.
@@ -1783,7 +2147,12 @@ fn size_cell(size: Size) -> String {
 
 fn verdict_cell(verdict: &Verdict) -> String {
     match verdict {
-        Verdict::Rejected { n, .. } => format!("refused at n={n}"),
+        // EP-OBSERVABILITY: the cell says how the column was attributed, since
+        // PostgreSQL's error did not name it, and never shows a byte count.
+        Verdict::Rejected { n, attributed, .. } => match attributed {
+            Some(how) => format!("refused at n={n} ({how})"),
+            None => format!("refused at n={n} (not attributed)"),
+        },
         Verdict::Projected { bytes, .. } => format!("{bytes:.0}"),
         Verdict::Measured(bytes) => bytes.to_string(),
     }
@@ -1805,7 +2174,7 @@ fn ratchet_row(row: &FitRow) -> String {
     };
     let _ = write!(
         line,
-        " {slope:>12} {intercept:>12} {:>20} {:>8}",
+        " {slope:>12} {intercept:>12} {:>46} {:>8}",
         verdict_cell(&row.verdict),
         if row.crosses() { "YES" } else { "no" }
     );
@@ -1828,7 +2197,7 @@ fn ratchet_lines(rows: &[FitRow], mode: RatchetMode) -> Vec<String> {
     }
     let _ = write!(
         header,
-        " {:>12} {:>12} {:>20} {:>8}",
+        " {:>12} {:>12} {:>46} {:>8}",
         "B/share",
         "intercept B",
         mode.verdict_header(),
@@ -1837,7 +2206,7 @@ fn ratchet_lines(rows: &[FitRow], mode: RatchetMode) -> Vec<String> {
     lines.push(header);
     lines.extend(rows.iter().map(ratchet_row));
     for row in rows {
-        if let Verdict::Rejected { n, text } = &row.verdict {
+        if let Verdict::Rejected { n, text, .. } = &row.verdict {
             lines.push(format!("  refused at n={n}: {} -> {text}", label(&row.key)));
         }
     }
@@ -2011,6 +2380,24 @@ fn assert_phases_reached(pipeline: &Pipeline) -> Result<()> {
 }
 
 fn assert_ratchet(rows: &[FitRow], mode: RatchetMode) -> Result<()> {
+    // EP-OBSERVABILITY: every refusal reaches this table through
+    // `attribute_refusal`. One that did not would print a table, column and
+    // phase that no projection ever backed.
+    for row in rows {
+        if let Verdict::Rejected {
+            n,
+            attributed: None,
+            ..
+        } = &row.verdict
+        {
+            bail!(
+                "the refusal at {}, n={n}, reached the ratchet without being attributed; \
+                 PostgreSQL does not name the refused column, so the gate must not print one \
+                 it has not checked against the projections",
+                label(&row.key)
+            );
+        }
+    }
     for line in ratchet_lines(rows, mode) {
         emit(&line);
     }
@@ -2101,6 +2488,29 @@ fn print_settings(settings: &GateSettings, mode: &str) {
     );
 }
 
+/// The reduced pair the CI gate fits: `n1`, then `n2`, then the straight line
+/// through them, projected to the target. The full-size run and the baseline
+/// sweep need the same fit to attribute their refusals, so they run it too.
+async fn reduced_pair(
+    url: &str,
+    settings: &GateSettings,
+) -> Result<(Pipeline, Pipeline, Vec<FitRow>)> {
+    let low = run_pipeline(url, settings.n1.value, settings).await?;
+    print_measurements(&low);
+    assert_phases_reached(&low)?;
+    ensure_reduced_low_accepted(&low)?;
+    let mut high = run_pipeline(url, settings.n2.value, settings).await?;
+    print_measurements(&high);
+    assert_phases_reached(&high)?;
+    // A refusal at n2 is only reachable by raising PRISM_JSONB_GATE_N2. The n1
+    // measurement is the only accepted sample below it, so the projection that
+    // attributes the refusal is that measurement scaled to n2.
+    let projections = projections_scaled(low.sample(), settings.n2.value)?;
+    attribute_refusals(&mut high, &projections)?;
+    let rows = fit([low.sample(), high.sample()], settings.target.value)?;
+    Ok((low, high, rows))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2114,13 +2524,7 @@ async fn jsonb_ceiling_ratchet_at_reduced_sizes() -> Result<()> {
     };
     settings.apply_statement_timeout();
     print_settings(&settings, "reduced sizes");
-    let low = run_pipeline(&url, settings.n1.value, &settings).await?;
-    print_measurements(&low);
-    assert_phases_reached(&low)?;
-    let high = run_pipeline(&url, settings.n2.value, &settings).await?;
-    print_measurements(&high);
-    assert_phases_reached(&high)?;
-    let rows = fit([low.sample(), high.sample()], settings.target.value)?;
+    let (low, high, rows) = reduced_pair(&url, &settings).await?;
     report!(
         "reduced-size wall clock: n={} in {:.1} s, n={} in {:.1} s, {:.1} s total",
         low.n,
@@ -2149,8 +2553,13 @@ async fn jsonb_ceiling_ratchet_at_reduced_sizes() -> Result<()> {
 ///
 /// Name the test: `--ignored` alone also starts the baseline sweep in the same
 /// process, against the same cluster.
+///
+/// It runs the reduced pair first. PostgreSQL's ceiling error names no column,
+/// so the refusals at 400,000 shares are attributed from what the reduced pair
+/// projects there; without that pair the gate would be blaming each refusal on
+/// the column its call site assumed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "full-size 400k-share run; minutes of wall clock and gigabytes of RAM"]
+#[ignore = "full-size 400k-share run, after the reduced pair; minutes of wall clock and gigabytes of RAM"]
 async fn jsonb_ceiling_ratchet_at_full_size() -> Result<()> {
     let settings = GateSettings::load()?;
     let Some(url) = database_url()? else {
@@ -2158,9 +2567,12 @@ async fn jsonb_ceiling_ratchet_at_full_size() -> Result<()> {
     };
     settings.apply_statement_timeout();
     print_settings(&settings, "full size");
-    let pipeline = run_pipeline(&url, settings.target.value, &settings).await?;
+    let (_, _, reduced) = reduced_pair(&url, &settings).await?;
+    let mut pipeline = run_pipeline(&url, settings.target.value, &settings).await?;
     print_measurements(&pipeline);
     assert_phases_reached(&pipeline)?;
+    let projections = projections_at(&reduced, pipeline.n);
+    attribute_refusals(&mut pipeline, &projections)?;
     let rows = absolute(pipeline.sample());
     assert_ratchet(&rows, RatchetMode::FullSize { target: pipeline.n })
 }
@@ -2173,6 +2585,15 @@ async fn jsonb_ceiling_ratchet_at_full_size() -> Result<()> {
 ///   cargo test --locked -p qbit-prism-server --test jsonb_ceiling_gate \
 ///   -- --ignored --nocapture jsonb_ceiling_baseline_sweep
 /// ```
+///
+/// The sweep also runs the reduced pair `n1` and `n2` - skipping a size the
+/// list already has - because the whole point of the sweep is to check that the
+/// projection CI makes from that pair still holds at larger windows. It checks
+/// that **per write**, against the two largest sweep sizes at which that write
+/// was accepted: the writes are refused at different sizes, so there is no one
+/// pair that fits them all. A write accepted at fewer than two sweep sizes
+/// fails the sweep instead of going unchecked, and the CI pair is also what
+/// attributes any refusal the sweep hits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "baseline sweep for the measurement document"]
 async fn jsonb_ceiling_baseline_sweep() -> Result<()> {
@@ -2186,32 +2607,84 @@ async fn jsonb_ceiling_baseline_sweep() -> Result<()> {
     settings.apply_statement_timeout();
     print_settings(&settings, "baseline sweep");
     report!("  {BASELINE_SIZES_VAR} = {sizes:?}");
-    let mut runs = Vec::new();
-    for size in sizes {
-        let pipeline = run_pipeline(&url, size, &settings).await?;
+    let (n1, n2, target) = (settings.n1.value, settings.n2.value, settings.target.value);
+    // The reduced pair is the CI projection this sweep checks, so the sweep
+    // runs it too; a size the list already has is never run twice.
+    let mut order: Vec<u64> = sizes.iter().copied().chain([n1, n2]).collect();
+    order.sort_unstable();
+    order.dedup();
+    report!("  the sweep also runs the reduced pair n1={n1} and n2={n2}; run order {order:?}");
+    let mut runs: BTreeMap<u64, Pipeline> = BTreeMap::new();
+    for size in &order {
+        let pipeline = run_pipeline(&url, *size, &settings).await?;
         print_measurements(&pipeline);
         assert_phases_reached(&pipeline)?;
-        runs.push(pipeline);
+        runs.insert(*size, pipeline);
     }
-    // Fit stability: the projection from the CI pair has to agree with the one
-    // from the largest pair measured here.
-    let large = fit(
-        [runs[runs.len() - 2].sample(), runs[runs.len() - 1].sample()],
-        settings.target.value,
-    )?;
-    report!("");
-    report!(
-        "--- projections from the largest baseline pair (n={} and n={}) ---",
-        runs[runs.len() - 2].n,
-        runs[runs.len() - 1].n
-    );
-    for row in &large {
-        let value = match &row.verdict {
-            Verdict::Rejected { n, .. } => format!("refused at n={n}"),
-            verdict => format!("{} B", verdict_cell(verdict)),
+    // The reduced pair first, exactly as the CI gate fits it: a refusal at n1
+    // cannot be attributed at all, and one at n2 is attributed from n1.
+    let low = runs.get(&n1).context("the sweep did not run n1")?;
+    ensure_reduced_low_accepted(low)?;
+    let scaled = projections_scaled(low.sample(), n2)?;
+    let high = runs.get_mut(&n2).context("the sweep did not run n2")?;
+    attribute_refusals(high, &scaled)?;
+    let ci_rows = fit([runs[&n1].sample(), runs[&n2].sample()], target)?;
+    // Every other size is attributed from that fit, projected to it.
+    for size in &order {
+        if *size == n1 || *size == n2 {
+            continue;
+        }
+        let projections = projections_at(&ci_rows, *size);
+        let pipeline = runs
+            .get_mut(size)
+            .with_context(|| format!("the sweep did not run n={size}"))?;
+        attribute_refusals(pipeline, &projections)?;
+    }
+
+    // Fit stability, per write: what CI projects from n1 and n2 has to agree
+    // with what that write's own largest accepted sweep pair projects.
+    let mut keys: BTreeSet<WriteKey> = ci_rows.iter().map(|row| row.key.clone()).collect();
+    for size in &sizes {
+        keys.extend(runs[size].sample().keys());
+    }
+    let mut stability = Vec::new();
+    for key in keys {
+        let ci = match ci_rows
+            .iter()
+            .find(|row| row.key == key)
+            .map(|row| &row.verdict)
+        {
+            Some(Verdict::Projected { bytes, .. }) => *bytes,
+            Some(Verdict::Rejected { n, .. }) => bail!(
+                "cannot check fit stability for {}: the reduced pair refused it at n={n}, so \
+                 there is no CI projection to compare against; lower PRISM_JSONB_GATE_N1 and \
+                 PRISM_JSONB_GATE_N2 until it is accepted at both",
+                label(&key)
+            ),
+            _ => bail!(
+                "cannot check fit stability for {}: the reduced pair at n={n1} and n={n2} \
+                 projected nothing for it, so there is no CI projection to compare against",
+                label(&key)
+            ),
         };
-        report!("  {:<48} {value:>20}", label(&row.key));
+        let measured: Vec<(u64, Size)> = sizes
+            .iter()
+            .map(|size| (*size, runs[size].sample().size(&key)))
+            .collect();
+        stability.push(fit_stability(&key, (n1, n2), ci, &measured, target)?);
     }
+    for line in stability_lines(&stability, target, (n1, n2)) {
+        emit(&line);
+    }
+    let failures: Vec<String> = stability
+        .iter()
+        .filter_map(StabilityRow::divergence)
+        .collect();
+    ensure!(failures.is_empty(), "{}", failures.join("\n"));
+    report!(
+        "fit stability holds: every compared write agrees within {:.0}%",
+        FIT_STABILITY_TOLERANCE * 100.0
+    );
     Ok(())
 }
 
@@ -2383,11 +2856,171 @@ fn superlinear_fit_is_refused() {
     assert!(project(200, 100).is_err());
 }
 
+/// EP-OBSERVABILITY: PostgreSQL's ceiling error names no column, so a refusal
+/// is attributed from what the refused phase's accepted measurements project at
+/// the refused size, and only when exactly one write of that phase explains it.
+#[test]
+fn a_refusal_is_attributed_to_exactly_one_projected_write() {
+    let jobs = test_key("qbit_prism_jobs", "payload", PHASE_REFRESH);
+    let outbox = test_key("qbit_block_candidate_outbox", "candidate", PHASE_ENQUEUE);
+    let manifest = test_key(
+        "qbit_block_candidate_outbox",
+        "reward_manifest",
+        PHASE_ENQUEUE,
+    );
+    let over = ATTRIBUTION_FLOOR + 1.0;
+    let under = ATTRIBUTION_FLOOR - 1.0;
+
+    // One candidate in the refused phase, and a refresh write far past the
+    // floor that has no part in an enqueue refusal.
+    let unique = vec![
+        (jobs.clone(), over * 2.0),
+        (outbox.clone(), over),
+        (manifest.clone(), under),
+    ];
+    assert_eq!(
+        attribute_refusal(PHASE_ENQUEUE, 400_000, &unique, &outbox).unwrap(),
+        outbox
+    );
+
+    // Two candidates in the refused phase: PostgreSQL named neither, so the
+    // gate names both and refuses to choose.
+    let ambiguous = vec![(outbox.clone(), over), (manifest.clone(), over)];
+    let error = format!(
+        "{:#}",
+        attribute_refusal(PHASE_ENQUEUE, 400_000, &ambiguous, &outbox).unwrap_err()
+    );
+    assert!(
+        error.contains(
+            "ambiguous refusal at enqueue, n=400000: PostgreSQL does not name the column; \
+             candidates: "
+        ),
+        "{error}"
+    );
+    assert!(
+        error.contains(&label(&outbox)) && error.contains(&label(&manifest)),
+        "{error}"
+    );
+
+    // No candidate: the only write past the floor belongs to another phase.
+    let elsewhere = vec![(jobs.clone(), over * 2.0), (outbox.clone(), under)];
+    let error = format!(
+        "{:#}",
+        attribute_refusal(PHASE_ENQUEUE, 400_000, &elsewhere, &outbox).unwrap_err()
+    );
+    assert!(
+        error.contains("refusal at enqueue, n=400000, is not explained by any projected write"),
+        "{error}"
+    );
+
+    // A unique candidate that is not the write the call site expects: both are
+    // named, and the refusal is never blamed on the expected one anyway.
+    let moved = vec![(manifest.clone(), over), (outbox.clone(), under)];
+    let error = format!(
+        "{:#}",
+        attribute_refusal(PHASE_ENQUEUE, 400_000, &moved, &outbox).unwrap_err()
+    );
+    assert!(
+        error.contains(&label(&manifest)) && error.contains(&label(&outbox)),
+        "{error}"
+    );
+}
+
+/// EP-VALIDATION: the sweep compares the CI projection against each write's own
+/// largest accepted pair, and says which write diverged rather than reporting a
+/// difference against sizes it never measured.
+#[test]
+fn fit_stability_is_checked_per_write() {
+    let key = test_key("qbit_prism_jobs", "payload", PHASE_REFRESH);
+    let ci_pair = (5_000, 20_000);
+    // Exactly 100 B per share: 100,000 and 200,000 project 40,000,000 B at
+    // 400,000 shares.
+    let all = [
+        (50_000, Size::Bytes(5_000_000)),
+        (100_000, Size::Bytes(10_000_000)),
+        (200_000, Size::Bytes(20_000_000)),
+    ];
+
+    // Agreement within the tolerance passes, and the row names the pair it
+    // compared against.
+    let row = fit_stability(&key, ci_pair, 39_800_000.0, &all, 400_000).unwrap();
+    let comparison = row.compared.expect("compared");
+    assert_eq!((comparison.low, comparison.high), (100_000, 200_000));
+    assert!(
+        (comparison.large - 40_000_000.0).abs() < 1.0,
+        "{comparison:?}"
+    );
+    assert!(
+        (comparison.difference - 0.005).abs() < 1e-9,
+        "{comparison:?}"
+    );
+    assert_eq!(row.divergence(), None);
+    let line = stability_row(&row);
+    assert!(
+        line.contains("0.50%") && line.contains("(n=100000 and n=200000)"),
+        "{line}"
+    );
+
+    // A 10% divergence fails and names the write.
+    let row = fit_stability(&key, ci_pair, 44_000_000.0, &all, 400_000).unwrap();
+    let failure = row.divergence().expect("10% is over the 5% tolerance");
+    assert!(
+        failure.contains(&label(&key)) && failure.contains("10.00%"),
+        "{failure}"
+    );
+
+    // Pair selection skips a size at which the write was refused.
+    let refused_at_the_top = [
+        (50_000, Size::Bytes(5_000_000)),
+        (100_000, Size::Bytes(10_000_000)),
+        (200_000, Size::Rejected),
+    ];
+    let row = fit_stability(&key, ci_pair, 40_000_000.0, &refused_at_the_top, 400_000).unwrap();
+    assert_eq!(
+        row.compared
+            .map(|comparison| (comparison.low, comparison.high)),
+        Some((50_000, 100_000))
+    );
+
+    // Accepted at fewer than two sweep sizes: unchecked is not an option.
+    let only_one = [
+        (50_000, Size::Bytes(5_000_000)),
+        (100_000, Size::Rejected),
+        (200_000, Size::Rejected),
+    ];
+    let error = format!(
+        "{:#}",
+        fit_stability(&key, ci_pair, 40_000_000.0, &only_one, 400_000).unwrap_err()
+    );
+    assert!(
+        error.contains(
+            "cannot check fit stability for qbit_prism_jobs.payload @ refresh: accepted at \
+             fewer than two sweep sizes"
+        ) && error.contains(BASELINE_SIZES_VAR),
+        "{error}"
+    );
+
+    // Below 1 MiB: relative noise on a tiny write is not a stability signal.
+    let row = fit_stability(&key, ci_pair, 1_000.0, &all, 400_000).unwrap();
+    assert!(row.compared.is_none(), "{row:?}");
+    assert_eq!(row.divergence(), None);
+    let line = stability_row(&row);
+    assert!(line.contains("not compared (below 1 MiB)"), "{line}");
+}
+
 fn test_key(table: &str, column: &str, phase: &'static str) -> WriteKey {
     WriteKey {
         table: table.into(),
         column: column.into(),
         phase,
+    }
+}
+
+/// A refusal as the gate holds one once it has been attributed.
+fn test_refusal(text: &str) -> Refusal {
+    Refusal {
+        text: text.to_owned(),
+        attributed: Some(ATTRIBUTED_BY_PROJECTION),
     }
 }
 
@@ -2414,7 +3047,7 @@ fn rejected_write_never_prints_a_byte_count() {
         assert_eq!(matching.len(), 1, "one {prefix} row in {lines:#?}");
         matching[0].split_whitespace().map(str::to_owned).collect()
     };
-    let rejections = BTreeMap::from([(outbox.clone(), text.to_owned())]);
+    let rejections = BTreeMap::from([(outbox.clone(), test_refusal(text))]);
 
     // Full size, even with a stray value attributed to the rejected column.
     let stray = BTreeMap::from([
@@ -2439,6 +3072,9 @@ fn rejected_write_never_prints_a_byte_count() {
             "refused",
             "at",
             "n=400000",
+            "(attributed",
+            "by",
+            "projection)",
             "YES"
         ]
     );
@@ -2504,7 +3140,19 @@ fn rejected_write_never_prints_a_byte_count() {
     );
     assert_eq!(
         fields(&lines, "qbit_block_candidate_outbox")[3..],
-        ["61934708", "rejected", "-", "-", "refused", "at", "n=20000", "YES"]
+        [
+            "61934708",
+            "rejected",
+            "-",
+            "-",
+            "refused",
+            "at",
+            "n=20000",
+            "(attributed",
+            "by",
+            "projection)",
+            "YES"
+        ]
     );
     assert!(lines.contains(&format!(
         "  refused at n=20000: qbit_block_candidate_outbox.candidate @ enqueue -> {text}"
