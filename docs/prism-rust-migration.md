@@ -271,6 +271,16 @@ the active chain. These deliberate accounting simplifications should be
 included in operator/miner rollout notes. Their payout effect is recorded in
 [Payout differences from 2.x.x (decision D2)](#payout-differences-from-2xx).
 
+`2.x.x` also read `PRISM_STRATUM_SHARE_WEIGHT` (default 1) and
+`PRISM_STRATUM_SHARE_WEIGHTS_JSON` (default empty), a JSON object keyed by miner
+username or payout address. A worker with an entry in that object was credited
+`max(1, override)` instead of its share target's difficulty; the default weight
+only filled the job's delivered `share_weight` field. `3.x.x` does not support
+these per-worker credited-difficulty overrides. With the `2.x.x` defaults, which
+set no overrides, both versions credit a share at its share target's difficulty,
+so crediting is unchanged. A deployment that set either variable must remove it
+before cutover, because `3.x.x` ignores it.
+
 <a id="payout-differences-from-2xx"></a>
 
 ## Payout differences from 2.x.x (decision D2)
