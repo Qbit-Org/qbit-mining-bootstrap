@@ -65,6 +65,16 @@ jobs:
           docker compose --env-file config/upstream.env.example --env-file .env.example \
             -f compose.yaml -f compose.prism-external-db.yaml --profile prism config --quiet
 
+      - name: Validate PRISM HA Compose stacks
+        run: |
+          export QBIT_SRC_DIR="$PWD"
+          export PRISM_DATABASE_URL=postgresql://fixture:fixture@writer.example:5432/prism
+          docker compose -f compose.yaml -f compose.prism-ha.yaml config --quiet
+          for overlays in "" "-f compose.production.yaml" "-f compose.prism-external-db.yaml" "-f compose.production.yaml -f compose.prism-external-db.yaml"; do
+            docker compose --env-file config/upstream.env.example --env-file .env.example \
+              -f compose.yaml $overlays -f compose.prism-ha.yaml --profile prism config --quiet
+          done
+
   python-tests:
     name: Python unit tests (shard ${{ matrix.shard }})
     runs-on: blacksmith-2vcpu-ubuntu-2404

@@ -506,7 +506,7 @@ services:
       start_period: 60s
       retries: 30
 
-  prism-coordinator:
+  prism-coordinator: &prism-coordinator
     profiles: ["prism"]
     image: ${PRISM_COORDINATOR_IMAGE:-qbit-lab-prism-coordinator:local}
     restart: on-failure
@@ -683,6 +683,13 @@ services:
       timeout: 5s
       start_period: 15s
       retries: 3
+
+  # Inactive template for compose.prism-ha.yaml. Keep the full environment shared
+  # here: Compose extends is resolved before file merging and loses overrides.
+  prism-coordinator-2:
+    <<: *prism-coordinator
+    profiles: ["prism-ha-overlay-required"]
+    ports: []
 
   # Public reads use a separate native process and pool, with optional replica checks.
   prism-public-api:

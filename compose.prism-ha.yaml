@@ -1,0 +1,30 @@
+# Apply LAST, after compose.production.yaml and/or compose.prism-external-db.yaml.
+# Two active frontends; the Stratum load balancer and independent production
+# nodes are operator-supplied. Defaults share the bundled node for a local lab.
+# Database replication/ACK policy is NOT selected by this overlay (D3 is open).
+# See docs/prism-ha-reference-architecture.md for the supported stacks/contract.
+services:
+  prism-coordinator:
+    environment:
+      PRISM_INSTANCE_ID: ${PRISM_HA_INSTANCE_ID_1:-prism-frontend-1}
+      QBIT_RPC_HOST: ${PRISM_HA_RPC_HOST_1:-qbitd}
+      QBIT_RPC_URL: ${PRISM_HA_RPC_URL_1:-}
+      # HTTP probes must reach the listener through the published management port.
+      PRISM_AUDIT_BIND: ${PRISM_AUDIT_BIND:-0.0.0.0}
+    ports: !override
+      - "${PRISM_STRATUM_PORT_HOST:-3340}:${PRISM_STRATUM_PORT:-3340}"
+      - "${PRISM_STRATUM_HIGHDIFF_PORT_HOST:-127.0.0.1:0}:${PRISM_STRATUM_HIGHDIFF_PORT:-4334}"
+      - "${PRISM_HA_HEALTH_PORT_HOST_1:-127.0.0.1:3341}:${PRISM_AUDIT_PORT:-3341}"
+
+  prism-coordinator-2:
+    # Activate the shared template after applying production/external overrides.
+    profiles: !override ["prism"]
+    environment:
+      PRISM_INSTANCE_ID: ${PRISM_HA_INSTANCE_ID_2:-prism-frontend-2}
+      QBIT_RPC_HOST: ${PRISM_HA_RPC_HOST_2:-qbitd}
+      QBIT_RPC_URL: ${PRISM_HA_RPC_URL_2:-}
+      PRISM_AUDIT_BIND: ${PRISM_AUDIT_BIND:-0.0.0.0}
+    ports: !override
+      - "${PRISM_HA_STRATUM_PORT_HOST_2:-3343}:${PRISM_STRATUM_PORT:-3340}"
+      - "${PRISM_HA_HIGHDIFF_PORT_HOST_2:-127.0.0.1:0}:${PRISM_STRATUM_HIGHDIFF_PORT:-4334}"
+      - "${PRISM_HA_HEALTH_PORT_HOST_2:-127.0.0.1:3344}:${PRISM_AUDIT_PORT:-3341}"

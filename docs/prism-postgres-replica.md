@@ -1,5 +1,10 @@
 # PRISM Postgres read replica
 
+For two mining frontends, the operator load-balancer contract and the primary
+plus **one** standby promotion/ACK policy choices, see the
+[HA reference architecture](prism-ha-reference-architecture.md). Replication and
+standby-down ACK policy remain open under D3; the bundled replica is asynchronous.
+
 `prism-public-api` runs `qbit-prism-server public-api` and serves public reads
 from a hot standby in the default Compose topology. The native process uses a
 separate SQL pool, requires no signing keys, and serves canonical audit bytes
