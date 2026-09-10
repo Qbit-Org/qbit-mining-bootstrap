@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+from collections.abc import Mapping
 import json
 import linecache
 import os
@@ -1094,17 +1095,17 @@ class CandidateStormRig:
                     block_hash=block_hash,
                     expected_height=(
                         int(intent["expected_height"])
-                        if isinstance(intent, dict)
+                        if isinstance(intent, Mapping)
                         else self.storm_height
                     ),
                     parent_hash=(
                         str(intent["parent_hash"]).lower()
-                        if isinstance(intent, dict)
+                        if isinstance(intent, Mapping)
                         else STORM_PARENT_HASH
                     ),
                     network_difficulty=(
                         float(intent["found_block"]["network_difficulty"])
-                        if isinstance(intent, dict)
+                        if isinstance(intent, Mapping)
                         and isinstance(intent.get("found_block"), dict)
                         and intent["found_block"].get("network_difficulty") is not None
                         else None

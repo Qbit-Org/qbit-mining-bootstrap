@@ -1440,6 +1440,12 @@ class LedgerConfig:
     share_commit_linger_seconds: float
     share_commit_timeout_seconds: float
     share_recovery_path: Path
+    # Issue #255: chunked candidate bodies. Version 2 writes bounded chunk
+    # bodies; version 1 keeps the legacy whole-jsonb write for the
+    # compatibility/rollback release. The reader handles both.
+    candidate_storage_version: int = 2
+    candidate_spool_dir: str | None = None
+    candidate_spool_reservation_bytes: int = 4 * 1024 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -2066,6 +2072,15 @@ def load_coordinator_config(environ: Env | None = None) -> CoordinatorConfig:
         / 1000.0,
         share_commit_timeout_seconds=env_positive_float(
             "PRISM_SHARE_COMMIT_TIMEOUT_SECONDS", DEFAULT_SHARE_COMMIT_TIMEOUT_SECONDS, environ=source
+        ),
+        candidate_storage_version=env_positive_int(
+            "PRISM_CANDIDATE_STORAGE_VERSION", 2, environ=source
+        ),
+        candidate_spool_dir=env_optional("PRISM_CANDIDATE_SPOOL_DIR", environ=source) or None,
+        candidate_spool_reservation_bytes=env_positive_int(
+            "PRISM_CANDIDATE_SPOOL_RESERVATION_BYTES",
+            4 * 1024 * 1024 * 1024,
+            environ=source,
         ),
         share_recovery_path=Path(
             env(

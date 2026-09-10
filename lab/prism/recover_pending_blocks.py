@@ -13,11 +13,14 @@ import hmac
 import json
 import signal
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 from lab.auxpow.stratum_codec import header_hash_hex
 from lab.prism.block_candidates import _BlockCandidateNodeSubmission
+from lab.prism.candidate_spool_view import iter_string_text_chunks
+from lab.prism.candidate_store import CANDIDATE_SCHEMA_CAPABILITY, candidate_schema_refusal
 from lab.prism.coordinator_config import CoordinatorConfig, load_coordinator_config
 from lab.prism.prism_coordinator import PrismCoordinator
 from lab.prism.recovery_json import cooperative_json
@@ -97,6 +100,30 @@ class RecoveryReader:
     def close(self) -> None:
         self.connection.close()
 
+    def require_candidate_schema(self) -> None:
+        """Refuse a database this release cannot finalize against (#255).
+
+        The coordinator's ledger applies the same rule when --apply builds
+        it; checking here lets the read-only plan report an unmigrated
+        database before any writer lease is requested.
+        """
+        presence = self.connection.execute(
+            """SELECT to_regclass('qbit_block_candidate_body') IS NOT NULL AS has_body_table,
+                      to_regclass('qbit_prism_schema_capabilities') IS NOT NULL AS has_capabilities"""
+        ).fetchone()
+        declared = None
+        if presence["has_capabilities"]:
+            capability = self.connection.execute(
+                """SELECT capability_value FROM qbit_prism_schema_capabilities
+                   WHERE capability = %s""",
+                (CANDIDATE_SCHEMA_CAPABILITY,),
+            ).fetchone()
+            if capability is not None:
+                declared = int(capability["capability_value"])
+        refusal = candidate_schema_refusal(declared, bool(presence["has_body_table"]))
+        if refusal is not None:
+            raise RecoveryError(refusal)
+
     def metadata(self, block_hash: str) -> dict[str, Any] | None:
         return self.connection.execute(
             """SELECT outbox.block_hash, outbox.state, outbox.candidate_sha256,
@@ -110,10 +137,23 @@ class RecoveryReader:
         ).fetchone()
 
     def candidate(self, block_hash: str) -> dict[str, Any]:
+        """One pending row's payload facts, for either storage version.
+
+        Issue #255: a version-2 row carries no ``candidate`` jsonb. Its
+        body lives in ``qbit_block_candidate_body`` and is read back in
+        bounded pages by the ledger (``hydrate_block_candidate_intent``),
+        never through this read-only session. The columns below name the
+        version explicitly so a chunked candidate is decoded through that
+        route rather than mistaken for a missing or corrupt payload.
+        """
         row = self.connection.execute(
-            """SELECT candidate, candidate_sha256
-               FROM qbit_block_candidate_outbox
-               WHERE block_hash = %s AND state = 'pending'""",
+            """SELECT outbox.candidate, outbox.candidate_sha256,
+                      outbox.storage_version, outbox.body_id, outbox.replay_header,
+                      body.byte_count, body.chunk_count, body.chunk_bytes,
+                      body.share_count, body.state AS body_state
+               FROM qbit_block_candidate_outbox outbox
+               LEFT JOIN qbit_block_candidate_body body ON body.body_id = outbox.body_id
+               WHERE outbox.block_hash = %s AND outbox.state = 'pending'""",
             (block_hash,),
         ).fetchone()
         if row is None:
@@ -146,10 +186,11 @@ def require_completed(row: dict[str, Any] | None, block: RecoveryBlock) -> None:
 
 
 def plan_recovery(reader: RecoveryReader, rpc: Any, hashes: list[str]) -> list[RecoveryBlock]:
-    """Validate the entire allowlist before the first writer lease is acquired."""
+    """Validate the schema and entire allowlist before the first writer lease."""
     hashes = [canonical_hex(value, name="block_hash", expected_bytes=32) for value in hashes]
     if not hashes or len(hashes) > MAX_RECOVERY_BLOCKS or len(set(hashes)) != len(hashes):
         raise RecoveryError(f"specify 1–{MAX_RECOVERY_BLOCKS} distinct block hashes")
+    reader.require_candidate_schema()
     blocks = []
     for block_hash in hashes:
         row = reader.metadata(block_hash)
@@ -166,11 +207,67 @@ def plan_recovery(reader: RecoveryReader, rpc: Any, hashes: list[str]) -> list[R
     return sorted(blocks, key=lambda block: block.height)
 
 
+def load_intent(
+    coordinator: PrismCoordinator, block: RecoveryBlock, row: dict[str, Any]
+) -> Any:
+    """The intent mapping for one pending row, by storage version (#255).
+
+    Version 1 is the legacy whole-jsonb payload the read-only session
+    already decoded (cooperatively, in this standalone process). Version 2
+    is hydrated by the coordinator's ledger in bounded chunk pages into a
+    spool file, and its decoded facts are exposed through the same mapping
+    interface. Any other version is refused rather than skipped.
+    """
+    storage_version = int(row.get("storage_version") or 1)
+    if storage_version == 1:
+        return row["candidate"]
+    if storage_version != 2:
+        raise RecoveryError(
+            f"unsupported candidate storage version {storage_version}: {block.block_hash}"
+        )
+    if row.get("body_id") is None or row.get("body_state") != "sealed":
+        raise RecoveryError(f"chunked candidate body is not sealed: {block.block_hash}")
+    hydrate = getattr(coordinator.ledger, "hydrate_block_candidate_intent", None)
+    if not callable(hydrate):
+        raise RecoveryError("the ledger cannot hydrate chunked candidate bodies")
+    header_row = {
+        "block_hash": block.block_hash,
+        "storage_version": 2,
+        "candidate_sha256": str(row["candidate_sha256"]),
+        "header": row.get("replay_header") or {},
+        "body": {
+            "body_id": row["body_id"],
+            "storage_version": 2,
+            "candidate_sha256": str(row["candidate_sha256"]),
+            "byte_count": row["byte_count"],
+            "chunk_count": row["chunk_count"],
+            "chunk_bytes": row["chunk_bytes"],
+            "share_count": row["share_count"],
+            "state": row["body_state"],
+        },
+    }
+    return hydrate(header_row, cancelled=coordinator.stop_event.is_set)
+
+
+def block_hex_prefix(block_hex: Any, length: int) -> str:
+    """The first ``length`` characters of a plain or streamed block hex.
+
+    A hydrated version-2 body keeps a large ``block_hex`` as a streamed
+    view that refuses ``str()``; only the header prefix is needed here.
+    """
+    prefix = ""
+    for chunk in iter_string_text_chunks(block_hex):
+        prefix += chunk
+        if len(prefix) >= length:
+            break
+    return prefix[:length]
+
+
 def decode_candidate(
     coordinator: PrismCoordinator, block: RecoveryBlock, row: dict[str, Any]
 ) -> Any:
-    intent = row["candidate"]
-    if not isinstance(intent, dict) or intent.get("block_hash_hex") != block.block_hash:
+    intent = load_intent(coordinator, block, row)
+    if not isinstance(intent, Mapping) or intent.get("block_hash_hex") != block.block_hash:
         raise RecoveryError("candidate payload does not match its outbox key")
     digest = block_candidate_identity_sha256(intent)
     if not hmac.compare_digest(digest, str(row["candidate_sha256"])):
@@ -180,7 +277,7 @@ def decode_candidate(
         or intent.get("parent_hash") != block.parent_hash
     ):
         raise RecoveryError(f"candidate does not match its active-chain header: {block.block_hash}")
-    header = bytes.fromhex(str(intent["block_hex"])[:160])
+    header = bytes.fromhex(block_hex_prefix(intent["block_hex"], 160))
     if len(header) != 80 or header_hash_hex(header) != block.block_hash:
         raise RecoveryError(f"candidate block bytes do not match its hash: {block.block_hash}")
     return replace(coordinator.block_candidate_from_intent(intent), durable_replay=True)

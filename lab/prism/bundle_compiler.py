@@ -27,8 +27,10 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Mapping, Sequence
 from typing import Any, Callable, Iterable, Iterator, Protocol
 
+from lab.prism.audit_bundle_view import CanonicalAuditBundleView
 from lab.prism.coordinator_config import (
     DEFAULT_PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS,
     DEFAULT_PRISM_JOB_BUILD_CANCEL_GRACE_SECONDS,
@@ -243,6 +245,144 @@ def _compact_share_tail_chunks(
         *share_chunks,
         "]}",
     )
+
+
+PRISM_BUILDER_INPUT_ARRAY_KEYS = (
+    "shares",
+    "prior_balances",
+    "witness_merkle_leaves_hex",
+    "compact_share_identities",
+    "compact_shares",
+)
+
+
+def _iter_share_window_items(
+    value: Any,
+    *,
+    batch_records: int,
+    chunk_chars: int,
+) -> Iterator[str | bytes]:
+    """The ``shares`` array body from the cheapest exact source.
+
+    A daemon-mirror sequence carries the window already encoded as
+    ``canonical_items`` (sorted-key records with numeric difficulties, the
+    bytes the builder daemon itself parses); a page-backed window carries
+    one such fragment per page. Both are spliced in bounded slices without
+    parsing a record -- in particular without touching the mirror's parsed
+    tuple cache. Any other replayable sequence is walked record by record.
+    The builder deserializes by field name, so record key order is
+    irrelevant to the canonical output.
+    """
+    items = getattr(value, "canonical_items", None)
+    if isinstance(items, (bytes, bytearray, memoryview)):
+        view = memoryview(items)
+        for offset in range(0, len(view), chunk_chars):
+            yield bytes(view[offset : offset + chunk_chars])
+        return
+    pages = getattr(value, "pages", None)
+    if isinstance(pages, (list, tuple)) and pages and all(
+        isinstance(getattr(page, "canonical_json_items", None), (bytes, bytearray, memoryview))
+        for page in pages
+    ):
+        needs_separator = False
+        for page in pages:
+            page_items = memoryview(page.canonical_json_items)
+            if not len(page_items):
+                continue
+            if needs_separator:
+                yield b","
+            for offset in range(0, len(page_items), chunk_chars):
+                yield bytes(page_items[offset : offset + chunk_chars])
+            needs_separator = True
+        return
+    yield from iter_json_array_text_chunks(
+        value,
+        batch_records=batch_records,
+        chunk_chars=chunk_chars,
+    )
+
+
+def _iter_build_input_chunks(
+    payload: Mapping[str, object],
+    *,
+    array_keys: Iterable[str] = PRISM_BUILDER_INPUT_ARRAY_KEYS,
+    batch_records: int = SHARE_JSON_BATCH_RECORDS,
+    chunk_chars: int = SHARE_JSON_CHUNK_BYTES,
+) -> Iterator[str | bytes]:
+    """The one-shot builder input in bounded chunks, every array streamed.
+
+    Byte-identical to ``json.dumps(payload, separators=(",", ":"))`` for a
+    payload of plain lists. :func:`iter_json_object_text_chunks` streams
+    only ``list``/``tuple`` members; here every member named in
+    ``array_keys`` streams whatever replayable sequence it holds (each
+    ``json.dumps`` covers at most ``batch_records`` records), the ``shares``
+    member additionally splices pre-encoded window bytes when the sequence
+    carries them, and the remaining members (found block, policy, script
+    suffix, settlement configuration) are fixed-size and take one
+    ``json.dumps`` each. Chunks are ``str`` except spliced window bytes,
+    which are yielded as ``bytes`` (#255).
+    """
+    keys = list(payload)
+    if any(not isinstance(key, str) for key in keys):
+        yield json.dumps(dict(payload), separators=(",", ":"))
+        return
+    streamed = set(array_keys)
+    pending: list[str] = []
+    pending_chars = 0
+
+    def flush() -> Iterator[str]:
+        nonlocal pending, pending_chars
+        if pending:
+            chunk = "".join(pending)
+            pending = []
+            pending_chars = 0
+            yield chunk
+
+    def push(text: str) -> Iterator[str]:
+        nonlocal pending_chars
+        if not text:
+            return
+        pending.append(text)
+        pending_chars += len(text)
+        if pending_chars >= chunk_chars:
+            yield from flush()
+
+    yield from push("{")
+    first = True
+    for key in keys:
+        value = payload[key]
+        prefix = ("" if first else ",") + json.dumps(key) + ":"
+        first = False
+        if (
+            key in streamed
+            and not isinstance(value, (str, bytes, bytearray, Mapping))
+            and isinstance(value, Iterable)
+        ):
+            yield from push(prefix + "[")
+            pieces: Iterable[str | bytes]
+            if key == "shares":
+                pieces = _iter_share_window_items(
+                    value,
+                    batch_records=batch_records,
+                    chunk_chars=chunk_chars,
+                )
+            else:
+                pieces = iter_json_array_text_chunks(
+                    value,
+                    batch_records=batch_records,
+                    chunk_chars=chunk_chars,
+                )
+            for piece in pieces:
+                if isinstance(piece, (bytes, bytearray)):
+                    yield from flush()
+                    yield bytes(piece)
+                else:
+                    yield from push(piece)
+            yield from push("]")
+        else:
+            yield from push(prefix + json.dumps(value, separators=(",", ":")))
+    yield from push("}")
+    yield from flush()
 
 
 def _iter_prepare_window_request_chunks(
@@ -1826,13 +1966,16 @@ class BundleCompiler:
                     time.monotonic() - artifact_started,
                 )
         else:
-            # Canonical builds serialize the full share window inline; a
-            # daemon-mirror sequence materializes its dicts here, on the
-            # rare found-block path that actually consumes them.
-            with self._routed_window_mirror_divergence():
-                payload["shares"] = (
-                    shares if isinstance(shares, list) else list(shares)
-                )
+            # Canonical builds serialize the full share window inline. Any
+            # replayable sequence -- a list, the daemon mirror, a page-backed
+            # window -- is walked record by record while the builder input
+            # is written; it is never copied into a list first (#255).
+            if isinstance(shares, (str, bytes, bytearray)) or not isinstance(
+                shares,
+                (Sequence, Iterable),
+            ):
+                raise TypeError("shares must be a sequence of share records")
+            payload["shares"] = shares
         if ctv_settlement is None and payout_policy is None:
             ctv_settlement = runtime.prism_ctv_settlement_config(
                 block_height=int(found_block["block_height"]),
@@ -2015,14 +2158,23 @@ class BundleCompiler:
                                 "qbit-prism-build-audit-bundle timed out"
                             )
 
-                    def write(self, value: str) -> int:
+                    def write(self, value: str | bytes) -> int:
                         nonlocal input_byte_count
                         self.check_cancelled()
                         if self.file_descriptor is None:
-                            written = int(self.stream.write(value))
-                            input_byte_count += len(value[:written].encode("utf-8"))
+                            text = (
+                                value.decode("utf-8")
+                                if isinstance(value, (bytes, bytearray))
+                                else value
+                            )
+                            written = int(self.stream.write(text))
+                            input_byte_count += len(text[:written].encode("utf-8"))
                             return written
-                        encoded = value.encode("utf-8")
+                        encoded = (
+                            bytes(value)
+                            if isinstance(value, (bytes, bytearray))
+                            else value.encode("utf-8")
+                        )
                         remaining = memoryview(encoded)
                         while remaining:
                             self.check_cancelled()
@@ -2129,16 +2281,12 @@ class BundleCompiler:
                         # member is one small json.dumps: the same bytes as
                         # one json.dump of the payload, without the
                         # pure-Python encoder's per-token writes or a
-                        # whole-window C call.
-                        for chunk in iter_json_object_text_chunks(
-                            payload,
-                            array_keys=(
-                                "shares",
-                                "compact_share_identities",
-                                "compact_shares",
-                            ),
-                        ):
-                            sink.write(chunk)
+                        # whole-window C call. A daemon-mirror window is
+                        # walked here, so a refuted mirror is routed exactly
+                        # as the retired list() copy was.
+                        with self._routed_window_mirror_divergence():
+                            for chunk in _iter_build_input_chunks(payload):
+                                sink.write(chunk)
                 except BrokenPipeError:
                     # Prefer the builder's diagnostic below.
                     pass
@@ -2295,18 +2443,67 @@ class BundleCompiler:
                 output_started = time.monotonic()
                 if cancellation is not None:
                     cancellation.raise_if_cancelled("builder output serialization")
-                bundle = json.load(output)
+                bundle: Any
+                if canonical_output_path is not None:
+                    # The canonical artifact on disk is the authority. It is
+                    # scanned once through bounded windows into a view whose
+                    # window-sized arrays (``shares`` and the reward
+                    # manifest's counted shares) stay on disk and replay on
+                    # demand; nothing window-sized is decoded into Python
+                    # objects in this process (#255). The descriptor is
+                    # duplicated so the view outlives this stack; the file
+                    # may be unlinked later without invalidating the view.
+                    scan_checkpoint: Callable[[], None] | None = None
+                    if cancellation is not None:
+                        scan_checkpoint = lambda: cancellation.raise_if_cancelled(  # noqa: E731
+                            "builder output scan"
+                        )
+                    bundle = CanonicalAuditBundleView.scan(
+                        os.dup(output.fileno()),
+                        path=canonical_output_path,
+                        cancellation=scan_checkpoint,
+                    )
+                    scan_stats = bundle.scan_stats
+                    if scan_stats.oversized_values:
+                        # One JSON value is the decoder's unit, so a record
+                        # above the soft limit was decoded whole. Valid work
+                        # is never refused for its size; the event is made
+                        # visible instead.
+                        print(
+                            "prism coordinator: canonical audit artifact "
+                            f"scan decoded {scan_stats.oversized_values} "
+                            "oversized JSON value(s) "
+                            f"max_value_chars={scan_stats.max_value_chars} "
+                            "window_high_water_chars="
+                            f"{scan_stats.window_high_water_chars} "
+                            f"path={canonical_output_path.name}",
+                            flush=True,
+                        )
+                else:
+                    # Embedders without a candidate artifact receive the
+                    # decoded document, as before; the finalization path
+                    # always names an artifact.
+                    bundle = json.load(output)
                 phases["output_serialization"] = phases.get(
                     "output_serialization",
                     0.0,
                 ) + (time.monotonic() - output_started)
-                if cancellation is not None:
-                    cancellation.raise_if_cancelled("builder verification")
-                if canonical_output_path is not None and canonical_output_adopter is not None:
-                    canonical_output_adopter(
-                        canonical_output_path,
-                        os.fstat(output.fileno()),
-                    )
+                try:
+                    if cancellation is not None:
+                        cancellation.raise_if_cancelled("builder verification")
+                    if (
+                        canonical_output_path is not None
+                        and canonical_output_adopter is not None
+                    ):
+                        canonical_output_adopter(
+                            canonical_output_path,
+                            os.fstat(output.fileno()),
+                        )
+                except BaseException:
+                    close_view = getattr(bundle, "close", None)
+                    if callable(close_view):
+                        close_view()
+                    raise
             succeeded = True
             return bundle
         finally:
@@ -2423,6 +2620,7 @@ __all__ = [
     "BundleCompilerRuntime",
     "CancellationPort",
     "PreparedWindowOutcome",
+    "PRISM_BUILDER_INPUT_ARRAY_KEYS",
     "PRISM_BUILDER_PHASE_METRICS_PREFIX",
     "PRISM_SERVE_BUILDER_PROTOCOL_VERSION",
     "PRISM_SERVE_BUILDER_WINDOW_CACHE_ENTRIES",
@@ -2431,6 +2629,8 @@ __all__ = [
     "_ServeBuilderClient",
     "_ServeBuilderUnavailable",
     "_ShareWindowSerialization",
+    "_iter_build_input_chunks",
+    "_iter_share_window_items",
     "_compact_share_payload",
     "_compact_share_tail_chunks",
     "_iter_prepare_window_request_chunks",

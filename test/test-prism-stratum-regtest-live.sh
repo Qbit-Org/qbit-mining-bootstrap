@@ -24,6 +24,10 @@ COORDINATOR_LOG="${DATADIR}/prism-coordinator.log"
 MINER_TIMEOUT_SECONDS="${QBIT_PRISM_LIVE_MINER_TIMEOUT_SECONDS:-90}"
 AUDIT_API_ENABLED="${QBIT_PRISM_LIVE_AUDIT_API:-0}"
 POSTGRES_ENABLED="${QBIT_PRISM_LIVE_POSTGRES:-0}"
+NATIVE_POSTGRES="${QBIT_PRISM_LIVE_NATIVE_POSTGRES:-0}"
+PRIMED_WINDOW="${QBIT_PRISM_LIVE_PRIMED_WINDOW:-0}"
+RESTART_REPLAY="${QBIT_PRISM_LIVE_RESTART_REPLAY:-0}"
+CRASH_MARKER="${DATADIR}/candidate-crash-marker.json"
 POSTGRES_IMAGE="${QBIT_PRISM_POSTGRES_IMAGE:-postgres:16-alpine}"
 POSTGRES_CONTAINER="${QBIT_PRISM_POSTGRES_CONTAINER:-qbit-prism-pg-$$}"
 MANIFEST_SIGNING_SEED_HEX="${QBIT_PRISM_MANIFEST_SIGNING_SEED_HEX:-4242424242424242424242424242424242424242424242424242424242424242}"
@@ -49,6 +53,14 @@ if [[ "${POSTGRES_ENABLED}" == "1" && "${AUDIT_API_ENABLED}" != "1" ]]; then
 fi
 if [[ "${TARGET_BLOCKS}" -gt 1 && "${AUDIT_API_ENABLED}" != "1" ]]; then
   echo "QBIT_PRISM_LIVE_BLOCKS>1 requires QBIT_PRISM_LIVE_AUDIT_API=1" >&2
+  exit 1
+fi
+if [[ "${RESTART_REPLAY}" == "1" && ( "${PRIMED_WINDOW}" != "1" || "${NATIVE_POSTGRES}" != "1" || "${POSTGRES_ENABLED}" != "1" ) ]]; then
+  echo "restart replay requires primed-window and native-Postgres fixture modes" >&2
+  exit 1
+fi
+if [[ "${RESTART_REPLAY}" == "1" && -n "${EXTERNAL_PSQL}" && -z "${PRISM_DATABASE_URL:-}" ]]; then
+  echo "restart replay with external Postgres requires PRISM_DATABASE_URL" >&2
   exit 1
 fi
 if [[ "${POWER_LAW_ENABLED}" == "1" && "${MINER_COUNT}" -lt 6 ]]; then
@@ -93,7 +105,12 @@ if [[ "${POSTGRES_ENABLED}" == "1" ]]; then
     done
   else
     docker rm -f "${POSTGRES_CONTAINER}" >/dev/null 2>&1 || true
+    postgres_port_args=()
+    if [[ "${NATIVE_POSTGRES}" == "1" ]]; then
+      postgres_port_args=(-p 127.0.0.1::5432)
+    fi
     docker run \
+      "${postgres_port_args[@]}" \
       --rm \
       --detach \
       --name "${POSTGRES_CONTAINER}" \
@@ -115,7 +132,14 @@ if [[ "${POSTGRES_ENABLED}" == "1" ]]; then
   fi
 fi
 
+node_fixture_args=()
+if [[ "${PRIMED_WINDOW}" == "1" ]]; then
+  # Keep ASERT near its anchor while mining enough blocks to separate the
+  # network target from the low Stratum share target. This is regtest only.
+  node_fixture_args=(-mocktime=1738714602)
+fi
 "${QBITD_BIN}" \
+  "${node_fixture_args[@]}" \
   -regtest \
   -asert \
   -p2mronly=1 \
@@ -134,21 +158,31 @@ fi
   -datadir="${DATADIR}" >/dev/null
 
 wait_for_qbit_rpc_state ready 60
-qbit_rpc createwallet "${WALLET_NAME}" >/dev/null
-
 miner_usernames=()
-for miner_index in $(seq 1 "${MINER_COUNT}"); do
-  miner_usernames+=("$(qbit_rpc -rpcwallet="${WALLET_NAME}" getnewaddress "" p2mr)")
-done
-
-# A virgin regtest chain reports initialblockdownload=true until its first
-# block, and the coordinator's chain-trust gate blocks job issuance during
-# IBD, so a fresh chain could never mine its own first block through the
-# pool. Pre-mine one block to exit IBD; the PRISM ledger stays empty, so the
-# fresh-ledger (collection-mode) path is still exercised by the miners.
-qbit_rpc generatetoaddress 1 "${miner_usernames[0]}" >/dev/null
+if [[ "${PRIMED_WINDOW}" == "1" ]]; then
+  # Wallet-free deterministic P2MR programs are enough to verify the mined
+  # coinbase. The extra identity keeps difficulty probes out of miner state.
+  for miner_index in $(seq 1 "$((MINER_COUNT + 1))"); do
+    miner_usernames+=("$(python3 - "${miner_index}" "${QBIT_SRC_DIR}" <<'PYADDR'
+import sys
+sys.path.insert(0, sys.argv[2] + "/test/functional")
+from test_framework.address import program_to_witness
+print(program_to_witness(2, int(sys.argv[1]).to_bytes(32, "big"), main=False))
+PYADDR
+)")
+  done
+  qbit_rpc generatetoaddress 1000 "${miner_usernames[0]}" >/dev/null
+else
+  qbit_rpc createwallet "${WALLET_NAME}" >/dev/null
+  for _miner_index in $(seq 1 "$((MINER_COUNT + 1))"); do
+    miner_usernames+=("$(qbit_rpc -rpcwallet="${WALLET_NAME}" getnewaddress "" p2mr)")
+  done
+  # Exit IBD without adding any PRISM ledger rows.
+  qbit_rpc generatetoaddress 1 "${miner_usernames[0]}" >/dev/null
+fi
 before_height="$(qbit_rpc getblockcount)"
 
+start_coordinator() {
 (
   cd "${ROOT_DIR}"
   export QBIT_RPC_HOST=127.0.0.1
@@ -160,12 +194,19 @@ before_height="$(qbit_rpc getblockcount)"
   export PRISM_STRATUM_HIGHDIFF_PORT="${HIGHDIFF_PORT}"
   export PRISM_STRATUM_HIGHDIFF_START_DIFF="${HIGHDIFF_START_DIFF}"
   export PRISM_STRATUM_HIGHDIFF_MIN_DIFF="${HIGHDIFF_START_DIFF}"
+  export PRISM_HOT_PATH_LOG=1
   export PRISM_MIN_READY_MINERS="${MINER_COUNT}"
   export PRISM_EVIDENCE_PATH="${EVIDENCE_PATH}"
   export PRISM_AUDIT_DIR="${DATADIR}"
   export PRISM_MANIFEST_SIGNING_SEED_HEX="${MANIFEST_SIGNING_SEED_HEX}"
   export PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX="${LEDGER_ATTESTATION_SIGNING_SEED_HEX}"
   export PRISM_ALLOW_BUNDLE_EMBEDDED_LEDGER_KEY=1
+  if [[ "${PRIMED_WINDOW}" == "1" ]]; then
+    # The template intentionally uses historical node mocktime. Ledger and
+    # coordinator clocks stay real, and all lease budgets stay unchanged.
+    PRISM_TEMPLATE_MAX_AGE_SECONDS="$(python3 -c 'import time; print(max(120, int(time.time()) - 1738714602 + 120))')"
+    export PRISM_TEMPLATE_MAX_AGE_SECONDS
+  fi
   export PRISM_STRATUM_SHARE_DIFF=0.000000001
   export PRISM_STOP_AFTER_BLOCK=1
   if [[ "${AUDIT_API_ENABLED}" == "1" ]]; then
@@ -179,12 +220,24 @@ before_height="$(qbit_rpc getblockcount)"
   if [[ "${POSTGRES_ENABLED}" == "1" ]]; then
     export PRISM_POSTGRES_PSQL_COMMAND="${PSQL_COMMAND}"
     export PRISM_POSTGRES_INIT_SCHEMA=1
+    if [[ "${NATIVE_POSTGRES}" == "1" ]]; then
+      if [[ -z "${EXTERNAL_PSQL}" ]]; then
+        postgres_port="$(docker port "${POSTGRES_CONTAINER}" 5432/tcp | head -1 | sed 's/.*://')"
+        export PRISM_DATABASE_URL="postgresql://qbit:qbit@127.0.0.1:${postgres_port}/qbit"
+      fi
+      export PRISM_POSTGRES_NATIVE_CLIENT=1
+    fi
   else
     export PRISM_ALLOW_MEMORY_LEDGER=1
   fi
-  python3 lab/prism/prism_coordinator.py
-) >"${COORDINATOR_LOG}" 2>&1 &
+  if [[ "${RESTART_REPLAY}" == "1" && ! -f "${CRASH_MARKER}" ]]; then
+    exec python3 tests/prism_regtest_crash_coordinator.py "${CRASH_MARKER}"
+  fi
+  exec python3 lab/prism/prism_coordinator.py
+) >>"${COORDINATOR_LOG}" 2>&1 &
 coordinator_pid="$!"
+}
+start_coordinator
 
 STRATUM_PORT="${STRATUM_PORT}" python3 <<'PY'
 import os
@@ -279,13 +332,23 @@ PY
 # explicit md= minimum and the high-diff wire floor still hold above it. On a
 # fresh regtest chain the network difficulty sits below every configured
 # value, so the first probe expects the network clamp.
-network_difficulty="$(qbit_rpc getdifficulty)"
-probe_first_difficulty "${STRATUM_PORT}" "${miner_usernames[0]}" "x" "${network_difficulty}"
+network_difficulty="$(qbit_rpc getblocktemplate '{"rules":["segwit"]}' | python3 -c '
+import json, sys
+bits = int(json.load(sys.stdin)["bits"], 16)
+size, mantissa = bits >> 24, bits & 0x7fffff
+target = mantissa << (8 * (size - 3)) if size > 3 else mantissa >> (8 * (3 - size))
+print(float(0xffff * 2**208 / target))
+')"
+start_difficulty="${network_difficulty}"
+if [[ "${PRIMED_WINDOW}" == "1" ]]; then
+  start_difficulty=0.000000001
+fi
+probe_first_difficulty "${STRATUM_PORT}" "${miner_usernames[0]}" "x" "${start_difficulty}"
 probe_first_difficulty "${HIGHDIFF_PORT}" "${miner_usernames[0]}" "x" "${HIGHDIFF_START_DIFF}"
 # Password d=/md= bound vardiff but do not lift the first advertised job
 # above the network clamp; only the high-diff listener floor is a wire
 # guarantee that holds above it.
-probe_first_difficulty "${STRATUM_PORT}" "${miner_usernames[0]}" "d=0.5,md=0.25" "${network_difficulty}"
+probe_first_difficulty "${STRATUM_PORT}" "${miner_usernames[$MINER_COUNT]}" "d=0.5,md=0.25" "${network_difficulty}"
 
 if [[ "${AUDIT_API_ENABLED}" == "1" ]]; then
   AUDIT_PORT="${AUDIT_PORT}" python3 <<'PY'
@@ -310,6 +373,11 @@ PY
   fi
 fi
 
+seed_miner_script=lab/miner-sim/miner_sim.py
+if [[ "${PRIMED_WINDOW}" == "1" ]]; then
+  seed_miner_script=tests/prism_regtest_share_miner.py
+fi
+
 for miner_index in $(seq 1 "${MINER_COUNT}"); do
   miner_username="${miner_usernames[$((miner_index - 1))]}"
   (
@@ -325,7 +393,7 @@ for miner_index in $(seq 1 "${MINER_COUNT}"); do
     QBIT_RPC_PORT="${RPC_PORT}" \
     QBIT_RPC_USER="${RPC_USER}" \
     QBIT_RPC_PASSWORD="${RPC_PASSWORD}" \
-    python3 lab/miner-sim/miner_sim.py
+    python3 "${seed_miner_script}"
   ) >"${DATADIR}/miner-${miner_index}.log" 2>&1 &
   miner_pids+=("$!")
 done
@@ -360,6 +428,34 @@ while [[ ! -f "${EVIDENCE_PATH}" && "${SECONDS}" -lt "${deadline}" ]]; do
   fi
   sleep 1
 done
+
+if [[ "${RESTART_REPLAY}" == "1" ]]; then
+  crash_deadline=$((SECONDS + MINER_TIMEOUT_SECONDS))
+  while kill -0 "${coordinator_pid}" >/dev/null 2>&1; do
+    if [[ "${SECONDS}" -ge "${crash_deadline}" ]]; then
+      echo "candidate crash fixture did not reach the durable publication boundary" >&2
+      cat "${COORDINATOR_LOG}" >&2
+      exit 1
+    fi
+    sleep 0.1
+  done
+  crash_status=0
+  wait "${coordinator_pid}" || crash_status=$?
+  coordinator_pid=""
+  if [[ "${crash_status}" != "75" || ! -f "${CRASH_MARKER}" ]]; then
+    echo "unexpected coordinator exit in crash fixture: ${crash_status}" >&2
+    cat "${COORDINATOR_LOG}" >&2
+    exit 1
+  fi
+  # No miners remain to resubmit or solve a replacement. The successor must
+  # discover and finish exactly the candidate committed by its predecessor.
+  for pid in "${miner_pids[@]}"; do
+    kill "${pid}" >/dev/null 2>&1 || true
+    wait "${pid}" >/dev/null 2>&1 || true
+  done
+  miner_pids=()
+  start_coordinator
+fi
 
 deadline=$((SECONDS + MINER_TIMEOUT_SECONDS))
 while [[ ! -f "${EVIDENCE_PATH}" && "${SECONDS}" -lt "${deadline}" ]]; do
@@ -398,6 +494,7 @@ for pid in "${miner_pids[@]}"; do
 done
 
 if [[ "${AUDIT_API_ENABLED}" == "1" ]]; then
+  RESTART_REPLAY="${RESTART_REPLAY}" CRASH_MARKER="${CRASH_MARKER}" \
   EVIDENCE_PATH="${EVIDENCE_PATH}" \
   DATADIR="${DATADIR}" \
   AUDIT_PORT="${AUDIT_PORT}" \
@@ -444,13 +541,19 @@ owed = get_json("/owed-balances")
 if owed["schema"] != "qbit.prism.owed-balances.v1":
     raise SystemExit("unexpected owed-balances schema")
 
-metrics = get_text("/metrics")
-for expected in (
+import time
+expected_metrics = (
     f"qbit_prism_accepted_shares_total {evidence['accepted_share_count']}",
     "qbit_prism_blocks_accepted_total 1",
-):
-    if expected not in metrics:
-        raise SystemExit(f"missing metrics line: {expected}")
+)
+metrics_deadline = time.monotonic() + 20
+while True:
+    metrics = get_text("/metrics")
+    if all(expected in metrics for expected in expected_metrics):
+        break
+    if time.monotonic() >= metrics_deadline:
+        raise SystemExit(f"metrics cache did not publish expected counters: {expected_metrics}")
+    time.sleep(0.25)
 
 if os.environ["POSTGRES_ENABLED"] == "1":
     import shlex
@@ -473,6 +576,27 @@ if os.environ["POSTGRES_ENABLED"] == "1":
             text=True,
         ).strip()
         return json.loads(raw.splitlines()[-1])
+
+    if os.environ.get("RESTART_REPLAY") == "1":
+        with open(os.environ["CRASH_MARKER"], encoding="utf-8") as handle:
+            crashed = json.load(handle)
+        if evidence["block_hash"] != crashed["block_hash"]:
+            raise SystemExit("restart finalized a different candidate")
+        replayed = psql_json("""
+            SELECT json_build_object(
+                'state', o.state, 'digest', o.candidate_sha256,
+                'share_id', o.share_id, 'share_count',
+                (SELECT count(*) FROM qbit_share_ledger s WHERE s.share_id = o.share_id),
+                'storage_version', COALESCE((to_jsonb(o)->>'storage_version')::integer, 1),
+                'body_id', to_jsonb(o)->>'body_id'
+            ) FROM qbit_block_candidate_outbox o
+            WHERE o.block_hash = '%s'
+        """ % crashed["block_hash"])
+        if replayed != {"state": "submitted", "digest": crashed["candidate_sha256"],
+                        "share_id": crashed["share_id"], "share_count": 1,
+                        "storage_version": crashed["storage_version"], "body_id": None}:
+            raise SystemExit(f"restart candidate identity or atomicity mismatch: {replayed}")
+        print("native candidate crash/restart replay PASS", flush=True)
 
     counts = psql_json(
         """

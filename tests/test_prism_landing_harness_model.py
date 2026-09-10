@@ -706,7 +706,7 @@ class LandingStatementClassificationTests(unittest.TestCase):
             page = _run(
                 harness,
                 harness.client,
-                lambda: ledger.pending_block_candidate_rows(limit=32),
+                lambda: ledger._legacy_pending_block_candidate_rows(limit=32),
                 "pending-page",
             ).value()
             self.assertEqual([row["block_hash"] for row in page], [BLOCK_C])
@@ -726,6 +726,72 @@ class LandingStatementClassificationTests(unittest.TestCase):
                 ).value(),
                 (),
             )
+
+            # Issue #255: the chunked-body statements. A candidate with a
+            # share array wider than the fast path gets a span and page
+            # index; the metadata-first page, a hydration (manifest, spans,
+            # pages, chunk pages), a retired staging body and one janitor
+            # step drive the rest.
+            block_d = "dd" * 32
+            self.assertEqual(
+                _run(
+                    harness,
+                    harness.client,
+                    ledger.verify_candidate_schema,
+                    "schema-check",
+                ).value(),
+                {"declared": 2, "has_body_table": True},
+            )
+            _run(
+                harness,
+                harness.client,
+                lambda: ledger.persist_block_candidate_intent(
+                    {
+                        "schema": "qbit.prism.block-candidate-intent.v1",
+                        "block_hash_hex": block_d,
+                        "block_hex": "00",
+                        "parent_hash": BLOCK_C,
+                        "expected_height": 13,
+                        "template": {"previousblockhash": BLOCK_C, "height": 13},
+                        "found_block": {"network_difficulty": 1},
+                        "pending_share": {"job_id": "job-d"},
+                        "credit_share_on_accept": False,
+                        "username": "miner-d",
+                        "shares_json": [{"share_seq": index, "share_id": f"s{index}"} for index in range(4000)],
+                    }
+                ),
+                "intent-d",
+            ).value()
+            headers = _run(
+                harness,
+                harness.client,
+                lambda: ledger.pending_block_candidate_headers(limit=32),
+                "header-page",
+            ).value()
+            # BLOCK_C stayed pending (its pool-block row vetoed the abandon).
+            self.assertEqual([row["block_hash"] for row in headers.rows], [BLOCK_C, block_d])
+            self.assertTrue(headers.exhausted)
+            hydrated = _run(
+                harness,
+                harness.client,
+                lambda: ledger.hydrate_block_candidate_intent(headers.rows[1]),
+                "hydrate-d",
+            ).value()
+            self.assertEqual(len(hydrated["shares_json"]), 4000)
+            self.assertEqual(hydrated["shares_json"][3999]["share_id"], "s3999")
+            hydrated.body.close()
+            _run(
+                harness,
+                harness.client,
+                lambda: ledger._retire_staging_body("ab" * 16),
+                "retire-staging",
+            ).value()
+            _run(
+                harness,
+                harness.client,
+                ledger.reap_retired_candidate_bodies,
+                "janitor",
+            ).value()
 
             observed = {
                 kind

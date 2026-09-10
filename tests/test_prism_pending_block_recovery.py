@@ -145,6 +145,62 @@ class RecoveryTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(recovery.RecoveryError):
                 recovery.decode_candidate(coordinator, block, modified)
 
+    def test_chunked_candidate_row_is_hydrated_not_misclassified(self):
+        """Issue #255: a version-2 row has no jsonb; it decodes via the ledger."""
+        from lab.prism.candidate_codec import prepare_candidate_intent
+
+        block, row = fixture()
+        prepared = prepare_candidate_intent(row["candidate"])
+        v2_row = {
+            "candidate": None,
+            "candidate_sha256": row["candidate_sha256"],
+            "storage_version": 2,
+            "body_id": "ab" * 16,
+            "replay_header": prepared.replay_header(),
+            "byte_count": prepared.manifest.byte_count,
+            "chunk_count": prepared.manifest.chunk_count,
+            "chunk_bytes": prepared.manifest.chunk_bytes,
+            "share_count": prepared.manifest.share_count,
+            "body_state": "sealed",
+        }
+        hydrations = []
+
+        def hydrate(header_row, *, cancelled):
+            hydrations.append(header_row)
+            self.assertEqual(header_row["body"]["body_id"], "ab" * 16)
+            self.assertFalse(cancelled())
+            return prepared
+
+        coordinator = SimpleNamespace(
+            block_candidate_from_intent=block_candidate_from_intent,
+            ledger=SimpleNamespace(hydrate_block_candidate_intent=hydrate),
+            stop_event=threading.Event(),
+        )
+        candidate = recovery.decode_candidate(coordinator, block, v2_row)
+        self.assertTrue(candidate.durable_replay)
+        self.assertEqual(candidate.submission.block_hash_hex, block.block_hash)
+        self.assertEqual(len(hydrations), 1)
+        # A digest that disagrees with the hydrated body is still refused.
+        with self.assertRaisesRegex(recovery.RecoveryError, "digest mismatch"):
+            recovery.decode_candidate(coordinator, block, {**v2_row, "candidate_sha256": "0" * 64})
+
+    def test_unsupported_storage_version_and_unsealed_body_fail_closed(self):
+        block, row = fixture()
+        coordinator = SimpleNamespace(
+            block_candidate_from_intent=block_candidate_from_intent,
+            ledger=SimpleNamespace(hydrate_block_candidate_intent=Mock()),
+            stop_event=threading.Event(),
+        )
+        base = {"candidate": None, "candidate_sha256": row["candidate_sha256"]}
+        for label, v2_row in {
+            "future version": {**base, "storage_version": 3, "body_id": "ab" * 16, "body_state": "sealed"},
+            "unsealed body": {**base, "storage_version": 2, "body_id": "ab" * 16, "body_state": "staging"},
+            "missing body": {**base, "storage_version": 2, "body_id": None, "body_state": None},
+        }.items():
+            with self.subTest(label=label), self.assertRaises(recovery.RecoveryError):
+                recovery.decode_candidate(coordinator, block, v2_row)
+        coordinator.ledger.hydrate_block_candidate_intent.assert_not_called()
+
     def test_apply_finalizes_only_after_normal_accounting_and_checks_durable_result(self):
         block, payload = fixture()
         events = []
@@ -254,12 +310,19 @@ class NativeRecoveryTests(unittest.TestCase):
         cls.schema = "recovery_" + uuid.uuid4().hex
         cls.admin = psycopg.connect(os.environ["PRISM_RECOVERY_TEST_DATABASE_URL"], autocommit=True)
         cls.admin.execute(f'CREATE SCHEMA "{cls.schema}"')
+        # Private schema only: with public on the path, 001's DROP FUNCTION
+        # statements would remove the shared database's public functions
+        # before creating the private replacements. Builtins stay implicitly
+        # available.
         cls.url = make_conninfo(
             os.environ["PRISM_RECOVERY_TEST_DATABASE_URL"],
-            options=f"-csearch_path={cls.schema},public",
+            options=f"-csearch_path={cls.schema}",
         )
         with psycopg.connect(cls.url, autocommit=True) as connection:
             connection.execute(Path("crates/qbit-prism/sql/001_share_ledger.sql").read_text())
+            # Issue #255: the chunked-body migration the ledger applies
+            # after 001 on every initialized start.
+            connection.execute(Path("crates/qbit-prism/sql/002_candidate_bodies.sql").read_text())
 
     @classmethod
     def tearDownClass(cls):
@@ -316,6 +379,36 @@ class NativeRecoveryTests(unittest.TestCase):
                     )
             finally:
                 reader.close()
+
+    def test_legacy_only_schema_is_refused_by_the_reader_and_the_ledger(self):
+        # A 001-only database: the staged-upgrade case with
+        # PRISM_POSTGRES_INIT_SCHEMA=0, which storage version 1 cannot rescue.
+        import psycopg
+        from psycopg.conninfo import make_conninfo
+
+        from lab.prism.candidate_store import IncompatibleCandidateSchema
+
+        schema = "recovery_legacy_" + uuid.uuid4().hex
+        self.admin.execute(f'CREATE SCHEMA "{schema}"')
+        self.addCleanup(self.admin.execute, f'DROP SCHEMA "{schema}" CASCADE')
+        url = make_conninfo(
+            os.environ["PRISM_RECOVERY_TEST_DATABASE_URL"], options=f"-csearch_path={schema}"
+        )
+        with psycopg.connect(url, autocommit=True) as connection:
+            connection.execute(Path("crates/qbit-prism/sql/001_share_ledger.sql").read_text())
+        reader = recovery.RecoveryReader(url)
+        self.addCleanup(reader.close)
+        with self.assertRaisesRegex(recovery.RecoveryError, "002_candidate_bodies.sql"):
+            reader.require_candidate_schema()
+        ledger = PsqlShareLedger(
+            psql_command="psql",
+            database_url=url,
+            native_client_mode="on",
+            candidate_storage_version=1,
+        )
+        self.addCleanup(ledger.close)
+        with self.assertRaisesRegex(IncompatibleCandidateSchema, "002_candidate_bodies.sql"):
+            ledger.verify_candidate_schema()
 
     def test_real_finalizer_persists_confirms_publishes_and_completes_outbox(self):
         # Real coordinator, PostgreSQL, lease heartbeat, finalizer and audit

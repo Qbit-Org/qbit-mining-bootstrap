@@ -1739,6 +1739,9 @@ class PrismShareLedgerTests(unittest.TestCase):
         ledger = FakeLeasePsqlShareLedger(
             [acquired_lease(), {"records": [record]}]
         )
+        # This pins the legacy whole-jsonb statement (storage version 1);
+        # the chunked-body statement is covered by the #255 suites.
+        ledger._candidate_storage_version = 1
         intent = {
             "schema": "qbit.prism.block-candidate-intent.v1",
             "block_hash_hex": "ab" * 32,
@@ -1801,6 +1804,9 @@ class PrismShareLedgerTests(unittest.TestCase):
         ledger = FakeLeasePsqlShareLedger(
             [acquired_lease(), {"inserted": 1}]
         )
+        # Legacy whole-jsonb statement (storage version 1); see #255 suites
+        # for the chunked-body route.
+        ledger._candidate_storage_version = 1
         intent = {
             "schema": "qbit.prism.block-candidate-intent.v1",
             "block_hash_hex": "cd" * 32,
@@ -4770,11 +4776,19 @@ class PrismShareLedgerTests(unittest.TestCase):
                     "external_body_matches_sha",
                     side_effect=AssertionError("same-version compact retry must compare bounded storage"),
                 ),
+                # The retry verifies the existing compact body by streaming
+                # its segments against the logical window (issue #255); it
+                # never reconstructs a whole-window bundle.
                 unittest.mock.patch.object(
                     store,
                     "resolve_audit_bundle_v2",
-                    wraps=store.resolve_audit_bundle_v2,
-                ) as reconstruct,
+                    side_effect=AssertionError("compact retry must not reconstruct the whole window"),
+                ),
+                unittest.mock.patch.object(
+                    store,
+                    "_compact_body_reconstructs_to",
+                    wraps=store._compact_body_reconstructs_to,
+                ) as verified,
             ):
                 second_uri = ledger._prepare_external_audit_body(
                     payload,
@@ -4790,8 +4804,8 @@ class PrismShareLedgerTests(unittest.TestCase):
                 self.assertEqual(path.stat().st_ino, first_stat.st_ino)
                 self.assertEqual(path.stat().st_mtime_ns, first_stat.st_mtime_ns)
             canonicalizer.assert_not_called()
-            reconstruct.assert_called_once()
-            self.assertFalse(reconstruct.call_args.kwargs["verify_digest"])
+            verified.assert_called_once()
+            self.assertEqual(verified.call_args.kwargs["expected"], body_sha)
             self.assertEqual(list(body_dir.glob(".*.tmp")), [])
 
     def test_psql_compact_body_rejects_canonical_and_logical_bundle_mismatch(self) -> None:

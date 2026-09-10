@@ -35,13 +35,14 @@ import hashlib
 import json
 import threading
 import time
-from typing import Any, Callable, Iterator, Protocol, Sequence
+from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 
 from lab.prism.accepted_preview_telemetry import (
     FULL_RESCAN_PATH_DAEMON,
     FULL_RESCAN_PATH_IN_PROCESS,
     ensure_accepted_preview_telemetry,
 )
+from lab.prism.candidate_window import disk_window_covers, recorded_share_ids
 from lab.prism.coordinator_config import (
     DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX,
     DEFAULT_PRISM_PAYOUT_ARTIFACT_FULL_RESCAN_SECONDS,
@@ -3540,10 +3541,20 @@ class PayoutStateService:
         *,
         prior_balances: list[dict[str, object]] | None = None,
     ) -> list[dict[str, object]]:
-        """Derive the confirmed carry-forward view from a verified bundle."""
+        """Derive the confirmed carry-forward view from a verified bundle.
+
+        The bundle may be a dictionary or a bounded artifact view whose
+        ``accounts`` member is a lazy on-disk sequence (issue #255); the
+        accounts are walked once, row by row, in either case.
+        """
         runtime = self._runtime
         manifest = final_bundle.get("payout_policy_manifest")
-        if not isinstance(manifest, dict) or not isinstance(manifest.get("accounts"), list):
+        accounts = manifest.get("accounts") if isinstance(manifest, Mapping) else None
+        if (
+            accounts is None
+            or isinstance(accounts, (str, bytes, bytearray))
+            or not isinstance(accounts, Sequence)
+        ):
             raise RuntimeError("accepted block payout manifest is missing accounts")
         prior_identities: dict[str, tuple[str, str]] = {}
         for balance in prior_balances or []:
@@ -3557,8 +3568,8 @@ class PayoutStateService:
                 prior_identities.get(program, identity),
             )
         balances: list[dict[str, object]] = []
-        for account in manifest["accounts"]:
-            if not isinstance(account, dict):
+        for account in accounts:
+            if not isinstance(account, Mapping):
                 continue
             if str(account.get("account_type", "miner")) == "pool_fee":
                 continue
@@ -5707,36 +5718,36 @@ class PayoutStateService:
             else None
         )
         audit_share_window = getattr(runtime.ledger, "audit_share_window", None)
+        window_covers = getattr(runtime.ledger, "candidate_window_covers", None)
         if (
             anchor_ms is None
             or network_difficulty is None
-            or not callable(audit_share_window)
+            or not (callable(window_covers) or callable(audit_share_window))
         ):
             # Fail closed: a candidate whose window cannot be replayed at a
             # declared anchor cannot prove its coinbase pays the window the
             # durable ledger requires.
             return False
-        durable_rows = audit_share_window(
-            anchor_job_issued_at_ms=int(anchor_ms),
-            network_difficulty=int(network_difficulty),
-        )
         try:
-            recorded_share_ids = {
-                str(row.get("share_id"))
-                for row in context.shares_json
-                if isinstance(row, dict)
-            }
+            if callable(window_covers):
+                return window_covers(
+                    context.shares_json,
+                    anchor_job_issued_at_ms=int(anchor_ms),
+                    network_difficulty=int(network_difficulty),
+                )
+            # Compatibility for in-memory ledgers and older test adapters.
+            # The PostgreSQL path returns only a boolean, never durable rows.
+            durable_rows = audit_share_window(
+                anchor_job_issued_at_ms=int(anchor_ms),
+                network_difficulty=int(network_difficulty),
+            )
+            return disk_window_covers(recorded_share_ids(context.shares_json), durable_rows)
         except DaemonWindowMirrorDivergence:
             # Fail closed, exactly like a candidate whose window cannot be
             # replayed at all: a recorded window the coordinator can no
             # longer read cannot prove the coinbase pays it.
             self._note_window_mirror_divergence()
             return False
-        return all(
-            str(row.get("share_id")) in recorded_share_ids
-            for row in durable_rows
-            if isinstance(row, dict)
-        )
 
     def normalized_prior_balances(self, balances: list[dict[str, object]]) -> list[dict[str, object]]:
         rows = [
