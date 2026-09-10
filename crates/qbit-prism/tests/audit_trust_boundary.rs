@@ -217,9 +217,9 @@ fn insolvent_dust_block_is_rejected() {
     ));
 }
 
-// Shares issued or accepted after the anchor are excluded from the window. The real Python and
-// SQL differentials are the frozen corpus replay, the daemon gate and the server's SQL window
-// oracle.
+// Shares issued or accepted after the anchor are excluded from the window. The Python
+// differential for the window fold is the frozen corpus replay (`window_frozen_vectors`,
+// `window_daemon_gate`); no test on this branch runs the ledger's SQL window read against it.
 #[test]
 fn window_excludes_shares_after_the_anchor() {
     let anchor = 1001i64;

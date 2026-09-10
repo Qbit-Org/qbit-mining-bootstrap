@@ -7,6 +7,10 @@
 //! the `inputs-unpinned.json` sidecar beside it. Every input is checked
 //! against its frozen `input_sha256` before any output is compared, and every
 //! output comparison is against the frozen bytes, never a re-serialization.
+//!
+//! `supplementary.json` holds the few cases the corpus never reaches (a whole
+//! page expiring at exactly `window_weight`), exported from the same 2.x.x
+//! oracle with the same entry shape and replayed under their own tally.
 #![allow(dead_code)]
 
 use qbit_prism::window::{prepare_window_out_of_range, DeclaredWidth};
@@ -21,15 +25,29 @@ const REFERENCE_JSON: &str =
     include_str!("../../../../tests/fixtures/window_pipeline_parity/reference.json");
 const UNPINNED_INPUTS_JSON: &str =
     include_str!("../../../../tests/fixtures/window_pipeline_parity/inputs-unpinned.json");
+const SUPPLEMENTARY_JSON: &str =
+    include_str!("../../../../tests/fixtures/window_pipeline_parity/supplementary.json");
 
 /// Pin of the frozen corpus file. The unpinned-inputs sidecar needs no pin of
 /// its own: each of its documents is pinned by its `input_sha256` in here.
 pub const REFERENCE_SHA256: &str =
     "017c787d3b894d92702d65774e47224ce5a09838bcd1118549f740a21b406142";
+/// Pin of the supplementary cases, whose entries carry their own inputs.
+pub const SUPPLEMENTARY_SHA256: &str =
+    "4a89967643938cfbec933b7f5582118e583245986eb2adf9e533d017ea252fc6";
 const REFERENCE_SCHEMA: &str = "qbit-prism-window-pipeline-parity-reference/v2";
 const INPUT_SCHEMA: &str = "qbit-prism-window-pipeline-parity-input/v1";
 const UNPINNED_SCHEMA: &str = "qbit-prism-window-pipeline-parity-unpinned-inputs/v1";
-const UNPINNED_SOURCE_COMMIT: &str = "504846cc0b72e8f86ed17f896d4ccbbe196a31dc";
+const SUPPLEMENTARY_SCHEMA: &str = "qbit-prism-window-pipeline-parity-supplementary/v1";
+/// The 2.x.x commit whose oracle exported both the sidecar and the
+/// supplementary cases.
+const ORACLE_SOURCE_COMMIT: &str = "504846cc0b72e8f86ed17f896d4ccbbe196a31dc";
+const SUPPLEMENTARY_CASES: [&str; 4] = [
+    "advance-page-expiry-at-weight",
+    "advance-page-expiry-at-weight-second-page",
+    "advance-page-expiry-one-above-weight",
+    "advance-page-expiry-one-below-weight",
+];
 const UNPINNED_CASES: [&str; 5] = [
     "bulk-seeded",
     "multi-page-interior-cutoff",
@@ -89,6 +107,15 @@ pub const EXPECTED_TALLY: Tally = Tally {
     byte_compared: 21,
     declined: 2,
     with_advance_stats: 8,
+};
+
+/// The counts both replays must reach on the supplementary cases.
+pub const EXPECTED_SUPPLEMENTARY_TALLY: Tally = Tally {
+    cases: 4,
+    rejections: 0,
+    byte_compared: 4,
+    declined: 0,
+    with_advance_stats: 4,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,8 +182,10 @@ impl Case {
                 let phase = if FULL_REJECTIONS.contains(&category) {
                     Phase::Full
                 } else {
-                    // Every advance rejection in the corpus refuses its final
-                    // delta; the steps before it must succeed.
+                    // The frozen entry records only the category: the phase
+                    // is derived from the input. `assert_corpus_shape` holds
+                    // every advance rejection to exactly one advance, so the
+                    // refused step is that one and the full fold must succeed.
                     Phase::Advance(self.advances().len() - 1)
                 };
                 Expectation::Rejected {
@@ -164,6 +193,31 @@ impl Case {
                     phase,
                 }
             }
+        }
+    }
+
+    /// The anchor of the case's final step, where its frozen window stands.
+    pub fn final_anchor(&self) -> &Value {
+        self.advances()
+            .last()
+            .map_or(&self.input["snapshot"]["anchor_job_issued_at_ms"], |step| {
+                &step["anchor_job_issued_at_ms"]
+            })
+    }
+
+    /// The spool tail bytes the frozen entry vouches for: the pinned literal,
+    /// or else `computed` when it hashes to the frozen `spool_tail_sha256`.
+    pub fn frozen_spool_tail(&self, computed: &[u8]) -> Option<Vec<u8>> {
+        let literal = self
+            .entry
+            .get("pinned_literals")
+            .and_then(|literals| literals.get("spool_tail"))
+            .and_then(Value::as_str);
+        match literal {
+            Some(literal) => Some(literal.as_bytes().to_vec()),
+            None => (self.entry["spool_tail_sha256"].as_str()
+                == Some(sha256_hex(computed).as_str()))
+            .then(|| computed.to_vec()),
         }
     }
 
@@ -215,7 +269,7 @@ pub fn load() -> Vec<Case> {
     let sidecar: Value =
         serde_json::from_str(UNPINNED_INPUTS_JSON).expect("inputs-unpinned.json parses");
     assert_eq!(sidecar["schema"], UNPINNED_SCHEMA);
-    assert_eq!(sidecar["source_commit"], UNPINNED_SOURCE_COMMIT);
+    assert_eq!(sidecar["source_commit"], ORACLE_SOURCE_COMMIT);
     let sidecar_cases = sidecar["cases"]
         .as_object()
         .expect("sidecar cases is an object");
@@ -249,6 +303,67 @@ pub fn load() -> Vec<Case> {
     }
 
     // input_sha256 first: a changed input invalidates every output check.
+    assert_input_hashes(&cases);
+    assert_corpus_shape(&cases, &sidecar_used, sidecar_cases.len());
+    assert_integer_domain(&cases);
+    cases
+}
+
+/// Load the supplementary cases, check their pin and every input's
+/// `input_sha256`, and assert their shape, before any output is compared.
+pub fn load_supplementary() -> Vec<Case> {
+    assert_eq!(
+        sha256_hex(SUPPLEMENTARY_JSON.as_bytes()),
+        SUPPLEMENTARY_SHA256,
+        "tests/fixtures/window_pipeline_parity/supplementary.json no longer matches its pin; \
+         it changes only in a reviewed commit that re-exports it and updates the pin"
+    );
+    let document: Value =
+        serde_json::from_str(SUPPLEMENTARY_JSON).expect("supplementary.json parses");
+    assert_eq!(document["schema"], SUPPLEMENTARY_SCHEMA);
+    assert_eq!(document["source_commit"], ORACLE_SOURCE_COMMIT);
+    let entries = document["cases"]
+        .as_object()
+        .expect("supplementary cases is an object");
+    let mut names: Vec<&str> = entries.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(names, SUPPLEMENTARY_CASES, "supplementary case names");
+
+    let cases: Vec<Case> = entries
+        .iter()
+        .map(|(name, entry)| {
+            let input = entry["pinned_literals"]["input"].clone();
+            assert_eq!(input["schema"], INPUT_SCHEMA, "{name}: input schema");
+            assert_eq!(input["name"], name.as_str(), "{name}: input name");
+            assert!(
+                entry.get("rejected").is_none(),
+                "{name}: the oracle accepted every supplementary case"
+            );
+            Case {
+                name: name.clone(),
+                entry: entry.clone(),
+                input,
+                input_from_sidecar: false,
+            }
+        })
+        .collect();
+    assert_input_hashes(&cases);
+    for case in &cases {
+        assert!(
+            prepare_window_out_of_range(&case.full_request()).is_none(),
+            "{}: supplementary inputs lie inside the declared widths",
+            case.name
+        );
+        assert!(
+            !case.advances().is_empty(),
+            "{}: every supplementary case advances",
+            case.name
+        );
+    }
+    cases
+}
+
+fn assert_input_hashes(cases: &[Case]) {
     let input_mismatches: Vec<String> = cases
         .iter()
         .filter_map(|case| {
@@ -273,10 +388,6 @@ pub fn load() -> Vec<Case> {
         input_mismatches.len(),
         input_mismatches.join("\n")
     );
-
-    assert_corpus_shape(&cases, &sidecar_used, sidecar_cases.len());
-    assert_integer_domain(&cases);
-    cases
 }
 
 fn assert_corpus_shape(cases: &[Case], sidecar_used: &BTreeSet<&str>, sidecar_len: usize) {
@@ -326,9 +437,11 @@ fn assert_corpus_shape(cases: &[Case], sidecar_used: &BTreeSet<&str>, sidecar_le
                 case.name
             );
         } else {
-            assert!(
-                !case.advances().is_empty(),
-                "{}: advance rejection without advances",
+            // `Case::expectation` derives the refused step from this.
+            assert_eq!(
+                case.advances().len(),
+                1,
+                "{}: advance rejection with other than exactly one advance",
                 case.name
             );
         }
@@ -621,14 +734,6 @@ impl Mismatches {
                 &canonical,
             );
         }
-        // The fragments are the items stream's elements, exactly.
-        self.check_bytes(
-            name,
-            "fragments joined by ','",
-            &outputs.canonical_items,
-            &outputs.fragments.join(&b","[..]),
-        );
-
         let stream = outputs.fragments.join(&b"\n"[..]);
         self.check(
             name,
@@ -699,13 +804,11 @@ impl Mismatches {
         );
     }
 
-    pub fn finish(self, what: &str, tally: Tally) {
+    pub fn finish(self, what: &str, tally: Tally, expected: Tally) {
         println!("{what}: {tally}");
         let mut mismatches = self.0;
-        if tally != EXPECTED_TALLY {
-            mismatches.push(format!(
-                "corpus: tally: expected {EXPECTED_TALLY}, got {tally}"
-            ));
+        if tally != expected {
+            mismatches.push(format!("corpus: tally: expected {expected}, got {tally}"));
         }
         assert!(
             mismatches.is_empty(),

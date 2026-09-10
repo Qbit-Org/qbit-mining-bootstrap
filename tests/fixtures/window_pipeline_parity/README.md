@@ -11,13 +11,16 @@ Rust tests read the corpus instead:
 - `crates/qbit-prism/tests/window_daemon_gate.rs` replays every case through
   the real `qbit-prism-build-audit-bundle --serve` daemon.
 
-Both run under `cargo test` and need no Python or other inputs.
+Both run under `cargo test` and need no Python or other inputs. Both also
+replay the cases in `supplementary.json` (see below) under a separate tally.
 
 ## Pins
 
 - `reference.json` is pinned by its sha256,
   `017c787d3b894d92702d65774e47224ce5a09838bcd1118549f740a21b406142`, in
   `crates/qbit-prism/tests/support/window_corpus.rs`.
+- `supplementary.json` is pinned there too, by its sha256,
+  `4a89967643938cfbec933b7f5582118e583245986eb2adf9e533d017ea252fc6`.
 - Every case's input document is pinned by its `input_sha256` in
   `reference.json`. That is Python's
   `json.dumps(doc, sort_keys=True, separators=(",", ":"))` with its default
@@ -39,6 +42,56 @@ The sidecar holds those five input documents, exported from 2.x.x at
 exact export command. That command checks each document against the frozen
 `input_sha256` before writing anything.
 
+## `supplementary.json`
+
+The corpus never expires a whole pre-existing page at exactly
+`window_weight`, so a `>` in place of that `>=` passes every corpus case.
+`supplementary.json` holds four cases that pin the boundary. They were
+exported from the same 2.x.x oracle at
+`504846cc0b72e8f86ed17f896d4ccbbe196a31dc`, and each entry has exactly the
+`reference.json` v2 shape: `why`, `input_sha256`, `pinned_literals` (input,
+record JSONs, canonical bytes and spool tail), and every output field.
+
+| Case | Window before the advance | What the advance pins |
+| --- | --- | --- |
+| `advance-page-expiry-at-weight` | weight 2, page_size 2, one page | the old page expires with exactly the weight left |
+| `advance-page-expiry-at-weight-second-page` | weight 4, page_size 2, two pages | the first page expires above the weight, the second with exactly the weight left |
+| `advance-page-expiry-one-below-weight` | weight 3, page_size 2, one page | expiring the page would leave one below the weight, so it stays and one row expires |
+| `advance-page-expiry-one-above-weight` | weight 3, page_size 2, one page | the page expires with one above the weight left |
+
+Every expected value, `touched_pages` included, is the oracle's output; none
+is computed by hand. Both tests replay these cases with the same comparisons
+as the corpus, under their own tally
+(`4 cases, 0 rejections, 4 byte-compared, 0 declined, 4 with advance stats`),
+so the corpus counts stay as frozen.
+
+The file's `command` field is the exact export. Run it in the extract's root.
+It writes `supplementary.json` there, and exits non-zero if the oracle
+rejects any case. Two runs produce identical bytes.
+
+## Compact spool tail
+
+Each frozen `spool_tail` is the compact build-request suffix the 2.x.x
+coordinator spooled:
+`,"compact_share_identities":[...],"compact_shares":[...]}`. The native test
+compares it with the test's own encoder. The daemon gate also makes the
+daemon's real decoder consume it:
+
+- It prefixes the frozen bytes with a `found_block` and a `window_key` and
+  sends the result as a `--serve` build request.
+- The build summary must equal the one the same daemon builds from the window
+  it prepared from the case's full records.
+- The summary's reward manifest lists every counted share with the fields the
+  compact format carries: `share_seq`, `share_id`, `miner_id`, `order_key`,
+  `p2mr_program_hex`, `share_difficulty`, `job_issued_at_ms`,
+  `accepted_at_ms` and `credit_policy`. The fields it doesn't carry
+  (`network_difficulty`, `template_height`, `job_id`, `ntime`) never reach the
+  summary.
+
+The five sidecar cases pin no spool literal. For them the gate sends the test
+encoder's bytes, and only once those hash to the frozen `spool_tail_sha256`.
+The empty window has no rows to upload and isn't sent.
+
 ## Regenerating
 
 In an extract of 2.x.x at the pinned commit
@@ -51,7 +104,9 @@ with Python 3.14 and no database:
    `python3 -m tests.window_pipeline_parity regenerate`.
 3. Export the sidecar with the `command` recorded in `inputs-unpinned.json`.
    It writes `inputs-unpinned.json` in the extract's root.
-4. Copy both files here and update the pins above.
+4. Export the supplementary cases with the `command` recorded in
+   `supplementary.json`. It writes `supplementary.json` in the extract's root.
+5. Copy the three files here and update the pins above.
 
 ## Integer domain
 

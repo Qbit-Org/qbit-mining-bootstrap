@@ -4,12 +4,15 @@
 //! generated on 2.x.x by the Python oracle -- is folded and advanced with
 //! `qbit_prism::window::PayoutWindow` and compared against the frozen bytes.
 //! The two cases outside the declared integer widths must fail the typed
-//! parse; see `support/window_corpus.rs`.
+//! parse; see `support/window_corpus.rs`. The supplementary cases replay the
+//! same way under their own tally.
 
 #[path = "support/window_corpus.rs"]
 mod window_corpus;
 
 use qbit_prism::window::{canonical_share_fragment, prepare_window_out_of_range, PayoutWindow};
+use std::any::Any;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use window_corpus::{spool_tail, Case, Mismatches, Outcome, Outputs, Phase, Tally};
 
 fn replay(case: &Case, mismatches: &mut Mismatches) -> Outcome {
@@ -91,24 +94,66 @@ fn replay(case: &Case, mismatches: &mut Mismatches) -> Outcome {
     }
 
     let shares = window.shares_for_build();
+    let canonical_items = window.canonical_items_bytes();
+    let fragments: Vec<Vec<u8>> = shares.iter().map(canonical_share_fragment).collect();
+    // Fragments encoded record by record must be the window's own items
+    // stream, exactly.
+    mismatches.check_bytes(
+        &case.name,
+        "fragments joined by ','",
+        &canonical_items,
+        &fragments.join(&b","[..]),
+    );
     Outcome::Outputs(Box::new(Outputs {
         record_count: window.record_count(),
-        canonical_items: window.canonical_items_bytes(),
+        canonical_items,
         canonical_digest: window.canonical_digest_hex(),
-        fragments: shares.iter().map(canonical_share_fragment).collect(),
+        fragments,
         spool_tail: spool_tail(&shares),
         advance_stats,
     }))
 }
 
-#[test]
-fn frozen_corpus_replays_through_the_native_window() {
-    let cases = window_corpus::load();
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| message.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
+/// Replay every case in isolation: a panic inside the engine (a
+/// `debug_assert!`, say) becomes a mismatch naming its case, and the
+/// remaining cases still run.
+fn replay_all(what: &str, cases: &[Case], expected: Tally) {
     let mut mismatches = Mismatches::default();
     let mut tally = Tally::default();
-    for case in &cases {
-        let outcome = replay(case, &mut mismatches);
-        mismatches.settle(case, outcome, &mut tally);
+    for case in cases {
+        match catch_unwind(AssertUnwindSafe(|| replay(case, &mut mismatches))) {
+            Ok(outcome) => mismatches.settle(case, outcome, &mut tally),
+            Err(payload) => {
+                tally.cases += 1;
+                mismatches.push(&case.name, "panic", panic_message(payload.as_ref()));
+            }
+        }
     }
-    mismatches.finish("window_frozen_vectors", tally);
+    mismatches.finish(what, tally, expected);
+}
+
+#[test]
+fn frozen_corpus_replays_through_the_native_window() {
+    replay_all(
+        "window_frozen_vectors",
+        &window_corpus::load(),
+        window_corpus::EXPECTED_TALLY,
+    );
+}
+
+#[test]
+fn supplementary_cases_replay_through_the_native_window() {
+    replay_all(
+        "window_frozen_vectors supplementary",
+        &window_corpus::load_supplementary(),
+        window_corpus::EXPECTED_SUPPLEMENTARY_TALLY,
+    );
 }
