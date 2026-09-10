@@ -69,6 +69,7 @@ struct StoredJob {
 pub struct Coordinator {
     pub config: Arc<Config>,
     pub ledger: Arc<Ledger>,
+    pub metrics: Arc<crate::metrics::Metrics>,
     pub rpc: Rpc,
     pub prepared: RwLock<Option<Arc<Prepared>>>,
     pub refresh: watch::Sender<u64>,
@@ -297,6 +298,7 @@ impl Coordinator {
             .await?;
         let (refresh, _) = watch::channel(0);
         Ok(Arc::new(Self {
+            metrics: Arc::new(crate::metrics::Metrics::default()),
             build_slots: Arc::new(Semaphore::new(config.build_workers)),
             config: Arc::new(config),
             ledger,
@@ -1752,6 +1754,7 @@ impl MiningBackend for Coordinator {
         match save {
             Ok(true) => {
                 self.accepted.fetch_add(1, Ordering::Relaxed);
+                self.metrics.record_share_accepted(stale);
                 if current.bundle.is_none() {
                     self.wake.notify_one();
                 }

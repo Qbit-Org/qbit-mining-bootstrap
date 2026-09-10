@@ -102,6 +102,7 @@ pub struct ApiState {
     /// Published by the runtime; health handlers never wait on database queries.
     pub health: Arc<RwLock<Value>>,
     metrics: Arc<RwLock<MetricsSnapshot>>,
+    registry: Arc<crate::metrics::Metrics>,
     pub latest_evidence: Arc<RwLock<Option<Value>>>,
     health_published_at: Arc<RwLock<Instant>>,
     client: reqwest::Client,
@@ -143,6 +144,7 @@ impl ApiState {
                 json!({"schema":"qbit.prism.audit-health.v1","ok":false,"state":"starting","error":"health snapshot warm-up has not completed yet"}),
             )),
             metrics: Arc::new(RwLock::new(MetricsSnapshot::default())),
+            registry: Arc::new(crate::metrics::Metrics::default()),
             latest_evidence: Arc::new(RwLock::new(None)),
             health_published_at: Arc::new(RwLock::new(Instant::now())),
             client: reqwest::Client::builder()
@@ -151,6 +153,13 @@ impl ApiState {
                 .expect("HTTP client"),
             cache: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+    pub fn with_metrics(mut self, registry: Arc<crate::metrics::Metrics>) -> Self {
+        self.registry = registry;
+        self
+    }
+    pub fn metrics(&self) -> Arc<crate::metrics::Metrics> {
+        self.registry.clone()
     }
     pub fn publish_health(&self, payload: Value) {
         let mut health = self.health.write().unwrap_or_else(|e| e.into_inner());
@@ -317,21 +326,27 @@ async fn handle_inner(
         if let Some(service) = &state.public_service {
             return finish(service.health_response(), &method);
         }
-        let mut payload = state
-            .health
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let age = state
-            .health_published_at
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .elapsed();
+        let (mut payload, age) = {
+            // Match the publisher's lock order so a later publication cannot
+            // lend its freshness to the previous health payload.
+            let health = state.health.read().unwrap_or_else(|e| e.into_inner());
+            let age = state
+                .health_published_at
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .elapsed();
+            (health.clone(), age)
+        };
         payload["snapshot_age_seconds"] = json!(age.as_secs_f64());
         if age > health_stale_after() {
             payload["ok"] = json!(false);
             payload["error"] = json!("health snapshot is stale");
         }
+        state
+            .registry
+            .runtime()
+            .snapshot()
+            .apply_health(&mut payload);
         return finish(
             json_response(
                 if payload["ok"] == true {
@@ -354,7 +369,11 @@ async fn handle_inner(
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         return finish(
-            snapshot.response(Instant::now(), health_stale_after()),
+            snapshot.response_with_runtime(
+                Instant::now(),
+                health_stale_after(),
+                Some(state.registry.runtime().snapshot()),
+            ),
             &method,
         );
     }

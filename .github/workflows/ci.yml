@@ -217,6 +217,8 @@ jobs:
           cargo test --locked -p qbit-prism-server
           --test stratum_admission_postgres -- --ignored --exact
           ten_thousand_unsubscribed_connections_do_not_advance_postgres_sequence
+      - name: Exercise native metrics collectors against PostgreSQL
+        run: cargo test --locked -p qbit-prism-server --test observability_database -- --ignored
 
   docker-builds:
     name: Build lightweight Docker images

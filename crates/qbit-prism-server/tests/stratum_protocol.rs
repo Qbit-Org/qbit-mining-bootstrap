@@ -40,6 +40,9 @@ struct Backend {
     network_bits: AtomicU32,
     fail_builds: AtomicU32,
     hint_reads_unavailable: AtomicBool,
+    submit_gate: Mutex<Option<Arc<observability::Gate>>>,
+    build_gate: Mutex<Option<Arc<observability::Gate>>>,
+    hint_gate: Mutex<Option<Arc<observability::Gate>>>,
 }
 
 impl MiningBackend for Backend {
@@ -73,6 +76,10 @@ impl MiningBackend for Backend {
         evidence: Option<&str>,
         downward: bool,
     ) -> anyhow::Result<()> {
+        let gate = self.hint_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.wait().await;
+        }
         let mut hints = self.hints.lock().unwrap();
         let key = (listener.into(), worker.username.clone());
         if downward {
@@ -118,6 +125,10 @@ impl MiningBackend for Backend {
         {
             return Err(StratumError::backend("temporary builder failure"));
         }
+        let gate = self.build_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.wait().await;
+        }
         let generation = self.generation.load(Ordering::SeqCst);
         let bits = self.network_bits.load(Ordering::Relaxed);
         let bits = if bits == 0 { 0x207fffff } else { bits };
@@ -162,6 +173,10 @@ impl MiningBackend for Backend {
         submission: Submission,
         grace: bool,
     ) -> Result<(), StratumError> {
+        let gate = self.submit_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.wait().await;
+        }
         let tip = format!("{:064x}", self.generation.load(Ordering::SeqCst));
         if job.wire.previousblockhash != tip && !grace {
             return Err(StratumError::new(21, "stale job", "stale-job"));
@@ -1255,3 +1270,6 @@ async fn admission_timeout_records_failure_and_shutdown_releases_session_stats()
     assert_eq!(snapshot.authorized, 0);
     assert_eq!(snapshot.pending_builds, 0);
 }
+
+#[path = "observability/stratum.rs"]
+mod observability;

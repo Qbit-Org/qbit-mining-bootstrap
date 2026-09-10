@@ -2,6 +2,7 @@ use crate::{
     api::{ApiConfig, ApiState},
     config::{self, Config},
     coordinator::Coordinator,
+    metrics::{self, TaskKind},
     stratum::{run_listener, StratumConfig, StratumStats},
 };
 use anyhow::{Context, Result};
@@ -13,10 +14,12 @@ use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 
 pub async fn run(config: Config) -> Result<()> {
     let rollup_settings = crate::rollups::settings_from_env()?;
-    let stratum_config = StratumConfig::from_env()?;
+    let mut stratum_config = StratumConfig::from_env()?;
     let stats = stratum_config.stats.clone();
-    let highdiff = stratum_config.highdiff_config()?;
     let coordinator = Coordinator::new(config).await?;
+    let registry = coordinator.metrics.clone();
+    stratum_config.metrics = registry.clone();
+    let highdiff = stratum_config.highdiff_config()?;
     let config = &coordinator.config;
     let (shutdown, shutdown_rx) = watch::channel(false);
     let primary = TcpListener::bind((
@@ -47,7 +50,10 @@ pub async fn run(config: Config) -> Result<()> {
     if api_config.minimum_payout_bits == 0 {
         api_config.minimum_payout_bits = config.payout_policy.min_output_sats()?;
     }
-    let api_state = ApiState::new(coordinator.ledger.pool.clone(), api_config);
+    let api_state =
+        ApiState::new(coordinator.ledger.pool.clone(), api_config).with_metrics(registry);
+    let metrics = api_state.metrics();
+    let runtime = metrics.runtime();
     let api_listener = if config.audit_port > 0 {
         Some(
             TcpListener::bind((config.audit_bind.as_str(), config.audit_port))
@@ -58,59 +64,68 @@ pub async fn run(config: Config) -> Result<()> {
         None
     };
     let mut tasks = JoinSet::new();
-    tasks.spawn(run_listener(
-        primary,
-        stratum_config,
-        coordinator.clone(),
-        coordinator.refresh.subscribe(),
-        shutdown_rx.clone(),
-    ));
-    if let (Some(listener), Some(highdiff)) = (high_listener, highdiff) {
-        tasks.spawn(run_listener(
-            listener,
-            highdiff,
+    tasks.spawn(runtime.track(
+        TaskKind::StratumListener,
+        run_listener(
+            primary,
+            stratum_config,
             coordinator.clone(),
             coordinator.refresh.subscribe(),
             shutdown_rx.clone(),
+        ),
+    ));
+    if let (Some(listener), Some(highdiff)) = (high_listener, highdiff) {
+        tasks.spawn(runtime.track(
+            TaskKind::StratumListener,
+            run_listener(
+                listener,
+                highdiff,
+                coordinator.clone(),
+                coordinator.refresh.subscribe(),
+                shutdown_rx.clone(),
+            ),
         ));
     }
-    tasks.spawn({
+    tasks.spawn(runtime.track(TaskKind::Refresh, {
         let coordinator = coordinator.clone();
         let rx = shutdown_rx.clone();
         async move {
             coordinator.refresh_loop(rx).await;
             Ok(())
         }
-    });
-    tasks.spawn({
+    }));
+    tasks.spawn(runtime.track(TaskKind::Submit, {
         let coordinator = coordinator.clone();
         let rx = shutdown_rx.clone();
         async move {
             coordinator.submit_loop(rx).await;
             Ok(())
         }
-    });
+    }));
     if config.blockwait {
-        tasks.spawn({
+        tasks.spawn(runtime.track(TaskKind::BlockWait, {
             let coordinator = coordinator.clone();
             let rx = shutdown_rx.clone();
             async move {
                 coordinator.blockwait_loop(rx).await;
                 Ok(())
             }
-        });
+        }));
     }
     if config.ctv_broadcast {
-        tasks.spawn(crate::broadcaster::run(
-            coordinator.clone(),
-            shutdown_rx.clone(),
+        tasks.spawn(runtime.track(
+            TaskKind::Broadcast,
+            crate::broadcaster::run(coordinator.clone(), shutdown_rx.clone()),
         ));
     }
     if let Some(settings) = rollup_settings {
-        tasks.spawn(crate::rollups::run(
-            coordinator.ledger.pool.clone(),
-            settings,
-            shutdown_rx.clone(),
+        tasks.spawn(runtime.track(
+            TaskKind::Rollup,
+            crate::rollups::run(
+                coordinator.ledger.pool.clone(),
+                settings,
+                shutdown_rx.clone(),
+            ),
         ));
     }
     if let Some(listener) = api_listener {
@@ -125,11 +140,18 @@ pub async fn run(config: Config) -> Result<()> {
             Ok(())
         });
     }
-    tasks.spawn(publish_health(
-        coordinator.clone(),
-        api_state,
-        stats,
-        shutdown_rx.clone(),
+    tasks.spawn(runtime.clone().run(shutdown_rx.clone()));
+    tasks.spawn(runtime.track(
+        TaskKind::Collector,
+        metrics::collectors::run(
+            metrics,
+            coordinator.ledger.pool.clone(),
+            shutdown_rx.clone(),
+        ),
+    ));
+    tasks.spawn(runtime.track(
+        TaskKind::HealthPublisher,
+        publish_health(coordinator.clone(), api_state, stats, shutdown_rx.clone()),
     ));
     let failure = tokio::select! {
         result=signal()=>{result?;None},
@@ -173,6 +195,10 @@ async fn publish_health(
     let mut missing_since = None::<Instant>;
     loop {
         tokio::select! {_=shutdown.changed()=>break,_=tick.tick()=>{}}
+        let _progress = state
+            .metrics()
+            .runtime()
+            .start_operation(TaskKind::HealthPublisher, coordinator.config.health_timeout);
         let mut health = coordinator.health().await;
         let snapshot = stats.snapshot(health["template_generation"].as_u64().unwrap_or(0));
         if snapshot.authorized_missing_current_work == 0 {
@@ -191,11 +217,19 @@ async fn publish_health(
             health["status"] = "job-delivery-stalled".into();
         }
         health["stratum"] = serde_json::to_value(&snapshot)?;
+        metrics::add_known_health_fields(&mut health);
         state.publish_health(health.clone());
-        let ready = health["ok"].as_bool().unwrap_or(false) as u8;
-        let mut metrics = format!("# TYPE qbit_prism_health_state gauge\nqbit_prism_health_state {ready}\n# TYPE qbit_prism_accepted_shares_total counter\nqbit_prism_accepted_shares_total {}\n# TYPE qbit_prism_rejected_shares_total counter\nqbit_prism_rejected_shares_total {}\n# TYPE qbit_prism_blocks_total counter\nqbit_prism_blocks_total {}\n# TYPE qbit_prism_runtime_workers gauge\nqbit_prism_runtime_workers {}\n",snapshot.accepted_submissions,snapshot.rejected_submissions,coordinator.blocks.load(Ordering::Relaxed),coordinator.config.runtime_workers);
-        metrics.push_str(&format!("qbit_prism_connections {}\nqbit_prism_authorized_clients {}\nqbit_prism_pending_job_builds {}\nqbit_prism_authorized_with_current_work {}\nqbit_prism_authorized_missing_current_work {}\nqbit_prism_job_delivery_successes_total {}\nqbit_prism_job_delivery_failures_total {}\n",snapshot.connections,snapshot.authorized,snapshot.pending_builds,snapshot.authorized_with_current_work,snapshot.authorized_missing_current_work,snapshot.job_delivery_successes,snapshot.job_delivery_failures));
-        state.publish_metrics(metrics)?;
+        let registry = state.metrics();
+        registry.publish_stratum(
+            &snapshot,
+            health["ok"] == true,
+            coordinator.config.runtime_workers,
+            coordinator.blocks.load(Ordering::Relaxed),
+        );
+        registry.publish_delivery(
+            stats.delivery_metrics(missing_since.map_or(Duration::ZERO, |at| at.elapsed())),
+        );
+        state.publish_metrics(registry.render())?;
         if let Err(error) = coordinator.ledger.heartbeat(health).await {
             tracing::warn!(%error,"cluster heartbeat failed");
         }

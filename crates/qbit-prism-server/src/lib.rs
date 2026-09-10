@@ -6,6 +6,7 @@ pub mod codec;
 pub mod config;
 pub mod coordinator;
 pub mod ledger;
+pub mod metrics;
 pub mod readiness;
 pub mod rollups;
 pub mod rpc;
