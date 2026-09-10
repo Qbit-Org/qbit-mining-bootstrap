@@ -1069,12 +1069,18 @@ async fn the_anchor_barrier_holds_at_large_millisecond_values() -> Result<()> {
 ///
 /// Only a conversion that lands *below* its millisecond loses one: flooring a
 /// value a microsecond high returns the same millisecond, so those round-trip
-/// cleanly. So rather than skip the read-back where it is known to be wrong,
-/// this test pins it from both sides: a millisecond whose conversion is at or
-/// above it must round-trip unchanged, and one whose conversion is below it
-/// must read back early by exactly one millisecond and no more. Nothing
-/// known-wrong is asserted as right, nothing is hidden, and a regression in
-/// either direction fails.
+/// cleanly. Membership is therefore asserted exactly, at every anchor, while
+/// the read-back is *bounded* rather than skipped or pinned: a millisecond
+/// whose conversion is at or above it must round-trip unchanged, and one whose
+/// conversion is below it may lose the millisecond to the floor but no more
+/// than one, and may never read back late.
+///
+/// Bounding it rather than requiring the drift keeps the defect visible
+/// without freezing it into the suite. The printed `read_back_early` list
+/// names the milliseconds that actually drifted, so a silent change of
+/// behaviour is still obvious; and the day `share_from_row` rounds instead of
+/// flooring, those milliseconds land on a drift of zero, the list comes back
+/// empty, and this test keeps passing rather than failing the fix.
 #[tokio::test]
 async fn writer_rows_follow_integer_milliseconds_past_2_43() -> Result<()> {
     let Some(url) = database_url("writer_rows_follow_integer_milliseconds_past_2_43")? else {
@@ -1144,15 +1150,21 @@ async fn writer_rows_follow_integer_milliseconds_past_2_43() -> Result<()> {
                 credited.job_issued_at_ms
             );
             if converts_below(&ledger.pool, share.accepted_at_ms).await? {
+                // A bound, not a pin: the read-back may lose the millisecond
+                // to the floor, but never more than one and never late. A fix
+                // that rounds instead of flooring lands on `drift == 0` and
+                // keeps this passing.
                 ensure!(
-                    drift == -1,
+                    drift == -1 || drift == 0,
                     "{scenario}: millisecond {} converts below its own millisecond, so the \
-                     {position} share was expected to read back exactly one millisecond early; \
-                     it read back {} ({drift} ms)",
+                     {position} share had to read back either unchanged or exactly one \
+                     millisecond early; it read back {} ({drift} ms)",
                     share.accepted_at_ms,
                     credited.accepted_at_ms
                 );
-                read_back_early.push(share.accepted_at_ms);
+                if drift == -1 {
+                    read_back_early.push(share.accepted_at_ms);
+                }
             } else {
                 ensure!(
                     drift == 0,
