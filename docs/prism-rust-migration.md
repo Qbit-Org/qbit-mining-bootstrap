@@ -282,7 +282,10 @@ replays every case through this engine. Window clipping, carry-only recipients,
 pool fees, dust recompute, remainder ties, and CTV chunking match `2.x.x`
 exactly. Every other difference is one of the entries below, under decision D2 of issue #260. Each
 differing case stores both the `2.x.x` and `3.x.x` payout and names its entry
-by anchor; the test fails if the anchor is removed. All amounts are in sats.
+by anchor. The test fails if the anchors the vectors use differ from the
+entries below, and it pins every vector file's sha256, so a vector changes only
+through a re-export in a reviewed commit that updates the pin. All amounts are
+in sats.
 All vectors use the day-one floor of 14720 sats.
 
 <a id="d2a-bootstrap-pooling"></a>
@@ -335,6 +338,9 @@ All vectors use the day-one floor of 14720 sats.
     - A block that is abandoned instead fails the submission with "block-only
       proof was not accepted on the active chain".
   - On both versions a credited share survives a later reorg.
+  - **Modeling assumption:** the `3.x.x` next-block payout assumes the
+    deferred credit lands before the next block's anchor, because the credit
+    row is stamped at confirmation, not at submission.
 - **Reason:**
   - `crates/qbit-prism-server/src/coordinator.rs` credits `network` difficulty
     when `share_pass` is false, and holds the share as the candidate's
@@ -366,7 +372,9 @@ recorded separately from D2a so it can be approved on its own.
   - The engine allocates the coinbase over both accounts' candidate balances.
 - **Reason:**
   - The `2.x.x` collection bundle passes `prior_balances=[]`
-    (`lab/prism/job_bundle.py` `build_collection_bundle`).
+    (`lab/prism/job_bundle.py` `build_collection_bundle`, which is `2.x.x`
+    code at `504846cc0b72e8f86ed17f896d4ccbbe196a31dc` and does not exist on
+    `3.x.x`).
   - `crates/qbit-prism-server/src/coordinator.rs` `build_bundle` passes
     `snapshot.prior_balances` in bootstrap too.
   - So a carry-only account at or above the floor can be paid in a bootstrap

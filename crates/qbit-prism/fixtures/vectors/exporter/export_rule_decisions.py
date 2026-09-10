@@ -117,7 +117,7 @@ def bootstrap_decision(scenario: dict[str, Any]) -> dict[str, Any]:
         built_by = "lab/prism/job_bundle.py:3550 build_collection_bundle (executed)"
     else:
         # The ready path builds from the ledger window and the published
-        # prior balances (lab/prism/job_bundle.py:3405-3408); it needs the
+        # prior balances (lab/prism/job_bundle.py:3400-3408); it needs the
         # ledger service, so its economic inputs are restated here.
         bundle = {
             "shares": scenario["ledger_shares"],
@@ -129,7 +129,7 @@ def bootstrap_decision(scenario: dict[str, Any]) -> dict[str, Any]:
             },
             "prior_balances": scenario["prior_balances"],
         }
-        built_by = "lab/prism/job_bundle.py:3405 ready build (ledger window and prior balances)"
+        built_by = "lab/prism/job_bundle.py:3400 ready build (ledger window and prior balances)"
     return {
         "accepted_share_count": stats[0],
         "distinct_miner_count": stats[1],
@@ -270,7 +270,7 @@ OUTCOMES_2XX = {
         "credited_at": "node acceptance; the share row survives the disconnect",
         "implemented_at": [
             "lab/prism/block_finalization.py:2027 append_accepted_share when credit_share_on_accept",
-            "lab/prism/accepted_preview_telemetry.py:148 no reorg path updates or deletes qbit_share_ledger",
+            "lab/prism/accepted_preview_telemetry.py:144 no reorg path updates or deletes qbit_share_ledger",
         ],
     },
     "rejected": {

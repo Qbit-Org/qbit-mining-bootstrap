@@ -4,10 +4,11 @@
 //! The vectors and their exporter live in `fixtures/vectors/`. Every case
 //! must reproduce its frozen value exactly. A case may differ from 2.x.x only
 //! through a D2 entry (`expected_2xx`, `expected_3xx` and `d2_entry`) in the
-//! bootstrap or below-target credit topics, and the entry's anchor must exist
-//! in `docs/prism-rust-migration.md`.
+//! bootstrap or below-target credit topics. The set of entries the cases use
+//! must equal the set documented in `docs/prism-rust-migration.md`, and every
+//! vector file is pinned by its sha256.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use qbit_prism::{
     apply_payout_policy, apply_proportional_fanout_fee, build_prism_reward_manifest,
@@ -17,10 +18,50 @@ use qbit_prism::{
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 const SCHEMA: &str = "qbit.prism.money-path-vectors.v1";
 const SOURCE_COMMIT: &str = "504846cc0b72e8f86ed17f896d4ccbbe196a31dc";
+/// The sha256 of each vector file as exported from `SOURCE_COMMIT`. The
+/// vectors change only through a re-export in a reviewed commit that updates
+/// these pins.
+const VECTOR_SHA256: [(&str, &str); 7] = [
+    (
+        "window.json",
+        "aef6c5bb2304c345d9cac198f2654c2fd987e09d8677d99b6ae847798020d90d",
+    ),
+    (
+        "carry_only.json",
+        "ed10a4361a0362e835f50c392bd5d0cf54f85b35a2c1ae48cc63bebede9c35e7",
+    ),
+    (
+        "pool_fee.json",
+        "ee9e64ed43f20dee3da6543fc2f5bde893526a09ad54bffbee5c8611e7d4d146",
+    ),
+    (
+        "fanout_fee_and_ties.json",
+        "f9e8c92377ba1d1b98e430d28a0ed6c94e7b60c4b59e9557fe28dce700d5be30",
+    ),
+    (
+        "settlement_chunks.json",
+        "4dcddf8d71dd5ff9c51122b5075587f987dba36959830d2a798a8a589675bf0f",
+    ),
+    (
+        "bootstrap_transition.json",
+        "6db2c6b8c00a1ce8402c6c97c7dd542b037a005afb538987c0cd75786c1b3fab",
+    ),
+    (
+        "below_target_credit.json",
+        "66a419f9a61b9ca4678895f6774ade52837eb6e52f2e530dde66f06154a8754e",
+    ),
+];
 const MIGRATION_DOC: &str = include_str!("../../../docs/prism-rust-migration.md");
+const D2_SECTION_HEADING: &str = "## Payout differences from 2.x.x (decision D2)";
+const D2_ENTRIES: [&str; 3] = [
+    "d2a-bootstrap-pooling",
+    "d2b-below-target-credit",
+    "d2c-prior-balances-during-bootstrap",
+];
 const D2_TOPICS: [u64; 2] = [8, 9];
 const VECTOR_FILES: [(&str, &str); 7] = [
     (
@@ -176,6 +217,21 @@ fn check(
     }
 }
 
+/// Every anchor in the doc's D2 section, up to the next level-two heading.
+fn documented_d2_entries() -> Result<BTreeSet<String>, String> {
+    let start = MIGRATION_DOC
+        .find(D2_SECTION_HEADING)
+        .ok_or_else(|| format!("docs/prism-rust-migration.md has no {D2_SECTION_HEADING:?}"))?;
+    let section = &MIGRATION_DOC[start + D2_SECTION_HEADING.len()..];
+    let section = &section[..section.find("\n## ").unwrap_or(section.len())];
+    Ok(section
+        .split("<a id=\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .map(str::to_string)
+        .collect())
+}
+
 #[test]
 fn money_path_vectors_match_frozen_2xx_values() {
     let mut mismatches = Vec::new();
@@ -183,6 +239,15 @@ fn money_path_vectors_match_frozen_2xx_values() {
     let mut d2_cases = BTreeMap::<String, usize>::new();
 
     for (file, raw) in VECTOR_FILES {
+        let actual_sha256 = hex::encode(Sha256::digest(raw.as_bytes()));
+        match VECTOR_SHA256.iter().find(|(name, _)| *name == file) {
+            Some((_, pinned)) if *pinned == actual_sha256 => {}
+            pinned => mismatches.push(format!(
+                "{file} / sha256: pinned {}, got {actual_sha256}; the vectors change only through a \
+                 re-export from {SOURCE_COMMIT} in a reviewed commit that updates the pin",
+                pinned.map_or("nothing", |(_, pin)| pin)
+            )),
+        }
         let document: Value =
             serde_json::from_str(raw).unwrap_or_else(|err| panic!("{file} is not JSON: {err}"));
         if document["schema"] != SCHEMA {
@@ -267,6 +332,25 @@ fn money_path_vectors_match_frozen_2xx_values() {
                 );
             }
         }
+    }
+
+    // A documented entry with no vector, or a vector with no entry, fails.
+    let used: BTreeSet<String> = d2_cases.keys().cloned().collect();
+    let listed: BTreeSet<String> = D2_ENTRIES.iter().map(|entry| entry.to_string()).collect();
+    match documented_d2_entries() {
+        Ok(documented) => {
+            if documented != listed {
+                mismatches.push(format!(
+                    "docs/prism-rust-migration.md D2 entries: expected {listed:?}, got {documented:?}"
+                ));
+            }
+            if used != documented {
+                mismatches.push(format!(
+                    "D2 entries used by vectors {used:?} differ from the documented entries {documented:?}"
+                ));
+            }
+        }
+        Err(err) => mismatches.push(err),
     }
 
     for topic in 1..=9 {

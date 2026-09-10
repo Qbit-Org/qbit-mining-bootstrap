@@ -217,10 +217,10 @@
           },
           "decision_3xx": {
             "bootstrap": false,
-            "bundle_built_by": "ledger snapshot window (crates/qbit-prism-server/src/coordinator.rs:749)",
+            "bundle_built_by": "ledger snapshot window (crates/qbit-prism-server/src/coordinator.rs:747)",
             "implemented_at": [
               "crates/qbit-prism-server/src/coordinator.rs:556 solver-only bundle only when snapshot.shares is empty",
-              "crates/qbit-prism-server/src/coordinator.rs:752-754 snapshot.prior_balances passed in bootstrap"
+              "crates/qbit-prism-server/src/coordinator.rs:759,773 snapshot.prior_balances passed in bootstrap"
             ],
             "prior_balances_kept": true
           },
@@ -533,7 +533,7 @@
         "rule": {
           "decision_2xx": {
             "accepted_share_count": 3,
-            "bundle_built_by": "lab/prism/job_bundle.py:3405 ready build (ledger window and prior balances)",
+            "bundle_built_by": "lab/prism/job_bundle.py:3400 ready build (ledger window and prior balances)",
             "distinct_miner_count": 3,
             "implemented_at": [
               "lab/prism/prism_coordinator.py:7778 pool_readiness_latched",
@@ -545,10 +545,10 @@
           },
           "decision_3xx": {
             "bootstrap": false,
-            "bundle_built_by": "ledger snapshot window (crates/qbit-prism-server/src/coordinator.rs:749)",
+            "bundle_built_by": "ledger snapshot window (crates/qbit-prism-server/src/coordinator.rs:747)",
             "implemented_at": [
               "crates/qbit-prism-server/src/coordinator.rs:556 solver-only bundle only when snapshot.shares is empty",
-              "crates/qbit-prism-server/src/coordinator.rs:752-754 snapshot.prior_balances passed in bootstrap"
+              "crates/qbit-prism-server/src/coordinator.rs:759,773 snapshot.prior_balances passed in bootstrap"
             ],
             "prior_balances_kept": true
           },
@@ -754,7 +754,7 @@
             "bundle_built_by": "synthetic solver share (crates/qbit-prism-server/src/coordinator.rs:727)",
             "implemented_at": [
               "crates/qbit-prism-server/src/coordinator.rs:556 solver-only bundle only when snapshot.shares is empty",
-              "crates/qbit-prism-server/src/coordinator.rs:752-754 snapshot.prior_balances passed in bootstrap"
+              "crates/qbit-prism-server/src/coordinator.rs:759,773 snapshot.prior_balances passed in bootstrap"
             ],
             "prior_balances_kept": true
           },
@@ -983,7 +983,7 @@
             "bundle_built_by": "synthetic solver share (crates/qbit-prism-server/src/coordinator.rs:727)",
             "implemented_at": [
               "crates/qbit-prism-server/src/coordinator.rs:556 solver-only bundle only when snapshot.shares is empty",
-              "crates/qbit-prism-server/src/coordinator.rs:752-754 snapshot.prior_balances passed in bootstrap"
+              "crates/qbit-prism-server/src/coordinator.rs:759,773 snapshot.prior_balances passed in bootstrap"
             ],
             "prior_balances_kept": true
           },

@@ -529,7 +529,35 @@ fn pool_fee_cases() -> Vec<Value> {
             p,
             policy_input(two_miners(100_000), vec![], fee_policy(10_001, CoinbaseOutputPolicy::Canonical)),
         ),
+        case(
+            4,
+            "fee-1-bps-floors-to-zero",
+            "1 bps of a 9999-sat coinbase is 0.9999 sats and floors to a zero pool fee; with a 1000-sat fixed floor the miners take the whole coinbase, and the fee account is recorded with 0 sats but gets no coinbase output.",
+            p,
+            policy_input(two_miners(9_999), vec![], fixed_floor(fee_policy(1, CoinbaseOutputPolicy::Canonical))),
+        ),
+        case(
+            4,
+            "fee-first-1-bps-floors-to-zero",
+            "The same zero pool fee under pool-fee-first: the fee account is recorded with 0 sats, and no zero-amount fee output is pinned.",
+            p,
+            policy_input(two_miners(9_999), vec![], fixed_floor(fee_policy(1, CoinbaseOutputPolicy::PoolFeeFirst))),
+        ),
+        case(
+            4,
+            "fee-1-bps-floors-to-zero-under-day-one-floor",
+            "The same zero pool fee with the day-one 14720-sat floor: the 9999-sat coinbase is below the floor, so the policy fails.",
+            p,
+            policy_input(two_miners(9_999), vec![], fee_policy(1, CoinbaseOutputPolicy::Canonical)),
+        ),
     ]
+}
+
+/// A 1000-sat fixed floor, so a coinbase small enough for a 1-bps fee to
+/// floor to zero still leaves the miners payable.
+fn fixed_floor(mut policy: PayoutPolicy) -> PayoutPolicy {
+    policy.min_output_sats = Some(1_000);
+    policy
 }
 
 // ---------------------------------------------------------------------------
@@ -847,12 +875,12 @@ fn bootstrap_cases(decisions: &Value) -> Vec<Value> {
                 "bundle_built_by": if bootstrap {
                     "synthetic solver share (crates/qbit-prism-server/src/coordinator.rs:727)"
                 } else {
-                    "ledger snapshot window (crates/qbit-prism-server/src/coordinator.rs:749)"
+                    "ledger snapshot window (crates/qbit-prism-server/src/coordinator.rs:747)"
                 },
                 "prior_balances_kept": true,
                 "implemented_at": [
                     "crates/qbit-prism-server/src/coordinator.rs:556 solver-only bundle only when snapshot.shares is empty",
-                    "crates/qbit-prism-server/src/coordinator.rs:752-754 snapshot.prior_balances passed in bootstrap",
+                    "crates/qbit-prism-server/src/coordinator.rs:759,773 snapshot.prior_balances passed in bootstrap",
                 ],
             });
             let d2_entry = match name {

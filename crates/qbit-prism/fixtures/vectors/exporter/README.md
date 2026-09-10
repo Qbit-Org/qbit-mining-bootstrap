@@ -13,3 +13,11 @@ source commit `504846cc0b72e8f86ed17f896d4ccbbe196a31dc` into an empty directory
 Copy `vectors-out/*.json` here. The export is deterministic: two runs must be byte-identical. The
 exporter refuses to write a bootstrap or credit case where the two rules pay differently unless
 that case is mapped to a D2 entry in `docs/prism-rust-migration.md`.
+
+The test pins the sha256 of every vector file (`VECTOR_SHA256`). A re-export that changes any file
+must update those pins in the same reviewed commit; never edit a vector by hand.
+
+Known gap: the TRUC per-transaction cap (1160 fanout recipients) is frozen only as a configuration
+bound (`fanout-size-at-the-truc-cap` and `fanout-size-one-over-the-truc-cap-is-an-error`, each with
+three recipients). A real 1160-recipient chunk, and a 1161-recipient one, would add about 1.6 MB to
+`settlement_chunks.json`, so they are not exported.

@@ -1316,7 +1316,7 @@
               "lab/prism/share_writer.py:281 runtime.accepted_share_difficulty(context)",
               "lab/prism/prism_coordinator.py:8410 accepted_share_difficulty",
               "lab/prism/block_finalization.py:2027 append_accepted_share when credit_share_on_accept",
-              "lab/prism/accepted_preview_telemetry.py:148 no reorg path updates or deletes qbit_share_ledger"
+              "lab/prism/accepted_preview_telemetry.py:144 no reorg path updates or deletes qbit_share_ledger"
             ],
             "network_difficulty": 1000000,
             "rejection": null,

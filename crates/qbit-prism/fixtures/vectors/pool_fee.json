@@ -668,6 +668,299 @@
       "name": "fee-10001-bps-is-an-error",
       "topic": 4,
       "why": "One basis point over 100% is rejected."
+    },
+    {
+      "entry_point": "apply_payout_policy",
+      "expected": {
+        "ok": {
+          "accounts": [
+            {
+              "action": "onchain",
+              "candidate_balance_sats": 3333,
+              "carry_forward_balance_sats": 0,
+              "gross_amount_sats": 3333,
+              "onchain_amount_sats": 3333,
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "prior_balance_sats": 0,
+              "recipient_id": "miner-a"
+            },
+            {
+              "action": "onchain",
+              "candidate_balance_sats": 6666,
+              "carry_forward_balance_sats": 0,
+              "gross_amount_sats": 6666,
+              "onchain_amount_sats": 6666,
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "prior_balance_sats": 0,
+              "recipient_id": "miner-b"
+            },
+            {
+              "account_type": "pool_fee",
+              "action": "onchain",
+              "candidate_balance_sats": 0,
+              "carry_forward_balance_sats": 0,
+              "gross_amount_sats": 0,
+              "onchain_amount_sats": 0,
+              "order_key": "99",
+              "p2mr_program_hex": "9999999999999999999999999999999999999999999999999999999999999999",
+              "prior_balance_sats": 0,
+              "recipient_id": "pool-fee"
+            }
+          ],
+          "block_height": 10,
+          "coinbase_value_sats": 9999,
+          "floor_formula": "configured fixed floor: 1000 sats",
+          "min_output_sats": 1000,
+          "onchain_entitlements": [
+            {
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "miner-a",
+              "weight": 3333
+            },
+            {
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "miner-b",
+              "weight": 6666
+            }
+          ],
+          "pool_fee": {
+            "amount_sats": 0,
+            "earned_pool_fee_sats": 0,
+            "fee_bps": 1,
+            "order_key": "99",
+            "p2mr_program_hex": "9999999999999999999999999999999999999999999999999999999999999999",
+            "recipient_id": "pool-fee",
+            "swept_dust_liability_sats": 0
+          },
+          "schema": "qbit.prism.payout-policy.v1"
+        }
+      },
+      "input": {
+        "policy": {
+          "min_output_sats": 1000,
+          "p2mr_spend_input_bytes": 3680,
+          "pool_fee_policy": {
+            "fee_bps": 1,
+            "order_key": "99",
+            "p2mr_program_hex": "9999999999999999999999999999999999999999999999999999999999999999",
+            "recipient_id": "pool-fee"
+          },
+          "safety_multiplier": 4,
+          "target_feerate_sats_per_byte": 1
+        },
+        "prior_balances": [],
+        "reward_manifest": {
+          "anchor_job_issued_at_ms": 1,
+          "anchor_share_seq": 1,
+          "block_height": 10,
+          "coinbase_value_sats": 9999,
+          "counted_window_weight": 3,
+          "entitlements": [
+            {
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "miner-a",
+              "weight": 1
+            },
+            {
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "miner-b",
+              "weight": 2
+            }
+          ],
+          "included_share_count": 2,
+          "network_difficulty": 1,
+          "newest_share_seq": 1,
+          "oldest_share_seq": 1,
+          "requested_window_weight": 8,
+          "schema": "qbit.prism.reward-manifest.v1",
+          "share_slice_digest_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+          "shares": [],
+          "window_multiplier": 8
+        }
+      },
+      "name": "fee-1-bps-floors-to-zero",
+      "topic": 4,
+      "why": "1 bps of a 9999-sat coinbase is 0.9999 sats and floors to a zero pool fee; with a 1000-sat fixed floor the miners take the whole coinbase, and the fee account is recorded with 0 sats but gets no coinbase output."
+    },
+    {
+      "entry_point": "apply_payout_policy",
+      "expected": {
+        "ok": {
+          "accounts": [
+            {
+              "action": "onchain",
+              "candidate_balance_sats": 3333,
+              "carry_forward_balance_sats": 0,
+              "gross_amount_sats": 3333,
+              "onchain_amount_sats": 3333,
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "prior_balance_sats": 0,
+              "recipient_id": "miner-a"
+            },
+            {
+              "action": "onchain",
+              "candidate_balance_sats": 6666,
+              "carry_forward_balance_sats": 0,
+              "gross_amount_sats": 6666,
+              "onchain_amount_sats": 6666,
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "prior_balance_sats": 0,
+              "recipient_id": "miner-b"
+            },
+            {
+              "account_type": "pool_fee",
+              "action": "onchain",
+              "candidate_balance_sats": 0,
+              "carry_forward_balance_sats": 0,
+              "gross_amount_sats": 0,
+              "onchain_amount_sats": 0,
+              "order_key": "99",
+              "p2mr_program_hex": "9999999999999999999999999999999999999999999999999999999999999999",
+              "prior_balance_sats": 0,
+              "recipient_id": "pool-fee"
+            }
+          ],
+          "block_height": 10,
+          "coinbase_output_policy": "pool-fee-first",
+          "coinbase_value_sats": 9999,
+          "floor_formula": "configured fixed floor: 1000 sats",
+          "min_output_sats": 1000,
+          "onchain_entitlements": [
+            {
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "miner-a",
+              "weight": 3333
+            },
+            {
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "miner-b",
+              "weight": 6666
+            }
+          ],
+          "pool_fee": {
+            "amount_sats": 0,
+            "earned_pool_fee_sats": 0,
+            "fee_bps": 1,
+            "order_key": "99",
+            "p2mr_program_hex": "9999999999999999999999999999999999999999999999999999999999999999",
+            "recipient_id": "pool-fee",
+            "swept_dust_liability_sats": 0
+          },
+          "schema": "qbit.prism.payout-policy.v1"
+        }
+      },
+      "input": {
+        "policy": {
+          "coinbase_output_policy": "pool-fee-first",
+          "min_output_sats": 1000,
+          "p2mr_spend_input_bytes": 3680,
+          "pool_fee_policy": {
+            "fee_bps": 1,
+            "order_key": "99",
+            "p2mr_program_hex": "9999999999999999999999999999999999999999999999999999999999999999",
+            "recipient_id": "pool-fee"
+          },
+          "safety_multiplier": 4,
+          "target_feerate_sats_per_byte": 1
+        },
+        "prior_balances": [],
+        "reward_manifest": {
+          "anchor_job_issued_at_ms": 1,
+          "anchor_share_seq": 1,
+          "block_height": 10,
+          "coinbase_value_sats": 9999,
+          "counted_window_weight": 3,
+          "entitlements": [
+            {
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "miner-a",
+              "weight": 1
+            },
+            {
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "miner-b",
+              "weight": 2
+            }
+          ],
+          "included_share_count": 2,
+          "network_difficulty": 1,
+          "newest_share_seq": 1,
+          "oldest_share_seq": 1,
+          "requested_window_weight": 8,
+          "schema": "qbit.prism.reward-manifest.v1",
+          "share_slice_digest_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+          "shares": [],
+          "window_multiplier": 8
+        }
+      },
+      "name": "fee-first-1-bps-floors-to-zero",
+      "topic": 4,
+      "why": "The same zero pool fee under pool-fee-first: the fee account is recorded with 0 sats, and no zero-amount fee output is pinned."
+    },
+    {
+      "entry_point": "apply_payout_policy",
+      "expected": {
+        "error": "coinbase value 9999 is below minimum output floor 14720"
+      },
+      "input": {
+        "policy": {
+          "p2mr_spend_input_bytes": 3680,
+          "pool_fee_policy": {
+            "fee_bps": 1,
+            "order_key": "99",
+            "p2mr_program_hex": "9999999999999999999999999999999999999999999999999999999999999999",
+            "recipient_id": "pool-fee"
+          },
+          "safety_multiplier": 4,
+          "target_feerate_sats_per_byte": 1
+        },
+        "prior_balances": [],
+        "reward_manifest": {
+          "anchor_job_issued_at_ms": 1,
+          "anchor_share_seq": 1,
+          "block_height": 10,
+          "coinbase_value_sats": 9999,
+          "counted_window_weight": 3,
+          "entitlements": [
+            {
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "miner-a",
+              "weight": 1
+            },
+            {
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "miner-b",
+              "weight": 2
+            }
+          ],
+          "included_share_count": 2,
+          "network_difficulty": 1,
+          "newest_share_seq": 1,
+          "oldest_share_seq": 1,
+          "requested_window_weight": 8,
+          "schema": "qbit.prism.reward-manifest.v1",
+          "share_slice_digest_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+          "shares": [],
+          "window_multiplier": 8
+        }
+      },
+      "name": "fee-1-bps-floors-to-zero-under-day-one-floor",
+      "topic": 4,
+      "why": "The same zero pool fee with the day-one 14720-sat floor: the 9999-sat coinbase is below the floor, so the policy fails."
     }
   ],
   "produced_by": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 crates/qbit-prism/examples/export_rule_decisions.py | cargo run --locked -q -p qbit-prism --example export_money_path_vectors -- vectors-out",
