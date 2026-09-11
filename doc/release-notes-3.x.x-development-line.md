@@ -33,10 +33,13 @@ carries a banner with the same statement.
     layout from #243 is kept;
   - the 2.0.0 and 2.0.2 release notes, as 2.x.x history;
   - the schema file `crates/qbit-prism/sql/002_candidate_bodies.sql`, carried
-    as an artifact only. The Rust migrator enumerates its SQL files explicitly
-    and applies `001_share_ledger.sql` plus its own migrations; it does not
-    apply `002_candidate_bodies.sql`. How that file is handled is frozen by
-    #285.
+    byte-identical to v2.0.2 and digest-pinned by the upgrade tests (#285).
+    The Rust migrator enumerates its SQL files explicitly and applies
+    `001_share_ledger.sql` plus its own migrations; it never applies
+    `002_candidate_bodies.sql`. It accepts a #258 source after the drain
+    check, keeping the 002 objects and the capability row, and refuses a
+    partial or newer source before any DDL; see
+    `docs/prism-rust-migration.md`.
 - `crates/qbit-prism-server/src/ledger.rs` is split into ownership
   submodules, `ledger/candidates.rs`, `ledger/jobs.rs`, `ledger/window.rs`,
   and `ledger/connect.rs`, with no behaviour change and no signature change,
@@ -75,8 +78,6 @@ they fixed or configured no longer exists on this line:
 - Real release notes are #291. The tree reads 3.0.0, but nothing on this
   line has been released under that version; `doc/release-notes-3.0.0.md` and
   the rollout notes are written there.
-- The migrator and schema freeze, including how `002_candidate_bodies.sql`
-  relates to the Rust migrations, is #285.
 - Native candidate recovery is #268.
 
 ## Upgrade and rollback
