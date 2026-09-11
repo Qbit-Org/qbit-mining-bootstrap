@@ -199,8 +199,8 @@ impl Ledger {
             let mut tx = begin(&pool, metrics.as_deref()).await?;
             lock(&mut tx, MIGRATION_LOCK, metrics.as_deref()).await?;
             sqlx::raw_sql("CREATE TABLE IF NOT EXISTS qbit_prism_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())").execute(&mut *tx).await?;
-            // 006/007 are reserved by independent workstreams. Track each
-            // applied migration rather than letting 009 hide an earlier gap.
+            // 006 is reserved by an independent workstream. Track each applied
+            // migration rather than letting 009 hide an earlier gap.
             let versions: Vec<i32> =
                 sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations")
                     .fetch_all(&mut *tx)
@@ -267,6 +267,48 @@ impl Ledger {
                     .execute(&mut *tx)
                     .await?;
                 sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(5)")
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            if !versions.contains(&7) {
+                // The pre-007 pending shapes, refused before any of 007's DDL
+                // runs, so a failure leaves the schema exactly as it was.
+                // #285's 006 need not have run in this startup, and 008 need
+                // not have either, so this predicate stands on its own:
+                //
+                // * `candidate ? 'bundle'` is a native pre-007 inline
+                //   candidate, whose claim path 007 removes;
+                // * `candidate IS NULL` on a pending row is #258's chunked
+                //   version-2 shape, which relaxed 001's pending CHECK;
+                // * `storage_version <> 1` is the same shape named directly,
+                //   on the 2.x.x schemas that have the column. Native schemas
+                //   do not, so the disjunct is added only when it exists.
+                //
+                // #321 (#285) brings a shared `refuse_undrained_outbox` and a
+                // `require_schema_version` set; whichever of the two rebases
+                // second switches this refusal over to them. Do not add a
+                // second copy of those helpers here.
+                let versioned: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='qbit_block_candidate_outbox' AND column_name='storage_version')",
+                ).fetch_one(&mut *tx).await?;
+                let undrained: Vec<String> = sqlx::query_scalar(&format!(
+                    "SELECT block_hash FROM qbit_block_candidate_outbox WHERE state='pending' AND (candidate IS NULL OR candidate ? 'bundle'{}) ORDER BY block_hash",
+                    if versioned { " OR storage_version<>1" } else { "" }
+                )).fetch_all(&mut *tx).await?;
+                ensure!(
+                    undrained.is_empty(),
+                    "migration 007 refuses undrained pre-007 block candidates: {}. \
+                     Drain the outbox with the pre-007 frontends running, then stop every \
+                     frontend, verify that SELECT count(*) FROM qbit_block_candidate_outbox \
+                     WHERE state='pending' is 0, and only then start the post-007 binary",
+                    undrained.join(", ")
+                );
+                sqlx::raw_sql(include_str!(
+                    "../../migrations/007_candidate_window_reference.sql"
+                ))
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(7)")
                     .execute(&mut *tx)
                     .await?;
             }
