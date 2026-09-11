@@ -6,8 +6,9 @@ compact prepared jobs or finish issue273. Authorization covers B-owned code
 only and is not A/C owner approval.
 
 This branch includes current `3.x.x` at
-`82a543d36447ce66ee92de90b6295adc7969765e` additively: `48a5923` includes
-PR313's merge `0af13ec`, and `c6bce3a` includes PR297's merge `82a543d`.
+`d39cf621ce25fea4d5a1e86b02cf6c3c66949ce5` additively: `48a5923` includes
+PR313's merge `0af13ec`, `c6bce3a` includes PR297's merge `82a543d`, and
+`b480ea1` includes PR319's merge `d39cf62`.
 PR313 and the #264 design dependency are no longer open blockers. The earlier
 dependency updates remain in history. The original PR313 worktree is untouched;
 this slice adds no release bump.
@@ -50,11 +51,12 @@ unimplemented here, pending the exact A265 interfaces listed below.
   digest indexes. Updates changing blob keys or contents are rejected; deletion
   remains available to the future coordinated GC. Legacy payloads and issued
   top-level `extranonce1` are untouched.
-- The migration runner checks version membership, matching PR319's minimal
-  approach. It applies 008 even when a higher version is already recorded.
-  No 006, 007, 009, candidate, audit reader, or deployment implementation was
-  imported. The existing legacy migration test now verifies the entire applied
-  version set instead of a hard-coded maximum of 5.
+- The migration runner adds 008 to the landed PR319 membership approach.
+  It applies 008 even when 009 is already installed, and 009 when only 008
+  is installed. No 006, 007, candidate or audit reader implementation was
+  imported. Migration009 is unchanged from base. Existing migration assertions
+  verify the full applied version set and exact preservation of every original
+  job field, with only 008's seven new null columns added.
 - The later B-owned `Ledger::payout_state()` returns a `PayoutState` containing
   current revision and current balance digest from one repeatable-read primary
   snapshot. It retains `payout_revision`'s fatal/read-only guards, reads no share
@@ -62,8 +64,8 @@ unimplemented here, pending the exact A265 interfaces listed below.
   closure. It has no private deadline or implicit eligibility decision.
   `WindowRef`, `Window`, `WindowError` and `read_window` signatures are unchanged.
 - B's tests use the shared `qbit_prism_test_gate` introduced by merged PR322.
-  All 13 regular B database cases are in `test/prism-gated-tests.txt`; explicit
-  large/cross-branch qualifications use the required-input gate. Test fixture
+  All 14 regular B database cases are in `test/prism-gated-tests.txt`; explicit
+  scale qualifications use the required-input gate. Test fixture
   modulo expressions follow the current pinned toolchain's Clippy rules.
 
 The bytea column contracts are `qbit_prism_templates(template_sha256,
@@ -123,8 +125,9 @@ access, push or public approval was performed.
 
 ## Current-base draft checkpoint
 
-The base is `3.x.x` at `82a543d`; Rust is now the repository's installed pin
-1.98.1, with disposable PostgreSQL 16.14 located through `pg_config --bindir`.
+At `a6e3482`, the base was `3.x.x` at `82a543d`; Rust is now the repository's
+installed pin 1.98.1, with disposable PostgreSQL 16.14 located through
+`pg_config --bindir`.
 The base merge retained upstream versions of every conflicted file; no
 foundation changes existed in those files. No release metadata was changed.
 
@@ -138,16 +141,46 @@ Workspace all-target compilation and Clippy with `-D warnings` passed. Existing
 miner assertions are unchanged. The two new guard unit tests prove cancelled
 payloads drop on a different thread and successful handoff preserves ownership.
 
-The full 400k/500k reader, actual 009 SQL and issued-dependency evidence below
-remains historical; it was not rerun for this draft checkpoint. Runtime
+The full 400k/500k reader and issued-dependency evidence below remains
+historical; it was not rerun for this draft checkpoint. The landed 009 SQL is
+now covered by the regular combined-base suite below. Runtime
 refresh/resume, candidate-aware GC, large-template/WAL, async standby and
 cutover qualification remain incomplete. Full deep-review is deferred until
 after draft publication; this document does not report missing lanes as green.
 
+### Combined base with landed PR319
+
+After the additive `b480ea1` merge of `3.x.x` at `d39cf62`, the regular suite
+passed **236 tests**: 144 library, 37 ledger, 1 migration rollback, 6 readiness,
+1 Stratum admission, 22 Stratum protocol, 8 window oracle and 17 window
+reference. Three qualifications remained ignored: the admission capacity
+measurement and B's two explicit scale measurements. All 14 regular B database
+cases recorded execution and passed the scoped manifest check.
+Formatting, workspace/all-target Clippy with `-D warnings`, the direct gate
+environment-read check (135 Rust files), and `git diff --check` passed after
+the combined-base test adjustments. The earlier all-target `cargo check`
+passed before this merge; all-target Clippy compiled the final combined base.
+
+The landed 009 SQL now runs in a regular B test in both orders with 008, using
+the actual membership runner and restart. The first combined run exposed
+PR319's whole-row comparison expecting no new columns; its expected result now
+includes exactly 008's seven null columns and still compares every original
+field, including payload/extranonce/expiry. Both existing migration tests now
+require `[2, 3, 4, 5, 8, 9]`; no assertion was reduced to a maximum version or
+subset. Migration009 and the session/candidate implementation are unchanged.
+
+```sh
+PRISM_TEST_GATE_MANIFEST=/tmp/window-reference-gates.txt \
+  bash test/prism-native-tests.sh cargo-args --locked -p qbit-prism-server \
+  --lib --test window_reference --test readiness_rpc --test stratum_protocol \
+  --test stratum_admission_postgres --test window_read_oracle \
+  --test ledger_postgres --test migration_rollback
+```
+
 ### Late cancellation at 400k
 
 The explicit `cancellation::cancelling_400k_read_after_96_pages_measures_runtime_stall`
-test ran separately on the same disposable PostgreSQL/toolchain. It loads the
+test ran at `a6e3482` on disposable PostgreSQL 16.14 and Rust 1.98.1. It loads the
 production-shaped 400,000-row fixture, streams 96 complete pages (393,216
 shares), then gates the next page's projected share ID with a transaction-level
 advisory lock. A single-thread Tokio runtime aborts and joins the reader while
@@ -222,7 +255,8 @@ RUSTUP_TOOLCHAIN=1.89.0 bash test/prism-native-tests.sh cargo-args \
 
 The external 009 fixture was read from PR319 commit
 `3a7ba469c9318791d5fb366359ca406397f3065b`. It was not copied into the repository.
-Set `PRISM_TEST_MIGRATION_009` to that reviewed SQL file and run:
+The historical reproduction at `d7526fc` set `PRISM_TEST_MIGRATION_009`
+to that reviewed SQL file and ran (current HEAD uses the landed regular test):
 
 ```sh
 RUSTUP_TOOLCHAIN=1.89.0 bash test/prism-native-tests.sh cargo-args \
@@ -306,7 +340,7 @@ RUSTUP_TOOLCHAIN=1.89.0 bash test/prism-native-tests.sh cargo-args \
 
 ### Exact A265 dependencies at this checkpoint
 
-Inspection of `3.x.x` at `82a543d` and A265's open
+Inspection of `3.x.x` at `d39cf62` and A265's open
 [PR325 at ff74abb](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/325)
 (`ff74abb0da65f15ddcd25689328a075f7ab2a1b4`) still finds
 `Candidate.bundle: AuditBundle`, an optional suffix, no candidate window
@@ -332,9 +366,11 @@ exist in 008. A/C must review their encoding/conflict and retention integration;
 that review does not require B to invent candidate types or copy migration007.
 
 The open source-schema [PR321](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/321)
-at `79498d4ac20e73cc92b619886b685a737657ee27` supplies migration006 and startup
+at `798860c1a79a05a536a9512208f1960220ff4ef9` supplies migration006 and startup
 capabilities, not the missing 007/candidate shape. Its runner will need the
 minimal 008 membership integration when combined; it is not copied here.
+Its latest delta strengthens source-schema sequence/partial-001 detection and
+adds gate records; it introduces none of the missing candidate interfaces.
 
 ### b3e8ba9 delta and decisions still open
 

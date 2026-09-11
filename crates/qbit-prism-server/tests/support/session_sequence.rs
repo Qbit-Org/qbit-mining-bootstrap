@@ -139,10 +139,29 @@ async fn migration_009_preserves_preexisting_jobs_and_runs_once_for_two_frontend
         .execute(&pool).await?;
     seed_job(&pool, "expired", "00000001", false).await?;
     seed_job(&pool, "old-arbitrary", "0000000A", true).await?;
-    let before: Vec<serde_json::Value> =
+    let mut before: Vec<serde_json::Value> =
         sqlx::query_scalar("SELECT to_jsonb(j) FROM qbit_prism_jobs j ORDER BY job_id")
             .fetch_all(&pool)
             .await?;
+    // The combined runner adds 008's nullable references. Require exactly
+    // those null additions while preserving every original field and value.
+    for row in &mut before {
+        for column in [
+            "template_sha256",
+            "window_anchor_ms",
+            "window_first_share_seq",
+            "window_last_share_seq",
+            "window_prior_balances_sha256",
+            "window_share_count",
+            "window_snapshot_sha256",
+        ] {
+            assert!(row
+                .as_object_mut()
+                .unwrap()
+                .insert(column.into(), serde_json::Value::Null)
+                .is_none());
+        }
+    }
     let (a, b) = tokio::try_join!(db.ledger("a"), db.ledger("b"))?;
     let after: Vec<serde_json::Value> =
         sqlx::query_scalar("SELECT to_jsonb(j) FROM qbit_prism_jobs j ORDER BY job_id")
@@ -153,7 +172,7 @@ async fn migration_009_preserves_preexisting_jobs_and_runs_once_for_two_frontend
         sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations ORDER BY version")
             .fetch_all(&pool)
             .await?;
-    assert_eq!(versions, vec![2, 3, 4, 5, 9]);
+    assert_eq!(versions, vec![2, 3, 4, 5, 8, 9]);
     let cycled: bool = sqlx::query_scalar(
         "SELECT seqcycle FROM pg_sequence WHERE seqrelid='qbit_prism_session_sequence'::regclass",
     )

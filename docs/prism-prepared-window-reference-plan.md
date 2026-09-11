@@ -17,8 +17,9 @@ must measure affected work and verify prompt replacement-job delivery.
 ## Verified dependency state
 
 Checked 2026-09-11 against GitHub and current `3.x.x` at
-`82a543d36447ce66ee92de90b6295adc7969765e`. This child includes that base
-additively through `48a5923` (merged PR313) and `c6bce3a` (merged PR297):
+`d39cf621ce25fea4d5a1e86b02cf6c3c66949ce5`. This child includes that base
+additively through `48a5923` (merged PR313), `c6bce3a` (merged PR297),
+and `b480ea1` (merged PR319):
 
 | Dependency | Observed state | Consequence |
 | --- | --- | --- |
@@ -31,17 +32,19 @@ additively through `48a5923` (merged PR313) and `c6bce3a` (merged PR297):
 | Builder version | `AUDIT_BUILDER_VERSION` absent | Latest design assigns its introduction and frozen-vector versioning to A's #265. B must not invent a second constant. |
 | Candidate representation | `Candidate.bundle` and submit still require owned `AuditBundle` | Latest design's slim resumed jobs cannot preserve candidate reconstruction without #265 or explicit coordinated integration. |
 | [A265 import PR325](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/325) | Open at `ff74abb0da65f15ddcd25689328a075f7ab2a1b4` | This supplies canonical import/read changes, not the candidate fields, builder constant, witness parser or 007. Import is not a missing B prerequisite. |
-| [Source-schema PR321](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/321) | Open at `79498d4ac20e73cc92b619886b685a737657ee27` | Adds 006/startup capabilities, not 007 or a slim candidate. Coordinate its runner with 008 when integrated; do not copy A-owned code here. |
-| Migrations | Local runner applies 002 through 005 and 008 by version membership | Minimal approach matches PR319; 006, 007 and 009 are not copied into this branch. Candidate-aware GC needs A's 007 fields and retention predicate. |
+| [Source-schema PR321](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/321) | Open at `798860c1a79a05a536a9512208f1960220ff4ef9` | Adds 006/startup capabilities, not 007 or a slim candidate. Coordinate its runner with 008 when integrated; do not copy A-owned code here. |
+| Migrations / [PR319](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/319) | Merged as `d39cf621ce25fea4d5a1e86b02cf6c3c66949ce5`; runner applies 002 through 005, 008 and 009 by membership | 009 is included unchanged from current base. No 006 or 007 is copied. Candidate-aware GC needs A's 007 fields and retention predicate. |
 
-Read-only inspection of B276 branch `djh58/prism-b4-wrap-safe-sequence` at
-`3a7ba469c9318791d5fb366359ca406397f3065b` found its runner already checks the
-set of applied versions individually. Its `009_wrap_safe_sessions.sql` creates
+The landed B276 runner and migration009 are now included through current
+`3.x.x`, without a whole open-branch cherry-pick. The only production runner
+addition is 008 membership. Migration009 still creates
 `qbit_prism_jobs_extranonce1_expiry_idx` on
 `(lower(payload->>'extranonce1'), expires_at)` and leaves existing jobs intact.
-The foundation tested actual 009 SQL in both orders with 008, using an external
-fixture and the real membership runner; this is not whole-branch integration.
-Do not duplicate or edit 009. Coordinate the final migration manifest with C.
+The regular B migration test now uses the landed 009 SQL, installs either
+predecessor under `MIGRATION_LOCK`, and runs/restarts the real combined runner.
+Both migration tests require the exact set `[2, 3, 4, 5, 8, 9]`. Existing job
+fields must match exactly, with only 008's seven new null columns added.
+Do not duplicate or edit 009. Coordinate the final 006/007 manifest with A/C.
 
 No candidate, landing, import, deployment, metrics, CI, or incremental-window
 change is authorized by this plan.

@@ -1,6 +1,6 @@
 //! Isolated B273 schema/reader tests; these do not enable compact runtime jobs.
 //! Run through test/prism-native-tests.sh cargo-args --locked -p qbit-prism-server
-//! --test window_reference. The PR319 SQL coexistence test is explicitly ignored.
+//! --test window_reference. Only the explicit scale measurements are ignored.
 use anyhow::{ensure, Context, Result};
 use futures_util::future::LocalBoxFuture;
 use qbit_pool_builder::ManifestSigningKey;
@@ -24,6 +24,22 @@ mod payout_state;
 
 const ANCHOR: i64 = 1_700_000_000_000;
 const MIGRATION_008: &str = include_str!("../migrations/008_prepared_window_reference.sql");
+const MIGRATION_009: &str = include_str!("../migrations/009_wrap_safe_sessions.sql");
+
+async fn preinstall_migration(db: &Database, version: i32, migration: &str) -> Result<()> {
+    let mut tx = db.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(0x505249534d000001i64)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::raw_sql(migration).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES($1)")
+        .bind(version)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
 
 struct Database {
     admin: PgPool,
@@ -534,8 +550,8 @@ async fn migration_preserves_legacy_payloads_and_applies_missing_008_below_009()
         let original = json!({"extranonce1":"ABCDEF01", "snapshot":{"shares":[{"legacy":true}]}});
         sqlx::query("INSERT INTO qbit_prism_jobs(job_id,instance_id,parent_hash,payout_revision,payload,expires_at) VALUES('legacy','test','parent',0,$1,clock_timestamp()+interval '1 hour')")
             .bind(&original).execute(&db.pool).await?;
-        // A higher number is intentionally present before the actual runner.
-        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(9)").execute(&db.pool).await?;
+        // Model an actual post-009 database before the 008 runner starts.
+        preinstall_migration(db, 9, MIGRATION_009).await?;
         let _ledger = db.ledger().await?;
         let row: Value = sqlx::query_scalar("SELECT to_jsonb(j) FROM qbit_prism_jobs j WHERE job_id='legacy'").fetch_one(&db.pool).await?;
         ensure!(row["payload"] == original && row["window_anchor_ms"].is_null()
@@ -637,21 +653,13 @@ async fn external_blobs_are_immutable_and_remain_deletable_for_gc() -> Result<()
 }
 
 #[tokio::test]
-#[ignore = "requires disposable PostgreSQL and PRISM_TEST_MIGRATION_009 pointing to reviewed PR319 SQL"]
-async fn reviewed_009_sql_coexists_with_008_in_both_orders() -> Result<()> {
-    require_database()?;
-    let path = std::env::var("PRISM_TEST_MIGRATION_009")
-        .context("supply the reviewed PR319 migration path")?;
-    let migration = std::fs::read_to_string(path)?;
+async fn landed_009_coexists_with_008_in_both_orders_under_runner() -> Result<()> {
     for nine_first in [true, false] {
-        let migration = migration.clone();
         run(move |db| Box::pin(async move {
-            if !nine_first { db.ledger().await?; }
-            let mut tx = db.pool.begin().await?;
-            sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(0x505249534d000001i64).execute(&mut *tx).await?;
-            sqlx::raw_sql(&migration).execute(&mut *tx).await?;
-            sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(9)").execute(&mut *tx).await?;
-            tx.commit().await?;
+            let (version, migration) = if nine_first { (9, MIGRATION_009) } else { (8, MIGRATION_008) };
+            preinstall_migration(db, version, migration).await?;
+            // Each branch has exactly one predecessor before the actual
+            // runner installs the missing migration and then restarts.
             db.ledger().await?;
             db.ledger().await?;
             let index: String = sqlx::query_scalar("SELECT indexdef FROM pg_indexes WHERE schemaname=current_schema() AND indexname='qbit_prism_jobs_extranonce1_expiry_idx'")
@@ -659,6 +667,9 @@ async fn reviewed_009_sql_coexists_with_008_in_both_orders() -> Result<()> {
             ensure!(index.contains("lower(") && index.contains("extranonce1") && index.contains("expires_at"), "009 index changed");
             let versions: Vec<i32> = sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations ORDER BY version").fetch_all(&db.pool).await?;
             ensure!(versions == [2,3,4,5,8,9], "008/009 order failed");
+            let cycle: bool = sqlx::query_scalar("SELECT seqcycle FROM pg_sequence WHERE seqrelid='qbit_prism_session_sequence'::regclass")
+                .fetch_one(&db.pool).await?;
+            ensure!(cycle, "009 session sequence did not retain CYCLE");
             Ok(())
         })).await?;
     }
