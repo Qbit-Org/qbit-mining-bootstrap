@@ -1141,6 +1141,7 @@ fn a_foreign_order_lock_holder_is_not_billed_to_the_frontends() {
         granted,
         waitstart: None,
         application_name: name.to_owned(),
+        activity_visible: true,
     };
     let rows = vec![
         // A frontend holding the lock is the normal case and belongs in no
@@ -1173,6 +1174,29 @@ fn a_foreign_order_lock_holder_is_not_billed_to_the_frontends() {
     assert_eq!(blind.own_holding.len(), 2);
     assert!(is_own_row(&row(5, true, "anything"), &[]));
     assert!(!is_own_row(&row(5, true, "anything"), &frontends));
+
+    // A lock row whose `pg_stat_activity` row this role cannot read is
+    // foreign, even with no attribution at all: nothing about it can be shown
+    // to belong to this run, and counting it as ours is the unsafe direction.
+    let opaque = LockRow {
+        activity_visible: false,
+        application_name: String::new(),
+        ..row(6, true, "")
+    };
+    assert!(!is_own_row(&opaque, &frontends));
+    assert!(!is_own_row(&opaque, &[]));
+    let blind_opaque = split_lock_rows(std::slice::from_ref(&opaque), &[]);
+    assert_eq!(blind_opaque.foreign_holding.len(), 1);
+    assert!(blind_opaque.own_holding.is_empty());
+    assert_eq!(
+        qbit_prism_load::measure::row_label(&opaque),
+        qbit_prism_load::measure::UNREADABLE_ACTIVITY,
+        "an unreadable row is named, not reported as an empty application_name"
+    );
+    assert_eq!(
+        qbit_prism_load::measure::row_label(&row(7, false, "load-fe-0")),
+        "load-fe-0"
+    );
 }
 
 #[test]

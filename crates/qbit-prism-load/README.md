@@ -418,9 +418,15 @@ The side report repeats all of this under `honest_value_notes`.
   lock is the normal case and is in none of them.
 - **ORDER_LOCK waits are sampled**, not instrumented. The metric family
   `qbit_prism_database_advisory_lock_wait_seconds` exists but has no producer,
-  so the harness samples every ORDER_LOCK row in `pg_locks`, joined to
+  so the harness samples every ORDER_LOCK row in `pg_locks`, left-joined to
   `pg_stat_activity`, every 10 ms, and reports a waiter-count summary over the
-  ungranted rows belonging to this run, an episode count as "at least N", and a
+  ungranted rows belonging to this run. The join is on the left so a lock row
+  whose backend the sampler's role cannot read still appears, and such a row
+  counts as foreign — it cannot be shown to be one of this run's frontends, and
+  that is the safe direction. Every poll carries the server's
+  `clock_timestamp()`, including a poll that finds no lock at all, so a sample
+  never mixes the harness's clock with the server's. Beside the counts it
+  reports an episode count as "at least N", and a
   Riemann waiter-seconds estimate that is a lower bound: waits shorter than the
   sampling interval can be missed entirely. The sampler's own query cost is
   reported beside the numbers. When `pg_stat_statements` is loaded, the

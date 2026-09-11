@@ -391,7 +391,17 @@ pub struct LockRow {
     pub granted: bool,
     pub waitstart: Option<chrono::DateTime<chrono::Utc>>,
     pub application_name: String,
+    /// Whether `pg_stat_activity` showed this backend to the sampler's role.
+    /// A row whose activity the sampler cannot read cannot be shown to be one
+    /// of this run's frontends, so it is counted as foreign: that is the safe
+    /// direction, and it matches the floor test.
+    pub activity_visible: bool,
 }
+
+/// What a foreign row with no readable `pg_stat_activity` is called in the
+/// foreign name lists, so an unreadable row is never reported as an empty
+/// `application_name`.
+pub const UNREADABLE_ACTIVITY: &str = "(activity row not visible to the sampler's role)";
 
 /// One `pg_locks` sample of every ORDER_LOCK row in this database.
 #[derive(Clone, Debug)]
@@ -478,7 +488,18 @@ pub struct LockRowSplit<'a> {
 /// every row counts as this run's and the summary says so rather than
 /// pretending the set is clean.
 pub fn is_own_row(row: &LockRow, frontends: &[String]) -> bool {
-    frontends.is_empty() || frontends.contains(&row.application_name)
+    // An unreadable activity row is foreign even with no attribution at all:
+    // nothing about it can be shown to belong to this run.
+    row.activity_visible && (frontends.is_empty() || frontends.contains(&row.application_name))
+}
+
+/// How a row appears in a foreign name list.
+pub fn row_label(row: &LockRow) -> String {
+    if row.activity_visible {
+        row.application_name.clone()
+    } else {
+        UNREADABLE_ACTIVITY.to_owned()
+    }
 }
 
 /// Split one sample's rows. Pure, so the attribution it decides is testable
@@ -536,15 +557,27 @@ impl LockSampler {
                 // Granted rows are selected too: the holder of ORDER_LOCK is
                 // what a foreign stall looks like, and filtering it out made
                 // one invisible.
+                // `pg_stat_activity` is joined on the left, so a lock row
+                // whose backend the sampler's role cannot read still appears
+                // and is counted as foreign rather than disappearing. The
+                // server's `clock_timestamp()` comes from the outer one-row
+                // source, so every poll carries it, including a poll that
+                // finds no lock at all: a sample never mixes the harness's
+                // clock with the server's.
                 let query = sqlx::query(
-                    "SELECT a.pid, l.granted, l.waitstart, \
-                     COALESCE(a.application_name,'') AS application_name, \
-                     clock_timestamp() AS sampled_at \
-                     FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid \
-                     WHERE l.locktype = 'advisory' \
-                       AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
-                       AND l.classid = $1::bigint::oid AND l.objid = $2::bigint::oid \
-                       AND l.objsubid = 1",
+                    "WITH locks AS ( \
+                       SELECT l.pid AS lock_pid, l.granted, l.waitstart, a.pid AS activity_pid, \
+                              COALESCE(a.application_name,'') AS application_name \
+                       FROM pg_locks l LEFT JOIN pg_stat_activity a ON a.pid = l.pid \
+                       WHERE l.locktype = 'advisory' \
+                         AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+                         AND l.classid = $1::bigint::oid AND l.objid = $2::bigint::oid \
+                         AND l.objsubid = 1 \
+                     ) \
+                     SELECT stamp.sampled_at, locks.lock_pid, locks.granted, locks.waitstart, \
+                            locks.activity_pid, locks.application_name \
+                     FROM (SELECT clock_timestamp() AS sampled_at) stamp \
+                     LEFT JOIN locks ON true",
                 )
                 .bind(ORDER_LOCK_CLASSID)
                 .bind(ORDER_LOCK_OBJID)
@@ -552,31 +585,57 @@ impl LockSampler {
                 .await;
                 match query {
                     Ok(rows) => {
-                        let server_time = rows
-                            .first()
-                            .and_then(|row| row.try_get("sampled_at").ok())
-                            .unwrap_or_else(chrono::Utc::now);
-                        let rows = rows
-                            .iter()
-                            .map(|row| LockRow {
-                                pid: row.try_get::<i32, _>("pid").unwrap_or_default(),
-                                granted: row.try_get::<bool, _>("granted").unwrap_or(false),
-                                waitstart: row
-                                    .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(
-                                        "waitstart",
-                                    )
-                                    .unwrap_or(None),
-                                application_name: row
-                                    .try_get::<String, _>("application_name")
-                                    .unwrap_or_default(),
-                            })
-                            .collect();
-                        samples.lock().expect("lock sampler").push(LockSample {
-                            monotonic: Instant::now(),
-                            server_time,
-                            rows,
-                            query_millis: started.elapsed().as_secs_f64() * 1000.0,
-                        });
+                        // The outer source guarantees one row, so a missing
+                        // server timestamp is a sampler failure, not a licence
+                        // to substitute the harness's clock.
+                        let server_time: Option<chrono::DateTime<chrono::Utc>> =
+                            rows.first().and_then(|row| row.try_get("sampled_at").ok());
+                        match server_time {
+                            None => {
+                                let mut state = failure.lock().expect("lock sampler failure");
+                                state.get_or_insert_with(|| {
+                                    "the sampler read no server clock_timestamp(), so its                                      samples would have mixed clocks"
+                                        .to_owned()
+                                });
+                            }
+                            Some(server_time) => {
+                                let rows = rows
+                                    .iter()
+                                    // A poll that found no lock still returns
+                                    // one row, with a null lock pid.
+                                    .filter_map(|row| {
+                                        let pid = row.try_get::<Option<i32>, _>("lock_pid").ok()??;
+                                        Some(LockRow {
+                                            pid,
+                                            granted: row
+                                                .try_get::<Option<bool>, _>("granted")
+                                                .ok()
+                                                .flatten()
+                                                .unwrap_or(false),
+                                            waitstart: row
+                                                .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(
+                                                    "waitstart",
+                                                )
+                                                .unwrap_or(None),
+                                            application_name: row
+                                                .try_get::<String, _>("application_name")
+                                                .unwrap_or_default(),
+                                            activity_visible: row
+                                                .try_get::<Option<i32>, _>("activity_pid")
+                                                .ok()
+                                                .flatten()
+                                                .is_some(),
+                                        })
+                                    })
+                                    .collect();
+                                samples.lock().expect("lock sampler").push(LockSample {
+                                    monotonic: Instant::now(),
+                                    server_time,
+                                    rows,
+                                    query_millis: started.elapsed().as_secs_f64() * 1000.0,
+                                });
+                            }
+                        }
                     }
                     Err(error) => {
                         *failure.lock().expect("lock sampler failure") = Some(error.to_string());
@@ -663,17 +722,13 @@ impl LockSampler {
             if foreign > 0 {
                 summary.foreign_waiter_samples += 1;
                 for row in &split.foreign_waiting {
-                    *foreign_names
-                        .entry(row.application_name.clone())
-                        .or_insert(0) += 1;
+                    *foreign_names.entry(row_label(row)).or_insert(0) += 1;
                 }
             }
             if foreign_holding > 0 {
                 summary.foreign_holder_samples += 1;
                 for row in &split.foreign_holding {
-                    *foreign_holder_names
-                        .entry(row.application_name.clone())
-                        .or_insert(0) += 1;
+                    *foreign_holder_names.entry(row_label(row)).or_insert(0) += 1;
                 }
             }
             if let Some(last) = previous {
