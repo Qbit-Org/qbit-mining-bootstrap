@@ -65,16 +65,101 @@ transaction lock. It preserves share sequence/history, balances, audit metadata,
 and settlement rows. New tables hold shared configuration/revision, instance
 heartbeats, expiring jobs, immutable audit snapshots, and durable claim state.
 Migration 3 retains `2.x.x` publication ordinals, retained worker difficulty,
-hashrate rollups, and their watermark. The base schema and native migrations
-apply in one transaction, including carry-forward summary repair.
-The migration is idempotent; a refusal due to an old active writer or unresolved
-legacy work must be resolved before admitting native traffic.
+hashrate rollups, and their watermark. Migration 6 pins the accepted `2.x.x`
+source schema, records what was migrated, and declares the schema capability
+every later start checks. The base schema and native migrations apply in one
+transaction, including carry-forward summary repair. The migration is
+idempotent; a refusal due to an old active writer, an unsupported source
+schema, or unresolved legacy work must be resolved before admitting native
+traffic.
 
-Specifically, a pending legacy candidate without the native bundle/hash/revision
-fields cannot be replayed by Rust. Migration refuses it transactionally without
-changing the schema. Drain it through the pinned legacy submitter first, then
-repeat the backup and migration boundary. Do not delete pending rows merely to
-bypass this check.
+### Supported 2.x.x source schemas
+
+The minimum supported source release is **v2.0.1** (`95ffe06`). A v2.0.0
+(`f6854a0`) database has the identical schema and migrates as the same source
+state, but drain it with the v2.0.1 or later image, because the offline
+recovery command below first shipped in v2.0.1. The newest supported source is
+**v2.0.2** (`504846c`, #258). The SQL those releases applied is frozen
+byte-for-byte under `crates/qbit-prism-server/tests/fixtures/schema_2x/`, and
+the migrator classifies the database before it runs any DDL:
+
+| Source state | Evidence | Verdict |
+| --- | --- | --- |
+| pre-#258 (v2.0.0, v2.0.1) | `001_share_ledger.sql` only: no `qbit_prism_schema_capabilities`, no `002_candidate_bodies.sql` object | accept after the drain check |
+| #258 applied (v2.0.2) | `candidate_storage_version = 2` and every `002_candidate_bodies.sql` object present | accept after the drain check |
+| partial 002 | some 002 objects or the capability row, but not all (v2.0.2 applies 001 and 002 as two script calls, and a restart between them leaves this) | refuse, naming the missing object; finish 002 with the v2.0.2 release (`PRISM_POSTGRES_INIT_SCHEMA=1`) or restore the backup |
+| newer | `candidate_storage_version > 2`, or a capability this release does not know | refuse before any DDL; a newer PRISM release wrote the database |
+
+`3.x.x` never applies `002_candidate_bodies.sql` and does not import #258's
+chunked candidate bodies. On a #258 source it keeps the 002 tables, triggers
+and the capability row untouched; native writers store version 1 JSONB
+candidates, which 002's dual-format rule accepts.
+
+**#258's rollback floor.** Once a `storage_version = 2` outbox row exists, a
+writer that predates v2.0.2 must not run against the database (see the header
+of `002_candidate_bodies.sql`). The same floor applies to this cutover from the
+other side: `3.x.x` cannot replay a v2 row either, so every v2 row must be
+drained by the v2.0.2 coordinator before migration. Never roll a #258 database
+back below v2.0.2 to drain it.
+
+**The drain requirement covers v1 and v2 rows.** A pending v1 candidate
+(JSONB body without the native `payout_revision`, `bundle` and `block_hash`
+fields) and a pending v2 candidate (`candidate` NULL, body in the chunk
+tables) both cannot be replayed by Rust. `migrate` refuses them
+transactionally, without changing the schema, and names the blocking rows:
+
+```
+legacy Python block outbox is not drained: 2 pending 2.x.x candidate row(s) cannot be
+replayed natively (block_hash=... storage_version=1 ...; block_hash=... storage_version=2 ...).
+Drain them with the pinned 2.x.x release before migrating: ...
+```
+
+The check reads outbox rows, not the capability row: 002 declares
+`candidate_storage_version = 2` whatever the writer stored, so the row proves
+002 ran, not that v2 work is pending. Drain with the pinned `2.x.x` image:
+
+1. Start the `2.x.x` coordinator (v2.0.2 for a #258 database, v2.0.1 or later
+   otherwise) and let its block submitter finish every pending candidate; it
+   replays every durable pending row on start.
+2. For a block that is already accepted on the active chain but cannot complete
+   through normal replay, run the `2.x.x` offline recovery command from the
+   `2.x.x` image, with the managed coordinator stopped:
+
+   ```sh
+   python3 -m lab.prism.recover_pending_blocks --block-hash "$HASH"          # plan
+   python3 -m lab.prism.recover_pending_blocks --block-hash "$HASH" --apply  # drain
+   ```
+
+   That command was removed from `3.x.x` with the Python runtime; it only
+   exists in the `2.x.x` image.
+3. Confirm `qbit_block_candidate_outbox` has no `pending` rows, then repeat the
+   backup and migration boundary. Do not delete pending rows merely to bypass
+   this check.
+
+A v2 row that reaches the native claim lane anyway (one written after the
+drain, for instance) is parked, not retried: the lane records why in
+`last_error`, releases the claim, and sets `next_attempt_at` to `infinity`, so
+no lease expiry offers it again. Find parked rows with
+`SELECT block_hash, storage_version, last_error FROM qbit_block_candidate_outbox
+WHERE state = 'pending' AND next_attempt_at = 'infinity'` and drain them with
+the `2.x.x` image as above; resetting `next_attempt_at` re-offers a row.
+
+**What was migrated.** After a successful migration
+`qbit_prism_migration_source` holds one row: the accepted source state
+(`pre_258`, `258_applied`, `fresh`, or `native` for a database that was
+already on the Rust schema), the `2.x.x` release and commit that source
+corresponds to, the capability value the source declared, the schema version
+before this migration, and which instance migrated it. `migrate` prints it,
+every start logs it, and a repeated `migrate` never rewrites it.
+
+**Startup gate.** Every start reads `qbit_prism_schema_migrations` and
+`qbit_prism_schema_capabilities`, with or without
+`PRISM_POSTGRES_INIT_SCHEMA`. A database below schema version 6, above it, or
+declaring a capability or `candidate_storage_version` this release does not
+understand is refused at connect, naming the required version, before any
+accounting statement runs. With the native default
+`PRISM_POSTGRES_INIT_SCHEMA=0` that means a newer binary refuses to start until
+`migrate` has run, instead of failing later in the claim path.
 
 `import-audits` processes database rows whose audit body is external. It resolves
 full v1/v1.1 bodies, legacy body refs, and v2 proof bodies, verifies segment
@@ -152,7 +237,9 @@ Check these before restoring ordinary traffic:
 - Candidate and CTV claim recovery work after a process interruption.
 
 A subsequent rollout between compatible **Rust** versions may drain and replace
-one frontend at a time. Review each version's schema compatibility separately.
+one frontend at a time. Review each version's schema compatibility separately:
+a release that adds a migration requires its schema version exactly, so run its
+`migrate` with every frontend stopped and start the new binaries afterwards.
 
 ## HA durability and failover
 
