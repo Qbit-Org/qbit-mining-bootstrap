@@ -106,7 +106,29 @@ def jinja_rules(rules):
     # Documentation-only fields never enter the Grafana provisioning contract.
     rows = [{key: value for key, value in rule.items()
              if key not in {"role", "basis", "producer_refs"}} for rule in rules]
-    return json.dumps(rows, indent=2).replace("__NETWORK__", '" ~ qbit_monitoring_stack_network ~ "')
+    text = json.dumps(rows, indent=2).replace("__NETWORK__", '" ~ qbit_monitoring_stack_network ~ "')
+    overrides = {
+        "qbit-prism-connected-clients": ("qbit_monitoring_stack_prism_alert_connected_clients_threshold", "qbit_monitoring_stack_prism_alert_connected_clients_for", "10"),
+        "qbit-prism-candidate-oldest": ("qbit_monitoring_stack_prism_alert_candidate_oldest_warning_seconds", "qbit_monitoring_stack_prism_alert_candidate_oldest_warning_for", "15"),
+        "qbit-prism-candidate-oldest-critical": ("qbit_monitoring_stack_prism_alert_candidate_oldest_critical_seconds", "qbit_monitoring_stack_prism_alert_candidate_oldest_critical_for", "60"),
+        "qbit-prism-semantic-work-coverage": ("qbit_monitoring_stack_prism_alert_semantic_coverage_warning_ratio", "qbit_monitoring_stack_prism_alert_semantic_coverage_warning_for", "0.95"),
+        "qbit-prism-semantic-coverage-critical": ("qbit_monitoring_stack_prism_alert_semantic_coverage_critical_ratio", "qbit_monitoring_stack_prism_alert_semantic_coverage_critical_for", "0.5"),
+    }
+    for uid, (threshold, dwell, literal) in overrides.items():
+        marker = '"uid": "' + uid + '"'
+        start = text.find(marker)
+        if start < 0: continue
+        end = text.find('"uid": "', start + len(marker))
+        block_end = end if end >= 0 else len(text)
+        block = text[start:block_end]
+        expr = re.search(r'("expr": ")(.*?)(",\n)', block)
+        if expr and literal in expr.group(2):
+            before, after = expr.group(2).split(literal, 1)
+            rebuilt = expr.group(1) + before + '" ~ (' + threshold + ' | default(' + literal + ')) ~ "' + after + expr.group(3)
+            block = block[:expr.start()] + rebuilt + block[expr.end():]
+        block = block.replace('"for": "3m"', '"for": "{{ ' + dwell + ' | default(\'3m\') }}"', 1)
+        text = text[:start] + block + text[block_end:]
+    return text
 
 
 def deployment_template(snapshot):

@@ -106,7 +106,7 @@
 -  that never increment RestartCount, so planned work needs no maintenance
 -  flag; drills that crash the coordinator on purpose use a Grafana silence.
 +{# Native 3.x.x cutover draft, bootstrap #279. Apply only with the native image.
-+   Specification SHA-256: 20fce857d66548a1b9e10917a45ada21d62395dcd258010f3dd741860385287b
++   Specification SHA-256: a6e751e6000f6304052d9e5a26dcd732380709970c39a3813fa9952ebbc424c8
 +   Generated from the reviewed a007a142 snapshot; backup, sidecar and lifecycle rules retain their producers.
 +   Native numeric bounds marked provisional must be measured in #291 before production cutover.
 +   The D3 group requires PRIMARY postgres_exporter query metrics; see bootstrap docs/prism-alert-migration.md.
@@ -257,11 +257,11 @@
 -    "no_data_state": "OK",
 -    "exec_err_state": "OK"
 -  },
-+    "expr": "(sum(qbit_prism_connections{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} and on(job, instance, network) (qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0) and on(job, instance, network) (up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1)) < bool 10) and on() (count(up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}) == count(qbit_prism_connections{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} and on(job, instance, network) (qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0) and on(job, instance, network) (up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1)))",
++    "expr": "(sum(qbit_prism_connections{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} and on(job, instance, network) (qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0) and on(job, instance, network) (up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1)) < bool " ~ (qbit_monitoring_stack_prism_alert_connected_clients_threshold | default(10)) ~ ") and on() (count(up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}) == count(qbit_prism_connections{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} and on(job, instance, network) (qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0) and on(job, instance, network) (up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1)))",
 +    "condition_type": "threshold",
 +    "evaluator": "gt",
 +    "threshold": 0,
-+    "for": "3m",
++    "for": "{{ qbit_monitoring_stack_prism_alert_connected_clients_for | default('3m') }}",
 +    "severity": "warning",
 +    "service": "qbit-mining-pool",
 +    "labels": {
@@ -420,11 +420,11 @@
 +  {
 +    "uid": "qbit-prism-semantic-work-coverage",
 +    "title": "PrismSemanticWorkCoverageLoss",
-+    "expr": "((qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} < bool 0.95) and on(job, instance, network) (qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} >= 0) and on(job, instance, network) (qbit_prism_authorized_clients{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} > 0)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0))",
++    "expr": "((qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} < bool " ~ (qbit_monitoring_stack_prism_alert_semantic_coverage_warning_ratio | default(0.95)) ~ ") and on(job, instance, network) (qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} >= 0) and on(job, instance, network) (qbit_prism_authorized_clients{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} > 0)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0))",
 +    "condition_type": "threshold",
 +    "evaluator": "gt",
 +    "threshold": 0,
-+    "for": "3m",
++    "for": "{{ qbit_monitoring_stack_prism_alert_semantic_coverage_warning_for | default('3m') }}",
 +    "severity": "warning",
 +    "service": "qbit-mining-pool",
 +    "labels": {
@@ -438,11 +438,11 @@
 +  {
 +    "uid": "qbit-prism-semantic-coverage-critical",
 +    "title": "PrismSemanticWorkCoverageLossCritical",
-+    "expr": "((qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} < bool 0.5) and on(job, instance, network) (qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} >= 0) and on(job, instance, network) (qbit_prism_authorized_clients{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} > 0)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0))",
++    "expr": "((qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} < bool " ~ (qbit_monitoring_stack_prism_alert_semantic_coverage_critical_ratio | default(0.5)) ~ ") and on(job, instance, network) (qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} >= 0) and on(job, instance, network) (qbit_prism_authorized_clients{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} > 0)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0))",
 +    "condition_type": "threshold",
 +    "evaluator": "gt",
 +    "threshold": 0,
-+    "for": "3m",
++    "for": "{{ qbit_monitoring_stack_prism_alert_semantic_coverage_critical_for | default('3m') }}",
 +    "severity": "critical",
 +    "service": "qbit-mining-pool",
 +    "labels": {
@@ -529,11 +529,11 @@
 +  {
 +    "uid": "qbit-prism-candidate-oldest-critical",
 +    "title": "PrismBlockCandidateOldestPendingCritical",
-+    "expr": "(qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} >= bool 60) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0)) and on(job, instance, network) (qbit_prism_collector_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",collector=\"database\"} == 1)",
++    "expr": "(qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} >= bool " ~ (qbit_monitoring_stack_prism_alert_candidate_oldest_critical_seconds | default(60)) ~ ") and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0)) and on(job, instance, network) (qbit_prism_collector_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",collector=\"database\"} == 1)",
 +    "condition_type": "threshold",
 +    "evaluator": "gt",
 +    "threshold": 0,
-+    "for": "3m",
++    "for": "{{ qbit_monitoring_stack_prism_alert_candidate_oldest_critical_for | default('3m') }}",
 +    "severity": "critical",
 +    "service": "qbit-mining-pool",
 +    "labels": {
