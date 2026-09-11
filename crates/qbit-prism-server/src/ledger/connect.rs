@@ -232,17 +232,6 @@ impl Ledger {
                     .await?;
             }
             tx.commit().await?;
-        } else {
-            let ready: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM qbit_prism_schema_migrations WHERE version=9)",
-            )
-            .fetch_one(&pool)
-            .await
-            .context("schema migrations table missing; initialize the Prism schema")?;
-            ensure!(
-                ready,
-                "Prism schema migration 009 is required when initialization is disabled"
-            );
         }
         let ledger = Self {
             pool,

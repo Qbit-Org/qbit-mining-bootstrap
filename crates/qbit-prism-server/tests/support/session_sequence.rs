@@ -50,18 +50,15 @@ async fn stopped_guard_blocks_cleanup_and_owner_filter_preserves_other_reservati
 }
 
 #[tokio::test]
-async fn initialize_false_rejects_pre009_schema() -> Result<()> {
+async fn initialize_false_allows_read_only_pre009_connection() -> Result<()> {
     let Some(db) = Database::open().await? else {
         return Ok(());
     };
     let pool = PgPool::connect(&db.url).await?;
     sqlx::raw_sql("CREATE TABLE qbit_prism_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp()); INSERT INTO qbit_prism_schema_migrations(version) VALUES(2),(3),(4),(5)")
         .execute(&pool).await?;
-    let error = match Ledger::connect(&db.url, "pre009".into(), 4, false).await {
-        Ok(_) => panic!("pre-009 schema must fail when initialization is disabled"),
-        Err(error) => error,
-    };
-    assert!(error.to_string().contains("migration 009"));
+    let ledger = Ledger::connect(&db.url, "pre009".into(), 4, false).await?;
+    ledger.pool.close().await;
     pool.close().await;
     db.close(vec![]).await
 }

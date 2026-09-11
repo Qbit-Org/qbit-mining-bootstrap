@@ -296,6 +296,18 @@ impl Coordinator {
             )
             .await?,
         );
+        if !config.initialize_schema {
+            let ready: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM qbit_prism_schema_migrations WHERE version=9)",
+            )
+            .fetch_one(&ledger.pool)
+            .await
+            .context("schema migrations table missing; initialize the Prism schema")?;
+            ensure!(
+                ready,
+                "Prism schema migration 009 is required for mining startup"
+            );
+        }
         ledger
             .configure(&config.fingerprint(genesis.as_str().context("invalid genesis hash")?)?)
             .await?;
