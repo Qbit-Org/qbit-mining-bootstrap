@@ -1134,6 +1134,34 @@ fn the_harness_reads_its_own_postgres_binary_variable() {
 }
 
 #[test]
+fn the_temporary_cluster_root_is_removed_even_when_start_up_fails() -> Result<()> {
+    use qbit_prism_load::cluster::TempRoot;
+    // The directory has to exist before the value that owns the cleanup can be
+    // built, so the guard owns it from the first instant: a failure anywhere
+    // between the two leaves nothing behind.
+    let path = {
+        let root = TempRoot::create(false)?;
+        assert!(root.path().is_dir());
+        std::fs::write(root.path().join("primary.log"), b"as if initdb had run")?;
+        root.path().to_path_buf()
+    };
+    assert!(
+        !path.exists(),
+        "{} survived the guard, so a failed start-up would orphan it",
+        path.display()
+    );
+
+    // `--keep-artifacts` means what it says.
+    let kept = {
+        let root = TempRoot::create(true)?;
+        root.path().to_path_buf()
+    };
+    assert!(kept.is_dir(), "--keep-artifacts must keep the root");
+    std::fs::remove_dir_all(&kept)?;
+    Ok(())
+}
+
+#[test]
 fn a_postgres_bin_directory_without_the_server_binaries_is_refused() -> Result<()> {
     use qbit_prism_load::cluster;
     let root = std::env::temp_dir().join(format!("prism-load-bindir-{}", std::process::id()));

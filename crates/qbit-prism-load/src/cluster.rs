@@ -165,6 +165,41 @@ impl Cluster {
     }
 }
 
+/// The temporary cluster root, removed on drop unless the run asked to keep
+/// it.
+///
+/// It is a guard rather than a plain path because the directory has to exist
+/// before the `ManagedPostgres` that owns the cleanup can be built: every `?`
+/// in between -- reading the current user, `initdb`, allocating a port,
+/// starting the primary -- used to return without removing it, leaving an
+/// orphan `/tmp/prism-load-<uuid>` behind, and a failure after `initdb` left a
+/// whole data directory there.
+pub struct TempRoot {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl TempRoot {
+    pub fn create(keep: bool) -> Result<Self> {
+        let path =
+            std::env::temp_dir().join(format!("prism-load-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&path).context("create cluster root")?;
+        Ok(Self { path, keep })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 /// A primary plus, optionally, one streaming standby, both owned by the run.
 pub struct ManagedPostgres {
     pub primary_url: String,
@@ -174,8 +209,8 @@ pub struct ManagedPostgres {
     pub replication: Replication,
     pub pg_stat_statements: Option<String>,
     pub bin_dir: PathBuf,
-    pub root: PathBuf,
-    keep_artifacts: bool,
+    /// Dropped after `stop`, which is what removes the directory.
+    root: TempRoot,
     primary: Cluster,
     standby: Option<Cluster>,
 }
@@ -265,14 +300,12 @@ impl ManagedPostgres {
         max_connections: u32,
         keep_artifacts: bool,
     ) -> Result<Self> {
-        let root =
-            std::env::temp_dir().join(format!("prism-load-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&root).context("create cluster root")?;
+        let root = TempRoot::create(keep_artifacts)?;
         let user = current_user()?;
         let mut primary = Cluster {
             bin: bin_dir.clone(),
-            data: root.join("primary"),
-            log: root.join("primary.log"),
+            data: root.path().join("primary"),
+            log: root.path().join("primary.log"),
             running: false,
         };
         primary.run(
@@ -298,7 +331,7 @@ impl ManagedPostgres {
             "-h 127.0.0.1 -p {primary_port} -k {root} -c fsync=on -c full_page_writes=on \
              -c wal_level=replica -c max_wal_senders=10 -c max_replication_slots=10 \
              -c max_connections={max_connections}",
-            root = root.display()
+            root = root.path().display()
         );
         if preload.is_some() {
             options.push_str(" -c shared_preload_libraries=pg_stat_statements");
@@ -313,8 +346,7 @@ impl ManagedPostgres {
             replication,
             pg_stat_statements: preload.clone().map(|_| "loaded".to_owned()),
             bin_dir: bin_dir.clone(),
-            root: root.clone(),
-            keep_artifacts,
+            root,
             primary,
             standby: None,
         };
@@ -342,8 +374,8 @@ impl ManagedPostgres {
         let standby_port = free_port()?;
         let mut standby = Cluster {
             bin: self.bin_dir.clone(),
-            data: self.root.join("standby"),
-            log: self.root.join("standby.log"),
+            data: self.root.path().join("standby"),
+            log: self.root.path().join("standby.log"),
             running: false,
         };
         let conninfo = format!(
@@ -383,7 +415,7 @@ impl ManagedPostgres {
         standby.start(&format!(
             "-h 127.0.0.1 -p {standby_port} -k {root} -c hot_standby=on -c fsync=on \
              -c full_page_writes=on -c max_connections={max_connections} -c max_wal_senders=10",
-            root = self.root.display()
+            root = self.root.path().display()
         ))?;
         self.standby = Some(standby);
         self.standby_port = Some(standby_port);
@@ -436,9 +468,8 @@ impl ManagedPostgres {
             standby.stop();
         }
         self.primary.stop();
-        if !self.keep_artifacts {
-            let _ = std::fs::remove_dir_all(&self.root);
-        }
+        // The root itself goes when `TempRoot` drops, which is after this
+        // returns, so the data directory is never removed under a live server.
     }
 }
 
