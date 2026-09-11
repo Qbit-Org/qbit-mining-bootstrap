@@ -93,7 +93,7 @@ release definition:
 | #258 applied (v2.0.2) | `candidate_storage_version = 2` and every `002_candidate_bodies.sql` object present | accept after the drain check |
 | partial 002 | some 002 objects or the capability row, but not all (v2.0.2 applies 001 and 002 as two script calls, and a restart between them leaves this) | refuse, naming the missing object; finish 002 with the v2.0.2 release (`PRISM_POSTGRES_INIT_SCHEMA=1`) or restore the backup |
 | newer | `candidate_storage_version > 2`, or a capability this release does not know | refuse before any DDL; a newer PRISM release wrote the database. A database that is already native gets the same check first, before 004, 005, 006 or 009 run, so `migrate` never alters a database a newer release wrote |
-| drifted 001 | a 001 (or 002) object whose definition, after 001 has run, differs from the frozen release: a table, column, index, sequence or named constraint that 001's `IF NOT EXISTS` skipped, or any 002 object, with a dropped constraint, a changed type, nullability or default, a different index definition, an altered sequence (a lowered maximum, a different increment), a table or sequence made `UNLOGGED` (or temporary), a release constraint left `NOT VALID` (other than the pinned `qbit_share_ledger_credit_policy_check`), a replaced function body or a disabled trigger | refuse transactionally, naming each object and what differs; the migration rolls back and the database is unchanged; restore the pre-migration backup or bring the database to the release schema with the `2.x.x` release, then migrate again |
+| drifted 001 | a 001 (or 002) object whose definition, after 001 has run, differs from the frozen release: a table, column, index, sequence or named constraint that 001's `IF NOT EXISTS` skipped, or any 002 object, with a dropped constraint, a changed type, nullability or default, a different index definition, an altered sequence (a lowered maximum, a different increment), a table or sequence made `UNLOGGED` (or temporary), a release constraint left `NOT VALID` (other than the pinned `qbit_share_ledger_credit_policy_check`), row-level security enabled or forced on a release table or a policy on one, a replaced function body or a disabled trigger | refuse transactionally, naming each object and what differs; the migration rolls back and the database is unchanged; restore the pre-migration backup or bring the database to the release schema with the `2.x.x` release, then migrate again |
 
 **The release definitions.** They are not a stored fingerprint: before any
 DDL touches the source, inside the migration transaction, the migrator opens
@@ -137,7 +137,18 @@ migrator runs in: for every table and sequence its persistence (the release
 creates ordinary logged relations, and an `UNLOGGED` or temporary table is
 one whose rows PostgreSQL truncates after a crash, so it is drift whatever
 its columns say; a sequence follows its table's persistence on PostgreSQL 15
-and later); column
+and later); for every table its row-level security, both flags (`ENABLE ROW
+LEVEL SECURITY` and `FORCE ROW LEVEL SECURITY`) and every policy on it, by
+name, with its command, whether it is permissive or restrictive, its roles
+and its `USING` and `WITH CHECK` expressions (the release creates none of
+this; a policy that hides rows from the migrate role, or forced security
+with no policy at all, would make the drain check see an empty outbox and
+the native claim lane never see the legacy rows it left behind, so a policy
+on a release table is drift, not an extra: `table qbit_block_candidate_outbox
+differs: expected row-level security disabled, found enabled and forced`,
+`policy hide_pending on qbit_block_candidate_outbox: FOR ALL USING ((state
+<> 'pending'::text)); the release has no row-level security policy on this
+table`); column
 type, NOT NULL, default, identity and generated status, collation;
 constraints per table by definition; index definitions and validity; trigger
 definitions and enabled state; function arguments, result, language, body,
