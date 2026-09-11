@@ -3,7 +3,8 @@ use qbit_prism_server::{
     codec::Submission,
     ledger::Ledger,
     stratum::{
-        run_listener, MiningBackend, MiningJob, StratumConfig, StratumError, StratumStats, Worker,
+        run_listener, MiningBackend, MiningJob, StaleGrace, StratumConfig, StratumError,
+        StratumStats, Worker,
     },
 };
 use serde_json::Value;
@@ -76,7 +77,7 @@ impl MiningBackend for Backend {
         _: &Worker,
         _: &MiningJob<()>,
         _: Submission,
-        _: bool,
+        _: StaleGrace,
     ) -> Result<(), StratumError> {
         unreachable!("this fixture issues no work")
     }

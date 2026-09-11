@@ -97,6 +97,8 @@ pub fn coordinator_config(
         expected_genesis_hash: None,
         min_peers: 2,
         template_max_age: Duration::from_secs(120),
+        submit_tip_max_age: Duration::from_secs(10),
+        template_refresh_failure_exit: Duration::from_secs(120),
         rpc_url: node.url.clone(),
         rpc_user: "test".into(),
         rpc_password: "test".into(),

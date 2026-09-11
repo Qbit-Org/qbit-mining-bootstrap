@@ -28,6 +28,7 @@ use connect::{lock, require_revision, writable};
 mod difficulty;
 mod fanout;
 mod jobs;
+pub use jobs::{IssuedJobSave, PreparedDependency};
 mod migration;
 mod window;
 pub use difficulty::WorkerDifficulty;

@@ -199,6 +199,30 @@ The grace interval starts when that client receives replacement work; stale
 blocks are never submitted. Retained vardiff hints are shared by listener and
 exact username, with accepted-work evidence controlling their expiry.
 
+Native submit classification also preserves the published-tip authority used by
+`2.x.x` at `95ffe063846d51f83999a66cc654da5f7476fdef`. A detected tip immediately
+fences block candidates. Miner share credit continues against the last published
+work while replacement is prepared, including when stale grace is zero. Its
+ordinary freshness budget is `PRISM_SUBMIT_TIP_MAX_AGE_SECONDS` (default 10);
+zero forces a live tip RPC for each share. A detected replacement may extend
+published authority through `PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS`
+(default 120), measured from the first departure. Repeated detections and failed
+refresh attempts do not restart that deadline. Once both budgets have expired,
+submit falls back to the node; RPC failures remain backend-unavailable.
+
+Successful work publication opens one-parent stale grace after the startup
+baseline. The deadline starts separately for each connection's first delivery
+of that tip, and same-tip refreshes do not slide it. An undelivered replacement
+keeps eligible retained work in a bounded per-connection graveyard;
+absolute reconnect-job expiry is never extended. Share credit retains the
+original issued worker, target, network difficulty and policy. Both ordinary
+published-work credit and stale-grace credit still commit under the current
+transactional payout revision. These are restorations of miner behavior, with
+ungated real-coordinator decision and socket/session regression tests; they do
+not relax current-chain candidate submission checks.
+See the [miner decision parity reference](prism-b8-miner-parity.md) for retained
+work bounds, the regression coverage map and disposable qualification commands.
+
 `PRISM_USERNAME_FALLBACK_ADDRESS` applies when validation explicitly identifies
 an invalid address or a recognized address type that Prism cannot pay. RPC
 failures and malformed validation responses reject authorization without
@@ -353,7 +377,7 @@ All vectors use the day-one floor of 14720 sats.
     deferred credit lands before the next block's anchor, because the credit
     row is stamped at confirmation, not at submission.
 - **Reason:**
-  - `crates/qbit-prism-server/src/coordinator.rs` credits `network` difficulty
+  - `crates/qbit-prism-server/src/coordinator/miner_submit.rs` credits `network` difficulty
     when `share_pass` is false, and holds the share as the candidate's
     `deferred_share` until the credit row exists.
   - `crates/qbit-prism-server/src/ledger/blocks.rs` (`credit_deferred_share`)
@@ -391,6 +415,23 @@ recorded separately from D2a because it was approved on its own.
   - So a carry-only account at or above the floor can be paid in a bootstrap
     block.
 - **D2 item:** D2c, prior balances during bootstrap.
+
+## Retained mining work
+
+Same-connection active eviction preserves the original worker, target and
+version mask, including after reauthorization. The configured per-connection
+retention count N bounds both the existing active set and the same-tip graveyard.
+A previous parent can temporarily own its former active set plus graveyard;
+the graveyard has a conservative total cap of 3N (4N including active work).
+Same-tip graveyard TTL starts at eviction. Previous-parent entries require a
+published transition and delivery-based grace; unrelated parents and absolute
+resume expiries are removed. Original username admission permits remain held
+while this retained work can credit, and are released on actual expiry, capacity
+eviction, payout replacement or disconnect. Reauthorization reuses the same
+connection's permit. Cross-connection resume still requires the exact original
+worker, the current published template's parent and payout revision, and an
+unexpired absolute job deadline. The durable current-revision fence remains
+separate from those original published payout inputs.
 
 ## Recovery and rollback
 
