@@ -311,7 +311,7 @@ not a graph someone reads. The Python tool that computed the verdict left with
 #244; the same verdict is one `awk` pass over the sample file:
 
 ```sh
-awk -F, -v warmup=3600 -v multiple=2.0 -v min_span=82800 '
+sort -t, -k1,1n soak-rss.csv | awk -F, -v warmup=3600 -v multiple=2.0 -v min_span=82800 '
   function numeric(s) { return s ~ /^[ \t]*-?([0-9]+\.?[0-9]*|\.[0-9]+)[ \t]*$/ }
   /^[ \t]*(#|$)/ { next }
   NF < 2 || !numeric($1) || !numeric($2) { bad = $0; unusable = 1; exit }
@@ -326,26 +326,29 @@ awk -F, -v warmup=3600 -v multiple=2.0 -v min_span=82800 '
     if (base == "" || !post) { print "unusable input: no warm-up or no post-warm-up samples"; exit 2 }
     if (last - t0 < min_span) { printf "unusable input: series spans %d s, soak needs %d s\n", last - t0, min_span; exit 2 }
     printf "baseline=%d bound=%d peak=%d peak_at=%d first_breach_at=%s\n", base, base * multiple, peak, peak_at, breach ? breach : "none"
-    exit breach ? 1 : 0 }' soak-rss.csv
+    exit breach ? 1 : 0 }'
 ```
 
 The input is one `seconds,rss_bytes` line per sample (absolute epoch seconds
 are fine). `#` comments and blank lines are skipped and `-1` samples are
-ignored; any other row that is not `seconds,rss_bytes` is unusable input
-(exit `2`), as it was in the Python tool, so a truncated row during an
-excursion cannot pass as a skipped one. The warm-up
-runs from the first sample and includes a sample taken exactly one hour after
-it, as it did in the Python tool; only later samples are judged against the
-bound. The command prints the baseline, the bound, the post-warm-up peak and
-its time, and the first breach time, and exits `0` on pass, `1` on fail, `2`
-on unusable input. The span floor is the Python tool's default:
-`min_span=82800` refuses a series that spans less than 23 hours from its first
-sample to its last, not one shorter than the soak. The tool's source recorded
-the hour of slack as tolerance for a late first sample; the run itself is
-still the 24 h that step 2 below asks for. The slope guard the Python tool
-offered (a leak slow enough to stay under the multiple inside 24 hours) has no
-replacement in the runbook; take it from the RSS series on the deployment's
-dashboard, whose rules #279 owns.
+ignored; any other row that is not `seconds,rss_bytes` is unusable input (exit
+`2`), as it was in the Python tool, so a truncated row during an excursion
+cannot pass as a skipped one. The samples are sorted by timestamp before they
+are judged, as the Python tool sorted them, so concatenated partial logs judge
+the same as a single file; comment and blank lines are still skipped wherever
+they sort, and a malformed row still exits `2`. The warm-up runs from the
+earliest sample and includes a sample taken exactly one hour after it, as it
+did in the Python tool; only later samples are judged against the bound. The
+command prints the baseline, the bound, the post-warm-up peak and its time, and
+the first breach time, and exits `0` on pass, `1` on fail, `2` on unusable
+input. The span floor is the Python tool's default: `min_span=82800` refuses a
+series that spans less than 23 hours from its first sample to its last, not one
+shorter than the soak. The tool's source recorded the hour of slack as
+tolerance for a late first sample; the run itself is still the 24 h that step 2
+below asks for. The slope guard the Python tool offered (a leak slow enough to
+stay under the multiple inside 24 hours) has no replacement in the runbook;
+take it from the RSS series on the deployment's dashboard, whose rules #279
+owns.
 
 When it fails: the first breach time says whether the growth is the steady
 slope (breach hours in) or an excursion (breach right after a candidate storm
