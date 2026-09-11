@@ -544,7 +544,9 @@ mod tests {
     }
     #[tokio::test]
     async fn every_sql_statement_uses_the_remaining_request_budget() {
-        let Ok(url) = std::env::var("PRISM_TEST_DATABASE_URL") else {
+        let Some(url) = qbit_prism_test_gate::database_url(qbit_prism_test_gate::site!())
+            .expect("integration gate")
+        else {
             return;
         };
         let pool = read_pool(PgConnectOptions::from_str(&url).unwrap(), 1);

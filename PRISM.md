@@ -266,11 +266,15 @@ cargo run --locked --release -p qbit-prism-server -- benchmark \
 ```
 
 The native test wrapper uses a supplied `PRISM_TEST_DATABASE_URL` or starts an
-isolated local PostgreSQL cluster. Its default database mode runs all server
-targets and then explicitly runs the ignored database collector test, matching
-the CI invocation. Live tests use real qbitd regtest and bounded
-CPU mining. The builder benchmark measures synthetic build-and-verify work;
-complete Stratum-to-durable-commit capacity requires separate load evidence.
+isolated local PostgreSQL cluster. Its default mode runs the whole workspace and
+the two explicit `--ignored` database runs, matching the CI job, and once
+`qbitd` and the PostgreSQL server tools are present it requires every gated
+test to execute and checks the gate's manifest against
+`test/prism-gated-tests.txt`; see
+[the integration test gate](docs/prism-integration-test-gate.md). Live tests
+use real qbitd regtest and bounded CPU mining. The builder benchmark measures
+synthetic build-and-verify work; complete Stratum-to-durable-commit capacity
+requires separate load evidence.
 
 - [Migration and multi-instance deployment](docs/prism-rust-migration.md)
 - [Ledger operations and recovery](docs/prism-ledger-ops.md)

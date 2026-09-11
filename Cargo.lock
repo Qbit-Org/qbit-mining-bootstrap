@@ -1349,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "qbit-pool-builder"
-version = "2.0.2"
+version = "3.0.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -1361,10 +1361,11 @@ dependencies = [
 
 [[package]]
 name = "qbit-prism"
-version = "2.0.2"
+version = "3.0.0"
 dependencies = [
  "hex",
  "qbit-pool-builder",
+ "qbit-prism-test-gate",
  "serde",
  "serde_json",
  "sha2",
@@ -1373,7 +1374,7 @@ dependencies = [
 
 [[package]]
 name = "qbit-prism-server"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1388,6 +1389,7 @@ dependencies = [
  "percent-encoding",
  "qbit-pool-builder",
  "qbit-prism",
+ "qbit-prism-test-gate",
  "rand 0.8.8",
  "reqwest",
  "serde",
@@ -1404,6 +1406,10 @@ dependencies = [
  "url",
  "uuid",
 ]
+
+[[package]]
+name = "qbit-prism-test-gate"
+version = "3.0.0"
 
 [[package]]
 name = "quinn"

@@ -1,8 +1,12 @@
 [package]
 name = "qbit-prism"
-version = "2.0.2"
+version.workspace = true
+rust-version.workspace = true
 edition = "2021"
 license = "MIT"
+# Built and shipped from this repository; its path dependencies carry no
+# version, which cargo-deny permits only for crates that are never published.
+publish = false
 description = "Payouts, Rewards, and Integrity Settlement Manifest pool accounting for qbit"
 
 [dependencies]
@@ -15,3 +19,6 @@ thiserror = "2.0"
 
 [dev-dependencies]
 hex = "0.4"
+# Every environment-gated test in this crate must take its inputs through the
+# shared gate; see docs/prism-integration-test-gate.md.
+qbit-prism-test-gate = { path = "../qbit-prism-test-gate" }

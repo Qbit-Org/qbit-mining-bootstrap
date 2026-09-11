@@ -605,3 +605,35 @@ delivers, and the numbers are what the soak produces.
 
    and record `start` against `after_release_gc` and `after_malloc_trim`,
    with the platform line, on #185.
+
+## Payout-window JSONB storage ceiling
+
+Independent of any load-test record, the payout window has a hard storage
+ceiling. PostgreSQL refuses a JSONB container whose elements exceed 268,435,455
+bytes, and four native writes still embed the whole window, so each grows
+linearly with the share count. `cargo test -p qbit-prism-server --test
+jsonb_ceiling_gate` measures them against 25% of that limit (67,108,863 bytes)
+and fails when the set of crossing writes changes in either direction.
+
+| Path | Column written | Window copies | At 400,000 shares | Removed by |
+| --- | --- | --- | --- | --- |
+| refresh | `qbit_prism_jobs.payload` | 3 | refused by PostgreSQL (measured) | #273 |
+| enqueue | `qbit_block_candidate_outbox.candidate` | 2 | refused by PostgreSQL (measured) | #265 |
+| landing | `qbit_pool_audit_bundles.audit_bundle` | 1 | 235 MB, 3.5x the gate threshold (measured) | #267 |
+| import | `qbit_pool_audit_bundles.audit_bundle` | 2 | refused by PostgreSQL (measured) | #265 |
+
+The host, gate commit, PostgreSQL version (16.15) and build mode (debug) behind
+these measurements are recorded under "Baseline, measured at the base commit
+plus the gate's own test files" and "At 400,000 shares" in
+`docs/prism-payout-artifact-measurement.md`.
+
+Sizes are uncompressed JSONB containers. A refused write is reported as refused,
+never with a size. After the enqueue write is refused, the gate writes a
+window-free substitute outbox row itself so the later phases stay measurable;
+the report labels that row `SUBSTITUTE` and never counts it as the enqueue write.
+See "JSONB ceiling gate and 400k-share
+baselines" in `docs/prism-payout-artifact-measurement.md` for the 50,000-,
+100,000-, 200,000- and 400,000-share measurements and how to reproduce them. A
+capacity qualification run should record the payout window size it exercised,
+because a window near 400,000 shares reaches this ceiling before it reaches any
+throughput limit.

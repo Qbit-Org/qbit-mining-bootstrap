@@ -4,7 +4,14 @@ members = [
     "crates/qbit-pool-builder",
     "crates/qbit-prism",
     "crates/qbit-prism-server",
+    "crates/qbit-prism-test-gate",
 ]
+
+[workspace.package]
+version = "3.0.0"
+# Pinned to the toolchain in rust-toolchain.toml; scripts/check_toolchain_pin.py
+# fails when they differ.
+rust-version = "1.98.1"
 
 [profile.release]
 lto = "thin"
