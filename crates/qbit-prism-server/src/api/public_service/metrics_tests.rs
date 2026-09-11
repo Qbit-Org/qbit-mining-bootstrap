@@ -8,7 +8,11 @@ async fn metrics_headers_follow_probe_age_not_database_success_or_wall_time() {
         .connect_lazy("postgres://invalid@127.0.0.1:1/invalid")
         .unwrap();
     let (app, service) = router(
-        ApiState::new(pool, ApiConfig::default()),
+        ApiState::new(
+            pool,
+            ApiConfig::default(),
+            std::sync::Arc::new(crate::metrics::Metrics::default()),
+        ),
         ServiceConfig {
             probe_interval: Duration::from_secs(10),
             ..Default::default()

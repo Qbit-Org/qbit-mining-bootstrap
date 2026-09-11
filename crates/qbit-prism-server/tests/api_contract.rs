@@ -15,7 +15,11 @@ fn state() -> ApiState {
     let pool = PgPoolOptions::new()
         .connect_lazy("postgres://invalid:invalid@127.0.0.1:1/invalid")
         .unwrap();
-    ApiState::new(pool, ApiConfig::default())
+    ApiState::new(
+        pool,
+        ApiConfig::default(),
+        std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
+    )
 }
 async fn get(app: Router, path: &str) -> (StatusCode, axum::http::HeaderMap, Value) {
     let response = app
@@ -164,7 +168,11 @@ async fn health_reads_runtime_snapshot_without_database_access() {
     let pool = PgPoolOptions::new()
         .connect_lazy("postgres://invalid:invalid@127.0.0.1:1/invalid")
         .unwrap();
-    let state = ApiState::new(pool, ApiConfig::default());
+    let state = ApiState::new(
+        pool,
+        ApiConfig::default(),
+        std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
+    );
     let (status, _, body) = get(router(state.clone()), "/healthz").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["state"], "starting");

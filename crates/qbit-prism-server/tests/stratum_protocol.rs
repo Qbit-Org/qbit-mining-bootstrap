@@ -40,6 +40,9 @@ struct Backend {
     network_bits: AtomicU32,
     fail_builds: AtomicU32,
     hint_reads_unavailable: AtomicBool,
+    submit_gate: Mutex<Option<Arc<observability::Gate>>>,
+    build_gate: Mutex<Option<Arc<observability::Gate>>>,
+    hint_gate: Mutex<Option<Arc<observability::Gate>>>,
 }
 
 impl MiningBackend for Backend {
@@ -73,6 +76,10 @@ impl MiningBackend for Backend {
         evidence: Option<&str>,
         downward: bool,
     ) -> anyhow::Result<()> {
+        let gate = self.hint_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.wait().await;
+        }
         let mut hints = self.hints.lock().unwrap();
         let key = (listener.into(), worker.username.clone());
         if downward {
@@ -118,6 +125,10 @@ impl MiningBackend for Backend {
         {
             return Err(StratumError::backend("temporary builder failure"));
         }
+        let gate = self.build_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.wait().await;
+        }
         let generation = self.generation.load(Ordering::SeqCst);
         let bits = self.network_bits.load(Ordering::Relaxed);
         let bits = if bits == 0 { 0x207fffff } else { bits };
@@ -162,6 +173,10 @@ impl MiningBackend for Backend {
         submission: Submission,
         grace: bool,
     ) -> Result<(), StratumError> {
+        let gate = self.submit_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.wait().await;
+        }
         let tip = format!("{:064x}", self.generation.load(Ordering::SeqCst));
         if job.wire.previousblockhash != tip && !grace {
             return Err(StratumError::new(21, "stale job", "stale-job"));
@@ -396,6 +411,23 @@ async fn start(
     watch::Sender<bool>,
     tokio::task::JoinHandle<()>,
 ) {
+    start_with_metrics(
+        config,
+        Arc::new(qbit_prism_server::metrics::Metrics::default()),
+    )
+    .await
+}
+
+async fn start_with_metrics(
+    config: StratumConfig,
+    metrics: Arc<qbit_prism_server::metrics::Metrics>,
+) -> (
+    std::net::SocketAddr,
+    Arc<Backend>,
+    watch::Sender<u64>,
+    watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let backend = Arc::new(Backend::default());
@@ -404,7 +436,7 @@ async fn start(
     let task = {
         let backend = backend.clone();
         tokio::spawn(async move {
-            run_listener(listener, config, backend, refresh_rx, shutdown_rx)
+            run_listener(listener, config, backend, refresh_rx, shutdown_rx, metrics)
                 .await
                 .unwrap();
         })
@@ -608,6 +640,7 @@ async fn resumed_difficulty_is_lane_scoped_ttl_bounded_and_explicit_requests_win
         backend.clone(),
         refresh.subscribe(),
         shutdown.subscribe(),
+        std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
     ));
     let mut other_lane = Client::connect(high_address).await;
     other_lane.login("miner.retained").await;
@@ -846,9 +879,16 @@ async fn reconnect_on_another_listener_preserves_original_entropy_mask_and_expir
         let refresh = refresh.subscribe();
         let shutdown = shutdown.subscribe();
         tokio::spawn(async move {
-            run_listener(listener, config, backend, refresh, shutdown)
-                .await
-                .unwrap();
+            run_listener(
+                listener,
+                config,
+                backend,
+                refresh,
+                shutdown,
+                std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
+            )
+            .await
+            .unwrap();
         })
     };
     let mut original = Client::connect(first).await;
@@ -1255,3 +1295,6 @@ async fn admission_timeout_records_failure_and_shutdown_releases_session_stats()
     assert_eq!(snapshot.authorized, 0);
     assert_eq!(snapshot.pending_builds, 0);
 }
+
+#[path = "observability/stratum.rs"]
+mod observability;

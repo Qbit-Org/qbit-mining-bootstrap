@@ -2,7 +2,7 @@
 use super::{env_num, HeaderValue, IntoResponse, Response};
 use std::time::{Duration, Instant};
 
-pub(super) fn health_stale_after() -> Duration {
+pub(crate) fn health_stale_after() -> Duration {
     Duration::from_secs(
         env_num("PRISM_HEALTH_REFRESH_SECONDS", 2)
             .saturating_mul(3)
@@ -24,15 +24,32 @@ impl MetricsSnapshot {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn response(self, now: Instant, stale_after: Duration) -> Response {
+        self.response_with_runtime(now, stale_after, None, None)
+    }
+
+    pub(super) fn response_with_runtime(
+        self,
+        now: Instant,
+        stale_after: Duration,
+        runtime: Option<crate::metrics::runtime::RuntimeSnapshot>,
+        collections: Option<&crate::metrics::Metrics>,
+    ) -> Response {
         let freshness = Freshness::new(
             self.published_at
                 .map(|at| now.saturating_duration_since(at).as_secs_f64()),
             stale_after.as_secs_f64(),
         );
-        let mut body = if freshness.stale() {
+        // Startup still exposes the registry contract while the first health
+        // probe is pending. Rendering is not a complete snapshot publication.
+        let registered_body = match (self.published_at, collections) {
+            (None, Some(metrics)) => metrics.render(),
+            _ => self.body,
+        };
+        let mut body = if freshness.stale() || runtime.as_ref().is_some_and(|view| view.stalled()) {
             // Rewrite only the health sample, never another family's metadata or value.
-            self.body
+            registered_body
                 .lines()
                 .map(|line| {
                     if line.split_whitespace().next() == Some("qbit_prism_health_state") {
@@ -47,28 +64,17 @@ impl MetricsSnapshot {
                     body
                 })
         } else {
-            self.body
+            registered_body
         };
-        for (name, help, value) in [
-            (
-                "available",
-                "Whether a complete metrics snapshot has been published.",
-                f64::from(u8::from(freshness.age_seconds.is_some())),
-            ),
-            (
-                "stale",
-                "Whether the metrics snapshot is missing or exceeds the health freshness budget.",
-                f64::from(u8::from(freshness.stale())),
-            ),
-            (
-                "age_seconds",
-                "Monotonic age of the metrics snapshot, or -1 before the first publication.",
-                freshness.age_seconds.unwrap_or(-1.),
-            ),
-        ] {
-            body.push_str(&format!(
-                "# HELP qbit_prism_metrics_snapshot_{name} {help}\n# TYPE qbit_prism_metrics_snapshot_{name} gauge\nqbit_prism_metrics_snapshot_{name} {value}\n"
-            ));
+        if let Some(collections) = collections {
+            collections.overlay_collections(&mut body);
+        }
+        body.push_str(&crate::metrics::render_freshness(
+            freshness.age_seconds,
+            freshness.stale(),
+        ));
+        if let Some(runtime) = runtime {
+            body.push_str(&runtime.render());
         }
         freshness.response(body)
     }

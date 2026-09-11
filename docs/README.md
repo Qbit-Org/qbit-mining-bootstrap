@@ -41,10 +41,12 @@ This is useful for reviewers and operators who need implementation detail:
   Python 2.x, native multi-instance operation, and rollback.
 - [prism-ledger-ops.md](prism-ledger-ops.md): native ledger invariants,
   transaction ordering, retention, and readiness probes.
+- [prism-native-metrics.md](prism-native-metrics.md): native cutover metric
+  inventory, measurement boundaries, and failure semantics.
 - [prism-overload-alerts.md](prism-overload-alerts.md): specification for
   historical Python overload and backlog alert rules (issue #188). Native
-  metrics are documented in [../PRISM.md](../PRISM.md); this repository holds
-  no live monitoring configuration.
+  metrics are documented in [prism-native-metrics.md](prism-native-metrics.md);
+  this repository holds no live monitoring configuration.
 - [prism-capacity-readiness.md](prism-capacity-readiness.md): optional
   Stratum-to-Postgres qualification artifact and standalone validator contract.
 - [prism-coordinator-refactor/README.md](prism-coordinator-refactor/README.md):

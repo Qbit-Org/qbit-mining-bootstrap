@@ -87,7 +87,11 @@ async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
         instance_id: "server-a".into(),
         ..ApiConfig::default()
     };
-    let app = router(ApiState::new(pool.clone(), config));
+    let app = router(ApiState::new(
+        pool.clone(),
+        config,
+        std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
+    ));
     let (status, fresh) = get(&app, "/public/v1/miners/alice").await;
     assert_eq!(status, StatusCode::OK, "{fresh}");
     assert!(fresh["estimated_next_block"]["estimated_reward_bits"].is_null());
@@ -399,6 +403,7 @@ async fn accepted_public_blocks_and_earnings_follow_confirmed_chain_state() {
             cache_enabled: false,
             ..ApiConfig::default()
         },
+        std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
     ));
     let mut hashes = Vec::new();
     // Unaccepted candidates have greater heights and distinct values, so accidentally

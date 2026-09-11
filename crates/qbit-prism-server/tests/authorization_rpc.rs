@@ -304,7 +304,11 @@ async fn authorization_fallback_requires_a_definitive_address_result() -> Result
     let node = Node::open().await?;
     config.rpc_url = node.url.clone();
     config.rpc_timeout = Duration::from_millis(150);
-    let coordinator = Coordinator::new(config).await?;
+    let coordinator = Coordinator::new(
+        config,
+        std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
+    )
+    .await?;
     let result = verify_authorization(&coordinator, &node).await;
     coordinator.ledger.pool.close().await;
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))

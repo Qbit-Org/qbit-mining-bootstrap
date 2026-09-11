@@ -1,0 +1,12 @@
+{
+  "source": "https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/95ffe063846d51f83999a66cc654da5f7476fdef/lab/prism/observability.py#L497-L510",
+  "known_fields": {
+    "ok": "boolean",
+    "schema": "string",
+    "ledger_backend": "string",
+    "accepted_share_count": "integer",
+    "accepted_block": "boolean",
+    "accepted_block_count": "integer"
+  },
+  "unmapped_fields": ["ready_miner_count", "max_blocks"]
+}

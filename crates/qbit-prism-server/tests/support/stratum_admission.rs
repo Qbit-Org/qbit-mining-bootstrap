@@ -104,6 +104,7 @@ impl Server {
             backend.clone(),
             refresh_rx,
             shutdown_rx,
+            Arc::new(qbit_prism_server::metrics::Metrics::default()),
         ));
         Self {
             address,

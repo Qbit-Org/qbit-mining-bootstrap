@@ -192,7 +192,11 @@ impl Fixture {
             audit_bind: "127.0.0.1".into(),
             audit_port: 0,
         };
-        let coordinator = Coordinator::new(config).await?;
+        let coordinator = Coordinator::new(
+            config,
+            std::sync::Arc::new(crate::metrics::Metrics::default()),
+        )
+        .await?;
         let successor =
             Ledger::connect(url.as_str(), "candidate-successor".into(), 4, false).await?;
         coordinator
