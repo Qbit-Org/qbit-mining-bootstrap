@@ -23,6 +23,9 @@ set -euo pipefail
 #   QBIT_PRISM_SCALE_WINDOW_READ_BUDGET_MS      warm budget (default 2000)
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=test/prism-postgres-lib.sh
+source "${ROOT_DIR}/test/prism-postgres-lib.sh"
+
 POSTGRES_IMAGE="${QBIT_PRISM_POSTGRES_IMAGE:-postgres:16-alpine}"
 POSTGRES_CONTAINER="${QBIT_PRISM_POSTGRES_CONTAINER:-qbit-prism-scale-pg-$$}"
 
@@ -66,15 +69,7 @@ else
     -e POSTGRES_DB=qbit \
     "${POSTGRES_IMAGE}" >/dev/null
 
-  deadline=$((SECONDS + 60))
-  until docker exec "${POSTGRES_CONTAINER}" pg_isready -U qbit -d qbit >/dev/null 2>&1; do
-    if [[ "${SECONDS}" -ge "${deadline}" ]]; then
-      echo "timed out waiting for PRISM Postgres container" >&2
-      docker logs "${POSTGRES_CONTAINER}" >&2 || true
-      exit 1
-    fi
-    sleep 1
-  done
+  wait_for_prism_postgres_container "${POSTGRES_CONTAINER}"
   PSQL_COMMAND="docker exec -i ${POSTGRES_CONTAINER} psql -U qbit -d qbit"
 fi
 

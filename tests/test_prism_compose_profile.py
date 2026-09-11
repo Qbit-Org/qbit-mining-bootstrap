@@ -8,6 +8,9 @@ import shutil
 import subprocess
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from lab.prism import public_read_service
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -330,7 +333,7 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_PUBLIC_CACHE_MAX_ENTRIES"], "512")
         self.assertEqual(env["PRISM_PUBLIC_CACHE_DEBUG_HEADERS"], "0")
         self.assertEqual(
-            env["PRISM_DATABASE_URL"],
+            self._public_database_url(),
             "postgresql://qbit:change-this@prism-postgres-replica:5432/qbit",
         )
         self.assertEqual(env["PRISM_AUDIT_DIR"], "/var/lib/qbit-prism/audit")
@@ -519,8 +522,11 @@ class PrismComposeProfileTests(unittest.TestCase):
     def test_public_read_service_reads_the_replica_not_the_primary(self) -> None:
         env = self._service_environment("prism-public-api")
 
-        self.assertIn("prism-postgres-replica", env["PRISM_DATABASE_URL"])
-        self.assertNotIn("@prism-postgres:", env["PRISM_DATABASE_URL"])
+        self.assertEqual(env["PRISM_DATABASE_URL"], "")
+        self.assertEqual(env["PRISM_PUBLIC_DATABASE_HOST"], "prism-postgres-replica")
+        database_url = self._public_database_url()
+        self.assertIn("prism-postgres-replica", database_url)
+        self.assertNotIn("@prism-postgres:", database_url)
         self.assertEqual(env["PRISM_PUBLIC_REPLICA_MODE"], "require")
         depends_on = self.config["services"]["prism-public-api"]["depends_on"]
         self.assertEqual({"prism-postgres-replica"}, set(depends_on))
@@ -531,6 +537,15 @@ class PrismComposeProfileTests(unittest.TestCase):
         # The coordinator keeps the primary; the split is the point.
         coordinator = self._service_environment("prism-coordinator")
         self.assertIn("@prism-postgres:", coordinator["PRISM_DATABASE_URL"])
+
+    def _public_database_url(self) -> str:
+        # Inspect the DSN consumed by both ledger backends after runtime encoding.
+        env = self._service_environment("prism-public-api")
+        with patch.dict(os.environ, env, clear=True), patch.object(
+            public_read_service, "PsqlShareLedger"
+        ) as ledger, patch.object(public_read_service, "build_audit_artifact_store", return_value=None):
+            public_read_service.build_ledger_from_env(env)
+        return ledger.call_args.kwargs["database_url"]
 
     def _service_environment(self, name: str) -> dict[str, str]:
         raw_env = self.config["services"][name]["environment"]

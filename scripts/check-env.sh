@@ -27,6 +27,7 @@ ENV_QBIT_DATA_SOURCE="${QBIT_DATA_SOURCE:-}"
 ENV_BITCOIN_DATA_SOURCE="${BITCOIN_DATA_SOURCE:-}"
 ENV_PRISM_POSTGRES_DATA_SOURCE="${PRISM_POSTGRES_DATA_SOURCE:-}"
 ENV_PRISM_POSTGRES_WAL_SOURCE="${PRISM_POSTGRES_WAL_SOURCE:-}"
+ENV_PRISM_POSTGRES_REPLICA_DATA_SOURCE="${PRISM_POSTGRES_REPLICA_DATA_SOURCE:-}"
 ENV_PRISM_AUDIT_DATA_SOURCE="${PRISM_AUDIT_DATA_SOURCE:-}"
 ENV_QBIT_CHAIN="${QBIT_CHAIN:-}"
 ENV_QBIT_CHAIN_FLAG="${QBIT_CHAIN_FLAG:-}"
@@ -165,6 +166,7 @@ for name in \
   BITCOIN_DATA_SOURCE \
   PRISM_POSTGRES_DATA_SOURCE \
   PRISM_POSTGRES_WAL_SOURCE \
+  PRISM_POSTGRES_REPLICA_DATA_SOURCE \
   PRISM_AUDIT_DATA_SOURCE; do
   override_name="ENV_${name}"
   if [[ -n "${!override_name}" ]]; then
@@ -595,22 +597,40 @@ check_absolute_storage_source() {
 
 check_distinct_storage_sources() {
   local names=("$@")
-  local left right
-  local left_name right_name
-  local left_value right_value
-
-  for ((left = 0; left < ${#names[@]}; left++)); do
-    left_name="${names[left]}"
-    left_value="${!left_name}"
-    left_value="${left_value%/}"
-    for ((right = left + 1; right < ${#names[@]}; right++)); do
-      right_name="${names[right]}"
-      right_value="${!right_name}"
-      right_value="${right_value%/}"
-      [[ "${left_value}" != "${right_value}" ]] || \
-        fail "release provenance storage sources ${left_name} and ${right_name} must be distinct"
-    done
+  local args=() name output
+  command -v python3 >/dev/null 2>&1 || fail "python3 is required to validate storage paths"
+  for name in "${names[@]}"; do
+    args+=("${name}" "${!name}")
   done
+  if ! output="$(python3 - "${args[@]}" <<'PYTHON'
+from pathlib import Path
+import sys
+
+sources = []
+try:
+    for name, raw in zip(sys.argv[1::2], sys.argv[2::2]):
+        path = Path(raw).resolve()
+        identities = []
+        for parent in (path, *path.parents):
+            try:
+                stat = parent.stat()
+                identities.append((stat.st_dev, stat.st_ino))
+            except FileNotFoundError:
+                identities.append(None)
+        for other_name, other_path, other_ids in sources:
+            if (path == other_path or path in other_path.parents
+                    or other_path in path.parents
+                    or identities[0] is not None and identities[0] in other_ids
+                    or other_ids[0] is not None and other_ids[0] in identities):
+                sys.exit(f"release provenance storage sources {other_name} and {name} "
+                         "must be distinct and non-overlapping (including filesystem aliases)")
+        sources.append((name, path, identities))
+except (OSError, RuntimeError):
+    sys.exit(f"cannot safely resolve release provenance storage source {name}")
+PYTHON
+  )"; then
+    fail "${output}"
+  fi
 }
 
 check_production_deployment_inputs() {
@@ -632,10 +652,12 @@ check_production_deployment_inputs() {
     check_digest_image PRISM_POSTGRES_IMAGE
     check_absolute_storage_source PRISM_POSTGRES_DATA_SOURCE
     check_absolute_storage_source PRISM_POSTGRES_WAL_SOURCE
+    check_absolute_storage_source PRISM_POSTGRES_REPLICA_DATA_SOURCE
     check_absolute_storage_source PRISM_AUDIT_DATA_SOURCE
     storage_names+=(
       PRISM_POSTGRES_DATA_SOURCE
       PRISM_POSTGRES_WAL_SOURCE
+      PRISM_POSTGRES_REPLICA_DATA_SOURCE
       PRISM_AUDIT_DATA_SOURCE
     )
   fi

@@ -39,7 +39,6 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterator
 from unittest.mock import patch
@@ -149,15 +148,17 @@ class ServiceHarness:
             replica=replica,  # type: ignore[arg-type]
         )
         handler = public_read_service.make_handler(self.service)
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.server = public_read_service.BoundedPublicHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        # Loopback fixtures must never inherit a cached process-wide proxy.
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def get(self, path_and_query: str) -> ServedResponse:
         url = self.base_url + path_and_query
         try:
-            with urllib.request.urlopen(url, timeout=5) as response:
+            with self.opener.open(url, timeout=5) as response:
                 return ServedResponse(
                     response.status,
                     response.read(),
@@ -221,6 +222,13 @@ class ContractEqualityTests(unittest.TestCase):
         parsed_query = urllib.parse.parse_qs(query)
         status, payload = public_api.dispatch(self.coordinator, path, parsed_query)
         policy = public_api.public_cache_policy(path)
+        budget = public_read_service.staleness_budget_for_path(path)
+        if budget is not None:
+            ttl = min(policy.ttl_seconds, int(budget))
+            policy = public_api.PublicCachePolicy(
+                ttl, max(0, min(policy.stale_while_revalidate_seconds, int(budget) - ttl)),
+                policy.immutable,
+            )
         # A fresh service cache serves the first request as a MISS at age 0,
         # which is exactly what the coordinator's handle_public did.
         headers = public_api.public_cache_headers(
@@ -285,6 +293,13 @@ class ContractEqualityTests(unittest.TestCase):
             endpoints[1]["url"],
         )
         self.assertEqual(4334, endpoints[1]["default_port"])
+
+    def test_harness_bypasses_a_cached_proxy_with_no_proxy_environment_cleared(self) -> None:
+        proxy_opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": "http://127.0.0.1:9"})
+        )
+        with patch.object(urllib.request, "_opener", proxy_opener), patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(self.harness.get("/public/v1/blocks").status, 200)
 
     def test_content_type_is_unchanged(self) -> None:
         for route in EXTRACTED_ROUTES:
@@ -835,6 +850,22 @@ class StaleServeTests(unittest.TestCase):
         self.assertEqual(200, served.status)
         self.assertEqual(warm.body, served.body)
         self.assertEqual("8", served.headers.get("Age"))
+
+    def test_cdn_policy_cannot_exceed_the_route_budget(self) -> None:
+        for ttl, swr, expected in (
+            (5, 30, "public, max-age=5, stale-while-revalidate=10"),
+            (60, 30, "public, max-age=15"),
+            (5, 0, "public, max-age=5"),
+        ):
+            with self.subTest(ttl=ttl, swr=swr), patch.object(
+                public_api, "public_cache_policy",
+                return_value=public_api.PublicCachePolicy(ttl, swr),
+            ):
+                served = self.harness.get(f"/public/v1/blocks?limit=1&case={ttl}-{swr}")
+                self.assertEqual(served.status, 200)
+                self.assertEqual(served.headers["X-Prism-Staleness-Budget-Seconds"], "15")
+                self.assertEqual(served.headers["CDN-Cache-Control"], expected)
+                self.assertEqual(served.headers["Vercel-CDN-Cache-Control"], expected)
 
     def test_stale_serves_are_counted_in_cache_metrics(self) -> None:
         self.harness.get("/public/v1/blocks")
@@ -1758,6 +1789,43 @@ class FailClosedStartupTests(unittest.TestCase):
             {"PRISM_PUBLIC_STRATUM_URL": "stratum+tcp://pool.example:3340"}
         )
         self.assertEqual("stratum+tcp://pool.example:3340", value)
+
+    def test_invalid_stratum_urls_refuse_before_database_construction(self) -> None:
+        for url in (
+            "pool.example:3340", "https://pool.example:3340",
+            "stratum+tcp://pool.example", "stratum+tcp://pool.example:not-a-port",
+            "stratum+tcp://pool.example:0", "stratum+tcp://pool.example:65536",
+            "stratum+tcp://:3340", "stratum+tcp://[broken:3340",
+            "stratum+tcp://user:password@pool.example:3340",
+            "stratum+tcp://pool.example:3340/path", "stratum+tcp://pool.example:3340?q=1",
+            "stratum+tcp://pool.example:3340#fragment", "stratum+tcp://bad host:3340",
+            "stratum+tcp://pool.example:33\t40", " stratum+tcp://pool.example:3340 ",
+            "stratum+tcp://bad%host:3340", "stratum+tcp://bad\\host:3340",
+        ):
+            with self.subTest(url=url), patch.object(
+                public_read_service, "build_ledger_from_env"
+            ) as ledger:
+                with self.assertRaises(public_read_service.PublicReadConfigurationError):
+                    public_read_service.build_service({"PRISM_PUBLIC_STRATUM_URL": url})
+                ledger.assert_not_called()
+
+    def test_highdiff_url_is_validated_only_when_advertised(self) -> None:
+        base = {"PRISM_PUBLIC_STRATUM_URL": "stratum+tcp://pool.example:3340"}
+        for bad in ("https://host/path", "stratum+tcp://host:not-a-port", " "):
+            with self.subTest(url=bad), patch.object(public_read_service, "build_ledger_from_env") as ledger:
+                with self.assertRaisesRegex(public_read_service.PublicReadConfigurationError, "PRISM_PUBLIC_STRATUM_HIGHDIFF_URL"):
+                    public_read_service.build_service({**base, "PRISM_STRATUM_HIGHDIFF_PORT": "4334", "PRISM_PUBLIC_STRATUM_HIGHDIFF_URL": bad})
+                ledger.assert_not_called()
+            self.assertEqual(public_read_service.require_public_stratum_url(
+                {**base, "PRISM_PUBLIC_STRATUM_HIGHDIFF_URL": bad}), base["PRISM_PUBLIC_STRATUM_URL"])
+        for explicit in ("", "stratum+ssl://[2001:db8::1]:443"):
+            self.assertEqual(public_read_service.require_public_stratum_url(
+                {**base, "PRISM_STRATUM_HIGHDIFF_PORT": "4334", "PRISM_PUBLIC_STRATUM_HIGHDIFF_URL": explicit}), base["PRISM_PUBLIC_STRATUM_URL"])
+
+    def test_ipv6_and_tls_stratum_urls_are_accepted(self) -> None:
+        for url in ("stratum+tcp://[2001:db8::1]:3340", "stratum+ssl://pool.example:443"):
+            self.assertEqual(public_read_service.require_public_stratum_url(
+                {"PRISM_PUBLIC_STRATUM_URL": url}), url)
 
     def test_memory_ledger_is_refused(self) -> None:
         with self.assertRaises(
