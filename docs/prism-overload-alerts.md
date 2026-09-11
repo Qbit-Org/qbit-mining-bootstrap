@@ -2,8 +2,10 @@
 
 Historical specification for the removed Python coordinator. Its scheduler,
 delivery, and backlog metric names do not describe the native runtime. Use the
-current metric inventory in [PRISM.md](../PRISM.md) when adapting deployment
-alerts for Rust. The remaining document records the original rationale.
+current [native metric inventory](prism-native-metrics.md) and
+[deployed-alert migration](prism-alert-migration.md) when adapting deployment
+alerts for Rust. The remaining document records the original rationale;
+its undeployed rules are not the native alert specification.
 
 Issue #188. This document specifies the alerting rules for PRISM's
 landing-path, delivery, and backlog overload classes. It is a

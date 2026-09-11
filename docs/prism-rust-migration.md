@@ -269,7 +269,20 @@ The supported settings are documented in [.env.example](../.env.example) and the
 The combined audit/operator HTTP port remains 3341; the separate native
 `public-api` role preserves public port 3342. `/healthz` retains its readiness role;
 process metrics describe native work rather than the old Python scheduler.
-Update alerts that depended on removed internal queue/lease/refresh series.
+Migrate deployed alerts using the [native inventory](prism-native-metrics.md)
+and [complete alert migration and deployment diff](prism-alert-migration.md).
+Queue-pressure intent moves to `qbit_prism_share_ack_seconds` and
+`qbit_prism_rejections_total{reason_id}`; Python lease wake delay moves to
+`qbit_prism_runtime_lag_seconds`, retained `qbit_prism_runtime_poll_lag_seconds`
+and `qbit_prism_runtime_task_stalled`. Refresh impact uses
+`qbit_prism_stratum_oldest_pending_initial_job_seconds` and
+`qbit_prism_stratum_current_tip_coverage_gap_seconds`; pending-candidate age and
+count retain their names. Guard body-based rules with #277's
+`qbit_prism_metrics_snapshot_available` / `qbit_prism_metrics_snapshot_stale`
+and database/RSS rules with `qbit_prism_collector_available` so unknown -1 is
+never healthy zero. First-offer and advisory-lock histograms are declared with
+rules deferred to A/#266 and #283. D3's dedicated standby alerts require the
+primary's deployment-provided PostgreSQL exporter, not public read replica data.
 Dashboard totals continue to derive from the shared database. The native
 `self-check` emits structured JSON and fails nonzero on an error instead of
 printing the Python checker's old PASS/WARN/FAIL table.

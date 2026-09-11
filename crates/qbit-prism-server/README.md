@@ -8,6 +8,11 @@ same pool using one HA PostgreSQL writer endpoint.
 See [PRISM.md](../../PRISM.md), the [ledger contract](../../docs/prism-ledger-ops.md),
 and the [migration guide](../../docs/prism-rust-migration.md).
 
+The [generated metric inventory](../../docs/prism-native-metrics.md) covers
+`/metrics` in both `run` and `public-api`, including labels, unknown values and
+2.x.x replacements. The [alert migration](../../docs/prism-alert-migration.md)
+provides the native rules and the review-only deployment-repository diff.
+
 ## Build and run
 
 ```sh
