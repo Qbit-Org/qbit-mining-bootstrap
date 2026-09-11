@@ -418,12 +418,26 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    and the image ID beside each run.
 3. **Capture every 5 minutes** for the whole soak: RSS from `/proc/1/status`
    for the bound, and the correlated series for the reading order above. Both
-   reads run inside the container; the parsing runs on the host:
+   reads run inside the container; the parsing runs on the host. The loop
+   also checks, before every sample, that it is still reading the process
+   the run started with, and stops the run as invalid when it is not:
 
    ```sh
    c=<prism-coordinator-container>
+   process() {
+     docker inspect --format '{{.State.Status}} {{.State.StartedAt}} {{.RestartCount}}' "$c"
+   }
+   first=$(process)
    while true; do
      now=$(date +%s)
+     current=$(process)
+     echo "$now $current" >> soak-process.log
+     if [ "$current" != "$first" ]; then
+       echo "$(date -u +%FT%TZ): soak invalid, the coordinator is not the process the run started with" >&2
+       echo "  at start: $first" >&2
+       echo "  now:      $current" >&2
+       break
+     fi
      docker exec "$c" cat /proc/1/status \
        | awk -v now="$now" '/^VmRSS:/ { printf "%s,%d\n", now, $2 * 1024 }' >> soak-rss.csv
      docker exec "$c" curl -sS --max-time 5 -D - http://127.0.0.1:3341/metrics \
@@ -433,6 +447,22 @@ two-hour cutover soak, which reads its own criteria from the same registry.
      sleep 300
    done
    ```
+
+   The bound is evidence about one process. `compose.yaml` gives
+   `prism-coordinator` `restart: on-failure`, so a coordinator that exits
+   mid-soak is started again by Compose inside the same container, and a loop
+   that only read `/proc/1/status` would go on sampling the new PID 1 without
+   a word: the CSV would splice several short lifetimes into one 23 h span,
+   each restart's low RSS and reset share counters would hide the growth, and
+   the bound, which assumes one process, could pass. The container is the
+   same across a Compose restart, so `docker inspect` on `$c` is the right
+   probe: `StartedAt` moves on any restart, `RestartCount` counts the ones the
+   policy made, and `Status` catches a process that exited and was not
+   restarted. `soak-process.log` keeps one reading per sample, so a later
+   reader can show the run was one process. Any change during the soak
+   invalidates the run: keep the message and the log, attach
+   `docker logs "$c"` (the container keeps the exited process's output), and
+   start over from step 2.
 
    `VmRSS` in `/proc/1/status` is the field the registry's process collector
    reads, so the CSV and the gauge agree up to collector cadence. The log also
@@ -457,7 +487,9 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    and the body at the breach is what the correlated reading works from.
 5. **Trim** is retired with `malloc_trim`; there is nothing to send at hour 23.
 6. **Judge** each run with the `awk` bound check above against
-   `soak-rss.csv`. Pass: exit `0`, and share-ack p99 at hour 24 within the
+   `soak-rss.csv`. A run whose capture loop stopped on a process change is
+   not judged: it is invalid and is run again from step 2.
+   Pass: exit `0`, and share-ack p99 at hour 24 within the
    alert threshold configured for the deployment (the native rules are
    #279's). Fail: exit `1`, or a share-ack regression between hour 1 and hour
    24 that the operator would alert on. Record every
