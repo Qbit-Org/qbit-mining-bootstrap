@@ -126,8 +126,8 @@ pub async fn run() -> Result<()> {
                 })
                 .unwrap_or_else(|| "unrecorded".to_owned());
             println!(
-                "PRISM PostgreSQL schema version {} ready; database source: {source}",
-                crate::ledger::REQUIRED_SCHEMA_VERSION
+                "PRISM PostgreSQL schema migrations {} ready; database source: {source}",
+                crate::ledger::schema_version_list(crate::ledger::REQUIRED_SCHEMA_VERSIONS)
             );
             ledger.pool.close().await;
             Ok(())

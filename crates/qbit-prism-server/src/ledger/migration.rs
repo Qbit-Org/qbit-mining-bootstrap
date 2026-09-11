@@ -7,14 +7,29 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// The schema version every native start requires. Bump it with each new
-/// migration file. `Ledger::connect` refuses an older schema even without
-/// `initialize`, so a newer binary never reaches the claim path on a database
-/// it has not migrated. A newer schema is accepted with a warning: native
-/// migrations are additive, and a release whose format an older binary must
-/// not touch declares a capability, which `require_known_capabilities`
-/// refuses.
-pub const REQUIRED_SCHEMA_VERSION: i32 = 6;
+/// The schema migrations every native start requires, each checked on its
+/// own. Add every new migration file here. `Ledger::connect` refuses a
+/// database missing any of them even without `initialize`, so a newer binary
+/// never reaches the claim path on a database it has not migrated, and a
+/// later number never hides an earlier gap: 007 and 008 are reserved by
+/// independent workstreams and may land after 009. A migration this binary
+/// does not know is accepted with a warning: native migrations are additive,
+/// and a release whose format an older binary must not touch declares a
+/// capability, which `require_known_capabilities` refuses.
+pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 9];
+
+/// Schema migration numbers as they appear in messages: `2, 3, 4`, or
+/// `none`.
+pub fn schema_version_list(versions: &[i32]) -> String {
+    if versions.is_empty() {
+        return "none".to_owned();
+    }
+    versions
+        .iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Capability rows this binary understands, with the highest value each may
 /// carry. #258's `002_candidate_bodies.sql` declares
@@ -453,17 +468,17 @@ pub(super) fn refuse_unknown_capabilities(rows: &[(String, i32)]) -> Result<()> 
 /// Refuse a pending 2.x.x row the native claim lane cannot replay, with the
 /// predicate built from the outbox columns that exist. The capability row is
 /// not consulted: 002 upserts it whatever the writer stored, so only rows say
-/// whether v2 work is pending. `native_version` is the recorded schema
-/// version when the database was migrated to native schema 3, 4 or 5 by an
-/// earlier 3.x.x build, whose drain check never counted a v2 row; that path
-/// gets its own wording and remedy. Native pending rows carry the native
+/// whether v2 work is pending. `native_versions` is the recorded migration
+/// set of a database an earlier 3.x.x build migrated to native schema 3, 4
+/// or 5, with or without 009, whose drain check never counted a v2 row; that
+/// path gets its own wording and remedy. Native pending rows carry the native
 /// `payout_revision`, `bundle` and `block_hash` fields, so the predicate
 /// never flags them; only a v2 body, a `body_id`, a `storage_version` other
 /// than 1, or a v1 body without those fields is refused.
 pub(super) async fn refuse_undrained_outbox(
     tx: &mut Transaction<'_, Postgres>,
     inventory: &SourceInventory,
-    native_version: Option<i32>,
+    native_versions: Option<&[i32]>,
 ) -> Result<()> {
     if !inventory.outbox {
         return Ok(());
@@ -509,9 +524,9 @@ pub(super) async fn refuse_undrained_outbox(
         named if named > rows.len() => format!(" and {} more", named - rows.len()),
         _ => String::new(),
     };
-    match native_version {
+    match native_versions {
         None => bail!("legacy Python block outbox is not drained: {total} pending 2.x.x candidate row(s) cannot be replayed natively ({listing}{more}). Drain them with the pinned 2.x.x release before migrating: start the 2.x.x coordinator (v2.0.2 for storage_version 2 rows, v2.0.1 or later otherwise) and let its block submitter finish every pending candidate, or for a block already accepted on the active chain run `python3 -m lab.prism.recover_pending_blocks --block-hash <hash> --apply` from the 2.x.x image; then take the final backup and repeat the migration. Do not delete pending rows to bypass this check"),
-        Some(version) => bail!("refusing to apply migration 006 to a native schema {version} database: an earlier 3.x.x build migrated it before the drain rule covered these rows, and the legacy Python block outbox is not drained: {total} pending 2.x.x candidate row(s) cannot be replayed natively ({listing}{more}). Nothing was changed. Restore the pre-migration 2.x.x backup and drain them with the pinned 2.x.x release (v2.0.2 for storage_version 2 rows, v2.0.1 or later otherwise): start its coordinator and let the block submitter finish every pending candidate, or for a block already accepted on the active chain run `python3 -m lab.prism.recover_pending_blocks --block-hash <hash> --apply` from the 2.x.x image; then take a new backup and migrate again with this release. The 2.x.x release is not supported against a native schema, so do not point it at this database. If native traffic was admitted after the earlier migration, that restore discards it: see the recovery section of docs/prism-rust-migration.md first. Do not delete pending rows to bypass this check"),
+        Some(versions) => bail!("refusing to apply migration 006 to a native database at schema migrations {}: an earlier 3.x.x build migrated it before the drain rule covered these rows, and the legacy Python block outbox is not drained: {total} pending 2.x.x candidate row(s) cannot be replayed natively ({listing}{more}). Nothing was changed. Restore the pre-migration 2.x.x backup and drain them with the pinned 2.x.x release (v2.0.2 for storage_version 2 rows, v2.0.1 or later otherwise): start its coordinator and let the block submitter finish every pending candidate, or for a block already accepted on the active chain run `python3 -m lab.prism.recover_pending_blocks --block-hash <hash> --apply` from the 2.x.x image; then take a new backup and migrate again with this release. The 2.x.x release is not supported against a native schema, so do not point it at this database. If native traffic was admitted after the earlier migration, that restore discards it: see the recovery section of docs/prism-rust-migration.md first. Do not delete pending rows to bypass this check", schema_version_list(versions)),
     }
 }
 
@@ -1507,6 +1522,8 @@ pub(super) async fn migrate_schema(
     let versions: Vec<i32> = sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations")
         .fetch_all(&mut **tx)
         .await?;
+    // The highest migration recorded before this run, which the source
+    // record keeps as `prior_schema_version`.
     let prior_version = versions.iter().copied().max().unwrap_or(0);
     let mut source = None;
     if !versions.contains(&3) {
@@ -1571,13 +1588,13 @@ pub(super) async fn migrate_schema(
         source = Some((state, inventory.capability("candidate_storage_version")));
     } else if !versions.contains(&6) {
         // A database an earlier 3.x.x build migrated to native schema 3, 4
-        // or 5. That build's drain check used the v1-only predicate, which
-        // never counted a v2 row (`candidate ?& ...` is NULL for a NULL
-        // body), so a pending v2 candidate can still be there. The
-        // column-aware check runs here, before 004, 005 or 006 touch
-        // anything, so a refusal on this path is before any DDL too.
+        // or 5, with or without 009. That build's drain check used the
+        // v1-only predicate, which never counted a v2 row (`candidate ?&
+        // ...` is NULL for a NULL body), so a pending v2 candidate can still
+        // be there. The column-aware check runs here, before 004, 005 or 006
+        // touch anything, so a refusal on this path is before any DDL too.
         let inventory = inspect_source_schema(tx).await?;
-        refuse_undrained_outbox(tx, &inventory, Some(prior_version)).await?;
+        refuse_undrained_outbox(tx, &inventory, Some(&versions)).await?;
     }
     if !versions.contains(&4) {
         sqlx::raw_sql(include_str!(
@@ -1646,36 +1663,51 @@ pub(super) async fn migrate_schema(
 }
 
 /// The startup gate. Every start, with or without `initialize`, reads the
-/// schema version and refuses one below `REQUIRED_SCHEMA_VERSION`. A newer
-/// one is accepted with a warning, so frontends on the previous release keep
-/// starting while a rollout drains and replaces them one at a time; a format
-/// an older binary must not touch is declared as a capability instead.
-pub(super) async fn require_schema_version(pool: &PgPool) -> Result<i32> {
+/// applied migrations and refuses a database missing any of
+/// `REQUIRED_SCHEMA_VERSIONS`, naming the gap. A migration this binary does
+/// not know is accepted with a warning that names it, so frontends on the
+/// previous release keep starting while a rollout drains and replaces them
+/// one at a time; a format an older binary must not touch is declared as a
+/// capability instead.
+pub(super) async fn require_schema_version(pool: &PgPool) -> Result<()> {
     let recorded: bool =
         sqlx::query_scalar("SELECT to_regclass('qbit_prism_schema_migrations') IS NOT NULL")
             .fetch_one(pool)
             .await?;
     ensure!(
         recorded,
-        "database has no native PRISM schema (qbit_prism_schema_migrations is missing) and this server requires schema version {REQUIRED_SCHEMA_VERSION}: run `qbit-prism-server migrate`, or start with PRISM_POSTGRES_INIT_SCHEMA=1, after draining the 2.x.x deployment"
+        "database has no native PRISM schema (qbit_prism_schema_migrations is missing) and this server requires schema migrations {}: run `qbit-prism-server migrate`, or start with PRISM_POSTGRES_INIT_SCHEMA=1, after draining the 2.x.x deployment",
+        schema_version_list(REQUIRED_SCHEMA_VERSIONS)
     );
-    let version: Option<i32> =
-        sqlx::query_scalar("SELECT max(version) FROM qbit_prism_schema_migrations")
-            .fetch_one(pool)
+    let applied: Vec<i32> =
+        sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations ORDER BY version")
+            .fetch_all(pool)
             .await?;
-    let version = version.unwrap_or(0);
+    let missing: Vec<i32> = REQUIRED_SCHEMA_VERSIONS
+        .iter()
+        .copied()
+        .filter(|version| !applied.contains(version))
+        .collect();
     ensure!(
-        version >= REQUIRED_SCHEMA_VERSION,
-        "database schema version {version} is below the version {REQUIRED_SCHEMA_VERSION} this server requires: run `qbit-prism-server migrate` with this release, or start with PRISM_POSTGRES_INIT_SCHEMA=1"
+        missing.is_empty(),
+        "database schema is missing migration(s) {}; this server requires {} and found {}: run `qbit-prism-server migrate` with this release, or start with PRISM_POSTGRES_INIT_SCHEMA=1",
+        schema_version_list(&missing),
+        schema_version_list(REQUIRED_SCHEMA_VERSIONS),
+        schema_version_list(&applied)
     );
-    if version > REQUIRED_SCHEMA_VERSION {
+    let unknown: Vec<i32> = applied
+        .iter()
+        .copied()
+        .filter(|version| !REQUIRED_SCHEMA_VERSIONS.contains(version))
+        .collect();
+    if !unknown.is_empty() {
         tracing::warn!(
-            schema_version = version,
-            required_schema_version = REQUIRED_SCHEMA_VERSION,
-            "database schema is newer than this server requires; a later release migrated it"
+            unknown_migrations = %schema_version_list(&unknown),
+            required_migrations = %schema_version_list(REQUIRED_SCHEMA_VERSIONS),
+            "database has schema migrations this server does not know; a later release applied them"
         );
     }
-    Ok(version)
+    Ok(())
 }
 
 /// Refuse capabilities or storage versions the binary does not understand.
