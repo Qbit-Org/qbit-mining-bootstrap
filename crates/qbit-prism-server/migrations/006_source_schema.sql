@@ -24,11 +24,13 @@
 -- or named constraint as it is. The migrator applies the same release SQL
 -- (001, plus 002 for a #258 source) to a scratch schema under a savepoint in
 -- the migration transaction, reads every table, column, constraint, index,
--- trigger and function it created, rolls the savepoint back, and requires an
--- equivalent definition in the source schema. Column order, comments,
--- auto-generated constraint names and NOT VALID are ignored; extra objects
--- are kept and logged; a missing or different one fails the migration, which
--- rolls back whole.
+-- trigger, function and sequence it created, rolls the savepoint back, and
+-- requires an equivalent definition in the source schema. A sequence is
+-- compared by its structure (type, start, increment, bounds, cache, cycle),
+-- never by the value it has reached. Column order, comments, auto-generated
+-- constraint names and NOT VALID are ignored; extra objects are kept and
+-- logged; a missing or different one fails the migration, which rolls back
+-- whole.
 
 -- What the database came from, written once by the migration that accepted
 -- it. Later starts and operators read it; a repeated migrate never rewrites it.

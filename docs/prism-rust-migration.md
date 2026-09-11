@@ -91,7 +91,7 @@ release definition:
 | #258 applied (v2.0.2) | `candidate_storage_version = 2` and every `002_candidate_bodies.sql` object present | accept after the drain check |
 | partial 002 | some 002 objects or the capability row, but not all (v2.0.2 applies 001 and 002 as two script calls, and a restart between them leaves this) | refuse, naming the missing object; finish 002 with the v2.0.2 release (`PRISM_POSTGRES_INIT_SCHEMA=1`) or restore the backup |
 | newer | `candidate_storage_version > 2`, or a capability this release does not know | refuse before any DDL; a newer PRISM release wrote the database |
-| drifted 001 | a 001 (or 002) object whose definition, after 001 has run, differs from the frozen release: a table, column, index or named constraint that 001's `IF NOT EXISTS` skipped, or any 002 object, with a dropped constraint, a changed type, nullability or default, a different index definition, a replaced function body or a disabled trigger | refuse transactionally, naming each object and what differs; the migration rolls back and the database is unchanged; restore the pre-migration backup or bring the database to the release schema with the `2.x.x` release, then migrate again |
+| drifted 001 | a 001 (or 002) object whose definition, after 001 has run, differs from the frozen release: a table, column, index, sequence or named constraint that 001's `IF NOT EXISTS` skipped, or any 002 object, with a dropped constraint, a changed type, nullability or default, a different index definition, an altered sequence (a lowered maximum, a different increment), a replaced function body or a disabled trigger | refuse transactionally, naming each object and what differs; the migration rolls back and the database is unchanged; restore the pre-migration backup or bring the database to the release schema with the `2.x.x` release, then migrate again |
 
 **The release-schema check.** 001 is the idempotent schema every `2.x.x`
 start re-applied, so the migrator applies it first: that repairs everything
@@ -102,27 +102,33 @@ NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` skip is checked next, before
 The expected definitions are not a stored fingerprint: inside the migration
 transaction the migrator opens a savepoint, creates a scratch schema, applies
 the same 001 there (plus `002_candidate_bodies.sql` for a #258 source), reads
-every table, column, constraint, index, trigger and function that produced,
-and rolls the savepoint back, so the comparison is exact for the PostgreSQL
-version in use and nothing from the scratch apply survives. Each object then
-needs an equivalent in the schema the migrator runs in: column type, NOT
-NULL, default, identity and generated status, collation; constraints per
-table by definition; index definitions and validity; trigger definitions and
-enabled state; function arguments, result, language, body, volatility and
-settings. Schema qualification, column order, comments, the names of
-auto-generated constraints and a `NOT VALID` mark on a CHECK 001 added to an
-upgraded table are ignored. Extra tables, columns, constraints, indexes,
-triggers and functions are kept and logged at warning level. A missing or
-different object refuses the migration:
+every table, column, constraint, index, trigger, function and sequence that
+produced, and rolls the savepoint back, so the comparison is exact for the
+PostgreSQL version in use and nothing from the scratch apply survives. Each
+object then needs an equivalent in the schema the migrator runs in: column
+type, NOT NULL, default, identity and generated status, collation;
+constraints per table by definition; index definitions and validity; trigger
+definitions and enabled state; function arguments, result, language, body,
+volatility and settings; and for every sequence, the ones behind `bigserial`
+columns and the explicit `qbit_audit_publication_sequence_seq` alike, its
+data type, start, increment, minimum, maximum, cache and cycle. The value a
+sequence has reached is data and is not compared, so a ledger whose share
+sequence has advanced migrates and keeps its position. Schema qualification,
+column order, comments, the names of auto-generated constraints and a `NOT
+VALID` mark on a CHECK 001 added to an upgraded table are ignored. Extra
+tables, columns, constraints, indexes, triggers, functions and sequences are
+kept and logged at warning level. A missing or different object refuses the
+migration:
 
 ```
 refusing to migrate a drifted 001 source: after 001_share_ledger.sql ran, the database does not
-match the v2.0.x release schema (v2.0.1, 001_share_ledger.sql), 2 object(s) differ (column
-qbit_pool_blocks.parent_hash differs: expected NOT NULL, found nullable; missing constraint
-qbit_block_candidate_outbox_share_id_fkey on qbit_block_candidate_outbox: FOREIGN KEY (share_id)
-REFERENCES qbit_share_ledger(share_id)). Nothing was changed: the migration rolled back. Restore the
-pre-migration backup, or bring the database to the release schema with the 2.x.x release (v2.0.1 or
-later; v2.0.2 for a #258 database) and take a new backup, then migrate again
+match the v2.0.x release schema (v2.0.1, 001_share_ledger.sql), 3 object(s) differ (column
+qbit_pool_blocks.parent_hash differs: expected NOT NULL, found nullable; sequence
+qbit_share_ledger_share_seq_seq differs: maximum expected 9223372036854775807, found 1000000;
+missing constraint qbit_block_candidate_outbox_share_id_fkey on qbit_block_candidate_outbox:
+FOREIGN KEY (share_id) REFERENCES qbit_share_ledger(share_id)). Nothing was changed: the migration
+rolled back. Restore the pre-migration backup, or bring the database to the release schema with the
+2.x.x release (v2.0.1 or later; v2.0.2 for a #258 database) and take a new backup, then migrate again
 ```
 
 The check needs the migrate role to hold `CREATE` on the database, for the
