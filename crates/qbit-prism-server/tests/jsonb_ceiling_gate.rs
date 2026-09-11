@@ -1,7 +1,7 @@
 //! JSONB ceiling gate for the PRISM payout window (issue #264, workstream #261).
 //!
 //! PostgreSQL refuses a JSONB container whose elements exceed 268,435,455
-//! bytes. Four native writes still embed the whole payout window, so they grow
+//! bytes. Three native writes still embed the whole payout window, so they grow
 //! linearly with the share count and walk into that wall. This gate drives the
 //! five window-carrying phases (refresh, enqueue, claim, landing, import)
 //! against a real PostgreSQL 16, measures every JSONB column it can discover,
@@ -160,7 +160,7 @@ struct Violation {
     phase: &'static str,
 }
 
-/// The four known window-carrying writes at this base commit. Each entry names
+/// The three known window-carrying writes at this base commit. Each entry names
 /// the issue that removes it; when that lands, the gate fails until the entry
 /// is deleted.
 const KNOWN_VIOLATIONS: &[Violation] = &[
@@ -181,12 +181,6 @@ const KNOWN_VIOLATIONS: &[Violation] = &[
         table: "qbit_pool_audit_bundles",
         column: "audit_bundle",
         phase: PHASE_LANDING,
-    },
-    // 2 window copies: the legacy import writes the full inline body. Removed by #265.
-    Violation {
-        table: "qbit_pool_audit_bundles",
-        column: "audit_bundle",
-        phase: PHASE_IMPORT,
     },
 ];
 

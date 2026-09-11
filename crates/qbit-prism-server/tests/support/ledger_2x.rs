@@ -1,5 +1,6 @@
 use super::*;
 use qbit_prism_server::ledger::audit_canonical_bytes;
+use serde_json::Value;
 use sqlx::Row;
 use std::io::Write;
 
@@ -525,4 +526,682 @@ async fn compact_bits_metadata_comes_from_durable_header_and_recovers_without_au
         "idempotent landing accepted contradictory header metadata"
     );
     db.close(vec![a, b]).await
+}
+
+// ---------------------------------------------------------------------------
+// Imported legacy audits are served from their canonical bytes (#265).
+// ---------------------------------------------------------------------------
+
+fn imported_audit_router(pool: &PgPool) -> axum::Router {
+    use qbit_prism_server::api::{self, ApiConfig, ApiState};
+    api::router(ApiState::new(
+        pool.clone(),
+        ApiConfig {
+            cache_enabled: false,
+            ..Default::default()
+        },
+        std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
+    ))
+}
+
+async fn api_get(app: &axum::Router, path: &str) -> Result<(axum::http::StatusCode, Value)> {
+    use tower::ServiceExt;
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(path)
+                .body(axum::body::Body::empty())?,
+        )
+        .await?;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    Ok((status, serde_json::from_slice(&bytes)?))
+}
+
+async fn land_confirmed(ledger: &Ledger, block: &Candidate) -> Result<()> {
+    ledger.enqueue_candidate(block.clone()).await?;
+    let claim = ledger.claim_candidate(60).await?.unwrap();
+    ledger
+        .land_candidate(&claim, &keys().1.public_key_hex())
+        .await?;
+    ledger.finish_candidate(&claim, true, None).await
+}
+
+/// Reshape a landed native row as a 2.x externalized row: its body lives only
+/// in the `body_uri` file, as the legacy import finds it.
+async fn externalize(
+    pool: &PgPool,
+    block: &Candidate,
+    dir: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    let path = dir.join(format!("legacy-audit-{}.json", block.block_hash));
+    std::fs::write(&path, serde_json::to_vec(&block.bundle)?)?;
+    sqlx::query("UPDATE qbit_pool_audit_bundles SET audit_bundle=NULL,share_snapshot_sha256=NULL,body_uri=$2 WHERE block_hash=$1")
+        .bind(&block.block_hash).bind(path.to_str().unwrap()).execute(pool).await?;
+    Ok(path)
+}
+
+/// The metadata columns the import writes, plus the stored bits it must not.
+async fn audit_metadata(pool: &PgPool, hash: &str) -> Result<Value> {
+    Ok(sqlx::query_scalar("SELECT jsonb_build_object('schema_version',schema_version,'difficulty',found_block_network_difficulty::text,'value',found_block_coinbase_value_sats,'commitments',audit_commitment_leaves_hex,'witness',witness_merkle_leaves_hex,'bits',found_block_bits) FROM qbit_pool_audit_bundles WHERE block_hash=$1")
+        .bind(hash).fetch_one(pool).await?)
+}
+
+async fn canonical_state(pool: &PgPool, hash: &str) -> Result<(bool, bool, bool)> {
+    let row = sqlx::query("SELECT audit_bundle IS NULL AS body_null,canonical_audit_bytes IS NOT NULL AS canonical,encode(sha256(canonical_audit_bytes),'hex') IS NOT DISTINCT FROM audit_bundle_sha256 AS digest FROM qbit_pool_audit_bundles WHERE block_hash=$1")
+        .bind(hash).fetch_one(pool).await?;
+    Ok((
+        row.try_get("body_null")?,
+        row.try_get("canonical")?,
+        row.try_get("digest")?,
+    ))
+}
+
+async fn dashboard_row(app: &axum::Router, hash: &str) -> Result<Value> {
+    let (status, blocks) = api_get(app, "/public/v1/blocks?chain_state=all&limit=100").await?;
+    ensure_ok(status, &blocks)?;
+    blocks["rows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|row| row["hash"] == hash)
+        .cloned()
+        .with_context(|| format!("dashboard is missing {hash}: {blocks}"))
+}
+
+fn ensure_ok(status: axum::http::StatusCode, body: &Value) -> Result<()> {
+    anyhow::ensure!(status == axum::http::StatusCode::OK, "{status}: {body}");
+    Ok(())
+}
+
+/// The dashboard as the pre-#265 import left it: the same metadata columns
+/// plus the inline logical body. Restores the row's current body afterwards.
+async fn dashboard_row_with_inline_import(
+    app: &axum::Router,
+    pool: &PgPool,
+    block: &Candidate,
+) -> Result<Value> {
+    let current: Option<Value> =
+        sqlx::query_scalar("SELECT audit_bundle FROM qbit_pool_audit_bundles WHERE block_hash=$1")
+            .bind(&block.block_hash)
+            .fetch_one(pool)
+            .await?;
+    sqlx::query("UPDATE qbit_pool_audit_bundles SET audit_bundle=$2 WHERE block_hash=$1")
+        .bind(&block.block_hash)
+        .bind(serde_json::to_value(&block.bundle)?)
+        .execute(pool)
+        .await?;
+    let row = dashboard_row(app, &block.block_hash).await;
+    sqlx::query("UPDATE qbit_pool_audit_bundles SET audit_bundle=$2 WHERE block_hash=$1")
+        .bind(&block.block_hash)
+        .bind(current)
+        .execute(pool)
+        .await?;
+    row
+}
+
+/// A bundle that records its settlement decision, as the coordinator builds it.
+fn settled_bundle(
+    snapshot: &Snapshot,
+    direct_floor_sats: u64,
+    config: qbit_prism::SettlementModeConfig,
+) -> Result<qbit_prism::AuditBundle> {
+    let (coinbase_key, ledger_key) = keys();
+    Ok(qbit_prism::build_audit_bundle_with_ctv_settlement_options(
+        snapshot.shares.clone(),
+        FoundBlock {
+            block_height: 101,
+            coinbase_value_sats: 500_000_000,
+            network_difficulty: 100,
+            anchor_job_issued_at_ms: snapshot.anchor_ms,
+        },
+        snapshot.prior_balances.clone(),
+        PayoutPolicy::day_one_default(),
+        direct_floor_sats,
+        config,
+        Some(qbit_prism::FanoutFeeRatePolicy::new(1000, 12000)),
+        None,
+        vec![],
+        &coinbase_key,
+        &ledger_key,
+    )?)
+}
+
+#[tokio::test]
+async fn imported_external_audit_is_served_from_canonical_bytes_without_the_legacy_file(
+) -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("imported-external").await?;
+    ledger.append(share(5001), None).await?;
+    let snapshot = ledger.snapshot(100).await?;
+    let block = candidate_with_bundle(
+        settled_bundle(&snapshot, 0, Default::default())?,
+        snapshot.payout_revision,
+        5001,
+    )?;
+    let hash = block.block_hash.clone();
+    let logical = serde_json::to_value(&block.bundle)?;
+    let commitment = block.bundle.audit_commitment_leaves_hex[0].clone();
+    land_confirmed(&ledger, &block).await?;
+    let metadata = audit_metadata(&ledger.pool, &hash).await?;
+    assert_eq!(metadata["bits"], "207fffff");
+    let dir = tempfile::tempdir()?;
+    let file = externalize(&ledger.pool, &block, dir.path()).await?;
+    let app = imported_audit_router(&ledger.pool);
+    let block_path = format!("/audit/blocks/{hash}/bundle");
+    let commitment_path = format!("/audit/commitments/{commitment}/bundle");
+    let settlement_path = format!("/public/v1/blocks/{hash}/settlement-artifacts");
+    // Before the import, the legacy file serves the same logical body the
+    // pre-#265 import stored inline.
+    let (status, before_block) = api_get(&app, &block_path).await?;
+    ensure_ok(status, &before_block)?;
+    assert_eq!(before_block["audit_bundle"], logical);
+    let (status, before_commitment) = api_get(&app, &commitment_path).await?;
+    ensure_ok(status, &before_commitment)?;
+    let (status, mut before_settlement) = api_get(&app, &settlement_path).await?;
+    ensure_ok(status, &before_settlement)?;
+    let before_dashboard = dashboard_row(&app, &hash).await?;
+    // 2.x wrote no metadata for some rows. The import restores all of it
+    // except the bits, which no audit body carries and which stay as stored.
+    sqlx::query("UPDATE qbit_pool_audit_bundles SET schema_version=NULL,found_block_network_difficulty=NULL,found_block_coinbase_value_sats=NULL,audit_commitment_leaves_hex=NULL,witness_merkle_leaves_hex=NULL WHERE block_hash=$1")
+        .bind(&hash).execute(&ledger.pool).await?;
+    assert_eq!(
+        ledger
+            .import_legacy_audits(Some(dir.path()), &keys().1.public_key_hex())
+            .await?,
+        1
+    );
+    assert_eq!(
+        canonical_state(&ledger.pool, &hash).await?,
+        (true, true, true),
+        "import must store digest-checked canonical bytes and no inline body"
+    );
+    assert_eq!(audit_metadata(&ledger.pool, &hash).await?, metadata);
+    std::fs::remove_file(&file)?;
+    assert_eq!(ledger.audit_bundle(&hash).await?, Some(logical.clone()));
+    let (status, after_block) = api_get(&app, &block_path).await?;
+    ensure_ok(status, &after_block)?;
+    assert_eq!(after_block, before_block);
+    assert!(
+        after_block.get("body_uri").is_none() && after_block.get("share_snapshot_sha256").is_none()
+    );
+    let (status, after_commitment) = api_get(&app, &commitment_path).await?;
+    ensure_ok(status, &after_commitment)?;
+    assert_eq!(after_commitment, before_commitment);
+    // Direct-coinbase blocks take their settlement payload from the body.
+    let (status, mut after_settlement) = api_get(&app, &settlement_path).await?;
+    ensure_ok(status, &after_settlement)?;
+    for payload in [&mut before_settlement, &mut after_settlement] {
+        payload.as_object_mut().unwrap().remove("generated_at");
+    }
+    assert_eq!(after_settlement, before_settlement);
+    assert_eq!(after_settlement["settlement_mode"], "direct_coinbase");
+    assert!(
+        after_settlement["artifact_links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|link| link["kind"] == "audit_bundle"),
+        "{after_settlement}"
+    );
+    let dashboard = dashboard_row(&app, &hash).await?;
+    assert_eq!(dashboard, before_dashboard);
+    assert_eq!(
+        dashboard,
+        dashboard_row_with_inline_import(&app, &ledger.pool, &block).await?
+    );
+    assert_eq!(dashboard["bits"], "207fffff");
+    let (status, latest) = api_get(&app, "/audit/latest").await?;
+    ensure_ok(status, &latest)?;
+    assert_eq!(latest["job_share_count"], 1);
+    db.close(vec![ledger]).await
+}
+
+#[tokio::test]
+async fn corrupt_imported_canonical_bytes_are_refused_not_served_from_the_legacy_file() -> Result<()>
+{
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("imported-corrupt").await?;
+    ledger.append(share(5101), None).await?;
+    let block = candidate(&ledger.snapshot(100).await?, 5101)?;
+    let hash = block.block_hash.clone();
+    let commitment = block.bundle.audit_commitment_leaves_hex[0].clone();
+    land_confirmed(&ledger, &block).await?;
+    let dir = tempfile::tempdir()?;
+    let file = externalize(&ledger.pool, &block, dir.path()).await?;
+    ledger
+        .import_legacy_audits(Some(dir.path()), &keys().1.public_key_hex())
+        .await?;
+    let (bytes, digest): (Vec<u8>, String) = sqlx::query_as(
+        "SELECT canonical_audit_bytes,audit_bundle_sha256 FROM qbit_pool_audit_bundles WHERE block_hash=$1",
+    )
+    .bind(&hash)
+    .fetch_one(&ledger.pool)
+    .await?;
+    let app = imported_audit_router(&ledger.pool);
+    let paths = [
+        format!("/audit/blocks/{hash}/bundle"),
+        format!("/audit/commitments/{commitment}/bundle"),
+    ];
+    let mut flipped = bytes.clone();
+    flipped[bytes.len() / 2] ^= 0x01;
+    let digest_of = |bytes: &[u8]| hex::encode(Sha256::digest(bytes));
+    // A well-formed inline body-ref envelope the shared parser would resolve.
+    let envelope = {
+        let mut body = serde_json::to_value(&block.bundle)?;
+        let shares = body.as_object_mut().unwrap().remove("shares").unwrap();
+        let seq = block.bundle.shares[0].share_seq;
+        serde_json::to_vec(
+            &json!({"schema":qbit_prism::AUDIT_BODY_REF_SCHEMA,"audit_bundle_sha256":digest,"share_count":1,"bundle_without_shares":body,"share_parts":[{"kind":"inline","first_share_seq":seq,"last_share_seq":seq,"share_count":1,"shares":shares}]}),
+        )?
+    };
+    for (case, stored, declared) in [
+        ("one flipped byte", flipped.clone(), digest.clone()),
+        ("declared digest mismatch", bytes.clone(), "00".repeat(32)),
+        (
+            "digest-valid empty object",
+            b"{}".to_vec(),
+            digest_of(b"{}"),
+        ),
+        ("digest-valid non-object", b"[]".to_vec(), digest_of(b"[]")),
+        (
+            "digest-valid non-JSON",
+            b"not json".to_vec(),
+            digest_of(b"not json"),
+        ),
+        (
+            "digest-valid body-ref envelope",
+            envelope.clone(),
+            digest_of(&envelope),
+        ),
+    ] {
+        sqlx::query("UPDATE qbit_pool_audit_bundles SET canonical_audit_bytes=$2,audit_bundle_sha256=$3 WHERE block_hash=$1")
+            .bind(&hash).bind(&stored).bind(&declared).execute(&ledger.pool).await?;
+        assert!(file.exists());
+        assert!(
+            ledger.audit_bundle(&hash).await.is_err(),
+            "{case}: Ledger::audit_bundle served a corrupt imported body"
+        );
+        for path in &paths {
+            let (status, body) = api_get(&app, path).await?;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{case}: {path} served {body}"
+            );
+            assert!(body.get("audit_bundle").is_none(), "{case}: {path}: {body}");
+        }
+    }
+    sqlx::query("UPDATE qbit_pool_audit_bundles SET canonical_audit_bytes=$2,audit_bundle_sha256=$3 WHERE block_hash=$1")
+        .bind(&hash).bind(&bytes).bind(&digest).execute(&ledger.pool).await?;
+    assert_eq!(
+        ledger.audit_bundle(&hash).await?,
+        Some(serde_json::to_value(&block.bundle)?)
+    );
+    for path in &paths {
+        let (status, body) = api_get(&app, path).await?;
+        ensure_ok(status, &body)?;
+    }
+    db.close(vec![ledger]).await
+}
+
+#[tokio::test]
+async fn imported_ctv_audit_backfills_and_links_without_the_legacy_file() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("imported-ctv").await?;
+    ledger.append(share(5201), None).await?;
+    let mut second = share(5202);
+    second.miner_id = "other".into();
+    second.order_key = "other".into();
+    second.p2mr_program_hex = "22".repeat(32);
+    ledger.append(second, None).await?;
+    let snapshot = ledger.snapshot(100).await?;
+    let ledger_key = keys().1;
+    let bundle = settled_bundle(
+        &snapshot,
+        u64::MAX,
+        qbit_prism::SettlementModeConfig {
+            max_fanout_recipients_per_transaction: 1,
+            ..Default::default()
+        },
+    )?;
+    let block = candidate_with_bundle(bundle, snapshot.payout_revision, 5201)?;
+    let hash = block.block_hash.clone();
+    land_confirmed(&ledger, &block).await?;
+    let dir = tempfile::tempdir()?;
+    let file = externalize(&ledger.pool, &block, dir.path()).await?;
+    assert_eq!(
+        ledger
+            .import_legacy_audits(Some(dir.path()), &ledger_key.public_key_hex())
+            .await?,
+        1
+    );
+    std::fs::remove_file(&file)?;
+    assert_eq!(ledger.backfill_ctv(&ledger_key.public_key_hex()).await?, 0);
+    sqlx::query("DELETE FROM qbit_ctv_fanout_artifacts WHERE block_hash=$1 AND chunk_index=1")
+        .bind(&hash)
+        .execute(&ledger.pool)
+        .await?;
+    assert_eq!(ledger.backfill_ctv(&ledger_key.public_key_hex()).await?, 1);
+    assert_eq!(ledger.backfill_ctv(&ledger_key.public_key_hex()).await?, 0);
+    let app = imported_audit_router(&ledger.pool);
+    // CTV payloads come from the fanout tables; the audit link comes from the
+    // metadata shortcut rather than a whole-body decode.
+    let (status, settlement) = api_get(
+        &app,
+        &format!("/public/v1/blocks/{hash}/settlement-artifacts"),
+    )
+    .await?;
+    ensure_ok(status, &settlement)?;
+    assert_eq!(settlement["settlement_mode"], "ctv_fanout");
+    let audit_sha = settlement["audit_bundle_sha256"].as_str().unwrap();
+    assert!(
+        settlement["artifact_links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|link| link["kind"] == "audit_bundle" && link["sha256"] == audit_sha),
+        "{settlement}"
+    );
+    assert_eq!(settlement["fanouts"].as_array().unwrap().len(), 2);
+    db.close(vec![ledger]).await
+}
+
+#[tokio::test]
+async fn inline_only_legacy_audit_import_keeps_its_body_and_serves_canonical_bytes() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("imported-inline").await?;
+    ledger.append(share(5301), None).await?;
+    let block = candidate(&ledger.snapshot(100).await?, 5301)?;
+    let hash = block.block_hash.clone();
+    let logical = serde_json::to_value(&block.bundle)?;
+    land_confirmed(&ledger, &block).await?;
+    let digest: String = sqlx::query_scalar(
+        "SELECT audit_bundle_sha256 FROM qbit_pool_audit_bundles WHERE block_hash=$1",
+    )
+    .bind(&hash)
+    .fetch_one(&ledger.pool)
+    .await?;
+    // A 2.x row from before externalization: an inline body-ref envelope, no
+    // body_uri, and none of the metadata columns, including the bits.
+    let mut body = logical.clone();
+    let shares = body.as_object_mut().unwrap().remove("shares").unwrap();
+    let seq = block.bundle.shares[0].share_seq;
+    let envelope = json!({"schema":"qbit.prism.audit-body-ref.v1","audit_bundle_sha256":digest,"share_count":1,"bundle_without_shares":body,"share_parts":[{"kind":"inline","first_share_seq":seq,"last_share_seq":seq,"share_count":1,"shares":shares}]});
+    sqlx::query("UPDATE qbit_pool_audit_bundles SET audit_bundle=$2,share_snapshot_sha256=NULL,body_uri=NULL,schema_version=NULL,found_block_network_difficulty=NULL,found_block_coinbase_value_sats=NULL,audit_commitment_leaves_hex=NULL,witness_merkle_leaves_hex=NULL,found_block_bits=NULL WHERE block_hash=$1")
+        .bind(&hash).bind(&envelope).execute(&ledger.pool).await?;
+    let app = imported_audit_router(&ledger.pool);
+    let block_path = format!("/audit/blocks/{hash}/bundle");
+    let (status, before) = api_get(&app, &block_path).await?;
+    ensure_ok(status, &before)?;
+    assert_eq!(before["audit_bundle"], envelope);
+    assert_eq!(
+        ledger
+            .import_legacy_audits(None, &keys().1.public_key_hex())
+            .await?,
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Value>(
+            "SELECT audit_bundle FROM qbit_pool_audit_bundles WHERE block_hash=$1"
+        )
+        .bind(&hash)
+        .fetch_one(&ledger.pool)
+        .await?,
+        envelope,
+        "option A keeps an inline-only row's stored body unchanged"
+    );
+    assert_eq!(
+        canonical_state(&ledger.pool, &hash).await?,
+        (false, true, true)
+    );
+    let metadata = audit_metadata(&ledger.pool, &hash).await?;
+    assert_eq!(metadata["difficulty"], "100");
+    assert_eq!(metadata["value"], 500_000_000);
+    assert_eq!(
+        metadata["commitments"],
+        json!(block.bundle.audit_commitment_leaves_hex)
+    );
+    assert!(metadata["bits"].is_null(), "the import invented bits");
+    // Both readers serve the canonical bytes' logical body, not the envelope.
+    assert_eq!(ledger.audit_bundle(&hash).await?, Some(logical.clone()));
+    let (status, after) = api_get(&app, &block_path).await?;
+    ensure_ok(status, &after)?;
+    assert_eq!(after["audit_bundle"], logical);
+    let commitment = &block.bundle.audit_commitment_leaves_hex[0];
+    let (status, by_commitment) =
+        api_get(&app, &format!("/audit/commitments/{commitment}/bundle")).await?;
+    ensure_ok(status, &by_commitment)?;
+    assert_eq!(by_commitment["audit_bundle"], logical);
+    let dashboard = dashboard_row(&app, &hash).await?;
+    assert_eq!(
+        dashboard,
+        dashboard_row_with_inline_import(&app, &ledger.pool, &block).await?
+    );
+    assert_eq!(dashboard["bits"], "00000000");
+    // A second run finds nothing left to import and leaves the row alone.
+    assert_eq!(
+        ledger
+            .import_legacy_audits(None, &keys().1.public_key_hex())
+            .await?,
+        0
+    );
+    db.close(vec![ledger]).await
+}
+
+/// The `audit_bundle` member each public bundle query loads for a row.
+async fn bundle_query_bodies(pool: &PgPool, hash: &str, commitment: &str) -> Result<[Value; 2]> {
+    let mut bodies = [Value::Null, Value::Null];
+    for (body, (sql, id)) in bodies.iter_mut().zip([
+        (include_str!("../../src/api/queries/audit_bundle.sql"), hash),
+        (
+            include_str!("../../src/api/queries/audit_bundle_by_commitment.sql"),
+            commitment,
+        ),
+    ]) {
+        let mut row: Value = sqlx::query_scalar(sql).bind(id).fetch_one(pool).await?;
+        anyhow::ensure!(
+            row["block_hash"] == hash && row.get("audit_bundle").is_some(),
+            "{row}"
+        );
+        *body = row["audit_bundle"].take();
+    }
+    Ok(bodies)
+}
+
+#[tokio::test]
+async fn superseded_inline_audit_body_is_not_loaded_for_imported_rows() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("imported-superseded").await?;
+    ledger.append(share(5401), None).await?;
+    let block = candidate(&ledger.snapshot(100).await?, 5401)?;
+    let hash = block.block_hash.clone();
+    let logical = serde_json::to_value(&block.bundle)?;
+    let commitment = block.bundle.audit_commitment_leaves_hex[0].clone();
+    land_confirmed(&ledger, &block).await?;
+    let dir = tempfile::tempdir()?;
+    let file = externalize(&ledger.pool, &block, dir.path()).await?;
+    let app = imported_audit_router(&ledger.pool);
+    let paths = [
+        format!("/audit/blocks/{hash}/bundle"),
+        format!("/audit/commitments/{commitment}/bundle"),
+    ];
+    let mut before = Vec::new();
+    for path in &paths {
+        let (status, body) = api_get(&app, path).await?;
+        ensure_ok(status, &body)?;
+        assert_eq!(body["audit_bundle"], logical);
+        before.push(body);
+    }
+    assert_eq!(
+        ledger
+            .import_legacy_audits(Some(dir.path()), &keys().1.public_key_hex())
+            .await?,
+        1
+    );
+    std::fs::remove_file(&file)?;
+    // The row as the pre-change import left it: the full inline logical body
+    // beside the canonical bytes that supersede it, its body_uri, and no
+    // snapshot.
+    sqlx::query("UPDATE qbit_pool_audit_bundles SET audit_bundle=$2 WHERE block_hash=$1")
+        .bind(&hash)
+        .bind(&logical)
+        .execute(&ledger.pool)
+        .await?;
+    assert_eq!(
+        canonical_state(&ledger.pool, &hash).await?,
+        (false, true, true)
+    );
+    assert!(sqlx::query_scalar::<_, bool>("SELECT body_uri IS NOT NULL AND share_snapshot_sha256 IS NULL FROM qbit_pool_audit_bundles WHERE block_hash=$1")
+        .bind(&hash).fetch_one(&ledger.pool).await?);
+    assert_eq!(
+        bundle_query_bodies(&ledger.pool, &hash, &commitment).await?,
+        [Value::Null, Value::Null],
+        "a bundle query loaded the superseded inline body"
+    );
+    for (path, before) in paths.iter().zip(&before) {
+        let (status, body) = api_get(&app, path).await?;
+        ensure_ok(status, &body)?;
+        assert_eq!(&body, before, "{path}");
+    }
+    assert_eq!(ledger.audit_bundle(&hash).await?, Some(logical.clone()));
+    // Without canonical bytes, the inline body is the served representation.
+    sqlx::query(
+        "UPDATE qbit_pool_audit_bundles SET canonical_audit_bytes=NULL WHERE block_hash=$1",
+    )
+    .bind(&hash)
+    .execute(&ledger.pool)
+    .await?;
+    assert_eq!(
+        bundle_query_bodies(&ledger.pool, &hash, &commitment).await?,
+        [logical.clone(), logical.clone()]
+    );
+    for (path, before) in paths.iter().zip(&before) {
+        let (status, body) = api_get(&app, path).await?;
+        ensure_ok(status, &body)?;
+        assert_eq!(&body, before, "{path}");
+    }
+    db.close(vec![ledger]).await
+}
+
+fn ensure_read_timeout((status, body): (axum::http::StatusCode, Value)) -> Result<()> {
+    anyhow::ensure!(
+        status == axum::http::StatusCode::SERVICE_UNAVAILABLE
+            && body["error"]["code"] == "read_timeout",
+        "{status}: {body}"
+    );
+    Ok(())
+}
+
+/// Imported audit decodes run after their read connection is released. The
+/// runtime has one blocking thread and the test occupies it, so a decode the
+/// API starts stays queued, holding its permit, until the test lets it run.
+#[test]
+fn imported_audit_decode_limit_outlives_a_dropped_request() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()?
+        .block_on(decode_limit_outlives_a_dropped_request())
+}
+
+async fn decode_limit_outlives_a_dropped_request() -> Result<()> {
+    use qbit_prism_server::api::{self, ApiConfig, ApiState};
+    use std::time::Duration;
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("imported-decode-limit").await?;
+    ledger.append(share(5501), None).await?;
+    let snapshot = ledger.snapshot(100).await?;
+    let block = candidate_with_bundle(
+        settled_bundle(&snapshot, 0, Default::default())?,
+        snapshot.payout_revision,
+        5501,
+    )?;
+    let hash = block.block_hash.clone();
+    land_confirmed(&ledger, &block).await?;
+    let dir = tempfile::tempdir()?;
+    let file = externalize(&ledger.pool, &block, dir.path()).await?;
+    assert_eq!(
+        ledger
+            .import_legacy_audits(Some(dir.path()), &keys().1.public_key_hex())
+            .await?,
+        1
+    );
+    std::fs::remove_file(&file)?;
+    let state = ApiState::new(
+        ledger.pool.clone(),
+        ApiConfig {
+            cache_enabled: false,
+            read_timeout: Duration::from_secs(1),
+            ..Default::default()
+        },
+        std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
+    )
+    .with_read_concurrency(1);
+    let limit = state.audit_decode_limit();
+    let app = api::router(state);
+    // A direct-coinbase settlement is read from one decode of the body.
+    let path = format!("/public/v1/blocks/{hash}/settlement-artifacts");
+    let settlement = |app: axum::Router| {
+        let path = path.clone();
+        async move {
+            let (status, mut body) = api_get(&app, &path).await?;
+            ensure_ok(status, &body)?;
+            body.as_object_mut().unwrap().remove("generated_at");
+            Ok::<_, anyhow::Error>(body)
+        }
+    };
+    let baseline = settlement(app.clone()).await?;
+    assert_eq!(baseline["settlement_mode"], "direct_coinbase");
+    assert_eq!(limit.available_permits(), 1);
+    // While another holder has the only permit, no decode starts: the
+    // request spends its own deadline waiting instead.
+    let held = limit.clone().acquire_owned().await?;
+    ensure_read_timeout(api_get(&app, &path).await?)?;
+    drop(held);
+    assert_eq!(settlement(app.clone()).await?, baseline);
+
+    let (release, blocked) = std::sync::mpsc::channel::<()>();
+    let (started, running) = tokio::sync::oneshot::channel();
+    let blocker = tokio::task::spawn_blocking(move || {
+        let _ = started.send(());
+        let _ = blocked.recv();
+    });
+    running.await?;
+    // The request takes the permit and queues its decode; the deadline then
+    // drops the request while it awaits that decode.
+    ensure_read_timeout(api_get(&app, &path).await?)?;
+    assert_eq!(
+        limit.available_permits(),
+        0,
+        "a dropped request released its permit before its decode finished"
+    );
+    // A second request cannot start another decode meanwhile.
+    ensure_read_timeout(api_get(&app, &path).await?)?;
+    assert_eq!(limit.available_permits(), 0);
+    release.send(())?;
+    blocker.await?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while limit.available_permits() != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("the finished decode kept its permit")?;
+    assert_eq!(settlement(app).await?, baseline);
+    db.close(vec![ledger]).await
 }

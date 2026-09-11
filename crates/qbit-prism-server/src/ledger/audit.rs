@@ -37,6 +37,40 @@ pub async fn audit_canonical_bytes(pool: &PgPool, block_hash: &str) -> Result<Op
     Ok(Some(bytes))
 }
 
+/// Logical audit body of an imported row, decoded from its stored canonical
+/// bytes. The bytes must match the row's declared digest and parse with the
+/// shared audit parser; the result is the value the import once stored inline.
+/// A two-copy body is hundreds of megabytes at production window sizes, so the
+/// digest, parse and serialization all stay off the runtime threads. A
+/// `permit` is held by the blocking job itself: Tokio keeps running that job
+/// after its awaiting caller is dropped, and the permit must bound it anyway.
+pub async fn decode_canonical_audit_body(
+    bytes: Vec<u8>,
+    expected: String,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<Value> {
+    tokio::task::spawn_blocking(move || -> Result<Value> {
+        let _permit = permit;
+        ensure!(
+            hex::encode(Sha256::digest(&bytes)) == expected,
+            "stored canonical audit bytes have a digest mismatch"
+        );
+        let value: Value = serde_json::from_slice(&bytes)?;
+        // Canonical bytes are always a flat bundle. The shared parser would
+        // also resolve an envelope, including files relative to this process.
+        ensure!(
+            !matches!(
+                value["schema"].as_str(),
+                Some(qbit_prism::AUDIT_BODY_REF_SCHEMA | qbit_prism::AUDIT_BUNDLE_V2_SCHEMA)
+            ),
+            "stored canonical audit bytes hold an audit envelope, not a bundle"
+        );
+        let bundle = qbit_prism::parse_audit_bundle_value(value, None)?;
+        Ok(serde_json::to_value(&bundle)?)
+    })
+    .await?
+}
+
 /// Hydrate the `audit_bundle` member of an API/database row. The range and
 /// checksum are verified before exposing the logical legacy v1 audit format.
 pub async fn materialize_audit_row(pool: &PgPool, row: &mut Value) -> Result<()> {
@@ -87,23 +121,37 @@ pub async fn materialize_audit_row(pool: &PgPool, row: &mut Value) -> Result<()>
 }
 
 impl Ledger {
-    /// New range-backed and old inline bodies. Legacy filesystem bodies are
-    /// imported by the migration command or resolved by the public API reader.
+    /// New range-backed bodies, imported canonical bytes, then old inline
+    /// bodies. Legacy filesystem bodies are imported by the migration command
+    /// or resolved by the public API reader. Imported bytes that fail their
+    /// digest or parse are an error, never a fallback to another source.
     pub async fn audit_bundle(&self, block_hash: &str) -> Result<Option<Value>> {
-        let row: Option<Value> = sqlx::query_scalar(
-            "SELECT jsonb_build_object('audit_bundle',audit_bundle,'audit_bundle_sha256',audit_bundle_sha256,'share_snapshot_sha256',share_snapshot_sha256) FROM qbit_pool_audit_bundles WHERE block_hash=$1",
-        )
-        .bind(block_hash)
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some(mut row) = row else {
+        // Load only the representation that will be served.
+        let row = sqlx::query("SELECT audit_bundle_sha256,share_snapshot_sha256,CASE WHEN share_snapshot_sha256 IS NULL THEN canonical_audit_bytes END AS canonical_audit_bytes,CASE WHEN share_snapshot_sha256 IS NOT NULL OR canonical_audit_bytes IS NULL THEN audit_bundle END AS audit_bundle FROM qbit_pool_audit_bundles WHERE block_hash=$1")
+            .bind(block_hash)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
             return Ok(None);
         };
-        materialize_audit_row(&self.pool, &mut row).await?;
-        Ok(row
-            .get("audit_bundle")
-            .filter(|body| !body.is_null())
-            .cloned())
+        let expected: String = row.try_get("audit_bundle_sha256")?;
+        let snapshot: Option<String> = row.try_get("share_snapshot_sha256")?;
+        let body: Option<Value> = row.try_get("audit_bundle")?;
+        let canonical: Option<Vec<u8>> = row.try_get("canonical_audit_bytes")?;
+        // The row still holds its own copy of the bytes; free it before the
+        // decode instead of keeping two copies alive across the await.
+        drop(row);
+        if snapshot.is_some() {
+            let mut logical = serde_json::json!({"audit_bundle":body,"audit_bundle_sha256":expected,"share_snapshot_sha256":snapshot});
+            materialize_audit_row(&self.pool, &mut logical).await?;
+            return Ok(Some(logical["audit_bundle"].take()).filter(|body| !body.is_null()));
+        }
+        if let Some(bytes) = canonical {
+            return Ok(Some(
+                decode_canonical_audit_body(bytes, expected, None).await?,
+            ));
+        }
+        Ok(body.filter(|body| !body.is_null()))
     }
 }
 
