@@ -540,7 +540,7 @@ that the comparison and the digest describe one moment:
   claim, shows that landing at the candidate's revision fails, and lands at
   the observed one. If `qbit_pool_audit_bundles` **already holds the block's
   audit**, because an earlier claim landed it and lost its lease after
-  landing (`srv/src/coordinator.rs:1046-1048`, `:1072-1074`) or a reconcile
+  landing (`srv/src/coordinator.rs:1041-1043`, `:1067-1069`) or a reconcile
   has confirmed it, the balances have legitimately moved. The claim then skips
   `read_window` and treats landing as done, once the landed row's columns are
   authenticated against the block the candidate found instead of a stored
@@ -568,13 +568,13 @@ that the comparison and the digest describe one moment:
   Only then does the claim treat landing as done. It skips the rebuild and
   `land_candidate` and continues through the rest of today's flow, never
   straight to finishing. A landed audit doesn't mean a submitted block: an
-  inactive block lands (`srv/src/coordinator.rs:1072-1074`) before the lease
-  renewal and `submitblock` (`:1089-1097`), so an earlier claim can land and
-  lose its lease before it submits. The claim observes the block (`:1044`,
-  `:1075`) and finishes it only where today's code does: an active block
-  (`:1045-1053`), or an inactive one whose revision or parent moved
-  (`:1055-1068`, `:1076-1085`). Otherwise it renews the lease and calls
-  `submitblock` (`:1089-1097`), as today. It never calls `materialize_audit_row`
+  inactive block lands (`srv/src/coordinator.rs:1067-1069`) before the lease
+  renewal and `submitblock` (`:1084-1092`), so an earlier claim can land and
+  lose its lease before it submits. The claim observes the block (`:1039`,
+  `:1070`) and finishes it only where today's code does: an active block
+  (`:1040-1048`), or an inactive one whose revision or parent moved
+  (`:1050-1063`, `:1071-1080`). Otherwise it renews the lease and calls
+  `submitblock` (`:1084-1092`), as today. It never calls `materialize_audit_row`
   (`srv/src/ledger/audit.rs:42-87`) on the submit loop. That function reads the
   whole range in one unpaged query, serializes and clones it on the runtime,
   and builds an owned `AuditBundle`: at 400k, two share arrays that the
@@ -625,11 +625,11 @@ that the comparison and the digest describe one moment:
      `candidate_sha256` covers. Otherwise the claim's pre-submit supersession
      checks would finish it before `submitblock` and discard the block: the
      cached-hint path (`srv/src/coordinator.rs:978-988`), the post-rebuild
-     check (`:1055-1068`) and the post-land check (`:1076-1085`). So would the
-     pre-submit landing (`:1072-1074`), which checks R0's balances against
+     check (`:1050-1063`) and the post-land check (`:1071-1080`). So would the
+     pre-submit landing (`:1067-1069`), which checks R0's balances against
      R1. A leased candidate skips all four, renews its lease, calls
-     `submitblock` (`:1089-1097`), and only then meets `observe_candidate`
-     (`:1100`). A leased block that isn't active is finished as superseded,
+     `submitblock` (`:1084-1092`), and only then meets `observe_candidate`
+     (`:1095`). A leased block that isn't active is finished as superseded,
      after submission. Whether an active leased block lands, and against
      which balances, is B8's rule together with #289 (old-epoch candidates);
      this record doesn't decide it. Every other candidate keeps today's
