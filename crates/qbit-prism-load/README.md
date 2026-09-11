@@ -386,7 +386,7 @@ The side report repeats all of this under `honest_value_notes`.
   non-zero, but they stay in `offered_valid_shares` and in
   `rejected_valid_shares`. The artifact is then honestly invalid for that
   phase. Only the harness-bug classes — `low-difficulty`, `malformed-submit`,
-  `duplicate-share`, every `invalid-*` and `unauthorized-worker` — exit 5.
+  `duplicate-share`, every `invalid-*` and `unauthorized-worker` — exit 7.
 - **ACK latency is client-measured**, from writing the submit line to reading
   its response line, on the client's monotonic clock. The server's own
   `qbit_prism_share_ack_seconds` histogram measures a narrower, server-side
