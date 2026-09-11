@@ -650,38 +650,34 @@ async fn read_lock_statements(pool: &PgPool) -> Value {
              has been created, so they are dominated by ORDER_LOCK",
         ),
     );
-    let available: Result<bool, _> =
-        sqlx::query_scalar("SELECT to_regclass('pg_stat_statements') IS NOT NULL")
-            .fetch_one(pool)
-            .await;
     let unavailable = |object: &mut Map<String, Value>, reason: String| {
         object.insert("status".to_owned(), Value::from("unavailable"));
         object.insert("reason".to_owned(), Value::from(reason));
         object.insert("calls".to_owned(), Value::Null);
         object.insert("total_exec_time_milliseconds".to_owned(), Value::Null);
     };
-    match available {
-        Ok(true) => {}
-        Ok(false) => {
+    let namespace = match lock_statements_namespace(pool).await {
+        Ok(Some(namespace)) => namespace,
+        Ok(None) => {
             unavailable(
                 &mut object,
-                "the pg_stat_statements view does not exist on this server".to_owned(),
+                "the pg_stat_statements extension is not installed on this server".to_owned(),
             );
             return Value::Object(object);
         }
         Err(error) => {
             unavailable(
                 &mut object,
-                format!("could not probe for pg_stat_statements: {error}"),
+                format!("could not look up the pg_stat_statements extension: {error}"),
             );
             return Value::Object(object);
         }
-    }
-    let row = sqlx::query(
+    };
+    let row = sqlx::query(&format!(
         "SELECT coalesce(sum(calls),0)::bigint AS calls, \
          coalesce(sum(total_exec_time),0)::double precision AS total_exec_time \
-         FROM pg_stat_statements WHERE query LIKE $1",
-    )
+         FROM {namespace}.pg_stat_statements WHERE query LIKE $1"
+    ))
     .bind(QUERY_MATCH)
     .fetch_one(pool)
     .await;
@@ -710,13 +706,34 @@ async fn read_lock_statements(pool: &PgPool) -> Value {
     Value::Object(object)
 }
 
+/// The schema `pg_stat_statements` was installed into, already quoted by the
+/// server, or `None` when the extension is absent.
+///
+/// The name has to be resolved rather than written unqualified. Every
+/// connection in this run carries `options=-csearch_path=<run schema>`, which
+/// *replaces* the search path, so `public` is not on it; an unqualified
+/// `pg_stat_statements` would then fail to resolve on a server that has the
+/// extension installed, and the report would say "unavailable" about a view
+/// that was sitting right there.
+async fn lock_statements_namespace(pool: &PgPool) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT quote_ident(n.nspname) FROM pg_extension e \
+         JOIN pg_namespace n ON n.oid = e.extnamespace \
+         WHERE e.extname = 'pg_stat_statements'",
+    )
+    .fetch_optional(pool)
+    .await
+}
+
 /// Best-effort reset before a level. A failure is not fatal: the extension may
 /// be absent, or the role may lack the privilege, and either way the level's
 /// `pg_stat_statements` block reports what it could read.
 async fn reset_lock_statements(pool: &PgPool) {
-    let _ = sqlx::query("SELECT pg_stat_statements_reset()")
-        .execute(pool)
-        .await;
+    if let Ok(Some(namespace)) = lock_statements_namespace(pool).await {
+        let _ = sqlx::query(&format!("SELECT {namespace}.pg_stat_statements_reset()"))
+            .execute(pool)
+            .await;
+    }
 }
 
 // ---------------------------------------------------------------------------
