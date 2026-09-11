@@ -7,7 +7,8 @@ a. No runnable ``python -m lab.…`` or ``python lab/….py`` command invokes a
    module or script absent from the branch, however it is wrapped across shell
    backslash continuation lines. There is no allowlist. The check is lexical:
    it reads direct ``python``/``python3``/``python3.N`` invocations with their
-   CPython option forms, quoted targets and ``./`` prefixes, and does not
+   CPython option forms, quoted interpreter names and targets and ``./``
+   prefixes, and does not
    follow ``cd``, ``PYTHONPATH`` or other environment indirection, aliases,
    or shell variables.
 b. Every ``lab/prism/…`` path or ``lab.prism.…`` module reference resolves to a
@@ -50,29 +51,37 @@ MODULE_REFERENCE = re.compile(r"\blab\.prism(?:\.[A-Za-z_][A-Za-z0-9_]*)*\b")
 # target: clustered flag letters, `-W`/`-X` with an attached or following
 # argument, and `--check-hash-based-pycs <mode>` (CPython rejects the `=`
 # spelling). `-c cmd` runs its argument and ends the option list, so it is
-# deliberately not a prefix option.
+# deliberately not a prefix option. The interpreter name may itself be quoted
+# (`"python3" -m lab.a.b`), which the shell strips before it runs; inside
+# `sh -c "python3 -m lab.a.b"` no quote closes right after the name, so the
+# quote group falls back to empty and the inner command is read as before.
 PYTHON_FLAG = r"[bBdEhiIOPqsSuvVx]"
 PYTHON_OPTION = (
     rf"-{PYTHON_FLAG}+"  # -O, -OO, -bb, -IsE
     rf"|-{PYTHON_FLAG}*[WX](?:\S+|\s+\S+)"  # -Xdev, -X dev, -W error, -uWerror
     r"|--check-hash-based-pycs\s+(?:always|default|never)"
 )
-PYTHON_COMMAND = rf"\bpython(?:3(?:\.\d+)?)?(?:\s+(?:{PYTHON_OPTION}))*"
 # `-m` may close a flag cluster and take its module attached: CPython 3.12 runs
 # `-mlab.x`, `-Im lab.x`, `-OOm lab.x` and `-Imlab.x` alike, while `-Wm lab.x`
 # hands `m` to `-W` and treats `lab.x` as a script path.
 MODULE_OPTION = rf"-{PYTHON_FLAG}*m\s*"
 
 
-def quoted(target: str) -> str:
+def quoted(target: str, group: str = "quote") -> str:
     """``target`` bare or in matching single or double quotes, which the shell strips.
 
     A mismatched quote is a shell syntax error: the line runs nothing and
-    matches nothing.
+    matches nothing. ``group`` names the capture that holds the quote, since a
+    command pattern may quote both its interpreter and its target and ``re``
+    rejects a group name used twice.
     """
-    return rf"(?P<quote>['\"]?){target}\b(?P=quote)"
+    return rf"(?P<{group}>['\"]?){target}\b(?P={group})"
 
 
+PYTHON_COMMAND = (
+    quoted(r"\bpython(?:3(?:\.\d+)?)?", group="interpreter_quote")
+    + rf"(?:\s+(?:{PYTHON_OPTION}))*"
+)
 # `python3 -m 'lab.a.b'` and `python3 "./lab/a/b.py"`. CPython resolves any
 # `./` prefixes on a script path, so ``target`` holds the normalised path.
 MODULE_COMMAND = re.compile(
@@ -378,6 +387,50 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(self.commands(text), [])
         self.assertEqual(self.references(text), ["lab.prism.x"])
         self.assertEqual(self.commands("python3 \"lab/prism/x.py'"), [])
+
+    def test_quoted_interpreters_with_missing_targets_are_caught(self) -> None:
+        # The shell strips matching quotes around the interpreter name and runs
+        # Python all the same, so `"python3" -m lab.x` is as dead as the bare form.
+        for quote in ("'", '"'):
+            with self.subTest(quote=quote):
+                for interpreter in ("python3", "python3.12", "python"):
+                    text = f"{quote}{interpreter}{quote} -m lab.prism.process_telemetry rss-bound"
+                    self.assertEqual(self.commands(text), ["lab/prism/process_telemetry.py"])
+                    text = f"{quote}{interpreter}{quote} lab/prism/storm.py --decide"
+                    self.assertEqual(self.commands(text), ["lab/prism/storm.py"])
+                self.assertEqual(
+                    self.commands(f"{quote}python{quote} -OO -m {quote}lab.prism.process_telemetry{quote}"),
+                    ["lab/prism/process_telemetry.py"],
+                )
+
+    def test_quoted_interpreters_with_existing_targets_pass(self) -> None:
+        tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py"}
+        text = (
+            "\"python3\" -m lab.prism.tool\n'python3.12' -OO -m lab.pkg\n\"python\" lab/prism/tool.py\n"
+            "'python3' \"./lab/prism/tool.py\""
+        )
+        self.assertEqual(dead_commands(text, tracked), [])
+
+    def test_quoted_interpreter_inside_a_shell_string_is_still_caught(self) -> None:
+        # A quote opens before the interpreter but nothing closes right after
+        # it, so the interpreter quote is empty and the inner command is read.
+        self.assertEqual(
+            self.commands('sh -c "python3 -m lab.prism.process_telemetry rss-bound"'),
+            ["lab/prism/process_telemetry.py"],
+        )
+        self.assertEqual(self.commands("sh -c 'python3.12 lab/prism/storm.py --decide'"), ["lab/prism/storm.py"])
+
+    def test_mismatched_interpreter_quotes_are_not_a_command(self) -> None:
+        text = "\"python3' -m lab.prism.x"
+        self.assertEqual(self.commands(text), [])
+        self.assertEqual(self.references(text), ["lab.prism.x"])
+        self.assertEqual(self.commands("'python3\" lab/prism/x.py"), [])
+
+    def test_wrapped_quoted_interpreter_is_caught_at_the_right_line(self) -> None:
+        text = "```bash\ncd repo\n\"python3\" \\\n  -m lab.prism.process_telemetry \\\n  rss-bound\n```"
+        self.assertEqual(self.located(text), [(3, "lab/prism/process_telemetry.py")])
+        text = "'python3.12' -OO \\\n  lab/prism/storm.py \\\n  --decide"
+        self.assertEqual(self.located(text), [(1, "lab/prism/storm.py")])
 
     def test_version_suffixed_interpreters_are_scanned(self) -> None:
         self.assertEqual(
