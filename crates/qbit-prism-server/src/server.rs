@@ -16,9 +16,10 @@ pub async fn run(config: Config) -> Result<()> {
     let rollup_settings = crate::rollups::settings_from_env()?;
     let stratum_config = StratumConfig::from_env()?;
     let stats = stratum_config.stats.clone();
+    // Validate both listeners before coordinator startup can write cluster state.
+    let highdiff = stratum_config.highdiff_config()?;
     let registry = Arc::new(metrics::Metrics::default());
     let coordinator = Coordinator::new(config, registry.clone()).await?;
-    let highdiff = stratum_config.highdiff_config()?;
     let config = &coordinator.config;
     let (shutdown, shutdown_rx) = watch::channel(false);
     let primary = TcpListener::bind((
