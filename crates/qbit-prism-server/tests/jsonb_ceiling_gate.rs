@@ -437,13 +437,23 @@ fn parse_baseline_sizes(raw: Option<&str>) -> Result<Vec<u64>> {
     Ok(sizes)
 }
 
-/// Trap 3: existing native tests return early when the URL is missing. This one
-/// takes the URL through the workspace's shared integration gate, so it never
-/// does that silently, and never does it at all in the `prism-native-postgres`
-/// job or under `PRISM_TEST_REQUIRE_INTEGRATION=1`. The gate prints the skip
-/// line and records the decision in the execution manifest.
+/// Trap 3: existing native tests return early when the URL is missing. The
+/// reduced-size gate takes the URL through the workspace's shared integration
+/// gate, so it never does that silently, and never does it at all in the
+/// `prism-native-postgres` job or under `PRISM_TEST_REQUIRE_INTEGRATION=1`.
+/// The gate prints the skip line and records the decision in the execution
+/// manifest.
 fn database_url() -> Result<Option<String>> {
     Ok(gate::database_url(gate::site!())?)
+}
+
+/// The two `#[ignore]` runs are asked for explicitly, with `--ignored`, so a
+/// missing URL fails them whatever the switch says: an explicit selection that
+/// printed a skip line and reported `ok` would be the vacuous pass the gate
+/// exists to prevent. They are not in `test/prism-gated-tests.txt`, since CI
+/// never selects them.
+fn required_database_url() -> Result<String> {
+    Ok(gate::required_database_url(gate::site!())?)
 }
 
 // ---------------------------------------------------------------------------
@@ -2598,9 +2608,7 @@ async fn jsonb_ceiling_ratchet_at_reduced_sizes() -> Result<()> {
 #[ignore = "full-size 400k-share run, after the reduced pair; minutes of wall clock and gigabytes of RAM"]
 async fn jsonb_ceiling_ratchet_at_full_size() -> Result<()> {
     let settings = GateSettings::load()?;
-    let Some(url) = database_url()? else {
-        return Ok(());
-    };
+    let url = required_database_url()?;
     settings.apply_statement_timeout();
     print_settings(&settings, "full size");
     let (low, _, reduced) = reduced_pair(&url, &settings).await?;
@@ -2671,9 +2679,7 @@ async fn jsonb_ceiling_baseline_sweep() -> Result<()> {
     // Validated before the database check and before any pipeline runs, so a
     // bad list fails in seconds instead of after the whole sweep.
     let sizes = baseline_sizes()?;
-    let Some(url) = database_url()? else {
-        return Ok(());
-    };
+    let url = required_database_url()?;
     settings.apply_statement_timeout();
     print_settings(&settings, "baseline sweep");
     report!("  {BASELINE_SIZES_VAR} = {sizes:?}");

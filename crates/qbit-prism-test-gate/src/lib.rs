@@ -318,7 +318,11 @@ impl Site {
     }
 }
 
-/// Appends `<kind> <id>` to the manifest at `path` as one write.
+/// Appends `<kind> <id>` to the manifest at `path` as one `O_APPEND` write.
+///
+/// The whole line is built first and handed to a single `write`, never
+/// `write_all`, which could split it across two writes after a short write and
+/// let another thread's line land in between. A short write is an error.
 pub fn record_to(path: &std::path::Path, kind: &str, id: &str) -> Result<(), Error> {
     let line = format!("{kind} {id}\n");
     let manifest = |source| Error::Manifest {
@@ -330,7 +334,17 @@ pub fn record_to(path: &std::path::Path, kind: &str, id: &str) -> Result<(), Err
         .append(true)
         .open(path)
         .map_err(manifest)?;
-    file.write_all(line.as_bytes()).map_err(manifest)
+    let written = file.write(line.as_bytes()).map_err(manifest)?;
+    if written != line.len() {
+        return Err(manifest(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            format!(
+                "short write: {written} of {} bytes; the manifest line may be torn",
+                line.len()
+            ),
+        )));
+    }
+    Ok(())
 }
 
 /// Records the decision in the manifest named by `PRISM_TEST_GATE_MANIFEST`,
@@ -343,8 +357,9 @@ fn record(kind: &str, id: &str) -> Result<(), Error> {
 }
 
 /// Prints one line on the process's real stderr, past libtest's capture, so
-/// a skip is visible without `--nocapture`. The line goes out in one write,
-/// so parallel test threads cannot interleave their lines.
+/// a skip is visible without `--nocapture`. The line goes out in a single
+/// `write`, so parallel test threads cannot interleave their lines; a short
+/// write is not retried, since a retry would be the second write.
 fn announce(line: &str) {
     let line = format!("{line}\n");
     #[cfg(unix)]
@@ -352,7 +367,7 @@ fn announce(line: &str) {
         use std::os::fd::AsFd;
         if let Ok(fd) = std::io::stderr().as_fd().try_clone_to_owned() {
             let mut stderr = std::fs::File::from(fd);
-            let _ = stderr.write_all(line.as_bytes());
+            let _ = stderr.write(line.as_bytes());
             return;
         }
     }
@@ -370,7 +385,8 @@ pub fn inputs(site: Site, inputs: &[Input]) -> Result<Option<Vec<String>>, Error
 
 /// Like [`inputs`], for a test that is selected explicitly (`#[ignore]`, run
 /// with `--ignored`): a missing input always fails, since nothing else stops
-/// the explicit selection from passing without running.
+/// the explicit selection from passing without running. Every `#[ignore]`
+/// gated test in the workspace uses this entry point.
 pub fn required_inputs(site: Site, inputs: &[Input]) -> Result<Vec<String>, Error> {
     settle(site, inputs, true).map(|values| values.expect("explicit tests never skip"))
 }

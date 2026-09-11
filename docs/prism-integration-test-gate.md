@@ -41,12 +41,16 @@ if the job's own environment were edited. Keying on `CI` would be wrong:
 GitHub sets `CI=true` in every job, including `rust-tests`, which runs the
 whole workspace with no database.
 
-Two tests are selected explicitly, with `#[ignore]` and `--ignored`, because
-they are long or destructive: the 10,000-connection admission test in
-`stratum_admission_postgres` and the collector test in
-`observability_database`. They use the gate's `required_*` entry points, which
-never skip: a missing input fails them whatever the switch says, since a
-vacuous pass is exactly what selecting them explicitly tried to avoid.
+Explicit `#[ignore]` runs are always required. Four gated tests are selected
+explicitly, with `#[ignore]` and `--ignored`, because they are long or
+destructive: the 10,000-connection admission test in
+`stratum_admission_postgres`, the collector test in `observability_database`,
+and the full-size ratchet and baseline sweep in `jsonb_ceiling_gate`. They use
+the gate's `required_*` entry points, which never skip: a missing input fails
+them whatever the switch says, since a vacuous pass is exactly what selecting
+them explicitly tried to avoid. The first two are in the expected list because
+the native job selects them; the two JSONB measurement runs are not, because
+CI never selects them.
 
 The table is a pure function, `qbit_prism_test_gate::decide`, over injected
 values, with unit tests for every row in the crate itself.
