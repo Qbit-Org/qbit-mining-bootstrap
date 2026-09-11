@@ -8,6 +8,64 @@ async fn wrap(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn stopped_guard_blocks_cleanup_and_owner_filter_preserves_other_reservations() -> Result<()>
+{
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("shutdown-guard").await?;
+    let other = db.ledger("other-owner").await?;
+    let held = ledger.new_session_id().await?;
+    let owner_token: String = sqlx::query_scalar(
+        "SELECT status->>'session_owner_token' FROM qbit_prism_instances WHERE instance_id='shutdown-guard'",
+    )
+    .fetch_one(&ledger.pool)
+    .await?;
+    sqlx::query("INSERT INTO qbit_prism_session_reservations(extranonce1,instance_id,owner_token,reservation_token) VALUES(99,'shutdown-guard',$1,'leftover')")
+        .bind(owner_token)
+        .execute(&ledger.pool)
+        .await?;
+    let other_token: String = sqlx::query_scalar("SELECT status->>'session_owner_token' FROM qbit_prism_instances WHERE instance_id='other-owner'")
+        .fetch_one(&other.pool).await?;
+    sqlx::query("INSERT INTO qbit_prism_session_reservations(extranonce1,instance_id,owner_token,reservation_token) VALUES(100,'other-owner',$1,'other')")
+        .bind(other_token).execute(&other.pool).await?;
+    let stopped = ledger.heartbeat(json!({"state":"stopped"})).await;
+    assert!(
+        stopped.is_err(),
+        "stopped must fail while a guard is active"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_session_reservations")
+        .fetch_one(&ledger.pool)
+        .await?;
+    assert_eq!(count, 3, "failed shutdown retains all reservations");
+    held.release().await?;
+    ledger.heartbeat(json!({"state":"stopped"})).await?;
+    ledger.release_session_owner_reservations().await?;
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_session_reservations")
+        .fetch_one(&ledger.pool)
+        .await?;
+    assert_eq!(count, 1, "successful stopped path cleans only this owner");
+    db.close(vec![ledger, other]).await
+}
+
+#[tokio::test]
+async fn initialize_false_rejects_pre009_schema() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    sqlx::raw_sql("CREATE TABLE qbit_prism_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp()); INSERT INTO qbit_prism_schema_migrations(version) VALUES(2),(3),(4),(5)")
+        .execute(&pool).await?;
+    let error = match Ledger::connect(&db.url, "pre009".into(), 4, false).await {
+        Ok(_) => panic!("pre-009 schema must fail when initialization is disabled"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("migration 009"));
+    pool.close().await;
+    db.close(vec![]).await
+}
+
 async fn seed_job(pool: &PgPool, id: &str, extra: &str, live: bool) -> Result<()> {
     sqlx::query("INSERT INTO qbit_prism_jobs(job_id,instance_id,parent_hash,payout_revision,payload,expires_at) VALUES($1,'pre-009','parent',0,$2,clock_timestamp()+$3*interval '1 hour')")
         .bind(id).bind(json!({"extranonce1":extra,"old-field":"retained"}))
