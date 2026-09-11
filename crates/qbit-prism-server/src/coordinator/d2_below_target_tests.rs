@@ -21,73 +21,13 @@
 //! against an in-memory backend and so cannot see the credited amount or its
 //! timing; this module is the accounting half of that pair.
 
+use super::d2_test_support::*;
 use super::*;
 use axum::{extract::State, routing::post, Json, Router};
-use sqlx::PgPool;
 use std::collections::BTreeMap;
 use std::future::Future;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::instrument::WithSubscriber;
-
-// ---------------------------------------------------------------------------
-// Integration guard
-// ---------------------------------------------------------------------------
-
-/// Decides whether this file's tests run, fail or skip.
-///
-/// | `PRISM_TEST_DATABASE_URL` | other variables | result |
-/// | --- | --- | --- |
-/// | set and non-empty | -- | run against that database |
-/// | unset or empty | `PRISM_TEST_REQUIRE_INTEGRATION=1` | fail, naming the variable |
-/// | unset or empty | `GITHUB_JOB=prism-native-postgres` | fail, naming the variable |
-/// | unset or empty | -- | print a skip line and return |
-///
-/// The three variables play different roles. This repository sets
-/// `PRISM_TEST_DATABASE_URL` itself, in the `prism-native-postgres` job of
-/// `.github/workflows/ci.yml`. GitHub sets `GITHUB_JOB` to the running job's
-/// id, so matching it on `prism-native-postgres` means a database outage in
-/// that job surfaces as a failure instead of a silent pass, even though
-/// nothing in the repository writes that variable. Nothing sets
-/// `PRISM_TEST_REQUIRE_INTEGRATION` yet: it is an opt-in switch proposed by
-/// #286 for a run that wants every integration test to be mandatory, honoured
-/// here in advance so that adopting it needs no change to this file.
-///
-/// Keying on `CI` instead would be wrong: GitHub sets `CI=true` in every job,
-/// including `rust-tests`, which builds and runs the whole workspace with no
-/// database at all.
-///
-/// An empty or whitespace-only URL counts as unset. A non-empty but malformed
-/// URL is deliberately not second-guessed here; it reaches `sqlx` and fails
-/// the test with the connection error, which is the diagnostic an operator
-/// needs.
-fn database_url(test_name: &str) -> Result<Option<String>> {
-    let configured = std::env::var("PRISM_TEST_DATABASE_URL").unwrap_or_default();
-    let configured = configured.trim();
-    if !configured.is_empty() {
-        return Ok(Some(configured.to_owned()));
-    }
-    let required_by = if matches!(
-        std::env::var("PRISM_TEST_REQUIRE_INTEGRATION").as_deref(),
-        Ok("1")
-    ) {
-        Some("PRISM_TEST_REQUIRE_INTEGRATION=1")
-    } else if matches!(
-        std::env::var("GITHUB_JOB").as_deref(),
-        Ok("prism-native-postgres")
-    ) {
-        Some("GITHUB_JOB=prism-native-postgres")
-    } else {
-        None
-    };
-    if let Some(signal) = required_by {
-        anyhow::bail!(
-            "{test_name} requires PostgreSQL: PRISM_TEST_DATABASE_URL is unset or empty while \
-             {signal} demands the integration suite"
-        );
-    }
-    eprintln!("skipping {test_name}: PRISM_TEST_DATABASE_URL is not set");
-    Ok(None)
-}
 
 // ---------------------------------------------------------------------------
 // Vectors
@@ -95,11 +35,6 @@ fn database_url(test_name: &str) -> Result<Option<String>> {
 
 const VECTORS: &str = include_str!("../../../qbit-prism/fixtures/vectors/below_target_credit.json");
 const D2_ENTRY: &str = "d2b-below-target-credit";
-/// Regtest-style compact target. Its `scaled_target_difficulty` is exactly the
-/// 1_000_000 network difficulty the vectors were exported against.
-const BITS: &str = "207fffff";
-const EXTRANONCE1: &str = "00000000";
-const EXTRANONCE2_SIZE: usize = 8;
 const NONCE_BUDGET: u32 = 200_000;
 /// The ledger's advisory locks are cluster-wide constants, so `candidate_lease_tests`
 /// in this same binary can hold `SETTLEMENT_LOCK` for a couple of seconds. No
@@ -222,12 +157,6 @@ impl NodeState {
     }
 }
 
-fn unix_now() -> Result<u64> {
-    Ok(std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs())
-}
-
 async fn node_reply(
     State(node): State<Arc<Mutex<NodeState>>>,
     Json(request): Json<Value>,
@@ -266,10 +195,12 @@ async fn node_reply(
                 None => Value::Null,
             }
         }
-        "getblocktemplate" => json!({"version":0x2000_0000u32,"bits":BITS,"height":tip_height+1,
+        "getblocktemplate" => {
+            json!({"version":0x2000_0000u32,"bits":TEMPLATE_BITS,"height":tip_height+1,
             "coinbasevalue":node.coinbase_value,
             "curtime":unix_now().expect("the host clock precedes the epoch"),
-            "previousblockhash":tip,"transactions":[]}),
+            "previousblockhash":tip,"transactions":[]})
+        }
         "submitblock" => {
             let block = hex::decode(
                 request["params"][0]
@@ -301,8 +232,7 @@ async fn node_reply(
 // ---------------------------------------------------------------------------
 
 struct Fixture {
-    admin: PgPool,
-    schema: String,
+    schema: TestSchema,
     coordinator: Arc<Coordinator>,
     node: Arc<Mutex<NodeState>>,
     server: AbortOnDropHandle<()>,
@@ -320,92 +250,54 @@ impl Fixture {
         let coinbase_value = scenario["next_block"]["coinbase_value_sats"]
             .as_u64()
             .context("vector next block has no coinbase value")?;
-        let admin = PgPool::connect(raw).await?;
-        let schema = format!("prism_d2_credit_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&admin)
-            .await?;
-        let mut url = url::Url::parse(raw)?;
-        url.query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"));
-        // The node starts one block below the found block, so the first
-        // refresh builds work for the height the vector solves.
-        let node = Arc::new(Mutex::new(NodeState {
-            chain: BTreeMap::from([(0, "00".repeat(32)), (parent_height, "aa".repeat(32))]),
-            chainwork: 1,
-            coinbase_value,
-            submit: SubmitMode::from_outcome(
-                scenario["node_outcome"]
-                    .as_str()
-                    .context("vector scenario has no node outcome")?,
-            )?,
-            submissions: 0,
-        }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let rpc_url = format!("http://{}/", listener.local_addr()?);
-        let app = Router::new()
-            .route("/", post(node_reply))
-            .with_state(node.clone());
-        let server = AbortOnDropHandle::new(tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        }));
-        let config = Config {
-            database_url: url.to_string(),
-            instance_id: "d2-below-target".into(),
-            database_connections: 6,
-            initialize_schema: true,
-            chain: "testnet".into(),
-            expected_genesis_hash: None,
-            min_peers: 1,
-            template_max_age: Duration::from_secs(120),
-            rpc_url,
-            rpc_user: "test".into(),
-            rpc_password: "test".into(),
-            rpc_timeout: Duration::from_secs(10),
-            block_submit_timeout: Duration::from_secs(10),
-            poll_interval: Duration::from_secs(1),
-            blockwait: false,
-            build_workers: 1,
-            runtime_workers: 2,
-            snapshot_interval: Duration::from_secs(60),
-            health_timeout: Duration::from_secs(60),
+        let schema = TestSchema::create(raw, "prism_d2_credit").await?;
+        let opened = async {
+            // The node starts one block below the found block, so the first
+            // refresh builds work for the height the vector solves.
+            let node = Arc::new(Mutex::new(NodeState {
+                chain: BTreeMap::from([(0, "00".repeat(32)), (parent_height, "aa".repeat(32))]),
+                chainwork: 1,
+                coinbase_value,
+                submit: SubmitMode::from_outcome(
+                    scenario["node_outcome"]
+                        .as_str()
+                        .context("vector scenario has no node outcome")?,
+                )?,
+                submissions: 0,
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let rpc_url = format!("http://{}/", listener.local_addr()?);
             // The block-only branch of `submit` blocks until its credit row
             // exists, and this test drives the candidate by hand in between.
             // Well above 15s so a slow schema bootstrap cannot masquerade as a
             // missing credit.
-            share_commit_timeout: Duration::from_secs(60),
-            extranonce2_size: EXTRANONCE2_SIZE,
-            coinbase_tag: "/PRISM/".into(),
-            manifest_seed: "11".repeat(32),
-            ledger_seed: "22".repeat(32),
-            ledger_public_key: ManifestSigningKey::from_seed_hex(&"22".repeat(32))?
-                .public_key_hex(),
-            username_fallback: None,
-            payout_policy: qbit_prism::PayoutPolicy::day_one_default(),
-            fee_address: None,
-            ctv_enabled: false,
-            ctv_config: qbit_prism::SettlementModeConfig::default(),
-            ctv_direct_floor: 10_485_760,
-            ctv_fee: None,
-            ctv_fee_premium_bps: 12000,
-            ctv_broadcast: false,
-            ctv_broadcast_interval: Duration::from_secs(10),
-            version_mask: codec::VERSION_ROLLING_MASK,
-            audit_bind: "127.0.0.1".into(),
-            audit_port: 0,
-        };
-        let coordinator = Coordinator::new(
-            config,
-            std::sync::Arc::new(crate::metrics::Metrics::default()),
-        )
-        .await?;
-        Ok(Self {
-            admin,
-            schema,
-            coordinator,
-            node,
-            server,
-        })
+            let config = test_config(
+                schema.url(),
+                rpc_url,
+                "d2-below-target",
+                Duration::from_secs(60),
+            )?;
+            let app = Router::new()
+                .route("/", post(node_reply))
+                .with_state(node.clone());
+            // Dropping the handle on any later failure aborts the server.
+            let server = AbortOnDropHandle::new(tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            }));
+            let coordinator =
+                Coordinator::new(config, Arc::new(crate::metrics::Metrics::default())).await?;
+            Ok::<_, anyhow::Error>((coordinator, node, server))
+        }
+        .await;
+        match opened {
+            Ok((coordinator, node, server)) => Ok(Self {
+                schema,
+                coordinator,
+                node,
+                server,
+            }),
+            Err(error) => Err(schema.abandon(error).await),
+        }
     }
 
     fn ledger(&self) -> &Ledger {
@@ -493,27 +385,13 @@ impl Fixture {
             .bundle
             .clone()
             .context("prepared work carries no payout bundle")?;
-        let reward = &bundle.reward_manifest;
-        Ok(json!({
-            "counted_window_weight": serde_json::to_value(reward.counted_window_weight)?,
-            "counted_shares": reward.shares.iter().map(|share| Ok(json!({
-                "share_seq": share.share_seq,
-                "miner_id": share.miner_id,
-                "counted_difficulty": serde_json::to_value(share.counted_difficulty)?,
-            }))).collect::<Result<Vec<_>>>()?,
-            "entitlements": serde_json::to_value(&reward.entitlements)?,
-            "payout_policy_manifest": serde_json::to_value(&bundle.payout_policy_manifest)?,
-        }))
+        bundle_payout(&bundle)
     }
 
     async fn close(self) -> Result<()> {
         self.server.abort();
         self.coordinator.ledger.pool.close().await;
-        sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
-            .execute(&self.admin)
-            .await?;
-        self.admin.close().await;
-        Ok(())
+        self.schema.remove().await
     }
 }
 
@@ -541,44 +419,12 @@ where
     }
 }
 
-/// Record every leaf where `actual` departs from `expected`.
-fn diff(path: &str, expected: &Value, actual: &Value, mismatches: &mut Vec<String>) {
-    match (expected, actual) {
-        (Value::Object(want), Value::Object(got)) => {
-            for key in want
-                .keys()
-                .chain(got.keys().filter(|key| !want.contains_key(*key)))
-            {
-                let child = format!("{path}.{key}");
-                match (want.get(key), got.get(key)) {
-                    (Some(want), Some(got)) => diff(&child, want, got, mismatches),
-                    (Some(want), None) => {
-                        mismatches.push(format!("{child}: expected {want}, got nothing"))
-                    }
-                    (None, Some(got)) => {
-                        mismatches.push(format!("{child}: expected nothing, got {got}"))
-                    }
-                    (None, None) => unreachable!(),
-                }
-            }
-        }
-        (Value::Array(want), Value::Array(got)) if want.len() == got.len() => {
-            for (index, (want, got)) in want.iter().zip(got).enumerate() {
-                diff(&format!("{path}[{index}]"), want, got, mismatches);
-            }
-        }
-        _ if expected == actual => {}
-        _ => mismatches.push(format!("{path}: expected {expected}, got {actual}")),
-    }
-}
-
 fn assert_projection(case: &str, expected: &Value, actual: &Value) -> Result<()> {
-    let mut mismatches = Vec::new();
-    diff("payout", expected, actual, &mut mismatches);
+    let departures = mismatches("payout", expected, actual);
     ensure!(
-        mismatches.is_empty(),
+        departures.is_empty(),
         "{case}: next-block payout departs from the vector:\n  {}",
-        mismatches.join("\n  ")
+        departures.join("\n  ")
     );
     Ok(())
 }
@@ -727,7 +573,7 @@ async fn solve(fixture: &Fixture, case: &Value) -> Result<Solved> {
 
     // 5. Work assigned above the network difficulty, which is what makes a
     //    valid block fall below its own share target.
-    let network_target = codec::target_from_compact(codec::parse_u32_hex(BITS)?)?;
+    let network_target = codec::target_from_compact(codec::parse_u32_hex(TEMPLATE_BITS)?)?;
     let assigned_target =
         (network_target.clone() * BigUint::from(network_scaled)) / BigUint::from(assigned_scaled);
     let job = MiningBackend::build_job(
@@ -837,6 +683,13 @@ async fn assert_credited(fixture: &Fixture, case: &Value, share_id: &str) -> Res
         &rule["decision_2xx"]["credited_difficulty"],
         "2.x.x credited difficulty",
     )?;
+    // Every case asserted here is a D2 case, so the vector itself must still
+    // record a difference; otherwise the equality below would pin nothing that
+    // tells 3.x.x from 2.x.x.
+    ensure!(
+        credited != legacy,
+        "{name}: the vector records {credited} on both sides, so it no longer pins a D2b difference"
+    );
     let actual = fixture
         .credited(share_id)
         .await?
@@ -845,12 +698,6 @@ async fn assert_credited(fixture: &Fixture, case: &Value, share_id: &str) -> Res
         actual == credited,
         "{name}: credited {actual} instead of the proven {credited}"
     );
-    if credited != legacy {
-        ensure!(
-            actual != legacy,
-            "{name}: credited the 2.x.x assigned difficulty {legacy}"
-        );
-    }
     Ok(())
 }
 
@@ -912,8 +759,7 @@ async fn block_only_proof_is_credited_network_work_only_once_the_block_is_active
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    fixture.close().await?;
-    outcome
+    settle(outcome, fixture.close().await)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -989,8 +835,7 @@ async fn block_only_proof_with_a_lost_submitblock_reply_is_credited_once_by_reco
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    fixture.close().await?;
-    outcome
+    settle(outcome, fixture.close().await)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1041,8 +886,7 @@ async fn block_only_credit_survives_a_reorg_that_disconnects_its_block() -> Resu
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    fixture.close().await?;
-    outcome
+    settle(outcome, fixture.close().await)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1105,8 +949,7 @@ async fn block_only_proof_the_node_rejects_fails_the_submission_without_credit()
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    fixture.close().await?;
-    outcome
+    settle(outcome, fixture.close().await)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1163,6 +1006,5 @@ async fn share_passing_block_proof_is_credited_its_assigned_difficulty_at_once()
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    fixture.close().await?;
-    outcome
+    settle(outcome, fixture.close().await)
 }

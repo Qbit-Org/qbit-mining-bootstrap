@@ -37,11 +37,11 @@
 //! PRISM_TEST_DATABASE_URL=postgres://postgres:prism@127.0.0.1:5432/postgres \
 //!     cargo test -p qbit-prism-server --lib d2_bootstrap_tests -- --nocapture
 
+use super::d2_test_support::*;
 use super::*;
-use anyhow::{anyhow, bail};
+use anyhow::anyhow;
 use axum::{extract::State, routing::post, Json, Router};
 use qbit_prism::{CarryForwardBalance, PayoutPolicy, PoolFeePolicy};
-use sqlx::PgPool;
 use tokio::task::JoinHandle;
 
 /// The ledger's advisory locks (`ORDER_LOCK`, `SETTLEMENT_LOCK`) are
@@ -50,78 +50,10 @@ use tokio::task::JoinHandle;
 static TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
 // ---------------------------------------------------------------------------
-// Integration guard
-// ---------------------------------------------------------------------------
-
-/// Decides whether this file's tests run, fail or skip.
-///
-/// | `PRISM_TEST_DATABASE_URL` | other variables | result |
-/// | --- | --- | --- |
-/// | set and non-empty | -- | run against that database |
-/// | unset or empty | `PRISM_TEST_REQUIRE_INTEGRATION=1` | fail, naming the variable |
-/// | unset or empty | `GITHUB_JOB=prism-native-postgres` | fail, naming the variable |
-/// | unset or empty | -- | print a skip line and return |
-///
-/// The three variables play different roles. This repository sets
-/// `PRISM_TEST_DATABASE_URL` itself, in the `prism-native-postgres` job of
-/// `.github/workflows/ci.yml`. GitHub sets `GITHUB_JOB` to the running job's
-/// id, so matching it on `prism-native-postgres` means a database outage in
-/// that job surfaces as a failure instead of a silent pass, even though
-/// nothing in the repository writes that variable. Nothing sets
-/// `PRISM_TEST_REQUIRE_INTEGRATION` yet: it is an opt-in switch proposed by
-/// #286 for a run that wants every integration test to be mandatory, honoured
-/// here in advance so that adopting it needs no change to this file.
-///
-/// Keying on `CI` instead would be wrong: GitHub sets `CI=true` in every job,
-/// including `rust-tests`, which builds and runs the whole workspace with no
-/// database at all.
-///
-/// An empty or whitespace-only URL counts as unset. A non-empty but malformed
-/// URL is deliberately not second-guessed here; it reaches `sqlx` and fails
-/// the test with the connection error, which is the diagnostic an operator
-/// needs.
-fn database_url(test_name: &str) -> Result<Option<String>> {
-    let configured = std::env::var("PRISM_TEST_DATABASE_URL").unwrap_or_default();
-    let configured = configured.trim();
-    if !configured.is_empty() {
-        return Ok(Some(configured.to_owned()));
-    }
-    let required_by = if matches!(
-        std::env::var("PRISM_TEST_REQUIRE_INTEGRATION").as_deref(),
-        Ok("1")
-    ) {
-        Some("PRISM_TEST_REQUIRE_INTEGRATION=1")
-    } else if matches!(
-        std::env::var("GITHUB_JOB").as_deref(),
-        Ok("prism-native-postgres")
-    ) {
-        Some("GITHUB_JOB=prism-native-postgres")
-    } else {
-        None
-    };
-    if let Some(signal) = required_by {
-        bail!(
-            "{test_name} requires PostgreSQL: PRISM_TEST_DATABASE_URL is unset or empty while \
-             {signal} demands the integration suite"
-        );
-    }
-    eprintln!("skipping {test_name}: PRISM_TEST_DATABASE_URL is not set");
-    Ok(None)
-}
-
-// ---------------------------------------------------------------------------
 // Harness constants
 // ---------------------------------------------------------------------------
 
-/// Regtest-style compact bits. `codec::scaled_target_difficulty` reads these
-/// as 1_000_000, and any header nonce passes the block target within a few
-/// thousand tries.
-const TEMPLATE_BITS: &str = "207fffff";
 const TEMPLATE_VERSION: u32 = 0x2000_0000;
-/// A future template time; `validate_template_age` accepts one.
-const TEMPLATE_CURTIME: u64 = 1_800_000_000;
-const EXTRANONCE1: &str = "00000000";
-const EXTRANONCE2_SIZE: usize = 8;
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// The difficulty the harness scales every comparison by.
@@ -218,67 +150,6 @@ fn scenario(case: &Value) -> Result<Scenario> {
 // ---------------------------------------------------------------------------
 // Projection and comparison
 // ---------------------------------------------------------------------------
-
-/// The payout consequence of one bundle, in exactly the shape
-/// `crates/qbit-prism/tests/money_path_vectors.rs` `bundle_payout` records:
-/// the counted window, the entitlements it produces and the payout policy
-/// manifest applied to them.
-fn bundle_payout(bundle: &AuditBundle) -> Result<Value> {
-    let reward = &bundle.reward_manifest;
-    Ok(json!({
-        "counted_window_weight": serde_json::to_value(reward.counted_window_weight)?,
-        "counted_shares": reward
-            .shares
-            .iter()
-            .map(|share| {
-                Ok(json!({
-                    "share_seq": share.share_seq,
-                    "miner_id": share.miner_id,
-                    "counted_difficulty": serde_json::to_value(share.counted_difficulty)?,
-                }))
-            })
-            .collect::<Result<Vec<_>>>()?,
-        "entitlements": serde_json::to_value(&reward.entitlements)?,
-        "payout_policy_manifest": serde_json::to_value(&bundle.payout_policy_manifest)?,
-    }))
-}
-
-/// Record every leaf where `actual` departs from `expected`.
-fn diff(path: &str, expected: &Value, actual: &Value, mismatches: &mut Vec<String>) {
-    match (expected, actual) {
-        (Value::Object(want), Value::Object(got)) => {
-            for key in want
-                .keys()
-                .chain(got.keys().filter(|key| !want.contains_key(*key)))
-            {
-                let child = format!("{path}.{key}");
-                match (want.get(key), got.get(key)) {
-                    (Some(want), Some(got)) => diff(&child, want, got, mismatches),
-                    (Some(want), None) => {
-                        mismatches.push(format!("{child}: expected {want}, got nothing"))
-                    }
-                    (None, Some(got)) => {
-                        mismatches.push(format!("{child}: expected nothing, got {got}"))
-                    }
-                    (None, None) => unreachable!(),
-                }
-            }
-        }
-        (Value::Array(want), Value::Array(got)) if want.len() == got.len() => {
-            for (index, (want, got)) in want.iter().zip(got).enumerate() {
-                diff(&format!("{path}[{index}]"), want, got, mismatches);
-            }
-        }
-        _ if expected == actual => {}
-        _ => mismatches.push(format!("{path}: expected {expected}, got {actual}")),
-    }
-}
-
-fn mismatches(path: &str, expected: &Value, actual: &Value) -> Vec<String> {
-    let mut found = Vec::new();
-    diff(path, expected, actual, &mut found);
-    found
-}
 
 /// One weight divided by the network difficulty it was measured against, so
 /// that a synthetic bootstrap share computed at 1_000_000 can be compared
@@ -401,7 +272,8 @@ async fn node_reply(
         }
         "getblocktemplate" => json!({"version":TEMPLATE_VERSION,"bits":TEMPLATE_BITS,
             "height":node.height+1,"coinbasevalue":node.coinbase_value_sats,
-            "curtime":TEMPLATE_CURTIME,"previousblockhash":node.tip(),"transactions":[]}),
+            "curtime":unix_now().expect("the host clock precedes the epoch"),
+            "previousblockhash":node.tip(),"transactions":[]}),
         "submitblock" => {
             let block = hex::decode(request["params"][0].as_str().unwrap()).unwrap();
             let hash = codec::hash_display(&codec::double_sha256(&block[..80]));
@@ -422,8 +294,7 @@ async fn node_reply(
 // ---------------------------------------------------------------------------
 
 struct Fixture {
-    admin: PgPool,
-    schema: String,
+    schema: TestSchema,
     coordinator: Arc<Coordinator>,
     node: Arc<Mutex<NodeState>>,
     server: JoinHandle<()>,
@@ -434,64 +305,22 @@ impl Fixture {
     /// failure after the schema exists tears it down again, so a partially
     /// built fixture leaks neither a schema, a pool nor an `axum` task.
     async fn open(raw: &str, node: Arc<Mutex<NodeState>>) -> Result<Self> {
-        let admin = PgPool::connect(raw).await?;
-        let schema = format!("prism_d2_boot_{}", uuid::Uuid::new_v4().simple());
+        let schema = TestSchema::create(raw, "prism_d2_boot").await?;
         let opened = async {
-            sqlx::query(&format!("CREATE SCHEMA {schema}"))
-                .execute(&admin)
-                .await?;
-            let mut url = url::Url::parse(raw)?;
-            url.query_pairs_mut()
-                .append_pair("options", &format!("-csearch_path={schema}"));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let rpc_url = format!("http://{}/", listener.local_addr()?);
+            let config = test_config(
+                schema.url(),
+                rpc_url,
+                "d2-bootstrap",
+                Duration::from_secs(15),
+            )?;
             let app = Router::new()
                 .route("/", post(node_reply))
                 .with_state(node.clone());
             let server = tokio::spawn(async move {
                 let _ = axum::serve(listener, app).await;
             });
-            let config = Config {
-                database_url: url.to_string(),
-                instance_id: "d2-bootstrap".into(),
-                database_connections: 6,
-                initialize_schema: true,
-                chain: "testnet".into(),
-                expected_genesis_hash: None,
-                min_peers: 1,
-                template_max_age: Duration::from_secs(120),
-                rpc_url,
-                rpc_user: "test".into(),
-                rpc_password: "test".into(),
-                rpc_timeout: Duration::from_secs(10),
-                block_submit_timeout: Duration::from_secs(10),
-                poll_interval: Duration::from_secs(1),
-                blockwait: false,
-                build_workers: 1,
-                runtime_workers: 2,
-                snapshot_interval: Duration::from_secs(60),
-                health_timeout: Duration::from_secs(60),
-                share_commit_timeout: Duration::from_secs(15),
-                extranonce2_size: EXTRANONCE2_SIZE,
-                coinbase_tag: "/PRISM/".into(),
-                manifest_seed: "11".repeat(32),
-                ledger_seed: "22".repeat(32),
-                ledger_public_key: ManifestSigningKey::from_seed_hex(&"22".repeat(32))?
-                    .public_key_hex(),
-                username_fallback: None,
-                payout_policy: PayoutPolicy::day_one_default(),
-                fee_address: None,
-                ctv_enabled: false,
-                ctv_config: qbit_prism::SettlementModeConfig::default(),
-                ctv_direct_floor: 10_485_760,
-                ctv_fee: None,
-                ctv_fee_premium_bps: 12000,
-                ctv_broadcast: false,
-                ctv_broadcast_interval: Duration::from_secs(10),
-                version_mask: codec::VERSION_ROLLING_MASK,
-                audit_bind: "127.0.0.1".into(),
-                audit_port: 0,
-            };
             match Coordinator::new(config, Arc::new(crate::metrics::Metrics::default())).await {
                 Ok(coordinator) => Ok((coordinator, server)),
                 Err(error) => {
@@ -503,19 +332,12 @@ impl Fixture {
         .await;
         match opened {
             Ok((coordinator, server)) => Ok(Self {
-                admin,
                 schema,
                 coordinator,
                 node,
                 server,
             }),
-            Err(error) => {
-                let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-                    .execute(&admin)
-                    .await;
-                admin.close().await;
-                Err(error)
-            }
+            Err(error) => Err(schema.abandon(error).await),
         }
     }
 
@@ -543,12 +365,7 @@ impl Fixture {
     async fn close(self) -> Result<()> {
         self.server.abort();
         self.coordinator.ledger.pool.close().await;
-        let dropped = sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
-            .execute(&self.admin)
-            .await;
-        self.admin.close().await;
-        dropped?;
-        Ok(())
+        self.schema.remove().await
     }
 }
 
@@ -605,7 +422,7 @@ async fn accepted_shares_below_the_2xx_readiness_gate_still_pay_the_window() -> 
 
         let prepared = fixture.prepared().await?;
         ensure!(
-            prepared.bundle.is_some() == !bootstrap,
+            prepared.bundle.is_some() != bootstrap,
             "refresh_once selected {} for a window of {} share(s); the vector's 3.x.x decision \
              records bootstrap={bootstrap}",
             if prepared.bundle.is_some() {
@@ -632,15 +449,16 @@ async fn accepted_shares_below_the_2xx_readiness_gate_still_pay_the_window() -> 
             "payout departs from the recorded 3.x.x outcome:\n{}",
             departures.join("\n")
         );
+        // The exact 3.x.x match above already rules out the 2.x.x outcome;
+        // this keeps the vector itself honest about recording a difference.
         ensure!(
-            !mismatches("2xx", &case["expected_2xx"]["ok"], &projection).is_empty(),
-            "payout matched the 2.x.x whole-coinbase outcome, so D2a is not in force"
+            !mismatches("2xx", &case["expected_2xx"]["ok"], &case["expected_3xx"]["ok"]).is_empty(),
+            "the vector records the same payout on both sides, so it no longer pins a D2a difference"
         );
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    fixture.close().await?;
-    result
+    settle(result, fixture.close().await)
 }
 
 /// The boundary the vectors do not cover: exactly one accepted share, from a
@@ -714,8 +532,7 @@ async fn a_single_share_from_another_miner_takes_the_whole_coinbase() -> Result<
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    fixture.close().await?;
-    result
+    settle(result, fixture.close().await)
 }
 
 // ---------------------------------------------------------------------------
@@ -757,8 +574,7 @@ async fn an_empty_ledger_pays_the_solver_through_a_synthetic_bootstrap_share() -
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    fixture.close().await?;
-    result
+    settle(result, fixture.close().await)
 }
 
 // ---------------------------------------------------------------------------
@@ -832,20 +648,21 @@ async fn a_bootstrap_block_still_pays_carried_forward_balances() -> Result<()> {
             scenario.prior_balances
         );
         assert_bootstrap_payout(&carried, &case["expected_3xx"]["ok"], &scenario)?;
+        // The exact 3.x.x match above already rules out the 2.x.x payout;
+        // this keeps the vector itself honest about recording a difference.
         ensure!(
             !mismatches(
                 "2xx",
                 &case["expected_2xx"]["ok"]["payout_policy_manifest"],
-                &serde_json::to_value(&carried.payout_policy_manifest)?,
+                &case["expected_3xx"]["ok"]["payout_policy_manifest"],
             )
             .is_empty(),
-            "the bootstrap payout dropped prior balances the way 2.x.x did"
+            "the vector records the same payout on both sides, so it no longer pins a D2c difference"
         );
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    fixture.close().await?;
-    result
+    settle(result, fixture.close().await)
 }
 
 /// Give the ledger the scenario's carry-forward balance by recording the
@@ -854,11 +671,10 @@ async fn a_bootstrap_block_still_pays_carried_forward_balances() -> Result<()> {
 /// Every figure comes from the engine: the parent's payout is built with
 /// `build_audit_bundle_with_coinbase_options` and verified with
 /// `verify_audit_bundle_with_ledger_public_key`, and it is that manifest's own
-/// accounts that are recorded, through the same statements and in the same
-/// order `Ledger::land_candidate` and `finish_candidate` use -- the block row
-/// first as `prepared`, then its payout and carry rows, then the flip to
-/// `confirmed` that the summary triggers turn into a balance. Nothing here
-/// invents a carry figure.
+/// accounts that are recorded, through `Ledger::land_candidate`'s own
+/// statements and in its order -- the block row first as `prepared`, then its
+/// payout and carry rows -- followed by the flip to `confirmed` that the
+/// summary triggers turn into a balance. Nothing here invents a carry figure.
 ///
 /// The seeding policy needs two settings working together. `min_output_sats`
 /// is raised so the carried account's share of that block lands below the
@@ -891,11 +707,16 @@ async fn a_bootstrap_block_still_pays_carried_forward_balances() -> Result<()> {
 ///   template's difficulty).
 ///
 /// So this is the migrated, or archived-history, state: the balances are
-/// there and the shares that earned them are not. The statements below mirror
-/// `ledger/blocks.rs` `land_candidate` and `finish_candidate` exactly --
-/// same columns, same JSON extraction, same `account_type = 'miner'` filter,
-/// same order -- so a schema change that moves the real landing path leaves
-/// this copy failing loudly instead of silently seeding a different state.
+/// there and the shares that earned them are not. The three INSERTs below
+/// repeat `ledger/blocks.rs` `land_candidate`'s statements for the block,
+/// payout and carry rows verbatim -- same columns, same JSON extraction, same
+/// `account_type = 'miner'` filter, same order -- so a schema change that moves
+/// them fails here loudly instead of seeding a different state. The rest of
+/// landing is left out because nothing under test reads it: the audit bundle
+/// and share snapshot rows, the CTV fanout artifacts and the payout-revision
+/// bump. The confirming UPDATE is the narrow form of `finish_candidate`'s: a
+/// fresh, immature, `prepared` block needs neither `inactive_since` nor the
+/// `inactive` branch.
 async fn seed_carry_forward_block(
     fixture: &Fixture,
     scenario: &Scenario,
