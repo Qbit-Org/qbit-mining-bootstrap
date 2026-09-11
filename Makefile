@@ -96,7 +96,7 @@ test-prism-postgres:
 	bash test/prism-native-tests.sh
 
 test-prism-postgres-throughput:
-	cargo run --locked --release -p qbit-prism-server -- benchmark --shares 100000 --miners 100 --iterations 10
+	bash test/test-prism-postgres-throughput.sh
 
 test-prism-public-read-replica:
 	bash test/prism-native-tests.sh replica
