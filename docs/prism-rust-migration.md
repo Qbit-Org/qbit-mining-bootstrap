@@ -93,7 +93,7 @@ release definition:
 | #258 applied (v2.0.2) | `candidate_storage_version = 2` and every `002_candidate_bodies.sql` object present | accept after the drain check |
 | partial 002 | some 002 objects or the capability row, but not all (v2.0.2 applies 001 and 002 as two script calls, and a restart between them leaves this) | refuse, naming the missing object; finish 002 with the v2.0.2 release (`PRISM_POSTGRES_INIT_SCHEMA=1`) or restore the backup |
 | newer | `candidate_storage_version > 2`, or a capability this release does not know | refuse before any DDL; a newer PRISM release wrote the database |
-| drifted 001 | a 001 (or 002) object whose definition, after 001 has run, differs from the frozen release: a table, column, index, sequence or named constraint that 001's `IF NOT EXISTS` skipped, or any 002 object, with a dropped constraint, a changed type, nullability or default, a different index definition, an altered sequence (a lowered maximum, a different increment), a table or sequence made `UNLOGGED` (or temporary), a replaced function body or a disabled trigger | refuse transactionally, naming each object and what differs; the migration rolls back and the database is unchanged; restore the pre-migration backup or bring the database to the release schema with the `2.x.x` release, then migrate again |
+| drifted 001 | a 001 (or 002) object whose definition, after 001 has run, differs from the frozen release: a table, column, index, sequence or named constraint that 001's `IF NOT EXISTS` skipped, or any 002 object, with a dropped constraint, a changed type, nullability or default, a different index definition, an altered sequence (a lowered maximum, a different increment), a table or sequence made `UNLOGGED` (or temporary), a release constraint left `NOT VALID` (other than the pinned `qbit_share_ledger_credit_policy_check`), a replaced function body or a disabled trigger | refuse transactionally, naming each object and what differs; the migration rolls back and the database is unchanged; restore the pre-migration backup or bring the database to the release schema with the `2.x.x` release, then migrate again |
 
 **The release definitions.** They are not a stored fingerprint: before any
 DDL touches the source, inside the migration transaction, the migrator opens
@@ -146,11 +146,20 @@ columns and the explicit `qbit_audit_publication_sequence_seq` alike, its
 data type, start, increment, minimum, maximum, cache and cycle. The value a
 sequence has reached is data and is not compared, so a ledger whose share
 sequence has advanced migrates and keeps its position. Schema qualification,
-column order, comments, the names of auto-generated constraints and a `NOT
-VALID` mark on a CHECK 001 added to an upgraded table are ignored. Extra
-tables, columns, constraints, indexes, triggers, functions and sequences are
-kept and logged at warning level. A missing or different object refuses the
-migration:
+column order, comments and the names of auto-generated constraints are
+ignored. A constraint's validation state is compared: a release constraint
+that is `NOT VALID` in the source, a foreign key or CHECK dropped and
+re-added without checking the rows that were there, is drift (`constraint
+qbit_block_candidate_outbox_share_id_fkey on qbit_block_candidate_outbox is
+NOT VALID; the release validates it`), because those rows may be orphaned
+or otherwise invalid. The one exemption is pinned:
+`qbit_share_ledger_credit_policy_check`, which the release 001 itself adds
+`NOT VALID` to a `qbit_share_ledger` upgraded from before the column
+existed and never validates, is accepted in either state. A test derives
+that list from the frozen release SQL, so it cannot drift from the release.
+Extra tables, columns, constraints, indexes, triggers, functions and
+sequences are kept and logged at warning level. A missing or different
+object refuses the migration:
 
 ```
 refusing to migrate a drifted 001 source: after 001_share_ledger.sql ran, the database does not
