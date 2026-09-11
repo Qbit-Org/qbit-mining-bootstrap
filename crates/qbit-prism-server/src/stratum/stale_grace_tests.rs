@@ -20,8 +20,8 @@ impl MiningBackend for Backend {
     async fn observed_tip_hint(&self) -> Option<RetentionTip> {
         self.fixture.coordinator.observed_tip_hint().await
     }
-    async fn new_session_id(&self) -> Result<u32, StratumError> {
-        Ok(1)
+    async fn new_session_id(&self) -> Result<SessionId, StratumError> {
+        Ok(SessionId::from(1))
     }
     async fn authorize(&self, _username: &str) -> Result<Worker, StratumError> {
         Ok(self.next.lock().unwrap().context.worker.clone())

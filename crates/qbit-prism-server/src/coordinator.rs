@@ -312,6 +312,18 @@ impl Coordinator {
             )
             .await?,
         );
+        if !config.initialize_schema {
+            let ready: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM qbit_prism_schema_migrations WHERE version=9)",
+            )
+            .fetch_one(&ledger.pool)
+            .await
+            .context("schema migrations table missing; initialize the Prism schema")?;
+            ensure!(
+                ready,
+                "Prism schema migration 009 is required for mining startup"
+            );
+        }
         ledger
             .configure(&config.fingerprint(genesis.as_str().context("invalid genesis hash")?)?)
             .await?;
@@ -1289,11 +1301,14 @@ impl MiningBackend for Coordinator {
         Ok(())
     }
 
-    async fn new_session_id(&self) -> Result<u32, StratumError> {
-        self.ledger
-            .new_session_id()
-            .await
-            .map_err(|_| protocol_error("backend-rpc-unavailable", "database unavailable"))
+    async fn new_session_id(&self) -> Result<crate::ledger::SessionId, StratumError> {
+        self.ledger.new_session_id().await.map_err(|error| {
+            if error.is::<crate::ledger::SessionAllocationExhausted>() {
+                protocol_error("session-allocation-exhausted", &error.to_string())
+            } else {
+                protocol_error("backend-rpc-unavailable", "database unavailable")
+            }
+        })
     }
 
     async fn authorize(&self, username: &str) -> Result<Worker, StratumError> {
