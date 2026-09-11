@@ -6,6 +6,7 @@ use futures_util::future::LocalBoxFuture;
 use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::{AcceptedShare, CarryForwardBalance, FoundBlock, PayoutPolicy};
 use qbit_prism_server::ledger::{BalanceSource, Ledger, ShareRange, WindowError, WindowRef};
+use qbit_prism_test_gate as gate;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -16,6 +17,8 @@ use tokio::time::{sleep, timeout};
 #[path = "support/window_fixture.rs"]
 mod window_fixture;
 
+#[path = "window_reference/cancellation.rs"]
+mod cancellation;
 #[path = "window_reference/payout_state.rs"]
 mod payout_state;
 
@@ -32,16 +35,8 @@ struct Database {
 
 impl Database {
     async fn open() -> Result<Option<Self>> {
-        let raw = match std::env::var("PRISM_TEST_DATABASE_URL") {
-            Ok(raw) if !raw.trim().is_empty() => raw,
-            Ok(_) | Err(std::env::VarError::NotPresent) => {
-                ensure!(std::env::var("PRISM_TEST_REQUIRE_INTEGRATION").as_deref() != Ok("1")
-                    && std::env::var("GITHUB_JOB").as_deref() != Ok("prism-native-postgres"),
-                    "window_reference requires PRISM_TEST_DATABASE_URL in the PostgreSQL integration job");
-                eprintln!("SKIPPED window_reference: set disposable PRISM_TEST_DATABASE_URL");
-                return Ok(None);
-            }
-            Err(error) => return Err(error.into()),
+        let Some(raw) = gate::database_url(gate::site!())? else {
+            return Ok(None);
         };
         let admin = PgPool::connect(&raw).await?;
         let schema = format!("prism_window_ref_{}", uuid::Uuid::new_v4().simple());
@@ -129,10 +124,15 @@ fn share(seq: u64, filtered: bool) -> AcceptedShare {
         network_difficulty: 1000,
         template_height: 100,
         job_id: "job".into(),
-        job_issued_at_ms: ANCHOR + if filtered && seq % 13 == 0 { 1 } else { -1 },
-        accepted_at_ms: ANCHOR + i64::from(filtered && seq % 11 == 0),
+        job_issued_at_ms: ANCHOR
+            + if filtered && seq.is_multiple_of(13) {
+                1
+            } else {
+                -1
+            },
+        accepted_at_ms: ANCHOR + i64::from(filtered && seq.is_multiple_of(11)),
         ntime: 100,
-        credit_policy: (seq % 2 == 0).then(|| "stale-grace".into()),
+        credit_policy: (seq.is_multiple_of(2)).then(|| "stale-grace".into()),
     }
 }
 
@@ -666,10 +666,7 @@ async fn reviewed_009_sql_coexists_with_008_in_both_orders() -> Result<()> {
 }
 
 fn require_database() -> Result<()> {
-    ensure!(
-        std::env::var("PRISM_TEST_DATABASE_URL").is_ok_and(|raw| !raw.trim().is_empty()),
-        "explicit qualification requires disposable PRISM_TEST_DATABASE_URL"
-    );
+    gate::required_database_url(gate::site!())?;
     Ok(())
 }
 

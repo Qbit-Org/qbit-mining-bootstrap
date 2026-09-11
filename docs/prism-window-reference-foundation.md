@@ -5,10 +5,12 @@ This local slice adds the schema and authenticated reader approved after the
 compact prepared jobs or finish issue273. Authorization covers B-owned code
 only and is not A/C owner approval.
 
-The dependency is open PR313 at `ec888ecfe131f4f9deebbafda9926b299392cac0`,
-added to this child branch through merge `91294e7`, after the earlier additive
-update `bae584e`. The new dependency commit restores D2 coordinator test
-membership. Its original worktree is untouched; this slice adds no release bump.
+This branch includes current `3.x.x` at
+`82a543d36447ce66ee92de90b6295adc7969765e` additively: `48a5923` includes
+PR313's merge `0af13ec`, and `c6bce3a` includes PR297's merge `82a543d`.
+PR313 and the #264 design dependency are no longer open blockers. The earlier
+dependency updates remain in history. The original PR313 worktree is untouched;
+this slice adds no release bump.
 
 The API remains compatible with [PR297's approved bed6ad8 contract](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/bed6ad8888d6bd58ec9fc96fed8b5ba409b63cee/docs/prism-coordinator-refactor/window-ref.md).
 The [posted user signoff](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/297#issuecomment-5638877264)
@@ -28,6 +30,12 @@ unimplemented here, pending the exact A265 interfaces listed below.
   probes endpoints, then reads ascending keyset pages of at most 4096 rows.
   Decode and hash work runs in `spawn_blocking`. Native share JSON is streamed
   into SHA-256 without allocating a serialized copy of the entire window.
+- A `BlockingDrop` guard transfers accumulated page state and vectors awaiting
+  commit to a blocking thread when the reader is cancelled or fails. A page
+  task's abandoned result carries the same guard. This implements the later
+  [cancellation note on #273](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/273#issuecomment-5639213901)
+  without changing `read_window`'s API. After successful return the caller owns
+  the window and its off-thread cleanup obligation.
 - Current balances are digest checked; as-issued balances are decoded from
   the immutable snapshot identified by their semantic digest. Both paths sort
   bytewise by `(order_key, recipient_id, p2mr_program_hex)`, as does the shared
@@ -53,6 +61,10 @@ unimplemented here, pending the exact A265 interfaces listed below.
   history or as-issued blob, and decodes/hashes/drops balances in a blocking
   closure. It has no private deadline or implicit eligibility decision.
   `WindowRef`, `Window`, `WindowError` and `read_window` signatures are unchanged.
+- B's tests use the shared `qbit_prism_test_gate` introduced by merged PR322.
+  All 13 regular B database cases are in `test/prism-gated-tests.txt`; explicit
+  large/cross-branch qualifications use the required-input gate. Test fixture
+  modulo expressions follow the current pinned toolchain's Clippy rules.
 
 The bytea column contracts are `qbit_prism_templates(template_sha256,
 template_bytes)` and `qbit_prism_balance_snapshots(prior_balances_digest,
@@ -108,6 +120,62 @@ SQL test, or issued-dependency suite; their earlier evidence remains below.
 Full refresh/resume, large-template/WAL, async standby, live-qbit, GC/enqueue
 races and full deep-review remain unrun for this integration. No production
 access, push or public approval was performed.
+
+## Current-base draft checkpoint
+
+The base is `3.x.x` at `82a543d`; Rust is now the repository's installed pin
+1.98.1, with disposable PostgreSQL 16.14 located through `pg_config --bindir`.
+The base merge retained upstream versions of every conflicted file; no
+foundation changes existed in those files. No release metadata was changed.
+
+The selected real-database regression run passed 225 tests: 144 library,
+29 ledger, 1 migration rollback, 5 readiness, 22 Stratum, 8 window oracle and
+16 window reference. Three explicit qualifications were ignored in that run.
+All 13 regular window-reference database cases recorded `executed`; the shared
+manifest checker passed against the B-only expected/actual subset. That scoped
+check is not a claim that the entire CI execution manifest has been qualified.
+Workspace all-target compilation and Clippy with `-D warnings` passed. Existing
+miner assertions are unchanged. The two new guard unit tests prove cancelled
+payloads drop on a different thread and successful handoff preserves ownership.
+
+The full 400k/500k reader, actual 009 SQL and issued-dependency evidence below
+remains historical; it was not rerun for this draft checkpoint. Runtime
+refresh/resume, candidate-aware GC, large-template/WAL, async standby and
+cutover qualification remain incomplete. Full deep-review is deferred until
+after draft publication; this document does not report missing lanes as green.
+
+### Late cancellation at 400k
+
+The explicit `cancellation::cancelling_400k_read_after_96_pages_measures_runtime_stall`
+test ran separately on the same disposable PostgreSQL/toolchain. It loads the
+production-shaped 400,000-row fixture, streams 96 complete pages (393,216
+shares), then gates the next page's projected share ID with a transaction-level
+advisory lock. A single-thread Tokio runtime aborts and joins the reader while
+a 1 ms timer measures its scheduling gaps, then verifies the sole reader
+connection can be reused.
+
+For this test-only connection, bitmap/sequence scans and sorting are disabled
+and `EXPLAIN` must contain only streaming nodes. The ordered view and this
+check prevent a sort from evaluating the gate before the first page has been
+returned. An earlier unconstrained sample was rejected for that reason; it is
+not evidence of late cancellation. This is a cleanup measurement, not a
+production query-plan or read-throughput benchmark.
+
+The validated sample reported 27 microseconds from abort to joined cancellation,
+a maximum 5,418 microsecond gap for the 1 ms ticker, and successful connection
+recovery. Test wall time was 29.00 s including fixture setup/read/cleanup;
+`/usr/bin/time -l` around the command reported 31.97 s and 380,977,152 bytes
+maximum RSS. That RSS is command-level (including build/fixture effects), not
+per-phase reader residency. No new timing threshold, full 30 s resume result,
+WAL result, or 500k cancellation qualification is claimed.
+
+```sh
+PRISM_TEST_GATE_MANIFEST=/tmp/window-cancel-gate.txt \
+  bash test/prism-native-tests.sh cargo-args --locked -p qbit-prism-server \
+  --test window_reference \
+  cancellation::cancelling_400k_read_after_96_pages_measures_runtime_stall \
+  -- --ignored --exact --nocapture
+```
 
 ## Initial foundation qualification (d7526fc)
 
@@ -220,7 +288,7 @@ RUSTUP_TOOLCHAIN=1.89.0 bash test/prism-native-tests.sh cargo-args \
    PR313 cold repair to restore all dependencies and the child with immutable
    conflict checks and the child's original absolute expiry. Add transactional,
    job/blob GC under `SETTLEMENT_LOCK` then `ORDER_LOCK`: expire at most 4096
-   jobs, prune their unreferenced templates, then sweep balances unreferenced by
+   jobs beyond a qualified post-expiry grace, prune their unreferenced templates, then sweep balances unreferenced by
    any job or nonterminal leased candidate. The balance sweep also runs when
    zero jobs expire, so candidate-retained orphans disappear after terminal
    completion. See the plan's GC/repair/enqueue race matrix. This foundation
@@ -238,25 +306,35 @@ RUSTUP_TOOLCHAIN=1.89.0 bash test/prism-native-tests.sh cargo-args \
 
 ### Exact A265 dependencies at this checkpoint
 
-Inspection of this combined base still finds `Candidate.bundle: AuditBundle`,
-an optional suffix, no candidate window columns, no `AUDIT_BUILDER_VERSION`,
-and no `codec::witness_merkle_leaves_from_block`. No open A265 implementation PR
-was visible in the repository's open-PR list at this check. The needed handoffs
-are concrete; B is not waiting for a second user signoff:
+Inspection of `3.x.x` at `82a543d` and A265's open
+[PR325 at ff74abb](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/325)
+(`ff74abb0da65f15ddcd25689328a075f7ab2a1b4`) still finds
+`Candidate.bundle: AuditBundle`, an optional suffix, no candidate window
+columns, no `AUDIT_BUILDER_VERSION`, and no
+`codec::witness_merkle_leaves_from_block`. PR325 supplies canonical import/read
+work and explicitly leaves enqueue for A's next PR; it is not a missing B
+import prerequisite. #264 is closed and PR297 is merged, so neither is a design
+blocker. The following remain #265 implementation handoffs, not unanswered
+design objections or a request for another user signoff:
 
 | A-owned interface | Needed by B |
 | --- | --- |
 | `qbit_prism::AUDIT_BUILDER_VERSION: u16` and versioned frozen vectors | Persist/check the actual builder version before reconstructing prepared work; no B-local substitute constant. |
 | Slim candidate fields: `window`, `found_block`, `payout_policy`, nested optional `ctv { direct_floor_sats, settlement_config, fanout_fee_policy }`, `audit_builder_version`, `signer_keys { manifest_key_hex, ledger_key_hex }`, `bootstrap_share`, `leased`, required `coinbase_suffix_hex`, original `payout_revision`, `job_id`, `deferred_share`, block identity/digest and bytes | Agree concrete shared Rust types/exports and construction API. B must retain these original inputs in the resumed job after releasing its full window/body; the old owned-bundle submit constructor cannot do that. |
 | Migration007's six outbox window columns, especially indexed `window_prior_balances_sha256`; authenticated `leased` flag and nonterminal-state predicate | GC must join actual typed references. Current states are `pending`, `submitted`, `abandoned`; A must confirm the retention predicate with 007, including claimed/retrying pending rows. Do not invent a SQL `leased` column when the record only specifies a JSON flag. |
-| Enqueue under `ORDER_LOCK`, with balance-reference existence/recovery contract | A must define the outcome if GC deletes an unreferenced balance row before enqueue acquires its lock. No dangling outbox reference may commit; B does not implement A's retry/repair API. |
-| Leased candidate dispatch: submit stored bytes before terminal supersession/rebuild; active audit uses `AsIssued`; changed-balance landing failure remains recoverable | Required to implement the approved candidate behavior while preserving issued revision. B's current independent candidate fences remain unchanged until A integration. |
+| Enqueue under `ORDER_LOCK`, receiving as-issued balances for digest-checked re-insertion and probing the share prefix | `406b273` answers the GC-first ordering case: reinsert balances before committing the reference, and enqueue/alert even if the share prefix is unexpectedly absent. A's concrete Rust method/input and immutable-conflict behavior are still needed; B does not invent them. |
+| Leased candidate dispatch: submit stored bytes first; rebuild with `AsIssued` and land before any terminal result, whether active or inactive; null inactive results and changed-balance landing failures remain recoverable | Required by the landed follow-up record while preserving issued revision. B's current independent candidate fences remain unchanged until A integration. |
 | Parts-based claim/landing and `codec::witness_merkle_leaves_from_block(&[u8]) -> Result<Vec<String>>` | Candidate reconstructs from immutable original inputs without forcing B to keep an owned `AuditBundle` or a full resumed window. No edits to A's audit/read-range path here. |
 
 B's `qbit_prism_templates(template_sha256, template_bytes)` and
 `qbit_prism_balance_snapshots(prior_balances_digest, balances)` shapes already
 exist in 008. A/C must review their encoding/conflict and retention integration;
 that review does not require B to invent candidate types or copy migration007.
+
+The open source-schema [PR321](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/321)
+at `79498d4ac20e73cc92b619886b685a737657ee27` supplies migration006 and startup
+capabilities, not the missing 007/candidate shape. Its runner will need the
+minimal 008 membership integration when combined; it is not copied here.
 
 ### b3e8ba9 delta and decisions still open
 
@@ -268,6 +346,11 @@ the current full-bundle representation is unchanged. A retention cap, eviction
 policy, and acceptable total RSS need separate qualification/review rather than
 being inferred from the bed6ad8 signoff. A265 owns the additional measurement of
 SQLx's contiguous whole-body bind copy on the runtime during first landing.
+The landed `406b273` follow-up also retains as-issued balances in the slim
+resumed job for enqueue repair and in an empty-window singleflight entry for
+each bootstrap build. Physical deletion waits a B273-selected expiry grace;
+that grace must be qualified above share-path latency and cannot extend job
+eligibility. No grace value or retention/eviction policy is selected here.
 
 At runtime cutover, drain old outbox work and stop all old frontends before the
 coordinated migration/start procedure. This development policy is not a rolling
@@ -276,5 +359,6 @@ compatibility guarantee.
 Full deep-review remains pending against the eventual integrated change:
 medium code-review, thermo, Fable and Codex adversarial lanes, and GitHub/CI/bot
 review have not run for this slice. Local implementation review and tests do
-not establish those lanes. No push, PR, merge-to-base, deployment, or paid
-review capacity was used.
+not establish those lanes. The foundation is intended for draft publication
+before that review, with all incomplete runtime/qualification items explicit.
+Draft visibility does not authorize ready-for-review, merge-to-base or deployment.

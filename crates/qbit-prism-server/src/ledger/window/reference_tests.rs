@@ -15,7 +15,7 @@ fn share(seq: u64) -> AcceptedShare {
         job_issued_at_ms: 1,
         accepted_at_ms: 2,
         ntime: 1,
-        credit_policy: (seq % 2 == 0).then(|| "stale-grace".into()),
+        credit_policy: (seq.is_multiple_of(2)).then(|| "stale-grace".into()),
     }
 }
 

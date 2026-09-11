@@ -2,6 +2,8 @@ use super::*;
 
 mod payout_state;
 pub use payout_state::PayoutState;
+mod blocking_drop;
+use blocking_drop::BlockingDrop;
 
 #[derive(Clone, Debug)]
 pub struct AppendResult {
@@ -145,7 +147,7 @@ impl Ledger {
                 let rows = prior_balance_rows(&mut tx).await?;
                 tokio::task::spawn_blocking(move || {
                     let decoded = decode_prior_balances(rows).map_err(WindowError::Decode)?;
-                    check_balances(decoded, expected_balances, balances)
+                    check_balances(decoded, expected_balances, balances).map(BlockingDrop::new)
                 })
             }
             BalanceSource::AsIssued => {
@@ -156,7 +158,7 @@ impl Ledger {
                 tokio::task::spawn_blocking(move || {
                     let decoded = serde_json::from_slice(&bytes)
                         .map_err(|error| WindowError::Decode(error.into()))?;
-                    check_balances(decoded, expected_balances, balances)
+                    check_balances(decoded, expected_balances, balances).map(BlockingDrop::new)
                 })
             }
         };
@@ -174,28 +176,35 @@ impl Ledger {
                     got: 0,
                 });
             }
-            let mut state = WindowRead::new(first - 1);
-            while state.cursor < last {
+            let mut state = BlockingDrop::new(WindowRead::new(first - 1));
+            while state.get().cursor < last {
                 let rows = sqlx::query(&format!("{SELECT_SHARE} WHERE accepted AND share_seq>$1 AND share_seq<=$2 AND accepted_at<=to_timestamp($3::double precision/1000) AND job_issued_at<=to_timestamp($3::double precision/1000) ORDER BY share_seq LIMIT 4096"))
-                    .bind(state.cursor).bind(last).bind(window.anchor_ms)
+                    .bind(state.get().cursor).bind(last).bind(window.anchor_ms)
                     .fetch_all(&mut *tx).await?;
                 if rows.is_empty() {
                     break;
                 }
-                state = tokio::task::spawn_blocking(move || state.page(rows, range.share_count))
-                    .await
-                    .map_err(|error| WindowError::Decode(error.into()))??;
-            }
-            tokio::task::spawn_blocking(move || state.finish(range))
+                state = tokio::task::spawn_blocking(move || {
+                    state
+                        .into_inner()
+                        .page(rows, range.share_count)
+                        .map(BlockingDrop::new)
+                })
                 .await
-                .map_err(|error| WindowError::Decode(error.into()))??
+                .map_err(|error| WindowError::Decode(error.into()))??;
+            }
+            tokio::task::spawn_blocking(move || {
+                state.into_inner().finish(range).map(BlockingDrop::new)
+            })
+            .await
+            .map_err(|error| WindowError::Decode(error.into()))??
         } else {
-            Vec::new()
+            BlockingDrop::new(Vec::new())
         };
         tx.commit().await?;
         Ok(Window {
-            shares,
-            prior_balances,
+            shares: shares.into_inner(),
+            prior_balances: prior_balances.into_inner(),
             payout_revision,
         })
     }

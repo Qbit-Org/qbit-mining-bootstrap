@@ -16,19 +16,22 @@ must measure affected work and verify prompt replacement-job delivery.
 
 ## Verified dependency state
 
-Checked 2026-09-11 against GitHub and local foundation `d7526fc`, with the
-additive PR313 update merged as `91294e7` in this child worktree only:
+Checked 2026-09-11 against GitHub and current `3.x.x` at
+`82a543d36447ce66ee92de90b6295adc7969765e`. This child includes that base
+additively through `48a5923` (merged PR313) and `c6bce3a` (merged PR297):
 
 | Dependency | Observed state | Consequence |
 | --- | --- | --- |
-| [PR313](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/313) | Open, head `ec888ecfe131f4f9deebbafda9926b299392cac0`, included additively | Restores D2 coordinator test membership; do not alter its original worktree. |
-| [Issue264](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/264) | Open | Its design-merge acceptance is not complete. |
-| [PR297](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/297) | Open, head `b3e8ba94bc10bff2b1dbfc670793480c10035464`; signoff pins `bed6ad8888d6bd58ec9fc96fed8b5ba409b63cee` | Keep the later bootstrap/memory delta separate from the approved contract; see below. |
+| [PR313](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/313) | Merged as `0af13ec9b405731ce4eb93fb473352c94972a730`, included | No remaining PR313 dependency; its original worktree is untouched. |
+| [Issue264](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/264) | Closed by the design merge | No longer a design-merge blocker. B's exact reader/types are implemented locally. |
+| [PR297](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/297) | Head `406b27344f53d9d84b68004adcae05b2f0f46f88` merged as `82a543d`; user signoff pins `bed6ad8` | The unchanged-balances restriction remains. Record later retention/candidate details without inferring a new cutover waiver or choosing an unmeasured retention grace. |
 | [Alex's response](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/297#issuecomment-5637165179) | All four B objections answered; the user approved the narrowed contract | Implementation is not waiting for that signoff. |
 | Borrowing builders and verification | Present in `crates/qbit-prism/src/lib.rs`; `AuditBundleBody`, four borrowed builders, parts verification/canonical serialization, public `prior_balances_digest` | Reuse these APIs. `AuditBundleBody.reward_manifest.shares` remains large and must never enter prepared JSONB. |
 | Shared window reader | `d7526fc` implements the exact types, `read_window` and migration008 under local B authorization | Foundation remains usable; no A-owned `audit::read_range` edit. Local authorization does not imply A/C implementation review. |
 | Builder version | `AUDIT_BUILDER_VERSION` absent | Latest design assigns its introduction and frozen-vector versioning to A's #265. B must not invent a second constant. |
 | Candidate representation | `Candidate.bundle` and submit still require owned `AuditBundle` | Latest design's slim resumed jobs cannot preserve candidate reconstruction without #265 or explicit coordinated integration. |
+| [A265 import PR325](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/325) | Open at `ff74abb0da65f15ddcd25689328a075f7ab2a1b4` | This supplies canonical import/read changes, not the candidate fields, builder constant, witness parser or 007. Import is not a missing B prerequisite. |
+| [Source-schema PR321](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/321) | Open at `79498d4ac20e73cc92b619886b685a737657ee27` | Adds 006/startup capabilities, not 007 or a slim candidate. Coordinate its runner with 008 when integrated; do not copy A-owned code here. |
 | Migrations | Local runner applies 002 through 005 and 008 by version membership | Minimal approach matches PR319; 006, 007 and 009 are not copied into this branch. Candidate-aware GC needs A's 007 fields and retention predicate. |
 
 Read-only inspection of B276 branch `djh58/prism-b4-wrap-safe-sequence` at
@@ -59,6 +62,32 @@ claim is invalid. A generation cap, eviction change, and acceptable total RSS
 remain qualification/contract decisions, not an inferred approval to alter
 retained miner work. The later record also names SQLx's whole-body bind copy on
 landing; A265 owns its 400k stall measurement and any follow-up decision.
+
+### Landed follow-ups through 406b273
+
+The empty-window singleflight entry keeps as-issued balances until every
+waiter's bootstrap build finishes. The slim resumed job also retains those
+balances for leased enqueue repair. A's enqueue re-inserts the digest-checked
+balance snapshot inside its `ORDER_LOCK` transaction; that previously open
+ordering question is now answered in the record and should not be asked again.
+The concrete Rust enqueue input/exports remain unavailable in PR325.
+
+The record now calls for an expiry grace before physical job deletion, and for
+expired-but-not-deleted jobs to retain D6's share floor. B must set and qualify
+that grace above measured share-path latency without extending the child's
+absolute eligibility deadline. The exact grace value is not specified or
+implemented here. A still enqueues and alerts on an unexpectedly missing share
+prefix so the block reaches the node; B does not change that candidate contract.
+Leased dispatch submits first, then lands the audit before any terminal result,
+even for an inactive block; null inactive results stay recoverable. These are
+A-owned implementation requirements, not missing design answers.
+
+The additional cancellation note on #273 is implemented independently in B's
+reader: accumulated state and completed vectors awaiting transaction commit
+have a guard that hands destruction to a blocking thread on cancellation/error.
+This also covers a completed blocking page whose awaiting future disappears.
+Successful return transfers the vectors to the caller, which retains its own
+off-thread cleanup obligation. The foundation report records its tests.
 
 ## Proposed schema and storage contract
 
@@ -199,7 +228,8 @@ post-wait authority checks, and immutable conflicts.
 GC acquires `SETTLEMENT_LOCK` **then `ORDER_LOCK`**, before deleting any rows,
 and runs three separate statements in that same transaction:
 
-1. Delete at most 4096 expired jobs, keeping the outer expiry recheck, and
+1. Delete at most 4096 jobs beyond the selected post-expiry retention grace,
+   keeping the outer expiry/grace recheck, and
    return their template digests.
 2. Delete templates among those digests only when no surviving job references
    them.
@@ -225,10 +255,12 @@ remove a nonterminal candidate's protection. No share-ledger pruning is added.
 Production GC remains gated on A265's typed outbox digest column/index and
 agreed authenticated `leased`/nonterminal predicate. The current inline outbox
 has no such columns; do not infer a reference from its old bundled payload or
-silently collect when a required schema/API is absent. A's enqueue must confirm
-the referenced balance row exists while holding `ORDER_LOCK`, or return an
-error that permits safe recovery if GC won first; B cannot promise preservation
-based on an unlocked earlier read. The exact enqueue recovery API is A-owned.
+silently collect when a required schema/API is absent. Per landed `406b273`,
+A's enqueue re-inserts the digest-checked as-issued balances under `ORDER_LOCK`
+before committing its reference, including when GC went first. A probes the
+share prefix but still enqueues with an alert if it is missing. The exact Rust
+input and immutable-conflict implementation remain A-owned. B cannot promise
+preservation based on an unlocked earlier read or invent a different outcome.
 
 ## Resume admission, capacity, and cancellation
 
@@ -306,9 +338,11 @@ one new frontend before the rest. Legacy inline prepared rows are cache misses
 and expire normally. This is not a rolling-upgrade compatibility promise.
 
 This is high-stakes work because it changes payout reconstruction and stored
-schema. Later qualification requires the full deep-review battery and accurate
-reporting of unavailable lanes. No push or PR is authorized before coordinator
-review of the plan and qualified diff; no merge, VERSION, or CHANGELOG change.
+schema. The completed foundation may be published as a draft before full
+deep-review, with incomplete runtime and qualification items explicit. The
+eventual integrated change still requires the full review battery and accurate
+reporting of unavailable lanes. Draft visibility is not approval to mark it
+ready or merge; no VERSION or CHANGELOG bump is part of this work.
 
 ## Initial execution evidence (historical)
 
