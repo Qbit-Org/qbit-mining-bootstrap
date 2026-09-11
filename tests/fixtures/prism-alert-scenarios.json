@@ -168,6 +168,16 @@
     }
   },
   {
+    "name": "public scrape fails while stale ready sample remains",
+    "series": {
+      "qbit_prism_public_ledger_ready{job=\"qbit-prism-public-read\",instance=\"failed\",network=\"mainnet\"}": 1,
+      "up{job=\"qbit-prism-public-read\",instance=\"failed\",network=\"mainnet\"}": 0
+    },
+    "expect": {
+      "PrismPublicLedgerUnready": 1
+    }
+  },
+  {
     "name": "network client floor: six plus six is healthy",
     "series": {
       "up{job=\"qbit-prism\",instance=\"coordinator-0\",network=\"mainnet\"}": 1,

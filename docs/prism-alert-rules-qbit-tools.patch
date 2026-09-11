@@ -106,7 +106,7 @@
 -  that never increment RestartCount, so planned work needs no maintenance
 -  flag; drills that crash the coordinator on purpose use a Grafana silence.
 +{# Native 3.x.x cutover draft, bootstrap #279. Apply only with the native image.
-+   Specification SHA-256: 79ea5c4531a8f65cf407c3dbbe68050634ba4500f151930eb5bd84b9a810334e
++   Specification SHA-256: 831315bcf6ac242a3db7edcf6273be392228d64a58ec62dab24821b41a9d98a5
 +   Generated from the reviewed a007a142 snapshot; backup, sidecar and lifecycle rules retain their producers.
 +   Native numeric bounds marked provisional must be measured in #291 before production cutover.
 +   The D3 group requires PRIMARY postgres_exporter query metrics; see bootstrap docs/prism-alert-migration.md.
@@ -638,7 +638,7 @@
 +  {
 +    "uid": "qbit-prism-public-ledger-unready",
 +    "title": "PrismPublicLedgerUnready",
-+    "expr": "(qbit_prism_public_ledger_ready{job=\"qbit-prism-public-read\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == bool 0) or on(job, instance, network) (0 * up{job=\"qbit-prism-public-read\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} + 1)",
++    "expr": "(((qbit_prism_public_ledger_ready{job=\"qbit-prism-public-read\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == bool 0) or on(job, instance, network) (0 * up{job=\"qbit-prism-public-read\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} + 1)) + on(job, instance, network) (up{job=\"qbit-prism-public-read\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == bool 0)) > bool 0",
 +    "condition_type": "threshold",
 +    "evaluator": "gt",
 +    "threshold": 0,
@@ -649,7 +649,7 @@
 +      "alert_class": "prism-runtime"
 +    },
 +    "summary": "PrismPublicLedgerUnready",
-+    "description": "The public read probe is failed, unknown or stale; its freshness owner does not emit the coordinator snapshot gauges. Readiness already rejects missing/failed probes and ages >= max(3 * probe interval, 15s). Missing readiness on any configured scrape target also fires, even while another public instance is healthy.",
++    "description": "The public read probe is failed, unknown or stale, or its scrape target is down; its freshness owner does not emit the coordinator snapshot gauges. Readiness already rejects missing/failed probes and ages >= max(3 * probe interval, 15s). Missing readiness and failed scrapes on any configured target fire, even while another public instance is healthy.",
 +    "no_data_state": "Alerting",
 +    "exec_err_state": "Alerting"
 +  },

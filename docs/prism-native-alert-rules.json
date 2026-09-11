@@ -615,7 +615,7 @@
       "uid": "qbit-prism-public-ledger-unready",
       "title": "PrismPublicLedgerUnready",
       "role": "public-api",
-      "expr": "(qbit_prism_public_ledger_ready{job=\"qbit-prism-public-read\",network=\"__NETWORK__\"} == bool 0) or on(job, instance, network) (0 * up{job=\"qbit-prism-public-read\",network=\"__NETWORK__\"} + 1)",
+      "expr": "(((qbit_prism_public_ledger_ready{job=\"qbit-prism-public-read\",network=\"__NETWORK__\"} == bool 0) or on(job, instance, network) (0 * up{job=\"qbit-prism-public-read\",network=\"__NETWORK__\"} + 1)) + on(job, instance, network) (up{job=\"qbit-prism-public-read\",network=\"__NETWORK__\"} == bool 0)) > bool 0",
       "condition_type": "threshold",
       "evaluator": "gt",
       "threshold": 0,
@@ -626,7 +626,7 @@
         "alert_class": "prism-runtime"
       },
       "summary": "PrismPublicLedgerUnready",
-      "description": "The public read probe is failed, unknown or stale; its freshness owner does not emit the coordinator snapshot gauges. Readiness already rejects missing/failed probes and ages >= max(3 * probe interval, 15s). Missing readiness on any configured scrape target also fires, even while another public instance is healthy.",
+      "description": "The public read probe is failed, unknown or stale, or its scrape target is down; its freshness owner does not emit the coordinator snapshot gauges. Readiness already rejects missing/failed probes and ages >= max(3 * probe interval, 15s). Missing readiness and failed scrapes on any configured target fire, even while another public instance is healthy.",
       "no_data_state": "Alerting",
       "exec_err_state": "Alerting",
       "basis": "Readiness already rejects missing/failed probes and ages >= max(3 * probe interval, 15s).",
