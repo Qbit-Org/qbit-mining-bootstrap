@@ -25,6 +25,7 @@ use candidates::persist_candidate;
 pub use candidates::{Candidate, CandidateClaim};
 mod connect;
 use connect::{lock, require_revision, writable};
+pub use connect::{SessionAllocationExhausted, SessionId};
 mod difficulty;
 mod fanout;
 mod jobs;

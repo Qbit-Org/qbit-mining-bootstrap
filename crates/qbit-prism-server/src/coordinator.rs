@@ -1218,11 +1218,14 @@ impl MiningBackend for Coordinator {
         Ok(())
     }
 
-    async fn new_session_id(&self) -> Result<u32, StratumError> {
-        self.ledger
-            .new_session_id()
-            .await
-            .map_err(|_| protocol_error("backend-rpc-unavailable", "database unavailable"))
+    async fn new_session_id(&self) -> Result<crate::ledger::SessionId, StratumError> {
+        self.ledger.new_session_id().await.map_err(|error| {
+            if error.is::<crate::ledger::SessionAllocationExhausted>() {
+                protocol_error("session-allocation-exhausted", &error.to_string())
+            } else {
+                protocol_error("backend-rpc-unavailable", "database unavailable")
+            }
+        })
     }
 
     async fn authorize(&self, username: &str) -> Result<Worker, StratumError> {

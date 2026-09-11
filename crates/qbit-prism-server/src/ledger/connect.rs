@@ -1,5 +1,73 @@
 use super::*;
 
+const SESSION_ALLOCATION_ATTEMPTS: usize = 1024;
+
+#[derive(Debug, thiserror::Error)]
+#[error("no free session extranonce found after 1024 allocation attempts; retry subscription")]
+pub struct SessionAllocationExhausted;
+
+/// Owns a four-byte extranonce for the lifetime of a subscribed connection.
+/// This is deliberately not Clone: dropping the owner releases its reservation.
+#[derive(Debug)]
+#[must_use = "retain the reservation guard for the entire subscribed session"]
+pub struct SessionId {
+    id: u32,
+    reservation: Option<(PgPool, String)>,
+}
+
+impl SessionId {
+    pub fn value(&self) -> u32 {
+        self.id
+    }
+
+    /// Release after a caller has finished using this session, awaiting the
+    /// durable cleanup. Drop provides the cancellation/disconnect fallback.
+    pub async fn release(mut self) -> Result<()> {
+        if let Some((pool, token)) = &self.reservation {
+            sqlx::query("DELETE FROM qbit_prism_session_reservations WHERE extranonce1=$1 AND reservation_token=$2")
+                .bind(i64::from(self.id)).bind(token).execute(pool).await?;
+            self.reservation = None;
+        }
+        Ok(())
+    }
+}
+
+/// Backends without a PostgreSQL ledger can supply their own unique ID.
+impl From<u32> for SessionId {
+    fn from(id: u32) -> Self {
+        Self {
+            id,
+            reservation: None,
+        }
+    }
+}
+
+impl std::fmt::LowerHex for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::LowerHex::fmt(&self.id, f)
+    }
+}
+
+impl Drop for SessionId {
+    fn drop(&mut self) {
+        let Some((pool, token)) = self.reservation.take() else {
+            return;
+        };
+        let id = self.id;
+        // Shutdown/cancellation must not release somebody else's replacement.
+        // A lost commit response or failed cleanup can retain a reservation;
+        // this is safe, and stopped-owner reclamation handles normal shutdown.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(error) = sqlx::query("DELETE FROM qbit_prism_session_reservations WHERE extranonce1=$1 AND reservation_token=$2")
+                    .bind(i64::from(id)).bind(token).execute(&pool).await {
+                    tracing::warn!(%error, "session reservation cleanup deferred");
+                }
+            });
+        }
+    }
+}
+
 impl Ledger {
     pub async fn connect(
         url: &str,
@@ -42,11 +110,13 @@ impl Ledger {
             let mut tx = pool.begin().await?;
             lock(&mut tx, MIGRATION_LOCK).await?;
             sqlx::raw_sql("CREATE TABLE IF NOT EXISTS qbit_prism_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())").execute(&mut *tx).await?;
-            let version: Option<i32> =
-                sqlx::query_scalar("SELECT max(version) FROM qbit_prism_schema_migrations")
-                    .fetch_one(&mut *tx)
+            // 006/007/008 are reserved by independent workstreams. Track each
+            // applied migration rather than letting 009 hide an earlier gap.
+            let versions: Vec<i32> =
+                sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations")
+                    .fetch_all(&mut *tx)
                     .await?;
-            if version.unwrap_or(0) < 3 {
+            if !versions.contains(&3) {
                 // Existing native writers use this same lock order. Keep the
                 // schema repair and cutover atomic with their accounting.
                 lock(&mut tx, SETTLEMENT_LOCK).await?;
@@ -78,7 +148,7 @@ impl Ledger {
                     "../../../qbit-prism/sql/001_share_ledger.sql"
                 ))?;
                 sqlx::raw_sql(&base_schema).execute(&mut *tx).await?;
-                if version.unwrap_or(0) < 2 {
+                if !versions.contains(&2) {
                     sqlx::raw_sql(include_str!("../../migrations/002_multi_instance.sql"))
                         .execute(&mut *tx)
                         .await?;
@@ -93,7 +163,7 @@ impl Ledger {
                     .execute(&mut *tx)
                     .await?;
             }
-            if version.unwrap_or(0) < 4 {
+            if !versions.contains(&4) {
                 sqlx::raw_sql(include_str!(
                     "../../migrations/004_cpfp_retired_funding.sql"
                 ))
@@ -103,11 +173,19 @@ impl Ledger {
                     .execute(&mut *tx)
                     .await?;
             }
-            if version.unwrap_or(0) < 5 {
+            if !versions.contains(&5) {
                 sqlx::raw_sql(include_str!("../../migrations/005_candidate_dispatch.sql"))
                     .execute(&mut *tx)
                     .await?;
                 sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(5)")
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            if !versions.contains(&9) {
+                sqlx::raw_sql(include_str!("../../migrations/009_wrap_safe_sessions.sql"))
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(9)")
                     .execute(&mut *tx)
                     .await?;
             }
@@ -154,12 +232,42 @@ impl Ledger {
         Ok(())
     }
 
-    /// Globally unique four-byte extranonce1; the sequence never cycles.
-    pub async fn new_session_id(&self) -> Result<u32> {
-        let id: i64 = sqlx::query_scalar("SELECT nextval('qbit_prism_session_sequence')")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(u32::try_from(id)?)
+    /// Reserve a four-byte extranonce across every frontend, including at wrap.
+    /// The caller must retain the returned guard for the entire session.
+    pub async fn new_session_id(&self) -> Result<SessionId> {
+        for _ in 0..SESSION_ALLOCATION_ATTEMPTS {
+            // Each attempt has its own short transaction. The unique key,
+            // rather than an extra global lock, arbitrates wrapped candidates.
+            let mut tx = self.pool.begin().await?;
+            let id: i64 = sqlx::query_scalar("SELECT nextval('qbit_prism_session_sequence')")
+                .fetch_one(&mut *tx)
+                .await?;
+            let id = u32::try_from(id)?;
+            let token = Uuid::new_v4().to_string();
+            let reserved = sqlx::query("INSERT INTO qbit_prism_session_reservations AS held (extranonce1,instance_id,reservation_token) VALUES($1,$2,$3) ON CONFLICT(extranonce1) DO UPDATE SET instance_id=EXCLUDED.instance_id,reservation_token=EXCLUDED.reservation_token,created_at=clock_timestamp() WHERE EXISTS (SELECT 1 FROM qbit_prism_instances owner WHERE owner.instance_id=held.instance_id AND owner.status->>'state'='stopped')")
+                .bind(i64::from(id)).bind(&self.instance_id).bind(&token)
+                .execute(&mut *tx).await?.rows_affected();
+            if reserved == 0 {
+                tx.rollback().await?;
+                continue;
+            }
+            let referenced: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM qbit_prism_jobs WHERE lower(payload->>'extranonce1')=$1 AND expires_at>clock_timestamp())")
+                .bind(format!("{id:08x}")).fetch_one(&mut *tx).await?;
+            if referenced {
+                tx.rollback().await?;
+                continue;
+            }
+            // Until now cancellation only rolls back an uncommitted attempt.
+            // Arm cleanup before commit; a lost commit response can at worst
+            // retain this token, never allow an unsafe reuse.
+            let session = SessionId {
+                id,
+                reservation: Some((self.pool.clone(), token)),
+            };
+            tx.commit().await?;
+            return Ok(session);
+        }
+        Err(SessionAllocationExhausted.into())
     }
 
     pub async fn payout_revision(&self) -> Result<i64> {

@@ -222,6 +222,56 @@ fn coordinator_config(database_url: String, node: &Node) -> Result<Config> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn coordinator_reports_wrap_exhaustion_truthfully() -> Result<()> {
+    let Ok(raw) = std::env::var("PRISM_TEST_DATABASE_URL") else {
+        eprintln!("set PRISM_TEST_DATABASE_URL for coordinator allocation error mapping");
+        return Ok(());
+    };
+    let admin = sqlx::PgPool::connect(&raw).await?;
+    let schema = format!("prism_allocation_error_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await?;
+    let mut url = url::Url::parse(&raw)?;
+    url.query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let node = Node::open().await?;
+    let coordinator = Coordinator::new(
+        coordinator_config(url.into(), &node)?,
+        Arc::new(qbit_prism_server::metrics::Metrics::default()),
+    )
+    .await?;
+    coordinator
+        .ledger
+        .save_job(
+            "occupied-second-value",
+            &json!({"extranonce1":"00000002"}),
+            0,
+            "parent",
+            3600,
+        )
+        .await?;
+    sqlx::query("ALTER SEQUENCE qbit_prism_session_sequence MAXVALUE 2")
+        .execute(&coordinator.ledger.pool)
+        .await?;
+    let held = coordinator.new_session_id().await?;
+    let error = coordinator.new_session_id().await.unwrap_err();
+    assert_eq!(
+        error.reason_id.as_deref(),
+        Some("session-allocation-exhausted")
+    );
+    assert_eq!(error.code, 20);
+    assert!(error.message.contains("1024 allocation attempts"));
+    held.release().await?;
+    coordinator.ledger.pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin)
+        .await?;
+    admin.close().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn observed_readiness_failure_closes_cached_work_and_candidate_settlement() -> Result<()> {
     let Ok(raw) = std::env::var("PRISM_TEST_DATABASE_URL") else {
         eprintln!("skipping coordinator readiness integration; set PRISM_TEST_DATABASE_URL");
@@ -278,7 +328,8 @@ async fn observed_readiness_failure_closes_cached_work_and_candidate_settlement(
             "equivalent timer reanchor reset semantic delivery coverage"
         );
         let worker = coordinator.authorize("miner.test").await?;
-        let extra = format!("{:08x}", coordinator.new_session_id().await?);
+        let session_id = coordinator.new_session_id().await?;
+        let extra = format!("{session_id:08x}");
         let job = coordinator.build_job(&worker, &extra, 1e-9, 0.0).await?;
         coordinator
             .persist_issued_job(&worker, &job, 0, Duration::from_secs(60))
@@ -541,7 +592,8 @@ async fn another_frontend_payout_revision_retires_same_parent_work_and_preserves
         first.refresh_once().await?;
         second.refresh_once().await?;
         let worker = first.authorize("miner.revision").await?;
-        let extra = format!("{:08x}", first.new_session_id().await?);
+        let session_id = first.new_session_id().await?;
+        let extra = format!("{session_id:08x}");
         let old = first.build_job(&worker, &extra, 1e-12, 0.0).await?;
         first.persist_issued_job(&worker, &old, 0, Duration::from_secs(60)).await?;
         ensure!(second.resume_job(&worker, &old.wire.job_id).await?.is_some());
@@ -672,7 +724,8 @@ async fn cached_ctv_work_revalidates_live_floors_and_fences_old_underfunded_jobs
             coordinator.refresh_once().await?;
             let original_generation = coordinator.health().await["template_generation"].clone();
             let worker = coordinator.authorize("miner.test").await?;
-            let extra = format!("{:08x}", coordinator.new_session_id().await?);
+            let session_id = coordinator.new_session_id().await?;
+            let extra = format!("{session_id:08x}");
             let low_job = coordinator.build_job(&worker, &extra, 1e-12, 0.0).await?;
             ensure!(
                 low_job.context.bundle.ctv_fanout_manifest_set.is_some(),

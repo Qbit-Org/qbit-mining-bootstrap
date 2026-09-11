@@ -91,8 +91,8 @@ impl MiningBackend for Backend {
         }
         Ok(())
     }
-    async fn new_session_id(&self) -> Result<u32, StratumError> {
-        Ok(self.sessions.fetch_add(1, Ordering::Relaxed) + 1)
+    async fn new_session_id(&self) -> Result<qbit_prism_server::ledger::SessionId, StratumError> {
+        Ok((self.sessions.fetch_add(1, Ordering::Relaxed) + 1).into())
     }
     async fn authorize(&self, username: &str) -> Result<Worker, StratumError> {
         if !username.starts_with("miner") {

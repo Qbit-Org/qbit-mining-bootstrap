@@ -1,7 +1,7 @@
 //! Actual listener/socket fixture; only backend I/O is controlled.
 use qbit_prism_server::{
     codec::Submission,
-    ledger::Ledger,
+    ledger::{Ledger, SessionAllocationExhausted, SessionId},
     stratum::{
         run_listener, MiningBackend, MiningJob, StratumConfig, StratumError, StratumStats, Worker,
     },
@@ -33,17 +33,20 @@ pub struct Backend {
 }
 impl MiningBackend for Backend {
     type Context = ();
-    async fn new_session_id(&self) -> Result<u32, StratumError> {
+    async fn new_session_id(&self) -> Result<SessionId, StratumError> {
         self.allocation_calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_once.swap(false, Ordering::SeqCst) {
             return Err(StratumError::backend("controlled allocator unavailable"));
         }
         let id = match &self.ledger {
-            Some(ledger) => ledger
-                .new_session_id()
-                .await
-                .map_err(|_| StratumError::backend("database unavailable"))?,
-            None => self.ids.fetch_add(1, Ordering::SeqCst) + 1,
+            Some(ledger) => ledger.new_session_id().await.map_err(|error| {
+                if error.is::<SessionAllocationExhausted>() {
+                    StratumError::new(20, error.to_string(), "session-allocation-exhausted")
+                } else {
+                    StratumError::backend("database unavailable")
+                }
+            })?,
+            None => (self.ids.fetch_add(1, Ordering::SeqCst) + 1).into(),
         };
         // Models a consumed sequence value whose RPC reply misses the deadline.
         if self.stall_once.swap(false, Ordering::SeqCst) {
