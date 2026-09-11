@@ -55,6 +55,15 @@ if [[ "${mode}" == live ]]; then
   cargo test --locked -p qbit-prism-server --test live_regtest -- --nocapture
 elif [[ "${mode}" == replica ]]; then
   cargo test --locked -p qbit-prism-server --test postgres_failover -- --nocapture
+elif [[ "${mode}" == cargo-args ]]; then
+  # Run an arbitrary cargo test invocation against the cluster this script
+  # prepared, so long or #[ignore]d runs can use the disposable database too.
+  shift
+  [[ $# -gt 0 ]] || {
+    echo 'Usage: test/prism-native-tests.sh cargo-args <cargo test arguments...>' >&2
+    exit 1
+  }
+  cargo test "$@"
 else
   cargo test --locked -p qbit-prism-server --all-targets
   cargo test --locked -p qbit-prism-server --test observability_database -- --ignored
