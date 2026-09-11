@@ -76,9 +76,10 @@ def main() -> None:
     # JSON-lines adapter for reproducible qualification, intentionally no I/O
     # beyond stdin/stdout and no claim of real load-balancer behavior.
     config = ProbeConfig()
+    probe = ReadinessProbe(config)
     for line in __import__("sys").stdin:
         item = json.loads(line)
-        print(json.dumps({"state": ReadinessProbe(config).observe(item["response"], item.get("elapsed_s", 0.0))}))
+        print(json.dumps({"state": probe.observe(item["response"], item.get("elapsed_s", 0.0))}))
 
 
 if __name__ == "__main__":
