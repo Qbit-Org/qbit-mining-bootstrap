@@ -753,7 +753,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     let profile_canonical = profile::canonical_json(&profile_document);
     let profile_digest = profile::digest(&profile_canonical);
     let profile_path = args.out.join("database-profile.json");
-    std::fs::write(&profile_path, format!("{profile_canonical}\n"))?;
+    profile::write_document(&profile_path, &profile_canonical)?;
 
     let subject: BTreeMap<String, String> = [
         ("coordinator_revision", ctx.revision.clone()),

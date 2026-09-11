@@ -55,6 +55,21 @@ pub fn digest(canonical: &str) -> String {
     hex::encode(Sha256::digest(canonical.as_bytes()))
 }
 
+/// Write exactly the bytes the digest was taken over.
+///
+/// Nothing may be appended, not even a trailing newline. The field exists so a
+/// third party can run `sha256sum database-profile.json` against
+/// `subject.database_profile_sha256`, and a mismatched digest in an evidence
+/// bundle honestly reads as a corrupted or tampered bundle. Digesting the
+/// file's bytes instead would make the digest a function of the serializer,
+/// which this module exists to avoid.
+pub fn write_document(path: &std::path::Path, canonical: &str) -> Result<()> {
+    use anyhow::Context;
+    std::fs::write(path, canonical.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 /// `SHOW ALL`, as a name to setting map plus the units the server reports.
 pub async fn show_all(pool: &PgPool) -> Result<Value> {
     let rows = sqlx::query("SELECT name, setting, COALESCE(unit,'') AS unit FROM pg_settings")

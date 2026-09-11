@@ -274,8 +274,11 @@ own session settings. If any of `fsync`, `full_page_writes` or
 Schema `qbit.prism.database-profile.v1`: canonical JSON with sorted keys,
 carrying `pg_settings`, the replication mode and rows, the proxy configuration,
 host facts and any cgroup limits. Its SHA-256 is the artifact's
-`subject.database_profile_sha256`. The repository defines no schema for this
-document; the harness writes one and ships it beside the artifact.
+`subject.database_profile_sha256`, over the file's exact bytes: the document is
+written with no trailing newline, so `sha256sum database-profile.json` is the
+value the artifact names and a third party can verify the bundle with one
+command. The repository defines no schema for this document; the harness writes
+one and ships it beside the artifact.
 
 ### 3. `load-harness-report.json`
 

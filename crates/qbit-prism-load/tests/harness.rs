@@ -1190,6 +1190,44 @@ fn the_database_profile_digest_is_a_function_of_the_content_only() {
 }
 
 #[test]
+fn the_shipped_profile_file_hashes_to_the_digest_the_artifact_names() -> Result<()> {
+    use sha2::{Digest, Sha256};
+    // The one check a third party can make on an evidence bundle is
+    // `sha256sum database-profile.json` against
+    // `subject.database_profile_sha256`, so the bytes on disk have to be
+    // exactly the bytes that were digested: no trailing newline, nothing else
+    // appended (F1).
+    let document = profile::build(
+        json!({"settings": {"fsync": "on"}}),
+        "16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)",
+        json!({"declared": "async"}),
+        json!({"kind": "in-harness tokio TCP proxy"}),
+        json!({"cpus": 8}),
+        json!([{"instance_id": "load-fe-0"}]),
+    );
+    let canonical = profile::canonical_json(&document);
+    let digest = profile::digest(&canonical);
+    let path = std::env::temp_dir().join(format!("prism-load-profile-{}.json", std::process::id()));
+    profile::write_document(&path, &canonical)?;
+    let bytes = std::fs::read(&path)?;
+    std::fs::remove_file(&path)?;
+    assert_eq!(
+        hex::encode(Sha256::digest(&bytes)),
+        digest,
+        "sha256sum of the shipped file must equal subject.database_profile_sha256"
+    );
+    assert_ne!(
+        bytes.last(),
+        Some(&b'\n'),
+        "a trailing newline would break every third-party verification"
+    );
+    // The file still parses as the document it describes.
+    let reparsed: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(reparsed["schema"], json!(profile::SCHEMA));
+    Ok(())
+}
+
+#[test]
 fn latency_percentiles_report_unknown_rather_than_zero() {
     let empty = qbit_prism_load::measure::summarize(Vec::new(), "client monotonic");
     assert_eq!(empty.samples, 0);
