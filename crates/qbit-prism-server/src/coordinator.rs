@@ -3,7 +3,7 @@ use crate::{
     config::Config,
     ledger::{BlockObservation, Candidate, CandidateClaim, Ledger, Snapshot},
     rpc::Rpc,
-    stratum::{MiningBackend, MiningJob, StratumError, Worker},
+    stratum::{MiningBackend, MiningJob, StaleGrace, StratumError, Worker},
 };
 use anyhow::{ensure, Context, Result};
 use num_bigint::BigUint;
@@ -23,6 +23,13 @@ use std::{
 };
 use tokio::sync::{watch, Mutex, Notify, RwLock, Semaphore};
 
+mod miner_submit;
+mod prepared_storage;
+mod submit_ledger;
+mod tip_observation;
+mod work_ledger;
+pub use tip_observation::TipState;
+
 pub struct JobContext {
     pub prepared: Arc<Prepared>,
     pub worker: Worker,
@@ -30,6 +37,13 @@ pub struct JobContext {
 }
 
 pub struct Prepared {
+    // Original durable representation, including bootstrap bundle=None and
+    // coinbase suffix. Heavy snapshot/bundle data is shared by the stored
+    // record; Prepared also keeps access-oriented views below.
+    stored: Arc<StoredPrepared>,
+    repair: Arc<Mutex<()>>,
+    #[cfg(test)]
+    repair_probe: std::sync::Mutex<Option<Arc<prepared_storage::RepairProbe>>>,
     pub template: Value,
     pub snapshot: Arc<Snapshot>,
     pub bundle: Option<Arc<AuditBundle>>,
@@ -78,7 +92,9 @@ pub struct Coordinator {
     pub rejected: AtomicU64,
     pub blocks: AtomicU64,
     readiness: RwLock<ReadinessState>,
-    pub observed_tip: RwLock<Option<String>>,
+    pub observed_tip: RwLock<TipState>,
+    submit_ledger: Arc<dyn submit_ledger::SubmitLedger>,
+    work_ledger: Arc<dyn work_ledger::WorkLedger>,
     pub last_error: RwLock<Option<String>>,
     build_slots: Arc<Semaphore>,
     refresh_lock: Mutex<()>,
@@ -316,6 +332,8 @@ impl Coordinator {
             metrics,
             build_slots: Arc::new(Semaphore::new(config.build_workers)),
             config: Arc::new(config),
+            submit_ledger: ledger.clone(),
+            work_ledger: ledger.clone(),
             ledger,
             rpc,
             refresh,
@@ -325,7 +343,7 @@ impl Coordinator {
             rejected: AtomicU64::new(0),
             blocks: AtomicU64::new(0),
             readiness: RwLock::new(ReadinessState::default()),
-            observed_tip: RwLock::new(None),
+            observed_tip: RwLock::new(TipState::default()),
             last_error: RwLock::new(None),
             refresh_lock: Mutex::new(()),
             identities: Mutex::new(HashMap::new()),
@@ -371,13 +389,26 @@ impl Coordinator {
     }
 
     async fn ready_chain_info(&self) -> Result<Value> {
+        self.observe_chain_info(false).await
+    }
+
+    async fn observe_chain_info(&self, from_refresh: bool) -> Result<Value> {
+        let sequence = self.observed_tip.write().await.reserve();
         let result =
             crate::readiness::chain_info(&self.rpc, &self.config.chain, self.config.min_peers)
-                .await;
+                .await
+                .and_then(|info| {
+                    let hash = tip_observation::tip_hash(&info["bestblockhash"])
+                        .context("qbit did not report a valid tip hash")?
+                        .to_owned();
+                    Ok((info, hash))
+                });
         match result {
-            Ok(info) => {
-                *self.observed_tip.write().await =
-                    info["bestblockhash"].as_str().map(str::to_owned);
+            Ok((info, hash)) => {
+                self.observed_tip
+                    .write()
+                    .await
+                    .observe(&hash, sequence, from_refresh);
                 Ok(info)
             }
             Err(error) => {
@@ -419,7 +450,7 @@ impl Coordinator {
     /// Reconcile against one coherent tip. Every frontend observes prepared
     /// parents before building a descendant with its carry-forward snapshot.
     pub async fn reconcile(&self, tip: &str, tip_height: u64, revision: i64) -> Result<()> {
-        let blocks = self.ledger.pool_blocks_for_reconcile().await?;
+        let blocks = self.work_ledger.pool_blocks().await?;
         let mut cache = self.chain_cache.lock().await;
         let extends = if let Some(previous) = cache.as_ref() {
             tip_height >= previous.height
@@ -468,8 +499,8 @@ impl Coordinator {
             "tip changed during reconciliation"
         );
         self.ready_tip(tip).await?;
-        self.ledger
-            .reconcile_blocks_at_revision(&observations, tip_height, revision)
+        self.work_ledger
+            .reconcile(&observations, tip_height, revision)
             .await?;
         *cache = Some(ChainCache {
             tip: tip.into(),
@@ -488,7 +519,7 @@ impl Coordinator {
         // refresh waits for RPC or database work. Their later failure must
         // survive an older successful proof completing afterwards.
         let readiness_generation = self.readiness.read().await.generation;
-        let info = self.ready_chain_info().await?;
+        let info = self.observe_chain_info(true).await?;
         let chainwork = info["chainwork"]
             .as_str()
             .context("node chainwork missing")?;
@@ -520,9 +551,9 @@ impl Coordinator {
             self.rpc.call("getbestblockhash", json!([])).await?.as_str() == Some(parent),
             "template tip is stale"
         );
-        *self.observed_tip.write().await = Some(parent.into());
+        self.cache_tip_parent(parent).await?;
         let observed_revision = self
-            .ledger
+            .work_ledger
             .observe_chain_view(parent, height - 1, chainwork)
             .await?;
         self.reconcile(parent, height - 1, observed_revision)
@@ -538,7 +569,7 @@ impl Coordinator {
                 .remove(field);
         }
         let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&stable)?));
-        let revision = self.ledger.payout_revision().await?;
+        let revision = self.work_ledger.payout_revision().await?;
         // Relay floors can change without changing the template or ledger.
         // Validate them on every refresh, including the cached-work path.
         let fee = self.fee_policy().await?;
@@ -557,7 +588,7 @@ impl Coordinator {
                 self.ready_tip(parent).await?;
                 self.ensure_template_fresh(&template).await?;
                 ensure!(
-                    self.ledger.payout_revision().await? == current.snapshot.payout_revision,
+                    self.work_ledger.payout_revision().await? == current.snapshot.payout_revision,
                     "payout revision changed during work reuse"
                 );
                 let mut readiness = self.readiness.write().await;
@@ -565,11 +596,12 @@ impl Coordinator {
                     readiness.generation == readiness_generation,
                     "node readiness changed during work reuse"
                 );
+                self.observed_tip.write().await.publish(parent)?;
                 readiness.last_poll = Some(Instant::now());
                 return Ok(());
             }
         }
-        let snapshot = Arc::new(self.ledger.snapshot(network).await?);
+        let snapshot = Arc::new(self.work_ledger.snapshot(network).await?);
         let bundle = if snapshot.shares.is_empty() {
             None
         } else {
@@ -611,7 +643,7 @@ impl Coordinator {
             None
         };
         ensure!(
-            self.ledger
+            self.work_ledger
                 .observe_chain_view(parent, height - 1, chainwork)
                 .await?
                 == snapshot.payout_revision,
@@ -631,17 +663,13 @@ impl Coordinator {
                 && current.fee == fee
         });
         let generation = *self.refresh.borrow() + u64::from(!equivalent);
-        let tip_header = self.rpc.call("getblockheader", json!([parent])).await?;
-        let parent_of_tip = tip_header["previousblockhash"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
+        let parent_of_tip = self.cache_tip_parent(parent).await?;
         let storage_key = format!(
             "prepared:{}:{}",
             self.config.instance_id,
             uuid::Uuid::new_v4().simple()
         );
-        let stored = StoredPrepared {
+        let stored = Arc::new(StoredPrepared {
             template: template.clone(),
             snapshot: snapshot.clone(),
             bundle: bundle.clone(),
@@ -654,8 +682,10 @@ impl Coordinator {
                 hex::encode(&self.config.coinbase_tag),
                 "00".repeat(4 + self.config.extranonce2_size)
             ),
-        };
-        let payload = tokio::task::spawn_blocking(move || serde_json::to_value(stored)).await??;
+        });
+        let serializable = stored.clone();
+        let payload =
+            tokio::task::spawn_blocking(move || serde_json::to_value(serializable)).await??;
         let retention =
             crate::config::number("PRISM_STRATUM_SAME_TIP_JOB_RETENTION_SECONDS", 30.0f64)?.max(
                 crate::config::number("PRISM_STRATUM_STALE_GRACE_SECONDS", 3.0f64)?,
@@ -669,7 +699,7 @@ impl Coordinator {
             + self.config.health_timeout.as_secs_f64()
             + 60.0)
             .ceil() as i64;
-        self.ledger
+        self.work_ledger
             .save_job(
                 &storage_key,
                 &payload,
@@ -683,7 +713,7 @@ impl Coordinator {
         let published_info = self.ready_tip(parent).await?;
         self.ensure_template_fresh(&template).await?;
         ensure!(
-            self.ledger
+            self.work_ledger
                 .observe_chain_view(
                     parent,
                     height - 1,
@@ -701,7 +731,13 @@ impl Coordinator {
             readiness.generation == readiness_generation,
             "node readiness changed before job publication"
         );
+        let mut tip_state = self.observed_tip.write().await;
+        tip_state.publish(parent)?;
         *prepared = Some(Arc::new(Prepared {
+            stored,
+            repair: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            repair_probe: Default::default(),
             template,
             snapshot,
             bundle,
@@ -833,10 +869,42 @@ impl Coordinator {
 
     pub async fn blockwait_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
         loop {
-            tokio::select! {
+            if *shutdown.borrow() {
+                break;
+            }
+            let notification = tokio::select! {
+                biased;
                 _=shutdown.changed()=>break,
-                result=self.rpc.call_timeout("waitfornewblock",json!([5000]),Some(Duration::from_secs(7)))=> {
-                    match result {Ok(value)=>{if let Some(hash)=value["hash"].as_str() {*self.observed_tip.write().await=Some(hash.into());}self.wake.notify_one();},Err(_)=>tokio::time::sleep(self.config.poll_interval).await}
+                result=self.rpc.call_timeout("waitfornewblock",json!([5000]),Some(Duration::from_secs(7)))=>result,
+            };
+            // A notification is a wake hint, not a sequenced chain proof. Even
+            // errors wake normal polling; an unavailable long-poll method must
+            // not terminate this critical task or declare the node unsafe.
+            self.wake.notify_one();
+            let verification = async {
+                let value = notification?;
+                let hash = tip_observation::tip_hash(&value["hash"])
+                    .context("qbit block notification has no valid tip hash")?;
+                let changed = self.observed_tip.read().await.as_deref() != Some(hash);
+                if changed {
+                    // Reserve order when this fresh request starts, after the
+                    // wait completes. A later poll can still supersede it.
+                    // No refresh lock: a pending build must not delay fencing.
+                    self.observe_chain_info(true).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            };
+            let result = tokio::select! {
+                biased;
+                _=shutdown.changed()=>break,
+                result=verification=>result,
+            };
+            if let Err(error) = result {
+                tracing::debug!(%error, "block notification deferred to polling");
+                tokio::select! {
+                    biased;
+                    _=shutdown.changed()=>break,
+                    _=tokio::time::sleep(self.config.poll_interval)=>{},
                 }
             }
         }
@@ -860,7 +928,7 @@ impl Coordinator {
                     .context("node chainwork missing")?,
             )
             .await?;
-        *self.observed_tip.write().await = Some(tip.clone());
+        // ready_chain_info already published this sequenced observation.
         let active = tip_height >= height
             && self
                 .rpc
@@ -1163,7 +1231,7 @@ impl Coordinator {
             )
         };
         let prepared = self.prepared.read().await.clone();
-        let observed = self.observed_tip.read().await.clone();
+        let observed = self.observed_tip.read().await.as_deref().map(str::to_owned);
         let revision = self.ledger.payout_revision().await.ok();
         let ready = prepared.as_ref().is_some_and(|work| {
             work.template["previousblockhash"].as_str() == observed.as_deref()
@@ -1185,6 +1253,9 @@ fn header_parent(block_hex: &str) -> Result<String> {
 }
 
 impl MiningBackend for Coordinator {
+    async fn observed_tip_hint(&self) -> Option<crate::stratum::RetentionTip> {
+        self.observed_tip.read().await.retention_hint()
+    }
     type Context = JobContext;
 
     async fn health_ready(&self) -> bool {
@@ -1342,24 +1413,10 @@ impl MiningBackend for Coordinator {
                 .await
                 .clone()
                 .context("no current template")?;
-            ensure!(
-                self.observed_tip.read().await.as_deref()
-                    == prepared.template["previousblockhash"].as_str(),
-                "new tip work is pending"
-            );
-            ensure!(
-                self.readiness
-                    .read()
-                    .await
-                    .last_poll
-                    .is_some_and(|at| at.elapsed() < self.config.health_timeout),
-                "tip polling stale"
-            );
+            self.issued_work_revision(&prepared)
+                .await?
+                .context("payout snapshot stale")?;
             self.ensure_job_fee_current(prepared.fee).await?;
-            ensure!(
-                self.ledger.payout_revision().await? == prepared.snapshot.payout_revision,
-                "payout snapshot stale"
-            );
             let bundle = if let Some(bundle) = &prepared.bundle {
                 bundle.clone()
             } else {
@@ -1429,35 +1486,7 @@ impl MiningBackend for Coordinator {
         version_mask: u32,
         ttl: Duration,
     ) -> Result<(), StratumError> {
-        let save = async {
-            let now_ms: i64 = sqlx::query_scalar(
-                "SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint",
-            )
-            .fetch_one(&self.ledger.pool)
-            .await?;
-            let ttl_seconds = ttl.as_secs_f64().ceil() as i64;
-            let record = StoredJob {
-                prepared_key: job.context.prepared.storage_key.clone(),
-                worker: worker.clone(),
-                extranonce1: job.wire.extranonce1.clone(),
-                extranonce2_size: job.wire.extranonce2_size,
-                share_target_hex: job.wire.share_target.to_str_radix(16),
-                share_difficulty: job.wire.share_difficulty,
-                version_mask,
-                expires_at_ms: now_ms
-                    .checked_add(ttl_seconds.checked_mul(1000).context("job TTL overflow")?)
-                    .context("job expiry overflow")?,
-            };
-            self.ledger
-                .save_job(
-                    &job.wire.job_id,
-                    &serde_json::to_value(record)?,
-                    job.context.prepared.snapshot.payout_revision,
-                    &job.wire.previousblockhash,
-                    ttl_seconds,
-                )
-                .await
-        };
+        let save = self.save_issued_record(worker, job, version_mask, ttl);
         save.await.map_err(|error| {
             tracing::warn!(%error,"job persistence deferred");
             protocol_error("backend-rpc-unavailable", "job persistence unavailable")
@@ -1473,7 +1502,7 @@ impl MiningBackend for Coordinator {
             if job_id.len() > 256 || job_id.starts_with("prepared:") {
                 return Ok(None);
             }
-            let Some(payload) = self.ledger.job(job_id).await? else {
+            let Some(payload) = self.work_ledger.job(job_id).await? else {
                 return Ok(None);
             };
             let stored: StoredJob = serde_json::from_value(payload)?;
@@ -1483,10 +1512,10 @@ impl MiningBackend for Coordinator {
             {
                 return Ok(None);
             }
-            let Some(payload) = self.ledger.job(&stored.prepared_key).await? else {
+            let Some(payload) = self.work_ledger.job(&stored.prepared_key).await? else {
                 return Ok(None);
             };
-            let prepared: StoredPrepared =
+            let prepared: Arc<StoredPrepared> =
                 tokio::task::spawn_blocking(move || serde_json::from_value(payload)).await??;
             let current = self
                 .prepared
@@ -1494,26 +1523,14 @@ impl MiningBackend for Coordinator {
                 .await
                 .clone()
                 .context("no current template")?;
-            ensure!(
-                self.observed_tip.read().await.as_deref()
-                    == current.template["previousblockhash"].as_str(),
-                "new tip work is pending"
-            );
-            let revision = self.ledger.payout_revision().await?;
+            if self.issued_work_revision(&current).await?.is_none() {
+                return Ok(None);
+            }
             if current.template["previousblockhash"] != prepared.template["previousblockhash"]
-                || current.snapshot.payout_revision != revision
-                || prepared.snapshot.payout_revision != revision
+                || prepared.snapshot.payout_revision != current.snapshot.payout_revision
             {
                 return Ok(None);
             }
-            ensure!(
-                self.readiness
-                    .read()
-                    .await
-                    .last_poll
-                    .is_some_and(|at| at.elapsed() < self.config.health_timeout),
-                "tip polling stale"
-            );
             self.ensure_job_fee_current(prepared.fee).await?;
             let bundle = match prepared.bundle.as_ref() {
                 Some(bundle) => bundle.clone(),
@@ -1567,11 +1584,7 @@ impl MiningBackend for Coordinator {
             wire.version_mask = stored.version_mask;
             wire.refresh_generation = prepared.generation;
             wire.payout_revision = prepared.snapshot.payout_revision;
-            let now_ms: i64 = sqlx::query_scalar(
-                "SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint",
-            )
-            .fetch_one(&self.ledger.pool)
-            .await?;
+            let now_ms = self.work_ledger.now_ms().await?;
             if now_ms >= stored.expires_at_ms {
                 return Ok(None);
             }
@@ -1581,15 +1594,19 @@ impl MiningBackend for Coordinator {
             // The absolute DB expiry is translated once to monotonic time;
             // moving the session between hosts never extends its work lease.
             let prepared = Arc::new(Prepared {
-                template: prepared.template,
-                snapshot: prepared.snapshot,
+                stored: prepared.clone(),
+                repair: Arc::new(Mutex::new(())),
+                #[cfg(test)]
+                repair_probe: Default::default(),
+                template: prepared.template.clone(),
+                snapshot: prepared.snapshot.clone(),
                 bundle: Some(bundle.clone()),
                 base_wire: None,
                 storage_key: stored.prepared_key,
                 fee: prepared.fee,
-                fingerprint: prepared.fingerprint,
+                fingerprint: prepared.fingerprint.clone(),
                 generation: prepared.generation,
-                parent_of_tip: prepared.parent_of_tip,
+                parent_of_tip: prepared.parent_of_tip.clone(),
                 created: Instant::now(),
             });
             Ok(Some(MiningJob {
@@ -1609,192 +1626,13 @@ impl MiningBackend for Coordinator {
 
     async fn submit(
         &self,
-        _worker: &Worker,
+        worker: &Worker,
         job: &MiningJob<JobContext>,
         submission: codec::Submission,
-        stale_grace_eligible: bool,
+        stale_grace: StaleGrace,
     ) -> Result<(), StratumError> {
-        if !self
-            .readiness
-            .read()
+        self.submit_share(worker, job, submission, stale_grace)
             .await
-            .last_poll
-            .is_some_and(|at| at.elapsed() < self.config.health_timeout)
-        {
-            return Err(protocol_error(
-                "backend-rpc-unavailable",
-                "current chain state is unavailable",
-            ));
-        }
-        let current = self
-            .prepared
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| protocol_error("pool-closed", "no current work"))?;
-        if self.observed_tip.read().await.as_deref()
-            != current.template["previousblockhash"].as_str()
-        {
-            return Err(protocol_error("stale-job", "new tip work is pending"));
-        }
-        let context = &job.context;
-        self.ensure_job_fee_current(context.prepared.fee)
-            .await
-            .map_err(|_| {
-                protocol_error("stale-job", "job CTV fee is below the current relay floor")
-            })?;
-        let revision = self.ledger.payout_revision().await.map_err(|_| {
-            protocol_error(
-                "backend-rpc-unavailable",
-                "current payout state is unavailable",
-            )
-        })?;
-        if current.snapshot.payout_revision != revision {
-            return Err(protocol_error("stale-job", "new payout work is pending"));
-        }
-        let parent_stale =
-            current.template["previousblockhash"] != context.prepared.template["previousblockhash"];
-        let stale = parent_stale || context.prepared.snapshot.payout_revision != revision;
-        if stale
-            && !(parent_stale
-                && stale_grace_eligible
-                && current.parent_of_tip == job.wire.previousblockhash)
-        {
-            return Err(protocol_error("stale-job", "stale job"));
-        }
-        if !submission.share_pass && !(submission.block_pass && !stale) {
-            return Err(protocol_error("low-difficulty", "low difficulty share"));
-        }
-        let network = context.bundle.found_block.network_difficulty;
-        let difficulty = if submission.share_pass {
-            codec::scaled_target_difficulty(&job.wire.share_target)
-                .map_err(|_| protocol_error("internal-error", "difficulty overflow"))?
-        } else {
-            network
-        };
-        let share = AcceptedShare {
-            share_seq: 0,
-            share_id: format!("{}:{}", context.worker.username, submission.block_hash_hex),
-            miner_id: context.worker.payout_address.clone(),
-            order_key: context.worker.payout_address.clone(),
-            p2mr_program_hex: context.worker.p2mr_program_hex.clone(),
-            share_difficulty: difficulty,
-            network_difficulty: network,
-            template_height: template_parent_height(context.bundle.found_block.block_height)
-                .map_err(|_| protocol_error("internal-error", "invalid candidate block height"))?,
-            job_id: job.wire.job_id.clone(),
-            job_issued_at_ms: context.prepared.snapshot.anchor_ms,
-            accepted_at_ms: 0,
-            ntime: submission.ntime,
-            credit_policy: stale.then(|| "stale-grace".into()),
-        };
-        let save = async {
-            let candidate = if submission.block_pass && !stale {
-                let original = context
-                    .bundle
-                    .coinbase_script_sig_suffix_hex
-                    .as_ref()
-                    .context("job coinbase suffix missing")?;
-                let placeholder_length = (4 + job.wire.extranonce2_size) * 2;
-                let prefix = original
-                    .get(
-                        ..original
-                            .len()
-                            .checked_sub(placeholder_length)
-                            .context("job coinbase suffix too short")?,
-                    )
-                    .context("invalid job suffix")?;
-                let suffix = format!(
-                    "{prefix}{}{}",
-                    job.wire.extranonce1, submission.extranonce2_hex
-                );
-                Some(Candidate {
-                    block_hash: submission.block_hash_hex.clone(),
-                    block_hex: submission.block_hex,
-                    job_id: job.wire.job_id.clone(),
-                    payout_revision: context.prepared.snapshot.payout_revision,
-                    bundle: (*context.bundle).clone(),
-                    coinbase_suffix_hex: Some(suffix),
-                    deferred_share: (!submission.share_pass).then(|| share.clone()),
-                })
-            } else {
-                None
-            };
-            if submission.share_pass {
-                let result = self
-                    .ledger
-                    .append_at_revision(share, candidate, revision)
-                    .await?;
-                Ok::<bool, anyhow::Error>(result.inserted)
-            } else {
-                let exists: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1)",
-                )
-                .bind(&share.share_id)
-                .fetch_one(&self.ledger.pool)
-                .await?;
-                if exists {
-                    return Ok(false);
-                }
-                if !self
-                    .ledger
-                    .enqueue_candidate_once(candidate.context("missing candidate")?)
-                    .await?
-                {
-                    return Ok(false);
-                }
-                // A block below the advertised share target earns only proven
-                // network work, and only after active-chain confirmation.
-                loop {
-                    // Observe credit and disposition in one MVCC snapshot so
-                    // finalization cannot fall between two separate reads.
-                    let (credited,state): (bool,Option<String>) = sqlx::query_as(
-                        "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1), (SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$2)",
-                    )
-                    .bind(&share.share_id)
-                    .bind(&submission.block_hash_hex)
-                    .fetch_one(&self.ledger.pool)
-                    .await?;
-                    if credited {
-                        break Ok(true);
-                    }
-                    ensure!(
-                        state.as_deref() == Some("pending"),
-                        "block-only proof was not accepted on the active chain"
-                    );
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            }
-        };
-        let save = tokio::time::timeout(self.config.share_commit_timeout, save)
-            .await
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("share confirmation deadline exceeded")));
-        match save {
-            Ok(true) => {
-                self.accepted.fetch_add(1, Ordering::Relaxed);
-                if stale {
-                    self.metrics.record_grace_credit();
-                }
-                if current.bundle.is_none() {
-                    self.wake.notify_one();
-                }
-                Ok(())
-            }
-            Ok(false) => Err(protocol_error("duplicate-share", "duplicate share")),
-            Err(error) => {
-                self.rejected.fetch_add(1, Ordering::Relaxed);
-                if error.to_string().contains("duplicate-share")
-                    || error.to_string().contains("duplicate share_id")
-                {
-                    return Err(protocol_error("duplicate-share", "duplicate share"));
-                }
-                tracing::warn!(%error,"share persistence failed");
-                Err(protocol_error(
-                    "ledger-confirmation-failed",
-                    "share was not confirmed by the database",
-                ))
-            }
-        }
     }
 }
 
@@ -1894,6 +1732,9 @@ mod fee_policy_tests;
 
 #[cfg(test)]
 mod candidate_lease_tests;
+
+#[cfg(test)]
+pub(crate) mod miner_tests;
 
 #[cfg(test)]
 mod d2_below_target_tests;
