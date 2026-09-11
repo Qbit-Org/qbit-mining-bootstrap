@@ -1,6 +1,7 @@
 [package]
 name = "qbit-prism-server"
 version.workspace = true
+rust-version.workspace = true
 edition = "2021"
 license = "MIT"
 # Built and shipped from this repository; its path dependencies carry no

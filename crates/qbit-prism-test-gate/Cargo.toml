@@ -1,6 +1,7 @@
 [package]
 name = "qbit-prism-test-gate"
 version.workspace = true
+rust-version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "One integration gate for every environment-gated test in the workspace"
