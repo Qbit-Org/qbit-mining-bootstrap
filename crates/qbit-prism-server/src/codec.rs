@@ -71,16 +71,24 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Strip witness structurally; txids never hash witness marker, flag or stacks.
-pub fn strip_witness_transaction(tx: &[u8]) -> Result<Vec<u8>> {
-    ensure!(tx.len() >= 10, "transaction is too short");
-    let mut c = Cursor {
-        bytes: tx,
-        offset: 4,
-    };
-    let witness = tx[4] == 0 && tx[5] != 0;
+/// Where one serialized transaction's parts sit inside the slice it starts at.
+/// A block walker needs `len`; the txid preimage needs the version, the
+/// witness-free body and the locktime.
+struct TransactionLayout {
+    body: std::ops::Range<usize>,
+    locktime: std::ops::Range<usize>,
+    len: usize,
+}
+
+/// Walk one segwit-aware transaction from the start of `bytes`, which may hold
+/// more than that transaction. Returns where it ends, so a caller reading a
+/// block's transactions back to back can advance past each one.
+fn walk_transaction(bytes: &[u8]) -> Result<TransactionLayout> {
+    ensure!(bytes.len() >= 10, "transaction is too short");
+    let mut c = Cursor { bytes, offset: 4 };
+    let witness = bytes[4] == 0 && bytes[5] != 0;
     if witness {
-        ensure!(tx[5] == 1, "unsupported witness transaction flags");
+        ensure!(bytes[5] == 1, "unsupported witness transaction flags");
         c.take(2)?;
     }
     let body_start = c.offset;
@@ -108,9 +116,64 @@ pub fn strip_witness_transaction(tx: &[u8]) -> Result<Vec<u8>> {
             }
         }
     }
-    let locktime = c.take(4)?;
-    ensure!(c.offset == tx.len(), "transaction has trailing bytes");
-    Ok([&tx[..4], &tx[body_start..body_end], locktime].concat())
+    let locktime_start = c.offset;
+    c.take(4)?;
+    Ok(TransactionLayout {
+        body: body_start..body_end,
+        locktime: locktime_start..c.offset,
+        len: c.offset,
+    })
+}
+
+/// Strip witness structurally; txids never hash witness marker, flag or stacks.
+pub fn strip_witness_transaction(tx: &[u8]) -> Result<Vec<u8>> {
+    let layout = walk_transaction(tx)?;
+    ensure!(layout.len == tx.len(), "transaction has trailing bytes");
+    Ok([&tx[..4], &tx[layout.body], &tx[layout.locktime]].concat())
+}
+
+/// The witness merkle leaves of an assembled block: `double_sha256` of every
+/// non-coinbase transaction's full serialized bytes, lowercase hex, in block
+/// order. Identical by construction to
+/// [`witness_merkle_leaves_hex`]`(&`[`transactions_from_template`]`(template))`
+/// for a block [`Job::assemble_submission`] built from that template, which
+/// appends the template's transactions verbatim after the coinbase.
+///
+/// A claim re-derives the leaves this way instead of storing one 64-hex string
+/// per transaction beside the candidate, which would scale the stored document
+/// with the block. The bytes are authenticated before this runs: the claim
+/// checks them against `block_sha256` and their 80-byte header against
+/// `block_hash`.
+pub fn witness_merkle_leaves_from_block(block: &[u8]) -> Result<Vec<String>> {
+    ensure!(block.len() >= 80, "truncated block header");
+    let mut c = Cursor {
+        bytes: block,
+        offset: 80,
+    };
+    let count = c.count().context("block transaction count")?;
+    // A block always has its coinbase. Zero would also make `count - 1`
+    // underflow below.
+    ensure!(count > 0, "block declares no transactions");
+    let mut offset = c.offset;
+    let mut leaves = Vec::with_capacity(count - 1);
+    for index in 0..count {
+        let rest = block
+            .get(offset..)
+            .context("truncated block transaction list")?;
+        let layout = walk_transaction(rest)
+            .with_context(|| format!("block transaction {index} of {count}"))?;
+        // The coinbase is not a witness merkle leaf; the commitment uses the
+        // all-zero placeholder for it, exactly as the template path does.
+        if index > 0 {
+            leaves.push(hex::encode(double_sha256(&rest[..layout.len])));
+        }
+        offset += layout.len;
+    }
+    ensure!(
+        offset == block.len(),
+        "block has trailing bytes after {count} transactions"
+    );
+    Ok(leaves)
 }
 
 pub fn split_coinbase_extranonce(tx: &[u8], placeholder: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -525,4 +588,162 @@ pub struct Submission {
     pub ntime: u32,
     pub nonce: u32,
     pub applied_version: u32,
+}
+
+#[cfg(test)]
+mod witness_leaf_tests {
+    use super::*;
+    use qbit_pool_builder::{build_manifest, CoinbaseBuildRequest, WeightedEntitlement};
+
+    /// A pre-segwit transaction: one input, one output, no marker or witness.
+    fn legacy_transaction(tag: u8) -> Vec<u8> {
+        let mut tx = vec![1, 0, 0, 0, 1];
+        tx.extend([tag; 32]);
+        tx.extend(0u32.to_le_bytes());
+        tx.extend([1, 0x51]);
+        tx.extend(u32::MAX.to_le_bytes());
+        tx.push(1);
+        tx.extend(1_000u64.to_le_bytes());
+        tx.extend([1, 0x51]);
+        tx.extend(0u32.to_le_bytes());
+        tx
+    }
+
+    /// The same shape with the segwit marker, flag and a one-item witness
+    /// stack, so its `double_sha256` covers bytes a txid never would.
+    fn segwit_transaction(tag: u8) -> Vec<u8> {
+        let mut tx = vec![2, 0, 0, 0, 0, 1, 1];
+        tx.extend([tag; 32]);
+        tx.extend(1u32.to_le_bytes());
+        tx.push(0);
+        tx.extend(u32::MAX.to_le_bytes());
+        tx.push(1);
+        tx.extend(2_000u64.to_le_bytes());
+        tx.extend([1, 0x51]);
+        tx.extend([1, 2, 0xaa, 0xbb]);
+        tx.extend(0u32.to_le_bytes());
+        tx
+    }
+
+    /// A block `assemble_submission` produced from a template holding exactly
+    /// these transactions, with the template beside it.
+    fn assembled_block(transactions: &[Vec<u8>]) -> (Vec<u8>, Value) {
+        let manifest = build_manifest(CoinbaseBuildRequest {
+            block_height: 101,
+            coinbase_value_sats: 5_000_000_000,
+            entitlements: vec![WeightedEntitlement {
+                recipient_id: "miner".into(),
+                order_key: "miner".into(),
+                p2mr_program_hex: "ab".repeat(32),
+                weight: 1,
+            }],
+            witness_nonce_hex: Some("00".repeat(32)),
+            witness_merkle_leaves_hex: witness_merkle_leaves_hex(transactions),
+            coinbase_script_sig_suffix_hex: Some(format!("505249534d12345678{}", "00".repeat(8))),
+            pinned_first_output: None,
+        })
+        .unwrap();
+        // The largest target this codec represents, so all but one hash in
+        // 65,536 is a block: this test is about the block's bytes, not proof
+        // of work, and the nonce search below makes the fixture deterministic.
+        let template = json!({"height":101,"coinbasevalue":5_000_000_000u64,
+            "previousblockhash":"0123456789abcdef".repeat(4),"version":0x20000000u32,
+            "bits":"2100ffff","curtime":1_700_000_000u32,"mintime":1_699_999_999u32,
+            "transactions": transactions.iter().map(|tx| json!({"data": hex::encode(tx)}))
+                .collect::<Vec<_>>()});
+        let job = Job::from_manifest(
+            "job".into(),
+            &template,
+            &manifest,
+            "12345678",
+            8,
+            1e-9,
+            0.0,
+            true,
+        )
+        .unwrap();
+        let submission = (0u32..64)
+            .map(|nonce| {
+                job.assemble_submission(
+                    "0000000000000000",
+                    "6553f100",
+                    &format!("{nonce:08x}"),
+                    None,
+                    VERSION_ROLLING_MASK,
+                )
+                .unwrap()
+            })
+            .find(|submission| submission.block_pass)
+            .expect("fixture block must carry its bytes");
+        (hex::decode(&submission.block_hex).unwrap(), template)
+    }
+
+    #[test]
+    fn block_derived_leaves_equal_the_template_derived_leaves() {
+        for transactions in [
+            vec![],
+            vec![legacy_transaction(1)],
+            vec![segwit_transaction(2)],
+            vec![
+                legacy_transaction(3),
+                segwit_transaction(4),
+                segwit_transaction(5),
+                legacy_transaction(6),
+            ],
+        ] {
+            let (block, template) = assembled_block(&transactions);
+            let expected =
+                witness_merkle_leaves_hex(&transactions_from_template(&template).unwrap());
+            assert_eq!(
+                witness_merkle_leaves_from_block(&block).unwrap(),
+                expected,
+                "{} transactions",
+                transactions.len()
+            );
+            // The coinbase is excluded, and every leaf is lowercase 64-hex.
+            assert_eq!(expected.len(), transactions.len());
+            assert!(expected
+                .iter()
+                .all(|leaf| leaf.len() == 64 && leaf.bytes().all(|b| b.is_ascii_hexdigit())));
+        }
+    }
+
+    #[test]
+    fn malformed_blocks_are_rejected_rather_than_yielding_partial_leaves() {
+        let transactions = vec![legacy_transaction(7), segwit_transaction(8)];
+        let (block, _) = assembled_block(&transactions);
+        let header = &block[..80];
+        // Three transactions, so the count is one compact-size byte.
+        let body = &block[81..];
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("truncated block header", block[..79].to_vec()),
+            (
+                "truncated block transaction list",
+                block[..block.len() - 3].to_vec(),
+            ),
+            (
+                "block has trailing bytes",
+                [block.as_slice(), &[0u8]].concat(),
+            ),
+            (
+                "block declares no transactions",
+                [header, &compact_size(0)].concat(),
+            ),
+            (
+                "count above the transactions present",
+                [header, &compact_size(4), body].concat(),
+            ),
+            (
+                "count below the transactions present",
+                [header, &compact_size(2), body].concat(),
+            ),
+        ];
+        for (case, bytes) in cases {
+            assert!(
+                witness_merkle_leaves_from_block(&bytes).is_err(),
+                "accepted {case}"
+            );
+        }
+        assert!(witness_merkle_leaves_from_block(&block).is_ok());
+    }
 }
