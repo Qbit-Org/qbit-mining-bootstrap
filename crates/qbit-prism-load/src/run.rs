@@ -103,6 +103,18 @@ struct DensePhase {
 
 pub async fn execute(args: Args) -> Result<i32> {
     args.validate()?;
+    // The managed cluster's binaries are resolved and checked before anything
+    // is created, so a wrong `--pg-bin-dir` names the flag and the missing
+    // binary rather than surfacing later as a failed `initdb`. An external
+    // database needs none of them, and is not asked for them.
+    let pg_bin_dir = match &args.database_url {
+        Some(_) => None,
+        None => {
+            let dir = cluster::resolve_bin_dir(args.pg_bin_dir.as_deref())?;
+            cluster::verify_bin_dir(&dir)?;
+            Some(dir)
+        }
+    };
     let started_wall = chrono::Utc::now();
     let run_id = uuid::Uuid::new_v4();
     let run_tag = run_id.simple().to_string()[..8].to_owned();
@@ -168,7 +180,7 @@ pub async fn execute(args: Args) -> Result<i32> {
     let direct_url = match &args.database_url {
         Some(url) => url.clone(),
         None => {
-            let bin_dir = cluster::resolve_bin_dir(args.pg_bin_dir.as_deref())?;
+            let bin_dir = pg_bin_dir.context("the PostgreSQL bin directory was not resolved")?;
             let cluster =
                 ManagedPostgres::start(bin_dir, replication, max_connections, args.keep_artifacts)
                     .await?;

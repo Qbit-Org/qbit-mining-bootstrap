@@ -1134,6 +1134,42 @@ fn the_harness_reads_its_own_postgres_binary_variable() {
 }
 
 #[test]
+fn a_postgres_bin_directory_without_the_server_binaries_is_refused() -> Result<()> {
+    use qbit_prism_load::cluster;
+    let root = std::env::temp_dir().join(format!("prism-load-bindir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+
+    let missing = format!(
+        "{:#}",
+        cluster::verify_bin_dir(&root).expect_err("a directory that does not exist is refused")
+    );
+    assert!(missing.contains("--pg-bin-dir"), "{missing}");
+    assert!(missing.contains("is not a directory"), "{missing}");
+
+    std::fs::create_dir_all(&root)?;
+    let empty = format!(
+        "{:#}",
+        cluster::verify_bin_dir(&root).expect_err("a directory with no binaries is refused")
+    );
+    assert!(empty.contains("initdb"), "{empty}");
+    assert!(empty.contains("pg_basebackup"), "{empty}");
+
+    for name in cluster::REQUIRED_BINARIES {
+        std::fs::write(root.join(name), b"")?;
+    }
+    cluster::verify_bin_dir(&root).expect("all three binaries present");
+
+    std::fs::remove_file(root.join("pg_ctl"))?;
+    let partial = format!(
+        "{:#}",
+        cluster::verify_bin_dir(&root).expect_err("one missing binary is refused")
+    );
+    assert!(partial.contains("pg_ctl"), "{partial}");
+    std::fs::remove_dir_all(&root)?;
+    Ok(())
+}
+
+#[test]
 fn database_urls_are_rewritten_onto_the_delay_proxy() -> Result<()> {
     assert_eq!(
         run::rewrite_host(

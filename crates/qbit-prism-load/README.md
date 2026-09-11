@@ -32,7 +32,10 @@ measure.
 - **PostgreSQL 16 server binaries** (`initdb`, `pg_ctl`, `pg_basebackup`) in
   `--pg-bin-dir`, or `QBIT_PRISM_LOAD_PG_BIN_DIR`, or `pg_config --bindir`. On
   Debian and Ubuntu that is `/usr/lib/postgresql/16/bin`. No container runtime
-  is needed.
+  is needed. The directory is resolved and checked before the run creates
+  anything, so a wrong path names the flag and the missing binary instead of
+  failing later inside `initdb`. A `--database-url` run is not asked for
+  them.
 
 - **A clean tree.** `subject.coordinator_revision` names the commit that was
   built. With modified tracked files the harness refuses to run unless

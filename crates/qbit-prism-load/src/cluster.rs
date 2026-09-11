@@ -220,6 +220,32 @@ pub fn resolve_bin_dir(explicit: Option<&Path>) -> Result<PathBuf> {
     ))
 }
 
+/// The server binaries the managed mode runs.
+pub const REQUIRED_BINARIES: [&str; 3] = ["initdb", "pg_ctl", "pg_basebackup"];
+
+/// Check that a resolved bin directory really holds the server binaries.
+///
+/// Called before anything is created, so a wrong `--pg-bin-dir` names the flag
+/// and the missing binary instead of surfacing much later as a failed `initdb`
+/// with a temporary cluster root already on disk (EP-VALIDATION).
+pub fn verify_bin_dir(dir: &Path) -> Result<()> {
+    ensure!(
+        dir.is_dir(),
+        "--pg-bin-dir {} is not a directory; point it, or {PG_BIN_DIR_VAR}, at the PostgreSQL 16 \
+         server binaries (on Debian and Ubuntu, /usr/lib/postgresql/16/bin)",
+        dir.display()
+    );
+    for name in REQUIRED_BINARIES {
+        ensure!(
+            dir.join(name).is_file(),
+            "--pg-bin-dir {} does not contain {name}; the managed cluster needs {}",
+            dir.display(),
+            REQUIRED_BINARIES.join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn pkglibdir(bin: &Path) -> Option<PathBuf> {
     let output = Command::new(bin.join("pg_config"))
         .arg("--pkglibdir")
