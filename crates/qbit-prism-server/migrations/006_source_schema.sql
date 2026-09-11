@@ -21,7 +21,11 @@
 -- with the predicate built from the columns the outbox has, also runs on a
 -- database an earlier 3.x.x build migrated to native schema 3, 4 or 5, before
 -- 004, 005 and this migration: that build's v1-only predicate never counted
--- a v2 row, so one can still be pending there.
+-- a v2 row, so one can still be pending there. Its capability rows are
+-- checked before that drain check, and before 004, 005 and this migration
+-- (or 009 on a database already at 6) run: a row beyond this release is
+-- refused before any DDL, the newer verdict above, so migrate never alters
+-- a database a newer release wrote. Connect refuses the same rows again.
 --
 -- The release definitions come from the migrator applying the same release
 -- SQL (001, plus 002 for a #258 source) to a scratch schema under a

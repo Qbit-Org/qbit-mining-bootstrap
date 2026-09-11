@@ -107,7 +107,7 @@ one line; the checker counts it once. An unwritable manifest fails the test.
 ## The expected list and the proof
 
 `test/prism-gated-tests.txt` lists every gated test the `prism-native-postgres`
-job must execute, one id per line, sorted; 98 today. Its length is the minimum
+job must execute, one id per line, sorted; 99 today. Its length is the minimum
 count.
 After the job's three `cargo test` invocations (the whole workspace with
 `--nocapture`, then the two explicit `--ignored` runs), it runs
