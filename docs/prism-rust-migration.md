@@ -261,21 +261,23 @@ reconciliation decision the recovery section describes.
 `qbit_prism_migration_source` holds one row: the accepted source state
 (`pre_258`, `258_applied`, `fresh`, or `native` for a database that was
 already on the Rust schema), the `2.x.x` release and commit that source
-corresponds to, the capability value the source declared, the schema version
-before this migration, and which instance migrated it. `migrate` prints it,
+corresponds to, the capability value the source declared, the highest
+schema migration recorded before this one, and which instance migrated it. `migrate` prints it,
 every start logs it, and a repeated `migrate` never rewrites it.
 
 **Startup gate.** Every start reads `qbit_prism_schema_migrations` and
 `qbit_prism_schema_capabilities`, with or without
-`PRISM_POSTGRES_INIT_SCHEMA`. A database below schema version 6 is refused at
-connect, naming the required version, before any accounting statement runs,
-and so is one declaring a capability or `candidate_storage_version` this
-release does not understand. A database above version 6 is accepted with a
-warning that names both versions: native migrations are additive, and a
-release whose format an older binary must not touch declares a capability.
-With the native default `PRISM_POSTGRES_INIT_SCHEMA=0` that means a newer
-binary refuses to start until `migrate` has run, instead of failing later in
-the claim path.
+`PRISM_POSTGRES_INIT_SCHEMA`. This release requires migrations 2, 3, 4, 5, 6
+and 9, each checked on its own rather than as a high-water mark: 007 and 008
+are reserved by other workstreams, so 009 being present never stands in for
+a missing 006. A database missing any of them is refused at connect, naming
+the gap, before any accounting statement runs, and so is one declaring a
+capability or `candidate_storage_version` this release does not understand.
+A migration this release does not know is accepted with a warning that names
+it: native migrations are additive, and a release whose format an older
+binary must not touch declares a capability. With the native default
+`PRISM_POSTGRES_INIT_SCHEMA=0` that means a newer binary refuses to start
+until `migrate` has run, instead of failing later in the claim path.
 
 `import-audits` processes database rows whose audit body is external. It resolves
 full v1/v1.1 bodies, legacy body refs, and v2 proof bodies, verifies segment
