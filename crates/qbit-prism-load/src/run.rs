@@ -43,6 +43,7 @@ struct Collected {
     reconnects: Vec<client::ReconnectRecord>,
     tips: Vec<(usize, String, Instant)>,
     discarded_block_solutions: u64,
+    discarded_offers: u64,
     difficulty_mismatches: Vec<(usize, f64, f64)>,
     failures: Vec<(usize, String)>,
     connects: u64,
@@ -352,6 +353,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                     Event::Reconnect(record) => state.reconnects.push(record),
                     Event::Tip { session, tip, at } => state.tips.push((session, tip, at)),
                     Event::DiscardedBlockSolution { .. } => state.discarded_block_solutions += 1,
+                    Event::DiscardedOffer { .. } => state.discarded_offers += 1,
                     Event::DifficultyMismatch {
                         session,
                         advertised,
@@ -860,6 +862,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         },
         "client": {
             "discarded_block_solutions": collected.discarded_block_solutions,
+            "discarded_offers": collected.discarded_offers,
             "difficulty_mismatches": collected.difficulty_mismatches.iter()
                 .map(|(session, advertised, configured)| json!({
                     "session": session, "advertised": advertised, "configured": configured}))

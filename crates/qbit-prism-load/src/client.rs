@@ -211,6 +211,12 @@ pub enum Event {
     DiscardedBlockSolution {
         session: usize,
     },
+    /// An offer the scheduler placed that this session never sent, because it
+    /// was paused or stopped first. Counted so `dispatched` and `offered` can
+    /// be reconciled against each other.
+    DiscardedOffer {
+        session: usize,
+    },
     /// A `set_difficulty` whose value disagrees with the difficulty the
     /// harness configured.
     DifficultyMismatch {
@@ -463,14 +469,14 @@ async fn run_session(
                 match message {
                     None | Some(Control::Stop) => {
                         stopping = true;
-                        drain_work(&mut work, &outstanding);
+                        drain_work(&mut work, &outstanding, &shared, config.index);
                     }
                     Some(Control::Pause) => {
                         paused = true;
                         // Queued offers this session will now never send must
                         // release their slot, or the run's drain would wait
                         // for work that is not coming.
-                        drain_work(&mut work, &outstanding);
+                        drain_work(&mut work, &outstanding, &shared, config.index);
                     }
                     Some(Control::Retarget { frontend: index, address: next, reconnect }) => {
                         frontend.store(index, Ordering::Relaxed);
@@ -571,9 +577,15 @@ async fn run_session(
 
 /// Discard offers this session has accepted but not yet sent, releasing their
 /// outstanding slots so the scheduler's accounting stays exact.
-fn drain_work(work: &mut mpsc::Receiver<Work>, outstanding: &Arc<AtomicUsize>) {
+fn drain_work(
+    work: &mut mpsc::Receiver<Work>,
+    outstanding: &Arc<AtomicUsize>,
+    shared: &Arc<SessionShared>,
+    session: usize,
+) {
     while work.try_recv().is_ok() {
         outstanding.fetch_sub(1, Ordering::Relaxed);
+        let _ = shared.events.send(Event::DiscardedOffer { session });
     }
 }
 
