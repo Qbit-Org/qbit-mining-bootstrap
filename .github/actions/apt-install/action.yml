@@ -1,0 +1,56 @@
+name: Install Ubuntu packages
+description: >-
+  Install Ubuntu packages with .github/scripts/apt-install.sh, which retries,
+  falls back to the mirrors in .github/apt/ubuntu-mirrors.txt, and keeps the
+  downloaded packages in a cache (saved with actions/cache) so an install can
+  still succeed while the Ubuntu mirrors are unreachable.
+
+inputs:
+  packages:
+    description: Space-separated Ubuntu package names.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Compute the package cache key
+      id: key
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        set -euo pipefail
+        read -r -d '' -a packages <<< "${PACKAGES}" || true
+        digest="$(printf '%s\n' "${packages[@]}" | sort -u | sha256sum | cut -c1-16)"
+        # One cache per package set and month: a new month saves a fresh set,
+        # and restores from the previous month until then.
+        prefix="apt-install-v1-${RUNNER_OS}-${RUNNER_ARCH}-${digest}-"
+        {
+          printf 'prefix=%s\n' "${prefix}"
+          printf 'key=%s%s\n' "${prefix}" "$(date -u +%Y-%m)"
+        } >> "${GITHUB_OUTPUT}"
+
+    - name: Restore the package cache
+      id: restore
+      uses: actions/cache/restore@v6
+      with:
+        path: ~/.cache/apt-install
+        key: ${{ steps.key.outputs.key }}
+        restore-keys: ${{ steps.key.outputs.prefix }}
+
+    - name: Install the packages
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        set -euo pipefail
+        read -r -d '' -a packages <<< "${PACKAGES}" || true
+        APT_INSTALL_CACHE_DIR="${HOME}/.cache/apt-install" \
+          bash "${GITHUB_ACTION_PATH}/../../scripts/apt-install.sh" "${packages[@]}"
+
+    - name: Save the package cache
+      if: steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ~/.cache/apt-install
+        key: ${{ steps.key.outputs.key }}
