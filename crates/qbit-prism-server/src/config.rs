@@ -145,6 +145,14 @@ fn seconds(name: &str, default: f64) -> Result<Duration> {
     );
     Ok(Duration::from_secs_f64(n))
 }
+fn seconds_allow_zero(name: &str, default: f64) -> Result<Duration> {
+    let n = number(name, default)?;
+    ensure!(
+        n.is_finite() && n >= 0.0 && n <= 86400.0,
+        "{name} must be between 0 and 86400 seconds"
+    );
+    Ok(Duration::from_secs_f64(n))
+}
 
 impl Config {
     pub fn from_env() -> Result<Self> {
@@ -200,14 +208,9 @@ impl Config {
         }
         let expected_genesis_hash = genesis_pin(&chain, optional("QBIT_EXPECTED_GENESIS_HASH"))?;
         let min_peers = positive("PRISM_MIN_PEERS", 1)?;
-        let submit_tip_max_age_seconds = number("PRISM_SUBMIT_TIP_MAX_AGE_SECONDS", 10.0f64)?;
-        let submit_tip_max_age = Duration::try_from_secs_f64(submit_tip_max_age_seconds)
-            .context("PRISM_SUBMIT_TIP_MAX_AGE_SECONDS must be finite and nonnegative")?;
-        let template_refresh_failure_exit = Duration::try_from_secs_f64(number(
-            "PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS",
-            120.0f64,
-        )?)
-        .context("PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS must be finite and nonnegative")?;
+        let submit_tip_max_age = seconds_allow_zero("PRISM_SUBMIT_TIP_MAX_AGE_SECONDS", 10.0)?;
+        let template_refresh_failure_exit =
+            seconds_allow_zero("PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS", 120.0)?;
         ensure!(
             !production || !template_refresh_failure_exit.is_zero(),
             "production mode requires a positive PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS"
