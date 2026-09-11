@@ -1,0 +1,610 @@
+{
+  "cases": {
+    "advance-page-expiry-at-weight": {
+      "advance_stats": [
+        {
+          "added_rows": 2,
+          "expired_rows": 2,
+          "touched_pages": 0
+        }
+      ],
+      "canonical_bytes_len": 661,
+      "canonical_bytes_sha256": "82a04cf66a192bb2401a881bfc28bdbc2bd293cb0e807c62ed5ead692275b5ed",
+      "canonical_digest": "82a04cf66a192bb2401a881bfc28bdbc2bd293cb0e807c62ed5ead692275b5ed",
+      "input_sha256": "1c31011179d010d61ea826516d9ffd4ce09ed3c9293ff1f23538fcd8efe42577",
+      "pinned_literals": {
+        "canonical_bytes": "[{\"accepted_at_ms\":300002,\"job_id\":\"job-5\",\"job_issued_at_ms\":300001,\"miner_id\":\"miner-5\",\"network_difficulty\":1000005,\"ntime\":1700000005,\"order_key\":\"05:miner-5\",\"p2mr_program_hex\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"share_difficulty\":1,\"share_id\":\"share-5\",\"share_seq\":5,\"template_height\":800000},{\"accepted_at_ms\":300002,\"job_id\":\"job-6\",\"job_issued_at_ms\":300001,\"miner_id\":\"miner-6\",\"network_difficulty\":1000006,\"ntime\":1700000006,\"order_key\":\"06:miner-6\",\"p2mr_program_hex\":\"0606060606060606060606060606060606060606060606060606060606060606\",\"share_difficulty\":1,\"share_id\":\"share-6\",\"share_seq\":6,\"template_height\":800000}]",
+        "input": {
+          "advances": [
+            {
+              "anchor_job_issued_at_ms": 300002,
+              "records": [
+                {
+                  "accepted_at_ms": 300002,
+                  "credit_policy": null,
+                  "job_id": "job-5",
+                  "job_issued_at_ms": 300001,
+                  "miner_id": "miner-5",
+                  "network_difficulty": 1000005,
+                  "ntime": 1700000005,
+                  "order_key": "05:miner-5",
+                  "p2mr_program_hex": "0505050505050505050505050505050505050505050505050505050505050505",
+                  "share_difficulty": 1,
+                  "share_id": "share-5",
+                  "share_seq": 5,
+                  "template_height": 800000
+                },
+                {
+                  "accepted_at_ms": 300002,
+                  "credit_policy": null,
+                  "job_id": "job-6",
+                  "job_issued_at_ms": 300001,
+                  "miner_id": "miner-6",
+                  "network_difficulty": 1000006,
+                  "ntime": 1700000006,
+                  "order_key": "06:miner-6",
+                  "p2mr_program_hex": "0606060606060606060606060606060606060606060606060606060606060606",
+                  "share_difficulty": 1,
+                  "share_id": "share-6",
+                  "share_seq": 6,
+                  "template_height": 800000
+                }
+              ]
+            }
+          ],
+          "name": "advance-page-expiry-at-weight",
+          "page_size": 2,
+          "schema": "qbit-prism-window-pipeline-parity-input/v1",
+          "snapshot": {
+            "anchor_job_issued_at_ms": 300000,
+            "records": [
+              {
+                "accepted_at_ms": 299991,
+                "credit_policy": null,
+                "job_id": "job-1",
+                "job_issued_at_ms": 299981,
+                "miner_id": "miner-1",
+                "network_difficulty": 1000001,
+                "ntime": 1700000001,
+                "order_key": "01:miner-1",
+                "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                "share_difficulty": 1,
+                "share_id": "share-1",
+                "share_seq": 1,
+                "template_height": 800000
+              },
+              {
+                "accepted_at_ms": 299992,
+                "credit_policy": null,
+                "job_id": "job-2",
+                "job_issued_at_ms": 299982,
+                "miner_id": "miner-2",
+                "network_difficulty": 1000002,
+                "ntime": 1700000002,
+                "order_key": "02:miner-2",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "share_difficulty": 1,
+                "share_id": "share-2",
+                "share_seq": 2,
+                "template_height": 800000
+              },
+              {
+                "accepted_at_ms": 299993,
+                "credit_policy": null,
+                "job_id": "job-3",
+                "job_issued_at_ms": 299983,
+                "miner_id": "miner-3",
+                "network_difficulty": 1000003,
+                "ntime": 1700000003,
+                "order_key": "03:miner-3",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "share_difficulty": 1,
+                "share_id": "share-3",
+                "share_seq": 3,
+                "template_height": 800000
+              },
+              {
+                "accepted_at_ms": 299994,
+                "credit_policy": null,
+                "job_id": "job-4",
+                "job_issued_at_ms": 299984,
+                "miner_id": "miner-4",
+                "network_difficulty": 1000004,
+                "ntime": 1700000004,
+                "order_key": "04:miner-4",
+                "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+                "share_difficulty": 1,
+                "share_id": "share-4",
+                "share_seq": 4,
+                "template_height": 800000
+              }
+            ]
+          },
+          "window_weight": 2
+        },
+        "record_jsons": [
+          "{\"accepted_at_ms\":300002,\"job_id\":\"job-5\",\"job_issued_at_ms\":300001,\"miner_id\":\"miner-5\",\"network_difficulty\":1000005,\"ntime\":1700000005,\"order_key\":\"05:miner-5\",\"p2mr_program_hex\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"share_difficulty\":1,\"share_id\":\"share-5\",\"share_seq\":5,\"template_height\":800000}",
+          "{\"accepted_at_ms\":300002,\"job_id\":\"job-6\",\"job_issued_at_ms\":300001,\"miner_id\":\"miner-6\",\"network_difficulty\":1000006,\"ntime\":1700000006,\"order_key\":\"06:miner-6\",\"p2mr_program_hex\":\"0606060606060606060606060606060606060606060606060606060606060606\",\"share_difficulty\":1,\"share_id\":\"share-6\",\"share_seq\":6,\"template_height\":800000}"
+        ],
+        "spool_tail": ",\"compact_share_identities\":[[\"miner-5\",\"05:miner-5\",\"0505050505050505050505050505050505050505050505050505050505050505\"],[\"miner-6\",\"06:miner-6\",\"0606060606060606060606060606060606060606060606060606060606060606\"]],\"compact_shares\":[[5,\"share-5\",0,1,300001,300002,null],[6,\"share-6\",1,1,300001,300002,null]]}"
+      },
+      "record_count": 2,
+      "record_stream_len": 659,
+      "record_stream_sha256": "53f3d5bc9fa4dd43cc9c6766969aaf2a886f19f922d9b555592b1d96586eba7a",
+      "spool_tail_len": 307,
+      "spool_tail_sha256": "67885cf4dc3a110d6a9c4014a3f83f15b6b107cb846d15f9cac884b18759863b",
+      "why": "page_size 2, weight 2, four difficulty-1 records: the snapshot retains the one full page [3,4] at total 2; the advance appends the fresh page [5,6] (total 4) and 4-2 = 2 >= 2 expires the old page wholesale exactly at the weight, touched_pages 0. A whole-page expiry using > instead of >= keeps the page, empties it in the partial loop and counts it touched"
+    },
+    "advance-page-expiry-at-weight-second-page": {
+      "advance_stats": [
+        {
+          "added_rows": 4,
+          "expired_rows": 4,
+          "touched_pages": 0
+        }
+      ],
+      "canonical_bytes_len": 1326,
+      "canonical_bytes_sha256": "108bcacec300122f4b5ddd0f5ef8e007f10c1735e566adb4866ba2b32b0dae5f",
+      "canonical_digest": "108bcacec300122f4b5ddd0f5ef8e007f10c1735e566adb4866ba2b32b0dae5f",
+      "input_sha256": "d7c2f76002324b57bc958d6c6fe66a4ef0be414902ae45e83aa0ea0420f8a2a1",
+      "pinned_literals": {
+        "canonical_bytes": "[{\"accepted_at_ms\":310002,\"job_id\":\"job-7\",\"job_issued_at_ms\":310001,\"miner_id\":\"miner-7\",\"network_difficulty\":1000007,\"ntime\":1700000007,\"order_key\":\"07:miner-7\",\"p2mr_program_hex\":\"0707070707070707070707070707070707070707070707070707070707070707\",\"share_difficulty\":1,\"share_id\":\"share-7\",\"share_seq\":7,\"template_height\":800000},{\"accepted_at_ms\":310002,\"job_id\":\"job-8\",\"job_issued_at_ms\":310001,\"miner_id\":\"miner-8\",\"network_difficulty\":1000008,\"ntime\":1700000008,\"order_key\":\"08:miner-8\",\"p2mr_program_hex\":\"0808080808080808080808080808080808080808080808080808080808080808\",\"share_difficulty\":1,\"share_id\":\"share-8\",\"share_seq\":8,\"template_height\":800000},{\"accepted_at_ms\":310002,\"job_id\":\"job-9\",\"job_issued_at_ms\":310001,\"miner_id\":\"miner-9\",\"network_difficulty\":1000009,\"ntime\":1700000009,\"order_key\":\"09:miner-9\",\"p2mr_program_hex\":\"0909090909090909090909090909090909090909090909090909090909090909\",\"share_difficulty\":1,\"share_id\":\"share-9\",\"share_seq\":9,\"template_height\":800000},{\"accepted_at_ms\":310002,\"job_id\":\"job-10\",\"job_issued_at_ms\":310001,\"miner_id\":\"miner-10\",\"network_difficulty\":1000010,\"ntime\":1700000010,\"order_key\":\"10:miner-10\",\"p2mr_program_hex\":\"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\",\"share_difficulty\":1,\"share_id\":\"share-10\",\"share_seq\":10,\"template_height\":800000}]",
+        "input": {
+          "advances": [
+            {
+              "anchor_job_issued_at_ms": 310002,
+              "records": [
+                {
+                  "accepted_at_ms": 310002,
+                  "credit_policy": null,
+                  "job_id": "job-7",
+                  "job_issued_at_ms": 310001,
+                  "miner_id": "miner-7",
+                  "network_difficulty": 1000007,
+                  "ntime": 1700000007,
+                  "order_key": "07:miner-7",
+                  "p2mr_program_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+                  "share_difficulty": 1,
+                  "share_id": "share-7",
+                  "share_seq": 7,
+                  "template_height": 800000
+                },
+                {
+                  "accepted_at_ms": 310002,
+                  "credit_policy": null,
+                  "job_id": "job-8",
+                  "job_issued_at_ms": 310001,
+                  "miner_id": "miner-8",
+                  "network_difficulty": 1000008,
+                  "ntime": 1700000008,
+                  "order_key": "08:miner-8",
+                  "p2mr_program_hex": "0808080808080808080808080808080808080808080808080808080808080808",
+                  "share_difficulty": 1,
+                  "share_id": "share-8",
+                  "share_seq": 8,
+                  "template_height": 800000
+                },
+                {
+                  "accepted_at_ms": 310002,
+                  "credit_policy": null,
+                  "job_id": "job-9",
+                  "job_issued_at_ms": 310001,
+                  "miner_id": "miner-9",
+                  "network_difficulty": 1000009,
+                  "ntime": 1700000009,
+                  "order_key": "09:miner-9",
+                  "p2mr_program_hex": "0909090909090909090909090909090909090909090909090909090909090909",
+                  "share_difficulty": 1,
+                  "share_id": "share-9",
+                  "share_seq": 9,
+                  "template_height": 800000
+                },
+                {
+                  "accepted_at_ms": 310002,
+                  "credit_policy": null,
+                  "job_id": "job-10",
+                  "job_issued_at_ms": 310001,
+                  "miner_id": "miner-10",
+                  "network_difficulty": 1000010,
+                  "ntime": 1700000010,
+                  "order_key": "10:miner-10",
+                  "p2mr_program_hex": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+                  "share_difficulty": 1,
+                  "share_id": "share-10",
+                  "share_seq": 10,
+                  "template_height": 800000
+                }
+              ]
+            }
+          ],
+          "name": "advance-page-expiry-at-weight-second-page",
+          "page_size": 2,
+          "schema": "qbit-prism-window-pipeline-parity-input/v1",
+          "snapshot": {
+            "anchor_job_issued_at_ms": 310000,
+            "records": [
+              {
+                "accepted_at_ms": 309991,
+                "credit_policy": null,
+                "job_id": "job-1",
+                "job_issued_at_ms": 309981,
+                "miner_id": "miner-1",
+                "network_difficulty": 1000001,
+                "ntime": 1700000001,
+                "order_key": "01:miner-1",
+                "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                "share_difficulty": 1,
+                "share_id": "share-1",
+                "share_seq": 1,
+                "template_height": 800000
+              },
+              {
+                "accepted_at_ms": 309992,
+                "credit_policy": null,
+                "job_id": "job-2",
+                "job_issued_at_ms": 309982,
+                "miner_id": "miner-2",
+                "network_difficulty": 1000002,
+                "ntime": 1700000002,
+                "order_key": "02:miner-2",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "share_difficulty": 1,
+                "share_id": "share-2",
+                "share_seq": 2,
+                "template_height": 800000
+              },
+              {
+                "accepted_at_ms": 309993,
+                "credit_policy": null,
+                "job_id": "job-3",
+                "job_issued_at_ms": 309983,
+                "miner_id": "miner-3",
+                "network_difficulty": 1000003,
+                "ntime": 1700000003,
+                "order_key": "03:miner-3",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "share_difficulty": 1,
+                "share_id": "share-3",
+                "share_seq": 3,
+                "template_height": 800000
+              },
+              {
+                "accepted_at_ms": 309994,
+                "credit_policy": null,
+                "job_id": "job-4",
+                "job_issued_at_ms": 309984,
+                "miner_id": "miner-4",
+                "network_difficulty": 1000004,
+                "ntime": 1700000004,
+                "order_key": "04:miner-4",
+                "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+                "share_difficulty": 1,
+                "share_id": "share-4",
+                "share_seq": 4,
+                "template_height": 800000
+              },
+              {
+                "accepted_at_ms": 309995,
+                "credit_policy": null,
+                "job_id": "job-5",
+                "job_issued_at_ms": 309985,
+                "miner_id": "miner-5",
+                "network_difficulty": 1000005,
+                "ntime": 1700000005,
+                "order_key": "05:miner-5",
+                "p2mr_program_hex": "0505050505050505050505050505050505050505050505050505050505050505",
+                "share_difficulty": 1,
+                "share_id": "share-5",
+                "share_seq": 5,
+                "template_height": 800000
+              },
+              {
+                "accepted_at_ms": 309996,
+                "credit_policy": null,
+                "job_id": "job-6",
+                "job_issued_at_ms": 309986,
+                "miner_id": "miner-6",
+                "network_difficulty": 1000006,
+                "ntime": 1700000006,
+                "order_key": "06:miner-6",
+                "p2mr_program_hex": "0606060606060606060606060606060606060606060606060606060606060606",
+                "share_difficulty": 1,
+                "share_id": "share-6",
+                "share_seq": 6,
+                "template_height": 800000
+              }
+            ]
+          },
+          "window_weight": 4
+        },
+        "record_jsons": [
+          "{\"accepted_at_ms\":310002,\"job_id\":\"job-7\",\"job_issued_at_ms\":310001,\"miner_id\":\"miner-7\",\"network_difficulty\":1000007,\"ntime\":1700000007,\"order_key\":\"07:miner-7\",\"p2mr_program_hex\":\"0707070707070707070707070707070707070707070707070707070707070707\",\"share_difficulty\":1,\"share_id\":\"share-7\",\"share_seq\":7,\"template_height\":800000}",
+          "{\"accepted_at_ms\":310002,\"job_id\":\"job-8\",\"job_issued_at_ms\":310001,\"miner_id\":\"miner-8\",\"network_difficulty\":1000008,\"ntime\":1700000008,\"order_key\":\"08:miner-8\",\"p2mr_program_hex\":\"0808080808080808080808080808080808080808080808080808080808080808\",\"share_difficulty\":1,\"share_id\":\"share-8\",\"share_seq\":8,\"template_height\":800000}",
+          "{\"accepted_at_ms\":310002,\"job_id\":\"job-9\",\"job_issued_at_ms\":310001,\"miner_id\":\"miner-9\",\"network_difficulty\":1000009,\"ntime\":1700000009,\"order_key\":\"09:miner-9\",\"p2mr_program_hex\":\"0909090909090909090909090909090909090909090909090909090909090909\",\"share_difficulty\":1,\"share_id\":\"share-9\",\"share_seq\":9,\"template_height\":800000}",
+          "{\"accepted_at_ms\":310002,\"job_id\":\"job-10\",\"job_issued_at_ms\":310001,\"miner_id\":\"miner-10\",\"network_difficulty\":1000010,\"ntime\":1700000010,\"order_key\":\"10:miner-10\",\"p2mr_program_hex\":\"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\",\"share_difficulty\":1,\"share_id\":\"share-10\",\"share_seq\":10,\"template_height\":800000}"
+        ],
+        "spool_tail": ",\"compact_share_identities\":[[\"miner-7\",\"07:miner-7\",\"0707070707070707070707070707070707070707070707070707070707070707\"],[\"miner-8\",\"08:miner-8\",\"0808080808080808080808080808080808080808080808080808080808080808\"],[\"miner-9\",\"09:miner-9\",\"0909090909090909090909090909090909090909090909090909090909090909\"],[\"miner-10\",\"10:miner-10\",\"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\"]],\"compact_shares\":[[7,\"share-7\",0,1,310001,310002,null],[8,\"share-8\",1,1,310001,310002,null],[9,\"share-9\",2,1,310001,310002,null],[10,\"share-10\",3,1,310001,310002,null]]}"
+      },
+      "record_count": 4,
+      "record_stream_len": 1324,
+      "record_stream_sha256": "388d090b2388249aefb5582b08833ce98fb9152f0e8f9c045591bdf8d5467976",
+      "spool_tail_len": 569,
+      "spool_tail_sha256": "8342a226773986bc571f2f655b54348f79dc385935e3fc7785a770c93860bddf",
+      "why": "page_size 2, weight 4, six difficulty-1 records: the snapshot retains pages [3,4],[5,6] at total 4; the advance appends [7,8],[9,10] (total 8); 8-2 = 6 expires [3,4] above the weight, then 6-2 = 4 >= 4 expires [5,6] exactly at the weight, retaining [7,8],[9,10] with touched_pages 0. The exact-weight page is the second retained page, so the whole-page loop must keep going after its first expiry"
+    },
+    "advance-page-expiry-one-above-weight": {
+      "advance_stats": [
+        {
+          "added_rows": 2,
+          "expired_rows": 2,
+          "touched_pages": 0
+        }
+      ],
+      "canonical_bytes_len": 661,
+      "canonical_bytes_sha256": "f1e28c7eb1642cc46855542061403d80db320b8207b82fd37b194e462e3d17c9",
+      "canonical_digest": "f1e28c7eb1642cc46855542061403d80db320b8207b82fd37b194e462e3d17c9",
+      "input_sha256": "b447bfdc7826b099c9968d0db6349cebf32fe7464c4313cf92bef0db37f90115",
+      "pinned_literals": {
+        "canonical_bytes": "[{\"accepted_at_ms\":330002,\"job_id\":\"job-5\",\"job_issued_at_ms\":330001,\"miner_id\":\"miner-5\",\"network_difficulty\":1000005,\"ntime\":1700000005,\"order_key\":\"05:miner-5\",\"p2mr_program_hex\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"share_difficulty\":2,\"share_id\":\"share-5\",\"share_seq\":5,\"template_height\":800000},{\"accepted_at_ms\":330002,\"job_id\":\"job-6\",\"job_issued_at_ms\":330001,\"miner_id\":\"miner-6\",\"network_difficulty\":1000006,\"ntime\":1700000006,\"order_key\":\"06:miner-6\",\"p2mr_program_hex\":\"0606060606060606060606060606060606060606060606060606060606060606\",\"share_difficulty\":2,\"share_id\":\"share-6\",\"share_seq\":6,\"template_height\":800000}]",
+        "input": {
+          "advances": [
+            {
+              "anchor_job_issued_at_ms": 330002,
+              "records": [
+                {
+                  "accepted_at_ms": 330002,
+                  "credit_policy": null,
+                  "job_id": "job-5",
+                  "job_issued_at_ms": 330001,
+                  "miner_id": "miner-5",
+                  "network_difficulty": 1000005,
+                  "ntime": 1700000005,
+                  "order_key": "05:miner-5",
+                  "p2mr_program_hex": "0505050505050505050505050505050505050505050505050505050505050505",
+                  "share_difficulty": 2,
+                  "share_id": "share-5",
+                  "share_seq": 5,
+                  "template_height": 800000
+                },
+                {
+                  "accepted_at_ms": 330002,
+                  "credit_policy": null,
+                  "job_id": "job-6",
+                  "job_issued_at_ms": 330001,
+                  "miner_id": "miner-6",
+                  "network_difficulty": 1000006,
+                  "ntime": 1700000006,
+                  "order_key": "06:miner-6",
+                  "p2mr_program_hex": "0606060606060606060606060606060606060606060606060606060606060606",
+                  "share_difficulty": 2,
+                  "share_id": "share-6",
+                  "share_seq": 6,
+                  "template_height": 800000
+                }
+              ]
+            }
+          ],
+          "name": "advance-page-expiry-one-above-weight",
+          "page_size": 2,
+          "schema": "qbit-prism-window-pipeline-parity-input/v1",
+          "snapshot": {
+            "anchor_job_issued_at_ms": 330000,
+            "records": [
+              {
+                "accepted_at_ms": 329991,
+                "credit_policy": null,
+                "job_id": "job-1",
+                "job_issued_at_ms": 329981,
+                "miner_id": "miner-1",
+                "network_difficulty": 1000001,
+                "ntime": 1700000001,
+                "order_key": "01:miner-1",
+                "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                "share_difficulty": 1,
+                "share_id": "share-1",
+                "share_seq": 1,
+                "template_height": 800000
+              },
+              {
+                "accepted_at_ms": 329992,
+                "credit_policy": null,
+                "job_id": "job-2",
+                "job_issued_at_ms": 329982,
+                "miner_id": "miner-2",
+                "network_difficulty": 1000002,
+                "ntime": 1700000002,
+                "order_key": "02:miner-2",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "share_difficulty": 1,
+                "share_id": "share-2",
+                "share_seq": 2,
+                "template_height": 800000
+              },
+              {
+                "accepted_at_ms": 329993,
+                "credit_policy": null,
+                "job_id": "job-3",
+                "job_issued_at_ms": 329983,
+                "miner_id": "miner-3",
+                "network_difficulty": 1000003,
+                "ntime": 1700000003,
+                "order_key": "03:miner-3",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "share_difficulty": 2,
+                "share_id": "share-3",
+                "share_seq": 3,
+                "template_height": 800000
+              },
+              {
+                "accepted_at_ms": 329994,
+                "credit_policy": null,
+                "job_id": "job-4",
+                "job_issued_at_ms": 329984,
+                "miner_id": "miner-4",
+                "network_difficulty": 1000004,
+                "ntime": 1700000004,
+                "order_key": "04:miner-4",
+                "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+                "share_difficulty": 1,
+                "share_id": "share-4",
+                "share_seq": 4,
+                "template_height": 800000
+              }
+            ]
+          },
+          "window_weight": 3
+        },
+        "record_jsons": [
+          "{\"accepted_at_ms\":330002,\"job_id\":\"job-5\",\"job_issued_at_ms\":330001,\"miner_id\":\"miner-5\",\"network_difficulty\":1000005,\"ntime\":1700000005,\"order_key\":\"05:miner-5\",\"p2mr_program_hex\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"share_difficulty\":2,\"share_id\":\"share-5\",\"share_seq\":5,\"template_height\":800000}",
+          "{\"accepted_at_ms\":330002,\"job_id\":\"job-6\",\"job_issued_at_ms\":330001,\"miner_id\":\"miner-6\",\"network_difficulty\":1000006,\"ntime\":1700000006,\"order_key\":\"06:miner-6\",\"p2mr_program_hex\":\"0606060606060606060606060606060606060606060606060606060606060606\",\"share_difficulty\":2,\"share_id\":\"share-6\",\"share_seq\":6,\"template_height\":800000}"
+        ],
+        "spool_tail": ",\"compact_share_identities\":[[\"miner-5\",\"05:miner-5\",\"0505050505050505050505050505050505050505050505050505050505050505\"],[\"miner-6\",\"06:miner-6\",\"0606060606060606060606060606060606060606060606060606060606060606\"]],\"compact_shares\":[[5,\"share-5\",0,2,330001,330002,null],[6,\"share-6\",1,2,330001,330002,null]]}"
+      },
+      "record_count": 2,
+      "record_stream_len": 659,
+      "record_stream_sha256": "7437fbce0a011de987f98327a714f0b770899b8772bfb21e6006cf59c4aa60f0",
+      "spool_tail_len": 307,
+      "spool_tail_sha256": "52da41ec514a86bc2ddfed1dcb153ae9ec39c825a2d59c20d0053bfd3a2b85e7",
+      "why": "page_size 2, weight 3, difficulties (1,1,2,1): the snapshot retains [3,4] at total 3; the advance appends [5,6] of difficulty 2 each (total 7); 7-3 = 4, one above the weight, expires the old page wholesale, and the partial loop keeps both new rows (4-2 = 2 < 3), touched_pages 0"
+    },
+    "advance-page-expiry-one-below-weight": {
+      "advance_stats": [
+        {
+          "added_rows": 2,
+          "expired_rows": 1,
+          "touched_pages": 1
+        }
+      ],
+      "canonical_bytes_len": 991,
+      "canonical_bytes_sha256": "5648decf18cbee474703e97c9e955d1aef7615152310671b8404abf96d1a2705",
+      "canonical_digest": "5648decf18cbee474703e97c9e955d1aef7615152310671b8404abf96d1a2705",
+      "input_sha256": "a6d72bd900dbd394969df4f28f979ae4dea30a9c65397fe64c69cbf9be9cee36",
+      "pinned_literals": {
+        "canonical_bytes": "[{\"accepted_at_ms\":319994,\"job_id\":\"job-4\",\"job_issued_at_ms\":319984,\"miner_id\":\"miner-4\",\"network_difficulty\":1000004,\"ntime\":1700000004,\"order_key\":\"04:miner-4\",\"p2mr_program_hex\":\"0404040404040404040404040404040404040404040404040404040404040404\",\"share_difficulty\":1,\"share_id\":\"share-4\",\"share_seq\":4,\"template_height\":800000},{\"accepted_at_ms\":320002,\"job_id\":\"job-5\",\"job_issued_at_ms\":320001,\"miner_id\":\"miner-5\",\"network_difficulty\":1000005,\"ntime\":1700000005,\"order_key\":\"05:miner-5\",\"p2mr_program_hex\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"share_difficulty\":1,\"share_id\":\"share-5\",\"share_seq\":5,\"template_height\":800000},{\"accepted_at_ms\":320002,\"job_id\":\"job-6\",\"job_issued_at_ms\":320001,\"miner_id\":\"miner-6\",\"network_difficulty\":1000006,\"ntime\":1700000006,\"order_key\":\"06:miner-6\",\"p2mr_program_hex\":\"0606060606060606060606060606060606060606060606060606060606060606\",\"share_difficulty\":1,\"share_id\":\"share-6\",\"share_seq\":6,\"template_height\":800000}]",
+        "input": {
+          "advances": [
+            {
+              "anchor_job_issued_at_ms": 320002,
+              "records": [
+                {
+                  "accepted_at_ms": 320002,
+                  "credit_policy": null,
+                  "job_id": "job-5",
+                  "job_issued_at_ms": 320001,
+                  "miner_id": "miner-5",
+                  "network_difficulty": 1000005,
+                  "ntime": 1700000005,
+                  "order_key": "05:miner-5",
+                  "p2mr_program_hex": "0505050505050505050505050505050505050505050505050505050505050505",
+                  "share_difficulty": 1,
+                  "share_id": "share-5",
+                  "share_seq": 5,
+                  "template_height": 800000
+                },
+                {
+                  "accepted_at_ms": 320002,
+                  "credit_policy": null,
+                  "job_id": "job-6",
+                  "job_issued_at_ms": 320001,
+                  "miner_id": "miner-6",
+                  "network_difficulty": 1000006,
+                  "ntime": 1700000006,
+                  "order_key": "06:miner-6",
+                  "p2mr_program_hex": "0606060606060606060606060606060606060606060606060606060606060606",
+                  "share_difficulty": 1,
+                  "share_id": "share-6",
+                  "share_seq": 6,
+                  "template_height": 800000
+                }
+              ]
+            }
+          ],
+          "name": "advance-page-expiry-one-below-weight",
+          "page_size": 2,
+          "schema": "qbit-prism-window-pipeline-parity-input/v1",
+          "snapshot": {
+            "anchor_job_issued_at_ms": 320000,
+            "records": [
+              {
+                "accepted_at_ms": 319991,
+                "credit_policy": null,
+                "job_id": "job-1",
+                "job_issued_at_ms": 319981,
+                "miner_id": "miner-1",
+                "network_difficulty": 1000001,
+                "ntime": 1700000001,
+                "order_key": "01:miner-1",
+                "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                "share_difficulty": 1,
+                "share_id": "share-1",
+                "share_seq": 1,
+                "template_height": 800000
+              },
+              {
+                "accepted_at_ms": 319992,
+                "credit_policy": null,
+                "job_id": "job-2",
+                "job_issued_at_ms": 319982,
+                "miner_id": "miner-2",
+                "network_difficulty": 1000002,
+                "ntime": 1700000002,
+                "order_key": "02:miner-2",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "share_difficulty": 1,
+                "share_id": "share-2",
+                "share_seq": 2,
+                "template_height": 800000
+              },
+              {
+                "accepted_at_ms": 319993,
+                "credit_policy": null,
+                "job_id": "job-3",
+                "job_issued_at_ms": 319983,
+                "miner_id": "miner-3",
+                "network_difficulty": 1000003,
+                "ntime": 1700000003,
+                "order_key": "03:miner-3",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "share_difficulty": 2,
+                "share_id": "share-3",
+                "share_seq": 3,
+                "template_height": 800000
+              },
+              {
+                "accepted_at_ms": 319994,
+                "credit_policy": null,
+                "job_id": "job-4",
+                "job_issued_at_ms": 319984,
+                "miner_id": "miner-4",
+                "network_difficulty": 1000004,
+                "ntime": 1700000004,
+                "order_key": "04:miner-4",
+                "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+                "share_difficulty": 1,
+                "share_id": "share-4",
+                "share_seq": 4,
+                "template_height": 800000
+              }
+            ]
+          },
+          "window_weight": 3
+        },
+        "record_jsons": [
+          "{\"accepted_at_ms\":319994,\"job_id\":\"job-4\",\"job_issued_at_ms\":319984,\"miner_id\":\"miner-4\",\"network_difficulty\":1000004,\"ntime\":1700000004,\"order_key\":\"04:miner-4\",\"p2mr_program_hex\":\"0404040404040404040404040404040404040404040404040404040404040404\",\"share_difficulty\":1,\"share_id\":\"share-4\",\"share_seq\":4,\"template_height\":800000}",
+          "{\"accepted_at_ms\":320002,\"job_id\":\"job-5\",\"job_issued_at_ms\":320001,\"miner_id\":\"miner-5\",\"network_difficulty\":1000005,\"ntime\":1700000005,\"order_key\":\"05:miner-5\",\"p2mr_program_hex\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"share_difficulty\":1,\"share_id\":\"share-5\",\"share_seq\":5,\"template_height\":800000}",
+          "{\"accepted_at_ms\":320002,\"job_id\":\"job-6\",\"job_issued_at_ms\":320001,\"miner_id\":\"miner-6\",\"network_difficulty\":1000006,\"ntime\":1700000006,\"order_key\":\"06:miner-6\",\"p2mr_program_hex\":\"0606060606060606060606060606060606060606060606060606060606060606\",\"share_difficulty\":1,\"share_id\":\"share-6\",\"share_seq\":6,\"template_height\":800000}"
+        ],
+        "spool_tail": ",\"compact_share_identities\":[[\"miner-4\",\"04:miner-4\",\"0404040404040404040404040404040404040404040404040404040404040404\"],[\"miner-5\",\"05:miner-5\",\"0505050505050505050505050505050505050505050505050505050505050505\"],[\"miner-6\",\"06:miner-6\",\"0606060606060606060606060606060606060606060606060606060606060606\"]],\"compact_shares\":[[4,\"share-4\",0,1,319984,319994,null],[5,\"share-5\",1,1,320001,320002,null],[6,\"share-6\",2,1,320001,320002,null]]}"
+      },
+      "record_count": 3,
+      "record_stream_len": 989,
+      "record_stream_sha256": "d92a5230d0b1788862ad11cba97c0b9371791c6450450b0daf7aaca069a6bd9b",
+      "spool_tail_len": 436,
+      "spool_tail_sha256": "2a0827b55d1e9557f5b3ad76e2d94253712556660ed35c36604f777ba9a00f35",
+      "why": "page_size 2, weight 3, difficulties (1,1,2,1): the snapshot retains [3,4] at total 3; the advance appends [5,6] of difficulty 1 each (total 5); 5-3 = 2, one below the weight, keeps the old page, and the partial loop expires seq 3 alone (5-2 = 3 >= 3, then 3-1 = 2 < 3), touched_pages 1"
+    }
+  },
+  "command": "PYTHONDONTWRITEBYTECODE=1 python3 -c 'import json, shlex, sys\nfrom tests import window_pipeline_parity as w\nrec = w.corpus_record\nCase = w.WindowPipelineCase\nAdvance = w.WindowPipelineAdvance\ndef snap(anchor, difficulties):\n    return tuple(rec(seq, share_difficulty=d, job_issued_at_ms=anchor - 20 + seq, accepted_at_ms=anchor - 10 + seq) for seq, d in enumerate(difficulties, 1))\ndef delta(anchor, first, difficulties):\n    return tuple(rec(seq, share_difficulty=d, job_issued_at_ms=anchor + 1, accepted_at_ms=anchor + 2) for seq, d in enumerate(difficulties, first))\ncases = (\n    Case(name=\"advance-page-expiry-at-weight\", why=\"page_size 2, weight 2, four difficulty-1 records: the snapshot retains the one full page [3,4] at total 2; the advance appends the fresh page [5,6] (total 4) and 4-2 = 2 >= 2 expires the old page wholesale exactly at the weight, touched_pages 0. A whole-page expiry using > instead of >= keeps the page, empties it in the partial loop and counts it touched\", anchor_job_issued_at_ms=300_000, window_weight=2, page_size=2, snapshot_records=snap(300_000, (1, 1, 1, 1)), advances=(Advance(anchor_job_issued_at_ms=300_002, delta_records=delta(300_000, 5, (1, 1))),)),\n    Case(name=\"advance-page-expiry-at-weight-second-page\", why=\"page_size 2, weight 4, six difficulty-1 records: the snapshot retains pages [3,4],[5,6] at total 4; the advance appends [7,8],[9,10] (total 8); 8-2 = 6 expires [3,4] above the weight, then 6-2 = 4 >= 4 expires [5,6] exactly at the weight, retaining [7,8],[9,10] with touched_pages 0. The exact-weight page is the second retained page, so the whole-page loop must keep going after its first expiry\", anchor_job_issued_at_ms=310_000, window_weight=4, page_size=2, snapshot_records=snap(310_000, (1, 1, 1, 1, 1, 1)), advances=(Advance(anchor_job_issued_at_ms=310_002, delta_records=delta(310_000, 7, (1, 1, 1, 1))),)),\n    Case(name=\"advance-page-expiry-one-below-weight\", why=\"page_size 2, weight 3, difficulties (1,1,2,1): the snapshot retains [3,4] at total 3; the advance appends [5,6] of difficulty 1 each (total 5); 5-3 = 2, one below the weight, keeps the old page, and the partial loop expires seq 3 alone (5-2 = 3 >= 3, then 3-1 = 2 < 3), touched_pages 1\", anchor_job_issued_at_ms=320_000, window_weight=3, page_size=2, snapshot_records=snap(320_000, (1, 1, 2, 1)), advances=(Advance(anchor_job_issued_at_ms=320_002, delta_records=delta(320_000, 5, (1, 1))),)),\n    Case(name=\"advance-page-expiry-one-above-weight\", why=\"page_size 2, weight 3, difficulties (1,1,2,1): the snapshot retains [3,4] at total 3; the advance appends [5,6] of difficulty 2 each (total 7); 7-3 = 4, one above the weight, expires the old page wholesale, and the partial loop keeps both new rows (4-2 = 2 < 3), touched_pages 0\", anchor_job_issued_at_ms=330_000, window_weight=3, page_size=2, snapshot_records=snap(330_000, (1, 1, 2, 1)), advances=(Advance(anchor_job_issued_at_ms=330_002, delta_records=delta(330_000, 5, (2, 2))),)),\n)\nadapter = w.PythonWindowPipelineAdapter()\nentries = {case.name: w.reference_case_entry(case, adapter.run(case)) for case in cases}\nrefused = sorted(name for name, entry in entries.items() if \"rejected\" in entry)\nrefused and sys.exit(\"supplementary case rejected by the oracle: \" + \", \".join(refused))\ncommand = \"PYTHONDONTWRITEBYTECODE=1 python3 -c \" + shlex.quote(sys.orig_argv[-1]) + \" > supplementary.json\"\ndocument = {\"schema\": \"qbit-prism-window-pipeline-parity-supplementary/v1\", \"source_commit\": \"504846cc0b72e8f86ed17f896d4ccbbe196a31dc\", \"command\": command, \"cases\": entries}\nsys.stdout.write(json.dumps(document, indent=2, sort_keys=True) + \"\\n\")' > supplementary.json",
+  "schema": "qbit-prism-window-pipeline-parity-supplementary/v1",
+  "source_commit": "504846cc0b72e8f86ed17f896d4ccbbe196a31dc"
+}
