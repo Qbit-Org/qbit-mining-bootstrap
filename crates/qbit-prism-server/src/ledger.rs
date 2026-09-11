@@ -39,7 +39,8 @@ mod window;
 pub use difficulty::WorkerDifficulty;
 pub use window::CommitGateClosed;
 pub use window::{
-    AppendResult, BalanceSource, PayoutState, ShareRange, Snapshot, Window, WindowError, WindowRef,
+    probe_share_rows, put_balance_snapshot, read_range_paged, AppendResult, BalanceSource,
+    PayoutState, ShareRange, Snapshot, Window, WindowError, WindowRef,
 };
 use window::{read_prior_balances, share_from_row};
 
