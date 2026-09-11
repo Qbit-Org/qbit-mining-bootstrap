@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/qbit-pool-builder",
     "crates/qbit-prism",
+    "crates/qbit-prism-load",
     "crates/qbit-prism-server",
 ]
 

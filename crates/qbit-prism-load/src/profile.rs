@@ -1,0 +1,94 @@
+//! `database-profile.json`: the document whose digest the artifact's
+//! `subject.database_profile_sha256` names.
+//!
+//! The repository defines no schema for it, so the harness writes one and
+//! ships it beside the artifact. It is canonical JSON — object keys sorted,
+//! no insignificant whitespace — so the digest is a function of the content
+//! and not of the serializer.
+
+use anyhow::Result;
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use sqlx::{PgPool, Row};
+
+pub const SCHEMA: &str = "qbit.prism.database-profile.v1";
+
+/// Sorted-key, compact JSON. `serde_json::Map` is already a `BTreeMap` in this
+/// workspace, but the digest must not depend on that staying true.
+pub fn canonical_json(value: &Value) -> String {
+    let mut out = String::new();
+    write_canonical(value, &mut out);
+    out
+}
+
+fn write_canonical(value: &Value, out: &mut String) {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (index, key) in keys.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String((*key).clone()).to_string());
+                out.push(':');
+                write_canonical(&map[*key], out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_canonical(item, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
+pub fn digest(canonical: &str) -> String {
+    hex::encode(Sha256::digest(canonical.as_bytes()))
+}
+
+/// `SHOW ALL`, as a name to setting map plus the units the server reports.
+pub async fn show_all(pool: &PgPool) -> Result<Value> {
+    let rows = sqlx::query("SELECT name, setting, COALESCE(unit,'') AS unit FROM pg_settings")
+        .fetch_all(pool)
+        .await?;
+    let mut settings = Map::new();
+    for row in rows {
+        let name: String = row.try_get("name")?;
+        let setting: String = row.try_get("setting")?;
+        let unit: String = row.try_get("unit")?;
+        settings.insert(name, json!({"setting": setting, "unit": unit}));
+    }
+    Ok(Value::Object(settings))
+}
+
+/// Build the profile document.
+#[allow(clippy::too_many_arguments)]
+pub fn build(
+    settings: Value,
+    server_version: &str,
+    replication: Value,
+    proxy: Value,
+    host: Value,
+    frontends: Value,
+) -> Value {
+    json!({
+        "schema": SCHEMA,
+        "postgres": {
+            "server_version": server_version,
+            "settings": settings,
+        },
+        "replication": replication,
+        "connection_path": proxy,
+        "host": host,
+        "frontends": frontends,
+    })
+}

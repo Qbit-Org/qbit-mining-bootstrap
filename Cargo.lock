@@ -1372,6 +1372,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "qbit-prism-load"
+version = "3.0.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "hex",
+ "libc",
+ "num-bigint",
+ "num-traits",
+ "qbit-prism",
+ "qbit-prism-server",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "qbit-prism-server"
 version = "3.0.0"
 dependencies = [

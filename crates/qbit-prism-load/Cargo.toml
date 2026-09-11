@@ -1,0 +1,36 @@
+[package]
+name = "qbit-prism-load"
+version.workspace = true
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Stratum-to-PostgreSQL load harness and capacity-evidence producer for PRISM"
+
+[lib]
+name = "qbit_prism_load"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qbit-prism-load"
+path = "src/main.rs"
+
+[dependencies]
+qbit-prism = { path = "../qbit-prism" }
+qbit-prism-server = { path = "../qbit-prism-server" }
+anyhow = "1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+libc = "0.2"
+num-bigint = { version = "0.4", features = ["serde"] }
+num-traits = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision", "raw_value"] }
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
