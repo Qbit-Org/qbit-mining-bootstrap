@@ -12,6 +12,15 @@ impl Gate {
         self.release.notified().await;
     }
 }
+fn reset_client(client: Client) {
+    // OwnedWriteHalf::drop performs a graceful write shutdown. Reunite first
+    // so SO_LINGER=0 closes the full socket with a reset instead of sending FIN.
+    let stream = client.reader.into_inner().reunite(client.writer).unwrap();
+    #[allow(deprecated)]
+    stream.set_linger(Some(Duration::ZERO)).unwrap();
+    drop(stream);
+}
+
 fn sample(metrics: &qbit_prism_server::metrics::Metrics, key: &str) -> f64 {
     metrics
         .render()
@@ -107,13 +116,7 @@ async fn accepted_share_with_failed_tcp_response_has_no_ack_or_rejection() {
         .send(client.solved_submit(20, "miner.write-failure", 0))
         .await;
     gate.entered.notified().await;
-    #[allow(deprecated)]
-    client
-        .writer
-        .as_ref()
-        .set_linger(Some(Duration::ZERO))
-        .unwrap();
-    drop(client);
+    reset_client(client);
     tokio::time::sleep(Duration::from_millis(50)).await;
     gate.release.notify_one();
     timeout(Duration::from_secs(3), async {
@@ -248,13 +251,7 @@ async fn failed_rejection_response_counts_the_decision_without_an_ack() {
     *backend.submit_gate.lock().unwrap() = Some(gate.clone());
     client.send(request).await;
     gate.entered.notified().await;
-    #[allow(deprecated)]
-    client
-        .writer
-        .as_ref()
-        .set_linger(Some(Duration::ZERO))
-        .unwrap();
-    drop(client);
+    reset_client(client);
     tokio::time::sleep(Duration::from_millis(50)).await;
     gate.release.notify_one();
     timeout(Duration::from_secs(3), async {
