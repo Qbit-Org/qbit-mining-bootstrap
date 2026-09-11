@@ -244,9 +244,10 @@ each fail the gate, naming what was found and what was expected, so a second
 oversized write in the same phase can never be recorded as the one already
 known. The projections come from the reduced pair, which is why the full-size
 run and the baseline sweep both run that pair first; at the reduced sizes
-themselves a refusal at `n2` is attributed from the `n1` measurement, and a
-refusal at `n1` fails the gate, since nothing smaller was accepted to attribute
-it from. The ratchet row says how: `refused at n=400000 (attributed by
+themselves a refusal at `n2` is attributed from the `n1` measurement, and that scaled measurement stays
+the write's projection for the full-size run and the sweep, so a violation
+already refused at `n2` is still explained at the target. A refusal at `n1`
+fails the gate, since nothing smaller was accepted to attribute it from. The ratchet row says how: `refused at n=400000 (attributed by
 projection)`, and never a byte count.
 
 The gate passes only when the set of crossing writes equals `KNOWN_VIOLATIONS`

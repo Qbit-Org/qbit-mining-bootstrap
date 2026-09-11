@@ -1920,6 +1920,27 @@ fn projections_scaled(sample: Sample<'_>, n: u64) -> Result<Vec<(WriteKey, f64)>
         .collect())
 }
 
+/// What the reduced pair projects for each write at `n`, to attribute a
+/// refusal there. A write the pair fitted is projected along its line. A write
+/// PostgreSQL already refused at `n2` has no line, so it keeps the projection
+/// that attributed that refusal: its `n1` measurement scaled to `n`. Dropping
+/// it would leave a known violation unexplained at the larger size, for example
+/// with `PRISM_JSONB_GATE_N2` equal to the target.
+fn reduced_projections(rows: &[FitRow], low: Sample<'_>, n: u64) -> Result<Vec<(WriteKey, f64)>> {
+    let refused: BTreeSet<&WriteKey> = rows
+        .iter()
+        .filter(|row| matches!(row.verdict, Verdict::Rejected { .. }))
+        .map(|row| &row.key)
+        .collect();
+    let mut projections = projections_at(rows, n);
+    projections.extend(
+        projections_scaled(low, n)?
+            .into_iter()
+            .filter(|(key, _)| refused.contains(key)),
+    );
+    Ok(projections)
+}
+
 /// EP-VALIDATION: the smaller half of the reduced pair is the only accepted
 /// sample a refusal at `n2` can be attributed from, so a refusal at `n1` itself
 /// leaves the gate with nothing to attribute from at all.
@@ -2567,11 +2588,11 @@ async fn jsonb_ceiling_ratchet_at_full_size() -> Result<()> {
     };
     settings.apply_statement_timeout();
     print_settings(&settings, "full size");
-    let (_, _, reduced) = reduced_pair(&url, &settings).await?;
+    let (low, _, reduced) = reduced_pair(&url, &settings).await?;
     let mut pipeline = run_pipeline(&url, settings.target.value, &settings).await?;
     print_measurements(&pipeline);
     assert_phases_reached(&pipeline)?;
-    let projections = projections_at(&reduced, pipeline.n);
+    let projections = reduced_projections(&reduced, low.sample(), pipeline.n)?;
     attribute_refusals(&mut pipeline, &projections)?;
     let rows = absolute(pipeline.sample());
     assert_ratchet(&rows, RatchetMode::FullSize { target: pipeline.n })
@@ -2629,12 +2650,13 @@ async fn jsonb_ceiling_baseline_sweep() -> Result<()> {
     let high = runs.get_mut(&n2).context("the sweep did not run n2")?;
     attribute_refusals(high, &scaled)?;
     let ci_rows = fit([runs[&n1].sample(), runs[&n2].sample()], target)?;
-    // Every other size is attributed from that fit, projected to it.
+    // Every other size is attributed from that fit, projected to it; a write
+    // refused at n2 keeps its n1 measurement scaled to that size.
     for size in &order {
         if *size == n1 || *size == n2 {
             continue;
         }
-        let projections = projections_at(&ci_rows, *size);
+        let projections = reduced_projections(&ci_rows, runs[&n1].sample(), *size)?;
         let pipeline = runs
             .get_mut(size)
             .with_context(|| format!("the sweep did not run n={size}"))?;
@@ -2923,6 +2945,59 @@ fn a_refusal_is_attributed_to_exactly_one_projected_write() {
     assert!(
         error.contains(&label(&manifest)) && error.contains(&label(&outbox)),
         "{error}"
+    );
+}
+
+/// A write refused at `n2` keeps a projection for the larger run: its `n1`
+/// measurement scaled up, the same one that attributed the `n2` refusal. With
+/// `n2` equal to the target, the full-size run's refusal is then attributed
+/// instead of reported as unexplained.
+#[test]
+fn a_write_refused_at_n2_keeps_its_scaled_projection() {
+    let jobs = test_key("qbit_prism_jobs", "payload", PHASE_REFRESH);
+    let outbox = test_key("qbit_block_candidate_outbox", "candidate", PHASE_ENQUEUE);
+    // 100,000 shares: both writes accepted. 200,000: refresh refused.
+    let low_writes = BTreeMap::from([
+        (jobs.clone(), test_write(190_000_000)),
+        (outbox.clone(), test_write(124_000_000)),
+    ]);
+    let high_writes = BTreeMap::from([(outbox.clone(), test_write(248_000_000))]);
+    let none = BTreeMap::new();
+    let refused = BTreeMap::from([(
+        jobs.clone(),
+        test_refusal("total size of jsonb object elements exceeds the maximum of 268435455 bytes"),
+    )]);
+    let low = || Sample {
+        n: 100_000,
+        writes: &low_writes,
+        rejections: &none,
+    };
+    let high = Sample {
+        n: 200_000,
+        writes: &high_writes,
+        rejections: &refused,
+    };
+    let rows = fit([low(), high], 200_000).unwrap();
+
+    // The fit alone has no line for the refused write: the gap this closes.
+    assert!(!projections_at(&rows, 200_000)
+        .iter()
+        .any(|(key, _)| *key == jobs));
+
+    let projections = reduced_projections(&rows, low(), 200_000).unwrap();
+    let scaled = projections
+        .iter()
+        .find(|(key, _)| *key == jobs)
+        .map(|(_, bytes)| *bytes);
+    assert_eq!(scaled, Some(380_000_000.0));
+    // The fitted write keeps its own line and is not added twice.
+    assert_eq!(
+        projections.iter().filter(|(key, _)| *key == outbox).count(),
+        1
+    );
+    assert_eq!(
+        attribute_refusal(PHASE_REFRESH, 200_000, &projections, &jobs).unwrap(),
+        jobs
     );
 }
 
