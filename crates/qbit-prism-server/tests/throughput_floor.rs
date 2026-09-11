@@ -32,6 +32,51 @@
 //! PRISM_TEST_DATABASE_URL=postgres://prism_test:prism_test@127.0.0.1:5432/prism_test \
 //!     cargo test -p qbit-prism-server --test throughput_floor -- --nocapture
 //! ```
+//!
+//! # Run this against a database nothing else is appending to
+//!
+//! The per-run schema isolates the *tables*, but `ORDER_LOCK` is a PostgreSQL
+//! advisory lock, and an advisory lock is scoped to the **database**, not to a
+//! schema. Any other backend appending shares into the same database — another
+//! copy of this test, a developer's PRISM, a staging frontend — serializes
+//! against this run's appenders and roughly halves the rate this file reports.
+//! So: point `PRISM_TEST_DATABASE_URL` at a database that is doing nothing
+//! else, ideally a disposable one.
+//!
+//! Because "ideally" is not "always", the run does not rely on the operator
+//! getting that right. Every connection it opens carries a per-run
+//! `application_name` (`throughput-<uuid>`), and the lock sampler splits what
+//! it sees into this run's waiters and everyone else's. A level during which
+//! any foreign backend held or waited on `ORDER_LOCK` is marked
+//! `contaminated: true`, in the level, at the top of the report and in the
+//! failure message. Such a level is still measured and still gated against the
+//! floor — the rate it recorded is the rate the appends actually achieved — but
+//! the number describes two workloads sharing one lock rather than this one,
+//! and nothing downstream should treat it as a property of the append path.
+//!
+//! `contaminated` is `null`, not `false`, on a level whose sampler could not
+//! look (an error, or a level that ended before the first poll returned).
+//! "Nobody checked" is not "nothing was there".
+//!
+//! # A cancelled run leaves its schema behind
+//!
+//! Cleanup is an ordinary `await` on every exit path, so a passing run, a
+//! failing run and a panicking run all drop their schema. A **cancelled** run
+//! does not: `SIGINT` (Ctrl-C) kills the process before the drop runs, and the
+//! `prism_throughput_<uuid>` schema survives with its seeded window in it.
+//! Installing a signal handler would mean a new dependency, which this test is
+//! not allowed to add, so the leak is documented rather than fixed. It is the
+//! same behaviour as the sibling database tests in this crate.
+//!
+//! Find and drop the leftovers by hand:
+//!
+//! ```text
+//! SELECT nspname FROM pg_namespace WHERE nspname LIKE 'prism\_throughput\_%';
+//! DROP SCHEMA prism_throughput_0ee059ccc0314cbb8a814c0319f846d5 CASCADE;
+//! ```
+//!
+//! Only do that when no run is in flight: a live run's schema matches the same
+//! pattern.
 
 use anyhow::{bail, ensure, Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -47,7 +92,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::Barrier;
+use tokio::sync::{Barrier, Notify};
 use uuid::Uuid;
 
 /// The #264 window generator, shared read-only with the JSONB ceiling gate.
@@ -115,6 +160,18 @@ const REPORT_VAR: &str = "QBIT_PRISM_THROUGHPUT_REPORT";
 
 const DEFAULT_APPENDERS: &str = "1,2,4";
 const DEFAULT_LOCK_SAMPLE_MS: u64 = 10;
+/// The sampler's interval is bounded at both ends, at entry.
+///
+/// Below 1 ms there is no interval at all, and the "sample" would be a busy
+/// loop competing with the appenders for the server. Above 1000 ms the poll can
+/// no longer resolve what it exists to measure: an `ORDER_LOCK` wait lasts
+/// milliseconds, so a sampler that looks once a second mostly looks between the
+/// waits and reports a handful of points as if they were a series. A coarse
+/// interval also used to be dead time at the end of every level; the sampler
+/// now wakes on demand, but the ceiling stays because the *measurement* is what
+/// a second-scale interval ruins.
+const MIN_LOCK_SAMPLE_MS: u64 = 1;
+const MAX_LOCK_SAMPLE_MS: u64 = 1_000;
 /// An appender count above this is refused: the levels are meant to model a
 /// handful of production frontends, and a four-figure count would exhaust the
 /// server's connection slots long before it said anything about the lock.
@@ -241,6 +298,24 @@ fn parse_positive_u64(name: &str, raw: Option<&str>, fallback: u64) -> Result<u6
     Ok(value)
 }
 
+/// The lock sampling interval, in milliseconds, bounded to
+/// `MIN_LOCK_SAMPLE_MS..=MAX_LOCK_SAMPLE_MS`.
+///
+/// Checked here, at entry, alongside every other variable and before any
+/// connection is opened (EP-VALIDATION), so a run configured to produce
+/// meaningless wait figures costs nothing rather than costing a full seeding
+/// pass first.
+fn parse_lock_sample_ms(raw: Option<&str>, fallback: u64) -> Result<u64> {
+    let value = parse_positive_u64(LOCK_SAMPLE_VAR, raw, fallback)?;
+    ensure!(
+        (MIN_LOCK_SAMPLE_MS..=MAX_LOCK_SAMPLE_MS).contains(&value),
+        "{LOCK_SAMPLE_VAR}={value} is outside {MIN_LOCK_SAMPLE_MS}..={MAX_LOCK_SAMPLE_MS} \
+         milliseconds; an interval coarser than a second cannot resolve millisecond lock \
+         waits, and would report a few stray points as if they were a series"
+    );
+    Ok(value)
+}
+
 /// The window size must divide the fixture's window weight exactly, otherwise
 /// the payout window the seeded shares form would not be the requested number
 /// of shares wide (`tests/support/window_fixture.rs`). `WindowPlan::new` says
@@ -346,6 +421,12 @@ fn derive_replication_mode(sync_states: &[String], standby_names: &str) -> &'sta
 /// Everything the run needs, validated before it touches a database.
 #[derive(Clone, Debug)]
 struct Config {
+    test_name: String,
+    /// The `application_name` every connection this run opens carries, so the
+    /// lock sampler can tell this run's backends from everyone else's
+    /// (EP-STATE). Unique per run, never per test name: two copies of the same
+    /// test against one database must not look like one run.
+    application_name: String,
     window_shares: u64,
     shares_per_level: u64,
     appenders: Vec<u32>,
@@ -363,7 +444,7 @@ struct Defaults {
 }
 
 impl Config {
-    fn from_env(defaults: Defaults) -> Result<Self> {
+    fn from_env(test_name: &str, defaults: Defaults) -> Result<Self> {
         let window_shares = parse_window_shares(
             env_raw(WINDOW_SHARES_VAR)?.as_deref(),
             defaults.window_shares,
@@ -380,11 +461,8 @@ impl Config {
             "{SHARES_VAR}={shares_per_level} is below the widest level's appender count \
              {widest}; every appender must get at least one share"
         );
-        let lock_sample_ms = parse_positive_u64(
-            LOCK_SAMPLE_VAR,
-            env_raw(LOCK_SAMPLE_VAR)?.as_deref(),
-            DEFAULT_LOCK_SAMPLE_MS,
-        )?;
+        let lock_sample_ms =
+            parse_lock_sample_ms(env_raw(LOCK_SAMPLE_VAR)?.as_deref(), DEFAULT_LOCK_SAMPLE_MS)?;
         let raw_minimum = env_raw(MIN_SHARES_VAR)?;
         let minimum = parse_minimum(raw_minimum.as_deref(), CI_MIN_SHARES_PER_SEC)?;
         let minimum_source = match raw_minimum {
@@ -402,9 +480,11 @@ impl Config {
                 );
                 PathBuf::from(trimmed)
             }
-            None => default_report_path(),
+            None => default_report_path(test_name),
         };
         Ok(Self {
+            test_name: test_name.to_owned(),
+            application_name: format!("throughput-{}", Uuid::new_v4().simple()),
             window_shares,
             shares_per_level,
             appenders,
@@ -416,15 +496,23 @@ impl Config {
     }
 }
 
-/// `<workspace root>/target/prism-postgres-throughput.json`.
-fn default_report_path() -> PathBuf {
+/// `<workspace root>/target/prism-postgres-throughput-<test name>.json`.
+///
+/// The path carries the test name because the two floor tests can run in
+/// parallel threads of one binary (`--include-ignored`), and a single default
+/// path meant whichever finished last silently overwrote the other. With a path
+/// per test neither can lose, and the `test` field in the report says which one
+/// wrote it even when an operator has redirected both with
+/// `QBIT_PRISM_THROUGHPUT_REPORT`, which remains the explicit override.
+fn default_report_path(test_name: &str) -> PathBuf {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let root = manifest
         .parent()
         .and_then(Path::parent)
         .unwrap_or(manifest)
         .to_path_buf();
-    root.join("target").join("prism-postgres-throughput.json")
+    root.join("target")
+        .join(format!("prism-postgres-throughput-{test_name}.json"))
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +525,11 @@ fn default_report_path() -> PathBuf {
 /// advisory lock; none of that may land in `public` or in another test's
 /// schema. `search_path` is pushed into the URL rather than set per session, so
 /// every pool `Ledger::connect` opens from that URL lands in the same place.
+///
+/// The same trick carries the run's `application_name`: it goes into the URL,
+/// which is the only thing `Ledger::connect` is handed, so the seeding ledger,
+/// every appender ledger and the sampler all announce themselves with it
+/// without any production code having to know this test exists.
 struct Database {
     admin: PgPool,
     schema: String,
@@ -444,13 +537,35 @@ struct Database {
 }
 
 impl Database {
-    async fn open(raw: &str) -> Result<Self> {
-        let admin = PgPool::connect(raw).await?;
+    async fn open(raw: &str, application_name: &str) -> Result<Self> {
+        let mut url = url::Url::parse(raw)?;
+        url.query_pairs_mut()
+            .append_pair("application_name", application_name);
+        let admin = PgPool::connect(url.as_str()).await?;
+        // EP-STATE: everything downstream — which waiter is ours, which level
+        // is contaminated, whether the floor describes one workload — rests on
+        // the server having actually recorded this name. sqlx 0.8 parses
+        // `application_name` out of the URL and sends it in the startup packet,
+        // but "the library is supposed to" is not evidence, and a silently
+        // ignored parameter would make every foreign backend look like ours and
+        // every contaminated run look clean. So the run asks the server, once,
+        // and refuses to measure anything if the answer is wrong.
+        let announced: String = sqlx::query_scalar("SELECT current_setting('application_name')")
+            .fetch_one(&admin)
+            .await
+            .context("reading back the run's application_name")?;
+        if announced != application_name {
+            admin.close().await;
+            bail!(
+                "the server recorded application_name {announced:?} for a connection opened with \
+                 application_name={application_name:?}; without it the lock sampler cannot tell \
+                 this run's backends from any other, so no measurement here would be trustworthy"
+            );
+        }
         let schema = format!("prism_throughput_{}", Uuid::new_v4().simple());
         sqlx::query(&format!("CREATE SCHEMA {schema}"))
             .execute(&admin)
             .await?;
-        let mut url = url::Url::parse(raw)?;
         url.query_pairs_mut()
             .append_pair("options", &format!("-csearch_path={schema}"));
         Ok(Self {
@@ -476,6 +591,42 @@ impl Database {
 // ORDER_LOCK wait sampling
 // ---------------------------------------------------------------------------
 
+/// The sampler's stop signal: a flag it can test, plus a wake-up it can wait
+/// on.
+///
+/// The flag alone was not enough. The sampler used to test it only at the top
+/// of the loop and then block in `sleep(interval)`, so every level paid up to
+/// one whole interval of dead time after its appends had finished, and
+/// `run_level` sat in `sampler.await` for all of it. Pairing the flag with a
+/// `Notify` makes the sleep interruptible: `stop()` sets the flag *and* hands
+/// the sampler a permit, `notify_one` stores that permit even if the sampler is
+/// not waiting yet, so there is no window in which the signal can be lost
+/// (EP-ERRORS: shutdown is prompt and guaranteed, not eventual).
+#[derive(Default)]
+struct SamplerStop {
+    flag: AtomicBool,
+    wake: Notify,
+}
+
+impl SamplerStop {
+    fn stop(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+        self.wake.notify_one();
+    }
+
+    fn stopped(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+
+    /// Sleeps for `interval`, or returns as soon as `stop` is called.
+    async fn sleep_until_stopped(&self, interval: Duration) {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = self.wake.notified() => {}
+        }
+    }
+}
+
 /// What a level's sampler saw. Every figure is an estimate from a 100 Hz poll,
 /// never an exact accounting, and the report labels it as such.
 #[derive(Debug, Default)]
@@ -490,6 +641,12 @@ struct LockWaitSummary {
     /// Sum over samples of `waiters x (time since the previous sample)`, a
     /// Riemann estimate of waiter-seconds.
     waiter_seconds: f64,
+    /// The largest number of backends *not* from this run seen holding or
+    /// waiting on `ORDER_LOCK` in a single sample.
+    foreign_waiters_max: u64,
+    /// Distinct pids of backends not from this run seen holding or waiting on
+    /// `ORDER_LOCK` at any point in the level.
+    foreign_backends: BTreeSet<i32>,
     /// Set when the sampler could not do its job. Then every figure above is
     /// reported as `null`: an unsampled level has an unknown wait, not a zero
     /// one (EP-OBSERVABILITY).
@@ -497,6 +654,33 @@ struct LockWaitSummary {
 }
 
 impl LockWaitSummary {
+    /// The error to report, which is the sampler's own error if it had one and
+    /// otherwise the fact that it never completed a poll.
+    ///
+    /// A level that ends before the first query returns used to emit
+    /// `mean_waiters: 0.0`, `max_waiters: 0` and `estimated_waiter_seconds:
+    /// 0.0` beside `samples: 0`. That reads as "nobody ever waited on the lock"
+    /// when the truth is "nobody looked", which is precisely the zero-for-
+    /// unknown this file forbids elsewhere (EP-OBSERVABILITY).
+    fn effective_error(&self) -> Option<String> {
+        self.error.clone().or_else(|| {
+            (self.samples == 0)
+                .then(|| "the level ended before the sampler completed a poll".to_owned())
+        })
+    }
+
+    /// `Some(true)` when a foreign backend was seen, `Some(false)` when the
+    /// sampler looked and saw none, `None` when it could not look. `None` is
+    /// deliberate: "the sampler never ran" is not evidence that the database
+    /// was quiet, and rendering it as `false` would be the same lie as
+    /// rendering an unmeasured wait as zero.
+    fn contaminated(&self) -> Option<bool> {
+        match self.effective_error() {
+            Some(_) => None,
+            None => Some(!self.foreign_backends.is_empty()),
+        }
+    }
+
     fn to_json(&self, interval: Duration) -> Value {
         let mut object = Map::new();
         object.insert(
@@ -506,9 +690,10 @@ impl LockWaitSummary {
         object.insert(
             "method".to_owned(),
             Value::from(
-                "pg_locks joined to pg_stat_activity, filtered to the ungranted ORDER_LOCK \
-                 advisory lock in this database, polled on a connection outside every appender \
-                 pool",
+                "pg_locks left-joined to pg_stat_activity, filtered to the ORDER_LOCK advisory \
+                 lock in this database, polled on a connection outside every appender pool; a \
+                 row is this run's when pg_stat_activity.application_name matches the run's \
+                 application_name, and foreign otherwise",
             ),
         );
         object.insert(
@@ -519,27 +704,49 @@ impl LockWaitSummary {
                  sum over the samples",
             ),
         );
-        match &self.error {
+        // The foreign figures are about a *different* population from the four
+        // below them: this run's waiters are ungranted holders-in-waiting of
+        // ORDER_LOCK, while a foreign backend counts whether it is waiting on
+        // the lock or holding it, because either way it is serialising against
+        // this run's appends.
+        object.insert(
+            "foreign_scope".to_owned(),
+            Value::from(
+                "a backend is foreign when it is not part of this run; it counts whether it was \
+                 waiting on ORDER_LOCK or holding it, because either serialises against this \
+                 run's appends. A backend whose pg_stat_activity row this role may not read \
+                 counts as foreign, which is the safe direction",
+            ),
+        );
+        let error = self.effective_error();
+        match &error {
             Some(error) => {
                 object.insert("error".to_owned(), Value::from(error.clone()));
                 for key in [
-                    "samples",
                     "mean_waiters",
                     "max_waiters",
                     "episodes_lower_bound",
                     "estimated_waiter_seconds",
+                    "foreign_waiters_max",
+                    "foreign_backends_seen",
                 ] {
                     object.insert(key.to_owned(), Value::Null);
                 }
+                // A real sampler error leaves the sample count unknown too; a
+                // level that simply ended too early knows exactly how many
+                // polls completed, and it was none.
+                object.insert(
+                    "samples".to_owned(),
+                    match self.error {
+                        Some(_) => Value::Null,
+                        None => Value::from(self.samples),
+                    },
+                );
             }
             None => {
                 object.insert("error".to_owned(), Value::Null);
                 object.insert("samples".to_owned(), Value::from(self.samples));
-                let mean = if self.samples == 0 {
-                    0.0
-                } else {
-                    self.total_waiters as f64 / self.samples as f64
-                };
+                let mean = self.total_waiters as f64 / self.samples as f64;
                 object.insert("mean_waiters".to_owned(), json_f64(mean));
                 object.insert("max_waiters".to_owned(), Value::from(self.max_waiters));
                 object.insert(
@@ -550,38 +757,58 @@ impl LockWaitSummary {
                     "estimated_waiter_seconds".to_owned(),
                     json_f64(self.waiter_seconds),
                 );
+                object.insert(
+                    "foreign_waiters_max".to_owned(),
+                    Value::from(self.foreign_waiters_max),
+                );
+                object.insert(
+                    "foreign_backends_seen".to_owned(),
+                    Value::from(self.foreign_backends.len() as u64),
+                );
             }
         }
+        object.insert(
+            "contaminated".to_owned(),
+            self.contaminated().map_or(Value::Null, Value::from),
+        );
         Value::Object(object)
     }
 }
 
-/// Polls for backends queued behind `ORDER_LOCK` until `stop` is set.
+/// Polls for backends queued behind `ORDER_LOCK` until `stop` is signalled.
 ///
 /// The connection is the caller's, opened outside every appender pool, so the
 /// sampler can never be the reason an appender waits for a connection. The
 /// first query failure ends the sampling and is recorded; carrying on would
 /// produce a series with an unknown hole in it.
+///
+/// The query deliberately does not filter on `granted`. This run's *waiters*
+/// are the ungranted rows, as before, but a foreign backend counts either way:
+/// one that holds `ORDER_LOCK` is making this run's appenders wait just as
+/// surely as one that is queued behind them.
 async fn sample_order_lock(
     pool: PgPool,
     interval: Duration,
-    stop: Arc<AtomicBool>,
+    application_name: String,
+    stop: Arc<SamplerStop>,
 ) -> LockWaitSummary {
-    const SQL: &str = "SELECT a.pid, l.waitstart FROM pg_locks l \
-                       JOIN pg_stat_activity a ON a.pid = l.pid \
+    const SQL: &str = "SELECT l.pid, l.granted, l.waitstart, \
+                       (a.application_name IS NOT DISTINCT FROM $4) AS own \
+                       FROM pg_locks l \
+                       LEFT JOIN pg_stat_activity a ON a.pid = l.pid \
                        WHERE l.locktype = 'advisory' \
                        AND l.classid = $1::bigint::oid \
                        AND l.objid = $2::bigint::oid \
                        AND l.objsubid = $3 \
-                       AND NOT l.granted \
                        AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())";
     let mut summary = LockWaitSummary::default();
     let mut previous = Instant::now();
-    while !stop.load(Ordering::Relaxed) {
+    while !stop.stopped() {
         let rows = sqlx::query(SQL)
             .bind(ORDER_LOCK_CLASSID)
             .bind(ORDER_LOCK_OBJID)
             .bind(ORDER_LOCK_OBJSUBID)
+            .bind(&application_name)
             .fetch_all(&pool)
             .await;
         let now = Instant::now();
@@ -589,11 +816,8 @@ async fn sample_order_lock(
         previous = now;
         match rows {
             Ok(rows) => {
-                let waiters = rows.len() as u64;
-                summary.samples += 1;
-                summary.total_waiters += waiters;
-                summary.max_waiters = summary.max_waiters.max(waiters);
-                summary.waiter_seconds += waiters as f64 * elapsed;
+                let mut waiters = 0u64;
+                let mut foreign = 0u64;
                 for row in rows {
                     let pid: i32 = match row.try_get("pid") {
                         Ok(pid) => pid,
@@ -602,6 +826,32 @@ async fn sample_order_lock(
                             return summary;
                         }
                     };
+                    let granted: bool = match row.try_get("granted") {
+                        Ok(granted) => granted,
+                        Err(error) => {
+                            summary.error =
+                                Some(format!("pg_locks.granted is unreadable: {error}"));
+                            return summary;
+                        }
+                    };
+                    let own: bool = match row.try_get("own") {
+                        Ok(own) => own,
+                        Err(error) => {
+                            summary.error = Some(format!(
+                                "pg_stat_activity.application_name is unreadable: {error}"
+                            ));
+                            return summary;
+                        }
+                    };
+                    if !own {
+                        foreign += 1;
+                        summary.foreign_backends.insert(pid);
+                        continue;
+                    }
+                    if granted {
+                        continue;
+                    }
+                    waiters += 1;
                     // `waitstart` arrived in PostgreSQL 14 and can still be
                     // NULL for a lock whose wait had not been recorded when the
                     // snapshot was taken.
@@ -616,13 +866,18 @@ async fn sample_order_lock(
                     };
                     summary.episodes.insert((pid, waitstart));
                 }
+                summary.samples += 1;
+                summary.total_waiters += waiters;
+                summary.max_waiters = summary.max_waiters.max(waiters);
+                summary.waiter_seconds += waiters as f64 * elapsed;
+                summary.foreign_waiters_max = summary.foreign_waiters_max.max(foreign);
             }
             Err(error) => {
                 summary.error = Some(format!("ORDER_LOCK sampling failed: {error}"));
                 return summary;
             }
         }
-        tokio::time::sleep(interval).await;
+        stop.sleep_until_stopped(interval).await;
     }
     summary
 }
@@ -746,6 +1001,10 @@ struct LevelResult {
     append_seconds: f64,
     shares_per_second: f64,
     passed_minimum: bool,
+    /// `Some(true)` when a backend outside this run held or waited on
+    /// `ORDER_LOCK` while this level was being timed, `Some(false)` when the
+    /// sampler looked and found none, `None` when it could not look.
+    contaminated: Option<bool>,
     per_appender: Vec<(String, i64)>,
     order_lock: Value,
 }
@@ -759,7 +1018,43 @@ struct Measurement {
     share_count: i64,
     slowest_shares_per_second: f64,
     passed_minimum: bool,
+    /// The run's verdict, folded from the levels: `Some(true)` if any level saw
+    /// a foreign backend, `Some(false)` only if every level looked and none
+    /// did, `None` when no level saw contamination but at least one could not
+    /// tell.
+    contaminated: Option<bool>,
 }
+
+/// Folds the levels' verdicts into the run's. `true` wins over everything, and
+/// an unknown wins over `false`: one level that could not be checked is enough
+/// to stop the run claiming it had the database to itself.
+fn fold_contamination(levels: impl IntoIterator<Item = Option<bool>>) -> Option<bool> {
+    let mut verdict = Some(false);
+    for level in levels {
+        match level {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => verdict = None,
+        }
+    }
+    verdict
+}
+
+/// The sentence the report and the failure message both carry when a level ran
+/// against a database that something else was using.
+const CONTAMINATION_NOTE: &str =
+    "the database was shared: a backend outside this run held or waited on ORDER_LOCK while a \
+     level was being timed. ORDER_LOCK is database-wide, not schema-wide, so those appends \
+     serialised against this run's. The rates below are what this run's appends actually \
+     achieved and they are still gated against the floor, but they describe two workloads \
+     sharing one lock rather than the append path on its own, and must not be carried forward \
+     as a property of the append path. Re-run against a database nothing else is appending to.";
+
+/// The same warning for a run in which some level could not be checked at all.
+const CONTAMINATION_UNKNOWN_NOTE: &str =
+    "whether the database was shared is unknown: at least one level's ORDER_LOCK sampler could \
+     not complete a poll, so nothing observed that level's foreign backends. Read the per-level \
+     order_lock.error before treating these rates as describing one workload.";
 
 struct Durability {
     fsync: String,
@@ -886,6 +1181,17 @@ async fn seed_and_run(db: &Database, config: &Config, seed: &Ledger) -> Result<M
             config.minimum,
             if result.passed_minimum { "pass" } else { "FAIL" },
         );
+        match result.contaminated {
+            Some(true) => println!(
+                "throughput_floor: WARNING, level of {} appender(s) is CONTAMINATED: {}",
+                result.appenders, CONTAMINATION_NOTE
+            ),
+            None => println!(
+                "throughput_floor: WARNING, level of {} appender(s): {}",
+                result.appenders, CONTAMINATION_UNKNOWN_NOTE
+            ),
+            Some(false) => {}
+        }
         levels.push(result);
     }
 
@@ -893,6 +1199,7 @@ async fn seed_and_run(db: &Database, config: &Config, seed: &Ledger) -> Result<M
         Some(durability) => durability,
         None => bail!("no appender level ran, so no durability settings were read"),
     };
+    let contaminated = fold_contamination(levels.iter().map(|level| level.contaminated));
     Ok(Measurement {
         postgres_version,
         postgres_server_version,
@@ -902,6 +1209,7 @@ async fn seed_and_run(db: &Database, config: &Config, seed: &Ledger) -> Result<M
         share_count: total_shares,
         slowest_shares_per_second: slowest,
         passed_minimum: passed_all,
+        contaminated,
     })
 }
 
@@ -920,10 +1228,11 @@ async fn run_level(
         .await
         .context("opening the ORDER_LOCK sampling connection")?;
     reset_lock_statements(&sampler_pool).await;
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(SamplerStop::default());
     let sampler = tokio::spawn(sample_order_lock(
         sampler_pool.clone(),
         config.lock_sample,
+        config.application_name.clone(),
         stop.clone(),
     ));
 
@@ -978,7 +1287,9 @@ async fn run_level(
         }
     }
     let append_seconds = started.elapsed().as_secs_f64();
-    stop.store(true, Ordering::Relaxed);
+    // Signalled, not just flagged: the sampler is woken out of its sleep, so
+    // the level ends when the appends end rather than one interval later.
+    stop.stop();
     let lock_summary = match sampler.await {
         Ok(summary) => summary,
         Err(error) => LockWaitSummary {
@@ -1005,6 +1316,7 @@ async fn run_level(
         "level of {appenders} appender(s) committed {share_count} shares, expected {expected}"
     );
     let shares_per_second = share_count as f64 / append_seconds.max(f64::MIN_POSITIVE);
+    let contaminated = lock_summary.contaminated();
     let mut order_lock = lock_summary.to_json(config.lock_sample);
     if let Some(object) = order_lock.as_object_mut() {
         object.insert("pg_stat_statements".to_owned(), statements);
@@ -1015,6 +1327,7 @@ async fn run_level(
         append_seconds,
         shares_per_second,
         passed_minimum: shares_per_second >= config.minimum,
+        contaminated,
         per_appender,
         order_lock,
     })
@@ -1133,13 +1446,73 @@ fn sysctl(name: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-fn build_report(config: &Config, measurement: &Measurement) -> Value {
+/// The fields that identify a run rather than describe its outcome: who ran,
+/// how it was configured, on what, from which commit.
+///
+/// Both reports start here — the measured one and the one an errored run leaves
+/// behind — so a failed run is identifiable by exactly the same fields as a
+/// successful one, and a reader never has to guess which test or which
+/// configuration produced the file in front of them.
+fn report_identity(config: &Config) -> Map<String, Value> {
     let mut root = Map::new();
     root.insert("schema".to_owned(), Value::from(REPORT_SCHEMA));
     root.insert(
         "generated_at".to_owned(),
         Value::from(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)),
     );
+    root.insert("test".to_owned(), Value::from(config.test_name.clone()));
+    root.insert(
+        "application_name".to_owned(),
+        Value::from(config.application_name.clone()),
+    );
+    root.insert(
+        "window_shares".to_owned(),
+        Value::from(config.window_shares),
+    );
+    root.insert(
+        "appended_shares_per_level".to_owned(),
+        Value::from(config.shares_per_level),
+    );
+    root.insert("min_shares_per_second".to_owned(), json_f64(config.minimum));
+    root.insert(
+        "min_shares_per_second_source".to_owned(),
+        Value::from(config.minimum_source.clone()),
+    );
+    root.insert("commit".to_owned(), commit_id());
+    root.insert(
+        "build_profile".to_owned(),
+        Value::from(if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }),
+    );
+    root.insert("machine".to_owned(), machine());
+    root
+}
+
+/// The report an errored run leaves behind, so a run that never reached a
+/// measurement still says who it was, how it was configured and what went
+/// wrong, instead of leaving a stale report from an earlier run as the only
+/// file on disk.
+///
+/// `results` is an empty array, not a missing key: a consumer that iterates the
+/// levels finds none rather than tripping over the shape of the file, and
+/// `passed_minimum` is `false` because a run that could not measure certainly
+/// did not clear the floor.
+fn build_error_report(config: &Config, error: &anyhow::Error) -> Value {
+    let mut root = report_identity(config);
+    // `{:#}` renders the whole anyhow chain, outermost first, so the report
+    // keeps the context each layer added rather than only the final cause.
+    root.insert("error".to_owned(), Value::from(format!("{error:#}")));
+    root.insert("passed_minimum".to_owned(), Value::from(false));
+    root.insert("results".to_owned(), Value::Array(Vec::new()));
+    Value::Object(root)
+}
+
+fn build_report(config: &Config, measurement: &Measurement) -> Value {
+    let mut root = report_identity(config);
+    root.insert("error".to_owned(), Value::Null);
     root.insert(
         "share_count".to_owned(),
         Value::from(measurement.share_count),
@@ -1148,14 +1521,21 @@ fn build_report(config: &Config, measurement: &Measurement) -> Value {
         "shares_per_second".to_owned(),
         json_f64(measurement.slowest_shares_per_second),
     );
-    root.insert("min_shares_per_second".to_owned(), json_f64(config.minimum));
-    root.insert(
-        "min_shares_per_second_source".to_owned(),
-        Value::from(config.minimum_source.clone()),
-    );
     root.insert(
         "passed_minimum".to_owned(),
         Value::from(measurement.passed_minimum),
+    );
+    root.insert(
+        "contaminated".to_owned(),
+        measurement.contaminated.map_or(Value::Null, Value::from),
+    );
+    root.insert(
+        "contamination_note".to_owned(),
+        match measurement.contaminated {
+            Some(true) => Value::from(CONTAMINATION_NOTE),
+            None => Value::from(CONTAMINATION_UNKNOWN_NOTE),
+            Some(false) => Value::Null,
+        },
     );
     root.insert(
         "postgres_version".to_owned(),
@@ -1183,14 +1563,6 @@ fn build_report(config: &Config, measurement: &Measurement) -> Value {
         Value::from(measurement.durability.synchronous_commit.clone()),
     );
     root.insert("durability".to_owned(), Value::Object(durability));
-    root.insert(
-        "window_shares".to_owned(),
-        Value::from(config.window_shares),
-    );
-    root.insert(
-        "appended_shares_per_level".to_owned(),
-        Value::from(config.shares_per_level),
-    );
     let results = measurement
         .levels
         .iter()
@@ -1206,6 +1578,10 @@ fn build_report(config: &Config, measurement: &Measurement) -> Value {
             entry.insert(
                 "passed_minimum".to_owned(),
                 Value::from(level.passed_minimum),
+            );
+            entry.insert(
+                "contaminated".to_owned(),
+                level.contaminated.map_or(Value::Null, Value::from),
             );
             let per_appender = level
                 .per_appender
@@ -1223,16 +1599,6 @@ fn build_report(config: &Config, measurement: &Measurement) -> Value {
         })
         .collect::<Vec<_>>();
     root.insert("results".to_owned(), Value::Array(results));
-    root.insert("commit".to_owned(), commit_id());
-    root.insert(
-        "build_profile".to_owned(),
-        Value::from(if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        }),
-    );
-    root.insert("machine".to_owned(), machine());
     root.insert("notes".to_owned(), Value::from(NOTES));
     Value::Object(root)
 }
@@ -1240,12 +1606,15 @@ fn build_report(config: &Config, measurement: &Measurement) -> Value {
 /// Writes the report and returns its path. Called before the floor assertion so
 /// that a run which fails the floor still leaves the evidence behind.
 fn write_report(config: &Config, measurement: &Measurement) -> Result<()> {
-    let report = build_report(config, measurement);
+    write_json(config, &build_report(config, measurement))
+}
+
+fn write_json(config: &Config, report: &Value) -> Result<()> {
     if let Some(parent) = config.report_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let mut text = serde_json::to_string_pretty(&report)?;
+    let mut text = serde_json::to_string_pretty(report)?;
     text.push('\n');
     std::fs::write(&config.report_path, text)
         .with_context(|| format!("writing {}", config.report_path.display()))?;
@@ -1262,35 +1631,39 @@ fn write_report(config: &Config, measurement: &Measurement) -> Result<()> {
 
 async fn run_floor(test_name: &str, defaults: Defaults) -> Result<()> {
     // Configuration is validated first, so a malformed variable costs nothing:
-    // no connection, no schema, no seeding.
-    let config = Config::from_env(defaults)?;
+    // no connection, no schema, no seeding. Nothing below this line can run
+    // with an out-of-range sampling interval or an uncomparable floor
+    // (EP-VALIDATION).
+    let config = Config::from_env(test_name, defaults)?;
     let Some(raw) = database_url(test_name)? else {
         return Ok(());
     };
     println!(
-        "throughput_floor: window={} shares/level={} appenders={:?} floor={:.1} ({})",
+        "throughput_floor: window={} shares/level={} appenders={:?} floor={:.1} ({}) \
+         application_name={}",
         config.window_shares,
         config.shares_per_level,
         config.appenders,
         config.minimum,
         config.minimum_source,
+        config.application_name,
     );
-    let db = Database::open(&raw).await?;
-    let measured = measure(&db, &config).await;
-    // The schema goes away either way. A cleanup failure is attached to the
-    // measurement error rather than replacing it, so a leaked schema can never
-    // hide the failure that actually mattered.
-    let cleanup = db.close().await;
-    let measurement = match measured {
-        Ok(measurement) => {
-            cleanup?;
-            measurement
-        }
+    let measurement = match measure_run(&config, &raw).await {
+        Ok(measurement) => measurement,
         Err(error) => {
-            return Err(match cleanup {
-                Ok(()) => error,
-                Err(cleanup) => error.context(format!("schema cleanup also failed: {cleanup}")),
-            })
+            // A run that dies connecting, seeding or appending still owes the
+            // operator a file saying what it was and what went wrong; without
+            // one, the newest report on disk belongs to some earlier run and
+            // reads as though this one never happened. The write can only add
+            // context to the original error, never replace it (EP-ERRORS).
+            return Err(
+                match write_json(&config, &build_error_report(&config, &error)) {
+                    Ok(()) => error,
+                    Err(write_error) => error.context(format!(
+                        "the error report could not be written either: {write_error:#}"
+                    )),
+                },
+            );
         }
     };
     write_report(&config, &measurement)?;
@@ -1298,15 +1671,43 @@ async fn run_floor(test_name: &str, defaults: Defaults) -> Result<()> {
         ensure!(
             level.passed_minimum,
             "share-append throughput floor: the level of {} appender(s) sustained {:.2} \
-             shares/s, below the floor of {:.2} shares/s ({}). The report is at {}.",
+             shares/s, below the floor of {:.2} shares/s ({}).{} The report is at {}.",
             level.appenders,
             level.shares_per_second,
             config.minimum,
             config.minimum_source,
+            match level.contaminated {
+                Some(true) => format!(" NOTE: {CONTAMINATION_NOTE}"),
+                None => format!(" NOTE: {CONTAMINATION_UNKNOWN_NOTE}"),
+                Some(false) => String::new(),
+            },
             config.report_path.display()
         );
     }
     Ok(())
+}
+
+/// Opens the run's schema, measures it, and drops the schema on the way out.
+///
+/// Split out of `run_floor` so that every error from the connection onwards
+/// arrives at one place, where the error report is written.
+async fn measure_run(config: &Config, raw: &str) -> Result<Measurement> {
+    let db = Database::open(raw, &config.application_name).await?;
+    let measured = measure(&db, config).await;
+    // The schema goes away either way. A cleanup failure is attached to the
+    // measurement error rather than replacing it, so a leaked schema can never
+    // hide the failure that actually mattered.
+    let cleanup = db.close().await;
+    match measured {
+        Ok(measurement) => {
+            cleanup?;
+            Ok(measurement)
+        }
+        Err(error) => Err(match cleanup {
+            Ok(()) => error,
+            Err(cleanup) => error.context(format!("schema cleanup also failed: {cleanup}")),
+        }),
+    }
 }
 
 /// The CI-sized floor: small enough to finish well inside the
@@ -1403,6 +1804,159 @@ fn environment_parsers_reject_impossible_counts() {
             "{WINDOW_SHARES_VAR}={good:?} divides {WINDOW_WEIGHT} and must be accepted"
         );
     }
+}
+
+#[test]
+fn lock_sample_interval_is_bounded_at_both_ends() {
+    // Zero is not an interval, and neither is a negative or fractional one.
+    for bad in ["", "0", "-1", "1.5", "abc"] {
+        assert!(
+            parse_lock_sample_ms(Some(bad), DEFAULT_LOCK_SAMPLE_MS).is_err(),
+            "{LOCK_SAMPLE_VAR}={bad:?} must be refused"
+        );
+    }
+    // Above a second the poll can no longer resolve a millisecond lock wait,
+    // which is the only thing it exists to measure.
+    for bad in ["1001", "20000", "18446744073709551615"] {
+        let error = parse_lock_sample_ms(Some(bad), DEFAULT_LOCK_SAMPLE_MS)
+            .expect_err("an interval above the ceiling must be refused")
+            .to_string();
+        assert!(
+            error.contains("coarser than a second"),
+            "the rejection must say why a coarse interval is useless, got {error:?}"
+        );
+    }
+    for (good, expected) in [("1", 1), (" 10 ", 10), ("1000", 1_000)] {
+        assert_eq!(
+            parse_lock_sample_ms(Some(good), DEFAULT_LOCK_SAMPLE_MS).expect("in range"),
+            expected
+        );
+    }
+    assert_eq!(
+        parse_lock_sample_ms(None, DEFAULT_LOCK_SAMPLE_MS).expect("fallback"),
+        DEFAULT_LOCK_SAMPLE_MS
+    );
+    assert!(
+        (MIN_LOCK_SAMPLE_MS..=MAX_LOCK_SAMPLE_MS).contains(&DEFAULT_LOCK_SAMPLE_MS),
+        "the compiled-in default must itself be inside the range it enforces"
+    );
+}
+
+#[test]
+fn a_level_that_never_sampled_reports_unknown_rather_than_zero() {
+    let interval = Duration::from_millis(10);
+
+    let never_polled = LockWaitSummary::default();
+    let json = never_polled.to_json(interval);
+    assert_eq!(
+        json["samples"],
+        Value::from(0u64),
+        "the count is known: none"
+    );
+    for unknown in [
+        "mean_waiters",
+        "max_waiters",
+        "episodes_lower_bound",
+        "estimated_waiter_seconds",
+        "foreign_waiters_max",
+        "foreign_backends_seen",
+    ] {
+        assert_eq!(
+            json[unknown],
+            Value::Null,
+            "{unknown} must be null when nobody looked, never 0"
+        );
+    }
+    assert_eq!(
+        json["error"],
+        Value::from("the level ended before the sampler completed a poll")
+    );
+    assert_eq!(
+        json["contaminated"],
+        Value::Null,
+        "an unsampled level cannot claim the database was quiet"
+    );
+
+    // A sampler that failed outright does not even know how many polls it got
+    // through, so its sample count is null as well.
+    let failed = LockWaitSummary {
+        error: Some("ORDER_LOCK sampling failed: connection closed".to_owned()),
+        samples: 4,
+        ..LockWaitSummary::default()
+    };
+    let json = failed.to_json(interval);
+    assert_eq!(json["samples"], Value::Null);
+    assert_eq!(json["contaminated"], Value::Null);
+
+    // A sampler that did its job reports real numbers, including honest zeros:
+    // here a level that was genuinely alone on the lock.
+    let quiet = LockWaitSummary {
+        samples: 6,
+        total_waiters: 3,
+        max_waiters: 1,
+        waiter_seconds: 0.03,
+        ..LockWaitSummary::default()
+    };
+    let json = quiet.to_json(interval);
+    assert_eq!(json["samples"], Value::from(6u64));
+    assert_eq!(json["mean_waiters"], json_f64(0.5));
+    assert_eq!(json["max_waiters"], Value::from(1u64));
+    assert_eq!(json["foreign_backends_seen"], Value::from(0u64));
+    assert_eq!(json["error"], Value::Null);
+    assert_eq!(json["contaminated"], Value::from(false));
+
+    let shared = LockWaitSummary {
+        samples: 6,
+        foreign_waiters_max: 2,
+        foreign_backends: [4242, 4243].into_iter().collect(),
+        ..LockWaitSummary::default()
+    };
+    let json = shared.to_json(interval);
+    assert_eq!(json["foreign_waiters_max"], Value::from(2u64));
+    assert_eq!(json["foreign_backends_seen"], Value::from(2u64));
+    assert_eq!(json["contaminated"], Value::from(true));
+}
+
+#[test]
+fn contamination_folds_true_over_unknown_over_false() {
+    assert_eq!(fold_contamination([]), Some(false));
+    assert_eq!(fold_contamination([Some(false), Some(false)]), Some(false));
+    assert_eq!(fold_contamination([Some(false), None]), None);
+    assert_eq!(fold_contamination([None, Some(true)]), Some(true));
+    assert_eq!(
+        fold_contamination([Some(true), Some(false)]),
+        Some(true),
+        "one shared level makes the whole run's numbers shared"
+    );
+}
+
+#[test]
+fn the_sampler_stop_signal_is_not_lost_before_the_sleep() {
+    // `notify_one` stores a permit, so a stop raised while the sampler is
+    // querying rather than sleeping still ends the very next sleep. If this
+    // ever regressed to `notify_waiters`, the signal would be dropped and the
+    // level would stall for a whole interval, which is the bug this replaced.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("a current-thread runtime");
+    runtime.block_on(async {
+        let stop = SamplerStop::default();
+        stop.stop();
+        assert!(stop.stopped());
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            stop.sleep_until_stopped(Duration::from_secs(3_600)),
+        )
+        .await
+        .expect("a signalled stop must not wait out the interval");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the sleep returned after {:?}, so the stop permit was lost",
+            started.elapsed()
+        );
+    });
 }
 
 #[test]
