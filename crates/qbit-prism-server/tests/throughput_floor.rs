@@ -125,22 +125,20 @@ const ORDER_LOCK_CLASSID: i64 = 0x5052_4953;
 const ORDER_LOCK_OBJID: i64 = 0x4d00_0002;
 const ORDER_LOCK_OBJSUBID: i32 = 1;
 
-/// PROVISIONAL: not yet calibrated on the CI runner.
+/// The CI floor, calibrated on the runner that enforces it.
 ///
-/// Derived as 25% of the slowest level rate measured while writing this file:
-/// 285.6 shares/s at one appender, in a **debug** build, on an 8-vCPU "Intel
-/// Core Processor (Haswell, no TSX)" VM with 22 GiB of RAM, against PostgreSQL
-/// 16.15 in Docker with `fsync=on`, `full_page_writes=on` and
-/// `synchronous_commit=on`. 25% of that is 71.4, rounded down to 71.
+/// It comes from this test's own summary line in four runs of the
+/// `prism-native-postgres` job on `blacksmith-2vcpu-ubuntu-2404`: a debug
+/// build, the job's PostgreSQL 16 service, a 20k-share window and 2,000 appends
+/// per level. The slowest level in each run was 1,290, 847, 1,242 and 1,200
+/// shares/s, so runs differ by about a third from one to the next. 250 is about
+/// 30% of the slowest level seen. That leaves enough headroom for a noisy
+/// runner, while a 3-4x collapse of the append path still fails the build.
 ///
-/// The debug figure is the right base precisely because CI's
-/// `prism-native-postgres` job builds and runs this test in debug. The 4x
-/// margin absorbs the GitHub 2-vCPU runner being slower than this host and
-/// run-to-run variance on shared hardware; it is wide enough that this constant
-/// catches a collapse of the append path but not a modest regression. The
-/// coordinator replaces it with a value measured on the CI runner itself, at
-/// which point the margin can shrink and the floor starts earning its name.
-const CI_MIN_SHARES_PER_SEC: f64 = 71.0;
+/// Re-derive it from the same summary lines if the runner, the PostgreSQL
+/// service or the append path changes. On any other host,
+/// `QBIT_PRISM_MIN_SHARES_PER_SEC` overrides it.
+const CI_MIN_SHARES_PER_SEC: f64 = 250.0;
 
 /// Each appender appends sequentially, so one connection would do; `connect`
 /// floors the pool at 2 anyway (`src/ledger/connect.rs`). Keeping it at the
@@ -434,9 +432,7 @@ impl Config {
         let minimum = parse_minimum(raw_minimum.as_deref(), CI_MIN_SHARES_PER_SEC)?;
         let minimum_source = match raw_minimum {
             Some(_) => format!("{MIN_SHARES_VAR} environment variable"),
-            None => {
-                "compiled-in CI_MIN_SHARES_PER_SEC (provisional, not yet CI-calibrated)".to_owned()
-            }
+            None => "compiled-in CI_MIN_SHARES_PER_SEC (calibrated on the CI runner)".to_owned(),
         };
         let report_path = match env_raw(REPORT_VAR)? {
             Some(raw) => {
