@@ -418,15 +418,18 @@ two-hour cutover soak, which reads its own criteria from the same registry.
        | awk -v now="$now" '/^VmRSS:/ { printf "%s,%d\n", now, $2 * 1024 }' >> soak-rss.csv
      docker exec "$c" curl -sS --max-time 5 -D - http://127.0.0.1:3341/metrics \
        | tr -d '\r' \
-       | grep -E '^(x-prism-metrics-state:|qbit_prism_(process_resident_memory_bytes|collector_available|collector_age_seconds|runtime_lag_seconds|runtime_task_stalled|connections|authorized_clients|accepted_shares_total|block_candidates_pending)[ {])' \
+       | grep -E '^(x-prism-metrics-state:|qbit_prism_(process_resident_memory_bytes|collector_available|collector_age_seconds|runtime_lag_seconds|runtime_task_stalled|runtime_poll_lag_seconds|database_pool_acquire_seconds(_bucket|_sum|_count)|connections|authorized_clients|accepted_shares_total|block_candidates_pending)[ {])' \
        | sed "s/^/$now /" >> soak-metrics.log
      sleep 300
    done
    ```
 
    `VmRSS` in `/proc/1/status` is the field the registry's process collector
-   reads, so the CSV and the gauge agree up to collector cadence. Also keep
-   the share-ack histogram at hours 1, 12 and 24 for the latency comparison:
+   reads, so the CSV and the gauge agree up to collector cadence. The log also
+   carries the runtime and pool series item 3 of the reading order cites, so a
+   breach found after the run can be read back at its own five-minute sample
+   instead of from the hour-1 or hour-24 snapshot. Also keep the share-ack
+   histogram at hours 1, 12 and 24 for the latency comparison:
 
    ```sh
    docker exec "$c" curl -sS --max-time 5 http://127.0.0.1:3341/metrics \
