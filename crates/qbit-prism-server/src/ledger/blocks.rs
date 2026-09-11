@@ -85,8 +85,8 @@ impl Ledger {
         let mut parent = block[4..36].to_vec();
         parent.reverse();
         let parent_hash = hex::encode(parent);
-        let mut tx = self.pool.begin().await?;
-        lock(&mut tx, SETTLEMENT_LOCK).await?;
+        let mut tx = self.begin().await?;
+        self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         writable(&mut tx).await?;
         require_claim(&mut tx, claim).await?;
         if let Some(expected) = expected_revision {
@@ -177,9 +177,9 @@ impl Ledger {
         error: Option<&str>,
         expected_revision: i64,
     ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        lock(&mut tx, SETTLEMENT_LOCK).await?;
-        lock(&mut tx, ORDER_LOCK).await?;
+        let mut tx = self.begin().await?;
+        self.lock(&mut tx, SETTLEMENT_LOCK).await?;
+        self.lock(&mut tx, ORDER_LOCK).await?;
         writable(&mut tx).await?;
         let revision: i64 =
             sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton")
@@ -244,9 +244,9 @@ impl Ledger {
         tip_height: u64,
         expected_revision: i64,
     ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        lock(&mut tx, SETTLEMENT_LOCK).await?;
-        lock(&mut tx, ORDER_LOCK).await?;
+        let mut tx = self.begin().await?;
+        self.lock(&mut tx, SETTLEMENT_LOCK).await?;
+        self.lock(&mut tx, ORDER_LOCK).await?;
         writable(&mut tx).await?;
         let revision: i64 =
             sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton")
@@ -322,7 +322,7 @@ impl Ledger {
 
     pub async fn claim_fanout(&self, lease_seconds: i64) -> Result<Option<FanoutClaim>> {
         ensure!(lease_seconds > 0, "claim duration must be positive");
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin().await?;
         writable(&mut tx).await?;
         let token = Uuid::new_v4().to_string();
         let row = sqlx::query("WITH next AS (SELECT a.fanout_txid FROM qbit_ctv_fanout_artifacts a JOIN qbit_pool_blocks b USING(block_hash) WHERE b.chain_state='confirmed' AND b.maturity_state='mature' AND (a.settlement_status IN ('broadcastable','broadcast_submitted','failed') OR (a.settlement_status='confirmed' AND (a.confirmed_depth<1000 OR a.fanout_txid=(SELECT fanout_txid FROM qbit_ctv_fanout_artifacts WHERE settlement_status='confirmed' AND confirmed_depth>=1000 ORDER BY confirmed_block_height DESC,fanout_txid DESC LIMIT 1)))) AND (a.next_broadcast_attempt_at IS NULL OR a.next_broadcast_attempt_at<=clock_timestamp()) AND (a.claim_expires_at IS NULL OR a.claim_expires_at<=clock_timestamp()) ORDER BY (a.settlement_status='confirmed'),a.next_broadcast_attempt_at NULLS FIRST,b.block_height,a.chunk_index FOR UPDATE OF a SKIP LOCKED LIMIT 1) UPDATE qbit_ctv_fanout_artifacts a SET claim_token=$1,claim_instance_id=$2,claim_expires_at=clock_timestamp()+$3*interval '1 second' FROM next WHERE a.fanout_txid=next.fanout_txid RETURNING a.fanout_txid,a.block_hash,a.manifest,a.broadcast_attempt_count,jsonb_build_object('status',a.settlement_status,'confirmed_block_hash',a.confirmed_block_hash,'confirmed_block_height',a.confirmed_block_height,'confirmed_depth',a.confirmed_depth,'scan_next_height',a.spend_scan_next_height,'scan_anchor_height',a.spend_scan_anchor_height,'scan_anchor_hash',a.spend_scan_anchor_hash) AS progress")
@@ -389,8 +389,8 @@ impl Ledger {
             .contains(&status),
             "invalid fanout result status"
         );
-        let mut tx = self.pool.begin().await?;
-        lock(&mut tx, SETTLEMENT_LOCK).await?;
+        let mut tx = self.begin().await?;
+        self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         writable(&mut tx).await?;
         super::fanout::require_fanout(&mut tx, claim).await?;
         super::fanout::apply_progress(&mut tx, claim, status, submit_result.as_ref()).await?;
