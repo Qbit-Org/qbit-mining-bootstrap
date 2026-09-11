@@ -301,16 +301,16 @@ async fn as_issued_snapshot_preserves_persisted_balance_order() -> Result<()> {
             seed_shares(&db.pool, 1, 1, false).await?;
             let original = vec![
                 CarryForwardBalance {
-                    recipient_id: "z-recipient".into(),
-                    order_key: "a-order".into(),
-                    p2mr_program_hex: "22".repeat(32),
-                    balance_sats: 7,
-                },
-                CarryForwardBalance {
                     recipient_id: "a-recipient".into(),
                     order_key: "z-order".into(),
                     p2mr_program_hex: "33".repeat(32),
                     balance_sats: 11,
+                },
+                CarryForwardBalance {
+                    recipient_id: "z-recipient".into(),
+                    order_key: "a-order".into(),
+                    p2mr_program_hex: "22".repeat(32),
+                    balance_sats: 7,
                 },
             ];
             let window = reference(&[share(1, false)], &original);

@@ -38,10 +38,12 @@ unimplemented here, pending the exact A265 interfaces listed below.
   without changing `read_window`'s API. After successful return the caller owns
   the window and its off-thread cleanup obligation.
 - Current balances are digest checked; as-issued balances are decoded from
-  the immutable snapshot identified by their semantic digest. Both paths sort
-  bytewise by `(order_key, recipient_id, p2mr_program_hex)`, as does the shared
-  snapshot balance helper. The returned revision is current, never an implicit
-  replacement for a job's original revision.
+  the immutable snapshot identified by their semantic digest. Digest
+  validation uses a bytewise `(order_key, recipient_id, p2mr_program_hex)`
+  clone, while each path returns the source vector order unchanged so legacy
+  persisted snapshots retain their exact balance ordering. The returned
+  revision is current, never an implicit replacement for a job's original
+  revision.
 - Missing endpoints/count mismatches, changed current balances, missing or
   corrupt as-issued balances, native digest mismatches, SQL failures, and decode
   failures keep their specified error variants. An empty reference never
