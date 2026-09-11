@@ -610,7 +610,7 @@ delivers, and the numbers are what the soak produces.
 
 Independent of any load-test record, the payout window has a hard storage
 ceiling. PostgreSQL refuses a JSONB container whose elements exceed 268,435,455
-bytes, and four native writes still embed the whole window, so each grows
+bytes, and three native writes still embed the whole window, so each grows
 linearly with the share count. `cargo test -p qbit-prism-server --test
 jsonb_ceiling_gate` measures them against 25% of that limit (67,108,863 bytes)
 and fails when the set of crossing writes changes in either direction.
@@ -620,7 +620,11 @@ and fails when the set of crossing writes changes in either direction.
 | refresh | `qbit_prism_jobs.payload` | 3 | refused by PostgreSQL (measured) | #273 |
 | enqueue | `qbit_block_candidate_outbox.candidate` | 2 | refused by PostgreSQL (measured) | #265 |
 | landing | `qbit_pool_audit_bundles.audit_bundle` | 1 | 235 MB, 3.5x the gate threshold (measured) | #267 |
-| import | `qbit_pool_audit_bundles.audit_bundle` | 2 | refused by PostgreSQL (measured) | #265 |
+
+The legacy audit import (`import-audits`) was a fourth such write, refused by
+PostgreSQL at 400,000 shares. #265 removed it. The import now stores only
+`canonical_audit_bytes`, which is `bytea`, so PostgreSQL's 1 GiB value limit
+bounds it rather than the JSONB ceiling. It writes no JSONB value.
 
 The host, gate commit, PostgreSQL version (16.15) and build mode (debug) behind
 these measurements are recorded under "Baseline, measured at the base commit

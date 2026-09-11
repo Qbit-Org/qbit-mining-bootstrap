@@ -382,8 +382,8 @@ async fn settlement_artifacts(state: &ApiState, hash: &str) -> ApiResult<Value> 
     let mut links = Vec::new();
     let audit_sha = payload["audit_bundle_sha256"].as_str();
     if let Some(sha) = audit_sha {
-        // Inline artifacts need no body read. External legacy bodies are validated before linking.
-        let metadata:Option<bool>=sqlx::query_scalar("SELECT audit_bundle IS NOT NULL FROM qbit_pool_audit_bundles WHERE audit_bundle_sha256=$1 LIMIT 1").bind(sha).fetch_optional(&state.pool).await?;
+        // Inline and imported canonical artifacts need no body read; imported bytes were digest-checked at import and are again when served. External legacy bodies are validated before linking.
+        let metadata:Option<bool>=sqlx::query_scalar("SELECT audit_bundle IS NOT NULL OR canonical_audit_bytes IS NOT NULL FROM qbit_pool_audit_bundles WHERE audit_bundle_sha256=$1 LIMIT 1").bind(sha).fetch_optional(&state.pool).await?;
         if metadata == Some(true) || artifact(state, sha).await.is_ok() {
             links.push(artifact_link("audit_bundle", sha, None));
         }

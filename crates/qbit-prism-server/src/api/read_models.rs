@@ -192,6 +192,33 @@ pub(super) async fn bundle(state: &ApiState, id: &str, commitment: bool) -> ApiR
         })
         .await
         .map_err(|_| ApiError::internal())??;
+    } else {
+        // Imported canonical bytes are authoritative over any inline or
+        // filesystem copy. A corrupt value refuses the row; it never falls
+        // back to body_uri, even when that file still exists.
+        let canonical: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT canonical_audit_bytes FROM qbit_pool_audit_bundles WHERE block_hash=$1",
+        )
+        .bind(
+            value["block_hash"]
+                .as_str()
+                .ok_or_else(ApiError::internal)?,
+        )
+        .fetch_optional(&state.pool)
+        .await?
+        .flatten();
+        if let Some(bytes) = canonical {
+            let expected = value["audit_bundle_sha256"]
+                .as_str()
+                .ok_or_else(ApiError::internal)?
+                .to_string();
+            value["audit_bundle"] = crate::ledger::decode_canonical_audit_body(bytes, expected)
+                .await
+                .map_err(|error| {
+                    tracing::warn!(%error,"imported canonical audit decode failed");
+                    audit_read_error(error)
+                })?;
+        }
     }
     if value["audit_bundle"].is_null() {
         let uri = value["body_uri"]
