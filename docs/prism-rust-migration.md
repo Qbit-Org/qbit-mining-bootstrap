@@ -377,7 +377,7 @@ All vectors use the day-one floor of 14720 sats.
     deferred credit lands before the next block's anchor, because the credit
     row is stamped at confirmation, not at submission.
 - **Reason:**
-  - `crates/qbit-prism-server/src/coordinator.rs` credits `network` difficulty
+  - `crates/qbit-prism-server/src/coordinator/miner_submit.rs` credits `network` difficulty
     when `share_pass` is false, and holds the share as the candidate's
     `deferred_share` until the credit row exists.
   - `crates/qbit-prism-server/src/ledger/blocks.rs` (`credit_deferred_share`)
