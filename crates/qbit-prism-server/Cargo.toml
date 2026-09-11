@@ -1,8 +1,12 @@
 [package]
 name = "qbit-prism-server"
 version.workspace = true
+rust-version.workspace = true
 edition = "2021"
 license = "MIT"
+# Built and shipped from this repository; its path dependencies carry no
+# version, which cargo-deny permits only for crates that are never published.
+publish = false
 description = "Native multi-instance Stratum, accounting, and audit server for PRISM"
 default-run = "qbit-prism-server"
 
@@ -35,5 +39,6 @@ url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+qbit-prism-test-gate = { path = "../qbit-prism-test-gate" }
 tempfile = "3"
 http-body-util = "0.1"
