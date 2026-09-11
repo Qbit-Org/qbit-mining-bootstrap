@@ -23,6 +23,10 @@ use tokio::{
     time::{interval, timeout, MissedTickBehavior},
 };
 
+mod retained_jobs;
+mod stale_grace;
+pub use stale_grace::{RetentionTip, StaleGrace};
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Worker {
     pub username: String,
@@ -83,6 +87,10 @@ impl std::error::Error for StratumError {}
 
 pub trait MiningBackend: Send + Sync + 'static {
     type Context: Send + Sync + 'static;
+    /// In-memory retention hint only. Authoritative submit checks stay in the backend.
+    fn observed_tip_hint(&self) -> impl Future<Output = Option<RetentionTip>> + Send {
+        async { None }
+    }
     fn health_ready(&self) -> impl Future<Output = bool> + Send {
         async { true }
     }
@@ -139,7 +147,7 @@ pub trait MiningBackend: Send + Sync + 'static {
         worker: &Worker,
         job: &MiningJob<Self::Context>,
         submission: Submission,
-        stale_grace_eligible: bool,
+        stale_grace: StaleGrace,
     ) -> impl Future<Output = std::result::Result<(), StratumError>> + Send;
 }
 
@@ -613,7 +621,6 @@ struct IssuedJob<C> {
     authorization_permit: Option<Arc<OwnedSemaphorePermit>>,
     version_mask: u32,
     retired_at: Option<Instant>,
-    tip_replaced_at: Option<Instant>,
 }
 
 struct Session<C> {
@@ -627,6 +634,8 @@ struct Session<C> {
     suggested: Option<f64>,
     vardiff: Vardiff,
     jobs: VecDeque<IssuedJob<C>>,
+    retained: retained_jobs::RetainedJobs<C>,
+    tip_work_delivered: Option<(String, Instant)>,
     retry_job: bool,
     authorization_permit: Option<Arc<OwnedSemaphorePermit>>,
     observation: SessionObservation,
@@ -650,6 +659,8 @@ impl<C> Session<C> {
             suggested: None,
             vardiff: Vardiff::new(config.vardiff.clone()),
             jobs: VecDeque::new(),
+            retained: retained_jobs::RetainedJobs::default(),
+            tip_work_delivered: None,
             retry_job: false,
             authorization_permit: None,
             observation,
@@ -657,21 +668,6 @@ impl<C> Session<C> {
             last_accepted_share: None,
             last_hint: None,
         }
-    }
-
-    fn prune_jobs(&mut self, config: &StratumConfig) {
-        let now = Instant::now();
-        self.jobs.retain(|issued| {
-            issued
-                .job
-                .wire
-                .resume_expires_at
-                .is_none_or(|expires| now < expires)
-                && issued.retired_at.is_none_or(|when| {
-                    now.duration_since(when).as_secs_f64()
-                        <= config.job_retention_seconds.max(config.stale_grace_seconds)
-                })
-        });
     }
 
     fn apply_requests(&mut self, config: &StratumConfig) {
@@ -832,9 +828,10 @@ async fn deliver_job<B: MiningBackend>(
     let Some(extranonce1) = session.extranonce1.as_deref() else {
         return Ok(());
     };
-    let Some(worker) = session.worker.as_ref() else {
+    let Some(worker) = session.worker.as_ref().cloned() else {
         return Ok(());
     };
+    let worker = &worker;
     let mut observation = DeliveryObservation::new(config.stats.clone());
     let build = async {
         let _admission = config
@@ -929,33 +926,27 @@ async fn deliver_job<B: MiningBackend>(
         session.vardiff.delivered_retarget();
         (difficulty, evidence, downward_only)
     });
-    let now = Instant::now();
+    session.note_delivery(&job.wire.previousblockhash);
+    let now = tokio::time::Instant::now().into_std();
     for prior in &mut session.jobs {
         prior.retired_at.get_or_insert(now);
-        if prior.job.wire.previousblockhash != job.wire.previousblockhash {
-            prior.tip_replaced_at.get_or_insert(now);
-        }
     }
     session.jobs.retain(|prior| {
         // A same-parent payout replacement has no stale grace. Previous-parent
         // jobs retain their separate, notification-anchored grace deadline.
-        (prior.job.wire.previousblockhash != job.wire.previousblockhash
-            || prior.job.wire.payout_revision == job.wire.payout_revision)
-            && prior.retired_at.is_none_or(|when| {
-                when.elapsed().as_secs_f64()
-                    <= config.job_retention_seconds.max(config.stale_grace_seconds)
-            })
+        prior.job.wire.previousblockhash != job.wire.previousblockhash
+            || prior.job.wire.payout_revision == job.wire.payout_revision
     });
-    while session.jobs.len() >= config.max_jobs_per_connection {
-        session.jobs.pop_front();
-    }
+    session.retained.replace_payout(&job.wire);
+    // Publication may have advanced while persistence or notification waited.
+    let retention_tip = backend.observed_tip_hint().await;
+    session.make_job_room(config, retention_tip.as_ref());
     session.jobs.push_back(IssuedJob {
         job,
         worker: worker.clone(),
         authorization_permit: session.authorization_permit.clone(),
         version_mask: mask,
         retired_at: None,
-        tip_replaced_at: None,
     });
     session.retry_job = false;
     observation.success = true;
@@ -982,10 +973,11 @@ async fn request<B: MiningBackend>(
     received_at: tokio::time::Instant,
     metrics: &crate::metrics::Metrics,
 ) -> Result<()> {
+    let observed_tip = backend.observed_tip_hint().await;
+    session.prune_jobs(config, observed_tip.as_ref());
     let is_submit = request.get("method").and_then(Value::as_str) == Some("mining.submit");
     let share_observation =
         share_observation::ShareObservation::begin(metrics, is_submit, received_at);
-    session.prune_jobs(config);
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let dispatch = async {
         let method = request
@@ -1052,7 +1044,8 @@ async fn request<B: MiningBackend>(
                         .jobs
                         .iter()
                         .find(|issued| issued.worker.username == worker.username)
-                        .and_then(|issued| issued.authorization_permit.clone());
+                        .and_then(|issued| issued.authorization_permit.clone())
+                        .or_else(|| session.retained.permit(&worker.username));
                     if let Some(permit) = retained {
                         Some(permit)
                     } else {
@@ -1217,6 +1210,7 @@ async fn request<B: MiningBackend>(
                     .worker
                     .as_ref()
                     .filter(|_| session.extranonce1.is_some())
+                    .cloned()
                     .ok_or_else(|| {
                         StratumError::new(
                             20,
@@ -1258,10 +1252,12 @@ async fn request<B: MiningBackend>(
                     )
                     .into());
                 }
-                if !session.jobs.iter().any(|j| j.job.wire.job_id == fields[1]) {
+                if !session.jobs.iter().any(|j| j.job.wire.job_id == fields[1])
+                    && session.retained.get(fields[1]).is_none()
+                {
                     if let Some(job) = timeout(
                         Duration::from_secs_f64(config.initial_job_timeout_seconds),
-                        backend.resume_job(worker, fields[1]),
+                        backend.resume_job(&worker, fields[1]),
                     )
                     .await
                     .map_err(|_| StratumError::backend("job resume timed out"))??
@@ -1270,16 +1266,15 @@ async fn request<B: MiningBackend>(
                             return Err(StratumError::internal("restored job ID mismatch").into());
                         }
                         let original_mask = job.wire.version_mask;
-                        while session.jobs.len() >= config.max_jobs_per_connection {
-                            session.jobs.pop_front();
-                        }
+                        // The request-entry hint can predate this resume await.
+                        let retention_tip = backend.observed_tip_hint().await;
+                        session.make_job_room(config, retention_tip.as_ref());
                         session.jobs.push_front(IssuedJob {
                             job,
                             worker: worker.clone(),
                             authorization_permit: session.authorization_permit.clone(),
                             version_mask: original_mask,
-                            retired_at: Some(Instant::now()),
-                            tip_replaced_at: None,
+                            retired_at: Some(tokio::time::Instant::now().into_std()),
                         });
                     }
                 }
@@ -1287,24 +1282,23 @@ async fn request<B: MiningBackend>(
                     .jobs
                     .iter()
                     .find(|j| j.job.wire.job_id == fields[1])
+                    .or_else(|| session.retained.get(fields[1]))
                     .ok_or_else(|| StratumError::new(21, "stale job", "unknown-job"))?;
+                // Resume may complete after the absolute lease expired. This
+                // check must follow the await and is independent of grace.
                 if issued
                     .job
                     .wire
                     .resume_expires_at
-                    .is_some_and(|expires| Instant::now() >= expires)
-                    || issued.retired_at.is_some_and(|when| {
-                        when.elapsed().as_secs_f64()
-                            > config.job_retention_seconds.max(config.stale_grace_seconds)
-                    })
+                    .is_some_and(|expires| tokio::time::Instant::now().into_std() >= expires)
                 {
                     return Err(StratumError::new(21, "stale job", "stale-job").into());
                 }
-                let grace = issued.job.wire.resume_expires_at.is_none()
-                    && config.stale_grace_seconds > 0.0
-                    && issued.tip_replaced_at.is_none_or(|when| {
-                        when.elapsed().as_secs_f64() <= config.stale_grace_seconds
-                    });
+                let grace = if issued.job.wire.resume_expires_at.is_none() {
+                    session.stale_grace(config)
+                } else {
+                    false.into()
+                };
                 let submission = issued
                     .job
                     .wire
@@ -1411,8 +1405,9 @@ async fn session<B: MiningBackend>(
                 session.retry_job = session.worker.is_some() && session.extranonce1.is_some();
             }
             _ = timer.tick() => {
-                if session.jobs.is_empty() && connected.elapsed().as_secs_f64() > config.initial_job_timeout_seconds { break; }
-                session.prune_jobs(&config);
+                if session.jobs.is_empty() && session.retained.is_empty() && connected.elapsed().as_secs_f64() > config.initial_job_timeout_seconds { break; }
+                let observed_tip = backend.observed_tip_hint().await;
+                session.prune_jobs(&config, observed_tip.as_ref());
                 session.retarget();
             }
             read = bounded_reader.read_until(b'\n',&mut buffer) => {
@@ -1543,3 +1538,6 @@ pub async fn probe_first_difficulty(
     .await
     .context("Stratum difficulty probe timed out")?
 }
+
+#[cfg(test)]
+mod stale_grace_tests;

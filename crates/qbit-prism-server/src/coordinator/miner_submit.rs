@@ -193,6 +193,9 @@ impl Coordinator {
         match save {
             Ok(true) => {
                 self.accepted.fetch_add(1, Ordering::Relaxed);
+                if grace {
+                    self.metrics.record_grace_credit();
+                }
                 if current.bundle.is_none() {
                     self.wake.notify_one();
                 }
