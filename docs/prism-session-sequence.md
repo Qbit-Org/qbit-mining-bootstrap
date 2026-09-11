@@ -15,6 +15,14 @@ attempts. After 1,024 occupied candidates, the client receives Stratum error 20
 with reason `session-allocation-exhausted` and can retry subscription; no partial
 subscription is published.
 
+Each Ledger process incarnation has a random owner token, recorded in its
+reservations and heartbeat status. A stopped marker must match that token as
+well as the instance ID, so another process using the same instance ID cannot
+make live reservations reclaimable. Reporting stopped atomically closes local
+allocation admission and requires zero pending or active session guards; a
+shutdown that has not finished cancelling sessions cannot publish the marker.
+All clones of the Ledger share that admission state.
+
 The session owns a non-cloneable guard. Disconnect and task cancellation schedule
 deletion of only that guard's reservation token; a late cleanup cannot delete a
 replacement reservation. Unexpired persisted jobs independently block reuse
@@ -61,22 +69,22 @@ and prevent that process from restarting during the operation. On the writer,
 mark that owner stopped (substitute the verified instance ID):
 
 ```sql
-INSERT INTO qbit_prism_instances (instance_id, status)
-VALUES ('verified-stopped-instance', '{"state":"stopped"}'::jsonb)
-ON CONFLICT (instance_id) DO UPDATE
-SET status = EXCLUDED.status, heartbeat_at = clock_timestamp();
+UPDATE qbit_prism_instances
+SET status = jsonb_set(status, '{state}', '"stopped"'::jsonb),
+    heartbeat_at = clock_timestamp()
+WHERE instance_id = 'verified-stopped-instance';
 ```
 
-The allocator will then reclaim its reservations as candidates are encountered,
-while retaining protection from unexpired jobs. To remove those stopped-owner
-reservations immediately under the same precondition:
+Preserve `session_owner_token` in that status: the allocator will reclaim only
+that process incarnation's reservations as candidates are encountered, while
+retaining protection from unexpired jobs. If the heartbeat row is absent or
+there are older incarnations, their reservations stay protected. To remove all
+reservations for the verified-stopped instance ID immediately, under the same
+precondition that **none** of its processes can still run or restart:
 
 ```sql
 DELETE FROM qbit_prism_session_reservations AS r
-USING qbit_prism_instances AS i
 WHERE r.instance_id = 'verified-stopped-instance'
-  AND i.instance_id = r.instance_id
-  AND i.status->>'state' = 'stopped'
   AND NOT EXISTS (
       SELECT 1 FROM qbit_prism_jobs AS j
       WHERE lower(j.payload->>'extranonce1') = lpad(to_hex(r.extranonce1), 8, '0')

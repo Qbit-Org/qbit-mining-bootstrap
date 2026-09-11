@@ -44,4 +44,5 @@ const SELECT_SHARE: &str = "SELECT share_seq,share_id,miner_id,payout_order_key,
 pub struct Ledger {
     pub pool: PgPool,
     pub instance_id: String,
+    session_owner: std::sync::Arc<connect::SessionOwner>,
 }

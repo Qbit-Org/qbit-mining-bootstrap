@@ -189,6 +189,14 @@ async fn only_stopped_owners_are_reclaimed_and_old_cleanup_cannot_release_a_repl
         "absent owners do not prove session exit"
     );
     skipped.release().await?;
+    let (owner_token, old_token): (String, String) = sqlx::query_as("SELECT owner_token,reservation_token FROM qbit_prism_session_reservations WHERE extranonce1=1")
+        .fetch_one(&a.pool).await?;
+    assert!(a.heartbeat(json!({"state":"stopped"})).await.is_err());
+    held.release().await?;
+    // Recreate a missed cleanup after the actual guard has ended. A stopped
+    // heartbeat must never be published while that live guard still exists.
+    sqlx::query("INSERT INTO qbit_prism_session_reservations(extranonce1,instance_id,owner_token,reservation_token) VALUES(1,'a',$1,$2)")
+        .bind(owner_token).bind(&old_token).execute(&a.pool).await?;
     a.heartbeat(json!({"state":"stopped"})).await?;
     seed_job(&a.pool, "stopped-live-job", "00000001", true).await?;
     wrap(&a.pool).await?;
@@ -205,7 +213,14 @@ async fn only_stopped_owners_are_reclaimed_and_old_cleanup_cannot_release_a_repl
     wrap(&a.pool).await?;
     let replacement = b.new_session_id().await?;
     assert_eq!(replacement.value(), 1);
-    held.release().await?;
+    let late_cleanup = sqlx::query(
+        "DELETE FROM qbit_prism_session_reservations WHERE extranonce1=1 AND reservation_token=$1",
+    )
+    .bind(old_token)
+    .execute(&a.pool)
+    .await?
+    .rows_affected();
+    assert_eq!(late_cleanup, 0);
     let owner: String = sqlx::query_scalar(
         "SELECT instance_id FROM qbit_prism_session_reservations WHERE extranonce1=1",
     )
@@ -217,6 +232,63 @@ async fn only_stopped_owners_are_reclaimed_and_old_cleanup_cannot_release_a_repl
     );
     replacement.release().await?;
     db.close(vec![a, b]).await
+}
+
+#[tokio::test]
+async fn stopped_requires_no_pending_or_live_sessions_and_cannot_reclaim_another_incarnation(
+) -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let a = db.ledger("reused-instance-id").await?;
+    let held = a.new_session_id().await?;
+    let other_incarnation = db.ledger("reused-instance-id").await?;
+    let allocator = db.ledger("allocator").await?;
+    assert!(
+        a.heartbeat(json!({"state":"stopped"})).await.is_err(),
+        "a live session prevents stopped"
+    );
+    assert!(
+        a.clone()
+            .heartbeat(json!({"state":"stopped"}))
+            .await
+            .is_err(),
+        "Ledger clones share admission state"
+    );
+    other_incarnation
+        .heartbeat(json!({"state":"stopped"}))
+        .await?;
+    wrap(&a.pool).await?;
+    let next = allocator.new_session_id().await?;
+    assert_eq!(next.value(),2,"stopped from a second process with the same instance ID cannot reclaim the first process's session");
+    next.release().await?;
+    held.release().await?;
+
+    // Poll allocation until it waits on a saturated real PostgreSQL pool,
+    // retaining the pending future across timeout instead of cancelling it.
+    let mut connections = Vec::new();
+    for _ in 0..8 {
+        connections.push(a.pool.acquire().await?);
+    }
+    let mut pending = Box::pin(a.new_session_id());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), pending.as_mut())
+            .await
+            .is_err()
+    );
+    assert!(
+        a.heartbeat(json!({"state":"stopped"})).await.is_err(),
+        "an allocation awaiting a connection also prevents stopped"
+    );
+    drop(pending);
+    drop(connections);
+    a.heartbeat(json!({"state":"stopped"})).await?;
+    let error = a.new_session_id().await.unwrap_err();
+    assert!(
+        error.to_string().contains("allocator is stopped"),
+        "stopped closes future admission"
+    );
+    db.close(vec![a, other_incarnation, allocator]).await
 }
 
 #[tokio::test]

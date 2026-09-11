@@ -6,6 +6,46 @@ const SESSION_ALLOCATION_ATTEMPTS: usize = 1024;
 #[error("no free session extranonce found after 1024 allocation attempts; retry subscription")]
 pub struct SessionAllocationExhausted;
 
+#[derive(Debug, Default)]
+struct SessionOwnerState {
+    stopped: bool,
+    active: usize,
+}
+
+#[derive(Debug)]
+pub(super) struct SessionOwner {
+    token: String,
+    state: std::sync::Mutex<SessionOwnerState>,
+}
+
+#[derive(Debug)]
+struct ActiveSession(std::sync::Arc<SessionOwner>);
+
+impl SessionOwner {
+    fn start(self: &std::sync::Arc<Self>) -> Result<ActiveSession> {
+        let mut state = self.state.lock().unwrap();
+        ensure!(!state.stopped, "session allocator is stopped");
+        state.active += 1;
+        Ok(ActiveSession(self.clone()))
+    }
+
+    fn stop(&self) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        ensure!(
+            state.active == 0,
+            "cannot report stopped with active or pending sessions"
+        );
+        state.stopped = true;
+        Ok(())
+    }
+}
+
+impl Drop for ActiveSession {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().active -= 1;
+    }
+}
+
 /// Owns a four-byte extranonce for the lifetime of a subscribed connection.
 /// This is deliberately not Clone: dropping the owner releases its reservation.
 #[derive(Debug)]
@@ -13,6 +53,7 @@ pub struct SessionAllocationExhausted;
 pub struct SessionId {
     id: u32,
     reservation: Option<(PgPool, String)>,
+    _active: Option<ActiveSession>,
 }
 
 impl SessionId {
@@ -38,6 +79,7 @@ impl From<u32> for SessionId {
         Self {
             id,
             reservation: None,
+            _active: None,
         }
     }
 }
@@ -191,7 +233,14 @@ impl Ledger {
             }
             tx.commit().await?;
         }
-        let ledger = Self { pool, instance_id };
+        let ledger = Self {
+            pool,
+            instance_id,
+            session_owner: std::sync::Arc::new(SessionOwner {
+                token: Uuid::new_v4().to_string(),
+                state: std::sync::Mutex::default(),
+            }),
+        };
         let mut tx = ledger.pool.begin().await?;
         writable(&mut tx).await?;
         tx.commit().await?;
@@ -226,7 +275,20 @@ impl Ledger {
         Ok(())
     }
 
-    pub async fn heartbeat(&self, status: Value) -> Result<()> {
+    pub async fn heartbeat(&self, mut status: Value) -> Result<()> {
+        // The stopped marker is proof about this process incarnation only.
+        // Closing admission and checking pending/active guards happen under
+        // one local mutex, before awaiting SQL; no new session can race it.
+        if status.get("state").and_then(Value::as_str) == Some("stopped") {
+            self.session_owner.stop()?;
+        }
+        status
+            .as_object_mut()
+            .context("heartbeat status must be an object")?
+            .insert(
+                "session_owner_token".into(),
+                self.session_owner.token.clone().into(),
+            );
         sqlx::query("INSERT INTO qbit_prism_instances(instance_id,status) VALUES($1,$2) ON CONFLICT(instance_id) DO UPDATE SET heartbeat_at=clock_timestamp(),status=EXCLUDED.status")
             .bind(&self.instance_id).bind(status).execute(&self.pool).await?;
         Ok(())
@@ -235,6 +297,9 @@ impl Ledger {
     /// Reserve a four-byte extranonce across every frontend, including at wrap.
     /// The caller must retain the returned guard for the entire session.
     pub async fn new_session_id(&self) -> Result<SessionId> {
+        // Count even an allocation still waiting for a connection/commit, so
+        // shutdown cannot publish stopped ahead of an in-flight allocation.
+        let active = self.session_owner.start()?;
         for _ in 0..SESSION_ALLOCATION_ATTEMPTS {
             // Each attempt has its own short transaction. The unique key,
             // rather than an extra global lock, arbitrates wrapped candidates.
@@ -244,8 +309,8 @@ impl Ledger {
                 .await?;
             let id = u32::try_from(id)?;
             let token = Uuid::new_v4().to_string();
-            let reserved = sqlx::query("INSERT INTO qbit_prism_session_reservations AS held (extranonce1,instance_id,reservation_token) VALUES($1,$2,$3) ON CONFLICT(extranonce1) DO UPDATE SET instance_id=EXCLUDED.instance_id,reservation_token=EXCLUDED.reservation_token,created_at=clock_timestamp() WHERE EXISTS (SELECT 1 FROM qbit_prism_instances owner WHERE owner.instance_id=held.instance_id AND owner.status->>'state'='stopped')")
-                .bind(i64::from(id)).bind(&self.instance_id).bind(&token)
+            let reserved = sqlx::query("INSERT INTO qbit_prism_session_reservations AS held (extranonce1,instance_id,owner_token,reservation_token) VALUES($1,$2,$3,$4) ON CONFLICT(extranonce1) DO UPDATE SET instance_id=EXCLUDED.instance_id,owner_token=EXCLUDED.owner_token,reservation_token=EXCLUDED.reservation_token,created_at=clock_timestamp() WHERE EXISTS (SELECT 1 FROM qbit_prism_instances owner WHERE owner.instance_id=held.instance_id AND owner.status->>'state'='stopped' AND owner.status->>'session_owner_token'=held.owner_token)")
+                .bind(i64::from(id)).bind(&self.instance_id).bind(&self.session_owner.token).bind(&token)
                 .execute(&mut *tx).await?.rows_affected();
             if reserved == 0 {
                 tx.rollback().await?;
@@ -263,6 +328,7 @@ impl Ledger {
             let session = SessionId {
                 id,
                 reservation: Some((self.pool.clone(), token)),
+                _active: Some(active),
             };
             tx.commit().await?;
             return Ok(session);
