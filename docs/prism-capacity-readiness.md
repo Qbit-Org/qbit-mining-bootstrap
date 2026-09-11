@@ -155,12 +155,275 @@ the artifact and raw results. Private canaries and routine restarts do not
 require it. Re-run only when the qualified image, bound load configuration,
 database/hardware profile, forecast, or ACK objective changes.
 
-## Retired Python Memory Instrumentation
+## Heap and Component-Cardinality Telemetry
 
-The heap census, allocator telemetry, `malloc_trim` controls, and resident-set
-soak tooling from issue #226 instrumented the Python coordinator. They were
-retired with that runtime and have no native equivalent settings; a capacity
-run on the native server does not configure or record them.
+Issue #226 recorded a coordinator whose resident set grew by roughly 390 MB per
+hour over 45 hours of uptime with no restart, no OOM kill, and a memory map made
+of hundreds of 4-64 MiB anonymous regions -- the shape of glibc per-thread
+malloc arenas across the process's 64 threads. The families this section used
+to describe were the always-on instrument for that question on the Python
+coordinator. That runtime was removed in #244 and the families went with it;
+what the native server exports in their place is the table further down.
+
+### Interpreter and allocator families
+
+Retired. The `qbit_prism_process_allocated_blocks`, `qbit_prism_process_gc_*`,
+`qbit_prism_process_threads` and `qbit_prism_process_malloc_*` families, with
+the `PRISM_MALLOC_TELEMETRY` switch, read CPython allocator and collector
+state and glibc `mallinfo2` from the Python coordinator's process-telemetry
+module. The native server has no interpreter, no cycle collector, and does not
+bind `mallinfo2`, so none of those readings has a Rust analogue and none is
+planned. `PRISM_MALLOC_TELEMETRY` is not read by the native server and is no
+longer in `compose.yaml` or `.env.example`.
+
+### Component-cardinality families
+
+Retired. `qbit_prism_component_entries{component}` and
+`qbit_prism_component_bytes{component}` were `len()` and byte readings over
+the Python coordinator's in-process structures, with the `component` label set
+pinned by two constants in its metrics module. The payout window, candidate
+registries and job caches they counted now live in PostgreSQL or in Rust
+structures the registry does not yet size. #278 keeps the per-worker and
+payout-build series at P2; #279 owns the inventory that decides which
+component gauges the native server carries. A `qbit_prism_component_*` series
+does not appear in a native `/metrics` body.
+
+### Process telemetry on the native server
+
+The registry landed by #308 exports one process reading and the state needed
+to trust it. Names are the ones in `docs/prism-native-metrics.md`; every family
+carries the `qbit_prism_` prefix.
+
+| Family | Type | Meaning |
+| --- | --- | --- |
+| `process_resident_memory_bytes` | gauge | `VmRSS` from `/proc/self/status`, in bytes, refreshed by the process collector every ten seconds. `-1` when the read failed, the platform is unsupported, or the observation is older than 30 seconds. |
+| `collector_available{collector="process"}` | gauge | 1 only while the latest completed process collection succeeded and is at most 30 seconds old. Read RSS only when this is 1. |
+| `collector_success{collector="process"}` | gauge | Latest attempt succeeded (1), failed (0), or none completed yet (-1). |
+| `collector_age_seconds{collector="process"}` | gauge | Monotonic age of the last successful process observation; `-1` before the first success. A failure does not refresh it. |
+| `runtime_workers` | gauge | Configured Tokio worker threads (`PRISM_RUNTIME_WORKERS`; empty chooses the available parallelism). |
+| `runtime_lag_seconds` | gauge | Latest wake lateness of the 100 ms runtime sampler; `-1` before its first tick. |
+| `runtime_poll_lag_seconds{task}` | gauge | Largest active poll, or a completed poll retained for 60 to 61 seconds, per monitored task. |
+| `runtime_progress_age_seconds{task}` | gauge | Oldest active explicit operation's time since progress; zero when idle. |
+| `runtime_task_stalled{task}` | gauge | 1 while a poll exceeds two seconds or an explicit operation exceeds its budget. |
+| `metrics_snapshot_available`, `metrics_snapshot_stale`, `metrics_snapshot_age_seconds` | gauge | The #277 freshness block for the cached body itself. |
+
+Every gauge here is a scrape-time render of cached observations; the scrape
+performs no I/O. Read the `x-prism-metrics-state` header (`fresh`, `stale` or
+`unavailable`) before trusting a body, as before. What the native block does
+not have, and who owns it: thread and open-file-descriptor gauges are in
+#278's cutover-minimum list and not yet on this branch; allocator arena,
+in-use, free and mmapped byte gauges are in no open issue, so a soak that
+needs the retention-versus-fragmentation split has to raise it on #279 rather
+than expect it.
+
+### What to look at first when RSS climbs
+
+1. **Is the reading real?** `qbit_prism_collector_available{collector="process"}`
+   must be 1 and the `x-prism-metrics-state` header `fresh`. RSS renders `-1`
+   when the collector failed or its observation aged out; a drop to `-1` is a
+   collection failure, not a release of memory.
+2. **Is it load or time?** Plot `qbit_prism_process_resident_memory_bytes`
+   against `qbit_prism_connections`, `qbit_prism_authorized_clients`, the rate
+   of `qbit_prism_accepted_shares_total`, and
+   `qbit_prism_block_candidates_pending`. RSS that moves with connections or
+   the candidate backlog and returns when they do is working set; RSS that
+   climbs at flat load is the #226 shape and is what the bound below catches.
+3. **Is the runtime keeping up?** `qbit_prism_runtime_task_stalled{task}` at 1,
+   `qbit_prism_runtime_poll_lag_seconds{task}` in whole seconds, or
+   `qbit_prism_database_pool_acquire_seconds` shifting into its upper buckets
+   during the climb points at a blocked worker holding buffers rather than at
+   a leak. The incident-6 lesson is that such a process still answers
+   `/healthz` from a surviving worker, so the runtime gauges are the tell.
+4. **Retention or fragmentation?** The native registry cannot say. The Python
+   lane split RSS into live objects, allocator in-use bytes, free bytes and
+   mmapped bytes; the native server exports RSS alone. The binary uses the
+   system allocator, glibc malloc in the shipped image, so arena mechanics
+   still apply to its worker and blocking-pool threads, but nothing on this
+   branch measures them. Record the RSS series and the correlated series
+   above and attach them to the finding; do not infer an allocator setting
+   from RSS alone.
+
+## Heap Census, Allocator Control, and the Resident-Set Bound
+
+Issue #226's second part. On the Python coordinator this section was the
+instrument that said *what* was retained (a `gc.get_objects()` census on
+`SIGUSR1`) and *which allocator setting* bounded the fragmentation
+(`malloc_trim` on `SIGRTMIN+1`, the `MALLOC_ARENA_MAX` experiment), plus the
+automated bound a fix had to pass. The census and the allocator controls were
+CPython and glibc instruments wired into the Python process and left with it
+in #244. The bound and the soak that produces its input are
+runtime-independent and are re-anchored below.
+
+### Running a census
+
+Retired. The heap census, its `SIGUSR1` arming and the `PRISM_HEAP_CENSUS*`
+settings applied to the retired Python coordinator (#244). The native server
+registers no census signal and reads none of those variables, `compose.yaml`
+and `.env.example` no longer pass them, and #288 adds the CI check that fails
+if one reappears in `docs/` as live. The native server handles only `SIGTERM`
+and `SIGINT`, so
+`docker kill --signal=SIGUSR1` against the native container terminates the
+coordinator. Do not send it.
+
+### Reading a census
+
+Retired with the census. The report format (`process`, `walk`,
+`types_by_count`, `types_by_bytes`, `tracemalloc`) described CPython heap
+state and has no native producer.
+
+### `malloc_trim`
+
+Retired. The trimmer, `PRISM_MALLOC_TRIM_SIGNAL` and
+`PRISM_MALLOC_TRIM_INTERVAL_SECONDS` were a Python-process instrument (#244).
+The native server exposes no trim hook, and `SIGRTMIN+1` is unhandled there,
+so the same warning as for `SIGUSR1` applies.
+
+### Allocator settings and the storm instrument
+
+Retired. The image no longer sets `MALLOC_ARENA_MAX`, `compose.yaml` and
+`.env.example` carry no allocator variable, and the candidate-storm rig under
+`tests/` that produced the arena experiment was deleted with the Python lane
+(#244). The `MALLOC_ARENA_MAX=1` setting in
+`docs/prism-payout-artifact-measurement.md` applies to that test process on
+the operator's host, not to the coordinator image. No native allocator
+experiment exists on this branch; if the soak below fails at flat load, the
+allocator is one candidate cause among others and gets its own issue with the
+soak evidence attached.
+
+### The resident-set bound
+
+The stated bound is unchanged: **after a one-hour warm-up, the resident set
+must stay within 2.0x the warm-up peak for the rest of a 24 h soak at ordinary
+load.** The warm-up peak is the baseline because the first hour materializes
+the payout window and runs the first full rescan; the #226 slope (390 MB/h from
+a 125-145 MiB start) breaches this bound in its third hour, and a post-storm
+excursion like #185's 613 MiB drains back under it. The check is automated,
+not a graph someone reads. The Python tool that computed the verdict left with
+#244; the same verdict is one `awk` pass over the sample file:
+
+```sh
+awk -F, -v warmup=3600 -v multiple=2.0 -v min_span=82800 '
+  /^#/ || NF < 2 || $2 < 0 { next }
+  { if (t0 == "") t0 = $1
+    if ($1 - t0 < warmup) { if ($2 > base) base = $2; next }
+    post++; last = $1
+    if ($2 > peak) { peak = $2; peak_at = $1 }
+    if (!breach && $2 > base * multiple) breach = $1 }
+  END {
+    if (base == "" || !post) { print "unusable input: no warm-up or no post-warm-up samples"; exit 2 }
+    if (last - t0 < min_span) { printf "unusable input: series spans %d s, soak needs %d s\n", last - t0, min_span; exit 2 }
+    printf "baseline=%d bound=%d peak=%d peak_at=%d first_breach_at=%s\n", base, base * multiple, peak, peak_at, breach ? breach : "none"
+    exit breach ? 1 : 0 }' soak-rss.csv
+```
+
+The input is one `seconds,rss_bytes` line per sample (absolute epoch seconds
+are fine; `#` comments are skipped; `-1` samples are ignored). The command
+prints the baseline, the bound, the post-warm-up peak and its time, and the
+first breach time, and exits `0` on pass, `1` on fail, `2` on unusable input;
+it refuses a series shorter than the soak. The slope guard the Python tool
+offered (a leak slow enough to stay under the multiple inside 24 hours) has no
+replacement in the runbook; take it from the RSS series on the deployment's
+dashboard, whose rules #279 owns.
+
+When it fails: the first breach time says whether the growth is the steady
+slope (breach hours in) or an excursion (breach right after a candidate storm
+or a rescan burst). There is no census to take at the breach; the evidence is
+the RSS series, the correlated series from "What to look at first when RSS
+climbs" at the breach time, and the full `/metrics` body captured there. Do
+not raise the multiple to make a soak pass.
+
+### Testnet 24 h soak runbook (deferred to the operator)
+
+This soak has not been run against the native server. Nothing here was
+verified against a live host; the thresholds and the procedure are what this
+document delivers, and the numbers are what the soak produces. It is the
+memory-bound evidence for the promotion decision and is distinct from #291's
+two-hour cutover soak, which reads its own criteria from the same registry.
+
+1. **Build** the coordinator image the deployment will run and record its
+   image ID (substitute the deployment's env files for the repository
+   examples):
+
+   ```sh
+   docker compose --env-file config/upstream.env.example --env-file .env.example \
+     -f compose.yaml --profile prism build prism-coordinator
+   docker image inspect --format '{{.Id}}' "${PRISM_COORDINATOR_IMAGE:-qbit-lab-prism-coordinator:local}"
+   ```
+
+2. **Run** one fresh coordinator process for at least 24 h at ordinary testnet
+   load with the same miner population throughout. The three
+   `MALLOC_ARENA_MAX` runs the Python lane called for are retired with the
+   allocator experiment above; there is one configuration to soak, the one
+   the deployment ships. Before trusting a run, confirm the process collector
+   is publishing and the body is fresh. The audit port is bound to the
+   container's loopback and compose publishes only the Stratum port, so the
+   read runs inside the container, where the server is PID 1 and the image
+   carries `curl` (`3341` is the default `PRISM_AUDIT_PORT`; substitute the
+   deployment's value):
+
+   ```sh
+   c=<prism-coordinator-container>
+   docker exec "$c" curl -sS --max-time 5 -D - http://127.0.0.1:3341/metrics \
+     | tr -d '\r' \
+     | grep -E '^(x-prism-metrics-state:|qbit_prism_collector_available\{collector="process"\} 1$)'
+   ```
+
+   Two lines, `x-prism-metrics-state: fresh` and the collector gauge at 1,
+   mean the RSS series is trustworthy. Record the deploy dotenv (secrets
+   redacted) and the image ID beside each run.
+3. **Capture every 5 minutes** for the whole soak: RSS from `/proc/1/status`
+   for the bound, and the correlated series for the reading order above. Both
+   reads run inside the container; the parsing runs on the host:
+
+   ```sh
+   c=<prism-coordinator-container>
+   while true; do
+     now=$(date +%s)
+     docker exec "$c" cat /proc/1/status \
+       | awk -v now="$now" '/^VmRSS:/ { printf "%s,%d\n", now, $2 * 1024 }' >> soak-rss.csv
+     docker exec "$c" curl -sS --max-time 5 -D - http://127.0.0.1:3341/metrics \
+       | tr -d '\r' \
+       | grep -E '^(x-prism-metrics-state:|qbit_prism_(process_resident_memory_bytes|collector_available|collector_age_seconds|runtime_lag_seconds|runtime_task_stalled|connections|authorized_clients|accepted_shares_total|block_candidates_pending)[ {])' \
+       | sed "s/^/$now /" >> soak-metrics.log
+     sleep 300
+   done
+   ```
+
+   `VmRSS` in `/proc/1/status` is the field the registry's process collector
+   reads, so the CSV and the gauge agree up to collector cadence. Also keep
+   the share-ack histogram at hours 1, 12 and 24 for the latency comparison:
+
+   ```sh
+   docker exec "$c" curl -sS --max-time 5 http://127.0.0.1:3341/metrics \
+     | grep -E '^qbit_prism_share_ack_seconds' > share-ack-h01.txt
+   ```
+
+4. **Snapshot** the full `/metrics` body, headers included, at hour 1 (the
+   baseline), hour 24, and at any breach:
+
+   ```sh
+   docker exec "$c" curl -sS --max-time 5 -D - http://127.0.0.1:3341/metrics > metrics-h01.txt
+   ```
+
+   This replaces the census step: there is no heap walk on the native server,
+   and the body at the breach is what the correlated reading works from.
+5. **Trim** is retired with `malloc_trim`; there is nothing to send at hour 23.
+6. **Judge** each run with the `awk` bound check above against
+   `soak-rss.csv`. Pass: exit `0`, and share-ack p99 at hour 24 within the
+   alert threshold configured for the deployment (the native rules are
+   #279's). Fail: exit `1`, or a share-ack regression between hour 1 and hour
+   24 that the operator would alert on. Record every
+   `qbit_prism_runtime_task_stalled` sample at 1 with its timestamp; a stall
+   that coincides with an RSS excursion is the first thing to explain.
+7. **Record** on issue #291, which owns cutover qualification: the verdict
+   line, `soak-rss.csv`, `soak-metrics.log`, the three share-ack histograms,
+   the hour-1, hour-24 and breach snapshots, the image ID, and the redacted
+   deploy dotenv. The glibc version inside the image
+   (`docker exec "$c" ldd --version`) still belongs in the record, because
+   the process uses it as its allocator.
+8. **The post-storm drain re-run** on #185 is retired; the storm rig was a
+   Python test deleted in #244, and #185's drain measurement is the Python
+   lane's record.
 
 ## Payout-window JSONB storage ceiling
 
