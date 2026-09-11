@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import re
 
 import jinja2
 from jinja2.meta import find_undeclared_variables
@@ -77,11 +78,15 @@ def main():
         return result
 
     combinations = [{}, {key: False for key in gates}] + [{key: False} for key in gates]
+    duration = re.compile(r"^[0-9]+(?:ms|s|m|h|d|w|y)$")
     for index, overrides in enumerate(combinations):
         values = {**variables, **overrides}
         old = yaml.safe_load(env.from_string(original.decode()).render(**values))
         new = yaml.safe_load(env.from_string(generated).render(**values))
         before, after = rules(old), rules(new)
+        for rule in after.values():
+            assert duration.fullmatch(str(rule["for"])), (rule["uid"], rule["for"])
+            assert "{{" not in str(rule["for"]) and '"' not in str(rule["for"])
         assert new["apiVersion"] == 1
         assert before.keys() & external == after.keys() & external, overrides
         for uid in before.keys() & external:
@@ -104,6 +109,14 @@ def main():
             rendered = after[rule["uid"]]
             assert rendered["noDataState"] == rendered["execErrState"] == "Alerting"
             assert rendered["for"] == "1m"
+    tuned = dict(variables, qbit_monitoring_stack_prism_alert_connected_clients_for="9m",
+                 qbit_monitoring_stack_prism_alert_block_candidate_age_for="7m",
+                 qbit_monitoring_stack_prism_alert_semantic_coverage_warning_for="11m")
+    rendered = yaml.safe_load(env.from_string(generated).render(**tuned))
+    tuned_rules = rules(rendered)
+    assert tuned_rules["qbit-prism-connected-clients"]["for"] == "9m"
+    assert tuned_rules["qbit-prism-block-candidate-oldest"]["for"] == "7m"
+    assert tuned_rules["qbit-prism-semantic-work-coverage"]["for"] == "11m"
     assert (args.snapshot / relative.name).read_bytes() == original
     print(f"Patch applies cleanly; {len(combinations)} Jinja gate combinations passed; "
           "78 original / 62 proposed rules; 34 external definitions preserved; "

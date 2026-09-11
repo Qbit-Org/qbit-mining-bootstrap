@@ -114,13 +114,14 @@ def jinja_rules(rules):
         "qbit-prism-semantic-work-coverage": ("qbit_monitoring_stack_prism_alert_semantic_coverage_warning_ratio", "qbit_monitoring_stack_prism_alert_semantic_coverage_warning_for", "0.95"),
         "qbit-prism-semantic-coverage-critical": ("qbit_monitoring_stack_prism_alert_semantic_coverage_critical_ratio", "qbit_monitoring_stack_prism_alert_semantic_coverage_critical_for", "0.5"),
     }
+    canonical = {r["uid"] for r in rules}
+    missing = set(overrides) - canonical
+    if missing and (canonical & set(overrides)):
+        raise AssertionError(f"override target UID missing from rendered rules: {sorted(missing)}")
     for uid, (threshold, dwell, literal) in overrides.items():
         marker = '"uid": "' + uid + '"'
         start = text.find(marker)
-        if start < 0:
-            if any(r.get("uid") == uid for r in rules):
-                raise AssertionError(f"override target UID missing from rendered rules: {uid}")
-            continue
+        if start < 0: continue
         end = text.find('"uid": "', start + len(marker))
         block_end = end if end >= 0 else len(text)
         block = text[start:block_end]
@@ -129,7 +130,7 @@ def jinja_rules(rules):
             before, after = expr.group(2).split(literal, 1)
             rebuilt = expr.group(1) + before + '" ~ (' + threshold + ' | default(' + literal + ')) ~ "' + after + expr.group(3)
             block = block[:expr.start()] + rebuilt + block[expr.end():]
-        block = block.replace('"for": "3m"', '"for": (' + dwell + ' | default(\'3m\') | tojson)', 1)
+        block = block.replace('"for": "3m"', '"for": (' + dwell + ' | default(\'3m\'))', 1)
         text = text[:start] + block + text[block_end:]
     return text
 
