@@ -105,6 +105,7 @@ class PrepareQbitSourceTests(unittest.TestCase):
         shutil.copyfile(ROOT / "config" / "upstream.env.example", root / "config" / "upstream.env")
         return root, script
 
+    @unittest.skipUnless(shutil.which("rsync"), "prepare-qbit-source.sh stages the source with rsync")
     def test_production_source_stages_exact_commit_without_dirty_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             checkout, commit = self.make_checkout(Path(tmp))
@@ -138,6 +139,7 @@ class PrepareQbitSourceTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("requires QBIT_GIT_COMMIT as exactly 40 hex characters", result.stderr)
 
+    @unittest.skipUnless(shutil.which("rsync"), "prepare-qbit-source.sh stages the source with rsync")
     def test_deploy_env_file_supplies_the_source_pin(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -171,6 +173,7 @@ class PrepareQbitSourceTests(unittest.TestCase):
         self.assertIn("requires QBIT_GIT_COMMIT as exactly 40 hex characters", result.stderr)
         self.assertNotIn("is not present in qbit source", result.stderr)
 
+    @unittest.skipUnless(shutil.which("rsync"), "prepare-qbit-source.sh stages the source with rsync")
     def test_external_environment_overrides_deployment_source_pin(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

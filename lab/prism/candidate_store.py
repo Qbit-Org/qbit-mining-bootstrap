@@ -80,6 +80,7 @@ from lab.prism.candidate_codec import (
     legacy_json_to_spool,
     prepared_intent_from_spool,
 )
+from lab.prism.helper_limits import apply_helper_memory_limit
 
 # Chunks per body read statement; three 256 KiB chunks base64-encode to
 # exactly 1 MiB of returned text, which is the transport ceiling.
@@ -1576,9 +1577,8 @@ def helper_main(stdin_stream: Any = None, stdout_stream: Any = None) -> int:
     try:
         request = json.loads(header.decode("utf-8"))
         if os.name == "posix":
-            import resource
             memory_limit = int(request.get("memory_limit_bytes", LEGACY_HELPER_MEMORY_BYTES))
-            resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
+            apply_helper_memory_limit(memory_limit)
         mode = request["mode"]
         transport = request["transport"]
         block_hash = str(request["block_hash"]).lower()

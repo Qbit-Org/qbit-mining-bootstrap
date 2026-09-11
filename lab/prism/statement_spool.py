@@ -21,9 +21,19 @@ STATEMENT_SPOOL_BYTES = 4 * 1024 * 1024 * 1024
 STATEMENT_HELPER_MEMORY_BYTES = 4 * 1024 * 1024 * 1024
 STATEMENT_RESULT_BYTES = 64 * 1024
 STATEMENT_HELPER_TIMEOUT_SECONDS = 600.0
+# Stdlib only: the child's import path is not guaranteed. The RLIMIT_AS block
+# is an inline copy of lab.prism.helper_limits.apply_helper_memory_limit.
 _EXEC_LIMITED = """
 import os, resource, sys
-resource.setrlimit(resource.RLIMIT_AS, (int(sys.argv[1]), int(sys.argv[1])))
+limit_bytes = int(sys.argv[1])
+try:
+    resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+except (ValueError, OSError) as exc:
+    if sys.platform != "darwin":
+        raise
+    sys.stderr.write(
+        f"prism helper: RLIMIT_AS {limit_bytes} refused on darwin ({exc}); continuing uncapped\\n"
+    )
 resource.setrlimit(resource.RLIMIT_FSIZE, (int(sys.argv[2]), int(sys.argv[2])))
 os.execvp(sys.argv[3], sys.argv[3:])
 """
