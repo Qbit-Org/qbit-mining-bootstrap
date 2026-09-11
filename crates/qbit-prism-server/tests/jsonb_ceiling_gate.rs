@@ -439,14 +439,32 @@ fn parse_baseline_sizes(raw: Option<&str>) -> Result<Vec<u64>> {
 /// Trap 3: existing native tests return early when the URL is missing. This one
 /// must never do that silently, and must never do it at all in CI.
 fn database_url() -> Result<Option<String>> {
-    let url = std::env::var("PRISM_TEST_DATABASE_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    if url.is_some() {
-        return Ok(url);
+    database_url_from(
+        std::env::var("PRISM_TEST_DATABASE_URL"),
+        std::env::var("CI"),
+    )
+}
+
+/// EP-VALIDATION: an unreadable variable is an error, never an absent one.
+/// Treating a non-Unicode `PRISM_TEST_DATABASE_URL` (or `CI`) as unset would
+/// let a deliberately configured run skip the ratchet without a word.
+fn database_url_from(
+    url: Result<String, std::env::VarError>,
+    ci: Result<String, std::env::VarError>,
+) -> Result<Option<String>> {
+    match url {
+        Ok(value) if !value.trim().is_empty() => return Ok(Some(value)),
+        Ok(_) | Err(std::env::VarError::NotPresent) => {}
+        Err(error) => bail!("PRISM_TEST_DATABASE_URL is set but not readable: {error}"),
     }
-    let ci = std::env::var("CI").ok().filter(|value| !value.is_empty());
-    if ci.is_some() {
+    let ci_set = match ci {
+        Ok(value) => !value.is_empty(),
+        Err(std::env::VarError::NotPresent) => false,
+        Err(error) => bail!(
+            "CI is set but not readable: {error}; treating it as unset could skip the gate in CI"
+        ),
+    };
+    if ci_set {
         bail!(
             "PRISM_TEST_DATABASE_URL is unset or empty while CI is set. The JSONB ceiling gate \
              must not silently skip in CI: point it at a PostgreSQL 16 instance."
@@ -3182,6 +3200,44 @@ fn fit_stability_is_checked_per_write() {
     assert_eq!(row.divergence(), None);
     let line = stability_row(&row);
     assert!(line.contains("not compared (below 1 MiB)"), "{line}");
+}
+
+/// EP-VALIDATION: a malformed database variable fails instead of skipping,
+/// and the existing CI rule still holds.
+#[test]
+fn an_unreadable_database_url_fails_instead_of_skipping() {
+    use std::env::VarError;
+    let missing = || Err(VarError::NotPresent);
+    assert_eq!(
+        database_url_from(Ok("postgresql://x/y".into()), missing()).unwrap(),
+        Some("postgresql://x/y".to_owned())
+    );
+    assert_eq!(database_url_from(missing(), missing()).unwrap(), None);
+    assert_eq!(database_url_from(Ok("  ".into()), missing()).unwrap(), None);
+    let in_ci = format!(
+        "{:#}",
+        database_url_from(missing(), Ok("true".into())).unwrap_err()
+    );
+    assert!(in_ci.contains("unset or empty while CI is set"), "{in_ci}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = || {
+            Err(VarError::NotUnicode(std::ffi::OsString::from_vec(vec![
+                0xff, 0xfe,
+            ])))
+        };
+        let url_error = format!("{:#}", database_url_from(bad(), missing()).unwrap_err());
+        assert!(
+            url_error.contains("PRISM_TEST_DATABASE_URL is set but not readable"),
+            "{url_error}"
+        );
+        let ci_error = format!("{:#}", database_url_from(missing(), bad()).unwrap_err());
+        assert!(
+            ci_error.contains("CI is set but not readable"),
+            "{ci_error}"
+        );
+    }
 }
 
 fn test_key(table: &str, column: &str, phase: &'static str) -> WriteKey {
