@@ -1,5 +1,10 @@
 # Prepared work window reference: implementation checkpoint
 
+This document records the initial dependency checkpoint. The later locally
+authorized schema/reader slice and its measured results are recorded in
+[the foundation report](prism-window-reference-foundation.md); final runtime
+integration still requires A265 and coordinated ownership decisions.
+
 Issue [#273](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/273),
 workstream B. This is a proposed implementation and qualification plan, not a
 claim that the implementation or its performance gates have passed.

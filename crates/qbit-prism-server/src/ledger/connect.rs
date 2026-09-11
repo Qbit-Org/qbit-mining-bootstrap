@@ -42,11 +42,13 @@ impl Ledger {
             let mut tx = pool.begin().await?;
             lock(&mut tx, MIGRATION_LOCK).await?;
             sqlx::raw_sql("CREATE TABLE IF NOT EXISTS qbit_prism_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())").execute(&mut *tx).await?;
-            let version: Option<i32> =
-                sqlx::query_scalar("SELECT max(version) FROM qbit_prism_schema_migrations")
-                    .fetch_one(&mut *tx)
+            // Match PR319's membership approach: independently reserved
+            // migrations must not hide a lower numbered, unapplied migration.
+            let versions: Vec<i32> =
+                sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations")
+                    .fetch_all(&mut *tx)
                     .await?;
-            if version.unwrap_or(0) < 3 {
+            if !versions.contains(&3) {
                 // Existing native writers use this same lock order. Keep the
                 // schema repair and cutover atomic with their accounting.
                 lock(&mut tx, SETTLEMENT_LOCK).await?;
@@ -78,7 +80,7 @@ impl Ledger {
                     "../../../qbit-prism/sql/001_share_ledger.sql"
                 ))?;
                 sqlx::raw_sql(&base_schema).execute(&mut *tx).await?;
-                if version.unwrap_or(0) < 2 {
+                if !versions.contains(&2) {
                     sqlx::raw_sql(include_str!("../../migrations/002_multi_instance.sql"))
                         .execute(&mut *tx)
                         .await?;
@@ -93,7 +95,7 @@ impl Ledger {
                     .execute(&mut *tx)
                     .await?;
             }
-            if version.unwrap_or(0) < 4 {
+            if !versions.contains(&4) {
                 sqlx::raw_sql(include_str!(
                     "../../migrations/004_cpfp_retired_funding.sql"
                 ))
@@ -103,11 +105,21 @@ impl Ledger {
                     .execute(&mut *tx)
                     .await?;
             }
-            if version.unwrap_or(0) < 5 {
+            if !versions.contains(&5) {
                 sqlx::raw_sql(include_str!("../../migrations/005_candidate_dispatch.sql"))
                     .execute(&mut *tx)
                     .await?;
                 sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(5)")
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            if !versions.contains(&8) {
+                sqlx::raw_sql(include_str!(
+                    "../../migrations/008_prepared_window_reference.sql"
+                ))
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(8)")
                     .execute(&mut *tx)
                     .await?;
             }
