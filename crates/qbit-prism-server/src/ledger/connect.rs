@@ -126,6 +126,7 @@ impl Ledger {
             instance_id,
             session_owner: std::sync::Arc::new(SessionOwner::new_for_tests()),
             metrics: None,
+            config_fingerprint: std::sync::Arc::default(),
         }
     }
 
@@ -375,6 +376,7 @@ impl Ledger {
                 state: std::sync::Mutex::default(),
             }),
             metrics,
+            config_fingerprint: std::sync::Arc::default(),
         };
         if register {
             let mut tx = ledger.begin().await?;
@@ -409,7 +411,20 @@ impl Ledger {
                 .await?;
         }
         tx.commit().await?;
+        // Retained only once the pin or the match is durable. A later writer
+        // fence compares the row it re-reads `FOR SHARE` against this value.
+        let _ = self.config_fingerprint.set(fingerprint.to_owned());
         Ok(())
+    }
+
+    /// The cluster fingerprint this frontend pinned or verified in
+    /// [`Ledger::configure`], or `None` before `configure` has succeeded.
+    ///
+    /// Writers fence against a fingerprint reset by re-reading
+    /// `qbit_prism_cluster.config_fingerprint` `FOR SHARE` in their own
+    /// transaction and refusing when it is not this value.
+    pub fn config_fingerprint(&self) -> Option<&str> {
+        self.config_fingerprint.get().map(String::as_str)
     }
 
     pub async fn heartbeat(&self, mut status: Value) -> Result<()> {
