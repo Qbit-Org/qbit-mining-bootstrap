@@ -32,7 +32,8 @@ mod jobs;
 pub use jobs::{IssuedJobSave, PreparedDependency};
 mod migration;
 pub use migration::{
-    MigrationSource, SourceState, SourceStateRule, REQUIRED_SCHEMA_VERSION, SOURCE_STATES,
+    MigrationSource, SourceState, SourceStateRule, NOT_VALID_EXEMPT, REQUIRED_SCHEMA_VERSION,
+    SOURCE_STATES,
 };
 mod window;
 pub use difficulty::WorkerDifficulty;

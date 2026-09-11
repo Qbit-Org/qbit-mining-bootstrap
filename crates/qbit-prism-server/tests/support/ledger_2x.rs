@@ -7,7 +7,8 @@
 //! below pin the fixtures, pin the live file, and compare the two.
 use super::*;
 use qbit_prism_server::ledger::{
-    audit_canonical_bytes, MigrationSource, SourceState, REQUIRED_SCHEMA_VERSION, SOURCE_STATES,
+    audit_canonical_bytes, MigrationSource, SourceState, NOT_VALID_EXEMPT, REQUIRED_SCHEMA_VERSION,
+    SOURCE_STATES,
 };
 use sqlx::Row;
 use std::io::Write;
@@ -123,6 +124,92 @@ fn live_sql_stays_pinned_to_the_frozen_2x_release() {
          with: git show {RELEASE_COMMIT_2_0_2}:crates/qbit-prism/sql/002_candidate_bodies.sql \
          > crates/qbit-prism/sql/002_candidate_bodies.sql. A native schema change belongs in a new \
          numbered migration under crates/qbit-prism-server/migrations/"
+    );
+}
+
+/// The constraints a SQL file adds with `NOT VALID` and never validates
+/// afterwards, as (table, constraint) pairs. Comments are removed and the
+/// text is split on `;`; quotes and parentheses are dropped so a statement
+/// built with `format('ALTER TABLE %I.t ' 'ADD CONSTRAINT ' ...)` reads like
+/// a plain one, and a `%I.` schema placeholder is removed from the table
+/// name.
+fn constraints_left_not_valid(sql: &str) -> Vec<(String, String)> {
+    let text = sql_statements(sql)
+        .join(" ")
+        .replace('\'', "")
+        .replace(['(', ')'], " ");
+    let mut added = Vec::new();
+    let mut validated = Vec::new();
+    for statement in text.split(';') {
+        let words: Vec<&str> = statement
+            .split_whitespace()
+            .map(|word| word.trim_end_matches(','))
+            .collect();
+        let after = |keyword: [&str; 2]| {
+            words
+                .windows(2)
+                .position(|pair| pair == keyword)
+                .map(|index| (index, words.get(index + 2)))
+                .and_then(|(index, word)| {
+                    word.map(|word| (index, word.trim_start_matches("%I.").to_owned()))
+                })
+        };
+        let Some((_, table)) = after(["ALTER", "TABLE"]) else {
+            continue;
+        };
+        if let Some((index, name)) = after(["ADD", "CONSTRAINT"]) {
+            if words[index..]
+                .windows(2)
+                .any(|pair| pair == ["NOT", "VALID"])
+            {
+                added.push((table.clone(), name));
+            }
+        }
+        if let Some((_, name)) = after(["VALIDATE", "CONSTRAINT"]) {
+            validated.push((table, name));
+        }
+    }
+    added.retain(|pair| !validated.contains(pair));
+    added.sort();
+    added.dedup();
+    added
+}
+
+#[test]
+fn frozen_release_not_valid_constraints_are_exactly_the_pinned_exemptions() {
+    // The parser: a plain ADD ... NOT VALID, one built with format(), a
+    // validated add, and one validated later in the same file.
+    assert_eq!(
+        constraints_left_not_valid(
+            "ALTER TABLE t ADD CONSTRAINT t_a_check CHECK (a > 0) NOT VALID; -- kept\n\
+             EXECUTE format('ALTER TABLE %I.u ' 'ADD CONSTRAINT ' 'u_b_check ' 'CHECK (b > 0) NOT VALID', ns);\n\
+             ALTER TABLE v ADD CONSTRAINT v_c_check CHECK (c > 0);\n\
+             ALTER TABLE w ADD CONSTRAINT w_d_check CHECK (d > 0) NOT VALID;\n\
+             EXECUTE format('ALTER TABLE %I.w ' 'VALIDATE CONSTRAINT ' 'w_d_check', ns);\n"
+        ),
+        vec![
+            ("t".to_owned(), "t_a_check".to_owned()),
+            ("u".to_owned(), "u_b_check".to_owned())
+        ]
+    );
+    let mut left = constraints_left_not_valid(FROZEN_2X_001);
+    left.extend(constraints_left_not_valid(FROZEN_2X_002));
+    left.sort();
+    let pinned: Vec<(String, String)> = NOT_VALID_EXEMPT
+        .iter()
+        .map(|(table, name)| ((*table).to_owned(), (*name).to_owned()))
+        .collect();
+    assert_eq!(
+        left, pinned,
+        "NOT_VALID_EXEMPT in src/ledger/migration.rs must be exactly the constraints the frozen \
+         2.x.x release SQL (tests/fixtures/schema_2x) adds NOT VALID and never validates"
+    );
+    assert_eq!(
+        pinned,
+        vec![(
+            "qbit_share_ledger".to_owned(),
+            "qbit_share_ledger_credit_policy_check".to_owned()
+        )]
     );
 }
 
@@ -941,6 +1028,65 @@ async fn unlogged_release_table_or_sequence_is_refused_naming_it_and_rolls_back(
         Some("pre_258".into())
     );
     exercise_native_writers(&ledger, 1, 5801).await?;
+    pool.close().await;
+    db.close(vec![ledger]).await
+}
+
+#[tokio::test]
+async fn release_constraint_left_not_valid_is_refused_naming_it_and_rolls_back() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    insert_v1_terminal(&pool, &legacy_hash(0x33), "submitted").await?;
+    // A foreign key and a CHECK the release validates, dropped and re-added
+    // NOT VALID: the same definitions, so they used to compare equal to the
+    // validated release constraints whatever rows they were never checked
+    // against. 001 creates both only inside CREATE TABLE, so its re-apply
+    // leaves them as they are.
+    sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox DROP CONSTRAINT qbit_block_candidate_outbox_share_id_fkey; ALTER TABLE qbit_block_candidate_outbox ADD CONSTRAINT qbit_block_candidate_outbox_share_id_fkey FOREIGN KEY (share_id) REFERENCES qbit_share_ledger(share_id) NOT VALID; ALTER TABLE qbit_payout_carry_forward DROP CONSTRAINT qbit_payout_carry_forward_block_height_check; ALTER TABLE qbit_payout_carry_forward ADD CONSTRAINT qbit_payout_carry_forward_block_height_check CHECK (block_height >= 0) NOT VALID")
+        .execute(&pool).await?;
+    let not_valid = || async {
+        sqlx::query_scalar::<_, String>("SELECT string_agg(conrelid::regclass::text||'.'||conname::text,',' ORDER BY conname) FROM pg_constraint WHERE connamespace=current_schema()::regnamespace AND NOT convalidated")
+            .fetch_one(&pool).await
+    };
+    let left = "qbit_block_candidate_outbox.qbit_block_candidate_outbox_share_id_fkey,qbit_payout_carry_forward.qbit_payout_carry_forward_block_height_check";
+    assert_eq!(not_valid().await?, left);
+    let error = db
+        .ledger("a")
+        .await
+        .err()
+        .context("migration accepted a release constraint left NOT VALID")?
+        .to_string();
+    assert!(
+        error.contains("refusing to migrate a drifted 001 source"),
+        "{error}"
+    );
+    assert!(error.contains("2 object(s) differ"), "{error}");
+    assert!(
+        error.contains("constraint qbit_block_candidate_outbox_share_id_fkey on qbit_block_candidate_outbox is NOT VALID; the release validates it"),
+        "{error}"
+    );
+    assert!(
+        error.contains("constraint qbit_payout_carry_forward_block_height_check on qbit_payout_carry_forward is NOT VALID; the release validates it"),
+        "{error}"
+    );
+    assert!(error.contains("Nothing was changed"), "{error}");
+    // Rolled back whole: no native table, and the refusal validated nothing.
+    assert!(native_tables_absent(&pool).await?, "refusal ran DDL");
+    assert_eq!(not_valid().await?, left);
+    // Validated, once the rows are known to satisfy them, the same source
+    // migrates and is recorded as v2.0.1.
+    sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox VALIDATE CONSTRAINT qbit_block_candidate_outbox_share_id_fkey; ALTER TABLE qbit_payout_carry_forward VALIDATE CONSTRAINT qbit_payout_carry_forward_block_height_check")
+        .execute(&pool).await?;
+    let ledger = db.ledger("a").await?;
+    assert_eq!(schema_version(&pool).await?, REQUIRED_SCHEMA_VERSION);
+    assert_eq!(
+        ledger.migration_source().await?.map(|s| s.source_state),
+        Some("pre_258".into())
+    );
+    exercise_native_writers(&ledger, 1, 5901).await?;
     pool.close().await;
     db.close(vec![ledger]).await
 }

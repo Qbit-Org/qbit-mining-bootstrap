@@ -45,9 +45,14 @@
 -- release's persistence: an UNLOGGED or temporary one is drift whatever its
 -- columns say, because PostgreSQL truncates it after a crash. A sequence is
 -- compared by its structure (type, start, increment, bounds, cache, cycle),
--- never by the value it has reached. Column order, comments, auto-generated constraint
--- names and NOT VALID are ignored; extra objects are kept and logged; a
--- missing or different one fails the migration, which rolls back whole.
+-- never by the value it has reached. A constraint's validation state is
+-- compared: a release constraint left NOT VALID in the source is drift,
+-- except qbit_share_ledger_credit_policy_check, which 001 itself adds NOT
+-- VALID on an upgraded table (NOT_VALID_EXEMPT in ledger/migration.rs, pinned
+-- to the frozen release by a test). Column order, comments and
+-- auto-generated constraint names are ignored; extra objects are kept and
+-- logged; a missing or different one fails the migration, which rolls back
+-- whole.
 
 -- What the database came from, written once by the migration that accepted
 -- it. Later starts and operators read it; a repeated migrate never rewrites it.

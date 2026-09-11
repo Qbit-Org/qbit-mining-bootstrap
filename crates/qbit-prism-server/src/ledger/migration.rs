@@ -598,8 +598,9 @@ struct SequenceDefinition {
 struct SchemaFingerprint {
     /// Keyed by name: each table's persistence and its columns.
     tables: BTreeMap<String, TableDefinition>,
-    /// Table, then constraint definition, to the name the constraint carries.
-    constraints: BTreeMap<String, BTreeMap<String, String>>,
+    /// Table, then constraint definition (`constraint_key`), to the name the
+    /// constraint carries and its validation state.
+    constraints: BTreeMap<String, BTreeMap<String, ConstraintDefinition>>,
     /// Indexes that do not back a constraint, by name; the constraint
     /// comparison covers the others under whatever name they were given.
     indexes: BTreeMap<String, IndexDefinition>,
@@ -676,14 +677,42 @@ fn normalize_function_config(item: &str, schema: &str) -> String {
     format!("{key}={value}")
 }
 
-/// A CHECK the release added to an upgraded table with `NOT VALID` is the
-/// same rule for every row the native writers produce; 001 itself compares
-/// constraint definitions this way.
-fn strip_not_valid(definition: &str) -> String {
+/// The constraints the frozen 2.x.x release adds with `NOT VALID` and never
+/// validates, as (table, constraint name): 001 adds its credit-policy CHECK
+/// that way on a `qbit_share_ledger` upgraded from before the column
+/// existed, and a fresh apply creates the same constraint validated inside
+/// `CREATE TABLE`. These are accepted in either validation state; every
+/// other release constraint must be validated in the source, because a
+/// `NOT VALID` foreign key or CHECK was never checked against the rows that
+/// were there when it was added. The list is pinned to the release: a test
+/// in `tests/support/ledger_2x.rs` derives the same set from the frozen 001
+/// and 002 fixtures and fails if the two differ.
+pub const NOT_VALID_EXEMPT: &[(&str, &str)] =
+    &[("qbit_share_ledger", "qbit_share_ledger_credit_policy_check")];
+
+fn not_valid_exempt(table: &str, name: &str) -> bool {
+    NOT_VALID_EXEMPT
+        .iter()
+        .any(|(exempt_table, exempt_name)| *exempt_table == table && *exempt_name == name)
+}
+
+/// The key a constraint is compared under: its rendered definition without
+/// the `NOT VALID` suffix, so a constraint that is not validated still finds
+/// its release counterpart by definition. Validation itself is compared from
+/// `pg_constraint.convalidated`, not from this text.
+fn constraint_key(definition: &str) -> String {
     definition
         .strip_suffix(" NOT VALID")
         .unwrap_or(definition)
         .to_owned()
+}
+
+/// A constraint's name and whether PostgreSQL has checked every existing
+/// row against it (`convalidated`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConstraintDefinition {
+    name: String,
+    validated: bool,
 }
 
 /// Read the catalog for every object in `namespace`. The `pg_get_*`
@@ -729,7 +758,7 @@ async fn fingerprint_schema(
             },
         );
     }
-    let rows = sqlx::query("SELECT c.relname::text AS table_name,k.conname::text AS name,pg_get_constraintdef(k.oid) AS definition FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' ORDER BY 1,2")
+    let rows = sqlx::query("SELECT c.relname::text AS table_name,k.conname::text AS name,pg_get_constraintdef(k.oid) AS definition,k.convalidated AS validated FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' ORDER BY 1,2")
         .bind(namespace).fetch_all(&mut **tx).await?;
     for row in &rows {
         let table: String = row.try_get("table_name")?;
@@ -738,11 +767,14 @@ async fn fingerprint_schema(
             .constraints
             .entry(table)
             .or_default()
-            .entry(strip_not_valid(&strip_schema_qualification(
+            .entry(constraint_key(&strip_schema_qualification(
                 &definition,
                 namespace,
             )))
-            .or_insert(row.try_get("name")?);
+            .or_insert(ConstraintDefinition {
+                name: row.try_get("name")?,
+                validated: row.try_get("validated")?,
+            });
     }
     let rows = sqlx::query("SELECT c.relname::text AS table_name,i.relname::text AS name,pg_get_indexdef(x.indexrelid) AS definition,x.indisvalid AS valid FROM pg_index x JOIN pg_class i ON i.oid=x.indexrelid JOIN pg_class c ON c.oid=x.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' AND NOT EXISTS(SELECT 1 FROM pg_constraint k WHERE k.conindid=x.indexrelid AND k.contype IN ('p','u','x')) ORDER BY 1,2")
         .bind(namespace).fetch_all(&mut **tx).await?;
@@ -1046,8 +1078,9 @@ fn sequence_differences(expected: &SequenceDefinition, found: &SequenceDefinitio
 /// anything else in the source is extra. An object on a table the source
 /// lacks is not reported twice. A table or sequence must also have the
 /// release's persistence: UNLOGGED is drift, whatever its columns say. A
-/// sequence is compared by its structure only: the value it has reached is
-/// the source's data.
+/// release constraint must be validated in the source unless it is one of
+/// `NOT_VALID_EXEMPT`. A sequence is compared by its structure only: the
+/// value it has reached is the source's data.
 fn compare_fingerprints(
     expected: &SchemaFingerprint,
     found: &SchemaFingerprint,
@@ -1111,11 +1144,26 @@ fn compare_fingerprints(
             continue;
         }
         let found_constraints = found.constraints.get(table).unwrap_or(&empty);
-        for (definition, name) in constraints {
-            if !found_constraints.contains_key(definition) {
-                comparison.drift.push(format!(
-                    "missing constraint {name} on {table}: {definition}"
-                ));
+        for (definition, constraint) in constraints {
+            match found_constraints.get(definition) {
+                None => comparison.drift.push(format!(
+                    "missing constraint {} on {table}: {definition}",
+                    constraint.name
+                )),
+                // The release validates it; the source never checked its
+                // rows against it. Only the pinned release exemptions are
+                // accepted in either state.
+                Some(actual)
+                    if constraint.validated
+                        && !actual.validated
+                        && !not_valid_exempt(table, &constraint.name) =>
+                {
+                    comparison.drift.push(format!(
+                        "constraint {} on {table} is NOT VALID; the release validates it",
+                        actual.name
+                    ))
+                }
+                Some(_) => {}
             }
         }
     }
@@ -1124,11 +1172,12 @@ fn compare_fingerprints(
             continue;
         }
         let expected_constraints = expected.constraints.get(table).unwrap_or(&empty);
-        for (definition, name) in constraints {
+        for (definition, constraint) in constraints {
             if !expected_constraints.contains_key(definition) {
-                comparison
-                    .extra
-                    .push(format!("constraint {name} on {table}: {definition}"));
+                comparison.extra.push(format!(
+                    "constraint {} on {table}: {definition}",
+                    constraint.name
+                ));
             }
         }
     }
@@ -1975,9 +2024,17 @@ mod tests {
             "work_mem=public"
         );
         assert_eq!(
-            strip_not_valid("CHECK ((a > 0)) NOT VALID"),
+            constraint_key("CHECK ((a > 0)) NOT VALID"),
             "CHECK ((a > 0))"
         );
+        assert_eq!(constraint_key("CHECK ((a > 0))"), "CHECK ((a > 0))");
+    }
+
+    fn constraint(name: &str, validated: bool) -> ConstraintDefinition {
+        ConstraintDefinition {
+            name: name.to_owned(),
+            validated,
+        }
     }
 
     #[test]
@@ -1994,7 +2051,7 @@ mod tests {
             .constraints
             .entry("t".into())
             .or_default()
-            .insert("CHECK ((a > 0))".into(), "t_a_check".into());
+            .insert("CHECK ((a > 0))".into(), constraint("t_a_check", true));
         expected.indexes.insert(
             "t_b_idx".into(),
             IndexDefinition {
@@ -2021,7 +2078,7 @@ mod tests {
             .constraints
             .entry("t".into())
             .or_default()
-            .insert("CHECK ((a > 0))".into(), "t_check1".into());
+            .insert("CHECK ((a > 0))".into(), constraint("t_check1", true));
         found.indexes.insert(
             "t_b_idx".into(),
             IndexDefinition {
@@ -2303,6 +2360,130 @@ mod tests {
         found.sequences.insert("u_id_seq".into(), release);
         let comparison = compare_fingerprints(&expected, &found);
         assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
+    }
+
+    #[test]
+    fn validation_state_is_compared_except_for_the_pinned_release_exemptions() {
+        assert_eq!(
+            NOT_VALID_EXEMPT,
+            &[("qbit_share_ledger", "qbit_share_ledger_credit_policy_check")]
+        );
+        assert!(not_valid_exempt(
+            "qbit_share_ledger",
+            "qbit_share_ledger_credit_policy_check"
+        ));
+        assert!(!not_valid_exempt(
+            "qbit_pool_blocks",
+            "qbit_share_ledger_credit_policy_check"
+        ));
+        let mut expected = SchemaFingerprint::default();
+        expected.tables.insert(
+            "qbit_share_ledger".into(),
+            table(&[("credit_policy", column("text", false))]),
+        );
+        expected.tables.insert(
+            "qbit_block_candidate_outbox".into(),
+            table(&[("share_id", column("text", false))]),
+        );
+        let exempt = "CHECK (((credit_policy IS NULL) OR (credit_policy = 'stale-grace'::text)))";
+        let foreign_key = "FOREIGN KEY (share_id) REFERENCES qbit_share_ledger(share_id)";
+        let check = "CHECK ((share_id <> ''::text))";
+        expected
+            .constraints
+            .entry("qbit_share_ledger".into())
+            .or_default()
+            .insert(
+                exempt.into(),
+                constraint("qbit_share_ledger_credit_policy_check", true),
+            );
+        let outbox = expected
+            .constraints
+            .entry("qbit_block_candidate_outbox".into())
+            .or_default();
+        outbox.insert(
+            foreign_key.into(),
+            constraint("qbit_block_candidate_outbox_share_id_fkey", true),
+        );
+        outbox.insert(
+            check.into(),
+            constraint("qbit_block_candidate_outbox_share_id_check", true),
+        );
+        // The same definitions, none of them validated: the exempt CHECK is
+        // accepted, the foreign key and the other CHECK are drift, named by
+        // the name the source gives them.
+        let mut found = SchemaFingerprint {
+            tables: expected.tables.clone(),
+            ..SchemaFingerprint::default()
+        };
+        found
+            .constraints
+            .entry("qbit_share_ledger".into())
+            .or_default()
+            .insert(
+                exempt.into(),
+                constraint("qbit_share_ledger_credit_policy_check", false),
+            );
+        let outbox = found
+            .constraints
+            .entry("qbit_block_candidate_outbox".into())
+            .or_default();
+        outbox.insert(
+            foreign_key.into(),
+            constraint("qbit_block_candidate_outbox_share_id_fkey", false),
+        );
+        outbox.insert(check.into(), constraint("outbox_share_id_check1", false));
+        let comparison = compare_fingerprints(&expected, &found);
+        assert_eq!(
+            comparison.drift,
+            vec![
+                "constraint outbox_share_id_check1 on qbit_block_candidate_outbox is NOT VALID; the release validates it",
+                "constraint qbit_block_candidate_outbox_share_id_fkey on qbit_block_candidate_outbox is NOT VALID; the release validates it",
+            ]
+        );
+        assert!(comparison.extra.is_empty(), "{:?}", comparison.extra);
+
+        // The exempt constraint in either state on either side: the scratch
+        // apply may itself leave it NOT VALID.
+        expected
+            .constraints
+            .get_mut("qbit_share_ledger")
+            .unwrap()
+            .get_mut(exempt)
+            .unwrap()
+            .validated = false;
+        found
+            .constraints
+            .get_mut("qbit_share_ledger")
+            .unwrap()
+            .get_mut(exempt)
+            .unwrap()
+            .validated = true;
+        // Validated in the source, the others are equivalent again.
+        for constraint in found
+            .constraints
+            .get_mut("qbit_block_candidate_outbox")
+            .unwrap()
+            .values_mut()
+        {
+            constraint.validated = true;
+        }
+        let comparison = compare_fingerprints(&expected, &found);
+        assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
+        // An extra constraint is extra whatever its state.
+        found
+            .constraints
+            .get_mut("qbit_block_candidate_outbox")
+            .unwrap()
+            .insert(
+                "CHECK ((share_id <> 'x'::text))".into(),
+                constraint("operator_check", false),
+            );
+        let comparison = compare_fingerprints(&expected, &found);
+        assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
+        assert_eq!(
+            comparison.extra,
+            vec!["constraint operator_check on qbit_block_candidate_outbox: CHECK ((share_id <> 'x'::text))"]
+        );
     }
 
     #[test]
