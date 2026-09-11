@@ -10,11 +10,12 @@ a. No runnable ``python -m lab.…`` or ``python lab/….py`` command invokes a
    to run a package that has only ``__init__.py``, and a bare directory is a
    namespace package with the same refusal, while a module file inside such a
    directory runs. There is no allowlist. The check is lexical:
-   it reads direct ``python``/``python3``/``python3.N`` invocations with their
-   CPython option forms, quoted interpreter names and targets, shell word
-   concatenation (``"lab.prism."deleted``) and ``./`` prefixes, and does not
-   follow ``cd``, ``PYTHONPATH`` or other environment indirection, aliases,
-   shell variables, or backslash escapes.
+   it reads direct ``python``/``python3``/``python3.N`` invocations, bare or
+   by path (``/usr/bin/python3``), with their CPython option forms, quoted
+   interpreter names and targets, shell word concatenation of the interpreter
+   and of the target (``"python"3``, ``'pyth'on3``, ``"lab.prism."deleted``)
+   and ``./`` prefixes, and does not follow ``cd``, ``PYTHONPATH`` or other
+   environment indirection, aliases, shell variables, or backslash escapes.
 b. Every ``lab/prism/…`` path or ``lab.prism.…`` module reference resolves to a
    tracked file or directory. GitHub links pinned to a 40-hex commit SHA are
    stable history and exempt. Pre-existing residue that #303 declares out of
@@ -64,9 +65,9 @@ def quoted(target: str, group: str = "quote") -> str:
     """``target`` bare or in matching single or double quotes, which the shell strips.
 
     A mismatched quote is a shell syntax error: the line runs nothing and
-    matches nothing. ``group`` names the capture that holds the quote, since a
-    command pattern may quote both its interpreter and its target and ``re``
-    rejects a group name used twice.
+    matches nothing. ``group`` names the capture that holds the quote, so a
+    pattern that uses this more than once can give each use its own name,
+    since ``re`` rejects a group name used twice.
     """
     return rf"(?P<{group}>['\"]?){target}\b(?P={group})"
 
@@ -78,11 +79,9 @@ MODULE_REFERENCE = re.compile(r"\blab\.prism(?:\.[A-Za-z_][A-Za-z0-9_]*)*\b")
 # target: clustered flag letters, `-W`/`-X` with an attached or following
 # argument, and `--check-hash-based-pycs <mode>` (CPython rejects the `=`
 # spelling). `-c cmd` runs its argument and ends the option list, so it is
-# deliberately not a prefix option. The interpreter name may itself be quoted
-# (`"python3" -m lab.a.b`), which the shell strips before it runs; inside
-# `sh -c "python3 -m lab.a.b"` no quote closes right after the name, so the
-# quote group falls back to empty and the inner command is read as before.
-# An option argument may be quoted the same way, attached or following:
+# deliberately not a prefix option. The interpreter name is read as a whole
+# shell word, see `PYTHON_COMMAND` below. An option argument may be quoted
+# the same way as a target, attached or following:
 # CPython 3.14 runs `-X 'dev'`, `-X"dev mode"`, `-W'error'` and
 # `--check-hash-based-pycs "always"` exactly as their bare spellings, since
 # the shell strips the quotes first. A bare argument therefore holds no quote
@@ -105,11 +104,26 @@ PYTHON_FLAG = r"[bBdEhiIOPqRsSuvVx]"
 # shell strips are removed by ``unquote`` before a word is read as a target.
 WORD_BREAK = r"\s|&;()<>`"
 QUOTED_STRING = r"'[^']*'|\"[^\"]*\""
-SHELL_WORD = (
-    rf"(?:[^{WORD_BREAK}'\"]|{QUOTED_STRING})"
-    rf"[^{WORD_BREAK}'\"]*(?:(?:{QUOTED_STRING})[^{WORD_BREAK}'\"]*)*"
-    rf"(?![^{WORD_BREAK}'\"])"
-)
+
+
+def shell_word(quoted_string: str) -> str:
+    """The word pattern above, with ``quoted_string`` as its quoted piece."""
+    return (
+        rf"(?:[^{WORD_BREAK}'\"]|{quoted_string})"
+        rf"[^{WORD_BREAK}'\"]*(?:(?:{quoted_string})[^{WORD_BREAK}'\"]*)*"
+        rf"(?![^{WORD_BREAK}'\"])"
+    )
+
+
+SHELL_WORD = shell_word(QUOTED_STRING)
+# The interpreter word is read with quoted pieces that hold no whitespace. A
+# program name is one word, so nothing is lost, and the restriction is what
+# lets the word be read from every position of a line: with arbitrary quoted
+# pieces, `"$c" sh -c "python3` read from `$c` would be the one word
+# `$c" sh -c "python3`, pairing the closing quote of `"$c"` with the opening
+# quote of the `sh -c` string and hiding the `python3` inside it.
+INTERPRETER_STRING = r"'[^'\s]*'|\"[^\"\s]*\""
+INTERPRETER_WORD = shell_word(INTERPRETER_STRING)
 PYTHON_OPTION = (
     rf"-{PYTHON_FLAG}+"  # -O, -OO, -bb, -IsE
     rf"|-{PYTHON_FLAG}*[WX](?:{SHELL_WORD}|\s+{SHELL_WORD})"  # -Xdev, -X 'dev', -uWerror
@@ -121,9 +135,30 @@ PYTHON_OPTION = (
 MODULE_OPTION = rf"-{PYTHON_FLAG}*m\s*"
 
 
+# The interpreter is read as a whole shell word (`INTERPRETER_WORD`), like
+# the target below: bash 3.2 runs `"python"3 -m json.tool`, `'pyth'on3 -m
+# json.tool`, `python"3" -m json.tool` and `"/usr/bin/pyth"on3 -m json.tool`
+# exactly as `python3`, so a name the shell assembles from pieces is as
+# runnable as a bare or a wholly quoted one. ``dead_commands`` strips the matching quotes, takes the
+# basename after the last `/` (`/usr/bin/python3` runs Python as `python3`
+# does) and accepts the word only if it is wholly `python`, `python3` or
+# `python3.N` (`INTERPRETER`): `mypython3`, `cpython3` and `python2` are
+# other programs, and bash answers `mypython3 -m json.tool` with "command not
+# found". A word starts where no unquoted word character precedes it, so
+# `env python3 …`, `docker exec "$c" python3 …`, `$(python3 …)`, inline-code
+# `` `python3 …` `` and the inner command of `sh -c "python3 …"` are read as
+# before, while `mypython3` is one word. A word may also start right after a
+# closing quote, so `"/usr/bin/"python3` and `"my"python3` are each one
+# candidate and their tail `python3` another; the command patterns are
+# therefore lookaheads that consume nothing, every word is a candidate
+# interpreter, and ``python_commands`` drops a candidate that starts inside
+# the interpreter word of the one before it. A word that opens a quote and
+# never closes it (`"python3' -m lab.a.b`) is a shell syntax error and
+# matches nothing, as before.
+INTERPRETER = re.compile(r"python(?:3(?:\.\d+)?)?")
 PYTHON_COMMAND = (
-    quoted(r"\bpython(?:3(?:\.\d+)?)?", group="interpreter_quote")
-    + rf"(?:\s+(?:{PYTHON_OPTION}))*"
+    rf"(?<![^{WORD_BREAK}'\"])(?P<interpreter>{INTERPRETER_WORD})"
+    rf"(?:\s+(?:{PYTHON_OPTION}))*"
 )
 # The `-m` target and the script path are read as whole shell words, since
 # bash hands `-m "lab.prism."deleted`, `-m lab."prism".deleted` and
@@ -137,8 +172,12 @@ PYTHON_COMMAND = (
 # runs it on CPython 3.14) but never `-m`: after `--` CPython takes `-m` as a
 # script name and fails to open a file called `-m`, so `python3 -- -m lab.a.b`
 # runs nothing and is deliberately not a module command.
-MODULE_COMMAND = re.compile(rf"{PYTHON_COMMAND}\s+{MODULE_OPTION}(?P<word>{SHELL_WORD})")
-SCRIPT_COMMAND = re.compile(rf"{PYTHON_COMMAND}\s+(?:--\s+)?(?P<word>{SHELL_WORD})")
+MODULE_COMMAND = re.compile(
+    rf"(?=(?P<command>{PYTHON_COMMAND}\s+{MODULE_OPTION}(?P<word>{SHELL_WORD})))"
+)
+SCRIPT_COMMAND = re.compile(
+    rf"(?=(?P<command>{PYTHON_COMMAND}\s+(?:--\s+)?(?P<word>{SHELL_WORD})))"
+)
 MODULE_TARGET = re.compile(r"lab(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
 SCRIPT_TARGET = re.compile(r"lab/[A-Za-z0-9_./\-]+\.py")
 DOT_SEGMENTS = re.compile(r"^(?:\./)+")
@@ -197,6 +236,29 @@ def unquote(word: str) -> str:
     return MATCHING_QUOTES.sub(lambda match: match.group(0)[1:-1], word)
 
 
+def runs_python(word: str) -> bool:
+    """Whether ``word`` names CPython: unquoted, its basename is ``python``, ``python3`` or ``python3.N``."""
+    return INTERPRETER.fullmatch(unquote(word).rsplit("/", 1)[-1]) is not None
+
+
+def python_commands(pattern: re.Pattern[str], line: str):
+    """Each match of ``pattern`` on ``line`` whose interpreter word names CPython.
+
+    The pattern is a lookahead, so every word start is a candidate. One that
+    starts inside the interpreter word of the candidate before it is the tail
+    of that word after a closing quote (``python3`` in ``"/usr/bin/"python3``
+    or in ``"my"python3``), not a command of its own, and is dropped whether
+    or not the whole word named Python.
+    """
+    end = 0
+    for match in pattern.finditer(line):
+        if match.start() < end:
+            continue
+        end = match.end("interpreter")
+        if runs_python(match.group("interpreter")):
+            yield match
+
+
 def shell_lines(text: str) -> list[tuple[int, str]]:
     """``(first line, text)`` per logical shell line, backslash continuations joined."""
     lines: list[tuple[int, str]] = []
@@ -218,17 +280,17 @@ def dead_commands(text: str, tracked: frozenset[str]) -> list[tuple[int, str, st
     """
     found = []
     for number, line in shell_lines(text):
-        for match in MODULE_COMMAND.finditer(line):
+        for match in python_commands(MODULE_COMMAND, line):
             module = unquote(match.group("word"))
             if not MODULE_TARGET.fullmatch(module):
                 continue
             candidates = runnable_candidates(module)
             if not any(candidate in tracked for candidate in candidates):
-                found.append((number, match.group(0), " or ".join(candidates)))
-        for match in SCRIPT_COMMAND.finditer(line):
+                found.append((number, match.group("command"), " or ".join(candidates)))
+        for match in python_commands(SCRIPT_COMMAND, line):
             script = DOT_SEGMENTS.sub("", unquote(match.group("word")))
             if SCRIPT_TARGET.fullmatch(script) and script not in tracked:
-                found.append((number, match.group(0), script))
+                found.append((number, match.group("command"), script))
     return found
 
 
@@ -761,6 +823,101 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(self.located(text), [(3, self.TELEMETRY)])
         text = "'python3.12' -OO \\\n  lab/prism/storm.py \\\n  --decide"
         self.assertEqual(self.located(text), [(1, "lab/prism/storm.py")])
+
+    # Each ran `json.tool` on bash 3.2 and CPython 3.14 exactly as `python3`:
+    # the shell joins the pieces of the interpreter word and strips the quotes
+    # before it looks the program up, so a name spelled in pieces runs Python.
+    CONCATENATED_INTERPRETERS = ('"python"3', "'pyth'on3", 'python"3"', "python''3", '"pyth"on"3"')
+
+    def test_concatenated_interpreters_with_missing_targets_are_caught(self) -> None:
+        for interpreter in self.CONCATENATED_INTERPRETERS:
+            with self.subTest(interpreter=interpreter):
+                text = f"{interpreter} -m lab.prism.process_telemetry rss-bound"
+                self.assertEqual(self.commands(text), [self.TELEMETRY])
+                self.assertEqual(
+                    self.commands(f"{interpreter} lab/prism/storm.py --decide"), ["lab/prism/storm.py"]
+                )
+                self.assertEqual(
+                    self.commands(f"{interpreter} -OO -m 'lab.prism.'process_telemetry"), [self.TELEMETRY]
+                )
+        self.assertEqual(self.commands("'pyth'on3.12 -m lab.prism.process_telemetry"), [self.TELEMETRY])
+
+    def test_concatenated_interpreters_with_existing_targets_pass(self) -> None:
+        tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py", "lab/pkg/__main__.py"}
+        for interpreter in self.CONCATENATED_INTERPRETERS:
+            with self.subTest(interpreter=interpreter):
+                text = (
+                    f"{interpreter} -m lab.prism.tool\n{interpreter} -OO -m lab.pkg\n"
+                    f"{interpreter} lab/prism/tool.py"
+                )
+                self.assertEqual(dead_commands(text, tracked), [])
+
+    def test_wrapped_concatenated_interpreter_is_caught_at_the_right_line(self) -> None:
+        text = "```bash\ncd repo\n\"python\"3 \\\n  -m lab.prism.process_telemetry \\\n  rss-bound\n```"
+        self.assertEqual(self.located(text), [(3, self.TELEMETRY)])
+        text = "'pyth'on3 -OO \\\n  lab/prism/storm.py \\\n  --decide"
+        self.assertEqual(self.located(text), [(1, "lab/prism/storm.py")])
+
+    # `/usr/bin/python3 -m json.tool` and `"/usr/bin/pyth"on3 -m json.tool` both
+    # ran on bash 3.2: the basename after the last `/` is what names Python.
+    def test_path_interpreters_with_missing_targets_are_caught_once(self) -> None:
+        for interpreter in (
+            "/usr/bin/python3",
+            "/opt/homebrew/bin/python3.12",
+            '"/usr/bin/pyth"on3',
+            '"/usr/bin/"python3',
+            "'/usr/bin/python'3",
+            "./venv/bin/python",
+        ):
+            with self.subTest(interpreter=interpreter):
+                self.assertEqual(
+                    self.commands(f"{interpreter} -m lab.prism.process_telemetry rss-bound"), [self.TELEMETRY]
+                )
+                self.assertEqual(self.commands(f"{interpreter} lab/prism/storm.py --decide"), ["lab/prism/storm.py"])
+        self.assertEqual(
+            dead_commands('"/usr/bin/"python3 lab/prism/storm.py', self.TRACKED),
+            [(1, '"/usr/bin/"python3 lab/prism/storm.py', "lab/prism/storm.py")],
+        )
+
+    def test_words_that_name_no_interpreter_are_not_a_command(self) -> None:
+        # bash answers `mypython3 -m json.tool` with "command not found", and
+        # `cpython3`, `python2`, `python3x` or a program merely under a `python`
+        # directory are other programs; the prose contract still sees the
+        # reference. A word that opens a quote it never closes is a syntax error.
+        for interpreter in (
+            "mypython3",
+            "cpython3",
+            "python2",
+            "python3x",
+            '"my"python3',
+            "python3/bin/tool",
+            "python\"3",
+            "env",
+        ):
+            with self.subTest(interpreter=interpreter):
+                text = f"{interpreter} -m lab.prism.x"
+                self.assertEqual(self.commands(text), [])
+                self.assertEqual(self.references(text), ["lab.prism.x"])
+                self.assertEqual(self.commands(f"{interpreter} lab/prism/x.py"), [])
+
+    def test_interpreter_words_start_after_shell_boundaries(self) -> None:
+        # A launcher word before the interpreter is not consumed with it: each
+        # of these still runs the missing target through `python3`.
+        for text in (
+            "env python3 lab/prism/storm.py",
+            "env -i python3 -m lab.prism.process_telemetry",
+            'docker exec "$c" python3 lab/prism/storm.py',
+            "sudo -u prism /usr/bin/python3 lab/prism/storm.py",
+            "nohup python3 lab/prism/storm.py &",
+            "(python3 lab/prism/storm.py)",
+            "$(python3 lab/prism/storm.py)",
+            "`python3 lab/prism/storm.py`",
+            "true && python3 lab/prism/storm.py",
+            "true; python3 lab/prism/storm.py",
+            'sh -c "python3 lab/prism/storm.py"',
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(len(self.commands(text)), 1, self.commands(text))
 
     def test_version_suffixed_interpreters_are_scanned(self) -> None:
         self.assertEqual(
