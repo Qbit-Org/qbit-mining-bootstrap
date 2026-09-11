@@ -85,6 +85,7 @@ use serde_json::{Map, Value};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::{
     collections::BTreeSet,
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -1625,6 +1626,47 @@ fn write_json(config: &Config, report: &Value) -> Result<()> {
     Ok(())
 }
 
+/// One line per measured run, written straight to the process's stderr.
+///
+/// libtest captures `println!` and `eprintln!` from a passing test and throws
+/// the output away, and CI keeps no report artifact, so a green
+/// `prism-native-postgres` run would otherwise record nothing about how far
+/// above the floor it was. A write through `std::io::stderr()` is not captured,
+/// so every CI log carries the per-level rates that calibrate
+/// `CI_MIN_SHARES_PER_SEC`.
+fn emit_summary(config: &Config, measurement: &Measurement) {
+    let levels = measurement
+        .levels
+        .iter()
+        .map(|level| format!("{}:{:.1}", level.appenders, level.shares_per_second))
+        .collect::<Vec<_>>()
+        .join(",");
+    let contaminated = match measurement.contaminated {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
+    };
+    let line = format!(
+        "throughput_floor summary: test={} build={} window={} shares_per_level={} \
+         shares_per_second_by_appenders={} floor={:.1} passed={} contaminated={}\n",
+        config.test_name,
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+        config.window_shares,
+        config.shares_per_level,
+        levels,
+        config.minimum,
+        measurement.passed_minimum,
+        contaminated,
+    );
+    // The report file already holds everything this line summarises, so a
+    // failed write to stderr must not fail the measurement.
+    let _ = std::io::stderr().lock().write_all(line.as_bytes());
+}
+
 // ---------------------------------------------------------------------------
 // Test bodies
 // ---------------------------------------------------------------------------
@@ -1667,6 +1709,7 @@ async fn run_floor(test_name: &str, defaults: Defaults) -> Result<()> {
         }
     };
     write_report(&config, &measurement)?;
+    emit_summary(&config, &measurement);
     for level in &measurement.levels {
         ensure!(
             level.passed_minimum,
