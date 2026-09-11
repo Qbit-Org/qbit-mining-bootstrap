@@ -1879,19 +1879,23 @@ fn attribute_refusal(
 /// what the projections found rather than by what the call site assumed.
 fn attribute_refusals(pipeline: &mut Pipeline, projections: &[(WriteKey, f64)]) -> Result<()> {
     let n = pipeline.n;
+    // Nothing is replaced until every refusal has attributed: a failure leaves
+    // the recorded refusals in place, still unattributed, for the report.
     let mut attributed = BTreeMap::new();
-    for (expected, refusal) in std::mem::take(&mut pipeline.rejections) {
-        let key = attribute_refusal(expected.phase, n, projections, &expected)?;
-        report!(
-            "[n={n}] refusal at {}: {ATTRIBUTED_BY_PROJECTION}",
-            label(&key)
-        );
+    for (expected, refusal) in &pipeline.rejections {
+        let key = attribute_refusal(expected.phase, n, projections, expected)?;
         attributed.insert(
             key,
             Refusal {
                 attributed: Some(ATTRIBUTED_BY_PROJECTION),
-                ..refusal
+                ..refusal.clone()
             },
+        );
+    }
+    for key in attributed.keys() {
+        report!(
+            "[n={n}] refusal at {}: {ATTRIBUTED_BY_PROJECTION}",
+            label(key)
         );
     }
     pipeline.rejections = attributed;
@@ -2287,14 +2291,31 @@ fn write_table_lines(
             ),
         ));
     }
-    for key in sample.rejections.keys() {
+    for (key, refusal) in sample.rejections {
+        // EP-OBSERVABILITY: PostgreSQL's error names no column. Until
+        // `attribute_refusals` has checked the projections, a refusal is shown
+        // by phase only, never under the column its call site assumed.
+        let (table, column, source) = match refusal.attributed {
+            Some(_) => (
+                key.table.as_str(),
+                key.column.as_str(),
+                "production write REJECTED by PostgreSQL; it has no size".to_owned(),
+            ),
+            None => (
+                "(refused)",
+                "(not attributed)",
+                "production write REJECTED by PostgreSQL; the column is not attributed yet, \
+                 and it has no size"
+                    .to_owned(),
+            ),
+        };
         entries.push((
             key,
             1,
             row(
-                (&key.table, &key.column, key.phase),
+                (table, column, key.phase),
                 ["-", "rejected", "rejected", "rejected"].map(str::to_owned),
-                "production write REJECTED by PostgreSQL; it has no size".into(),
+                source,
             ),
         ));
     }
@@ -2526,13 +2547,15 @@ async fn reduced_pair(
     assert_phases_reached(&low)?;
     ensure_reduced_low_accepted(&low)?;
     let mut high = run_pipeline(url, settings.n2.value, settings).await?;
-    print_measurements(&high);
-    assert_phases_reached(&high)?;
     // A refusal at n2 is only reachable by raising PRISM_JSONB_GATE_N2. The n1
     // measurement is the only accepted sample below it, so the projection that
-    // attributes the refusal is that measurement scaled to n2.
+    // attributes the refusal is that measurement scaled to n2. Attribute before
+    // printing, and print whatever the outcome.
     let projections = projections_scaled(low.sample(), settings.n2.value)?;
-    attribute_refusals(&mut high, &projections)?;
+    let attributed = attribute_refusals(&mut high, &projections);
+    print_measurements(&high);
+    assert_phases_reached(&high)?;
+    attributed?;
     let rows = fit([low.sample(), high.sample()], settings.target.value)?;
     Ok((low, high, rows))
 }
@@ -2595,12 +2618,46 @@ async fn jsonb_ceiling_ratchet_at_full_size() -> Result<()> {
     print_settings(&settings, "full size");
     let (low, _, reduced) = reduced_pair(&url, &settings).await?;
     let mut pipeline = run_pipeline(&url, settings.target.value, &settings).await?;
+    // Attribute before printing, and print whatever the outcome: a refusal the
+    // projections do not back is shown by phase only.
+    let projections = reduced_projections(&reduced, low.sample(), pipeline.n)?;
+    let attributed = attribute_refusals(&mut pipeline, &projections);
     print_measurements(&pipeline);
     assert_phases_reached(&pipeline)?;
-    let projections = reduced_projections(&reduced, low.sample(), pipeline.n)?;
-    attribute_refusals(&mut pipeline, &projections)?;
+    attributed?;
     let rows = absolute(pipeline.sample());
     assert_ratchet(&rows, RatchetMode::FullSize { target: pipeline.n })
+}
+
+/// Attribute every refusal the sweep recorded, and return the CI fit the sweep
+/// checks its own sizes against. The reduced pair goes first, exactly as the CI
+/// gate fits it: a refusal at `n1` cannot be attributed at all, and one at `n2`
+/// is attributed from `n1`. Every other size is attributed from that fit
+/// projected to it; a write refused at `n2` keeps its `n1` measurement scaled to
+/// that size.
+fn attribute_sweep(
+    runs: &mut BTreeMap<u64, Pipeline>,
+    order: &[u64],
+    (n1, n2): (u64, u64),
+    target: u64,
+) -> Result<Vec<FitRow>> {
+    let low = runs.get(&n1).context("the sweep did not run n1")?;
+    ensure_reduced_low_accepted(low)?;
+    let scaled = projections_scaled(low.sample(), n2)?;
+    let high = runs.get_mut(&n2).context("the sweep did not run n2")?;
+    attribute_refusals(high, &scaled)?;
+    let ci_rows = fit([runs[&n1].sample(), runs[&n2].sample()], target)?;
+    for size in order {
+        if *size == n1 || *size == n2 {
+            continue;
+        }
+        let projections = reduced_projections(&ci_rows, runs[&n1].sample(), *size)?;
+        let pipeline = runs
+            .get_mut(size)
+            .with_context(|| format!("the sweep did not run n={size}"))?;
+        attribute_refusals(pipeline, &projections)?;
+    }
+    Ok(ci_rows)
 }
 
 /// Baseline sweep for `docs/prism-payout-artifact-measurement.md`. Ignored by
@@ -2643,30 +2700,18 @@ async fn jsonb_ceiling_baseline_sweep() -> Result<()> {
     let mut runs: BTreeMap<u64, Pipeline> = BTreeMap::new();
     for size in &order {
         let pipeline = run_pipeline(&url, *size, &settings).await?;
-        print_measurements(&pipeline);
-        assert_phases_reached(&pipeline)?;
         runs.insert(*size, pipeline);
     }
-    // The reduced pair first, exactly as the CI gate fits it: a refusal at n1
-    // cannot be attributed at all, and one at n2 is attributed from n1.
-    let low = runs.get(&n1).context("the sweep did not run n1")?;
-    ensure_reduced_low_accepted(low)?;
-    let scaled = projections_scaled(low.sample(), n2)?;
-    let high = runs.get_mut(&n2).context("the sweep did not run n2")?;
-    attribute_refusals(high, &scaled)?;
-    let ci_rows = fit([runs[&n1].sample(), runs[&n2].sample()], target)?;
-    // Every other size is attributed from that fit, projected to it; a write
-    // refused at n2 keeps its n1 measurement scaled to that size.
+    // Attribute every refusal before any table is printed, and print whatever
+    // the outcome, so no row names a column the projections have not backed.
+    let attributed = attribute_sweep(&mut runs, &order, (n1, n2), target);
     for size in &order {
-        if *size == n1 || *size == n2 {
-            continue;
-        }
-        let projections = reduced_projections(&ci_rows, runs[&n1].sample(), *size)?;
-        let pipeline = runs
-            .get_mut(size)
-            .with_context(|| format!("the sweep did not run n={size}"))?;
-        attribute_refusals(pipeline, &projections)?;
+        print_measurements(&runs[size]);
     }
+    for size in &order {
+        assert_phases_reached(&runs[size])?;
+    }
+    let ci_rows = attributed?;
 
     // Fit stability, per write: what CI projects from n1 and n2 has to agree
     // with what that write's own largest accepted sweep pair projects.
@@ -3003,6 +3048,57 @@ fn a_write_refused_at_n2_keeps_its_scaled_projection() {
     assert_eq!(
         attribute_refusal(PHASE_REFRESH, 200_000, &projections, &jobs).unwrap(),
         jobs
+    );
+}
+
+/// EP-OBSERVABILITY: until a refusal is attributed, the write table shows it by
+/// phase only; once attributed, it carries its table and column.
+#[test]
+fn an_unattributed_refusal_names_no_column() {
+    let outbox = test_key("qbit_block_candidate_outbox", "candidate", PHASE_ENQUEUE);
+    let text = "total size of jsonb object elements exceeds the maximum of 268435455 bytes";
+    let none = BTreeMap::new();
+    let unattributed = BTreeMap::from([(outbox.clone(), Refusal::unattributed(text.to_owned()))]);
+    let lines = write_table_lines(
+        Sample {
+            n: 400_000,
+            writes: &none,
+            rejections: &unattributed,
+        },
+        &BTreeMap::new(),
+        17,
+    );
+    let refused: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.contains("REJECTED"))
+        .collect();
+    assert_eq!(refused.len(), 1, "{lines:#?}");
+    assert!(
+        !refused[0].contains("qbit_block_candidate_outbox"),
+        "{}",
+        refused[0]
+    );
+    assert!(
+        refused[0].contains("(not attributed)") && refused[0].contains(PHASE_ENQUEUE),
+        "{}",
+        refused[0]
+    );
+
+    let attributed = BTreeMap::from([(outbox.clone(), test_refusal(text))]);
+    let lines = write_table_lines(
+        Sample {
+            n: 400_000,
+            writes: &none,
+            rejections: &attributed,
+        },
+        &BTreeMap::new(),
+        17,
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("REJECTED") && line.contains("qbit_block_candidate_outbox")),
+        "{lines:#?}"
     );
 }
 

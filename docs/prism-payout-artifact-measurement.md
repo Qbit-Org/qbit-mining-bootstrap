@@ -249,6 +249,9 @@ the write's projection for the full-size run and the sweep, so a violation
 already refused at `n2` is still explained at the target. A refusal at `n1`
 fails the gate, since nothing smaller was accepted to attribute it from. The ratchet row says how: `refused at n=400000 (attributed by
 projection)`, and never a byte count.
+Until a refusal is attributed, the measurement table shows it by phase
+only, under `(not attributed)`, never under the column its call site
+assumed; each run attributes before it prints.
 
 The gate passes only when the set of crossing writes equals `KNOWN_VIOLATIONS`
 exactly. An unlisted write that crosses fails it as a new violation. A listed
