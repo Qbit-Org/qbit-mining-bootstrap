@@ -1116,6 +1116,24 @@ fn the_two_reconciliation_gaps_have_distinct_exit_codes() {
 }
 
 #[test]
+fn the_harness_reads_its_own_postgres_binary_variable() {
+    // The shared test-gate variables belong to the gate crate (#322); a second
+    // reader of one would make that gate's manifest wrong.
+    assert_eq!(
+        qbit_prism_load::cluster::PG_BIN_DIR_VAR,
+        "QBIT_PRISM_LOAD_PG_BIN_DIR"
+    );
+    for shared in [
+        concat!("PRISM_TEST", "_PG_BIN_DIR"),
+        concat!("PRISM_TEST", "_DATABASE_URL"),
+        concat!("QBITD", "_BIN"),
+        concat!("GITHUB", "_JOB"),
+    ] {
+        assert_ne!(qbit_prism_load::cluster::PG_BIN_DIR_VAR, shared);
+    }
+}
+
+#[test]
 fn database_urls_are_rewritten_onto_the_delay_proxy() -> Result<()> {
     assert_eq!(
         run::rewrite_host(

@@ -194,13 +194,18 @@ fn current_user() -> Result<String> {
     )
 }
 
+/// The harness's own PostgreSQL binary-directory variable. It is deliberately
+/// not one of the shared test-gate variables: those belong to the gate crate
+/// (#322), and a second reader of one would make the gate's manifest wrong.
+pub const PG_BIN_DIR_VAR: &str = "QBIT_PRISM_LOAD_PG_BIN_DIR";
+
 /// Resolve the server binary directory: `--pg-bin-dir`, then
-/// `PRISM_TEST_PG_BIN_DIR`, then `pg_config --bindir`.
+/// [`PG_BIN_DIR_VAR`], then `pg_config --bindir`.
 pub fn resolve_bin_dir(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
     }
-    if let Ok(value) = std::env::var("PRISM_TEST_PG_BIN_DIR") {
+    if let Ok(value) = std::env::var(PG_BIN_DIR_VAR) {
         if !value.trim().is_empty() {
             return Ok(PathBuf::from(value.trim()));
         }
@@ -208,7 +213,7 @@ pub fn resolve_bin_dir(explicit: Option<&Path>) -> Result<PathBuf> {
     let output = Command::new("pg_config")
         .arg("--bindir")
         .output()
-        .context("pg_config --bindir (set --pg-bin-dir or PRISM_TEST_PG_BIN_DIR)")?;
+        .with_context(|| format!("pg_config --bindir (set --pg-bin-dir or {PG_BIN_DIR_VAR})"))?;
     ensure!(output.status.success(), "pg_config --bindir failed");
     Ok(PathBuf::from(
         String::from_utf8(output.stdout)?.trim().to_owned(),

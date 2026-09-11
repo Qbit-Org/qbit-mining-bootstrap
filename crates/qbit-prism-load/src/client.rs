@@ -34,7 +34,9 @@ const NONCE_SPAN: u32 = 1 << 22;
 /// hash with its words swapped (`codec.rs`, `Job::from_manifest`); the
 /// transform is its own inverse.
 pub fn word_swap(bytes: &mut [u8]) {
-    for word in bytes.chunks_exact_mut(4) {
+    // `as_chunks_mut` over a constant width: a trailing partial word is left
+    // alone, which is what the server's own transform does for a 32-byte hash.
+    for word in bytes.as_chunks_mut::<4>().0 {
         word.reverse();
     }
 }

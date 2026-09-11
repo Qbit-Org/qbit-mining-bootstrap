@@ -944,6 +944,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "mechanism": "coordinator.rs wraps the append in \
                           tokio::time::timeout(share_commit_timeout, save); when it fires the \
                           sqlx future is dropped mid-COMMIT and PostgreSQL can still commit.",
+            "server_issue": "Qbit-Org/qbit-mining-bootstrap#324",
             "share_commit_timeout_seconds": args.share_commit_timeout_seconds,
             "count": divergences.len(),
             "shares": divergences,

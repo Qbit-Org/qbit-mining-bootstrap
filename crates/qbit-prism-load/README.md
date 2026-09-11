@@ -30,7 +30,7 @@ measure.
   ```
 
 - **PostgreSQL 16 server binaries** (`initdb`, `pg_ctl`, `pg_basebackup`) in
-  `--pg-bin-dir`, or `PRISM_TEST_PG_BIN_DIR`, or `pg_config --bindir`. On
+  `--pg-bin-dir`, or `QBIT_PRISM_LOAD_PG_BIN_DIR`, or `pg_config --bindir`. On
   Debian and Ubuntu that is `/usr/lib/postgresql/16/bin`. No container runtime
   is needed.
 
@@ -63,7 +63,7 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--allow-debug-server` | off | Run a debug-profile server anyway |
 | `--allow-dirty-tree` | off | Run with modified tracked files; forces `artifact_kind: example` |
 | `--example-artifact` | off | Emit `artifact_kind: example` from a clean tree |
-| `--pg-bin-dir` | `PRISM_TEST_PG_BIN_DIR`, then `pg_config --bindir` | PostgreSQL server binaries |
+| `--pg-bin-dir` | `QBIT_PRISM_LOAD_PG_BIN_DIR`, then `pg_config --bindir` | PostgreSQL server binaries. The harness keeps its own variable rather than reading one of the shared test-gate variables, which belong to the gate crate (#322) |
 | `--database-url` | none | Use an existing database; no standby is managed and the replication mode is detected, never assumed |
 | `--replication` | `async` | `async`, `sync` or `none` |
 | `--frontends` | 1 | 1, 2 or 4 |
@@ -116,7 +116,7 @@ The artifact's phases are exactly `steady_state`, `reconnect` and
 | 2 | The harness failed before it could measure anything |
 | 3 | Blocked: no frontend served work, or a log showed a refusal |
 | 4 | A durability loss: an acknowledged share is missing from PostgreSQL, or a committed share was never acknowledged and nothing explains it |
-| 5 | An ACK/commit divergence: PostgreSQL holds a share the server refused with `ledger-confirmation-failed` |
+| 5 | An ACK/commit divergence: PostgreSQL holds a share the server refused with `ledger-confirmation-failed` (#324) |
 | 6 | The run was aborted, by a signal or by the memory floor |
 | 7 | Rejections classified as harness bugs |
 
@@ -228,7 +228,7 @@ The side report repeats all of this under `honest_value_notes`.
 - **An ACK/commit divergence is counted, never smoothed over.** A share
   PostgreSQL holds after the server refused it is in `ack_commit_divergence`,
   in `unexpected_committed_share_ids` and in `rejected_valid_shares`, and it
-  exits 5. It is reported apart from a durability loss because only a loss
+  exits 5. The server-side bug is #324. It is reported apart from a durability loss because only a loss
   means credited work disappeared.
 - **`offered_valid_shares`** counts shares the harness believed valid when it
   offered them: every acknowledged share, plus every rejection that is not a
@@ -303,6 +303,8 @@ different failures, and the harness never reports them as one thing.
   in `crates/qbit-prism-server/src/coordinator.rs`, which wraps the append in
   `tokio::time::timeout(share_commit_timeout, save)`; when that deadline fires
   the sqlx future is dropped mid-`COMMIT`, and PostgreSQL may still commit it.
+  The server-side bug is filed as
+  [#324](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/324).
   Those shares appear in `ack_commit_divergence` with their phase, frontend,
   session, send-to-response time and the commit deadline they crossed; they are
   counted in `unexpected_committed_share_ids` and in `rejected_valid_shares`,

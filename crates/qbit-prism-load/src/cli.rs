@@ -55,7 +55,7 @@ pub struct Args {
     pub example_artifact: bool,
 
     /// Directory holding `initdb`, `pg_ctl` and `pg_basebackup`. Defaults to
-    /// `PRISM_TEST_PG_BIN_DIR`, then `pg_config --bindir`.
+    /// `QBIT_PRISM_LOAD_PG_BIN_DIR`, then `pg_config --bindir`.
     #[arg(long)]
     pub pg_bin_dir: Option<PathBuf>,
     /// Use an existing database instead of managing clusters. No standby is
