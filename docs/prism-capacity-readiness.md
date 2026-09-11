@@ -438,8 +438,20 @@ two-hour cutover soak, which reads its own criteria from the same registry.
        echo "  now:      $current" >&2
        break
      fi
-     docker exec "$c" cat /proc/1/status \
-       | awk -v now="$now" '/^VmRSS:/ { printf "%s,%d\n", now, $2 * 1024 }' >> soak-rss.csv
+     body=$(docker exec "$c" cat /proc/1/status)
+     rc=$?
+     rss=$(printf '%s\n' "$body" | awk -v now="$now" '
+       /^VmRSS:/ && $2 ~ /^[0-9]+$/ && $3 == "kB" { n++; row = now "," $2 * 1024 }
+       END { if (n == 1) print row }')
+     case $rss in
+       "$now",[0-9]*) echo "$rss" >> soak-rss.csv ;;
+       *)
+         echo "$(date -u +%FT%TZ): soak invalid, no RSS sample at $now" >&2
+         if [ "$rc" -ne 0 ]; then echo "  docker exec exited $rc" >&2; fi
+         echo "  read from /proc/1/status:" >&2
+         printf '%s\n' "$body" | sed 's/^/    /' >&2
+         break ;;
+     esac
      docker exec "$c" curl -sS --max-time 5 -D - http://127.0.0.1:3341/metrics \
        | tr -d '\r' \
        | grep -E '^(x-prism-metrics-state:|qbit_prism_(process_resident_memory_bytes|collector_available|collector_age_seconds|runtime_lag_seconds|runtime_task_stalled|runtime_poll_lag_seconds|database_pool_acquire_seconds(_bucket|_sum|_count)|connections|authorized_clients|accepted_shares_total|block_candidates_pending)[ {])' \
@@ -464,6 +476,22 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    `docker logs "$c"` (the container keeps the exited process's output), and
    start over from step 2.
 
+   A missing sample invalidates the run for the same reason. The bound assumes
+   an unbroken five-minute series: its span floor only checks the first and
+   last timestamps, so two samples 23 h apart satisfy it, and a gap between
+   them can hide an excursion that drained back before the next sample. A
+   loop that wrote nothing on a failed read would leave exactly that gap, and
+   the judge's malformed-row rule cannot catch it because no row is written
+   at all. So each iteration writes exactly one `seconds,bytes` row or stops:
+   the body is read into a variable first, because the exit status of a
+   pipeline is its last command's without `pipefail`, which not every
+   operator shell sets; the row is printed only when the body carries one
+   `VmRSS:` line in kB; and an empty or malformed result, whether from a
+   `docker exec` that failed (its exit status is printed) or a body without
+   `VmRSS:` (the body is printed), ends the run. A transient `docker exec`
+   failure is therefore not skipped: the run is invalid and starts over from
+   step 2.
+
    `VmRSS` in `/proc/1/status` is the field the registry's process collector
    reads, so the CSV and the gauge agree up to collector cadence. The log also
    carries the runtime and pool series item 3 of the reading order cites, so a
@@ -487,8 +515,8 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    and the body at the breach is what the correlated reading works from.
 5. **Trim** is retired with `malloc_trim`; there is nothing to send at hour 23.
 6. **Judge** each run with the `awk` bound check above against
-   `soak-rss.csv`. A run whose capture loop stopped on a process change is
-   not judged: it is invalid and is run again from step 2.
+   `soak-rss.csv`. A run whose capture loop stopped on a process change or a
+   missing sample is not judged: it is invalid and is run again from step 2.
    Pass: exit `0`, and share-ack p99 at hour 24 within the
    alert threshold configured for the deployment (the native rules are
    #279's). Fail: exit `1`, or a share-ack regression between hour 1 and hour
