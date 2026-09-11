@@ -138,11 +138,74 @@ jobs:
         # whose execution manifest proves it.
         run: cargo test --locked --workspace --all-targets
 
+  rust-fmt:
+    name: Rust formatting
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  rust-clippy:
+    name: Rust lints
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Lint every target with clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  cargo-deny:
+    name: Dependency audit
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install pinned cargo-deny
+        run: |
+          bash .github/scripts/install-pinned-tool.sh cargo-deny "${RUNNER_TEMP}/bin"
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+
+      - name: Check advisories, licenses, bans, and sources
+        run: cargo deny --locked check
+
+  dockerfile-lint:
+    name: Dockerfile lint
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install pinned hadolint
+        run: |
+          bash .github/scripts/install-pinned-tool.sh hadolint "${RUNNER_TEMP}/bin"
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+
+      - name: Lint every Dockerfile
+        run: git ls-files -z '*Dockerfile*' | xargs -0 hadolint
+
   checks:
     # Preserve the existing check name for branch protection and consumers.
     name: Lint, compile, and test
     if: ${{ always() }}
-    needs: [lint-compile-compose, python-tests, rust-tests, prism-native-postgres]
+    needs: [lint-compile-compose, python-tests, rust-tests, rust-fmt, rust-clippy, cargo-deny, dockerfile-lint, prism-native-postgres]
     runs-on: blacksmith-2vcpu-ubuntu-2404
 
     steps:

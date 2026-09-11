@@ -3,6 +3,9 @@ name = "qbit-prism-server"
 version.workspace = true
 edition = "2021"
 license = "MIT"
+# Built and shipped from this repository; its path dependencies carry no
+# version, which cargo-deny permits only for crates that are never published.
+publish = false
 description = "Native multi-instance Stratum, accounting, and audit server for PRISM"
 default-run = "qbit-prism-server"
 

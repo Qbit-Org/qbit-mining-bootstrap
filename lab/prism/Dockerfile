@@ -9,8 +9,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --locked --release -p qbit-prism-server -p qbit-prism --bins
 
 FROM debian:bookworm-slim
+# Versions are the current bookworm packages; bump them when a Debian point
+# release or security update replaces them (apt names the missing version).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates=20230311+deb12u1 \
+        curl=7.88.1-10+deb12u15 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /build/target/release/qbit-prism-server /usr/local/bin/
