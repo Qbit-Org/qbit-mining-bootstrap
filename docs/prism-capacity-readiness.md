@@ -356,13 +356,23 @@ memory-bound evidence for the promotion decision and is distinct from #291's
 two-hour cutover soak, which reads its own criteria from the same registry.
 
 1. **Build** the coordinator image the deployment will run and record its
-   image ID (substitute the deployment's env files for the repository
-   examples):
+   image ID. Substitute the deployment's env files for the repository
+   examples once, in the function; the same Compose invocation then builds
+   the image and resolves its name, so a `PRISM_COORDINATOR_IMAGE` set only
+   in an env file is the image inspected, not the default. The name is read
+   from the resolved service record because `config --images` also lists the
+   images of the services the coordinator depends on; the read needs
+   `python3` on the operator host:
 
    ```sh
-   docker compose --env-file config/upstream.env.example --env-file .env.example \
-     -f compose.yaml --profile prism build prism-coordinator
-   docker image inspect --format '{{.Id}}' "${PRISM_COORDINATOR_IMAGE:-qbit-lab-prism-coordinator:local}"
+   compose() {
+     docker compose --env-file config/upstream.env.example --env-file .env.example \
+       -f compose.yaml --profile prism "$@"
+   }
+   compose build prism-coordinator
+   image=$(compose config --format json \
+     | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["prism-coordinator"]["image"])')
+   docker image inspect --format '{{.Id}}' "$image"
    ```
 
 2. **Run** one fresh coordinator process for at least 24 h at ordinary testnet
