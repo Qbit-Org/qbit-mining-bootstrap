@@ -142,10 +142,10 @@ pub struct Args {
     #[arg(long, default_value_t = 15.0)]
     pub share_commit_timeout_seconds: f64,
 
-    /// ORDER_LOCK sampling interval, in milliseconds.
+    /// ORDER_LOCK sampling interval, in milliseconds (1..1000).
     #[arg(long, default_value_t = 10)]
     pub lock_sample_interval_ms: u64,
-    /// Per-frontend CPU and RSS sampling interval, in milliseconds.
+    /// Per-frontend CPU and RSS sampling interval, in milliseconds (50..60000).
     #[arg(long, default_value_t = 1000)]
     pub process_sample_interval_ms: u64,
     /// Stop the run if `MemAvailable` falls below this many mebibytes.
@@ -242,13 +242,16 @@ impl Args {
             self.blockpoll_seconds.is_finite() && self.blockpoll_seconds > 0.0,
             "--blockpoll-seconds must be finite and positive"
         );
+        // A sampling interval has to be bounded above as well as below: an
+        // interval longer than a phase measures nothing, and one longer than
+        // the phase's own length would stretch the run.
         ensure!(
-            self.lock_sample_interval_ms > 0,
-            "--lock-sample-interval-ms must be positive"
+            (1..=1000).contains(&self.lock_sample_interval_ms),
+            "--lock-sample-interval-ms must be 1..1000"
         );
         ensure!(
-            self.process_sample_interval_ms > 0,
-            "--process-sample-interval-ms must be positive"
+            (50..=60_000).contains(&self.process_sample_interval_ms),
+            "--process-sample-interval-ms must be 50..60000"
         );
         ensure!(self.work_timeout > 0, "--work-timeout must be positive");
         for (name, value) in [

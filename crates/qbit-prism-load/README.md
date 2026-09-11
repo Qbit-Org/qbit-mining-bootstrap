@@ -90,8 +90,8 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--runtime-workers` | 2 | `PRISM_RUNTIME_WORKERS` per frontend |
 | `--blockpoll-seconds` | 2 | `PRISM_BLOCKPOLL_SECONDS` per frontend |
 | `--share-commit-timeout-seconds` | 15 | `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS` per frontend |
-| `--lock-sample-interval-ms` | 10 | ORDER_LOCK sampling cadence |
-| `--process-sample-interval-ms` | 1000 | CPU and RSS sampling cadence |
+| `--lock-sample-interval-ms` | 10 | ORDER_LOCK sampling cadence, 1..1000 ms |
+| `--process-sample-interval-ms` | 1000 | CPU and RSS sampling cadence, 50..60000 ms |
 | `--min-mem-available-mib` | 4096 | Stop the run if `MemAvailable` falls below this |
 | `--out` | `load-out` | Output directory |
 | `--keep-artifacts` | off | Keep cluster data directories and logs |
@@ -115,9 +115,10 @@ The artifact's phases are exactly `steady_state`, `reconnect` and
 | 0 | The run completed and reconciled exactly |
 | 2 | The harness failed before it could measure anything |
 | 3 | Blocked: no frontend served work, or a log showed a refusal |
-| 4 | A durability finding: an acknowledged share is missing from PostgreSQL, or a committed share was never acknowledged |
-| 5 | Rejections classified as harness bugs |
+| 4 | A durability loss: an acknowledged share is missing from PostgreSQL, or a committed share was never acknowledged and nothing explains it |
+| 5 | An ACK/commit divergence: PostgreSQL holds a share the server refused with `ledger-confirmation-failed` |
 | 6 | The run was aborted, by a signal or by the memory floor |
+| 7 | Rejections classified as harness bugs |
 
 ## Outputs
 
@@ -224,6 +225,11 @@ The side report repeats all of this under `honest_value_notes`.
   and `0`, which describe the behaviour that actually happens — one share per
   transaction, no batching delay, and no such native sweep — and records them
   as unread. A value like `64`/`5` would suggest batching that does not exist.
+- **An ACK/commit divergence is counted, never smoothed over.** A share
+  PostgreSQL holds after the server refused it is in `ack_commit_divergence`,
+  in `unexpected_committed_share_ids` and in `rejected_valid_shares`, and it
+  exits 5. It is reported apart from a durability loss because only a loss
+  means credited work disappeared.
 - **`offered_valid_shares`** counts shares the harness believed valid when it
   offered them: every acknowledged share, plus every rejection that is not a
   race the server was entitled to lose, plus every submit that received no
@@ -246,6 +252,15 @@ The side report repeats all of this under `honest_value_notes`.
 - **`database_delay_milliseconds` is the one-way per-chunk proxy delay.** A
   round trip pays it twice. The configured delay and the measured added
   round-trip time are both recorded under `delay_proxy`.
+- **ORDER_LOCK is database-wide.** Anything else in the same database taking
+  the same advisory lock would distort every number in that section, so each
+  frontend connects with `application_name=load-fe-<i>` and the sampler
+  attributes waiters by it. Whether the driver really carried the name is
+  verified against `pg_stat_activity` rather than assumed: when it did not, the
+  summary says so and counts every waiter in the database instead. Waiters that
+  are not this run's frontends are reported separately as
+  `foreign_waiter_samples`, `foreign_application_names` and
+  `foreign_waiter_seconds_estimate`.
 - **ORDER_LOCK waits are sampled**, not instrumented. The metric family
   `qbit_prism_database_advisory_lock_wait_seconds` exists but has no producer,
   so the harness samples `pg_locks` joined to `pg_stat_activity` every 10 ms
@@ -275,11 +290,27 @@ username prefix, and which are in O.
   PostgreSQL's `COLLATE "C"`; the database's default collation may disagree, so
   the harness always sorts in process.
 
-In a normal phase, an acknowledged share missing from PostgreSQL, or a
-committed share that was never acknowledged, is a durability finding: the run
-exits 4 with the evidence in the side report. Only the `mid_flight_kill` phase
-can legitimately produce an indeterminate share, and those are re-offered with
-the same header and their final database outcome is reported.
+A gap between what was acknowledged and what PostgreSQL holds is one of two
+different failures, and the harness never reports them as one thing.
+
+- **A durability loss** is an acknowledged share the database does not hold, or
+  a committed share that was never acknowledged and that nothing explains. The
+  run exits 4 with the evidence in the side report, and it is a stop-and-ask.
+- **An ACK/commit divergence** is a share the database holds that the server
+  had already refused with `ledger-confirmation-failed` / `share was not
+  confirmed by the database`. Nothing was lost: the share is credited in the
+  payout window, but the miner was told it was not confirmed. The mechanism is
+  in `crates/qbit-prism-server/src/coordinator.rs`, which wraps the append in
+  `tokio::time::timeout(share_commit_timeout, save)`; when that deadline fires
+  the sqlx future is dropped mid-`COMMIT`, and PostgreSQL may still commit it.
+  Those shares appear in `ack_commit_divergence` with their phase, frontend,
+  session, send-to-response time and the commit deadline they crossed; they are
+  counted in `unexpected_committed_share_ids` and in `rejected_valid_shares`,
+  so the artifact cannot hide them; and the run exits 5.
+
+Only the `mid_flight_kill` phase can legitimately produce an indeterminate
+share. Those are re-offered with the same header and their final database
+outcome is reported.
 
 ## Measurement hygiene
 

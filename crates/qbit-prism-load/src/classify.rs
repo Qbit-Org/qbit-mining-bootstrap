@@ -87,6 +87,21 @@ pub fn classify(rejection: &Rejection) -> RejectionClass {
     }
 }
 
+/// The rejection the coordinator returns when the share-commit path did not
+/// confirm inside `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS`, or when the append
+/// failed for another reason.
+///
+/// It is the only refusal that can be followed by the share appearing in
+/// PostgreSQL anyway: `coordinator.rs` wraps the append in
+/// `tokio::time::timeout(share_commit_timeout, save)`, and when that fires the
+/// sqlx future is dropped mid-COMMIT, which PostgreSQL may still complete.
+pub const LEDGER_CONFIRMATION_FAILED: &str = "ledger-confirmation-failed";
+pub const NOT_CONFIRMED_BY_DATABASE: &str = "share was not confirmed by the database";
+
+pub fn is_confirmation_failure(rejection: &Rejection) -> bool {
+    rejection.reason_id.as_deref() == Some(LEDGER_CONFIRMATION_FAILED)
+}
+
 /// True for the two payout/tip rebuild messages the contract calls out as
 /// expected after tips and blocks.
 pub fn is_rebuild_pending(rejection: &Rejection) -> bool {

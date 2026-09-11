@@ -861,6 +861,35 @@ fn the_rejection_classifier_separates_harness_bugs_from_expected_races() {
 }
 
 #[test]
+fn only_a_confirmation_failure_can_be_followed_by_a_commit() {
+    // This is the one refusal the append can lose a race with: the commit
+    // deadline answers the miner while PostgreSQL still commits the append.
+    let failure = rejection(
+        20,
+        Some(classify::LEDGER_CONFIRMATION_FAILED),
+        classify::NOT_CONFIRMED_BY_DATABASE,
+    );
+    assert!(classify::is_confirmation_failure(&failure));
+    assert_eq!(classify::classify(&failure), RejectionClass::Backend);
+    for other in [
+        rejection(21, Some("stale-job"), classify::NEW_TIP_WORK_PENDING),
+        rejection(23, Some("low-difficulty"), "low difficulty share"),
+        rejection(
+            20,
+            Some("backend-rpc-unavailable"),
+            "current chain state is unavailable",
+        ),
+        rejection(22, Some("duplicate-share"), "duplicate share"),
+    ] {
+        assert!(
+            !classify::is_confirmation_failure(&other),
+            "{:?} must not be treated as a confirmation failure",
+            other.reason_id
+        );
+    }
+}
+
+#[test]
 fn the_blocked_log_classifier_recognises_the_real_refusal_messages() {
     // The refusal the JSONB container ceiling produces, wrapped in the warning
     // `coordinator.rs` `refresh_loop` actually logs.
@@ -902,6 +931,25 @@ fn the_blocked_log_classifier_recognises_the_real_refusal_messages() {
 // --- small helpers --------------------------------------------------------
 
 #[test]
+fn the_two_reconciliation_gaps_have_distinct_exit_codes() {
+    // A loss and a divergence are different failures, and neither may be
+    // reported as a clean run.
+    let codes = [
+        run::EXIT_OK,
+        run::EXIT_ERROR,
+        run::EXIT_BLOCKED,
+        run::EXIT_DURABILITY,
+        run::EXIT_ACK_COMMIT_DIVERGENCE,
+        run::EXIT_ABORTED,
+        run::EXIT_HARNESS_BUG_REJECTIONS,
+    ];
+    let unique: std::collections::BTreeSet<i32> = codes.into_iter().collect();
+    assert_eq!(unique.len(), codes.len(), "exit codes must be distinct");
+    assert_ne!(run::EXIT_ACK_COMMIT_DIVERGENCE, run::EXIT_DURABILITY);
+    assert_ne!(run::EXIT_ACK_COMMIT_DIVERGENCE, run::EXIT_OK);
+}
+
+#[test]
 fn database_urls_are_rewritten_onto_the_delay_proxy() -> Result<()> {
     assert_eq!(
         run::rewrite_host(
@@ -920,6 +968,14 @@ fn database_urls_are_rewritten_onto_the_delay_proxy() -> Result<()> {
     assert_eq!(
         run::rewrite_host("postgresql://127.0.0.1:5432/postgres", "127.0.0.1:2")?,
         "postgresql://127.0.0.1:2/postgres"
+    );
+    assert_eq!(
+        run::with_application_name("postgresql://u@h:1/db", "load-fe-0"),
+        "postgresql://u@h:1/db?application_name=load-fe-0"
+    );
+    assert_eq!(
+        run::with_application_name("postgresql://u@h:1/db?sslmode=disable", "load-fe-1"),
+        "postgresql://u@h:1/db?sslmode=disable&application_name=load-fe-1"
     );
     assert_eq!(run::host_port("postgresql://u@host:6000/db")?, "host:6000");
     assert_eq!(run::host_port("postgresql://u@host/db")?, "host:5432");
@@ -1061,6 +1117,25 @@ fn command_line_validation_rejects_impossible_runs() {
     let mut bad = args.clone();
     bad.db_max_connections = 2;
     assert!(bad.validate().is_err());
+
+    // A sampling interval must be bounded above as well as below: one longer
+    // than the phase measures nothing.
+    for interval in [0u64, 1_001, 60_000] {
+        let mut bad = args.clone();
+        bad.lock_sample_interval_ms = interval;
+        assert!(
+            bad.validate().is_err(),
+            "--lock-sample-interval-ms {interval} must be refused"
+        );
+    }
+    for interval in [0u64, 10, 120_000] {
+        let mut bad = args.clone();
+        bad.process_sample_interval_ms = interval;
+        assert!(
+            bad.validate().is_err(),
+            "--process-sample-interval-ms {interval} must be refused"
+        );
+    }
 
     let mut bad = args.clone();
     bad.steady_state_seconds = Some(30);

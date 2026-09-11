@@ -377,12 +377,20 @@ impl ProcessSampler {
     }
 }
 
+/// One backend waiting on ORDER_LOCK at one instant.
+#[derive(Clone, Debug)]
+pub struct Waiter {
+    pub pid: i32,
+    pub waitstart: Option<chrono::DateTime<chrono::Utc>>,
+    pub application_name: String,
+}
+
 /// One `pg_locks` sample of the ORDER_LOCK waiter set.
 #[derive(Clone, Debug)]
 pub struct LockSample {
     pub monotonic: Instant,
     pub server_time: chrono::DateTime<chrono::Utc>,
-    pub waiters: Vec<(i32, Option<chrono::DateTime<chrono::Utc>>)>,
+    pub waiters: Vec<Waiter>,
     pub query_millis: f64,
 }
 
@@ -395,10 +403,20 @@ pub struct LockSummary {
     pub objid: i64,
     pub key_note: &'static str,
     pub sample_interval_milliseconds: f64,
+    /// How waiters were attributed to this run's frontends.
+    pub attribution: String,
+    /// Frontends whose connections the sampler recognised.
+    pub attributed_application_names: Vec<String>,
     pub samples: usize,
     pub samples_with_waiters: usize,
     pub max_waiters: usize,
     pub mean_waiters: Option<f64>,
+    /// ORDER_LOCK is database-wide, so anything else holding or waiting on it
+    /// in the same database would distort every number here. These are the
+    /// waiters that were not this run's frontends.
+    pub foreign_waiter_samples: usize,
+    pub foreign_application_names: Vec<String>,
+    pub foreign_waiter_seconds_estimate: Option<f64>,
     /// Riemann estimate of the total time backends spent waiting, in
     /// waiter-seconds. Waits shorter than the sampling interval can be missed
     /// entirely, so this is a lower bound.
@@ -429,15 +447,25 @@ pub struct LockSampler {
     stop: Arc<AtomicBool>,
     interval: Duration,
     failure: Arc<std::sync::Mutex<Option<String>>>,
+    /// `application_name` of each frontend, when the driver carried it.
+    frontends: Vec<String>,
+    attribution: String,
 }
 
 impl LockSampler {
-    pub fn start(pool: PgPool, interval: Duration) -> Self {
+    pub fn start(
+        pool: PgPool,
+        interval: Duration,
+        frontends: Vec<String>,
+        attribution: String,
+    ) -> Self {
         let sampler = Self {
             samples: Arc::new(std::sync::Mutex::new(Vec::new())),
             stop: Arc::new(AtomicBool::new(false)),
             interval,
             failure: Arc::new(std::sync::Mutex::new(None)),
+            frontends,
+            attribution,
         };
         let samples = sampler.samples.clone();
         let stop = sampler.stop.clone();
@@ -446,7 +474,8 @@ impl LockSampler {
             while !stop.load(Ordering::Relaxed) {
                 let started = Instant::now();
                 let query = sqlx::query(
-                    "SELECT a.pid, l.waitstart, clock_timestamp() AS sampled_at \
+                    "SELECT a.pid, l.waitstart, COALESCE(a.application_name,'') AS application_name, \
+                     clock_timestamp() AS sampled_at \
                      FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid \
                      WHERE l.locktype = 'advisory' \
                        AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
@@ -465,14 +494,16 @@ impl LockSampler {
                             .unwrap_or_else(chrono::Utc::now);
                         let waiters = rows
                             .iter()
-                            .map(|row| {
-                                (
-                                    row.try_get::<i32, _>("pid").unwrap_or_default(),
-                                    row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(
+                            .map(|row| Waiter {
+                                pid: row.try_get::<i32, _>("pid").unwrap_or_default(),
+                                waitstart: row
+                                    .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(
                                         "waitstart",
                                     )
                                     .unwrap_or(None),
-                                )
+                                application_name: row
+                                    .try_get::<String, _>("application_name")
+                                    .unwrap_or_default(),
                             })
                             .collect();
                         samples.lock().expect("lock sampler").push(LockSample {
@@ -503,6 +534,12 @@ impl LockSampler {
             .into_iter()
             .filter(|s| s.monotonic >= since && s.monotonic <= until)
             .collect();
+        let attributing = !self.frontends.is_empty();
+        let mine = |waiter: &Waiter| -> bool {
+            // Without attribution every waiter in this database counts, and
+            // the summary says so rather than pretending the set is clean.
+            !attributing || self.frontends.contains(&waiter.application_name)
+        };
         let mut summary = LockSummary {
             lock: "ORDER_LOCK",
             key: "0x505249534d000002",
@@ -510,10 +547,15 @@ impl LockSampler {
             objid: ORDER_LOCK_OBJID,
             key_note: ORDER_LOCK_KEY_NOTE,
             sample_interval_milliseconds: self.interval.as_secs_f64() * 1000.0,
+            attribution: self.attribution.clone(),
+            attributed_application_names: self.frontends.clone(),
             samples: window.len(),
             samples_with_waiters: 0,
             max_waiters: 0,
             mean_waiters: None,
+            foreign_waiter_samples: 0,
+            foreign_application_names: Vec::new(),
+            foreign_waiter_seconds_estimate: None,
             waiter_seconds_estimate: None,
             episodes_at_least: 0,
             longest_observed_wait_seconds: None,
@@ -533,16 +575,28 @@ impl LockSampler {
             (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
         > = HashMap::new();
         let mut waiter_seconds = 0.0f64;
+        let mut foreign_seconds = 0.0f64;
+        let mut foreign_names: BTreeMap<String, usize> = BTreeMap::new();
         let mut total_waiters = 0usize;
         let mut previous: Option<Instant> = None;
         let mut query_millis = Vec::with_capacity(window.len());
         for sample in &window {
             query_millis.push(sample.query_millis);
-            let count = sample.waiters.len();
+            let ours: Vec<&Waiter> = sample.waiters.iter().filter(|w| mine(w)).collect();
+            let foreign = sample.waiters.len() - ours.len();
+            let count = ours.len();
             total_waiters += count;
             summary.max_waiters = summary.max_waiters.max(count);
             if count > 0 {
                 summary.samples_with_waiters += 1;
+            }
+            if foreign > 0 {
+                summary.foreign_waiter_samples += 1;
+                for waiter in sample.waiters.iter().filter(|w| !mine(w)) {
+                    *foreign_names
+                        .entry(waiter.application_name.clone())
+                        .or_insert(0) += 1;
+                }
             }
             if let Some(last) = previous {
                 let delta = sample
@@ -550,18 +604,25 @@ impl LockSampler {
                     .saturating_duration_since(last)
                     .as_secs_f64();
                 waiter_seconds += count as f64 * delta;
+                foreign_seconds += foreign as f64 * delta;
             }
             previous = Some(sample.monotonic);
-            for (pid, waitstart) in &sample.waiters {
-                let key = (*pid, waitstart.map(|w| w.to_rfc3339()).unwrap_or_default());
-                let entry = episodes
-                    .entry(key)
-                    .or_insert((waitstart.unwrap_or(sample.server_time), sample.server_time));
+            for waiter in ours {
+                let key = (
+                    waiter.pid,
+                    waiter.waitstart.map(|w| w.to_rfc3339()).unwrap_or_default(),
+                );
+                let entry = episodes.entry(key).or_insert((
+                    waiter.waitstart.unwrap_or(sample.server_time),
+                    sample.server_time,
+                ));
                 entry.1 = sample.server_time;
             }
         }
         summary.mean_waiters = Some(total_waiters as f64 / window.len() as f64);
         summary.waiter_seconds_estimate = Some(waiter_seconds);
+        summary.foreign_waiter_seconds_estimate = Some(foreign_seconds);
+        summary.foreign_application_names = foreign_names.into_keys().collect();
         summary.episodes_at_least = episodes.len();
         summary.longest_observed_wait_seconds = episodes
             .values()

@@ -33,9 +33,14 @@ use std::{
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_ERROR: i32 = 2;
 pub const EXIT_BLOCKED: i32 = 3;
+/// An acknowledged share that PostgreSQL does not hold: a loss.
 pub const EXIT_DURABILITY: i32 = 4;
-pub const EXIT_HARNESS_BUG_REJECTIONS: i32 = 5;
+/// A share PostgreSQL holds that the server told the client it had not
+/// confirmed. Nothing was lost, but an acknowledgement and a commit diverged.
+pub const EXIT_ACK_COMMIT_DIVERGENCE: i32 = 5;
 pub const EXIT_ABORTED: i32 = 6;
+/// Rejections that can only happen if the harness offered bad work.
+pub const EXIT_HARNESS_BUG_REJECTIONS: i32 = 7;
 
 #[derive(Default)]
 struct Collected {
@@ -291,12 +296,13 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     let mut frontends: Vec<Frontend> = Vec::new();
     let mut blocked: Vec<BlockedLog> = Vec::new();
     for index in 0..args.frontends {
+        let instance_id = format!("load-fe-{index}");
         let spec = FrontendSpec {
             index,
-            instance_id: format!("load-fe-{index}"),
+            database_url: with_application_name(&proxied_url, &instance_id),
+            instance_id,
             stratum_port: free_port()?,
             audit_port: free_port()?,
-            database_url: proxied_url.clone(),
         };
         let environment = frontend::frontend_environment(&shared_env, &spec);
         let mut child = Frontend::launch(ctx.server_bin.clone(), spec, environment, &ctx.log_dir)?;
@@ -335,9 +341,47 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             )
         })
         .collect();
+    // ORDER_LOCK is database-wide, so the sampler has to know which backends
+    // are this run's. `application_name` only works if the driver carries it,
+    // which is checked here rather than assumed.
+    let frontend_names: Vec<String> = frontends
+        .iter()
+        .map(|child| child.spec.instance_id.clone())
+        .collect();
+    let live_names: Vec<String> = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT COALESCE(application_name,'') FROM pg_stat_activity \
+         WHERE datname = current_database()",
+    )
+    .fetch_all(&side)
+    .await
+    .unwrap_or_default();
+    let attributed: Vec<String> = frontend_names
+        .iter()
+        .filter(|name| live_names.contains(name))
+        .cloned()
+        .collect();
+    let (sampler_names, attribution) = if attributed.len() == frontend_names.len() {
+        (
+            frontend_names.clone(),
+            "application_name carried in PRISM_DATABASE_URL and seen in pg_stat_activity"
+                .to_owned(),
+        )
+    } else {
+        (
+            Vec::new(),
+            format!(
+                "every ORDER_LOCK waiter in this database is counted: the driver carried                  application_name for {} of {} frontends ({:?} seen). A foreign holder of the                  same advisory lock would distort these numbers.",
+                attributed.len(),
+                frontend_names.len(),
+                live_names
+            ),
+        )
+    };
     let lock_sampler = LockSampler::start(
         side.clone(),
         Duration::from_millis(args.lock_sample_interval_ms),
+        sampler_names,
+        attribution,
     );
 
     // --- sessions ---------------------------------------------------------
@@ -761,7 +805,13 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         .iter()
         .filter(|record| !record.reoffer && bug_rejection(record))
         .collect();
-    let durability_findings = durability_findings(&runs, &phase_reconciliations, &attribution);
+    let (durability_findings, divergences) = classify_gaps(
+        &runs,
+        &phase_reconciliations,
+        &attribution,
+        &collected.submits,
+        args.share_commit_timeout_seconds,
+    );
     let node_submissions = ctx.node_state.submissions();
     let tip_changes = ctx.node_state.tip_changes();
     let side_report = json!({
@@ -887,6 +937,17 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "log_matches": blocked,
         },
         "durability_findings": durability_findings,
+        "ack_commit_divergence": {
+            "definition": "a share PostgreSQL holds that the server refused with \
+                           ledger-confirmation-failed. Nothing was lost: the share is credited \
+                           in the payout window, but the miner was told it was not confirmed.",
+            "mechanism": "coordinator.rs wraps the append in \
+                          tokio::time::timeout(share_commit_timeout, save); when it fires the \
+                          sqlx future is dropped mid-COMMIT and PostgreSQL can still commit.",
+            "share_commit_timeout_seconds": args.share_commit_timeout_seconds,
+            "count": divergences.len(),
+            "shares": divergences,
+        },
         "honest_value_notes": report::honest_value_notes(),
         "drain": {
             "note": "sessions quiesce before the run closes their sockets; anything still \
@@ -940,6 +1001,15 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             report_path.display()
         );
         return Ok(EXIT_HARNESS_BUG_REJECTIONS);
+    }
+    if !divergences.is_empty() {
+        eprintln!(
+            "{} shares committed after the server refused them with \
+             ledger-confirmation-failed; see {}",
+            divergences.len(),
+            report_path.display()
+        );
+        return Ok(EXIT_ACK_COMMIT_DIVERGENCE);
     }
     Ok(EXIT_OK)
 }
@@ -1275,6 +1345,14 @@ pub fn host_port(url: &str) -> Result<String> {
     })
 }
 
+/// Add an `application_name` parameter, so `pg_stat_activity` can say which
+/// frontend a backend belongs to. sqlx reads it out of the URL; whether it
+/// really carried it is verified against `pg_stat_activity`, never assumed.
+pub fn with_application_name(url: &str, name: &str) -> String {
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}application_name={name}")
+}
+
 /// Replace the authority of a `postgresql://` URL, keeping user info and path.
 pub fn rewrite_host(url: &str, host_port: &str) -> Result<String> {
     let (scheme, rest) = url
@@ -1588,15 +1666,31 @@ fn phase_report(
     })
 }
 
-fn durability_findings(
+/// Split the gaps between what was acknowledged and what PostgreSQL holds into
+/// the two failures they really are.
+///
+/// An acknowledged share the database does not hold is a loss. A share the
+/// database holds that the server refused with `ledger-confirmation-failed` is
+/// not a loss: the append committed after the commit deadline had already
+/// answered the miner. They are reported separately because only the first
+/// means a miner's credited work disappeared.
+fn classify_gaps(
     runs: &[PhaseRun],
     reconciliations: &[(String, digest::Reconciliation)],
     attribution: &digest::UnexpectedAttribution,
-) -> Value {
+    submits: &[SubmitRecord],
+    share_commit_timeout_seconds: f64,
+) -> (Value, Vec<Value>) {
     let mut findings = Vec::new();
+    let mut divergences = Vec::new();
+    let by_share: HashMap<&str, &SubmitRecord> = submits
+        .iter()
+        .filter(|record| !record.reoffer)
+        .map(|record| (record.share_id.as_str(), record))
+        .collect();
     for phase in runs {
-        // Only phases that deliberately tear a socket down can produce an
-        // indeterminate share; everywhere else a gap is a durability finding.
+        // Only a phase that deliberately tears a socket down can legitimately
+        // produce an indeterminate share; everywhere else a gap is a finding.
         if phase.plan.mid_flight_kill {
             continue;
         }
@@ -1614,22 +1708,49 @@ fn durability_findings(
                 "sample": reconciliation.missing.iter().take(20).collect::<Vec<_>>(),
             }));
         }
-        if let Some((_, rows)) = attribution
+        let Some((_, rows)) = attribution
             .by_phase
             .iter()
             .find(|(name, _)| *name == phase.plan.name)
-        {
-            if !rows.is_empty() {
-                findings.push(json!({
+        else {
+            continue;
+        };
+        let mut unexplained = Vec::new();
+        for share in rows {
+            let record = by_share.get(share.as_str()).copied();
+            let rejection = record.and_then(|record| match &record.outcome {
+                Outcome::Rejected(rejection) => Some(rejection),
+                _ => None,
+            });
+            match rejection.filter(|rejection| classify::is_confirmation_failure(rejection)) {
+                Some(rejection) => divergences.push(json!({
+                    "share_id": share,
                     "phase": phase.plan.name,
-                    "kind": "committed share that was never acknowledged",
-                    "count": rows.len(),
-                    "sample": rows.iter().take(20).collect::<Vec<_>>(),
-                }));
+                    "frontend": record.map(|record| record.frontend),
+                    "session": record.map(|record| record.session),
+                    "job_id": record.map(|record| record.job_id.clone()),
+                    "code": rejection.code,
+                    "reason_id": rejection.reason_id,
+                    "message": rejection.message,
+                    "send_to_response_milliseconds": record.and_then(|r| r.latency_millis),
+                    "share_commit_timeout_milliseconds": share_commit_timeout_seconds * 1000.0,
+                    "response_after_commit_deadline": record
+                        .and_then(|r| r.latency_millis)
+                        .map(|latency| latency >= share_commit_timeout_seconds * 1000.0),
+                })),
+                None => unexplained.push(share.clone()),
             }
         }
+        if !unexplained.is_empty() {
+            findings.push(json!({
+                "phase": phase.plan.name,
+                "kind": "committed share that was never acknowledged",
+                "count": unexplained.len(),
+                "sample": unexplained.iter().take(20).collect::<Vec<_>>(),
+            }));
+        }
     }
-    json!(findings)
+    (json!(findings), divergences)
 }
 
 async fn finish_blocked(
