@@ -88,14 +88,14 @@
       "labels": {
         "result": "Outcome"
       },
-      "status": "Client-observed `PgPool::acquire` time: waiting for a pool permit, the idle-connection liveness ping and, when the pool grows, connection setup; excludes transaction BEGIN and the queries that follow. Recorded by the metrics collector, including its own cancellations, and since #328 by every ledger transaction; queries run directly on the pool outside a transaction are not timed. `failure` includes acquire errors, the 15-second acquire timeout and acquisitions abandoned by cancellation, recorded with the elapsed wait."
+      "status": "Collector acquisition attempts, including cancellations as failure with elapsed pool wait (excluding subsequent transaction work). Ledger hot paths remain unwired."
     },
     "database_advisory_lock_wait_seconds": {
       "labels": {
         "lock": "LockKind",
         "result": "Outcome"
       },
-      "status": "Client-observed duration of the `pg_advisory_xact_lock` statement, including one database round trip, recorded by the coordinator's ledger for the migration, order and settlement locks; the migration lock is taken only when the coordinator initializes the schema. `failure` includes lock timeout (`PRISM_DATABASE_LOCK_TIMEOUT_MS`, default 5 seconds), statement timeout, deadlock and connection errors, and waits abandoned by cancellation. The CPFP funding lock is not observed (#328). Series appear on their first observation, so a restart's first failure is not visible to `increase()`."
+      "status": "Declared, rule deferred to #283 and A/C accounting-lock owners; no production observations yet."
     },
     "collector_available": {
       "labels": {

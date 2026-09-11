@@ -124,8 +124,8 @@ impl Ledger {
                     ))
                 })
                 .await??;
-            let mut tx = self.begin().await?;
-            self.lock(&mut tx, SETTLEMENT_LOCK).await?;
+            let mut tx = self.pool.begin().await?;
+            lock(&mut tx, SETTLEMENT_LOCK).await?;
             writable(&mut tx).await?;
             // Store the exact canonical bytes and the non-share metadata only;
             // readers decode the bytes. A two-copy inline JSONB body would cross
@@ -170,8 +170,8 @@ impl Ledger {
             let Some(set) = bundle.ctv_fanout_manifest_set else {
                 continue;
             };
-            let mut tx = self.begin().await?;
-            self.lock(&mut tx, SETTLEMENT_LOCK).await?;
+            let mut tx = self.pool.begin().await?;
+            lock(&mut tx, SETTLEMENT_LOCK).await?;
             writable(&mut tx).await?;
             let before: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM qbit_ctv_fanout_artifacts WHERE block_hash=$1",

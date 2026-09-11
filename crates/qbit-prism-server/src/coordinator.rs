@@ -308,12 +308,11 @@ impl Coordinator {
             "configured QBIT_CHAIN differs from connected node"
         );
         let ledger = Arc::new(
-            Ledger::connect_with_metrics(
+            Ledger::connect(
                 &config.database_url,
                 config.instance_id.clone(),
                 config.database_connections,
                 config.initialize_schema,
-                Some(metrics.clone()),
             )
             .await?,
         );

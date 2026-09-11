@@ -20,7 +20,7 @@ impl Ledger {
     /// stored balance blob is read. Decode, sorting, hashing and vector drop
     /// stay inside one blocking closure. The caller owns its original deadline.
     pub async fn payout_state(&self) -> Result<PayoutState, WindowError> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.pool.begin().await?;
         // Do not force READ WRITE: a connection configured read-only must fail
         // the same admission guard as payout_revision, not override that guard.
         // These are only reads, but both must use the same MVCC snapshot.

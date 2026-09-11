@@ -2,7 +2,7 @@ use super::*;
 
 // Allocation and retirement span two tables; this short lock makes their
 // combined outpoint exclusion atomic across independently claimed fanouts.
-pub(super) const CPFP_FUNDING_LOCK: i64 = 0x505249534d000006;
+const CPFP_FUNDING_LOCK: i64 = 0x505249534d000006;
 
 impl Ledger {
     /// Renew only a still-live token. An expired worker must not revive itself
@@ -12,7 +12,7 @@ impl Ledger {
             (1..=600).contains(&seconds),
             "invalid fanout lease duration"
         );
-        let mut tx = self.begin().await?;
+        let mut tx = self.pool.begin().await?;
         writable(&mut tx).await?;
         require_fanout(&mut tx, claim).await?;
         sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET claim_expires_at=clock_timestamp()+$3*interval '1 second' WHERE fanout_txid=$1 AND claim_token=$2")
@@ -27,7 +27,7 @@ impl Ledger {
         next: u64,
         anchor: Option<(u64, String)>,
     ) -> Result<()> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.pool.begin().await?;
         writable(&mut tx).await?;
         require_fanout(&mut tx, claim).await?;
         let (height, hash) = anchor.map_or((None, None), |(h, hash)| (Some(h), Some(hash)));
@@ -51,8 +51,8 @@ impl Ledger {
             .as_i64()
             .unwrap_or(10)
             .clamp(1, 3600);
-        let mut tx = self.begin().await?;
-        self.lock(&mut tx, SETTLEMENT_LOCK).await?;
+        let mut tx = self.pool.begin().await?;
+        lock(&mut tx, SETTLEMENT_LOCK).await?;
         writable(&mut tx).await?;
         require_fanout(&mut tx, claim).await?;
         apply_progress(&mut tx, claim, status, Some(&result)).await?;
@@ -67,8 +67,8 @@ impl Ledger {
         claim: &FanoutClaim,
         expected_revision: i64,
     ) -> Result<()> {
-        let mut tx = self.begin().await?;
-        self.lock(&mut tx, SETTLEMENT_LOCK).await?;
+        let mut tx = self.pool.begin().await?;
+        lock(&mut tx, SETTLEMENT_LOCK).await?;
         require_fanout(&mut tx, claim).await?;
         require_revision(&mut tx, expected_revision).await?;
         sqlx::query("UPDATE qbit_prism_cluster SET fatal_error=$1,updated_at=clock_timestamp() WHERE singleton")
@@ -94,10 +94,10 @@ impl Ledger {
         vout: u32,
         value: u64,
     ) -> Result<bool> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.pool.begin().await?;
         writable(&mut tx).await?;
         require_fanout(&mut tx, claim).await?;
-        self.lock(&mut tx, CPFP_FUNDING_LOCK).await?;
+        lock(&mut tx, CPFP_FUNDING_LOCK).await?;
         let inserted=sqlx::query("INSERT INTO qbit_prism_cpfp_packages(fanout_txid,funding_txid,funding_vout,funding_value_sats,wallet_name) SELECT $1,$2,$3,$4,$5 WHERE NOT EXISTS(SELECT 1 FROM qbit_prism_cpfp_retired_funding WHERE funding_txid=$2 AND funding_vout=$3) ON CONFLICT DO NOTHING")
             .bind(&claim.fanout_txid).bind(txid).bind(i32::try_from(vout)?).bind(i64::try_from(value)?).bind(wallet).execute(&mut *tx).await?.rows_affected();
         tx.commit().await?;
@@ -115,10 +115,10 @@ impl Ledger {
             !reason.is_empty() && reason.len() <= 1024,
             "invalid funding retirement reason"
         );
-        let mut tx = self.begin().await?;
+        let mut tx = self.pool.begin().await?;
         writable(&mut tx).await?;
         require_fanout(&mut tx, claim).await?;
-        self.lock(&mut tx, CPFP_FUNDING_LOCK).await?;
+        lock(&mut tx, CPFP_FUNDING_LOCK).await?;
         // Never drop even a supposedly released lock's cleanup record without
         // checking the wallet: the previous owner could have crashed at an RPC.
         let moved = sqlx::query("WITH retired AS (DELETE FROM qbit_prism_cpfp_packages WHERE fanout_txid=$1 AND funding_txid=$2 AND funding_vout=$3 AND signed_child_hex IS NULL AND child_txid IS NULL RETURNING *) INSERT INTO qbit_prism_cpfp_retired_funding(fanout_txid,funding_txid,funding_vout,funding_value_sats,wallet_name,retirement_reason) SELECT fanout_txid,funding_txid,funding_vout,funding_value_sats,wallet_name,$4 FROM retired")
@@ -143,7 +143,7 @@ impl Ledger {
         vout: u32,
         unlocked: bool,
     ) -> Result<()> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.pool.begin().await?;
         writable(&mut tx).await?;
         require_fanout(&mut tx, claim).await?;
         let updated = sqlx::query("UPDATE qbit_prism_cpfp_retired_funding SET wallet_lock_released=$4,updated_at=clock_timestamp() WHERE fanout_txid=$1 AND funding_txid=$2 AND funding_vout=$3 AND NOT wallet_lock_released")
@@ -169,7 +169,7 @@ impl Ledger {
         signed_child_hex: &str,
         child_txid: &str,
     ) -> Result<()> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.pool.begin().await?;
         writable(&mut tx).await?;
         require_fanout(&mut tx, claim).await?;
         let updated=sqlx::query("UPDATE qbit_prism_cpfp_packages SET signed_child_hex=$2,child_txid=$3,updated_at=clock_timestamp() WHERE fanout_txid=$1 AND (signed_child_hex IS NULL OR (signed_child_hex=$2 AND child_txid=$3))")
@@ -183,7 +183,7 @@ impl Ledger {
     }
 
     pub async fn mark_cpfp_wallet_unlocked(&self, claim: &FanoutClaim) -> Result<()> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.pool.begin().await?;
         writable(&mut tx).await?;
         require_fanout(&mut tx, claim).await?;
         sqlx::query("UPDATE qbit_prism_cpfp_packages SET wallet_lock_released=true,updated_at=clock_timestamp() WHERE fanout_txid=$1").bind(&claim.fanout_txid).execute(&mut *tx).await?;
@@ -192,7 +192,7 @@ impl Ledger {
     }
 
     pub async fn mark_cpfp_wallet_lock_pending(&self, claim: &FanoutClaim) -> Result<()> {
-        let mut tx = self.begin().await?;
+        let mut tx = self.pool.begin().await?;
         writable(&mut tx).await?;
         require_fanout(&mut tx, claim).await?;
         sqlx::query("UPDATE qbit_prism_cpfp_packages SET wallet_lock_released=false,updated_at=clock_timestamp() WHERE fanout_txid=$1").bind(&claim.fanout_txid).execute(&mut *tx).await?;
