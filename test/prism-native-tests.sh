@@ -57,4 +57,5 @@ elif [[ "${mode}" == replica ]]; then
   cargo test --locked -p qbit-prism-server --test postgres_failover -- --nocapture
 else
   cargo test --locked -p qbit-prism-server --all-targets
+  cargo test --locked -p qbit-prism-server --test observability_database -- --ignored
 fi

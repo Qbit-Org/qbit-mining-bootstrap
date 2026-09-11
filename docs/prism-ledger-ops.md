@@ -219,13 +219,27 @@ integrity, CTV state, and API reads before declaring recovery complete.
 and current payout revision and job delivery can progress; otherwise it returns
 503. The HTTP handler reads a published snapshot and fails closed when that
 snapshot becomes stale. Database or node outages therefore cannot keep an old
-green response indefinitely.
+green response indefinitely. A tracked task polling beyond two seconds, or an
+explicit operation exceeding its progress budget, also returns 503 with
+`ok=false`, `ready=false`, and `status="runtime-stalled"`; the corresponding
+`qbit_prism_runtime_task_stalled{task="..."}` is 1. This live check requires a
+surviving runtime worker to serve the probe; a completed long poll retains
+metric evidence without keeping readiness failed.
+
+The coordinator health payload also supplies three known 2.x compatibility
+aliases: `ledger_backend` is `postgres-native` for the PostgreSQL backend,
+`accepted_block` is whether `found_block_count` is positive, and
+`accepted_block_count` copies that count. `ready_miner_count` and `max_blocks`
+remain unmapped because their native sources have not been agreed.
 
 `/metrics` exports native process health, accepted/rejected share and block
 counters, runtime workers, connections, pending builds, current-work delivery
-coverage, and delivery outcomes. Scrape every instance with its own label;
-process counters reset after restart. Dashboard accounting is read
-from PostgreSQL across instances. Detailed Python queue, writer lease, watchdog,
+coverage, and delivery outcomes. It also includes share ACK latency and reject
+reasons, initial-work waits, candidate backlog, collector pool waits and status,
+runtime lag, and RSS; the full [native family inventory](prism-native-metrics.md)
+identifies the timing families declared without samples. Scrape every instance
+with its own label; process counters reset after restart. Dashboard accounting
+is read from PostgreSQL across instances. Detailed Python queue, writer lease, watchdog,
 and incremental-refresh metrics no longer describe this runtime.
 
 The coordinator (`run`) serves the last complete metrics publication and adds
@@ -244,7 +258,9 @@ Compose supplies 5 by default. Both values give a 15-second freshness budget.
 The publisher still ticks every 2 seconds: this setting changes the staleness
 budget, not the publication interval.
 Once the age exceeds that budget, a scrape sets `qbit_prism_health_state` to `0`
-while retaining the other cached samples.
+while retaining the other cached samples. Collector age/availability and runtime
+state are overlaid from memory at scrape time; this does not refresh the cached
+body timestamp or a collector's last-success timestamp.
 Scraping neither renews the publication age nor queries the database.
 
 Both `run` and `public-api` return HTTP 200 for `/metrics`, including missing
@@ -278,8 +294,9 @@ QBITD_BIN=/path/to/qbitd bash test/prism-native-tests.sh live
 ```
 
 The database test wrapper starts a private local cluster unless
-`PRISM_TEST_DATABASE_URL` is supplied. Live tests add actual qbitd regtest and
-bounded CPU mining. Use an isolated database for tests. The native builder
+`PRISM_TEST_DATABASE_URL` is supplied. Its default mode runs all targets, then
+the ignored database collector test explicitly, as CI does. Live tests add actual
+qbitd regtest and bounded CPU mining. Use an isolated database for tests. The native builder
 benchmark measures CPU build/verify work, not end-to-end accepted-share capacity;
 see [measurement](prism-payout-artifact-measurement.md) and
 [optional qualification](prism-capacity-readiness.md).
@@ -296,3 +313,15 @@ PRISM_TEST_PG_BIN_DIR=/usr/lib/postgresql/16/bin \
 
 The test skips unless that server-tool directory is provided. Its test proxy
 and promotion sequence do not replace validation of a production HA manager.
+
+The collector failure/recovery test requires a disposable PostgreSQL database
+and is ignored by ordinary `--all-targets` runs. Invoke it explicitly when
+running without the wrapper:
+
+```sh
+PRISM_TEST_DATABASE_URL=postgresql://test_user@127.0.0.1:5432/test_db \
+  cargo test --locked -p qbit-prism-server --test observability_database -- --ignored
+```
+
+It verifies valid zero values, a blocked query, pool exhaustion, and recovery;
+never point test fixtures at a production database.

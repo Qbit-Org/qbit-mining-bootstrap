@@ -21,10 +21,10 @@ Histograms also export `_sum` and `_count`.
 | `duplicate_shares_total` | counter | none | Duplicate rejection decisions |
 | `low_difficulty_shares_total` | counter | none | Low-difficulty rejection decisions |
 | `grace_credited_shares_total` | counter | none | Coordinator's actual stale decision, only after durable `Ok(true)` acceptance |
-| `stratum_pending_initial_jobs` | gauge | none | Authorized local sessions awaiting usable work, including reauthorization |
-| `stratum_oldest_pending_initial_job_seconds` | gauge | none | Oldest such wait, from authorization to successful job notification; zero when none wait |
+| `stratum_pending_initial_jobs` | gauge | none | Authorized local sessions awaiting usable work, including reauthorization; -1 before the first snapshot |
+| `stratum_oldest_pending_initial_job_seconds` | gauge | none | Oldest such wait, from authorization to successful job notification; zero when none wait; -1 before the first snapshot |
 | `stratum_current_tip_coverage_gap_seconds` | gauge | none | Continuous native generation coverage below 95%, reset at or above 95%; unknown before the first snapshot |
-| `stratum_semantic_current_work_ratio` | gauge | none | Existing generation coverage divided by authorized sessions; one with no authorized sessions |
+| `stratum_semantic_current_work_ratio` | gauge | none | Existing generation coverage divided by authorized sessions; one with no authorized sessions; -1 before the first snapshot |
 | `block_submit_seconds` | histogram | none | **Declared, not yet populated**; A/#266 owns locally validated proof to first node-offer timestamp transport |
 | `block_candidates_pending` | gauge | none | PostgreSQL count of outbox rows with `state='pending'`, including claimed/retry-delayed rows |
 | `block_candidate_oldest_pending_seconds` | gauge | none | Oldest pending creation time relative to the same PostgreSQL transaction timestamp; clamped to zero for future timestamps |
@@ -87,6 +87,13 @@ The existing twelve coordinator families keep their names and types:
 `job_delivery_failures_total`. The #277 `metrics_snapshot_available`,
 `metrics_snapshot_stale`, and `metrics_snapshot_age_seconds` names, labels,
 HELP/TYPE lines, headers, and atomic body/timestamp publication remain unchanged.
+Deployment alert compatibility was checked against the frozen `SwapLabsInc/qbit-tools`
+templates at `a007a14260548cb93e277882672d788fe9a3f95e`. The seven overlapping
+families keep their names/types/labels; #279 owns migrating remaining legacy
+rules, including joins on retired `stratum_authorized_connections`. The existing
+public-role `qbit_prism_public_requests_total` includes `/healthz`, `/metrics`,
+and other routed requests, so its rate is not a dashboard-only request rate.
+
 The coordinator adds the three health compatibility aliases whose native sources
 are known; the fixture deliberately identifies unmapped legacy fields.
 
