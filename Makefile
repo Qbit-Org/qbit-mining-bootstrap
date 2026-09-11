@@ -105,7 +105,7 @@ test-prism-postgres-seed-guard:
 	bash test/test-prism-postgres-seed-guard.sh
 
 test-prism-postgres-throughput:
-	cargo run --locked --release -p qbit-prism-server -- benchmark --shares 100000 --miners 100 --iterations 10
+	bash test/test-prism-postgres-throughput.sh
 
 test-prism-public-read-replica:
 	bash test/test-prism-public-read-replica.sh
