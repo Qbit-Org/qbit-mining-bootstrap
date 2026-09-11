@@ -34,46 +34,76 @@ pub struct SourceStateRule {
     pub verdict: &'static str,
 }
 
+/// The names of the source states. Code cites a state by its name and finds
+/// its row with `source_rule`, never by position, so the table can be
+/// reordered or grown without a refusal silently citing the wrong row.
+const STATE_FRESH: &str = "fresh";
+const STATE_PARTIAL_001: &str = "partial 001";
+const STATE_PRE_258: &str = "pre-#258";
+const STATE_APPLIED_258: &str = "#258 applied";
+const STATE_PARTIAL_002: &str = "partial 002";
+const STATE_NEWER: &str = "newer";
+const STATE_DRIFTED_001: &str = "drifted 001";
+
 /// The source states migration 006 accepts or refuses, as data. Detection is
 /// column-aware: it asks the catalog which 002 objects exist, so a fixed
 /// predicate never errors on a source that lacks a column, and it looks at
 /// outbox rows for the drain check because the capability row proves only
-/// that 002 ran. The last row is decided after 001 has run: the release 001
-/// is idempotent and repairs what it re-asserts, so the check compares what
-/// its `IF NOT EXISTS` left alone against a fresh apply of the same release
-/// SQL, and a refusal rolls the whole migration back.
-pub const SOURCE_STATES: [SourceStateRule; 6] = [
+/// that 002 ran. The release definitions come from applying the frozen
+/// release SQL to a scratch schema under a savepoint, before any DDL touches
+/// the source. A database without `qbit_share_ledger` is fresh only if it
+/// has nothing else that 001 creates; otherwise it is a partial 001,
+/// refused before any DDL. The last row is decided after 001 has run: the
+/// release 001 is idempotent and repairs what it re-asserts, so the check
+/// compares what its `IF NOT EXISTS` left alone against the same scratch
+/// apply, and a refusal rolls the whole migration back.
+pub const SOURCE_STATES: [SourceStateRule; 7] = [
     SourceStateRule {
-        name: "fresh",
-        evidence: "no qbit_share_ledger at all",
+        name: STATE_FRESH,
+        evidence: "no 001 or 002 object at all",
         verdict: "accept",
     },
     SourceStateRule {
-        name: "pre-#258",
+        name: STATE_PARTIAL_001,
+        evidence: "no qbit_share_ledger, but some 001 object present",
+        verdict: "refuse before any DDL, naming the objects present",
+    },
+    SourceStateRule {
+        name: STATE_PRE_258,
         evidence: "no qbit_prism_schema_capabilities, no 002 object",
         verdict: "accept after the drain check",
     },
     SourceStateRule {
-        name: "#258 applied",
+        name: STATE_APPLIED_258,
         evidence: "candidate_storage_version = 2 and every 002 object present",
         verdict: "accept after the drain check",
     },
     SourceStateRule {
-        name: "partial 002",
+        name: STATE_PARTIAL_002,
         evidence: "some 002 objects or the capability row, not all",
         verdict: "refuse, naming the missing object",
     },
     SourceStateRule {
-        name: "newer",
+        name: STATE_NEWER,
         evidence: "candidate_storage_version > 2 or an unknown capability",
         verdict: "refuse before any DDL",
     },
     SourceStateRule {
-        name: "drifted 001",
+        name: STATE_DRIFTED_001,
         evidence: "a 001 (or 002) object whose definition, after 001 has run, differs from the frozen release",
         verdict: "refuse transactionally, naming the object",
     },
 ];
+
+/// The row of `SOURCE_STATES` with this name. Every name the code cites is
+/// one of the `STATE_*` constants, each of which names a row above; the
+/// unit tests check every one, so this cannot fail at run time.
+fn source_rule(name: &str) -> &'static SourceStateRule {
+    SOURCE_STATES
+        .iter()
+        .find(|rule| rule.name == name)
+        .unwrap_or_else(|| panic!("{name} is not a row of SOURCE_STATES"))
+}
 
 /// An accepted source. Each 2.x.x variant names the frozen release SQL under
 /// `tests/fixtures/schema_2x` that produces it.
@@ -111,11 +141,11 @@ impl SourceState {
     }
 
     fn rule(self) -> &'static SourceStateRule {
-        match self {
-            Self::Fresh => &SOURCE_STATES[0],
-            Self::Pre258 => &SOURCE_STATES[1],
-            Self::Applied258 => &SOURCE_STATES[2],
-        }
+        source_rule(match self {
+            Self::Fresh => STATE_FRESH,
+            Self::Pre258 => STATE_PRE_258,
+            Self::Applied258 => STATE_APPLIED_258,
+        })
     }
 }
 
@@ -1145,20 +1175,19 @@ fn named_objects(objects: &[String]) -> String {
     }
 }
 
-/// After 001 has run on a 2.x.x source, refuse anything its `IF NOT EXISTS`
-/// left alone that differs from the frozen release. The expected definitions
-/// come from applying the same release SQL (001, plus 002 for a #258 source)
-/// to a scratch schema inside this transaction, under a savepoint that is
-/// rolled back before the source is read, so the comparison is exact for
-/// this server's PostgreSQL version and nothing from the scratch apply
-/// survives. Extra objects, columns, constraints, indexes and sequences are
-/// kept and logged; a missing or different one fails the migration, which
-/// rolls back whole, so the database is unchanged.
-async fn require_release_schema(
+/// The frozen release's definitions and the name of the schema the source
+/// lives in. The definitions come from applying the release SQL (001, plus
+/// 002 for a #258 source) to a scratch schema inside this transaction,
+/// under a savepoint that is rolled back before anything else happens, so
+/// they are exact for this server's PostgreSQL version and nothing from the
+/// scratch apply survives. Taken once, before any DDL touches the source,
+/// and used both to decide whether a database without `qbit_share_ledger`
+/// is really fresh and, after 001 has run, to check what it left alone.
+async fn release_fingerprint(
     tx: &mut Transaction<'_, Postgres>,
     state: SourceState,
     base_schema: &str,
-) -> Result<()> {
+) -> Result<(SchemaFingerprint, String)> {
     let row = sqlx::query("SELECT current_schema()::text AS schema,current_setting('search_path') AS search_path,current_database()::text AS database,current_user::text AS role")
         .fetch_one(&mut **tx).await?;
     let source_schema: String = row.try_get("schema")?;
@@ -1214,12 +1243,103 @@ async fn require_release_schema(
         "release schema scratch apply did not roll back (current schema {restored}, expected {source_schema}; scratch schema {scratch} present: {})",
         !scratch_gone
     );
-    let mut found = fingerprint_schema(tx, &source_schema).await?;
-    // The migrator's own version table was created before any source object
-    // was read; it is native bookkeeping, not part of the 2.x.x source.
+    Ok((expected, source_schema))
+}
+
+/// The source schema as it is now, without the migrator's own version
+/// table: that was created before any source object was read and is native
+/// bookkeeping, not part of the 2.x.x source.
+async fn source_fingerprint(
+    tx: &mut Transaction<'_, Postgres>,
+    source_schema: &str,
+) -> Result<SchemaFingerprint> {
+    let mut found = fingerprint_schema(tx, source_schema).await?;
     found.tables.remove("qbit_prism_schema_migrations");
     found.constraints.remove("qbit_prism_schema_migrations");
-    let comparison = compare_fingerprints(&expected, &found);
+    Ok(found)
+}
+
+/// Every table, sequence, index, trigger and function the release creates
+/// that the source already has, named the way the drift report names them.
+fn release_objects_present(expected: &SchemaFingerprint, found: &SchemaFingerprint) -> Vec<String> {
+    let mut present = Vec::new();
+    for table in expected.tables.keys() {
+        if found.tables.contains_key(table) {
+            present.push(format!("table {table}"));
+        }
+    }
+    for name in expected.sequences.keys() {
+        if found.sequences.contains_key(name) {
+            present.push(format!("sequence {name}"));
+        }
+    }
+    for name in expected.indexes.keys() {
+        if let Some(actual) = found.indexes.get(name) {
+            present.push(format!("index {name} on {}", actual.table));
+        }
+    }
+    for (table, name) in expected.triggers.keys() {
+        if found.triggers.contains_key(&(table.clone(), name.clone())) {
+            present.push(format!("trigger {name} on {table}"));
+        }
+    }
+    for (name, identity) in expected.functions.keys() {
+        if found
+            .functions
+            .contains_key(&(name.clone(), identity.clone()))
+        {
+            present.push(format!("function {name}({identity})"));
+        }
+    }
+    present
+}
+
+/// A database without `qbit_share_ledger` is fresh only when it has nothing
+/// else the release 001 creates either. Anything else is a partial 001: a
+/// selective restore, or a piece of the schema installed by hand, which
+/// 001's `IF NOT EXISTS` would keep exactly as it is. Refused before any
+/// DDL. Objects the release does not create, an operator's own table for
+/// instance, do not disqualify a fresh database; they are logged as extras.
+async fn require_fresh_source(
+    tx: &mut Transaction<'_, Postgres>,
+    expected: &SchemaFingerprint,
+    source_schema: &str,
+) -> Result<()> {
+    let found = source_fingerprint(tx, source_schema).await?;
+    let present = release_objects_present(expected, &found);
+    ensure!(
+        present.is_empty(),
+        "refusing to migrate a {STATE_PARTIAL_001} source before any DDL: the database has no qbit_share_ledger but holds {} object(s) that the 2.x.x release's 001_share_ledger.sql creates ({}), so it is neither an empty database nor a 2.x.x ledger, and 001's IF NOT EXISTS would keep those objects whatever they hold. Nothing was changed. Restore the full pre-migration backup, or migrate into an empty database",
+        present.len(),
+        named_objects(&present)
+    );
+    let comparison = compare_fingerprints(expected, &found);
+    if !comparison.extra.is_empty() {
+        tracing::warn!(
+            source = STATE_FRESH,
+            extra = comparison.extra.len(),
+            objects = %named_objects(&comparison.extra),
+            "empty database has objects the 2.x.x release does not create; they are kept as they are"
+        );
+    }
+    Ok(())
+}
+
+/// After 001 has run, refuse anything its `IF NOT EXISTS` left alone that
+/// differs from the frozen release, whose definitions `release_fingerprint`
+/// took before any DDL. On a fresh database 001 just created everything,
+/// so this passes trivially; it runs there too, as a second guard. Extra
+/// objects, columns, constraints, indexes and sequences are kept and
+/// logged; a missing or different one fails the migration, which rolls back
+/// whole, so the database is unchanged.
+async fn require_release_schema(
+    tx: &mut Transaction<'_, Postgres>,
+    state: SourceState,
+    expected: &SchemaFingerprint,
+    source_schema: &str,
+) -> Result<()> {
+    let found = source_fingerprint(tx, source_schema).await?;
+    let comparison = compare_fingerprints(expected, &found);
     let (release, files) = match state {
         SourceState::Applied258 => (
             "v2.0.2",
@@ -1238,8 +1358,7 @@ async fn require_release_schema(
     }
     ensure!(
         comparison.drift.is_empty(),
-        "refusing to migrate a {} source: after 001_share_ledger.sql ran, the database does not match the v2.0.x release schema ({release}, {files}), {} object(s) differ ({}). Nothing was changed: the migration rolled back. Restore the pre-migration backup, or bring the database to the release schema with the 2.x.x release (v2.0.1 or later; v2.0.2 for a #258 database) and take a new backup, then migrate again",
-        SOURCE_STATES[5].name,
+        "refusing to migrate a {STATE_DRIFTED_001} source: after 001_share_ledger.sql ran, the database does not match the v2.0.x release schema ({release}, {files}), {} object(s) differ ({}). Nothing was changed: the migration rolled back. Restore the pre-migration backup, or bring the database to the release schema with the 2.x.x release (v2.0.1 or later; v2.0.2 for a #258 database) and take a new backup, then migrate again",
         comparison.drift.len(),
         named_objects(&comparison.drift)
     );
@@ -1298,25 +1417,29 @@ pub(super) async fn migrate_schema(
         let state = match classify_source(&inventory) {
             SourceVerdict::Accept(state) => state,
             SourceVerdict::Newer(reason) => bail!(
-                "refusing to migrate a {} source before any DDL: {reason}",
-                SOURCE_STATES[4].name
+                "refusing to migrate a {STATE_NEWER} source before any DDL: {reason}"
             ),
             SourceVerdict::Partial(missing) => bail!(
-                "refusing to migrate a {} source: 001_share_ledger.sql ran but 002_candidate_bodies.sql did not finish, missing {}. Finish it with the v2.0.2 release (PRISM_POSTGRES_INIT_SCHEMA=1 applies both files) or restore the pre-migration backup, then migrate again",
-                SOURCE_STATES[3].name,
+                "refusing to migrate a {STATE_PARTIAL_002} source: 001_share_ledger.sql ran but 002_candidate_bodies.sql did not finish, missing {}. Finish it with the v2.0.2 release (PRISM_POSTGRES_INIT_SCHEMA=1 applies both files) or restore the pre-migration backup, then migrate again",
                 missing.join(", ")
             ),
         };
-        refuse_undrained_outbox(tx, &inventory).await?;
         let base_schema = base_schema_transaction_body(include_str!(
             "../../../qbit-prism/sql/001_share_ledger.sql"
         ))?;
+        // The release definitions, taken once under a savepoint and rolled
+        // back before the source is touched.
+        let (expected, source_schema) = release_fingerprint(tx, state, &base_schema).await?;
+        if state == SourceState::Fresh {
+            // No share ledger and no 002 object: fresh only if nothing else
+            // of 001 is there either, or 001 would keep it as it is.
+            require_fresh_source(tx, &expected, &source_schema).await?;
+        }
+        refuse_undrained_outbox(tx, &inventory).await?;
         sqlx::raw_sql(&base_schema).execute(&mut **tx).await?;
         // 001 repaired what it re-asserts; what it skipped must already be
         // the release definition before any native DDL alters those tables.
-        if state != SourceState::Fresh {
-            require_release_schema(tx, state, &base_schema).await?;
-        }
+        require_release_schema(tx, state, &expected, &source_schema).await?;
         if !versions.contains(&2) {
             sqlx::raw_sql(include_str!("../../migrations/002_multi_instance.sql"))
                 .execute(&mut **tx)
@@ -1878,6 +2001,164 @@ mod tests {
             .map(|index| format!("object {index}"))
             .collect();
         assert!(named_objects(&long).ends_with("; object 15 and 3 more"));
+    }
+
+    #[test]
+    fn every_cited_source_state_is_a_row_found_by_name() {
+        for name in [
+            STATE_FRESH,
+            STATE_PARTIAL_001,
+            STATE_PRE_258,
+            STATE_APPLIED_258,
+            STATE_PARTIAL_002,
+            STATE_NEWER,
+            STATE_DRIFTED_001,
+        ] {
+            assert_eq!(source_rule(name).name, name);
+            assert_eq!(
+                SOURCE_STATES
+                    .iter()
+                    .filter(|rule| rule.name == name)
+                    .count(),
+                1,
+                "{name} must be exactly one row"
+            );
+        }
+        assert_eq!(SOURCE_STATES.len(), 7, "every row has a name constant");
+        for state in [
+            SourceState::Fresh,
+            SourceState::Pre258,
+            SourceState::Applied258,
+        ] {
+            assert!(SOURCE_STATES.contains(state.rule()));
+        }
+        assert_eq!(SourceState::Fresh.rule().name, "fresh");
+        assert_eq!(SourceState::Pre258.rule().name, "pre-#258");
+        assert_eq!(SourceState::Applied258.rule().name, "#258 applied");
+        assert_eq!(
+            source_rule(STATE_PARTIAL_001).verdict,
+            "refuse before any DDL, naming the objects present"
+        );
+    }
+
+    #[test]
+    fn a_leftover_release_object_disqualifies_fresh_and_an_operator_object_does_not() {
+        let mut expected = SchemaFingerprint::default();
+        expected.tables.insert(
+            "qbit_pool_blocks".into(),
+            table(&[("a", column("text", true))]),
+        );
+        expected.sequences.insert(
+            "qbit_audit_publication_sequence_seq".into(),
+            sequence("bigint", 1, i64::MAX),
+        );
+        expected.indexes.insert(
+            "qbit_pool_blocks_maturity_idx".into(),
+            IndexDefinition {
+                table: "qbit_pool_blocks".into(),
+                definition:
+                    "CREATE INDEX qbit_pool_blocks_maturity_idx ON qbit_pool_blocks USING btree (a)"
+                        .into(),
+                valid: true,
+            },
+        );
+        expected.triggers.insert(
+            ("qbit_pool_blocks".into(), "qbit_pool_blocks_guard".into()),
+            TriggerDefinition {
+                definition: "CREATE TRIGGER ...".into(),
+                enabled: "O".into(),
+            },
+        );
+        expected.functions.insert(
+            ("qbit_prism_window".into(), "w numeric".into()),
+            FunctionDefinition {
+                arguments: "w numeric".into(),
+                result: None,
+                language: "sql".into(),
+                body: None,
+                volatility: "v".into(),
+                strict: false,
+                security_definer: false,
+                leakproof: false,
+                parallel: "u".into(),
+                kind: "f".into(),
+                config: Vec::new(),
+            },
+        );
+        let mut found = SchemaFingerprint::default();
+        found.tables.insert(
+            "operator_notes".into(),
+            table(&[("note", column("text", true))]),
+        );
+        found.sequences.insert(
+            "operator_notes_note_id_seq".into(),
+            sequence("bigint", 1, i64::MAX),
+        );
+        assert!(release_objects_present(&expected, &found).is_empty());
+        let comparison = compare_fingerprints(&expected, &found);
+        assert_eq!(
+            comparison.extra,
+            vec![
+                "table operator_notes",
+                "sequence operator_notes_note_id_seq"
+            ]
+        );
+
+        // Each kind of leftover is named, tables first.
+        for (kind, name) in [
+            ("table", "qbit_pool_blocks"),
+            ("sequence", "qbit_audit_publication_sequence_seq"),
+            ("function", "qbit_prism_window(w numeric)"),
+        ] {
+            let mut found = SchemaFingerprint::default();
+            match kind {
+                "table" => {
+                    found
+                        .tables
+                        .insert(name.into(), table(&[("other", column("bigint", false))]));
+                }
+                "sequence" => {
+                    found
+                        .sequences
+                        .insert(name.into(), sequence("integer", 1, 2_147_483_647));
+                }
+                _ => {
+                    found.functions.insert(
+                        ("qbit_prism_window".into(), "w numeric".into()),
+                        expected.functions.values().next().unwrap().clone(),
+                    );
+                }
+            }
+            assert_eq!(
+                release_objects_present(&expected, &found),
+                vec![format!("{kind} {name}")]
+            );
+        }
+        let mut found = SchemaFingerprint::default();
+        found.tables.insert(
+            "qbit_pool_blocks".into(),
+            table(&[("a", column("text", true))]),
+        );
+        found.indexes.insert(
+            "qbit_pool_blocks_maturity_idx".into(),
+            expected.indexes["qbit_pool_blocks_maturity_idx"].clone(),
+        );
+        found.triggers.insert(
+            ("qbit_pool_blocks".into(), "qbit_pool_blocks_guard".into()),
+            expected.triggers[&(
+                "qbit_pool_blocks".to_owned(),
+                "qbit_pool_blocks_guard".to_owned(),
+            )]
+                .clone(),
+        );
+        assert_eq!(
+            release_objects_present(&expected, &found),
+            vec![
+                "table qbit_pool_blocks",
+                "index qbit_pool_blocks_maturity_idx on qbit_pool_blocks",
+                "trigger qbit_pool_blocks_guard on qbit_pool_blocks",
+            ]
+        );
     }
 
     fn sequence(data_type: &str, increment: i64, max: i64) -> SequenceDefinition {

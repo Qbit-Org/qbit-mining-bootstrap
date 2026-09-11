@@ -136,6 +136,10 @@ fn source_state_table_is_the_pinned_data() {
         rows,
         vec![
             ("fresh", "accept"),
+            (
+                "partial 001",
+                "refuse before any DDL, naming the objects present"
+            ),
             ("pre-#258", "accept after the drain check"),
             ("#258 applied", "accept after the drain check"),
             ("partial 002", "refuse, naming the missing object"),
@@ -222,6 +226,40 @@ pub async fn drain_2x_row(pool: &PgPool, hash: &str, v2: bool) -> Result<()> {
             .bind(hash).execute(pool).await?;
     }
     Ok(())
+}
+
+/// Leave only the named tables, sequences and functions of a frozen 001
+/// apply in place, as a selective restore does: every other function, then
+/// every other table (with what depends on it) and standalone sequence, is
+/// dropped. A kept table keeps its indexes; its triggers go with the
+/// functions they call.
+async fn leave_only(pool: &PgPool, keep: &[&str]) -> Result<()> {
+    let keep = keep
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    sqlx::raw_sql(&format!(
+        "DO $$ DECLARE item record; BEGIN
+           FOR item IN SELECT p.oid::regprocedure::text AS signature FROM pg_proc p WHERE p.pronamespace=current_schema()::regnamespace AND p.proname<>ALL(ARRAY[{keep}]::text[]) LOOP
+             EXECUTE format('DROP FUNCTION %s CASCADE', item.signature);
+           END LOOP;
+           FOR item IN SELECT c.relname, c.relkind FROM pg_class c WHERE c.relnamespace=current_schema()::regnamespace AND c.relkind IN ('r','S') AND c.relname<>ALL(ARRAY[{keep}]::text[]) LOOP
+             IF item.relkind='r' THEN EXECUTE format('DROP TABLE IF EXISTS %I CASCADE', item.relname);
+             ELSE EXECUTE format('DROP SEQUENCE IF EXISTS %I CASCADE', item.relname); END IF;
+           END LOOP;
+         END $$"
+    ))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Every relation and function of the test schema, so a refusal can be
+/// shown to have changed nothing.
+async fn schema_objects(pool: &PgPool) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar("SELECT relkind::text||' '||relname::text FROM pg_class WHERE relnamespace=current_schema()::regnamespace AND relkind IN ('r','S','i') UNION ALL SELECT 'f '||oid::regprocedure::text FROM pg_proc WHERE pronamespace=current_schema()::regnamespace ORDER BY 1")
+        .fetch_all(pool).await?)
 }
 
 async fn native_tables_absent(pool: &PgPool) -> Result<bool> {
@@ -561,6 +599,127 @@ async fn partial_002_source_is_refused_naming_the_missing_object() -> Result<()>
     assert!(native_tables_absent(&pool).await?, "refusal ran DDL");
     pool.close().await;
     db.close(vec![]).await
+}
+
+#[tokio::test]
+async fn partial_001_source_is_refused_before_any_ddl_naming_the_objects_present() -> Result<()> {
+    // Three selective restores of a v2.0.1 database, each without
+    // qbit_share_ledger: one table with its indexes, one standalone
+    // sequence, one function. Each object is the release definition,
+    // because it came from applying the frozen 001 and dropping the rest.
+    for (keep, named, count) in [
+        (
+            "qbit_pool_blocks",
+            vec![
+                "table qbit_pool_blocks",
+                "index qbit_pool_blocks_audit_publication_sequence_idx on qbit_pool_blocks",
+                "index qbit_pool_blocks_maturity_idx on qbit_pool_blocks",
+                "index qbit_pool_blocks_public_recent_idx on qbit_pool_blocks",
+            ],
+            4,
+        ),
+        (
+            "qbit_audit_publication_sequence_seq",
+            vec!["sequence qbit_audit_publication_sequence_seq"],
+            1,
+        ),
+        (
+            "qbit_prism_window",
+            vec!["function qbit_prism_window(anchor_job_issued_at timestamp with time zone, window_weight numeric)"],
+            1,
+        ),
+    ] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let pool = PgPool::connect(&db.url).await?;
+        apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+        leave_only(&pool, &[keep]).await?;
+        let before = schema_objects(&pool).await?;
+        assert!(
+            !before.iter().any(|object| object.ends_with(" qbit_share_ledger")),
+            "{before:?}"
+        );
+        let error = db
+            .ledger("a")
+            .await
+            .err()
+            .with_context(|| format!("migration accepted a partial 001 source (only {keep})"))?
+            .to_string();
+        assert!(
+            error.contains("refusing to migrate a partial 001 source before any DDL: the database has no qbit_share_ledger but holds"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!(
+                "holds {count} object(s) that the 2.x.x release's 001_share_ledger.sql creates ({})",
+                named.join("; ")
+            )),
+            "{error}"
+        );
+        assert!(
+            error.contains("so it is neither an empty database nor a 2.x.x ledger")
+                && error.contains("Nothing was changed. Restore the full pre-migration backup, or migrate into an empty database"),
+            "{error}"
+        );
+        assert!(native_tables_absent(&pool).await?, "refusal ran DDL");
+        assert_eq!(schema_objects(&pool).await?, before, "refusal changed the schema");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'qbit_prism_scratch_%'"
+            )
+            .fetch_one(&pool)
+            .await?,
+            0,
+            "scratch schema survived the refusal"
+        );
+        pool.close().await;
+        db.close(vec![]).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_database_migrates_as_fresh_with_or_without_an_operator_table() -> Result<()> {
+    // Truly empty.
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    assert!(schema_objects(&pool).await?.is_empty());
+    let ledger = db.ledger("a").await?;
+    assert_eq!(schema_version(&pool).await?, REQUIRED_SCHEMA_VERSION);
+    assert_eq!(
+        ledger.migration_source().await?.map(|s| s.source_state),
+        Some("fresh".into())
+    );
+    exercise_native_writers(&ledger, 1, 5401).await?;
+    pool.close().await;
+    db.close(vec![ledger]).await?;
+
+    // Empty apart from an operator's own table, which brings a sequence of
+    // its own: nothing the release creates, so still fresh, and kept.
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    sqlx::raw_sql("CREATE TABLE operator_notes(note_id bigserial PRIMARY KEY, note text NOT NULL); INSERT INTO operator_notes(note) VALUES('restored by hand')")
+        .execute(&pool).await?;
+    let ledger = db.ledger("a").await?;
+    assert_eq!(schema_version(&pool).await?, REQUIRED_SCHEMA_VERSION);
+    assert_eq!(
+        ledger.migration_source().await?.map(|s| s.source_state),
+        Some("fresh".into())
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT note FROM operator_notes WHERE note_id=1")
+            .fetch_one(&pool)
+            .await?,
+        "restored by hand"
+    );
+    exercise_native_writers(&ledger, 1, 5402).await?;
+    pool.close().await;
+    db.close(vec![ledger]).await
 }
 
 #[tokio::test]

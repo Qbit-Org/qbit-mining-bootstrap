@@ -6,7 +6,8 @@
 -- data in ledger/migration.rs (SOURCE_STATES); this comment is its record.
 --
 --   source state   evidence                                             verdict
---   fresh          no qbit_share_ledger at all                          accept
+--   fresh          no 001 or 002 object at all                          accept
+--   partial 001    no qbit_share_ledger, but some 001 object present    refuse before any DDL, naming the objects present
 --   pre-#258       no qbit_prism_schema_capabilities, no 002 object     accept after the drain check
 --   #258 applied   candidate_storage_version = 2, every 002 object     accept after the drain check
 --   partial 002    some 002 objects or the capability row, not all      refuse, naming the missing object
@@ -18,19 +19,29 @@
 -- upserts candidate_storage_version = 2 whatever the 2.x.x writer stored, so
 -- the row proves 002 ran, not that v2 rows exist or do not.
 --
+-- The release definitions come from the migrator applying the same release
+-- SQL (001, plus 002 for a #258 source) to a scratch schema under a
+-- savepoint in the migration transaction, reading every table, column,
+-- constraint, index, trigger, function and sequence it created, and rolling
+-- the savepoint back, all before any DDL touches the source.
+--
+-- A database without qbit_share_ledger (and without any 002 object) is
+-- fresh only if it has no table, sequence, index, trigger or function that
+-- 001 creates; otherwise it is a partial 001, a selective restore or a
+-- hand-installed piece of the schema, refused before any DDL and naming the
+-- objects present. Objects the release does not create do not disqualify a
+-- fresh database; they are kept and logged.
+--
 -- The last row is decided after 001_share_ledger.sql has run on the source
 -- and before any native DDL: 001 is idempotent and repairs what it
--- re-asserts, but its IF NOT EXISTS leaves an existing table, column, index
--- or named constraint as it is. The migrator applies the same release SQL
--- (001, plus 002 for a #258 source) to a scratch schema under a savepoint in
--- the migration transaction, reads every table, column, constraint, index,
--- trigger, function and sequence it created, rolls the savepoint back, and
--- requires an equivalent definition in the source schema. A sequence is
--- compared by its structure (type, start, increment, bounds, cache, cycle),
--- never by the value it has reached. Column order, comments, auto-generated
--- constraint names and NOT VALID are ignored; extra objects are kept and
--- logged; a missing or different one fails the migration, which rolls back
--- whole.
+-- re-asserts, but its IF NOT EXISTS leaves an existing table, column, index,
+-- sequence or named constraint as it is. The migrator requires an equivalent
+-- of every release definition in the source schema, on a fresh database too,
+-- where 001 has just created everything. A sequence is compared by its
+-- structure (type, start, increment, bounds, cache, cycle), never by the
+-- value it has reached. Column order, comments, auto-generated constraint
+-- names and NOT VALID are ignored; extra objects are kept and logged; a
+-- missing or different one fails the migration, which rolls back whole.
 
 -- What the database came from, written once by the migration that accepted
 -- it. Later starts and operators read it; a repeated migrate never rewrites it.

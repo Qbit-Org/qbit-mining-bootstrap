@@ -87,25 +87,53 @@ release definition:
 
 | Source state | Evidence | Verdict |
 | --- | --- | --- |
+| fresh | no `qbit_share_ledger`, no other object `001_share_ledger.sql` creates, no `002_candidate_bodies.sql` object: an empty database, with or without objects of the operator's own | accept |
+| partial 001 | no `qbit_share_ledger`, but some table, sequence, index, trigger or function that 001 creates is present: a selective restore, or part of the schema installed by hand | refuse before any DDL, naming the objects present; restore the full pre-migration backup or migrate into an empty database |
 | pre-#258 (v2.0.0, v2.0.1) | `001_share_ledger.sql` only: no `qbit_prism_schema_capabilities`, no `002_candidate_bodies.sql` object | accept after the drain check |
 | #258 applied (v2.0.2) | `candidate_storage_version = 2` and every `002_candidate_bodies.sql` object present | accept after the drain check |
 | partial 002 | some 002 objects or the capability row, but not all (v2.0.2 applies 001 and 002 as two script calls, and a restart between them leaves this) | refuse, naming the missing object; finish 002 with the v2.0.2 release (`PRISM_POSTGRES_INIT_SCHEMA=1`) or restore the backup |
 | newer | `candidate_storage_version > 2`, or a capability this release does not know | refuse before any DDL; a newer PRISM release wrote the database |
 | drifted 001 | a 001 (or 002) object whose definition, after 001 has run, differs from the frozen release: a table, column, index, sequence or named constraint that 001's `IF NOT EXISTS` skipped, or any 002 object, with a dropped constraint, a changed type, nullability or default, a different index definition, an altered sequence (a lowered maximum, a different increment), a replaced function body or a disabled trigger | refuse transactionally, naming each object and what differs; the migration rolls back and the database is unchanged; restore the pre-migration backup or bring the database to the release schema with the `2.x.x` release, then migrate again |
 
+**The release definitions.** They are not a stored fingerprint: before any
+DDL touches the source, inside the migration transaction, the migrator opens
+a savepoint, creates a scratch schema, applies the frozen 001 there (plus
+`002_candidate_bodies.sql` for a #258 source), reads every table, column,
+constraint, index, trigger, function and sequence that produced, and rolls
+the savepoint back, so the comparison is exact for the PostgreSQL version in
+use and nothing from the scratch apply survives. Both checks below use that
+one reading.
+
+**The fresh check.** A database without `qbit_share_ledger` and without any
+002 object is fresh only if it has none of the other objects 001 creates.
+Anything else, a `qbit_pool_blocks` restored on its own, a leftover
+`qbit_audit_publication_sequence_seq`, a hand-created function, is a partial
+001: 001's `IF NOT EXISTS` would keep it exactly as it is, so the migration
+is refused before any DDL, naming what is present:
+
+```
+refusing to migrate a partial 001 source before any DDL: the database has no qbit_share_ledger but
+holds 4 object(s) that the 2.x.x release's 001_share_ledger.sql creates (table qbit_pool_blocks;
+index qbit_pool_blocks_audit_publication_sequence_idx on qbit_pool_blocks; index
+qbit_pool_blocks_maturity_idx on qbit_pool_blocks; index qbit_pool_blocks_public_recent_idx on
+qbit_pool_blocks), so it is neither an empty database nor a 2.x.x ledger, and 001's IF NOT EXISTS
+would keep those objects whatever they hold. Nothing was changed. Restore the full pre-migration
+backup, or migrate into an empty database
+```
+
+Objects the release does not create, an operator's own table for instance,
+do not disqualify a fresh database; they are kept and logged at warning
+level.
+
 **The release-schema check.** 001 is the idempotent schema every `2.x.x`
-start re-applied, so the migrator applies it first: that repairs everything
+start re-applied, so the migrator applies it next: that repairs everything
 001 re-asserts (its functions, its triggers, the columns and constraints it
 alters or re-adds by name). What `CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF
-NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` skip is checked next, before
+NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` skip is checked after it, before
 `002_multi_instance.sql` or any later native migration alters those tables.
-The expected definitions are not a stored fingerprint: inside the migration
-transaction the migrator opens a savepoint, creates a scratch schema, applies
-the same 001 there (plus `002_candidate_bodies.sql` for a #258 source), reads
-every table, column, constraint, index, trigger, function and sequence that
-produced, and rolls the savepoint back, so the comparison is exact for the
-PostgreSQL version in use and nothing from the scratch apply survives. Each
-object then needs an equivalent in the schema the migrator runs in: column
+It runs on a fresh database too, where 001 has just created everything and
+it passes trivially. Each object needs an equivalent in the schema the
+migrator runs in: column
 type, NOT NULL, default, identity and generated status, collation;
 constraints per table by definition; index definitions and validity; trigger
 definitions and enabled state; function arguments, result, language, body,
