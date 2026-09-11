@@ -59,6 +59,10 @@ are reused on same-connection reauthorization. Expiry, actual capacity eviction,
 payout replacement and disconnect release them. Reconnect still uses the exact
 worker ownership, same-parent, payout and absolute-expiry checks in Coordinator.
 Absolute expiry is checked again after an awaited resume returns.
+The connection timer checks both active and retained work before applying its
+initial-work timeout. Expiry of an older resumed job cannot disconnect a mature
+connection while newer retained work can still earn credit. Once both sets are
+empty, the existing timeout and username-permit cleanup still apply.
 
 Accepted records preserve issued economics and original-worker deduplication.
 Eligible prior-parent shares use the stale-grace policy and the current durable
@@ -89,6 +93,7 @@ focused regression evidence](prism-b8-prepared-dependency.md).
 | Real refresh orchestration at 1/32/128 clients with identical RPC counts; build/persist/publish gates; repeated refresh failure; stale-vs-unavailable resume; obsolete payout issuance | `coordinator/miner_tests/refresh.rs` |
 | Durable dependency expiry; delayed publication; return/redeparture; original bootstrap repair; concurrent repair and cancellation | `coordinator/miner_tests/prepared_expiry.rs` |
 | Actual socket delivery, original-worker retained dedup/weight, unknown-before-node-RPC, absolute expiry crossing resume | `stratum/stale_grace_tests.rs` |
+| Mature-session timer after resumed-job expiry, retained-job credit and final cleanup; unauthenticated/never-usable timeout controls | `stratum/session_timer_tests.rs` |
 | Zero/aged cache undelivered grace, real reconnect ownership and parent controls, TTL/capacity/permit lifecycle, unrelated-parent pruning, hard retention bound | `stratum/retained_tests.rs` |
 
 All paths are under `crates/qbit-prism-server/src/`. The prepared-dependency
@@ -125,6 +130,22 @@ PRISM_TEST_PG_BIN_DIR="$LOCAL_POSTGRES_BIN" \
   cargo +1.89.0 test --locked -j2 -p qbit-prism-server --all-targets \
     -- --test-threads=2 --nocapture
 ```
+
+With the same disposable environment, run the two explicit PostgreSQL acceptance
+targets as CI does. They fail when the database configuration is missing:
+
+```sh
+cargo +1.89.0 test --locked -j2 -p qbit-prism-server \
+  --test issued_job_dependency -- --ignored --test-threads=2
+cargo +1.89.0 test --locked -j2 -p qbit-prism-server \
+  --test stratum_admission_postgres -- --ignored --exact \
+  ten_thousand_unsubscribed_connections_do_not_advance_postgres_sequence
+```
+
+Final shipping qualification also runs `--workspace --all-targets`, exercising
+the separately landed payout-vector, window-corpus and SQL-window-oracle tests.
+The commit-specific result below is historical; final-head results belong in the
+PR's qualification record rather than being inferred from an older run.
 
 A full qualification must report the gated database, live node and physical
 failover tests as exercised, rather than counting their environment-skipped

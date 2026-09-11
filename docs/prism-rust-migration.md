@@ -416,6 +416,8 @@ recorded separately from D2a because it was approved on its own.
     block.
 - **D2 item:** D2c, prior balances during bootstrap.
 
+## Retained mining work
+
 Same-connection active eviction preserves the original worker, target and
 version mask, including after reauthorization. The configured per-connection
 retention count N bounds both the existing active set and the same-tip graveyard.
@@ -427,7 +429,9 @@ resume expiries are removed. Original username admission permits remain held
 while this retained work can credit, and are released on actual expiry, capacity
 eviction, payout replacement or disconnect. Reauthorization reuses the same
 connection's permit. Cross-connection resume still requires the exact original
-worker, a matching current parent and payout revision, and an unexpired lease.
+worker, the current published template's parent and payout revision, and an
+unexpired absolute job deadline. The durable current-revision fence remains
+separate from those original published payout inputs.
 
 ## Recovery and rollback
 
