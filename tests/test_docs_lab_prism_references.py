@@ -76,7 +76,9 @@ MODULE_REFERENCE = re.compile(r"\blab\.prism(?:\.[A-Za-z_][A-Za-z0-9_]*)*\b")
 # `--check-hash-based-pycs "always"` exactly as their bare spellings, since
 # the shell strips the quotes first. A bare argument therefore holds no quote
 # character at all: `-X 'dev"` is an unterminated shell string, not an option.
-PYTHON_FLAG = r"[bBdEhiIOPqsSuvVx]"
+# The flag letters are every single-letter option `python3 --help` lists on
+# CPython 3.14 other than `-c` and `-m`; `-?`, the alias of `-h`, is left out.
+PYTHON_FLAG = r"[bBdEhiIOPqRsSuvVx]"
 # A word the shell hands over as one argument: runs of unquoted characters
 # and matching-quoted strings (`'error'::Warning`, `"dev mode"`), non-empty.
 # Unquoted runs and quoted strings alternate rather than nest, so the pattern
@@ -103,11 +105,15 @@ PYTHON_COMMAND = (
 )
 # `python3 -m 'lab.a.b'` and `python3 "./lab/a/b.py"`. CPython resolves any
 # `./` prefixes on a script path, so ``target`` holds the normalised path.
+# The `--` terminator may precede a script path (`python3 -OO -- lab/a/b.py`
+# runs it on CPython 3.14) but never `-m`: after `--` CPython takes `-m` as a
+# script name and fails to open a file called `-m`, so `python3 -- -m lab.a.b`
+# runs nothing and is deliberately not a module command.
 MODULE_COMMAND = re.compile(
     rf"{PYTHON_COMMAND}\s+{MODULE_OPTION}" + quoted(r"(?P<target>lab(?:\.[A-Za-z_][A-Za-z0-9_]*)+)")
 )
 SCRIPT_COMMAND = re.compile(
-    rf"{PYTHON_COMMAND}\s+" + quoted(r"(?:\./)*(?P<target>lab/[A-Za-z0-9_./\-]+\.py)")
+    rf"{PYTHON_COMMAND}\s+(?:--\s+)?" + quoted(r"(?:\./)*(?P<target>lab/[A-Za-z0-9_./\-]+\.py)")
 )
 PINNED_GITHUB_URL = re.compile(
     r"github\.com/[^/\s]+/[^/\s]+/(?:blob|tree|raw)/[0-9a-f]{40}/$"
@@ -366,6 +372,8 @@ class ScannerTests(unittest.TestCase):
         "-OO",
         "-bb -u",
         "-IsE",
+        "-R",
+        "-ER -X dev",
         "-X dev",
         "-Xdev",
         "-W error",
@@ -432,6 +440,40 @@ class ScannerTests(unittest.TestCase):
         '--check-hash-based-pycs "never"',
     )
 
+    # On CPython 3.14, `python3 -- s.py` and `python3 -O -- s.py` run the
+    # script, while `python3 -- -m json.tool` fails with "can't open file
+    # '.../-m'": after `--` the `-m` is a script path, not an option.
+    def test_terminated_script_commands_with_missing_targets_are_caught(self) -> None:
+        for options in ("--", "-OO --", "-R -X dev --"):
+            with self.subTest(options=options):
+                self.assertEqual(
+                    self.commands(f"python3 {options} lab/prism/storm.py --decide"), ["lab/prism/storm.py"]
+                )
+                self.assertEqual(
+                    self.commands(f"python {options} './lab/prism/storm.py'"), ["lab/prism/storm.py"]
+                )
+
+    def test_terminated_script_commands_with_existing_targets_pass(self) -> None:
+        tracked = self.TRACKED | {"lab/prism/tool.py"}
+        text = (
+            "python3 -- lab/prism/tool.py\npython3.12 -OO -- \"./lab/prism/tool.py\"\n"
+            "python -R -- lab/prism/tool.py"
+        )
+        self.assertEqual(dead_commands(text, tracked), [])
+
+    def test_wrapped_terminated_script_command_with_missing_target_is_caught(self) -> None:
+        text = "python3 -OO \\\n  -- \\\n  lab/prism/storm.py \\\n  --decide"
+        self.assertEqual(self.located(text), [(1, "lab/prism/storm.py")])
+
+    def test_terminator_before_module_option_is_not_a_command(self) -> None:
+        # CPython treats everything after `--` as the script path and its
+        # arguments, so `-m` names a file called `-m` that does not exist and
+        # nothing runs; the prose contract still sees the module reference.
+        for text in ("python3 -- -m lab.prism.x", "python3 -OO -- -m lab.prism.x"):
+            with self.subTest(text=text):
+                self.assertEqual(self.commands(text), [])
+                self.assertEqual(self.references(text), ["lab.prism.x"])
+
     def test_quoted_option_arguments_with_missing_targets_are_caught(self) -> None:
         for options in self.QUOTED_OPTIONS:
             with self.subTest(options=options):
@@ -476,9 +518,10 @@ class ScannerTests(unittest.TestCase):
             with self.subTest(script=script):
                 self.assertEqual(self.commands(f"python3 {script} --decide"), ["lab/prism/storm.py"])
 
-    # Every `-m` spelling here ran `json.tool` on CPython 3.12; `-Wm json.tool`
-    # and `-Xm json.tool` did not, opening `json.tool` as a script instead.
-    ADJACENT_MODULE_OPTIONS = ("-m{}", "-m'{}'", "-Im {}", "-OOm {}", "-Im{}")
+    # Every `-m` spelling here ran `json.tool` on CPython 3.12 (`-Rm` on 3.14);
+    # `-Wm json.tool` and `-Xm json.tool` did not, opening `json.tool` as a
+    # script instead.
+    ADJACENT_MODULE_OPTIONS = ("-m{}", "-m'{}'", "-Im {}", "-OOm {}", "-Im{}", "-Rm {}")
 
     def test_adjacent_module_options_with_missing_targets_are_caught(self) -> None:
         for option in self.ADJACENT_MODULE_OPTIONS:
