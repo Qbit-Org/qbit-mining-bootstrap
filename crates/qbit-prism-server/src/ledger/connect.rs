@@ -22,6 +22,13 @@ pub(super) struct SessionOwner {
 struct ActiveSession(std::sync::Arc<SessionOwner>);
 
 impl SessionOwner {
+    #[cfg(test)]
+    fn new_for_tests() -> Self {
+        Self {
+            token: Uuid::new_v4().to_string(),
+            state: std::sync::Mutex::default(),
+        }
+    }
     fn start(self: &std::sync::Arc<Self>) -> Result<ActiveSession> {
         let mut state = self.state.lock().unwrap();
         ensure!(!state.stopped, "session allocator is stopped");
@@ -111,6 +118,14 @@ impl Drop for SessionId {
 }
 
 impl Ledger {
+    #[cfg(test)]
+    pub(crate) fn offline_for_tests(pool: PgPool, instance_id: String) -> Self {
+        Self {
+            pool,
+            instance_id,
+            session_owner: std::sync::Arc::new(SessionOwner::new_for_tests()),
+        }
+    }
     pub async fn connect(
         url: &str,
         instance_id: String,
