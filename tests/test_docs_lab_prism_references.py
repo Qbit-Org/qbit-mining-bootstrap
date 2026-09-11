@@ -5,7 +5,11 @@ Two contracts over every tracked file under ``docs/``:
 
 a. No runnable ``python -m lab.…`` or ``python lab/….py`` command invokes a
    module or script absent from the branch, however it is wrapped across shell
-   backslash continuation lines. There is no allowlist. The check is lexical:
+   backslash continuation lines. A ``-m`` target must be a module file
+   (``lab/a/b.py``) or a package with ``lab/a/b/__main__.py``: CPython refuses
+   to run a package that has only ``__init__.py``, and a bare directory is a
+   namespace package with the same refusal, while a module file inside such a
+   directory runs. There is no allowlist. The check is lexical:
    it reads direct ``python``/``python3``/``python3.N`` invocations with their
    CPython option forms, quoted interpreter names and targets and ``./``
    prefixes, and does not
@@ -108,8 +112,21 @@ def tracked_paths() -> frozenset[str]:
 
 
 def module_candidates(module: str) -> tuple[str, ...]:
+    """Every tracked path a prose ``lab.a.b`` mention may name: file, package or directory."""
     relative = module.replace(".", "/")
     return (f"{relative}.py", f"{relative}/__init__.py", relative)
+
+
+def runnable_candidates(module: str) -> tuple[str, str]:
+    """The paths ``python -m lab.a.b`` can execute: a module file or a package ``__main__``.
+
+    Neither ``__init__.py`` nor a bare directory counts: CPython 3.14 answers
+    both with "No module named lab.a.b.__main__; 'lab.a.b' is a package and
+    cannot be directly executed" and exits 1, while ``lab/a/b.py`` runs even
+    when ``lab/a`` is a namespace package without ``__init__.py``.
+    """
+    relative = module.replace(".", "/")
+    return (f"{relative}.py", f"{relative}/__main__.py")
 
 
 def shell_lines(text: str) -> list[tuple[int, str]]:
@@ -125,13 +142,18 @@ def shell_lines(text: str) -> list[tuple[int, str]]:
 
 
 def dead_commands(text: str, tracked: frozenset[str]) -> list[tuple[int, str, str]]:
-    """``(first line, command, missing path)`` for each runnable command with no target."""
+    """``(first line, command, missing path)`` for each runnable command with no target.
+
+    A dead ``-m`` command reports both paths that would make it runnable, joined
+    by ``or``, so the reader is not sent to create ``lab/a/b.py`` beside a
+    tracked ``lab/a/b/`` package that merely lacks ``__main__.py``.
+    """
     found = []
     for number, line in shell_lines(text):
         for match in MODULE_COMMAND.finditer(line):
-            candidates = module_candidates(match.group("target"))[:2]
+            candidates = runnable_candidates(match.group("target"))
             if not any(candidate in tracked for candidate in candidates):
-                found.append((number, match.group(0), candidates[0]))
+                found.append((number, match.group(0), " or ".join(candidates)))
         for match in SCRIPT_COMMAND.finditer(line):
             if match.group("target") not in tracked:
                 found.append((number, match.group(0), match.group("target")))
@@ -220,6 +242,9 @@ class DocsLabPrismReferenceTests(unittest.TestCase):
 
 class ScannerTests(unittest.TestCase):
     TRACKED = frozenset({"lab", "lab/prism", "lab/prism/Dockerfile"})
+    # What `dead_commands` reports for `-m lab.prism.process_telemetry`: either
+    # path would make the command runnable, so both are named.
+    TELEMETRY = "lab/prism/process_telemetry.py or lab/prism/process_telemetry/__main__.py"
 
     def references(self, text: str) -> list[str]:
         return [ref for _, ref in dangling_references(text, self.TRACKED)]
@@ -252,19 +277,55 @@ class ScannerTests(unittest.TestCase):
     def test_module_commands_with_missing_targets_are_caught(self) -> None:
         self.assertEqual(
             self.commands("python3 -m lab.prism.process_telemetry rss-bound --samples s.csv \\"),
-            ["lab/prism/process_telemetry.py"],
+            [self.TELEMETRY],
         )
         self.assertEqual(
             self.commands('docker exec "$c" python3 -m lab.prism.process_telemetry rss-sample --pid 1'),
-            ["lab/prism/process_telemetry.py"],
+            [self.TELEMETRY],
         )
-        self.assertEqual(self.commands("python -u -m lab.tool run"), ["lab/tool.py"])
+        self.assertEqual(self.commands("python -u -m lab.tool run"), ["lab/tool.py or lab/tool/__main__.py"])
         self.assertEqual(self.commands("python3 lab/prism/storm.py --decide"), ["lab/prism/storm.py"])
 
     def test_commands_with_existing_targets_pass(self) -> None:
-        tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py"}
+        tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py", "lab/pkg/__main__.py"}
         text = "python3 -m lab.prism.tool\npython -m lab.pkg\npython3 lab/prism/tool.py"
         self.assertEqual(dead_commands(text, tracked), [])
+
+    # Verified on CPython 3.14: `python3 -m lab.pkg` with only `lab/pkg/__init__.py`,
+    # or with a bare `lab/pkg/` directory, prints "No module named
+    # lab.pkg.__main__; 'lab.pkg' is a package and cannot be directly executed"
+    # and exits 1; with `lab/pkg/__main__.py` it runs, and `python3 -m
+    # lab.auxpow.vardiff` runs `lab/auxpow/vardiff.py` with no `lab/auxpow/__init__.py`.
+    def test_module_command_on_init_only_package_is_dead(self) -> None:
+        tracked = self.TRACKED | {"lab/pkg", "lab/pkg/__init__.py"}
+        self.assertEqual(
+            dead_commands("python3 -m lab.pkg run", tracked),
+            [(1, "python3 -m lab.pkg", "lab/pkg.py or lab/pkg/__main__.py")],
+        )
+
+    def test_module_command_on_namespace_directory_is_dead(self) -> None:
+        tracked = self.TRACKED | {"lab/auxpow", "lab/auxpow/vardiff.py"}
+        self.assertEqual(
+            dead_commands("python3 -m lab.auxpow", tracked),
+            [(1, "python3 -m lab.auxpow", "lab/auxpow.py or lab/auxpow/__main__.py")],
+        )
+
+    def test_module_command_on_package_with_main_passes(self) -> None:
+        tracked = self.TRACKED | {"lab/pkg", "lab/pkg/__init__.py", "lab/pkg/__main__.py"}
+        self.assertEqual(dead_commands("python3 -m lab.pkg run", tracked), [])
+        self.assertEqual(dead_commands("python3 -m lab.pkg", self.TRACKED | {"lab/pkg/__main__.py"}), [])
+
+    def test_module_command_on_file_inside_namespace_package_passes(self) -> None:
+        tracked = self.TRACKED | {"lab/auxpow", "lab/auxpow/vardiff.py"}
+        self.assertEqual(dead_commands("python3 -m lab.auxpow.vardiff --help", tracked), [])
+
+    def test_prose_mention_of_init_only_package_is_not_dangling(self) -> None:
+        # The prose contract asks whether the name exists, not whether it runs:
+        # `lab.prism.pkg` still resolves through `.py`, `__init__.py` or the directory.
+        tracked = self.TRACKED | {"lab/prism/pkg", "lab/prism/pkg/__init__.py"}
+        self.assertEqual(dangling_references("see lab.prism.pkg", tracked), [])
+        self.assertEqual(dangling_references("see lab.prism.bare", self.TRACKED | {"lab/prism/bare"}), [])
+        self.assertEqual(dangling_references("see lab.prism.gone", tracked), [(1, "lab.prism.gone")])
 
     def test_wrapped_module_commands_with_missing_targets_are_caught(self) -> None:
         for wrapped in (
@@ -274,14 +335,14 @@ class ScannerTests(unittest.TestCase):
         ):
             with self.subTest(wrapped=wrapped):
                 text = f"```bash\ncd repo\n{wrapped} \\\n  --samples s.csv\n```"
-                self.assertEqual(self.located(text), [(3, "lab/prism/process_telemetry.py")])
+                self.assertEqual(self.located(text), [(3, self.TELEMETRY)])
 
     def test_wrapped_script_command_with_missing_target_is_caught(self) -> None:
         text = "python3 \\\n  lab/prism/storm.py \\\n  --decide"
         self.assertEqual(self.located(text), [(1, "lab/prism/storm.py")])
 
     def test_wrapped_commands_with_existing_targets_pass(self) -> None:
-        tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py"}
+        tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py", "lab/pkg/__main__.py"}
         text = "python3 -m \\\n  lab.prism.tool\npython \\\n  -m lab.pkg\npython3 \\\n  lab/prism/tool.py"
         self.assertEqual(dead_commands(text, tracked), [])
 
@@ -303,7 +364,7 @@ class ScannerTests(unittest.TestCase):
             with self.subTest(options=options):
                 self.assertEqual(
                     self.commands(f"python3 {options} -m lab.prism.process_telemetry rss-bound"),
-                    ["lab/prism/process_telemetry.py"],
+                    [self.TELEMETRY],
                 )
                 self.assertEqual(
                     self.commands(f"python {options} lab/prism/storm.py --decide"),
@@ -311,7 +372,7 @@ class ScannerTests(unittest.TestCase):
                 )
 
     def test_commands_with_real_option_forms_and_existing_targets_pass(self) -> None:
-        tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py"}
+        tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py", "lab/pkg/__main__.py"}
         for options in self.OPTIONS:
             with self.subTest(options=options):
                 text = (
@@ -325,7 +386,7 @@ class ScannerTests(unittest.TestCase):
             wrapped = options.replace(" ", " \\\n  ")
             with self.subTest(options=options):
                 text = f"python3 \\\n  {wrapped} \\\n  -m lab.prism.process_telemetry \\\n  rss-bound"
-                self.assertEqual(self.located(text), [(1, "lab/prism/process_telemetry.py")])
+                self.assertEqual(self.located(text), [(1, self.TELEMETRY)])
                 text = f"python3.12 {wrapped} \\\n  lab/prism/storm.py \\\n  --decide"
                 self.assertEqual(self.located(text), [(1, "lab/prism/storm.py")])
 
@@ -334,7 +395,7 @@ class ScannerTests(unittest.TestCase):
             with self.subTest(quote=quote):
                 self.assertEqual(
                     self.commands(f"python3 -m {quote}lab.prism.process_telemetry{quote} rss-bound"),
-                    ["lab/prism/process_telemetry.py"],
+                    [self.TELEMETRY],
                 )
                 self.assertEqual(
                     self.commands(f"python3 {quote}lab/prism/storm.py{quote} --decide"),
@@ -354,19 +415,19 @@ class ScannerTests(unittest.TestCase):
         for option in self.ADJACENT_MODULE_OPTIONS:
             with self.subTest(option=option):
                 text = f"python3 {option.format('lab.prism.process_telemetry')} rss-bound"
-                self.assertEqual(self.commands(text), ["lab/prism/process_telemetry.py"])
+                self.assertEqual(self.commands(text), [self.TELEMETRY])
         self.assertEqual(self.commands("python3 -Wm lab.prism.process_telemetry"), [])
         self.assertEqual(self.commands("python3 -Xm lab.prism.process_telemetry"), [])
 
     def test_adjacent_module_options_with_existing_targets_pass(self) -> None:
-        tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py"}
+        tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py", "lab/pkg/__main__.py"}
         for option in self.ADJACENT_MODULE_OPTIONS:
             with self.subTest(option=option):
                 text = f"python3 {option.format('lab.prism.tool')}\npython3.12 {option.format('lab.pkg')}"
                 self.assertEqual(dead_commands(text, tracked), [])
 
     def test_quoted_and_dot_relative_forms_with_existing_targets_pass(self) -> None:
-        tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py"}
+        tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py", "lab/pkg/__main__.py"}
         text = (
             "python3 -m 'lab.prism.tool'\npython -m \"lab.pkg\"\npython3 'lab/prism/tool.py'\n"
             "python3 \"./lab/prism/tool.py\"\npython3 ./lab/prism/tool.py"
@@ -375,7 +436,7 @@ class ScannerTests(unittest.TestCase):
 
     def test_wrapped_quoted_targets_with_missing_targets_are_caught(self) -> None:
         text = "python3 -m \\\n  'lab.prism.process_telemetry' \\\n  rss-bound"
-        self.assertEqual(self.located(text), [(1, "lab/prism/process_telemetry.py")])
+        self.assertEqual(self.located(text), [(1, self.TELEMETRY)])
         text = "python3 \\\n  \"./lab/prism/storm.py\" \\\n  --decide"
         self.assertEqual(self.located(text), [(1, "lab/prism/storm.py")])
 
@@ -395,16 +456,16 @@ class ScannerTests(unittest.TestCase):
             with self.subTest(quote=quote):
                 for interpreter in ("python3", "python3.12", "python"):
                     text = f"{quote}{interpreter}{quote} -m lab.prism.process_telemetry rss-bound"
-                    self.assertEqual(self.commands(text), ["lab/prism/process_telemetry.py"])
+                    self.assertEqual(self.commands(text), [self.TELEMETRY])
                     text = f"{quote}{interpreter}{quote} lab/prism/storm.py --decide"
                     self.assertEqual(self.commands(text), ["lab/prism/storm.py"])
                 self.assertEqual(
                     self.commands(f"{quote}python{quote} -OO -m {quote}lab.prism.process_telemetry{quote}"),
-                    ["lab/prism/process_telemetry.py"],
+                    [self.TELEMETRY],
                 )
 
     def test_quoted_interpreters_with_existing_targets_pass(self) -> None:
-        tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py"}
+        tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py", "lab/pkg/__main__.py"}
         text = (
             "\"python3\" -m lab.prism.tool\n'python3.12' -OO -m lab.pkg\n\"python\" lab/prism/tool.py\n"
             "'python3' \"./lab/prism/tool.py\""
@@ -416,7 +477,7 @@ class ScannerTests(unittest.TestCase):
         # it, so the interpreter quote is empty and the inner command is read.
         self.assertEqual(
             self.commands('sh -c "python3 -m lab.prism.process_telemetry rss-bound"'),
-            ["lab/prism/process_telemetry.py"],
+            [self.TELEMETRY],
         )
         self.assertEqual(self.commands("sh -c 'python3.12 lab/prism/storm.py --decide'"), ["lab/prism/storm.py"])
 
@@ -428,14 +489,14 @@ class ScannerTests(unittest.TestCase):
 
     def test_wrapped_quoted_interpreter_is_caught_at_the_right_line(self) -> None:
         text = "```bash\ncd repo\n\"python3\" \\\n  -m lab.prism.process_telemetry \\\n  rss-bound\n```"
-        self.assertEqual(self.located(text), [(3, "lab/prism/process_telemetry.py")])
+        self.assertEqual(self.located(text), [(3, self.TELEMETRY)])
         text = "'python3.12' -OO \\\n  lab/prism/storm.py \\\n  --decide"
         self.assertEqual(self.located(text), [(1, "lab/prism/storm.py")])
 
     def test_version_suffixed_interpreters_are_scanned(self) -> None:
         self.assertEqual(
             self.commands("python3.12 -m lab.prism.process_telemetry rss-bound"),
-            ["lab/prism/process_telemetry.py"],
+            [self.TELEMETRY],
         )
         self.assertEqual(self.commands("python3.14 -OO lab/prism/storm.py"), ["lab/prism/storm.py"])
         self.assertEqual(self.commands("python2 -m lab.prism.process_telemetry"), [])
