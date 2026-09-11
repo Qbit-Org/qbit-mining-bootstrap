@@ -171,8 +171,10 @@ impl Ledger {
         // The startup gate. Every start, with or without `initialize`, reads
         // the schema version and the declared capabilities before any
         // accounting statement: a newer binary never reaches the claim path
-        // on a database it has not migrated, and an older binary never
-        // writes a database newer than itself.
+        // on a database it has not migrated, and an older binary is kept off
+        // a format it must not touch by the capabilities a release declares,
+        // not by the version number, so a rollout can replace one frontend
+        // at a time.
         migration::require_schema_version(&pool).await?;
         migration::require_known_capabilities(&pool).await?;
         let ledger = Self {

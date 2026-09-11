@@ -682,30 +682,34 @@ async fn startup_without_initialize_requires_the_current_schema_version() -> Res
         Some("init".into())
     );
 
-    // A newer schema: a later release migrated it.
+    // A newer schema: a later release's additive migration ran first, and a
+    // frontend still on this release keeps starting during the rollout. A
+    // format it must not touch is declared as a capability, which
+    // newer_storage_version_or_capability_is_refused_at_migrate_and_at_connect
+    // covers.
     sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES($1)")
         .bind(REQUIRED_SCHEMA_VERSION + 1)
         .execute(&pool)
         .await?;
-    let error = Ledger::connect(&db.url, "cold".into(), 8, false)
+    let follower = Ledger::connect(&db.url, "cold".into(), 8, false)
         .await
-        .err()
-        .context("a start accepted a newer schema")?
-        .to_string();
-    assert!(
-        error.contains(&format!(
-            "schema version {} is newer than the version {REQUIRED_SCHEMA_VERSION} this server supports",
-            REQUIRED_SCHEMA_VERSION + 1
-        )),
-        "{error}"
+        .context("a start refused an additive newer schema")?;
+    assert_eq!(
+        schema_version(&pool).await?,
+        REQUIRED_SCHEMA_VERSION + 1,
+        "a non-initializing start rewrote the newer schema"
     );
-    sqlx::query("DELETE FROM qbit_prism_schema_migrations WHERE version=$1")
-        .bind(REQUIRED_SCHEMA_VERSION + 1)
-        .execute(&pool)
-        .await?;
-    let follower = Ledger::connect(&db.url, "cold".into(), 8, false).await?;
+    // Initializing on it is a no-op too: no migration is reapplied and the
+    // source record stands.
+    let initializer = db.ledger("init-on-newer").await?;
+    assert_eq!(schema_version(&pool).await?, REQUIRED_SCHEMA_VERSION + 1);
+    assert_eq!(
+        initializer.migration_source().await?.map(|s| s.migrated_by),
+        Some("init".into())
+    );
     pool.close().await;
-    db.close(vec![ledger, repaired, follower]).await
+    db.close(vec![ledger, repaired, follower, initializer])
+        .await
 }
 
 #[tokio::test]

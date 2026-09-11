@@ -33,9 +33,11 @@ and vardiff bounds and rejects the test-key allowances.
 default is false. Prefer an explicit `migrate` step for production cutover.
 Migration refuses a live legacy Python writer lease and prevents reacquisition,
 accepts only the pinned `2.x.x` source schemas, and refuses an undrained
-candidate outbox. Every start, with or without initialization, requires the
-schema version this release migrates to and refuses capabilities it does not
-understand; see the [migration guide](../../docs/prism-rust-migration.md).
+candidate outbox. Every start, with or without initialization, refuses a
+schema below the version this release migrates to and refuses capabilities it
+does not understand; a newer schema is accepted with a warning, so a rollout
+can replace one frontend at a time. See the
+[migration guide](../../docs/prism-rust-migration.md).
 
 ## Commands
 

@@ -154,12 +154,15 @@ every start logs it, and a repeated `migrate` never rewrites it.
 
 **Startup gate.** Every start reads `qbit_prism_schema_migrations` and
 `qbit_prism_schema_capabilities`, with or without
-`PRISM_POSTGRES_INIT_SCHEMA`. A database below schema version 6, above it, or
-declaring a capability or `candidate_storage_version` this release does not
-understand is refused at connect, naming the required version, before any
-accounting statement runs. With the native default
-`PRISM_POSTGRES_INIT_SCHEMA=0` that means a newer binary refuses to start until
-`migrate` has run, instead of failing later in the claim path.
+`PRISM_POSTGRES_INIT_SCHEMA`. A database below schema version 6 is refused at
+connect, naming the required version, before any accounting statement runs,
+and so is one declaring a capability or `candidate_storage_version` this
+release does not understand. A database above version 6 is accepted with a
+warning that names both versions: native migrations are additive, and a
+release whose format an older binary must not touch declares a capability.
+With the native default `PRISM_POSTGRES_INIT_SCHEMA=0` that means a newer
+binary refuses to start until `migrate` has run, instead of failing later in
+the claim path.
 
 `import-audits` processes database rows whose audit body is external. It resolves
 full v1/v1.1 bodies, legacy body refs, and v2 proof bodies, verifies segment
@@ -237,9 +240,12 @@ Check these before restoring ordinary traffic:
 - Candidate and CTV claim recovery work after a process interruption.
 
 A subsequent rollout between compatible **Rust** versions may drain and replace
-one frontend at a time. Review each version's schema compatibility separately:
-a release that adds a migration requires its schema version exactly, so run its
-`migrate` with every frontend stopped and start the new binaries afterwards.
+one frontend at a time. Review each version's schema compatibility separately.
+Run the new release's `migrate` first; frontends still on the previous release
+keep starting on the newer schema while its migrations are additive and it
+declares no capability they do not understand, so they can be drained and
+replaced one at a time. A release that declares a new capability needs every
+frontend stopped first.
 
 ## HA durability and failover
 
