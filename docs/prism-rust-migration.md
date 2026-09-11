@@ -93,7 +93,7 @@ release definition:
 | #258 applied (v2.0.2) | `candidate_storage_version = 2` and every `002_candidate_bodies.sql` object present | accept after the drain check |
 | partial 002 | some 002 objects or the capability row, but not all (v2.0.2 applies 001 and 002 as two script calls, and a restart between them leaves this) | refuse, naming the missing object; finish 002 with the v2.0.2 release (`PRISM_POSTGRES_INIT_SCHEMA=1`) or restore the backup |
 | newer | `candidate_storage_version > 2`, or a capability this release does not know | refuse before any DDL; a newer PRISM release wrote the database |
-| drifted 001 | a 001 (or 002) object whose definition, after 001 has run, differs from the frozen release: a table, column, index, sequence or named constraint that 001's `IF NOT EXISTS` skipped, or any 002 object, with a dropped constraint, a changed type, nullability or default, a different index definition, an altered sequence (a lowered maximum, a different increment), a replaced function body or a disabled trigger | refuse transactionally, naming each object and what differs; the migration rolls back and the database is unchanged; restore the pre-migration backup or bring the database to the release schema with the `2.x.x` release, then migrate again |
+| drifted 001 | a 001 (or 002) object whose definition, after 001 has run, differs from the frozen release: a table, column, index, sequence or named constraint that 001's `IF NOT EXISTS` skipped, or any 002 object, with a dropped constraint, a changed type, nullability or default, a different index definition, an altered sequence (a lowered maximum, a different increment), a table or sequence made `UNLOGGED` (or temporary), a replaced function body or a disabled trigger | refuse transactionally, naming each object and what differs; the migration rolls back and the database is unchanged; restore the pre-migration backup or bring the database to the release schema with the `2.x.x` release, then migrate again |
 
 **The release definitions.** They are not a stored fingerprint: before any
 DDL touches the source, inside the migration transaction, the migrator opens
@@ -133,7 +133,11 @@ NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` skip is checked after it, before
 `002_multi_instance.sql` or any later native migration alters those tables.
 It runs on a fresh database too, where 001 has just created everything and
 it passes trivially. Each object needs an equivalent in the schema the
-migrator runs in: column
+migrator runs in: for every table and sequence its persistence (the release
+creates ordinary logged relations, and an `UNLOGGED` or temporary table is
+one whose rows PostgreSQL truncates after a crash, so it is drift whatever
+its columns say; a sequence follows its table's persistence on PostgreSQL 15
+and later); column
 type, NOT NULL, default, identity and generated status, collation;
 constraints per table by definition; index definitions and validity; trigger
 definitions and enabled state; function arguments, result, language, body,
