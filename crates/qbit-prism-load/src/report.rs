@@ -37,11 +37,22 @@ pub fn honest_value_notes() -> Value {
         {
             "field": "phases.*.offered_valid_shares",
             "note": "Counts shares the harness believed valid when it offered them: every \
-                     acknowledged share, plus any rejection classified as a harness bug, plus any \
-                     submit that received no response. Transient rejections the server is \
-                     entitled to make (stale-job after a tip change or a payout-revision bump) \
-                     are excluded here and reported in full under `rejections`; none of them \
-                     persists a share, so they cannot affect reconciliation."
+                     acknowledged share, plus every rejection that is not a race the server was \
+                     entitled to lose, plus every submit that received no response. Only the \
+                     transient rejections (stale-job after a tip change or a payout-revision \
+                     bump, an unknown or retired job, a closed pool) are excluded; none of them \
+                     persists a share, so none can affect reconciliation. A backend refusal \
+                     such as `current chain state is unavailable` or `share was not confirmed \
+                     by the database` is a capacity result rather than a harness defect, but it \
+                     stays in `offered_valid_shares` and in `rejected_valid_shares` so the \
+                     artifact cannot hide it."
+        },
+        {
+            "field": "rejected_valid_shares",
+            "note": "Every rejection except the entitled races. Only the harness-bug classes \
+                     (low-difficulty, malformed-submit, duplicate-share, invalid-*, \
+                     unauthorized-worker) make the run exit non-zero; a backend refusal is \
+                     counted, reported and left to the reader as a capacity finding."
         },
         {
             "field": "phases.slow_database.database_delay_milliseconds",

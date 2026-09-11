@@ -186,9 +186,28 @@ forecast of 2,000 shares/s that phase's gate fails.
 
 **That is a result, not a harness bug.** The artifact is emitted anyway, the
 run exits 0 if it completed and reconciled, and the verdict is reported. To
-demonstrate a validating artifact, re-run the validator with a forecast no
-higher than half the slowest phase's rate; the side report prints that number
-as `validator.suggested_forecast_for_a_valid_artifact`.
+demonstrate a validating artifact, run again with a forecast no higher than
+half the slowest phase's rate; the side report prints that number as
+`validator.suggested_forecast_for_a_valid_artifact`.
+
+Two other gates bind in the same phase, and the side report prints what each
+of them would need:
+
+- **The ACK p99 limit.** Under delay the phase's client ACK p99 runs into
+  seconds, well past the 1,000 ms default. `--ack-p99-limit-ms` can be raised
+  as far as `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS` × 1000 and no further, because
+  the consumer refuses anything above it;
+  `validator.suggested_ack_p99_limit_milliseconds` is the rounded-up value the
+  run would need, capped at that ceiling. When the observed p99 is above the
+  ceiling, no limit admits the phase, and that too is a result.
+- **`offered == acknowledged`.** Under delay the frontends' readiness poll goes
+  stale behind the blocked refresh loop and submits are refused with `current
+  chain state is unavailable`. Those refusals are counted, so the phase reports
+  more offered than acknowledged.
+
+Because the forecast and the limit are recorded in the artifact and checked
+against the expectations, changing either means running again, not
+re-validating the same file.
 
 ## Honest values
 
@@ -206,12 +225,19 @@ The side report repeats all of this under `honest_value_notes`.
   transaction, no batching delay, and no such native sweep — and records them
   as unread. A value like `64`/`5` would suggest batching that does not exist.
 - **`offered_valid_shares`** counts shares the harness believed valid when it
-  offered them: every acknowledged share, plus any rejection classified as a
-  harness bug, plus any submit that received no response. Transient rejections
-  the server is entitled to make — `stale-job` after a tip change or a
-  payout-revision bump — are excluded there and reported in full under
-  `rejections`. None of them persists a share, so none can affect
-  reconciliation.
+  offered them: every acknowledged share, plus every rejection that is not a
+  race the server was entitled to lose, plus every submit that received no
+  response. Only the transient rejections are excluded — `stale-job` after a
+  tip change or a payout-revision bump, an unknown or retired job, a closed
+  pool — and they are reported in full under `rejections`. None of those
+  persists a share, so none can affect reconciliation.
+- **A backend refusal is counted, not hidden.** `current chain state is
+  unavailable` and `share was not confirmed by the database` are capacity
+  results rather than harness defects, so they do not make the run exit
+  non-zero, but they stay in `offered_valid_shares` and in
+  `rejected_valid_shares`. The artifact is then honestly invalid for that
+  phase. Only the harness-bug classes — `low-difficulty`, `malformed-submit`,
+  `duplicate-share`, every `invalid-*` and `unauthorized-worker` — exit 5.
 - **ACK latency is client-measured**, from writing the submit line to reading
   its response line, on the client's monotonic clock. The server's own
   `qbit_prism_share_ack_seconds` histogram measures a narrower, server-side

@@ -669,7 +669,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             offered: reconciliation.offered.len() as u64,
             acknowledged: reconciliation.acknowledged.len() as u64,
             committed: reconciliation.committed.len() as u64,
-            rejected_valid: harness_bug_count(&collected.submits, &phase.plan.name),
+            rejected_valid: rejected_valid_count(&collected.submits, &phase.plan.name),
             missing: reconciliation.missing.len() as u64,
             unexpected: *unexpected_by_phase.get(&phase.plan.name).unwrap_or(&0) as u64,
             acknowledged_digest: reconciliation.acknowledged_digest(),
@@ -1319,9 +1319,28 @@ fn harness_bug_count(records: &[SubmitRecord], phase: &str) -> u64 {
         .count() as u64
 }
 
-/// O and A for one phase. A share whose rejection the server was entitled to
-/// make is not an offered valid share; it never reaches PostgreSQL, and the
-/// full census is in the side report.
+/// A rejection of a share the harness believed valid: everything except the
+/// races the server is entitled to lose. A backend refusal is a capacity
+/// result, not a harness defect, but it is still a share that did not get its
+/// acknowledgement, so the artifact has to carry it.
+fn rejected_valid(record: &SubmitRecord) -> bool {
+    !record.reoffer
+        && rejection_of(record)
+            .map(|rejection| classify::classify(rejection) != RejectionClass::Expected)
+            .unwrap_or(false)
+}
+
+fn rejected_valid_count(records: &[SubmitRecord], phase: &str) -> u64 {
+    records
+        .iter()
+        .filter(|record| record.phase == phase && rejected_valid(record))
+        .count() as u64
+}
+
+/// O and A for one phase. A share the server refused in a race it was entitled
+/// to lose is not an offered valid share: it never reaches PostgreSQL, and the
+/// full census is in the side report. Everything else the harness offered and
+/// did not get acknowledged stays in O, so the artifact cannot hide it.
 fn offered_and_acknowledged(
     records: &[SubmitRecord],
     phase: &str,
@@ -1341,7 +1360,7 @@ fn offered_and_acknowledged(
                 offered.insert(record.share_id.clone());
             }
             Outcome::Rejected(rejection) => {
-                if classify::classify(rejection) == RejectionClass::HarnessBug {
+                if classify::classify(rejection) != RejectionClass::Expected {
                     offered.insert(record.share_id.clone());
                 }
             }
@@ -1551,6 +1570,8 @@ fn phase_report(
         "min_mem_available_kib": phase.min_mem_available_kib,
         "scheduled_blocks": phase.scheduled_blocks,
         "frontend_restarts": phase.frontend_restarts,
+        "rejected_valid_shares": rejected_valid_count(&collected.submits, &phase.plan.name),
+        "harness_bug_rejections": harness_bug_count(&collected.submits, &phase.plan.name),
         "reconciliation": reconciliation.map(|rec| json!({
             "offered": rec.offered.len(),
             "acknowledged": rec.acknowledged.len(),
