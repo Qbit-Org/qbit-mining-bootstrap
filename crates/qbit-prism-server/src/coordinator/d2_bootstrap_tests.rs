@@ -6,10 +6,13 @@
 //!   proportional window applies, and 2.x.x's `PRISM_MIN_READY_MINERS=3`
 //!   readiness gate is *not* restored.
 //! * **D2c, prior balances during bootstrap.** Carried-forward balances stay
-//!   in the payout of a bootstrap block. The bundle a bootstrap job carries is
-//!   pinned here for the balances the ledger actually holds; the carry-only
-//!   case still needs a way to reach an empty window alongside a non-zero
-//!   carry, which 3.x.x's own write paths cannot produce.
+//!   in the payout of a bootstrap block. That combination -- an empty payout
+//!   window beside a non-zero carry -- is the *migrated* state a pool reaches
+//!   when it inherits balances without the share history that earned them, and
+//!   3.x.x's own write paths cannot produce it in one schema. The test
+//!   therefore records the carrying parent block's rows directly, from the
+//!   engine's own verified payout manifest; `seed_carry_forward_block`
+//!   documents why, and what that recording mirrors.
 //!
 //! The before/after examples live in `docs/prism-rust-migration.md`, section
 //! "Payout differences from 2.x.x (decision D2)", and their machine-readable
@@ -37,7 +40,7 @@
 use super::*;
 use anyhow::{anyhow, bail};
 use axum::{extract::State, routing::post, Json, Router};
-use qbit_prism::{CarryForwardBalance, PayoutPolicy};
+use qbit_prism::{CarryForwardBalance, PayoutPolicy, PoolFeePolicy};
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
 
@@ -422,6 +425,7 @@ struct Fixture {
     admin: PgPool,
     schema: String,
     coordinator: Arc<Coordinator>,
+    node: Arc<Mutex<NodeState>>,
     server: JoinHandle<()>,
 }
 
@@ -502,6 +506,7 @@ impl Fixture {
                 admin,
                 schema,
                 coordinator,
+                node,
                 server,
             }),
             Err(error) => {
@@ -754,6 +759,248 @@ async fn an_empty_ledger_pays_the_solver_through_a_synthetic_bootstrap_share() -
     .await;
     fixture.close().await?;
     result
+}
+
+// ---------------------------------------------------------------------------
+// D2c: prior balances during bootstrap
+// ---------------------------------------------------------------------------
+
+/// An empty share window with one carry-only account whose balance is above
+/// the day-one floor. 2.x.x dropped prior balances from its collection bundle
+/// and did not pay that account; 3.x.x keeps the snapshot's prior balances in
+/// the bootstrap bundle, so the account is paid out of this block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bootstrap_block_still_pays_carried_forward_balances() -> Result<()> {
+    let Some(url) = database_url("a_bootstrap_block_still_pays_carried_forward_balances")? else {
+        return Ok(());
+    };
+    let _serial = TEST_LOCK.lock().await;
+    let case = vector_case(
+        "bootstrap-carry-only-account-at-or-above-floor",
+        Some("d2c-prior-balances-during-bootstrap"),
+    )?;
+    let scenario = scenario(&case)?;
+    ensure!(
+        scenario.ledger_shares.is_empty() && scenario.prior_balances.len() == 1,
+        "the carry-only bootstrap case stopped being carry-only"
+    );
+    let network_difficulty = template_network_difficulty()?;
+    // The carrying block is the parent of the block under test, so the node's
+    // tip is both the scenario template's parent and the pool block that
+    // produced the carry.
+    let node = NodeState::at_tip(
+        scenario.block_height - 1,
+        &"aa".repeat(32),
+        scenario.coinbase_value_sats,
+    );
+    let fixture = Fixture::open(&url, node).await?;
+    let result = async {
+        seed_carry_forward_block(&fixture, &scenario, network_difficulty).await?;
+        let snapshot = fixture
+            .coordinator
+            .ledger
+            .snapshot(network_difficulty)
+            .await?;
+        ensure!(
+            snapshot.shares.is_empty(),
+            "the seeding block left shares in the payout window"
+        );
+        ensure!(
+            snapshot.prior_balances == scenario.prior_balances,
+            "the seeded parent block produced {:?}, the vector expects {:?}",
+            snapshot.prior_balances,
+            scenario.prior_balances
+        );
+
+        fixture.coordinator.refresh_once().await?;
+        ensure!(
+            fixture.prepared().await?.bundle.is_none(),
+            "an empty ledger window was published as payable prepared work"
+        );
+        let carried = fixture.solver_bundle(&scenario.solver).await?;
+        ensure!(
+            carried.found_block.block_height == scenario.block_height,
+            "the bootstrap bundle was built for height {}, the vector expects {}",
+            carried.found_block.block_height,
+            scenario.block_height
+        );
+        assert_bootstrap_share(&carried, &scenario.solver)?;
+        ensure!(
+            carried.prior_balances == scenario.prior_balances,
+            "the bootstrap bundle carried {:?}, the vector expects {:?}",
+            carried.prior_balances,
+            scenario.prior_balances
+        );
+        assert_bootstrap_payout(&carried, &case["expected_3xx"]["ok"], &scenario)?;
+        ensure!(
+            !mismatches(
+                "2xx",
+                &case["expected_2xx"]["ok"]["payout_policy_manifest"],
+                &serde_json::to_value(&carried.payout_policy_manifest)?,
+            )
+            .is_empty(),
+            "the bootstrap payout dropped prior balances the way 2.x.x did"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    fixture.close().await?;
+    result
+}
+
+/// Give the ledger the scenario's carry-forward balance by recording the
+/// parent block that produced it.
+///
+/// Every figure comes from the engine: the parent's payout is built with
+/// `build_audit_bundle_with_coinbase_options` and verified with
+/// `verify_audit_bundle_with_ledger_public_key`, and it is that manifest's own
+/// accounts that are recorded, through the same statements and in the same
+/// order `Ledger::land_candidate` and `finish_candidate` use -- the block row
+/// first as `prepared`, then its payout and carry rows, then the flip to
+/// `confirmed` that the summary triggers turn into a balance. Nothing here
+/// invents a carry figure.
+///
+/// The seeding policy needs two settings working together. `min_output_sats`
+/// is raised so the carried account's share of that block lands below the
+/// floor and accrues instead of being paid. That alone cannot settle:
+/// excluding the account leaves its satoshis unassigned and the engine rejects
+/// the shortfall as `PayoutExceedsCandidateBalance`. A zero-bps pool fee gives
+/// that dust somewhere to go -- the fee output absorbs exactly the excluded
+/// amount and earns nothing else. Neither setting touches the block under
+/// test, which runs on the coordinator's own `PayoutPolicy::day_one_default()`.
+///
+/// Recording those rows here, rather than landing a real block, is forced.
+/// An empty payout window beside a non-zero carry is not reachable through any
+/// 3.x.x write path within one schema, and all three exits are closed:
+///
+/// * A block that *accrues* must carry real ledger shares.
+///   `persist_audit_snapshot` (`ledger/audit.rs:124-138`) re-reads the
+///   bundle's share range out of `qbit_share_ledger` and requires it to match,
+///   exempting only a single synthetic `bootstrap-share`.
+/// * A bootstrap-shaped block cannot accrue at all. With one share there is
+///   one entitlement, and `apply_payout_policy`
+///   (`crates/qbit-prism/src/lib.rs:1079-1090`) rejects the block outright
+///   when the miner reward is below the floor, while allocating that whole
+///   reward to the single account otherwise -- so it always clears the floor
+///   it was just checked against, and is always paid in full.
+/// * Shares cannot be removed afterwards: the `qbit_share_ledger` trigger
+///   `qbit_prism_immutable_share_history` refuses every UPDATE, DELETE and
+///   TRUNCATE, and while even one accepted row exists the window is never
+///   empty (`Ledger::snapshot` walks back from the newest share until
+///   `8 * network_difficulty` of weight is spent -- eight million at this
+///   template's difficulty).
+///
+/// So this is the migrated, or archived-history, state: the balances are
+/// there and the shares that earned them are not. The statements below mirror
+/// `ledger/blocks.rs` `land_candidate` and `finish_candidate` exactly --
+/// same columns, same JSON extraction, same `account_type = 'miner'` filter,
+/// same order -- so a schema change that moves the real landing path leaves
+/// this copy failing loudly instead of silently seeding a different state.
+async fn seed_carry_forward_block(
+    fixture: &Fixture,
+    scenario: &Scenario,
+    network_difficulty: u128,
+) -> Result<()> {
+    let carried = scenario
+        .prior_balances
+        .first()
+        .context("the scenario records no prior balance to seed")?;
+    let balance_sats = u64::try_from(carried.balance_sats)?;
+    let coinbase_value_sats = scenario.coinbase_value_sats;
+    ensure!(
+        balance_sats > 0 && coinbase_value_sats.is_multiple_of(balance_sats),
+        "cannot seed a carry of {balance_sats} out of a {coinbase_value_sats} sat coinbase"
+    );
+    // One difficulty unit per `balance_sats` of coinbase, so the carried
+    // account's single unit is worth exactly the balance the vector records.
+    let units = u128::from(coinbase_value_sats / balance_sats);
+    let block_height = scenario.block_height - 1;
+    let seed_share = |share_seq: u64, miner: &str, program: &str, difficulty: u128| AcceptedShare {
+        share_seq,
+        share_id: format!("carry-seed-{miner}"),
+        miner_id: miner.into(),
+        order_key: miner.into(),
+        p2mr_program_hex: program.into(),
+        share_difficulty: difficulty,
+        network_difficulty,
+        template_height: block_height - 1,
+        job_id: "carry-seed-job".into(),
+        job_issued_at_ms: 1,
+        accepted_at_ms: 1,
+        ntime: 1_800_000_000,
+        credit_policy: None,
+    };
+    let bundle = qbit_prism::build_audit_bundle_with_coinbase_options(
+        vec![
+            seed_share(1, &carried.recipient_id, &carried.p2mr_program_hex, 1),
+            seed_share(2, "miner-seed", &"07".repeat(32), units - 1),
+        ],
+        FoundBlock {
+            block_height,
+            coinbase_value_sats,
+            network_difficulty,
+            anchor_job_issued_at_ms: 2,
+        },
+        vec![],
+        PayoutPolicy {
+            min_output_sats: Some(balance_sats + 10_000),
+            pool_fee_policy: Some(PoolFeePolicy {
+                fee_bps: 0,
+                recipient_id: "pool-fee".into(),
+                order_key: "pool-fee".into(),
+                p2mr_program_hex: "0f".repeat(32),
+            }),
+            ..PayoutPolicy::day_one_default()
+        },
+        None,
+        vec![],
+        &ManifestSigningKey::from_seed_hex(&"11".repeat(32))?,
+        &ManifestSigningKey::from_seed_hex(&"22".repeat(32))?,
+    )?;
+    let report = qbit_prism::verify_audit_bundle_with_ledger_public_key(
+        &bundle,
+        &fixture.coordinator.config.ledger_public_key,
+    )?;
+    let accrued = bundle
+        .payout_policy_manifest
+        .accounts
+        .iter()
+        .find(|account| account.recipient_id == carried.recipient_id)
+        .context("the seeding payout has no account for the carried recipient")?;
+    ensure!(
+        accrued.carry_forward_balance_sats == carried.balance_sats,
+        "the seeding payout accrued {} for {}, the vector expects {}",
+        accrued.carry_forward_balance_sats,
+        carried.recipient_id,
+        carried.balance_sats
+    );
+    let (block_hash, parent_hash) = {
+        let node = fixture.node.lock().await;
+        (
+            node.tip(),
+            node.hashes
+                .get(&(block_height - 1))
+                .cloned()
+                .unwrap_or_else(|| GENESIS_HASH.to_owned()),
+        )
+    };
+    let accounts = serde_json::to_value(&bundle.payout_policy_manifest.accounts)?;
+    let pool = &fixture.coordinator.ledger.pool;
+    let mut tx = pool.begin().await?;
+    sqlx::query("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256) VALUES($1,$2,$3,$4,$5)")
+        .bind(&block_hash).bind(i64::try_from(block_height)?).bind(&parent_hash)
+        .bind(&report.coinbase_txid).bind(&report.coinbase_manifest_sha256_hex)
+        .execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO qbit_pool_payout_entries(block_hash,block_height,miner_id,payout_order_key,p2mr_program,onchain_amount_sats,carry_forward_balance_sats,action) SELECT $1,$2,a->>'recipient_id',a->>'order_key',decode(a->>'p2mr_program_hex','hex'),(a->>'onchain_amount_sats')::bigint,(a->>'carry_forward_balance_sats')::numeric,a->>'action' FROM jsonb_array_elements($3::jsonb) a")
+        .bind(&block_hash).bind(i64::try_from(block_height)?).bind(&accounts).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO qbit_payout_carry_forward(block_hash,block_height,miner_id,payout_order_key,p2mr_program,gross_amount_sats,prior_balance_sats,candidate_balance_sats,onchain_amount_sats,settlement_fee_sats,carry_forward_balance_sats,action) SELECT $1,$2,a->>'recipient_id',a->>'order_key',decode(a->>'p2mr_program_hex','hex'),(a->>'gross_amount_sats')::bigint,(a->>'prior_balance_sats')::numeric,(a->>'candidate_balance_sats')::numeric,(a->>'onchain_amount_sats')::bigint,COALESCE((a->>'settlement_fee_sats')::bigint,0),(a->>'carry_forward_balance_sats')::numeric,a->>'action' FROM jsonb_array_elements($3::jsonb) a WHERE COALESCE(a->>'account_type','miner')='miner'")
+        .bind(&block_hash).bind(i64::try_from(block_height)?).bind(&accounts).execute(&mut *tx).await?;
+    // Confirming is a separate statement, as in production: the summary
+    // triggers count a block's carry rows exactly once, when it is flipped.
+    sqlx::query("UPDATE qbit_pool_blocks SET chain_state='confirmed' WHERE block_hash=$1 AND chain_state='prepared'")
+        .bind(&block_hash).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// A bootstrap bundle pays exactly one synthetic share, to the solver.
