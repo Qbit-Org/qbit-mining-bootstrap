@@ -1,5 +1,10 @@
 use super::*;
 
+mod payout_state;
+pub use payout_state::PayoutState;
+mod blocking_drop;
+use blocking_drop::BlockingDrop;
+
 #[derive(Clone, Debug)]
 pub struct AppendResult {
     pub share: AcceptedShare,
@@ -15,7 +20,195 @@ pub struct Snapshot {
     pub prior_balances: Vec<CarryForwardBalance>,
 }
 
+/// Immutable builder inputs; the issued/current revision belongs to the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowRef {
+    pub anchor_ms: i64,
+    #[serde(with = "hex32")]
+    pub prior_balances_digest: [u8; 32],
+    pub shares: Option<ShareRange>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareRange {
+    pub first_share_seq: u64,
+    pub last_share_seq: u64,
+    pub share_count: u64,
+    /// SHA-256 of native AcceptedShare JSON, not PayoutWindow's sorted-key digest.
+    #[serde(with = "hex32")]
+    pub snapshot_sha256: [u8; 32],
+}
+
+#[derive(Debug)]
+pub struct Window {
+    pub shares: Vec<AcceptedShare>,
+    pub prior_balances: Vec<CarryForwardBalance>,
+    /// Current revision in the read transaction; never replace the issued one.
+    pub payout_revision: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BalanceSource {
+    Current,
+    AsIssued,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WindowError {
+    #[error("window range incomplete: expected {expected} shares, read {got}")]
+    Incomplete { expected: u64, got: u64 },
+    #[error("prior balances changed since the reference was written")]
+    PriorBalancesChanged {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+    #[error("as-issued balance snapshot missing")]
+    BalanceSnapshotMissing { digest: [u8; 32] },
+    #[error("window snapshot digest mismatch")]
+    SnapshotDigestMismatch {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+    #[error("window database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("window decode error: {0}")]
+    Decode(#[source] anyhow::Error),
+}
+
+impl ShareRange {
+    fn bounds(self) -> Result<(i64, i64), WindowError> {
+        let checked = || -> Result<(i64, i64)> {
+            let first = i64::try_from(self.first_share_seq)?;
+            let last = i64::try_from(self.last_share_seq)?;
+            ensure!(
+                first >= 1 && last >= first,
+                "invalid window sequence bounds"
+            );
+            ensure!(
+                (1..=u64::try_from(last - first + 1)?).contains(&self.share_count),
+                "invalid window share count"
+            );
+            Ok((first, last))
+        };
+        checked().map_err(WindowError::Decode)
+    }
+}
+
+mod hex32 {
+    use serde::{de::Error, Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        value: &[u8; 32],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::encode(value))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<[u8; 32], D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(D::Error::custom(
+                "digest must be exactly 64 lowercase hex characters",
+            ));
+        }
+        let mut digest = [0; 32];
+        hex::decode_to_slice(value, &mut digest).map_err(D::Error::custom)?;
+        Ok(digest)
+    }
+}
+
 impl Ledger {
+    /// Reconstruct and authenticate a complete window on the primary, in one
+    /// repeatable-read snapshot. This owns its blocking decode/hash hand-offs.
+    /// Callers own build/read permits and the single end-to-end deadline; this
+    /// API acquires no nested permits and makes no job/candidate eligibility decision.
+    pub async fn read_window(
+        &self,
+        window: &WindowRef,
+        balances: BalanceSource,
+    ) -> Result<Window, WindowError> {
+        let bounds = window.shares.map(ShareRange::bounds).transpose()?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        let payout_revision = sqlx::query_scalar(
+            "SELECT payout_revision FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL AND NOT pg_is_in_recovery()",
+        ).fetch_one(&mut *tx).await?;
+        let expected_balances = window.prior_balances_digest;
+        let balance_task = match balances {
+            BalanceSource::Current => {
+                let rows = prior_balance_rows(&mut tx).await?;
+                tokio::task::spawn_blocking(move || {
+                    let decoded = decode_prior_balances(rows).map_err(WindowError::Decode)?;
+                    check_balances(decoded, expected_balances, balances).map(BlockingDrop::new)
+                })
+            }
+            BalanceSource::AsIssued => {
+                let bytes: Vec<u8> = sqlx::query_scalar(
+                    "SELECT balances FROM qbit_prism_balance_snapshots WHERE prior_balances_digest=$1",
+                ).bind(hex::encode(expected_balances)).fetch_optional(&mut *tx).await?
+                    .ok_or(WindowError::BalanceSnapshotMissing { digest: expected_balances })?;
+                tokio::task::spawn_blocking(move || {
+                    let decoded = serde_json::from_slice(&bytes)
+                        .map_err(|error| WindowError::Decode(error.into()))?;
+                    check_balances(decoded, expected_balances, balances).map(BlockingDrop::new)
+                })
+            }
+        };
+        let prior_balances = balance_task
+            .await
+            .map_err(|error| WindowError::Decode(error.into()))??;
+        let shares = if let (Some(range), Some((first, last))) = (window.shares, bounds) {
+            let endpoints: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_seq=$1) AND EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_seq=$2)",
+            ).bind(first).bind(last).fetch_one(&mut *tx).await?;
+            if !endpoints {
+                // No page has been read; an endpoint probe is not a window count.
+                return Err(WindowError::Incomplete {
+                    expected: range.share_count,
+                    got: 0,
+                });
+            }
+            let mut state = BlockingDrop::new(WindowRead::new(first - 1));
+            while state.get().cursor < last {
+                let rows = sqlx::query(&format!("{SELECT_SHARE} WHERE accepted AND share_seq>$1 AND share_seq<=$2 AND accepted_at<=to_timestamp($3::double precision/1000) AND job_issued_at<=to_timestamp($3::double precision/1000) ORDER BY share_seq LIMIT 4096"))
+                    .bind(state.get().cursor).bind(last).bind(window.anchor_ms)
+                    .fetch_all(&mut *tx).await?;
+                if rows.is_empty() {
+                    break;
+                }
+                state = tokio::task::spawn_blocking(move || {
+                    state
+                        .into_inner()
+                        .page(rows, range.share_count)
+                        .map(BlockingDrop::new)
+                })
+                .await
+                .map_err(|error| WindowError::Decode(error.into()))??;
+            }
+            tokio::task::spawn_blocking(move || {
+                state.into_inner().finish(range).map(BlockingDrop::new)
+            })
+            .await
+            .map_err(|error| WindowError::Decode(error.into()))??
+        } else {
+            BlockingDrop::new(Vec::new())
+        };
+        tx.commit().await?;
+        Ok(Window {
+            shares: shares.into_inner(),
+            prior_balances: prior_balances.into_inner(),
+            payout_revision,
+        })
+    }
+
     /// Coordinate nodes by cumulative proof of work. A slower peer or an
     /// equal-work sibling cannot reverse another instance's accepted chain.
     pub async fn observe_chain_view(
@@ -244,12 +437,128 @@ impl Ledger {
 pub(super) async fn read_prior_balances(
     tx: &mut Transaction<'_, Postgres>,
 ) -> Result<Vec<CarryForwardBalance>> {
-    sqlx::query("SELECT miner_id,payout_order_key,encode(p2mr_program,'hex') AS program,balance_sats::text AS balance FROM qbit_current_carry_forward_balances()")
-        .fetch_all(&mut **tx).await?.into_iter().map(|row| Ok(CarryForwardBalance {
-            recipient_id: row.try_get("miner_id")?, order_key: row.try_get("payout_order_key")?,
-            p2mr_program_hex: row.try_get("program")?, balance_sats: row.try_get::<String,_>("balance")?.parse()?,
-        })).collect()
+    let rows = prior_balance_rows(tx).await?;
+    tokio::task::spawn_blocking(move || decode_prior_balances(rows)).await?
 }
+
+async fn prior_balance_rows(tx: &mut Transaction<'_, Postgres>) -> Result<Vec<PgRow>, sqlx::Error> {
+    sqlx::query("SELECT miner_id,payout_order_key,encode(p2mr_program,'hex') AS program,balance_sats::text AS balance FROM qbit_current_carry_forward_balances()")
+        .fetch_all(&mut **tx).await
+}
+
+fn decode_prior_balances(rows: Vec<PgRow>) -> Result<Vec<CarryForwardBalance>> {
+    rows.into_iter()
+        .map(|row| {
+            Ok(CarryForwardBalance {
+                recipient_id: row.try_get("miner_id")?,
+                order_key: row.try_get("payout_order_key")?,
+                p2mr_program_hex: row.try_get("program")?,
+                balance_sats: row.try_get::<String, _>("balance")?.parse()?,
+            })
+        })
+        .collect()
+}
+
+fn sort_balances(balances: &mut [CarryForwardBalance]) {
+    balances.sort_by(|a, b| {
+        a.order_key
+            .cmp(&b.order_key)
+            .then_with(|| a.recipient_id.cmp(&b.recipient_id))
+            .then_with(|| a.p2mr_program_hex.cmp(&b.p2mr_program_hex))
+    });
+}
+
+fn check_balances(
+    balances: Vec<CarryForwardBalance>,
+    expected: [u8; 32],
+    source: BalanceSource,
+) -> Result<Vec<CarryForwardBalance>, WindowError> {
+    let mut digest_input = balances.clone();
+    sort_balances(&mut digest_input);
+    let actual = qbit_prism::prior_balances_digest(&digest_input);
+    if actual != expected {
+        return Err(match source {
+            BalanceSource::Current => WindowError::PriorBalancesChanged { expected, actual },
+            BalanceSource::AsIssued => WindowError::Decode(anyhow::anyhow!(
+                "immutable balance snapshot digest mismatch"
+            )),
+        });
+    }
+    Ok(balances)
+}
+
+struct DigestWriter<'a>(&'a mut Sha256);
+impl std::io::Write for DigestWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct WindowRead {
+    shares: Vec<AcceptedShare>,
+    digest: Sha256,
+    cursor: i64,
+}
+impl WindowRead {
+    fn new(cursor: i64) -> Self {
+        Self {
+            shares: Vec::new(),
+            digest: Sha256::new(),
+            cursor,
+        }
+    }
+
+    fn push(&mut self, share: AcceptedShare) -> Result<(), WindowError> {
+        self.digest
+            .update(if self.shares.is_empty() { b"[" } else { b"," });
+        serde_json::to_writer(DigestWriter(&mut self.digest), &share)
+            .map_err(|error| WindowError::Decode(error.into()))?;
+        self.cursor =
+            i64::try_from(share.share_seq).map_err(|error| WindowError::Decode(error.into()))?;
+        self.shares.push(share);
+        Ok(())
+    }
+
+    fn page(mut self, rows: Vec<PgRow>, expected: u64) -> Result<Self, WindowError> {
+        for row in rows {
+            self.push(share_from_row(&row).map_err(WindowError::Decode)?)?;
+        }
+        if self.shares.len() as u64 > expected {
+            return Err(WindowError::Incomplete {
+                expected,
+                got: self.shares.len() as u64,
+            });
+        }
+        Ok(self)
+    }
+
+    fn finish(mut self, range: ShareRange) -> Result<Vec<AcceptedShare>, WindowError> {
+        let got = self.shares.len() as u64;
+        if got != range.share_count {
+            return Err(WindowError::Incomplete {
+                expected: range.share_count,
+                got,
+            });
+        }
+        self.digest.update(b"]");
+        let actual = self.digest.finalize().into();
+        if actual != range.snapshot_sha256 {
+            return Err(WindowError::SnapshotDigestMismatch {
+                expected: range.snapshot_sha256,
+                actual,
+            });
+        }
+        Ok(self.shares)
+    }
+}
+
+#[cfg(test)]
+#[path = "window/reference_tests.rs"]
+mod reference_tests;
 
 fn share_header_hash(share_id: &str) -> String {
     if let Some(suffix) = share_id.get(share_id.len().saturating_sub(64)..) {

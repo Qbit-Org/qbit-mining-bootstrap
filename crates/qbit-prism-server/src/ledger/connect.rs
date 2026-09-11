@@ -167,7 +167,7 @@ impl Ledger {
             let mut tx = pool.begin().await?;
             lock(&mut tx, MIGRATION_LOCK).await?;
             sqlx::raw_sql("CREATE TABLE IF NOT EXISTS qbit_prism_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())").execute(&mut *tx).await?;
-            // 006/007/008 are reserved by independent workstreams. Track each
+            // 006/007 are reserved by independent workstreams. Track each
             // applied migration rather than letting 009 hide an earlier gap.
             let versions: Vec<i32> =
                 sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations")
@@ -235,6 +235,16 @@ impl Ledger {
                     .execute(&mut *tx)
                     .await?;
                 sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(5)")
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            if !versions.contains(&8) {
+                sqlx::raw_sql(include_str!(
+                    "../../migrations/008_prepared_window_reference.sql"
+                ))
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(8)")
                     .execute(&mut *tx)
                     .await?;
             }
