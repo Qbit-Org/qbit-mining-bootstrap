@@ -41,9 +41,11 @@
 -- re-asserts, but its IF NOT EXISTS leaves an existing table, column, index,
 -- sequence or named constraint as it is. The migrator requires an equivalent
 -- of every release definition in the source schema, on a fresh database too,
--- where 001 has just created everything. A sequence is compared by its
--- structure (type, start, increment, bounds, cache, cycle), never by the
--- value it has reached. Column order, comments, auto-generated constraint
+-- where 001 has just created everything. A table or sequence must have the
+-- release's persistence: an UNLOGGED or temporary one is drift whatever its
+-- columns say, because PostgreSQL truncates it after a crash. A sequence is
+-- compared by its structure (type, start, increment, bounds, cache, cycle),
+-- never by the value it has reached. Column order, comments, auto-generated constraint
 -- names and NOT VALID are ignored; extra objects are kept and logged; a
 -- missing or different one fails the migration, which rolls back whole.
 

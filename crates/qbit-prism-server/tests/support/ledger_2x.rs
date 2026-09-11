@@ -872,6 +872,80 @@ async fn drifted_002_object_is_refused_on_a_258_source() -> Result<()> {
 }
 
 #[tokio::test]
+async fn unlogged_release_table_or_sequence_is_refused_naming_it_and_rolls_back() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    insert_v1_terminal(&pool, &legacy_hash(0x33), "submitted").await?;
+    // qbit_payout_carry_forward holds the carried balances and has no
+    // foreign key in either direction, so SET UNLOGGED is accepted as it
+    // is, and the sequence behind its bigserial column follows the table.
+    // Columns, constraints and indexes are all still the release's, so only
+    // persistence can tell these apart from the scratch apply. (The explicit
+    // qbit_audit_publication_sequence_seq is not used here: 001's own guard
+    // already refuses that sequence when it is not logged.)
+    sqlx::raw_sql("ALTER TABLE qbit_payout_carry_forward SET UNLOGGED")
+        .execute(&pool)
+        .await?;
+    let persistence = || async {
+        sqlx::query_scalar::<_, String>("SELECT string_agg(relname::text||'='||relpersistence::text,',' ORDER BY relname) FROM pg_class WHERE relnamespace=current_schema()::regnamespace AND relname IN ('qbit_payout_carry_forward','qbit_payout_carry_forward_carry_forward_seq_seq')")
+            .fetch_one(&pool).await
+    };
+    assert_eq!(
+        persistence().await?,
+        "qbit_payout_carry_forward=u,qbit_payout_carry_forward_carry_forward_seq_seq=u"
+    );
+    let error = db
+        .ledger("a")
+        .await
+        .err()
+        .context("migration accepted an UNLOGGED release table")?
+        .to_string();
+    assert!(
+        error.contains("refusing to migrate a drifted 001 source"),
+        "{error}"
+    );
+    assert!(error.contains("2 object(s) differ"), "{error}");
+    assert!(
+        error.contains("table qbit_payout_carry_forward differs: expected logged, found UNLOGGED"),
+        "{error}"
+    );
+    assert!(
+        error.contains("sequence qbit_payout_carry_forward_carry_forward_seq_seq differs: expected logged, found UNLOGGED"),
+        "{error}"
+    );
+    assert!(error.contains("Nothing was changed"), "{error}");
+    // Rolled back whole: no native table, the relations as unlogged as
+    // they were, the row untouched.
+    assert!(native_tables_absent(&pool).await?, "refusal ran DDL");
+    assert_eq!(
+        persistence().await?,
+        "qbit_payout_carry_forward=u,qbit_payout_carry_forward_carry_forward_seq_seq=u"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM qbit_block_candidate_outbox")
+            .fetch_one(&pool)
+            .await?,
+        1
+    );
+    // Logged again, the same source migrates and is recorded as v2.0.1.
+    sqlx::raw_sql("ALTER TABLE qbit_payout_carry_forward SET LOGGED")
+        .execute(&pool)
+        .await?;
+    let ledger = db.ledger("a").await?;
+    assert_eq!(schema_version(&pool).await?, REQUIRED_SCHEMA_VERSION);
+    assert_eq!(
+        ledger.migration_source().await?.map(|s| s.source_state),
+        Some("pre_258".into())
+    );
+    exercise_native_writers(&ledger, 1, 5801).await?;
+    pool.close().await;
+    db.close(vec![ledger]).await
+}
+
+#[tokio::test]
 async fn tolerated_source_differences_still_migrate() -> Result<()> {
     let Some(db) = Database::open().await? else {
         return Ok(());

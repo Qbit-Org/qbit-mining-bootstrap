@@ -561,11 +561,25 @@ struct FunctionDefinition {
     config: Vec<String>,
 }
 
+/// A table's persistence and its columns. `pg_class.relpersistence` is `p`
+/// for an ordinary logged table, `u` for UNLOGGED and `t` for temporary. The
+/// release creates logged tables only: an unlogged ledger or outbox is one
+/// whose rows PostgreSQL truncates after a crash, so persistence is part of
+/// the definition, not a tuning knob.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TableDefinition {
+    persistence: String,
+    columns: BTreeMap<String, ColumnDefinition>,
+}
+
 /// The structure of a sequence, from `pg_sequence`: what a `serial` column
-/// or `CREATE SEQUENCE` fixed. Its current value (`last_value`, `is_called`)
-/// is data the writers advance and is not read.
+/// or `CREATE SEQUENCE` fixed, and its persistence (PostgreSQL 15 and later
+/// have unlogged sequences, and a sequence owned by an unlogged table is
+/// unlogged with it). Its current value (`last_value`, `is_called`) is data
+/// the writers advance and is not read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SequenceDefinition {
+    persistence: String,
     data_type: String,
     start: i64,
     increment: i64,
@@ -582,7 +596,8 @@ struct SequenceDefinition {
 /// is irrelevant; comments are not read.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SchemaFingerprint {
-    tables: BTreeMap<String, BTreeMap<String, ColumnDefinition>>,
+    /// Keyed by name: each table's persistence and its columns.
+    tables: BTreeMap<String, TableDefinition>,
     /// Table, then constraint definition, to the name the constraint carries.
     constraints: BTreeMap<String, BTreeMap<String, String>>,
     /// Indexes that do not back a constraint, by name; the constraint
@@ -681,17 +696,28 @@ async fn fingerprint_schema(
     namespace: &str,
 ) -> Result<SchemaFingerprint> {
     let mut fingerprint = SchemaFingerprint::default();
-    let tables: Vec<String> = sqlx::query_scalar("SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' ORDER BY 1")
+    let tables: Vec<(String, String)> = sqlx::query_as("SELECT c.relname::text,c.relpersistence::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' ORDER BY 1")
         .bind(namespace).fetch_all(&mut **tx).await?;
-    for table in tables {
-        fingerprint.tables.entry(table).or_default();
+    for (table, persistence) in tables {
+        fingerprint.tables.insert(
+            table,
+            TableDefinition {
+                persistence,
+                columns: BTreeMap::new(),
+            },
+        );
     }
     let rows = sqlx::query("SELECT c.relname::text AS table_name,a.attname::text AS column_name,format_type(a.atttypid,a.atttypmod) AS data_type,a.attnotnull AS not_null,pg_get_expr(d.adbin,d.adrelid) AS default_expr,a.attidentity::text AS identity,a.attgenerated::text AS generated,CASE WHEN a.attcollation<>t.typcollation THEN col.collname::text END AS collation FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped JOIN pg_type t ON t.oid=a.atttypid LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum LEFT JOIN pg_collation col ON col.oid=a.attcollation WHERE n.nspname=$1 AND c.relkind='r' ORDER BY 1,2")
         .bind(namespace).fetch_all(&mut **tx).await?;
     for row in &rows {
         let table: String = row.try_get("table_name")?;
         let default: Option<String> = row.try_get("default_expr")?;
-        fingerprint.tables.entry(table).or_default().insert(
+        let columns = &mut fingerprint
+            .tables
+            .get_mut(&table)
+            .with_context(|| format!("column of {table} read without its table"))?
+            .columns;
+        columns.insert(
             row.try_get("column_name")?,
             ColumnDefinition {
                 data_type: row.try_get("data_type")?,
@@ -768,12 +794,13 @@ async fn fingerprint_schema(
             },
         );
     }
-    let rows = sqlx::query("SELECT c.relname::text AS name,format_type(s.seqtypid,NULL) AS data_type,s.seqstart AS start,s.seqincrement AS increment,s.seqmin AS min,s.seqmax AS max,s.seqcache AS cache,s.seqcycle AS cycle FROM pg_sequence s JOIN pg_class c ON c.oid=s.seqrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='S' ORDER BY 1")
+    let rows = sqlx::query("SELECT c.relname::text AS name,c.relpersistence::text AS persistence,format_type(s.seqtypid,NULL) AS data_type,s.seqstart AS start,s.seqincrement AS increment,s.seqmin AS min,s.seqmax AS max,s.seqcache AS cache,s.seqcycle AS cycle FROM pg_sequence s JOIN pg_class c ON c.oid=s.seqrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='S' ORDER BY 1")
         .bind(namespace).fetch_all(&mut **tx).await?;
     for row in &rows {
         fingerprint.sequences.insert(
             row.try_get("name")?,
             SequenceDefinition {
+                persistence: row.try_get("persistence")?,
                 data_type: row.try_get("data_type")?,
                 start: row.try_get("start")?,
                 increment: row.try_get("increment")?,
@@ -968,8 +995,25 @@ fn function_differences(expected: &FunctionDefinition, found: &FunctionDefinitio
     parts.join(", ")
 }
 
+/// `relpersistence` the way `CREATE TABLE` spells it.
+fn persistence(code: &str) -> &str {
+    match code {
+        "p" => "logged",
+        "u" => "UNLOGGED",
+        "t" => "TEMPORARY",
+        other => other,
+    }
+}
+
 fn sequence_differences(expected: &SequenceDefinition, found: &SequenceDefinition) -> String {
     let mut parts = Vec::new();
+    if expected.persistence != found.persistence {
+        parts.push(format!(
+            "expected {}, found {}",
+            persistence(&expected.persistence),
+            persistence(&found.persistence)
+        ));
+    }
     if expected.data_type != found.data_type {
         parts.push(format!(
             "type expected {}, found {}",
@@ -1000,18 +1044,29 @@ fn sequence_differences(expected: &SequenceDefinition, found: &SequenceDefinitio
 
 /// Every object the release creates must have an equivalent in the source;
 /// anything else in the source is extra. An object on a table the source
-/// lacks is not reported twice. A sequence is compared by its structure
-/// only: the value it has reached is the source's data.
+/// lacks is not reported twice. A table or sequence must also have the
+/// release's persistence: UNLOGGED is drift, whatever its columns say. A
+/// sequence is compared by its structure only: the value it has reached is
+/// the source's data.
 fn compare_fingerprints(
     expected: &SchemaFingerprint,
     found: &SchemaFingerprint,
 ) -> SchemaComparison {
     let mut comparison = SchemaComparison::default();
-    for (table, columns) in &expected.tables {
-        let Some(found_columns) = found.tables.get(table) else {
+    for (table, definition) in &expected.tables {
+        let Some(found_table) = found.tables.get(table) else {
             comparison.drift.push(format!("missing table {table}"));
             continue;
         };
+        if found_table.persistence != definition.persistence {
+            comparison.drift.push(format!(
+                "table {table} differs: expected {}, found {}",
+                persistence(&definition.persistence),
+                persistence(&found_table.persistence)
+            ));
+        }
+        let columns = &definition.columns;
+        let found_columns = &found_table.columns;
         for (column, definition) in columns {
             match found_columns.get(column) {
                 None => comparison
@@ -1869,11 +1924,14 @@ mod tests {
         }
     }
 
-    fn table(columns: &[(&str, ColumnDefinition)]) -> BTreeMap<String, ColumnDefinition> {
-        columns
-            .iter()
-            .map(|(name, definition)| ((*name).to_owned(), definition.clone()))
-            .collect()
+    fn table(columns: &[(&str, ColumnDefinition)]) -> TableDefinition {
+        TableDefinition {
+            persistence: "p".into(),
+            columns: columns
+                .iter()
+                .map(|(name, definition)| ((*name).to_owned(), definition.clone()))
+                .collect(),
+        }
     }
 
     #[test]
@@ -2001,6 +2059,7 @@ mod tests {
             .tables
             .get_mut("t")
             .unwrap()
+            .columns
             .insert("a".into(), column("bigint", true));
         let comparison = compare_fingerprints(&expected, &found);
         assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
@@ -2182,6 +2241,7 @@ mod tests {
 
     fn sequence(data_type: &str, increment: i64, max: i64) -> SequenceDefinition {
         SequenceDefinition {
+            persistence: "p".into(),
             data_type: data_type.to_owned(),
             start: 1,
             increment,
@@ -2241,6 +2301,85 @@ mod tests {
         found.sequences.insert("gone_seq".into(), release.clone());
         found.sequences.insert("t_id_seq".into(), release.clone());
         found.sequences.insert("u_id_seq".into(), release);
+        let comparison = compare_fingerprints(&expected, &found);
+        assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
+    }
+
+    #[test]
+    fn persistence_is_compared_for_tables_and_sequences() {
+        let mut expected = SchemaFingerprint::default();
+        expected.tables.insert(
+            "qbit_share_ledger".into(),
+            table(&[("share_id", column("text", true))]),
+        );
+        expected.tables.insert(
+            "qbit_pool_blocks".into(),
+            table(&[("block_hash", column("text", true))]),
+        );
+        expected.sequences.insert(
+            "qbit_share_ledger_share_seq_seq".into(),
+            sequence("bigint", 1, i64::MAX),
+        );
+        // The same columns and structure, but the ledger, its sequence and a
+        // temporary blocks table are not the logged relations the release
+        // creates; an unlogged table of the operator's own is only extra.
+        let mut found = SchemaFingerprint::default();
+        let mut unlogged = table(&[("share_id", column("text", true))]);
+        unlogged.persistence = "u".into();
+        found
+            .tables
+            .insert("qbit_share_ledger".into(), unlogged.clone());
+        let mut temporary = table(&[("block_hash", column("text", true))]);
+        temporary.persistence = "t".into();
+        found.tables.insert("qbit_pool_blocks".into(), temporary);
+        found.tables.insert("operator_scratch".into(), unlogged);
+        let mut unlogged_sequence = sequence("bigint", 1, i64::MAX);
+        unlogged_sequence.persistence = "u".into();
+        found
+            .sequences
+            .insert("qbit_share_ledger_share_seq_seq".into(), unlogged_sequence);
+        let comparison = compare_fingerprints(&expected, &found);
+        assert_eq!(
+            comparison.drift,
+            vec![
+                "table qbit_pool_blocks differs: expected logged, found TEMPORARY",
+                "table qbit_share_ledger differs: expected logged, found UNLOGGED",
+                "sequence qbit_share_ledger_share_seq_seq differs: expected logged, found UNLOGGED",
+            ]
+        );
+        assert_eq!(comparison.extra, vec!["table operator_scratch"]);
+        assert_eq!(
+            release_objects_present(&expected, &found),
+            vec![
+                "table qbit_pool_blocks",
+                "table qbit_share_ledger",
+                "sequence qbit_share_ledger_share_seq_seq",
+            ]
+        );
+
+        // Persistence is named alongside the other sequence properties.
+        let mut changed = sequence("bigint", 2, i64::MAX);
+        changed.persistence = "u".into();
+        assert_eq!(
+            sequence_differences(&sequence("bigint", 1, i64::MAX), &changed),
+            "expected logged, found UNLOGGED, increment expected 1, found 2"
+        );
+        // Logged everywhere: nothing to report.
+        found
+            .tables
+            .get_mut("qbit_share_ledger")
+            .unwrap()
+            .persistence = "p".into();
+        found
+            .tables
+            .get_mut("qbit_pool_blocks")
+            .unwrap()
+            .persistence = "p".into();
+        found
+            .sequences
+            .get_mut("qbit_share_ledger_share_seq_seq")
+            .unwrap()
+            .persistence = "p".into();
         let comparison = compare_fingerprints(&expected, &found);
         assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
     }

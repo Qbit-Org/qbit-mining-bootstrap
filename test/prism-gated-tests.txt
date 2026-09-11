@@ -62,6 +62,7 @@ qbit-prism-server::ledger_postgres::two_x::pre_006_native_schema_with_only_nativ
 qbit-prism-server::ledger_postgres::two_x::startup_without_initialize_requires_the_current_schema_version
 qbit-prism-server::ledger_postgres::two_x::tolerated_source_differences_still_migrate
 qbit-prism-server::ledger_postgres::two_x::unknown_storage_version_row_is_parked_and_not_reclaimed_at_lease_expiry
+qbit-prism-server::ledger_postgres::two_x::unlogged_release_table_or_sequence_is_refused_naming_it_and_rolls_back
 qbit-prism-server::ledger_postgres::verified_landing_reconstructs_audit_and_reorgs_are_revision_fenced
 qbit-prism-server::live_regtest::cpfp_tests::real_cpfp_abandoned_child_repair_retains_unremovable_spent_lock
 qbit-prism-server::live_regtest::cpfp_tests::real_cpfp_recovers_reserved_funding_after_owner_crash
