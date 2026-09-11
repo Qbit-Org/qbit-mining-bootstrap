@@ -1393,3 +1393,634 @@ fn the_short_plan_runs_every_artifact_phase_for_a_minute() -> Result<()> {
     assert!(phases.iter().all(|phase| phase.name != "burst"));
     Ok(())
 }
+
+// --- the dense-cadence scenario (#271 criterion 6) -----------------------
+
+#[test]
+fn the_gap_pattern_repeats_cyclically_and_reserves_a_measurement_tail() -> Result<()> {
+    use qbit_prism_load::cadence;
+    let gaps = cadence::parse_gaps(cadence::DEFAULT_GAPS)?;
+    assert_eq!(gaps, vec![9.0, 19.0, 9.0, 18.0, 20.0]);
+    let offsets = cadence::landing_offsets(&gaps, 240.0);
+    assert!(
+        offsets.len() >= cadence::MIN_LANDINGS,
+        "a 240 s phase must hold at least {} landings, held {}",
+        cadence::MIN_LANDINGS,
+        offsets.len()
+    );
+    assert_eq!(offsets[0], cadence::LEAD_IN_SECONDS);
+    // The pattern repeats cyclically, so the differences are the gaps again.
+    let deltas: Vec<f64> = offsets.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    for (index, delta) in deltas.iter().enumerate() {
+        assert_eq!(*delta, gaps[index % gaps.len()], "gap {index}");
+    }
+    // #224's shape: 9 s single gaps, and 18-20 s pairs.
+    assert!(deltas.contains(&9.0));
+    assert!(deltas.iter().any(|delta| (18.0..=20.0).contains(delta)));
+    let last = *offsets.last().expect("at least one landing");
+    assert!(
+        last + cadence::TAIL_SECONDS <= 240.0,
+        "the last landing at {last} s leaves less than the {} s measurement tail",
+        cadence::TAIL_SECONDS
+    );
+    Ok(())
+}
+
+#[test]
+fn a_gap_pattern_that_cannot_be_measured_is_refused_at_entry() {
+    use qbit_prism_load::cadence;
+    let refusal = |text: &str| {
+        format!(
+            "{:#}",
+            cadence::parse_gaps(text).expect_err("{text} should be refused")
+        )
+    };
+    assert!(refusal("4").contains("floor"), "{}", refusal("4"));
+    assert!(refusal("9,4,9").contains("floor"));
+    assert!(refusal("9,,19").contains("empty"));
+    assert!(refusal("").contains("empty"));
+    assert!(refusal("nine").contains("not a number"));
+    assert!(refusal("inf").contains("finite"));
+    // The pattern and the phase length are checked against each other: a
+    // phase too short for ten landings measures nothing.
+    let short = format!(
+        "{:#}",
+        cadence::validate(cadence::DEFAULT_GAPS, 120).expect_err("120 s is too short")
+    );
+    assert!(short.contains("at least 10"), "{short}");
+    assert!(short.contains("--cadence-seconds"), "{short}");
+    cadence::validate(cadence::DEFAULT_GAPS, 240).expect("240 s holds ten landings");
+    assert!(cadence::Cadence::parse("dense").expect("dense").is_dense());
+    assert!(!cadence::Cadence::parse("none").expect("none").is_dense());
+    assert!(cadence::Cadence::parse("fast").is_err());
+}
+
+#[test]
+fn the_dense_cadence_phase_is_a_side_phase_after_slow_database() -> Result<()> {
+    use clap::Parser;
+    let plain = qbit_prism_load::cli::Args::parse_from(["qbit-prism-load"]);
+    plain.validate()?;
+    let before = qbit_prism_load::cli::phases(&plain)?;
+    assert!(
+        before
+            .iter()
+            .all(|phase| phase.name != qbit_prism_load::cadence::PHASE),
+        "a run that did not ask for a cadence must not grow a phase"
+    );
+
+    let dense = qbit_prism_load::cli::Args::parse_from([
+        "qbit-prism-load",
+        "--cadence",
+        "dense",
+        "--rate",
+        "50",
+    ]);
+    dense.validate()?;
+    let phases = qbit_prism_load::cli::phases(&dense)?;
+    let position = phases
+        .iter()
+        .position(|phase| phase.name == qbit_prism_load::cadence::PHASE)
+        .expect("the dense phase is planned");
+    let slow = phases
+        .iter()
+        .position(|phase| phase.name == "slow_database")
+        .expect("slow_database is planned");
+    assert!(position > slow, "the dense phase runs after slow_database");
+    let phase = &phases[position];
+    assert!(phase.dense_cadence);
+    assert!(!phase.in_artifact, "it is a side phase");
+    assert_eq!(phase.database_delay_ms, 0, "no proxy delay");
+    assert_eq!(phase.seconds, 240);
+    assert_eq!(phase.rate, 50.0, "it defaults to the steady-state rate");
+    // The artifact's phases are untouched by the new phase (EP-COMPAT).
+    let artifact_before: Vec<&String> = before
+        .iter()
+        .filter(|phase| phase.in_artifact)
+        .map(|phase| &phase.name)
+        .collect();
+    let artifact_after: Vec<&String> = phases
+        .iter()
+        .filter(|phase| phase.in_artifact)
+        .map(|phase| &phase.name)
+        .collect();
+    assert_eq!(artifact_before, artifact_after);
+
+    let too_short = qbit_prism_load::cli::Args::parse_from([
+        "qbit-prism-load",
+        "--cadence",
+        "dense",
+        "--cadence-seconds",
+        "120",
+    ]);
+    assert!(
+        too_short.validate().is_err(),
+        "a phase too short for ten landings is refused at entry"
+    );
+    Ok(())
+}
+
+// --- synthetic attribution -----------------------------------------------
+
+const HASH_ZERO: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const HASH_ONE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+fn at(base: std::time::Instant, millis: u64) -> std::time::Instant {
+    base + std::time::Duration::from_millis(millis)
+}
+
+fn dense_submit(
+    hash: &str,
+    session: usize,
+    frontend: usize,
+    sent: std::time::Instant,
+    responded: std::time::Instant,
+    outcome: client::Outcome,
+    scheduled_block: bool,
+) -> client::SubmitRecord {
+    client::SubmitRecord {
+        share_id: format!("pload1abc.s{session:05}:{hash}"),
+        session,
+        frontend,
+        phase: qbit_prism_load::cadence::PHASE.to_owned(),
+        job_id: format!("job-{session}"),
+        sent,
+        responded: Some(responded),
+        latency_millis: Some(responded.saturating_duration_since(sent).as_secs_f64() * 1000.0),
+        outcome,
+        scheduled_block,
+        reoffer: false,
+        header_hex: String::new(),
+        extranonce2_hex: String::new(),
+        ntime_hex: String::new(),
+        nonce_hex: String::new(),
+    }
+}
+
+fn pending(message: &str) -> client::Outcome {
+    client::Outcome::Rejected(Rejection {
+        code: 21,
+        reason_id: Some("stale-job".into()),
+        message: message.to_owned(),
+    })
+}
+
+fn node_submission(hash: &str, height: u64, accepted: bool) -> node::SubmissionRecord {
+    node::SubmissionRecord {
+        block_hash: hash.to_owned(),
+        parent: HASH_ZERO.to_owned(),
+        height,
+        accepted,
+        rejection: (!accepted).then(|| node::PARENT_MISMATCH.to_owned()),
+        received_at: chrono::Utc::now(),
+        block_bytes: 494,
+    }
+}
+
+fn pool_tip(hash: &str, height: u64, monotonic: std::time::Instant) -> node::TipChange {
+    node::TipChange {
+        hash: hash.to_owned(),
+        height,
+        origin: node::TipOrigin::Pool,
+        monotonic,
+        wall: chrono::Utc::now(),
+    }
+}
+
+fn bump(
+    revision: i64,
+    previous: Option<i64>,
+    monotonic: std::time::Instant,
+) -> qbit_prism_load::cadence::RevisionSample {
+    qbit_prism_load::cadence::RevisionSample {
+        revision,
+        server_timestamp: chrono::Utc::now(),
+        monotonic,
+        previous_revision: previous,
+    }
+}
+
+fn health(index: usize) -> qbit_prism_load::cadence::FrontendHealth {
+    qbit_prism_load::cadence::FrontendHealth {
+        index,
+        instance_id: format!("load-fe-{index}"),
+        restarts_before: 0,
+        restarts_after: 0,
+        exited: None,
+    }
+}
+
+#[test]
+fn rejections_and_bumps_are_attributed_to_the_landing_they_follow() {
+    use qbit_prism_load::cadence;
+    let base = std::time::Instant::now();
+    let landings = vec![
+        cadence::Landing {
+            index: 0,
+            scheduled_offset_seconds: 5.0,
+            requested_monotonic: at(base, 5_000),
+            requested_wall: chrono::Utc::now(),
+            session: 0,
+            frontend: 0,
+        },
+        cadence::Landing {
+            index: 1,
+            scheduled_offset_seconds: 14.0,
+            requested_monotonic: at(base, 14_000),
+            requested_wall: chrono::Utc::now(),
+            session: 1,
+            frontend: 0,
+        },
+        cadence::Landing {
+            index: 2,
+            scheduled_offset_seconds: 23.0,
+            requested_monotonic: at(base, 23_000),
+            requested_wall: chrono::Utc::now(),
+            session: 0,
+            frontend: 0,
+        },
+    ];
+    let submits = vec![
+        // The two landings that landed.
+        dense_submit(
+            HASH_ZERO,
+            0,
+            0,
+            at(base, 5_100),
+            at(base, 5_200),
+            client::Outcome::Accepted,
+            true,
+        ),
+        dense_submit(
+            HASH_ONE,
+            1,
+            0,
+            at(base, 14_100),
+            at(base, 14_200),
+            client::Outcome::Accepted,
+            true,
+        ),
+        // One rebuild-pending rejection before any landing: unattributed.
+        dense_submit(
+            &"1".repeat(64),
+            2,
+            0,
+            at(base, 2_900),
+            at(base, 3_000),
+            pending(classify::NEW_TIP_WORK_PENDING),
+            false,
+        ),
+        // Landing 0's window: two tip-pending, then one payout-pending.
+        dense_submit(
+            &"2".repeat(64),
+            2,
+            0,
+            at(base, 7_100),
+            at(base, 7_200),
+            pending(classify::NEW_TIP_WORK_PENDING),
+            false,
+        ),
+        dense_submit(
+            &"3".repeat(64),
+            3,
+            0,
+            at(base, 7_900),
+            at(base, 8_000),
+            pending(classify::NEW_TIP_WORK_PENDING),
+            false,
+        ),
+        dense_submit(
+            &"4".repeat(64),
+            2,
+            0,
+            at(base, 8_900),
+            at(base, 9_000),
+            pending(classify::NEW_PAYOUT_WORK_PENDING),
+            false,
+        ),
+        // Landing 1's window.
+        dense_submit(
+            &"5".repeat(64),
+            3,
+            0,
+            at(base, 16_400),
+            at(base, 16_500),
+            pending(classify::NEW_TIP_WORK_PENDING),
+            false,
+        ),
+    ];
+    let node_submissions = vec![
+        node_submission(HASH_ZERO, 104, true),
+        node_submission(HASH_ONE, 105, true),
+    ];
+    let tip_changes = vec![
+        pool_tip(HASH_ZERO, 104, at(base, 7_000)),
+        pool_tip(HASH_ONE, 105, at(base, 16_000)),
+    ];
+    let revisions = cadence::RevisionSeries {
+        interval_ms: 25,
+        samples: 9_000,
+        errors: 0,
+        first_error: None,
+        baseline: Some(bump(4, None, base)),
+        changes: vec![
+            // Before any landing: unattributed, cause unknown.
+            bump(5, Some(4), at(base, 2_000)),
+            // Landing 0 causes two: the chainwork bump at the rebuild, and
+            // the candidate confirmation.
+            bump(6, Some(5), at(base, 7_500)),
+            bump(7, Some(6), at(base, 9_000)),
+            // Landing 1 causes one.
+            bump(8, Some(7), at(base, 17_000)),
+        ],
+    };
+    let notifies = vec![
+        client::NotifySighting {
+            session: 2,
+            frontend: 0,
+            job_id: "job-a".into(),
+            tip: HASH_ZERO.to_owned(),
+            clean_jobs: true,
+            at: at(base, 10_000),
+        },
+        client::NotifySighting {
+            session: 3,
+            frontend: 0,
+            job_id: "job-b".into(),
+            tip: HASH_ZERO.to_owned(),
+            clean_jobs: true,
+            at: at(base, 10_500),
+        },
+        client::NotifySighting {
+            session: 2,
+            frontend: 0,
+            job_id: "job-c".into(),
+            tip: HASH_ONE.to_owned(),
+            clean_jobs: true,
+            at: at(base, 18_000),
+        },
+    ];
+    let tips = vec![
+        client::TipSighting {
+            session: 2,
+            frontend: 0,
+            tip: HASH_ZERO.to_owned(),
+            at: at(base, 7_300),
+        },
+        client::TipSighting {
+            session: 3,
+            frontend: 0,
+            tip: HASH_ZERO.to_owned(),
+            at: at(base, 7_400),
+        },
+    ];
+    let failures = vec![(
+        0usize,
+        "scheduled block: no block solution found under job job-0".to_owned(),
+        at(base, 23_100),
+    )];
+    let frontends = vec![health(0)];
+    let session_frontend = vec![0usize, 0, 0, 0];
+    let gaps = vec![9.0, 19.0];
+    let offsets = vec![5.0, 14.0, 23.0];
+    let committed = std::collections::BTreeSet::new();
+    let document = cadence::build(&cadence::ReportInputs {
+        cadence: cadence::Cadence::Dense,
+        gaps: &gaps,
+        offsets: &offsets,
+        phase_seconds: 240,
+        phase_rate: 50.0,
+        phase_started: base,
+        phase_started_wall: chrono::Utc::now(),
+        phase_ended: at(base, 240_000),
+        phase_duration_millis: 240_000,
+        landing_budget: 3,
+        slots_over_budget: 0,
+        landings: &landings,
+        revisions: Some(&revisions),
+        submits: &submits,
+        notifies: &notifies,
+        tips: &tips,
+        node_submissions: &node_submissions,
+        tip_changes: &tip_changes,
+        session_frontend: &session_frontend,
+        frontends: &frontends,
+        failures: &failures,
+        committed: &committed,
+        aborted: None,
+    });
+
+    assert_eq!(document["ran"], json!(true));
+    assert_eq!(document["landings"], json!(2), "two landings landed");
+    assert_eq!(document["landing_attempts"], json!(3));
+    assert_eq!(document["landing_outcomes"]["landed"], json!(2));
+    assert_eq!(document["landing_outcomes"]["never_produced"], json!(1));
+    assert_eq!(
+        document["bumps"],
+        json!(3),
+        "three bumps followed a landing"
+    );
+    assert_eq!(document["bump_attribution"]["attributed"], json!(3));
+    assert_eq!(
+        document["bump_attribution"]["unattributed"],
+        json!(1),
+        "the bump before the first landing is unattributed, never dropped"
+    );
+    let bumps = document["bump_records"].as_array().expect("bump records");
+    assert_eq!(bumps.len(), 4);
+    assert_eq!(bumps[0]["attributed_to_landing"], Value::Null);
+    assert!(bumps[0]["cause"]
+        .as_str()
+        .expect("cause")
+        .contains("unknown"));
+    assert_eq!(bumps[1]["attributed_to_landing"], json!(0));
+    assert_eq!(bumps[1]["revision_delta"], json!(1));
+    assert_eq!(bumps[2]["attributed_to_landing"], json!(0));
+    assert_eq!(bumps[3]["attributed_to_landing"], json!(1));
+
+    assert_eq!(
+        document["rejection_attribution"]["rebuild_pending_rejections_in_phase"],
+        json!(5)
+    );
+    assert_eq!(document["rejection_attribution"]["attributed"], json!(4));
+    assert_eq!(document["rejection_attribution"]["unattributed"], json!(1));
+
+    let landing = &document["landing_records"][0];
+    assert_eq!(landing["outcome"], json!("landed"));
+    assert_eq!(landing["block_hash"], json!(HASH_ZERO));
+    assert_eq!(landing["node"]["accepted"], json!(true));
+    assert_eq!(landing["bumps"], json!(2));
+    assert_eq!(landing["bump_revisions"], json!([6, 7]));
+    let table = &landing["frontends"][0];
+    assert_eq!(table["frontend"], json!(0));
+    assert_eq!(table["tip_pending_window"]["count"], json!(2));
+    assert_eq!(
+        table["tip_pending_window"]["first_millis_after_landing"],
+        json!(200.0)
+    );
+    assert_eq!(
+        table["tip_pending_window"]["duration_millis"],
+        json!(800.0),
+        "7.2 s to 8.0 s after the tip change"
+    );
+    assert_eq!(table["payout_pending_window"]["count"], json!(1));
+    assert_eq!(
+        table["payout_pending_window"]["duration_millis"],
+        json!(0.0),
+        "one rejection is a zero-length window, not a missing one"
+    );
+    assert_eq!(
+        table["combined_rebuild_pending_window"]["count"],
+        json!(3),
+        "both messages, in one window"
+    );
+    assert_eq!(
+        table["combined_rebuild_pending_window"]["duration_millis"],
+        json!(1_800.0)
+    );
+    assert_eq!(
+        table["reference_bump"]["revision"],
+        json!(7),
+        "the last bump of the landing is the revision a frontend must reach"
+    );
+    assert_eq!(
+        table["rejected_before_new_revision_work"],
+        json!(3),
+        "all three rejections came before the first clean_jobs job"
+    );
+    assert_eq!(table["lost_valid_shares"], json!(3));
+    assert_eq!(table["lost_valid_shares_found_in_postgres"], json!(0));
+    assert_eq!(table["incomplete"], json!(false));
+    assert_eq!(
+        table["time_to_new_tip_work_millis"]["max"],
+        json!(400.0),
+        "measured from the node's tip stamp"
+    );
+    assert_eq!(
+        table["time_to_new_revision_work_millis"]["max"],
+        json!(1_500.0),
+        "measured from the reference bump at 9.0 s"
+    );
+    assert!(table["new_revision_work_approximation"]
+        .as_str()
+        .expect("the approximation is labelled")
+        .contains("clean_jobs"));
+
+    let last = &document["landing_records"][2];
+    assert_eq!(last["outcome"], json!("never_produced"));
+    assert!(last["never_produced_error"]
+        .as_str()
+        .expect("the failure is reported, not hidden")
+        .contains("no block solution"));
+    assert_eq!(last["frontends"], json!([]));
+
+    assert_eq!(document["lost_valid_work"]["shares"], json!(4));
+    assert_eq!(
+        document["lost_valid_work"]["shares_found_in_postgres"],
+        json!(0)
+    );
+    assert!(document["proposed_budget_for_issue_291"]["window_p99_millis"].is_number());
+    assert!(document["definitions"]["combined_rebuild_pending_window"].is_string());
+}
+
+#[test]
+fn a_run_with_no_landing_reports_zero_landings_zero_bumps_and_no_window() {
+    use qbit_prism_load::cadence;
+    let base = std::time::Instant::now();
+    let gaps = cadence::parse_gaps(cadence::DEFAULT_GAPS).expect("the default gaps parse");
+    let offsets = cadence::landing_offsets(&gaps, 240.0);
+    let revisions = cadence::RevisionSeries {
+        interval_ms: 25,
+        samples: 9_000,
+        errors: 0,
+        first_error: None,
+        baseline: Some(bump(4, None, base)),
+        changes: Vec::new(),
+    };
+    let frontends = vec![health(0), health(1)];
+    let session_frontend = vec![0usize, 1];
+    let committed = std::collections::BTreeSet::new();
+    let inputs = cadence::ReportInputs {
+        cadence: cadence::Cadence::Dense,
+        gaps: &gaps,
+        offsets: &offsets,
+        phase_seconds: 240,
+        phase_rate: 50.0,
+        phase_started: base,
+        phase_started_wall: chrono::Utc::now(),
+        phase_ended: at(base, 240_000),
+        phase_duration_millis: 240_000,
+        landing_budget: 0,
+        slots_over_budget: offsets.len(),
+        landings: &[],
+        revisions: Some(&revisions),
+        submits: &[],
+        notifies: &[],
+        tips: &[],
+        node_submissions: &[],
+        tip_changes: &[],
+        session_frontend: &session_frontend,
+        frontends: &frontends,
+        failures: &[],
+        committed: &committed,
+        aborted: None,
+    };
+    let document = cadence::build(&inputs);
+    assert_eq!(document["ran"], json!(true), "the phase itself did run");
+    assert_eq!(document["landings"], json!(0));
+    assert_eq!(document["bumps"], json!(0));
+    assert_eq!(document["windows_available"], json!(false));
+    assert_eq!(document["landing_records"], json!([]));
+    assert_eq!(document["landing_attempts"], json!(0));
+    let reason = document["reason"].as_str().expect("a reason, not silence");
+    assert!(reason.contains("--scheduled-blocks"), "{reason}");
+    assert_eq!(
+        document["summaries"]["overall"]["combined_rebuild_pending_window_duration_millis"]["p99"],
+        Value::Null
+    );
+    assert_eq!(
+        document["proposed_budget_for_issue_291"]["window_p99_millis"],
+        Value::Null,
+        "a budget is unknown, never zero, when nothing landed"
+    );
+    assert_eq!(
+        document["proposed_budget_for_issue_291"]["recommended_soak_budget_millis"],
+        Value::Null
+    );
+    assert_eq!(document["lost_valid_work"]["shares"], json!(0));
+
+    // Every attempt failing is a different reason, and it names the tally.
+    let landings = vec![cadence::Landing {
+        index: 0,
+        scheduled_offset_seconds: 5.0,
+        requested_monotonic: at(base, 5_000),
+        requested_wall: chrono::Utc::now(),
+        session: 0,
+        frontend: 0,
+    }];
+    let failed = cadence::build(&cadence::ReportInputs {
+        landing_budget: 12,
+        slots_over_budget: 0,
+        landings: &landings,
+        ..inputs
+    });
+    assert_eq!(failed["landings"], json!(0));
+    assert_eq!(failed["bumps"], json!(0));
+    let reason = failed["reason"].as_str().expect("a reason");
+    assert!(reason.contains("never_produced=1"), "{reason}");
+
+    // A run that never asked for the scenario says so.
+    let none = cadence::build(&cadence::ReportInputs {
+        cadence: cadence::Cadence::None,
+        ..cadence::ReportInputs {
+            landing_budget: 0,
+            slots_over_budget: 0,
+            landings: &[],
+            ..inputs
+        }
+    });
+    assert_eq!(none["ran"], json!(false));
+    assert!(none["reason"]
+        .as_str()
+        .expect("a reason")
+        .contains("--cadence dense"));
+}
