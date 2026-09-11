@@ -420,7 +420,7 @@ one `tokio::time::timeout` around `read_window` plus the rebuild:
 
 | Caller | Deadline | On expiry |
 | --- | --- | --- |
-| claim (#265) | **60 s** for the whole call. The candidate lease is not a deadline: its heartbeat renews it every 30 s for as long as processing runs (`srv/src/coordinator.rs:887-907`), and only a failed renewal drops the work (`:950-963`). Against the estimate, 60 s is twelve times the 5 s upper bound and four statement timeouts at the 15 s default, so a rebuild that needs longer is a harness finding, not a reason to raise it | fail the attempt through `retry_candidate` (`srv/src/ledger/candidates.rs:114`) with an alert; the lease was renewed within the last 30 s of a 120 s term, so the `claim_expires_at > clock_timestamp()` condition holds and the row is rescheduled after `LEAST(60, attempt_count)` seconds (`:118`), never abandoned |
+| claim (#265) | **60 s** around `read_window` plus the rebuild only, the work this record adds. The steps after it keep their existing deadlines: observation, landing, lease renewal and `submitblock`, whose RPC timeout `PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS` may be set up to 86,400 s (`srv/src/config.rs:428`, bounded at `:138-145`). A 60 s bound around them would cancel an in-flight submission and reschedule it as a reconstruction timeout. The candidate lease is not a deadline: its heartbeat renews it every 30 s for as long as processing runs (`srv/src/coordinator.rs:887-907`), and only a failed renewal drops the work (`:950-963`). Against the estimate, 60 s is twelve times the 5 s upper bound and four statement timeouts at the 15 s default, so a rebuild that needs longer is a harness finding, not a reason to raise it | fail the attempt through `retry_candidate` (`srv/src/ledger/candidates.rs:114`) with an alert; the lease was renewed within the last 30 s of a 120 s term, so the `claim_expires_at > clock_timestamp()` condition holds and the row is rescheduled after `LEAST(60, attempt_count)` seconds (`:118`), never abandoned |
 | resume (#273) | strictly shorter than the caller's: `resume_job`'s only caller already wraps it in `timeout(initial_job_timeout_seconds, …)` and maps expiry to the backend error "job resume timed out" (`srv/src/stratum.rs:1227-1232`). Proposed: from the `Duration` the caller already builds, `outer = Duration::from_secs_f64(initial_job_timeout_seconds)`, the inner deadline is `outer - (outer / 2).min(Duration::from_secs(5))`, that is `outer − min(5 s, outer / 2)`: 25 s at the 30 s default (`srv/src/config.rs:195`), 2 s at a 4 s setting, always positive, strictly shorter than the outer timeout and free of `Duration` underflow, so it adds no failure mode the outer `from_secs_f64` does not already have. A plain `− 5 s` would be zero or negative for any setting at or below 5 s, which validation allows: production only requires `> 0.0` (`srv/src/config.rs:194-197`) and `srv/src/stratum.rs:449-452` parses the value without a range check. Tunable by #273 | cache miss: log and return `Ok(None)`; the share is then rejected as `unknown-job` (`srv/src/stratum.rs:1251-1255`), not answered with fresh work |
 
 ### Errors and callers
@@ -565,6 +565,34 @@ prune computes the floor, and deletes strictly below it. It must also keep a hor
 the window start earlier (`srv/src/ledger/window.rs:190-232`). A read that began
 before such a commit still sees its snapshot; one that begins after it fails
 with `Incomplete` at the existence probe.
+
+**In-flight windows.** The floor covers written references only.
+`Ledger::snapshot` fixes its cutoff and releases both locks when its first
+transaction commits (`srv/src/ledger/window.rs:195-208`). The page scan
+(`:212-233`), the digest, the bundle and `save_job`
+(`srv/src/coordinator.rs:560-668`) all come after that, while no row
+references the window yet. Miners get the work only after `save_job` commits
+(`:686-705`), so the gap ends there. A prune inside the gap, after a fall in
+difficulty shrinks the next selectable window, could delete rows of the
+window being built, and `save_job` would then publish a reference to rows
+that are gone. So D6 adds a reservation:
+
+- `Ledger::snapshot`'s first transaction, still under both locks, inserts a
+  reservation row holding its cutoff and an expiry longer than any refresh
+  can take. The window start isn't known yet, so the row's `first_share_seq`
+  stays NULL until the scan ends and the refresh fills it in.
+- `save_job` deletes the reservation in its own transaction, where the job
+  row's reference takes over. It publishes nothing, a cache miss, if the
+  reservation has expired or the window's `first_share_seq` row is gone,
+  checked with the existence probe `read_window` uses; a prune only removes a
+  prefix, so that row's presence means the whole range is present.
+- The prune, holding both locks, skips its run while any unexpired
+  reservation still has a NULL `first_share_seq`, and otherwise lowers its
+  floor to the smallest reserved `first_share_seq`.
+
+An age-based horizon was rejected: how far back in time a window reaches
+depends on the pool's hashrate, so no fixed age is safe. Until D6 lands
+nothing is pruned, and none of this is needed.
 
 ## Stored bundle inputs
 
@@ -873,7 +901,7 @@ not on every refresh.
 | write | submit (`srv/src/coordinator.rs:1691-1699`) clones `Prepared.window`, the `WindowRef` `refresh_once` already computed, a few hundred bytes, so a found block never re-digests the window on the share path (the 0.7 to 1.4 s the cost table budgets once per refresh), and sets `bootstrap_share` when `context.prepared.bundle.is_none()` (`:27`; the `None` arm at `:1343` is where the per-worker bootstrap bundle was built); persist (`srv/src/ledger/candidates.rs:182-183`) serializes and digests the small row before the append transaction opens and writes the columns with it | `refresh_once` (`srv/src/coordinator.rs:468`, the store at `:627-641`) computes the reference once per non-cached refresh and keeps it as `Prepared.window`, which submit clones (#265) and a resume takes from `StoredPrepared`; `save_job` writes the columns and a payload with no `shares` key; an empty snapshot writes an empty-window reference |
 | read | claim decode (`srv/src/ledger/candidates.rs:73-79`) checks the digest and the columns | resume (`srv/src/coordinator.rs:1447-1470`) decodes the small payload inline; `:1469-1470` no longer needs `spawn_blocking` |
 | fence | `process_candidate_inner` (`srv/src/coordinator.rs:966`) keeps `:972-979`; `Window.payout_revision != candidate.payout_revision` is a second hint for the same `observe_candidate` probe and never a supersession by itself ([Revision fence and reorgs](#revision-fence-and-reorgs)) | `:1483-1488` stays, then `Window.payout_revision` against the row's `payout_revision`; any inequality is `Ok(None)` |
-| rebuild | under a `build_slots` permit (`:997`) and the 60 s whole-call deadline: if `qbit_pool_audit_bundles` already holds the block's audit, authenticate that row against the block's coinbase ([Revision fence and reorgs](#revision-fence-and-reorgs)), skip `read_window`, the rebuild and `land_candidate`, never call `materialize_audit_row`, and continue to observe, renew the lease and `submitblock` as today; else await `read_window`, re-derive the witness leaves from `block_hex`, run `build_audit_bundle_body_*(&window.shares, …)` directly in `spawn_blocking` (`:998-1031`; never `build_bundle`, which takes a second permit at `:712`), and put `into_bundle(window.shares)` in `CandidateClaim` for landing | under one `build_slots` permit, the single-flight entry for the `storage_key` and the inner timeout: await `read_window`, move its `Vec` into the `Snapshot` and rebuild `Prepared` as `(Arc<Snapshot>, Arc<AuditBundleBody>)` through the borrowing builders called directly, never `build_bundle`, or use the local incremental window once #274 lands |
+| rebuild | under a `build_slots` permit (`:997`) and the 60 s deadline around `read_window` and the rebuild: if `qbit_pool_audit_bundles` already holds the block's audit, authenticate that row against the block's coinbase ([Revision fence and reorgs](#revision-fence-and-reorgs)), skip `read_window`, the rebuild and `land_candidate`, never call `materialize_audit_row`, and continue to observe, renew the lease and `submitblock` as today; else await `read_window`, re-derive the witness leaves from `block_hex`, run `build_audit_bundle_body_*(&window.shares, …)` directly in `spawn_blocking` (`:998-1031`; never `build_bundle`, which takes a second permit at `:712`), and put `into_bundle(window.shares)` in `CandidateClaim` for landing | under one `build_slots` permit, the single-flight entry for the `storage_key` and the inner timeout: await `read_window`, move its `Vec` into the `Snapshot` and rebuild `Prepared` as `(Arc<Snapshot>, Arc<AuditBundleBody>)` through the borrowing builders called directly, never `build_bundle`, or use the local incremental window once #274 lands |
 | empty window | build over `&[bootstrap_share]` | the single-flight entry carries `bundle: None`; each miner gets its own bootstrap bundle, built with the builders directly under a fresh `build_slots` permit taken after the entry's permit is released, from the synthetic share `build_bundle` fabricates from the worker today (`:727-745`, reached from `:1498-1510`), the stored template, anchor, `payout_policy` and `ctv`, and the returned balances and revision; never `build_bundle`, which reads `config` for signed fields (`:755`, `:760-762`) |
 | import | `srv/src/ledger/migration.rs:117` stores `canonical_audit_bytes` plus non-share metadata and no inline body. The same PR makes both readers decode `canonical_audit_bytes`, digest-checked against `audit_bundle_sha256` and under `spawn_blocking` (a two-copy body is about 470 MB at 400k), before any `body_uri` fallback, as `audit_canonical_bytes` already does (`srv/src/ledger/audit.rs:12-23`): `Ledger::audit_bundle` (`:92-107`), which today returns only the JSON column, so `backfill-ctv` would stop on imported rows with "import legacy audits first" (`srv/src/ledger/migration.rs:133-136`); and the bundle endpoint's fallback (`srv/src/api/read_models.rs:196-231`), which today reads only `body_uri`, so every frontend would still need the legacy filesystem. Keeping the inline body instead would bring back the two-copy JSONB document this design removes | n/a |
 | must not | serialize a share array into the outbox; re-digest the window at submit instead of cloning `Prepared.window`; hydrate a landed audit on the submit loop through `materialize_audit_row`; finish a recovered claim without checking the landed coinbase and audit root against `block_hex`; finish a claim only because its audit has landed; hold `ORDER_LOCK` across `read_window`; call `read_window` without a `window_reads` permit; decode inline candidates on a post-007 schema; read local configuration for any stored input; rebuild a reference whose `audit_builder_version` or `signer_keys` differ from this binary's; accept a new fingerprint in `configure` while a pending row stores other `signer_keys`; wrap `read_window` in `spawn_blocking`; call `build_bundle` under a held `build_slots` permit; leave an imported audit readable only through `body_uri` | write a share array into `payload`; call `read_window` without a `window_reads` permit; wrap `read_window` in `spawn_blocking`; run whole-window serde on a runtime thread; call `build_bundle` for any resume rebuild, empty window included (it takes a second permit and reads `config` for signed fields); hold an owned `AuditBundle` beside the `Snapshot` in `Prepared` or `JobContext`; resume a job whose `audit_builder_version` or `signer_keys` differ from this binary's; change the `save_job` revision fence (`srv/src/ledger/jobs.rs:16-23`) or the cached-work reuse conditions (`srv/src/coordinator.rs:528-533`) |
@@ -908,7 +936,8 @@ normalizes `reward_manifest.shares` out of the stored body; the
 - **D6 (#260).** Retention must never prune below the floor above, must keep
   a horizon wider than any window the next snapshot can select, must take
   `SETTLEMENT_LOCK` then `ORDER_LOCK`, the established order, while it
-  computes and deletes, and must
+  computes and deletes, must honour the in-flight reservations
+  ([Immutability and retention](#immutability-and-retention)), and must
   narrow the immutability trigger only for that job. It may add the
   `window_first_share_seq` index.
 - **#265, #285 and #287.** Whether 007's refusal should also consider live
