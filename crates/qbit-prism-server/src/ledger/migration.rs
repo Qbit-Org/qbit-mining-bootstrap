@@ -521,11 +521,25 @@ struct FunctionDefinition {
     config: Vec<String>,
 }
 
-/// Every table, column, constraint, index, trigger and function of one
-/// schema, as the server renders them, without schema qualification. Columns
-/// are keyed by name, so their physical order is irrelevant; constraints are
-/// keyed per table by definition, so an auto-generated name is irrelevant;
-/// comments are not read.
+/// The structure of a sequence, from `pg_sequence`: what a `serial` column
+/// or `CREATE SEQUENCE` fixed. Its current value (`last_value`, `is_called`)
+/// is data the writers advance and is not read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SequenceDefinition {
+    data_type: String,
+    start: i64,
+    increment: i64,
+    min: i64,
+    max: i64,
+    cache: i64,
+    cycle: bool,
+}
+
+/// Every table, column, constraint, index, trigger, function and sequence of
+/// one schema, as the server renders them, without schema qualification.
+/// Columns are keyed by name, so their physical order is irrelevant;
+/// constraints are keyed per table by definition, so an auto-generated name
+/// is irrelevant; comments are not read.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SchemaFingerprint {
     tables: BTreeMap<String, BTreeMap<String, ColumnDefinition>>,
@@ -538,6 +552,9 @@ struct SchemaFingerprint {
     triggers: BTreeMap<(String, String), TriggerDefinition>,
     /// Keyed by name, then identity arguments.
     functions: BTreeMap<(String, String), FunctionDefinition>,
+    /// Keyed by name: the sequences behind `serial` columns and the ones
+    /// created explicitly alike.
+    sequences: BTreeMap<String, SequenceDefinition>,
 }
 
 /// What the source has that the release does not create (`extra`, kept and
@@ -708,6 +725,22 @@ async fn fingerprint_schema(
                     .iter()
                     .map(|item| normalize_function_config(item, namespace))
                     .collect(),
+            },
+        );
+    }
+    let rows = sqlx::query("SELECT c.relname::text AS name,format_type(s.seqtypid,NULL) AS data_type,s.seqstart AS start,s.seqincrement AS increment,s.seqmin AS min,s.seqmax AS max,s.seqcache AS cache,s.seqcycle AS cycle FROM pg_sequence s JOIN pg_class c ON c.oid=s.seqrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='S' ORDER BY 1")
+        .bind(namespace).fetch_all(&mut **tx).await?;
+    for row in &rows {
+        fingerprint.sequences.insert(
+            row.try_get("name")?,
+            SequenceDefinition {
+                data_type: row.try_get("data_type")?,
+                start: row.try_get("start")?,
+                increment: row.try_get("increment")?,
+                min: row.try_get("min")?,
+                max: row.try_get("max")?,
+                cache: row.try_get("cache")?,
+                cycle: row.try_get("cycle")?,
             },
         );
     }
@@ -895,9 +928,40 @@ fn function_differences(expected: &FunctionDefinition, found: &FunctionDefinitio
     parts.join(", ")
 }
 
+fn sequence_differences(expected: &SequenceDefinition, found: &SequenceDefinition) -> String {
+    let mut parts = Vec::new();
+    if expected.data_type != found.data_type {
+        parts.push(format!(
+            "type expected {}, found {}",
+            expected.data_type, found.data_type
+        ));
+    }
+    for (property, expected, found) in [
+        ("start", expected.start, found.start),
+        ("increment", expected.increment, found.increment),
+        ("minimum", expected.min, found.min),
+        ("maximum", expected.max, found.max),
+        ("cache", expected.cache, found.cache),
+    ] {
+        if expected != found {
+            parts.push(format!("{property} expected {expected}, found {found}"));
+        }
+    }
+    if expected.cycle != found.cycle {
+        let cycle = |cycle: bool| if cycle { "CYCLE" } else { "NO CYCLE" };
+        parts.push(format!(
+            "expected {}, found {}",
+            cycle(expected.cycle),
+            cycle(found.cycle)
+        ));
+    }
+    parts.join(", ")
+}
+
 /// Every object the release creates must have an equivalent in the source;
 /// anything else in the source is extra. An object on a table the source
-/// lacks is not reported twice.
+/// lacks is not reported twice. A sequence is compared by its structure
+/// only: the value it has reached is the source's data.
 fn compare_fingerprints(
     expected: &SchemaFingerprint,
     found: &SchemaFingerprint,
@@ -929,6 +993,21 @@ fn compare_fingerprints(
     for table in found.tables.keys() {
         if !expected.tables.contains_key(table) {
             comparison.extra.push(format!("table {table}"));
+        }
+    }
+    for (name, sequence) in &expected.sequences {
+        match found.sequences.get(name) {
+            None => comparison.drift.push(format!("missing sequence {name}")),
+            Some(actual) if actual != sequence => comparison.drift.push(format!(
+                "sequence {name} differs: {}",
+                sequence_differences(sequence, actual)
+            )),
+            Some(_) => {}
+        }
+    }
+    for name in found.sequences.keys() {
+        if !expected.sequences.contains_key(name) {
+            comparison.extra.push(format!("sequence {name}"));
         }
     }
     let empty = BTreeMap::new();
@@ -1072,9 +1151,9 @@ fn named_objects(objects: &[String]) -> String {
 /// to a scratch schema inside this transaction, under a savepoint that is
 /// rolled back before the source is read, so the comparison is exact for
 /// this server's PostgreSQL version and nothing from the scratch apply
-/// survives. Extra objects, columns, constraints and indexes are kept and
-/// logged; a missing or different one fails the migration, which rolls back
-/// whole, so the database is unchanged.
+/// survives. Extra objects, columns, constraints, indexes and sequences are
+/// kept and logged; a missing or different one fails the migration, which
+/// rolls back whole, so the database is unchanged.
 async fn require_release_schema(
     tx: &mut Transaction<'_, Postgres>,
     state: SourceState,
@@ -1171,6 +1250,7 @@ async fn require_release_schema(
         indexes = expected.indexes.len(),
         triggers = expected.triggers.len(),
         functions = expected.functions.len(),
+        sequences = expected.sequences.len(),
         extra = comparison.extra.len(),
         "source schema matches the 2.x.x release"
     );
@@ -1798,5 +1878,70 @@ mod tests {
             .map(|index| format!("object {index}"))
             .collect();
         assert!(named_objects(&long).ends_with("; object 15 and 3 more"));
+    }
+
+    fn sequence(data_type: &str, increment: i64, max: i64) -> SequenceDefinition {
+        SequenceDefinition {
+            data_type: data_type.to_owned(),
+            start: 1,
+            increment,
+            min: 1,
+            max,
+            cache: 1,
+            cycle: false,
+        }
+    }
+
+    #[test]
+    fn sequence_comparison_refuses_structure_and_names_each_difference() {
+        let release = sequence("bigint", 1, i64::MAX);
+        let mut expected = SchemaFingerprint::default();
+        expected
+            .sequences
+            .insert("t_id_seq".into(), release.clone());
+        expected
+            .sequences
+            .insert("u_id_seq".into(), release.clone());
+        expected
+            .sequences
+            .insert("gone_seq".into(), release.clone());
+        let mut found = SchemaFingerprint::default();
+        // A lowered maximum with a narrowed type, a changed increment, a
+        // missing sequence, and one the release does not create.
+        found
+            .sequences
+            .insert("t_id_seq".into(), sequence("integer", 1, 2_147_483_647));
+        found
+            .sequences
+            .insert("u_id_seq".into(), sequence("bigint", 2, i64::MAX));
+        found
+            .sequences
+            .insert("operator_seq".into(), release.clone());
+        let comparison = compare_fingerprints(&expected, &found);
+        assert_eq!(
+            comparison.drift,
+            vec![
+                "missing sequence gone_seq",
+                "sequence t_id_seq differs: type expected bigint, found integer, maximum expected 9223372036854775807, found 2147483647",
+                "sequence u_id_seq differs: increment expected 1, found 2",
+            ]
+        );
+        assert_eq!(comparison.extra, vec!["sequence operator_seq"]);
+
+        // Every property is named; the current value is not a property.
+        let mut advanced = release.clone();
+        advanced.start = 5;
+        advanced.min = 0;
+        advanced.cache = 20;
+        advanced.cycle = true;
+        assert_eq!(
+            sequence_differences(&release, &advanced),
+            "start expected 1, found 5, minimum expected 1, found 0, cache expected 1, found 20, expected NO CYCLE, found CYCLE"
+        );
+        found.sequences.insert("gone_seq".into(), release.clone());
+        found.sequences.insert("t_id_seq".into(), release.clone());
+        found.sequences.insert("u_id_seq".into(), release);
+        let comparison = compare_fingerprints(&expected, &found);
+        assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
     }
 }

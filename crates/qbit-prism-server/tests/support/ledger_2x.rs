@@ -572,12 +572,14 @@ async fn drifted_pre_258_source_is_refused_naming_each_object_and_rolls_back() -
     apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
     let terminal = legacy_hash(0x33);
     insert_v1_terminal(&pool, &terminal, "submitted").await?;
-    // Four edits 001's IF NOT EXISTS cannot repair: a foreign key 001 only
+    // Six edits 001's IF NOT EXISTS cannot repair: a foreign key 001 only
     // creates inside CREATE TABLE, a NOT NULL and a column type it never
-    // re-asserts, and an index that keeps its name but not its definition.
-    // (001 re-creates every function and trigger itself, so those are only
-    // checked as found on 002 objects.)
-    sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox DROP CONSTRAINT qbit_block_candidate_outbox_share_id_fkey; ALTER TABLE qbit_pool_blocks ALTER COLUMN parent_hash DROP NOT NULL; ALTER TABLE qbit_share_ledger ALTER COLUMN ntime TYPE integer; DROP INDEX qbit_share_ledger_template_height_idx; CREATE INDEX qbit_share_ledger_template_height_idx ON qbit_share_ledger (template_height)")
+    // re-asserts, an index that keeps its name but not its definition, and
+    // the structure of two sequences behind bigserial columns, which
+    // CREATE TABLE IF NOT EXISTS leaves as they are. (001 re-creates every
+    // function and trigger itself, so those are only checked as found on
+    // 002 objects.)
+    sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox DROP CONSTRAINT qbit_block_candidate_outbox_share_id_fkey; ALTER TABLE qbit_pool_blocks ALTER COLUMN parent_hash DROP NOT NULL; ALTER TABLE qbit_share_ledger ALTER COLUMN ntime TYPE integer; DROP INDEX qbit_share_ledger_template_height_idx; CREATE INDEX qbit_share_ledger_template_height_idx ON qbit_share_ledger (template_height); ALTER SEQUENCE qbit_share_ledger_share_seq_seq MAXVALUE 1000000; ALTER SEQUENCE qbit_pool_payout_entries_payout_entry_seq_seq INCREMENT BY 2")
         .execute(&pool).await?;
     let error = db
         .ledger("a")
@@ -590,7 +592,7 @@ async fn drifted_pre_258_source_is_refused_naming_each_object_and_rolls_back() -
         "{error}"
     );
     assert!(
-        error.contains("does not match the v2.0.x release schema (v2.0.1, 001_share_ledger.sql), 4 object(s) differ"),
+        error.contains("does not match the v2.0.x release schema (v2.0.1, 001_share_ledger.sql), 6 object(s) differ"),
         "{error}"
     );
     assert!(
@@ -612,6 +614,14 @@ async fn drifted_pre_258_source_is_refused_naming_each_object_and_rolls_back() -
     assert!(
         error.contains("index qbit_share_ledger_template_height_idx differs: expected CREATE INDEX qbit_share_ledger_template_height_idx ON qbit_share_ledger USING btree (template_height, share_seq)")
             && error.contains(", found CREATE INDEX qbit_share_ledger_template_height_idx ON qbit_share_ledger USING btree (template_height)"),
+        "{error}"
+    );
+    assert!(
+        error.contains("sequence qbit_share_ledger_share_seq_seq differs: maximum expected 9223372036854775807, found 1000000"),
+        "{error}"
+    );
+    assert!(
+        error.contains("sequence qbit_pool_payout_entries_payout_entry_seq_seq differs: increment expected 1, found 2"),
         "{error}"
     );
     assert!(
@@ -637,10 +647,10 @@ async fn drifted_pre_258_source_is_refused_naming_each_object_and_rolls_back() -
     .fetch_all(&pool)
     .await?;
     assert_eq!(rows, vec![(terminal.clone(), "submitted".into())]);
-    assert!(sqlx::query_scalar::<_,bool>("SELECT NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=to_regclass('qbit_block_candidate_outbox') AND conname='qbit_block_candidate_outbox_share_id_fkey') AND EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass('qbit_share_ledger') AND attname='ntime' AND atttypid='integer'::regtype)").fetch_one(&pool).await?, "refusal changed the source schema");
+    assert!(sqlx::query_scalar::<_,bool>("SELECT NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=to_regclass('qbit_block_candidate_outbox') AND conname='qbit_block_candidate_outbox_share_id_fkey') AND EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass('qbit_share_ledger') AND attname='ntime' AND atttypid='integer'::regtype) AND (SELECT seqmax FROM pg_sequence WHERE seqrelid=to_regclass('qbit_share_ledger_share_seq_seq'))=1000000 AND (SELECT seqincrement FROM pg_sequence WHERE seqrelid=to_regclass('qbit_pool_payout_entries_payout_entry_seq_seq'))=2").fetch_one(&pool).await?, "refusal changed the source schema");
     // Back at the release schema (the index by re-running the 2.x.x file),
     // the source migrates and is still recorded as the v2.0.1 schema.
-    sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox ADD CONSTRAINT qbit_block_candidate_outbox_share_id_fkey FOREIGN KEY (share_id) REFERENCES qbit_share_ledger(share_id); ALTER TABLE qbit_pool_blocks ALTER COLUMN parent_hash SET NOT NULL; ALTER TABLE qbit_share_ledger ALTER COLUMN ntime TYPE bigint; DROP INDEX qbit_share_ledger_template_height_idx")
+    sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox ADD CONSTRAINT qbit_block_candidate_outbox_share_id_fkey FOREIGN KEY (share_id) REFERENCES qbit_share_ledger(share_id); ALTER TABLE qbit_pool_blocks ALTER COLUMN parent_hash SET NOT NULL; ALTER TABLE qbit_share_ledger ALTER COLUMN ntime TYPE bigint; DROP INDEX qbit_share_ledger_template_height_idx; ALTER SEQUENCE qbit_share_ledger_share_seq_seq NO MAXVALUE; ALTER SEQUENCE qbit_pool_payout_entries_payout_entry_seq_seq INCREMENT BY 1")
         .execute(&pool).await?;
     sqlx::raw_sql(FROZEN_2X_001).execute(&pool).await?;
     let ledger = db.ledger("a").await?;
@@ -711,10 +721,12 @@ async fn tolerated_source_differences_still_migrate() -> Result<()> {
     apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
     sqlx::raw_sql("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256) VALUES(repeat('aa',32),100,repeat('00',32),repeat('ab',32),repeat('ac',32))")
         .execute(&pool).await?;
-    // Extra objects an operator may have added; a column 001 creates in
-    // CREATE TABLE moved to a different physical position with its data;
-    // and the NOT VALID mark 001 itself leaves on an upgraded table.
-    sqlx::raw_sql("CREATE TABLE operator_notes(note_id bigserial PRIMARY KEY, note text NOT NULL); ALTER TABLE qbit_share_ledger ADD COLUMN operator_note text; CREATE INDEX qbit_share_ledger_operator_idx ON qbit_share_ledger (miner_id); ALTER TABLE qbit_pool_blocks ADD COLUMN parent_hash_moved text; UPDATE qbit_pool_blocks SET parent_hash_moved=parent_hash; ALTER TABLE qbit_pool_blocks DROP COLUMN parent_hash; ALTER TABLE qbit_pool_blocks RENAME COLUMN parent_hash_moved TO parent_hash; ALTER TABLE qbit_pool_blocks ALTER COLUMN parent_hash SET NOT NULL; ALTER TABLE qbit_share_ledger DROP CONSTRAINT qbit_share_ledger_credit_policy_check; ALTER TABLE qbit_share_ledger ADD CONSTRAINT qbit_share_ledger_credit_policy_check CHECK (credit_policy IS NULL OR credit_policy IN ('stale-grace')) NOT VALID")
+    // Extra objects an operator may have added (the operator table brings
+    // its own sequence); a column 001 creates in CREATE TABLE moved to a
+    // different physical position with its data; the NOT VALID mark 001
+    // itself leaves on an upgraded table; and a share sequence a 2.x.x
+    // deployment has advanced, which is data, not structure.
+    sqlx::raw_sql("CREATE TABLE operator_notes(note_id bigserial PRIMARY KEY, note text NOT NULL); ALTER TABLE qbit_share_ledger ADD COLUMN operator_note text; CREATE INDEX qbit_share_ledger_operator_idx ON qbit_share_ledger (miner_id); ALTER TABLE qbit_pool_blocks ADD COLUMN parent_hash_moved text; UPDATE qbit_pool_blocks SET parent_hash_moved=parent_hash; ALTER TABLE qbit_pool_blocks DROP COLUMN parent_hash; ALTER TABLE qbit_pool_blocks RENAME COLUMN parent_hash_moved TO parent_hash; ALTER TABLE qbit_pool_blocks ALTER COLUMN parent_hash SET NOT NULL; ALTER TABLE qbit_share_ledger DROP CONSTRAINT qbit_share_ledger_credit_policy_check; ALTER TABLE qbit_share_ledger ADD CONSTRAINT qbit_share_ledger_credit_policy_check CHECK (credit_policy IS NULL OR credit_policy IN ('stale-grace')) NOT VALID; SELECT setval('qbit_share_ledger_share_seq_seq', 5000000)")
         .execute(&pool).await?;
     let order: Vec<String> = sqlx::query_scalar("SELECT attname::text FROM pg_attribute WHERE attrelid=to_regclass('qbit_pool_blocks') AND attnum>0 AND NOT attisdropped ORDER BY attnum")
         .fetch_all(&pool).await?;
@@ -736,6 +748,14 @@ async fn tolerated_source_differences_still_migrate() -> Result<()> {
         "00".repeat(32)
     );
     exercise_native_writers(&ledger, 1, 5301).await?;
+    // The advanced sequence kept its position: the first native share took
+    // the next value after it.
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT min(share_seq) FROM qbit_share_ledger")
+            .fetch_one(&pool)
+            .await?,
+        5_000_001
+    );
     pool.close().await;
     db.close(vec![ledger]).await
 }
