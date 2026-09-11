@@ -22,6 +22,12 @@ use std::{
 /// stores the high 32 bits as `classid` and the low 32 as `objid`.
 pub const ORDER_LOCK_CLASSID: i64 = 0x5052_4953;
 pub const ORDER_LOCK_OBJID: i64 = 0x4d00_0002;
+/// The predicate is derived from the hex key, not typed in decimal: the high
+/// half of `0x505249534d000002` is `0x50524953`, which is 1347570003, and the
+/// low half `0x4d000002` is 1291845634.
+pub const ORDER_LOCK_KEY_NOTE: &str =
+    "classid is the high 32 bits of 0x505249534d000002 (0x50524953 = 1347570003) and objid the \
+     low 32 bits (0x4d000002 = 1291845634), with objsubid = 1";
 
 /// Raise this process's file-descriptor soft limit to what the session count
 /// needs. Child frontends inherit it.
@@ -384,8 +390,10 @@ pub struct LockSample {
 #[derive(Clone, Debug, Serialize)]
 pub struct LockSummary {
     pub lock: &'static str,
+    pub key: &'static str,
     pub classid: i64,
     pub objid: i64,
+    pub key_note: &'static str,
     pub sample_interval_milliseconds: f64,
     pub samples: usize,
     pub samples_with_waiters: usize,
@@ -497,8 +505,10 @@ impl LockSampler {
             .collect();
         let mut summary = LockSummary {
             lock: "ORDER_LOCK",
+            key: "0x505249534d000002",
             classid: ORDER_LOCK_CLASSID,
             objid: ORDER_LOCK_OBJID,
+            key_note: ORDER_LOCK_KEY_NOTE,
             sample_interval_milliseconds: self.interval.as_secs_f64() * 1000.0,
             samples: window.len(),
             samples_with_waiters: 0,

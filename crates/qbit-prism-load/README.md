@@ -1,0 +1,300 @@
+# `qbit-prism-load`
+
+A Stratum-to-PostgreSQL load harness for PRISM, and the only thing that
+produces a `qbit-prism-capacity-evidence/v2` artifact (#303).
+
+It launches real `qbit-prism-server run` child processes, drives them over real
+Stratum sockets with real proof of work, and reports what the cluster did:
+client ACK latency, ORDER_LOCK waits, per-frontend CPU and RSS, reconnect
+behaviour, time to usable work after a new tip, and rejections by reason.
+
+Nothing in the harness changes production code, adds a metric, or bypasses a
+validation. The server verifies every share for real.
+
+## What it measures, and why
+
+Decision D1 (#260) sets the targets: 2,000 shares/s for a minute, 500 shares/s
+for five minutes, 2,000 sessions, a 400,000-share payout window and a 500,000
+headroom run. Decision D3 sets the topology: one primary and one asynchronous
+standby, with synchronous mode a primary-side flip the harness can make and
+measure.
+
+## Prerequisites
+
+- **Release builds.** A debug-profile server is not a capacity measurement; the
+  harness refuses one unless `--allow-debug-server` is given, and records the
+  build profile of both binaries either way.
+
+  ```sh
+  cargo build --locked --release -p qbit-prism-server -p qbit-prism-load
+  ```
+
+- **PostgreSQL 16 server binaries** (`initdb`, `pg_ctl`, `pg_basebackup`) in
+  `--pg-bin-dir`, or `PRISM_TEST_PG_BIN_DIR`, or `pg_config --bindir`. On
+  Debian and Ubuntu that is `/usr/lib/postgresql/16/bin`. No container runtime
+  is needed.
+
+- **A clean tree.** `subject.coordinator_revision` names the commit that was
+  built. With modified tracked files the harness refuses to run unless
+  `--allow-dirty-tree` is given, and that flag forces `artifact_kind:
+  "example"` and marks the side report `dirty: true`.
+
+- **File descriptors.** The harness raises its own soft `RLIMIT_NOFILE` to what
+  the session count needs and the child frontends inherit it.
+
+## Running
+
+```sh
+target/release/qbit-prism-load \
+  --server-bin target/release/qbit-prism-server \
+  --pg-bin-dir /usr/lib/postgresql/16/bin \
+  --frontends 2 --sessions 200 --window-shares 20000 \
+  --replication async --plan short --rate 50 \
+  --out load-out
+```
+
+The D1 plan is `--plan d1`. Every phase length and rate is overridable.
+
+### Flags
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--server-bin` | the `qbit-prism-server` beside this binary | Frontend executable |
+| `--allow-debug-server` | off | Run a debug-profile server anyway |
+| `--allow-dirty-tree` | off | Run with modified tracked files; forces `artifact_kind: example` |
+| `--example-artifact` | off | Emit `artifact_kind: example` from a clean tree |
+| `--pg-bin-dir` | `PRISM_TEST_PG_BIN_DIR`, then `pg_config --bindir` | PostgreSQL server binaries |
+| `--database-url` | none | Use an existing database; no standby is managed and the replication mode is detected, never assumed |
+| `--replication` | `async` | `async`, `sync` or `none` |
+| `--frontends` | 1 | 1, 2 or 4 |
+| `--sessions` | 100 | Stratum sessions, round-robin across the frontends |
+| `--window-shares` | 20000 | Shares pre-seeded into the payout window |
+| `--seed-share-bytes` | 581 | Serialized size of one seeded share |
+| `--plan` | `short` | `d1` or `short` |
+| `--rate` | 50 | Offered shares per second for the `short` plan |
+| `--max-outstanding-per-session` | 1 | The server answers one request per session at a time |
+| `--warmup-seconds` | 30 | Warm-up before the first artifact phase; not in the artifact |
+| `--steady-state-seconds`, `--steady-state-rate` | plan | Override the `steady_state` phase |
+| `--burst-seconds`, `--burst-rate` | plan | Override the burst phase (side report only) |
+| `--reconnect-seconds` | 60 | `reconnect` phase length |
+| `--slow-database-seconds` | 60 | `slow_database` phase length |
+| `--reconnect-target` | 12 | Completed reconnects to drive; the artifact needs at least 10 |
+| `--slow-db-delay-ms` | 10 | One-way per-chunk proxy delay; the artifact phase needs at least 10 |
+| `--mid-flight-kill` | off | SIGKILL a frontend with submits outstanding, in a side phase |
+| `--scheduled-blocks` | 0 | Own blocks to find and submit during `steady_state` |
+| `--external-tips` | 3 | Tips minted during warm-up, for time to usable work |
+| `--work-timeout` | 120 | Seconds to wait for frontends to serve work |
+| `--forecast-peak-shares-per-second` | 2000 | D1's forecast; the validator's gate is twice this |
+| `--ack-p99-limit-ms` | 1000 | Must be at most `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS` × 1000 |
+| `--db-max-connections` | 16 | `PRISM_DATABASE_MAX_CONNECTIONS` per frontend |
+| `--runtime-workers` | 2 | `PRISM_RUNTIME_WORKERS` per frontend |
+| `--blockpoll-seconds` | 2 | `PRISM_BLOCKPOLL_SECONDS` per frontend |
+| `--share-commit-timeout-seconds` | 15 | `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS` per frontend |
+| `--lock-sample-interval-ms` | 10 | ORDER_LOCK sampling cadence |
+| `--process-sample-interval-ms` | 1000 | CPU and RSS sampling cadence |
+| `--min-mem-available-mib` | 4096 | Stop the run if `MemAvailable` falls below this |
+| `--out` | `load-out` | Output directory |
+| `--keep-artifacts` | off | Keep cluster data directories and logs |
+
+### The D1 plan
+
+1. **warm-up**, not in the artifact. External tips are minted here.
+2. **`steady_state`**, 500 shares/s for 300 s.
+3. **`burst`**, 2,000 shares/s for 60 s. Side report only.
+4. **`reconnect`**, at least 60 s with at least 10 completed reconnects.
+5. **`slow_database`**, at least 60 s at a delay of at least 10 ms.
+6. **`mid_flight_kill`**, only with `--mid-flight-kill`. Side report only.
+
+The artifact's phases are exactly `steady_state`, `reconnect` and
+`slow_database`.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | The run completed and reconciled exactly |
+| 2 | The harness failed before it could measure anything |
+| 3 | Blocked: no frontend served work, or a log showed a refusal |
+| 4 | A durability finding: an acknowledged share is missing from PostgreSQL, or a committed share was never acknowledged |
+| 5 | Rejections classified as harness bugs |
+| 6 | The run was aborted, by a signal or by the memory floor |
+
+## Outputs
+
+`--out` receives four things.
+
+### 1. `capacity-evidence.json`
+
+Schema `qbit-prism-capacity-evidence/v2`, exactly the shape
+`crates/qbit-prism-server/src/capacity.rs` validates: `TOP_KEYS`,
+`SUBJECT_KEYS`, `durability`, the 16 `CONFIGURATION_KEYS` read out of the exact
+environment the frontends were launched with, and each phase's extra keys.
+
+`durability` is read back from PostgreSQL on a connection carrying the ledger's
+own session settings. If any of `fsync`, `full_page_writes` or
+`synchronous_commit` is not `on`, the harness aborts before the load.
+
+### 2. `database-profile.json`
+
+Schema `qbit.prism.database-profile.v1`: canonical JSON with sorted keys,
+carrying `pg_settings`, the replication mode and rows, the proxy configuration,
+host facts and any cgroup limits. Its SHA-256 is the artifact's
+`subject.database_profile_sha256`. The repository defines no schema for this
+document; the harness writes one and ships it beside the artifact.
+
+### 3. `load-harness-report.json`
+
+Schema `qbit.prism.load-harness.v1`. Everything the artifact cannot carry: the
+host, versions and build profiles, the redacted frontend environment, window
+sizes requested, computed and read back, per-phase measurements, the
+reconciliation definition and results, rejections by `(code, reason_id,
+message)` per phase and frontend, reconnect statistics, time to usable work,
+the mid-flight-kill census, blocked-run records, the honest-value notes, the
+validator verdict and the exact `capacity-evidence` command line.
+
+### 4. Logs
+
+`logs/load-fe-<i>.stdout.log` and `logs/load-fe-<i>.stderr.log` per frontend,
+plus the fake node's submission log inside the side report.
+
+## Validating the artifact
+
+The harness validates its own artifact in process, with
+`ValidationOptions` carrying the exact configuration, subject, forecast and
+limit the run used, and records the verdict. It also prints the equivalent CLI:
+
+```
+qbit-prism-server capacity-evidence load-out/capacity-evidence.json \
+  --expect PRISM_STRATUM_SHARE_DIFF=… \
+  …one --expect per configuration key, 16 in all… \
+  --expect-coordinator-revision … \
+  --expect-coordinator-image-digest … \
+  --expect-postgres-server-version … \
+  --expect-database-profile-sha256 … \
+  --forecast-peak-shares-per-second … \
+  --ack-p99-limit-milliseconds …
+```
+
+### Expect the 2× gate to fail at a realistic forecast
+
+Every accepted share runs about eight statements while holding the global
+`ORDER_LOCK` advisory lock, so shares are serialized cluster-wide at the
+database. Under a 10 ms one-way delay each of those round trips pays the delay
+twice, and the `slow_database` phase sustains only a low rate. The validator
+requires every phase to sustain at least twice the forecast peak, so at D1's
+forecast of 2,000 shares/s that phase's gate fails.
+
+**That is a result, not a harness bug.** The artifact is emitted anyway, the
+run exits 0 if it completed and reconciled, and the verdict is reported. To
+demonstrate a validating artifact, re-run the validator with a forecast no
+higher than half the slowest phase's rate; the side report prints that number
+as `validator.suggested_forecast_for_a_valid_artifact`.
+
+## Honest values
+
+The side report repeats all of this under `honest_value_notes`.
+
+- **`subject.coordinator_image_digest` is a binary digest.** There is no OCI
+  image: it is `sha256:` followed by the SHA-256 of the `qbit-prism-server`
+  executable's bytes. A validator run with `--expect-coordinator-image-digest`
+  set to a real image digest will correctly reject it. Never fabricate a value
+  that looks like an image digest.
+- **Three configuration keys are not read by the native runtime** (#288):
+  `PRISM_SHARE_COMMIT_BATCH_SIZE`, `PRISM_SHARE_COMMIT_LINGER_MILLISECONDS` and
+  `PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS`. The harness sets them to `1`, `0`
+  and `0`, which describe the behaviour that actually happens — one share per
+  transaction, no batching delay, and no such native sweep — and records them
+  as unread. A value like `64`/`5` would suggest batching that does not exist.
+- **`offered_valid_shares`** counts shares the harness believed valid when it
+  offered them: every acknowledged share, plus any rejection classified as a
+  harness bug, plus any submit that received no response. Transient rejections
+  the server is entitled to make — `stale-job` after a tip change or a
+  payout-revision bump — are excluded there and reported in full under
+  `rejections`. None of them persists a share, so none can affect
+  reconciliation.
+- **ACK latency is client-measured**, from writing the submit line to reading
+  its response line, on the client's monotonic clock. The server's own
+  `qbit_prism_share_ack_seconds` histogram measures a narrower, server-side
+  boundary (complete frame receipt to completed response write) with 10/25/50/
+  100 ms buckets; it is reported separately as per-phase bucket deltas.
+- **`database_delay_milliseconds` is the one-way per-chunk proxy delay.** A
+  round trip pays it twice. The configured delay and the measured added
+  round-trip time are both recorded under `delay_proxy`.
+- **ORDER_LOCK waits are sampled**, not instrumented. The metric family
+  `qbit_prism_database_advisory_lock_wait_seconds` exists but has no producer,
+  so the harness samples `pg_locks` joined to `pg_stat_activity` every 10 ms
+  and reports a waiter-count summary, an episode count as "at least N", and a
+  Riemann waiter-seconds estimate that is a lower bound: waits shorter than the
+  sampling interval can be missed entirely. The sampler's own query cost is
+  reported beside the numbers. When `pg_stat_statements` is loaded, the
+  advisory-lock statement's `calls` and `total_exec_time` are recorded too, and
+  the three PRISM locks share one normalized query text.
+- **Unknown is never zero.** A measurement that could not be taken is `null`
+  with a reason. A peak RSS from Linux's `VmHWM` is labelled a kernel peak; on
+  macOS it is a sampled maximum, and on other platforms it is `null`.
+
+## Reconciliation
+
+For each phase the harness takes the offered set O, the acknowledged set A, and
+the committed set C — `qbit_share_ledger` rows that are `accepted`, whose
+`writer_id` is one of the run's frontends, whose `share_id` carries the run's
+username prefix, and which are in O.
+
+- **`missing`** is A minus the database.
+- **`unexpected`** is every run-prefixed database row that is in no phase's A,
+  attributed to the phase in which it was offered, or to "outside phases".
+- **The digest** is SHA-256 in lowercase hex over the de-duplicated share
+  identifiers sorted by UTF-8 byte order, each followed by one `0x0a` byte. The
+  top level uses the union of the artifact phases. Byte order is Rust's and
+  PostgreSQL's `COLLATE "C"`; the database's default collation may disagree, so
+  the harness always sorts in process.
+
+In a normal phase, an acknowledged share missing from PostgreSQL, or a
+committed share that was never acknowledged, is a durability finding: the run
+exits 4 with the evidence in the side report. Only the `mid_flight_kill` phase
+can legitimately produce an indeterminate share, and those are re-offered with
+the same header and their final database outcome is reported.
+
+## Measurement hygiene
+
+- Build release. Debug builds change every number.
+- Run on a quiet host. The harness records the lowest `MemAvailable` it saw and
+  stops the run if it falls below `--min-mem-available-mib`.
+- Repeat and interleave runs. Take at least three of each configuration and
+  interleave the frontend counts rather than running all of one and then all of
+  another, so a drifting host shows up as spread rather than as a trend.
+- Never mix hosts in one table. Every row carries its host; two hosts belong in
+  two tables.
+- Record the whole side report, not a number out of it. The forecast, the
+  window size, the delay and the session count all move the result.
+- The harness's own client cost is small — about 50 double-SHA-256 attempts per
+  share at a 20,000-share window — but it shares the host with the frontends
+  and PostgreSQL. Record its CPU too if the host is small.
+
+## Blocked sizes
+
+Some sizes are refused today. A refusal is a result, never something to work
+around: the harness records the run as blocked with the error text from the
+log, writes the side report and exits 3.
+
+| Size | Refused by | Unblocked by |
+|---|---|---|
+| Payout windows of 200,000 shares and above | PostgreSQL's JSONB container ceiling of 268,435,455 bytes, hit when the prepared job is persisted | #273 |
+| Found-block candidates at a 400,000-share window | the audit bundle written at landing | #265 |
+| Operator gates for large windows | — | #236 |
+
+The blocked-log classifier keys on the refusal text PostgreSQL produces
+(`jsonb` … `exceeds the maximum of`) inside the warnings the runtime logs
+(`template refresh deferred`, `job preparation deferred`, `job persistence
+deferred`).
+
+## Tests
+
+`cargo test --locked -p qbit-prism-load` is database-free and covers header
+building and share-identifier derivation against the server's own `codec`,
+digest canonicalisation, the window arithmetic, the fake node's chainwork,
+height map, `submitblock` parent check and `waitfornewblock` wake-up, that the
+frontend environment carries all 16 configuration keys, that the artifact
+builder's output passes `validate_capacity_evidence` and fails once one
+required field or one phase is removed, the rejection classifier, and the
+blocked-log classifier against the real refusal message.

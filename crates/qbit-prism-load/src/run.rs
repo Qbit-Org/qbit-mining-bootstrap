@@ -506,6 +506,24 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     *shared_session.phase.write().expect("phase lock") = "teardown".to_owned();
 
     // --- stop the load ----------------------------------------------------
+    // Quiesce first: a socket closed with a submit outstanding manufactures an
+    // indeterminate share that no phase asked for, and the run would then
+    // report a durability finding it created itself.
+    for session in &sessions {
+        let _ = session.control.send(client::Control::Pause);
+    }
+    let drain_deadline = Instant::now() + Duration::from_secs(90);
+    while Instant::now() < drain_deadline
+        && sessions
+            .iter()
+            .any(|session| session.outstanding.load(Ordering::Relaxed) > 0)
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let undrained: usize = sessions
+        .iter()
+        .map(|session| session.outstanding.load(Ordering::Relaxed))
+        .sum();
     for session in &sessions {
         let _ = session.control.send(client::Control::Stop);
     }
@@ -732,6 +750,10 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                 / (phase.duration_millis as f64 / 1000.0).max(f64::MIN_POSITIVE)
         })
         .fold(f64::INFINITY, f64::min);
+    let worst_p99 = phase_evidence
+        .iter()
+        .map(|phase| phase.ack_p99_millis)
+        .max_by(f64::total_cmp);
     let harness_bugs: Vec<&SubmitRecord> = collected
         .submits
         .iter()
@@ -863,6 +885,11 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         },
         "durability_findings": durability_findings,
         "honest_value_notes": report::honest_value_notes(),
+        "drain": {
+            "note": "sessions quiesce before the run closes their sockets; anything still \
+                     outstanding here is a genuine lost acknowledgement",
+            "submits_outstanding_at_stop": undrained,
+        },
         "validator": {
             "verdict": verdict,
             "command": command,
@@ -870,6 +897,13 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "forecast_used": args.forecast_peak_shares_per_second,
             "slowest_artifact_phase_rate_shares_per_second": slowest_rate,
             "suggested_forecast_for_a_valid_artifact": (slowest_rate / 2.0).max(0.0),
+            "ack_p99_limit_used_milliseconds": args.ack_p99_limit_ms,
+            "worst_artifact_phase_ack_p99_milliseconds": worst_p99,
+            "suggested_ack_p99_limit_milliseconds": worst_p99.map(|p99| {
+                // Round up to the next 100 ms, and never above the commit
+                // timeout the consumer checks against.
+                ((p99 / 100.0).ceil() * 100.0).min(args.share_commit_timeout_seconds * 1000.0)
+            }),
         },
     });
     let report_path = args.out.join("load-harness-report.json");

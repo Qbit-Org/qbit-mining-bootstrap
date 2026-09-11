@@ -461,8 +461,17 @@ async fn run_session(
             biased;
             message = control.recv() => {
                 match message {
-                    None | Some(Control::Stop) => { stopping = true; }
-                    Some(Control::Pause) => { paused = true; }
+                    None | Some(Control::Stop) => {
+                        stopping = true;
+                        drain_work(&mut work, &outstanding);
+                    }
+                    Some(Control::Pause) => {
+                        paused = true;
+                        // Queued offers this session will now never send must
+                        // release their slot, or the run's drain would wait
+                        // for work that is not coming.
+                        drain_work(&mut work, &outstanding);
+                    }
                     Some(Control::Retarget { frontend: index, address: next, reconnect }) => {
                         frontend.store(index, Ordering::Relaxed);
                         address = next;
@@ -557,6 +566,14 @@ async fn run_session(
     if let Some(mut active) = connection {
         fail_pending(&mut active, "run ended", &shared, &config, &outstanding);
         active.drop_reader();
+    }
+}
+
+/// Discard offers this session has accepted but not yet sent, releasing their
+/// outstanding slots so the scheduler's accounting stays exact.
+fn drain_work(work: &mut mpsc::Receiver<Work>, outstanding: &Arc<AtomicUsize>) {
+    while work.try_recv().is_ok() {
+        outstanding.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
