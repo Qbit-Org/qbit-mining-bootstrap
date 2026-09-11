@@ -4,7 +4,8 @@
 Two contracts over every tracked file under ``docs/``:
 
 a. No runnable ``python -m lab.…`` or ``python lab/….py`` command invokes a
-   module or script absent from the branch. There is no allowlist.
+   module or script absent from the branch, however it is wrapped across shell
+   backslash continuation lines. There is no allowlist.
 b. Every ``lab/prism/…`` path or ``lab.prism.…`` module reference resolves to a
    tracked file or directory. GitHub links pinned to a 40-hex commit SHA are
    stable history and exempt. Pre-existing residue that #303 declares out of
@@ -67,10 +68,22 @@ def module_candidates(module: str) -> tuple[str, ...]:
     return (f"{relative}.py", f"{relative}/__init__.py", relative)
 
 
-def dead_commands(text: str, tracked: frozenset[str]) -> list[tuple[int, str, str]]:
-    """``(line, command, missing path)`` for each runnable command with no target."""
-    found = []
+def shell_lines(text: str) -> list[tuple[int, str]]:
+    """``(first line, text)`` per logical shell line, backslash continuations joined."""
+    lines: list[tuple[int, str]] = []
     for number, line in enumerate(text.splitlines(), 1):
+        if lines and lines[-1][1].endswith("\\"):
+            first, head = lines[-1]
+            lines[-1] = (first, head[:-1] + line)
+        else:
+            lines.append((number, line))
+    return lines
+
+
+def dead_commands(text: str, tracked: frozenset[str]) -> list[tuple[int, str, str]]:
+    """``(first line, command, missing path)`` for each runnable command with no target."""
+    found = []
+    for number, line in shell_lines(text):
         for match in MODULE_COMMAND.finditer(line):
             candidates = module_candidates(match.group(1))[:2]
             if not any(candidate in tracked for candidate in candidates):
@@ -170,6 +183,9 @@ class ScannerTests(unittest.TestCase):
     def commands(self, text: str) -> list[str]:
         return [missing for _, _, missing in dead_commands(text, self.TRACKED)]
 
+    def located(self, text: str) -> list[tuple[int, str]]:
+        return [(number, missing) for number, _, missing in dead_commands(text, self.TRACKED)]
+
     def test_bare_path_to_deleted_module_is_dangling(self) -> None:
         self.assertEqual(self.references("Rendered by `lab/prism/metrics.py`."), ["lab/prism/metrics.py"])
 
@@ -204,6 +220,25 @@ class ScannerTests(unittest.TestCase):
     def test_commands_with_existing_targets_pass(self) -> None:
         tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py"}
         text = "python3 -m lab.prism.tool\npython -m lab.pkg\npython3 lab/prism/tool.py"
+        self.assertEqual(dead_commands(text, tracked), [])
+
+    def test_wrapped_module_commands_with_missing_targets_are_caught(self) -> None:
+        for wrapped in (
+            "python3 -m \\\n  lab.prism.process_telemetry rss-bound",
+            "python3 \\\n  -m lab.prism.process_telemetry rss-bound",
+            "python3 -u \\\n  -m lab.prism.process_telemetry \\\n  rss-bound",
+        ):
+            with self.subTest(wrapped=wrapped):
+                text = f"```bash\ncd repo\n{wrapped} \\\n  --samples s.csv\n```"
+                self.assertEqual(self.located(text), [(3, "lab/prism/process_telemetry.py")])
+
+    def test_wrapped_script_command_with_missing_target_is_caught(self) -> None:
+        text = "python3 \\\n  lab/prism/storm.py \\\n  --decide"
+        self.assertEqual(self.located(text), [(1, "lab/prism/storm.py")])
+
+    def test_wrapped_commands_with_existing_targets_pass(self) -> None:
+        tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py"}
+        text = "python3 -m \\\n  lab.prism.tool\npython \\\n  -m lab.pkg\npython3 \\\n  lab/prism/tool.py"
         self.assertEqual(dead_commands(text, tracked), [])
 
 
