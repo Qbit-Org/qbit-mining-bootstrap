@@ -24,6 +24,51 @@ def specification_digest():
     ])).hexdigest()
 
 
+def postgres_rules():
+    """D3: compare durable WAL prefixes, not the last reported replay latency."""
+    target = 'job="qbit-postgres-primary",network="__NETWORK__"'
+    standby = target + ',application_name="prism_standby_1"'
+    identity = "job, instance, network, application_name"
+
+    def metric(name):
+        return "pg_stat_replication_" + name + "{" + standby + "}"
+
+    def unknown(sample, age=0):
+        # An absent/negative sample or missing recent history remains unknown.
+        # With 1s scrapes allow at most one missed interval (2s sample age).
+        elapsed = f"(time() - timestamp({sample}))"
+        return f"(max(({sample} < bool 0) + ({elapsed} < bool {age}) + ({elapsed} > bool {age + 2})) or vector(1))"
+
+    common = [f"(max({name}{{{target}}} != bool {healthy}) or vector(1))"
+              for name, healthy in [("up", 1), ("pg_up", 1), ("pg_exporter_last_scrape_error", 0)]]
+    common += [f"((count(up{{{target}}}) != bool 1) or vector(1))", unknown(metric("count"))]
+    primary_hi, primary_lo = [metric("primary_flush_lsn_" + half) for half in ["hi", "lo"]]
+    replay_hi, replay_lo = [metric("replay_lsn_" + half) for half in ["hi", "lo"]]
+    old_hi, old_lo = primary_hi + " offset 5s", primary_lo + " offset 5s"
+    # Lexicographic comparison retains all 64 LSN bits, including low-word wrap.
+    behind = (f"({replay_hi} < bool on({identity}) {old_hi}) + "
+              f"(({replay_hi} == bool on({identity}) {old_hi}) * on({identity}) "
+              f"({replay_lo} < bool on({identity}) {old_lo}))")
+    lag_terms = common + [unknown(value) for value in [primary_hi, primary_lo, replay_hi, replay_lo]]
+    lag_terms += [unknown(value, 5) for value in [old_hi, old_lo]]
+    lag_terms += [f"(max({behind}) or vector(1))"]
+    disconnected_terms = common + [f"(max({metric('count')} != bool 1) or vector(1))"]
+    original = load("docs/prism-postgres-alert-rules.json")["rules"]
+    for rule, terms in zip(original, [lag_terms, disconnected_terms], strict=True):
+        rule["expr"] = "clamp_max(" + " + ".join(terms) + ", 1)"
+    original[0]["description"] = (
+        "D3: standby replay has not reached the primary durable WAL prefix observed five seconds earlier, "
+        "or position/history/exporter observations are unknown, stale or failed. "
+        "Deployment-provided: requires primary SQL query metrics and one-second scrapes; verify in #281/#291. "
+        "Idle caught-up positions are healthy even when PostgreSQL reports NULL replay_lag. "
+        "The five-second comparison is sampled, with up to one scrape interval of timing uncertainty.")
+    original[1]["description"] = (
+        "D3: the primary reports zero or ambiguous rows for prism_standby_1, or exporter/query observations "
+        "are missing, stale or failed. Deployment-provided: requires the primary exporter and one-second "
+        "scrapes; verify in #281/#291. This is the dedicated asynchronous HA standby, not the public read replica.")
+    return {"rules": original}
+
+
 def migration_tables():
     migration = load("docs/prism-alert-migration.json")
     lines = [START, "<!-- Run: python3 scripts/generate_prism_alerts.py -->", "",
@@ -126,6 +171,7 @@ def main():
     parser.add_argument("--snapshot", type=Path, help="read-only snapshot directory, required to regenerate the deployment patch")
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
+    update(ROOT / "docs/prism-postgres-alert-rules.json", json.dumps(postgres_rules(), indent=2) + "\n", args.check)
     doc = ROOT / "docs/prism-alert-migration.md"
     before, rest = doc.read_text().split(START)
     _, after = rest.split(END)

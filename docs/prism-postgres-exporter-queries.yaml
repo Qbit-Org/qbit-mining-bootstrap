@@ -1,14 +1,31 @@
 # Deployment-provided D3 query extension on the PRIMARY, not the public replica.
 # Configure through the deployment's supported SQL-query exporter mechanism;
-# stock collector versions differ. Verify all three families in #281/#291.
-# pg_up is provided by postgres_exporter itself, on the same scrape target.
+# stock collector versions differ. Verify the query metrics and exporter status
+# in #281/#291. Scrape this primary target every 1s; the rule compares positions
+# with the primary's durable WAL position observed 5s earlier.
+# pg_up, pg_exporter_last_scrape_error and Prometheus up must share this target.
 pg_stat_replication:
   query: |
+    WITH primary_wal AS (
+      SELECT pg_wal_lsn_diff(pg_current_wal_flush_lsn(), '0/0') AS durable_position
+    ), standby AS (
+      SELECT COUNT(*) AS count,
+             COUNT(*) = 1 AND BOOL_AND(state = 'streaming' AND replay_lsn IS NOT NULL) AS known,
+             MIN(pg_wal_lsn_diff(replay_lsn, '0/0')) AS replay_position,
+             MAX(EXTRACT(EPOCH FROM replay_lag)) AS reported_lag
+      FROM pg_stat_replication
+      WHERE application_name = 'prism_standby_1'
+    )
     SELECT 'prism_standby_1' AS application_name,
-           COUNT(*)::double precision AS count,
-           COALESCE(MAX(EXTRACT(EPOCH FROM replay_lag)), -1)::double precision AS replay_lag
-    FROM pg_stat_replication
-    WHERE application_name = 'prism_standby_1'
+           count::double precision,
+           FLOOR(durable_position / 4294967296)::double precision AS primary_flush_lsn_hi,
+           MOD(durable_position, 4294967296)::double precision AS primary_flush_lsn_lo,
+           CASE WHEN known THEN FLOOR(replay_position / 4294967296) ELSE -1 END::double precision AS replay_lsn_hi,
+           CASE WHEN known THEN MOD(replay_position, 4294967296) ELSE -1 END::double precision AS replay_lsn_lo,
+           CASE WHEN NOT COALESCE(known, false) THEN -1
+                WHEN replay_position >= durable_position THEN 0
+                ELSE COALESCE(reported_lag, -1) END::double precision AS replay_lag
+    FROM primary_wal CROSS JOIN standby
   metrics:
     - application_name:
         usage: LABEL
@@ -18,4 +35,16 @@ pg_stat_replication:
         description: Matching replication rows; zero if disconnected
     - replay_lag:
         usage: GAUGE
-        description: Replay lag seconds from the primary; -1 if absent or NULL
+        description: Diagnostic last-reported latency; zero only with caught-up WAL proof, -1 if unknown
+    - primary_flush_lsn_hi:
+        usage: GAUGE
+        description: High 32 bits of primary durable WAL position, exact in Prometheus float64
+    - primary_flush_lsn_lo:
+        usage: GAUGE
+        description: Low 32 bits of primary durable WAL position, exact in Prometheus float64
+    - replay_lsn_hi:
+        usage: GAUGE
+        description: High 32 bits of known streaming standby replay position, or -1
+    - replay_lsn_lo:
+        usage: GAUGE
+        description: Low 32 bits of known streaming standby replay position, or -1

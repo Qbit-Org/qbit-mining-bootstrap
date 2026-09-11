@@ -120,38 +120,53 @@ in #281/#291.** The dedicated failover standby is not the public read replica.
 Never use `qbit_prism_public_replica_*` for this group. Its inventory is external
 and deliberately excluded from the native-family test.
 
-Signal semantics must be configured in the deployment exporter, starting with:
+The [query extension](prism-postgres-exporter-queries.yaml) observes the primary's
+flushed (locally durable) WAL position and the dedicated standby's replay position.
+It emits each position as exact high/low 32-bit components: Prometheus float64
+cannot represent every 64-bit LSN as one number. The rule compares the current
+replay position lexicographically with the primary flushed position observed five
+seconds earlier, with a one-minute dwell. A backlog of bytes alone has no time
+unit; comparing an observed durable prefix over time supplies the five-second
+budget without treating the last reported write latency as current backlog age.
 
-```sql
-SELECT application_name, state, EXTRACT(EPOCH FROM replay_lag) AS replay_lag
-FROM pg_stat_replication
-WHERE application_name = 'prism_standby_1';
+Require **one-second primary exporter scrapes** and one-second standby
+`wal_receiver_status_interval` updates. Current samples must be at most two
+seconds old, and the five-second historical samples at most seven seconds old;
+missing history remains unknown. This sampled comparison has up to one scrape
+interval of boundary uncertainty. Exporter query execution must refresh on each
+scrape, without a long-lived statistics transaction/cache. #281/#291 must verify
+that cadence, permissions (`pg_read_all_stats` or an appropriately scoped monitoring
+role), scrape cost, and the actual exporter failure behavior before cutover.
 
-SELECT 'prism_standby_1' AS application_name, COUNT(*)::double precision AS count
-FROM pg_stat_replication
-WHERE application_name = 'prism_standby_1';
+The diagnostic `pg_stat_replication_replay_lag` remains available but does not
+feed the firing rule. PostgreSQL can report NULL when an idle standby has caught
+up, and can retain a recent nonzero latency after it catches up. The query emits
+zero only when exactly one streaming connection has a known replay position at
+or beyond the primary's durable position; unknown positions, duplicate identity,
+and NULL latency with outstanding WAL remain -1. This follows the documented
+[PostgreSQL replay-lag semantics](https://www.postgresql.org/docs/16/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION-VIEW).
+
+Expose `pg_stat_replication_{primary_flush_lsn_hi,primary_flush_lsn_lo,replay_lsn_hi,replay_lsn_lo,count,replay_lag}`
+with `application_name="prism_standby_1"`. The count query always emits a row,
+including zero when disconnected. `up`, `pg_up` and
+`pg_exporter_last_scrape_error` must describe the same primary target, using
+`job="qbit-postgres-primary"`, `instance`, and `network`; exactly one primary
+exporter target per network is required. Query failure, exporter failure,
+missing status, stale/negative positions and ambiguous identities remain
+alertable. These are an explicit deployment query contract, not a claim that
+stock postgres_exporter versions enable these names by default; the query stanza
+is also included in the review-only diff.
+
+The disposable SQL test executes that exact query against one primary and one
+asynchronous standby, feeds the observed positions into promtool, and checks
+idle NULL, paused replay, one-minute dwell, recovery, disconnection, and a query
+run against the wrong database role. Separate PromQL fixtures cover failed or
+missing exporter/query observations and precise LSN boundaries. No deployment
+exporter is started by these tests; its integration remains a #281/#291 check.
+
+```sh
+PRISM_TEST_PG_BIN_DIR=/path/to/postgresql/bin python3 scripts/test_prism_postgres_alerts.py --promtool /path/to/promtool
 ```
-
-The [ready-to-install query extension](prism-postgres-exporter-queries.yaml)
-combines these into one aggregate query with an explicit -1 sentinel for NULL
-and zero rows when disconnected; the exact stanza is also included in the diff.
-Expose the replay signal as `pg_stat_replication_replay_lag{application_name}`
-in seconds and the second as `pg_stat_replication_count{application_name}`; also
-expose `pg_up` on the same primary target. Use `job="qbit-postgres-primary"` and
-`network`, with only one primary writer target per network. A NULL replay lag
-must be absent or -1, never silently coerced to healthy zero. NULL can occur on
-an idle caught-up connection; until the deployment exporter can prove caught-up
-state independently, this is an explicit unknown notification, not evidence of
-loss. The count query must emit zero even when there are no matching rows.
-
-These are an explicit deployment query contract, not a claim that every
-postgres_exporter version enables these names by default. The
-[upstream replication collector](https://github.com/prometheus-community/postgres_exporter/blob/master/collector/pg_stat_replication.go)
-exports WAL byte positions/differences, which cannot be compared to a five-second
-budget. #281 must configure the SQL-backed seconds/count signals through its
-chosen exporter version and #291 must verify connected, disconnected, lagged,
-NULL, failed-query and missing-exporter cases. The native rule test never invents
-these families in #278's registry.
 
 <!-- generated-migration:start -->
 <!-- Run: python3 scripts/generate_prism_alerts.py -->
