@@ -186,3 +186,169 @@ async fn rapid_publications_keep_the_graveyard_bounded_before_its_next_prune() {
         .iter()
         .all(|id| client.session.retained.get(id).is_none()));
 }
+
+#[tokio::test]
+async fn published_tip_capacity_preserves_prior_work_when_current_work_resumes_without_delivery() {
+    let mut client = Connection::new(30.0, 1).await;
+    let permits = Arc::new(Semaphore::new(1));
+    client.session.authorization_permit =
+        Some(Arc::new(permits.clone().acquire_owned().await.unwrap()));
+    let oldest = client.deliver().await;
+    client.session.authorization_permit = None;
+    let prior_active = client.deliver().await;
+    let delivered = client.session.tip_work_delivered.clone();
+    client.tip(2).await;
+    // This is genuine persisted B work for the same username, recovered by
+    // Coordinator::resume_job. This connection has received no B notify.
+    let current = client.backend.next.lock().unwrap().clone();
+    client
+        .backend
+        .fixture
+        .coordinator
+        .persist_issued_job(
+            &current.context.worker,
+            &current,
+            0,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    client.backend.fixture.node.lock().unwrap().calls.clear();
+    assert_eq!(client.submit(&current, 0).await["result"], true);
+    assert_eq!(client.session.tip_work_delivered, delivered);
+    assert_eq!(client.session.jobs.len(), 1);
+    assert!(client
+        .session
+        .retained
+        .get(&prior_active.wire.job_id)
+        .is_some());
+    let response = client.submit(&oldest, 0).await;
+    assert_eq!(
+        response["result"], true,
+        "old prior-parent work must survive: {response}"
+    );
+    assert!(client.session.retained.get(&oldest.wire.job_id).is_some());
+    assert_eq!(permits.available_permits(), 0);
+    let records = client.backend.fixture.store.records.lock().unwrap();
+    assert_eq!(records.len(), 2);
+    let (share, candidate, _) = &records[1];
+    assert_eq!(share.job_id, oldest.wire.job_id);
+    assert!(share.share_id.starts_with("original.worker:"));
+    assert_eq!(
+        share.job_issued_at_ms,
+        oldest.context.prepared.snapshot.anchor_ms
+    );
+    assert_eq!(
+        share.network_difficulty,
+        oldest.context.bundle.found_block.network_difficulty
+    );
+    assert_eq!(share.credit_policy.as_deref(), Some("stale-grace"));
+    assert!(candidate.is_none());
+    drop(records);
+    assert!(client.backend.fixture.node.lock().unwrap().calls.is_empty());
+    drop(client);
+    assert_eq!(permits.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn published_tip_capacity_is_reselected_after_awaited_resume() {
+    let mut client = Connection::new(30.0, 1).await;
+    let oldest = client.deliver().await;
+    let prior_active = client.deliver().await;
+    let worker = oldest.context.worker.clone();
+    let unseen = client
+        .backend
+        .build_job(&worker, "00000000", 1e-12, 0.0)
+        .await
+        .unwrap();
+    client
+        .backend
+        .persist_issued_job(&worker, &unseen, 0, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let delivered = client.session.tip_work_delivered.clone();
+    let gate = Arc::new(Gate::default());
+    *client.backend.slow_resume.lock().unwrap() =
+        Some((Instant::now() + Duration::from_secs(30), gate.clone()));
+    let coordinator = client.backend.fixture.coordinator.clone();
+    let node = client.backend.fixture.node.clone();
+    let (response, ()) = tokio::join!(client.submit(&unseen, 0), async move {
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        // The request-entry hint was A. Publish B only after the real resume
+        // validated A's stored ownership, payout, parent and absolute expiry.
+        node.lock().unwrap().tip = "02".repeat(32);
+        coordinator.refresh_once().await.unwrap();
+        node.lock().unwrap().calls.clear();
+        gate.release.notify_one();
+    });
+    assert_eq!(response["error"][2]["reason_id"], "stale-job");
+    assert!(client
+        .backend
+        .fixture
+        .store
+        .records
+        .lock()
+        .unwrap()
+        .is_empty());
+    assert_eq!(client.session.tip_work_delivered, delivered);
+    assert_eq!(client.session.jobs.len(), 1);
+    assert!(client
+        .session
+        .retained
+        .get(&prior_active.wire.job_id)
+        .is_some());
+    let response = client.submit(&oldest, 0).await;
+    assert_eq!(
+        response["result"], true,
+        "failed resumed work must not evict eligible prior work: {response}"
+    );
+    let records = client.backend.fixture.store.records.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].0.job_id, oldest.wire.job_id);
+    assert_eq!(records[0].0.credit_policy.as_deref(), Some("stale-grace"));
+    assert!(records[0].1.is_none());
+    assert!(client.backend.fixture.node.lock().unwrap().calls.is_empty());
+}
+
+#[tokio::test]
+async fn published_tip_capacity_is_reselected_after_delayed_prior_tip_delivery() {
+    let mut client = Connection::new(30.0, 1).await;
+    let oldest = client.deliver().await;
+    let prior_active = client.deliver().await;
+    let delivered = client.session.tip_work_delivered.clone();
+    let gate = Arc::new(Gate::default());
+    *client.backend.after_persist.lock().unwrap() = Some(gate.clone());
+    let coordinator = client.backend.fixture.coordinator.clone();
+    let node = client.backend.fixture.node.clone();
+    let (late, ()) = tokio::join!(client.deliver(), async move {
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        // A2 is durably persisted but has not yet been written to the socket.
+        node.lock().unwrap().tip = "02".repeat(32);
+        coordinator.refresh_once().await.unwrap();
+        node.lock().unwrap().calls.clear();
+        gate.release.notify_one();
+    });
+    assert_eq!(late.wire.previousblockhash, oldest.wire.previousblockhash);
+    assert_eq!(client.session.tip_work_delivered, delivered);
+    assert_eq!(client.session.jobs.len(), 1);
+    assert!(client
+        .session
+        .retained
+        .get(&prior_active.wire.job_id)
+        .is_some());
+    let response = client.submit(&oldest, 0).await;
+    assert_eq!(
+        response["result"], true,
+        "delayed A delivery must use B's capacity class: {response}"
+    );
+    let records = client.backend.fixture.store.records.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].0.job_id, oldest.wire.job_id);
+    assert_eq!(records[0].0.credit_policy.as_deref(), Some("stale-grace"));
+    assert!(records[0].1.is_none());
+    assert!(client.backend.fixture.node.lock().unwrap().calls.is_empty());
+}

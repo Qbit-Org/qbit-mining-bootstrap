@@ -35,15 +35,17 @@ impl<C> RetainedJobs<C> {
         self.order.retain(|id| self.jobs.contains_key(id));
     }
 
-    fn bury(&mut self, mut job: IssuedJob<C>, config: &StratumConfig, delivered_tip: Option<&str>) {
+    fn bury(&mut self, mut job: IssuedJob<C>, config: &StratumConfig, published_tip: Option<&str>) {
         let id = job.job.wire.job_id.clone();
         self.order.retain(|old| old != &id);
         // Legacy TTL starts at burial, not the earlier same-tip retirement.
         job.retired_at = Some(tokio::time::Instant::now().into_std());
         self.jobs.insert(id.clone(), job);
         self.order.push_back(id);
+        // Capacity follows publication, even before this connection receives
+        // replacement work. Delivery state owns grace timing, not this class.
         let is_same_tip = |job: &IssuedJob<C>| {
-            delivered_tip.is_none_or(|tip| job.job.wire.previousblockhash == tip)
+            published_tip.is_none_or(|tip| job.job.wire.previousblockhash == tip)
         };
         let mut same_tip = self.jobs.values().filter(|job| is_same_tip(job)).count();
         self.order.retain(|id| {
@@ -95,16 +97,11 @@ impl<C> RetainedJobs<C> {
 }
 
 impl<C> Session<C> {
-    pub(super) fn make_job_room(&mut self, config: &StratumConfig) {
+    pub(super) fn make_job_room(&mut self, config: &StratumConfig, tip: Option<&RetentionTip>) {
         while self.jobs.len() >= config.max_jobs_per_connection {
             if let Some(job) = self.jobs.pop_front() {
-                self.retained.bury(
-                    job,
-                    config,
-                    self.tip_work_delivered
-                        .as_ref()
-                        .map(|(tip, _)| tip.as_str()),
-                );
+                self.retained
+                    .bury(job, config, tip.map(|tip| tip.hash.as_str()));
             }
         }
     }

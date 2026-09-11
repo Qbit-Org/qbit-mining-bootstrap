@@ -12,6 +12,7 @@ struct Backend {
     fail_build: Mutex<bool>,
     sequence: AtomicU64,
     slow_resume: Mutex<Option<(Instant, Arc<Gate>)>>,
+    after_persist: Mutex<Option<Arc<Gate>>>,
 }
 
 impl MiningBackend for Backend {
@@ -49,7 +50,15 @@ impl MiningBackend for Backend {
         self.fixture
             .coordinator
             .persist_issued_job(worker, job, mask, ttl)
-            .await
+            .await?;
+        let gate = self.after_persist.lock().unwrap().take();
+        if let Some(gate) = gate {
+            // Delay delivery only after real persistence/revision checks have
+            // succeeded. A pre-commit gate would instead reject the old job.
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+        Ok(())
     }
     async fn resume_job(
         &self,
@@ -145,6 +154,7 @@ impl Connection {
                 fail_build: Mutex::new(false),
                 sequence: AtomicU64::new(1),
                 slow_resume: Mutex::new(None),
+                after_persist: Mutex::new(None),
             },
             session,
             config,
