@@ -127,7 +127,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Run Rust tests
-        run: cargo test --locked --workspace --all-targets
+        # This job has no database. With CI set and no database the JSONB
+        # ceiling gate fails instead of skipping, so it runs in
+        # prism-native-postgres and is skipped here by name.
+        run: cargo test --locked --workspace --all-targets -- --skip jsonb_ceiling_ratchet_at_reduced_sizes
 
   checks:
     # Preserve the existing check name for branch protection and consumers.
