@@ -48,6 +48,18 @@ RATCHET = {
     "docs/prism-rust-migration.md": 1,
 }
 
+
+def quoted(target: str, group: str = "quote") -> str:
+    """``target`` bare or in matching single or double quotes, which the shell strips.
+
+    A mismatched quote is a shell syntax error: the line runs nothing and
+    matches nothing. ``group`` names the capture that holds the quote, since a
+    command pattern may quote both its interpreter and its target and ``re``
+    rejects a group name used twice.
+    """
+    return rf"(?P<{group}>['\"]?){target}\b(?P={group})"
+
+
 PATH_REFERENCE = re.compile(r"lab/prism(?:/[A-Za-z0-9_][A-Za-z0-9_.\-]*)*")
 MODULE_REFERENCE = re.compile(r"\blab\.prism(?:\.[A-Za-z_][A-Za-z0-9_]*)*\b")
 # `python3 -OO -X dev -m lab.a.b` and `python3.12 -Werror lab/a/b.py`. Every
@@ -59,27 +71,30 @@ MODULE_REFERENCE = re.compile(r"\blab\.prism(?:\.[A-Za-z_][A-Za-z0-9_]*)*\b")
 # (`"python3" -m lab.a.b`), which the shell strips before it runs; inside
 # `sh -c "python3 -m lab.a.b"` no quote closes right after the name, so the
 # quote group falls back to empty and the inner command is read as before.
+# An option argument may be quoted the same way, attached or following:
+# CPython 3.14 runs `-X 'dev'`, `-X"dev mode"`, `-W'error'` and
+# `--check-hash-based-pycs "always"` exactly as their bare spellings, since
+# the shell strips the quotes first. A bare argument therefore holds no quote
+# character at all: `-X 'dev"` is an unterminated shell string, not an option.
 PYTHON_FLAG = r"[bBdEhiIOPqsSuvVx]"
+# A word the shell hands over as one argument: runs of unquoted characters
+# and matching-quoted strings (`'error'::Warning`, `"dev mode"`), non-empty.
+# Unquoted runs and quoted strings alternate rather than nest, so the pattern
+# never has two ways to split one word and cannot backtrack exponentially.
+OPTION_ARGUMENT = (
+    r"(?=\S)"  # non-empty, and a lone quote is not a word
+    r"[^\s'\"]*(?:(?:'[^']*'|\"[^\"]*\")[^\s'\"]*)*"
+    r"(?!\S)"  # a word ends at whitespace, so an unmatched quote ends nothing
+)
 PYTHON_OPTION = (
     rf"-{PYTHON_FLAG}+"  # -O, -OO, -bb, -IsE
-    rf"|-{PYTHON_FLAG}*[WX](?:\S+|\s+\S+)"  # -Xdev, -X dev, -W error, -uWerror
-    r"|--check-hash-based-pycs\s+(?:always|default|never)"
+    rf"|-{PYTHON_FLAG}*[WX](?:{OPTION_ARGUMENT}|\s+{OPTION_ARGUMENT})"  # -Xdev, -X 'dev', -uWerror
+    r"|--check-hash-based-pycs\s+" + quoted(r"(?:always|default|never)", group="pycs_quote")
 )
 # `-m` may close a flag cluster and take its module attached: CPython 3.12 runs
 # `-mlab.x`, `-Im lab.x`, `-OOm lab.x` and `-Imlab.x` alike, while `-Wm lab.x`
 # hands `m` to `-W` and treats `lab.x` as a script path.
 MODULE_OPTION = rf"-{PYTHON_FLAG}*m\s*"
-
-
-def quoted(target: str, group: str = "quote") -> str:
-    """``target`` bare or in matching single or double quotes, which the shell strips.
-
-    A mismatched quote is a shell syntax error: the line runs nothing and
-    matches nothing. ``group`` names the capture that holds the quote, since a
-    command pattern may quote both its interpreter and its target and ``re``
-    rejects a group name used twice.
-    """
-    return rf"(?P<{group}>['\"]?){target}\b(?P={group})"
 
 
 PYTHON_COMMAND = (
@@ -401,6 +416,60 @@ class ScannerTests(unittest.TestCase):
                     self.commands(f"python3 {quote}lab/prism/storm.py{quote} --decide"),
                     ["lab/prism/storm.py"],
                 )
+
+    # Each ran `json.tool` on CPython 3.14 exactly as its bare spelling: the
+    # shell strips matching quotes, attached or not, before CPython sees them.
+    QUOTED_OPTIONS = (
+        "-X 'dev'",
+        '-X "dev mode"',
+        "-X'dev'",
+        '-X"dev mode"',
+        "-W 'error'",
+        '-W"error"',
+        "-uW 'error'",
+        "-W 'error'::DeprecationWarning",
+        "--check-hash-based-pycs 'always'",
+        '--check-hash-based-pycs "never"',
+    )
+
+    def test_quoted_option_arguments_with_missing_targets_are_caught(self) -> None:
+        for options in self.QUOTED_OPTIONS:
+            with self.subTest(options=options):
+                self.assertEqual(
+                    self.commands(f"python3 {options} -m lab.prism.process_telemetry rss-bound"),
+                    [self.TELEMETRY],
+                )
+                self.assertEqual(
+                    self.commands(f"python {options} lab/prism/storm.py --decide"),
+                    ["lab/prism/storm.py"],
+                )
+
+    def test_quoted_option_arguments_with_existing_targets_pass(self) -> None:
+        tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py", "lab/pkg/__main__.py"}
+        for options in self.QUOTED_OPTIONS:
+            with self.subTest(options=options):
+                text = (
+                    f"python3 {options} -m lab.prism.tool\npython3.12 {options} -m lab.pkg\n"
+                    f"python {options} lab/prism/tool.py"
+                )
+                self.assertEqual(dead_commands(text, tracked), [])
+
+    def test_wrapped_quoted_option_arguments_with_missing_targets_are_caught(self) -> None:
+        text = "python3 \\\n  -X \\\n  'dev mode' \\\n  -m lab.prism.process_telemetry \\\n  rss-bound"
+        self.assertEqual(self.located(text), [(1, self.TELEMETRY)])
+        text = "python3.12 --check-hash-based-pycs \\\n  \"always\" \\\n  lab/prism/storm.py \\\n  --decide"
+        self.assertEqual(self.located(text), [(1, "lab/prism/storm.py")])
+
+    def test_mismatched_option_argument_quotes_are_not_a_command(self) -> None:
+        # bash rejects `-X 'dev"` with "unexpected EOF while looking for
+        # matching `''" before Python starts, so the line runs nothing; the
+        # prose contract still sees the reference.
+        for options in ("-X 'dev\"", "-X\"dev'", "-W \"error'", "--check-hash-based-pycs 'always\""):
+            with self.subTest(options=options):
+                text = f"python3 {options} -m lab.prism.x"
+                self.assertEqual(self.commands(text), [])
+                self.assertEqual(self.references(text), ["lab.prism.x"])
+                self.assertEqual(self.commands(f"python3 {options} lab/prism/x.py"), [])
 
     def test_dot_relative_scripts_are_caught_as_the_bare_path(self) -> None:
         for script in ("./lab/prism/storm.py", '"./lab/prism/storm.py"', "././lab/prism/storm.py"):
