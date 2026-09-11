@@ -106,7 +106,7 @@
 -  that never increment RestartCount, so planned work needs no maintenance
 -  flag; drills that crash the coordinator on purpose use a Grafana silence.
 +{# Native 3.x.x cutover draft, bootstrap #279. Apply only with the native image.
-+   Specification SHA-256: 831315bcf6ac242a3db7edcf6273be392228d64a58ec62dab24821b41a9d98a5
++   Specification SHA-256: 20fce857d66548a1b9e10917a45ada21d62395dcd258010f3dd741860385287b
 +   Generated from the reviewed a007a142 snapshot; backup, sidecar and lifecycle rules retain their producers.
 +   Native numeric bounds marked provisional must be measured in #291 before production cutover.
 +   The D3 group requires PRIMARY postgres_exporter query metrics; see bootstrap docs/prism-alert-migration.md.
@@ -121,7 +121,7 @@
  {% set prism_stratum_target_selector = 'job="qbit-stratum-health-sidecar",network="' ~ qbit_monitoring_stack_network ~ '",service="qbit-mining-pool",prism_capable="true"' %}
  {% set prism_stratum_selector = 'job="qbit-stratum-health-sidecar",network="' ~ qbit_monitoring_stack_network ~ '",service="qbit-mining-pool",prism_capable="true",check=~"prism(-highdiff)?"' %}
  {% set prism_backup_selector = 'job="qbit-node-exporter",network="' ~ qbit_monitoring_stack_network ~ '",service="' ~ qbit_monitoring_stack_prism_backup_alert_service ~ '",node="' ~ qbit_monitoring_stack_prism_backup_alert_node ~ '"' %}
-@@ -118,53 +14,560 @@
+@@ -118,53 +14,580 @@
  {% set prism_backup_database_growth_gib_per_day = "(sum(clamp_min(last_over_time(qbit_prism_backup_last_success_bytes{" ~ prism_backup_selector ~ ",operation=\"full\"}[1h]) - last_over_time(qbit_prism_backup_last_success_bytes{" ~ prism_backup_selector ~ ",operation=\"full\"}[1h] offset " ~ qbit_monitoring_stack_prism_backup_alert_growth_window ~ "), 0)) / " ~ qbit_monitoring_stack_prism_backup_alert_growth_window_days ~ " / 1073741824)" %}
  {% set prism_backup_audit_growth_gib_per_day = "(sum(clamp_min(deriv(qbit_prism_backup_last_success_bytes{" ~ prism_backup_selector ~ ",operation=\"audit\"}[" ~ qbit_monitoring_stack_prism_backup_alert_growth_window ~ "]), 0)) * 86400 / 1073741824)" %}
  {% set prism_backup_wal_growth_gib_per_day = "(sum(clamp_min(rate(qbit_prism_backup_wal_generated_bytes_total{" ~ prism_backup_selector ~ "}[" ~ qbit_monitoring_stack_prism_backup_alert_growth_window ~ "]), 0)) * 86400 / 1073741824)" %}
@@ -364,6 +364,24 @@
 +    "exec_err_state": "OK"
 +  },
 +  {
++    "uid": "qbit-prism-share-append-failures",
++    "title": "PrismShareAppendFailures",
++    "expr": "(sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",reason_id=\"ledger-confirmation-failed\"}[5m])) > bool 0) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0))",
++    "condition_type": "threshold",
++    "evaluator": "gt",
++    "threshold": 0,
++    "for": "3m",
++    "severity": "warning",
++    "service": "qbit-mining-pool",
++    "labels": {
++      "alert_class": "prism-runtime"
++    },
++    "summary": "PrismShareAppendFailures",
++    "description": "At least one share was rejected because its durable ledger confirmation failed in the five-minute window. This preserves the low-volume total-write-failure signal from the deployed rule while retaining the native reason_id and freshness guards.",
++    "no_data_state": "OK",
++    "exec_err_state": "OK"
++  },
++  {
 +    "uid": "qbit-prism-time-to-usable-work",
 +    "title": "PrismTimeToUsableWorkHigh",
 +    "expr": "((qbit_prism_stratum_oldest_pending_initial_job_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} > bool 15) and on(job, instance, network) (qbit_prism_stratum_pending_initial_jobs{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} > 0)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0))",
@@ -425,10 +443,11 @@
 +    "evaluator": "gt",
 +    "threshold": 0,
 +    "for": "3m",
-+    "severity": "warning",
++    "severity": "critical",
 +    "service": "qbit-mining-pool",
 +    "labels": {
-+      "alert_class": "prism-runtime"
++      "alert_class": "prism-runtime",
++      "page": "true"
 +    },
 +    "summary": "PrismSemanticWorkCoverageLossCritical",
 +    "description": "Unknown ratio -1 is excluded from coverage and reported separately; no-client ratio one is healthy. Native semantic generation coverage; warning matches the strict 95-percent timer boundary. Critical 50 percent and three-minute dwell: Provisional, measure in #291.",
@@ -515,10 +534,11 @@
 +    "evaluator": "gt",
 +    "threshold": 0,
 +    "for": "3m",
-+    "severity": "warning",
++    "severity": "critical",
 +    "service": "qbit-mining-pool",
 +    "labels": {
-+      "alert_class": "prism-runtime"
++      "alert_class": "prism-runtime",
++      "page": "true"
 +    },
 +    "summary": "PrismBlockCandidateOldestPendingCritical",
 +    "description": "Per-scrape-target view of cluster-wide backlog; do not sum repeated database snapshots across coordinators. Unknown -1 belongs to the collector-unavailable alert. Native pending outbox rows include claimed/retry-delayed candidates; count bounds 2/5 and age bounds 15/60 seconds. Provisional, measure in #291.",
@@ -714,7 +734,7 @@
    {
      "uid": "qbit-prism-stratum-nodata",
      "title": "PrismStratumHealthNoData",
-@@ -230,752 +633,17 @@
+@@ -230,752 +653,17 @@
      "value_annotations": ["check_failures_in_window"],
      "no_data_state": "OK",
      "exec_err_state": "OK"
@@ -1470,7 +1490,7 @@
  {% endif %}
  {% if qbit_monitoring_stack_prism_backup_alerts_effective | bool %}
  {% set alert_rules = alert_rules + [
-@@ -1454,5 +1122,86 @@
+@@ -1454,5 +1142,84 @@
    }
  ] %}
  {% endif %}
@@ -1494,8 +1514,6 @@
 +    uid: qbit-prism-share-writer-backlog-critical
 +  - orgId: 1
 +    uid: qbit-prism-shares-recovered-to-disk
-+  - orgId: 1
-+    uid: qbit-prism-share-append-failures
 +  - orgId: 1
 +    uid: qbit-prism-shares-replayed
 +  - orgId: 1

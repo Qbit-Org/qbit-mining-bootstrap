@@ -117,9 +117,9 @@
       "external": false,
       "disposition": "migrated",
       "replacement": [
-        "PrismRejectRatioByReasonHigh"
+        "PrismShareAppendFailures"
       ],
-      "reason": "Native ledger-confirmation-failed and backend-rpc-unavailable reason IDs expose failed submits; canonical reasons replace append retries."
+      "reason": "Native ledger-confirmation-failed reason IDs preserve the deployed any-failure signal, including a 60/60 low-volume write outage, without requiring the reject-ratio volume floor."
     },
     {
       "uid": "qbit-prism-shares-replayed",

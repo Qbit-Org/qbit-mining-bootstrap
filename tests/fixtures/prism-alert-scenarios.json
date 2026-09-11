@@ -178,6 +178,19 @@
     }
   },
   {
+    "name": "low-volume total ledger write failures remain visible",
+    "series": {
+      "qbit_prism_rejections_total{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",reason_id=\"ledger-confirmation-failed\"}": "0+0x300 1+1x59",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1
+    },
+    "expect": {
+      "PrismShareAppendFailures": 1,
+      "PrismRejectRatioByReasonHigh": null
+    }
+  },
+  {
     "name": "network client floor: six plus six is healthy",
     "series": {
       "up{job=\"qbit-prism\",instance=\"coordinator-0\",network=\"mainnet\"}": 1,
