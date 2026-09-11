@@ -88,11 +88,13 @@ quantile alarm. Reject ratios preserve canonical `reason_id` and use accepted
 plus canonical rejection decisions as their denominator; ACK timing is not a
 durable-credit counter. The collector pool histogram records each started
 `PgPool::acquire` attempt once: success when acquired, or failure on acquisition
-error or cancellation, including the three-second collection deadline. Durations
-measure elapsed pool wait and exclude subsequent transaction work. Collector
-availability remains a separate alert guard. **Proof-to-first-offer and advisory-lock
-waits are declared, rule deferred to A/#266 and #283** respectively; neither has
-a firing rule.
+error or cancellation, including the three-second collection deadline. Since #328
+every ledger transaction's acquisition records the same way; queries run directly
+on the pool outside a transaction are not timed. Durations measure elapsed pool
+wait and exclude subsequent transaction work. Collector availability remains a
+separate alert guard. **Proof-to-first-offer waits are declared, rule deferred to
+A/#266; advisory-lock waits are recorded since #328 with no rule written yet**;
+neither has a firing rule.
 
 Numeric bounds without native measurement are explicitly **provisional, measure
 in #291** in each rule's `basis` and provisioned description. This includes RSS
