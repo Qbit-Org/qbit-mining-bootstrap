@@ -3331,9 +3331,24 @@ class ShareWindowSpoolTests(unittest.TestCase):
         self.assertEqual(first["received"], self._expected_payload(shares, height=10))
         self.assertEqual(second["received"], first["received"])
 
+    def _splice_or_emulation(self) -> None:
+        # Production streams the spool only where os.splice exists. Without
+        # it (macOS), a pread/write stand-in keeps the spool path under test;
+        # where it exists, the real splice runs untouched.
+        if hasattr(os, "splice"):
+            return
+
+        def splice(src: int, dst: int, count: int, *, offset_src: int) -> int:
+            return os.write(dst, os.pread(src, count, offset_src))
+
+        patcher = patch.object(os, "splice", splice, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_spool_feeds_builder_and_is_written_once_per_generation(
         self,
     ) -> None:
+        self._splice_or_emulation()
         server = self._coordinator()
         shares = [spool_share(seq) for seq in range(1, 4)]
         serialization = server._share_window_serialization_for_artifact(
@@ -3375,6 +3390,7 @@ class ShareWindowSpoolTests(unittest.TestCase):
         self.assertEqual(len(spool_creations), 1)
 
     def test_spool_creation_failure_falls_back_to_pipe_writes(self) -> None:
+        self._splice_or_emulation()
         server = self._coordinator()
         shares = [spool_share(seq) for seq in range(1, 4)]
         serialization = server._share_window_serialization_for_artifact(
@@ -3422,6 +3438,7 @@ class ShareWindowSpoolTests(unittest.TestCase):
         with patch(
             "lab.prism.prism_coordinator.os.splice",
             side_effect=OSError("splice unsupported"),
+            create=True,
         ):
             first = self._build_with_echo_builder(
                 server,
@@ -3464,6 +3481,7 @@ class ShareWindowSpoolTests(unittest.TestCase):
         with patch(
             "lab.prism.prism_coordinator.os.splice",
             side_effect=[16, OSError("splice io error")],
+            create=True,
         ):
             with self.assertRaises(OSError):
                 self._build_with_echo_builder(
@@ -3936,6 +3954,7 @@ class ServeBuilderTests(unittest.TestCase):
             with patch(
                 "lab.prism.prism_coordinator.os.splice",
                 side_effect=[16, OSError("splice io error")],
+                create=True,
             ):
                 result = self._build(server, shares, serialization, height=10)
 
