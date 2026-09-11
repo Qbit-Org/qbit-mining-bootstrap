@@ -472,6 +472,66 @@ fn summarize_live_instances(observed_at: &str, rows: Value) -> LiveInstancesRepo
     }
 }
 
+fn benchmark(count: usize, miners: usize, iterations: usize) -> Result<Value> {
+    ensure!(
+        count > 0
+            && count <= 10_000_000
+            && miners > 0
+            && miners <= count
+            && iterations > 0
+            && iterations <= 10_000,
+        "invalid benchmark dimensions"
+    );
+    let shares: Vec<_> = (0..count)
+        .map(|i| qbit_prism::AcceptedShare {
+            share_seq: i as u64 + 1,
+            share_id: format!("share-{i}"),
+            miner_id: format!("miner-{}", i % miners),
+            order_key: format!("miner-{}", i % miners),
+            p2mr_program_hex: format!("{:064x}", i % miners + 1),
+            share_difficulty: 1,
+            network_difficulty: count as u128,
+            template_height: 1,
+            job_id: "benchmark".into(),
+            job_issued_at_ms: 0,
+            accepted_at_ms: 0,
+            ntime: 1,
+            credit_policy: None,
+        })
+        .collect();
+    let key = qbit_pool_builder::ManifestSigningKey::from_seed_hex(&"11".repeat(32))?;
+    let ledger_key = qbit_pool_builder::ManifestSigningKey::from_seed_hex(&"22".repeat(32))?;
+    let found = qbit_prism::FoundBlock {
+        block_height: 2,
+        coinbase_value_sats: 5_000_000_000,
+        network_difficulty: count as u128,
+        anchor_job_issued_at_ms: 1,
+    };
+    let mut milliseconds = Vec::new();
+    let mut last_bytes = 0;
+    for _ in 0..iterations {
+        let started = Instant::now();
+        let bundle = qbit_prism::build_audit_bundle(
+            shares.clone(),
+            found.clone(),
+            vec![],
+            qbit_prism::PayoutPolicy::day_one_default(),
+            &key,
+            &ledger_key,
+        )?;
+        qbit_prism::verify_audit_bundle_with_ledger_public_key(
+            &bundle,
+            &ledger_key.public_key_hex(),
+        )?;
+        milliseconds.push(started.elapsed().as_secs_f64() * 1000.0);
+        last_bytes = qbit_prism::canonical_audit_bundle_bytes(&bundle)?.len();
+    }
+    milliseconds.sort_by(f64::total_cmp);
+    Ok(
+        json!({"schema":"qbit.prism.native-builder-benchmark.v1","shares":count,"miners":miners,"iterations":iterations,"build_and_verify_p50_ms":milliseconds[iterations/2],"build_and_verify_p99_ms":milliseconds[(iterations*99/100).min(iterations-1)],"canonical_audit_bytes":last_bytes,"engine":"in-process-rust"}),
+    )
+}
+
 #[cfg(test)]
 mod live_instance_tests {
     use super::*;
@@ -591,64 +651,4 @@ mod live_instance_tests {
         pool.close().await;
         Ok(())
     }
-}
-
-fn benchmark(count: usize, miners: usize, iterations: usize) -> Result<Value> {
-    ensure!(
-        count > 0
-            && count <= 10_000_000
-            && miners > 0
-            && miners <= count
-            && iterations > 0
-            && iterations <= 10_000,
-        "invalid benchmark dimensions"
-    );
-    let shares: Vec<_> = (0..count)
-        .map(|i| qbit_prism::AcceptedShare {
-            share_seq: i as u64 + 1,
-            share_id: format!("share-{i}"),
-            miner_id: format!("miner-{}", i % miners),
-            order_key: format!("miner-{}", i % miners),
-            p2mr_program_hex: format!("{:064x}", i % miners + 1),
-            share_difficulty: 1,
-            network_difficulty: count as u128,
-            template_height: 1,
-            job_id: "benchmark".into(),
-            job_issued_at_ms: 0,
-            accepted_at_ms: 0,
-            ntime: 1,
-            credit_policy: None,
-        })
-        .collect();
-    let key = qbit_pool_builder::ManifestSigningKey::from_seed_hex(&"11".repeat(32))?;
-    let ledger_key = qbit_pool_builder::ManifestSigningKey::from_seed_hex(&"22".repeat(32))?;
-    let found = qbit_prism::FoundBlock {
-        block_height: 2,
-        coinbase_value_sats: 5_000_000_000,
-        network_difficulty: count as u128,
-        anchor_job_issued_at_ms: 1,
-    };
-    let mut milliseconds = Vec::new();
-    let mut last_bytes = 0;
-    for _ in 0..iterations {
-        let started = Instant::now();
-        let bundle = qbit_prism::build_audit_bundle(
-            shares.clone(),
-            found.clone(),
-            vec![],
-            qbit_prism::PayoutPolicy::day_one_default(),
-            &key,
-            &ledger_key,
-        )?;
-        qbit_prism::verify_audit_bundle_with_ledger_public_key(
-            &bundle,
-            &ledger_key.public_key_hex(),
-        )?;
-        milliseconds.push(started.elapsed().as_secs_f64() * 1000.0);
-        last_bytes = qbit_prism::canonical_audit_bundle_bytes(&bundle)?.len();
-    }
-    milliseconds.sort_by(f64::total_cmp);
-    Ok(
-        json!({"schema":"qbit.prism.native-builder-benchmark.v1","shares":count,"miners":miners,"iterations":iterations,"build_and_verify_p50_ms":milliseconds[iterations/2],"build_and_verify_p99_ms":milliseconds[(iterations*99/100).min(iterations-1)],"canonical_audit_bytes":last_bytes,"engine":"in-process-rust"}),
-    )
 }
