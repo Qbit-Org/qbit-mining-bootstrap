@@ -8,8 +8,16 @@ use std::{
 use tokio::{process::Command, time::timeout};
 
 async fn check(production: bool, settings: &[(&str, &str)]) -> Output {
+    configured_command("check-config", production, settings).await
+}
+
+async fn configured_command(
+    subcommand: &str,
+    production: bool,
+    settings: &[(&str, &str)],
+) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_qbit-prism-server"));
-    command.arg("check-config").kill_on_drop(true);
+    command.arg(subcommand).kill_on_drop(true);
     for (name, _) in std::env::vars().filter(|(name, _)| {
         name.starts_with("PRISM_") || name.starts_with("QBIT_") || name == "RUST_LOG"
     }) {
@@ -50,7 +58,7 @@ async fn check(production: bool, settings: &[(&str, &str)]) -> Output {
     }
     timeout(Duration::from_secs(3), command.output())
         .await
-        .expect("check-config attempted network access or stalled")
+        .expect("configuration validation attempted network access or stalled")
         .unwrap()
 }
 
@@ -463,5 +471,24 @@ async fn ctv_fee_premiums_are_validated_before_automatic_or_explicit_fee_work() 
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+}
+
+#[tokio::test]
+async fn run_rejects_invalid_highdiff_settings_before_connecting() {
+    for settings in [
+        vec![("PRISM_STRATUM_HIGHDIFF_PORT", "0")],
+        vec![
+            ("PRISM_STRATUM_HIGHDIFF_PORT", "4334"),
+            ("PRISM_STRATUM_HIGHDIFF_SHARE_DIFF", "invalid"),
+        ],
+    ] {
+        // The fixture's database and RPC endpoints are intentionally unreachable.
+        // Reject these settings before either external dependency is contacted.
+        let output = configured_command("run", false, &settings).await;
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("invalid PRISM_STRATUM_HIGHDIFF"), "{error}");
+        assert!(!error.contains("test-only-password"));
     }
 }

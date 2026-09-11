@@ -72,6 +72,7 @@ impl Fixture {
                 read_timeout: Duration::from_millis(250),
                 ..Default::default()
             },
+            std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
         )
     }
     async fn close(self) -> Result<()> {

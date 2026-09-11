@@ -2,7 +2,15 @@ name: CI
 
 on:
   pull_request:
+  # Pull requests are tested as their merge result; a push to a PR branch
+  # would run the same jobs a second time. Push runs cover direct commits
+  # to the long-lived branches only.
   push:
+    branches:
+      - main
+      - 1.x.x
+      - 2.x.x
+      - 3.x.x
   workflow_dispatch:
 
 permissions:
@@ -23,9 +31,7 @@ jobs:
           python-version: "3.14"
 
       - name: Install lint tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends shellcheck
+        run: bash .github/scripts/apt-install.sh shellcheck
 
       - name: Check shell syntax
         run: git ls-files -z '*.sh' | xargs -0 -n 1 bash -n
@@ -56,6 +62,30 @@ jobs:
           done
           docker compose --env-file config/upstream.env.example --env-file .env.example \
             -f compose.yaml -f compose.prism-external-db.yaml --profile prism config --quiet
+
+      - name: Validate PRISM HA Compose stacks
+        run: |
+          export QBIT_SRC_DIR="$PWD"
+          for overlays in "" "-f compose.production.yaml" "-f compose.prism-external-db.yaml" "-f compose.production.yaml -f compose.prism-external-db.yaml"; do
+            (
+              unset PRISM_DATABASE_URL
+              if [[ "$overlays" == *compose.prism-external-db.yaml* ]]; then
+                export PRISM_DATABASE_URL=postgresql://fixture:fixture@writer.example:5432/prism
+              fi
+              docker compose --env-file config/upstream.env.example --env-file .env.example \
+                -f compose.yaml $overlays -f compose.prism-ha.yaml --profile prism config --format json |
+                jq -e '
+                  [.services["prism-coordinator"], .services["prism-coordinator-2"]] as $pair |
+                  ($pair | all(.environment.PRISM_AUDIT_BIND == "0.0.0.0")) and
+                  ($pair | all(. as $s |
+                    (.environment.PRISM_AUDIT_PORT | tonumber) > 0 and
+                    any(.ports[]; .target == ($s.environment.PRISM_AUDIT_PORT | tonumber)))) and
+                  ([$pair[].environment.PRISM_INSTANCE_ID] | unique | length == 2) and
+                  ([$pair[].environment.PRISM_DATABASE_URL] | unique | length == 1) and
+                  ([$pair[].ports[] | select(.published != "0") | .published] |
+                    length == (unique | length))'
+            )
+          done
 
   python-tests:
     name: Python unit tests (shard ${{ matrix.shard }})
@@ -131,8 +161,7 @@ jobs:
 
       - name: Install ckpool build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          bash .github/scripts/apt-install.sh \
             autoconf automake build-essential libtool pkgconf yasm \
             libcurl4-openssl-dev libjansson-dev libzmq3-dev
 
@@ -164,9 +193,7 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Install tools for disposable primary and standby failover test
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends postgresql-16
+        run: bash .github/scripts/apt-install.sh postgresql-16
       - name: Install pinned qbit for native mining and CTV integration
         run: |
           set -euo pipefail
@@ -183,6 +210,13 @@ jobs:
           printf 'QBITD_BIN=%s/qbit-1.0.0/bin/qbitd\n' "${prism_qbit_dir}" >> "${GITHUB_ENV}"
       - name: Run native ledger, API, and Stratum tests
         run: cargo test --locked -p qbit-prism-server --all-targets
+      - name: Verify unsubscribed connections do not consume shared mining IDs
+        run: >-
+          cargo test --locked -p qbit-prism-server
+          --test stratum_admission_postgres -- --ignored --exact
+          ten_thousand_unsubscribed_connections_do_not_advance_postgres_sequence
+      - name: Exercise native metrics collectors against PostgreSQL
+        run: cargo test --locked -p qbit-prism-server --test observability_database -- --ignored
 
   docker-builds:
     name: Build lightweight Docker images

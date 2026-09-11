@@ -69,6 +69,7 @@ struct StoredJob {
 pub struct Coordinator {
     pub config: Arc<Config>,
     pub ledger: Arc<Ledger>,
+    pub metrics: Arc<crate::metrics::Metrics>,
     pub rpc: Rpc,
     pub prepared: RwLock<Option<Arc<Prepared>>>,
     pub refresh: watch::Sender<u64>,
@@ -242,7 +243,10 @@ fn validate_fee_floor(policy: FanoutFeeRatePolicy, required_rate: u64) -> Result
 }
 
 impl Coordinator {
-    pub async fn new(mut config: Config) -> Result<Arc<Self>> {
+    pub async fn new(
+        mut config: Config,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) -> Result<Arc<Self>> {
         let rpc = Rpc::new(
             config.rpc_url.clone(),
             config.rpc_user.clone(),
@@ -297,6 +301,7 @@ impl Coordinator {
             .await?;
         let (refresh, _) = watch::channel(0);
         Ok(Arc::new(Self {
+            metrics,
             build_slots: Arc::new(Semaphore::new(config.build_workers)),
             config: Arc::new(config),
             ledger,
@@ -1752,6 +1757,9 @@ impl MiningBackend for Coordinator {
         match save {
             Ok(true) => {
                 self.accepted.fetch_add(1, Ordering::Relaxed);
+                if stale {
+                    self.metrics.record_grace_credit();
+                }
                 if current.bundle.is_none() {
                     self.wake.notify_one();
                 }

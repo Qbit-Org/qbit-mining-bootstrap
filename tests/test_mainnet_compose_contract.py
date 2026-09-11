@@ -90,6 +90,76 @@ class MainnetComposeContractTests(unittest.TestCase):
                 f"stderr:\n{completed.stderr}"
             )
         cls.config = json.loads(completed.stdout)
+        cls.compose_env = env
+        cls.ha_config = cls.render_ha()
+
+    @classmethod
+    def render_ha(cls, **overrides: str) -> dict[str, Any]:
+        completed = subprocess.run(
+            [cls.docker, "compose", "--env-file", str(ROOT / "config/upstream.env.example"),
+             "--env-file", str(FIXTURE), "-f", str(ROOT / "compose.yaml"),
+             "-f", str(ROOT / "compose.production.yaml"),
+             "-f", str(ROOT / "compose.prism-ha.yaml"),
+             "--project-name", "qbit-mainnet-ha-contract", "--profile", "prism",
+             "config", "--format", "json"],
+            cwd=ROOT, env={**cls.compose_env, **overrides}, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(f"HA compose render failed: {completed.stderr}")
+        return json.loads(completed.stdout)
+
+    def test_ha_preserves_global_rpc_and_shared_database(self) -> None:
+        base = self._environment("prism-coordinator")
+        for name in ("prism-coordinator", "prism-coordinator-2"):
+            with self.subTest(service=name):
+                env = self.ha_config["services"][name]["environment"]
+                for key in ("QBIT_RPC_HOST", "QBIT_RPC_URL", "PRISM_DATABASE_URL"):
+                    self.assertEqual(env[key], base[key], key)
+                self.assertEqual(env["PRISM_AUDIT_BIND"], "0.0.0.0")
+
+    def test_ha_frontends_have_distinct_ids_and_published_ports(self) -> None:
+        pair = [self.ha_config["services"][name]
+                for name in ("prism-coordinator", "prism-coordinator-2")]
+        self.assertEqual(len({s["environment"]["PRISM_INSTANCE_ID"] for s in pair}), 2)
+        ports = [str(p["published"]) for s in pair for p in s["ports"]
+                 if str(p["published"]) != "0"]
+        self.assertEqual(len(ports), len(set(ports)))
+
+    def test_ha_requires_http_health_despite_base_listener_disable(self) -> None:
+        for port in ("3341", "25351"):
+            config = self.render_ha(PRISM_AUDIT_PORT="0", PRISM_HA_AUDIT_PORT=port)
+            for name in ("prism-coordinator", "prism-coordinator-2"):
+                with self.subTest(service=name, port=port):
+                    service = config["services"][name]
+                    self.assertEqual(service["environment"]["PRISM_AUDIT_PORT"], port)
+                    self.assertIn(int(port), [p["target"] for p in service["ports"]])
+
+    def test_ha_per_frontend_overrides_win_over_base_values(self) -> None:
+        config = self.render_ha(
+            PRISM_HA_RPC_URL_1="https://east.example.invalid/rpc",
+            PRISM_HA_RPC_URL_2="https://west.example.invalid/rpc",
+            PRISM_HA_RPC_HOST_1="east.example.invalid",
+            PRISM_HA_RPC_HOST_2="west.example.invalid",
+            PRISM_HA_INSTANCE_ID_1="verify-east", PRISM_HA_INSTANCE_ID_2="verify-west",
+            PRISM_HA_STRATUM_PORT_HOST_1="127.0.0.1:25340",
+            PRISM_HA_STRATUM_PORT_HOST_2="127.0.0.1:25343",
+            PRISM_HA_HIGHDIFF_PORT_HOST_1="127.0.0.1:25345",
+            PRISM_HA_HIGHDIFF_PORT_HOST_2="127.0.0.1:25346",
+            PRISM_HA_AUDIT_BIND="::",
+        )
+        for name, side, ports in (
+            ("prism-coordinator", "east", {"25340", "25345"}),
+            ("prism-coordinator-2", "west", {"25343", "25346"}),
+        ):
+            with self.subTest(service=name):
+                service = config["services"][name]
+                env = service["environment"]
+                self.assertEqual(env["PRISM_INSTANCE_ID"], f"verify-{side}")
+                self.assertEqual(env["QBIT_RPC_HOST"], f"{side}.example.invalid")
+                self.assertEqual(env["QBIT_RPC_URL"], f"https://{side}.example.invalid/rpc")
+                self.assertEqual(env["PRISM_AUDIT_BIND"], "::")
+                self.assertLessEqual(ports, {str(p["published"]) for p in service["ports"]})
 
     def test_profiles_render_expected_service_graph(self) -> None:
         services = set(self.config["services"])

@@ -129,6 +129,10 @@ server tools. Live regtest requires `QBITD_BIN` and exercises two native
 instances, real RPC/block validation, and constrained CPU miners. The CI database
 job runs the native package against PostgreSQL.
 
+The [subscription admission reference](../../docs/prism-b4-stratum-admission.md)
+describes lazy session-ID allocation, failure behavior and its explicit
+PostgreSQL acceptance test.
+
 The separate physical failover test starts disposable primary and synchronous
 standby PostgreSQL processes behind a stable TCP endpoint. It reconciles commits
 from two ledger clients after immediate primary loss and standby promotion, then

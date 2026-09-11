@@ -118,6 +118,8 @@ services:
       CKPOOL_VERSION_MASK: ${CKPOOL_VERSION_MASK:-1fffe000}
       CKPOOL_VERSION_MASK_MODE: ${CKPOOL_VERSION_MASK_MODE:-dynamic}
       CKPOOL_VERSION_MASK_RPC_TIMEOUT_SECONDS: ${CKPOOL_VERSION_MASK_RPC_TIMEOUT_SECONDS:-5}
+      CKPOOL_VERSION_MASK_PROBE_ATTEMPTS: ${CKPOOL_VERSION_MASK_PROBE_ATTEMPTS:-3}
+      CKPOOL_VERSION_MASK_PROBE_RETRY_SECONDS: ${CKPOOL_VERSION_MASK_PROBE_RETRY_SECONDS:-2}
       CKPOOL_STRATUM_PORT: 3333
     ports:
       - "${CKPOOL_STRATUM_PORT_HOST:-3333}:3333"
@@ -504,7 +506,7 @@ services:
       start_period: 60s
       retries: 30
 
-  prism-coordinator:
+  prism-coordinator: &prism-coordinator
     profiles: ["prism"]
     image: ${PRISM_COORDINATOR_IMAGE:-qbit-lab-prism-coordinator:local}
     restart: on-failure
@@ -681,6 +683,15 @@ services:
       timeout: 5s
       start_period: 15s
       retries: 3
+
+  # Inactive template for compose.prism-ha.yaml. Keep the full environment shared
+  # here: Compose extends is resolved before file merging and loses overrides.
+  # The audit mount is deliberately shared for legacy compatibility; native
+  # Rust audit bodies are canonical in PostgreSQL, not written to this mount.
+  prism-coordinator-2:
+    <<: *prism-coordinator
+    profiles: ["prism-ha-overlay-required"]
+    ports: []
 
   # Public reads use a separate native process and pool, with optional replica checks.
   prism-public-api:

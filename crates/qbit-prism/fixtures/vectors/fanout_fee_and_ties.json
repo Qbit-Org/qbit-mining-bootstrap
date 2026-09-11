@@ -1,0 +1,468 @@
+{
+  "cases": [
+    {
+      "entry_point": "apply_proportional_fanout_fee",
+      "expected": {
+        "ok": {
+          "applied_fee_sats": 1000,
+          "carry_forward_recipients": [
+            {
+              "fee_sats": 0,
+              "gross_amount_sats": 10000,
+              "net_amount_sats": 10000,
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "small-a"
+            },
+            {
+              "fee_sats": 0,
+              "gross_amount_sats": 10000,
+              "net_amount_sats": 10000,
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "small-b"
+            }
+          ],
+          "payable_recipients": [
+            {
+              "fee_sats": 1000,
+              "gross_amount_sats": 100000,
+              "net_amount_sats": 99000,
+              "order_key": "03",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "recipient_id": "large"
+            }
+          ],
+          "requested_fee_sats": 1000,
+          "total_gross_sats": 120000
+        }
+      },
+      "input": {
+        "fee_sats": 1000,
+        "min_output_sats": 9950,
+        "recipients": [
+          {
+            "amount_sats": 10000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "recipient_id": "small-a"
+          },
+          {
+            "amount_sats": 10000,
+            "order_key": "02",
+            "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+            "recipient_id": "small-b"
+          },
+          {
+            "amount_sats": 100000,
+            "order_key": "03",
+            "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+            "recipient_id": "large"
+          }
+        ]
+      },
+      "name": "prune-below-floor-and-recompute",
+      "topic": 5,
+      "why": "Both small recipients fall under 9950 after their fee share; they carry forward fee-free and the whole fee is recomputed over the large one."
+    },
+    {
+      "entry_point": "apply_proportional_fanout_fee",
+      "expected": {
+        "ok": {
+          "applied_fee_sats": 1100,
+          "carry_forward_recipients": [],
+          "payable_recipients": [
+            {
+              "fee_sats": 1000,
+              "gross_amount_sats": 100000,
+              "net_amount_sats": 99000,
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "large"
+            },
+            {
+              "fee_sats": 100,
+              "gross_amount_sats": 10000,
+              "net_amount_sats": 9900,
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "small"
+            }
+          ],
+          "requested_fee_sats": 1100,
+          "total_gross_sats": 110000
+        }
+      },
+      "input": {
+        "fee_sats": 1100,
+        "min_output_sats": 9900,
+        "recipients": [
+          {
+            "amount_sats": 100000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "recipient_id": "large"
+          },
+          {
+            "amount_sats": 10000,
+            "order_key": "02",
+            "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+            "recipient_id": "small"
+          }
+        ]
+      },
+      "name": "net-exactly-at-floor-is-payable",
+      "topic": 5,
+      "why": "The small recipient's fee share is exactly 100, leaving 9900: at the floor, so it is paid."
+    },
+    {
+      "entry_point": "apply_proportional_fanout_fee",
+      "expected": {
+        "ok": {
+          "applied_fee_sats": 1100,
+          "carry_forward_recipients": [
+            {
+              "fee_sats": 0,
+              "gross_amount_sats": 10000,
+              "net_amount_sats": 10000,
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "small"
+            }
+          ],
+          "payable_recipients": [
+            {
+              "fee_sats": 1100,
+              "gross_amount_sats": 100000,
+              "net_amount_sats": 98900,
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "large"
+            }
+          ],
+          "requested_fee_sats": 1100,
+          "total_gross_sats": 110000
+        }
+      },
+      "input": {
+        "fee_sats": 1100,
+        "min_output_sats": 9901,
+        "recipients": [
+          {
+            "amount_sats": 100000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "recipient_id": "large"
+          },
+          {
+            "amount_sats": 10000,
+            "order_key": "02",
+            "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+            "recipient_id": "small"
+          }
+        ]
+      },
+      "name": "net-one-sat-under-floor-is-carried",
+      "topic": 5,
+      "why": "The same split with floor 9901 leaves the small recipient one sat under, so it carries and the large one pays the whole fee."
+    },
+    {
+      "entry_point": "apply_proportional_fanout_fee",
+      "expected": {
+        "ok": {
+          "applied_fee_sats": 0,
+          "carry_forward_recipients": [
+            {
+              "fee_sats": 0,
+              "gross_amount_sats": 10000,
+              "net_amount_sats": 10000,
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "tiny"
+            }
+          ],
+          "payable_recipients": [],
+          "requested_fee_sats": 1000,
+          "total_gross_sats": 10000
+        }
+      },
+      "input": {
+        "fee_sats": 1000,
+        "min_output_sats": 9500,
+        "recipients": [
+          {
+            "amount_sats": 10000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "recipient_id": "tiny"
+          }
+        ]
+      },
+      "name": "all-carry-when-no-recipient-survives",
+      "topic": 5,
+      "why": "The only recipient falls under the floor, so every recipient carries and no fee is applied."
+    },
+    {
+      "entry_point": "apply_proportional_fanout_fee",
+      "expected": {
+        "error": "cannot select a settlement mode: min_output_sats must be positive"
+      },
+      "input": {
+        "fee_sats": 1000,
+        "min_output_sats": 0,
+        "recipients": [
+          {
+            "amount_sats": 10000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "recipient_id": "tiny"
+          }
+        ]
+      },
+      "name": "zero-floor-is-an-error",
+      "topic": 5,
+      "why": "min_output_sats must be positive."
+    },
+    {
+      "entry_point": "apply_proportional_fanout_fee",
+      "expected": {
+        "ok": {
+          "applied_fee_sats": 10,
+          "carry_forward_recipients": [],
+          "payable_recipients": [
+            {
+              "fee_sats": 4,
+              "gross_amount_sats": 100,
+              "net_amount_sats": 96,
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "a"
+            },
+            {
+              "fee_sats": 3,
+              "gross_amount_sats": 100,
+              "net_amount_sats": 97,
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "b"
+            },
+            {
+              "fee_sats": 3,
+              "gross_amount_sats": 100,
+              "net_amount_sats": 97,
+              "order_key": "03",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "recipient_id": "c"
+            }
+          ],
+          "requested_fee_sats": 10,
+          "total_gross_sats": 300
+        }
+      },
+      "input": {
+        "fee_sats": 10,
+        "min_output_sats": 1,
+        "recipients": [
+          {
+            "amount_sats": 100,
+            "order_key": "03",
+            "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+            "recipient_id": "c"
+          },
+          {
+            "amount_sats": 100,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "recipient_id": "a"
+          },
+          {
+            "amount_sats": 100,
+            "order_key": "02",
+            "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+            "recipient_id": "b"
+          }
+        ]
+      },
+      "name": "equal-remainders-broken-by-canonical-order",
+      "topic": 6,
+      "why": "Three equal recipients share a 10-sat fee: 3 each plus one remainder sat, which goes to the first account in canonical order regardless of input order."
+    },
+    {
+      "entry_point": "apply_proportional_fanout_fee",
+      "expected": {
+        "ok": {
+          "applied_fee_sats": 1,
+          "carry_forward_recipients": [],
+          "payable_recipients": [
+            {
+              "fee_sats": 1,
+              "gross_amount_sats": 100,
+              "net_amount_sats": 99,
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "z-miner"
+            },
+            {
+              "fee_sats": 0,
+              "gross_amount_sats": 100,
+              "net_amount_sats": 100,
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "a-miner"
+            }
+          ],
+          "requested_fee_sats": 1,
+          "total_gross_sats": 200
+        }
+      },
+      "input": {
+        "fee_sats": 1,
+        "min_output_sats": 1,
+        "recipients": [
+          {
+            "amount_sats": 100,
+            "order_key": "02",
+            "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+            "recipient_id": "a-miner"
+          },
+          {
+            "amount_sats": 100,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "recipient_id": "z-miner"
+          }
+        ]
+      },
+      "name": "equal-remainders-order-key-before-recipient-id",
+      "topic": 6,
+      "why": "The canonical tie-break compares order_key before recipient_id, so the remainder sat goes to order key 01 even though its id sorts last."
+    },
+    {
+      "entry_point": "apply_payout_policy",
+      "expected": {
+        "ok": {
+          "accounts": [
+            {
+              "action": "onchain",
+              "candidate_balance_sats": 166666667,
+              "carry_forward_balance_sats": 0,
+              "gross_amount_sats": 166666667,
+              "onchain_amount_sats": 166666667,
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "prior_balance_sats": 0,
+              "recipient_id": "miner-a"
+            },
+            {
+              "action": "onchain",
+              "candidate_balance_sats": 166666667,
+              "carry_forward_balance_sats": 0,
+              "gross_amount_sats": 166666667,
+              "onchain_amount_sats": 166666667,
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "prior_balance_sats": 0,
+              "recipient_id": "miner-b"
+            },
+            {
+              "action": "onchain",
+              "candidate_balance_sats": 166666666,
+              "carry_forward_balance_sats": 0,
+              "gross_amount_sats": 166666666,
+              "onchain_amount_sats": 166666666,
+              "order_key": "03",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "prior_balance_sats": 0,
+              "recipient_id": "miner-c"
+            }
+          ],
+          "block_height": 10,
+          "coinbase_value_sats": 500000000,
+          "floor_formula": "3680 bytes/input * 1 sat/byte * 4x safety",
+          "min_output_sats": 14720,
+          "onchain_entitlements": [
+            {
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "miner-a",
+              "weight": 166666667
+            },
+            {
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "miner-b",
+              "weight": 166666667
+            },
+            {
+              "order_key": "03",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "recipient_id": "miner-c",
+              "weight": 166666666
+            }
+          ],
+          "schema": "qbit.prism.payout-policy.v1"
+        }
+      },
+      "input": {
+        "policy": {
+          "p2mr_spend_input_bytes": 3680,
+          "safety_multiplier": 4,
+          "target_feerate_sats_per_byte": 1
+        },
+        "prior_balances": [],
+        "reward_manifest": {
+          "anchor_job_issued_at_ms": 1,
+          "anchor_share_seq": 1,
+          "block_height": 10,
+          "coinbase_value_sats": 500000000,
+          "counted_window_weight": 3,
+          "entitlements": [
+            {
+              "order_key": "03",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "recipient_id": "miner-c",
+              "weight": 1
+            },
+            {
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "miner-a",
+              "weight": 1
+            },
+            {
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "miner-b",
+              "weight": 1
+            }
+          ],
+          "included_share_count": 3,
+          "network_difficulty": 1,
+          "newest_share_seq": 1,
+          "oldest_share_seq": 1,
+          "requested_window_weight": 8,
+          "schema": "qbit.prism.reward-manifest.v1",
+          "share_slice_digest_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+          "shares": [],
+          "window_multiplier": 8
+        }
+      },
+      "name": "three-way-split-of-500000000",
+      "topic": 6,
+      "why": "500000000 over three equal weights is 166666666 each plus two remainder sats for the first two accounts in canonical order."
+    }
+  ],
+  "produced_by": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 crates/qbit-prism/examples/export_rule_decisions.py | cargo run --locked -q -p qbit-prism --example export_money_path_vectors -- vectors-out",
+  "schema": "qbit.prism.money-path-vectors.v1",
+  "source_commit": "504846cc0b72e8f86ed17f896d4ccbbe196a31dc",
+  "topics": [
+    {
+      "id": 5,
+      "name": "dust floor exclusion and recompute"
+    },
+    {
+      "id": 6,
+      "name": "largest-remainder ties"
+    }
+  ]
+}

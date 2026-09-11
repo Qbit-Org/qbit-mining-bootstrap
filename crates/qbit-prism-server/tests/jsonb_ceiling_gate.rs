@@ -1070,7 +1070,12 @@ async fn run_pipeline(raw_url: &str, n: u64, settings: &GateSettings) -> Result<
     let db = Database::open(raw_url).await?;
     let node = FakeNode::open().await?;
     let config = coordinator_config(db.url.clone(), &node, "jsonb-gate")?;
-    let coordinator = match Coordinator::new(config).await {
+    let coordinator = match Coordinator::new(
+        config,
+        std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
+    )
+    .await
+    {
         Ok(coordinator) => coordinator,
         Err(error) => {
             let _ = db.close(Vec::new()).await;

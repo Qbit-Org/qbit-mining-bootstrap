@@ -6,10 +6,12 @@ services:
     profiles: !override ["local-database"]
   prism-postgres-replica:
     profiles: !override ["local-database"]
-  prism-coordinator:
+  prism-coordinator: &prism-coordinator-external-db
     depends_on: !override
       qbitd:
         condition: service_healthy
+  prism-coordinator-2:
+    <<: *prism-coordinator-external-db
   prism-public-api:
     depends_on: !override {}
     environment:

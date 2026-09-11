@@ -187,6 +187,12 @@ counters describe the individual process; dashboard accounting reads the shared
 database. The old Python scheduler's detailed metric series are replaced by
 native process health and counters.
 
+Both runtime roles serve `/metrics` with HTTP 200 and freshness headers, even
+before the first observation or when it is stale. Read `X-Prism-Metrics-State`
+alongside readiness from `/healthz`; see the [metrics freshness contract and
+inspection command](docs/prism-ledger-ops.md#health-diagnostics-and-validation)
+and the [native metric inventory](docs/prism-native-metrics.md).
+
 ## Run and operate
 
 Build native binaries:
@@ -257,12 +263,15 @@ cargo run --locked --release -p qbit-prism-server -- benchmark \
 ```
 
 The native test wrapper uses a supplied `PRISM_TEST_DATABASE_URL` or starts an
-isolated local PostgreSQL cluster. Live tests use real qbitd regtest and bounded
+isolated local PostgreSQL cluster. Its default database mode runs all server
+targets and then explicitly runs the ignored database collector test, matching
+the CI invocation. Live tests use real qbitd regtest and bounded
 CPU mining. The builder benchmark measures synthetic build-and-verify work;
 complete Stratum-to-durable-commit capacity requires separate load evidence.
 
 - [Migration and multi-instance deployment](docs/prism-rust-migration.md)
 - [Ledger operations and recovery](docs/prism-ledger-ops.md)
+- [Native metrics inventory](docs/prism-native-metrics.md)
 - [Mainnet deployment](docs/mainnet-deployment.md)
 - [Storage and resource planning](docs/prism-storage-sizing.md)
 - [Native performance measurement](docs/prism-payout-artifact-measurement.md)

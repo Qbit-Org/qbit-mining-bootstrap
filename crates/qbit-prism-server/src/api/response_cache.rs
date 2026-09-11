@@ -203,6 +203,7 @@ mod tests {
                 .connect_lazy("postgres://invalid@127.0.0.1:1/invalid")
                 .unwrap(),
             ApiConfig::default(),
+            std::sync::Arc::new(crate::metrics::Metrics::default()),
         )
     }
     async fn seed(state: &ApiState, path: &str, age: u64) {
