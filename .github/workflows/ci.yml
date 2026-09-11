@@ -31,7 +31,9 @@ jobs:
           python-version: "3.14"
 
       - name: Install lint tools
-        run: bash .github/scripts/apt-install.sh shellcheck
+        uses: ./.github/actions/apt-install
+        with:
+          packages: shellcheck
 
       - name: Check shell syntax
         run: git ls-files -z '*.sh' | xargs -0 -n 1 bash -n
@@ -124,8 +126,14 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Check VERSION against every workspace crate
+        run: python3 scripts/check_version_skew.py
+
       - name: Run Rust tests
-        run: cargo test --locked --workspace --all-targets
+        # This job has no database. With CI set and no database the JSONB
+        # ceiling gate fails instead of skipping, so it runs in
+        # prism-native-postgres and is skipped here by name.
+        run: cargo test --locked --workspace --all-targets -- --skip jsonb_ceiling_ratchet_at_reduced_sizes
 
   checks:
     # Preserve the existing check name for branch protection and consumers.
@@ -157,9 +165,10 @@ jobs:
           python-version: "3.14"
 
       - name: Install ckpool build dependencies
-        run: |
-          bash .github/scripts/apt-install.sh \
-            autoconf automake build-essential libtool pkgconf yasm \
+        uses: ./.github/actions/apt-install
+        with:
+          packages: >-
+            autoconf automake build-essential libtool pkgconf yasm
             libcurl4-openssl-dev libjansson-dev libzmq3-dev
 
       - name: Build patched ckpool and run live regression and load tests
@@ -190,7 +199,9 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Install tools for disposable primary and standby failover test
-        run: bash .github/scripts/apt-install.sh postgresql-16
+        uses: ./.github/actions/apt-install
+        with:
+          packages: postgresql-16
       - name: Install pinned qbit for native mining and CTV integration
         run: |
           set -euo pipefail

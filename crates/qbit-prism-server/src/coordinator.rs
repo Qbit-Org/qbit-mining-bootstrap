@@ -1882,3 +1882,12 @@ mod fee_policy_tests;
 
 #[cfg(test)]
 mod candidate_lease_tests;
+
+#[cfg(test)]
+mod d2_below_target_tests;
+
+#[cfg(test)]
+mod d2_bootstrap_tests;
+
+#[cfg(test)]
+mod d2_test_support;

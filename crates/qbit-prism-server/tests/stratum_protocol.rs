@@ -800,6 +800,9 @@ async fn same_parent_payout_replacement_clears_retained_work_but_equivalent_upda
     task.await.unwrap();
 }
 
+// This runs against an in-memory backend, so it proves only that the frame is
+// forwarded: the credited amount and its timing are covered by
+// `coordinator::d2_below_target_tests` (decision D2b).
 #[tokio::test]
 async fn highdiff_floor_still_forwards_valid_block_below_share_target() {
     let mut config = StratumConfig {

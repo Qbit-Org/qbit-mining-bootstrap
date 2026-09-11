@@ -41,6 +41,13 @@ carries a banner with the same statement.
   submodules, `ledger/candidates.rs`, `ledger/jobs.rs`, `ledger/window.rs`,
   and `ledger/connect.rs`, with no behaviour change and no signature change,
   so parallel workstream pull requests stop colliding on one file.
+- One release identity, `3.0.0`, per #284. The single source is
+  `[workspace.package].version` in the root `Cargo.toml`, which every crate
+  inherits with `version.workspace = true`, plus the `VERSION` file; bump the
+  two together. `scripts/check_version_skew.py` (also `make
+  check-version-skew`) fails when `VERSION` differs from the version Cargo
+  resolves for any workspace crate, and CI runs it in the Rust tests job that
+  the merge gate requires.
 
 The following 2.x.x changes were deliberately not carried, because the code
 they fixed or configured no longer exists on this line:
@@ -65,11 +72,9 @@ they fixed or configured no longer exists on this line:
 - There is no production release of the Rust server. The Postgres-backed and
   live-regtest Rust suites need a PostgreSQL server and a `qbitd` binary; see
   `test/prism-native-tests.sh`. They are not part of this note's verification.
-- Versions and real release notes are #284. `VERSION` and the
-  `qbit-pool-builder` and `qbit-prism` crate versions read 2.0.2 by
-  inheritance from the 2.x.x merge, and `qbit-prism-server` reads 2.0.0 from
-  #244. None of those values names a 3.x.x release; #284 assigns the 3.x.x
-  version and writes its release notes.
+- Real release notes are #291. The tree reads 3.0.0, but nothing on this
+  line has been released under that version; `doc/release-notes-3.0.0.md` and
+  the rollout notes are written there.
 - The migrator and schema freeze, including how `002_candidate_bodies.sql`
   relates to the Rust migrations, is #285.
 - Native candidate recovery is #268.
