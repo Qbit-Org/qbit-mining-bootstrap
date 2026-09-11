@@ -109,15 +109,18 @@ def jinja_rules(rules):
     text = json.dumps(rows, indent=2).replace("__NETWORK__", '" ~ qbit_monitoring_stack_network ~ "')
     overrides = {
         "qbit-prism-connected-clients": ("qbit_monitoring_stack_prism_alert_connected_clients_threshold", "qbit_monitoring_stack_prism_alert_connected_clients_for", "10"),
-        "qbit-prism-candidate-oldest": ("qbit_monitoring_stack_prism_alert_candidate_oldest_warning_seconds", "qbit_monitoring_stack_prism_alert_candidate_oldest_warning_for", "15"),
-        "qbit-prism-candidate-oldest-critical": ("qbit_monitoring_stack_prism_alert_candidate_oldest_critical_seconds", "qbit_monitoring_stack_prism_alert_candidate_oldest_critical_for", "60"),
+        "qbit-prism-block-candidate-oldest": ("qbit_monitoring_stack_prism_alert_block_candidate_age_warning_seconds", "qbit_monitoring_stack_prism_alert_block_candidate_age_for", "15"),
+        "qbit-prism-candidate-oldest-critical": ("qbit_monitoring_stack_prism_alert_block_candidate_age_critical_seconds", "qbit_monitoring_stack_prism_alert_block_candidate_age_for", "60"),
         "qbit-prism-semantic-work-coverage": ("qbit_monitoring_stack_prism_alert_semantic_coverage_warning_ratio", "qbit_monitoring_stack_prism_alert_semantic_coverage_warning_for", "0.95"),
         "qbit-prism-semantic-coverage-critical": ("qbit_monitoring_stack_prism_alert_semantic_coverage_critical_ratio", "qbit_monitoring_stack_prism_alert_semantic_coverage_critical_for", "0.5"),
     }
     for uid, (threshold, dwell, literal) in overrides.items():
         marker = '"uid": "' + uid + '"'
         start = text.find(marker)
-        if start < 0: continue
+        if start < 0:
+            if any(r.get("uid") == uid for r in rules):
+                raise AssertionError(f"override target UID missing from rendered rules: {uid}")
+            continue
         end = text.find('"uid": "', start + len(marker))
         block_end = end if end >= 0 else len(text)
         block = text[start:block_end]
@@ -126,7 +129,7 @@ def jinja_rules(rules):
             before, after = expr.group(2).split(literal, 1)
             rebuilt = expr.group(1) + before + '" ~ (' + threshold + ' | default(' + literal + ')) ~ "' + after + expr.group(3)
             block = block[:expr.start()] + rebuilt + block[expr.end():]
-        block = block.replace('"for": "3m"', '"for": "{{ ' + dwell + ' | default(\'3m\') }}"', 1)
+        block = block.replace('"for": "3m"', '"for": (' + dwell + ' | default(\'3m\') | tojson)', 1)
         text = text[:start] + block + text[block_end:]
     return text
 
