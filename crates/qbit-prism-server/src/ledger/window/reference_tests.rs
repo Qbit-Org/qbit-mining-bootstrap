@@ -131,7 +131,7 @@ fn balance_order_and_failure_variants_match_the_source() {
     for source in [BalanceSource::Current, BalanceSource::AsIssued] {
         assert_eq!(
             check_balances(reversed.clone(), digest, source).unwrap(),
-            expected
+            reversed
         );
     }
     assert!(matches!(

@@ -294,6 +294,39 @@ async fn as_issued_balances_and_signed_outputs_survive_current_revision_change()
 }
 
 #[tokio::test]
+async fn as_issued_snapshot_preserves_persisted_balance_order() -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            let ledger = db.ledger().await?;
+            seed_shares(&db.pool, 1, 1, false).await?;
+            let original = vec![
+                CarryForwardBalance {
+                    recipient_id: "z-recipient".into(),
+                    order_key: "a-order".into(),
+                    p2mr_program_hex: "22".repeat(32),
+                    balance_sats: 7,
+                },
+                CarryForwardBalance {
+                    recipient_id: "a-recipient".into(),
+                    order_key: "z-order".into(),
+                    p2mr_program_hex: "33".repeat(32),
+                    balance_sats: 11,
+                },
+            ];
+            let window = reference(&[share(1, false)], &original);
+            stored_balances(&db.pool, &original).await?;
+            let result = ledger.read_window(&window, BalanceSource::AsIssued).await?;
+            ensure!(
+                result.prior_balances == original,
+                "as-issued reader reordered the persisted legacy bundle"
+            );
+            Ok(())
+        })
+    })
+    .await
+}
+
+#[tokio::test]
 async fn empty_window_never_queries_share_history_and_errors_keep_their_types() -> Result<()> {
     run(|db| {
         Box::pin(async move {
@@ -367,6 +400,27 @@ async fn empty_window_never_queries_share_history_and_errors_keep_their_types() 
                 .execute(&db.pool).await?;
             ensure!(matches!(ledger.read_window(&empty, BalanceSource::Current).await,
                 Err(WindowError::Decode(_))), "unrepresentable balance lost decode error");
+            Ok(())
+        })
+    })
+    .await
+}
+
+#[tokio::test]
+async fn fatal_cluster_refuses_window_revision_reads() -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            let ledger = db.ledger().await?;
+            sqlx::query("UPDATE qbit_prism_cluster SET fatal_error='halted for review'")
+                .execute(&db.pool)
+                .await?;
+            let result = ledger
+                .read_window(&reference(&[], &[]), BalanceSource::Current)
+                .await;
+            ensure!(
+                matches!(result, Err(WindowError::Database(sqlx::Error::RowNotFound))),
+                "fatal cluster must not expose a payout revision: {result:?}"
+            );
             Ok(())
         })
     })

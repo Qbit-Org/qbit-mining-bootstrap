@@ -139,7 +139,7 @@ impl Ledger {
             .execute(&mut *tx)
             .await?;
         let payout_revision = sqlx::query_scalar(
-            "SELECT payout_revision FROM qbit_prism_cluster WHERE singleton AND NOT pg_is_in_recovery()",
+            "SELECT payout_revision FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL AND NOT pg_is_in_recovery()",
         ).fetch_one(&mut *tx).await?;
         let expected_balances = window.prior_balances_digest;
         let balance_task = match balances {
@@ -438,12 +438,7 @@ pub(super) async fn read_prior_balances(
     tx: &mut Transaction<'_, Postgres>,
 ) -> Result<Vec<CarryForwardBalance>> {
     let rows = prior_balance_rows(tx).await?;
-    tokio::task::spawn_blocking(move || {
-        let mut balances = decode_prior_balances(rows)?;
-        sort_balances(&mut balances);
-        Ok(balances)
-    })
-    .await?
+    tokio::task::spawn_blocking(move || decode_prior_balances(rows)).await?
 }
 
 async fn prior_balance_rows(tx: &mut Transaction<'_, Postgres>) -> Result<Vec<PgRow>, sqlx::Error> {
@@ -474,12 +469,13 @@ fn sort_balances(balances: &mut [CarryForwardBalance]) {
 }
 
 fn check_balances(
-    mut balances: Vec<CarryForwardBalance>,
+    balances: Vec<CarryForwardBalance>,
     expected: [u8; 32],
     source: BalanceSource,
 ) -> Result<Vec<CarryForwardBalance>, WindowError> {
-    sort_balances(&mut balances);
-    let actual = qbit_prism::prior_balances_digest(&balances);
+    let mut digest_input = balances.clone();
+    sort_balances(&mut digest_input);
+    let actual = qbit_prism::prior_balances_digest(&digest_input);
     if actual != expected {
         return Err(match source {
             BalanceSource::Current => WindowError::PriorBalancesChanged { expected, actual },
