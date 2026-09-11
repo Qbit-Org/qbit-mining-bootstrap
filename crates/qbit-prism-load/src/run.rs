@@ -3,9 +3,13 @@
 
 use crate::{
     artifact::{self, ArtifactInputs, PhaseEvidence},
+    cadence::{self, FrontendHealth, Landing, RevisionSampler, RevisionSeries},
     classify::{self, BlockedLog, Rejection, RejectionClass},
     cli::{phases, Args, PhasePlan},
-    client::{self, Event, Outcome, SessionConfig, SessionHandle, SessionShared, SubmitRecord},
+    client::{
+        self, Event, NotifySighting, Outcome, SessionConfig, SessionHandle, SessionShared,
+        SubmitRecord, TipSighting,
+    },
     cluster::{self, ManagedPostgres, Replication},
     digest,
     frontend::{self, Frontend, FrontendSpec, SharedEnvironment},
@@ -46,11 +50,14 @@ pub const EXIT_HARNESS_BUG_REJECTIONS: i32 = 7;
 struct Collected {
     submits: Vec<SubmitRecord>,
     reconnects: Vec<client::ReconnectRecord>,
-    tips: Vec<(usize, String, Instant)>,
+    tips: Vec<TipSighting>,
+    /// Only recorded while a phase asks for them; see
+    /// `SessionShared::record_notifies`.
+    notifies: Vec<NotifySighting>,
     discarded_block_solutions: u64,
     discarded_offers: u64,
     difficulty_mismatches: Vec<(usize, f64, f64)>,
-    failures: Vec<(usize, String)>,
+    failures: Vec<(usize, String, Instant)>,
     connects: u64,
     disconnects: Vec<(usize, usize, String)>,
 }
@@ -75,6 +82,23 @@ struct PhaseRun {
     mid_flight_indeterminate: Vec<SubmitRecord>,
     /// Submits outstanding on the killed frontend at the instant of the kill.
     outstanding_at_kill: Option<usize>,
+    /// Monotonic bounds of the phase, for the dense-cadence section's offsets.
+    started: Instant,
+    ended: Instant,
+    /// Set only for the `dense_cadence` phase.
+    dense: Option<DensePhase>,
+}
+
+/// What the dense-cadence phase collected beyond the usual per-phase numbers.
+struct DensePhase {
+    gaps: Vec<f64>,
+    offsets: Vec<f64>,
+    landings: Vec<Landing>,
+    slots_over_budget: usize,
+    revisions: RevisionSeries,
+    /// Each session's frontend, snapshotted at the end of the phase.
+    session_frontend: Vec<usize>,
+    frontend_health: Vec<FrontendHealth>,
 }
 
 pub async fn execute(args: Args) -> Result<i32> {
@@ -397,7 +421,8 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                 match event {
                     Event::Submit(record) => state.submits.push(*record),
                     Event::Reconnect(record) => state.reconnects.push(record),
-                    Event::Tip { session, tip, at } => state.tips.push((session, tip, at)),
+                    Event::Tip(sighting) => state.tips.push(sighting),
+                    Event::Notify(sighting) => state.notifies.push(sighting),
                     Event::DiscardedBlockSolution { .. } => state.discarded_block_solutions += 1,
                     Event::DiscardedOffer { .. } => state.discarded_offers += 1,
                     Event::DifficultyMismatch {
@@ -413,7 +438,9 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                         frontend,
                         reason,
                     } => state.disconnects.push((session, frontend, reason)),
-                    Event::Failure { session, error } => state.failures.push((session, error)),
+                    Event::Failure { session, error, at } => {
+                        state.failures.push((session, error, at))
+                    }
                 }
             }
         })
@@ -421,6 +448,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     let shared_session = Arc::new(SessionShared {
         phase: std::sync::RwLock::new("setup".to_owned()),
         events: events_tx,
+        record_notifies: std::sync::atomic::AtomicBool::new(false),
     });
     let mut sessions: Vec<SessionHandle> = Vec::with_capacity(args.sessions);
     for index in 0..args.sessions {
@@ -491,6 +519,16 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             before_scrapes
                 .push(measure::scrape_metrics(&child.spec.instance_id, &child.metrics_url()).await);
         }
+        let restarts_before: Vec<usize> = frontends.iter().map(|child| child.restarts).collect();
+        let revision_sampler = plan.dense_cadence.then(|| {
+            RevisionSampler::start(
+                side.clone(),
+                Duration::from_millis(cadence::REVISION_SAMPLE_INTERVAL_MS),
+            )
+        });
+        shared_session
+            .record_notifies
+            .store(plan.dense_cadence, std::sync::atomic::Ordering::Relaxed);
         let started = Instant::now();
         let started_wall = chrono::Utc::now();
         let outcome = drive_phase(
@@ -508,6 +546,40 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         .await?;
         let ended = Instant::now();
         let ended_wall = chrono::Utc::now();
+        shared_session
+            .record_notifies
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let dense = match revision_sampler {
+            Some(sampler) => {
+                let revisions = sampler.finish().await;
+                let aborted_text = outcome.aborted.clone().unwrap_or_default();
+                Some(DensePhase {
+                    gaps: args.cadence_gaps()?,
+                    offsets: outcome.dense_offsets.clone(),
+                    landings: outcome.dense_landings.clone(),
+                    slots_over_budget: outcome.slots_over_budget,
+                    revisions,
+                    session_frontend: sessions
+                        .iter()
+                        .map(|session| session.frontend.load(Ordering::Relaxed))
+                        .collect(),
+                    frontend_health: frontends
+                        .iter()
+                        .zip(restarts_before.iter())
+                        .map(|(child, before)| FrontendHealth {
+                            index: child.spec.index,
+                            instance_id: child.spec.instance_id.clone(),
+                            restarts_before: *before,
+                            restarts_after: child.restarts,
+                            exited: aborted_text
+                                .contains(&child.spec.instance_id)
+                                .then(|| aborted_text.clone()),
+                        })
+                        .collect(),
+                })
+            }
+            None => None,
+        };
         let mut after_scrapes = Vec::new();
         for child in &frontends {
             after_scrapes
@@ -545,6 +617,9 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             frontend_restarts: outcome.frontend_restarts,
             mid_flight_indeterminate: outcome.indeterminate,
             outstanding_at_kill: outcome.outstanding_at_kill,
+            started,
+            ended,
+            dense,
         });
         if let Some(reason) = outcome.aborted {
             aborted = Some(reason);
@@ -817,6 +892,15 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     );
     let node_submissions = ctx.node_state.submissions();
     let tip_changes = ctx.node_state.tip_changes();
+    let dense_cadence = dense_cadence_report(
+        args,
+        &runs,
+        &collected,
+        &node_submissions,
+        &tip_changes,
+        &committed,
+        aborted.as_deref(),
+    );
     let side_report = json!({
         "schema": report::SCHEMA,
         "run_id": ctx.run_id.to_string(),
@@ -903,6 +987,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             },
         },
         "time_to_usable_work": time_to_usable_work(&external_tips, &collected, args.sessions),
+        "dense_cadence": dense_cadence,
         "node": {
             "url": ctx.node_url,
             "template_bits": window::TEMPLATE_BITS,
@@ -921,7 +1006,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                     "session": session, "advertised": advertised, "configured": configured}))
                 .collect::<Vec<_>>(),
             "failures": collected.failures.iter().take(200)
-                .map(|(session, error)| json!({"session": session, "error": error}))
+                .map(|(session, error, _)| json!({"session": session, "error": error}))
                 .collect::<Vec<_>>(),
             "failure_count": collected.failures.len(),
             "connects": collected.connects,
@@ -1031,6 +1116,11 @@ struct PhaseOutcome {
     indeterminate: Vec<SubmitRecord>,
     /// Submits outstanding on the killed frontend at the instant of the kill.
     outstanding_at_kill: Option<usize>,
+    /// The dense-cadence schedule this phase drove, and what it drove.
+    dense_offsets: Vec<f64>,
+    dense_landings: Vec<Landing>,
+    /// Schedule slots the landing budget could not pay for.
+    slots_over_budget: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1059,6 +1149,9 @@ async fn drive_phase(
         frontend_restarts: 0,
         indeterminate: Vec::new(),
         outstanding_at_kill: None,
+        dense_offsets: Vec::new(),
+        dense_landings: Vec::new(),
+        slots_over_budget: 0,
     };
     // Event schedule inside the phase.
     let reconnect_interval = if plan.reconnects {
@@ -1070,14 +1163,19 @@ async fn drive_phase(
     let mut next_reconnect = reconnect_interval.unwrap_or(f64::INFINITY);
     let mut reconnect_cursor = 0usize;
     let mut restart_done = restart_at.is_none();
-    let block_times: Vec<f64> = if plan.name == "steady_state" && *remaining_blocks > 0 {
-        let count = *remaining_blocks;
-        (0..count)
-            .map(|index| duration.as_secs_f64() * (index as f64 + 1.0) / (count as f64 + 1.0))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // With `--cadence dense`, `--scheduled-blocks` is the dense phase's
+    // landing budget and `steady_state` schedules none, so the budget is not
+    // spent before the phase that measures it. Without it, nothing changes.
+    let dense_run = args.cadence()?.is_dense();
+    let block_times: Vec<f64> =
+        if plan.name == "steady_state" && !dense_run && *remaining_blocks > 0 {
+            let count = *remaining_blocks;
+            (0..count)
+                .map(|index| duration.as_secs_f64() * (index as f64 + 1.0) / (count as f64 + 1.0))
+                .collect()
+        } else {
+            Vec::new()
+        };
     let mut block_cursor = 0usize;
     let tip_times: Vec<f64> = if plan.name == "warm_up" && *remaining_tips > 0 {
         let count = *remaining_tips;
@@ -1089,6 +1187,16 @@ async fn drive_phase(
     };
     let mut tip_cursor = 0usize;
     let mut kill_done = !plan.mid_flight_kill;
+    // The dense-cadence schedule: one own-block landing per offset, each paid
+    // for out of the landing budget. A slot the budget cannot pay for is
+    // counted, never silently dropped (EP-ERRORS).
+    let landing_offsets: Vec<f64> = if plan.dense_cadence {
+        cadence::landing_offsets(&args.cadence_gaps()?, duration.as_secs_f64())
+    } else {
+        Vec::new()
+    };
+    outcome.dense_offsets = landing_offsets.clone();
+    let mut landing_cursor = 0usize;
     let mut mem_check = Instant::now();
 
     let mut ticker = tokio::time::interval(Duration::from_millis(1));
@@ -1134,6 +1242,29 @@ async fn drive_phase(
             outcome.scheduled_blocks += 1;
             if let Some(session) = sessions.first() {
                 let _ = session.control.send(client::Control::ScheduledBlock);
+            }
+        }
+        if landing_cursor < landing_offsets.len() && seconds >= landing_offsets[landing_cursor] {
+            let offset = landing_offsets[landing_cursor];
+            landing_cursor += 1;
+            if *remaining_blocks == 0 || sessions.is_empty() {
+                outcome.slots_over_budget += 1;
+            } else {
+                *remaining_blocks -= 1;
+                outcome.scheduled_blocks += 1;
+                // Landings rotate across sessions so no single frontend is
+                // privileged with an early view of its own block.
+                let index = outcome.dense_landings.len() % sessions.len();
+                let session = &sessions[index];
+                let _ = session.control.send(client::Control::ScheduledBlock);
+                outcome.dense_landings.push(Landing {
+                    index: outcome.dense_landings.len(),
+                    scheduled_offset_seconds: offset,
+                    requested_monotonic: Instant::now(),
+                    requested_wall: chrono::Utc::now(),
+                    session: session.index,
+                    frontend: session.frontend.load(Ordering::Relaxed),
+                });
             }
         }
         if tip_cursor < tip_times.len() && seconds >= tip_times[tip_cursor] {
@@ -1613,9 +1744,9 @@ fn time_to_usable_work(
         .iter()
         .map(|tip| {
             let mut first: HashMap<usize, Instant> = HashMap::new();
-            for (session, seen, at) in &collected.tips {
-                if *seen == tip.hash && *at >= tip.monotonic {
-                    first.entry(*session).or_insert(*at);
+            for sighting in &collected.tips {
+                if sighting.tip == tip.hash && sighting.at >= tip.monotonic {
+                    first.entry(sighting.session).or_insert(sighting.at);
                 }
             }
             let deltas: Vec<f64> = first
@@ -1643,6 +1774,85 @@ fn time_to_usable_work(
                        mining.notify whose prevhash resolves to that tip",
         "tips": entries,
     })
+}
+
+/// The `dense_cadence` section of the side report.
+///
+/// Additive: nothing else in the report or the artifact changes shape, and a
+/// run without `--cadence dense` says so rather than emitting an empty table
+/// that could be read as a measurement (EP-COMPAT, EP-OBSERVABILITY).
+#[allow(clippy::too_many_arguments)]
+fn dense_cadence_report(
+    args: &Args,
+    runs: &[PhaseRun],
+    collected: &Collected,
+    node_submissions: &[crate::node::SubmissionRecord],
+    tip_changes: &[crate::node::TipChange],
+    committed: &BTreeSet<String>,
+    aborted: Option<&str>,
+) -> Value {
+    let cadence = args.cadence().unwrap_or(cadence::Cadence::None);
+    if !cadence.is_dense() {
+        return json!({
+            "ran": false,
+            "cadence": cadence.as_str(),
+            "reason": "the run did not ask for --cadence dense",
+        });
+    }
+    let Some((phase, dense)) = runs
+        .iter()
+        .find(|phase| phase.plan.dense_cadence)
+        .and_then(|phase| phase.dense.as_ref().map(|dense| (phase, dense)))
+    else {
+        return json!({
+            "ran": false,
+            "cadence": cadence.as_str(),
+            "landings": 0,
+            "bumps": 0,
+            "reason": "the run ended before the dense_cadence phase could run, so there is no \
+                       schedule, no landing and no window to report",
+            "aborted": aborted,
+        });
+    };
+    let mut document = cadence::build(&cadence::ReportInputs {
+        cadence,
+        gaps: &dense.gaps,
+        offsets: &dense.offsets,
+        phase_seconds: phase.plan.seconds,
+        phase_rate: phase.plan.rate,
+        phase_started: phase.started,
+        phase_started_wall: phase.started_wall,
+        phase_ended: phase.ended,
+        phase_duration_millis: phase.duration_millis,
+        landing_budget: args.scheduled_blocks,
+        slots_over_budget: dense.slots_over_budget,
+        landings: &dense.landings,
+        revisions: Some(&dense.revisions),
+        submits: &collected.submits,
+        notifies: &collected.notifies,
+        tips: &collected.tips,
+        node_submissions,
+        tip_changes,
+        session_frontend: &dense.session_frontend,
+        frontends: &dense.frontend_health,
+        failures: &collected.failures,
+        committed,
+        aborted,
+    });
+    // The run-level view of the same measurement, over every session at once,
+    // through the section the whole run already uses for tips of any origin.
+    let pool_tips: Vec<crate::node::TipChange> = tip_changes
+        .iter()
+        .filter(|change| {
+            change.origin == crate::node::TipOrigin::Pool
+                && change.monotonic >= phase.started
+                && change.monotonic <= phase.ended
+        })
+        .cloned()
+        .collect();
+    document["time_to_new_tip_work_all_sessions"] =
+        time_to_usable_work(&pool_tips, collected, dense.session_frontend.len());
+    document
 }
 
 fn phase_report(

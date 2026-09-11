@@ -1,0 +1,1202 @@
+//! The dense-cadence scenario: own blocks landing about 9 s apart and in
+//! 18–20 s pairs, and what each payout-revision bump costs every frontend.
+//!
+//! #271's acceptance criterion 6 asks for the shape #224 recorded — an
+//! accepted-candidate minimum interarrival of about 9.14 s, 35 accepted blocks
+//! in the trailing hour, and repeated pairs about 18–20 s apart — and for a
+//! per-frontend answer to two questions: how long does a frontend reject
+//! shares with `new payout work is pending`, and how many shares does it
+//! reject before it serves work at the new revision. The answer sets the
+//! budget for #291's soak.
+//!
+//! Four clocks appear here, and every reported time names the one it came
+//! from (EP-OBSERVABILITY):
+//!
+//! - **harness monotonic** (`std::time::Instant`), reported as milliseconds
+//!   since the phase's own start instant, and used for every duration;
+//! - **harness wall clock** (UTC), stamped when the harness asked a session
+//!   for a landing;
+//! - **fake-node wall clock** (UTC), stamped inside `submitblock` and at each
+//!   tip transition;
+//! - **PostgreSQL's `clock_timestamp()`**, read in the same row as
+//!   `payout_revision`, so a bump carries the server's own notion of when it
+//!   was visible.
+//!
+//! Nothing in this module reads production code's behaviour differently from
+//! the rest of the harness: the revision sampler runs one read-only
+//! `SELECT` on the harness's side pool, outside the frontends' path and
+//! outside the delay proxy.
+
+use crate::{
+    classify::{self, Rejection},
+    client::{NotifySighting, Outcome, SubmitRecord, TipSighting},
+    measure,
+    node::{SubmissionRecord, TipChange, TipOrigin},
+};
+use anyhow::{ensure, Context, Result};
+use chrono::{DateTime, Utc};
+use serde_json::{json, Value};
+use sqlx::PgPool;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
+};
+
+/// The side phase's name, in the side report and in every `SubmitRecord`.
+pub const PHASE: &str = "dense_cadence";
+
+/// #224's shape: 9 s single gaps, and 18–20 s pairs.
+pub const DEFAULT_GAPS: &str = "9,19,9,18,20";
+/// A gap shorter than this cannot be measured: a frontend's rebuild alone
+/// takes `PRISM_BLOCKPOLL_SECONDS` plus build time, so two landings closer
+/// than 5 s would share one rebuild and no window could be attributed to
+/// either (EP-VALIDATION).
+pub const MIN_GAP_SECONDS: f64 = 5.0;
+/// #271 asks for at least ten landings in the phase.
+pub const MIN_LANDINGS: usize = 10;
+/// Seconds of load before the first landing, so the phase is already at its
+/// offered rate when the first block lands.
+pub const LEAD_IN_SECONDS: f64 = 5.0;
+/// Seconds reserved after the last landing, so its windows are observed
+/// inside the phase rather than truncated by its end.
+pub const TAIL_SECONDS: f64 = 15.0;
+/// How often `payout_revision` is sampled during the phase.
+pub const REVISION_SAMPLE_INTERVAL_MS: u64 = 25;
+/// A defensive ceiling on the generated schedule. With gaps of at least
+/// `MIN_GAP_SECONDS` a phase would have to run for hours to reach it.
+const MAX_LANDINGS: usize = 4096;
+
+/// Which cadence scenario a run asked for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Cadence {
+    /// No dense-cadence phase. This is what every run before #271's criterion
+    /// 6 did, and what the default still does.
+    None,
+    /// The `dense_cadence` side phase.
+    Dense,
+}
+
+impl Cadence {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "none" => Ok(Self::None),
+            "dense" => Ok(Self::Dense),
+            other => anyhow::bail!("unknown cadence {other:?}; use none or dense"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Dense => "dense",
+        }
+    }
+
+    pub fn is_dense(self) -> bool {
+        self == Self::Dense
+    }
+}
+
+/// Parse `--cadence-gaps` into seconds, refusing anything unmeasurable at the
+/// entry boundary (EP-VALIDATION).
+pub fn parse_gaps(text: &str) -> Result<Vec<f64>> {
+    let mut gaps = Vec::new();
+    for (position, field) in text.split(',').enumerate() {
+        let trimmed = field.trim();
+        ensure!(
+            !trimmed.is_empty(),
+            "--cadence-gaps entry {} is empty; give a comma-separated list of seconds",
+            position + 1
+        );
+        let value: f64 = trimmed.parse().with_context(|| {
+            format!(
+                "--cadence-gaps entry {} ({trimmed:?}) is not a number of seconds",
+                position + 1
+            )
+        })?;
+        ensure!(
+            value.is_finite(),
+            "--cadence-gaps entry {} ({value}) must be finite",
+            position + 1
+        );
+        ensure!(
+            value >= MIN_GAP_SECONDS,
+            "--cadence-gaps entry {} ({value}) is below the {MIN_GAP_SECONDS} s floor; a shorter \
+             gap shares one frontend rebuild between two landings, so neither landing's window \
+             could be attributed",
+            position + 1
+        );
+        gaps.push(value);
+    }
+    ensure!(
+        !gaps.is_empty(),
+        "--cadence-gaps must name at least one gap"
+    );
+    Ok(gaps)
+}
+
+/// The landing offsets the gap pattern places inside a phase of
+/// `phase_seconds`, in seconds from the phase's start.
+///
+/// The first landing is at `LEAD_IN_SECONDS`; each later one is the previous
+/// plus the next gap, cycling through the pattern. A landing is only placed if
+/// `TAIL_SECONDS` still fit after it, so the last landing's windows are
+/// measured inside the phase.
+pub fn landing_offsets(gaps: &[f64], phase_seconds: f64) -> Vec<f64> {
+    let latest = phase_seconds - TAIL_SECONDS;
+    let mut offsets = Vec::new();
+    if gaps.is_empty() {
+        return offsets;
+    }
+    let mut at = LEAD_IN_SECONDS;
+    let mut index = 0usize;
+    while at <= latest && offsets.len() < MAX_LANDINGS {
+        offsets.push(at);
+        let gap = gaps[index % gaps.len()];
+        if gap <= 0.0 || !gap.is_finite() {
+            break;
+        }
+        at += gap;
+        index += 1;
+    }
+    offsets
+}
+
+/// Validate `--cadence-gaps` against `--cadence-seconds` and return the gaps.
+///
+/// Refuses at entry, and says why, when the pattern cannot place
+/// `MIN_LANDINGS` landings inside the phase.
+pub fn validate(gaps_text: &str, phase_seconds: u64) -> Result<Vec<f64>> {
+    let gaps = parse_gaps(gaps_text)?;
+    let offsets = landing_offsets(&gaps, phase_seconds as f64);
+    ensure!(
+        offsets.len() >= MIN_LANDINGS,
+        "--cadence-gaps {gaps_text:?} places only {} landing(s) in a {phase_seconds} s phase, and \
+         #271 asks for at least {MIN_LANDINGS}. The schedule starts at {LEAD_IN_SECONDS} s and \
+         reserves the last {TAIL_SECONDS} s for the final landing's windows, so raise \
+         --cadence-seconds to at least {} or shorten the gaps",
+        offsets.len(),
+        required_seconds(&gaps).ceil() as u64
+    );
+    Ok(gaps)
+}
+
+/// The shortest phase that holds `MIN_LANDINGS` landings at this pattern.
+pub fn required_seconds(gaps: &[f64]) -> f64 {
+    if gaps.is_empty() {
+        return f64::INFINITY;
+    }
+    let mut at = LEAD_IN_SECONDS;
+    for index in 0..MIN_LANDINGS.saturating_sub(1) {
+        at += gaps[index % gaps.len()];
+    }
+    at + TAIL_SECONDS
+}
+
+// --- payout-revision sampling --------------------------------------------
+
+/// One reading of `qbit_prism_cluster.payout_revision`, on both clocks.
+#[derive(Clone, Debug)]
+pub struct RevisionSample {
+    pub revision: i64,
+    /// The server's `clock_timestamp()`, read in the same row.
+    pub server_timestamp: DateTime<Utc>,
+    /// The harness's monotonic clock, stamped when the row came back.
+    pub monotonic: Instant,
+    /// The revision this reading replaced. `None` for the baseline.
+    pub previous_revision: Option<i64>,
+}
+
+/// What the sampler saw over one phase.
+#[derive(Clone, Debug, Default)]
+pub struct RevisionSeries {
+    pub interval_ms: u64,
+    pub samples: u64,
+    pub errors: u64,
+    /// The first sampler error, verbatim. A sampler that failed is reported as
+    /// having failed, never as having seen nothing (EP-ERRORS).
+    pub first_error: Option<String>,
+    /// The revision the phase started at.
+    pub baseline: Option<RevisionSample>,
+    /// Every observed change, in order.
+    pub changes: Vec<RevisionSample>,
+}
+
+impl RevisionSeries {
+    /// True when the sampler produced no reading at all, so the bump list is
+    /// unknown rather than empty.
+    pub fn blind(&self) -> bool {
+        self.baseline.is_none()
+    }
+}
+
+/// Samples `payout_revision` on the harness's side pool for the life of a
+/// phase.
+///
+/// `qbit_prism_cluster` is the singleton row `Ledger::payout_revision()` reads
+/// (`crates/qbit-prism-server/src/ledger/connect.rs`), bumped by
+/// `observe_chain_view` (`ledger/window.rs`) and by candidate confirmation or
+/// abandonment (`ledger/blocks.rs`). The read takes no advisory lock and no
+/// row lock, so it cannot perturb what it measures.
+pub struct RevisionSampler {
+    series: Arc<Mutex<RevisionSeries>>,
+    stop: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl RevisionSampler {
+    pub fn start(pool: PgPool, interval: Duration) -> Self {
+        let series = Arc::new(Mutex::new(RevisionSeries {
+            interval_ms: interval.as_millis() as u64,
+            ..Default::default()
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let task = {
+            let series = series.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(interval);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut last: Option<i64> = None;
+                while !stop.load(Ordering::Relaxed) {
+                    ticker.tick().await;
+                    let read = sqlx::query_as::<_, (i64, DateTime<Utc>)>(
+                        "SELECT payout_revision, clock_timestamp() FROM qbit_prism_cluster \
+                         WHERE singleton",
+                    )
+                    .fetch_one(&pool)
+                    .await;
+                    let at = Instant::now();
+                    let mut state = series.lock().expect("revision sampler lock");
+                    match read {
+                        Ok((revision, server_timestamp)) => {
+                            state.samples += 1;
+                            let sample = RevisionSample {
+                                revision,
+                                server_timestamp,
+                                monotonic: at,
+                                previous_revision: last,
+                            };
+                            match last {
+                                None => state.baseline = Some(sample),
+                                Some(previous) if previous != revision => {
+                                    state.changes.push(sample)
+                                }
+                                Some(_) => {}
+                            }
+                            last = Some(revision);
+                        }
+                        Err(error) => {
+                            state.errors += 1;
+                            if state.first_error.is_none() {
+                                state.first_error = Some(format!("{error}"));
+                            }
+                        }
+                    }
+                }
+            })
+        };
+        Self { series, stop, task }
+    }
+
+    /// Stop sampling and take what was seen.
+    pub async fn finish(self) -> RevisionSeries {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.task).await;
+        std::mem::take(&mut *self.series.lock().expect("revision sampler lock"))
+    }
+}
+
+// --- landings -------------------------------------------------------------
+
+/// One landing the harness asked for.
+#[derive(Clone, Debug)]
+pub struct Landing {
+    pub index: usize,
+    /// Where the gap pattern put it, in seconds from the phase's start.
+    pub scheduled_offset_seconds: f64,
+    /// When the harness sent `Control::ScheduledBlock`, on both clocks.
+    pub requested_monotonic: Instant,
+    pub requested_wall: DateTime<Utc>,
+    pub session: usize,
+    pub frontend: usize,
+}
+
+/// A frontend's health across the phase, so a window measured while it was
+/// restarting is marked incomplete rather than reported as a clean number.
+#[derive(Clone, Debug)]
+pub struct FrontendHealth {
+    pub index: usize,
+    pub instance_id: String,
+    pub restarts_before: usize,
+    pub restarts_after: usize,
+    /// Set when the frontend exited during the phase.
+    pub exited: Option<String>,
+}
+
+impl FrontendHealth {
+    fn restarted(&self) -> bool {
+        self.restarts_after > self.restarts_before
+    }
+
+    fn trouble(&self) -> Option<String> {
+        match (self.restarted(), &self.exited) {
+            (_, Some(status)) => Some(format!(
+                "{} exited during the phase ({status})",
+                self.instance_id
+            )),
+            (true, None) => Some(format!(
+                "{} restarted {} time(s) during the phase",
+                self.instance_id,
+                self.restarts_after - self.restarts_before
+            )),
+            (false, None) => None,
+        }
+    }
+}
+
+/// Everything the report builder needs. It is deliberately a plain data
+/// struct over already-collected records: the builder is pure, so attribution
+/// is unit-testable without a database (EP-STATE).
+pub struct ReportInputs<'a> {
+    pub cadence: Cadence,
+    pub gaps: &'a [f64],
+    pub offsets: &'a [f64],
+    pub phase_seconds: u64,
+    pub phase_rate: f64,
+    pub phase_started: Instant,
+    pub phase_started_wall: DateTime<Utc>,
+    pub phase_ended: Instant,
+    pub phase_duration_millis: u64,
+    /// `--scheduled-blocks`, which is the dense phase's landing budget.
+    pub landing_budget: usize,
+    /// Schedule slots the budget could not pay for.
+    pub slots_over_budget: usize,
+    pub landings: &'a [Landing],
+    pub revisions: Option<&'a RevisionSeries>,
+    pub submits: &'a [SubmitRecord],
+    pub notifies: &'a [NotifySighting],
+    pub tips: &'a [TipSighting],
+    pub node_submissions: &'a [SubmissionRecord],
+    pub tip_changes: &'a [TipChange],
+    /// Each session's frontend, snapshotted at the end of the phase.
+    pub session_frontend: &'a [usize],
+    pub frontends: &'a [FrontendHealth],
+    /// `(session, error, instant)` for every client failure of the run.
+    pub failures: &'a [(usize, String, Instant)],
+    /// This run's committed share identifiers, so "lost valid work" can be
+    /// shown to be lost rather than asserted to be.
+    pub committed: &'a BTreeSet<String>,
+    pub aborted: Option<&'a str>,
+}
+
+/// How a landing ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LandingOutcome {
+    /// The node accepted the block and the tip moved to it.
+    Landed,
+    /// The frontend or the node refused it.
+    Rejected,
+    /// The session never produced a submit for it.
+    NeverProduced,
+    /// The frontend accepted the share and candidate, but no `submitblock`
+    /// was recorded before the phase ended.
+    AcceptedWithoutNodeSubmission,
+    /// The submit's answer never arrived.
+    NoResponse,
+}
+
+impl LandingOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Landed => "landed",
+            Self::Rejected => "rejected",
+            Self::NeverProduced => "never_produced",
+            Self::AcceptedWithoutNodeSubmission => "accepted_without_node_submission",
+            Self::NoResponse => "no_response",
+        }
+    }
+}
+
+/// One landing, resolved against the submits, the node and the tip changes.
+struct Resolved<'a> {
+    landing: &'a Landing,
+    submit: Option<&'a SubmitRecord>,
+    block_hash: Option<String>,
+    node: Option<&'a SubmissionRecord>,
+    tip: Option<&'a TipChange>,
+    outcome: LandingOutcome,
+    failure: Option<&'a str>,
+    /// The attribution span, for landings that really landed.
+    span: Option<(Instant, Instant, bool)>,
+}
+
+fn rejection_of(record: &SubmitRecord) -> Option<&Rejection> {
+    match &record.outcome {
+        Outcome::Rejected(rejection) => Some(rejection),
+        _ => None,
+    }
+}
+
+/// The block hash a submit carried: the part of the share identifier after the
+/// colon, which `coordinator.rs` builds from the header's display hash, and
+/// which is therefore exactly the hash the fake node records for
+/// `submitblock`.
+fn block_hash_of(record: &SubmitRecord) -> Option<String> {
+    record
+        .share_id
+        .rsplit_once(':')
+        .map(|(_, hash)| hash.to_owned())
+}
+
+fn millis_since(origin: Instant, at: Instant) -> f64 {
+    at.saturating_duration_since(origin).as_secs_f64() * 1000.0
+}
+
+/// Resolve every landing, then give the ones that landed a contiguous
+/// attribution span so each later rejection and bump belongs to exactly one
+/// landing or to nothing (EP-STATE).
+fn resolve<'a>(inputs: &ReportInputs<'a>) -> Vec<Resolved<'a>> {
+    // Scheduled-block submits of this phase, oldest first, each consumed by at
+    // most one landing.
+    let mut candidates: Vec<&SubmitRecord> = inputs
+        .submits
+        .iter()
+        .filter(|record| record.phase == PHASE && record.scheduled_block && !record.reoffer)
+        .collect();
+    candidates.sort_by_key(|record| record.sent);
+    let mut taken = vec![false; candidates.len()];
+
+    let mut resolved: Vec<Resolved<'a>> = Vec::with_capacity(inputs.landings.len());
+    for (position, landing) in inputs.landings.iter().enumerate() {
+        // A landing's own attempt window runs to the next landing's request,
+        // so a session that answered late cannot be credited to the wrong one.
+        let until = inputs
+            .landings
+            .get(position + 1)
+            .map(|next| next.requested_monotonic)
+            .unwrap_or(inputs.phase_ended);
+        let mut submit = None;
+        for (slot, record) in candidates.iter().enumerate() {
+            if taken[slot]
+                || record.session != landing.session
+                || record.sent < landing.requested_monotonic
+                || record.sent >= until
+            {
+                continue;
+            }
+            taken[slot] = true;
+            submit = Some(*record);
+            break;
+        }
+        let failure = inputs
+            .failures
+            .iter()
+            .find(|(session, error, at)| {
+                *session == landing.session
+                    && error.starts_with("scheduled block:")
+                    && *at >= landing.requested_monotonic
+                    && *at < until
+            })
+            .map(|(_, error, _)| error.as_str());
+        let block_hash = submit.and_then(block_hash_of);
+        let node = block_hash.as_ref().and_then(|hash| {
+            inputs
+                .node_submissions
+                .iter()
+                .find(|record| record.block_hash == *hash)
+        });
+        let tip = block_hash.as_ref().and_then(|hash| {
+            inputs
+                .tip_changes
+                .iter()
+                .find(|change| change.hash == *hash && change.origin == TipOrigin::Pool)
+        });
+        let outcome = match (submit, node, tip) {
+            (None, _, _) => LandingOutcome::NeverProduced,
+            (Some(record), _, _) if matches!(record.outcome, Outcome::NoResponse { .. }) => {
+                LandingOutcome::NoResponse
+            }
+            (Some(record), _, _) if rejection_of(record).is_some() => LandingOutcome::Rejected,
+            (Some(_), Some(submission), _) if !submission.accepted => LandingOutcome::Rejected,
+            (Some(_), Some(_), Some(_)) => LandingOutcome::Landed,
+            (Some(_), _, _) => LandingOutcome::AcceptedWithoutNodeSubmission,
+        };
+        resolved.push(Resolved {
+            landing,
+            submit,
+            block_hash,
+            node,
+            tip,
+            outcome,
+            failure,
+            span: None,
+        });
+    }
+
+    // Spans run from one landing's tip change to the next one's, so the
+    // intervals tile the phase without overlapping.
+    let landed: Vec<usize> = {
+        let mut order: Vec<usize> = resolved
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.tip.is_some())
+            .map(|(index, _)| index)
+            .collect();
+        order.sort_by_key(|index| resolved[*index].tip.expect("tip present").monotonic);
+        order
+    };
+    for (position, index) in landed.iter().enumerate() {
+        let start = resolved[*index].tip.expect("tip present").monotonic;
+        let (end, truncated) = match landed.get(position + 1) {
+            Some(next) => (resolved[*next].tip.expect("tip present").monotonic, false),
+            None => (inputs.phase_ended, true),
+        };
+        resolved[*index].span = Some((start, end, truncated));
+    }
+    resolved
+}
+
+/// One rebuild-pending rejection, already attributed.
+struct PendingRejection<'a> {
+    record: &'a SubmitRecord,
+    at: Instant,
+    payout: bool,
+}
+
+fn pending_rejections(submits: &[SubmitRecord]) -> Vec<PendingRejection<'_>> {
+    submits
+        .iter()
+        .filter(|record| record.phase == PHASE && !record.reoffer)
+        .filter_map(|record| {
+            let rejection = rejection_of(record)?;
+            if !classify::is_rebuild_pending(rejection) {
+                return None;
+            }
+            // A rejection is stamped when the client read it, which is the
+            // only instant the harness observed directly.
+            let at = record.responded?;
+            Some(PendingRejection {
+                record,
+                at,
+                payout: rejection.message == classify::NEW_PAYOUT_WORK_PENDING,
+            })
+        })
+        .collect()
+}
+
+/// First, last, count and duration of one window.
+fn window(origin: Instant, times: &[Instant]) -> Value {
+    let first = times.iter().min();
+    let last = times.iter().max();
+    match (first, last) {
+        (Some(first), Some(last)) => json!({
+            "count": times.len(),
+            "first_millis_after_landing": millis_since(origin, *first),
+            "last_millis_after_landing": millis_since(origin, *last),
+            "duration_millis": millis_since(*first, *last),
+        }),
+        _ => json!({
+            "count": 0,
+            "first_millis_after_landing": Value::Null,
+            "last_millis_after_landing": Value::Null,
+            "duration_millis": Value::Null,
+            "unavailable_reason": "this frontend returned no such rejection inside the landing's span",
+        }),
+    }
+}
+
+/// Accumulated per-frontend distributions, for the run summaries.
+#[derive(Default)]
+struct Distribution {
+    tip_duration: Vec<f64>,
+    payout_duration: Vec<f64>,
+    combined_duration: Vec<f64>,
+    tip_count: Vec<f64>,
+    payout_count: Vec<f64>,
+    combined_count: Vec<f64>,
+    before_revision: Vec<f64>,
+    lost: Vec<f64>,
+    tip_work_max: Vec<f64>,
+    revision_work_max: Vec<f64>,
+}
+
+impl Distribution {
+    fn summarize(&self) -> Value {
+        json!({
+            "tip_pending_window_duration_millis": measure::summarize(self.tip_duration.clone(), CLOCK),
+            "payout_pending_window_duration_millis": measure::summarize(self.payout_duration.clone(), CLOCK),
+            "combined_rebuild_pending_window_duration_millis": measure::summarize(self.combined_duration.clone(), CLOCK),
+            "tip_pending_rejections_per_landing": measure::summarize(self.tip_count.clone(), COUNT_CLOCK),
+            "payout_pending_rejections_per_landing": measure::summarize(self.payout_count.clone(), COUNT_CLOCK),
+            "combined_rebuild_pending_rejections_per_landing": measure::summarize(self.combined_count.clone(), COUNT_CLOCK),
+            "rejected_before_new_revision_work_per_landing": measure::summarize(self.before_revision.clone(), COUNT_CLOCK),
+            "lost_valid_shares_per_landing": measure::summarize(self.lost.clone(), COUNT_CLOCK),
+            "time_to_new_tip_work_max_millis": measure::summarize(self.tip_work_max.clone(), CLOCK),
+            "time_to_new_revision_work_max_millis": measure::summarize(self.revision_work_max.clone(), CLOCK),
+        })
+    }
+}
+
+const CLOCK: &str = "harness monotonic";
+/// `measure::summarize` labels its unit as milliseconds, which a count is
+/// not; the clock string says so rather than letting the unit be misread.
+const COUNT_CLOCK: &str = "counts, not milliseconds; one sample per landing";
+
+/// Build the `dense_cadence` section of the side report.
+///
+/// The section is additive: it carries no field any earlier consumer reads,
+/// and the capacity-evidence artifact is untouched (EP-COMPAT).
+pub fn build(inputs: &ReportInputs<'_>) -> Value {
+    if !inputs.cadence.is_dense() {
+        return json!({
+            "ran": false,
+            "cadence": inputs.cadence.as_str(),
+            "reason": "the run did not ask for --cadence dense",
+        });
+    }
+    let resolved = resolve(inputs);
+    let rejections = pending_rejections(inputs.submits);
+    let empty = RevisionSeries::default();
+    let revisions = inputs.revisions.unwrap_or(&empty);
+
+    // --- bumps ------------------------------------------------------------
+    // Every change the sampler saw belongs to exactly one landing's span or
+    // to nothing; nothing is dropped (EP-STATE).
+    let mut bump_records = Vec::new();
+    let mut attributed_bumps = 0usize;
+    let mut unattributed_bumps = 0usize;
+    let mut bumps_by_landing: BTreeMap<usize, Vec<&RevisionSample>> = BTreeMap::new();
+    for change in &revisions.changes {
+        let owner = resolved.iter().find(|entry| {
+            entry
+                .span
+                .is_some_and(|(start, end, _)| change.monotonic >= start && change.monotonic < end)
+        });
+        match owner {
+            Some(entry) => {
+                attributed_bumps += 1;
+                bumps_by_landing
+                    .entry(entry.landing.index)
+                    .or_default()
+                    .push(change);
+            }
+            None => unattributed_bumps += 1,
+        }
+        bump_records.push(json!({
+            "revision": change.revision,
+            "previous_revision": change.previous_revision,
+            "revision_delta": change
+                .previous_revision
+                .map(|previous| change.revision - previous),
+            "server_timestamp": change.server_timestamp.to_rfc3339(),
+            "harness_monotonic_millis_since_phase_start":
+                millis_since(inputs.phase_started, change.monotonic),
+            "attributed_to_landing": owner.map(|entry| entry.landing.index),
+            "cause": match owner {
+                Some(entry) => json!(format!(
+                    "followed the pool tip {} at height {}",
+                    entry
+                        .tip
+                        .map(|tip| tip.hash.clone())
+                        .unwrap_or_default(),
+                    entry.tip.map(|tip| tip.height).unwrap_or_default(),
+                )),
+                None => json!("unknown: the bump fell inside no landing's span"),
+            },
+        }));
+    }
+
+    // --- landings ---------------------------------------------------------
+    let mut landing_records = Vec::new();
+    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut per_frontend: BTreeMap<usize, Distribution> = BTreeMap::new();
+    let mut overall = Distribution::default();
+    let mut lost_total = 0usize;
+    let mut lost_in_postgres: Vec<String> = Vec::new();
+    let mut attributed_rejections = 0usize;
+
+    for entry in &resolved {
+        *counts.entry(entry.outcome.as_str()).or_insert(0) += 1;
+        let mut frontend_tables = Vec::new();
+        if let Some((start, end, truncated)) = entry.span {
+            let reference = bumps_by_landing
+                .get(&entry.landing.index)
+                .and_then(|bumps| bumps.last().copied());
+            for health in inputs.frontends {
+                let sessions: Vec<usize> = inputs
+                    .session_frontend
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, frontend)| **frontend == health.index)
+                    .map(|(session, _)| session)
+                    .collect();
+                let mine: Vec<&PendingRejection<'_>> = rejections
+                    .iter()
+                    .filter(|rejection| {
+                        rejection.record.frontend == health.index
+                            && rejection.at >= start
+                            && rejection.at < end
+                    })
+                    .collect();
+                attributed_rejections += mine.len();
+                let tip_times: Vec<Instant> = mine
+                    .iter()
+                    .filter(|rejection| !rejection.payout)
+                    .map(|rejection| rejection.at)
+                    .collect();
+                let payout_times: Vec<Instant> = mine
+                    .iter()
+                    .filter(|rejection| rejection.payout)
+                    .map(|rejection| rejection.at)
+                    .collect();
+                let combined_times: Vec<Instant> =
+                    mine.iter().map(|rejection| rejection.at).collect();
+
+                // Time to new-tip work, by the same definition
+                // `run::time_to_usable_work` uses: the first mining.notify
+                // whose prevhash resolves to the new tip, measured from the
+                // node's tip stamp.
+                let tip_hash = entry.tip.map(|tip| tip.hash.as_str()).unwrap_or_default();
+                let mut tip_work: Vec<f64> = Vec::new();
+                for session in &sessions {
+                    if let Some(at) = inputs
+                        .tips
+                        .iter()
+                        .filter(|sighting| {
+                            sighting.session == *session
+                                && sighting.tip == tip_hash
+                                && sighting.at >= start
+                        })
+                        .map(|sighting| sighting.at)
+                        .min()
+                    {
+                        tip_work.push(millis_since(start, at));
+                    }
+                }
+
+                // Time to new-revision work. The wire carries no payout
+                // revision, so the first clean_jobs=true notify at or after
+                // the bump stands in for it, and is labelled as an
+                // approximation.
+                let mut revision_work: Vec<f64> = Vec::new();
+                let mut first_revision_work: Option<Instant> = None;
+                if let Some(bump) = reference {
+                    for session in &sessions {
+                        if let Some(at) = inputs
+                            .notifies
+                            .iter()
+                            .filter(|notify| {
+                                notify.session == *session
+                                    && notify.clean_jobs
+                                    && notify.at >= bump.monotonic
+                            })
+                            .map(|notify| notify.at)
+                            .min()
+                        {
+                            revision_work.push(millis_since(bump.monotonic, at));
+                            first_revision_work = Some(
+                                first_revision_work.map_or(at, |current: Instant| current.min(at)),
+                            );
+                        }
+                    }
+                }
+                let rejected_before_new_revision_work = first_revision_work
+                    .map(|at| mine.iter().filter(|rejection| rejection.at < at).count());
+
+                // Lost valid work: the client only ever offers a nonce that
+                // meets the share target, so every rebuild-pending rejection
+                // is a valid share the pool threw away. None of them is
+                // persisted, which is checked here rather than asserted.
+                let lost: Vec<&str> = mine
+                    .iter()
+                    .map(|rejection| rejection.record.share_id.as_str())
+                    .collect();
+                lost_total += lost.len();
+                for share in &lost {
+                    if inputs.committed.contains(*share) {
+                        lost_in_postgres.push((*share).to_owned());
+                    }
+                }
+
+                let incomplete = health.trouble().or_else(|| {
+                    inputs
+                        .aborted
+                        .map(|reason| format!("the phase was aborted: {reason}"))
+                });
+                let distribution = per_frontend.entry(health.index).or_default();
+                for target in [distribution, &mut overall] {
+                    if let (Some(first), Some(last)) =
+                        (tip_times.iter().min(), tip_times.iter().max())
+                    {
+                        target.tip_duration.push(millis_since(*first, *last));
+                    }
+                    if let (Some(first), Some(last)) =
+                        (payout_times.iter().min(), payout_times.iter().max())
+                    {
+                        target.payout_duration.push(millis_since(*first, *last));
+                    }
+                    if let (Some(first), Some(last)) =
+                        (combined_times.iter().min(), combined_times.iter().max())
+                    {
+                        target.combined_duration.push(millis_since(*first, *last));
+                    }
+                    target.tip_count.push(tip_times.len() as f64);
+                    target.payout_count.push(payout_times.len() as f64);
+                    target.combined_count.push(combined_times.len() as f64);
+                    if let Some(count) = rejected_before_new_revision_work {
+                        target.before_revision.push(count as f64);
+                    }
+                    target.lost.push(lost.len() as f64);
+                    if let Some(worst) = tip_work.iter().copied().max_by(f64::total_cmp) {
+                        target.tip_work_max.push(worst);
+                    }
+                    if let Some(worst) = revision_work.iter().copied().max_by(f64::total_cmp) {
+                        target.revision_work_max.push(worst);
+                    }
+                }
+
+                frontend_tables.push(json!({
+                    "frontend": health.index,
+                    "instance_id": health.instance_id,
+                    "sessions": sessions.len(),
+                    "tip_pending_window": window(start, &tip_times),
+                    "payout_pending_window": window(start, &payout_times),
+                    "combined_rebuild_pending_window":
+                        window(start, &combined_times),
+                    "reference_bump": reference.map(|bump| json!({
+                        "revision": bump.revision,
+                        "server_timestamp": bump.server_timestamp.to_rfc3339(),
+                        "millis_after_landing": millis_since(start, bump.monotonic),
+                    })),
+                    "time_to_new_tip_work_millis": measure::summarize(tip_work.clone(), CLOCK),
+                    "sessions_with_new_tip_work": tip_work.len(),
+                    "time_to_new_revision_work_millis":
+                        measure::summarize(revision_work.clone(), CLOCK),
+                    "sessions_with_new_revision_work": revision_work.len(),
+                    "new_revision_work_approximation": NEW_REVISION_APPROXIMATION,
+                    "rejected_before_new_revision_work": rejected_before_new_revision_work,
+                    "rejected_before_new_revision_work_unavailable_reason":
+                        rejected_before_new_revision_work.is_none().then(|| {
+                            if reference.is_none() {
+                                "no bump was attributed to this landing"
+                            } else {
+                                "no session on this frontend received a clean_jobs job after the bump"
+                            }
+                        }),
+                    "lost_valid_shares": lost.len(),
+                    "lost_valid_shares_found_in_postgres": lost
+                        .iter()
+                        .filter(|share| inputs.committed.contains(**share))
+                        .count(),
+                    "incomplete": incomplete.is_some(),
+                    "incomplete_reason": incomplete,
+                    "span_truncated_at_phase_end": truncated,
+                }));
+            }
+        }
+        landing_records.push(json!({
+            "index": entry.landing.index,
+            "scheduled_offset_seconds": entry.landing.scheduled_offset_seconds,
+            "requested_at": entry.landing.requested_wall.to_rfc3339(),
+            "requested_millis_since_phase_start":
+                millis_since(inputs.phase_started, entry.landing.requested_monotonic),
+            "session": entry.landing.session,
+            "frontend": entry.landing.frontend,
+            "outcome": entry.outcome.as_str(),
+            "block_hash": entry.block_hash,
+            "submit": entry.submit.map(|record| json!({
+                "share_id": record.share_id,
+                "job_id": record.job_id,
+                "sent_millis_since_phase_start": millis_since(inputs.phase_started, record.sent),
+                "response_millis_since_phase_start":
+                    record.responded.map(|at| millis_since(inputs.phase_started, at)),
+                "send_to_response_millis": record.latency_millis,
+                "answer": match &record.outcome {
+                    Outcome::Accepted => json!({"outcome": "accepted"}),
+                    Outcome::Rejected(rejection) => json!({
+                        "outcome": "rejected",
+                        "code": rejection.code,
+                        "reason_id": rejection.reason_id,
+                        "message": rejection.message,
+                    }),
+                    Outcome::NoResponse { reason } =>
+                        json!({"outcome": "no-response", "reason": reason}),
+                },
+            })),
+            "never_produced_error": entry.failure,
+            "node": entry.node.map(|record| json!({
+                "accepted": record.accepted,
+                "rejection": record.rejection,
+                "height": record.height,
+                "parent": record.parent,
+                "block_bytes": record.block_bytes,
+                "received_at": record.received_at.to_rfc3339(),
+            })),
+            "tip_change": entry.tip.map(|tip| json!({
+                "hash": tip.hash,
+                "height": tip.height,
+                "origin": tip.origin,
+                "wall": tip.wall.to_rfc3339(),
+                "millis_since_phase_start": millis_since(inputs.phase_started, tip.monotonic),
+            })),
+            "bumps": bumps_by_landing
+                .get(&entry.landing.index)
+                .map(|bumps| bumps.len())
+                .unwrap_or(0),
+            "bump_revisions": bumps_by_landing
+                .get(&entry.landing.index)
+                .map(|bumps| bumps.iter().map(|bump| bump.revision).collect::<Vec<_>>())
+                .unwrap_or_default(),
+            "frontends": frontend_tables,
+        }));
+    }
+
+    let landed = *counts.get("landed").unwrap_or(&0);
+    let unattributed_rejections = rejections.len().saturating_sub(attributed_rejections);
+    let no_landing_reason = no_landing_reason(inputs, &resolved, landed);
+    let combined_p99 =
+        optional_summary(&overall.combined_duration, CLOCK).and_then(|summary| summary.p99);
+    let count_p99 =
+        optional_summary(&overall.combined_count, COUNT_CLOCK).and_then(|summary| summary.p99);
+
+    json!({
+        "ran": true,
+        "cadence": inputs.cadence.as_str(),
+        "phase": PHASE,
+        "in_artifact": false,
+        "note": "a side phase: it is not part of the capacity-evidence artifact, and it runs with \
+                 no proxy delay",
+        "phase_seconds": inputs.phase_seconds,
+        "phase_duration_millis": inputs.phase_duration_millis,
+        "phase_started_at": inputs.phase_started_wall.to_rfc3339(),
+        "offered_rate_shares_per_second": inputs.phase_rate,
+        "gap_pattern_seconds": inputs.gaps,
+        "gap_pattern_note": "repeated cyclically; #224's shape is 9 s single gaps and 18-20 s pairs",
+        "lead_in_seconds": LEAD_IN_SECONDS,
+        "tail_seconds": TAIL_SECONDS,
+        "scheduled_landing_offsets_seconds": inputs.offsets,
+        "landing_budget": inputs.landing_budget,
+        "schedule_slots_over_budget": inputs.slots_over_budget,
+        "landings": landed,
+        "bumps": attributed_bumps,
+        "landing_attempts": resolved.len(),
+        "windows_available": landed > 0,
+        "reason": no_landing_reason,
+        "revision_sampler": {
+            "source": "SELECT payout_revision, clock_timestamp() FROM qbit_prism_cluster WHERE singleton",
+            "interval_millis": if revisions.interval_ms == 0 {
+                REVISION_SAMPLE_INTERVAL_MS
+            } else {
+                revisions.interval_ms
+            },
+            "samples": revisions.samples,
+            "errors": revisions.errors,
+            "first_error": revisions.first_error,
+            "blind": revisions.blind(),
+            "blind_reason": revisions.blind().then_some(
+                "the sampler produced no reading, so the bump list is unknown rather than empty"
+            ),
+            "baseline_revision": revisions.baseline.as_ref().map(|sample| sample.revision),
+            "baseline_server_timestamp": revisions
+                .baseline
+                .as_ref()
+                .map(|sample| sample.server_timestamp.to_rfc3339()),
+            "changes_observed": revisions.changes.len(),
+        },
+        "landing_records": landing_records,
+        "landing_outcomes": {
+            "landed": landed,
+            "rejected": counts.get("rejected").copied().unwrap_or(0),
+            "never_produced": counts.get("never_produced").copied().unwrap_or(0),
+            "accepted_without_node_submission":
+                counts.get("accepted_without_node_submission").copied().unwrap_or(0),
+            "no_response": counts.get("no_response").copied().unwrap_or(0),
+        },
+        "bump_records": bump_records,
+        "bump_attribution": {
+            "attributed": attributed_bumps,
+            "unattributed": unattributed_bumps,
+            "note": "a bump is attributed to the landing whose pool tip change it follows and \
+                     which the next landing has not yet replaced; anything else is unattributed \
+                     with its cause unknown",
+        },
+        "rejection_attribution": {
+            "rebuild_pending_rejections_in_phase": rejections.len(),
+            "attributed": attributed_rejections,
+            "unattributed": unattributed_rejections,
+            "note": "a rebuild-pending rejection outside every landing's span is counted as \
+                     unattributed, never dropped",
+        },
+        "lost_valid_work": {
+            "definition": "a share the client had already proven against the share target, \
+                           rejected with new tip work is pending or new payout work is pending. \
+                           It was never persisted, so it is not a durability finding, but it is \
+                           miner work the pool discarded.",
+            "shares": lost_total,
+            "shares_found_in_postgres": lost_in_postgres.len(),
+            "shares_found_in_postgres_sample": lost_in_postgres.iter().take(10).collect::<Vec<_>>(),
+        },
+        "frontend_health": inputs.frontends.iter().map(|health| json!({
+            "frontend": health.index,
+            "instance_id": health.instance_id,
+            "restarts_before_phase": health.restarts_before,
+            "restarts_after_phase": health.restarts_after,
+            "restarted_during_phase": health.restarted(),
+            "exited_during_phase": health.exited,
+            "windows_incomplete": health.trouble().is_some() || inputs.aborted.is_some(),
+        })).collect::<Vec<_>>(),
+        "summaries": {
+            "per_frontend": per_frontend.iter().map(|(frontend, distribution)| {
+                let mut value = distribution.summarize();
+                value["frontend"] = json!(frontend);
+                value
+            }).collect::<Vec<_>>(),
+            "overall": overall.summarize(),
+        },
+        "proposed_budget_for_issue_291": {
+            "metric": "p99 of the combined rebuild-pending window per landing, per frontend",
+            "window_p99_millis": combined_p99,
+            "rejections_per_landing_per_frontend_p99": count_p99,
+            "recommended_soak_budget_millis": combined_p99
+                .map(|p99| (p99 / 100.0).ceil() * 100.0),
+            "note": "the soak in #291 should fail if either number is exceeded at the same \
+                     topology. Both are unknown, not zero, when this run produced no landing.",
+        },
+        "definitions": definitions(),
+    })
+}
+
+/// Why a run produced no landing, when it produced none.
+fn no_landing_reason(
+    inputs: &ReportInputs<'_>,
+    resolved: &[Resolved<'_>],
+    landed: usize,
+) -> Option<String> {
+    if landed > 0 {
+        return None;
+    }
+    if inputs.landing_budget == 0 {
+        return Some(format!(
+            "the landing budget --scheduled-blocks was 0, so the {} scheduled slot(s) in the \
+             pattern were never used; no window is reported and none is invented",
+            inputs.offsets.len()
+        ));
+    }
+    if inputs.offsets.is_empty() {
+        return Some(
+            "the gap pattern placed no landing inside the phase; no window is reported".to_owned(),
+        );
+    }
+    if resolved.is_empty() {
+        return Some(
+            "the phase ended before any scheduled slot came due; no window is reported".to_owned(),
+        );
+    }
+    Some(format!(
+        "all {} landing attempt(s) failed: {}",
+        resolved.len(),
+        {
+            let mut tally: BTreeMap<&str, usize> = BTreeMap::new();
+            for entry in resolved {
+                *tally.entry(entry.outcome.as_str()).or_insert(0) += 1;
+            }
+            tally
+                .into_iter()
+                .map(|(kind, count)| format!("{kind}={count}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    ))
+}
+
+/// How the first `clean_jobs` notify stands in for a revision the wire never
+/// carries.
+pub const NEW_REVISION_APPROXIMATION: &str =
+    "approximate: mining.notify carries no payout revision, so the first notify with \
+     clean_jobs=true at or after the bump stands in for the first job built at the new \
+     revision. clean_jobs is set when the parent or the payout revision differs from the \
+     session's last job (stratum.rs, deliver_job), so inside a landing's span, after the tip \
+     has already been served, it is the rebuild at the new revision.";
+
+/// Exactly how every window and time in this section is measured, and on which
+/// clock.
+pub fn definitions() -> Value {
+    json!({
+        "clocks": {
+            "harness_monotonic": "std::time::Instant in the harness process. Every duration and \
+                                  every *_millis_* field is on this clock, and offsets are \
+                                  measured from the phase's start instant or from the landing's \
+                                  tip change, as the field name says.",
+            "harness_wall": "chrono::Utc::now() in the harness process, stamped when the harness \
+                             asked a session for a landing (requested_at).",
+            "node_wall": "chrono::Utc::now() inside the fake node, stamped when submitblock was \
+                          answered (node.received_at) and at each tip transition (tip_change.wall).",
+            "postgres_clock_timestamp": "clock_timestamp() read in the same row as \
+                                         payout_revision, so a bump carries the server's own \
+                                         notion of when the new value was visible."
+        },
+        "landing": "one own block: the harness sends Control::ScheduledBlock, the session searches \
+                    its current job for a network-target solution and submits it, the frontend \
+                    appends the share with a candidate, and the candidate worker calls submitblock. \
+                    A landing counts as landed only when the fake node accepted the block and the \
+                    tip moved to it. The block hash is the part of the share identifier after the \
+                    colon, which is the same display hash the node records, so the match is exact \
+                    rather than by time.",
+        "landings": "the number of landings that landed. landing_attempts counts every slot the \
+                     budget paid for, whatever happened to it.",
+        "span": "a landing's attribution span runs from its own pool tip change to the next \
+                 landing's pool tip change, and for the last landing to the end of the phase \
+                 (span_truncated_at_phase_end is then true). The spans tile the phase, so every \
+                 bump and every rebuild-pending rejection belongs to exactly one landing or to \
+                 unattributed.",
+        "tip_pending_window": "the first and last `new tip work is pending` rejection that \
+                               frontend returned inside the span, the count, and last minus first \
+                               in milliseconds. The instant is when the client read the rejection \
+                               line, which is the only instant the harness observed directly.",
+        "payout_pending_window": "the same for `new payout work is pending`. The two are reported \
+                                  apart because coordinator.rs checks the tip before the payout \
+                                  revision, so a landing produces the tip message first and the \
+                                  payout message only if the revision moved again after the \
+                                  rebuild.",
+        "combined_rebuild_pending_window": "first to last of either message, with the sum of both \
+                                            counts. This is the window #291 should budget against.",
+        "time_to_new_tip_work": "t1 - t0 per session, where t0 is the landing's tip change on the \
+                                 node and t1 is the first mining.notify whose prevhash resolves to \
+                                 that tip. Same definition as the run's time_to_usable_work \
+                                 section, restricted to one frontend's sessions.",
+        "time_to_new_revision_work": NEW_REVISION_APPROXIMATION,
+        "reference_bump": "the last bump attributed to the landing: the revision a frontend has to \
+                           reach before it stops answering `new payout work is pending`. \
+                           time_to_new_revision_work and rejected_before_new_revision_work are \
+                           both measured from it.",
+        "rejected_before_new_revision_work": "rebuild-pending rejections that frontend returned \
+                                              between the landing's tip change and the earliest \
+                                              new-revision work on any of its sessions. Null, with \
+                                              a reason, when there was no bump or no such job.",
+        "lost_valid_shares": "every rebuild-pending rejection in the span. The client only submits \
+                              a nonce it has already checked against the share target, so each one \
+                              is a valid share the pool discarded. None is persisted, which is \
+                              verified against this run's committed share identifiers rather than \
+                              asserted.",
+        "bump": "an observed change of qbit_prism_cluster.payout_revision. Two bumps inside one \
+                 sampling interval appear as one change with revision_delta above 1, so the delta \
+                 is reported rather than assumed to be 1.",
+        "unknown_is_not_zero": "a measurement that could not be taken is null with a reason. A \
+                                run with no landing reports landings 0 and bumps 0 and no windows."
+    })
+}
+
+/// `measure::summarize` returns a summary even for an empty sample; this says
+/// "there was nothing to summarize" instead, so a budget proposal from no data
+/// is `null` rather than a number.
+fn optional_summary(values: &[f64], clock: &'static str) -> Option<measure::LatencySummary> {
+    if values.is_empty() {
+        return None;
+    }
+    Some(measure::summarize(values.to_vec(), clock))
+}

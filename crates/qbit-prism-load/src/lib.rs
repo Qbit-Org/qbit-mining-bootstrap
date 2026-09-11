@@ -9,7 +9,12 @@
 //! Nothing here changes production code. Helpers copied from the server's own
 //! test support name their source file inline.
 
+// The side report is built as one `serde_json::json!` document, and the macro
+// expands recursively once per key. The default limit of 128 is not enough.
+#![recursion_limit = "512"]
+
 pub mod artifact;
+pub mod cadence;
 pub mod classify;
 pub mod cli;
 pub mod client;

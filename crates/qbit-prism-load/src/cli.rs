@@ -121,6 +121,22 @@ pub struct Args {
     #[arg(long, default_value_t = 3)]
     pub external_tips: usize,
 
+    /// `none`, or `dense` for the #271 dense-cadence side phase: own blocks
+    /// about 9 s apart and in 18-20 s pairs, measuring what each
+    /// payout-revision bump costs every frontend.
+    #[arg(long, default_value = "none")]
+    pub cadence: String,
+    /// Length of the `dense_cadence` phase, in seconds.
+    #[arg(long, default_value_t = 240)]
+    pub cadence_seconds: u64,
+    /// Offered share rate during `dense_cadence`. Defaults to the
+    /// steady-state rate.
+    #[arg(long)]
+    pub cadence_rate: Option<f64>,
+    /// Seconds between own-block landings, repeated cyclically.
+    #[arg(long, default_value = crate::cadence::DEFAULT_GAPS)]
+    pub cadence_gaps: String,
+
     /// Seconds to wait for the first frontend to serve work.
     #[arg(long, default_value_t = 120)]
     pub work_timeout: u64,
@@ -187,6 +203,7 @@ impl Args {
         for (name, value) in [
             ("--steady-state-rate", self.steady_state_rate),
             ("--burst-rate", self.burst_rate),
+            ("--cadence-rate", self.cadence_rate),
         ] {
             if let Some(value) = value {
                 ensure!(
@@ -268,7 +285,27 @@ impl Args {
         }
         self.plan()?;
         crate::cluster::Replication::parse(&self.replication)?;
+        // The gap pattern and the phase length are checked against each other
+        // here, at the entry boundary, because a pattern that cannot hold ten
+        // landings measures nothing and the run must say so before it starts
+        // (EP-VALIDATION).
+        if self.cadence()?.is_dense() {
+            crate::cadence::validate(&self.cadence_gaps, self.cadence_seconds)?;
+        }
         Ok(())
+    }
+
+    pub fn cadence(&self) -> Result<crate::cadence::Cadence> {
+        crate::cadence::Cadence::parse(&self.cadence)
+    }
+
+    /// The gap pattern, for a run that asked for one. Empty otherwise.
+    pub fn cadence_gaps(&self) -> Result<Vec<f64>> {
+        if self.cadence()?.is_dense() {
+            crate::cadence::parse_gaps(&self.cadence_gaps)
+        } else {
+            Ok(Vec::new())
+        }
     }
 }
 
@@ -286,6 +323,9 @@ pub struct PhasePlan {
     pub database_delay_ms: u64,
     /// SIGKILL a frontend with submits outstanding.
     pub mid_flight_kill: bool,
+    /// Drive own-block landings on the `--cadence-gaps` pattern and measure
+    /// the payout-revision bumps they cause.
+    pub dense_cadence: bool,
 }
 
 pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
@@ -320,6 +360,7 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
             reconnects: false,
             database_delay_ms: 0,
             mid_flight_kill: false,
+            dense_cadence: false,
         });
     }
     plans.push(PhasePlan {
@@ -330,6 +371,7 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
         reconnects: false,
         database_delay_ms: 0,
         mid_flight_kill: false,
+        dense_cadence: false,
     });
     if let Some((seconds, rate)) = burst {
         plans.push(PhasePlan {
@@ -340,6 +382,7 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
             reconnects: false,
             database_delay_ms: 0,
             mid_flight_kill: false,
+            dense_cadence: false,
         });
     }
     plans.push(PhasePlan {
@@ -350,6 +393,7 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
         reconnects: true,
         database_delay_ms: 0,
         mid_flight_kill: false,
+        dense_cadence: false,
     });
     plans.push(PhasePlan {
         name: "slow_database".into(),
@@ -359,7 +403,23 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
         reconnects: false,
         database_delay_ms: args.slow_db_delay_ms,
         mid_flight_kill: false,
+        dense_cadence: false,
     });
+    // The dense-cadence phase is a side phase, after `slow_database` and with
+    // no proxy delay: the measurement is the frontends' rebuild latency, which
+    // a delayed database would drown out.
+    if args.cadence()?.is_dense() {
+        plans.push(PhasePlan {
+            name: crate::cadence::PHASE.into(),
+            seconds: args.cadence_seconds,
+            rate: args.cadence_rate.unwrap_or(steady_rate),
+            in_artifact: false,
+            reconnects: false,
+            database_delay_ms: 0,
+            mid_flight_kill: false,
+            dense_cadence: true,
+        });
+    }
     if args.mid_flight_kill {
         plans.push(PhasePlan {
             name: "mid_flight_kill".into(),
@@ -374,6 +434,7 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
             // long enough for the kill to mean something.
             database_delay_ms: args.slow_db_delay_ms,
             mid_flight_kill: true,
+            dense_cadence: false,
         });
     }
     Ok(plans)

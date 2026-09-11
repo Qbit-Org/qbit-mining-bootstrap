@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -197,17 +197,39 @@ pub struct ReconnectRecord {
     pub seconds: f64,
 }
 
+/// The first time one session saw work built on a tip.
+#[derive(Clone, Debug)]
+pub struct TipSighting {
+    pub session: usize,
+    pub frontend: usize,
+    pub tip: String,
+    pub at: Instant,
+}
+
+/// One `mining.notify` a session received.
+///
+/// Recorded only while the run asks for it, because in the dense-cadence
+/// phase the arrival of a job *is* the measurement, and in every other phase
+/// the record would be a few thousand rows nothing reads.
+#[derive(Clone, Debug)]
+pub struct NotifySighting {
+    pub session: usize,
+    pub frontend: usize,
+    pub job_id: String,
+    pub tip: String,
+    pub clean_jobs: bool,
+    pub at: Instant,
+}
+
 /// Everything a session reports back.
 #[derive(Debug)]
 pub enum Event {
     Submit(Box<SubmitRecord>),
     Reconnect(ReconnectRecord),
-    /// The first time this session saw work built on `tip`.
-    Tip {
-        session: usize,
-        tip: String,
-        at: Instant,
-    },
+    /// The first time this session saw work built on a tip.
+    Tip(TipSighting),
+    /// One `mining.notify`, while `SessionShared::record_notifies` is set.
+    Notify(NotifySighting),
     /// A share-passing nonce that also solved a block and was therefore never
     /// submitted.
     DiscardedBlockSolution {
@@ -238,6 +260,9 @@ pub enum Event {
     Failure {
         session: usize,
         error: String,
+        /// When the failure happened, so a scheduled-block failure can be
+        /// attributed to the landing that asked for it (EP-ERRORS).
+        at: Instant,
     },
 }
 
@@ -291,11 +316,18 @@ pub struct SessionConfig {
 pub struct SessionShared {
     pub phase: std::sync::RwLock<String>,
     pub events: mpsc::UnboundedSender<Event>,
+    /// Set for the phases that measure job arrival. Off everywhere else, so
+    /// no existing run pays for a record it does not report.
+    pub record_notifies: AtomicBool,
 }
 
 impl SessionShared {
     pub fn phase(&self) -> String {
         self.phase.read().expect("phase lock").clone()
+    }
+
+    pub fn recording_notifies(&self) -> bool {
+        self.record_notifies.load(Ordering::Relaxed)
     }
 }
 
@@ -413,7 +445,7 @@ async fn run_session(
     while !stopping {
         if connection.is_none() {
             let started = Instant::now();
-            match connect(&config, &address, &shared).await {
+            match connect(&config, &address, &shared, &frontend).await {
                 Ok(fresh) => {
                     let _ = shared.events.send(Event::Connected {
                         session: config.index,
@@ -508,6 +540,7 @@ async fn run_session(
                             let _ = shared.events.send(Event::Failure {
                                 session: config.index,
                                 error: format!("scheduled block: {error:#}"),
+                                at: Instant::now(),
                             });
                         }
                     }
@@ -530,6 +563,7 @@ async fn run_session(
                             let _ = shared.events.send(Event::Failure {
                                 session: config.index,
                                 error: format!("re-offer: {error:#}"),
+                                at: Instant::now(),
                             });
                         }
                     }
@@ -542,6 +576,7 @@ async fn run_session(
                             let _ = shared.events.send(Event::Failure {
                                 session: config.index,
                                 error: format!("{error:#}"),
+                                at: Instant::now(),
                             });
                         }
                     }
@@ -571,6 +606,7 @@ async fn run_session(
                             let _ = shared.events.send(Event::Failure {
                                 session: config.index,
                                 error: format!("{error:#}"),
+                                at: Instant::now(),
                             });
                         }
                     }
@@ -672,6 +708,7 @@ async fn connect(
     config: &SessionConfig,
     address: &str,
     shared: &Arc<SessionShared>,
+    frontend: &Arc<AtomicUsize>,
 ) -> Result<Connection> {
     let stream = tokio::time::timeout(config.connect_timeout, TcpStream::connect(address))
         .await
@@ -724,7 +761,7 @@ async fn connect(
         &json!({"id": subscribe, "method": "mining.subscribe", "params": ["qbit-prism-load/1"]}),
     )
     .await?;
-    let response = await_response(&mut connection, subscribe, config, shared).await?;
+    let response = await_response(&mut connection, subscribe, config, shared, frontend).await?;
     let result = response
         .get("result")
         .and_then(Value::as_array)
@@ -755,7 +792,7 @@ async fn connect(
         ]}),
     )
     .await?;
-    await_response(&mut connection, configure, config, shared).await?;
+    await_response(&mut connection, configure, config, shared, frontend).await?;
 
     let authorize = connection.next_id;
     connection.next_id += 1;
@@ -765,7 +802,7 @@ async fn connect(
                 "params": [config.username, config.password]}),
     )
     .await?;
-    let response = await_response(&mut connection, authorize, config, shared).await?;
+    let response = await_response(&mut connection, authorize, config, shared, frontend).await?;
     ensure!(
         response.get("result") == Some(&Value::Bool(true)),
         "mining.authorize was refused: {response}"
@@ -784,7 +821,7 @@ async fn connect(
                     config,
                     shared,
                     &Arc::new(AtomicUsize::new(0)),
-                    None,
+                    frontend,
                 )?;
             }
             Ok(Some(Incoming::Closed(reason))) => bail!("socket closed during handshake: {reason}"),
@@ -800,6 +837,7 @@ async fn await_response(
     id: u64,
     config: &SessionConfig,
     shared: &Arc<SessionShared>,
+    frontend: &Arc<AtomicUsize>,
 ) -> Result<Value> {
     let deadline = Instant::now() + config.handshake_timeout;
     loop {
@@ -821,7 +859,7 @@ async fn await_response(
                     config,
                     shared,
                     &Arc::new(AtomicUsize::new(0)),
-                    None,
+                    frontend,
                 )?;
             }
             Ok(Some(Incoming::Closed(reason))) => bail!("socket closed: {reason}"),
@@ -839,14 +877,7 @@ fn handle_line(
     frontend: &Arc<AtomicUsize>,
     outstanding: &Arc<AtomicUsize>,
 ) -> Result<()> {
-    consume(
-        connection,
-        line,
-        config,
-        shared,
-        outstanding,
-        Some(frontend.load(Ordering::Relaxed)),
-    )
+    consume(connection, line, config, shared, outstanding, frontend)
 }
 
 /// Dispatch one inbound line: a response to a submit, or a server push.
@@ -856,7 +887,7 @@ fn consume(
     config: &SessionConfig,
     shared: &Arc<SessionShared>,
     outstanding: &Arc<AtomicUsize>,
-    _frontend: Option<usize>,
+    frontend: &Arc<AtomicUsize>,
 ) -> Result<()> {
     if line.is_empty() {
         return Ok(());
@@ -898,7 +929,7 @@ fn consume(
         }
     }
     match value.get("method").and_then(Value::as_str) {
-        Some("mining.notify") => note_job(connection, &value, config, shared)?,
+        Some("mining.notify") => note_job(connection, &value, config, shared, frontend)?,
         Some("mining.set_difficulty") => {
             if let Some(advertised) = value["params"][0].as_f64() {
                 // The harness pins the difficulty, so a disagreement here means
@@ -933,6 +964,7 @@ fn note_job(
     value: &Value,
     config: &SessionConfig,
     shared: &Arc<SessionShared>,
+    frontend: &Arc<AtomicUsize>,
 ) -> Result<()> {
     let params = value["params"]
         .as_array()
@@ -984,6 +1016,8 @@ fn note_job(
         share_target: target_bytes_le(&share_target),
         network_target: target_bytes_le(&network_target),
     };
+    let job_id = job.job_id.clone();
+    let seen = job.received;
     if clean_jobs {
         connection.jobs.clear();
     }
@@ -991,13 +1025,25 @@ fn note_job(
     while connection.jobs.len() > JOB_HISTORY {
         connection.jobs.pop_front();
     }
+    let frontend = frontend.load(Ordering::Relaxed);
+    if shared.recording_notifies() {
+        let _ = shared.events.send(Event::Notify(NotifySighting {
+            session: config.index,
+            frontend,
+            job_id,
+            tip: tip.clone(),
+            clean_jobs,
+            at: seen,
+        }));
+    }
     if connection.last_tip.as_deref() != Some(tip.as_str()) {
         connection.last_tip = Some(tip.clone());
-        let _ = shared.events.send(Event::Tip {
+        let _ = shared.events.send(Event::Tip(TipSighting {
             session: config.index,
+            frontend,
             tip,
-            at: Instant::now(),
-        });
+            at: seen,
+        }));
     }
     Ok(())
 }
