@@ -54,6 +54,68 @@ async fn idle_http_scrape_has_unique_help_and_type_for_every_family() {
     let state = state(metrics.clone());
     state.publish_metrics(metrics.render()).unwrap();
     let body = scrape(&state).await;
+    assert_complete_registry(&body);
+}
+
+#[tokio::test]
+async fn startup_scrape_renders_registry_without_fabricating_publication() {
+    let metrics = Arc::new(Metrics::default());
+    let state = state(metrics.clone());
+    for published in [false, true] {
+        if published {
+            state.publish_metrics(metrics.render()).unwrap();
+        }
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(
+            response.headers()["x-prism-metrics-state"],
+            if published { "fresh" } else { "unavailable" }
+        );
+        assert_eq!(response.headers().contains_key("age"), published);
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_complete_registry(&body);
+        assert_eq!(sample(&body, "qbit_prism_health_state"), 0.);
+        assert_eq!(sample(&body, "qbit_prism_accepted_shares_total"), 0.);
+        assert_eq!(
+            sample(&body, "qbit_prism_stratum_pending_initial_jobs"),
+            -1.
+        );
+        assert_eq!(sample(&body, "qbit_prism_block_candidates_pending"), -1.);
+        assert_eq!(
+            sample(&body, "qbit_prism_metrics_snapshot_available"),
+            f64::from(published)
+        );
+        assert_eq!(
+            sample(&body, "qbit_prism_metrics_snapshot_stale"),
+            f64::from(!published)
+        );
+        let age = sample(&body, "qbit_prism_metrics_snapshot_age_seconds");
+        assert!(if published { age >= 0. } else { age == -1. });
+        for deferred in [
+            "qbit_prism_block_submit_seconds",
+            "qbit_prism_database_advisory_lock_wait_seconds",
+        ] {
+            assert!(!body.lines().any(|line| line.starts_with(deferred)));
+        }
+    }
+}
+
+fn assert_complete_registry(body: &str) {
     let expected: BTreeSet<_> = metrics::descriptors().map(|d| d.name).collect();
     let mut helps = BTreeMap::new();
     let mut types = BTreeMap::new();

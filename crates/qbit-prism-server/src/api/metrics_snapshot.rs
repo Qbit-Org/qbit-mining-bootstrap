@@ -41,9 +41,15 @@ impl MetricsSnapshot {
                 .map(|at| now.saturating_duration_since(at).as_secs_f64()),
             stale_after.as_secs_f64(),
         );
+        // Startup still exposes the registry contract while the first health
+        // probe is pending. Rendering is not a complete snapshot publication.
+        let registered_body = match (self.published_at, collections) {
+            (None, Some(metrics)) => metrics.render(),
+            _ => self.body,
+        };
         let mut body = if freshness.stale() || runtime.as_ref().is_some_and(|view| view.stalled()) {
             // Rewrite only the health sample, never another family's metadata or value.
-            self.body
+            registered_body
                 .lines()
                 .map(|line| {
                     if line.split_whitespace().next() == Some("qbit_prism_health_state") {
@@ -58,7 +64,7 @@ impl MetricsSnapshot {
                     body
                 })
         } else {
-            self.body
+            registered_body
         };
         if let Some(collections) = collections {
             collections.overlay_collections(&mut body);

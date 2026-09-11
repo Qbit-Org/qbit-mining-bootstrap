@@ -11,6 +11,12 @@ metadata, including families declared without samples. Histogram boundaries in
 seconds are 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, and +Inf.
 Histograms also export `_sum` and `_count`.
 
+Before the first complete health/metrics publication, scrapes expose the full
+initialized registry while snapshot availability remains 0, snapshot age remains
+-1, and `x-prism-metrics-state` remains `unavailable` without an `Age` header.
+This includes declared histogram metadata without samples for unwired producers;
+rendering the startup registry does not create a publication timestamp.
+
 ## Cutover inventory
 
 | Family suffix | Type | Labels | Producer / status |
