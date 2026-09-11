@@ -267,8 +267,9 @@ concurrent passes from double-counting. `PRISM_HASHRATE_ROLLUP_ENABLED`,
 Bootstrap now pays the solver only when there are no historical shares; there
 is no three-miner readiness gate. A network-valid proof below its assigned share
 target is credited at network difficulty only after its block is confirmed on
-the active chain. These deliberate accounting simplifications should be
-included in operator/miner rollout notes. Their payout effect is recorded in
+the active chain. These deliberate accounting simplifications were approved
+under decision D2 in #260, and belong in the operator release notes. Their
+payout effect is recorded in
 [Payout differences from 2.x.x (decision D2)](#payout-differences-from-2xx).
 
 `2.x.x` also read `PRISM_STRATUM_SHARE_WEIGHT` (default 1) and
@@ -366,8 +367,8 @@ All vectors use the day-one floor of 14720 sats.
 
 ### D2c: prior balances during bootstrap
 
-**Status:** pending explicit approval by the D2 umbrella owner. This entry is
-recorded separately from D2a so it can be approved on its own.
+**Status:** approved on 2026-09-11 under decision D2 in #260. This entry is
+recorded separately from D2a because it was approved on its own.
 
 - **Vector:** `bootstrap_transition.json`, case
   `bootstrap-carry-only-account-at-or-above-floor`.
