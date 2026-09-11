@@ -452,8 +452,25 @@ two-hour cutover soak, which reads its own criteria from the same registry.
          printf '%s\n' "$body" | sed 's/^/    /' >&2
          break ;;
      esac
-     docker exec "$c" curl -sS --max-time 5 -D - http://127.0.0.1:3341/metrics \
-       | tr -d '\r' \
+     metrics=$(docker exec "$c" curl -sS --max-time 5 -D - http://127.0.0.1:3341/metrics)
+     rc=$?
+     metrics=$(printf '%s\n' "$metrics" | tr -d '\r')
+     why=$(printf '%s\n' "$metrics" | awk -v rc="$rc" '
+       /^x-prism-metrics-state:/ { state = $0 }
+       $0 == "x-prism-metrics-state: fresh" { fresh = 1 }
+       /^qbit_prism_process_resident_memory_bytes[ {]/ { rss = 1 }
+       END {
+         if (rc != 0) print "docker exec exited " rc
+         else if (!fresh) print (state ? "state header read \"" state "\"" : "no x-prism-metrics-state header")
+         else if (!rss) print "no qbit_prism_process_resident_memory_bytes sample" }')
+     if [ -n "$why" ]; then
+       echo "$(date -u +%FT%TZ): soak invalid, no metrics sample at $now" >&2
+       echo "  $why" >&2
+       echo "  headers read from /metrics:" >&2
+       printf '%s\n' "$metrics" | awk 'NF == 0 { exit } { print "    " $0 }' >&2
+       break
+     fi
+     printf '%s\n' "$metrics" \
        | grep -E '^(x-prism-metrics-state:|qbit_prism_(process_resident_memory_bytes|collector_available|collector_age_seconds|runtime_lag_seconds|runtime_task_stalled|runtime_poll_lag_seconds|database_pool_acquire_seconds(_bucket|_sum|_count)|connections|authorized_clients|accepted_shares_total|block_candidates_pending)[ {])' \
        | sed "s/^/$now /" >> soak-metrics.log
      sleep 300
@@ -492,6 +509,22 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    failure is therefore not skipped: the run is invalid and starts over from
    step 2.
 
+   The metrics sample is held to the same rule. The correlated series is what
+   reads an RSS excursion back at its own five-minute sample, so a scrape
+   that fails, or whose header says `stale` or `unavailable`, would leave
+   that series with a hole at the very interval the RSS series may need
+   explained. The response is read into a variable the same way, and the
+   filtered lines are appended only when the exec succeeded, the body carries
+   the line `x-prism-metrics-state: fresh`, and the RSS gauge family,
+   `qbit_prism_process_resident_memory_bytes`, the series the reading order
+   starts from, is present; anything else prints the time, the condition
+   that failed (the exit status, the state header actually seen, or the
+   missing family) and the header lines to stderr, and ends the run. The
+   other families in the filter are not required, because a histogram bucket
+   or a `runtime_task_stalled{task}` series can legitimately be absent from a
+   given scrape. The step-2 gate proves the body fresh once, at the start;
+   this check proves it at every sample.
+
    `VmRSS` in `/proc/1/status` is the field the registry's process collector
    reads, so the CSV and the gauge agree up to collector cadence. The log also
    carries the runtime and pool series item 3 of the reading order cites, so a
@@ -515,8 +548,9 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    and the body at the breach is what the correlated reading works from.
 5. **Trim** is retired with `malloc_trim`; there is nothing to send at hour 23.
 6. **Judge** each run with the `awk` bound check above against
-   `soak-rss.csv`. A run whose capture loop stopped on a process change or a
-   missing sample is not judged: it is invalid and is run again from step 2.
+   `soak-rss.csv`. A run whose capture loop stopped on a process change, a
+   missing RSS sample or a metrics scrape that failed or was not fresh is not
+   judged: it is invalid and is run again from step 2.
    Pass: exit `0`, and share-ack p99 at hour 24 within the
    alert threshold configured for the deployment (the native rules are
    #279's). Fail: exit `1`, or a share-ack regression between hour 1 and hour
