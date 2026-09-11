@@ -41,11 +41,21 @@ RATCHET = {
 
 PATH_REFERENCE = re.compile(r"lab/prism(?:/[A-Za-z0-9_][A-Za-z0-9_.\-]*)*")
 MODULE_REFERENCE = re.compile(r"\blab\.prism(?:\.[A-Za-z_][A-Za-z0-9_]*)*\b")
-# `python3 -u -m lab.a.b` and `python lab/a/b.py`; single-letter flags allowed.
-MODULE_COMMAND = re.compile(
-    r"\bpython3?(?:\s+-[A-Za-z])*\s+-m\s+(lab(?:\.[A-Za-z_][A-Za-z0-9_]*)+)\b"
+# `python3 -OO -X dev -m lab.a.b` and `python3.12 -Werror lab/a/b.py`. Every
+# option form `python3 --help` lists may sit between the interpreter and its
+# target: clustered flag letters, `-W`/`-X` with an attached or following
+# argument, and `--check-hash-based-pycs <mode>` (CPython rejects the `=`
+# spelling). `-c cmd` runs its argument and ends the option list, so it is
+# deliberately not a prefix option.
+PYTHON_FLAG = r"[bBdEhiIOPqsSuvVx]"
+PYTHON_OPTION = (
+    rf"-{PYTHON_FLAG}+"  # -O, -OO, -bb, -IsE
+    rf"|-{PYTHON_FLAG}*[WX](?:\S+|\s+\S+)"  # -Xdev, -X dev, -W error, -uWerror
+    r"|--check-hash-based-pycs\s+(?:always|default|never)"
 )
-SCRIPT_COMMAND = re.compile(r"\bpython3?(?:\s+-[A-Za-z])*\s+(lab/[A-Za-z0-9_./\-]+\.py)\b")
+PYTHON_COMMAND = rf"\bpython(?:3(?:\.\d+)?)?(?:\s+(?:{PYTHON_OPTION}))*"
+MODULE_COMMAND = re.compile(rf"{PYTHON_COMMAND}\s+-m\s+(lab(?:\.[A-Za-z_][A-Za-z0-9_]*)+)\b")
+SCRIPT_COMMAND = re.compile(rf"{PYTHON_COMMAND}\s+(lab/[A-Za-z0-9_./\-]+\.py)\b")
 PINNED_GITHUB_URL = re.compile(
     r"github\.com/[^/\s]+/[^/\s]+/(?:blob|tree|raw)/[0-9a-f]{40}/$"
 )
@@ -240,6 +250,68 @@ class ScannerTests(unittest.TestCase):
         tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py"}
         text = "python3 -m \\\n  lab.prism.tool\npython \\\n  -m lab.pkg\npython3 \\\n  lab/prism/tool.py"
         self.assertEqual(dead_commands(text, tracked), [])
+
+    # Every option form `python3 --help` accepts ahead of `-m` or a script path.
+    OPTIONS = (
+        "-OO",
+        "-bb -u",
+        "-IsE",
+        "-X dev",
+        "-Xdev",
+        "-W error",
+        "-uWerror",
+        "-X importtime=2",
+        "--check-hash-based-pycs always",
+    )
+
+    def test_commands_with_real_option_forms_and_missing_targets_are_caught(self) -> None:
+        for options in self.OPTIONS:
+            with self.subTest(options=options):
+                self.assertEqual(
+                    self.commands(f"python3 {options} -m lab.prism.process_telemetry rss-bound"),
+                    ["lab/prism/process_telemetry.py"],
+                )
+                self.assertEqual(
+                    self.commands(f"python {options} lab/prism/storm.py --decide"),
+                    ["lab/prism/storm.py"],
+                )
+
+    def test_commands_with_real_option_forms_and_existing_targets_pass(self) -> None:
+        tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py"}
+        for options in self.OPTIONS:
+            with self.subTest(options=options):
+                text = (
+                    f"python3 {options} -m lab.prism.tool\npython3.12 {options} -m lab.pkg\n"
+                    f"python {options} lab/prism/tool.py"
+                )
+                self.assertEqual(dead_commands(text, tracked), [])
+
+    def test_wrapped_option_forms_with_missing_targets_are_caught(self) -> None:
+        for options in self.OPTIONS:
+            wrapped = options.replace(" ", " \\\n  ")
+            with self.subTest(options=options):
+                text = f"python3 \\\n  {wrapped} \\\n  -m lab.prism.process_telemetry \\\n  rss-bound"
+                self.assertEqual(self.located(text), [(1, "lab/prism/process_telemetry.py")])
+                text = f"python3.12 {wrapped} \\\n  lab/prism/storm.py \\\n  --decide"
+                self.assertEqual(self.located(text), [(1, "lab/prism/storm.py")])
+
+    def test_version_suffixed_interpreters_are_scanned(self) -> None:
+        self.assertEqual(
+            self.commands("python3.12 -m lab.prism.process_telemetry rss-bound"),
+            ["lab/prism/process_telemetry.py"],
+        )
+        self.assertEqual(self.commands("python3.14 -OO lab/prism/storm.py"), ["lab/prism/storm.py"])
+        self.assertEqual(self.commands("python2 -m lab.prism.process_telemetry"), [])
+
+    def test_inline_code_is_neither_a_module_nor_a_script_command(self) -> None:
+        # `-c cmd` runs its argument and ends the option list; the prose contract
+        # still sees the module reference inside the code string.
+        text = "python3 -c 'import lab.prism.x'"
+        self.assertEqual(self.commands(text), [])
+        self.assertEqual(self.references(text), ["lab.prism.x"])
+        self.assertEqual(self.commands("python3 -OO -c 'import lab.prism.x'"), [])
+        self.assertEqual(self.commands("python3 -c -m lab.prism.x"), [])
+        self.assertEqual(self.commands("python3 -c lab/prism/x.py"), [])
 
 
 if __name__ == "__main__":
