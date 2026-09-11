@@ -314,7 +314,7 @@ not a graph someone reads. The Python tool that computed the verdict left with
 awk -F, -v warmup=3600 -v multiple=2.0 -v min_span=82800 '
   /^#/ || NF < 2 || $2 < 0 { next }
   { if (t0 == "") t0 = $1
-    if ($1 - t0 < warmup) { if ($2 > base) base = $2; next }
+    if ($1 - t0 <= warmup) { if ($2 > base) base = $2; next }
     post++; last = $1
     if ($2 > peak) { peak = $2; peak_at = $1 }
     if (!breach && $2 > base * multiple) breach = $1 }
@@ -326,13 +326,15 @@ awk -F, -v warmup=3600 -v multiple=2.0 -v min_span=82800 '
 ```
 
 The input is one `seconds,rss_bytes` line per sample (absolute epoch seconds
-are fine; `#` comments are skipped; `-1` samples are ignored). The command
-prints the baseline, the bound, the post-warm-up peak and its time, and the
-first breach time, and exits `0` on pass, `1` on fail, `2` on unusable input;
-it refuses a series shorter than the soak. The slope guard the Python tool
-offered (a leak slow enough to stay under the multiple inside 24 hours) has no
-replacement in the runbook; take it from the RSS series on the deployment's
-dashboard, whose rules #279 owns.
+are fine; `#` comments are skipped; `-1` samples are ignored). The warm-up
+runs from the first sample and includes a sample taken exactly one hour after
+it, as it did in the Python tool; only later samples are judged against the
+bound. The command prints the baseline, the bound, the post-warm-up peak and
+its time, and the first breach time, and exits `0` on pass, `1` on fail, `2`
+on unusable input; it refuses a series shorter than the soak. The slope guard
+the Python tool offered (a leak slow enough to stay under the multiple inside
+24 hours) has no replacement in the runbook; take it from the RSS series on
+the deployment's dashboard, whose rules #279 owns.
 
 When it fails: the first breach time says whether the growth is the steady
 slope (breach hours in) or an excursion (breach right after a candidate storm
