@@ -63,6 +63,7 @@ import time
 from typing import Any, Callable, Iterable, Iterator
 import weakref
 
+from lab.prism.helper_limits import apply_helper_memory_limit
 from lab.prism.share_json_stream import iter_json_array_text_chunks
 
 
@@ -1079,9 +1080,7 @@ def _helper_main(argv: Sequence[str]) -> int:
     Runs in a child process so a record of any size is decoded outside the
     lease-bearing coordinator. Exit status 2 marks a malformed record.
     """
-    import resource
-
-    resource.setrlimit(resource.RLIMIT_AS, (RAW_RECORD_HELPER_MEMORY_BYTES, RAW_RECORD_HELPER_MEMORY_BYTES))
+    apply_helper_memory_limit(RAW_RECORD_HELPER_MEMORY_BYTES)
     member_limit = RAW_RECORD_MEMBER_LIMIT_BYTES
     if len(argv) >= 2 and argv[0] == "--normalize-record":
         member_limit = int(argv[1])
