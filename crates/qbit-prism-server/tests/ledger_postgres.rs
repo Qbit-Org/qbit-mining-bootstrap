@@ -16,6 +16,9 @@ use uuid::Uuid;
 #[path = "support/ledger_2x.rs"]
 mod two_x;
 
+#[path = "support/session_sequence.rs"]
+mod session_sequence;
+
 struct Database {
     admin: PgPool,
     schema: String,
@@ -408,8 +411,9 @@ async fn concurrent_instances_have_one_commit_order_and_stable_snapshots() -> Re
     let limited = a.snapshot(1).await?;
     assert_eq!(limited.shares.len(), 8);
     let ids = futures_util::future::try_join_all((0..32).map(|_| b.new_session_id())).await?;
-    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    let unique: std::collections::HashSet<_> = ids.iter().map(|id| id.value()).collect();
     assert_eq!(ids.len(), unique.len());
+    drop(ids);
     db.close(vec![a, b]).await
 }
 

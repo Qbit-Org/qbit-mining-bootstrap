@@ -40,5 +40,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 qbit-prism-test-gate = { path = "../qbit-prism-test-gate" }
+tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 http-body-util = "0.1"

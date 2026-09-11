@@ -8,6 +8,11 @@ same pool using one HA PostgreSQL writer endpoint.
 See [PRISM.md](../../PRISM.md), the [ledger contract](../../docs/prism-ledger-ops.md),
 and the [migration guide](../../docs/prism-rust-migration.md).
 
+The [generated metric inventory](../../docs/prism-native-metrics.md) covers
+`/metrics` in both `run` and `public-api`, including labels, unknown values and
+2.x.x replacements. The [alert migration](../../docs/prism-alert-migration.md)
+provides the native rules and the review-only deployment-repository diff.
+
 ## Build and run
 
 ```sh
@@ -76,6 +81,8 @@ cache budgets, schema readiness, and read-role configuration.
 | `PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS` | 1 | `submitblock` deadline; ambiguous results retain the durable candidate for recovery |
 | `PRISM_MIN_PEERS` | 1 | Minimum connected peers for public-chain readiness |
 | `PRISM_TEMPLATE_MAX_AGE_SECONDS` | 120 | Maximum template age in integral seconds; 0..86400 |
+| `PRISM_SUBMIT_TIP_MAX_AGE_SECONDS` | 10 | Published-tip freshness budget in seconds; zero forces a live tip RPC per share and disables the replacement-build lease |
+| `PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS` | 120 | Published-work credit extension from the first detected departure, without renewal on failed refreshes; positive in production; does not control native process exit |
 | `QBIT_EXPECTED_GENESIS_HASH` | absent | Required 64-hex mainnet genesis pin; optional pins on other chains are also checked |
 | `PRISM_BLOCKWAIT_ENABLED` | true | Additional node tip-change wakeup |
 | `PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS` | 15 | Maximum healthy tip-poll age |

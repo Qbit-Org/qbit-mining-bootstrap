@@ -1,0 +1,453 @@
+{
+  "repository": "SwapLabsInc/qbit-tools",
+  "commit": "a007a14260548cb93e277882672d788fe9a3f95e",
+  "path": "ansible/roles/qbit_monitoring_stack/templates/grafana-alert-rules-prism.yml.j2",
+  "sha256": "8446692bfb4bffa7ad1cf9b775249aba15e75a3410cc403dedd475ed7ac47f38",
+  "metric_names": [
+    "qbit_prism_accepted_block_preview_publication_seconds_bucket",
+    "qbit_prism_accepted_block_preview_publication_seconds_count",
+    "qbit_prism_accepted_parent_preview_wait_timeouts_total",
+    "qbit_prism_accepted_parent_unresolved_depth_max",
+    "qbit_prism_accepted_parent_unresolved_oldest_seconds",
+    "qbit_prism_accepted_parent_unresolved_transitions",
+    "qbit_prism_accepted_shares_total",
+    "qbit_prism_accepted_stats_reconcile_age_seconds",
+    "qbit_prism_accepted_stats_reconcile_failures_total",
+    "qbit_prism_backup_audit_snapshot_exists",
+    "qbit_prism_backup_collector_success",
+    "qbit_prism_backup_collector_timestamp_seconds",
+    "qbit_prism_backup_job_result",
+    "qbit_prism_backup_last_duration_seconds",
+    "qbit_prism_backup_last_success_bytes",
+    "qbit_prism_backup_last_success_timestamp_seconds",
+    "qbit_prism_backup_wal_failed_total",
+    "qbit_prism_backup_wal_filesystem_free_bytes",
+    "qbit_prism_backup_wal_filesystem_size_bytes",
+    "qbit_prism_backup_wal_generated_bytes_total",
+    "qbit_prism_backup_wal_last_archived_timestamp_seconds",
+    "qbit_prism_backup_wal_unarchived_segments",
+    "qbit_prism_block_candidate_cleanup_backpressure_active",
+    "qbit_prism_block_candidate_cleanup_backpressure_total",
+    "qbit_prism_block_candidate_cleanup_retry_backlog",
+    "qbit_prism_block_candidate_cleanup_retry_backlog_max",
+    "qbit_prism_block_candidate_cleanup_retry_oldest_seconds",
+    "qbit_prism_block_candidate_oldest_pending_seconds",
+    "qbit_prism_block_candidates_pending",
+    "qbit_prism_connected_clients",
+    "qbit_prism_coordinator_collector_success",
+    "qbit_prism_coordinator_collector_timestamp_seconds",
+    "qbit_prism_coordinator_unexpected_restarts_total",
+    "qbit_prism_job_build_orphan_evicted_total",
+    "qbit_prism_lease_heartbeat_monitor_exit_guarantee_breaches_total",
+    "qbit_prism_lease_heartbeat_monitor_late_wakes_total",
+    "qbit_prism_lease_heartbeat_monitor_wake_delay_window_max_seconds",
+    "qbit_prism_lease_heartbeat_policy_seconds",
+    "qbit_prism_lease_heartbeat_server_proven_age_seconds",
+    "qbit_prism_metrics_snapshot_age_seconds",
+    "qbit_prism_metrics_snapshot_available",
+    "qbit_prism_metrics_snapshot_stale",
+    "qbit_prism_public_ledger_ready",
+    "qbit_prism_public_responses_total",
+    "qbit_prism_public_staleness_refusals_total",
+    "qbit_prism_refresh_pending",
+    "qbit_prism_refresh_pending_age_seconds",
+    "qbit_prism_share_append_failures_total",
+    "qbit_prism_share_append_queue_depth",
+    "qbit_prism_shares_recovered_to_disk_total",
+    "qbit_prism_shares_replayed_total",
+    "qbit_prism_stratum_authorized_connections",
+    "qbit_prism_stratum_semantic_current_work_ratio"
+  ],
+  "alerts": [
+    {
+      "uid": "qbit-prism-metrics-nodata",
+      "title": "PrismMetricsNoData",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-metrics-endpoint-down",
+      "title": "PrismMetricsEndpointDown",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-connected-clients",
+      "title": "PRISM Connected Clients",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-stratum-nodata",
+      "title": "PrismStratumHealthNoData",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-stratum-down-warning",
+      "title": "PrismStratumUnavailableWarning",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-stratum-down",
+      "title": "PrismStratumUnavailable",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-stratum-failure-rate",
+      "title": "PrismStratumCheckFailureRateHigh",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-share-writer-backlog",
+      "title": "PrismShareWriterBacklog",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-share-writer-backlog-critical",
+      "title": "PrismShareWriterBacklogCritical",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-block-candidate-backlog",
+      "title": "PrismBlockCandidateBacklog",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-shares-recovered-to-disk",
+      "title": "PrismSharesRecoveredToDisk",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-share-append-failures",
+      "title": "PrismShareAppendFailures",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-shares-replayed",
+      "title": "PrismSharesReplayed",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-job-build-orphan-evicted",
+      "title": "PrismJobBuildOrphanEvictions",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-stats-reconcile-stale",
+      "title": "PrismAcceptedStatsReconcileStale",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-lease-proven-age",
+      "title": "PrismWriterLeaseServerProvenAgeNearCap",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-lease-monitor-wake",
+      "title": "PrismWriterLeaseMonitorWakeDelayHigh",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-lease-monitor-guarantee",
+      "title": "PrismWriterLeaseMonitorExitGuaranteeBreached",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-lease-surplus-invalid",
+      "title": "PrismWriterLeaseStabilitySurplusExhausted",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-preview-publish-latency",
+      "title": "PrismAcceptedPreviewPublicationLatencyHigh",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-preview-publish-latency-crit",
+      "title": "PrismAcceptedPreviewPublicationLatencyCritical",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-preview-publish-degraded",
+      "title": "PrismAcceptedPreviewPublicationDegraded",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-parent-preview-timeouts",
+      "title": "PrismAcceptedParentPreviewWaitTimeouts",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-parent-preview-timeouts-crit",
+      "title": "PrismAcceptedParentPreviewWaitTimeoutsCritical",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-unresolved-parent-depth",
+      "title": "PrismUnresolvedParentDepthNonzero",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-unresolved-parent-near-cap",
+      "title": "PrismUnresolvedParentDepthNearCap",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-unresolved-parent-at-cap",
+      "title": "PrismUnresolvedParentDepthAtCap",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-unresolved-parent-age",
+      "title": "PrismUnresolvedParentAgeOverBudget",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-unresolved-parent-age-crit",
+      "title": "PrismUnresolvedParentAgeCritical",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-candidate-backlog-critical",
+      "title": "PrismBlockCandidateBacklogCritical",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-block-candidate-oldest",
+      "title": "PrismBlockCandidateOldestPending",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-candidate-oldest-critical",
+      "title": "PrismBlockCandidateOldestPendingCritical",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-candidate-metrics-unavailable",
+      "title": "PrismBlockCandidateMetricsUnavailable",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-cleanup-backlog-depth",
+      "title": "PrismCollapseCleanupBacklog",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-cleanup-backlog-oldest",
+      "title": "PrismCollapseCleanupBacklogOldest",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-cleanup-backlog-near-bound",
+      "title": "PrismCollapseCleanupBacklogNearBound",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-cleanup-backpressure-active",
+      "title": "PrismCollapseCleanupBackpressure",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-cleanup-backpressure-engaged",
+      "title": "PrismCollapseCleanupBackpressureEngaged",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-semantic-work-coverage",
+      "title": "PrismSemanticWorkCoverageLoss",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-semantic-coverage-critical",
+      "title": "PrismSemanticWorkCoverageLossCritical",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-refresh-pending",
+      "title": "PrismRefreshPendingPastDeadline",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-refresh-pending-critical",
+      "title": "PrismRefreshPendingPastDeadlineCritical",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-metrics-snapshot-stale",
+      "title": "PrismMetricsSnapshotStale",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-metrics-snapshot-unavailable",
+      "title": "PrismMetricsSnapshotUnavailable",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-metrics-snapshot-age",
+      "title": "PrismMetricsSnapshotAgeHigh",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-public-staleness-refusal",
+      "title": "PrismPublicStalenessRefusalsIncreasing",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-public-ledger-unready",
+      "title": "PrismPublicLedgerUnready",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-public-5xx-sustained",
+      "title": "PrismPublic5xxSustained",
+      "external": false
+    },
+    {
+      "uid": "qbit-prism-backup-metrics-nodata",
+      "title": "PrismBackupMetricsNoData",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-collector-stale",
+      "title": "PrismBackupCollectorStale",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-full-stale-warning",
+      "title": "PrismBackupFullStaleWarning",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-full-stale-critical",
+      "title": "PrismBackupFullStaleCritical",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-diff-stale-warning",
+      "title": "PrismBackupDifferentialStaleWarning",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-diff-stale-critical",
+      "title": "PrismBackupDifferentialStaleCritical",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-check-warning",
+      "title": "PrismBackupCheckWarning",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-check-critical",
+      "title": "PrismBackupCheckCritical",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-wal-stale-warning",
+      "title": "PrismBackupWalArchiveStaleWarning",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-wal-stale-critical",
+      "title": "PrismBackupWalArchiveStaleCritical",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-wal-fail-warning",
+      "title": "PrismBackupWalArchiveFailureWarning",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-wal-fail-critical",
+      "title": "PrismBackupWalArchiveFailureCritical",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-wal-space-warning",
+      "title": "PrismBackupWalFilesystemSpaceWarning",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-wal-space-critical",
+      "title": "PrismBackupWalFilesystemSpaceCritical",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-audit-stale-warning",
+      "title": "PrismBackupAuditSnapshotStaleWarning",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-audit-stale-critical",
+      "title": "PrismBackupAuditSnapshotStaleCritical",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-audit-slow-warning",
+      "title": "PrismBackupAuditDurationWarning",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-audit-slow-critical",
+      "title": "PrismBackupAuditDurationCritical",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-job-fail-warning",
+      "title": "PrismBackupScheduledJobFailureWarning",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-job-fail-critical",
+      "title": "PrismBackupScheduledJobFailureCritical",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-coverage-critical",
+      "title": "PrismBackupCombinedCoverageCritical",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-db-growth-warning",
+      "title": "PrismBackupDatabaseGrowthWarning",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-db-growth-critical",
+      "title": "PrismBackupDatabaseGrowthCritical",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-audit-growth-warning",
+      "title": "PrismBackupAuditGrowthWarning",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-audit-growth-critical",
+      "title": "PrismBackupAuditGrowthCritical",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-wal-growth-warning",
+      "title": "PrismBackupWalGenerationGrowthWarning",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-backup-wal-growth-critical",
+      "title": "PrismBackupWalGenerationGrowthCritical",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-coordinator-collector-stale",
+      "title": "PrismCoordinatorCollectorStale",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-coordinator-restart",
+      "title": "PrismCoordinatorUnexpectedRestart",
+      "external": true
+    },
+    {
+      "uid": "qbit-prism-coordinator-restart-loop",
+      "title": "PrismCoordinatorRestartLoop",
+      "external": true
+    }
+  ]
+}

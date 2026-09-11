@@ -17,6 +17,8 @@ pub struct Config {
     pub expected_genesis_hash: Option<String>,
     pub min_peers: u64,
     pub template_max_age: Duration,
+    pub submit_tip_max_age: Duration,
+    pub template_refresh_failure_exit: Duration,
     pub rpc_url: String,
     pub rpc_user: String,
     pub rpc_password: String,
@@ -143,6 +145,14 @@ fn seconds(name: &str, default: f64) -> Result<Duration> {
     );
     Ok(Duration::from_secs_f64(n))
 }
+fn seconds_allow_zero(name: &str, default: f64) -> Result<Duration> {
+    let n = number(name, default)?;
+    ensure!(
+        n.is_finite() && (0.0..=86400.0).contains(&n),
+        "{name} must be between 0 and 86400 seconds"
+    );
+    Ok(Duration::from_secs_f64(n))
+}
 
 impl Config {
     pub fn from_env() -> Result<Self> {
@@ -198,6 +208,13 @@ impl Config {
         }
         let expected_genesis_hash = genesis_pin(&chain, optional("QBIT_EXPECTED_GENESIS_HASH"))?;
         let min_peers = positive("PRISM_MIN_PEERS", 1)?;
+        let submit_tip_max_age = seconds_allow_zero("PRISM_SUBMIT_TIP_MAX_AGE_SECONDS", 10.0)?;
+        let template_refresh_failure_exit =
+            seconds_allow_zero("PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS", 120.0)?;
+        ensure!(
+            !production || !template_refresh_failure_exit.is_zero(),
+            "production mode requires a positive PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS"
+        );
         let template_max_age_seconds = number("PRISM_TEMPLATE_MAX_AGE_SECONDS", 120u64)?;
         ensure!(
             template_max_age_seconds <= 86400,
@@ -421,6 +438,8 @@ impl Config {
             expected_genesis_hash,
             min_peers,
             template_max_age: Duration::from_secs(template_max_age_seconds),
+            submit_tip_max_age,
+            template_refresh_failure_exit,
             rpc_url,
             rpc_user,
             rpc_password,
@@ -508,6 +527,8 @@ mod tests {
             expected_genesis_hash: None,
             min_peers: 1,
             template_max_age: Duration::from_secs(120),
+            submit_tip_max_age: Duration::from_secs(10),
+            template_refresh_failure_exit: Duration::from_secs(120),
             rpc_url: "http://127.0.0.1:18452/".into(),
             rpc_user: "operator".into(),
             rpc_password: "test-only".into(),

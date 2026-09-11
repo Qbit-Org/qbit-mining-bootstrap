@@ -189,6 +189,8 @@ fn coordinator_config(database_url: String, node: &Node) -> Result<Config> {
         expected_genesis_hash: None,
         min_peers: 2,
         template_max_age: Duration::from_secs(120),
+        submit_tip_max_age: Duration::from_secs(10),
+        template_refresh_failure_exit: Duration::from_secs(120),
         rpc_url: node.url.clone(),
         rpc_user: "test".into(),
         rpc_password: "test".into(),
@@ -220,6 +222,55 @@ fn coordinator_config(database_url: String, node: &Node) -> Result<Config> {
         audit_bind: "127.0.0.1".into(),
         audit_port: 0,
     })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn coordinator_reports_wrap_exhaustion_truthfully() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let admin = sqlx::PgPool::connect(&raw).await?;
+    let schema = format!("prism_allocation_error_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await?;
+    let mut url = url::Url::parse(&raw)?;
+    url.query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let node = Node::open().await?;
+    let coordinator = Coordinator::new(
+        coordinator_config(url.into(), &node)?,
+        Arc::new(qbit_prism_server::metrics::Metrics::default()),
+    )
+    .await?;
+    coordinator
+        .ledger
+        .save_job(
+            "occupied-second-value",
+            &json!({"extranonce1":"00000002"}),
+            0,
+            "parent",
+            3600,
+        )
+        .await?;
+    sqlx::query("ALTER SEQUENCE qbit_prism_session_sequence MAXVALUE 2")
+        .execute(&coordinator.ledger.pool)
+        .await?;
+    let held = coordinator.new_session_id().await?;
+    let error = coordinator.new_session_id().await.unwrap_err();
+    assert_eq!(
+        error.reason_id.as_deref(),
+        Some("session-allocation-exhausted")
+    );
+    assert_eq!(error.code, 20);
+    assert!(error.message.contains("1024 allocation attempts"));
+    held.release().await?;
+    coordinator.ledger.pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin)
+        .await?;
+    admin.close().await;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -278,7 +329,8 @@ async fn observed_readiness_failure_closes_cached_work_and_candidate_settlement(
             "equivalent timer reanchor reset semantic delivery coverage"
         );
         let worker = coordinator.authorize("miner.test").await?;
-        let extra = format!("{:08x}", coordinator.new_session_id().await?);
+        let session_id = coordinator.new_session_id().await?;
+        let extra = format!("{session_id:08x}");
         let job = coordinator.build_job(&worker, &extra, 1e-9, 0.0).await?;
         coordinator
             .persist_issued_job(&worker, &job, 0, Duration::from_secs(60))
@@ -345,7 +397,7 @@ async fn observed_readiness_failure_closes_cached_work_and_candidate_settlement(
                 .await
                 .is_err());
             ensure!(coordinator
-                .submit(&worker, &job, proof.clone(), false)
+                .submit(&worker, &job, proof.clone(), false.into())
                 .await
                 .is_err());
             if failure != "template" {
@@ -481,7 +533,7 @@ async fn observed_readiness_failure_closes_cached_work_and_candidate_settlement(
                 .await
                 .is_err());
             ensure!(coordinator
-                .submit(&worker, &job, proof.clone(), false)
+                .submit(&worker, &job, proof.clone(), false.into())
                 .await
                 .is_err());
             coordinator.refresh_once().await?;
@@ -540,7 +592,8 @@ async fn another_frontend_payout_revision_retires_same_parent_work_and_preserves
         first.refresh_once().await?;
         second.refresh_once().await?;
         let worker = first.authorize("miner.revision").await?;
-        let extra = format!("{:08x}", first.new_session_id().await?);
+        let session_id = first.new_session_id().await?;
+        let extra = format!("{session_id:08x}");
         let old = first.build_job(&worker, &extra, 1e-12, 0.0).await?;
         first.persist_issued_job(&worker, &old, 0, Duration::from_secs(60)).await?;
         ensure!(second.resume_job(&worker, &old.wire.job_id).await?.is_some());
@@ -562,14 +615,14 @@ async fn another_frontend_payout_revision_retires_same_parent_work_and_preserves
         for frontend in [&first, &second] {
             ensure!(frontend.health().await["ready"] == false);
             for grace in [false, true] {
-                let error = frontend.submit(&worker, &old, old_proof.clone(), grace).await.unwrap_err();
+                let error = frontend.submit(&worker, &old, old_proof.clone(), grace.into()).await.unwrap_err();
                 ensure!(error.reason_id.as_deref() == Some("stale-job"), "{error}");
             }
             ensure!(frontend.resume_job(&worker, &old.wire.job_id).await?.is_none());
             frontend.refresh_once().await?;
             ensure!(frontend.health().await["ready"] == true);
             for grace in [false, true] {
-                let error = frontend.submit(&worker, &old, old_proof.clone(), grace).await.unwrap_err();
+                let error = frontend.submit(&worker, &old, old_proof.clone(), grace.into()).await.unwrap_err();
                 ensure!(error.reason_id.as_deref() == Some("stale-job"), "{error}");
             }
             ensure!(frontend.resume_job(&worker, &old.wire.job_id).await?.is_none());
@@ -582,7 +635,7 @@ async fn another_frontend_payout_revision_retires_same_parent_work_and_preserves
         ensure!(fresh.wire.previousblockhash == old.wire.previousblockhash);
         ensure!(fresh.wire.payout_revision == revision);
         let proof = solve(&fresh, 0)?;
-        first.submit(&worker, &fresh, proof.clone(), false).await?;
+        first.submit(&worker, &fresh, proof.clone(), false.into()).await?;
         let candidate: Value = sqlx::query_scalar("SELECT candidate FROM qbit_block_candidate_outbox WHERE block_hash=$1")
             .bind(&proof.block_hash_hex).fetch_one(&first.ledger.pool).await?;
         let candidate: Candidate = serde_json::from_value(candidate)?;
@@ -604,8 +657,8 @@ async fn another_frontend_payout_revision_retires_same_parent_work_and_preserves
         }
         first.refresh_once().await?;
         let grace_proof = solve(&fresh, 20_000)?;
-        ensure!(first.submit(&worker, &fresh, grace_proof.clone(), false).await.unwrap_err().reason_id.as_deref() == Some("stale-job"));
-        first.submit(&worker, &fresh, grace_proof.clone(), true).await?;
+        ensure!(first.submit(&worker, &fresh, grace_proof.clone(), false.into()).await.unwrap_err().reason_id.as_deref() == Some("stale-job"));
+        first.submit(&worker, &fresh, grace_proof.clone(), true.into()).await?;
         let credited: (String,bool) = sqlx::query_as("SELECT credit_policy,EXISTS(SELECT 1 FROM qbit_block_candidate_outbox WHERE block_hash=$2) FROM qbit_share_ledger WHERE share_id=$1")
             .bind(format!("{}:{}", worker.username, grace_proof.block_hash_hex))
             .bind(&grace_proof.block_hash_hex).fetch_one(&first.ledger.pool).await?;
@@ -670,7 +723,8 @@ async fn cached_ctv_work_revalidates_live_floors_and_fences_old_underfunded_jobs
             coordinator.refresh_once().await?;
             let original_generation = coordinator.health().await["template_generation"].clone();
             let worker = coordinator.authorize("miner.test").await?;
-            let extra = format!("{:08x}", coordinator.new_session_id().await?);
+            let session_id = coordinator.new_session_id().await?;
+            let extra = format!("{session_id:08x}");
             let low_job = coordinator.build_job(&worker, &extra, 1e-12, 0.0).await?;
             ensure!(
                 low_job.context.bundle.ctv_fanout_manifest_set.is_some(),
@@ -724,7 +778,7 @@ async fn cached_ctv_work_revalidates_live_floors_and_fences_old_underfunded_jobs
                 .await
                 .is_err());
             ensure!(coordinator
-                .submit(&worker, &low_job, low_proof.clone(), false)
+                .submit(&worker, &low_job, low_proof.clone(), false.into())
                 .await
                 .is_err());
             ensure!(coordinator.health().await["template_generation"] == original_generation);
@@ -783,7 +837,7 @@ async fn cached_ctv_work_revalidates_live_floors_and_fences_old_underfunded_jobs
                     .await
                     .is_err());
                 ensure!(coordinator
-                    .submit(&worker, &low_job, low_proof.clone(), false)
+                    .submit(&worker, &low_job, low_proof.clone(), false.into())
                     .await
                     .is_err());
                 {
@@ -809,7 +863,7 @@ async fn cached_ctv_work_revalidates_live_floors_and_fences_old_underfunded_jobs
                     .await?
                     .is_some());
                 coordinator
-                    .submit(&worker, &high_job, share_proof(&high_job)?, false)
+                    .submit(&worker, &high_job, share_proof(&high_job)?, false.into())
                     .await?;
             }
             let count: i64 =
