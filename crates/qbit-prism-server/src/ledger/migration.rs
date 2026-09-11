@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 /// independent workstreams and may land after 009. A migration this binary
 /// does not know is accepted with a warning: native migrations are additive,
 /// and a release whose format an older binary must not touch declares a
-/// capability, which `require_known_capabilities` refuses.
+/// capability, which `migrate_schema` refuses before any DDL and
+/// `require_known_capabilities` refuses again at connect.
 pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 9];
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
@@ -34,7 +35,10 @@ pub fn schema_version_list(versions: &[i32]) -> String {
 /// Capability rows this binary understands, with the highest value each may
 /// carry. #258's `002_candidate_bodies.sql` declares
 /// `candidate_storage_version = 2`; migration 006 declares 1 on every other
-/// source. Any other row or value is a database newer than this binary.
+/// source. Any other row or value is a database newer than this binary,
+/// refused before any DDL on every migrate path (`classify_source` on a
+/// 2.x.x source, `refuse_newer_native_database` on a native one) and again
+/// at connect by `require_known_capabilities`.
 const KNOWN_CAPABILITIES: &[(&str, i32)] = &[("candidate_storage_version", 2)];
 
 /// How many blocking outbox rows a drain refusal names.
@@ -340,6 +344,8 @@ async fn owned_present(
 
 /// Ask the catalog, not the data, which 002 objects exist. `to_regclass` and
 /// `to_regproc` follow the connection's search path exactly as the DDL did.
+/// On a native database the same inventory carries the capability rows and
+/// the outbox columns the native checks read, taken once, before any DDL.
 pub(super) async fn inspect_source_schema(
     tx: &mut Transaction<'_, Postgres>,
 ) -> Result<SourceInventory> {
@@ -451,7 +457,8 @@ where
 }
 
 /// A capability this binary does not know, or a known one beyond the value
-/// it understands, means a newer PRISM release wrote the database.
+/// it understands, means a newer PRISM release wrote the database. Refused
+/// before any DDL on every migrate path, and again at connect.
 pub(super) fn refuse_unknown_capabilities(rows: &[(String, i32)]) -> Result<()> {
     for (name, value) in rows {
         match KNOWN_CAPABILITIES.iter().find(|(known, _)| known == name) {
@@ -460,6 +467,24 @@ pub(super) fn refuse_unknown_capabilities(rows: &[(String, i32)]) -> Result<()> 
                 (1..=*max).contains(value),
                 "database declares {name} = {value}, but this server understands {name} 1 to {max} only: a newer PRISM release wrote this database; upgrade the server before starting it here"
             ),
+        }
+    }
+    Ok(())
+}
+
+/// The native path's "newer" verdict: refuse a database an earlier 3.x.x
+/// build migrated and a newer release then wrote, before any DDL, as
+/// `classify_source` refuses a 2.x.x source. Without this, 004, 005 and
+/// 006, or 009, would alter that database and record their versions, and
+/// only `require_known_capabilities` would refuse it, after the commit.
+/// `versions` is the recorded migration set, named in the refusal.
+fn refuse_newer_native_database(versions: &[i32], inventory: &SourceInventory) -> Result<()> {
+    if let Some(rows) = &inventory.capabilities {
+        if let Err(reason) = refuse_unknown_capabilities(rows) {
+            bail!(
+                "refusing to migrate a native database at schema migrations {} before any DDL: {reason}",
+                schema_version_list(versions)
+            );
         }
     }
     Ok(())
@@ -1519,13 +1544,18 @@ pub(super) async fn migrate_schema(
     // 007 and 008 are reserved by independent workstreams, so a later number
     // must not hide an earlier gap. Every step runs when its own version is
     // missing, in order.
-    let versions: Vec<i32> = sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations")
-        .fetch_all(&mut **tx)
-        .await?;
+    let versions: Vec<i32> =
+        sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations ORDER BY version")
+            .fetch_all(&mut **tx)
+            .await?;
     // The highest migration recorded before this run, which the source
     // record keeps as `prior_schema_version`.
     let prior_version = versions.iter().copied().max().unwrap_or(0);
-    let mut source = None;
+    // What 006 records when it runs: the accepted 2.x.x source state, or
+    // `None` for a database that was already native, and the
+    // `candidate_storage_version` the database declared before 006 declares
+    // one for it.
+    let mut source: (Option<SourceState>, Option<i32>) = (None, None);
     if !versions.contains(&3) {
         // Existing native writers use this same lock order. Keep the
         // schema repair and cutover atomic with their accounting.
@@ -1585,16 +1615,29 @@ pub(super) async fn migrate_schema(
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(3)")
             .execute(&mut **tx)
             .await?;
-        source = Some((state, inventory.capability("candidate_storage_version")));
-    } else if !versions.contains(&6) {
-        // A database an earlier 3.x.x build migrated to native schema 3, 4
-        // or 5, with or without 009. That build's drain check used the
-        // v1-only predicate, which never counted a v2 row (`candidate ?&
-        // ...` is NULL for a NULL body), so a pending v2 candidate can still
-        // be there. The column-aware check runs here, before 004, 005 or 006
-        // touch anything, so a refusal on this path is before any DDL too.
+        source = (
+            Some(state),
+            inventory.capability("candidate_storage_version"),
+        );
+    } else {
+        // A native database, one an earlier 3.x.x build migrated. Its
+        // capability rows are refused first, before any DDL, exactly as
+        // `classify_source` refuses them on a 2.x.x source: otherwise 004,
+        // 005 and 006, or 009, would alter a database a newer release wrote
+        // and record their versions, and only the connect-time gate, after
+        // the commit, would refuse it.
         let inventory = inspect_source_schema(tx).await?;
-        refuse_undrained_outbox(tx, &inventory, Some(&versions)).await?;
+        refuse_newer_native_database(&versions, &inventory)?;
+        if !versions.contains(&6) {
+            // Native schema 3, 4 or 5, with or without 009. That build's
+            // drain check used the v1-only predicate, which never counted a
+            // v2 row (`candidate ?& ...` is NULL for a NULL body), so a
+            // pending v2 candidate can still be there. The column-aware
+            // check runs here, before 004, 005 or 006 touch anything, so a
+            // refusal on this path is before any DDL too.
+            refuse_undrained_outbox(tx, &inventory, Some(&versions)).await?;
+            source = (None, inventory.capability("candidate_storage_version"));
+        }
     }
     if !versions.contains(&4) {
         sqlx::raw_sql(include_str!(
@@ -1615,28 +1658,10 @@ pub(super) async fn migrate_schema(
             .await?;
     }
     if !versions.contains(&6) {
-        // A native database that predates 006 declared nothing; read what it
-        // has before 006 declares version 1 for it.
-        let (state, capability) = match source {
-            Some((state, capability)) => (Some(state), capability),
-            None => {
-                let declared: bool = sqlx::query_scalar(
-                    "SELECT to_regclass('qbit_prism_schema_capabilities') IS NOT NULL",
-                )
-                .fetch_one(&mut **tx)
-                .await?;
-                let capability = if declared {
-                    read_capabilities(&mut **tx)
-                        .await?
-                        .into_iter()
-                        .find(|(name, _)| name == "candidate_storage_version")
-                        .map(|(_, value)| value)
-                } else {
-                    None
-                };
-                (None, capability)
-            }
-        };
+        // 006 declares version 1 for a database that declared nothing; the
+        // record keeps what the database declared before it ran, read with
+        // the inventory above.
+        let (state, capability) = source;
         sqlx::raw_sql(include_str!("../../migrations/006_source_schema.sql"))
             .execute(&mut **tx)
             .await?;
@@ -1710,7 +1735,9 @@ pub(super) async fn require_schema_version(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Refuse capabilities or storage versions the binary does not understand.
+/// The connect-time gate: refuse capabilities or storage versions the
+/// binary does not understand. Every start runs it, with or without
+/// `initialize`; `migrate_schema` refused the same rows before any DDL.
 pub(super) async fn require_known_capabilities(pool: &PgPool) -> Result<()> {
     let declared: bool =
         sqlx::query_scalar("SELECT to_regclass('qbit_prism_schema_capabilities') IS NOT NULL")

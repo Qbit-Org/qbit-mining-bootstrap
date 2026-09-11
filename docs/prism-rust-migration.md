@@ -92,7 +92,7 @@ release definition:
 | pre-#258 (v2.0.0, v2.0.1) | `001_share_ledger.sql` only: no `qbit_prism_schema_capabilities`, no `002_candidate_bodies.sql` object | accept after the drain check |
 | #258 applied (v2.0.2) | `candidate_storage_version = 2` and every `002_candidate_bodies.sql` object present | accept after the drain check |
 | partial 002 | some 002 objects or the capability row, but not all (v2.0.2 applies 001 and 002 as two script calls, and a restart between them leaves this) | refuse, naming the missing object; finish 002 with the v2.0.2 release (`PRISM_POSTGRES_INIT_SCHEMA=1`) or restore the backup |
-| newer | `candidate_storage_version > 2`, or a capability this release does not know | refuse before any DDL; a newer PRISM release wrote the database |
+| newer | `candidate_storage_version > 2`, or a capability this release does not know | refuse before any DDL; a newer PRISM release wrote the database. A database that is already native gets the same check first, before 004, 005, 006 or 009 run, so `migrate` never alters a database a newer release wrote |
 | drifted 001 | a 001 (or 002) object whose definition, after 001 has run, differs from the frozen release: a table, column, index, sequence or named constraint that 001's `IF NOT EXISTS` skipped, or any 002 object, with a dropped constraint, a changed type, nullability or default, a different index definition, an altered sequence (a lowered maximum, a different increment), a table or sequence made `UNLOGGED` (or temporary), a release constraint left `NOT VALID` (other than the pinned `qbit_share_ledger_credit_policy_check`), a replaced function body or a disabled trigger | refuse transactionally, naming each object and what differs; the migration rolls back and the database is unchanged; restore the pre-migration backup or bring the database to the release schema with the `2.x.x` release, then migrate again |
 
 **The release definitions.** They are not a stored fingerprint: before any
@@ -256,6 +256,20 @@ database), so restore the pre-migration `2.x.x` backup, drain there with the
 pinned image, take a new backup and migrate again. If native traffic was
 admitted after the earlier migration, that restore discards it and needs the
 reconciliation decision the recovery section describes.
+
+The capability rows of that database are checked before the drain check, so
+`migrate` never applies 004, 005 and 006 to a database a newer release wrote:
+one that declares `candidate_storage_version > 2` or a capability this
+release does not know is refused before any DDL, the "newer" verdict of the
+table above, and nothing is recorded for it. A database already at 6 gets
+the same check before 009. The remedy is the startup gate's: upgrade the
+server.
+
+```
+refusing to migrate a native database at schema migrations 2, 3, 4, 5, 9 before any DDL: database declares
+candidate_storage_version = 3, but this server understands candidate_storage_version 1 to 2 only: a newer
+PRISM release wrote this database; upgrade the server before starting it here
+```
 
 **What was migrated.** After a successful migration
 `qbit_prism_migration_source` holds one row: the accepted source state

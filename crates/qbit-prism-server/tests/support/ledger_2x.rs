@@ -1600,6 +1600,104 @@ async fn pre_006_native_schema_on_a_258_source_refuses_a_pending_v2_row_before_a
     db.close(vec![earlier, migrated]).await
 }
 
+/// A database an earlier 3.x.x build migrated, which a newer release then
+/// wrote: its capability rows are refused before 004, 005 and 006 run, so
+/// this build never alters it and never records version 6 for it. On a
+/// #258 source the row is 002's and survives `undo_006`.
+#[tokio::test]
+async fn pre_006_native_schema_declaring_a_newer_capability_is_refused_before_any_ddl() -> Result<()>
+{
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    apply_frozen_2x_schema(&pool, SourceState::Applied258).await?;
+    let earlier = db.ledger("earlier-build").await?;
+    undo_006(&pool, SourceState::Applied258).await?;
+    // The row 002 made, raised as a newer release would raise it.
+    sqlx::raw_sql("UPDATE qbit_prism_schema_capabilities SET capability_value=3 WHERE capability='candidate_storage_version'")
+        .execute(&pool).await?;
+    let before = schema_objects(&pool).await?;
+    let error = db
+        .ledger("this-build")
+        .await
+        .err()
+        .context(
+            "migrate accepted a pre-006 native database declaring candidate_storage_version = 3",
+        )?
+        .to_string();
+    assert!(
+        error.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 9 before any DDL"),
+        "{error}"
+    );
+    assert!(
+        error.contains("candidate_storage_version = 3, but this server understands candidate_storage_version 1 to 2"),
+        "{error}"
+    );
+    assert!(error.contains("upgrade the server"), "{error}");
+    // Unchanged: migrations 2, 3, 4, 5, 9, no 006 object, the schema and
+    // the row as they were.
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 9]);
+    assert!(objects_006_absent(&pool, SourceState::Applied258).await?);
+    assert_eq!(schema_objects(&pool).await?, before);
+    assert_eq!(capability(&pool).await?, Some(3));
+    // A start without initialize is refused as well, by whichever gate
+    // reads the database first: the missing 006 or the row.
+    let error = Ledger::connect(&db.url, "cold".into(), 8, false)
+        .await
+        .err()
+        .context("a non-initializing start accepted a pre-006 native database declaring candidate_storage_version = 3")?
+        .to_string();
+    assert!(
+        error.contains("missing migration(s) 6") || error.contains("candidate_storage_version = 3"),
+        "{error}"
+    );
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 9]);
+    assert_eq!(schema_objects(&pool).await?, before);
+    // Back at 2, a capability this release does not know is refused the
+    // same way, naming it.
+    sqlx::raw_sql("UPDATE qbit_prism_schema_capabilities SET capability_value=2; INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('sealed_share_pages',1)")
+        .execute(&pool).await?;
+    let error = db
+        .ledger("this-build")
+        .await
+        .err()
+        .context("migrate accepted a pre-006 native database declaring an unknown capability")?
+        .to_string();
+    assert!(
+        error.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 9 before any DDL"),
+        "{error}"
+    );
+    assert!(
+        error.contains("capability sealed_share_pages = 1, which this server does not understand"),
+        "{error}"
+    );
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 9]);
+    assert!(objects_006_absent(&pool, SourceState::Applied258).await?);
+    assert_eq!(schema_objects(&pool).await?, before);
+    assert_eq!(capability(&pool).await?, Some(2));
+    // Without that row the same database migrates to 6 and is recorded as
+    // a native source that declared version 2.
+    sqlx::raw_sql(
+        "DELETE FROM qbit_prism_schema_capabilities WHERE capability='sealed_share_pages'",
+    )
+    .execute(&pool)
+    .await?;
+    let migrated = db.ledger("this-build").await?;
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    let source = migrated
+        .migration_source()
+        .await?
+        .context("migration source not recorded")?;
+    assert_eq!(source.source_state, "native");
+    assert_eq!(source.prior_schema_version, 9);
+    assert_eq!(source.candidate_storage_version, Some(2));
+    assert_eq!(capability(&pool).await?, Some(2));
+    exercise_native_writers(&migrated, 1, 6001).await?;
+    pool.close().await;
+    db.close(vec![earlier, migrated]).await
+}
+
 #[tokio::test]
 async fn pre_006_native_schema_with_only_native_pending_candidates_migrates_and_keeps_them_claimable(
 ) -> Result<()> {
