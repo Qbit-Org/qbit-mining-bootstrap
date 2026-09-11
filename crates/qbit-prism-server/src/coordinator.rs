@@ -38,7 +38,8 @@ pub struct JobContext {
 
 pub struct Prepared {
     // Original durable representation, including bootstrap bundle=None and
-    // coinbase suffix. Heavy snapshot/bundle data is shared, never recopied.
+    // coinbase suffix. Heavy snapshot/bundle data is shared by the stored
+    // record; Prepared also keeps access-oriented views below.
     stored: Arc<StoredPrepared>,
     repair: Arc<Mutex<()>>,
     #[cfg(test)]

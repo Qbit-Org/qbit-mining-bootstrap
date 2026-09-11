@@ -114,7 +114,7 @@ lease, publication-during-fallback returning stale-job, and a discarded long-pol
 notification admitting an old-tip candidate while real refresh awaited persistence.
 The payout race replays the handoff between two real refresh-built publications
 at the existing locks; it executes the actual submit and final revision fence.
-Restoring the fixes passes all 42 Coordinator miner tests, including the ten
+Restoring the fixes passes all 52 Coordinator miner tests, including the ten
 new admission and long-poll cases.
 
 ## Qualification
@@ -157,8 +157,8 @@ assertions remain unchanged.
 
 Qualification on 2026-09-10 after rebasing onto `3.x.x`
 `f39442755448b1483bd5e183d8d972c7e461b997`, at runtime commit
-`551b741cb4a1b7b8cb9729936b5b9f6929d60942`, with all three disposable integration
-gates enabled:
+`551b741cb4a1b7b8cb9729936b5b9f6929d60942` (historical runtime), with all three
+disposable integration gates enabled:
 208 tests passed, zero failed, zero ignored, across 20 target summaries. This
 includes all six candidate-lease database tests, 29 ledger database tests,
 eight real qbitd regtest cases, two physical PostgreSQL failover tests, five

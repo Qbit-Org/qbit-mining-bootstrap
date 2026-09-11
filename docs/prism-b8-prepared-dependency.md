@@ -32,8 +32,9 @@ only on this cold path. An `Arc` retains that record and shares its snapshot and
 bundle with live prepared work; there is no eager serialized JSON cache. Resume
 also keeps the original record, including bootstrap `bundle: null` and its
 original coinbase suffix, even if reconstructing miner work requires a bundle.
-A per-prepared mutex coalesces concurrent repairs, and the existing build-slot
-semaphore bounds serialization. Both owned guards live through the actual
+A per-`Arc<Prepared>` mutex coalesces concurrent repairs for that live prepared
+record, and the existing build-slot semaphore bounds serialization. Repair
+coalescing is per in-memory record, not a global storage-key promise. Both owned guards live through the actual
 blocking work when its asynchronous waiter is canceled. A follower retries
 compact persistence before doing heavy work. Repair rechecks issuance admission,
 retains the original child deadline, and verifies any competing existing prepared
@@ -69,7 +70,8 @@ publication, returning/redeparting tips, original/current revision separation,
 unchanged target/worker/version mask, independent candidate fencing, bootstrap
 identity after resume, fixed child expiry, competing repairs, duration overflow,
 coalesced repair, and cancellation retaining capacity through blocking completion.
-The full native library run passed 107 tests, with no ignored or skipped tests:
+The historical native library run passed 107 tests, with no ignored or skipped
+tests; final-head counts belong in the PR qualification record:
 
 ```sh
 CARGO_TARGET_DIR=/tmp/prism-b8-expiry-target \

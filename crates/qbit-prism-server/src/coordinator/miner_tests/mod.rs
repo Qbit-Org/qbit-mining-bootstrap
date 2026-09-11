@@ -221,6 +221,21 @@ impl Fixture {
         if cache_parent {
             self.coordinator.cache_tip_parent(&hash(tip)).await.unwrap();
         }
+        // Publication in production always couples the observed tip to work
+        // built for that tip while holding the publication boundary. Keep the
+        // fixture on that reachable path instead of publishing a new tip with
+        // the previous tip's prepared work.
+        let revision = self
+            .coordinator
+            .prepared
+            .read()
+            .await
+            .as_ref()
+            .map(|prepared| prepared.snapshot.payout_revision)
+            .unwrap_or_default();
+        let job = self.job(tip, revision, "original.worker");
+        *self.store.snapshot.lock().unwrap() = Some((*job.context.prepared.snapshot).clone());
+        *self.coordinator.prepared.write().await = Some(job.context.prepared.clone());
         self.coordinator
             .observed_tip
             .write()
