@@ -18,9 +18,13 @@ def load(path):
 
 
 def specification_digest():
+    # Include the source inputs and the generator/fixture contract itself.  A
+    # stale generator or deployment manifest must invalidate the checked-in
+    # patch just as surely as a changed rule specification.
     return hashlib.sha256(b"".join((ROOT / path).read_bytes() for path in [
         "docs/prism-native-alert-rules.json", "docs/prism-postgres-alert-rules.json",
         "docs/prism-postgres-exporter-queries.yaml", "docs/prism-alert-migration.json",
+        "tests/fixtures/prism-deployed-alerts.json", "scripts/generate_prism_alerts.py",
     ])).hexdigest()
 
 

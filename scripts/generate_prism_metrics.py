@@ -19,20 +19,32 @@ def generate():
         name: re.findall(r'=> "([^"]+)"', body)
         for name, body in re.findall(r"labels!\((\w+)\s*\{(.*?)\}\);", labels_source, re.S)
     }
-    rows = []
-    for kind, suffix, meaning in re.findall(
+    registry = re.findall(
         r'\w+: (Counter|Gauge|Histogram), "([^"]+)", "([^"]+)";', source
-    ):
+    )
+    suffixes = {suffix for _, suffix, _ in registry}
+    native_metadata = metadata["native"]
+    unknown_native = sorted(set(native_metadata) - suffixes)
+    if unknown_native:
+        raise SystemExit("metadata names absent from registry: " + ", ".join(unknown_native))
+    rows = []
+    for kind, suffix, meaning in registry:
         annotation = metadata["native"].get(suffix, {})
-        labels = "; ".join(
-            f"`{key}=" + ",".join(enums[enum]) + "`"
-            for key, enum in annotation.get("labels", {}).items()
-        ) or "none"
+        label_parts = []
+        for key, enum in annotation.get("labels", {}).items():
+            if enum not in enums:
+                raise SystemExit(f"metadata label enum {enum!r} for {suffix!r} is absent from labels.rs")
+            label_parts.append(f"`{key}=" + ",".join(enums[enum]) + "`")
+        labels = "; ".join(label_parts) or "none"
         if annotation.get("status"):
             meaning += " " + annotation["status"]
         legacy = ", ".join(f"`{name}`" for name in annotation.get("replaces", [])) or "none"
         rows.append(("qbit_prism_" + suffix, kind.lower(), labels, "run", meaning, legacy))
     for name, annotation in metadata["public"].items():
+        if not name.startswith("qbit_prism_"):
+            raise SystemExit(f"public metadata family is not a PRISM family: {name}")
+        if not annotation.get("role") or not annotation.get("type") or not annotation.get("meaning"):
+            raise SystemExit(f"public metadata for {name!r} is missing type, role or meaning")
         rows.append((name, annotation["type"], annotation["labels"],
                      annotation["role"], annotation["meaning"], f"`{name}`"))
     assert len(rows) == len({row[0] for row in rows}), "duplicate family"
