@@ -7,10 +7,12 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// The schema version every native start requires. Bump it with each new
-/// migration file. `Ledger::connect` refuses any other version even without
+/// migration file. `Ledger::connect` refuses an older schema even without
 /// `initialize`, so a newer binary never reaches the claim path on a database
-/// it has not migrated, and an older binary never writes a schema it does
-/// not know.
+/// it has not migrated. A newer schema is accepted with a warning: native
+/// migrations are additive, and a release whose format an older binary must
+/// not touch declares a capability, which `require_known_capabilities`
+/// refuses.
 pub const REQUIRED_SCHEMA_VERSION: i32 = 6;
 
 /// Capability rows this binary understands, with the highest value each may
@@ -601,7 +603,10 @@ pub(super) async fn migrate_schema(
 }
 
 /// The startup gate. Every start, with or without `initialize`, reads the
-/// schema version and refuses anything but `REQUIRED_SCHEMA_VERSION`.
+/// schema version and refuses one below `REQUIRED_SCHEMA_VERSION`. A newer
+/// one is accepted with a warning, so frontends on the previous release keep
+/// starting while a rollout drains and replaces them one at a time; a format
+/// an older binary must not touch is declared as a capability instead.
 pub(super) async fn require_schema_version(pool: &PgPool) -> Result<i32> {
     let recorded: bool =
         sqlx::query_scalar("SELECT to_regclass('qbit_prism_schema_migrations') IS NOT NULL")
@@ -620,10 +625,13 @@ pub(super) async fn require_schema_version(pool: &PgPool) -> Result<i32> {
         version >= REQUIRED_SCHEMA_VERSION,
         "database schema version {version} is below the version {REQUIRED_SCHEMA_VERSION} this server requires: run `qbit-prism-server migrate` with this release, or start with PRISM_POSTGRES_INIT_SCHEMA=1"
     );
-    ensure!(
-        version == REQUIRED_SCHEMA_VERSION,
-        "database schema version {version} is newer than the version {REQUIRED_SCHEMA_VERSION} this server supports: a newer PRISM release migrated this database; upgrade the server before starting it here"
-    );
+    if version > REQUIRED_SCHEMA_VERSION {
+        tracing::warn!(
+            schema_version = version,
+            required_schema_version = REQUIRED_SCHEMA_VERSION,
+            "database schema is newer than this server requires; a later release migrated it"
+        );
+    }
     Ok(version)
 }
 
