@@ -47,7 +47,14 @@
 -- of every release definition in the source schema, on a fresh database too,
 -- where 001 has just created everything. A table or sequence must have the
 -- release's persistence: an UNLOGGED or temporary one is drift whatever its
--- columns say, because PostgreSQL truncates it after a crash. A sequence is
+-- columns say, because PostgreSQL truncates it after a crash. A table must
+-- have the release's row-level security flags (ENABLE and FORCE ROW LEVEL
+-- SECURITY, neither set by the release) and exactly the release's policies
+-- (none), each compared by command, permissive or restrictive, roles, USING
+-- and WITH CHECK: a policy that hides rows from the migrate role, or forced
+-- security with no policy, would make the drain check see an empty outbox
+-- and the native claim lane never see the legacy rows, so a policy on a
+-- release table is drift, not an extra. A sequence is
 -- compared by its structure (type, start, increment, bounds, cache, cycle),
 -- never by the value it has reached. A constraint's validation state is
 -- compared: a release constraint left NOT VALID in the source is drift,

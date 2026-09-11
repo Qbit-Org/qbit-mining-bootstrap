@@ -1094,6 +1094,140 @@ async fn release_constraint_left_not_valid_is_refused_naming_it_and_rolls_back()
 }
 
 #[tokio::test]
+async fn row_level_security_on_a_release_table_is_refused_naming_it_and_rolls_back() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let database: String = sqlx::query_scalar("SELECT current_database()::text")
+        .fetch_one(&pool)
+        .await?;
+    // The test's own connection is a superuser, which bypasses row-level
+    // security, so the source is built and migrated by an ordinary role
+    // that owns the 2.x.x objects and may create in the database: the
+    // migrate role a deployment uses, and the one the security applies to.
+    let role = format!("prism_rls_{}", Uuid::new_v4().simple());
+    sqlx::raw_sql(&format!(
+        "CREATE ROLE {role} LOGIN PASSWORD 'rls'; GRANT USAGE, CREATE ON SCHEMA {} TO {role}; GRANT CREATE ON DATABASE {database} TO {role}",
+        db.schema
+    ))
+    .execute(&pool)
+    .await?;
+    let mut limited = url::Url::parse(&db.url)?;
+    limited.set_username(&role).ok().context("role username")?;
+    limited
+        .set_password(Some("rls"))
+        .ok()
+        .context("role password")?;
+    let limited_pool = PgPool::connect(limited.as_str()).await?;
+    apply_frozen_2x_schema(&limited_pool, SourceState::Pre258).await?;
+    let hash = legacy_hash(0x44);
+    insert_v1_pending(&limited_pool, &hash).await?;
+    // Forced row-level security with a policy that hides pending rows. To
+    // the owner the outbox now looks drained, so the drain check passes and
+    // the native claim lane would never see the row; only the catalog says
+    // otherwise.
+    sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox ENABLE ROW LEVEL SECURITY; ALTER TABLE qbit_block_candidate_outbox FORCE ROW LEVEL SECURITY; CREATE POLICY hide_pending ON qbit_block_candidate_outbox USING (state <> 'pending')")
+        .execute(&limited_pool).await?;
+    let security = || async {
+        sqlx::query_scalar::<_, String>("SELECT relrowsecurity::text||','||relforcerowsecurity::text||coalesce((SELECT ','||string_agg(polname::text||'='||polcmd::text||':'||coalesce(pg_get_expr(polqual,polrelid),''),';' ORDER BY polname) FROM pg_policy WHERE polrelid=c.oid),'') FROM pg_class c WHERE c.oid=to_regclass('qbit_block_candidate_outbox')")
+            .fetch_one(&pool).await
+    };
+    let hidden = "true,true,hide_pending=*:(state <> 'pending'::text)";
+    assert_eq!(security().await?, hidden);
+    assert_eq!(pending_rows(&pool).await?, 1);
+    assert_eq!(pending_rows(&limited_pool).await?, 0);
+    let objects = schema_objects(&pool).await?;
+    let error = Ledger::connect(limited.as_str(), "rls".into(), 8, true)
+        .await
+        .err()
+        .context(
+            "migration accepted a release table with forced row-level security and a hiding policy",
+        )?
+        .to_string();
+    assert!(
+        error.contains("refusing to migrate a drifted 001 source"),
+        "{error}"
+    );
+    assert!(error.contains("2 object(s) differ"), "{error}");
+    assert!(
+        error.contains("table qbit_block_candidate_outbox differs: expected row-level security disabled, found enabled and forced"),
+        "{error}"
+    );
+    assert!(
+        error.contains("policy hide_pending on qbit_block_candidate_outbox: FOR ALL USING ((state <> 'pending'::text)); the release has no row-level security policy on this table"),
+        "{error}"
+    );
+    assert!(error.contains("Nothing was changed"), "{error}");
+    // Rolled back whole: no native table, the same objects, the security as
+    // it was, the row still pending and still hidden from the role.
+    assert!(native_tables_absent(&pool).await?, "refusal ran DDL");
+    assert_eq!(schema_objects(&pool).await?, objects);
+    assert_eq!(security().await?, hidden);
+    assert_eq!(pending_rows(&pool).await?, 1);
+    assert_eq!(pending_rows(&limited_pool).await?, 0);
+    // Without the policy, forced security hides every row from the owner
+    // just the same: still refused, naming the flags.
+    sqlx::raw_sql("DROP POLICY hide_pending ON qbit_block_candidate_outbox")
+        .execute(&limited_pool)
+        .await?;
+    assert_eq!(security().await?, "true,true");
+    assert_eq!(pending_rows(&limited_pool).await?, 0);
+    let error = Ledger::connect(limited.as_str(), "rls".into(), 8, true)
+        .await
+        .err()
+        .context("migration accepted a release table with forced row-level security")?
+        .to_string();
+    assert!(
+        error.contains("refusing to migrate a drifted 001 source"),
+        "{error}"
+    );
+    assert!(error.contains("1 object(s) differ"), "{error}");
+    assert!(
+        error.contains("table qbit_block_candidate_outbox differs: expected row-level security disabled, found enabled and forced"),
+        "{error}"
+    );
+    assert!(!error.contains("policy"), "{error}");
+    assert!(native_tables_absent(&pool).await?, "refusal ran DDL");
+    assert_eq!(schema_objects(&pool).await?, objects);
+    assert_eq!(security().await?, "true,true");
+    // Security off, the role sees the row again, and the drain check
+    // refuses it as it must; drained, the same source migrates as the same
+    // role and is recorded as v2.0.1.
+    sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox NO FORCE ROW LEVEL SECURITY; ALTER TABLE qbit_block_candidate_outbox DISABLE ROW LEVEL SECURITY")
+        .execute(&limited_pool).await?;
+    assert_eq!(security().await?, "false,false");
+    assert_eq!(pending_rows(&limited_pool).await?, 1);
+    let error = Ledger::connect(limited.as_str(), "rls".into(), 8, true)
+        .await
+        .err()
+        .context("migration accepted an undrained outbox once its row was visible")?
+        .to_string();
+    assert!(
+        error.contains(
+            "legacy Python block outbox is not drained: 1 pending 2.x.x candidate row(s)"
+        ),
+        "{error}"
+    );
+    assert!(native_tables_absent(&pool).await?, "refusal ran DDL");
+    drain_2x_row(&limited_pool, &hash, false).await?;
+    let ledger = Ledger::connect(limited.as_str(), "rls".into(), 8, true).await?;
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    assert_eq!(
+        ledger.migration_source().await?.map(|s| s.source_state),
+        Some("pre_258".into())
+    );
+    exercise_native_writers(&ledger, 1, 6001).await?;
+    ledger.pool.close().await;
+    limited_pool.close().await;
+    sqlx::raw_sql(&format!("DROP OWNED BY {role}; DROP ROLE {role}"))
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+    db.close(vec![]).await
+}
+
+#[tokio::test]
 async fn tolerated_source_differences_still_migrate() -> Result<()> {
     let Some(db) = Database::open().await? else {
         return Ok(());

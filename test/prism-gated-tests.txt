@@ -61,6 +61,7 @@ qbit-prism-server::ledger_postgres::two_x::pre_006_native_schema_on_a_pre_258_so
 qbit-prism-server::ledger_postgres::two_x::pre_006_native_schema_with_009_applies_006_on_the_next_migrate
 qbit-prism-server::ledger_postgres::two_x::pre_006_native_schema_with_only_native_pending_candidates_migrates_and_keeps_them_claimable
 qbit-prism-server::ledger_postgres::two_x::release_constraint_left_not_valid_is_refused_naming_it_and_rolls_back
+qbit-prism-server::ledger_postgres::two_x::row_level_security_on_a_release_table_is_refused_naming_it_and_rolls_back
 qbit-prism-server::ledger_postgres::two_x::startup_without_initialize_refuses_a_pre_006_native_schema_with_009
 qbit-prism-server::ledger_postgres::two_x::startup_without_initialize_requires_the_current_schema_version
 qbit-prism-server::ledger_postgres::two_x::tolerated_source_differences_still_migrate

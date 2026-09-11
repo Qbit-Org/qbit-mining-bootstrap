@@ -601,15 +601,36 @@ struct FunctionDefinition {
     config: Vec<String>,
 }
 
-/// A table's persistence and its columns. `pg_class.relpersistence` is `p`
-/// for an ordinary logged table, `u` for UNLOGGED and `t` for temporary. The
-/// release creates logged tables only: an unlogged ledger or outbox is one
-/// whose rows PostgreSQL truncates after a crash, so persistence is part of
-/// the definition, not a tuning knob.
+/// A table's persistence, its row-level security flags and its columns.
+/// `pg_class.relpersistence` is `p` for an ordinary logged table, `u` for
+/// UNLOGGED and `t` for temporary. The release creates logged tables only:
+/// an unlogged ledger or outbox is one whose rows PostgreSQL truncates after
+/// a crash, so persistence is part of the definition, not a tuning knob.
+/// `relrowsecurity` (ENABLE ROW LEVEL SECURITY) and `relforcerowsecurity`
+/// (FORCE ROW LEVEL SECURITY, applying it to the owner too) decide which
+/// rows a role that does not bypass row-level security sees and may write;
+/// the release creates none, and on the outbox they would decide what the
+/// drain check and the native claim lane see.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TableDefinition {
     persistence: String,
+    row_security: bool,
+    force_row_security: bool,
     columns: BTreeMap<String, ColumnDefinition>,
+}
+
+/// A row-level security policy, from `pg_policy`: the command it applies to
+/// (`polcmd`: `r`, `a`, `w`, `d` or `*`), whether it is permissive or
+/// restrictive, the roles it applies to (`PUBLIC` for oid 0, sorted), and
+/// its USING and WITH CHECK expressions as the server renders them, without
+/// schema qualification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PolicyDefinition {
+    command: String,
+    permissive: bool,
+    roles: Vec<String>,
+    using: Option<String>,
+    with_check: Option<String>,
 }
 
 /// The structure of a sequence, from `pg_sequence`: what a `serial` column
@@ -629,14 +650,16 @@ struct SequenceDefinition {
     cycle: bool,
 }
 
-/// Every table, column, constraint, index, trigger, function and sequence of
-/// one schema, as the server renders them, without schema qualification.
-/// Columns are keyed by name, so their physical order is irrelevant;
-/// constraints are keyed per table by definition, so an auto-generated name
-/// is irrelevant; comments are not read.
+/// Every table, column, constraint, index, trigger, function, sequence and
+/// row-level security policy of one schema, as the server renders them,
+/// without schema qualification. Columns are keyed by name, so their
+/// physical order is irrelevant; constraints are keyed per table by
+/// definition, so an auto-generated name is irrelevant; comments are not
+/// read.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SchemaFingerprint {
-    /// Keyed by name: each table's persistence and its columns.
+    /// Keyed by name: each table's persistence, its row-level security
+    /// flags and its columns.
     tables: BTreeMap<String, TableDefinition>,
     /// Table, then constraint definition (`constraint_key`), to the name the
     /// constraint carries and its validation state.
@@ -646,6 +669,8 @@ struct SchemaFingerprint {
     indexes: BTreeMap<String, IndexDefinition>,
     /// Keyed by table, then trigger name.
     triggers: BTreeMap<(String, String), TriggerDefinition>,
+    /// Keyed by table, then policy name.
+    policies: BTreeMap<(String, String), PolicyDefinition>,
     /// Keyed by name, then identity arguments.
     functions: BTreeMap<(String, String), FunctionDefinition>,
     /// Keyed by name: the sequences behind `serial` columns and the ones
@@ -765,13 +790,15 @@ async fn fingerprint_schema(
     namespace: &str,
 ) -> Result<SchemaFingerprint> {
     let mut fingerprint = SchemaFingerprint::default();
-    let tables: Vec<(String, String)> = sqlx::query_as("SELECT c.relname::text,c.relpersistence::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' ORDER BY 1")
+    let tables: Vec<(String, String, bool, bool)> = sqlx::query_as("SELECT c.relname::text,c.relpersistence::text,c.relrowsecurity,c.relforcerowsecurity FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' ORDER BY 1")
         .bind(namespace).fetch_all(&mut **tx).await?;
-    for (table, persistence) in tables {
+    for (table, persistence, row_security, force_row_security) in tables {
         fingerprint.tables.insert(
             table,
             TableDefinition {
                 persistence,
+                row_security,
+                force_row_security,
                 columns: BTreeMap::new(),
             },
         );
@@ -838,6 +865,24 @@ async fn fingerprint_schema(
             TriggerDefinition {
                 definition: strip_schema_qualification(&definition, namespace),
                 enabled: row.try_get("enabled")?,
+            },
+        );
+    }
+    let rows = sqlx::query("SELECT c.relname::text AS table_name,p.polname::text AS name,p.polcmd::text AS command,p.polpermissive AS permissive,(SELECT coalesce(array_agg(CASE WHEN u.role_oid=0 THEN 'PUBLIC' ELSE pg_get_userbyid(u.role_oid)::text END),'{}') FROM unnest(p.polroles) AS u(role_oid))::text[] AS roles,pg_get_expr(p.polqual,p.polrelid) AS using_expr,pg_get_expr(p.polwithcheck,p.polrelid) AS with_check FROM pg_policy p JOIN pg_class c ON c.oid=p.polrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 ORDER BY 1,2")
+        .bind(namespace).fetch_all(&mut **tx).await?;
+    for row in &rows {
+        let mut roles: Vec<String> = row.try_get("roles")?;
+        roles.sort();
+        let using: Option<String> = row.try_get("using_expr")?;
+        let with_check: Option<String> = row.try_get("with_check")?;
+        fingerprint.policies.insert(
+            (row.try_get("table_name")?, row.try_get("name")?),
+            PolicyDefinition {
+                command: row.try_get("command")?,
+                permissive: row.try_get("permissive")?,
+                roles,
+                using: using.map(|expr| strip_schema_qualification(&expr, namespace)),
+                with_check: with_check.map(|expr| strip_schema_qualification(&expr, namespace)),
             },
         );
     }
@@ -1077,6 +1122,76 @@ fn persistence(code: &str) -> &str {
     }
 }
 
+/// A table's two row-level security flags the way `ALTER TABLE` sets them.
+/// FORCE without ENABLE is a state PostgreSQL keeps (it takes effect once
+/// security is enabled) and is named as such.
+fn row_security_state(table: &TableDefinition) -> &'static str {
+    match (table.row_security, table.force_row_security) {
+        (false, false) => "disabled",
+        (true, false) => "enabled",
+        (true, true) => "enabled and forced",
+        (false, true) => "disabled but forced",
+    }
+}
+
+/// What differs between two tables apart from their columns: persistence
+/// and row-level security.
+fn table_differences(expected: &TableDefinition, found: &TableDefinition) -> String {
+    let mut parts = Vec::new();
+    if expected.persistence != found.persistence {
+        parts.push(format!(
+            "expected {}, found {}",
+            persistence(&expected.persistence),
+            persistence(&found.persistence)
+        ));
+    }
+    if (expected.row_security, expected.force_row_security)
+        != (found.row_security, found.force_row_security)
+    {
+        parts.push(format!(
+            "expected row-level security {}, found {}",
+            row_security_state(expected),
+            row_security_state(found)
+        ));
+    }
+    parts.join(", ")
+}
+
+/// `pg_policy.polcmd` the way `CREATE POLICY ... FOR` spells it.
+fn policy_command(code: &str) -> &str {
+    match code {
+        "r" => "SELECT",
+        "a" => "INSERT",
+        "w" => "UPDATE",
+        "d" => "DELETE",
+        "*" => "ALL",
+        other => other,
+    }
+}
+
+/// A policy the way `CREATE POLICY` would state it after its name and
+/// table: the defaults (permissive, `TO PUBLIC`) are left out, so the text
+/// names what the policy actually restricts.
+fn policy_text(policy: &PolicyDefinition) -> String {
+    let mut text = String::new();
+    if !policy.permissive {
+        text.push_str("AS RESTRICTIVE ");
+    }
+    text.push_str("FOR ");
+    text.push_str(policy_command(&policy.command));
+    if policy.roles != ["PUBLIC"] {
+        text.push_str(" TO ");
+        text.push_str(&policy.roles.join(", "));
+    }
+    if let Some(using) = &policy.using {
+        text.push_str(&format!(" USING ({using})"));
+    }
+    if let Some(with_check) = &policy.with_check {
+        text.push_str(&format!(" WITH CHECK ({with_check})"));
+    }
+    text
+}
+
 fn sequence_differences(expected: &SequenceDefinition, found: &SequenceDefinition) -> String {
     let mut parts = Vec::new();
     if expected.persistence != found.persistence {
@@ -1118,9 +1233,15 @@ fn sequence_differences(expected: &SequenceDefinition, found: &SequenceDefinitio
 /// anything else in the source is extra. An object on a table the source
 /// lacks is not reported twice. A table or sequence must also have the
 /// release's persistence: UNLOGGED is drift, whatever its columns say. A
-/// release constraint must be validated in the source unless it is one of
-/// `NOT_VALID_EXEMPT`. A sequence is compared by its structure only: the
-/// value it has reached is the source's data.
+/// release table must have the release's row-level security flags, and
+/// exactly the release's policies: unlike an extra constraint, index or
+/// trigger, a policy the release does not have on a release table is drift,
+/// not extra, because it changes which rows the migrator and the native
+/// writers see rather than adding to the schema. Policies on tables the
+/// release does not create are not reported. A release constraint must be
+/// validated in the source unless it is one of `NOT_VALID_EXEMPT`. A
+/// sequence is compared by its structure only: the value it has reached is
+/// the source's data.
 fn compare_fingerprints(
     expected: &SchemaFingerprint,
     found: &SchemaFingerprint,
@@ -1131,12 +1252,11 @@ fn compare_fingerprints(
             comparison.drift.push(format!("missing table {table}"));
             continue;
         };
-        if found_table.persistence != definition.persistence {
-            comparison.drift.push(format!(
-                "table {table} differs: expected {}, found {}",
-                persistence(&definition.persistence),
-                persistence(&found_table.persistence)
-            ));
+        let differences = table_differences(definition, found_table);
+        if !differences.is_empty() {
+            comparison
+                .drift
+                .push(format!("table {table} differs: {differences}"));
         }
         let columns = &definition.columns;
         let found_columns = &found_table.columns;
@@ -1287,6 +1407,45 @@ fn compare_fingerprints(
         {
             comparison.extra.push(format!("trigger {name} on {table}"));
         }
+    }
+    for ((table, name), policy) in &expected.policies {
+        if !found.tables.contains_key(table) {
+            continue;
+        }
+        match found.policies.get(&(table.clone(), name.clone())) {
+            None => comparison.drift.push(format!(
+                "missing policy {name} on {table}: {}",
+                policy_text(policy)
+            )),
+            Some(actual) if actual != policy => comparison.drift.push(format!(
+                "policy {name} on {table} differs: expected {}, found {}",
+                policy_text(policy),
+                policy_text(actual)
+            )),
+            Some(_) => {}
+        }
+    }
+    for ((table, name), policy) in &found.policies {
+        if !expected.tables.contains_key(table)
+            || expected
+                .policies
+                .contains_key(&(table.clone(), name.clone()))
+        {
+            continue;
+        }
+        let release_policy_on_table = expected
+            .policies
+            .keys()
+            .any(|(release_table, _)| release_table == table);
+        comparison.drift.push(format!(
+            "policy {name} on {table}: {}; the release {}",
+            policy_text(policy),
+            if release_policy_on_table {
+                "does not create it"
+            } else {
+                "has no row-level security policy on this table"
+            }
+        ));
     }
     for ((name, identity), function) in &expected.functions {
         match found.functions.get(&(name.clone(), identity.clone())) {
@@ -1484,8 +1643,9 @@ async fn require_fresh_source(
 /// took before any DDL. On a fresh database 001 just created everything,
 /// so this passes trivially; it runs there too, as a second guard. Extra
 /// objects, columns, constraints, indexes and sequences are kept and
-/// logged; a missing or different one fails the migration, which rolls back
-/// whole, so the database is unchanged.
+/// logged; a missing or different one, or row-level security on a release
+/// table, fails the migration, which rolls back whole, so the database is
+/// unchanged.
 async fn require_release_schema(
     tx: &mut Transaction<'_, Postgres>,
     state: SourceState,
@@ -1522,6 +1682,7 @@ async fn require_release_schema(
         tables = expected.tables.len(),
         indexes = expected.indexes.len(),
         triggers = expected.triggers.len(),
+        policies = expected.policies.len(),
         functions = expected.functions.len(),
         sequences = expected.sequences.len(),
         extra = comparison.extra.len(),
@@ -2035,6 +2196,8 @@ mod tests {
     fn table(columns: &[(&str, ColumnDefinition)]) -> TableDefinition {
         TableDefinition {
             persistence: "p".into(),
+            row_security: false,
+            force_row_security: false,
             columns: columns
                 .iter()
                 .map(|(name, definition)| ((*name).to_owned(), definition.clone()))
@@ -2622,5 +2785,153 @@ mod tests {
             .persistence = "p".into();
         let comparison = compare_fingerprints(&expected, &found);
         assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
+    }
+
+    fn policy(command: &str, using: Option<&str>) -> PolicyDefinition {
+        PolicyDefinition {
+            command: command.to_owned(),
+            permissive: true,
+            roles: vec!["PUBLIC".into()],
+            using: using.map(str::to_owned),
+            with_check: None,
+        }
+    }
+
+    #[test]
+    fn row_level_security_and_policies_are_compared_for_release_tables() {
+        let mut expected = SchemaFingerprint::default();
+        expected.tables.insert(
+            "qbit_block_candidate_outbox".into(),
+            table(&[("state", column("text", true))]),
+        );
+        expected.tables.insert(
+            "qbit_share_ledger".into(),
+            table(&[("share_id", column("text", true))]),
+        );
+        // The same columns, but the outbox has forced row-level security
+        // with a policy that hides pending rows, the ledger has it enabled
+        // with no policy, and an operator table of its own has both, which
+        // is only extra: the release does not create that table.
+        let mut found = SchemaFingerprint::default();
+        let mut outbox = table(&[("state", column("text", true))]);
+        outbox.row_security = true;
+        outbox.force_row_security = true;
+        found
+            .tables
+            .insert("qbit_block_candidate_outbox".into(), outbox.clone());
+        let mut ledger = table(&[("share_id", column("text", true))]);
+        ledger.row_security = true;
+        found.tables.insert("qbit_share_ledger".into(), ledger);
+        found.tables.insert("operator_notes".into(), outbox);
+        let hide_pending = policy("*", Some("(state <> 'pending'::text)"));
+        found.policies.insert(
+            ("qbit_block_candidate_outbox".into(), "hide_pending".into()),
+            hide_pending.clone(),
+        );
+        found.policies.insert(
+            ("operator_notes".into(), "mine".into()),
+            policy("r", Some("(owner = CURRENT_USER)")),
+        );
+        let comparison = compare_fingerprints(&expected, &found);
+        assert_eq!(
+            comparison.drift,
+            vec![
+                "table qbit_block_candidate_outbox differs: expected row-level security disabled, found enabled and forced",
+                "table qbit_share_ledger differs: expected row-level security disabled, found enabled",
+                "policy hide_pending on qbit_block_candidate_outbox: FOR ALL USING ((state <> 'pending'::text)); the release has no row-level security policy on this table",
+            ]
+        );
+        assert_eq!(comparison.extra, vec!["table operator_notes"]);
+        assert_eq!(
+            release_objects_present(&expected, &found),
+            vec![
+                "table qbit_block_candidate_outbox",
+                "table qbit_share_ledger"
+            ]
+        );
+
+        // Persistence and security are named on one line, in that order.
+        let mut unlogged = expected.tables["qbit_share_ledger"].clone();
+        unlogged.persistence = "u".into();
+        unlogged.force_row_security = true;
+        assert_eq!(
+            table_differences(&expected.tables["qbit_share_ledger"], &unlogged),
+            "expected logged, found UNLOGGED, expected row-level security disabled, found disabled but forced"
+        );
+
+        // Symmetric: a release policy the source lacks, or defines
+        // differently, is drift too; one the release also has on that table
+        // is named as not created rather than as the table's only policy.
+        expected
+            .tables
+            .get_mut("qbit_block_candidate_outbox")
+            .unwrap()
+            .row_security = true;
+        expected
+            .tables
+            .get_mut("qbit_block_candidate_outbox")
+            .unwrap()
+            .force_row_security = true;
+        expected.policies.insert(
+            ("qbit_block_candidate_outbox".into(), "release_only".into()),
+            policy("r", Some("(state = 'pending'::text)")),
+        );
+        expected.policies.insert(
+            (
+                "qbit_block_candidate_outbox".into(),
+                "release_writes".into(),
+            ),
+            policy("a", None),
+        );
+        found.policies.insert(
+            (
+                "qbit_block_candidate_outbox".into(),
+                "release_writes".into(),
+            ),
+            PolicyDefinition {
+                permissive: false,
+                roles: vec!["operator".into(), "prism".into()],
+                with_check: Some("(state = 'pending'::text)".into()),
+                ..policy("a", None)
+            },
+        );
+        let comparison = compare_fingerprints(&expected, &found);
+        assert_eq!(
+            comparison.drift,
+            vec![
+                "table qbit_share_ledger differs: expected row-level security disabled, found enabled",
+                "missing policy release_only on qbit_block_candidate_outbox: FOR SELECT USING ((state = 'pending'::text))",
+                "policy release_writes on qbit_block_candidate_outbox differs: expected FOR INSERT, found AS RESTRICTIVE FOR INSERT TO operator, prism WITH CHECK ((state = 'pending'::text))",
+                "policy hide_pending on qbit_block_candidate_outbox: FOR ALL USING ((state <> 'pending'::text)); the release does not create it",
+            ]
+        );
+        for (code, command) in [
+            ("r", "SELECT"),
+            ("a", "INSERT"),
+            ("w", "UPDATE"),
+            ("d", "DELETE"),
+            ("*", "ALL"),
+        ] {
+            assert_eq!(policy_command(code), command);
+        }
+
+        // The same flags and policies on both sides: nothing to report.
+        expected.policies.clear();
+        expected.policies.insert(
+            ("qbit_block_candidate_outbox".into(), "hide_pending".into()),
+            hide_pending,
+        );
+        found.policies.remove(&(
+            "qbit_block_candidate_outbox".to_owned(),
+            "release_writes".to_owned(),
+        ));
+        found
+            .tables
+            .get_mut("qbit_share_ledger")
+            .unwrap()
+            .row_security = false;
+        let comparison = compare_fingerprints(&expected, &found);
+        assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
+        assert_eq!(comparison.extra, vec!["table operator_notes"]);
     }
 }
