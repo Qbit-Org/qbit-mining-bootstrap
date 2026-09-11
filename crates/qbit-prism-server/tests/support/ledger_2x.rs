@@ -274,6 +274,21 @@ async fn exercise_native_writers(ledger: &Ledger, share_id: u64, nonce: u32) -> 
     Ok(block.block_hash)
 }
 
+async fn parked_row(
+    pool: &PgPool,
+    hash: &str,
+) -> Result<(Option<String>, Option<String>, bool, i32, String)> {
+    let row = sqlx::query("SELECT claim_token,last_error,next_attempt_at='infinity' AS parked,attempt_count,state FROM qbit_block_candidate_outbox WHERE block_hash=$1")
+        .bind(hash).fetch_one(pool).await?;
+    Ok((
+        row.try_get("claim_token")?,
+        row.try_get("last_error")?,
+        row.try_get("parked")?,
+        row.try_get("attempt_count")?,
+        row.try_get("state")?,
+    ))
+}
+
 #[tokio::test]
 async fn frozen_258_source_refuses_pending_v1_and_v2_rows_and_migrates_terminal_rows() -> Result<()>
 {
@@ -383,6 +398,23 @@ async fn frozen_258_source_refuses_pending_v1_and_v2_rows_and_migrates_terminal_
         "a repeated migrate rewrote the source record"
     );
 
+    // A v2 row that appears after cutover is parked, not looped through the
+    // claim lane, and does not block ordinary v1 work.
+    let late_v2 = legacy_hash(0x55);
+    insert_v2_pending(&pool, &late_v2).await?;
+    assert!(ledger.claim_candidate(60).await?.is_none());
+    let (token, last_error, parked, attempts, state) = parked_row(&pool, &late_v2).await?;
+    assert!(token.is_none());
+    assert!(
+        last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("storage_version 2")),
+        "{last_error:?}"
+    );
+    assert!(parked && attempts == 1 && state == "pending");
+    assert!(follower.claim_candidate(60).await?.is_none());
+    let native = exercise_native_writers(&ledger, 2, 5002).await?;
+    assert_ne!(native, late_v2);
     pool.close().await;
     db.close(vec![ledger, follower, again]).await
 }
@@ -674,6 +706,58 @@ async fn startup_without_initialize_requires_the_current_schema_version() -> Res
     let follower = Ledger::connect(&db.url, "cold".into(), 8, false).await?;
     pool.close().await;
     db.close(vec![ledger, repaired, follower]).await
+}
+
+#[tokio::test]
+async fn unknown_storage_version_row_is_parked_and_not_reclaimed_at_lease_expiry() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let a = db.ledger("a").await?;
+    let b = db.ledger("b").await?;
+    a.append(share(1), None).await?;
+    let unknown = candidate(&a.snapshot(100).await?, 6001)?;
+    a.enqueue_candidate(unknown.clone()).await?;
+    // A later release's storage version on a row this binary cannot decode.
+    sqlx::query("UPDATE qbit_block_candidate_outbox SET storage_version=3 WHERE block_hash=$1")
+        .bind(&unknown.block_hash)
+        .execute(&a.pool)
+        .await?;
+    assert!(
+        a.claim_candidate(60).await?.is_none(),
+        "claimed an unknown version"
+    );
+    let (token, last_error, parked, attempts, state) =
+        parked_row(&a.pool, &unknown.block_hash).await?;
+    assert!(token.is_none(), "parked row kept its claim");
+    assert!(
+        last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("storage_version 3")),
+        "{last_error:?}"
+    );
+    assert!(parked, "next_attempt_at was not moved past every lease");
+    assert_eq!((attempts, state.as_str()), (1, "pending"));
+    // The next lease expiry, on either instance, does not offer it again.
+    sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE block_hash=$1")
+        .bind(&unknown.block_hash).execute(&a.pool).await?;
+    assert!(b.claim_candidate(60).await?.is_none());
+    assert!(a.claim_candidate(60).await?.is_none());
+    let (_, _, _, attempts, _) = parked_row(&a.pool, &unknown.block_hash).await?;
+    assert_eq!(attempts, 1, "parked row was re-claimed");
+    // Ordinary work is unaffected.
+    let good = candidate(&a.snapshot(100).await?, 6002)?;
+    a.enqueue_candidate(good.clone()).await?;
+    let claim = b.claim_candidate(60).await?.context("good candidate")?;
+    assert_eq!(claim.candidate.block_hash, good.block_hash);
+    b.finish_candidate(&claim, false, Some("test")).await?;
+    // Parking is operator-reversible: a release that reads the row, or an
+    // operator who converted it, resets next_attempt_at.
+    sqlx::query("UPDATE qbit_block_candidate_outbox SET storage_version=1,next_attempt_at=clock_timestamp() WHERE block_hash=$1")
+        .bind(&unknown.block_hash).execute(&a.pool).await?;
+    let claim = a.claim_candidate(60).await?.context("unparked candidate")?;
+    assert_eq!(claim.candidate.block_hash, unknown.block_hash);
+    db.close(vec![a, b]).await
 }
 
 async fn seed_legacy_carry(pool: &PgPool) -> Result<()> {
