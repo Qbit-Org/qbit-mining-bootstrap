@@ -3,6 +3,7 @@
 //! artifacts. Validation is performed before any write; operator files and
 //! historical rows are retained.
 use super::*;
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -37,8 +38,11 @@ pub struct SourceStateRule {
 /// column-aware: it asks the catalog which 002 objects exist, so a fixed
 /// predicate never errors on a source that lacks a column, and it looks at
 /// outbox rows for the drain check because the capability row proves only
-/// that 002 ran.
-pub const SOURCE_STATES: [SourceStateRule; 5] = [
+/// that 002 ran. The last row is decided after 001 has run: the release 001
+/// is idempotent and repairs what it re-asserts, so the check compares what
+/// its `IF NOT EXISTS` left alone against a fresh apply of the same release
+/// SQL, and a refusal rolls the whole migration back.
+pub const SOURCE_STATES: [SourceStateRule; 6] = [
     SourceStateRule {
         name: "fresh",
         evidence: "no qbit_share_ledger at all",
@@ -63,6 +67,11 @@ pub const SOURCE_STATES: [SourceStateRule; 5] = [
         name: "newer",
         evidence: "candidate_storage_version > 2 or an unknown capability",
         verdict: "refuse before any DDL",
+    },
+    SourceStateRule {
+        name: "drifted 001",
+        evidence: "a 001 (or 002) object whose definition, after 001 has run, differs from the frozen release",
+        verdict: "refuse transactionally, naming the object",
     },
 ];
 
@@ -466,9 +475,712 @@ pub(super) async fn refuse_undrained_outbox(
     bail!("legacy Python block outbox is not drained: {total} pending 2.x.x candidate row(s) cannot be replayed natively ({listing}{more}). Drain them with the pinned 2.x.x release before migrating: start the 2.x.x coordinator (v2.0.2 for storage_version 2 rows, v2.0.1 or later otherwise) and let its block submitter finish every pending candidate, or for a block already accepted on the active chain run `python3 -m lab.prism.recover_pending_blocks --block-hash <hash> --apply` from the 2.x.x image; then take the final backup and repeat the migration. Do not delete pending rows to bypass this check")
 }
 
+/// How many drifted or extra objects a release-schema report names.
+const DRIFT_OBJECTS_NAMED: usize = 16;
+
+/// What both sides of the release-schema comparison call the schema an
+/// object lives in, so the scratch apply and the source compare equal
+/// whatever their schemas are named.
+const SCHEMA_PLACEHOLDER: &str = "<schema>";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ColumnDefinition {
+    data_type: String,
+    not_null: bool,
+    default: Option<String>,
+    identity: String,
+    generated: String,
+    collation: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IndexDefinition {
+    table: String,
+    definition: String,
+    valid: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TriggerDefinition {
+    definition: String,
+    enabled: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FunctionDefinition {
+    arguments: String,
+    result: Option<String>,
+    language: String,
+    body: Option<String>,
+    volatility: String,
+    strict: bool,
+    security_definer: bool,
+    leakproof: bool,
+    parallel: String,
+    kind: String,
+    config: Vec<String>,
+}
+
+/// Every table, column, constraint, index, trigger and function of one
+/// schema, as the server renders them, without schema qualification. Columns
+/// are keyed by name, so their physical order is irrelevant; constraints are
+/// keyed per table by definition, so an auto-generated name is irrelevant;
+/// comments are not read.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SchemaFingerprint {
+    tables: BTreeMap<String, BTreeMap<String, ColumnDefinition>>,
+    /// Table, then constraint definition, to the name the constraint carries.
+    constraints: BTreeMap<String, BTreeMap<String, String>>,
+    /// Indexes that do not back a constraint, by name; the constraint
+    /// comparison covers the others under whatever name they were given.
+    indexes: BTreeMap<String, IndexDefinition>,
+    /// Keyed by table, then trigger name.
+    triggers: BTreeMap<(String, String), TriggerDefinition>,
+    /// Keyed by name, then identity arguments.
+    functions: BTreeMap<(String, String), FunctionDefinition>,
+}
+
+/// What the source has that the release does not create (`extra`, kept and
+/// logged) and what it lacks or defines differently (`drift`, refused).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SchemaComparison {
+    drift: Vec<String>,
+    extra: Vec<String>,
+}
+
+/// Remove `schema.` and `"schema".` where they qualify a name. Only a
+/// qualifier is removed: the schema name followed by a dot and not preceded
+/// by an identifier character, so an identifier that merely contains the
+/// schema name is left alone.
+fn strip_schema_qualification(text: &str, schema: &str) -> String {
+    let quoted = format!("\"{}\"", schema.replace('"', "\"\""));
+    let mut stripped = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let after_identifier = stripped
+            .chars()
+            .next_back()
+            .is_some_and(|last| last.is_alphanumeric() || last == '_' || last == '$');
+        let qualifier = [quoted.as_str(), schema].into_iter().find(|name| {
+            !after_identifier
+                && rest.len() > name.len()
+                && rest.starts_with(name)
+                && rest[name.len()..].starts_with('.')
+        });
+        match qualifier {
+            Some(name) => rest = &rest[name.len() + 1..],
+            None => {
+                let character = rest.chars().next().unwrap_or_default();
+                stripped.push(character);
+                rest = &rest[character.len_utf8()..];
+            }
+        }
+    }
+    stripped
+}
+
+/// A function's `SET search_path` names its installation schema (001 pins
+/// two functions that way); replace that name with the placeholder.
+fn normalize_function_config(item: &str, schema: &str) -> String {
+    let Some((key, value)) = item.split_once('=') else {
+        return item.to_owned();
+    };
+    if key != "search_path" {
+        return item.to_owned();
+    }
+    let quoted = format!("\"{}\"", schema.replace('"', "\"\""));
+    let value = value
+        .split(',')
+        .map(str::trim)
+        .map(|token| {
+            if token == schema || token == quoted {
+                SCHEMA_PLACEHOLDER
+            } else {
+                token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{key}={value}")
+}
+
+/// A CHECK the release added to an upgraded table with `NOT VALID` is the
+/// same rule for every row the native writers produce; 001 itself compares
+/// constraint definitions this way.
+fn strip_not_valid(definition: &str) -> String {
+    definition
+        .strip_suffix(" NOT VALID")
+        .unwrap_or(definition)
+        .to_owned()
+}
+
+/// Read the catalog for every object in `namespace`. The `pg_get_*`
+/// renderers qualify a name only when it is not visible on the search path,
+/// except that an index or trigger always qualifies its table, so this runs
+/// while `namespace` is the current schema and strips its name from what is
+/// rendered.
+async fn fingerprint_schema(
+    tx: &mut Transaction<'_, Postgres>,
+    namespace: &str,
+) -> Result<SchemaFingerprint> {
+    let mut fingerprint = SchemaFingerprint::default();
+    let tables: Vec<String> = sqlx::query_scalar("SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' ORDER BY 1")
+        .bind(namespace).fetch_all(&mut **tx).await?;
+    for table in tables {
+        fingerprint.tables.entry(table).or_default();
+    }
+    let rows = sqlx::query("SELECT c.relname::text AS table_name,a.attname::text AS column_name,format_type(a.atttypid,a.atttypmod) AS data_type,a.attnotnull AS not_null,pg_get_expr(d.adbin,d.adrelid) AS default_expr,a.attidentity::text AS identity,a.attgenerated::text AS generated,CASE WHEN a.attcollation<>t.typcollation THEN col.collname::text END AS collation FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped JOIN pg_type t ON t.oid=a.atttypid LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum LEFT JOIN pg_collation col ON col.oid=a.attcollation WHERE n.nspname=$1 AND c.relkind='r' ORDER BY 1,2")
+        .bind(namespace).fetch_all(&mut **tx).await?;
+    for row in &rows {
+        let table: String = row.try_get("table_name")?;
+        let default: Option<String> = row.try_get("default_expr")?;
+        fingerprint.tables.entry(table).or_default().insert(
+            row.try_get("column_name")?,
+            ColumnDefinition {
+                data_type: row.try_get("data_type")?,
+                not_null: row.try_get("not_null")?,
+                default: default.map(|expr| strip_schema_qualification(&expr, namespace)),
+                identity: row.try_get("identity")?,
+                generated: row.try_get("generated")?,
+                collation: row.try_get("collation")?,
+            },
+        );
+    }
+    let rows = sqlx::query("SELECT c.relname::text AS table_name,k.conname::text AS name,pg_get_constraintdef(k.oid) AS definition FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' ORDER BY 1,2")
+        .bind(namespace).fetch_all(&mut **tx).await?;
+    for row in &rows {
+        let table: String = row.try_get("table_name")?;
+        let definition: String = row.try_get("definition")?;
+        fingerprint
+            .constraints
+            .entry(table)
+            .or_default()
+            .entry(strip_not_valid(&strip_schema_qualification(
+                &definition,
+                namespace,
+            )))
+            .or_insert(row.try_get("name")?);
+    }
+    let rows = sqlx::query("SELECT c.relname::text AS table_name,i.relname::text AS name,pg_get_indexdef(x.indexrelid) AS definition,x.indisvalid AS valid FROM pg_index x JOIN pg_class i ON i.oid=x.indexrelid JOIN pg_class c ON c.oid=x.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' AND NOT EXISTS(SELECT 1 FROM pg_constraint k WHERE k.conindid=x.indexrelid AND k.contype IN ('p','u','x')) ORDER BY 1,2")
+        .bind(namespace).fetch_all(&mut **tx).await?;
+    for row in &rows {
+        let definition: String = row.try_get("definition")?;
+        fingerprint.indexes.insert(
+            row.try_get("name")?,
+            IndexDefinition {
+                table: row.try_get("table_name")?,
+                definition: strip_schema_qualification(&definition, namespace),
+                valid: row.try_get("valid")?,
+            },
+        );
+    }
+    let rows = sqlx::query("SELECT c.relname::text AS table_name,t.tgname::text AS name,pg_get_triggerdef(t.oid) AS definition,t.tgenabled::text AS enabled FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND NOT t.tgisinternal ORDER BY 1,2")
+        .bind(namespace).fetch_all(&mut **tx).await?;
+    for row in &rows {
+        let definition: String = row.try_get("definition")?;
+        fingerprint.triggers.insert(
+            (row.try_get("table_name")?, row.try_get("name")?),
+            TriggerDefinition {
+                definition: strip_schema_qualification(&definition, namespace),
+                enabled: row.try_get("enabled")?,
+            },
+        );
+    }
+    let rows = sqlx::query("SELECT p.proname::text AS name,pg_get_function_identity_arguments(p.oid) AS identity,pg_get_function_arguments(p.oid) AS arguments,pg_get_function_result(p.oid) AS result,l.lanname::text AS language,p.prosrc AS body,p.provolatile::text AS volatility,p.proisstrict AS strict,p.prosecdef AS security_definer,p.proleakproof AS leakproof,p.proparallel::text AS parallel,p.prokind::text AS kind,coalesce(p.proconfig,'{}') AS config FROM pg_proc p JOIN pg_language l ON l.oid=p.prolang JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname=$1 ORDER BY 1,2")
+        .bind(namespace).fetch_all(&mut **tx).await?;
+    for row in &rows {
+        let config: Vec<String> = row.try_get("config")?;
+        let result: Option<String> = row.try_get("result")?;
+        fingerprint.functions.insert(
+            (row.try_get("name")?, row.try_get("identity")?),
+            FunctionDefinition {
+                arguments: row.try_get("arguments")?,
+                result: result.map(|result| strip_schema_qualification(&result, namespace)),
+                language: row.try_get("language")?,
+                body: row.try_get("body")?,
+                volatility: row.try_get("volatility")?,
+                strict: row.try_get("strict")?,
+                security_definer: row.try_get("security_definer")?,
+                leakproof: row.try_get("leakproof")?,
+                parallel: row.try_get("parallel")?,
+                kind: row.try_get("kind")?,
+                config: config
+                    .iter()
+                    .map(|item| normalize_function_config(item, namespace))
+                    .collect(),
+            },
+        );
+    }
+    Ok(fingerprint)
+}
+
+fn column_differences(expected: &ColumnDefinition, found: &ColumnDefinition) -> String {
+    let nullability = |not_null: bool| if not_null { "NOT NULL" } else { "nullable" };
+    let identity = |identity: &str| match identity {
+        "a" => "always",
+        "d" => "by default",
+        _ => "none",
+    };
+    let generated = |generated: &str| match generated {
+        "s" => "stored",
+        _ => "none",
+    };
+    let optional = |value: &Option<String>| value.clone().unwrap_or_else(|| "none".to_owned());
+    let mut parts = Vec::new();
+    if expected.data_type != found.data_type {
+        parts.push(format!(
+            "type expected {}, found {}",
+            expected.data_type, found.data_type
+        ));
+    }
+    if expected.not_null != found.not_null {
+        parts.push(format!(
+            "expected {}, found {}",
+            nullability(expected.not_null),
+            nullability(found.not_null)
+        ));
+    }
+    if expected.default != found.default {
+        parts.push(format!(
+            "default expected {}, found {}",
+            optional(&expected.default),
+            optional(&found.default)
+        ));
+    }
+    if expected.identity != found.identity {
+        parts.push(format!(
+            "identity expected {}, found {}",
+            identity(&expected.identity),
+            identity(&found.identity)
+        ));
+    }
+    if expected.generated != found.generated {
+        parts.push(format!(
+            "generated expected {}, found {}",
+            generated(&expected.generated),
+            generated(&found.generated)
+        ));
+    }
+    if expected.collation != found.collation {
+        parts.push(format!(
+            "collation expected {}, found {}",
+            expected.collation.as_deref().unwrap_or("default"),
+            found.collation.as_deref().unwrap_or("default")
+        ));
+    }
+    parts.join(", ")
+}
+
+fn trigger_state(enabled: &str) -> &str {
+    match enabled {
+        "O" => "enabled",
+        "D" => "disabled",
+        "R" => "enabled on replicas only",
+        "A" => "always enabled",
+        other => other,
+    }
+}
+
+fn function_differences(expected: &FunctionDefinition, found: &FunctionDefinition) -> String {
+    let volatility = |volatility: &str| match volatility {
+        "i" => "IMMUTABLE",
+        "s" => "STABLE",
+        _ => "VOLATILE",
+    };
+    let parallel = |parallel: &str| match parallel {
+        "s" => "PARALLEL SAFE",
+        "r" => "PARALLEL RESTRICTED",
+        _ => "PARALLEL UNSAFE",
+    };
+    let kind = |kind: &str| match kind {
+        "p" => "procedure",
+        "a" => "aggregate",
+        "w" => "window function",
+        _ => "function",
+    };
+    let optional = |value: &Option<String>| value.clone().unwrap_or_else(|| "none".to_owned());
+    let mut parts = Vec::new();
+    if expected.body != found.body {
+        parts.push("body".to_owned());
+    }
+    if expected.arguments != found.arguments {
+        parts.push(format!(
+            "arguments expected ({}), found ({})",
+            expected.arguments, found.arguments
+        ));
+    }
+    if expected.result != found.result {
+        parts.push(format!(
+            "result expected {}, found {}",
+            optional(&expected.result),
+            optional(&found.result)
+        ));
+    }
+    if expected.language != found.language {
+        parts.push(format!(
+            "language expected {}, found {}",
+            expected.language, found.language
+        ));
+    }
+    if expected.volatility != found.volatility {
+        parts.push(format!(
+            "expected {}, found {}",
+            volatility(&expected.volatility),
+            volatility(&found.volatility)
+        ));
+    }
+    if expected.strict != found.strict {
+        let strictness = |strict: bool| {
+            if strict {
+                "STRICT"
+            } else {
+                "CALLED ON NULL INPUT"
+            }
+        };
+        parts.push(format!(
+            "expected {}, found {}",
+            strictness(expected.strict),
+            strictness(found.strict)
+        ));
+    }
+    if expected.security_definer != found.security_definer {
+        let security = |definer: bool| {
+            if definer {
+                "SECURITY DEFINER"
+            } else {
+                "SECURITY INVOKER"
+            }
+        };
+        parts.push(format!(
+            "expected {}, found {}",
+            security(expected.security_definer),
+            security(found.security_definer)
+        ));
+    }
+    if expected.leakproof != found.leakproof {
+        let leakproof = |leakproof: bool| {
+            if leakproof {
+                "LEAKPROOF"
+            } else {
+                "NOT LEAKPROOF"
+            }
+        };
+        parts.push(format!(
+            "expected {}, found {}",
+            leakproof(expected.leakproof),
+            leakproof(found.leakproof)
+        ));
+    }
+    if expected.parallel != found.parallel {
+        parts.push(format!(
+            "expected {}, found {}",
+            parallel(&expected.parallel),
+            parallel(&found.parallel)
+        ));
+    }
+    if expected.kind != found.kind {
+        parts.push(format!(
+            "expected a {}, found a {}",
+            kind(&expected.kind),
+            kind(&found.kind)
+        ));
+    }
+    if expected.config != found.config {
+        parts.push(format!(
+            "configuration expected [{}], found [{}]",
+            expected.config.join(", "),
+            found.config.join(", ")
+        ));
+    }
+    parts.join(", ")
+}
+
+/// Every object the release creates must have an equivalent in the source;
+/// anything else in the source is extra. An object on a table the source
+/// lacks is not reported twice.
+fn compare_fingerprints(
+    expected: &SchemaFingerprint,
+    found: &SchemaFingerprint,
+) -> SchemaComparison {
+    let mut comparison = SchemaComparison::default();
+    for (table, columns) in &expected.tables {
+        let Some(found_columns) = found.tables.get(table) else {
+            comparison.drift.push(format!("missing table {table}"));
+            continue;
+        };
+        for (column, definition) in columns {
+            match found_columns.get(column) {
+                None => comparison
+                    .drift
+                    .push(format!("missing column {table}.{column}")),
+                Some(actual) if actual != definition => comparison.drift.push(format!(
+                    "column {table}.{column} differs: {}",
+                    column_differences(definition, actual)
+                )),
+                Some(_) => {}
+            }
+        }
+        for column in found_columns.keys() {
+            if !columns.contains_key(column) {
+                comparison.extra.push(format!("column {table}.{column}"));
+            }
+        }
+    }
+    for table in found.tables.keys() {
+        if !expected.tables.contains_key(table) {
+            comparison.extra.push(format!("table {table}"));
+        }
+    }
+    let empty = BTreeMap::new();
+    for (table, constraints) in &expected.constraints {
+        if !found.tables.contains_key(table) {
+            continue;
+        }
+        let found_constraints = found.constraints.get(table).unwrap_or(&empty);
+        for (definition, name) in constraints {
+            if !found_constraints.contains_key(definition) {
+                comparison.drift.push(format!(
+                    "missing constraint {name} on {table}: {definition}"
+                ));
+            }
+        }
+    }
+    for (table, constraints) in &found.constraints {
+        if !expected.tables.contains_key(table) {
+            continue;
+        }
+        let expected_constraints = expected.constraints.get(table).unwrap_or(&empty);
+        for (definition, name) in constraints {
+            if !expected_constraints.contains_key(definition) {
+                comparison
+                    .extra
+                    .push(format!("constraint {name} on {table}: {definition}"));
+            }
+        }
+    }
+    for (name, index) in &expected.indexes {
+        if !found.tables.contains_key(&index.table) {
+            continue;
+        }
+        match found.indexes.get(name) {
+            None => comparison
+                .drift
+                .push(format!("missing index {name} on {}", index.table)),
+            Some(actual) if actual.definition != index.definition => {
+                comparison.drift.push(format!(
+                    "index {name} differs: expected {}, found {}",
+                    index.definition, actual.definition
+                ))
+            }
+            Some(actual) if !actual.valid => comparison
+                .drift
+                .push(format!("index {name} on {} is not valid", index.table)),
+            Some(_) => {}
+        }
+    }
+    for (name, index) in &found.indexes {
+        if expected.tables.contains_key(&index.table) && !expected.indexes.contains_key(name) {
+            comparison
+                .extra
+                .push(format!("index {name} on {}", index.table));
+        }
+    }
+    for ((table, name), trigger) in &expected.triggers {
+        if !found.tables.contains_key(table) {
+            continue;
+        }
+        match found.triggers.get(&(table.clone(), name.clone())) {
+            None => comparison
+                .drift
+                .push(format!("missing trigger {name} on {table}")),
+            Some(actual) if actual != trigger => {
+                let mut parts = Vec::new();
+                if actual.definition != trigger.definition {
+                    parts.push(format!(
+                        "expected {}, found {}",
+                        trigger.definition, actual.definition
+                    ));
+                }
+                if actual.enabled != trigger.enabled {
+                    parts.push(format!(
+                        "expected {}, found {}",
+                        trigger_state(&trigger.enabled),
+                        trigger_state(&actual.enabled)
+                    ));
+                }
+                comparison.drift.push(format!(
+                    "trigger {name} on {table} differs: {}",
+                    parts.join(", ")
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    for (table, name) in found.triggers.keys() {
+        if expected.tables.contains_key(table)
+            && !expected
+                .triggers
+                .contains_key(&(table.clone(), name.clone()))
+        {
+            comparison.extra.push(format!("trigger {name} on {table}"));
+        }
+    }
+    for ((name, identity), function) in &expected.functions {
+        match found.functions.get(&(name.clone(), identity.clone())) {
+            None => comparison
+                .drift
+                .push(format!("missing function {name}({identity})")),
+            Some(actual) if actual != function => comparison.drift.push(format!(
+                "function {name}({identity}) differs: {}",
+                function_differences(function, actual)
+            )),
+            Some(_) => {}
+        }
+    }
+    for (name, identity) in found.functions.keys() {
+        if !expected
+            .functions
+            .contains_key(&(name.clone(), identity.clone()))
+        {
+            comparison
+                .extra
+                .push(format!("function {name}({identity})"));
+        }
+    }
+    comparison
+}
+
+/// Up to `DRIFT_OBJECTS_NAMED` objects, then a count of the rest.
+fn named_objects(objects: &[String]) -> String {
+    let listing = objects
+        .iter()
+        .take(DRIFT_OBJECTS_NAMED)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("; ");
+    match objects.len() {
+        named if named > DRIFT_OBJECTS_NAMED => {
+            format!("{listing} and {} more", named - DRIFT_OBJECTS_NAMED)
+        }
+        _ => listing,
+    }
+}
+
+/// After 001 has run on a 2.x.x source, refuse anything its `IF NOT EXISTS`
+/// left alone that differs from the frozen release. The expected definitions
+/// come from applying the same release SQL (001, plus 002 for a #258 source)
+/// to a scratch schema inside this transaction, under a savepoint that is
+/// rolled back before the source is read, so the comparison is exact for
+/// this server's PostgreSQL version and nothing from the scratch apply
+/// survives. Extra objects, columns, constraints and indexes are kept and
+/// logged; a missing or different one fails the migration, which rolls back
+/// whole, so the database is unchanged.
+async fn require_release_schema(
+    tx: &mut Transaction<'_, Postgres>,
+    state: SourceState,
+    base_schema: &str,
+) -> Result<()> {
+    let row = sqlx::query("SELECT current_schema()::text AS schema,current_setting('search_path') AS search_path,current_database()::text AS database,current_user::text AS role")
+        .fetch_one(&mut **tx).await?;
+    let source_schema: String = row.try_get("schema")?;
+    let search_path: String = row.try_get("search_path")?;
+    let database: String = row.try_get("database")?;
+    let role: String = row.try_get("role")?;
+    let scratch = format!("qbit_prism_scratch_{}", Uuid::new_v4().simple());
+    sqlx::raw_sql("SAVEPOINT qbit_prism_release_schema")
+        .execute(&mut **tx)
+        .await?;
+    if let Err(error) = sqlx::raw_sql(&format!("CREATE SCHEMA {scratch}"))
+        .execute(&mut **tx)
+        .await
+    {
+        if matches!(&error, sqlx::Error::Database(failure) if failure.code().as_deref() == Some("42501"))
+        {
+            bail!("cannot verify the source schema against the v2.0.x release: role {role} lacks the CREATE privilege on database {database}, which the check needs to apply the release SQL to a scratch schema inside the migration transaction (it is rolled back afterwards). Grant it with `GRANT CREATE ON DATABASE {database} TO {role}` and migrate again; nothing was changed");
+        }
+        return Err(error.into());
+    }
+    sqlx::raw_sql(&format!("SET LOCAL search_path TO {scratch}"))
+        .execute(&mut **tx)
+        .await?;
+    sqlx::raw_sql(base_schema).execute(&mut **tx).await?;
+    if state == SourceState::Applied258 {
+        sqlx::raw_sql(include_str!(
+            "../../../qbit-prism/sql/002_candidate_bodies.sql"
+        ))
+        .execute(&mut **tx)
+        .await?;
+    }
+    let applied_in: String = sqlx::query_scalar("SELECT current_schema()::text")
+        .fetch_one(&mut **tx)
+        .await?;
+    ensure!(
+        applied_in == scratch,
+        "release schema was applied in {applied_in}, not in scratch schema {scratch}"
+    );
+    let expected = fingerprint_schema(tx, &scratch).await?;
+    sqlx::raw_sql("ROLLBACK TO SAVEPOINT qbit_prism_release_schema; RELEASE SAVEPOINT qbit_prism_release_schema")
+        .execute(&mut **tx).await?;
+    sqlx::query("SELECT set_config('search_path',$1,true)")
+        .bind(&search_path)
+        .execute(&mut **tx)
+        .await?;
+    let (restored, scratch_gone): (String, bool) =
+        sqlx::query_as("SELECT current_schema()::text,to_regnamespace($1) IS NULL")
+            .bind(&scratch)
+            .fetch_one(&mut **tx)
+            .await?;
+    ensure!(
+        restored == source_schema && scratch_gone,
+        "release schema scratch apply did not roll back (current schema {restored}, expected {source_schema}; scratch schema {scratch} present: {})",
+        !scratch_gone
+    );
+    let mut found = fingerprint_schema(tx, &source_schema).await?;
+    // The migrator's own version table was created before any source object
+    // was read; it is native bookkeeping, not part of the 2.x.x source.
+    found.tables.remove("qbit_prism_schema_migrations");
+    found.constraints.remove("qbit_prism_schema_migrations");
+    let comparison = compare_fingerprints(&expected, &found);
+    let (release, files) = match state {
+        SourceState::Applied258 => (
+            "v2.0.2",
+            "001_share_ledger.sql and 002_candidate_bodies.sql",
+        ),
+        _ => ("v2.0.1", "001_share_ledger.sql"),
+    };
+    if !comparison.extra.is_empty() {
+        tracing::warn!(
+            source = state.rule().name,
+            release,
+            extra = comparison.extra.len(),
+            objects = %named_objects(&comparison.extra),
+            "source schema has objects the 2.x.x release does not create; they are kept as they are"
+        );
+    }
+    ensure!(
+        comparison.drift.is_empty(),
+        "refusing to migrate a {} source: after 001_share_ledger.sql ran, the database does not match the v2.0.x release schema ({release}, {files}), {} object(s) differ ({}). Nothing was changed: the migration rolled back. Restore the pre-migration backup, or bring the database to the release schema with the 2.x.x release (v2.0.1 or later; v2.0.2 for a #258 database) and take a new backup, then migrate again",
+        SOURCE_STATES[5].name,
+        comparison.drift.len(),
+        named_objects(&comparison.drift)
+    );
+    tracing::info!(
+        source = state.rule().name,
+        release,
+        tables = expected.tables.len(),
+        indexes = expected.indexes.len(),
+        triggers = expected.triggers.len(),
+        functions = expected.functions.len(),
+        extra = comparison.extra.len(),
+        "source schema matches the 2.x.x release"
+    );
+    Ok(())
+}
+
 /// Apply the base schema and every native migration inside the caller's
 /// transaction, which holds the migration lock throughout. Refusals happen
-/// before any DDL, so a refused database is unchanged.
+/// before any DDL or roll the transaction back, so a refused database is
+/// unchanged.
 pub(super) async fn migrate_schema(
     tx: &mut Transaction<'_, Postgres>,
     instance_id: &str,
@@ -520,6 +1232,11 @@ pub(super) async fn migrate_schema(
             "../../../qbit-prism/sql/001_share_ledger.sql"
         ))?;
         sqlx::raw_sql(&base_schema).execute(&mut **tx).await?;
+        // 001 repaired what it re-asserts; what it skipped must already be
+        // the release definition before any native DDL alters those tables.
+        if state != SourceState::Fresh {
+            require_release_schema(tx, state, &base_schema).await?;
+        }
         if !versions.contains(&2) {
             sqlx::raw_sql(include_str!("../../migrations/002_multi_instance.sql"))
                 .execute(&mut **tx)
@@ -913,4 +1630,173 @@ fn resolve_import_path(root_dir: Option<&Path>, uri: &str) -> Result<PathBuf> {
         );
     }
     Ok(canonical)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn column(data_type: &str, not_null: bool) -> ColumnDefinition {
+        ColumnDefinition {
+            data_type: data_type.to_owned(),
+            not_null,
+            default: None,
+            identity: String::new(),
+            generated: String::new(),
+            collation: None,
+        }
+    }
+
+    fn table(columns: &[(&str, ColumnDefinition)]) -> BTreeMap<String, ColumnDefinition> {
+        columns
+            .iter()
+            .map(|(name, definition)| ((*name).to_owned(), definition.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn schema_qualification_is_stripped_only_where_it_qualifies() {
+        assert_eq!(
+            strip_schema_qualification(
+                "CREATE INDEX qbit_pool_blocks_public_recent_idx ON public.qbit_pool_blocks USING btree (a)",
+                "public"
+            ),
+            "CREATE INDEX qbit_pool_blocks_public_recent_idx ON qbit_pool_blocks USING btree (a)"
+        );
+        assert_eq!(
+            strip_schema_qualification(
+                "ON \"Prism\".t FOR EACH ROW EXECUTE FUNCTION \"Prism\".f()",
+                "Prism"
+            ),
+            "ON t FOR EACH ROW EXECUTE FUNCTION f()"
+        );
+        assert_eq!(
+            strip_schema_qualification(
+                "nextval('qbit_prism_scratch_ab.s'::regclass)",
+                "qbit_prism_scratch_ab"
+            ),
+            "nextval('s'::regclass)"
+        );
+        assert_eq!(
+            strip_schema_qualification("republic.x", "public"),
+            "republic.x"
+        );
+        assert_eq!(strip_schema_qualification("public", "public"), "public");
+        assert_eq!(
+            normalize_function_config("search_path=pg_catalog, public, pg_temp", "public"),
+            "search_path=pg_catalog, <schema>, pg_temp"
+        );
+        assert_eq!(
+            normalize_function_config("search_path=pg_catalog, \"Prism\", pg_temp", "Prism"),
+            "search_path=pg_catalog, <schema>, pg_temp"
+        );
+        assert_eq!(
+            normalize_function_config("work_mem=public", "public"),
+            "work_mem=public"
+        );
+        assert_eq!(
+            strip_not_valid("CHECK ((a > 0)) NOT VALID"),
+            "CHECK ((a > 0))"
+        );
+    }
+
+    #[test]
+    fn comparison_refuses_missing_or_different_and_tolerates_extra() {
+        let mut expected = SchemaFingerprint::default();
+        expected.tables.insert(
+            "t".into(),
+            table(&[("a", column("bigint", true)), ("b", column("text", false))]),
+        );
+        expected
+            .tables
+            .insert("gone".into(), table(&[("x", column("text", true))]));
+        expected
+            .constraints
+            .entry("t".into())
+            .or_default()
+            .insert("CHECK ((a > 0))".into(), "t_a_check".into());
+        expected.indexes.insert(
+            "t_b_idx".into(),
+            IndexDefinition {
+                table: "t".into(),
+                definition: "CREATE INDEX t_b_idx ON t USING btree (b)".into(),
+                valid: true,
+            },
+        );
+        let mut found = SchemaFingerprint::default();
+        // Different column order, a widened type, an extra column, the same
+        // constraint under another name, an extra index and an extra table.
+        found.tables.insert(
+            "t".into(),
+            table(&[
+                ("extra", column("text", false)),
+                ("b", column("text", false)),
+                ("a", column("numeric", true)),
+            ]),
+        );
+        found
+            .tables
+            .insert("other".into(), table(&[("x", column("text", true))]));
+        found
+            .constraints
+            .entry("t".into())
+            .or_default()
+            .insert("CHECK ((a > 0))".into(), "t_check1".into());
+        found.indexes.insert(
+            "t_b_idx".into(),
+            IndexDefinition {
+                table: "t".into(),
+                definition: "CREATE INDEX t_b_idx ON t USING btree (b)".into(),
+                valid: true,
+            },
+        );
+        found.indexes.insert(
+            "t_extra_idx".into(),
+            IndexDefinition {
+                table: "t".into(),
+                definition: "CREATE INDEX t_extra_idx ON t USING btree (extra)".into(),
+                valid: true,
+            },
+        );
+        let comparison = compare_fingerprints(&expected, &found);
+        assert_eq!(
+            comparison.drift,
+            vec![
+                "missing table gone",
+                "column t.a differs: type expected bigint, found numeric",
+            ]
+        );
+        assert_eq!(
+            comparison.extra,
+            vec!["column t.extra", "table other", "index t_extra_idx on t"]
+        );
+
+        // A matching source has nothing to report.
+        found
+            .tables
+            .insert("gone".into(), table(&[("x", column("text", true))]));
+        found
+            .tables
+            .get_mut("t")
+            .unwrap()
+            .insert("a".into(), column("bigint", true));
+        let comparison = compare_fingerprints(&expected, &found);
+        assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
+
+        // A constraint by definition, not by name; an invalid index.
+        found.constraints.get_mut("t").unwrap().clear();
+        found.indexes.get_mut("t_b_idx").unwrap().valid = false;
+        let comparison = compare_fingerprints(&expected, &found);
+        assert_eq!(
+            comparison.drift,
+            vec![
+                "missing constraint t_a_check on t: CHECK ((a > 0))",
+                "index t_b_idx on t is not valid",
+            ]
+        );
+        let long: Vec<String> = (0..DRIFT_OBJECTS_NAMED + 3)
+            .map(|index| format!("object {index}"))
+            .collect();
+        assert!(named_objects(&long).ends_with("; object 15 and 3 more"));
+    }
 }

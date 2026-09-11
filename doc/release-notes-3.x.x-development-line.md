@@ -37,8 +37,10 @@ carries a banner with the same statement.
     The Rust migrator enumerates its SQL files explicitly and applies
     `001_share_ledger.sql` plus its own migrations; it never applies
     `002_candidate_bodies.sql`. It accepts a #258 source after the drain
-    check, keeping the 002 objects and the capability row, and refuses a
-    partial or newer source before any DDL; see
+    check, keeping the 002 objects and the capability row, refuses a
+    partial or newer source before any DDL, and after 001 has run compares
+    what its `IF NOT EXISTS` left alone against a scratch apply of the
+    release SQL, refusing a drifted definition transactionally; see
     `docs/prism-rust-migration.md`.
 - `crates/qbit-prism-server/src/ledger.rs` is split into ownership
   submodules, `ledger/candidates.rs`, `ledger/jobs.rs`, `ledger/window.rs`,

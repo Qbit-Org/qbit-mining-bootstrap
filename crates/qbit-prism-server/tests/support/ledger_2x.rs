@@ -140,6 +140,7 @@ fn source_state_table_is_the_pinned_data() {
             ("#258 applied", "accept after the drain check"),
             ("partial 002", "refuse, naming the missing object"),
             ("newer", "refuse before any DDL"),
+            ("drifted 001", "refuse transactionally, naming the object"),
         ]
     );
     assert_eq!(SourceState::Pre258.release().map(|r| r.0), Some("2.0.1"));
@@ -558,6 +559,247 @@ async fn partial_002_source_is_refused_naming_the_missing_object() -> Result<()>
         "{error}"
     );
     assert!(native_tables_absent(&pool).await?, "refusal ran DDL");
+    pool.close().await;
+    db.close(vec![]).await
+}
+
+#[tokio::test]
+async fn drifted_pre_258_source_is_refused_naming_each_object_and_rolls_back() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    let terminal = legacy_hash(0x33);
+    insert_v1_terminal(&pool, &terminal, "submitted").await?;
+    // Four edits 001's IF NOT EXISTS cannot repair: a foreign key 001 only
+    // creates inside CREATE TABLE, a NOT NULL and a column type it never
+    // re-asserts, and an index that keeps its name but not its definition.
+    // (001 re-creates every function and trigger itself, so those are only
+    // checked as found on 002 objects.)
+    sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox DROP CONSTRAINT qbit_block_candidate_outbox_share_id_fkey; ALTER TABLE qbit_pool_blocks ALTER COLUMN parent_hash DROP NOT NULL; ALTER TABLE qbit_share_ledger ALTER COLUMN ntime TYPE integer; DROP INDEX qbit_share_ledger_template_height_idx; CREATE INDEX qbit_share_ledger_template_height_idx ON qbit_share_ledger (template_height)")
+        .execute(&pool).await?;
+    let error = db
+        .ledger("a")
+        .await
+        .err()
+        .context("migration accepted a drifted 001 source")?
+        .to_string();
+    assert!(
+        error.contains("refusing to migrate a drifted 001 source"),
+        "{error}"
+    );
+    assert!(
+        error.contains("does not match the v2.0.x release schema (v2.0.1, 001_share_ledger.sql), 4 object(s) differ"),
+        "{error}"
+    );
+    assert!(
+        error.contains("missing constraint qbit_block_candidate_outbox_share_id_fkey on qbit_block_candidate_outbox: FOREIGN KEY (share_id) REFERENCES qbit_share_ledger(share_id)"),
+        "{error}"
+    );
+    assert!(
+        error.contains(
+            "column qbit_pool_blocks.parent_hash differs: expected NOT NULL, found nullable"
+        ),
+        "{error}"
+    );
+    assert!(
+        error.contains(
+            "column qbit_share_ledger.ntime differs: type expected bigint, found integer"
+        ),
+        "{error}"
+    );
+    assert!(
+        error.contains("index qbit_share_ledger_template_height_idx differs: expected CREATE INDEX qbit_share_ledger_template_height_idx ON qbit_share_ledger USING btree (template_height, share_seq)")
+            && error.contains(", found CREATE INDEX qbit_share_ledger_template_height_idx ON qbit_share_ledger USING btree (template_height)"),
+        "{error}"
+    );
+    assert!(
+        error.contains("Nothing was changed")
+            && error.contains("Restore the pre-migration backup, or bring the database to the release schema with the 2.x.x release"),
+        "{error}"
+    );
+    // The whole transaction rolled back: no native table, no scratch schema,
+    // the 2.x.x rows and the drift exactly as they were.
+    assert!(native_tables_absent(&pool).await?, "refusal ran DDL");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'qbit_prism_scratch_%'"
+        )
+        .fetch_one(&pool)
+        .await?,
+        0,
+        "scratch schema survived the refusal"
+    );
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT block_hash,state FROM qbit_block_candidate_outbox ORDER BY block_hash",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(rows, vec![(terminal.clone(), "submitted".into())]);
+    assert!(sqlx::query_scalar::<_,bool>("SELECT NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=to_regclass('qbit_block_candidate_outbox') AND conname='qbit_block_candidate_outbox_share_id_fkey') AND EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass('qbit_share_ledger') AND attname='ntime' AND atttypid='integer'::regtype)").fetch_one(&pool).await?, "refusal changed the source schema");
+    // Back at the release schema (the index by re-running the 2.x.x file),
+    // the source migrates and is still recorded as the v2.0.1 schema.
+    sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox ADD CONSTRAINT qbit_block_candidate_outbox_share_id_fkey FOREIGN KEY (share_id) REFERENCES qbit_share_ledger(share_id); ALTER TABLE qbit_pool_blocks ALTER COLUMN parent_hash SET NOT NULL; ALTER TABLE qbit_share_ledger ALTER COLUMN ntime TYPE bigint; DROP INDEX qbit_share_ledger_template_height_idx")
+        .execute(&pool).await?;
+    sqlx::raw_sql(FROZEN_2X_001).execute(&pool).await?;
+    let ledger = db.ledger("a").await?;
+    assert_eq!(
+        ledger.migration_source().await?.map(|s| s.source_state),
+        Some("pre_258".into())
+    );
+    exercise_native_writers(&ledger, 1, 5201).await?;
+    pool.close().await;
+    db.close(vec![ledger]).await
+}
+
+#[tokio::test]
+async fn drifted_002_object_is_refused_on_a_258_source() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    apply_frozen_2x_schema(&pool, SourceState::Applied258).await?;
+    insert_v2_terminal(&pool, &legacy_hash(0x44), "abandoned").await?;
+    // 3.x.x never re-applies 002, so its definitions are checked as found:
+    // a replaced function body and a disabled trigger.
+    sqlx::raw_sql("CREATE OR REPLACE FUNCTION qbit_prism_fact_oversized(value jsonb, expected text, byte_limit integer) RETURNS boolean AS $$ SELECT false $$ LANGUAGE sql IMMUTABLE; ALTER TABLE qbit_block_candidate_body_chunk DISABLE TRIGGER qbit_block_candidate_body_chunk_guard")
+        .execute(&pool).await?;
+    let error = db
+        .ledger("a")
+        .await
+        .err()
+        .context("migration accepted a drifted 002 object")?
+        .to_string();
+    assert!(
+        error.contains("refusing to migrate a drifted 001 source"),
+        "{error}"
+    );
+    assert!(
+        error.contains(
+            "(v2.0.2, 001_share_ledger.sql and 002_candidate_bodies.sql), 2 object(s) differ"
+        ),
+        "{error}"
+    );
+    assert!(
+        error.contains("function qbit_prism_fact_oversized(value jsonb, expected text, byte_limit integer) differs: body"),
+        "{error}"
+    );
+    assert!(
+        error.contains("trigger qbit_block_candidate_body_chunk_guard on qbit_block_candidate_body_chunk differs: expected enabled, found disabled"),
+        "{error}"
+    );
+    assert!(native_tables_absent(&pool).await?, "refusal ran DDL");
+    assert_eq!(capability(&pool).await?, Some(2));
+    // The v2.0.2 release re-creates its functions and triggers.
+    sqlx::raw_sql(FROZEN_2X_002).execute(&pool).await?;
+    let ledger = db.ledger("a").await?;
+    assert_eq!(
+        ledger.migration_source().await?.map(|s| s.source_state),
+        Some("258_applied".into())
+    );
+    pool.close().await;
+    db.close(vec![ledger]).await
+}
+
+#[tokio::test]
+async fn tolerated_source_differences_still_migrate() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    sqlx::raw_sql("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256) VALUES(repeat('aa',32),100,repeat('00',32),repeat('ab',32),repeat('ac',32))")
+        .execute(&pool).await?;
+    // Extra objects an operator may have added; a column 001 creates in
+    // CREATE TABLE moved to a different physical position with its data;
+    // and the NOT VALID mark 001 itself leaves on an upgraded table.
+    sqlx::raw_sql("CREATE TABLE operator_notes(note_id bigserial PRIMARY KEY, note text NOT NULL); ALTER TABLE qbit_share_ledger ADD COLUMN operator_note text; CREATE INDEX qbit_share_ledger_operator_idx ON qbit_share_ledger (miner_id); ALTER TABLE qbit_pool_blocks ADD COLUMN parent_hash_moved text; UPDATE qbit_pool_blocks SET parent_hash_moved=parent_hash; ALTER TABLE qbit_pool_blocks DROP COLUMN parent_hash; ALTER TABLE qbit_pool_blocks RENAME COLUMN parent_hash_moved TO parent_hash; ALTER TABLE qbit_pool_blocks ALTER COLUMN parent_hash SET NOT NULL; ALTER TABLE qbit_share_ledger DROP CONSTRAINT qbit_share_ledger_credit_policy_check; ALTER TABLE qbit_share_ledger ADD CONSTRAINT qbit_share_ledger_credit_policy_check CHECK (credit_policy IS NULL OR credit_policy IN ('stale-grace')) NOT VALID")
+        .execute(&pool).await?;
+    let order: Vec<String> = sqlx::query_scalar("SELECT attname::text FROM pg_attribute WHERE attrelid=to_regclass('qbit_pool_blocks') AND attnum>0 AND NOT attisdropped ORDER BY attnum")
+        .fetch_all(&pool).await?;
+    assert_eq!(order.last().map(String::as_str), Some("parent_hash"));
+    let ledger = db.ledger("a").await?;
+    assert_eq!(schema_version(&pool).await?, REQUIRED_SCHEMA_VERSION);
+    assert_eq!(
+        ledger.migration_source().await?.map(|s| s.source_state),
+        Some("pre_258".into())
+    );
+    // The extras and the moved column survive, with the data.
+    assert!(sqlx::query_scalar::<_,bool>("SELECT to_regclass('operator_notes') IS NOT NULL AND to_regclass('qbit_share_ledger_operator_idx') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass('qbit_share_ledger') AND attname='operator_note' AND NOT attisdropped)").fetch_one(&pool).await?);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT parent_hash FROM qbit_pool_blocks WHERE block_hash=repeat('aa',32)"
+        )
+        .fetch_one(&pool)
+        .await?,
+        "00".repeat(32)
+    );
+    exercise_native_writers(&ledger, 1, 5301).await?;
+    pool.close().await;
+    db.close(vec![ledger]).await
+}
+
+#[tokio::test]
+async fn migrate_role_without_create_on_the_database_is_told_the_grant_it_needs() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let database: String = sqlx::query_scalar("SELECT current_database()::text")
+        .fetch_one(&pool)
+        .await?;
+    // A role that may create in the test schema but not in the database, and
+    // that owns the 2.x.x objects because it applied them.
+    let role = format!("prism_limited_{}", Uuid::new_v4().simple());
+    sqlx::raw_sql(&format!(
+        "CREATE ROLE {role} LOGIN PASSWORD 'limited'; GRANT USAGE, CREATE ON SCHEMA {} TO {role}",
+        db.schema
+    ))
+    .execute(&pool)
+    .await?;
+    let mut limited = url::Url::parse(&db.url)?;
+    limited
+        .set_username(&role)
+        .ok()
+        .context("limited role username")?;
+    limited
+        .set_password(Some("limited"))
+        .ok()
+        .context("limited role password")?;
+    let limited_pool = PgPool::connect(limited.as_str()).await?;
+    apply_frozen_2x_schema(&limited_pool, SourceState::Pre258).await?;
+    limited_pool.close().await;
+    let error = Ledger::connect(limited.as_str(), "limited".into(), 8, true)
+        .await
+        .err()
+        .context("migration ran the release-schema check without CREATE on the database")?
+        .to_string();
+    assert!(
+        error.contains(&format!(
+            "role {role} lacks the CREATE privilege on database {database}"
+        )),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("GRANT CREATE ON DATABASE {database} TO {role}"))
+            && error.contains("nothing was changed"),
+        "{error}"
+    );
+    assert!(native_tables_absent(&pool).await?, "refusal ran DDL");
+    // With the grant the same role migrates.
+    sqlx::raw_sql(&format!("GRANT CREATE ON DATABASE {database} TO {role}"))
+        .execute(&pool)
+        .await?;
+    let ledger = Ledger::connect(limited.as_str(), "limited".into(), 8, true).await?;
+    assert_eq!(
+        ledger.migration_source().await?.map(|s| s.source_state),
+        Some("pre_258".into())
+    );
+    ledger.pool.close().await;
+    sqlx::raw_sql(&format!("DROP OWNED BY {role}; DROP ROLE {role}"))
+        .execute(&pool)
+        .await?;
     pool.close().await;
     db.close(vec![]).await
 }
