@@ -377,20 +377,28 @@ impl ProcessSampler {
     }
 }
 
-/// One backend waiting on ORDER_LOCK at one instant.
+/// One backend's ORDER_LOCK row at one instant: waiting when `granted` is
+/// false, holding when it is true.
+///
+/// The holder matters as much as the waiter. A foreign process that *holds*
+/// ORDER_LOCK stalls every frontend, and the frontends then queue up as
+/// waiters and are correctly recognised as this run's own -- so a sampler that
+/// only selected ungranted rows billed the whole stall to them and reported
+/// that nothing foreign was involved.
 #[derive(Clone, Debug)]
-pub struct Waiter {
+pub struct LockRow {
     pub pid: i32,
+    pub granted: bool,
     pub waitstart: Option<chrono::DateTime<chrono::Utc>>,
     pub application_name: String,
 }
 
-/// One `pg_locks` sample of the ORDER_LOCK waiter set.
+/// One `pg_locks` sample of every ORDER_LOCK row in this database.
 #[derive(Clone, Debug)]
 pub struct LockSample {
     pub monotonic: Instant,
     pub server_time: chrono::DateTime<chrono::Utc>,
-    pub waiters: Vec<Waiter>,
+    pub rows: Vec<LockRow>,
     pub query_millis: f64,
 }
 
@@ -417,6 +425,17 @@ pub struct LockSummary {
     pub foreign_waiter_samples: usize,
     pub foreign_application_names: Vec<String>,
     pub foreign_waiter_seconds_estimate: Option<f64>,
+    /// A foreign *holder* is what a foreign stall looks like from here: it
+    /// blocks every frontend, and the frontends then queue up as waiters that
+    /// are correctly this run's own. Without these three, that stall would be
+    /// billed to them.
+    pub foreign_holder_samples: usize,
+    pub foreign_holder_application_names: Vec<String>,
+    pub foreign_holder_seconds_estimate: Option<f64>,
+    /// One answer for a reader who should not have to notice a zero in the
+    /// right field. `None` means the sampler could not attribute rows at all,
+    /// so it cannot say: unknown, not false.
+    pub foreign_contention_observed: Option<bool>,
     /// Riemann estimate of the total time backends spent waiting, in
     /// waiter-seconds. Waits shorter than the sampling interval can be missed
     /// entirely, so this is a lower bound.
@@ -439,6 +458,47 @@ pub struct AdvisoryStatementStats {
     pub calls: i64,
     pub total_exec_milliseconds: f64,
     pub note: &'static str,
+}
+
+/// One sample's rows, split by whose they are and whether they are granted.
+///
+/// `own_holding` is the normal case -- a frontend in the middle of an append
+/// -- and deliberately stays out of every foreign counter.
+pub struct LockRowSplit<'a> {
+    pub own_waiting: Vec<&'a LockRow>,
+    pub own_holding: Vec<&'a LockRow>,
+    pub foreign_waiting: Vec<&'a LockRow>,
+    pub foreign_holding: Vec<&'a LockRow>,
+}
+
+/// Whether a row belongs to one of this run's frontends.
+///
+/// With no attribution -- the driver did not carry `application_name`, or
+/// `pg_stat_activity` did not show it -- no row can be called foreign, so
+/// every row counts as this run's and the summary says so rather than
+/// pretending the set is clean.
+pub fn is_own_row(row: &LockRow, frontends: &[String]) -> bool {
+    frontends.is_empty() || frontends.contains(&row.application_name)
+}
+
+/// Split one sample's rows. Pure, so the attribution it decides is testable
+/// without a database.
+pub fn split_lock_rows<'a>(rows: &'a [LockRow], frontends: &[String]) -> LockRowSplit<'a> {
+    let mut split = LockRowSplit {
+        own_waiting: Vec::new(),
+        own_holding: Vec::new(),
+        foreign_waiting: Vec::new(),
+        foreign_holding: Vec::new(),
+    };
+    for row in rows {
+        match (is_own_row(row, frontends), row.granted) {
+            (true, false) => split.own_waiting.push(row),
+            (true, true) => split.own_holding.push(row),
+            (false, false) => split.foreign_waiting.push(row),
+            (false, true) => split.foreign_holding.push(row),
+        }
+    }
+    split
 }
 
 /// Side-connection sampler for ORDER_LOCK waits.
@@ -473,14 +533,18 @@ impl LockSampler {
         tokio::spawn(async move {
             while !stop.load(Ordering::Relaxed) {
                 let started = Instant::now();
+                // Granted rows are selected too: the holder of ORDER_LOCK is
+                // what a foreign stall looks like, and filtering it out made
+                // one invisible.
                 let query = sqlx::query(
-                    "SELECT a.pid, l.waitstart, COALESCE(a.application_name,'') AS application_name, \
+                    "SELECT a.pid, l.granted, l.waitstart, \
+                     COALESCE(a.application_name,'') AS application_name, \
                      clock_timestamp() AS sampled_at \
                      FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid \
                      WHERE l.locktype = 'advisory' \
                        AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
                        AND l.classid = $1::bigint::oid AND l.objid = $2::bigint::oid \
-                       AND l.objsubid = 1 AND NOT l.granted",
+                       AND l.objsubid = 1",
                 )
                 .bind(ORDER_LOCK_CLASSID)
                 .bind(ORDER_LOCK_OBJID)
@@ -492,10 +556,11 @@ impl LockSampler {
                             .first()
                             .and_then(|row| row.try_get("sampled_at").ok())
                             .unwrap_or_else(chrono::Utc::now);
-                        let waiters = rows
+                        let rows = rows
                             .iter()
-                            .map(|row| Waiter {
+                            .map(|row| LockRow {
                                 pid: row.try_get::<i32, _>("pid").unwrap_or_default(),
+                                granted: row.try_get::<bool, _>("granted").unwrap_or(false),
                                 waitstart: row
                                     .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(
                                         "waitstart",
@@ -509,7 +574,7 @@ impl LockSampler {
                         samples.lock().expect("lock sampler").push(LockSample {
                             monotonic: Instant::now(),
                             server_time,
-                            waiters,
+                            rows,
                             query_millis: started.elapsed().as_secs_f64() * 1000.0,
                         });
                     }
@@ -535,11 +600,6 @@ impl LockSampler {
             .filter(|s| s.monotonic >= since && s.monotonic <= until)
             .collect();
         let attributing = !self.frontends.is_empty();
-        let mine = |waiter: &Waiter| -> bool {
-            // Without attribution every waiter in this database counts, and
-            // the summary says so rather than pretending the set is clean.
-            !attributing || self.frontends.contains(&waiter.application_name)
-        };
         let mut summary = LockSummary {
             lock: "ORDER_LOCK",
             key: "0x505249534d000002",
@@ -556,6 +616,10 @@ impl LockSampler {
             foreign_waiter_samples: 0,
             foreign_application_names: Vec::new(),
             foreign_waiter_seconds_estimate: None,
+            foreign_holder_samples: 0,
+            foreign_holder_application_names: Vec::new(),
+            foreign_holder_seconds_estimate: None,
+            foreign_contention_observed: None,
             waiter_seconds_estimate: None,
             episodes_at_least: 0,
             longest_observed_wait_seconds: None,
@@ -576,15 +640,21 @@ impl LockSampler {
         > = HashMap::new();
         let mut waiter_seconds = 0.0f64;
         let mut foreign_seconds = 0.0f64;
+        let mut foreign_holder_seconds = 0.0f64;
         let mut foreign_names: BTreeMap<String, usize> = BTreeMap::new();
+        let mut foreign_holder_names: BTreeMap<String, usize> = BTreeMap::new();
         let mut total_waiters = 0usize;
         let mut previous: Option<Instant> = None;
         let mut query_millis = Vec::with_capacity(window.len());
         for sample in &window {
             query_millis.push(sample.query_millis);
-            let ours: Vec<&Waiter> = sample.waiters.iter().filter(|w| mine(w)).collect();
-            let foreign = sample.waiters.len() - ours.len();
-            let count = ours.len();
+            let split = split_lock_rows(&sample.rows, &self.frontends);
+            // Every waiter number stays over ungranted rows belonging to this
+            // run, exactly as before; the granted rows are new information
+            // beside them, never folded into them.
+            let foreign = split.foreign_waiting.len();
+            let foreign_holding = split.foreign_holding.len();
+            let count = split.own_waiting.len();
             total_waiters += count;
             summary.max_waiters = summary.max_waiters.max(count);
             if count > 0 {
@@ -592,9 +662,17 @@ impl LockSampler {
             }
             if foreign > 0 {
                 summary.foreign_waiter_samples += 1;
-                for waiter in sample.waiters.iter().filter(|w| !mine(w)) {
+                for row in &split.foreign_waiting {
                     *foreign_names
-                        .entry(waiter.application_name.clone())
+                        .entry(row.application_name.clone())
+                        .or_insert(0) += 1;
+                }
+            }
+            if foreign_holding > 0 {
+                summary.foreign_holder_samples += 1;
+                for row in &split.foreign_holding {
+                    *foreign_holder_names
+                        .entry(row.application_name.clone())
                         .or_insert(0) += 1;
                 }
             }
@@ -605,9 +683,10 @@ impl LockSampler {
                     .as_secs_f64();
                 waiter_seconds += count as f64 * delta;
                 foreign_seconds += foreign as f64 * delta;
+                foreign_holder_seconds += foreign_holding as f64 * delta;
             }
             previous = Some(sample.monotonic);
-            for waiter in ours {
+            for waiter in split.own_waiting {
                 let key = (
                     waiter.pid,
                     waiter.waitstart.map(|w| w.to_rfc3339()).unwrap_or_default(),
@@ -623,6 +702,10 @@ impl LockSampler {
         summary.waiter_seconds_estimate = Some(waiter_seconds);
         summary.foreign_waiter_seconds_estimate = Some(foreign_seconds);
         summary.foreign_application_names = foreign_names.into_keys().collect();
+        summary.foreign_holder_seconds_estimate = Some(foreign_holder_seconds);
+        summary.foreign_holder_application_names = foreign_holder_names.into_keys().collect();
+        summary.foreign_contention_observed = attributing
+            .then_some(summary.foreign_waiter_samples > 0 || summary.foreign_holder_samples > 0);
         summary.episodes_at_least = episodes.len();
         summary.longest_observed_wait_seconds = episodes
             .values()

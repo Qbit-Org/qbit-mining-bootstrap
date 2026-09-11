@@ -1134,6 +1134,48 @@ fn the_harness_reads_its_own_postgres_binary_variable() {
 }
 
 #[test]
+fn a_foreign_order_lock_holder_is_not_billed_to_the_frontends() {
+    use qbit_prism_load::measure::{is_own_row, split_lock_rows, LockRow};
+    let row = |pid: i32, granted: bool, name: &str| LockRow {
+        pid,
+        granted,
+        waitstart: None,
+        application_name: name.to_owned(),
+    };
+    let rows = vec![
+        // A frontend holding the lock is the normal case and belongs in no
+        // foreign counter.
+        row(1, true, "load-fe-0"),
+        row(2, false, "load-fe-1"),
+        // Anything else holding it stalls every frontend, which is exactly
+        // what used to be invisible.
+        row(3, true, "adversarial-foreign-holder"),
+        row(4, false, "psql"),
+    ];
+    let frontends = vec!["load-fe-0".to_owned(), "load-fe-1".to_owned()];
+    let split = split_lock_rows(&rows, &frontends);
+    assert_eq!(split.own_holding.len(), 1);
+    assert_eq!(split.own_waiting.len(), 1, "the waiter numbers stay ours");
+    assert_eq!(split.foreign_holding.len(), 1);
+    assert_eq!(
+        split.foreign_holding[0].application_name,
+        "adversarial-foreign-holder"
+    );
+    assert_eq!(split.foreign_waiting.len(), 1);
+    assert_eq!(split.foreign_waiting[0].application_name, "psql");
+
+    // With no attribution nothing can be called foreign: every ungranted row
+    // counts as this run's, which is what the summary's attribution note says.
+    let blind = split_lock_rows(&rows, &[]);
+    assert!(blind.foreign_holding.is_empty());
+    assert!(blind.foreign_waiting.is_empty());
+    assert_eq!(blind.own_waiting.len(), 2);
+    assert_eq!(blind.own_holding.len(), 2);
+    assert!(is_own_row(&row(5, true, "anything"), &[]));
+    assert!(!is_own_row(&row(5, true, "anything"), &frontends));
+}
+
+#[test]
 fn the_temporary_cluster_root_is_removed_even_when_start_up_fails() -> Result<()> {
     use qbit_prism_load::cluster::TempRoot;
     // The directory has to exist before the value that owns the cleanup can be

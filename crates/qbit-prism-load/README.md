@@ -401,16 +401,25 @@ The side report repeats all of this under `honest_value_notes`.
 - **ORDER_LOCK is database-wide.** Anything else in the same database taking
   the same advisory lock would distort every number in that section, so each
   frontend connects with `application_name=load-fe-<i>` and the sampler
-  attributes waiters by it. Whether the driver really carried the name is
+  attributes rows by it. Whether the driver really carried the name is
   verified against `pg_stat_activity` rather than assumed: when it did not, the
-  summary says so and counts every waiter in the database instead. Waiters that
-  are not this run's frontends are reported separately as
-  `foreign_waiter_samples`, `foreign_application_names` and
-  `foreign_waiter_seconds_estimate`.
+  summary says so and counts every waiter in the database instead. Rows that
+  are not this run's frontends are reported separately, and the holder is
+  reported apart from the waiter because they are different events: a foreign
+  *holder* blocks every frontend, and the frontends then queue up as waiters
+  that really are this run's own, so a holder-blind sampler would bill the
+  whole stall to them. The fields are `foreign_waiter_samples`,
+  `foreign_application_names` and `foreign_waiter_seconds_estimate` for
+  waiters, `foreign_holder_samples`, `foreign_holder_application_names` and
+  `foreign_holder_seconds_estimate` for holders, and one
+  `foreign_contention_observed` covering both — `null` rather than `false`
+  when the sampler could not attribute rows at all. A frontend holding the
+  lock is the normal case and is in none of them.
 - **ORDER_LOCK waits are sampled**, not instrumented. The metric family
   `qbit_prism_database_advisory_lock_wait_seconds` exists but has no producer,
-  so the harness samples `pg_locks` joined to `pg_stat_activity` every 10 ms
-  and reports a waiter-count summary, an episode count as "at least N", and a
+  so the harness samples every ORDER_LOCK row in `pg_locks`, joined to
+  `pg_stat_activity`, every 10 ms, and reports a waiter-count summary over the
+  ungranted rows belonging to this run, an episode count as "at least N", and a
   Riemann waiter-seconds estimate that is a lower bound: waits shorter than the
   sampling interval can be missed entirely. The sampler's own query cost is
   reported beside the numbers. When `pg_stat_statements` is loaded, the
