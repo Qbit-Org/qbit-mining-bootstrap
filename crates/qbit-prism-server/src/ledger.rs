@@ -34,7 +34,7 @@ mod window;
 pub use difficulty::WorkerDifficulty;
 use window::{read_prior_balances, share_from_row};
 pub use window::{
-    AppendResult, BalanceSource, ShareRange, Snapshot, Window, WindowError, WindowRef,
+    AppendResult, BalanceSource, PayoutState, ShareRange, Snapshot, Window, WindowError, WindowRef,
 };
 
 const MIGRATION_LOCK: i64 = 0x505249534d000001;

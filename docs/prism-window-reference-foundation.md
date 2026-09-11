@@ -5,11 +5,18 @@ This local slice adds the schema and authenticated reader approved after the
 compact prepared jobs or finish issue273. Authorization covers B-owned code
 only and is not A/C owner approval.
 
-The dependency is open PR313 at `4e366c12518d8ecf795fbe1aa7adfb2ecb48e0b8`,
-added to this child branch through merge `bae584e`. Upstream release metadata
-and D2 tests arrived with that dependency; this slice adds no release bump.
-The API follows [design PR297 at 652438d](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/652438d00376f5eb7edc668e8d41b542bea97eff/docs/prism-coordinator-refactor/window-ref.md).
-That newer design's leased-candidate changes remain outside this slice.
+The dependency is open PR313 at `ec888ecfe131f4f9deebbafda9926b299392cac0`,
+added to this child branch through merge `91294e7`, after the earlier additive
+update `bae584e`. The new dependency commit restores D2 coordinator test
+membership. Its original worktree is untouched; this slice adds no release bump.
+
+The API remains compatible with [PR297's approved bed6ad8 contract](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/bed6ad8888d6bd58ec9fc96fed8b5ba409b63cee/docs/prism-coordinator-refactor/window-ref.md).
+The [posted user signoff](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/297#issuecomment-5638877264)
+authorizes the narrower lease: revision changes are bridged only while the
+balance digest is unchanged; changed balances end the lease immediately.
+It does not waive affected-work/replacement-delivery qualification or establish
+full miner parity. Final resume/submit and leased-candidate wiring remain
+unimplemented here, pending the exact A265 interfaces listed below.
 
 ## Implemented contract
 
@@ -40,6 +47,12 @@ That newer design's leased-candidate changes remain outside this slice.
   No 006, 007, 009, candidate, audit reader, or deployment implementation was
   imported. The existing legacy migration test now verifies the entire applied
   version set instead of a hard-coded maximum of 5.
+- The later B-owned `Ledger::payout_state()` returns a `PayoutState` containing
+  current revision and current balance digest from one repeatable-read primary
+  snapshot. It retains `payout_revision`'s fatal/read-only guards, reads no share
+  history or as-issued blob, and decodes/hashes/drops balances in a blocking
+  closure. It has no private deadline or implicit eligibility decision.
+  `WindowRef`, `Window`, `WindowError` and `read_window` signatures are unchanged.
 
 The bytea column contracts are `qbit_prism_templates(template_sha256,
 template_bytes)` and `qbit_prism_balance_snapshots(prior_balances_digest,
@@ -48,7 +61,55 @@ its key is `qbit_prism::prior_balances_digest`, **not** the hash of those bytes.
 Future writers must authenticate content and compare immutable conflicts in
 the same save/repair transaction. Schema immutability alone is not that writer.
 
-## Local qualification
+## Post-signoff qualification
+
+The coherent-state follow-up was tested on the additive PR313 dependency
+`91294e7`, with Rust 1.89.0 and disposable PostgreSQL 16.14 discovered through
+`pg_config --bindir`. Workspace all-target compilation, formatting and
+`git diff --check` passed. The regular database command below passed 223 tests:
+
+| Suite | Passed |
+| --- | --- |
+| Server library, including PR313's nine restored D2 coordinator cases | 142 |
+| `ledger_postgres` / `migration_rollback` | 29 / 1 |
+| `readiness_rpc` / `stratum_protocol` | 5 / 22 |
+| `window_read_oracle` | 8 |
+| `window_reference` | 16; the two explicit qualification tests remained ignored |
+
+The four new `window_reference::payout_state` database cases passed both alone
+and in the regression run:
+
+- Revision-only change preserves the balance identity; changed balances alter
+  it, without requiring share history or the as-issued store.
+- A test-only database view gates the revision result before the balance
+  statement starts. Another transaction commits a new revision and balance set
+  during that wait; the reader returns the old coherent pair, and the next read
+  sees the new pair. Blocking the balance statement itself is insufficient to
+  distinguish transaction isolation from that statement's own snapshot.
+- Empty balances remain valid; fatal state, read-only configuration, missing
+  current-balance storage and numeric decode overflow remain truthful errors.
+- SQLSTATE 57014 and cancellation during the balance query release the only
+  connection, which a subsequent state read successfully reuses.
+
+The coherence test was checked with a temporary local mutation replacing
+`REPEATABLE READ` with `READ COMMITTED`. It failed with the expected
+`payout eligibility mixed two MVCC snapshots` error. The mutation was restored
+in a `finally` cleanup; the four focused cases were then rerun on the real code.
+
+The first compile caught the new test fixture's `u64` balance field; it was
+corrected to the existing `CarryForwardBalance.balance_sats: i128` contract
+before the passing runs. Existing as-issued signed-equality and miner assertions
+were not changed. The new tests exercise the helper, not runtime lease
+revocation or candidate dispatch. No credit-policy success is inferred from
+these regression results.
+
+This follow-up did not rerun the ignored 400k/500k reader, actual external 009
+SQL test, or issued-dependency suite; their earlier evidence remains below.
+Full refresh/resume, large-template/WAL, async standby, live-qbit, GC/enqueue
+races and full deep-review remain unrun for this integration. No production
+access, push or public approval was performed.
+
+## Initial foundation qualification (d7526fc)
 
 Rust 1.89.0, PostgreSQL 16.14 discovered through `pg_config --bindir`, macOS.
 Every database run used the existing disposable-cluster runner; no production
@@ -143,26 +204,70 @@ RUSTUP_TOOLCHAIN=1.89.0 bash test/prism-native-tests.sh cargo-args \
 
 ## Remaining integration hooks
 
-1. Obtain A/C agreement and A265's `AUDIT_BUILDER_VERSION`, stored candidate
-   inputs, and slim candidate representation. A's `audit::read_range` is
-   unchanged. No placeholder builder version or candidate adapter exists here.
+1. Obtain A265's concrete interfaces below and A/C integration review. User
+   signoff on the narrowed contract has already been given; it is not a blocker.
+   A's `audit::read_range` is unchanged. No placeholder builder version or
+   candidate adapter exists here.
 2. Switch `StoredPrepared`/`Prepared`, WorkLedger and refresh to references and
    stored policy/signer/hash inputs. Authenticate fetched template bytes before
    decoding, compare payload/reference columns, and preserve exact original
-   signed hashes. Define the legacy prepared-row miss at that runtime cutover.
+   signed hashes. Wire coherent `payout_state` through WorkLedger/SubmitLedger
+   admission, comparing against the issued digest with publication/lease/expiry
+   rechecks after waits and the unchanged transaction revision fence. State-read
+   failure remains an error; known mismatch is ineligible. Define the legacy
+   prepared-row miss at that runtime cutover.
 3. Insert/reuse template, balance snapshot and prepared job atomically; extend
    PR313 cold repair to restore all dependencies and the child with immutable
    conflict checks and the child's original absolute expiry. Add transactional,
-   bounded job/blob GC under the existing settlement lock and both lock-order
-   race tests. This foundation does not change `save_job` or GC.
+   job/blob GC under `SETTLEMENT_LOCK` then `ORDER_LOCK`: expire at most 4096
+   jobs, prune their unreferenced templates, then sweep balances unreferenced by
+   any job or nonterminal leased candidate. The balance sweep also runs when
+   zero jobs expire, so candidate-retained orphans disappear after terminal
+   completion. See the plan's GC/repair/enqueue race matrix. This foundation
+   does not change `save_job` or runtime GC.
 4. Add shared reader capacity, build permits, bounded singleflight, original
    deadline, and per-waiter authority/expiry checks in callers. The reader has
-   no permits or private timeout by design. Release full rebuilt windows before
-   resumed jobs enter sessions, using A265's candidate integration.
+   no permits or private timeout by design. Release full rebuilt windows inside
+   the blocking closure before resumed jobs enter sessions, using A265's
+   candidate integration. Preserve the original synthetic bootstrap share.
 5. Qualify real 400k refresh plus frontend-A-to-B resume, 500k headroom, a large
    valid template, all refresh JSONB values below 1 MB, and measured refresh WAL
    against the 5 MB target. Large reader tests do not establish those gates.
-   Record dedicated asynchronous standby results and per-phase RSS/read counts.
+   Record dedicated asynchronous standby results, per-phase RSS/read counts,
+   retained local generations, affected work, and replacement delivery latency.
+
+### Exact A265 dependencies at this checkpoint
+
+Inspection of this combined base still finds `Candidate.bundle: AuditBundle`,
+an optional suffix, no candidate window columns, no `AUDIT_BUILDER_VERSION`,
+and no `codec::witness_merkle_leaves_from_block`. No open A265 implementation PR
+was visible in the repository's open-PR list at this check. The needed handoffs
+are concrete; B is not waiting for a second user signoff:
+
+| A-owned interface | Needed by B |
+| --- | --- |
+| `qbit_prism::AUDIT_BUILDER_VERSION: u16` and versioned frozen vectors | Persist/check the actual builder version before reconstructing prepared work; no B-local substitute constant. |
+| Slim candidate fields: `window`, `found_block`, `payout_policy`, nested optional `ctv { direct_floor_sats, settlement_config, fanout_fee_policy }`, `audit_builder_version`, `signer_keys { manifest_key_hex, ledger_key_hex }`, `bootstrap_share`, `leased`, required `coinbase_suffix_hex`, original `payout_revision`, `job_id`, `deferred_share`, block identity/digest and bytes | Agree concrete shared Rust types/exports and construction API. B must retain these original inputs in the resumed job after releasing its full window/body; the old owned-bundle submit constructor cannot do that. |
+| Migration007's six outbox window columns, especially indexed `window_prior_balances_sha256`; authenticated `leased` flag and nonterminal-state predicate | GC must join actual typed references. Current states are `pending`, `submitted`, `abandoned`; A must confirm the retention predicate with 007, including claimed/retrying pending rows. Do not invent a SQL `leased` column when the record only specifies a JSON flag. |
+| Enqueue under `ORDER_LOCK`, with balance-reference existence/recovery contract | A must define the outcome if GC deletes an unreferenced balance row before enqueue acquires its lock. No dangling outbox reference may commit; B does not implement A's retry/repair API. |
+| Leased candidate dispatch: submit stored bytes before terminal supersession/rebuild; active audit uses `AsIssued`; changed-balance landing failure remains recoverable | Required to implement the approved candidate behavior while preserving issued revision. B's current independent candidate fences remain unchanged until A integration. |
+| Parts-based claim/landing and `codec::witness_merkle_leaves_from_block(&[u8]) -> Result<Vec<String>>` | Candidate reconstructs from immutable original inputs without forcing B to keep an owned `AuditBundle` or a full resumed window. No edits to A's audit/read-range path here. |
+
+B's `qbit_prism_templates(template_sha256, template_bytes)` and
+`qbit_prism_balance_snapshots(prior_balances_digest, balances)` shapes already
+exist in 008. A/C must review their encoding/conflict and retention integration;
+that review does not require B to invent candidate types or copy migration007.
+
+### b3e8ba9 delta and decisions still open
+
+The newer head preserves the exact synthetic `JobContext.bootstrap_share` for
+empty-window local jobs when converting to body-only storage. It also corrects
+memory accounting: each retained local generation keeps its full window, even
+after another generation is published. Both are recorded integration facts;
+the current full-bundle representation is unchanged. A retention cap, eviction
+policy, and acceptable total RSS need separate qualification/review rather than
+being inferred from the bed6ad8 signoff. A265 owns the additional measurement of
+SQLx's contiguous whole-body bind copy on the runtime during first landing.
 
 At runtime cutover, drain old outbox work and stop all old frontends before the
 coordinated migration/start procedure. This development policy is not a rolling

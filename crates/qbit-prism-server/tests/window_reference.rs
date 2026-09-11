@@ -16,6 +16,9 @@ use tokio::time::{sleep, timeout};
 #[path = "support/window_fixture.rs"]
 mod window_fixture;
 
+#[path = "window_reference/payout_state.rs"]
+mod payout_state;
+
 const ANCHOR: i64 = 1_700_000_000_000;
 const MIGRATION_008: &str = include_str!("../migrations/008_prepared_window_reference.sql");
 

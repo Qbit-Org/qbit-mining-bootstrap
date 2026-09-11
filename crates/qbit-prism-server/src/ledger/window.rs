@@ -1,5 +1,8 @@
 use super::*;
 
+mod payout_state;
+pub use payout_state::PayoutState;
+
 #[derive(Clone, Debug)]
 pub struct AppendResult {
     pub share: AcceptedShare,
