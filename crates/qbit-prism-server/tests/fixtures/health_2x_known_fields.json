@@ -8,5 +8,9 @@
     "accepted_block": "boolean",
     "accepted_block_count": "integer"
   },
-  "unmapped_fields": ["ready_miner_count", "max_blocks"]
+  "unmapped_fields": ["ready_miner_count", "max_blocks"],
+  "intentional_differences": {
+    "ready_miner_count": "2.x accepted-share participants; native snapshots expose authorized/current-work counts instead",
+    "max_blocks": "2.x block-history capacity setting; native PostgreSQL health has no equivalent bounded history setting"
+  }
 }
