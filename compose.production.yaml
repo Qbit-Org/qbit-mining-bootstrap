@@ -55,7 +55,7 @@ services:
         bind:
           create_host_path: false
 
-  prism-coordinator:
+  prism-coordinator: &prism-coordinator-production
     image: ${PRISM_COORDINATOR_IMAGE:-invalid.invalid/qbit-mining-bootstrap/prism:production-image-not-configured}
     pull_policy: always
     restart: unless-stopped
@@ -65,6 +65,9 @@ services:
         target: ${PRISM_AUDIT_DIR:-/var/lib/qbit-prism/audit}
         bind:
           create_host_path: false
+
+  prism-coordinator-2:
+    <<: *prism-coordinator-production
 
   # The standby the public read tier serves from. Its data directory is cloned
   # by pg_basebackup rather than initdb, so it takes no WAL bind of its own --

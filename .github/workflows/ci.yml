@@ -65,6 +65,30 @@ jobs:
           docker compose --env-file config/upstream.env.example --env-file .env.example \
             -f compose.yaml -f compose.prism-external-db.yaml --profile prism config --quiet
 
+      - name: Validate PRISM HA Compose stacks
+        run: |
+          export QBIT_SRC_DIR="$PWD"
+          for overlays in "" "-f compose.production.yaml" "-f compose.prism-external-db.yaml" "-f compose.production.yaml -f compose.prism-external-db.yaml"; do
+            (
+              unset PRISM_DATABASE_URL
+              if [[ "$overlays" == *compose.prism-external-db.yaml* ]]; then
+                export PRISM_DATABASE_URL=postgresql://fixture:fixture@writer.example:5432/prism
+              fi
+              docker compose --env-file config/upstream.env.example --env-file .env.example \
+                -f compose.yaml $overlays -f compose.prism-ha.yaml --profile prism config --format json |
+                jq -e '
+                  [.services["prism-coordinator"], .services["prism-coordinator-2"]] as $pair |
+                  ($pair | all(.environment.PRISM_AUDIT_BIND == "0.0.0.0")) and
+                  ($pair | all(. as $s |
+                    (.environment.PRISM_AUDIT_PORT | tonumber) > 0 and
+                    any(.ports[]; .target == ($s.environment.PRISM_AUDIT_PORT | tonumber)))) and
+                  ([$pair[].environment.PRISM_INSTANCE_ID] | unique | length == 2) and
+                  ([$pair[].environment.PRISM_DATABASE_URL] | unique | length == 1) and
+                  ([$pair[].ports[] | select(.published != "0") | .published] |
+                    length == (unique | length))'
+            )
+          done
+
   python-tests:
     name: Python unit tests (shard ${{ matrix.shard }})
     runs-on: blacksmith-2vcpu-ubuntu-2404
