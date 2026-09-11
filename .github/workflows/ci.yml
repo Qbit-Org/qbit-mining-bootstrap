@@ -46,6 +46,9 @@ jobs:
       - name: Compile Python sources
         run: python -m compileall -q docker lab tests examples scripts
 
+      - name: Check that gated tests read their inputs only through the shared gate
+        run: python3 scripts/check_gate_env_reads.py
+
       - name: Validate mainnet Compose contract
         run: python -m unittest tests.test_mainnet_compose_contract
 
@@ -130,10 +133,10 @@ jobs:
         run: python3 scripts/check_version_skew.py
 
       - name: Run Rust tests
-        # This job has no database. With CI set and no database the JSONB
-        # ceiling gate fails instead of skipping, so it runs in
-        # prism-native-postgres and is skipped here by name.
-        run: cargo test --locked --workspace --all-targets -- --skip jsonb_ceiling_ratchet_at_reduced_sizes
+        # This job has no database, qbitd or PostgreSQL server tools, so every
+        # gated test prints its skip line here and runs in prism-native-postgres,
+        # whose execution manifest proves it.
+        run: cargo test --locked --workspace --all-targets
 
   checks:
     # Preserve the existing check name for branch protection and consumers.

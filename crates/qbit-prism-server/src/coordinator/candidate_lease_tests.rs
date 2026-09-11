@@ -1,6 +1,7 @@
 //! Real PostgreSQL ownership tests with short leases and deliberately blocked work.
 use super::*;
 use axum::{extract::State, routing::post, Json, Router};
+use qbit_prism_test_gate as gate;
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
 
@@ -124,8 +125,7 @@ struct Fixture {
 
 impl Fixture {
     async fn open() -> Result<Option<Self>> {
-        let Ok(raw) = std::env::var("PRISM_TEST_DATABASE_URL") else {
-            eprintln!("set PRISM_TEST_DATABASE_URL for candidate lease integration");
+        let Some(raw) = gate::database_url(gate::site!())? else {
             return Ok(None);
         };
         let admin = PgPool::connect(&raw).await?;

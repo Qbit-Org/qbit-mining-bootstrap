@@ -4,6 +4,7 @@ members = [
     "crates/qbit-pool-builder",
     "crates/qbit-prism",
     "crates/qbit-prism-server",
+    "crates/qbit-prism-test-gate",
 ]
 
 [workspace.package]

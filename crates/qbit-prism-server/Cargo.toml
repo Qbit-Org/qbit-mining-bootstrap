@@ -35,5 +35,6 @@ url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+qbit-prism-test-gate = { path = "../qbit-prism-test-gate" }
 tempfile = "3"
 http-body-util = "0.1"

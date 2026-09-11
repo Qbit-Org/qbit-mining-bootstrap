@@ -15,3 +15,6 @@ thiserror = "2.0"
 
 [dev-dependencies]
 hex = "0.4"
+# Every environment-gated test in this crate must take its inputs through the
+# shared gate; see docs/prism-integration-test-gate.md.
+qbit-prism-test-gate = { path = "../qbit-prism-test-gate" }

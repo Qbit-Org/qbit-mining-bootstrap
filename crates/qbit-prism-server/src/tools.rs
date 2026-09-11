@@ -612,8 +612,7 @@ mod live_instance_tests {
 
     #[tokio::test]
     async fn heartbeat_sql_observes_empty_stale_and_missing_table() -> Result<()> {
-        let Ok(url) = std::env::var("PRISM_TEST_DATABASE_URL") else {
-            eprintln!("set PRISM_TEST_DATABASE_URL for the live-instance SQL probe");
+        let Some(url) = qbit_prism_test_gate::database_url(qbit_prism_test_gate::site!())? else {
             return Ok(());
         };
         let pool = sqlx::postgres::PgPoolOptions::new()
