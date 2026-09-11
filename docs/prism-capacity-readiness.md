@@ -190,9 +190,9 @@ Retired. `qbit_prism_component_entries{component}` and
 the Python coordinator's in-process structures, with the `component` label set
 pinned by two constants in its metrics module. The payout window, candidate
 registries and job caches they counted now live in PostgreSQL or in Rust
-structures the registry does not yet size. #278 keeps the per-worker and
-payout-build series at P2; #279 owns the inventory that decides which
-component gauges the native server carries. A `qbit_prism_component_*` series
+structures the registry does not yet size. #278's cutover-minimum scope does
+not size them either, and defers its per-worker series to P2 (#262); #279 owns
+the inventory that decides which component gauges the native server carries. A `qbit_prism_component_*` series
 does not appear in a native `/metrics` body.
 
 ### Process telemetry on the native server
@@ -217,8 +217,9 @@ carries the `qbit_prism_` prefix.
 Every gauge here is a scrape-time render of cached observations; the scrape
 performs no I/O. Read the `x-prism-metrics-state` header (`fresh`, `stale` or
 `unavailable`) before trusting a body, as before. What the native block does
-not have, and who owns it: thread and open-file-descriptor gauges are in
-#278's cutover-minimum list and not yet on this branch; allocator arena,
+not have, and who owns it: thread and open-file-descriptor gauges were on
+#278's original list but fall outside its cutover-minimum scope, which keeps
+RSS alone from the process block; allocator arena,
 in-use, free and mmapped byte gauges are in no open issue, so a soak that
 needs the retention-versus-fragmentation split has to raise it on #279 rather
 than expect it.
@@ -266,11 +267,12 @@ runtime-independent and are re-anchored below.
 Retired. The heap census, its `SIGUSR1` arming and the `PRISM_HEAP_CENSUS*`
 settings applied to the retired Python coordinator (#244). The native server
 registers no census signal and reads none of those variables, `compose.yaml`
-and `.env.example` no longer pass them, and #288 adds the CI check that fails
-if one reappears in `docs/` as live. The native server handles only `SIGTERM`
-and `SIGINT`, so
-`docker kill --signal=SIGUSR1` against the native container terminates the
-coordinator. Do not send it.
+and `.env.example` no longer pass them, and #288's acceptance includes a CI
+check that fails if one reappears in `docs/` as live. The native server
+installs handlers for `SIGTERM` and `SIGINT` only. In the shipped container it
+is PID 1 with no init, so the kernel drops `SIGUSR1` and the signal does
+nothing; run as a bare process or under an init, the default action
+terminates it. Do not send it.
 
 ### Reading a census
 
