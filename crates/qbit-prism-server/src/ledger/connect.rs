@@ -165,89 +165,18 @@ impl Ledger {
             .await?;
         if initialize {
             let mut tx = pool.begin().await?;
-            lock(&mut tx, MIGRATION_LOCK).await?;
-            sqlx::raw_sql("CREATE TABLE IF NOT EXISTS qbit_prism_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())").execute(&mut *tx).await?;
-            // 006/007/008 are reserved by independent workstreams. Track each
-            // applied migration rather than letting 009 hide an earlier gap.
-            let versions: Vec<i32> =
-                sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations")
-                    .fetch_all(&mut *tx)
-                    .await?;
-            if !versions.contains(&3) {
-                // Existing native writers use this same lock order. Keep the
-                // schema repair and cutover atomic with their accounting.
-                lock(&mut tx, SETTLEMENT_LOCK).await?;
-                lock(&mut tx, ORDER_LOCK).await?;
-                let lease_exists: bool = sqlx::query_scalar(
-                    "SELECT to_regclass('qbit_ledger_writer_lease') IS NOT NULL",
-                )
-                .fetch_one(&mut *tx)
-                .await?;
-                if lease_exists {
-                    // The table lock also closes the race with a legacy process
-                    // trying to reacquire its lease during the cutover.
-                    sqlx::query("LOCK TABLE qbit_ledger_writer_lease IN ACCESS EXCLUSIVE MODE")
-                        .execute(&mut *tx)
-                        .await?;
-                    let live: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_ledger_writer_lease WHERE lease_expires_at > clock_timestamp())").fetch_one(&mut *tx).await?;
-                    ensure!(!live, "live legacy Python writer lease: stop the Python deployment and release or wait for its lease before Rust migration");
-                }
-                let outbox_exists: bool = sqlx::query_scalar(
-                    "SELECT to_regclass('qbit_block_candidate_outbox') IS NOT NULL",
-                )
-                .fetch_one(&mut *tx)
-                .await?;
-                if outbox_exists {
-                    let legacy_pending:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_block_candidate_outbox WHERE state='pending' AND NOT(candidate ?& ARRAY['payout_revision','bundle','block_hash']))").fetch_one(&mut *tx).await?;
-                    ensure!(!legacy_pending,"legacy Python block outbox is not drained; restart the legacy submitter and finish pending candidates before Rust migration");
-                }
-                let base_schema = migration::base_schema_transaction_body(include_str!(
-                    "../../../qbit-prism/sql/001_share_ledger.sql"
-                ))?;
-                sqlx::raw_sql(&base_schema).execute(&mut *tx).await?;
-                if !versions.contains(&2) {
-                    sqlx::raw_sql(include_str!("../../migrations/002_multi_instance.sql"))
-                        .execute(&mut *tx)
-                        .await?;
-                    sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)")
-                        .execute(&mut *tx)
-                        .await?;
-                }
-                sqlx::raw_sql(include_str!("../../migrations/003_2x_compatibility.sql"))
-                    .execute(&mut *tx)
-                    .await?;
-                sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(3)")
-                    .execute(&mut *tx)
-                    .await?;
-            }
-            if !versions.contains(&4) {
-                sqlx::raw_sql(include_str!(
-                    "../../migrations/004_cpfp_retired_funding.sql"
-                ))
-                .execute(&mut *tx)
-                .await?;
-                sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(4)")
-                    .execute(&mut *tx)
-                    .await?;
-            }
-            if !versions.contains(&5) {
-                sqlx::raw_sql(include_str!("../../migrations/005_candidate_dispatch.sql"))
-                    .execute(&mut *tx)
-                    .await?;
-                sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(5)")
-                    .execute(&mut *tx)
-                    .await?;
-            }
-            if !versions.contains(&9) {
-                sqlx::raw_sql(include_str!("../../migrations/009_wrap_safe_sessions.sql"))
-                    .execute(&mut *tx)
-                    .await?;
-                sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(9)")
-                    .execute(&mut *tx)
-                    .await?;
-            }
+            migration::migrate_schema(&mut tx, &instance_id).await?;
             tx.commit().await?;
         }
+        // The startup gate. Every start, with or without `initialize`, reads
+        // the schema version and the declared capabilities before any
+        // accounting statement: a newer binary never reaches the claim path
+        // on a database it has not migrated, and an older binary is kept off
+        // a format it must not touch by the capabilities a release declares,
+        // not by the version number, so a rollout can replace one frontend
+        // at a time.
+        migration::require_schema_version(&pool).await?;
+        migration::require_known_capabilities(&pool).await?;
         let ledger = Self {
             pool,
             instance_id,
@@ -256,6 +185,14 @@ impl Ledger {
                 state: std::sync::Mutex::default(),
             }),
         };
+        if let Some(source) = ledger.migration_source().await? {
+            tracing::info!(
+                state = %source.source_state,
+                release = ?source.source_release,
+                prior_schema_version = source.prior_schema_version,
+                "PRISM database source"
+            );
+        }
         let mut tx = ledger.pool.begin().await?;
         writable(&mut tx).await?;
         tx.commit().await?;

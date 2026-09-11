@@ -42,11 +42,13 @@ sessions against the migrated sequence.
 
 Start one or more new frontends with the existing migration runner enabled.
 Its transaction advisory lock serializes concurrent migrations, and 009 is
-recorded after the available 002–005 migrations. Numbers 006–008 remain reserved
-for other workstreams; the runner checks applied versions individually so 009
-does not conceal a lower-numbered gap when those migrations are integrated.
-There is no schema-pin startup mechanism on the current baseline. Before
-starting a frontend with initialization disabled, verify on the writer:
+recorded after the 002–006 migrations. Numbers 007 and 008 remain reserved
+for other workstreams; the runner checks applied versions individually, so 009
+does not conceal a lower-numbered gap when those migrations are integrated,
+and a database at 2, 3, 4, 5 and 9 still receives 006 on its next migrate.
+Every start also requires each of those migrations (the startup gate in
+`docs/prism-rust-migration.md`), so a frontend with initialization disabled
+refuses a database missing 009. Before starting one, verify on the writer:
 
 ```sql
 SELECT version FROM qbit_prism_schema_migrations WHERE version = 9;

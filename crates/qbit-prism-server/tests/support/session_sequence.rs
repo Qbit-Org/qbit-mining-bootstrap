@@ -49,34 +49,6 @@ async fn stopped_guard_blocks_cleanup_and_owner_filter_preserves_other_reservati
     db.close(vec![ledger, other]).await
 }
 
-#[tokio::test]
-async fn initialize_false_allows_read_only_pre009_connection() -> Result<()> {
-    let Some(db) = Database::open().await? else {
-        return Ok(());
-    };
-    let pool = PgPool::connect(&db.url).await?;
-    sqlx::raw_sql(include_str!("../../../qbit-prism/sql/001_share_ledger.sql"))
-        .execute(&pool)
-        .await?;
-    for sql in [
-        include_str!("../../migrations/002_multi_instance.sql"),
-        include_str!("../../migrations/003_2x_compatibility.sql"),
-        include_str!("../../migrations/004_cpfp_retired_funding.sql"),
-        include_str!("../../migrations/005_candidate_dispatch.sql"),
-    ] {
-        sqlx::raw_sql(sql).execute(&pool).await?;
-    }
-    sqlx::raw_sql("CREATE TABLE qbit_prism_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())")
-        .execute(&pool).await?;
-    sqlx::raw_sql("INSERT INTO qbit_prism_schema_migrations(version) VALUES(2),(3),(4),(5)")
-        .execute(&pool)
-        .await?;
-    let ledger = Ledger::connect(&db.url, "pre009".into(), 4, false).await?;
-    ledger.pool.close().await;
-    pool.close().await;
-    db.close(vec![]).await
-}
-
 async fn seed_job(pool: &PgPool, id: &str, extra: &str, live: bool) -> Result<()> {
     sqlx::query("INSERT INTO qbit_prism_jobs(job_id,instance_id,parent_hash,payout_revision,payload,expires_at) VALUES($1,'pre-009','parent',0,$2,clock_timestamp()+$3*interval '1 hour')")
         .bind(id).bind(json!({"extranonce1":extra,"old-field":"retained"}))
@@ -123,7 +95,8 @@ async fn migration_009_preserves_preexisting_jobs_and_runs_once_for_two_frontend
         return Ok(());
     };
     let pool = PgPool::connect(&db.url).await?;
-    // Build the actual pre-009 schema, not an already-migrated approximation.
+    // Build the actual pre-006, pre-009 schema, not an already-migrated
+    // approximation; the runner applies both, each in its place.
     sqlx::raw_sql(include_str!("../../../qbit-prism/sql/001_share_ledger.sql"))
         .execute(&pool)
         .await?;
@@ -153,7 +126,7 @@ async fn migration_009_preserves_preexisting_jobs_and_runs_once_for_two_frontend
         sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations ORDER BY version")
             .fetch_all(&pool)
             .await?;
-    assert_eq!(versions, vec![2, 3, 4, 5, 9]);
+    assert_eq!(versions, vec![2, 3, 4, 5, 6, 9]);
     let cycled: bool = sqlx::query_scalar(
         "SELECT seqcycle FROM pg_sequence WHERE seqrelid='qbit_prism_session_sequence'::regclass",
     )

@@ -68,21 +68,45 @@ impl Ledger {
                         .await?;
             }
         }
+        // Decode by storage version. A v1 row carries its JSONB candidate; a
+        // #258 v2 row carries NULL and a chunk body this server does not
+        // import, and a later version is unknown. Those are parked inside the
+        // claim transaction so the due lane never offers them again.
+        let mut claimed = None;
+        if let Some(row) = row {
+            let block_hash: String = row.try_get("block_hash")?;
+            let storage_version: i32 = row.try_get("storage_version")?;
+            let candidate: Option<Value> = row.try_get("candidate")?;
+            match (storage_version, candidate) {
+                (1, Some(candidate)) => {
+                    claimed = Some((candidate, row.try_get::<String, _>("candidate_sha256")?));
+                }
+                (version, candidate) => {
+                    let reason = if version == 1 {
+                        "pending storage_version 1 candidate has no JSONB body".to_owned()
+                    } else {
+                        format!("candidate storage_version {version} is not supported by this server; only version 1 JSONB candidates are (a #258 chunked body must be drained by the 2.x.x release)")
+                    };
+                    park_candidate(&mut tx, &block_hash, &token, &reason).await?;
+                    tracing::warn!(block=%block_hash, storage_version=version, has_body=candidate.is_some(), "parked a candidate this server cannot decode; operator action required");
+                }
+            }
+        }
         tx.commit().await?;
-        row.map(|row| {
-            let candidate: Candidate = serde_json::from_value(row.try_get("candidate")?)
-                .context("invalid persisted candidate")?;
-            let digest: String = row.try_get("candidate_sha256")?;
-            ensure!(
-                hex::encode(Sha256::digest(serde_json::to_vec(&candidate)?)) == digest,
-                "persisted candidate digest mismatch"
-            );
-            Ok(CandidateClaim {
-                candidate,
-                claim_token: token,
+        claimed
+            .map(|(candidate, digest)| {
+                let candidate: Candidate =
+                    serde_json::from_value(candidate).context("invalid persisted candidate")?;
+                ensure!(
+                    hex::encode(Sha256::digest(serde_json::to_vec(&candidate)?)) == digest,
+                    "persisted candidate digest mismatch"
+                );
+                Ok(CandidateClaim {
+                    candidate,
+                    claim_token: token,
+                })
             })
-        })
-        .transpose()
+            .transpose()
     }
 
     /// Keep a live processing attempt owned while it waits for build capacity
@@ -157,13 +181,30 @@ async fn claim_candidate_lane(
         // an older candidate that has not yet received its first attempt.
         "ORDER BY next_attempt_at,created_at,block_hash"
     };
-    let query = format!("WITH next AS (SELECT block_hash FROM qbit_block_candidate_outbox WHERE state='pending' AND next_attempt_at<=clock_timestamp() AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()) {ordering} FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE qbit_block_candidate_outbox o SET claim_token=$1,claim_instance_id=$2,claim_expires_at=clock_timestamp()+$3*interval '1 second',attempt_count=attempt_count+1,updated_at=clock_timestamp() FROM next WHERE o.block_hash=next.block_hash RETURNING candidate,candidate_sha256");
+    let query = format!("WITH next AS (SELECT block_hash FROM qbit_block_candidate_outbox WHERE state='pending' AND next_attempt_at<=clock_timestamp() AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()) {ordering} FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE qbit_block_candidate_outbox o SET claim_token=$1,claim_instance_id=$2,claim_expires_at=clock_timestamp()+$3*interval '1 second',attempt_count=attempt_count+1,updated_at=clock_timestamp() FROM next WHERE o.block_hash=next.block_hash RETURNING o.block_hash,o.storage_version,o.candidate,o.candidate_sha256");
     Ok(sqlx::query(&query)
         .bind(token)
         .bind(instance_id)
         .bind(lease_seconds)
         .fetch_optional(&mut **tx)
         .await?)
+}
+
+/// Park a claimed row this server cannot decode: release the claim, record
+/// why in `last_error`, and move `next_attempt_at` past every lease expiry.
+/// The row stays `pending` with its body untouched, so a release that reads
+/// it can pick it up by resetting `next_attempt_at`; until then it is
+/// operator work, not a retry loop.
+async fn park_candidate(
+    tx: &mut Transaction<'_, Postgres>,
+    block_hash: &str,
+    token: &str,
+    reason: &str,
+) -> Result<()> {
+    let parked = sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,last_error=$3,next_attempt_at='infinity',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='pending'")
+        .bind(block_hash).bind(token).bind(reason).execute(&mut **tx).await?.rows_affected();
+    ensure!(parked == 1, "candidate to park was not held by this claim");
+    Ok(())
 }
 
 pub(super) async fn persist_candidate(
