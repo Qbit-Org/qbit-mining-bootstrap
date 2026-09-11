@@ -301,10 +301,14 @@ jobs:
         # The whole workspace, so a gated test added under crates/qbit-prism
         # is covered by this required job too. --nocapture keeps every gate
         # line in the log, which the proof step scans.
+        id: workspace_tests
+        continue-on-error: true
         run: |
           set -euo pipefail
           cargo test --locked --workspace --all-targets -- --nocapture 2>&1 | tee "${PRISM_TEST_LOG}"
       - name: Verify unsubscribed connections do not consume shared mining IDs
+        id: stratum_admission_postgres
+        continue-on-error: true
         run: |
           set -euo pipefail
           cargo test --locked -p qbit-prism-server --test stratum_admission_postgres \
@@ -312,6 +316,8 @@ jobs:
             ten_thousand_unsubscribed_connections_do_not_advance_postgres_sequence \
             2>&1 | tee -a "${PRISM_TEST_LOG}"
       - name: Exercise native metrics collectors against PostgreSQL
+        id: observability_database
+        continue-on-error: true
         run: |
           set -euo pipefail
           cargo test --locked -p qbit-prism-server --test observability_database \
@@ -319,10 +325,21 @@ jobs:
       - name: Prove every gated test executed
         if: ${{ !cancelled() }}
         run: |
+          set +e
           python3 scripts/check_gate_manifest.py \
             --manifest "${PRISM_TEST_GATE_MANIFEST}" \
             --expected test/prism-gated-tests.txt \
             --log "${PRISM_TEST_LOG}"
+          manifest_status=$?
+          test_status=0
+          if [[ "${{ steps.workspace_tests.outcome }}" != success || \
+                "${{ steps.stratum_admission_postgres.outcome }}" != success || \
+                "${{ steps.observability_database.outcome }}" != success ]]; then
+            test_status=1
+          fi
+          if (( manifest_status != 0 || test_status != 0 )); then
+            exit 1
+          fi
       - name: Upload the gate manifest
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
