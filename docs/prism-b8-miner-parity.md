@@ -67,6 +67,15 @@ allows an old-parent or old-revision block candidate. Readiness revocation durin
 an awaited lookup rejects before persistence, and the ledger's transaction
 remains the final cross-frontend revision fence.
 
+## Prepared dependency lifetime
+
+Issued work now retains its original shared prepared record atomically through
+its absolute reconnect deadline. Expired metadata can be extended; a physically
+pruned dependency is repaired from the original typed record under bounded
+serialization capacity. Original worker, target, policy, coinbase suffix and
+payout revision remain unchanged. See [the dependency lifetime contract and
+focused regression evidence](prism-b8-prepared-dependency.md).
+
 ## Ungated regression coverage
 
 | Boundary | Executable coverage |
@@ -78,11 +87,12 @@ remains the final cross-frontend revision fence.
 | Actual long-poll loop during blocked refresh; fresh verification ordering; failed/malformed verification; same-hash RPC count; shutdown during wait, verification and backoff | `coordinator/miner_tests/blockwait.rs` |
 | Zero-grace published authority; nonrenewing divergence lease; expiry; return/redeparture; candidate-only observation | `coordinator/miner_tests/published_lease.rs` |
 | Real refresh orchestration at 1/32/128 clients with identical RPC counts; build/persist/publish gates; repeated refresh failure; stale-vs-unavailable resume; obsolete payout issuance | `coordinator/miner_tests/refresh.rs` |
+| Durable dependency expiry; delayed publication; return/redeparture; original bootstrap repair; concurrent repair and cancellation | `coordinator/miner_tests/prepared_expiry.rs` |
 | Actual socket delivery, original-worker retained dedup/weight, unknown-before-node-RPC, absolute expiry crossing resume | `stratum/stale_grace_tests.rs` |
 | Zero/aged cache undelivered grace, real reconnect ownership and parent controls, TTL/capacity/permit lifecycle, unrelated-parent pruning, hard retention bound | `stratum/retained_tests.rs` |
 
-All paths are under `crates/qbit-prism-server/src/`. These comprise 54 ungated
-regressions. The config CLI test also covers both restored settings' defaults,
+All paths are under `crates/qbit-prism-server/src/`. The prepared-dependency
+change adds ten ungated regressions to the earlier miner-parity coverage. The config CLI test also covers both restored settings' defaults,
 fractional values, zero behavior and invalid inputs. Existing protocol tests
 exercise permit reuse across reauthorization, timer expiry, payout replacement,
 and disconnect with active capacity eviction.

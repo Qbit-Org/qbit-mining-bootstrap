@@ -15,6 +15,7 @@ mod config;
 mod credit;
 mod interleavings;
 mod observations;
+mod prepared_expiry;
 mod published_lease;
 mod refresh;
 mod work_store;
@@ -36,7 +37,8 @@ pub(crate) struct MemoryLedger {
     pub revision_gate: StdMutex<Option<Arc<Gate>>>,
     pub append_gate: StdMutex<Option<Arc<Gate>>>,
     pub fail_revision: AtomicBool,
-    pub jobs: StdMutex<HashMap<String, Value>>,
+    pub jobs: StdMutex<HashMap<String, work_store::MemoryJob>>,
+    pub clock_offset_ms: AtomicI64,
     pub snapshot: StdMutex<Option<Snapshot>>,
     pub tip: StdMutex<Option<String>>,
     pub save_gate: StdMutex<Option<Arc<Gate>>>,
@@ -296,6 +298,18 @@ impl Fixture {
         wire.share_target = codec::target_from_compact(0x207fffff).unwrap();
         wire.payout_revision = revision;
         let prepared = Arc::new(Prepared {
+            stored: Arc::new(StoredPrepared {
+                template: template.clone(),
+                snapshot: snapshot.clone(),
+                bundle: Some(bundle.clone()),
+                fee: None,
+                fingerprint: "fixture".into(),
+                generation: 1,
+                parent_of_tip: hash(tip.saturating_sub(1)),
+                coinbase_suffix: "00".repeat(12),
+            }),
+            repair: Arc::new(Mutex::new(())),
+            repair_probe: Default::default(),
             template,
             snapshot,
             bundle: Some(bundle.clone()),

@@ -1,6 +1,6 @@
 //! Work preparation I/O; orchestration and miner decisions stay in Coordinator.
 use super::*;
-use crate::ledger::PoolBlock;
+use crate::ledger::{IssuedJobSave, PoolBlock, PreparedDependency};
 use futures_util::future::BoxFuture;
 
 pub(super) trait WorkLedger: Send + Sync {
@@ -27,6 +27,16 @@ pub(super) trait WorkLedger: Send + Sync {
         parent: &'a str,
         ttl: i64,
     ) -> BoxFuture<'a, Result<()>>;
+    fn save_issued_job<'a>(
+        &'a self,
+        id: &'a str,
+        payload: &'a Value,
+        revision: i64,
+        parent: &'a str,
+        expires_at_ms: i64,
+        dependency: PreparedDependency<'a>,
+        repair_payload: Option<&'a Value>,
+    ) -> BoxFuture<'a, Result<IssuedJobSave>>;
     fn job<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Option<Value>>>;
     fn now_ms(&self) -> BoxFuture<'_, Result<i64>>;
 }
@@ -71,6 +81,27 @@ impl WorkLedger for Ledger {
         ttl: i64,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(Ledger::save_job(self, id, payload, revision, parent, ttl))
+    }
+    fn save_issued_job<'a>(
+        &'a self,
+        id: &'a str,
+        payload: &'a Value,
+        revision: i64,
+        parent: &'a str,
+        expires_at_ms: i64,
+        dependency: PreparedDependency<'a>,
+        repair_payload: Option<&'a Value>,
+    ) -> BoxFuture<'a, Result<IssuedJobSave>> {
+        Box::pin(Ledger::save_issued_job(
+            self,
+            id,
+            payload,
+            revision,
+            parent,
+            expires_at_ms,
+            dependency,
+            repair_payload,
+        ))
     }
     fn job<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Option<Value>>> {
         Box::pin(Ledger::job(self, id))
