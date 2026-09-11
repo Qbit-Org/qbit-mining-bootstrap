@@ -134,6 +134,12 @@ class _PublicInflight:
     exception: BaseException | None = None
 
 
+# Shared by every public response cache in this process. Admission is
+# nonblocking: excess stale hits keep their bounded-age response without
+# creating workers or queued refresh tasks behind the database read slots.
+_PUBLIC_REFRESH_SLOTS = threading.BoundedSemaphore(4)
+
+
 class PublicResponseCache:
     """Small in-process cache for public read-model responses."""
 
@@ -189,7 +195,7 @@ class PublicResponseCache:
                         "STALE",
                         max(0, int(now - entry.stored_at)),
                     )
-                    if key not in self._inflight:
+                    if key not in self._inflight and _PUBLIC_REFRESH_SLOTS.acquire(blocking=False):
                         refresh = _PublicInflight(event=threading.Event())
                         self._inflight[key] = refresh
                 else:
@@ -209,7 +215,7 @@ class PublicResponseCache:
             if refresh is not None:
                 try:
                     threading.Thread(
-                        target=self._refresh_entry,
+                        target=self._refresh_entry_admitted,
                         args=(key, ttl_seconds, stale_while_revalidate_seconds, compute, refresh),
                         name="prism-public-cache-refresh",
                         daemon=True,
@@ -226,6 +232,7 @@ class PublicResponseCache:
                         if self._inflight.get(key) is refresh:
                             del self._inflight[key]
                     refresh.event.set()
+                    _PUBLIC_REFRESH_SLOTS.release()
             return stale_result
 
         if not owner:
@@ -321,6 +328,15 @@ class PublicResponseCache:
                     del self._entries[stale_key]
             while len(self._entries) > max_entries:
                 self._entries.popitem(last=False)
+
+    def _refresh_entry_admitted(self, *args) -> None:
+        try:
+            self._refresh_entry(*args)
+        finally:
+            # A failed compute retains caller frames through f_back too. Drop
+            # the flight-bearing arguments before returning the admission slot.
+            del args
+            _PUBLIC_REFRESH_SLOTS.release()
 
     def _refresh_entry(
         self,

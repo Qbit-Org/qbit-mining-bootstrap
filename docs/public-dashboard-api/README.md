@@ -48,13 +48,38 @@ read models live here; dashboard rendering lives outside the pool process.
 `prism-public-api` also serves its own `/healthz` and `/metrics` for that
 process; those are operator surfaces and must not be exposed publicly.
 
+The HTTP server admits up to `PRISM_PUBLIC_HTTP_MAX_CONNECTIONS` connections
+(default 64, range 1–1,024); it immediately closes excess connections without
+queuing workers. `PRISM_PUBLIC_HTTP_TIMEOUT_SECONDS` (default 10, finite and
+positive) bounds the complete request-line/header phase and socket I/O idle
+time. Each response closes its connection, including requests asking for
+HTTP/1.1 keep-alive. Size proxy upstream connections accordingly. Database and
+public dispatch deadlines remain separate from this network timeout.
+
+Startup requires `PRISM_PUBLIC_STRATUM_URL` to contain a `stratum+tcp` or
+`stratum+ssl` scheme, a valid hostname (or bracketed IPv6 address), and an
+explicit port from 1 to 65,535. Credentials, paths, queries, fragments and
+whitespace are refused before opening the database or HTTP listener. The same
+validation applies to an explicit `PRISM_PUBLIC_STRATUM_HIGHDIFF_URL` when
+`PRISM_STRATUM_HIGHDIFF_PORT` enables that advertised endpoint; an empty override
+continues to derive its URL from the primary endpoint.
+
 ## Caching
 
 Successful `GET /public/v1` responses are safe to cache briefly. The service
 emits conservative browser caching (`Cache-Control: public, max-age=0,
 must-revalidate`) plus shared-cache headers for CDNs such as Vercel. Dynamic
 dashboard read models default to a 5-second shared-cache TTL with 30 seconds of
-`stale-while-revalidate`. The pool-wide aggregate read models —
+`stale-while-revalidate` before applying the route limit. Both shared-cache TTL
+and stale-while-revalidate are clamped to the route's
+published staleness budget. For example, a default plain read uses a 5-second
+TTL and at most 10 additional stale seconds within its 15-second budget.
+Background refreshes share four worker slots across all response caches in the
+process. When they are busy, eligible stale responses remain available within
+their existing window; additional refresh work is not queued. A later request
+can retry after capacity returns.
+
+The pool-wide aggregate read models —
 `GET /public/v1/pool-summary`, `GET /public/v1/hashrate-series`, and
 `GET /public/v1/miners/{recipient_id}/workers` — are expensive to recompute and
 default to a 30-second shared-cache TTL instead.
