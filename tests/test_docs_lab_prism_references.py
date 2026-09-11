@@ -19,6 +19,10 @@ b. Every ``lab/prism/…`` path or ``lab.prism.…`` module reference resolves t
    tracked file or directory. GitHub links pinned to a 40-hex commit SHA are
    stable history and exempt. Pre-existing residue that #303 declares out of
    scope is ratcheted in ``RATCHET``: the count may shrink, never grow.
+
+A ``.patch`` or ``.diff`` file under ``docs/`` quotes another tree's before-and-
+after text and is not this repository's prose, so neither contract reads it;
+every other tracked file under ``docs/`` is in scope, whatever its suffix.
 """
 
 from __future__ import annotations
@@ -47,6 +51,13 @@ RATCHET = {
     "docs/prism-coordinator-refactor/validation.md": 1,
     "docs/prism-rust-migration.md": 1,
 }
+
+# A unified diff under docs/ is quoted history: its `-` and `+` lines are the
+# text of another tree before and after a change (`docs/prism-alert-rules-
+# qbit-tools.patch` is a diff of qbit-tools' Ansible role), and editing them
+# would break the patch. Neither contract reads such a file. Every other suffix
+# stays in scope, so a `.json` or `.yaml` example is still checked.
+QUOTED_HISTORY_SUFFIXES = frozenset({".patch", ".diff"})
 
 
 def quoted(target: str, group: str = "quote") -> str:
@@ -149,6 +160,20 @@ def tracked_paths() -> frozenset[str]:
     return frozenset(paths)
 
 
+def documented(paths) -> list[str]:
+    """The tracked paths under ``docs/`` both contracts read, sorted.
+
+    Quoted history (``QUOTED_HISTORY_SUFFIXES``) is left out. ``tracked_paths``
+    lists directory prefixes as well, so the caller settles whether a path is
+    a file against the working tree.
+    """
+    return sorted(
+        path
+        for path in paths
+        if path.startswith("docs/") and Path(path).suffix not in QUOTED_HISTORY_SUFFIXES
+    )
+
+
 def module_candidates(module: str) -> tuple[str, ...]:
     """Every tracked path a prose ``lab.a.b`` mention may name: file, package or directory."""
     relative = module.replace(".", "/")
@@ -227,11 +252,7 @@ class DocsLabPrismReferenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.tracked = tracked_paths()
-        cls.docs = sorted(
-            path
-            for path in cls.tracked
-            if path.startswith("docs/") and (ROOT / path).is_file()
-        )
+        cls.docs = [path for path in documented(cls.tracked) if (ROOT / path).is_file()]
         cls.texts = {
             path: (ROOT / path).read_text(encoding="utf-8", errors="replace")
             for path in cls.docs
@@ -285,6 +306,30 @@ class DocsLabPrismReferenceTests(unittest.TestCase):
 
     def test_capacity_readiness_is_not_ratcheted(self) -> None:
         self.assertNotIn("docs/prism-capacity-readiness.md", RATCHET)
+
+    def test_quoted_history_under_docs_is_not_read(self) -> None:
+        # A patch or diff quotes another tree's lines, so it is left out of
+        # both contracts; prose and data files of any other suffix stay in.
+        paths = {
+            "docs",
+            "docs/prism-alert-rules-qbit-tools.patch",
+            "docs/prism-coordinator-refactor/history.diff",
+            "docs/prism-capacity-readiness.md",
+            "docs/prism-coordinator-refactor/dashboard.json",
+            "docs/prism-alerts.yaml",
+            "lab/prism/Dockerfile",
+            "tests/history.patch",
+        }
+        self.assertEqual(
+            documented(paths),
+            [
+                "docs/prism-alerts.yaml",
+                "docs/prism-capacity-readiness.md",
+                "docs/prism-coordinator-refactor/dashboard.json",
+            ],
+        )
+        for path in self.docs:
+            self.assertNotIn(Path(path).suffix, QUOTED_HISTORY_SUFFIXES, path)
 
 
 class ScannerTests(unittest.TestCase):
