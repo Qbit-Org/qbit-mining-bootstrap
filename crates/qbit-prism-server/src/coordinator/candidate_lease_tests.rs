@@ -205,7 +205,7 @@ impl Fixture {
             .ledger
             .observe_chain_view(&"aa".repeat(32), 100, "01")
             .await?;
-        *coordinator.observed_tip.write().await = TipState::baseline("aa".repeat(32));
+        *coordinator.observed_tip.write().await = Some("aa".repeat(32));
         coordinator
             .ledger
             .append(
@@ -536,7 +536,7 @@ async fn early_chain_probe_skips_only_proven_stale_work_and_recovers_active_bloc
                 node.height = 101;
                 node.chainwork = "02".into();
             }
-            *fixture.coordinator.observed_tip.write().await = TipState::default();
+            *fixture.coordinator.observed_tip.write().await = None;
             let mut process = fixture.process(SHORT_LEASE);
             if active {
                 fixture.wait_for_renewal().await?;
