@@ -180,7 +180,9 @@ jobs:
   prism-native-postgres:
     name: Rust PRISM PostgreSQL and multi-instance contracts
     runs-on: blacksmith-2vcpu-ubuntu-2404
-    timeout-minutes: 20
+    # The whole workspace runs here, not only qbit-prism-server; the extra
+    # suites (qbit-prism's scale distributions above all) need the headroom.
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:16
@@ -196,9 +198,19 @@ jobs:
     env:
       PRISM_TEST_DATABASE_URL: postgresql://prism_test:prism_test@127.0.0.1:5432/prism_test
       PRISM_TEST_PG_BIN_DIR: /usr/lib/postgresql/16/bin
+      # Every gated test must execute here: with the switch set, a missing
+      # input fails the test instead of skipping it (the shared gate also keys
+      # on GITHUB_JOB=prism-native-postgres, so keep this job id). The gate
+      # appends one line per decision to PRISM_TEST_GATE_MANIFEST, named
+      # below, which the proof step compares with test/prism-gated-tests.txt.
+      PRISM_TEST_REQUIRE_INTEGRATION: "1"
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+      - name: Name the gate manifest and the test log
+        run: |
+          printf 'PRISM_TEST_GATE_MANIFEST=%s/prism-gate-manifest.txt\n' "${RUNNER_TEMP}" >> "${GITHUB_ENV}"
+          printf 'PRISM_TEST_LOG=%s/prism-native-tests.log\n' "${RUNNER_TEMP}" >> "${GITHUB_ENV}"
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Install tools for disposable primary and standby failover test
@@ -219,15 +231,39 @@ jobs:
             qbit-1.0.0-x86_64-linux-gnu.tar.gz | sha256sum --check
           tar -xzf qbit-1.0.0-x86_64-linux-gnu.tar.gz
           printf 'QBITD_BIN=%s/qbit-1.0.0/bin/qbitd\n' "${prism_qbit_dir}" >> "${GITHUB_ENV}"
-      - name: Run native ledger, API, and Stratum tests
-        run: cargo test --locked -p qbit-prism-server --all-targets
+      - name: Run every workspace test in required integration mode
+        # The whole workspace, so a gated test added under crates/qbit-prism
+        # is covered by this required job too. --nocapture keeps every gate
+        # line in the log, which the proof step scans.
+        run: |
+          set -euo pipefail
+          cargo test --locked --workspace --all-targets -- --nocapture 2>&1 | tee "${PRISM_TEST_LOG}"
       - name: Verify unsubscribed connections do not consume shared mining IDs
-        run: >-
-          cargo test --locked -p qbit-prism-server
-          --test stratum_admission_postgres -- --ignored --exact
-          ten_thousand_unsubscribed_connections_do_not_advance_postgres_sequence
+        run: |
+          set -euo pipefail
+          cargo test --locked -p qbit-prism-server --test stratum_admission_postgres \
+            -- --ignored --nocapture --exact \
+            ten_thousand_unsubscribed_connections_do_not_advance_postgres_sequence \
+            2>&1 | tee -a "${PRISM_TEST_LOG}"
       - name: Exercise native metrics collectors against PostgreSQL
-        run: cargo test --locked -p qbit-prism-server --test observability_database -- --ignored
+        run: |
+          set -euo pipefail
+          cargo test --locked -p qbit-prism-server --test observability_database \
+            -- --ignored --nocapture 2>&1 | tee -a "${PRISM_TEST_LOG}"
+      - name: Prove every gated test executed
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/check_gate_manifest.py \
+            --manifest "${PRISM_TEST_GATE_MANIFEST}" \
+            --expected test/prism-gated-tests.txt \
+            --log "${PRISM_TEST_LOG}"
+      - name: Upload the gate manifest
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-gate-manifest
+          path: ${{ env.PRISM_TEST_GATE_MANIFEST }}
+          if-no-files-found: error
 
   docker-builds:
     name: Build lightweight Docker images
