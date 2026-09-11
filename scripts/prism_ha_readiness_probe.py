@@ -57,6 +57,21 @@ def run(sequence: list[tuple[Any, float]], config: ProbeConfig = ProbeConfig()) 
     return [probe.observe(response, elapsed) for response, elapsed in sequence]
 
 
+def run_timeline(
+    sequence: list[tuple[float, Any, float]], config: ProbeConfig = ProbeConfig()
+) -> list[str]:
+    """Run starts on a monotonic schedule; rejects overlapping/early probes."""
+    probe = ReadinessProbe(config)
+    previous = None
+    states = []
+    for started_at, response, elapsed in sequence:
+        if previous is not None and started_at - previous < config.interval_s:
+            raise ValueError("probe starts must honor the configured monotonic interval")
+        previous = started_at
+        states.append(probe.observe(response, elapsed))
+    return states
+
+
 def main() -> None:
     # JSON-lines adapter for reproducible qualification, intentionally no I/O
     # beyond stdin/stdout and no claim of real load-balancer behavior.

@@ -1,6 +1,6 @@
 import unittest
 
-from scripts.prism_ha_readiness_probe import ProbeConfig, ReadinessProbe, run
+from scripts.prism_ha_readiness_probe import ProbeConfig, ReadinessProbe, run, run_timeline
 
 
 OK = {"status": 200, "ok": True, "schema": "qbit.prism.audit-health.v1"}
@@ -30,6 +30,13 @@ class ReadinessProbeTests(unittest.TestCase):
         self.assertEqual(p.state, "down")
         p.observe(OK)
         self.assertEqual(p.state, "up")
+
+    def test_timing_bound_and_monotonic_schedule(self):
+        events = [(float(i * 2), BAD, 1.0) for i in range(6)]
+        self.assertEqual(run_timeline(events), ["unknown"] * 5 + ["down"])
+        self.assertLessEqual(events[-1][0] + 1.0, 13.0)
+        with self.assertRaises(ValueError):
+            run_timeline([(0.0, BAD, 0), (1.0, BAD, 0)])
 
     def test_transient_rebuild_does_not_eject(self):
         p = ReadinessProbe()
