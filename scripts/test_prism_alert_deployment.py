@@ -68,6 +68,7 @@ def main():
     all_new = external | {row["uid"] for path in ["docs/prism-native-alert-rules.json",
                                                  "docs/prism-postgres-alert-rules.json"]
                           for row in load(path)["rules"]}
+    native_uids = {row["uid"] for row in load("docs/prism-native-alert-rules.json")["rules"]}
 
     def rules(document):
         rows = [rule for group in document.get("groups", []) or [] for rule in group["rules"]]
@@ -86,12 +87,13 @@ def main():
         for uid in before.keys() & external:
             assert before[uid] == after[uid], (uid, overrides)
         deletions = [row["uid"] for row in new["deleteRules"]]
-        assert len(deletions) == len(set(deletions)) == 27
+        assert len(deletions) == len(set(deletions))
         assert all(row["orgId"] == 1 for row in new["deleteRules"])
-        assert set(deletions) == all_old - all_new
+        assert set(deletions) == (all_old - all_new) | (native_uids - after.keys()), overrides
         assert not after.keys() & set(deletions)
         if index == 0:
             assert len(before) == 78 and len(after) == 61
+            assert len(deletions) == 27
         if index == 1:
             assert len(new["groups"]) == 1 and len(after) == 2
         for rule in load("docs/prism-postgres-alert-rules.json")["rules"]:
@@ -100,7 +102,8 @@ def main():
             assert rendered["for"] == "1m"
     assert (args.snapshot / relative.name).read_bytes() == original
     print(f"Patch applies cleanly; {len(combinations)} Jinja gate combinations passed; "
-          "78 original / 61 proposed rules; 34 external definitions preserved; 27 explicit deletions")
+          "78 original / 61 proposed rules; 34 external definitions preserved; "
+          "27 retired deletions plus every native UID disabled by its gate")
 
 
 if __name__ == "__main__":

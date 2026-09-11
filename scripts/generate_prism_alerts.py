@@ -150,7 +150,12 @@ def deployment_template(snapshot):
                "{% endif %}", "{% endfor %}", "apiVersion: 1", "deleteRules:"]
     for uid in deleted:
         output += ["  - orgId: 1", "    uid: " + uid]
-    output += ["groups:", "{% if native_partitions.standard %}",
+    output += ["{# Disabled native rules must be deleted too, including reused legacy UIDs. #}",
+               "{% set emitted_uids = alert_rules | map(attribute='uid') | list %}",
+               "{% for rule in prism_native_rules + prism_public_read_alert_rules %}",
+               "{% if rule.uid not in emitted_uids %}",
+               "  - orgId: 1", "    uid: {{ rule.uid }}", "{% endif %}", "{% endfor %}",
+               "groups:", "{% if native_partitions.standard %}",
                "{{ render_alert_rule_group('qbit-prism-alerts', qbit_monitoring_stack_grafana_alert_standard_evaluation_interval, native_partitions.standard) }}", "{% endif %}",
                "{% if native_partitions.paging %}",
                "{{ render_alert_rule_group('qbit-prism-alerts-paging', qbit_monitoring_stack_grafana_alert_paging_evaluation_interval, native_partitions.paging) }}", "{% endif %}",

@@ -1463,7 +1463,7 @@
  {% endif %}
  {% if qbit_monitoring_stack_prism_backup_alerts_effective | bool %}
  {% set alert_rules = alert_rules + [
-@@ -1454,5 +1115,78 @@
+@@ -1454,5 +1115,86 @@
    }
  ] %}
  {% endif %}
@@ -1535,6 +1535,14 @@
 +    uid: qbit-prism-refresh-pending
 +  - orgId: 1
 +    uid: qbit-prism-refresh-pending-critical
++{# Disabled native rules must be deleted too, including reused legacy UIDs. #}
++{% set emitted_uids = alert_rules | map(attribute='uid') | list %}
++{% for rule in prism_native_rules + prism_public_read_alert_rules %}
++{% if rule.uid not in emitted_uids %}
++  - orgId: 1
++    uid: {{ rule.uid }}
++{% endif %}
++{% endfor %}
 +groups:
 +{% if native_partitions.standard %}
 +{{ render_alert_rule_group('qbit-prism-alerts', qbit_monitoring_stack_grafana_alert_standard_evaluation_interval, native_partitions.standard) }}

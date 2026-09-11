@@ -33,8 +33,11 @@ the public, connected-client and sidecar gates keep their meaning. Python
 `overload_alerts_enabled` and `writer_lease_alerts_enabled` gates no longer
 control native observability. The separate PostgreSQL HA group is required by
 D3 and deliberately reports missing instrumentation. Provisioning `deleteRules`
-removes every legacy UID that is not reused; omission alone does not remove an
-existing Grafana rule. Native critical-named bounds are warnings without page
+removes every legacy UID that is not reused, plus each native UID disabled by
+its current gate (including reused legacy UIDs); omission alone does not remove
+an existing Grafana rule. This also removes previously enabled native rules on
+a later gate change. External provisioning behavior is preserved. Native
+critical-named bounds are warnings without page
 labels until #291 qualifies the native thresholds; existing external paging is
 preserved. Sidecar miner-impact and host-loss pages remain the outage net.
 
