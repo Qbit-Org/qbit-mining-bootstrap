@@ -218,6 +218,32 @@ no lease expiry offers it again. Find parked rows with
 WHERE state = 'pending' AND next_attempt_at = 'infinity'` and drain them with
 the `2.x.x` image as above; resetting `next_attempt_at` re-offers a row.
 
+**A database an earlier 3.x.x build migrated before 006.** `3.x.x` is a
+development line with no supported production upgrade, but a database an
+earlier `3.x.x` build brought to native schema 3, 4 or 5 can still hold a
+pending v2 row: that build's drain check used the v1-only predicate, which
+never counted a row whose `candidate` is NULL. `migrate` therefore runs the
+same column-aware drain check on a native schema 3, 4 or 5 before 004, 005
+and 006, and refuses before any DDL when such a row is pending, naming the
+rows as above:
+
+```
+refusing to apply migration 006 to a native schema 5 database: an earlier 3.x.x build migrated it
+before the drain rule covered these rows, and the legacy Python block outbox is not drained: 1 pending
+2.x.x candidate row(s) cannot be replayed natively (block_hash=... storage_version=2 ...). Nothing was
+changed. Restore the pre-migration 2.x.x backup and drain them with the pinned 2.x.x release ...
+```
+
+Native pending rows the earlier build wrote carry the native fields and are
+not counted; a v2 body, a `body_id`, a `storage_version` other than 1, or a
+v1 body without the native fields is. The remedy is the one in the recovery
+section below: the `2.x.x` release is not supported against a native schema
+(its revert script refuses one, and this guide never points it at a migrated
+database), so restore the pre-migration `2.x.x` backup, drain there with the
+pinned image, take a new backup and migrate again. If native traffic was
+admitted after the earlier migration, that restore discards it and needs the
+reconciliation decision the recovery section describes.
+
 **What was migrated.** After a successful migration
 `qbit_prism_migration_source` holds one row: the accepted source state
 (`pre_258`, `258_applied`, `fresh`, or `native` for a database that was

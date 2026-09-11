@@ -453,10 +453,17 @@ pub(super) fn refuse_unknown_capabilities(rows: &[(String, i32)]) -> Result<()> 
 /// Refuse a pending 2.x.x row the native claim lane cannot replay, with the
 /// predicate built from the outbox columns that exist. The capability row is
 /// not consulted: 002 upserts it whatever the writer stored, so only rows say
-/// whether v2 work is pending.
+/// whether v2 work is pending. `native_version` is the recorded schema
+/// version when the database was migrated to native schema 3, 4 or 5 by an
+/// earlier 3.x.x build, whose drain check never counted a v2 row; that path
+/// gets its own wording and remedy. Native pending rows carry the native
+/// `payout_revision`, `bundle` and `block_hash` fields, so the predicate
+/// never flags them; only a v2 body, a `body_id`, a `storage_version` other
+/// than 1, or a v1 body without those fields is refused.
 pub(super) async fn refuse_undrained_outbox(
     tx: &mut Transaction<'_, Postgres>,
     inventory: &SourceInventory,
+    native_version: Option<i32>,
 ) -> Result<()> {
     if !inventory.outbox {
         return Ok(());
@@ -502,7 +509,10 @@ pub(super) async fn refuse_undrained_outbox(
         named if named > rows.len() => format!(" and {} more", named - rows.len()),
         _ => String::new(),
     };
-    bail!("legacy Python block outbox is not drained: {total} pending 2.x.x candidate row(s) cannot be replayed natively ({listing}{more}). Drain them with the pinned 2.x.x release before migrating: start the 2.x.x coordinator (v2.0.2 for storage_version 2 rows, v2.0.1 or later otherwise) and let its block submitter finish every pending candidate, or for a block already accepted on the active chain run `python3 -m lab.prism.recover_pending_blocks --block-hash <hash> --apply` from the 2.x.x image; then take the final backup and repeat the migration. Do not delete pending rows to bypass this check")
+    match native_version {
+        None => bail!("legacy Python block outbox is not drained: {total} pending 2.x.x candidate row(s) cannot be replayed natively ({listing}{more}). Drain them with the pinned 2.x.x release before migrating: start the 2.x.x coordinator (v2.0.2 for storage_version 2 rows, v2.0.1 or later otherwise) and let its block submitter finish every pending candidate, or for a block already accepted on the active chain run `python3 -m lab.prism.recover_pending_blocks --block-hash <hash> --apply` from the 2.x.x image; then take the final backup and repeat the migration. Do not delete pending rows to bypass this check"),
+        Some(version) => bail!("refusing to apply migration 006 to a native schema {version} database: an earlier 3.x.x build migrated it before the drain rule covered these rows, and the legacy Python block outbox is not drained: {total} pending 2.x.x candidate row(s) cannot be replayed natively ({listing}{more}). Nothing was changed. Restore the pre-migration 2.x.x backup and drain them with the pinned 2.x.x release (v2.0.2 for storage_version 2 rows, v2.0.1 or later otherwise): start its coordinator and let the block submitter finish every pending candidate, or for a block already accepted on the active chain run `python3 -m lab.prism.recover_pending_blocks --block-hash <hash> --apply` from the 2.x.x image; then take a new backup and migrate again with this release. The 2.x.x release is not supported against a native schema, so do not point it at this database. If native traffic was admitted after the earlier migration, that restore discards it: see the recovery section of docs/prism-rust-migration.md first. Do not delete pending rows to bypass this check"),
+    }
 }
 
 /// How many drifted or extra objects a release-schema report names.
@@ -1435,7 +1445,7 @@ pub(super) async fn migrate_schema(
             // of 001 is there either, or 001 would keep it as it is.
             require_fresh_source(tx, &expected, &source_schema).await?;
         }
-        refuse_undrained_outbox(tx, &inventory).await?;
+        refuse_undrained_outbox(tx, &inventory, None).await?;
         sqlx::raw_sql(&base_schema).execute(&mut **tx).await?;
         // 001 repaired what it re-asserts; what it skipped must already be
         // the release definition before any native DDL alters those tables.
@@ -1455,6 +1465,15 @@ pub(super) async fn migrate_schema(
             .execute(&mut **tx)
             .await?;
         source = Some((state, inventory.capability("candidate_storage_version")));
+    } else if !versions.contains(&6) {
+        // A database an earlier 3.x.x build migrated to native schema 3, 4
+        // or 5. That build's drain check used the v1-only predicate, which
+        // never counted a v2 row (`candidate ?& ...` is NULL for a NULL
+        // body), so a pending v2 candidate can still be there. The
+        // column-aware check runs here, before 004, 005 or 006 touch
+        // anything, so a refusal on this path is before any DDL too.
+        let inventory = inspect_source_schema(tx).await?;
+        refuse_undrained_outbox(tx, &inventory, Some(prior_version)).await?;
     }
     if !versions.contains(&4) {
         sqlx::raw_sql(include_str!(

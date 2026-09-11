@@ -1185,6 +1185,209 @@ async fn unknown_storage_version_row_is_parked_and_not_reclaimed_at_lease_expiry
     db.close(vec![a, b]).await
 }
 
+/// Simulate the database an earlier 3.x.x build left at native schema 5,
+/// before migration 006 existed, on a 2.x.x source of the given state. Built
+/// faithfully: the frozen release files, then the current migration, then
+/// 006 undone. The version 6 row is deleted and `qbit_prism_migration_source`
+/// is dropped. On a #258 source 006's other statements were no-ops, because
+/// 002 had already added `storage_version` and the capability row and 006's
+/// `ADD COLUMN IF NOT EXISTS` and `ON CONFLICT DO NOTHING` left them alone,
+/// so the 002 objects and the capability row stay exactly as 002 made them.
+/// On a pre-#258 source 006 created the column and the capability table
+/// itself, so both are dropped again: that build saw an outbox without
+/// `storage_version`.
+async fn undo_006(pool: &PgPool, state: SourceState) -> Result<()> {
+    assert_eq!(schema_version(pool).await?, REQUIRED_SCHEMA_VERSION);
+    sqlx::raw_sql("DELETE FROM qbit_prism_schema_migrations WHERE version=6; DROP TABLE qbit_prism_migration_source")
+        .execute(pool).await?;
+    if state == SourceState::Pre258 {
+        sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox DROP COLUMN storage_version; DROP TABLE qbit_prism_schema_capabilities")
+            .execute(pool).await?;
+    }
+    assert_eq!(schema_version(pool).await?, 5);
+    assert!(objects_006_absent(pool, state).await?);
+    Ok(())
+}
+
+/// Nothing 006 creates is present: its record table, and on a pre-#258
+/// source the capability table and the `storage_version` column too (002
+/// owns those on a #258 source).
+async fn objects_006_absent(pool: &PgPool, state: SourceState) -> Result<bool> {
+    let record_absent: bool =
+        sqlx::query_scalar("SELECT to_regclass('qbit_prism_migration_source') IS NULL")
+            .fetch_one(pool)
+            .await?;
+    if state == SourceState::Applied258 {
+        return Ok(record_absent);
+    }
+    let rest_absent: bool = sqlx::query_scalar("SELECT to_regclass('qbit_prism_schema_capabilities') IS NULL AND NOT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass('qbit_block_candidate_outbox') AND attname='storage_version' AND NOT attisdropped)")
+        .fetch_one(pool).await?;
+    Ok(record_absent && rest_absent)
+}
+
+#[tokio::test]
+async fn pre_006_native_schema_on_a_258_source_refuses_a_pending_v2_row_before_any_ddl(
+) -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    apply_frozen_2x_schema(&pool, SourceState::Applied258).await?;
+    insert_v2_terminal(&pool, &legacy_hash(0x44), "abandoned").await?;
+    let earlier = db.ledger("earlier-build").await?;
+    undo_006(&pool, SourceState::Applied258).await?;
+    // The pending v2 row that build's v1-only predicate never counted.
+    let pending = legacy_hash(0x22);
+    let body = insert_v2_pending(&pool, &pending).await?;
+    let before = schema_objects(&pool).await?;
+    let error = db
+        .ledger("this-build")
+        .await
+        .err()
+        .context("migration 006 accepted a pre-006 native database with a pending v2 row")?
+        .to_string();
+    assert!(
+        error.contains("refusing to apply migration 006 to a native schema 5 database: an earlier 3.x.x build migrated it before the drain rule covered these rows, and the legacy Python block outbox is not drained: 1 pending 2.x.x candidate row(s) cannot be replayed natively"),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("block_hash={pending} storage_version=2")),
+        "{error}"
+    );
+    assert!(
+        error.contains("Nothing was changed. Restore the pre-migration 2.x.x backup")
+            && error.contains("lab.prism.recover_pending_blocks")
+            && error.contains("not supported against a native schema")
+            && error.contains("Do not delete pending rows"),
+        "{error}"
+    );
+    // Unchanged: version 5, no 006 object, the schema and the rows as they were.
+    assert_eq!(schema_version(&pool).await?, 5);
+    assert!(objects_006_absent(&pool, SourceState::Applied258).await?);
+    assert_eq!(schema_objects(&pool).await?, before);
+    assert_eq!(pending_rows(&pool).await?, 1);
+    assert_eq!(capability(&pool).await?, Some(2));
+    assert!(sqlx::query_scalar::<_,bool>("SELECT state='pending' AND body_id=$2 AND claim_token IS NULL FROM qbit_block_candidate_outbox WHERE block_hash=$1")
+        .bind(&pending).bind(&body).fetch_one(&pool).await?, "refusal touched the row");
+    // Drained with the 2.x.x release, the same database migrates to 6 and is
+    // recorded as a native source that declared version 2.
+    drain_2x_row(&pool, &pending, true).await?;
+    let migrated = db.ledger("this-build").await?;
+    assert_eq!(schema_version(&pool).await?, REQUIRED_SCHEMA_VERSION);
+    let source = migrated
+        .migration_source()
+        .await?
+        .context("migration source not recorded")?;
+    assert_eq!(source.source_state, "native");
+    assert_eq!(source.prior_schema_version, 5);
+    assert_eq!(source.candidate_storage_version, Some(2));
+    assert_eq!(capability(&pool).await?, Some(2));
+    exercise_native_writers(&migrated, 1, 5501).await?;
+    pool.close().await;
+    db.close(vec![earlier, migrated]).await
+}
+
+#[tokio::test]
+async fn pre_006_native_schema_with_only_native_pending_candidates_migrates_and_keeps_them_claimable(
+) -> Result<()> {
+    for state in [SourceState::Applied258, SourceState::Pre258] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let pool = PgPool::connect(&db.url).await?;
+        apply_frozen_2x_schema(&pool, state).await?;
+        insert_v1_terminal(&pool, &legacy_hash(0x33), "submitted").await?;
+        let earlier = db.ledger("earlier-build").await?;
+        // A block that build found and had not submitted yet: a native v1
+        // row, whose body carries payout_revision, bundle and block_hash.
+        earlier.append(share(1), None).await?;
+        let block = candidate(&earlier.snapshot(100).await?, 5601)?;
+        earlier.enqueue_candidate(block.clone()).await?;
+        undo_006(&pool, state).await?;
+        assert_eq!(pending_rows(&pool).await?, 1);
+        let migrated = db.ledger("this-build").await.with_context(|| {
+            format!("006 refused a native pending candidate on a {state:?} source")
+        })?;
+        assert_eq!(schema_version(&pool).await?, REQUIRED_SCHEMA_VERSION);
+        let source = migrated
+            .migration_source()
+            .await?
+            .context("migration source not recorded")?;
+        assert_eq!(source.source_state, "native");
+        assert_eq!(source.prior_schema_version, 5);
+        let declared = match state {
+            SourceState::Applied258 => Some(2),
+            _ => None,
+        };
+        assert_eq!(source.candidate_storage_version, declared);
+        assert_eq!(capability(&pool).await?, Some(declared.unwrap_or(1)));
+        let claim = migrated
+            .claim_candidate(60)
+            .await?
+            .context("the native candidate is no longer claimable after 006")?;
+        assert_eq!(claim.candidate.block_hash, block.block_hash);
+        migrated
+            .land_candidate(&claim, &keys().1.public_key_hex())
+            .await?;
+        migrated.finish_candidate(&claim, true, None).await?;
+        assert_eq!(pending_rows(&pool).await?, 0);
+        pool.close().await;
+        db.close(vec![earlier, migrated]).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn pre_006_native_schema_on_a_pre_258_source_refuses_an_undrained_v1_row_with_the_v1_only_predicate(
+) -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    let earlier = db.ledger("earlier-build").await?;
+    undo_006(&pool, SourceState::Pre258).await?;
+    // A 2.x.x v1 row the native lane cannot replay, on an outbox without
+    // storage_version or body_id: the predicate must take its v1-only form.
+    let pending = legacy_hash(0x11);
+    insert_v1_pending(&pool, &pending).await?;
+    let error = db
+        .ledger("this-build")
+        .await
+        .err()
+        .context("migration 006 accepted a pre-006 native database with an undrained v1 row")?
+        .to_string();
+    assert!(
+        error.contains("refusing to apply migration 006 to a native schema 5 database"),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("block_hash={pending} storage_version=1")),
+        "{error}"
+    );
+    assert!(
+        !error.contains("does not exist"),
+        "pre-#258 native refusal was a SQL error: {error}"
+    );
+    assert_eq!(schema_version(&pool).await?, 5);
+    assert!(objects_006_absent(&pool, SourceState::Pre258).await?);
+    assert_eq!(pending_rows(&pool).await?, 1);
+    drain_2x_row(&pool, &pending, false).await?;
+    let migrated = db.ledger("this-build").await?;
+    assert_eq!(schema_version(&pool).await?, REQUIRED_SCHEMA_VERSION);
+    assert_eq!(capability(&pool).await?, Some(1));
+    assert_eq!(
+        migrated
+            .migration_source()
+            .await?
+            .map(|s| (s.source_state, s.prior_schema_version)),
+        Some(("native".into(), 5))
+    );
+    exercise_native_writers(&migrated, 1, 5701).await?;
+    pool.close().await;
+    db.close(vec![earlier, migrated]).await
+}
+
 async fn seed_legacy_carry(pool: &PgPool) -> Result<()> {
     sqlx::raw_sql("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256,chain_state) VALUES(repeat('aa',32),100,repeat('00',32),repeat('ab',32),repeat('ac',32),'confirmed'),(repeat('ee',32),101,repeat('aa',32),repeat('ef',32),repeat('e0',32),'prepared'); INSERT INTO qbit_payout_carry_forward(block_height,block_hash,miner_id,payout_order_key,p2mr_program,gross_amount_sats,prior_balance_sats,candidate_balance_sats,onchain_amount_sats,carry_forward_balance_sats,action) VALUES(100,repeat('aa',32),'miner-a','a',decode(repeat('11',32),'hex'),1000,0,1000,0,1000,'accrued'),(101,repeat('ee',32),'miner-b','b',decode(repeat('22',32),'hex'),500,0,500,0,500,'accrued'); DELETE FROM qbit_payout_carry_forward_current; UPDATE qbit_pool_blocks SET chain_state='confirmed' WHERE block_hash=repeat('ee',32);")
         .execute(pool).await?;
