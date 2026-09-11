@@ -73,6 +73,8 @@ struct PhaseRun {
     scheduled_blocks: usize,
     frontend_restarts: usize,
     mid_flight_indeterminate: Vec<SubmitRecord>,
+    /// Submits outstanding on the killed frontend at the instant of the kill.
+    outstanding_at_kill: Option<usize>,
 }
 
 pub async fn execute(args: Args) -> Result<i32> {
@@ -542,6 +544,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             scheduled_blocks: outcome.scheduled_blocks,
             frontend_restarts: outcome.frontend_restarts,
             mid_flight_indeterminate: outcome.indeterminate,
+            outstanding_at_kill: outcome.outstanding_at_kill,
         });
         if let Some(reason) = outcome.aborted {
             aborted = Some(reason);
@@ -1026,6 +1029,8 @@ struct PhaseOutcome {
     scheduled_blocks: usize,
     frontend_restarts: usize,
     indeterminate: Vec<SubmitRecord>,
+    /// Submits outstanding on the killed frontend at the instant of the kill.
+    outstanding_at_kill: Option<usize>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1053,6 +1058,7 @@ async fn drive_phase(
         scheduled_blocks: 0,
         frontend_restarts: 0,
         indeterminate: Vec::new(),
+        outstanding_at_kill: None,
     };
     // Event schedule inside the phase.
     let reconnect_interval = if plan.reconnects {
@@ -1137,8 +1143,10 @@ async fn drive_phase(
         }
         if !kill_done && seconds >= duration.as_secs_f64() / 3.0 {
             kill_done = true;
-            outcome.indeterminate =
+            let (indeterminate, outstanding) =
                 mid_flight_kill(args, sessions, frontends, samplers, collected).await?;
+            outcome.indeterminate = indeterminate;
+            outcome.outstanding_at_kill = Some(outstanding);
             outcome.frontend_restarts += 1;
         }
         if mem_check.elapsed() >= Duration::from_secs(1) {
@@ -1240,9 +1248,25 @@ async fn mid_flight_kill(
     frontends: &mut [Frontend],
     samplers: &[ProcessSampler],
     collected: &Arc<Mutex<Collected>>,
-) -> Result<Vec<SubmitRecord>> {
+) -> Result<(Vec<SubmitRecord>, usize)> {
     let index = if frontends.len() >= 2 { 1 } else { 0 };
     let before = collected.lock().expect("collector lock").submits.len();
+    // Wait for the frontend to actually be holding work. A kill with nothing
+    // in flight tears down an idle socket and proves nothing, so the harness
+    // reports what it found rather than assuming the scenario happened.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let outstanding_on = |sessions: &[SessionHandle]| -> usize {
+        sessions
+            .iter()
+            .filter(|session| session.frontend.load(Ordering::Relaxed) == index)
+            .map(|session| session.outstanding.load(Ordering::Relaxed))
+            .sum()
+    };
+    let mut outstanding = outstanding_on(sessions);
+    while outstanding == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        outstanding = outstanding_on(sessions);
+    }
     frontends[index].kill();
     tokio::time::sleep(Duration::from_millis(500)).await;
     frontends[index].restart()?;
@@ -1284,7 +1308,7 @@ async fn mid_flight_kill(
         }
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
-    Ok(indeterminate)
+    Ok((indeterminate, outstanding))
 }
 
 // --- helpers -------------------------------------------------------------
@@ -1571,7 +1595,11 @@ fn mid_flight_report(
     json!({
         "ran": true,
         "phase": phase.plan.name,
+        "submits_outstanding_at_kill": phase.outstanding_at_kill,
         "indeterminate_shares": shares.len(),
+        "note": "an indeterminate share is one whose acknowledgement the kill destroyed; it is \
+                 re-offered with exactly the header it carried, and its final PostgreSQL outcome \
+                 is reported. Zero outstanding at the kill means the scenario did not exercise.",
         "shares": shares,
     })
 }

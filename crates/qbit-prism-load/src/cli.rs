@@ -367,7 +367,12 @@ pub fn phases(args: &Args) -> Result<Vec<PhasePlan>> {
             rate: steady_rate,
             in_artifact: false,
             reconnects: false,
-            database_delay_ms: 0,
+            // The kill has to land while submits really are outstanding. With
+            // no delay an acknowledgement takes a few milliseconds, so at any
+            // ordinary rate almost nothing is in flight and the scenario
+            // silently does not happen. The proxy delay holds submits open
+            // long enough for the kill to mean something.
+            database_delay_ms: args.slow_db_delay_ms,
             mid_flight_kill: true,
         });
     }

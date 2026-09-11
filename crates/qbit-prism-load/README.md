@@ -80,7 +80,7 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--slow-database-seconds` | 60 | `slow_database` phase length |
 | `--reconnect-target` | 12 | Completed reconnects to drive; the artifact needs at least 10 |
 | `--slow-db-delay-ms` | 10 | One-way per-chunk proxy delay; the artifact phase needs at least 10 |
-| `--mid-flight-kill` | off | SIGKILL a frontend with submits outstanding, in a side phase |
+| `--mid-flight-kill` | off | SIGKILL a frontend with submits outstanding, in a side phase. That phase runs under the same proxy delay as `slow_database` and the kill waits for the target frontend to actually hold work, because with no delay an acknowledgement takes a few milliseconds and the scenario would quietly not happen. The report carries `submits_outstanding_at_kill`, and zero there means it did not exercise |
 | `--scheduled-blocks` | 0 | Own blocks to find and submit during `steady_state`. Each one bumps the payout revision, so expect a burst of `new payout work is pending` on every frontend afterwards |
 | `--external-tips` | 3 | Tips minted during warm-up, for time to usable work. They need a warm-up phase: with `--warmup-seconds 0` none is minted and the time-to-usable-work section is empty rather than zero |
 | `--work-timeout` | 120 | Seconds to wait for frontends to serve work |
