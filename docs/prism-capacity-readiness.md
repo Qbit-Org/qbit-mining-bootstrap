@@ -312,13 +312,17 @@ not a graph someone reads. The Python tool that computed the verdict left with
 
 ```sh
 awk -F, -v warmup=3600 -v multiple=2.0 -v min_span=82800 '
-  /^#/ || NF < 2 || $2 < 0 { next }
+  function numeric(s) { return s ~ /^[ \t]*-?([0-9]+\.?[0-9]*|\.[0-9]+)[ \t]*$/ }
+  /^[ \t]*(#|$)/ { next }
+  NF < 2 || !numeric($1) || !numeric($2) { bad = $0; unusable = 1; exit }
+  $2 < 0 { next }
   { if (t0 == "") t0 = $1
     if ($1 - t0 <= warmup) { if ($2 > base) base = $2; next }
     post++; last = $1
     if ($2 > peak) { peak = $2; peak_at = $1 }
     if (!breach && $2 > base * multiple) breach = $1 }
   END {
+    if (unusable) { print "unusable input: row \"" bad "\" is not seconds,rss_bytes"; exit 2 }
     if (base == "" || !post) { print "unusable input: no warm-up or no post-warm-up samples"; exit 2 }
     if (last - t0 < min_span) { printf "unusable input: series spans %d s, soak needs %d s\n", last - t0, min_span; exit 2 }
     printf "baseline=%d bound=%d peak=%d peak_at=%d first_breach_at=%s\n", base, base * multiple, peak, peak_at, breach ? breach : "none"
@@ -326,7 +330,10 @@ awk -F, -v warmup=3600 -v multiple=2.0 -v min_span=82800 '
 ```
 
 The input is one `seconds,rss_bytes` line per sample (absolute epoch seconds
-are fine; `#` comments are skipped; `-1` samples are ignored). The warm-up
+are fine). `#` comments and blank lines are skipped and `-1` samples are
+ignored; any other row that is not `seconds,rss_bytes` is unusable input
+(exit `2`), as it was in the Python tool, so a truncated row during an
+excursion cannot pass as a skipped one. The warm-up
 runs from the first sample and includes a sample taken exactly one hour after
 it, as it did in the Python tool; only later samples are judged against the
 bound. The command prints the baseline, the bound, the post-warm-up peak and
