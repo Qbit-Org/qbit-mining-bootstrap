@@ -81,6 +81,7 @@
 use anyhow::{bail, ensure, Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use qbit_prism_server::ledger::Ledger;
+use qbit_prism_test_gate as gate;
 use serde_json::{Map, Value};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::{
@@ -187,53 +188,18 @@ const NOTES: &str = "v2 measures per-share transactional Ledger::append: one BEG
                      durability and build_profile fields.";
 
 // ---------------------------------------------------------------------------
-// Integration guard
+// Integration gate
 // ---------------------------------------------------------------------------
-
-/// Decides whether this file's tests run, fail or skip.
-///
-/// | `PRISM_TEST_DATABASE_URL` | other variables | result |
-/// | --- | --- | --- |
-/// | set and non-empty | -- | run against that database |
-/// | unset or empty | `PRISM_TEST_REQUIRE_INTEGRATION=1` | fail, naming the variable |
-/// | unset or empty | `GITHUB_JOB=prism-native-postgres` | fail, naming the variable |
-/// | unset or empty | -- | print a skip line and return |
-///
-/// This is `window_read_oracle.rs`'s guard, copied verbatim so the two files
-/// cannot drift into different answers for the same environment. The reasoning
-/// is recorded there: CI's database-free `rust-tests` job builds and runs every
-/// workspace target with no server, so skipping has to stay possible, while
-/// `prism-native-postgres` runs `--all-targets` against a PostgreSQL 16 service
-/// and a database outage there must be a failure rather than a silent pass.
-/// That second job is also how this floor reaches CI with no workflow change.
-fn database_url(test_name: &str) -> Result<Option<String>> {
-    let configured = std::env::var("PRISM_TEST_DATABASE_URL").unwrap_or_default();
-    let configured = configured.trim();
-    if !configured.is_empty() {
-        return Ok(Some(configured.to_owned()));
-    }
-    let required_by = if matches!(
-        std::env::var("PRISM_TEST_REQUIRE_INTEGRATION").as_deref(),
-        Ok("1")
-    ) {
-        Some("PRISM_TEST_REQUIRE_INTEGRATION=1")
-    } else if matches!(
-        std::env::var("GITHUB_JOB").as_deref(),
-        Ok("prism-native-postgres")
-    ) {
-        Some("GITHUB_JOB=prism-native-postgres")
-    } else {
-        None
-    };
-    if let Some(signal) = required_by {
-        bail!(
-            "{test_name} requires PostgreSQL: PRISM_TEST_DATABASE_URL is unset or empty while \
-             {signal} demands the integration suite"
-        );
-    }
-    eprintln!("skipping {test_name}: PRISM_TEST_DATABASE_URL is not set");
-    Ok(None)
-}
+//
+// Whether the database tests here run, fail or skip is decided by the shared
+// integration gate (`qbit_prism_test_gate`, #286), the one decision table every
+// gated test in the workspace uses. With no database URL, a test fails under
+// the integration switch or in the `prism-native-postgres` job, and skips
+// otherwise; CI's database-free `rust-tests` job therefore skips it, while the
+// native job runs it against PostgreSQL 16 with no workflow change.
+// `share_append_throughput_floor` is listed in `test/prism-gated-tests.txt`, so
+// that job also proves it executed. The full-size test is not selected in CI
+// and is not listed. See `docs/prism-integration-test-gate.md`.
 
 // ---------------------------------------------------------------------------
 // Environment parsing (EP-VALIDATION)
@@ -1677,7 +1643,7 @@ async fn run_floor(test_name: &str, defaults: Defaults) -> Result<()> {
     // with an out-of-range sampling interval or an uncomparable floor
     // (EP-VALIDATION).
     let config = Config::from_env(test_name, defaults)?;
-    let Some(raw) = database_url(test_name)? else {
+    let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
     println!(
