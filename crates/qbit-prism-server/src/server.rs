@@ -189,6 +189,19 @@ pub async fn run(config: Config) -> Result<()> {
     Ok(())
 }
 
+// One operation ends at publication; subsequent database maintenance is not
+// a missing publication. Use the same effective budget as the scrape contract.
+async fn with_health_publication_progress<T>(
+    state: &ApiState,
+    publication: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let _progress = state
+        .metrics()
+        .runtime()
+        .start_operation(TaskKind::HealthPublisher, crate::api::health_stale_after());
+    publication.await
+}
+
 async fn publish_health(
     coordinator: Arc<Coordinator>,
     state: ApiState,
@@ -200,39 +213,39 @@ async fn publish_health(
     let mut missing_since = None::<Instant>;
     loop {
         tokio::select! {_=shutdown.changed()=>break,_=tick.tick()=>{}}
-        let _progress = state
-            .metrics()
-            .runtime()
-            .start_operation(TaskKind::HealthPublisher, coordinator.config.health_timeout);
-        let mut health = coordinator.health().await;
-        let snapshot = stats.snapshot(health["template_generation"].as_u64().unwrap_or(0));
-        if snapshot.authorized_missing_current_work == 0 {
-            missing_since = None;
-        } else {
-            missing_since.get_or_insert_with(Instant::now);
-        }
-        let delivery_stalled = missing_since
-            .is_some_and(|at| at.elapsed() > coordinator.config.health_timeout)
-            && snapshot
-                .last_delivery_progress_age_seconds
-                .is_none_or(|age| age > coordinator.config.health_timeout.as_secs_f64());
-        if delivery_stalled {
-            health["ok"] = false.into();
-            health["ready"] = false.into();
-            health["status"] = "job-delivery-stalled".into();
-        }
-        health["stratum"] = serde_json::to_value(&snapshot)?;
-        metrics::add_known_health_fields(&mut health);
-        state.publish_health(health.clone());
-        let registry = state.metrics();
-        registry.publish_stratum(
-            &snapshot,
-            health["ok"] == true,
-            coordinator.config.runtime_workers,
-            coordinator.blocks.load(Ordering::Relaxed),
-        );
-        registry.publish_delivery(stats.delivery_metrics());
-        state.publish_metrics(registry.render())?;
+        let health = with_health_publication_progress(&state, async {
+            let mut health = coordinator.health().await;
+            let snapshot = stats.snapshot(health["template_generation"].as_u64().unwrap_or(0));
+            if snapshot.authorized_missing_current_work == 0 {
+                missing_since = None;
+            } else {
+                missing_since.get_or_insert_with(Instant::now);
+            }
+            let delivery_stalled = missing_since
+                .is_some_and(|at| at.elapsed() > coordinator.config.health_timeout)
+                && snapshot
+                    .last_delivery_progress_age_seconds
+                    .is_none_or(|age| age > coordinator.config.health_timeout.as_secs_f64());
+            if delivery_stalled {
+                health["ok"] = false.into();
+                health["ready"] = false.into();
+                health["status"] = "job-delivery-stalled".into();
+            }
+            health["stratum"] = serde_json::to_value(&snapshot)?;
+            metrics::add_known_health_fields(&mut health);
+            state.publish_health(health.clone());
+            let registry = state.metrics();
+            registry.publish_stratum(
+                &snapshot,
+                health["ok"] == true,
+                coordinator.config.runtime_workers,
+                coordinator.blocks.load(Ordering::Relaxed),
+            );
+            registry.publish_delivery(stats.delivery_metrics());
+            state.publish_metrics(registry.render())?;
+            Ok(health)
+        })
+        .await?;
         if let Err(error) = coordinator.ledger.heartbeat(health).await {
             tracing::warn!(%error,"cluster heartbeat failed");
         }
@@ -253,4 +266,133 @@ pub(crate) async fn signal() -> Result<()> {
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    fn state() -> ApiState {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://invalid@127.0.0.1:1/invalid")
+            .unwrap();
+        ApiState::new(
+            pool,
+            ApiConfig::default(),
+            Arc::new(metrics::Metrics::default()),
+        )
+    }
+
+    async fn assert_healthy(state: ApiState) {
+        let response = crate::api::router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn publication_guard_finishes_before_slow_maintenance() {
+        for phase in ["heartbeat", "prune"] {
+            let state = state();
+            let runtime = state.metrics().runtime();
+            let task_state = state.clone();
+            let (entered, maintenance_started) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                with_health_publication_progress(&task_state, async {
+                    task_state.publish_health(json!({"ok":true,"ready":true}));
+                    task_state.publish_metrics("qbit_prism_health_state 1\n".into())?;
+                    Ok(())
+                })
+                .await?;
+                entered.send(()).unwrap();
+                released.await?; // Simulate the later asynchronous database call.
+                Ok::<_, anyhow::Error>(())
+            });
+            maintenance_started.await.unwrap();
+            assert!(
+                !runtime
+                    .snapshot_at(Instant::now() + Duration::from_secs(3600))
+                    .stalled(),
+                "{phase} must not retain the publication progress guard"
+            );
+            assert_healthy(state).await;
+            release.send(()).unwrap();
+            task.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn publication_progress_uses_configured_freshness_budget() {
+        const CHILD: &str = "PRISM_PUBLICATION_BUDGET_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Exercise the real reader in an isolated process; never mutate
+            // configuration underneath parallel tests in this process.
+            let output = tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "server::tests::publication_progress_uses_configured_freshness_budget",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("PRISM_HEALTH_REFRESH_SECONDS", "6")
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let budget = crate::api::health_stale_after();
+        assert_eq!(budget, Duration::from_secs(18));
+        let state = state();
+        let runtime = state.metrics().runtime();
+        let task_state = state.clone();
+        let (entered, publication_started) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let before_registration = Instant::now();
+        let task = tokio::spawn(async move {
+            with_health_publication_progress(&task_state, async {
+                entered.send(Instant::now()).unwrap();
+                released.await?; // The required publication is blocked.
+                task_state.publish_health(json!({"ok":true,"ready":true}));
+                task_state.publish_metrics("qbit_prism_health_state 1\n".into())?;
+                Ok(())
+            })
+            .await
+        });
+        let after_registration = publication_started.await.unwrap();
+        assert!(!runtime.snapshot_at(before_registration + budget).stalled());
+        let expired = runtime.snapshot_at(after_registration + budget);
+        assert!(
+            expired.stalled(),
+            "the registered budget must match the real freshness reader"
+        );
+        let mut health = json!({"ok":true,"ready":true});
+        expired.apply_health(&mut health);
+        assert_eq!(health["status"], "runtime-stalled");
+        assert_eq!(health["ok"], false);
+        release.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        assert!(!runtime.snapshot_at(after_registration + budget).stalled());
+        assert_healthy(state).await;
+    }
 }

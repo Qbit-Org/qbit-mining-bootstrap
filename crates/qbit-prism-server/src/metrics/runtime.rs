@@ -146,7 +146,7 @@ impl RuntimeMonitor {
     pub fn snapshot(&self) -> RuntimeSnapshot {
         self.snapshot_at(Instant::now())
     }
-    fn snapshot_at(&self, now: Instant) -> RuntimeSnapshot {
+    pub(crate) fn snapshot_at(&self, now: Instant) -> RuntimeSnapshot {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut tasks: BTreeMap<_, _> = TaskKind::ALL
             .iter()

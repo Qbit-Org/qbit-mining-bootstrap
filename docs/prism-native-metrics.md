@@ -49,7 +49,11 @@ Reject labels are the closed `RejectReason` enum: `stale-job`,
 Task labels are `refresh`, `submit`, `block_wait`, `broadcast`, `rollup`,
 `health_publisher`, `stratum_listener`, `stratum_session`, and `collector`.
 Session futures and server-owned background futures are monitored. Only the
-health publisher currently registers an explicit operation-progress budget.
+health publisher currently registers an explicit operation-progress budget,
+covering health and metrics publication only. It uses the same effective
+`max(3 * PRISM_HEALTH_REFRESH_SECONDS, 15)` seconds as #277 freshness and ends
+immediately after publication; later heartbeat/prune waits are outside that
+deadline. Those futures still receive ordinary blocked-poll monitoring.
 Idle socket reads and asynchronous waits are not blocked polls. A blocked poll
 can degrade live `/healthz` and `health_state` when a surviving worker serves the
 probe; a completed long poll retains timing evidence but does not keep readiness

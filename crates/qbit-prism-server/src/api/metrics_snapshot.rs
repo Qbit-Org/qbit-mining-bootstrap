@@ -2,7 +2,7 @@
 use super::{env_num, HeaderValue, IntoResponse, Response};
 use std::time::{Duration, Instant};
 
-pub(super) fn health_stale_after() -> Duration {
+pub(crate) fn health_stale_after() -> Duration {
     Duration::from_secs(
         env_num("PRISM_HEALTH_REFRESH_SECONDS", 2)
             .saturating_mul(3)

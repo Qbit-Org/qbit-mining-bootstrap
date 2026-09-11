@@ -220,11 +220,14 @@ and current payout revision and job delivery can progress; otherwise it returns
 503. The HTTP handler reads a published snapshot and fails closed when that
 snapshot becomes stale. Database or node outages therefore cannot keep an old
 green response indefinitely. A tracked task polling beyond two seconds, or an
-explicit operation exceeding its progress budget, also returns 503 with
+health/metrics publication exceeding the existing freshness budget, also
+returns 503 with
 `ok=false`, `ready=false`, and `status="runtime-stalled"`; the corresponding
 `qbit_prism_runtime_task_stalled{task="..."}` is 1. This live check requires a
 surviving runtime worker to serve the probe; a completed long poll retains
-metric evidence without keeping readiness failed.
+metric evidence without keeping readiness failed. The publication progress
+guard ends before heartbeat/prune maintenance; their asynchronous waits do not
+mark a just-published snapshot runtime-stalled.
 
 The coordinator health payload also supplies three known 2.x compatibility
 aliases: `ledger_backend` is `postgres-native` for the PostgreSQL backend,
