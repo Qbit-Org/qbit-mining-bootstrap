@@ -11,8 +11,7 @@ use support::{Backend, Client, Server};
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrap_exhaustion_leaves_subscription_retryable_and_disconnect_releases_guard() -> Result<()>
 {
-    let Ok(raw) = std::env::var("PRISM_TEST_DATABASE_URL") else {
-        eprintln!("set PRISM_TEST_DATABASE_URL for the wrap subscription test");
+    let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
     let admin = sqlx::PgPool::connect(&raw).await?;

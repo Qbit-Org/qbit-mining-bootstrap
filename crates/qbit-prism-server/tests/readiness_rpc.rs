@@ -224,8 +224,7 @@ fn coordinator_config(database_url: String, node: &Node) -> Result<Config> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn coordinator_reports_wrap_exhaustion_truthfully() -> Result<()> {
-    let Ok(raw) = std::env::var("PRISM_TEST_DATABASE_URL") else {
-        eprintln!("set PRISM_TEST_DATABASE_URL for coordinator allocation error mapping");
+    let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
     let admin = sqlx::PgPool::connect(&raw).await?;
