@@ -1,0 +1,284 @@
+[
+  {
+    "name": "successful real zero is healthy",
+    "series": {
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": 1.0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"process\"}": 1.0,
+      "qbit_prism_block_candidates_pending{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_process_resident_memory_bytes{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_stratum_oldest_pending_initial_job_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_runtime_lag_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_runtime_poll_lag_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",task=\"refresh\"}": 0.0,
+      "qbit_prism_runtime_task_stalled{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",task=\"refresh\"}": 0.0,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_health_state{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0
+    },
+    "expect": {
+      "PrismBlockCandidateBacklog": 0,
+      "PrismBlockCandidateMetricsUnavailable": 0,
+      "PrismResidentMemoryHigh": 0,
+      "PrismProcessMetricsUnavailable": 0,
+      "PrismSemanticWorkCoverageLoss": 0,
+      "PrismWorkMetricsUnavailable": 0,
+      "PrismRuntimeLagHigh": 0,
+      "PrismMetricsNoData": 0
+    }
+  },
+  {
+    "name": "unknown is not healthy",
+    "series": {
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": 0.0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"process\"}": 0.0,
+      "qbit_prism_block_candidates_pending{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": -1.0,
+      "qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": -1.0,
+      "qbit_prism_process_resident_memory_bytes{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": -1.0,
+      "qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": -1.0,
+      "qbit_prism_stratum_oldest_pending_initial_job_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": -1.0,
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_runtime_lag_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_runtime_poll_lag_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",task=\"refresh\"}": 0.0,
+      "qbit_prism_runtime_task_stalled{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",task=\"refresh\"}": 0.0,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_health_state{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0
+    },
+    "expect": {
+      "PrismBlockCandidateBacklog": null,
+      "PrismBlockCandidateMetricsUnavailable": 1,
+      "PrismResidentMemoryHigh": null,
+      "PrismProcessMetricsUnavailable": 1,
+      "PrismSemanticWorkCoverageLoss": null,
+      "PrismWorkMetricsUnavailable": 2
+    }
+  },
+  {
+    "name": "stale body does not fire threshold or mask runtime",
+    "series": {
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": 1.0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"process\"}": 1.0,
+      "qbit_prism_block_candidates_pending{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 10.0,
+      "qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_process_resident_memory_bytes{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 9000000000.0,
+      "qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_stratum_oldest_pending_initial_job_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_runtime_lag_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_runtime_poll_lag_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",task=\"refresh\"}": 3.0,
+      "qbit_prism_runtime_task_stalled{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",task=\"refresh\"}": 0.0,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_health_state{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0
+    },
+    "expect": {
+      "PrismBlockCandidateBacklog": null,
+      "PrismResidentMemoryHigh": null,
+      "PrismMetricsSnapshotStale": 1,
+      "PrismRuntimeLagHigh": 1
+    }
+  },
+  {
+    "name": "fresh native pressure",
+    "series": {
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": 1.0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"process\"}": 1.0,
+      "qbit_prism_block_candidates_pending{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 5.0,
+      "qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 60.0,
+      "qbit_prism_process_resident_memory_bytes{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 9000000000.0,
+      "qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.4,
+      "qbit_prism_stratum_oldest_pending_initial_job_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_runtime_lag_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_runtime_poll_lag_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",task=\"refresh\"}": 0.0,
+      "qbit_prism_runtime_task_stalled{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",task=\"refresh\"}": 0.0,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_health_state{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0
+    },
+    "expect": {
+      "PrismBlockCandidateBacklog": 1,
+      "PrismBlockCandidateBacklogCritical": 1,
+      "PrismBlockCandidateOldestPendingCritical": 1,
+      "PrismResidentMemoryHigh": 1,
+      "PrismSemanticWorkCoverageLoss": 1,
+      "PrismSemanticWorkCoverageLossCritical": 1
+    }
+  },
+  {
+    "name": "missing health family on live scrape",
+    "series": {
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": 1.0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"process\"}": 1.0,
+      "qbit_prism_block_candidates_pending{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_process_resident_memory_bytes{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_stratum_oldest_pending_initial_job_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_runtime_lag_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_runtime_poll_lag_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",task=\"refresh\"}": 0.0,
+      "qbit_prism_runtime_task_stalled{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",task=\"refresh\"}": 0.0,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0
+    },
+    "expect": {
+      "PrismMetricsNoData": 1
+    }
+  },
+  {
+    "name": "D3 healthy",
+    "series": {
+      "pg_up{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\"}": 1.0,
+      "pg_stat_replication_replay_lag{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 0.02,
+      "pg_stat_replication_count{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1.0
+    },
+    "expect": {
+      "PrismHAStandbyReplayLagHigh": 0,
+      "PrismHAStandbyDisconnected": 0
+    }
+  },
+  {
+    "name": "D3 exact boundary",
+    "series": {
+      "pg_up{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\"}": 1.0,
+      "pg_stat_replication_replay_lag{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 5.0,
+      "pg_stat_replication_count{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1.0
+    },
+    "expect": {
+      "PrismHAStandbyReplayLagHigh": 0,
+      "PrismHAStandbyDisconnected": 0
+    }
+  },
+  {
+    "name": "D3 lagged",
+    "series": {
+      "pg_up{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\"}": 1.0,
+      "pg_stat_replication_replay_lag{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 5.001,
+      "pg_stat_replication_count{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1.0
+    },
+    "expect": {
+      "PrismHAStandbyReplayLagHigh": 1,
+      "PrismHAStandbyDisconnected": 0
+    }
+  },
+  {
+    "name": "D3 disconnected",
+    "series": {
+      "pg_up{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\"}": 1.0,
+      "pg_stat_replication_replay_lag{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": -1.0,
+      "pg_stat_replication_count{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 0.0
+    },
+    "expect": {
+      "PrismHAStandbyReplayLagHigh": 1,
+      "PrismHAStandbyDisconnected": 1
+    }
+  },
+  {
+    "name": "D3 failed database",
+    "series": {
+      "pg_up{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\"}": 0.0,
+      "pg_stat_replication_replay_lag{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 0.0,
+      "pg_stat_replication_count{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1.0
+    },
+    "expect": {
+      "PrismHAStandbyReplayLagHigh": 1,
+      "PrismHAStandbyDisconnected": 1
+    }
+  },
+  {
+    "name": "D3 missing exporter",
+    "series": {},
+    "expect": {
+      "PrismHAStandbyReplayLagHigh": 1,
+      "PrismHAStandbyDisconnected": 1
+    }
+  },
+  {
+    "name": "D3 unknown lag",
+    "series": {
+      "pg_up{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\"}": 1.0,
+      "pg_stat_replication_replay_lag{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": -1.0,
+      "pg_stat_replication_count{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1.0
+    },
+    "expect": {
+      "PrismHAStandbyReplayLagHigh": 1,
+      "PrismHAStandbyDisconnected": 0
+    }
+  },
+  {
+    "name": "D3 missing lag query",
+    "series": {
+      "pg_up{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\"}": 1.0,
+      "pg_stat_replication_count{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1.0
+    },
+    "expect": {
+      "PrismHAStandbyReplayLagHigh": 1,
+      "PrismHAStandbyDisconnected": 0
+    }
+  },
+  {
+    "name": "D3 missing count query",
+    "series": {
+      "pg_up{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\"}": 1.0,
+      "pg_stat_replication_replay_lag{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 0.0
+    },
+    "expect": {
+      "PrismHAStandbyReplayLagHigh": 0,
+      "PrismHAStandbyDisconnected": 1
+    }
+  },
+  {
+    "name": "D3 negative count",
+    "series": {
+      "pg_up{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\"}": 1.0,
+      "pg_stat_replication_replay_lag{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 0.0,
+      "pg_stat_replication_count{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": -1.0
+    },
+    "expect": {
+      "PrismHAStandbyReplayLagHigh": 0,
+      "PrismHAStandbyDisconnected": 1
+    }
+  },
+  {
+    "name": "runtime sampler unknown",
+    "series": {
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"database\"}": 1.0,
+      "qbit_prism_collector_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",collector=\"process\"}": 1.0,
+      "qbit_prism_block_candidates_pending{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_process_resident_memory_bytes{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_stratum_oldest_pending_initial_job_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 0.0,
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_runtime_lag_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": -1,
+      "qbit_prism_runtime_poll_lag_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",task=\"refresh\"}": 0.0,
+      "qbit_prism_runtime_task_stalled{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",task=\"refresh\"}": 0.0,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0,
+      "qbit_prism_health_state{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1.0
+    },
+    "expect": {
+      "PrismRuntimeLagHigh": 1
+    }
+  },
+  {
+    "name": "public scrape missing while peer is healthy",
+    "series": {
+      "qbit_prism_public_ledger_ready{job=\"qbit-prism-public-read\",instance=\"healthy\",network=\"mainnet\"}": 1,
+      "up{job=\"qbit-prism-public-read\",instance=\"healthy\",network=\"mainnet\"}": 1,
+      "up{job=\"qbit-prism-public-read\",instance=\"failed\",network=\"mainnet\"}": 0
+    },
+    "expect": {
+      "PrismPublicLedgerUnready": 1
+    }
+  }
+]

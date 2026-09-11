@@ -1,0 +1,40 @@
+{
+  "rules": [
+    {
+      "uid": "qbit-prism-ha-standby-replay-lag",
+      "title": "PrismHAStandbyReplayLagHigh",
+      "expr": "clamp_max((max(pg_stat_replication_replay_lag{job=\"qbit-postgres-primary\",network=\"__NETWORK__\",application_name=\"prism_standby_1\"} > bool 5) or vector(0)) + (max(pg_stat_replication_replay_lag{job=\"qbit-postgres-primary\",network=\"__NETWORK__\",application_name=\"prism_standby_1\"} < bool 0) or vector(0)) + (1 - ((count(pg_stat_replication_replay_lag{job=\"qbit-postgres-primary\",network=\"__NETWORK__\",application_name=\"prism_standby_1\"}) > bool 0) or vector(0))) + (1 - (max(pg_up{job=\"qbit-postgres-primary\",network=\"__NETWORK__\"}) or vector(0))), 1)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "1m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-database-ha"
+      },
+      "summary": "PrismHAStandbyReplayLagHigh",
+      "description": "D3: primary-side replay lag exceeds 5 seconds, is unknown, or the primary exporter/database cannot be read. Deployment-provided: requires primary postgres_exporter query metrics; verify presence in #281/#291. This is not the public read replica.",
+      "no_data_state": "Alerting",
+      "exec_err_state": "Alerting"
+    },
+    {
+      "uid": "qbit-prism-ha-standby-disconnected",
+      "title": "PrismHAStandbyDisconnected",
+      "expr": "clamp_max((1 - ((max(pg_stat_replication_count{job=\"qbit-postgres-primary\",network=\"__NETWORK__\",application_name=\"prism_standby_1\"}) > bool 0) or vector(0))) + (1 - (max(pg_up{job=\"qbit-postgres-primary\",network=\"__NETWORK__\"}) or vector(0))), 1)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "1m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-database-ha"
+      },
+      "summary": "PrismHAStandbyDisconnected",
+      "description": "D3: the primary has zero rows for application_name prism_standby_1, or the exporter/database is missing or failed. Deployment-provided: requires primary postgres_exporter query metrics; verify presence in #281/#291. This is not the public read replica.",
+      "no_data_state": "Alerting",
+      "exec_err_state": "Alerting"
+    }
+  ]
+}

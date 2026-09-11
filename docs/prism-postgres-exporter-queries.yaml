@@ -1,0 +1,21 @@
+# Deployment-provided D3 query extension on the PRIMARY, not the public replica.
+# Configure through the deployment's supported SQL-query exporter mechanism;
+# stock collector versions differ. Verify all three families in #281/#291.
+# pg_up is provided by postgres_exporter itself, on the same scrape target.
+pg_stat_replication:
+  query: |
+    SELECT 'prism_standby_1' AS application_name,
+           COUNT(*)::double precision AS count,
+           COALESCE(MAX(EXTRACT(EPOCH FROM replay_lag)), -1)::double precision AS replay_lag
+    FROM pg_stat_replication
+    WHERE application_name = 'prism_standby_1'
+  metrics:
+    - application_name:
+        usage: LABEL
+        description: Dedicated failover standby application name
+    - count:
+        usage: GAUGE
+        description: Matching replication rows; zero if disconnected
+    - replay_lag:
+        usage: GAUGE
+        description: Replay lag seconds from the primary; -1 if absent or NULL

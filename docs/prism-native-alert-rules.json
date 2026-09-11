@@ -1,0 +1,663 @@
+{
+  "network_placeholder": "__NETWORK__",
+  "rules": [
+    {
+      "uid": "qbit-prism-metrics-nodata",
+      "title": "PrismMetricsNoData",
+      "role": "run",
+      "expr": "((count by (job, instance, network) (qbit_prism_health_state{job=\"qbit-prism\",network=\"__NETWORK__\"})) or on(job, instance, network) (0 * up{job=\"qbit-prism\",network=\"__NETWORK__\"})) == bool 0",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismMetricsNoData",
+      "description": "A configured coordinator target has no native health family; restore scrape visibility. Preserves the deployed three-minute scrape coverage grace.",
+      "no_data_state": "Alerting",
+      "exec_err_state": "Alerting",
+      "basis": "Preserves the deployed three-minute scrape coverage grace.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L43",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-metrics-endpoint-down",
+      "title": "PrismMetricsEndpointDown",
+      "role": "run",
+      "expr": "up{job=\"qbit-prism\",network=\"__NETWORK__\"} == bool 0",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismMetricsEndpointDown",
+      "description": "Coordinator /metrics cannot be scraped; miner-impact paging remains with the sidecar. Preserves the deployed three-minute scrape outage grace.",
+      "no_data_state": "Alerting",
+      "exec_err_state": "Alerting",
+      "basis": "Preserves the deployed three-minute scrape outage grace.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-connected-clients",
+      "title": "PRISM Connected Clients",
+      "role": "run",
+      "expr": "(qbit_prism_connections{job=\"qbit-prism\",network=\"__NETWORK__\"} < bool 10) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PRISM Connected Clients",
+      "description": "Authorized and unauthenticated local connections are included; no synthetic zero for unknown data. Deployed operator floor: ten clients for three minutes, now counted locally by the native registry.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Deployed operator floor: ten clients for three minutes, now counted locally by the native registry.",
+      "connected_clients_rule": true,
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L45",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L78",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-metrics-snapshot-stale",
+      "title": "PrismMetricsSnapshotStale",
+      "role": "run",
+      "expr": "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} > bool 0",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismMetricsSnapshotStale",
+      "description": "Snapshot stale means cached operational gauges cannot establish health. #277 computes staleness at scrape time from max(3 * health refresh, 15s); no copied age constant.",
+      "no_data_state": "Alerting",
+      "exec_err_state": "Alerting",
+      "basis": "#277 computes staleness at scrape time from max(3 * health refresh, 15s); no copied age constant.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-metrics-snapshot-unavailable",
+      "title": "PrismMetricsSnapshotUnavailable",
+      "role": "run",
+      "expr": "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == bool 0",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismMetricsSnapshotUnavailable",
+      "description": "Snapshot unavailable means cached operational gauges cannot establish health. #277 computes staleness at scrape time from max(3 * health refresh, 15s); no copied age constant.",
+      "no_data_state": "Alerting",
+      "exec_err_state": "Alerting",
+      "basis": "#277 computes staleness at scrape time from max(3 * health refresh, 15s); no copied age constant.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L78",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-metrics-snapshot-age",
+      "title": "PrismMetricsSnapshotAgeHigh",
+      "role": "run",
+      "expr": "(qbit_prism_metrics_snapshot_age_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} >= bool 0) * on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == bool 1)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismMetricsSnapshotAgeHigh",
+      "description": "Snapshot agehigh means cached operational gauges cannot establish health. #277 computes staleness at scrape time from max(3 * health refresh, 15s); no copied age constant.",
+      "no_data_state": "Alerting",
+      "exec_err_state": "Alerting",
+      "basis": "#277 computes staleness at scrape time from max(3 * health refresh, 15s); no copied age constant.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L80",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-share-ack-p99",
+      "title": "PrismShareAckP99High",
+      "role": "run",
+      "expr": "((histogram_quantile(0.99, sum by (job, instance, network, le) (rate(qbit_prism_share_ack_seconds_bucket{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m]))) > bool 1) and on(job, instance, network) (sum by (job, instance, network) (increase(qbit_prism_share_ack_seconds_count{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m])) >= 100)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismShareAckP99High",
+      "description": "Frame receipt to completed response write, both results combined; durable credit can precede a failed write. Replaces writer-queue pressure with miner-visible latency. One-second histogram boundary; at least 100 completed ACKs in five minutes. Provisional, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "One-second histogram boundary; at least 100 completed ACKs in five minutes. Provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L55",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L78",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L15",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-reject-ratio",
+      "title": "PrismRejectRatioByReasonHigh",
+      "role": "run",
+      "expr": "(((sum by (job, instance, network, reason_id) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m])) / on(job, instance, network) group_left() (sum by (job, instance, network) (increase(qbit_prism_accepted_shares_total{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m])) + sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m])))) > bool 0.05) and on(job, instance, network) ((sum by (job, instance, network) (increase(qbit_prism_accepted_shares_total{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m])) + sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m]))) >= 100)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismRejectRatioByReasonHigh",
+      "description": "Preserves reason_id on each alert; rejected includes failed response writes. Diagnose ledger-confirmation-failed, backend-rpc-unavailable, stale-job, duplicate-share and low-difficulty separately. Five percent per canonical reason over five minutes, with at least 100 acceptance/rejection decisions. Provisional, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Five percent per canonical reason over five minutes, with at least 100 acceptance/rejection decisions. Provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L50",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L56",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L78",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L25",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-time-to-usable-work",
+      "title": "PrismTimeToUsableWorkHigh",
+      "role": "run",
+      "expr": "((qbit_prism_stratum_oldest_pending_initial_job_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} > bool 15) and on(job, instance, network) (qbit_prism_stratum_pending_initial_jobs{job=\"qbit-prism\",network=\"__NETWORK__\"} > 0)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismTimeToUsableWorkHigh",
+      "description": "Reports miners awaiting first usable work, including reauthorization; -1 is unknown and snapshot coverage is required. Authorization to successfully written first job; 15 seconds is a provisional bound, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Authorization to successfully written first job; 15 seconds is a provisional bound, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L61",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L62",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L78",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-current-work-gap",
+      "title": "PrismCurrentWorkGapHigh",
+      "role": "run",
+      "expr": "((qbit_prism_stratum_current_tip_coverage_gap_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} > bool 15) and on(job, instance, network) (qbit_prism_authorized_clients{job=\"qbit-prism\",network=\"__NETWORK__\"} > 0)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismCurrentWorkGapHigh",
+      "description": "Current-generation usable work remains missing; replaces the operational intent of refresh deadline rules, not Python refresh task state. Native timer advances only while semantic coverage is strictly below 0.95; 15-second duration is provisional, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Native timer advances only while semantic coverage is strictly below 0.95; 15-second duration is provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L46",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L63",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L78",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-semantic-work-coverage",
+      "title": "PrismSemanticWorkCoverageLoss",
+      "role": "run",
+      "expr": "((qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",network=\"__NETWORK__\"} < bool 0.95) and on(job, instance, network) (qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",network=\"__NETWORK__\"} >= 0) and on(job, instance, network) (qbit_prism_authorized_clients{job=\"qbit-prism\",network=\"__NETWORK__\"} > 0)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismSemanticWorkCoverageLoss",
+      "description": "Unknown ratio -1 is excluded from coverage and reported separately; no-client ratio one is healthy. Native semantic generation coverage; warning matches the strict 95-percent timer boundary. Critical 50 percent and three-minute dwell: Provisional, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Native semantic generation coverage; warning matches the strict 95-percent timer boundary. Critical 50 percent and three-minute dwell: Provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L46",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L64",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L78",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-semantic-coverage-critical",
+      "title": "PrismSemanticWorkCoverageLossCritical",
+      "role": "run",
+      "expr": "((qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",network=\"__NETWORK__\"} < bool 0.5) and on(job, instance, network) (qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",network=\"__NETWORK__\"} >= 0) and on(job, instance, network) (qbit_prism_authorized_clients{job=\"qbit-prism\",network=\"__NETWORK__\"} > 0)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismSemanticWorkCoverageLossCritical",
+      "description": "Unknown ratio -1 is excluded from coverage and reported separately; no-client ratio one is healthy. Native semantic generation coverage; warning matches the strict 95-percent timer boundary. Critical 50 percent and three-minute dwell: Provisional, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Native semantic generation coverage; warning matches the strict 95-percent timer boundary. Critical 50 percent and three-minute dwell: Provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L46",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L64",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L78",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-work-metrics-unavailable",
+      "title": "PrismWorkMetricsUnavailable",
+      "role": "run",
+      "expr": "((qbit_prism_stratum_semantic_current_work_ratio{job=\"qbit-prism\",network=\"__NETWORK__\"} < bool 0) + on(job, instance, network) (qbit_prism_stratum_oldest_pending_initial_job_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} < bool 0)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismWorkMetricsUnavailable",
+      "description": "A published snapshot has not observed work delivery; inspect the publisher and delivery sampler. Unknown sentinels must never masquerade as healthy work coverage.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Unknown sentinels must never masquerade as healthy work coverage.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L62",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L64",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L78",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-block-candidate-backlog",
+      "title": "PrismBlockCandidateBacklog",
+      "role": "run",
+      "expr": "(qbit_prism_block_candidates_pending{job=\"qbit-prism\",network=\"__NETWORK__\"} >= bool 2) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0)) and on(job, instance, network) (qbit_prism_collector_available{job=\"qbit-prism\",network=\"__NETWORK__\",collector=\"database\"} == 1)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismBlockCandidateBacklog",
+      "description": "Per-scrape-target view of cluster-wide backlog; do not sum repeated database snapshots across coordinators. Unknown -1 belongs to the collector-unavailable alert. Native pending outbox rows include claimed/retry-delayed candidates; count bounds 2/5 and age bounds 15/60 seconds. Provisional, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Native pending outbox rows include claimed/retry-delayed candidates; count bounds 2/5 and age bounds 15/60 seconds. Provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L66",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L70",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L78",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L18",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-candidate-backlog-critical",
+      "title": "PrismBlockCandidateBacklogCritical",
+      "role": "run",
+      "expr": "(qbit_prism_block_candidates_pending{job=\"qbit-prism\",network=\"__NETWORK__\"} >= bool 5) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0)) and on(job, instance, network) (qbit_prism_collector_available{job=\"qbit-prism\",network=\"__NETWORK__\",collector=\"database\"} == 1)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismBlockCandidateBacklogCritical",
+      "description": "Per-scrape-target view of cluster-wide backlog; do not sum repeated database snapshots across coordinators. Unknown -1 belongs to the collector-unavailable alert. Native pending outbox rows include claimed/retry-delayed candidates; count bounds 2/5 and age bounds 15/60 seconds. Provisional, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Native pending outbox rows include claimed/retry-delayed candidates; count bounds 2/5 and age bounds 15/60 seconds. Provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L66",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L70",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L78",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L18",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-block-candidate-oldest",
+      "title": "PrismBlockCandidateOldestPending",
+      "role": "run",
+      "expr": "(qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} >= bool 15) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0)) and on(job, instance, network) (qbit_prism_collector_available{job=\"qbit-prism\",network=\"__NETWORK__\",collector=\"database\"} == 1)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismBlockCandidateOldestPending",
+      "description": "Per-scrape-target view of cluster-wide backlog; do not sum repeated database snapshots across coordinators. Unknown -1 belongs to the collector-unavailable alert. Native pending outbox rows include claimed/retry-delayed candidates; count bounds 2/5 and age bounds 15/60 seconds. Provisional, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Native pending outbox rows include claimed/retry-delayed candidates; count bounds 2/5 and age bounds 15/60 seconds. Provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L67",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L70",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L78",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L18",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-candidate-oldest-critical",
+      "title": "PrismBlockCandidateOldestPendingCritical",
+      "role": "run",
+      "expr": "(qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} >= bool 60) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0)) and on(job, instance, network) (qbit_prism_collector_available{job=\"qbit-prism\",network=\"__NETWORK__\",collector=\"database\"} == 1)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismBlockCandidateOldestPendingCritical",
+      "description": "Per-scrape-target view of cluster-wide backlog; do not sum repeated database snapshots across coordinators. Unknown -1 belongs to the collector-unavailable alert. Native pending outbox rows include claimed/retry-delayed candidates; count bounds 2/5 and age bounds 15/60 seconds. Provisional, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Native pending outbox rows include claimed/retry-delayed candidates; count bounds 2/5 and age bounds 15/60 seconds. Provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L67",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L70",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L78",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L18",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-candidate-metrics-unavailable",
+      "title": "PrismBlockCandidateMetricsUnavailable",
+      "role": "run",
+      "expr": "(qbit_prism_collector_available{job=\"qbit-prism\",network=\"__NETWORK__\",collector=\"database\"} == bool 0) or on(job, instance, network) (qbit_prism_block_candidates_pending{job=\"qbit-prism\",network=\"__NETWORK__\"} < bool 0) or on(job, instance, network) (qbit_prism_block_candidate_oldest_pending_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} < bool 0)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismBlockCandidateMetricsUnavailable",
+      "description": "Database candidate age/count are unknown, not zero; collector state is live at scrape time. Collector failure, cancellation or expiry after 30 seconds invalidates both gauges.",
+      "no_data_state": "Alerting",
+      "exec_err_state": "Alerting",
+      "basis": "Collector failure, cancellation or expiry after 30 seconds invalidates both gauges.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L66",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L67",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L70",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L18",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-database-pool-wait",
+      "title": "PrismDatabasePoolWaitHigh",
+      "role": "run",
+      "expr": "((histogram_quantile(0.99, sum by (job, instance, network, le) (rate(qbit_prism_database_pool_acquire_seconds_bucket{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m]))) > bool 0.5) and on(job, instance, network) (sum by (job, instance, network) (increase(qbit_prism_database_pool_acquire_seconds_count{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m])) >= 10)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0)) and on(job, instance, network) (qbit_prism_collector_available{job=\"qbit-prism\",network=\"__NETWORK__\",collector=\"database\"} == 1)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismDatabasePoolWaitHigh",
+      "description": "Only actual collector PgPool::acquire waits are timed. Cancellation is covered by collector availability; no advisory-lock rule until #283/A/C populate it. Pool p99 >0.5 seconds from at least ten completed acquisitions in five minutes; provisional, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Pool p99 >0.5 seconds from at least ten completed acquisitions in five minutes; provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L68",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L70",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L78",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L16",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L18",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-lease-monitor-wake",
+      "title": "PrismRuntimeLagHigh",
+      "role": "run",
+      "expr": "(max_over_time(qbit_prism_runtime_lag_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m]) > bool 2) + on(job, instance, network) (max by (job, instance, network) (max_over_time(qbit_prism_runtime_poll_lag_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m])) > bool 2) + on(job, instance, network) (max by (job, instance, network) (qbit_prism_runtime_task_stalled{job=\"qbit-prism\",network=\"__NETWORK__\"}) > bool 0) + on(job, instance, network) (qbit_prism_runtime_lag_seconds{job=\"qbit-prism\",network=\"__NETWORK__\"} < bool 0)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismRuntimeLagHigh",
+      "description": "Runtime scheduling pressure replaces writer-lease monitor wake delay. Scrape-time runtime signals deliberately remain active during snapshot staleness; retained completed polls capture recovery even when latest wake lag drops within 100ms. Two-second native blocked-poll budget; five-minute evidence window and three-minute dwell replace the legacy lease-wake episode, provisional, measure in #291. A runtime sampler that never observes a tick remains unknown and alerts after the same dwell.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Two-second native blocked-poll budget; five-minute evidence window and three-minute dwell replace the legacy lease-wake episode, provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L74",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L75",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L77",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L19",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-resident-memory",
+      "title": "PrismResidentMemoryHigh",
+      "role": "run",
+      "expr": "(qbit_prism_process_resident_memory_bytes{job=\"qbit-prism\",network=\"__NETWORK__\"} > bool 4294967296) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0)) and on(job, instance, network) (qbit_prism_collector_available{job=\"qbit-prism\",network=\"__NETWORK__\",collector=\"process\"} == 1)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismResidentMemoryHigh",
+      "description": "Linux process VmRSS, not heap allocation; a real zero is valid and unsupported/failed/stale collection is -1. Four GiB is an unqualified initial RSS bound; set against actual container headroom. Provisional, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Four GiB is an unqualified initial RSS bound; set against actual container headroom. Provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L70",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L73",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L78",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L79",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L18",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-process-metrics-unavailable",
+      "title": "PrismProcessMetricsUnavailable",
+      "role": "run",
+      "expr": "(qbit_prism_collector_available{job=\"qbit-prism\",network=\"__NETWORK__\",collector=\"process\"} == bool 0) or on(job, instance, network) (qbit_prism_process_resident_memory_bytes{job=\"qbit-prism\",network=\"__NETWORK__\"} < bool 0)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismProcessMetricsUnavailable",
+      "description": "RSS cannot establish memory health until process collection succeeds. Process collector expires after 30 seconds or on failure; unsupported platforms are unknown.",
+      "no_data_state": "Alerting",
+      "exec_err_state": "Alerting",
+      "basis": "Process collector expires after 30 seconds or on failure; unsupported platforms are unknown.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L70",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L73",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L18",
+        "crates/qbit-prism-server/src/metrics.rs#L39"
+      ]
+    },
+    {
+      "uid": "qbit-prism-public-staleness-refusal",
+      "title": "PrismPublicStalenessRefusalsIncreasing",
+      "role": "public-api",
+      "expr": "increase(qbit_prism_public_staleness_refusals_total{job=\"qbit-prism-public-read\",network=\"__NETWORK__\"}[5m]) > bool 0",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismPublicStalenessRefusalsIncreasing",
+      "description": "Cached public responses exceeded their route-specific budget. Any refusal is an actual endpoint staleness-budget breach; five-minute window is provisional, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Any refusal is an actual endpoint staleness-budget breach; five-minute window is provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/api/public_service.rs#L309",
+        "crates/qbit-prism-server/src/api/public_service.rs#L320"
+      ]
+    },
+    {
+      "uid": "qbit-prism-public-ledger-unready",
+      "title": "PrismPublicLedgerUnready",
+      "role": "public-api",
+      "expr": "(qbit_prism_public_ledger_ready{job=\"qbit-prism-public-read\",network=\"__NETWORK__\"} == bool 0) or on(job, instance, network) (0 * up{job=\"qbit-prism-public-read\",network=\"__NETWORK__\"} + 1)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismPublicLedgerUnready",
+      "description": "The public read probe is failed, unknown or stale; its freshness owner does not emit the coordinator snapshot gauges. Readiness already rejects missing/failed probes and ages >= max(3 * probe interval, 15s). Missing readiness on any configured scrape target also fires, even while another public instance is healthy.",
+      "no_data_state": "Alerting",
+      "exec_err_state": "Alerting",
+      "basis": "Readiness already rejects missing/failed probes and ages >= max(3 * probe interval, 15s).",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/api/public_service.rs#L309",
+        "crates/qbit-prism-server/src/api/public_service.rs#L320"
+      ]
+    },
+    {
+      "uid": "qbit-prism-public-5xx-sustained",
+      "title": "PrismPublic5xxSustained",
+      "role": "public-api",
+      "expr": "rate(qbit_prism_public_responses_total{job=\"qbit-prism-public-read\",network=\"__NETWORK__\",status=~\"5..\"}[5m]) > bool 0",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "3m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismPublic5xxSustained",
+      "description": "This response counter includes health probes; it is an error signal and is not divided by public_requests_total. Any sustained 5xx response, preserving deployed failure intent; five-minute window is provisional, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Any sustained 5xx response, preserving deployed failure intent; five-minute window is provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/api/public_service.rs#L309",
+        "crates/qbit-prism-server/src/api/public_service.rs#L320"
+      ]
+    }
+  ]
+}

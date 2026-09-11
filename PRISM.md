@@ -191,7 +191,10 @@ Both runtime roles serve `/metrics` with HTTP 200 and freshness headers, even
 before the first observation or when it is stale. Read `X-Prism-Metrics-State`
 alongside readiness from `/healthz`; see the [metrics freshness contract and
 inspection command](docs/prism-ledger-ops.md#health-diagnostics-and-validation)
-and the [native metric inventory](docs/prism-native-metrics.md).
+and the [generated metric inventory for both roles](docs/prism-native-metrics.md).
+Use the [deployed-alert migration and rules-file diff](docs/prism-alert-migration.md)
+when cutting over from Python; it maps every retired alert to its native rule or
+explains why there is no replacement.
 
 ## Run and operate
 

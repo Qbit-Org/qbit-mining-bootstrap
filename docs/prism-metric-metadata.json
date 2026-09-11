@@ -1,0 +1,266 @@
+{
+  "native": {
+    "accepted_shares_total": {
+      "replaces": [
+        "qbit_prism_accepted_shares_total"
+      ],
+      "status": "Process-local counter; legacy canonical ledger count was persistent."
+    },
+    "share_ack_seconds": {
+      "replaces": [
+        "qbit_prism_share_ack_seconds"
+      ],
+      "labels": {
+        "result": "AckResult"
+      }
+    },
+    "rejections_total": {
+      "replaces": [
+        "qbit_prism_rejections_total"
+      ],
+      "labels": {
+        "reason_id": "RejectReason"
+      }
+    },
+    "stale_shares_total": {
+      "replaces": [
+        "qbit_prism_stale_shares_total"
+      ]
+    },
+    "duplicate_shares_total": {
+      "replaces": [
+        "qbit_prism_duplicate_shares_total"
+      ]
+    },
+    "low_difficulty_shares_total": {
+      "replaces": [
+        "qbit_prism_low_difficulty_shares_total"
+      ]
+    },
+    "grace_credited_shares_total": {
+      "replaces": [
+        "qbit_prism_grace_credited_shares_total"
+      ]
+    },
+    "stratum_pending_initial_jobs": {
+      "replaces": [
+        "qbit_prism_stratum_pending_initial_jobs"
+      ]
+    },
+    "stratum_oldest_pending_initial_job_seconds": {
+      "replaces": [
+        "qbit_prism_stratum_oldest_pending_initial_job_seconds"
+      ]
+    },
+    "stratum_current_tip_coverage_gap_seconds": {
+      "replaces": [
+        "qbit_prism_stratum_current_tip_coverage_gap_seconds"
+      ]
+    },
+    "stratum_semantic_current_work_ratio": {
+      "replaces": [
+        "qbit_prism_stratum_semantic_current_work_ratio"
+      ],
+      "status": "-1 before observation; one when no clients are authorized."
+    },
+    "block_submit_seconds": {
+      "replaces": [
+        "qbit_prism_block_submit_seconds"
+      ],
+      "status": "Declared, rule deferred to A/#266; no production observations yet."
+    },
+    "block_candidates_pending": {
+      "replaces": [
+        "qbit_prism_block_candidates_pending"
+      ]
+    },
+    "block_candidate_oldest_pending_seconds": {
+      "replaces": [
+        "qbit_prism_block_candidate_oldest_pending_seconds"
+      ]
+    },
+    "process_resident_memory_bytes": {
+      "replaces": [
+        "qbit_prism_process_resident_memory_bytes"
+      ]
+    },
+    "database_pool_acquire_seconds": {
+      "labels": {
+        "result": "Outcome"
+      },
+      "status": "Collector acquisitions only; ledger hot paths remain unwired."
+    },
+    "database_advisory_lock_wait_seconds": {
+      "labels": {
+        "lock": "LockKind",
+        "result": "Outcome"
+      },
+      "status": "Declared, rule deferred to #283 and A/C accounting-lock owners; no production observations yet."
+    },
+    "collector_available": {
+      "labels": {
+        "collector": "Collector"
+      }
+    },
+    "collector_success": {
+      "labels": {
+        "collector": "Collector"
+      }
+    },
+    "collector_age_seconds": {
+      "labels": {
+        "collector": "Collector"
+      }
+    },
+    "runtime_poll_lag_seconds": {
+      "labels": {
+        "task": "TaskKind"
+      }
+    },
+    "runtime_progress_age_seconds": {
+      "labels": {
+        "task": "TaskKind"
+      }
+    },
+    "runtime_task_stalled": {
+      "labels": {
+        "task": "TaskKind"
+      }
+    },
+    "connections": {
+      "replaces": [
+        "qbit_prism_connected_clients",
+        "qbit_prism_stratum_active_connections"
+      ]
+    },
+    "authorized_clients": {
+      "replaces": [
+        "qbit_prism_stratum_authorized_connections"
+      ]
+    },
+    "authorized_with_current_work": {
+      "replaces": [
+        "qbit_prism_stratum_clients_with_current_tip_jobs"
+      ]
+    },
+    "pending_job_builds": {
+      "replaces": [
+        "qbit_prism_job_delivery_queue_depth"
+      ],
+      "status": "Delivery count replaces the operational intent of queue depth, not its implementation."
+    },
+    "runtime_lag_seconds": {
+      "replaces": [
+        "qbit_prism_lease_heartbeat_monitor_wake_delay_window_max_seconds"
+      ],
+      "status": "Runtime-stall intent replaces lease wake delay; no native writer lease."
+    },
+    "metrics_snapshot_available": {
+      "replaces": [
+        "qbit_prism_metrics_snapshot_available"
+      ]
+    },
+    "metrics_snapshot_stale": {
+      "replaces": [
+        "qbit_prism_metrics_snapshot_stale"
+      ]
+    },
+    "metrics_snapshot_age_seconds": {
+      "replaces": [
+        "qbit_prism_metrics_snapshot_age_seconds"
+      ]
+    },
+    "blocks_total": {
+      "replaces": [
+        "qbit_prism_blocks_accepted_total"
+      ],
+      "status": "Native confirmed-block process counter; not the legacy node-acceptance accounting boundary."
+    }
+  },
+  "public": {
+    "qbit_prism_public_requests_total": {
+      "type": "counter",
+      "labels": "none",
+      "role": "public-api",
+      "meaning": "Every routed request, including /healthz and /metrics; never use in a request-rate rule."
+    },
+    "qbit_prism_public_ledger_ready": {
+      "type": "gauge",
+      "labels": "none",
+      "role": "public-api",
+      "meaning": "Schema/read probe succeeded and remains within its freshness budget; zero before a probe, after failure, or when stale. Does not include the separate replica heartbeat refusal."
+    },
+    "qbit_prism_public_ledger_probe_age_seconds": {
+      "type": "gauge",
+      "labels": "none",
+      "role": "public-api",
+      "meaning": "Monotonic age of the last completed readiness probe (including failure); -1 before the first attempt."
+    },
+    "qbit_prism_public_staleness_refusals_total": {
+      "type": "counter",
+      "labels": "none",
+      "role": "public-api",
+      "meaning": "Responses refused for exceeding an endpoint cache-age budget."
+    },
+    "qbit_prism_public_replica_refusals_total": {
+      "type": "counter",
+      "labels": "none",
+      "role": "public-api",
+      "meaning": "Database-reading routes refused by the public replica contract."
+    },
+    "qbit_prism_public_degraded_responses_total": {
+      "type": "counter",
+      "labels": "none",
+      "role": "public-api",
+      "meaning": "Cached HIT responses served during database unavailability."
+    },
+    "qbit_prism_public_database_outage_refusals_total": {
+      "type": "counter",
+      "labels": "none",
+      "role": "public-api",
+      "meaning": "Uncached database reads refused during database unavailability."
+    },
+    "qbit_prism_public_responses_total": {
+      "type": "counter",
+      "labels": "`status` (HTTP status code)",
+      "role": "public-api",
+      "meaning": "HTTP responses by status, including health probes; appears after the first response."
+    },
+    "qbit_prism_public_cache_total": {
+      "type": "counter",
+      "labels": "`state=HIT,MISS,STALE,BYPASS`",
+      "role": "public-api",
+      "meaning": "Public route cache outcomes; appears after a public route request."
+    },
+    "qbit_prism_public_replica_in_recovery": {
+      "type": "gauge",
+      "labels": "none",
+      "role": "public-api (replica=require)",
+      "meaning": "Last observed public read database recovery state; zero if never observed. Not the dedicated HA standby."
+    },
+    "qbit_prism_public_replica_heartbeat_age_seconds": {
+      "type": "gauge",
+      "labels": "none",
+      "role": "public-api (replica=require)",
+      "meaning": "Last observed public WAL-receiver heartbeat age plus monotonic time since observation; -1 if unknown/disconnected."
+    },
+    "qbit_prism_public_replica_replay_lag_seconds": {
+      "type": "gauge",
+      "labels": "none",
+      "role": "public-api (replica=require)",
+      "meaning": "Time since the last replayed transaction plus observation age; can increase on an idle primary and is not a byte-backlog or HA failover-loss measurement; -1 if unknown."
+    },
+    "qbit_prism_public_replica_apply_backlog_bytes": {
+      "type": "gauge",
+      "labels": "none",
+      "role": "public-api (replica=require)",
+      "meaning": "Last observed receive-LSN minus replay-LSN bytes; -1 if unknown; may remain cached after probe failure."
+    },
+    "qbit_prism_public_replica_max_lag_seconds": {
+      "type": "gauge",
+      "labels": "none",
+      "role": "public-api (replica=require)",
+      "meaning": "Configured public read replica maximum lag/heartbeat-age budget in seconds."
+    }
+  }
+}
