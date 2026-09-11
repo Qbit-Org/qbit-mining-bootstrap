@@ -421,7 +421,7 @@ reconnecting miner (`resume_job`, `:1447-1470`) and every miner of one job
 reads the same `prepared:` row (`:1466`), so #273 coalesces concurrent
 resumes of the same `storage_key` behind one in-flight rebuild, for example a
 single-flight map next to the `Prepared` cache: later miners await the first
-rebuild's `Arc<Snapshot>` and `Arc<AuditBundleBody>` instead of reading the window again. The entry shares only that pair, and only until the job's coinbase is built (below):
+rebuild's `Arc<Snapshot>` and `Arc<AuditBundleBody>` instead of reading the window again. The entry shares only the slim resumed form built from that pair (below):
 each waiter still runs its own checks on its own job (worker, target,
 extranonce, version mask, absolute expiry and final authority), and
 cancelling a waiter neither renews a job nor hands a bootstrap bundle to
@@ -447,10 +447,16 @@ each held their `Arc<Snapshot>` and `Arc<AuditBundleBody>` could pin about
 The candidate takes its stored inputs from there, never from local
 configuration ([Stored bundle inputs](#stored-bundle-inputs)). Submit reads
 nothing that depends on the window (`srv/src/coordinator.rs:1621-1666`,
-`:1695`), and the whole-bundle clone at `:1696` goes with #265. `Snapshot.shares` and the
-body's `reward_manifest.shares` are dropped before the job reaches the
-session, so the single-flight entry frees the window when its last waiter
-has its coinbase. Windows then exist only inside rebuilds, and the
+`:1695`), and the whole-bundle clone at `:1696` goes with #265. The window never reaches async code. The rebuild's `spawn_blocking`
+closure builds the coinbase and the slim resumed form, then drops
+`Snapshot.shares` and the body's `reward_manifest.shares` inside the same
+closure, so only the slim form crosses back, and the single-flight entry
+shares only that. Freeing about 0.5 GB of vectors and their heap-backed
+fields on a runtime worker would stall candidate-lease heartbeats and share
+processing. The same rule covers every other release of a rebuilt window:
+the claim's rebuilt `CandidateClaim` bundle after landing, and a replaced
+local `Prepared`, go to `spawn_blocking(move || drop(…))` instead of being
+dropped on the runtime. Windows then exist only inside rebuilds, and the
 `k × 0.5 GB` bound in the cost table holds however many resumed jobs sessions
 keep. The local frontend's current `Prepared` keeps its one full window, as
 today. That pair holds the window once. `Prepared` and `JobContext`
@@ -596,7 +602,12 @@ that the comparison and the digest describe one moment:
   1. B's published-identity and lease check decides whether the stored job
      is still eligible. Only the published job gains the lease, and only
      inside it; an arbitrary older job at the same parent never does.
-     Ineligible work is a cache miss, `Ok(None)`.
+     Ineligible work is a cache miss, `Ok(None)`. **Interim
+     constraint:** until B8 and #289 define how an active leased block lands
+     against R0's balances, the lease covers only revision changes that
+     leave `prior_balances_digest` unchanged, and a balance change ends it at
+     once. An active leased block then carries the current balances and lands
+     through today's path.
   2. Eligible work is rebuilt with its **as-issued** economics: the balances
      it was published with, not the current ones. `read_window(…, BalanceSource::AsIssued)` does this
      ([`Ledger::read_window`](#ledgerread_window)): it takes the balances from
@@ -635,9 +646,13 @@ that the comparison and the digest describe one moment:
      calls `submitblock` (`:1084-1092`), and only then meets
      `observe_candidate` (`:1095`). If the block is active, any rebuild for
      its audit uses `BalanceSource::AsIssued`. A leased block that isn't active is finished as superseded,
-     after submission. Whether an active leased block lands, and against
-     which balances, is B8's rule together with #289 (old-epoch candidates);
-     this record doesn't decide it. Every other candidate keeps today's
+     after submission. Under the interim constraint in step 1 its balances equal the
+     current ones, so an active leased block lands through today's path,
+     `land_candidate_at_revision` at the observed revision
+     (`srv/src/coordinator.rs:1041-1043`). A balance change after enqueue is
+     the case every candidate has today: `retry_candidate` with an alert,
+     never abandoned. A rule for landing across a balance change is B8's and
+     #289's to define before the lease may bridge one. Every other candidate keeps today's
      fences.
 
   **As-issued balances.** Once R1 lands, the current view can't return R0's
@@ -1104,7 +1119,7 @@ not on every refresh.
 | rebuild | under a `build_slots` permit (`:997`) and the 60 s deadline around `read_window` and the rebuild: if `qbit_pool_audit_bundles` already holds the block's audit, authenticate that row against the block's coinbase ([Revision fence and reorgs](#revision-fence-and-reorgs)), skip `read_window`, the rebuild and `land_candidate`, never call `materialize_audit_row`, and continue to observe, renew the lease and `submitblock` as today; else await `read_window(…, BalanceSource::Current)` (a `leased` candidate submits before any rebuild and rebuilds only with `AsIssued`, [Revision fence and reorgs](#revision-fence-and-reorgs)), re-derive the witness leaves from `block_hex`, run `build_audit_bundle_body_*(&window.shares, …)` directly in `spawn_blocking` (`:998-1031`; never `build_bundle`, which takes a second permit at `:712`), and put `into_bundle(window.shares)` in `CandidateClaim` for landing | under one `build_slots` permit, the single-flight entry for the `storage_key`, within the caller's end-to-end deadline: await `read_window(…, BalanceSource::AsIssued)`, move its `Vec` into a `Snapshot` whose `payout_revision` is `StoredPrepared.payout_revision`, not `Window.payout_revision`, and rebuild `Prepared` as `(Arc<Snapshot>, Arc<AuditBundleBody>)` through the borrowing builders called directly, never `build_bundle`, or use the local incremental window once #274 lands; once the job's coinbase is built, keep only the slim resumed `Prepared`, with no window ([Threads, concurrency and deadlines](#threads-concurrency-and-deadlines)) |
 | empty window | build over `&[bootstrap_share]` | the single-flight entry carries `bundle: None`; each miner gets its own bootstrap bundle, built with the builders directly under a fresh `build_slots` permit taken after the entry's permit is released, from the synthetic share `build_bundle` fabricates from the worker today (`:727-745`, reached from `:1498-1510`), the stored template, anchor, `payout_policy` and `ctv`, the as-issued balances `read_window` returned and the issued `payout_revision` from `StoredPrepared`; never `build_bundle`, which reads `config` for signed fields (`:755`, `:760-762`) |
 | import | `srv/src/ledger/migration.rs:117` stores `canonical_audit_bytes` plus non-share metadata and no inline body. The same PR makes both readers decode `canonical_audit_bytes`, digest-checked against `audit_bundle_sha256` and under `spawn_blocking` (a two-copy body is about 470 MB at 400k), before any `body_uri` fallback, as `audit_canonical_bytes` already does (`srv/src/ledger/audit.rs:12-23`): `Ledger::audit_bundle` (`:92-107`), which today returns only the JSON column, so `backfill-ctv` would stop on imported rows with "import legacy audits first" (`srv/src/ledger/migration.rs:133-136`); and the bundle endpoint's fallback (`srv/src/api/read_models.rs:196-231`), which today reads only `body_uri`, so every frontend would still need the legacy filesystem. Keeping the inline body instead would bring back the two-copy JSONB document this design removes | n/a |
-| must not | serialize a share array into the outbox; re-digest the window at submit instead of cloning `Prepared.window`; hydrate a landed audit on the submit loop through `materialize_audit_row`; finish a recovered claim without checking the landed coinbase and audit root against `block_hex`; finish a claim only because its audit has landed; finish or land a `leased` candidate before `submitblock`; rebuild a `leased` candidate with `BalanceSource::Current`, or before `submitblock`; use block bytes whose `block_sha256` or header hash doesn't match; leave `block_bytes` set on a terminal row; hold `ORDER_LOCK` across `read_window`; call `read_window` without a `window_reads` permit; decode inline candidates on a post-007 schema; read local configuration for any stored input; rebuild a reference whose `audit_builder_version` or `signer_keys` differ from this binary's; accept a new fingerprint in `configure` while a pending row stores other `signer_keys`; enqueue a candidate without re-reading `config_fingerprint` `FOR SHARE` in the same transaction; wrap `read_window` in `spawn_blocking`; call `build_bundle` under a held `build_slots` permit; leave an imported audit readable only through `body_uri` | write a share array into `payload`; call `read_window` without a `window_reads` permit; wrap `read_window` in `spawn_blocking`; run whole-window serde on a runtime thread; call `build_bundle` for any resume rebuild, empty window included (it takes a second permit and reads `config` for signed fields); hold an owned `AuditBundle` beside the `Snapshot` in `Prepared` or `JobContext`; resume a job whose `audit_builder_version` or `signer_keys` differ from this binary's; rebuild published work with the current balances; let any job but the published one gain the replacement lease; turn a decode, digest, database or deadline failure into `unknown-job`; keep the full template in the prepared payload; insert a template or balance-snapshot row outside `save_job`'s transaction, or prune them without `SETTLEMENT_LOCK` then `ORDER_LOCK`; give a resumed `Snapshot` the current revision instead of `StoredPrepared.payout_revision`; run `save_job` without re-reading `config_fingerprint` `FOR SHARE` in its transaction; keep `Snapshot.shares` or `reward_manifest.shares` in a resumed job once its coinbase is built; drop a stored input from a resumed job before its candidate is enqueued; mark leased work stale at submit on a revision change, or drop a block found on it; release a `build_slots` permit before its blocking build finishes; change the `save_job` revision fence (`srv/src/ledger/jobs.rs:16-23`) or the cached-work reuse conditions (`srv/src/coordinator.rs:528-533`) |
+| must not | serialize a share array into the outbox; re-digest the window at submit instead of cloning `Prepared.window`; hydrate a landed audit on the submit loop through `materialize_audit_row`; finish a recovered claim without checking the landed coinbase and audit root against `block_hex`; finish a claim only because its audit has landed; finish or land a `leased` candidate before `submitblock`; rebuild a `leased` candidate with `BalanceSource::Current`, or before `submitblock`; drop the rebuilt `CandidateClaim` bundle on a runtime thread; use block bytes whose `block_sha256` or header hash doesn't match; leave `block_bytes` set on a terminal row; hold `ORDER_LOCK` across `read_window`; call `read_window` without a `window_reads` permit; decode inline candidates on a post-007 schema; read local configuration for any stored input; rebuild a reference whose `audit_builder_version` or `signer_keys` differ from this binary's; accept a new fingerprint in `configure` while a pending row stores other `signer_keys`; enqueue a candidate without re-reading `config_fingerprint` `FOR SHARE` in the same transaction; wrap `read_window` in `spawn_blocking`; call `build_bundle` under a held `build_slots` permit; leave an imported audit readable only through `body_uri` | write a share array into `payload`; call `read_window` without a `window_reads` permit; wrap `read_window` in `spawn_blocking`; run whole-window serde on a runtime thread; call `build_bundle` for any resume rebuild, empty window included (it takes a second permit and reads `config` for signed fields); hold an owned `AuditBundle` beside the `Snapshot` in `Prepared` or `JobContext`; resume a job whose `audit_builder_version` or `signer_keys` differ from this binary's; rebuild published work with the current balances; let any job but the published one gain the replacement lease; turn a decode, digest, database or deadline failure into `unknown-job`; keep the full template in the prepared payload; insert a template or balance-snapshot row outside `save_job`'s transaction, or prune them without `SETTLEMENT_LOCK` then `ORDER_LOCK`; give a resumed `Snapshot` the current revision instead of `StoredPrepared.payout_revision`; run `save_job` without re-reading `config_fingerprint` `FOR SHARE` in its transaction; keep `Snapshot.shares` or `reward_manifest.shares` in a resumed job once its coinbase is built; drop a rebuilt window on a runtime thread; drop a stored input from a resumed job before its candidate is enqueued; mark leased work stale at submit on a revision change, or drop a block found on it; bridge a change of `prior_balances_digest` with the lease before B8 and #289 define how such a block lands; release a `build_slots` permit before its blocking build finishes; change the `save_job` revision fence (`srv/src/ledger/jobs.rs:16-23`) or the cached-work reuse conditions (`srv/src/coordinator.rs:528-533`) |
 | text to amend on merge | "reconstructs … through `Ledger::read_window` in `spawn_blocking`": `read_window` is awaited, only the builder runs in `spawn_blocking`; the closed field list ("stores the `WindowRef` … plus … not the bundle"): it is the [Stored bundle inputs](#stored-bundle-inputs) table, `found_block`, `payout_policy`, `ctv`, `bootstrap_share`, `audit_builder_version`, `signer_keys` and the required `coinbase_suffix_hex`; and "outbox row under 1 MB", met by moving `block_hex` into a `bytea` column | the five-field reference list: it is `anchor_ms`, `prior_balances_digest` and an optional range of four (`first_share_seq`, `last_share_seq`, `share_count`, `snapshot_sha256`) |
 
 **#267, audit bodies.** Uses `AuditBundleBody`, `verify_audit_parts` and
@@ -1125,7 +1140,10 @@ normalizes `reward_manifest.shares` out of the stored body; the
   upgrade policy for the development line that C's migration procedure and
   tests must state, not a production compatibility guarantee. The 0.7 to
   1.4 s of digest CPU per non-cached refresh is an interim cost to measure,
-  not an approved budget.
+  not an approved budget. Also for djh58 and #289: how an active leased block
+  lands against as-issued balances after a balance change. Until that rule
+  exists, the lease covers only revision changes that leave
+  `prior_balances_digest` unchanged.
 - **Anatolie (#283).** Narrowed by #300, not settled. `ledger/window.rs`
   exists under B and already holds `share_from_row`, so `WindowRef`,
   `read_window`, `Window` and `WindowError` land there with no cross-workstream
