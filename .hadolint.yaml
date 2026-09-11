@@ -1,0 +1,5 @@
+# hadolint configuration. CI runs the version that
+# .github/scripts/install-pinned-tool.sh pins over every Dockerfile in the
+# repository. Nothing is ignored globally: a rule that a particular image
+# cannot follow is ignored inline, next to the instruction, with its reason.
+failure-threshold: info

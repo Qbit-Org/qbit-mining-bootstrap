@@ -1365,6 +1365,7 @@ version = "3.0.0"
 dependencies = [
  "hex",
  "qbit-pool-builder",
+ "qbit-prism-test-gate",
  "serde",
  "serde_json",
  "sha2",
@@ -1388,6 +1389,7 @@ dependencies = [
  "percent-encoding",
  "qbit-pool-builder",
  "qbit-prism",
+ "qbit-prism-test-gate",
  "rand 0.8.8",
  "reqwest",
  "serde",
@@ -1404,6 +1406,10 @@ dependencies = [
  "url",
  "uuid",
 ]
+
+[[package]]
+name = "qbit-prism-test-gate"
+version = "3.0.0"
 
 [[package]]
 name = "quinn"
