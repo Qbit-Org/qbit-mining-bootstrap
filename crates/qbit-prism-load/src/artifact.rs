@@ -223,13 +223,35 @@ pub fn verdict(document: &Value, options: &ValidationOptions) -> Verdict {
     }
 }
 
+/// Quote a value so the printed command can be pasted into a shell unchanged.
+/// `SHOW server_version` returns things like `16.15 (Ubuntu 16.15-…)`, which a
+/// shell would otherwise split and choke on.
+pub fn shell_quote(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:=/-+,@".contains(&b));
+    if safe {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
 /// The exact `qbit-prism-server capacity-evidence` invocation that reproduces
 /// the harness's own self-check.
 pub fn cli_command(inputs: &ArtifactInputs, evidence_path: &str, server_bin: &str) -> String {
-    let mut parts = vec![format!("{server_bin} capacity-evidence {evidence_path}")];
+    let mut parts = vec![format!(
+        "{} capacity-evidence {}",
+        shell_quote(server_bin),
+        shell_quote(evidence_path)
+    )];
     for key in CONFIGURATION_KEYS {
         let value = inputs.configuration.get(*key).cloned().unwrap_or_default();
-        parts.push(format!("  --expect {key}={value}"));
+        parts.push(format!(
+            "  --expect {}",
+            shell_quote(&format!("{key}={value}"))
+        ));
     }
     for (flag, key) in [
         ("--expect-coordinator-revision", "coordinator_revision"),
@@ -247,15 +269,15 @@ pub fn cli_command(inputs: &ArtifactInputs, evidence_path: &str, server_bin: &st
         ),
     ] {
         let value = inputs.subject.get(key).cloned().unwrap_or_default();
-        parts.push(format!("  {flag} {value}"));
+        parts.push(format!("  {flag} {}", shell_quote(&value)));
     }
     parts.push(format!(
         "  --forecast-peak-shares-per-second {}",
-        inputs.forecast_peak_shares_per_second
+        shell_quote(&inputs.forecast_peak_shares_per_second)
     ));
     parts.push(format!(
         "  --ack-p99-limit-milliseconds {}",
-        inputs.ack_p99_limit_milliseconds
+        shell_quote(&inputs.ack_p99_limit_milliseconds)
     ));
     if inputs.artifact_kind == ARTIFACT_EXAMPLE {
         parts.push("  --allow-example-evidence-for-tests".into());

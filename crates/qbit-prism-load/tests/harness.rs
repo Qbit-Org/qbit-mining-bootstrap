@@ -737,6 +737,41 @@ fn the_printed_cli_command_names_every_binding_the_self_check_used() {
     assert!(!command.contains("--allow-example-evidence-for-tests"));
 }
 
+#[test]
+fn the_printed_cli_command_survives_a_shell() -> Result<()> {
+    // `SHOW server_version` returns values like `16.15 (Ubuntu 16.15-…)`; an
+    // unquoted one turns the printed command into a syntax error.
+    let mut inputs = sample_inputs();
+    inputs.subject.insert(
+        "postgres_server_version".into(),
+        "16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)".into(),
+    );
+    let command = artifact::cli_command(
+        &inputs,
+        "/tmp/out dir/capacity-evidence.json",
+        "./qbit-prism-server",
+    );
+    assert!(
+        command.contains("'16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)'"),
+        "the version must be quoted: {command}"
+    );
+    assert!(command.contains("'/tmp/out dir/capacity-evidence.json'"));
+    // A shell has to be able to parse it.
+    let parsed = std::process::Command::new("bash")
+        .arg("-n")
+        .arg("-c")
+        .arg(&command)
+        .output()?;
+    assert!(
+        parsed.status.success(),
+        "bash refused the printed command: {}\n{command}",
+        String::from_utf8_lossy(&parsed.stderr)
+    );
+    assert_eq!(artifact::shell_quote("plain-value_1.2"), "plain-value_1.2");
+    assert_eq!(artifact::shell_quote("it's"), "'it'\\''s'");
+    Ok(())
+}
+
 // --- rejection and blocked-log classifiers --------------------------------
 
 fn rejection(code: i64, reason: Option<&str>, message: &str) -> Rejection {
