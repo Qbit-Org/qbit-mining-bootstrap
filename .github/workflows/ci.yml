@@ -214,6 +214,10 @@ jobs:
           ten_thousand_unsubscribed_connections_do_not_advance_postgres_sequence
       - name: Exercise native metrics collectors against PostgreSQL
         run: cargo test --locked -p qbit-prism-server --test observability_database -- --ignored
+      - name: Verify issued work retains its prepared dependency atomically
+        run: >-
+          cargo test --locked -p qbit-prism-server
+          --test issued_job_dependency -- --ignored --test-threads=2
 
   docker-builds:
     name: Build lightweight Docker images
