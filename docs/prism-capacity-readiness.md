@@ -400,12 +400,22 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    c=<prism-coordinator-container>
    docker exec "$c" curl -sS --max-time 5 -D - http://127.0.0.1:3341/metrics \
      | tr -d '\r' \
-     | grep -E '^(x-prism-metrics-state:|qbit_prism_collector_available\{collector="process"\} 1$)'
+     | awk '
+       $0 == "x-prism-metrics-state: fresh" { fresh = 1 }
+       $0 == "qbit_prism_collector_available{collector=\"process\"} 1" { up = 1 }
+       END {
+         if (fresh && up) { print "ready"; exit 0 }
+         if (!fresh) why = "x-prism-metrics-state is not fresh"
+         if (!up) why = why (why ? ", " : "") "process collector gauge is not 1"
+         print "not ready: " why; exit 1 }'
    ```
 
-   Two lines, `x-prism-metrics-state: fresh` and the collector gauge at 1,
-   mean the RSS series is trustworthy. Record the deploy dotenv (secrets
-   redacted) and the image ID beside each run.
+   Both lines are required, `x-prism-metrics-state: fresh` and the process
+   collector gauge at 1: a `stale` or `unavailable` body is a cached render
+   whose process gauge can still read 1, so the gauge alone proves nothing.
+   Do not start the run, and do not trust its RSS series, until the check
+   prints `ready` and exits `0`. Record the deploy dotenv (secrets redacted)
+   and the image ID beside each run.
 3. **Capture every 5 minutes** for the whole soak: RSS from `/proc/1/status`
    for the bound, and the correlated series for the reading order above. Both
    reads run inside the container; the parsing runs on the host:
