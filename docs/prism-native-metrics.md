@@ -148,7 +148,7 @@ public-role `qbit_prism_public_requests_total` includes `/healthz`, `/metrics`,
 and other routed requests, so its rate is not a dashboard-only request rate.
 
 The coordinator adds the three health compatibility aliases whose native sources
-are known; the fixture deliberately identifies unmapped legacy fields.
+are known; the fixture deliberately identifies unmapped legacy fields: `ready_miner_count` (accepted-share participants) and `max_blocks` (the 2.x accepted-block pool-close cap) have no native health equivalents.
 
 No new configuration setting is introduced. Worker slots, per-worker series,
 node gauges, rollup-lag series, cardinality/privacy qualification, payout build

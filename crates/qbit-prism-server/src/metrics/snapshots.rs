@@ -227,7 +227,8 @@ pub(super) fn invalidate(registry: &mut Registry, collector: Collector) {
 
 /// Only compatibility aliases whose values have an existing native meaning.
 /// ready_miner_count counts accepted-share participants in 2.x, not current
-/// connections. That field and max_blocks need an agreed source.
+/// connections. max_blocks was the accepted-block pool-close cap; neither has
+/// a native health source in this runtime.
 pub fn add_known_health_fields(health: &mut serde_json::Value) {
     if let Some(backend) = health.get("backend").cloned() {
         health["ledger_backend"] = if backend == "postgres" {
@@ -511,5 +512,10 @@ mod tests {
             .as_object()
             .unwrap()
             .contains_key("max_blocks"));
+        let unmapped: std::collections::BTreeSet<_> = fixture["unmapped_fields"]
+            .as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        let explained: std::collections::BTreeSet<_> = fixture["intentional_differences"]
+            .as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(unmapped, explained);
     }
 }
