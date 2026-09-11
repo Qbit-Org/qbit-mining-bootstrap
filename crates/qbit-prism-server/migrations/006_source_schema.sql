@@ -11,10 +11,24 @@
 --   #258 applied   candidate_storage_version = 2, every 002 object     accept after the drain check
 --   partial 002    some 002 objects or the capability row, not all      refuse, naming the missing object
 --   newer          candidate_storage_version > 2, unknown capability    refuse before any DDL
+--   drifted 001    a 001 (or 002) object whose definition, after 001     refuse transactionally, naming the object
+--                  has run, differs from the frozen release
 --
 -- The drain check looks at outbox rows, never at the capability row: 002
 -- upserts candidate_storage_version = 2 whatever the 2.x.x writer stored, so
 -- the row proves 002 ran, not that v2 rows exist or do not.
+--
+-- The last row is decided after 001_share_ledger.sql has run on the source
+-- and before any native DDL: 001 is idempotent and repairs what it
+-- re-asserts, but its IF NOT EXISTS leaves an existing table, column, index
+-- or named constraint as it is. The migrator applies the same release SQL
+-- (001, plus 002 for a #258 source) to a scratch schema under a savepoint in
+-- the migration transaction, reads every table, column, constraint, index,
+-- trigger and function it created, rolls the savepoint back, and requires an
+-- equivalent definition in the source schema. Column order, comments,
+-- auto-generated constraint names and NOT VALID are ignored; extra objects
+-- are kept and logged; a missing or different one fails the migration, which
+-- rolls back whole.
 
 -- What the database came from, written once by the migration that accepted
 -- it. Later starts and operators read it; a repeated migrate never rewrites it.
