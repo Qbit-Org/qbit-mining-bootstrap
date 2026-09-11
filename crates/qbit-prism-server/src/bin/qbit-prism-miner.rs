@@ -77,7 +77,7 @@ impl Work {
         let field = |index: usize| p[index].as_str().context("notify field must be a string");
         let mut previous = hex::decode(field(1)?)?;
         ensure!(previous.len() == 32, "invalid prevhash length");
-        for word in previous.chunks_exact_mut(4) {
+        for word in previous.as_chunks_mut::<4>().0 {
             word.reverse();
         }
         let branch = p[4]

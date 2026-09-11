@@ -49,7 +49,7 @@
 //!
 //! | variable | default | meaning |
 //! | --- | --- | --- |
-//! | `PRISM_TEST_DATABASE_URL` | none | PostgreSQL to test against. Missing plus `CI` set is a failure, never a skip. |
+//! | `PRISM_TEST_DATABASE_URL` | none | PostgreSQL to test against, taken through the shared integration gate: missing is a skip, or a failure once `PRISM_TEST_REQUIRE_INTEGRATION=1` or the `prism-native-postgres` job demands the suite. |
 //! | `PRISM_JSONB_GATE_TARGET_SHARES` | `400000` | share count the reduced run projects to |
 //! | `PRISM_JSONB_GATE_N1` | `5000` | smaller reduced size |
 //! | `PRISM_JSONB_GATE_N2` | `20000` | larger reduced size |
@@ -67,6 +67,7 @@ use qbit_prism_server::{
     coordinator::Coordinator,
     ledger::{Candidate, CandidateClaim, Ledger, Snapshot},
 };
+use qbit_prism_test_gate as gate;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::{
@@ -430,45 +431,23 @@ fn parse_baseline_sizes(raw: Option<&str>) -> Result<Vec<u64>> {
     Ok(sizes)
 }
 
-/// Trap 3: existing native tests return early when the URL is missing. This one
-/// must never do that silently, and must never do it at all in CI.
+/// Trap 3: existing native tests return early when the URL is missing. The
+/// reduced-size gate takes the URL through the workspace's shared integration
+/// gate, so it never does that silently, and never does it at all in the
+/// `prism-native-postgres` job or under `PRISM_TEST_REQUIRE_INTEGRATION=1`.
+/// The gate prints the skip line and records the decision in the execution
+/// manifest.
 fn database_url() -> Result<Option<String>> {
-    database_url_from(
-        std::env::var("PRISM_TEST_DATABASE_URL"),
-        std::env::var("CI"),
-    )
+    Ok(gate::database_url(gate::site!())?)
 }
 
-/// EP-VALIDATION: an unreadable variable is an error, never an absent one.
-/// Treating a non-Unicode `PRISM_TEST_DATABASE_URL` (or `CI`) as unset would
-/// let a deliberately configured run skip the ratchet without a word.
-fn database_url_from(
-    url: Result<String, std::env::VarError>,
-    ci: Result<String, std::env::VarError>,
-) -> Result<Option<String>> {
-    match url {
-        Ok(value) if !value.trim().is_empty() => return Ok(Some(value)),
-        Ok(_) | Err(std::env::VarError::NotPresent) => {}
-        Err(error) => bail!("PRISM_TEST_DATABASE_URL is set but not readable: {error}"),
-    }
-    let ci_set = match ci {
-        Ok(value) => !value.is_empty(),
-        Err(std::env::VarError::NotPresent) => false,
-        Err(error) => bail!(
-            "CI is set but not readable: {error}; treating it as unset could skip the gate in CI"
-        ),
-    };
-    if ci_set {
-        bail!(
-            "PRISM_TEST_DATABASE_URL is unset or empty while CI is set. The JSONB ceiling gate \
-             must not silently skip in CI: point it at a PostgreSQL 16 instance."
-        );
-    }
-    report!(
-        "SKIPPED: jsonb_ceiling_gate did not run. Set PRISM_TEST_DATABASE_URL to a PostgreSQL 16 \
-         instance (CI is unset, so skipping is allowed here)."
-    );
-    Ok(None)
+/// The two `#[ignore]` runs are asked for explicitly, with `--ignored`, so a
+/// missing URL fails them whatever the switch says: an explicit selection that
+/// printed a skip line and reported `ok` would be the vacuous pass the gate
+/// exists to prevent. They are not in `test/prism-gated-tests.txt`, since CI
+/// never selects them.
+fn required_database_url() -> Result<String> {
+    Ok(gate::required_database_url(gate::site!())?)
 }
 
 // ---------------------------------------------------------------------------
@@ -2623,9 +2602,7 @@ async fn jsonb_ceiling_ratchet_at_reduced_sizes() -> Result<()> {
 #[ignore = "full-size 400k-share run, after the reduced pair; minutes of wall clock and gigabytes of RAM"]
 async fn jsonb_ceiling_ratchet_at_full_size() -> Result<()> {
     let settings = GateSettings::load()?;
-    let Some(url) = database_url()? else {
-        return Ok(());
-    };
+    let url = required_database_url()?;
     settings.apply_statement_timeout();
     print_settings(&settings, "full size");
     let (low, _, reduced) = reduced_pair(&url, &settings).await?;
@@ -2696,9 +2673,7 @@ async fn jsonb_ceiling_baseline_sweep() -> Result<()> {
     // Validated before the database check and before any pipeline runs, so a
     // bad list fails in seconds instead of after the whole sweep.
     let sizes = baseline_sizes()?;
-    let Some(url) = database_url()? else {
-        return Ok(());
-    };
+    let url = required_database_url()?;
     settings.apply_statement_timeout();
     print_settings(&settings, "baseline sweep");
     report!("  {BASELINE_SIZES_VAR} = {sizes:?}");
@@ -3197,22 +3172,33 @@ fn fit_stability_is_checked_per_write() {
 }
 
 /// EP-VALIDATION: a malformed database variable fails instead of skipping,
-/// and the existing CI rule still holds.
+/// and the native-job rule still holds, both through the shared gate's table.
 #[test]
 fn an_unreadable_database_url_fails_instead_of_skipping() {
+    use gate::{decide, Decision, Input, REQUIRED_JOB};
     use std::env::VarError;
+    let db = &[Input::DatabaseUrl];
     let missing = || Err(VarError::NotPresent);
+    let skip = Decision::Skip {
+        missing: vec![Input::DatabaseUrl],
+    };
     assert_eq!(
-        database_url_from(Ok("postgresql://x/y".into()), missing()).unwrap(),
-        Some("postgresql://x/y".to_owned())
+        decide(db, &[Ok("postgresql://x/y".into())], &missing(), &missing()).unwrap(),
+        Decision::Run(vec!["postgresql://x/y".to_owned()])
     );
-    assert_eq!(database_url_from(missing(), missing()).unwrap(), None);
-    assert_eq!(database_url_from(Ok("  ".into()), missing()).unwrap(), None);
-    let in_ci = format!(
-        "{:#}",
-        database_url_from(missing(), Ok("true".into())).unwrap_err()
+    assert_eq!(
+        decide(db, &[missing()], &missing(), &missing()).unwrap(),
+        skip
     );
-    assert!(in_ci.contains("unset or empty while CI is set"), "{in_ci}");
+    assert_eq!(
+        decide(db, &[Ok("  ".into())], &missing(), &missing()).unwrap(),
+        skip
+    );
+    let in_native_job = decide(db, &[missing()], &missing(), &Ok(REQUIRED_JOB.into())).unwrap();
+    assert!(
+        matches!(in_native_job, Decision::Fail { .. }),
+        "{in_native_job:?}"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt;
@@ -3221,15 +3207,21 @@ fn an_unreadable_database_url_fails_instead_of_skipping() {
                 0xff, 0xfe,
             ])))
         };
-        let url_error = format!("{:#}", database_url_from(bad(), missing()).unwrap_err());
+        let url_error = format!(
+            "{:#}",
+            decide(db, &[bad()], &missing(), &missing()).unwrap_err()
+        );
         assert!(
             url_error.contains("PRISM_TEST_DATABASE_URL is set but not readable"),
             "{url_error}"
         );
-        let ci_error = format!("{:#}", database_url_from(missing(), bad()).unwrap_err());
+        let job_error = format!(
+            "{:#}",
+            decide(db, &[missing()], &missing(), &bad()).unwrap_err()
+        );
         assert!(
-            ci_error.contains("CI is set but not readable"),
-            "{ci_error}"
+            job_error.contains("GITHUB_JOB is set but not readable"),
+            "{job_error}"
         );
     }
 }

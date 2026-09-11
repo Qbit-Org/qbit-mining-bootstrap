@@ -3,6 +3,7 @@
 use anyhow::{ensure, Context, Result};
 use qbit_prism::AcceptedShare;
 use qbit_prism_server::ledger::Ledger;
+use qbit_prism_test_gate as gate;
 use sqlx::PgPool;
 use std::{
     path::{Path, PathBuf},
@@ -86,8 +87,7 @@ fn proof(id: u64) -> AcceptedShare {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn acknowledged_shares_survive_synchronous_primary_loss_and_pool_reconnect() -> Result<()> {
-    let Ok(bin) = std::env::var("PRISM_TEST_PG_BIN_DIR") else {
-        eprintln!("skipping physical PostgreSQL failover; set PRISM_TEST_PG_BIN_DIR");
+    let Some(bin) = gate::pg_bin_dir(gate::site!())? else {
         return Ok(());
     };
     let dir = tempfile::tempdir()?;

@@ -5,6 +5,10 @@ ARG UBUNTU_VERSION=24.04
 FROM ubuntu:${UBUNTU_VERSION} AS build-from-source
 
 ARG DEBIAN_FRONTEND=noninteractive
+# Package versions follow the image's Ubuntu release rather than pins that
+# rot with every security update; the runtime and its base are not this
+# workstream's to change (#288 owns container hardening).
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
@@ -21,9 +25,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src/qbit
+# qbit-src is a named build context (`--build-context qbit-src=...`), not a stage.
+# hadolint ignore=DL3022
 COPY --from=qbit-src . .
 RUN rm -rf build
 
+# Clean, configure, build and install are separate layers on purpose: a failed
+# build does not redo the configure step, and the install layer stays small.
+# hadolint ignore=DL3059
 RUN cmake -S . -B build \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_DAEMON=ON \
@@ -36,7 +45,9 @@ RUN cmake -S . -B build \
     -DBUILD_BENCH=OFF \
     -DBUILD_FUZZ_BINARY=OFF
 
+# hadolint ignore=DL3059
 RUN cmake --build build --target bitcoind bitcoin-cli -j"$(nproc)"
+# hadolint ignore=DL3059
 RUN cmake --install build --prefix /opt/qbit --component qbitd \
     && cmake --install build --prefix /opt/qbit --component qbit-cli \
     && if [ ! -x /opt/qbit/bin/qbitd ]; then \
@@ -53,6 +64,10 @@ RUN cmake --install build --prefix /opt/qbit --component qbitd \
 FROM ubuntu:${UBUNTU_VERSION} AS runtime
 
 ARG DEBIAN_FRONTEND=noninteractive
+# Package versions follow the image's Ubuntu release rather than pins that
+# rot with every security update; the runtime and its base are not this
+# workstream's to change (#288 owns container hardening).
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libevent-core-2.1-7t64 \

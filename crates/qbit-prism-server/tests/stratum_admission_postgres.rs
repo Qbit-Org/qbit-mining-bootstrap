@@ -1,8 +1,9 @@
 //! Explicit real-PostgreSQL acceptance: never silently passes without a database.
 #[path = "support/stratum_admission.rs"]
 mod support;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use qbit_prism_server::{ledger::Ledger, stratum::StratumConfig};
+use qbit_prism_test_gate as gate;
 use serde_json::json;
 use std::sync::{atomic::Ordering, Arc};
 use support::{Backend, Client, Server};
@@ -10,8 +11,7 @@ use support::{Backend, Client, Server};
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires disposable PRISM_TEST_DATABASE_URL; run explicitly in database CI"]
 async fn ten_thousand_unsubscribed_connections_do_not_advance_postgres_sequence() -> Result<()> {
-    let raw = std::env::var("PRISM_TEST_DATABASE_URL")
-        .context("this explicit acceptance test requires disposable PRISM_TEST_DATABASE_URL")?;
+    let raw = gate::required_database_url(gate::site!())?;
     let admin = sqlx::PgPool::connect(&raw).await?;
     let schema = format!("prism_admission_{}", uuid::Uuid::new_v4().simple());
     sqlx::query(&format!("CREATE SCHEMA {schema}"))

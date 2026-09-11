@@ -717,8 +717,7 @@ async fn submission_result(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn block_only_proof_is_credited_network_work_only_once_the_block_is_active() -> Result<()> {
-    let test = "block_only_proof_is_credited_network_work_only_once_the_block_is_active";
-    let Some(raw) = database_url(test)? else {
+    let Some(raw) = database_url()? else {
         return Ok(());
     };
     let _serial = TEST_LOCK.lock().await;
@@ -765,8 +764,7 @@ async fn block_only_proof_is_credited_network_work_only_once_the_block_is_active
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn block_only_proof_with_a_lost_submitblock_reply_is_credited_once_by_reconciliation(
 ) -> Result<()> {
-    let test = "block_only_proof_with_a_lost_submitblock_reply_is_credited_once_by_reconciliation";
-    let Some(raw) = database_url(test)? else {
+    let Some(raw) = database_url()? else {
         return Ok(());
     };
     let _serial = TEST_LOCK.lock().await;
@@ -840,8 +838,7 @@ async fn block_only_proof_with_a_lost_submitblock_reply_is_credited_once_by_reco
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn block_only_credit_survives_a_reorg_that_disconnects_its_block() -> Result<()> {
-    let test = "block_only_credit_survives_a_reorg_that_disconnects_its_block";
-    let Some(raw) = database_url(test)? else {
+    let Some(raw) = database_url()? else {
         return Ok(());
     };
     let _serial = TEST_LOCK.lock().await;
@@ -891,8 +888,7 @@ async fn block_only_credit_survives_a_reorg_that_disconnects_its_block() -> Resu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn block_only_proof_the_node_rejects_fails_the_submission_without_credit() -> Result<()> {
-    let test = "block_only_proof_the_node_rejects_fails_the_submission_without_credit";
-    let Some(raw) = database_url(test)? else {
+    let Some(raw) = database_url()? else {
         return Ok(());
     };
     let _serial = TEST_LOCK.lock().await;
@@ -954,8 +950,7 @@ async fn block_only_proof_the_node_rejects_fails_the_submission_without_credit()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn share_passing_block_proof_is_credited_its_assigned_difficulty_at_once() -> Result<()> {
-    let test = "share_passing_block_proof_is_credited_its_assigned_difficulty_at_once";
-    let Some(raw) = database_url(test)? else {
+    let Some(raw) = database_url()? else {
         return Ok(());
     };
     let _serial = TEST_LOCK.lock().await;
