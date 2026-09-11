@@ -3,7 +3,7 @@
 //! artifacts. Validation is performed before any write; operator files and
 //! historical rows are retained.
 use super::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -62,6 +62,7 @@ const STATE_PRE_258: &str = "pre-#258";
 const STATE_APPLIED_258: &str = "#258 applied";
 const STATE_PARTIAL_002: &str = "partial 002";
 const STATE_NEWER: &str = "newer";
+const STATE_NATIVE_COLLISION: &str = "native collision";
 const STATE_DRIFTED_001: &str = "drifted 001";
 
 /// The source states migration 006 accepts or refuses, as data. Detection is
@@ -72,11 +73,16 @@ const STATE_DRIFTED_001: &str = "drifted 001";
 /// release SQL to a scratch schema under a savepoint, before any DDL touches
 /// the source. A database without `qbit_share_ledger` is fresh only if it
 /// has nothing else that 001 creates; otherwise it is a partial 001,
-/// refused before any DDL. The last row is decided after 001 has run: the
-/// release 001 is idempotent and repairs what it re-asserts, so the check
-/// compares what its `IF NOT EXISTS` left alone against the same scratch
-/// apply, and a refusal rolls the whole migration back.
-pub const SOURCE_STATES: [SourceStateRule; 7] = [
+/// refused before any DDL. The native migrations are applied to the same
+/// scratch schema after the release SQL, so the objects and columns they
+/// create and the release does not are known before any DDL too: one
+/// already present is a native collision, refused before any DDL, because
+/// a native migration's `IF NOT EXISTS` would keep it whatever it holds.
+/// The last row is decided after 001 has run: the release 001 is
+/// idempotent and repairs what it re-asserts, so the check compares what
+/// its `IF NOT EXISTS` left alone against the same scratch apply, and a
+/// refusal rolls the whole migration back.
+pub const SOURCE_STATES: [SourceStateRule; 8] = [
     SourceStateRule {
         name: STATE_FRESH,
         evidence: "no 001 or 002 object at all",
@@ -106,6 +112,11 @@ pub const SOURCE_STATES: [SourceStateRule; 7] = [
         name: STATE_NEWER,
         evidence: "candidate_storage_version > 2 or an unknown capability",
         verdict: "refuse before any DDL",
+    },
+    SourceStateRule {
+        name: STATE_NATIVE_COLLISION,
+        evidence: "a table, sequence, index, trigger, function or column a native migration creates is already present in a 2.x.x or empty database",
+        verdict: "refuse before any DDL, naming the objects",
     },
     SourceStateRule {
         name: STATE_DRIFTED_001,
@@ -1488,19 +1499,78 @@ fn named_objects(objects: &[String]) -> String {
     }
 }
 
-/// The frozen release's definitions and the name of the schema the source
-/// lives in. The definitions come from applying the release SQL (001, plus
-/// 002 for a #258 source) to a scratch schema inside this transaction,
-/// under a savepoint that is rolled back before anything else happens, so
-/// they are exact for this server's PostgreSQL version and nothing from the
-/// scratch apply survives. Taken once, before any DDL touches the source,
-/// and used both to decide whether a database without `qbit_share_ledger`
-/// is really fresh and, after 001 has run, to check what it left alone.
+/// The native migrations in the order `migrate_schema` applies them, each
+/// with the version it records. The scratch apply of `release_fingerprint`
+/// runs the same files in the same order, so the reserved set is derived
+/// from what they create, never from a hand-maintained list.
+const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
+    (2, include_str!("../../migrations/002_multi_instance.sql")),
+    (3, include_str!("../../migrations/003_2x_compatibility.sql")),
+    (
+        4,
+        include_str!("../../migrations/004_cpfp_retired_funding.sql"),
+    ),
+    (
+        5,
+        include_str!("../../migrations/005_candidate_dispatch.sql"),
+    ),
+    (6, include_str!("../../migrations/006_source_schema.sql")),
+    (
+        9,
+        include_str!("../../migrations/009_wrap_safe_sessions.sql"),
+    ),
+];
+
+/// The SQL of one native migration, by the version it records.
+fn native_migration(version: i32) -> &'static str {
+    NATIVE_MIGRATIONS
+        .iter()
+        .find(|(recorded, _)| *recorded == version)
+        .map(|(_, sql)| *sql)
+        .unwrap_or_else(|| panic!("migration {version} is not in NATIVE_MIGRATIONS"))
+}
+
+/// What the scratch apply established before any DDL touches the source.
+struct ReleaseDefinitions {
+    /// The frozen release's objects: 001, plus 002 for a #258 source.
+    release: SchemaFingerprint,
+    /// What the native migrations create and the release does not; a
+    /// source that already has any of it is refused.
+    reserved: ReservedObjects,
+    /// The schema the source lives in.
+    source_schema: String,
+}
+
+/// What the native migrations create and the release does not: the second
+/// reading of the scratch schema minus the first.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReservedObjects {
+    /// The tables, sequences, indexes, triggers and functions whose names
+    /// the native migrations take.
+    objects: SchemaFingerprint,
+    /// Per release table, the columns the native migrations add to it with
+    /// `ADD COLUMN IF NOT EXISTS`, which would keep a column of that name
+    /// whatever its type or default. Kept apart from `objects`: the
+    /// partial-001 check shares `objects_present`, refuses on a present
+    /// table, and would only be cluttered by that table's columns.
+    columns: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// The frozen release's definitions, the objects the native migrations
+/// reserve, and the name of the schema the source lives in. The definitions
+/// come from applying the release SQL (001, plus 002 for a #258 source) to
+/// a scratch schema inside this transaction, and then the native migrations
+/// in order, under a savepoint that is rolled back before anything else
+/// happens, so they are exact for this server's PostgreSQL version and
+/// nothing from the scratch apply survives. Taken once, before any DDL
+/// touches the source, and used to decide whether a database without
+/// `qbit_share_ledger` is really fresh, whether a native object or column
+/// is already present, and, after 001 has run, to check what it left alone.
 async fn release_fingerprint(
     tx: &mut Transaction<'_, Postgres>,
     state: SourceState,
     base_schema: &str,
-) -> Result<(SchemaFingerprint, String)> {
+) -> Result<ReleaseDefinitions> {
     let row = sqlx::query("SELECT current_schema()::text AS schema,current_setting('search_path') AS search_path,current_database()::text AS database,current_user::text AS role")
         .fetch_one(&mut **tx).await?;
     let source_schema: String = row.try_get("schema")?;
@@ -1540,6 +1610,10 @@ async fn release_fingerprint(
         "release schema was applied in {applied_in}, not in scratch schema {scratch}"
     );
     let expected = fingerprint_schema(tx, &scratch).await?;
+    for (_, sql) in NATIVE_MIGRATIONS {
+        sqlx::raw_sql(sql).execute(&mut **tx).await?;
+    }
+    let native = fingerprint_schema(tx, &scratch).await?;
     sqlx::raw_sql("ROLLBACK TO SAVEPOINT qbit_prism_release_schema; RELEASE SAVEPOINT qbit_prism_release_schema")
         .execute(&mut **tx).await?;
     sqlx::query("SELECT set_config('search_path',$1,true)")
@@ -1556,7 +1630,68 @@ async fn release_fingerprint(
         "release schema scratch apply did not roll back (current schema {restored}, expected {source_schema}; scratch schema {scratch} present: {})",
         !scratch_gone
     );
-    Ok((expected, source_schema))
+    let reserved = reserved_objects(&native, &expected);
+    Ok(ReleaseDefinitions {
+        release: expected,
+        reserved,
+        source_schema,
+    })
+}
+
+/// The tables, sequences, indexes, triggers and functions the native
+/// migrations create and the release does not, and, per release table, the
+/// columns they add to it. An object in both sets (the capability table on
+/// a #258 source, a function 003 re-asserts) stays governed by the release
+/// checks, and so does a column in both: the outbox's `storage_version` on
+/// a #258 source, where the release 002 added it (on a pre-#258 source 006
+/// adds it, so it is reserved there). `qbit_prism_schema_migrations` is
+/// the migrator's own, created before any source object is read, and is
+/// never reserved.
+fn reserved_objects(native: &SchemaFingerprint, release: &SchemaFingerprint) -> ReservedObjects {
+    let mut objects = SchemaFingerprint::default();
+    let mut columns = BTreeMap::new();
+    for (table, definition) in &native.tables {
+        if table == "qbit_prism_schema_migrations" {
+            continue;
+        }
+        match release.tables.get(table) {
+            None => {
+                objects.tables.insert(table.clone(), definition.clone());
+            }
+            Some(released) => {
+                let added: BTreeSet<String> = definition
+                    .columns
+                    .keys()
+                    .filter(|column| !released.columns.contains_key(*column))
+                    .cloned()
+                    .collect();
+                if !added.is_empty() {
+                    columns.insert(table.clone(), added);
+                }
+            }
+        }
+    }
+    for (name, definition) in &native.sequences {
+        if !release.sequences.contains_key(name) {
+            objects.sequences.insert(name.clone(), definition.clone());
+        }
+    }
+    for (name, definition) in &native.indexes {
+        if !release.indexes.contains_key(name) {
+            objects.indexes.insert(name.clone(), definition.clone());
+        }
+    }
+    for (key, definition) in &native.triggers {
+        if !release.triggers.contains_key(key) {
+            objects.triggers.insert(key.clone(), definition.clone());
+        }
+    }
+    for (key, definition) in &native.functions {
+        if !release.functions.contains_key(key) {
+            objects.functions.insert(key.clone(), definition.clone());
+        }
+    }
+    ReservedObjects { objects, columns }
 }
 
 /// The source schema as it is now, without the migrator's own version
@@ -1572,9 +1707,9 @@ async fn source_fingerprint(
     Ok(found)
 }
 
-/// Every table, sequence, index, trigger and function the release creates
-/// that the source already has, named the way the drift report names them.
-fn release_objects_present(expected: &SchemaFingerprint, found: &SchemaFingerprint) -> Vec<String> {
+/// Every table, sequence, index, trigger and function of `expected` that
+/// the source already has, named the way the drift report names them.
+fn objects_present(expected: &SchemaFingerprint, found: &SchemaFingerprint) -> Vec<String> {
     let mut present = Vec::new();
     for table in expected.tables.keys() {
         if found.tables.contains_key(table) {
@@ -1613,20 +1748,15 @@ fn release_objects_present(expected: &SchemaFingerprint, found: &SchemaFingerpri
 /// 001's `IF NOT EXISTS` would keep exactly as it is. Refused before any
 /// DDL. Objects the release does not create, an operator's own table for
 /// instance, do not disqualify a fresh database; they are logged as extras.
-async fn require_fresh_source(
-    tx: &mut Transaction<'_, Postgres>,
-    expected: &SchemaFingerprint,
-    source_schema: &str,
-) -> Result<()> {
-    let found = source_fingerprint(tx, source_schema).await?;
-    let present = release_objects_present(expected, &found);
+fn require_fresh_source(expected: &SchemaFingerprint, found: &SchemaFingerprint) -> Result<()> {
+    let present = objects_present(expected, found);
     ensure!(
         present.is_empty(),
         "refusing to migrate a {STATE_PARTIAL_001} source before any DDL: the database has no qbit_share_ledger but holds {} object(s) that the 2.x.x release's 001_share_ledger.sql creates ({}), so it is neither an empty database nor a 2.x.x ledger, and 001's IF NOT EXISTS would keep those objects whatever they hold. Nothing was changed. Restore the full pre-migration backup, or migrate into an empty database",
         present.len(),
         named_objects(&present)
     );
-    let comparison = compare_fingerprints(expected, &found);
+    let comparison = compare_fingerprints(expected, found);
     if !comparison.extra.is_empty() {
         tracing::warn!(
             source = STATE_FRESH,
@@ -1635,6 +1765,53 @@ async fn require_fresh_source(
             "empty database has objects the 2.x.x release does not create; they are kept as they are"
         );
     }
+    Ok(())
+}
+
+/// Every reserved column that the source's release table already has,
+/// named the way the drift report names columns.
+fn columns_present(
+    reserved: &BTreeMap<String, BTreeSet<String>>,
+    found: &SchemaFingerprint,
+) -> Vec<String> {
+    let mut present = Vec::new();
+    for (table, columns) in reserved {
+        let Some(found_table) = found.tables.get(table) else {
+            continue;
+        };
+        for column in columns {
+            if found_table.columns.contains_key(column) {
+                present.push(format!("column {table}.{column}"));
+            }
+        }
+    }
+    present
+}
+
+/// A table, sequence, index, trigger, function or column that a native
+/// migration creates and the release does not must not be there yet, on a
+/// 2.x.x source or an empty database alike: a native migration's `IF NOT
+/// EXISTS` would keep it whatever it holds, the migration would record a
+/// schema it did not build, and the writers would fail only afterwards.
+/// Refused before any DDL, naming the objects. Nothing is dropped: what
+/// such an object holds is the operator's to judge.
+fn require_no_native_collision(
+    state: SourceState,
+    reserved: &ReservedObjects,
+    found: &SchemaFingerprint,
+) -> Result<()> {
+    let mut present = objects_present(&reserved.objects, found);
+    present.extend(columns_present(&reserved.columns, found));
+    ensure!(
+        present.is_empty(),
+        "refusing to migrate a {STATE_NATIVE_COLLISION} source before any DDL: the {} already holds {} object(s) that the native migrations create and the 2.x.x release does not ({}), so a native migration's IF NOT EXISTS would keep each such table, sequence, index, trigger, function or column whatever it holds and the migration would record a schema it did not build. Nothing was changed. Restore the full pre-migration backup, or check what those objects hold and remove them yourself, then migrate again",
+        match state {
+            SourceState::Fresh => "empty database",
+            _ => "2.x.x database",
+        },
+        present.len(),
+        named_objects(&present)
+    );
     Ok(())
 }
 
@@ -1749,28 +1926,37 @@ pub(super) async fn migrate_schema(
         let base_schema = base_schema_transaction_body(include_str!(
             "../../../qbit-prism/sql/001_share_ledger.sql"
         ))?;
-        // The release definitions, taken once under a savepoint and rolled
-        // back before the source is touched.
-        let (expected, source_schema) = release_fingerprint(tx, state, &base_schema).await?;
+        // The release definitions and the reserved native objects, taken
+        // once under a savepoint and rolled back before the source is
+        // touched.
+        let ReleaseDefinitions {
+            release: expected,
+            reserved,
+            source_schema,
+        } = release_fingerprint(tx, state, &base_schema).await?;
+        let found = source_fingerprint(tx, &source_schema).await?;
         if state == SourceState::Fresh {
             // No share ledger and no 002 object: fresh only if nothing else
             // of 001 is there either, or 001 would keep it as it is.
-            require_fresh_source(tx, &expected, &source_schema).await?;
+            require_fresh_source(&expected, &found)?;
         }
+        // Nothing a native migration creates may be there yet, or its IF
+        // NOT EXISTS would keep it as it is.
+        require_no_native_collision(state, &reserved, &found)?;
         refuse_undrained_outbox(tx, &inventory, None).await?;
         sqlx::raw_sql(&base_schema).execute(&mut **tx).await?;
         // 001 repaired what it re-asserts; what it skipped must already be
         // the release definition before any native DDL alters those tables.
         require_release_schema(tx, state, &expected, &source_schema).await?;
         if !versions.contains(&2) {
-            sqlx::raw_sql(include_str!("../../migrations/002_multi_instance.sql"))
+            sqlx::raw_sql(native_migration(2))
                 .execute(&mut **tx)
                 .await?;
             sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)")
                 .execute(&mut **tx)
                 .await?;
         }
-        sqlx::raw_sql(include_str!("../../migrations/003_2x_compatibility.sql"))
+        sqlx::raw_sql(native_migration(3))
             .execute(&mut **tx)
             .await?;
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(3)")
@@ -1801,17 +1987,15 @@ pub(super) async fn migrate_schema(
         }
     }
     if !versions.contains(&4) {
-        sqlx::raw_sql(include_str!(
-            "../../migrations/004_cpfp_retired_funding.sql"
-        ))
-        .execute(&mut **tx)
-        .await?;
+        sqlx::raw_sql(native_migration(4))
+            .execute(&mut **tx)
+            .await?;
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(4)")
             .execute(&mut **tx)
             .await?;
     }
     if !versions.contains(&5) {
-        sqlx::raw_sql(include_str!("../../migrations/005_candidate_dispatch.sql"))
+        sqlx::raw_sql(native_migration(5))
             .execute(&mut **tx)
             .await?;
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(5)")
@@ -1823,7 +2007,7 @@ pub(super) async fn migrate_schema(
         // record keeps what the database declared before it ran, read with
         // the inventory above.
         let (state, capability) = source;
-        sqlx::raw_sql(include_str!("../../migrations/006_source_schema.sql"))
+        sqlx::raw_sql(native_migration(6))
             .execute(&mut **tx)
             .await?;
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(6)")
@@ -1838,7 +2022,7 @@ pub(super) async fn migrate_schema(
         }
     }
     if !versions.contains(&9) {
-        sqlx::raw_sql(include_str!("../../migrations/009_wrap_safe_sessions.sql"))
+        sqlx::raw_sql(native_migration(9))
             .execute(&mut **tx)
             .await?;
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(9)")
@@ -2205,6 +2389,22 @@ mod tests {
         }
     }
 
+    fn function(language: &str, body: &str) -> FunctionDefinition {
+        FunctionDefinition {
+            arguments: String::new(),
+            result: None,
+            language: language.to_owned(),
+            body: Some(body.to_owned()),
+            volatility: "v".into(),
+            strict: false,
+            security_definer: false,
+            leakproof: false,
+            parallel: "u".into(),
+            kind: "f".into(),
+            config: Vec::new(),
+        }
+    }
+
     #[test]
     fn schema_qualification_is_stripped_only_where_it_qualifies() {
         assert_eq!(
@@ -2369,6 +2569,7 @@ mod tests {
             STATE_APPLIED_258,
             STATE_PARTIAL_002,
             STATE_NEWER,
+            STATE_NATIVE_COLLISION,
             STATE_DRIFTED_001,
         ] {
             assert_eq!(source_rule(name).name, name);
@@ -2381,7 +2582,7 @@ mod tests {
                 "{name} must be exactly one row"
             );
         }
-        assert_eq!(SOURCE_STATES.len(), 7, "every row has a name constant");
+        assert_eq!(SOURCE_STATES.len(), 8, "every row has a name constant");
         for state in [
             SourceState::Fresh,
             SourceState::Pre258,
@@ -2451,7 +2652,7 @@ mod tests {
             "operator_notes_note_id_seq".into(),
             sequence("bigint", 1, i64::MAX),
         );
-        assert!(release_objects_present(&expected, &found).is_empty());
+        assert!(objects_present(&expected, &found).is_empty());
         let comparison = compare_fingerprints(&expected, &found);
         assert_eq!(
             comparison.extra,
@@ -2487,7 +2688,7 @@ mod tests {
                 }
             }
             assert_eq!(
-                release_objects_present(&expected, &found),
+                objects_present(&expected, &found),
                 vec![format!("{kind} {name}")]
             );
         }
@@ -2509,7 +2710,7 @@ mod tests {
                 .clone(),
         );
         assert_eq!(
-            release_objects_present(&expected, &found),
+            objects_present(&expected, &found),
             vec![
                 "table qbit_pool_blocks",
                 "index qbit_pool_blocks_maturity_idx on qbit_pool_blocks",
@@ -2752,7 +2953,7 @@ mod tests {
         );
         assert_eq!(comparison.extra, vec!["table operator_scratch"]);
         assert_eq!(
-            release_objects_present(&expected, &found),
+            objects_present(&expected, &found),
             vec![
                 "table qbit_pool_blocks",
                 "table qbit_share_ledger",
@@ -2843,7 +3044,7 @@ mod tests {
         );
         assert_eq!(comparison.extra, vec!["table operator_notes"]);
         assert_eq!(
-            release_objects_present(&expected, &found),
+            objects_present(&expected, &found),
             vec![
                 "table qbit_block_candidate_outbox",
                 "table qbit_share_ledger"
@@ -2933,5 +3134,226 @@ mod tests {
         let comparison = compare_fingerprints(&expected, &found);
         assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
         assert_eq!(comparison.extra, vec!["table operator_notes"]);
+    }
+
+    #[test]
+    fn native_migrations_are_the_applied_versions_in_order() {
+        let versions: Vec<i32> = NATIVE_MIGRATIONS.iter().map(|(v, _)| *v).collect();
+        assert_eq!(versions, REQUIRED_SCHEMA_VERSIONS);
+        for (version, sql) in NATIVE_MIGRATIONS {
+            assert!(!sql.trim().is_empty(), "migration {version} is empty");
+            assert_eq!(native_migration(*version), *sql);
+        }
+    }
+
+    #[test]
+    fn reserved_objects_are_the_native_ones_the_release_lacks_without_the_migrator_table() {
+        let mut release = SchemaFingerprint::default();
+        release.tables.insert(
+            "qbit_share_ledger".into(),
+            table(&[("share_id", column("bigint", true))]),
+        );
+        // The outbox of a #258 source: the release 002 added storage_version.
+        release.tables.insert(
+            "qbit_block_candidate_outbox".into(),
+            table(&[
+                ("block_hash", column("text", true)),
+                ("storage_version", column("integer", true)),
+            ]),
+        );
+        release.sequences.insert(
+            "qbit_share_ledger_share_seq".into(),
+            sequence("bigint", 1, i64::MAX),
+        );
+        release.functions.insert(
+            ("qbit_prism_window".into(), "w numeric".into()),
+            function("sql", "1"),
+        );
+        let mut native = SchemaFingerprint::default();
+        // Kept from the release, re-asserted by 003, and the migrator's own.
+        native.tables.insert(
+            "qbit_share_ledger".into(),
+            table(&[("share_id", column("bigint", true))]),
+        );
+        native.sequences.insert(
+            "qbit_share_ledger_share_seq".into(),
+            sequence("bigint", 1, i64::MAX),
+        );
+        native.functions.insert(
+            ("qbit_prism_window".into(), "w numeric".into()),
+            function("sql", "2"),
+        );
+        native.tables.insert(
+            "qbit_prism_schema_migrations".into(),
+            table(&[("version", column("integer", true))]),
+        );
+        // The release's outbox columns kept, and the claim columns 002 adds.
+        native.tables.insert(
+            "qbit_block_candidate_outbox".into(),
+            table(&[
+                ("block_hash", column("text", true)),
+                ("storage_version", column("integer", true)),
+                ("claim_token", column("text", false)),
+                ("next_attempt_at", column("timestamp with time zone", true)),
+            ]),
+        );
+        // Created by the native migrations only.
+        native.tables.insert(
+            "qbit_prism_cluster".into(),
+            table(&[
+                ("singleton", column("boolean", true)),
+                ("fatal_error", column("text", false)),
+            ]),
+        );
+        native.sequences.insert(
+            "qbit_prism_session_sequence".into(),
+            sequence("bigint", 1, 4294967295),
+        );
+        native.indexes.insert(
+            "qbit_prism_jobs_expiry_idx".into(),
+            IndexDefinition {
+                table: "qbit_prism_jobs".into(),
+                definition: "CREATE INDEX qbit_prism_jobs_expiry_idx ON qbit_prism_jobs USING btree (expires_at)".into(),
+                valid: true,
+            },
+        );
+        native.triggers.insert(
+            ("qbit_share_ledger".into(), "qbit_prism_no_legacy_writer".into()),
+            TriggerDefinition {
+                definition: "CREATE TRIGGER qbit_prism_no_legacy_writer BEFORE INSERT ON qbit_share_ledger FOR EACH ROW EXECUTE FUNCTION qbit_prism_reject_legacy_writer()".into(),
+                enabled: "O".into(),
+            },
+        );
+        native.functions.insert(
+            ("qbit_prism_reject_legacy_writer".into(), String::new()),
+            function("plpgsql", "BEGIN RETURN NEW; END"),
+        );
+        let reserved = reserved_objects(&native, &release);
+        assert_eq!(
+            reserved.objects.tables.keys().collect::<Vec<_>>(),
+            ["qbit_prism_cluster"]
+        );
+        assert_eq!(
+            reserved.objects.sequences.keys().collect::<Vec<_>>(),
+            ["qbit_prism_session_sequence"]
+        );
+        assert_eq!(
+            reserved.objects.indexes.keys().collect::<Vec<_>>(),
+            ["qbit_prism_jobs_expiry_idx"]
+        );
+        assert_eq!(
+            reserved.objects.triggers.keys().collect::<Vec<_>>(),
+            [&(
+                "qbit_share_ledger".to_owned(),
+                "qbit_prism_no_legacy_writer".to_owned()
+            )]
+        );
+        assert_eq!(
+            reserved.objects.functions.keys().collect::<Vec<_>>(),
+            [&("qbit_prism_reject_legacy_writer".to_owned(), String::new())]
+        );
+        // The columns the native migrations add to a release table, and
+        // nothing of a reserved table, whose columns come with it. A column
+        // in both readings (storage_version on a #258 source) is not
+        // reserved.
+        assert_eq!(
+            reserved.columns,
+            BTreeMap::from([(
+                "qbit_block_candidate_outbox".to_owned(),
+                BTreeSet::from(["claim_token".to_owned(), "next_attempt_at".to_owned()])
+            )])
+        );
+        // On a pre-#258 source the release lacks storage_version and 006
+        // adds it, so it is reserved there (a real pre-#258 source that has
+        // it is a partial 002, refused earlier).
+        release
+            .tables
+            .get_mut("qbit_block_candidate_outbox")
+            .unwrap()
+            .columns
+            .remove("storage_version");
+        let reserved_pre_258 = reserved_objects(&native, &release);
+        assert_eq!(reserved_pre_258.objects, reserved.objects);
+        assert_eq!(
+            reserved_pre_258.columns["qbit_block_candidate_outbox"],
+            BTreeSet::from([
+                "claim_token".to_owned(),
+                "next_attempt_at".to_owned(),
+                "storage_version".to_owned()
+            ])
+        );
+        // A source that has any of them is named the way the drift report
+        // names objects and columns; the release's own are not collisions.
+        let mut found = SchemaFingerprint::default();
+        found.tables.insert(
+            "qbit_share_ledger".into(),
+            table(&[("share_id", column("bigint", true))]),
+        );
+        found.tables.insert(
+            "qbit_block_candidate_outbox".into(),
+            table(&[
+                ("block_hash", column("text", true)),
+                ("storage_version", column("integer", true)),
+                ("claim_token", column("integer", false)),
+            ]),
+        );
+        found.tables.insert(
+            "qbit_prism_cluster".into(),
+            table(&[("singleton", column("boolean", true))]),
+        );
+        found.functions.insert(
+            ("qbit_prism_reject_legacy_writer".into(), String::new()),
+            function("plpgsql", "BEGIN RETURN NULL; END"),
+        );
+        assert_eq!(
+            objects_present(&reserved.objects, &found),
+            vec![
+                "table qbit_prism_cluster",
+                "function qbit_prism_reject_legacy_writer()"
+            ]
+        );
+        assert_eq!(
+            columns_present(&reserved.columns, &found),
+            vec!["column qbit_block_candidate_outbox.claim_token"]
+        );
+        let error = require_no_native_collision(SourceState::Pre258, &reserved, &found)
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("refusing to migrate a native collision source before any DDL: the 2.x.x database already holds 3 object(s)"), "{error}");
+        assert!(
+            error.contains("(table qbit_prism_cluster; function qbit_prism_reject_legacy_writer(); column qbit_block_candidate_outbox.claim_token)"),
+            "{error}"
+        );
+        assert!(
+            error.contains("table, sequence, index, trigger, function or column"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Nothing was changed") && error.contains("remove them yourself"),
+            "{error}"
+        );
+        let error = require_no_native_collision(SourceState::Fresh, &reserved, &found)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("the empty database already holds"),
+            "{error}"
+        );
+        found.tables.remove("qbit_prism_cluster");
+        found.functions.clear();
+        let error = require_no_native_collision(SourceState::Applied258, &reserved, &found)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("already holds 1 object(s) that the native migrations create and the 2.x.x release does not (column qbit_block_candidate_outbox.claim_token)"),
+            "{error}"
+        );
+        found
+            .tables
+            .get_mut("qbit_block_candidate_outbox")
+            .unwrap()
+            .columns
+            .remove("claim_token");
+        require_no_native_collision(SourceState::Applied258, &reserved, &found).unwrap();
     }
 }

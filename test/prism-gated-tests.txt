@@ -46,6 +46,7 @@ qbit-prism-server::ledger_postgres::two_x::drifted_002_object_is_refused_on_a_25
 qbit-prism-server::ledger_postgres::two_x::drifted_pre_258_source_is_refused_naming_each_object_and_rolls_back
 qbit-prism-server::ledger_postgres::two_x::durable_worker_hints_order_by_shared_evidence_and_keep_original_ttl
 qbit-prism-server::ledger_postgres::two_x::empty_database_migrates_as_fresh_with_or_without_an_operator_table
+qbit-prism-server::ledger_postgres::two_x::empty_database_with_a_stray_native_table_is_refused_naming_it_before_any_ddl
 qbit-prism-server::ledger_postgres::two_x::frozen_258_source_refuses_pending_v1_and_v2_rows_and_migrates_terminal_rows
 qbit-prism-server::ledger_postgres::two_x::frozen_pre_258_source_refuses_pending_v1_cleanly_and_migrates_terminal_rows
 qbit-prism-server::ledger_postgres::two_x::legacy_2x_failed_native_migration_rolls_back_seed_repair_and_all_ddl
@@ -65,6 +66,8 @@ qbit-prism-server::ledger_postgres::two_x::row_level_security_on_a_release_table
 qbit-prism-server::ledger_postgres::two_x::startup_without_initialize_refuses_a_pre_006_native_schema_with_009
 qbit-prism-server::ledger_postgres::two_x::startup_without_initialize_requires_the_current_schema_version
 qbit-prism-server::ledger_postgres::two_x::tolerated_source_differences_still_migrate
+qbit-prism-server::ledger_postgres::two_x::two_x_source_with_a_stray_native_column_is_refused_naming_it_before_any_ddl
+qbit-prism-server::ledger_postgres::two_x::two_x_source_with_stray_native_objects_is_refused_naming_each_before_any_ddl
 qbit-prism-server::ledger_postgres::two_x::unknown_storage_version_row_is_parked_and_not_reclaimed_at_lease_expiry
 qbit-prism-server::ledger_postgres::two_x::unlogged_release_table_or_sequence_is_refused_naming_it_and_rolls_back
 qbit-prism-server::ledger_postgres::verified_landing_reconstructs_audit_and_reorgs_are_revision_fenced

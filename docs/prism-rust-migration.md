@@ -93,6 +93,7 @@ release definition:
 | #258 applied (v2.0.2) | `candidate_storage_version = 2` and every `002_candidate_bodies.sql` object present | accept after the drain check |
 | partial 002 | some 002 objects or the capability row, but not all (v2.0.2 applies 001 and 002 as two script calls, and a restart between them leaves this) | refuse, naming the missing object; finish 002 with the v2.0.2 release (`PRISM_POSTGRES_INIT_SCHEMA=1`) or restore the backup |
 | newer | `candidate_storage_version > 2`, or a capability this release does not know | refuse before any DDL; a newer PRISM release wrote the database. A database that is already native gets the same check first, before 004, 005, 006 or 009 run, so `migrate` never alters a database a newer release wrote |
+| native collision | a table, sequence, index, trigger, function or column that a native migration (`002_multi_instance.sql` to `009_wrap_safe_sessions.sql`) creates and the `2.x.x` release does not is already present, in an empty database or a `2.x.x` one: a leftover of an earlier native attempt, a selective restore, or something installed by hand | refuse before any DDL, naming the objects; nothing is dropped; restore the full pre-migration backup, or check what the objects hold and remove them, then migrate again |
 | drifted 001 | a 001 (or 002) object whose definition, after 001 has run, differs from the frozen release: a table, column, index, sequence or named constraint that 001's `IF NOT EXISTS` skipped, or any 002 object, with a dropped constraint, a changed type, nullability or default, a different index definition, an altered sequence (a lowered maximum, a different increment), a table or sequence made `UNLOGGED` (or temporary), a release constraint left `NOT VALID` (other than the pinned `qbit_share_ledger_credit_policy_check`), row-level security enabled or forced on a release table or a policy on one, a replaced function body or a disabled trigger | refuse transactionally, naming each object and what differs; the migration rolls back and the database is unchanged; restore the pre-migration backup or bring the database to the release schema with the `2.x.x` release, then migrate again |
 
 **The release definitions.** They are not a stored fingerprint: before any
@@ -124,6 +125,38 @@ backup, or migrate into an empty database
 Objects the release does not create, an operator's own table for instance,
 do not disqualify a fresh database; they are kept and logged at warning
 level.
+
+**The native-collision check.** The same scratch apply continues with the
+native migrations, in the order the migrator applies them, and is read
+again; the second reading minus the first is every table, sequence, index,
+trigger and function a native migration creates and the release does not
+(`qbit_prism_schema_migrations`, which the migrator creates itself, is never
+in it), and, per release table, every column a native migration adds to it
+(the claim columns 002 adds to the outbox and the fanout artifacts, for
+instance). A `2.x.x` database or an empty one that already has one of those
+objects or columns is refused before any DDL, whatever it holds: `CREATE
+TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS` and their kin would keep it
+as it is, the migration would then record a schema it did not build, and a
+writer would fail only afterwards. For example, a leftover
+`qbit_prism_cluster(singleton boolean PRIMARY KEY)` on an otherwise empty
+database is refused like this:
+
+```
+refusing to migrate a native collision source before any DDL: the empty database already holds
+1 object(s) that the native migrations create and the 2.x.x release does not (table
+qbit_prism_cluster), so a native migration's IF NOT EXISTS would keep each such table, sequence,
+index, trigger, function or column whatever it holds and the migration would record a schema it
+did not build. Nothing was changed. Restore the full pre-migration backup, or check what those
+objects hold and remove them yourself, then migrate again
+```
+
+A column already on a release table under a reserved name, a `claim_token
+integer` on the outbox say, is named as `column
+qbit_block_candidate_outbox.claim_token`. Nothing is dropped for you. An
+object or column in both readings, the capability table on a #258 source
+for instance, or the outbox's `storage_version` there (the release 002
+added it; on a pre-#258 source 006 adds it, so it is reserved), stays
+governed by the release checks.
 
 **The release-schema check.** 001 is the idempotent schema every `2.x.x`
 start re-applied, so the migrator applies it next: that repairs everything

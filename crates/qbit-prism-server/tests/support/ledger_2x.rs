@@ -231,6 +231,10 @@ fn source_state_table_is_the_pinned_data() {
             ("#258 applied", "accept after the drain check"),
             ("partial 002", "refuse, naming the missing object"),
             ("newer", "refuse before any DDL"),
+            (
+                "native collision",
+                "refuse before any DDL, naming the objects"
+            ),
             ("drifted 001", "refuse transactionally, naming the object"),
         ]
     );
@@ -809,6 +813,219 @@ async fn empty_database_migrates_as_fresh_with_or_without_an_operator_table() ->
     exercise_native_writers(&ledger, 1, 5402).await?;
     pool.close().await;
     db.close(vec![ledger]).await
+}
+
+/// `qbit_prism_schema_migrations` is created by the migrator first, inside
+/// the migration transaction, so a refusal before any DDL leaves none.
+async fn migrator_table_absent(pool: &PgPool) -> Result<bool> {
+    Ok(
+        sqlx::query_scalar("SELECT to_regclass('qbit_prism_schema_migrations') IS NULL")
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+/// The object Codex's report names: a cluster table whose shape no native
+/// writer can use, which 002's `CREATE TABLE IF NOT EXISTS` would keep.
+const STRAY_CLUSTER_TABLE: &str = "CREATE TABLE qbit_prism_cluster(singleton boolean PRIMARY KEY)";
+
+#[tokio::test]
+async fn empty_database_with_a_stray_native_table_is_refused_naming_it_before_any_ddl() -> Result<()>
+{
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    sqlx::raw_sql(STRAY_CLUSTER_TABLE).execute(&pool).await?;
+    let before = schema_objects(&pool).await?;
+    let error = db
+        .ledger("init")
+        .await
+        .err()
+        .context("migrate accepted an empty database with a stray native table")?
+        .to_string();
+    assert!(
+        error.contains("refusing to migrate a native collision source before any DDL: the empty database already holds 1 object(s) that the native migrations create and the 2.x.x release does not (table qbit_prism_cluster)"),
+        "{error}"
+    );
+    assert!(
+        error.contains("Nothing was changed")
+            && error.contains("Restore the full pre-migration backup")
+            && error.contains("remove them yourself"),
+        "{error}"
+    );
+    assert!(
+        !error.contains("DROP"),
+        "the refusal must not suggest a drop: {error}"
+    );
+    // Unchanged: no version recorded, no migrator table, the stray table as it was.
+    assert!(migrator_table_absent(&pool).await?);
+    assert_eq!(schema_objects(&pool).await?, before);
+    assert!(sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass('qbit_prism_cluster') AND attname='singleton') AND NOT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass('qbit_prism_cluster') AND attname='fatal_error')")
+        .fetch_one(&pool).await?, "the stray table was altered");
+    // Removed by the operator, the same database migrates as fresh.
+    sqlx::raw_sql("DROP TABLE qbit_prism_cluster")
+        .execute(&pool)
+        .await?;
+    let ledger = db.ledger("init").await?;
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    assert_eq!(
+        ledger.migration_source().await?.map(|s| s.source_state),
+        Some("fresh".into())
+    );
+    exercise_native_writers(&ledger, 1, 5901).await?;
+    pool.close().await;
+    db.close(vec![ledger]).await
+}
+
+#[tokio::test]
+async fn two_x_source_with_stray_native_objects_is_refused_naming_each_before_any_ddl() -> Result<()>
+{
+    for state in [SourceState::Pre258, SourceState::Applied258] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let pool = PgPool::connect(&db.url).await?;
+        apply_frozen_2x_schema(&pool, state).await?;
+        insert_v1_terminal(&pool, &legacy_hash(0x55), "submitted").await?;
+        // A native table (002), a native function (002, a trigger function
+        // 002 would replace) and a native sequence (005, whose IF NOT
+        // EXISTS would keep this narrower one).
+        sqlx::raw_sql(&format!("{STRAY_CLUSTER_TABLE}; CREATE FUNCTION qbit_prism_reject_legacy_writer() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$; CREATE SEQUENCE qbit_prism_candidate_dispatch_sequence AS integer"))
+            .execute(&pool).await?;
+        let before = schema_objects(&pool).await?;
+        let error = db
+            .ledger("this-build")
+            .await
+            .err()
+            .with_context(|| {
+                format!("migrate accepted a {state:?} source with stray native objects")
+            })?
+            .to_string();
+        assert!(
+            error.contains("refusing to migrate a native collision source before any DDL: the 2.x.x database already holds 3 object(s) that the native migrations create and the 2.x.x release does not (table qbit_prism_cluster; sequence qbit_prism_candidate_dispatch_sequence; function qbit_prism_reject_legacy_writer())"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Nothing was changed") && error.contains("remove them yourself"),
+            "{error}"
+        );
+        // Unchanged: no migrator table, every object and the row as they were.
+        assert!(migrator_table_absent(&pool).await?);
+        assert_eq!(schema_objects(&pool).await?, before);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM qbit_block_candidate_outbox")
+                .fetch_one(&pool)
+                .await?,
+            1
+        );
+        // The release's own objects were never the collision: on a #258
+        // source the capability table is in both sets and its row stands.
+        if state == SourceState::Applied258 {
+            assert_eq!(capability(&pool).await?, Some(2));
+        }
+        // Removed by the operator, the same database migrates.
+        sqlx::raw_sql("DROP TABLE qbit_prism_cluster; DROP FUNCTION qbit_prism_reject_legacy_writer(); DROP SEQUENCE qbit_prism_candidate_dispatch_sequence")
+            .execute(&pool).await?;
+        let ledger = db.ledger("this-build").await?;
+        assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+        assert_eq!(
+            ledger.migration_source().await?.map(|s| s.source_state),
+            Some(state.as_str().to_owned())
+        );
+        exercise_native_writers(&ledger, 1, 5902).await?;
+        pool.close().await;
+        db.close(vec![ledger]).await?;
+    }
+    Ok(())
+}
+
+/// The type of a column of the test schema as the server renders it, or
+/// `None` when the table has no such column.
+async fn column_type(pool: &PgPool, table: &str, column: &str) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar("SELECT format_type(atttypid,atttypmod) FROM pg_attribute WHERE attrelid=to_regclass($1) AND attname=$2 AND attnum>0 AND NOT attisdropped")
+        .bind(table).bind(column).fetch_optional(pool).await?)
+}
+
+#[tokio::test]
+async fn two_x_source_with_a_stray_native_column_is_refused_naming_it_before_any_ddl() -> Result<()>
+{
+    // claim_token is a column 002 adds to the outbox with ADD COLUMN IF NOT
+    // EXISTS on either state; the release never creates it. (The outbox's
+    // storage_version is the release's own on a #258 source, and a stray
+    // one on a pre-#258 source is a 002 object, refused as a partial 002
+    // before this check.)
+    for state in [SourceState::Pre258, SourceState::Applied258] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let pool = PgPool::connect(&db.url).await?;
+        apply_frozen_2x_schema(&pool, state).await?;
+        insert_v1_terminal(&pool, &legacy_hash(0x56), "submitted").await?;
+        // A claim token of a type the native claim lane cannot use, which
+        // 002's ADD COLUMN IF NOT EXISTS would keep.
+        sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox ADD COLUMN claim_token integer")
+            .execute(&pool)
+            .await?;
+        let before = schema_objects(&pool).await?;
+        let error = db
+            .ledger("this-build")
+            .await
+            .err()
+            .with_context(|| {
+                format!("migrate accepted a {state:?} source with a stray native column")
+            })?
+            .to_string();
+        assert!(
+            error.contains("refusing to migrate a native collision source before any DDL: the 2.x.x database already holds 1 object(s) that the native migrations create and the 2.x.x release does not (column qbit_block_candidate_outbox.claim_token)"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Nothing was changed") && error.contains("remove them yourself"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("DROP"),
+            "the refusal must not suggest a drop: {error}"
+        );
+        // Unchanged: no migrator table, every object and the column as they
+        // were, the row still there.
+        assert!(migrator_table_absent(&pool).await?);
+        assert_eq!(schema_objects(&pool).await?, before);
+        assert_eq!(
+            column_type(&pool, "qbit_block_candidate_outbox", "claim_token")
+                .await?
+                .as_deref(),
+            Some("integer")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM qbit_block_candidate_outbox")
+                .fetch_one(&pool)
+                .await?,
+            1
+        );
+        // Removed by the operator, the same database migrates, and 002 adds
+        // the column it wanted.
+        sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox DROP COLUMN claim_token")
+            .execute(&pool)
+            .await?;
+        let ledger = db.ledger("this-build").await?;
+        assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+        assert_eq!(
+            ledger.migration_source().await?.map(|s| s.source_state),
+            Some(state.as_str().to_owned())
+        );
+        assert_eq!(
+            column_type(&pool, "qbit_block_candidate_outbox", "claim_token")
+                .await?
+                .as_deref(),
+            Some("text")
+        );
+        exercise_native_writers(&ledger, 1, 5903).await?;
+        pool.close().await;
+        db.close(vec![ledger]).await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]

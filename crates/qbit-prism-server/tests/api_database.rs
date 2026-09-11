@@ -68,6 +68,12 @@ async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
         .execute(&pool)
         .await
         .unwrap();
+    // What the migrator records for 002 and 003. Native objects with no
+    // record are a native collision, which migrate refuses before any DDL.
+    sqlx::raw_sql("CREATE TABLE qbit_prism_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp()); INSERT INTO qbit_prism_schema_migrations(version) VALUES(2),(3)")
+        .execute(&pool)
+        .await
+        .unwrap();
     for (id, miner, worker, difficulty, writer, seconds) in [
         ("1", "alice", "rig-a", 6000000i64, "server-a", 30i32),
         ("2", "bob", "rig-b", 4000000, "server-b", 20),
@@ -272,9 +278,10 @@ async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
     scoped_url
         .query_pairs_mut()
         .append_pair("options", &format!("-csearch_path={schema}"));
-    // The hand-applied schema above stops at migration 003. A start without
-    // initialize refuses anything below the required version, so this
-    // connect brings the schema forward (every migration is idempotent).
+    // The hand-applied schema above stops at migration 003, recorded as the
+    // migrator records it. A start without initialize refuses anything
+    // below the required version, so this connect brings the schema
+    // forward, applying 004 to 009 on the native path.
     let ledger = qbit_prism_server::ledger::Ledger::connect(
         scoped_url.as_str(),
         "api-hydration".into(),
