@@ -497,7 +497,12 @@ async fn run_session(
                         paused = false;
                     }
                     Some(Control::ScheduledBlock) => {
+                        // A scheduled block occupies an outstanding slot like
+                        // any other submit: its response goes through the same
+                        // path, which releases the slot exactly once.
+                        outstanding.fetch_add(1, Ordering::Relaxed);
                         if let Err(error) = offer(active, &config, &shared, &frontend, true).await {
+                            outstanding.fetch_sub(1, Ordering::Relaxed);
                             let _ = shared.events.send(Event::Failure {
                                 session: config.index,
                                 error: format!("scheduled block: {error:#}"),
@@ -512,12 +517,14 @@ async fn run_session(
                         nonce_hex,
                         header_hex,
                     }) => {
+                        outstanding.fetch_add(1, Ordering::Relaxed);
                         if let Err(error) = reoffer(
                             active, &config, &shared, &frontend, share_id, job_id,
                             extranonce2_hex, ntime_hex, nonce_hex, header_hex,
                         )
                         .await
                         {
+                            outstanding.fetch_sub(1, Ordering::Relaxed);
                             let _ = shared.events.send(Event::Failure {
                                 session: config.index,
                                 error: format!("re-offer: {error:#}"),
@@ -1183,5 +1190,9 @@ async fn reoffer(
             phase: shared.phase(),
         },
     );
-    write_line(&mut connection.writer, &request).await
+    if let Err(error) = write_line(&mut connection.writer, &request).await {
+        connection.pending.remove(&id);
+        return Err(error);
+    }
+    Ok(())
 }
