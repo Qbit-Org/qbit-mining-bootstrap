@@ -106,7 +106,7 @@
 -  that never increment RestartCount, so planned work needs no maintenance
 -  flag; drills that crash the coordinator on purpose use a Grafana silence.
 +{# Native 3.x.x cutover draft, bootstrap #279. Apply only with the native image.
-+   Specification SHA-256: b49b750be80b03b9d6368acc21df7eea3338133028efdfa52aa8915339e8a32b
++   Specification SHA-256: cf4fb2e4a03239a02317b522c6706c18926eecbd020b5c6b0c4b21b922a93bbd
 +   Generated from the reviewed a007a142 snapshot; backup, sidecar and lifecycle rules retain their producers.
 +   Native numeric bounds marked provisional must be measured in #291 before production cutover.
 +   The D3 group requires PRIMARY postgres_exporter query metrics; see bootstrap docs/prism-alert-migration.md.
@@ -221,7 +221,7 @@
 -    "no_data_state": "OK",
 -    "exec_err_state": "OK"
 -  },
-+    "expr": "(qbit_prism_connections{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} < bool 10) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0))",
++    "expr": "(sum(qbit_prism_connections{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} and on(job, instance, network) (qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0) and on(job, instance, network) (up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1)) < bool 10) and on() (count(up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}) == count(qbit_prism_connections{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} and on(job, instance, network) (qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0) and on(job, instance, network) (up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1)))",
 +    "condition_type": "threshold",
 +    "evaluator": "gt",
 +    "threshold": 0,
@@ -232,7 +232,7 @@
 +      "alert_class": "prism-runtime"
 +    },
 +    "summary": "PRISM Connected Clients",
-+    "description": "Authorized and unauthenticated local connections are included; no synthetic zero for unknown data. Deployed operator floor: ten clients for three minutes, now counted locally by the native registry.",
++    "description": "Authorized and unauthenticated connections are included in the network total; six connections on each of two coordinators is twelve and remains healthy. Missing, failed or stale targets suppress the incomplete sum and remain covered by the scrape/snapshot alerts. Preserves the deployed network-wide floor: sum all local native connection counts, below ten for three minutes; evaluate only with fresh measurements for every configured target.",
 +    "no_data_state": "OK",
 +    "exec_err_state": "OK",
 +    "connected_clients_rule": true

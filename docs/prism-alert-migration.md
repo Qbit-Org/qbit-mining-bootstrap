@@ -44,6 +44,8 @@ primary exporter job `qbit-postgres-primary`, all with `network`. Exporter-owned
 labels (`result`, `reason_id`, `collector`, `task`) come from the registry;
 `job`, `instance`, and `network` are Prometheus target labels. Evaluate native
 ratios per instance, never sum replicated candidate/RSS gauges across hosts.
+The connected-client floor preserves the deployed network-wide total and only
+evaluates when every configured coordinator has a fresh observation.
 For a permitted rollback to 2.x.x, restore its template/gates and explicitly
 delete any newly introduced native/D3 UIDs that should no longer run. This rules
 change does not authorize database rollback or mixed-version writer operation.
@@ -302,7 +304,7 @@ These are the only rewritten native rules; the historical appendix is not an act
 | --- | --- | --- |
 | PrismMetricsNoData | Preserves the deployed three-minute scrape coverage grace. | [registry.rs#L43](../crates/qbit-prism-server/src/metrics/registry.rs#L43), [metrics.rs#L39](../crates/qbit-prism-server/src/metrics.rs#L39) |
 | PrismMetricsEndpointDown | Preserves the deployed three-minute scrape outage grace. | [metrics.rs#L39](../crates/qbit-prism-server/src/metrics.rs#L39) |
-| PRISM Connected Clients | Deployed operator floor: ten clients for three minutes, now counted locally by the native registry. | [registry.rs#L45](../crates/qbit-prism-server/src/metrics/registry.rs#L45), [registry.rs#L78](../crates/qbit-prism-server/src/metrics/registry.rs#L78), [registry.rs#L79](../crates/qbit-prism-server/src/metrics/registry.rs#L79), [metrics.rs#L39](../crates/qbit-prism-server/src/metrics.rs#L39) |
+| PRISM Connected Clients | Preserves the deployed network-wide floor: sum all local native connection counts, below ten for three minutes; evaluate only with fresh measurements for every configured target. | [registry.rs#L45](../crates/qbit-prism-server/src/metrics/registry.rs#L45), [registry.rs#L78](../crates/qbit-prism-server/src/metrics/registry.rs#L78), [registry.rs#L79](../crates/qbit-prism-server/src/metrics/registry.rs#L79), [metrics.rs#L39](../crates/qbit-prism-server/src/metrics.rs#L39) |
 | PrismMetricsSnapshotStale | #277 computes staleness at scrape time from max(3 * health refresh, 15s); no copied age constant. | [registry.rs#L79](../crates/qbit-prism-server/src/metrics/registry.rs#L79), [metrics.rs#L39](../crates/qbit-prism-server/src/metrics.rs#L39) |
 | PrismMetricsSnapshotUnavailable | #277 computes staleness at scrape time from max(3 * health refresh, 15s); no copied age constant. | [registry.rs#L78](../crates/qbit-prism-server/src/metrics/registry.rs#L78), [metrics.rs#L39](../crates/qbit-prism-server/src/metrics.rs#L39) |
 | PrismMetricsSnapshotAgeHigh | #277 computes staleness at scrape time from max(3 * health refresh, 15s); no copied age constant. | [registry.rs#L79](../crates/qbit-prism-server/src/metrics/registry.rs#L79), [registry.rs#L80](../crates/qbit-prism-server/src/metrics/registry.rs#L80), [metrics.rs#L39](../crates/qbit-prism-server/src/metrics.rs#L39) |

@@ -52,7 +52,7 @@
       "uid": "qbit-prism-connected-clients",
       "title": "PRISM Connected Clients",
       "role": "run",
-      "expr": "(qbit_prism_connections{job=\"qbit-prism\",network=\"__NETWORK__\"} < bool 10) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))",
+      "expr": "(sum(qbit_prism_connections{job=\"qbit-prism\",network=\"__NETWORK__\"} and on(job, instance, network) (qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0) and on(job, instance, network) (up{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1)) < bool 10) and on() (count(up{job=\"qbit-prism\",network=\"__NETWORK__\"}) == count(qbit_prism_connections{job=\"qbit-prism\",network=\"__NETWORK__\"} and on(job, instance, network) (qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0) and on(job, instance, network) (up{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1)))",
       "condition_type": "threshold",
       "evaluator": "gt",
       "threshold": 0,
@@ -63,10 +63,10 @@
         "alert_class": "prism-runtime"
       },
       "summary": "PRISM Connected Clients",
-      "description": "Authorized and unauthenticated local connections are included; no synthetic zero for unknown data. Deployed operator floor: ten clients for three minutes, now counted locally by the native registry.",
+      "description": "Authorized and unauthenticated connections are included in the network total; six connections on each of two coordinators is twelve and remains healthy. Missing, failed or stale targets suppress the incomplete sum and remain covered by the scrape/snapshot alerts. Preserves the deployed network-wide floor: sum all local native connection counts, below ten for three minutes; evaluate only with fresh measurements for every configured target.",
       "no_data_state": "OK",
       "exec_err_state": "OK",
-      "basis": "Deployed operator floor: ten clients for three minutes, now counted locally by the native registry.",
+      "basis": "Preserves the deployed network-wide floor: sum all local native connection counts, below ten for three minutes; evaluate only with fresh measurements for every configured target.",
       "connected_clients_rule": true,
       "producer_refs": [
         "crates/qbit-prism-server/src/metrics/registry.rs#L45",

@@ -280,5 +280,53 @@
     "expect": {
       "PrismPublicLedgerUnready": 1
     }
+  },
+  {
+    "name": "network client floor: six plus six is healthy",
+    "series": {
+      "up{job=\"qbit-prism\",instance=\"coordinator-0\",network=\"mainnet\"}": 1,
+      "qbit_prism_connections{job=\"qbit-prism\",instance=\"coordinator-0\",network=\"mainnet\"}": 6,
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"coordinator-0\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"coordinator-0\",network=\"mainnet\"}": 0,
+      "up{job=\"qbit-prism\",instance=\"coordinator-1\",network=\"mainnet\"}": 1,
+      "qbit_prism_connections{job=\"qbit-prism\",instance=\"coordinator-1\",network=\"mainnet\"}": 6,
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"coordinator-1\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"coordinator-1\",network=\"mainnet\"}": 0
+    },
+    "expect": {
+      "PRISM Connected Clients": 0
+    }
+  },
+  {
+    "name": "network client floor: six plus three is low",
+    "series": {
+      "up{job=\"qbit-prism\",instance=\"coordinator-0\",network=\"mainnet\"}": 1,
+      "qbit_prism_connections{job=\"qbit-prism\",instance=\"coordinator-0\",network=\"mainnet\"}": 6,
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"coordinator-0\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"coordinator-0\",network=\"mainnet\"}": 0,
+      "up{job=\"qbit-prism\",instance=\"coordinator-1\",network=\"mainnet\"}": 1,
+      "qbit_prism_connections{job=\"qbit-prism\",instance=\"coordinator-1\",network=\"mainnet\"}": 3,
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"coordinator-1\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"coordinator-1\",network=\"mainnet\"}": 0
+    },
+    "expect": {
+      "PRISM Connected Clients": 1
+    }
+  },
+  {
+    "name": "network client floor: partial stale data is unknown",
+    "series": {
+      "up{job=\"qbit-prism\",instance=\"coordinator-0\",network=\"mainnet\"}": 1,
+      "qbit_prism_connections{job=\"qbit-prism\",instance=\"coordinator-0\",network=\"mainnet\"}": 6,
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"coordinator-0\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"coordinator-0\",network=\"mainnet\"}": 0,
+      "up{job=\"qbit-prism\",instance=\"coordinator-1\",network=\"mainnet\"}": 1,
+      "qbit_prism_connections{job=\"qbit-prism\",instance=\"coordinator-1\",network=\"mainnet\"}": 6,
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"coordinator-1\",network=\"mainnet\"}": 1,
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"coordinator-1\",network=\"mainnet\"}": 1
+    },
+    "expect": {
+      "PRISM Connected Clients": null
+    }
   }
 ]
