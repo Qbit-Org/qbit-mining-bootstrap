@@ -12,12 +12,20 @@ ARG BITCOIN_RELEASE_URL
 ARG BITCOIN_RELEASE_SHA256_AMD64
 ARG BITCOIN_RELEASE_SHA256_ARM64
 
+# Package versions follow the image's Ubuntu release rather than pins that
+# rot with every security update; the runtime and its base are not this
+# workstream's to change (#288 owns container hardening).
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     tini \
     && rm -rf /var/lib/apt/lists/*
 
+# The pipes feed commands whose own exit status is what each step checks
+# (`grep -q` and `sha256sum -c` under `set -e`); a `SHELL` with pipefail would
+# change every RUN in this image, which is not this workstream's to do.
+# hadolint ignore=DL4006
 RUN set -eu; \
     case "${TARGETARCH}" in \
       amd64) release_arch="x86_64-linux-gnu"; release_sha256="${BITCOIN_RELEASE_SHA256_AMD64}" ;; \

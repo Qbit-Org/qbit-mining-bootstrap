@@ -396,9 +396,7 @@ async fn seed_window(ledger: &Ledger, shares: &[AcceptedShare]) -> Result<()> {
 /// whole-coinbase-to-the-finder outcome.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn accepted_shares_below_the_2xx_readiness_gate_still_pay_the_window() -> Result<()> {
-    let Some(url) =
-        database_url("accepted_shares_below_the_2xx_readiness_gate_still_pay_the_window")?
-    else {
+    let Some(url) = database_url()? else {
         return Ok(());
     };
     let _serial = TEST_LOCK.lock().await;
@@ -467,8 +465,7 @@ async fn accepted_shares_below_the_2xx_readiness_gate_still_pay_the_window() -> 
 /// restored gate of two or more distinct miners would pay the solver instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_single_share_from_another_miner_takes_the_whole_coinbase() -> Result<()> {
-    let Some(url) = database_url("a_single_share_from_another_miner_takes_the_whole_coinbase")?
-    else {
+    let Some(url) = database_url()? else {
         return Ok(());
     };
     let _serial = TEST_LOCK.lock().await;
@@ -544,9 +541,7 @@ async fn a_single_share_from_another_miner_takes_the_whole_coinbase() -> Result<
 /// `bootstrap-share` that pays them the whole coinbase.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_empty_ledger_pays_the_solver_through_a_synthetic_bootstrap_share() -> Result<()> {
-    let Some(url) =
-        database_url("an_empty_ledger_pays_the_solver_through_a_synthetic_bootstrap_share")?
-    else {
+    let Some(url) = database_url()? else {
         return Ok(());
     };
     let _serial = TEST_LOCK.lock().await;
@@ -587,7 +582,7 @@ async fn an_empty_ledger_pays_the_solver_through_a_synthetic_bootstrap_share() -
 /// the bootstrap bundle, so the account is paid out of this block.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_bootstrap_block_still_pays_carried_forward_balances() -> Result<()> {
-    let Some(url) = database_url("a_bootstrap_block_still_pays_carried_forward_balances")? else {
+    let Some(url) = database_url()? else {
         return Ok(());
     };
     let _serial = TEST_LOCK.lock().await;

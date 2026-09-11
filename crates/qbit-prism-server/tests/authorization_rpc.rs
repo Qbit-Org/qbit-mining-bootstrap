@@ -2,6 +2,7 @@
 //! configuration is isolated in a child process; no parallel test mutates env.
 use anyhow::{bail, ensure, Context, Result};
 use qbit_prism_server::{config::Config, coordinator::Coordinator, stratum::MiningBackend};
+use qbit_prism_test_gate as gate;
 use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
@@ -264,8 +265,7 @@ async fn verify_authorization(coordinator: &Coordinator, node: &Node) -> Result<
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authorization_fallback_requires_a_definitive_address_result() -> Result<()> {
     if std::env::var_os("PRISM_AUTHORIZATION_TEST_CHILD").is_none() {
-        let Ok(database_url) = std::env::var("PRISM_TEST_DATABASE_URL") else {
-            eprintln!("skipping authorization RPC integration; set PRISM_TEST_DATABASE_URL");
+        let Some(database_url) = gate::database_url(gate::site!())? else {
             return Ok(());
         };
         let output = std::process::Command::new(std::env::current_exe()?)

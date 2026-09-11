@@ -128,8 +128,13 @@ PRISM_TEST_PG_BIN_DIR=/usr/lib/postgresql/16/bin \
 Database tests use isolated schemas. The shell wrapper uses
 `PRISM_TEST_DATABASE_URL` or starts a private PostgreSQL cluster with installed
 server tools. Live regtest requires `QBITD_BIN` and exercises two native
-instances, real RPC/block validation, and constrained CPU miners. The CI database
-job runs the native package against PostgreSQL.
+instances, real RPC/block validation, and constrained CPU miners. Every test
+that needs one of these inputs takes it through the shared integration gate,
+which skips with a prefixed line when the input is absent and fails instead
+under `PRISM_TEST_REQUIRE_INTEGRATION=1`; the CI database job sets that switch,
+runs the whole workspace against PostgreSQL, and proves from the gate's
+manifest that every gated test executed. See
+[the integration test gate](../../docs/prism-integration-test-gate.md).
 
 The [subscription admission reference](../../docs/prism-b4-stratum-admission.md)
 describes lazy session-ID allocation, failure behavior and its explicit
