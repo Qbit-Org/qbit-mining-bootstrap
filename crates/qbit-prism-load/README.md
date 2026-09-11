@@ -81,7 +81,11 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--reconnect-target` | 12 | Completed reconnects to drive; the artifact needs at least 10 |
 | `--slow-db-delay-ms` | 10 | One-way per-chunk proxy delay; the artifact phase needs at least 10 |
 | `--mid-flight-kill` | off | SIGKILL a frontend with submits outstanding, in a side phase. That phase runs under the same proxy delay as `slow_database` and the kill waits for the target frontend to actually hold work, because with no delay an acknowledgement takes a few milliseconds and the scenario would quietly not happen. The report carries `submits_outstanding_at_kill`, and zero there means it did not exercise |
-| `--scheduled-blocks` | 0 | Own blocks to find and submit during `steady_state`. Each one bumps the payout revision, so expect a burst of `new payout work is pending` on every frontend afterwards |
+| `--scheduled-blocks` | 0 | Own blocks to find and submit during `steady_state`. Each one bumps the payout revision, so expect a burst of rebuild-pending rejections on every frontend afterwards. With `--cadence dense` this is instead the dense phase's landing budget, and `steady_state` schedules none |
+| `--cadence` | `none` | `none`, or `dense` for the dense-cadence side phase (#271 criterion 6) |
+| `--cadence-seconds` | 240 | Length of the `dense_cadence` phase |
+| `--cadence-rate` | the steady-state rate | Offered shares per second during `dense_cadence` |
+| `--cadence-gaps` | `9,19,9,18,20` | Seconds between own-block landings, repeated cyclically. Every gap must be finite and at least 5 s, and the pattern must place at least 10 landings in the phase, or the run is refused at entry |
 | `--external-tips` | 3 | Tips minted during warm-up, for time to usable work. They need a warm-up phase: with `--warmup-seconds 0` none is minted and the time-to-usable-work section is empty rather than zero |
 | `--work-timeout` | 120 | Seconds to wait for frontends to serve work |
 | `--forecast-peak-shares-per-second` | 2000 | D1's forecast; the validator's gate is twice this |
@@ -103,10 +107,140 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 3. **`burst`**, 2,000 shares/s for 60 s. Side report only.
 4. **`reconnect`**, at least 60 s with at least 10 completed reconnects.
 5. **`slow_database`**, at least 60 s at a delay of at least 10 ms.
-6. **`mid_flight_kill`**, only with `--mid-flight-kill`. Side report only.
+6. **`dense_cadence`**, only with `--cadence dense`. Side report only.
+7. **`mid_flight_kill`**, only with `--mid-flight-kill`. Side report only.
 
 The artifact's phases are exactly `steady_state`, `reconnect` and
-`slow_database`.
+`slow_database`. Adding `--cadence dense` does not change any of them.
+
+## The dense-cadence scenario
+
+`--cadence dense` adds a side phase, `dense_cadence`, that lands own blocks on
+the shape #224 recorded — an accepted-candidate minimum interarrival of about
+9.14 s, 35 accepted blocks in the trailing hour, and repeated pairs about
+18–20 s apart — and reports, for every payout-revision bump, how long each
+frontend rejects shares with `new payout work is pending` and how many shares
+it rejects before it serves work at the new revision. That number is the budget
+#291's soak should hold itself to.
+
+It runs after `slow_database`, with **no proxy delay**: the measurement is the
+frontends' rebuild latency, and a delayed database would drown it out. It is
+not part of the capacity-evidence artifact.
+
+### The schedule
+
+Landings follow `--cadence-gaps`, repeated cyclically. The first is at 5 s into
+the phase, and a landing is only placed if 15 s still fit after it, so the last
+landing's windows are measured inside the phase rather than truncated by its
+end. At the default gaps a 240 s phase holds 15 landings; a phase shorter than
+170 s cannot hold ten and is refused at entry.
+
+Each landing uses the same `Control::ScheduledBlock` path a
+`--scheduled-blocks` run uses: the harness asks one session to search its
+current job for a network-target solution (about 131,000 hashes) and submit it,
+the frontend appends the share together with a candidate, and the candidate
+worker calls `submitblock`. Landings rotate across sessions, so no single
+frontend has an early view of its own block. A landing the session could not
+produce, one the frontend rejected, and one the node rejected each get their own
+entry and are counted; none is dropped.
+
+### Where the bumps come from
+
+`payout_revision` lives in the singleton `qbit_prism_cluster` row, which is
+what `Ledger::payout_revision()` reads. The harness samples
+
+```sql
+SELECT payout_revision, clock_timestamp() FROM qbit_prism_cluster WHERE singleton
+```
+
+every 25 ms on its side pool — outside the frontends' path and outside the
+delay proxy — and records every change with the server's `clock_timestamp()`
+and its own monotonic clock. That is the authoritative list of bumps; nothing
+is inferred from a rejection.
+
+One landing can cause more than one bump, and the report says how many rather
+than assuming. Two bumps inside one 25 ms interval appear as a single change
+with `revision_delta` above 1, which is reported as such.
+
+A bump is attributed to the landing whose pool tip change it follows and which
+the next landing has not yet replaced. Anything else is `unattributed`, with
+its cause recorded as unknown.
+
+### The two windows are reported apart
+
+`coordinator.rs` checks the observed tip before it checks the payout revision,
+so a landing produces `new tip work is pending` first, and
+`new payout work is pending` only when the revision moves again after that
+frontend has rebuilt. The report therefore carries three windows per landing
+and frontend:
+
+- the **tip-pending window**: first and last `new tip work is pending`, the
+  count, and last minus first;
+- the **payout-pending window**: the same for `new payout work is pending`;
+- the **combined rebuild-pending window**: first to last of either, with both
+  counts summed. This is the one #291 should budget against.
+
+A rejection is stamped when the client read the response line, which is the
+only instant the harness observed directly.
+
+### Time to new-tip work and time to new-revision work
+
+**Time to new-tip work** is the run's usual definition, restricted to one
+frontend's sessions: the first `mining.notify` whose prevhash resolves to the
+landing's tip, measured from the fake node's tip stamp. The whole-phase view
+over every session is in the same section, through the harness's own
+`time_to_usable_work`.
+
+**Time to new-revision work is an approximation, and is labelled as one.**
+`mining.notify` carries no payout revision, so the first notify with
+`clean_jobs=true` at or after the bump stands in for the first job built at the
+new revision. `clean_jobs` is set when the parent *or* the payout revision
+differs from the session's last job (`stratum.rs`, `deliver_job`), so inside a
+landing's window — after the new tip has already been served — it is the
+rebuild at the new revision. The bump it is measured from is the last bump
+attributed to the landing: the revision a frontend has to reach before it stops
+answering `new payout work is pending`.
+
+`rejected_before_new_revision_work` counts the rebuild-pending rejections a
+frontend returned between the landing and the earliest new-revision work on any
+of its sessions. It is `null`, with a reason, when there was no bump or no such
+job.
+
+### Lost valid work
+
+Every rebuild-pending rejection is a share the client had already proven
+against the share target, so each one is miner work the pool discarded. None of
+them is persisted, so none is a durability finding — and the report checks that
+against this run's committed share identifiers rather than asserting it
+(`lost_valid_shares_found_in_postgres`, which must be 0).
+
+### Honest output
+
+- No landing — `--scheduled-blocks 0`, a pattern that places none, or every
+  scheduled block failing — reports `landings: 0` and `bumps: 0` with the
+  reason and no windows. No percentile is invented; the budget proposal is
+  `null`.
+- A sampler that could not read the revision reports its error count and its
+  first error, and marks itself `blind`, so an empty bump list is never read as
+  "no bumps happened".
+- A frontend that restarted or died during the phase is reported, and its
+  windows are marked `incomplete` with the reason. The last landing's window is
+  marked `span_truncated_at_phase_end`.
+- Every rebuild-pending rejection and every bump belongs to exactly one landing
+  or to `unattributed`; the counts are reconciled in
+  `rejection_attribution` and `bump_attribution`.
+
+### Running it
+
+```sh
+target/release/qbit-prism-load \
+  --server-bin target/release/qbit-prism-server \
+  --pg-bin-dir /usr/lib/postgresql/16/bin \
+  --frontends 2 --sessions 100 --window-shares 20000 \
+  --replication async --plan short --rate 50 \
+  --cadence dense --scheduled-blocks 12 \
+  --out load-out
+```
 
 ## Exit codes
 
@@ -152,6 +286,12 @@ reconciliation definition and results, rejections by `(code, reason_id,
 message)` per phase and frontend, reconnect statistics, time to usable work,
 the mid-flight-kill census, blocked-run records, the honest-value notes, the
 validator verdict and the exact `capacity-evidence` command line.
+
+The `dense_cadence` key is added by `--cadence dense` and holds the gap
+pattern, the landing list, the bump list on both clocks, the per-landing and
+per-frontend window tables, the run summaries and a `definitions` block stating
+exactly how each window and time is measured and on which clock. It is
+additive: every other key keeps its shape, and the artifact is untouched.
 
 ### 4. Logs
 
@@ -355,5 +495,8 @@ digest canonicalisation, the window arithmetic, the fake node's chainwork,
 height map, `submitblock` parent check and `waitfornewblock` wake-up, that the
 frontend environment carries all 16 configuration keys, that the artifact
 builder's output passes `validate_capacity_evidence` and fails once one
-required field or one phase is removed, the rejection classifier, and the
-blocked-log classifier against the real refusal message.
+required field or one phase is removed, the rejection classifier, the
+blocked-log classifier against the real refusal message, the dense-cadence gap
+generator and its entry validation, the attribution of synthetic rejections and
+bumps to landings (including the unattributed ones), and the no-landing
+report.
