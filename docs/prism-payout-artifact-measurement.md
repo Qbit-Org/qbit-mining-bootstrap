@@ -458,6 +458,16 @@ refresh, refused at 200,000, keeps 50,000 and 100,000:
 | import | 494,919,351 B | 498,733,206 B | 0.76% |
 | landing | 233,066,529 B | 236,373,666 B | 1.40% |
 
+### After #265's import change
+
+The baseline above predates #265, whose import stores the canonical audit
+bytes instead of an inline JSONB body. With that change, at 400,000 shares the
+import writes no JSONB value: it ran in 129.5 s with 18.7 MB of WAL, and
+`canonical_audit_bytes` holds 445,390,610 B (bytea, reported only). The ratchet
+holds with three known violations. This run was measured on a different host
+from the baseline (Apple M-series, debug build, PostgreSQL 16), so compare its
+timings with the tables above only loosely.
+
 ### Fixture
 
 The window is loaded by `crates/qbit-prism-server/tests/support/window_fixture.rs`

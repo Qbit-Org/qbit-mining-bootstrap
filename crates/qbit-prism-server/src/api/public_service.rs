@@ -343,11 +343,8 @@ fn numeric(value: &Value) -> Option<f64> {
         .filter(|n| n.is_finite())
 }
 
-pub fn router(mut state: ApiState, config: ServiceConfig) -> (Router, Arc<ServiceState>) {
-    state.public_pool = read_pool(
-        state.pool.connect_options().as_ref().clone(),
-        config.read_concurrency,
-    );
+pub fn router(state: ApiState, config: ServiceConfig) -> (Router, Arc<ServiceState>) {
+    let mut state = state.with_read_concurrency(config.read_concurrency);
     let service = Arc::new(ServiceState {
         config,
         pool: state.public_pool.clone(),
