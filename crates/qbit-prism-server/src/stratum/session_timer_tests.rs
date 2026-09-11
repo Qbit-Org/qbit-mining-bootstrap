@@ -60,6 +60,7 @@ impl LiveSession {
             config.clone(),
             backend.fixture.coordinator.refresh.subscribe(),
             receiver,
+            Arc::new(crate::metrics::Metrics::default()),
         ));
         Self {
             backend,

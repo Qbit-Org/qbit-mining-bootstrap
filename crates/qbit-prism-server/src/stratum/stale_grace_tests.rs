@@ -197,6 +197,8 @@ impl Connection {
             &mut self.writer,
             &self.config,
             input,
+            tokio::time::Instant::now(),
+            &crate::metrics::Metrics::default(),
         )
         .await
         .unwrap();

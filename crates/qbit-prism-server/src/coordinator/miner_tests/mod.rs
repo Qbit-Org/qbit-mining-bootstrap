@@ -180,6 +180,7 @@ impl Fixture {
         });
         let (refresh, _) = watch::channel(1);
         let coordinator = Arc::new(Coordinator {
+            metrics: Arc::new(crate::metrics::Metrics::default()),
             rpc: Rpc::new(url, "test".into(), "test".into(), Duration::from_secs(5)).unwrap(),
             config: Arc::new(config),
             ledger,

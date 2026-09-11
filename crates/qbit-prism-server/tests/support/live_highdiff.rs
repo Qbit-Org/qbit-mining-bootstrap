@@ -496,7 +496,9 @@ async fn observability_grace_counter_moves_only_after_real_durable_credit() -> R
         });
         let normal = proofs.next().context("no normal regtest proof")?;
         let grace = proofs.next().context("no grace regtest proof")?;
-        coordinator.submit(&worker, &job, normal, false).await?;
+        coordinator
+            .submit(&worker, &job, normal, false.into())
+            .await?;
         ensure!(
             metrics
                 .render()
@@ -510,7 +512,7 @@ async fn observability_grace_counter_moves_only_after_real_durable_credit() -> R
         coordinator.refresh_once().await?;
         let share_id = format!("{}:{}", worker.username, grace.block_hash_hex);
         coordinator
-            .submit(&worker, &job, grace.clone(), true)
+            .submit(&worker, &job, grace.clone(), true.into())
             .await?;
         let policy: Option<String> =
             sqlx::query_scalar("SELECT credit_policy FROM qbit_share_ledger WHERE share_id=$1")
@@ -529,7 +531,7 @@ async fn observability_grace_counter_moves_only_after_real_durable_credit() -> R
             "durable grace hook did not move"
         );
         let duplicate = coordinator
-            .submit(&worker, &job, grace, true)
+            .submit(&worker, &job, grace, true.into())
             .await
             .unwrap_err();
         ensure!(
