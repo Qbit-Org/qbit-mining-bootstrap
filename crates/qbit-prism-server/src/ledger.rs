@@ -34,10 +34,10 @@ mod migration;
 mod window;
 pub use difficulty::WorkerDifficulty;
 pub use window::CommitGateClosed;
-use window::{read_prior_balances, share_from_row};
 pub use window::{
     AppendResult, BalanceSource, PayoutState, ShareRange, Snapshot, Window, WindowError, WindowRef,
 };
+use window::{read_prior_balances, share_from_row};
 
 const MIGRATION_LOCK: i64 = 0x505249534d000001;
 const ORDER_LOCK: i64 = 0x505249534d000002;
@@ -49,4 +49,10 @@ pub struct Ledger {
     pub pool: PgPool,
     pub instance_id: String,
     session_owner: std::sync::Arc<connect::SessionOwner>,
+    /// The cluster fingerprint [`Ledger::configure`] pinned or verified, read
+    /// back through [`Ledger::config_fingerprint`]. Shared across clones, so
+    /// every handle to one frontend's ledger sees the same pinned value: the
+    /// writer fence re-reads `qbit_prism_cluster.config_fingerprint` `FOR
+    /// SHARE` in its own transaction and compares it against this.
+    config_fingerprint: std::sync::Arc<std::sync::OnceLock<String>>,
 }
