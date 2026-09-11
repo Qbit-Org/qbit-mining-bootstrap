@@ -111,6 +111,25 @@ impl HighdiffClient {
         }
     }
 
+    async fn wait_for_parent(&mut self, parent: &str) -> Result<()> {
+        let mut wire_parent = hex::decode(parent)?;
+        wire_parent.reverse();
+        let (words, _) = wire_parent.as_chunks_mut::<4>();
+        for word in words {
+            word.reverse();
+        }
+        let expected = hex::encode(wire_parent);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while self.notify["params"][1].as_str() != Some(expected.as_str()) {
+                self.read().await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("replacement parent was not delivered")??;
+        Ok(())
+    }
+
     fn solve(&self, id: u64, future_time: bool) -> Result<(Value, String, u128)> {
         let params = self.notify["params"].as_array().context("notify missing")?;
         let field = |index: usize| params[index].as_str().context("invalid notify field");
@@ -211,6 +230,10 @@ async fn real_highdiff_block_only_proof_waits_for_active_chain_credit() -> Resul
         // A valid PoW with an invalid future timestamp reaches submitblock,
         // whose terminal rejection must produce no accepted share or ACK.
         let mut miner=HighdiffClient::open(&fixture,1).await?;
+        // A new connection may legitimately receive still-published work
+        // during the replacement lease. To exercise node timestamp rejection,
+        // first receive work that actually builds on the just-confirmed block.
+        miner.wait_for_parent(&block_hash).await?;
         let (request,rejected_hash,_)=miner.solve(11,true)?;
         miner.send(request).await?;
         let response=tokio::time::timeout(Duration::from_secs(15),miner.response(11)).await??;
@@ -328,7 +351,7 @@ async fn real_share_height_queries_use_template_parent_height() -> Result<()> {
             bundle: std::sync::Arc::new(bundle),
         });
         let rejected = coordinator
-            .submit(&worker, &malformed, submission.clone(), false)
+            .submit(&worker, &malformed, submission.clone(), false.into())
             .await
             .err()
             .context("zero candidate height accepted")?;
@@ -337,7 +360,9 @@ async fn real_share_height_queries_use_template_parent_height() -> Result<()> {
             "wrong invalid-height error: {rejected}"
         );
         let share_id = format!("{}:{}", worker.username, submission.block_hash_hex);
-        coordinator.submit(&worker, &job, submission, false).await?;
+        coordinator
+            .submit(&worker, &job, submission, false.into())
+            .await?;
         assert_share_height_boundary(&fixture, &share_id, candidate_height).await?;
         coordinator.ledger.pool.close().await;
         Ok::<_, anyhow::Error>(())
@@ -361,6 +386,8 @@ fn direct_coordinator_config(fixture: &Fixture) -> Result<qbit_prism_server::con
         expected_genesis_hash: None,
         min_peers: 1,
         template_max_age: Duration::from_secs(120),
+        submit_tip_max_age: Duration::from_secs(10),
+        template_refresh_failure_exit: Duration::from_secs(120),
         rpc_url: format!("http://127.0.0.1:{}/", fixture.rpc_port),
         rpc_user: "prismtest".into(),
         rpc_password: "prismtest".into(),
@@ -416,15 +443,15 @@ async fn observed_tip_advance_fences_old_prepared_jobs_and_health() -> Result<()
         // This is the state between observing a validated new tip and
         // successfully building/publishing its payout work. A failed builder
         // must not leave the older immutable prepared object authoritative.
-        *coordinator.observed_tip.write().await=Some("fe".repeat(32));
+        *coordinator.observed_tip.write().await=qbit_prism_server::coordinator::TipState::baseline("fe".repeat(32));
         ensure!(coordinator.health().await["ready"]==false,"stale prepared work remained healthy after tip observation");
         ensure!(coordinator.build_job(&worker,&format!("{session:08x}"),1e-9,0.0).await.is_err(),"new miner received work for superseded observed tip");
         ensure!(coordinator.resume_job(&worker,&job.wire.job_id).await.is_err(),"reconnect restored work while new observed tip was pending");
-        let rejected=coordinator.submit(&worker,&job,submission,false).await.err().context("old share was accepted while new tip publication was pending")?;
+        let rejected=coordinator.submit(&worker,&job,submission, false.into()).await.err().context("old share was accepted while new tip publication was pending")?;
         ensure!(rejected.reason_id.as_deref()==Some("stale-job"),"wrong stale tip rejection: {rejected}");
         let credits:i64=sqlx::query_scalar("SELECT count(*) FROM qbit_share_ledger WHERE accepted").fetch_one(&fixture.pool).await?;
         ensure!(credits==0,"untrusted cached job inflated share accounting");
-        *coordinator.observed_tip.write().await=Some(original);
+        *coordinator.observed_tip.write().await=qbit_prism_server::coordinator::TipState::baseline(original);
         ensure!(coordinator.health().await["ready"]==true,"restoring tip authority did not restore health");
         coordinator.ledger.pool.close().await;
         eprintln!("observed-tip regression: health, new jobs, resume and submitted shares all fenced during unpublished tip transition");
@@ -470,7 +497,9 @@ async fn observability_grace_counter_moves_only_after_real_durable_credit() -> R
         });
         let normal = proofs.next().context("no normal regtest proof")?;
         let grace = proofs.next().context("no grace regtest proof")?;
-        coordinator.submit(&worker, &job, normal, false).await?;
+        coordinator
+            .submit(&worker, &job, normal, false.into())
+            .await?;
         ensure!(
             metrics
                 .render()
@@ -484,7 +513,7 @@ async fn observability_grace_counter_moves_only_after_real_durable_credit() -> R
         coordinator.refresh_once().await?;
         let share_id = format!("{}:{}", worker.username, grace.block_hash_hex);
         coordinator
-            .submit(&worker, &job, grace.clone(), true)
+            .submit(&worker, &job, grace.clone(), true.into())
             .await?;
         let policy: Option<String> =
             sqlx::query_scalar("SELECT credit_policy FROM qbit_share_ledger WHERE share_id=$1")
@@ -503,7 +532,7 @@ async fn observability_grace_counter_moves_only_after_real_durable_credit() -> R
             "durable grace hook did not move"
         );
         let duplicate = coordinator
-            .submit(&worker, &job, grace, true)
+            .submit(&worker, &job, grace, true.into())
             .await
             .unwrap_err();
         ensure!(

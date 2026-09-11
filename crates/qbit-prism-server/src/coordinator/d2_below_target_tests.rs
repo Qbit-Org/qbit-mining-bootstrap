@@ -636,7 +636,9 @@ async fn solve(fixture: &Fixture, case: &Value) -> Result<Solved> {
     let submit = {
         let coordinator = fixture.coordinator.clone();
         let worker = worker.clone();
-        async move { MiningBackend::submit(&*coordinator, &worker, &job, submission, false).await }
+        async move {
+            MiningBackend::submit(&*coordinator, &worker, &job, submission, false.into()).await
+        }
     };
     Ok(Solved {
         share_id,
