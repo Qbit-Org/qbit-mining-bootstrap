@@ -1,6 +1,7 @@
 //! Bounded, concurrent Stratum v1 connections on Tokio's multithread runtime.
 use crate::{
     codec::{self, Job, Submission},
+    ledger::SessionId,
     vardiff::{password_difficulties, Vardiff, VardiffConfig},
 };
 use anyhow::{ensure, Context, Result};
@@ -112,8 +113,9 @@ pub trait MiningBackend: Send + Sync + 'static {
     ) -> impl Future<Output = Result<()>> + Send {
         async { Ok(()) }
     }
-    fn new_session_id(&self)
-        -> impl Future<Output = std::result::Result<u32, StratumError>> + Send;
+    fn new_session_id(
+        &self,
+    ) -> impl Future<Output = std::result::Result<SessionId, StratumError>> + Send;
     fn authorize(
         &self,
         username: &str,
@@ -626,6 +628,7 @@ struct IssuedJob<C> {
 struct Session<C> {
     worker: Option<Worker>,
     extranonce1: Option<String>,
+    _session_id: Option<SessionId>,
     miner_version_mask: Option<u32>,
     advertised_version_mask: u32,
     difficulty: f64,
@@ -649,6 +652,7 @@ impl<C> Session<C> {
         Self {
             worker: None,
             extranonce1: None,
+            _session_id: None,
             miner_version_mask: None,
             advertised_version_mask: 0,
             difficulty: config
@@ -1014,6 +1018,7 @@ async fn request<B: MiningBackend>(
                     // Requests are serial within a session. Publish only a
                     // successful allocation; later subscribes reuse this ID.
                     session.extranonce1 = Some(format!("{id:08x}"));
+                    session._session_id = Some(id);
                 }
                 result(
                     writer,

@@ -172,12 +172,12 @@ impl Fixture {
         let store = Arc::new(MemoryLedger::default());
         let mut config = config::test_config();
         config.submit_tip_max_age = max_age;
-        let ledger = Arc::new(Ledger {
-            pool: sqlx::postgres::PgPoolOptions::new()
+        let ledger = Arc::new(Ledger::offline_for_tests(
+            sqlx::postgres::PgPoolOptions::new()
                 .connect_lazy("postgresql://unused@127.0.0.1:1/unused")
                 .unwrap(),
-            instance_id: "offline-decisions".into(),
-        });
+            "offline-decisions".into(),
+        ));
         let (refresh, _) = watch::channel(1);
         let coordinator = Arc::new(Coordinator {
             metrics: Arc::new(crate::metrics::Metrics::default()),

@@ -54,7 +54,7 @@ async fn legacy_2x_upgrade_repairs_partial_carry_seed_and_preserves_shared_state
         )
         .fetch_all(&pool)
         .await?,
-        vec![2, 3, 4, 5, 8]
+        vec![2, 3, 4, 5, 8, 9]
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT last_share_seq FROM qbit_hashrate_rollup_progress")
