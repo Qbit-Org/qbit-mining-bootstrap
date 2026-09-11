@@ -965,6 +965,137 @@ fn the_blocked_log_classifier_recognises_the_real_refusal_messages() {
 
 // --- small helpers --------------------------------------------------------
 
+fn submit_record(
+    phase: &str,
+    outcome: qbit_prism_load::client::Outcome,
+) -> qbit_prism_load::client::SubmitRecord {
+    qbit_prism_load::client::SubmitRecord {
+        share_id: format!("pload1abc.s00001:{}", "0".repeat(64)),
+        session: 1,
+        frontend: 0,
+        phase: phase.to_owned(),
+        job_id: "job-1".into(),
+        sent: std::time::Instant::now(),
+        responded: None,
+        latency_millis: Some(16_000.0),
+        outcome,
+        scheduled_block: false,
+        reoffer: false,
+        header_hex: String::new(),
+        extranonce2_hex: String::new(),
+        ntime_hex: String::new(),
+        nonce_hex: String::new(),
+    }
+}
+
+#[test]
+fn a_committed_share_is_a_divergence_only_when_a_confirmation_failure_explains_it() {
+    use qbit_prism_load::client::Outcome;
+    use qbit_prism_load::run::GapKind;
+    let divergence = submit_record(
+        "slow_database",
+        Outcome::Rejected(rejection(
+            20,
+            Some(classify::LEDGER_CONFIRMATION_FAILED),
+            classify::NOT_CONFIRMED_BY_DATABASE,
+        )),
+    );
+    assert_eq!(
+        run::classify_committed_gap(Some(&divergence)),
+        GapKind::AckCommitDivergence
+    );
+    // Every other explanation, and no explanation at all, is a loss.
+    for outcome in [
+        Outcome::Accepted,
+        Outcome::NoResponse {
+            reason: "socket closed".into(),
+        },
+        Outcome::Rejected(rejection(
+            20,
+            Some("backend-rpc-unavailable"),
+            "current chain state is unavailable",
+        )),
+        Outcome::Rejected(rejection(
+            21,
+            Some("stale-job"),
+            classify::NEW_TIP_WORK_PENDING,
+        )),
+    ] {
+        let record = submit_record("slow_database", outcome);
+        assert_eq!(
+            run::classify_committed_gap(Some(&record)),
+            GapKind::DurabilityLoss,
+            "{:?} must not be read as a divergence",
+            record.outcome
+        );
+    }
+    assert_eq!(
+        run::classify_committed_gap(None),
+        GapKind::DurabilityLoss,
+        "a committed row the harness never offered is a loss, not a divergence"
+    );
+}
+
+#[test]
+fn only_entitled_races_are_kept_out_of_the_offered_set() {
+    use qbit_prism_load::client::Outcome;
+    let mut records = Vec::new();
+    let mut push = |id: &str, outcome: Outcome| {
+        let mut record = submit_record("steady_state", outcome);
+        record.share_id = id.to_owned();
+        records.push(record);
+    };
+    push("accepted", Outcome::Accepted);
+    push(
+        "expected",
+        Outcome::Rejected(rejection(
+            21,
+            Some("stale-job"),
+            classify::NEW_TIP_WORK_PENDING,
+        )),
+    );
+    push(
+        "backend",
+        Outcome::Rejected(rejection(
+            20,
+            Some(classify::LEDGER_CONFIRMATION_FAILED),
+            classify::NOT_CONFIRMED_BY_DATABASE,
+        )),
+    );
+    push(
+        "bug",
+        Outcome::Rejected(rejection(
+            23,
+            Some("low-difficulty"),
+            "low difficulty share",
+        )),
+    );
+    push(
+        "lost",
+        Outcome::NoResponse {
+            reason: "socket closed".into(),
+        },
+    );
+    push("other_phase", Outcome::Accepted);
+    records.last_mut().unwrap().phase = "reconnect".into();
+
+    let (offered, acknowledged) = run::offered_and_acknowledged(&records, "steady_state");
+    assert_eq!(
+        offered.iter().map(String::as_str).collect::<Vec<_>>(),
+        vec!["accepted", "backend", "bug", "lost"],
+        "only the entitled race is excluded, and only this phase is counted"
+    );
+    assert_eq!(
+        acknowledged.iter().map(String::as_str).collect::<Vec<_>>(),
+        vec!["accepted"]
+    );
+    // A re-offer is never an offer of its own.
+    let mut with_reoffer = records.clone();
+    with_reoffer[0].reoffer = true;
+    let (offered, _) = run::offered_and_acknowledged(&with_reoffer, "steady_state");
+    assert!(!offered.contains("accepted"));
+}
+
 #[test]
 fn the_two_reconciliation_gaps_have_distinct_exit_codes() {
     // A loss and a divergence are different failures, and neither may be

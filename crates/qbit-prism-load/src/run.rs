@@ -1422,7 +1422,7 @@ fn rejected_valid_count(records: &[SubmitRecord], phase: &str) -> u64 {
 /// to lose is not an offered valid share: it never reaches PostgreSQL, and the
 /// full census is in the side report. Everything else the harness offered and
 /// did not get acknowledged stays in O, so the artifact cannot hide it.
-fn offered_and_acknowledged(
+pub fn offered_and_acknowledged(
     records: &[SubmitRecord],
     phase: &str,
 ) -> (BTreeSet<String>, BTreeSet<String>) {
@@ -1674,6 +1674,32 @@ fn phase_report(
 /// not a loss: the append committed after the commit deadline had already
 /// answered the miner. They are reported separately because only the first
 /// means a miner's credited work disappeared.
+/// Which of the two failures a committed-but-unacknowledged share is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GapKind {
+    /// PostgreSQL holds it, and the server had already refused it with
+    /// `ledger-confirmation-failed`. Nothing was lost.
+    AckCommitDivergence,
+    /// PostgreSQL holds it and nothing explains why no acknowledgement
+    /// covers it.
+    DurabilityLoss,
+}
+
+/// Decide from the submit record the harness has, if any.
+pub fn classify_committed_gap(record: Option<&SubmitRecord>) -> GapKind {
+    let confirmation_failure = record
+        .and_then(|record| match &record.outcome {
+            Outcome::Rejected(rejection) => Some(rejection),
+            _ => None,
+        })
+        .is_some_and(classify::is_confirmation_failure);
+    if confirmation_failure {
+        GapKind::AckCommitDivergence
+    } else {
+        GapKind::DurabilityLoss
+    }
+}
+
 fn classify_gaps(
     runs: &[PhaseRun],
     reconciliations: &[(String, digest::Reconciliation)],
@@ -1722,23 +1748,23 @@ fn classify_gaps(
                 Outcome::Rejected(rejection) => Some(rejection),
                 _ => None,
             });
-            match rejection.filter(|rejection| classify::is_confirmation_failure(rejection)) {
-                Some(rejection) => divergences.push(json!({
+            match classify_committed_gap(record) {
+                GapKind::AckCommitDivergence => divergences.push(json!({
                     "share_id": share,
                     "phase": phase.plan.name,
                     "frontend": record.map(|record| record.frontend),
                     "session": record.map(|record| record.session),
                     "job_id": record.map(|record| record.job_id.clone()),
-                    "code": rejection.code,
-                    "reason_id": rejection.reason_id,
-                    "message": rejection.message,
+                    "code": rejection.map(|r| r.code),
+                    "reason_id": rejection.and_then(|r| r.reason_id.clone()),
+                    "message": rejection.map(|r| r.message.clone()),
                     "send_to_response_milliseconds": record.and_then(|r| r.latency_millis),
                     "share_commit_timeout_milliseconds": share_commit_timeout_seconds * 1000.0,
                     "response_after_commit_deadline": record
                         .and_then(|r| r.latency_millis)
                         .map(|latency| latency >= share_commit_timeout_seconds * 1000.0),
                 })),
-                None => unexplained.push(share.clone()),
+                GapKind::DurabilityLoss => unexplained.push(share.clone()),
             }
         }
         if !unexplained.is_empty() {
