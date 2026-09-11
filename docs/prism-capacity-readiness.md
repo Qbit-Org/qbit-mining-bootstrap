@@ -331,10 +331,14 @@ runs from the first sample and includes a sample taken exactly one hour after
 it, as it did in the Python tool; only later samples are judged against the
 bound. The command prints the baseline, the bound, the post-warm-up peak and
 its time, and the first breach time, and exits `0` on pass, `1` on fail, `2`
-on unusable input; it refuses a series shorter than the soak. The slope guard
-the Python tool offered (a leak slow enough to stay under the multiple inside
-24 hours) has no replacement in the runbook; take it from the RSS series on
-the deployment's dashboard, whose rules #279 owns.
+on unusable input. The span floor is the Python tool's default:
+`min_span=82800` refuses a series that spans less than 23 hours from its first
+sample to its last, not one shorter than the soak. The tool's source recorded
+the hour of slack as tolerance for a late first sample; the run itself is
+still the 24 h that step 2 below asks for. The slope guard the Python tool
+offered (a leak slow enough to stay under the multiple inside 24 hours) has no
+replacement in the runbook; take it from the RSS series on the deployment's
+dashboard, whose rules #279 owns.
 
 When it fails: the first breach time says whether the growth is the steady
 slope (breach hours in) or an excursion (breach right after a candidate storm
