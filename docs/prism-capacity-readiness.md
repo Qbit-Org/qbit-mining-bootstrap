@@ -458,11 +458,14 @@ two-hour cutover soak, which reads its own criteria from the same registry.
      why=$(printf '%s\n' "$metrics" | awk -v rc="$rc" '
        /^x-prism-metrics-state:/ { state = $0 }
        $0 == "x-prism-metrics-state: fresh" { fresh = 1 }
-       /^qbit_prism_process_resident_memory_bytes[ {]/ { rss = 1 }
+       /^qbit_prism_collector_available\{collector="process"\} / { up = $0 }
+       $0 == "qbit_prism_collector_available{collector=\"process\"} 1" { up_ok = 1 }
+       /^qbit_prism_process_resident_memory_bytes[ {]/ { rss = $0; if ($NF ~ /^[0-9]+$/) rss_ok = 1 }
        END {
          if (rc != 0) print "docker exec exited " rc
          else if (!fresh) print (state ? "state header read \"" state "\"" : "no x-prism-metrics-state header")
-         else if (!rss) print "no qbit_prism_process_resident_memory_bytes sample" }')
+         else if (!up_ok) print (up ? "process collector gauge read \"" up "\"" : "no qbit_prism_collector_available{collector=\"process\"} sample")
+         else if (!rss_ok) print (rss ? "RSS gauge read \"" rss "\"" : "no qbit_prism_process_resident_memory_bytes sample") }')
      if [ -n "$why" ]; then
        echo "$(date -u +%FT%TZ): soak invalid, no metrics sample at $now" >&2
        echo "  $why" >&2
@@ -515,15 +518,27 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    that series with a hole at the very interval the RSS series may need
    explained. The response is read into a variable the same way, and the
    filtered lines are appended only when the exec succeeded, the body carries
-   the line `x-prism-metrics-state: fresh`, and the RSS gauge family,
-   `qbit_prism_process_resident_memory_bytes`, the series the reading order
-   starts from, is present; anything else prints the time, the condition
-   that failed (the exit status, the state header actually seen, or the
-   missing family) and the header lines to stderr, and ends the run. The
-   other families in the filter are not required, because a histogram bucket
-   or a `runtime_task_stalled{task}` series can legitimately be absent from a
-   given scrape. The step-2 gate proves the body fresh once, at the start;
-   this check proves it at every sample.
+   the line `x-prism-metrics-state: fresh` and the line
+   `qbit_prism_collector_available{collector="process"} 1`, and the RSS gauge
+   family, `qbit_prism_process_resident_memory_bytes`, the series the reading
+   order starts from, carries a nonnegative integer value; anything else
+   prints the time, the first condition that failed (the exit status, the
+   state header actually seen or its absence, the process collector gauge
+   line actually seen or its absence, or the RSS gauge line actually seen or
+   its absence) and the header lines to stderr, and ends the run. The header
+   alone does not make the RSS value usable: it describes the age of the last
+   snapshot publication, and a fresh snapshot can carry a failed process
+   collection. The collector families are overlaid at scrape time, and when
+   the last successful process collection is absent or older than 30
+   seconds, the server renders the process collector gauge at 0 and
+   `qbit_prism_process_resident_memory_bytes` at `-1` under a header that
+   still says `fresh`. That sample has no RSS value for the reading order to
+   start from, so it is unusable and the run is invalid. The other families
+   in the filter are not required, because a histogram bucket or a
+   `runtime_task_stalled{task}` series can legitimately be absent from a
+   given scrape. The step-2 gate proves the body fresh and the collector
+   publishing once, at the start; this check proves both, and a usable RSS
+   value, at every sample.
 
    `VmRSS` in `/proc/1/status` is the field the registry's process collector
    reads, so the CSV and the gauge agree up to collector cadence. The log also
@@ -549,7 +564,8 @@ two-hour cutover soak, which reads its own criteria from the same registry.
 5. **Trim** is retired with `malloc_trim`; there is nothing to send at hour 23.
 6. **Judge** each run with the `awk` bound check above against
    `soak-rss.csv`. A run whose capture loop stopped on a process change, a
-   missing RSS sample or a metrics scrape that failed or was not fresh is not
+   missing RSS sample or a metrics scrape that failed, was not fresh, had its
+   process collector unavailable or carried no usable RSS value is not
    judged: it is invalid and is run again from step 2.
    Pass: exit `0`, and share-ack p99 at hour 24 within the
    alert threshold configured for the deployment (the native rules are
