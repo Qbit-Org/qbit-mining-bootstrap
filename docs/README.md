@@ -51,6 +51,13 @@ This is useful for reviewers and operators who need implementation detail:
   Stratum-to-Postgres qualification artifact and standalone validator contract.
 - [prism-coordinator-refactor/README.md](prism-coordinator-refactor/README.md):
   historical Python coordinator decomposition and validation evidence.
+- [prism-integration-test-gate.md](prism-integration-test-gate.md): the
+  shared gate every environment-dependent Rust test goes through, its
+  required-mode switch, the execution manifest CI proves against, and how to
+  add a gated test.
+- [prism-deleted-test-map.md](prism-deleted-test-map.md): every 2.x.x test
+  file absent on 3.x.x, grouped by area, with its native replacement or the
+  open issue that closes the gap.
 
 ## Public-Site Guidance
 

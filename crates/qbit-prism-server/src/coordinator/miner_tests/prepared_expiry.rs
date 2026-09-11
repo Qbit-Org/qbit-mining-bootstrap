@@ -85,11 +85,12 @@ async fn fresh_lease_job_resumes_after_original_prepared_deadline() {
     assert_eq!(resumed.wire.share_difficulty, issued.wire.share_difficulty);
     assert_eq!(resumed.wire.version_mask, 0x1fffe000);
     assert_eq!(resumed.context.worker.username, "original.worker");
-    let rows = fixture.store.jobs.lock().unwrap();
-    assert_eq!(rows[&original.storage_key].revision, 0);
-    assert_eq!(rows[&issued.wire.job_id].revision, 7);
-    assert_eq!(rows[&issued.wire.job_id].expires_at_ms, 300_000);
-    drop(rows);
+    {
+        let rows = fixture.store.jobs.lock().unwrap();
+        assert_eq!(rows[&original.storage_key].revision, 0);
+        assert_eq!(rows[&issued.wire.job_id].revision, 7);
+        assert_eq!(rows[&issued.wire.job_id].expires_at_ms, 300_000);
+    }
     fixture.submit(&resumed, false).await.unwrap();
     assert!(
         fixture.store.records.lock().unwrap()[0].1.is_none(),

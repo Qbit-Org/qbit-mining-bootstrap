@@ -100,8 +100,7 @@ impl Drop for PausedWalSender {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn read_only_public_service_tracks_real_standby_stream_and_refuses_promotion() -> Result<()> {
-    let Ok(bin) = std::env::var("PRISM_TEST_PG_BIN_DIR") else {
-        eprintln!("skipping physical public-read replica test; set PRISM_TEST_PG_BIN_DIR");
+    let Some(bin) = gate::pg_bin_dir(gate::site!())? else {
         return Ok(());
     };
     let dir = tempfile::tempdir()?;

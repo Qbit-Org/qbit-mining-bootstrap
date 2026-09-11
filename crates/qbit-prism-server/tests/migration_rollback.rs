@@ -1,11 +1,11 @@
 use anyhow::{ensure, Result};
 use qbit_prism_server::ledger::Ledger;
+use qbit_prism_test_gate as gate;
 use sqlx::PgPool;
 
 #[tokio::test]
 async fn legacy_ordinal_revert_refuses_native_schema_without_removing_columns() -> Result<()> {
-    let Ok(raw) = std::env::var("PRISM_TEST_DATABASE_URL") else {
-        eprintln!("set PRISM_TEST_DATABASE_URL for the native rollback guard test");
+    let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
     let admin = PgPool::connect(&raw).await?;

@@ -7,6 +7,7 @@ use qbit_prism::{
     PayoutPolicy,
 };
 use qbit_prism_server::ledger::{BlockObservation, Candidate, Ledger, Snapshot};
+use qbit_prism_test_gate as gate;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -22,8 +23,7 @@ struct Database {
 }
 impl Database {
     async fn open() -> Result<Option<Self>> {
-        let Ok(raw) = std::env::var("PRISM_TEST_DATABASE_URL") else {
-            eprintln!("skipping PostgreSQL integration test; set PRISM_TEST_DATABASE_URL");
+        let Some(raw) = gate::database_url(gate::site!())? else {
             return Ok(None);
         };
         let admin = PgPool::connect(&raw).await?;

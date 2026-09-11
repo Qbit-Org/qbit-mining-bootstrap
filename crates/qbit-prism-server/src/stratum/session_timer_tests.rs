@@ -207,11 +207,12 @@ async fn mature_session_keeps_newer_retained_work_after_real_resumed_job_expires
         "creditable work keeps its original username permit"
     );
     assert_eq!(live.submit(6, &newer).await["result"], true);
-    let records = live.backend.fixture.store.records.lock().unwrap();
-    assert_eq!(records.len(), 2);
-    assert_eq!(records[1].0.job_id, newer.wire.job_id);
-    assert!(records[1].0.share_id.starts_with("original.worker"));
-    drop(records);
+    {
+        let records = live.backend.fixture.store.records.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].0.job_id, newer.wire.job_id);
+        assert!(records[1].0.share_id.starts_with("original.worker"));
+    }
     for _ in 0..3 {
         live.tick().await;
     }

@@ -3,6 +3,7 @@
 //! --test issued_job_dependency -- --ignored --test-threads=2
 use anyhow::{ensure, Context, Result};
 use qbit_prism_server::ledger::{IssuedJobSave, Ledger, PreparedDependency};
+use qbit_prism_test_gate as gate;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::time::Duration;
@@ -21,8 +22,7 @@ struct Database {
 }
 impl Database {
     async fn open() -> Result<Self> {
-        let raw = std::env::var("PRISM_TEST_DATABASE_URL")
-            .context("explicit dependency tests require disposable PRISM_TEST_DATABASE_URL")?;
+        let raw = gate::required_database_url(gate::site!())?;
         let admin = PgPool::connect(&raw).await?;
         let schema = format!("prism_dependency_{}", uuid::Uuid::new_v4().simple());
         sqlx::query(&format!("CREATE SCHEMA {schema}"))

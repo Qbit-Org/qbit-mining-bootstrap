@@ -2491,7 +2491,7 @@ mod tests {
         verify_ctv_fanout_manifest_structure(&manifest).unwrap();
         verify_ctv_fanout_manifest_commitment_leaf(
             &manifest,
-            &[manifest.commitment_witness_leaf_hex.clone()],
+            std::slice::from_ref(&manifest.commitment_witness_leaf_hex),
         )
         .unwrap();
     }
