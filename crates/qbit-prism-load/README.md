@@ -81,8 +81,8 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--reconnect-target` | 12 | Completed reconnects to drive; the artifact needs at least 10 |
 | `--slow-db-delay-ms` | 10 | One-way per-chunk proxy delay; the artifact phase needs at least 10 |
 | `--mid-flight-kill` | off | SIGKILL a frontend with submits outstanding, in a side phase |
-| `--scheduled-blocks` | 0 | Own blocks to find and submit during `steady_state` |
-| `--external-tips` | 3 | Tips minted during warm-up, for time to usable work |
+| `--scheduled-blocks` | 0 | Own blocks to find and submit during `steady_state`. Each one bumps the payout revision, so expect a burst of `new payout work is pending` on every frontend afterwards |
+| `--external-tips` | 3 | Tips minted during warm-up, for time to usable work. They need a warm-up phase: with `--warmup-seconds 0` none is minted and the time-to-usable-work section is empty rather than zero |
 | `--work-timeout` | 120 | Seconds to wait for frontends to serve work |
 | `--forecast-peak-shares-per-second` | 2000 | D1's forecast; the validator's gate is twice this |
 | `--ack-p99-limit-ms` | 1000 | Must be at most `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS` × 1000 |
