@@ -12,10 +12,11 @@ a. No runnable ``python -m lab.…`` or ``python lab/….py`` command invokes a
    directory runs. There is no allowlist. The check is lexical:
    it reads direct ``python``/``python3``/``python3.N`` invocations, bare or
    by path (``/usr/bin/python3``), with their CPython option forms, quoted
-   interpreter names and targets, shell word concatenation of the interpreter
-   and of the target (``"python"3``, ``'pyth'on3``, ``"lab.prism."deleted``)
-   and ``./`` prefixes, and does not follow ``cd``, ``PYTHONPATH`` or other
-   environment indirection, aliases, shell variables, or backslash escapes.
+   interpreter names and targets (plain, ANSI-C ``$'…'`` or locale ``$"…"``
+   quotes), shell word concatenation of the interpreter and of the target
+   (``"python"3``, ``'pyth'on3``, ``"lab.prism."deleted``) and ``./``
+   prefixes, and does not follow ``cd``, ``PYTHONPATH`` or other environment
+   indirection, aliases, shell variables, or backslash escapes.
 b. Every ``lab/prism/…`` path or ``lab.prism.…`` module reference resolves to a
    tracked file or directory. GitHub links pinned to a 40-hex commit SHA are
    stable history and exempt. Pre-existing residue that #303 declares out of
@@ -91,26 +92,38 @@ MODULE_REFERENCE = re.compile(r"\blab\.prism(?:\.[A-Za-z_][A-Za-z0-9_]*)*\b")
 PYTHON_FLAG = r"[bBdEhiIOPqRsSuvVx]"
 # A word the shell hands over as one argument: runs of unquoted characters
 # alternating with matching-quoted strings (`'error'::Warning`, `"dev mode"`,
-# `"lab.prism."deleted`), non-empty. The first piece is one unquoted
-# character or one quoted string, so a lone or unterminated opening quote is
-# not a word; after it, unquoted runs and quoted strings alternate rather
-# than nest, so the pattern never has two ways to split one word and cannot
-# backtrack exponentially. The word ends at whitespace, at a bash
-# metacharacter (`|`, `&`, `;`, `(`, `)`, `<`, `>`), at a backtick (which
-# closes the inline code a command sits in, and in the shell opens a command
-# substitution this check does not follow), or at a quote that opens no
-# string: inside `sh -c "python3 -m lab.a.b"` the closing `"` belongs to the
-# enclosing string, and the inner command is read as before. The quotes the
-# shell strips are removed by ``unquote`` before a word is read as a target.
+# `"lab.prism."deleted`), non-empty. A quoted string may carry bash's `$`
+# prefix: ANSI-C quoting `$'…'` and locale quoting `$"…"` are strings the
+# shell strips like plain quotes, so `python3 -m $'json.'tool`, `python3 -m
+# $"json.tool"` and `$'python3' -m json.tool` all ran `json.tool` on bash 3.2.
+# A `$` directly before a quote therefore belongs to the quoted piece and is
+# never an unquoted character, which keeps the split of a word unique; a `$`
+# before anything else (`$VAR`, `"$c"`) is an ordinary unquoted character, as
+# before. The first piece is one unquoted character or one quoted string, so
+# a lone or unterminated opening quote is not a word; after it, unquoted runs
+# and quoted strings alternate rather than nest, so the pattern never has two
+# ways to split one word and cannot backtrack exponentially. The word ends at
+# whitespace, at a bash metacharacter (`|`, `&`, `;`, `(`, `)`, `<`, `>`), at
+# a backtick (which closes the inline code a command sits in, and in the
+# shell opens a command substitution this check does not follow), or at a
+# quote that opens no string: inside `sh -c "python3 -m lab.a.b"` the closing
+# `"` belongs to the enclosing string, and the inner command is read as
+# before. The quotes the shell strips, with their `$` prefix, are removed by
+# ``unquote`` before a word is read as a target. The backslash escapes
+# `$'…'` decodes are not: bash runs `python3 -m $'json\x2etool'` as
+# `json.tool`, but this check follows no backslash escape (module docstring),
+# so an escape inside `$'…'` stays in the unquoted word, matches no target and
+# is not reported.
 WORD_BREAK = r"\s|&;()<>`"
-QUOTED_STRING = r"'[^']*'|\"[^\"]*\""
+UNQUOTED_CHARACTER = rf"[^{WORD_BREAK}'\"$]|\$(?!['\"])"
+QUOTED_STRING = r"\$?'[^']*'|\$?\"[^\"]*\""
 
 
 def shell_word(quoted_string: str) -> str:
     """The word pattern above, with ``quoted_string`` as its quoted piece."""
     return (
-        rf"(?:[^{WORD_BREAK}'\"]|{quoted_string})"
-        rf"[^{WORD_BREAK}'\"]*(?:(?:{quoted_string})[^{WORD_BREAK}'\"]*)*"
+        rf"(?:{UNQUOTED_CHARACTER}|{quoted_string})"
+        rf"(?:{UNQUOTED_CHARACTER})*(?:(?:{quoted_string})(?:{UNQUOTED_CHARACTER})*)*"
         rf"(?![^{WORD_BREAK}'\"])"
     )
 
@@ -122,7 +135,7 @@ SHELL_WORD = shell_word(QUOTED_STRING)
 # pieces, `"$c" sh -c "python3` read from `$c` would be the one word
 # `$c" sh -c "python3`, pairing the closing quote of `"$c"` with the opening
 # quote of the `sh -c` string and hiding the `python3` inside it.
-INTERPRETER_STRING = r"'[^'\s]*'|\"[^\"\s]*\""
+INTERPRETER_STRING = r"\$?'[^'\s]*'|\$?\"[^\"\s]*\""
 INTERPRETER_WORD = shell_word(INTERPRETER_STRING)
 PYTHON_OPTION = (
     rf"-{PYTHON_FLAG}+"  # -O, -OO, -bb, -IsE
@@ -232,8 +245,12 @@ def runnable_candidates(module: str) -> tuple[str, str]:
 
 
 def unquote(word: str) -> str:
-    """``word`` as the shell hands it to CPython: matching quotes removed, their contents kept."""
-    return MATCHING_QUOTES.sub(lambda match: match.group(0)[1:-1], word)
+    """``word`` as the shell hands it to CPython: matching quotes removed, their contents kept.
+
+    The ``$`` of an ANSI-C ``$'…'`` or locale ``$"…"`` string goes with its
+    quotes, so ``$'lab.prism.'deleted`` is ``lab.prism.deleted``.
+    """
+    return MATCHING_QUOTES.sub(lambda match: match.group(0).removeprefix("$")[1:-1], word)
 
 
 def runs_python(word: str) -> bool:
@@ -724,6 +741,79 @@ class ScannerTests(unittest.TestCase):
         text = "```bash\ncd repo\npython3 -m \\\n  \"lab.prism.\"process_telemetry \\\n  rss-bound\n```"
         self.assertEqual(self.located(text), [(3, self.TELEMETRY)])
         text = "python3 \\\n  \"./lab/prism/\"storm.py \\\n  --decide"
+        self.assertEqual(self.located(text), [(1, "lab/prism/storm.py")])
+
+    # Each ran on bash 3.2 and CPython 3.14 exactly as the plain spelling:
+    # `python3 -m $'json.tool'`, `python3 -m $'json.'tool`, `python3 -m
+    # $"json.tool"`, `$'python3' -m json.tool`, `$"python3" -m json.tool`,
+    # `python3 $'lab/prism/'storm.py` and `python3 lab/prism/$'storm'.py`.
+    ANSI_C_MODULES = ("$'lab.prism.{}'", "$'lab.prism.'{}", '$"lab.prism.{}"', "lab.prism.$'{}'", "lab.$'prism'.{}")
+    ANSI_C_SCRIPTS = ("$'lab/prism/{}.py'", "$'lab/prism/'{}.py", '$"lab/prism/{}.py"', "lab/prism/$'{}'.py")
+    ANSI_C_INTERPRETERS = ("$'python3'", '$"python3"', "$'pyth'on3", "$'/usr/bin/'python3", "$'python3.12'")
+
+    def test_ansi_c_quoted_words_with_missing_targets_are_caught_as_the_bare_target(self) -> None:
+        for module in self.ANSI_C_MODULES:
+            with self.subTest(module=module):
+                text = f"python3 -m {module.format('process_telemetry')} rss-bound"
+                self.assertEqual(self.commands(text), [self.TELEMETRY])
+        for script in self.ANSI_C_SCRIPTS:
+            with self.subTest(script=script):
+                self.assertEqual(self.commands(f"python3 {script.format('storm')} --decide"), ["lab/prism/storm.py"])
+        for interpreter in self.ANSI_C_INTERPRETERS:
+            with self.subTest(interpreter=interpreter):
+                self.assertEqual(
+                    self.commands(f"{interpreter} -m lab.prism.process_telemetry rss-bound"), [self.TELEMETRY]
+                )
+                self.assertEqual(self.commands(f"{interpreter} lab/prism/storm.py --decide"), ["lab/prism/storm.py"])
+        self.assertEqual(
+            self.commands("$'python3' -X $'dev' -m $'lab.prism.'process_telemetry"), [self.TELEMETRY]
+        )
+        self.assertEqual(
+            dead_commands("$'python3' -m $'lab.prism.'process_telemetry", self.TRACKED),
+            [(1, "$'python3' -m $'lab.prism.'process_telemetry", self.TELEMETRY)],
+        )
+
+    def test_ansi_c_quoted_words_with_existing_targets_pass(self) -> None:
+        tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py", "lab/pkg/__main__.py"}
+        for module in self.ANSI_C_MODULES:
+            with self.subTest(module=module):
+                self.assertEqual(dead_commands(f"python3 -m {module.format('tool')}", tracked), [])
+        for script in self.ANSI_C_SCRIPTS:
+            with self.subTest(script=script):
+                self.assertEqual(dead_commands(f"python3 {script.format('tool')}", tracked), [])
+        for interpreter in self.ANSI_C_INTERPRETERS:
+            with self.subTest(interpreter=interpreter):
+                self.assertEqual(dead_commands(f"{interpreter} -m lab.prism.tool", tracked), [])
+                self.assertEqual(dead_commands(f"{interpreter} lab/prism/tool.py", tracked), [])
+        self.assertEqual(dead_commands("python -m $'lab'.pkg run", tracked), [])
+
+    def test_ansi_c_escapes_are_not_followed(self) -> None:
+        # bash decodes `\x2e` to `.` and runs `python3 -m $'lab\x2eprism.x'`,
+        # but backslash escapes are outside this check (module docstring): the
+        # backslash stays in the word, which then names no target and no
+        # interpreter. An unterminated `$'` is a syntax error like a bare one;
+        # a `$` before anything but a quote is an ordinary character, so a
+        # variable is still not a command.
+        for text in (
+            "python3 -m $'lab\\x2eprism.process_telemetry' rss-bound",
+            "python3 $'lab/prism/storm\\x2epy' --decide",
+            "$'pyth\\x6fn3' -m lab.prism.process_telemetry",
+            "python3 -m $'lab.prism.process_telemetry\\'' rss-bound",
+            "python3 -m $'lab.prism.x\"",
+            "python3 $\"lab/prism/x.py'",
+            "python3 -m $MODULE rss-bound",
+            "python3 -m $MODULE'.x'",
+            "python3 -m lab.prism.$MODULE",
+            "python3 -m lab.prism.x$",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.commands(text), [])
+        self.assertEqual(self.references("python3 -m $'lab.prism.x\""), ["lab.prism.x"])
+
+    def test_wrapped_ansi_c_quoted_words_are_caught_at_the_right_line(self) -> None:
+        text = "```bash\ncd repo\npython3 -m \\\n  $'lab.prism.'process_telemetry \\\n  rss-bound\n```"
+        self.assertEqual(self.located(text), [(3, self.TELEMETRY)])
+        text = "$'python3' \\\n  $\"lab/prism/storm.py\" \\\n  --decide"
         self.assertEqual(self.located(text), [(1, "lab/prism/storm.py")])
 
     def test_words_that_name_no_lab_target_are_not_a_command(self) -> None:
