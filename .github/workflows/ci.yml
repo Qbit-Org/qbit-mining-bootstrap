@@ -126,6 +126,9 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Check VERSION against every workspace crate
+        run: python3 scripts/check_version_skew.py
+
       - name: Run Rust tests
         # This job has no database. With CI set and no database the JSONB
         # ceiling gate fails instead of skipping, so it runs in
