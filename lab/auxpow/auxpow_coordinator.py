@@ -174,6 +174,7 @@ def load_vardiff_config() -> vardiff.VardiffConfig:
     target_shares_per_second = env_optional_decimal("AUXPOW_STRATUM_VARDIFF_TARGET_SHARES_PER_SECOND")
     if target_shares_per_second is not None:
         target_interval = Decimal(1) / target_shares_per_second
+    max_step_factor = env_decimal("AUXPOW_STRATUM_VARDIFF_MAX_STEP_FACTOR", "4")
     try:
         return vardiff.VardiffConfig(
             enabled=env_bool("AUXPOW_STRATUM_VARDIFF_ENABLED", True),
@@ -181,7 +182,7 @@ def load_vardiff_config() -> vardiff.VardiffConfig:
             min_difficulty=env_decimal("AUXPOW_STRATUM_VARDIFF_MIN_DIFF", "1024"),
             max_difficulty=env_decimal("AUXPOW_STRATUM_VARDIFF_MAX_DIFF", "4294967296"),
             retarget_interval_seconds=env_decimal("AUXPOW_STRATUM_VARDIFF_RETARGET_SECONDS", "120"),
-            max_step_factor=env_decimal("AUXPOW_STRATUM_VARDIFF_MAX_STEP_FACTOR", "4"),
+            max_step_factor=max_step_factor,
             startup_difficulty=env_decimal_default_on_empty(
                 "AUXPOW_STRATUM_VARDIFF_STARTUP_DIFF",
                 "8192",
@@ -189,6 +190,11 @@ def load_vardiff_config() -> vardiff.VardiffConfig:
             max_step_down_factor=env_decimal("AUXPOW_STRATUM_VARDIFF_MAX_STEP_DOWN_FACTOR", "2"),
             ewma_alpha=env_decimal("AUXPOW_STRATUM_VARDIFF_EWMA_ALPHA", "0.4"),
             retarget_tolerance=env_nonnegative_decimal("AUXPOW_STRATUM_VARDIFF_RETARGET_TOLERANCE", "0.25"),
+            # Fast initial convergence is a PRISM policy. Keep the shared
+            # math type's cap aligned with AuxPoW's ordinary cap so legacy
+            # values above PRISM's default of 64 remain valid.
+            initial_convergence_enabled=False,
+            initial_max_step_factor=max_step_factor,
         )
     except ValueError as exc:
         raise SystemExit(f"AUXPOW_STRATUM_VARDIFF_* configuration is invalid: {exc}") from exc

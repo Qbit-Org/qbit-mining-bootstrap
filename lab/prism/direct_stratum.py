@@ -493,15 +493,30 @@ def assemble_submission(
     if strip_witness_transaction(full_coinbase_hex) != coinbase_without_witness:
         raise ValueError("full coinbase witness transaction does not match Stratum txid preimage")
     header_hash_int = stratum_codec.header_hash_int(header)
+    block_pass = header_hash_int <= job.qbit_target
     return DirectQbitSubmission(
         coinbase_tx_hex=full_coinbase_hex,
         coinbase_txid_preimage_hex=coinbase_without_witness.hex(),
         header_hex=header.hex(),
-        block_hex=serialize_block(header, full_coinbase_hex, job.transaction_hexes).hex(),
+        # Serializing the block costs O(block bytes) of GIL-held decode,
+        # concatenate and re-encode, and only the block-landing path ever
+        # reads the result, so only a hash that actually solved the block
+        # pays for it. ``block_pass`` is the exact precondition rather than a
+        # heuristic: share_submission.classify_submit_work makes it necessary
+        # for every route that builds a PrismBlockCandidate, so the bytes are
+        # always materialized here -- eagerly, on the client thread, inside
+        # the call that already validates the coinbase -- before a candidate
+        # exists and long before its durable intent is written. An ordinary
+        # share can never need them.
+        block_hex=(
+            serialize_block(header, full_coinbase_hex, job.transaction_hexes).hex()
+            if block_pass
+            else ""
+        ),
         block_hash_hex=stratum_codec.header_hash_hex(header),
         block_hash_int=header_hash_int,
         share_pass=header_hash_int <= job.share_target,
-        block_pass=header_hash_int <= job.qbit_target,
+        block_pass=block_pass,
         applied_version_hex=version_hex,
     )
 

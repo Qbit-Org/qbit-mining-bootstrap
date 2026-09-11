@@ -54,9 +54,30 @@ else
   PSQL_COMMAND="docker exec -i ${POSTGRES_CONTAINER} psql -U qbit -d qbit"
 fi
 
+# Every PsqlShareLedger session GUC rides PGOPTIONS on the psql path, and
+# "docker exec" does not forward the caller's environment, so the container
+# form silently drops them. The read-only session assertion at the end needs
+# PGOPTIONS to actually arrive, so it runs through a command that asks docker
+# to pass the variable through. An external psql inherits the environment
+# already and needs no help.
+if [[ -n "${EXTERNAL_PSQL}" ]]; then
+  PSQL_COMMAND_WITH_ENV="${PSQL_COMMAND}"
+else
+  PSQL_COMMAND_WITH_ENV="docker exec -i -e PGOPTIONS ${POSTGRES_CONTAINER} psql -U qbit -d qbit"
+fi
+
+if [[ -n "${EXTERNAL_PSQL}" ]]; then
+  GATE_IMAGE="external-postgres"
+  GATE_IMAGE_DIGEST="not-applicable"
+else
+  GATE_IMAGE="$(docker inspect --format '{{.Config.Image}}' "${POSTGRES_CONTAINER}")"
+  GATE_IMAGE_DIGEST="$(docker inspect --format '{{.Image}}' "${POSTGRES_CONTAINER}")"
+fi
+
 (
   cd "${ROOT_DIR}"
   PRISM_PSQL_COMMAND="${PSQL_COMMAND}" \
+  PRISM_PSQL_COMMAND_WITH_ENV="${PSQL_COMMAND_WITH_ENV}" \
     python3 <<'PY'
 from __future__ import annotations
 
@@ -67,7 +88,13 @@ import os
 import tempfile
 from pathlib import Path
 
-from lab.prism.share_ledger import PendingShare, PsqlShareLedger
+from lab.prism.share_ledger import (
+    PendingShare,
+    PsqlShareLedger,
+    ShareReplayConflict,
+    SingleWriterShareLedger,
+)
+from tests.prism_window_rows_reference import assert_rows_match_aggregate
 
 
 def pending(
@@ -139,6 +166,34 @@ SELECT json_build_object(
     assert_equal(int(comparison["drift_count"]), 0, message + " (drift count)")
 
 
+def share_ledger_identity(runner: PsqlShareLedger) -> dict[str, object]:
+    """The exact identity of qbit_share_ledger, for the #224 invariant.
+
+    Every column of every row in sequence order, digested together with
+    each tuple's ctid and xmin -- so an UPDATE that rewrote a row to the
+    same values still changes it -- plus the sequence allocator, so an
+    INSERT that rolled back still changes it.
+    """
+    return runner._run_json(
+        """
+SELECT json_build_object(
+    'row_count', (SELECT count(*) FROM qbit_share_ledger),
+    'digest', (
+        SELECT md5(COALESCE(string_agg(
+            ctid::text || '|' || xmin::text || '|' || ledger::text,
+            E'\\n' ORDER BY share_seq
+        ), ''))
+        FROM qbit_share_ledger AS ledger
+    ),
+    'sequence', (
+        SELECT json_build_object('last_value', last_value, 'is_called', is_called)
+        FROM qbit_share_ledger_share_seq_seq
+    )
+);
+"""
+    )
+
+
 def force_expired_idle_lease(runner: PsqlShareLedger) -> None:
     runner._run_sql(
         """
@@ -150,7 +205,10 @@ SET updated_at = clock_timestamp() - interval '6 minutes',
 
 
 psql = os.environ["PRISM_PSQL_COMMAND"]
+psql_with_env = os.environ["PRISM_PSQL_COMMAND_WITH_ENV"]
 ledger = PsqlShareLedger(
+    # This gate mutates legacy JSONB fixtures; the storage gate covers v2.
+    candidate_storage_version=1,
     psql_command=psql,
     writer_id="writer-a",
     writer_epoch=1,
@@ -190,11 +248,52 @@ candidate_intent = {
 candidate_row = ledger.append_batch([(batch_c, candidate_intent)])[0]
 assert_equal(candidate_row.share_seq, 3, "candidate share sequence")
 assert_equal(ledger.append_batch([(batch_c, candidate_intent)])[0].share_seq, 3, "exact replay")
+recovery_exact = ledger.append_recovered_share(batch_c)
+assert_equal(recovery_exact.disposition, "exact_existing", "typed recovery exact replay")
+assert_equal(recovery_exact.record.share_seq, 3, "typed recovery exact replay keeps sequence")
+try:
+    ledger.append_recovered_share(
+        PendingShare(**{**batch_c.__dict__, "ntime": batch_c.ntime + 1})
+    )
+except ShareReplayConflict:
+    pass
+else:
+    raise SystemExit("typed recovery payload conflict was not rejected")
 assert_equal(ledger.pending_block_candidates(), [candidate_intent], "pending candidate replay")
+pending_rows = ledger.pending_block_candidate_rows()
 assert_equal(
-    ledger.pending_block_candidate_rows(),
-    [{"block_hash": "ab" * 32, "candidate": candidate_intent}],
+    [
+        {key: value for key, value in row.items() if key != "cursor"}
+        for row in pending_rows
+    ],
+    [
+        {
+            "block_hash": "ab" * 32,
+            "candidate": candidate_intent,
+            "pool_block_exists": False,
+        }
+    ],
     "pending candidate replay retains authoritative outbox key",
+)
+# Startup enumeration pages this read with a keyset cursor, so the cursor
+# has to round-trip through the server exactly: a truncated stamp would
+# make a page re-emit or skip its equal-timestamp peers.
+assert_equal(
+    ledger.pending_block_candidate_rows(after_cursor=pending_rows[0]["cursor"]),
+    [],
+    "pending candidate cursor resumes strictly after its own row",
+)
+cursor_stamp, cursor_hash = pending_rows[0]["cursor"]
+assert_equal(cursor_hash, "ab" * 32, "pending candidate cursor carries its row key")
+assert_equal(
+    ledger._run_json(
+        "SELECT json_build_object('matched', ("
+        "SELECT count(*) FROM qbit_block_candidate_outbox "
+        f"WHERE created_at = '{cursor_stamp}'::timestamptz "
+        f"AND block_hash = '{cursor_hash}'))"
+    )["matched"],
+    1,
+    "pending candidate cursor stamp round-trips at full precision",
 )
 assert ledger.mark_block_candidate_submitted(block_hash="ab" * 32)
 assert_equal(ledger.pending_block_candidates(), [], "submitted candidate leaves pending set")
@@ -210,6 +309,14 @@ assert_equal(ledger.pending_block_candidates(), [candidate_only], "candidate-onl
 assert_equal(ledger.append_batch([(batch_d, candidate_only)])[0].share_seq, 4, "linked solver credit")
 assert ledger.mark_block_candidate_submitted(block_hash="cd" * 32)
 assert_equal(ledger.pending_block_candidates(), [], "linked candidate completion")
+batch_recovered = pending(94, job_ms=908, accepted_ms=909, share_id="batch-recovered")
+recovery_inserted = ledger.append_recovered_share(batch_recovered)
+assert_equal(recovery_inserted.disposition, "inserted", "typed recovery inserts a new row")
+assert_equal(
+    recovery_inserted.record.share_id,
+    "batch-recovered",
+    "typed recovery returns the inserted record",
+)
 poison_hash = "ef" * 32
 poison_candidate = {
     **candidate_intent,
@@ -233,6 +340,160 @@ assert ledger.mark_block_candidate_abandoned(
     error="invalid durable candidate intent",
 )
 assert_equal(ledger.pending_block_candidates(), [], "poison row quarantined by durable key")
+
+# The bulk terminal update replaces N single-hash abandonments on the storm
+# path, so its fence, its exactly-pending predicate, its pool-block veto and
+# its RETURNING-fed report all have to hold against the real table -- where
+# state, completed_at and candidate are checked together in SQL and a
+# half-applied terminal row would be rejected outright.
+bulk_pending_a = "1a" * 32
+bulk_pending_b = "1b" * 32
+bulk_submitted = "1c" * 32
+bulk_landed = "1d" * 32
+bulk_missing = "99" * 32
+for bulk_hash in (bulk_pending_a, bulk_pending_b, bulk_submitted, bulk_landed):
+    assert ledger.persist_block_candidate_intent(
+        {**candidate_intent, "block_hash_hex": bulk_hash}
+    )
+assert ledger.mark_block_candidate_submitted(block_hash=bulk_submitted)
+ledger._run_sql(
+    "INSERT INTO qbit_pool_blocks "
+    "(block_hash, block_height, parent_hash, coinbase_txid, payout_manifest_sha256) "
+    f"VALUES ('{bulk_landed}', 11, '{'00' * 32}', '{'11' * 32}', '{'22' * 32}');"
+)
+# The page read answers the landed-block question for every row it returns,
+# so the caller never pays one round trip per pending hash.
+assert_equal(
+    {
+        row["block_hash"]: row["pool_block_exists"]
+        for row in ledger.pending_block_candidate_rows(limit=32)
+    },
+    {bulk_pending_a: False, bulk_pending_b: False, bulk_landed: True},
+    "pending page reports authoritative pool-block existence",
+)
+assert_equal(
+    ledger.mark_block_candidates_abandoned(block_hashes=[], error="unused"),
+    (),
+    "empty bulk abandon page is a no-op",
+)
+bulk_abandoned = ledger.mark_block_candidates_abandoned(
+    block_hashes=[
+        bulk_pending_b,
+        bulk_pending_a.upper(),
+        bulk_pending_a,
+        bulk_submitted,
+        bulk_landed,
+        bulk_missing,
+    ],
+    error="superseded by decided height",
+)
+assert_equal(
+    list(bulk_abandoned),
+    [bulk_pending_a, bulk_pending_b],
+    "bulk abandon reports exactly the pending rows it won",
+)
+assert_equal(
+    ledger.pending_block_candidates(),
+    [{**candidate_intent, "block_hash_hex": bulk_landed}],
+    "bulk abandon leaves the landed candidate pending",
+)
+bulk_rows = ledger._run_json(
+    "SELECT json_build_object('rows', COALESCE(json_agg(json_build_object("
+    "'block_hash', block_hash, 'state', state, 'last_error', last_error, "
+    "'candidate_cleared', candidate IS NULL, "
+    "'completed', completed_at IS NOT NULL) ORDER BY block_hash), '[]'::json)) "
+    "FROM qbit_block_candidate_outbox WHERE block_hash = ANY(ARRAY["
+    f"'{bulk_pending_a}', '{bulk_pending_b}', '{bulk_submitted}', '{bulk_landed}'"
+    "]::text[]);"
+)["rows"]
+assert_equal(
+    bulk_rows,
+    [
+        {
+            "block_hash": bulk_pending_a,
+            "state": "abandoned",
+            "last_error": "superseded by decided height",
+            "candidate_cleared": True,
+            "completed": True,
+        },
+        {
+            "block_hash": bulk_pending_b,
+            "state": "abandoned",
+            "last_error": "superseded by decided height",
+            "candidate_cleared": True,
+            "completed": True,
+        },
+        {
+            "block_hash": bulk_submitted,
+            "state": "submitted",
+            "last_error": None,
+            "candidate_cleared": True,
+            "completed": True,
+        },
+        {
+            "block_hash": bulk_landed,
+            "state": "pending",
+            "last_error": None,
+            "candidate_cleared": False,
+            "completed": False,
+        },
+    ],
+    "bulk abandon writes the terminal column set and spares every other row",
+)
+assert_equal(
+    ledger.mark_block_candidates_abandoned(
+        block_hashes=[bulk_pending_a, bulk_pending_b],
+        error="second attempt",
+    ),
+    (),
+    "already-terminal rows are not re-won",
+)
+ledger._run_sql(f"DELETE FROM qbit_pool_blocks WHERE block_hash = '{bulk_landed}';")
+# The stale-page case below asserts an exact page and terminal set. Isolate it
+# from the pending row intentionally retained by the bulk-abandon case above.
+ledger._run_sql("DELETE FROM qbit_block_candidate_outbox;")
+
+# Issue #211 removed the writer gate from the page read, which makes the page
+# advisory by construction: a candidate can land between the snapshot and
+# whatever the caller does with it. The case above inserted the pool block
+# first, so its page was never stale. This one reads the page *before* the
+# landing, so the set handed to the terminal write genuinely disagrees with
+# the durable state -- and the veto has to come from the fenced UPDATE's own
+# re-check rather than from the fact the caller carried.
+stale_pending = "2a" * 32
+stale_landed = "2b" * 32
+for stale_hash in (stale_pending, stale_landed):
+    assert ledger.persist_block_candidate_intent(
+        {**candidate_intent, "block_hash_hex": stale_hash}
+    )
+stale_page = ledger.pending_block_candidate_rows(limit=32)
+assert_equal(
+    {row["block_hash"]: row["pool_block_exists"] for row in stale_page},
+    {stale_pending: False, stale_landed: False},
+    "a page read before the landing reports no pool block for either row",
+)
+ledger._run_sql(
+    "INSERT INTO qbit_pool_blocks "
+    "(block_hash, block_height, parent_hash, coinbase_txid, payout_manifest_sha256) "
+    f"VALUES ('{stale_landed}', 12, '{'00' * 32}', '{'33' * 32}', '{'44' * 32}');"
+)
+assert_equal(
+    list(
+        ledger.mark_block_candidates_abandoned(
+            block_hashes=[str(row["block_hash"]) for row in stale_page],
+            error="acted on a stale page",
+        )
+    ),
+    [stale_pending],
+    "a candidate that landed after the page read is refused by the fence",
+)
+assert_equal(
+    [row["block_hash"] for row in ledger.pending_block_candidate_rows(limit=32)],
+    [stale_landed],
+    "the landed candidate survived a stale page that named it",
+)
+ledger._run_sql(f"DELETE FROM qbit_pool_blocks WHERE block_hash = '{stale_landed}';")
+
 ledger._run_sql(
     """
 DELETE FROM qbit_block_candidate_outbox;
@@ -258,6 +519,8 @@ WHERE table_name = 'qbit_ctv_fanout_artifacts'
 assert_equal(legacy_anchor_nullable, "NO", "old schema simulation makes anchor_vout not nullable")
 ledger.release_writer_lease()
 ledger = PsqlShareLedger(
+    # This gate mutates legacy JSONB fixtures; the storage gate covers v2.
+    candidate_storage_version=1,
     psql_command=psql,
     writer_id="writer-a",
     writer_epoch=1,
@@ -685,6 +948,86 @@ assert_equal(
     ["submitted"],
     "CTV broadcast attempt is journaled",
 )
+# A second pending fanout on the same block, with its own attempts, proves the
+# public pending-fanout page scopes broadcast_attempts to each row's fanout.
+# The persisted manifest set is immutable, so the sibling is a row copy; it is
+# removed again so later block-level checks see the original single fanout.
+replacement._run_sql(
+    """
+INSERT INTO qbit_ctv_fanout_artifacts (
+    fanout_txid,
+    block_hash,
+    manifest_set_sha256,
+    manifest_json,
+    manifest,
+    manifest_sha256,
+    precommitment_sha256,
+    ctv_hash,
+    commitment_witness_leaf_hex,
+    chunk_index,
+    chunk_count,
+    parent_coinbase_txid,
+    parent_coinbase_vout,
+    fanout_tx_template_hex,
+    fanout_tx_hex,
+    anchor_vout,
+    covenant_output_value_sats,
+    fanout_output_sum_sats,
+    settlement_status
+)
+SELECT
+    '""" + "17" * 32 + """',
+    block_hash,
+    manifest_set_sha256,
+    manifest_json,
+    manifest,
+    manifest_sha256,
+    precommitment_sha256,
+    ctv_hash,
+    commitment_witness_leaf_hex,
+    1,
+    2,
+    parent_coinbase_txid,
+    parent_coinbase_vout,
+    fanout_tx_template_hex,
+    fanout_tx_hex,
+    anchor_vout,
+    covenant_output_value_sats,
+    fanout_output_sum_sats,
+    'broadcastable'
+FROM qbit_ctv_fanout_artifacts
+WHERE fanout_txid = '""" + "12" * 32 + """';
+"""
+)
+for sibling_package_txid in ("18" * 32, "19" * 32):
+    replacement.record_ctv_fanout_broadcast_attempt(
+        fanout_txid="17" * 32,
+        attempt_status="submitted",
+        package_tx_hexes=["02"],
+        package_txids=[sibling_package_txid],
+        submit_result={"accepted": True},
+    )
+pending_fanout_page = replacement.dashboard_pending_fanout_rows(page=1, limit=15)
+assert_equal(
+    [
+        [
+            row["fanout_txid"],
+            [attempt["package_txids"] for attempt in row["broadcast_attempts"]],
+        ]
+        for row in pending_fanout_page["rows"]
+    ],
+    [
+        ["12" * 32, [["16" * 32]]],
+        ["17" * 32, [["18" * 32], ["19" * 32]]],
+    ],
+    "pending fanout rows carry only their own broadcast attempts, in order",
+)
+sibling_attempt_seqs = [attempt["attempt_seq"] for attempt in pending_fanout_page["rows"][1]["broadcast_attempts"]]
+assert_equal(sibling_attempt_seqs, sorted(sibling_attempt_seqs), "pending fanout broadcast attempts ascend by attempt_seq")
+replacement._run_sql(
+    "DELETE FROM qbit_ctv_fanout_broadcast_attempts WHERE fanout_txid = '" + "17" * 32 + "';\n"
+    "DELETE FROM qbit_ctv_fanout_artifacts WHERE fanout_txid = '" + "17" * 32 + "';"
+)
 duplicate_persist = replacement.persist_accepted_block(
     block_hash="44" * 32,
     block_height=7,
@@ -774,8 +1117,59 @@ WHERE miner_id LIKE 'miner-unanchored-%';
 """
 )
 assert_equal(unanchored_balances, [], "unanchored carry rows require a confirmed pool block")
+unknown_confirmation = replacement.confirm_accepted_block(
+    block_hash="ff" * 32,
+    active_tip_height=7,
+)
+assert_equal(
+    unknown_confirmation,
+    {"backend": "postgres-psql", "confirmed_count": 0},
+    "unknown block confirmation exposes no publication ordinal",
+)
+wrong_height_confirmation = replacement.confirm_accepted_block(
+    block_hash="44" * 32,
+    active_tip_height=8,
+)
+assert_equal(
+    wrong_height_confirmation,
+    {"backend": "postgres-psql", "confirmed_count": 0},
+    "wrong-height confirmation exposes no publication ordinal",
+)
 confirmed = replacement.confirm_accepted_block(block_hash="44" * 32, active_tip_height=7)
-assert_equal(confirmed["confirmed_count"], 1, "confirmed block count")
+assert_equal(confirmed["confirmed_count"], 1, "fresh confirmation reports the flip disposition")
+first_publication_sequence = int(confirmed["audit_publication_sequence"])
+if first_publication_sequence <= 0:
+    raise SystemExit("first confirmed block received a non-positive publication ordinal")
+allocator_after_flip = replacement._run_json(
+    "SELECT json_build_object('last_value', last_value, 'is_called', is_called) "
+    "FROM qbit_audit_publication_sequence_seq;"
+)
+confirmed_replay = replacement.confirm_accepted_block(
+    block_hash="44" * 32,
+    active_tip_height=7,
+)
+# The idempotent arm is the durable discriminator this contract exists for:
+# the UPDATE matched nothing, so the row keeps the ordinal its flip
+# allocated and the caller can tell a replay from a genuinely new
+# confirmation that has to publish payout state (issue #61).
+assert_equal(
+    confirmed_replay["confirmed_count"],
+    2,
+    "exact confirmation replay reports the idempotent disposition",
+)
+assert_equal(
+    int(confirmed_replay["audit_publication_sequence"]),
+    first_publication_sequence,
+    "exact confirmation replay preserves publication ordinal",
+)
+assert_equal(
+    replacement._run_json(
+        "SELECT json_build_object('last_value', last_value, 'is_called', is_called) "
+        "FROM qbit_audit_publication_sequence_seq;"
+    ),
+    allocator_after_flip,
+    "exact confirmation replay burns no publication ordinal",
+)
 assert_equal(
     replacement.dashboard_miner_pending_maturity_bits(recipient_id="miner-b"),
     49500,
@@ -799,14 +1193,16 @@ INSERT INTO qbit_pool_blocks (
     parent_hash,
     coinbase_txid,
     payout_manifest_sha256,
-    chain_state
+    chain_state,
+    audit_publication_sequence
 ) VALUES (
     '""" + alias_block_hash + """',
     72,
     '""" + "44" * 32 + """',
     '""" + "46" * 32 + """',
     '""" + "47" * 32 + """',
-    'confirmed'
+    'confirmed',
+    nextval('qbit_audit_publication_sequence_seq')
 );
 
 INSERT INTO qbit_payout_carry_forward (
@@ -887,6 +1283,56 @@ WHERE block_hash = '""" + alias_block_hash + """';
 """
 )
 
+# Reorg visibility on the public block read model, against a real reversed
+# row: the default view keeps hiding it, chain_state=reversed surfaces it
+# with its disconnect time, and every pagination total describes exactly its
+# own filtered set.
+default_blocks = replacement.dashboard_blocks(page=1, limit=50)
+all_blocks = replacement.dashboard_blocks(page=1, limit=50, chain_state="all")
+reversed_blocks = replacement.dashboard_blocks(page=1, limit=50, chain_state="reversed")
+if any(row["hash"] == alias_block_hash for row in default_blocks["rows"]):
+    raise SystemExit("default dashboard blocks view leaked a reversed block")
+if any("chain_state" in row or "disconnected_at" in row for row in default_blocks["rows"]):
+    raise SystemExit("default dashboard blocks view leaked chain-state fields")
+assert_equal(
+    all_blocks["pagination"]["total_count"],
+    default_blocks["pagination"]["total_count"] + reversed_blocks["pagination"]["total_count"],
+    "chain_state filters partition the block history",
+)
+reversed_rows_by_hash = {row["hash"]: row for row in reversed_blocks["rows"]}
+if alias_block_hash not in reversed_rows_by_hash:
+    raise SystemExit("chain_state=reversed did not surface the reversed block")
+reversed_row = reversed_rows_by_hash[alias_block_hash]
+assert_equal(reversed_row["chain_state"], "reversed", "reversed block reports its chain state")
+if not str(reversed_row["disconnected_at"] or "").endswith("Z"):
+    raise SystemExit("reversed block disconnected_at is not a UTC timestamp")
+for row in all_blocks["rows"]:
+    if "chain_state" not in row or "disconnected_at" not in row:
+        raise SystemExit("chain_state=all rows must carry the state fields")
+    if (row["chain_state"] == "reversed") != (row["disconnected_at"] is not None):
+        raise SystemExit("disconnected_at must be set exactly for reversed rows")
+paged_reversed = replacement.dashboard_blocks(page=1, limit=1, chain_state="reversed")
+assert_equal(
+    paged_reversed["pagination"]["total_count"],
+    reversed_blocks["pagination"]["total_count"],
+    "reversed pagination total is limit-independent",
+)
+assert_equal(len(paged_reversed["rows"]), 1, "reversed page honours its limit")
+reorg_snapshot = replacement.dashboard_pool_snapshot(
+    current_network_difficulty="1000",
+    generated_at="2026-01-01T00:00:00Z",
+)
+assert_equal(
+    reorg_snapshot["blocks_reversed_total"],
+    reversed_blocks["pagination"]["total_count"],
+    "pool snapshot reversed counter matches the reversed block view",
+)
+assert_equal(
+    reorg_snapshot["blocks_found_total"],
+    default_blocks["pagination"]["total_count"],
+    "blocks_found_total keeps excluding reversed blocks",
+)
+
 zero_net_bundle = copy.deepcopy(bundle)
 zero_net_bundle["signed_coinbase_manifest"]["manifest"]["payout_count"] = 1
 zero_net_bundle["payout_policy_manifest"]["accounts"] = [
@@ -911,7 +1357,13 @@ replacement.persist_accepted_block(
     audit_report=zero_net_report,
 )
 force_expired_idle_lease(replacement)
-replacement.confirm_accepted_block(block_hash="45" * 32, active_tip_height=8)
+second_confirmation = replacement.confirm_accepted_block(
+    block_hash="45" * 32,
+    active_tip_height=8,
+)
+second_publication_sequence = int(second_confirmation["audit_publication_sequence"])
+if second_publication_sequence == first_publication_sequence:
+    raise SystemExit("distinct confirmed blocks shared a publication ordinal")
 zero_net_balances = replacement._run_json(
     """
 SELECT COALESCE(json_agg(json_build_object(
@@ -933,8 +1385,45 @@ replacement.persist_accepted_block(
     final_bundle=zero_net_bundle,
     audit_report=zero_net_report,
 )
+# The stranded-prepared sweep finds exactly the rows the reorg watch read
+# structurally cannot: prepared and buried past the reject depth floor.
+# Nothing else re-examines them once their outbox row is gone.
+assert_equal(
+    replacement.stranded_prepared_blocks(
+        active_tip_height=9 + 100,
+        min_depth=100,
+    ),
+    [{"block_hash": "46" * 32, "block_height": 9, "parent_hash": "45" * 32}],
+    "stranded prepared sweep finds a buried prepared row",
+)
+assert_equal(
+    replacement.stranded_prepared_blocks(
+        active_tip_height=9 + 99,
+        min_depth=100,
+    ),
+    [],
+    "stranded prepared sweep leaves rows inside the depth floor alone",
+)
+assert_equal(
+    replacement.stranded_prepared_blocks(
+        active_tip_height=9 + 100,
+        min_depth=100,
+        limit=0,
+    ),
+    [],
+    "stranded prepared sweep honours its page bound",
+)
 rejected_count = replacement.reject_prepared_block(block_hash="46" * 32, active_tip_height=8)["rejected_count"]
 assert_equal(rejected_count, 3, "reject prepared block/payout/carry row count")
+# The fenced rejection is what retires the row from the sweep.
+assert_equal(
+    replacement.stranded_prepared_blocks(
+        active_tip_height=9 + 100,
+        min_depth=100,
+    ),
+    [],
+    "rejected block leaves the stranded prepared sweep",
+)
 rejected_state = replacement._run_json(
     """
 SELECT json_build_object(
@@ -950,6 +1439,28 @@ assert_equal(
     {"chain_state": "rejected", "maturity_state": "reversed"},
     "rejected prepared block state",
 )
+# The reject flip stamps disconnected_at (its maturity_state 'reversed'
+# requires it), but the public contract defines disconnected_at as a reorg
+# disconnect time that is null for every non-reversed row -- a rejected
+# block must not read as a reorg casualty.
+rejected_all_view = replacement.dashboard_blocks(page=1, limit=50, chain_state="all")
+rejected_public_row = next(
+    (row for row in rejected_all_view["rows"] if row["hash"] == "46" * 32),
+    None,
+)
+if rejected_public_row is None:
+    raise SystemExit("chain_state=all did not surface the rejected block")
+assert_equal(rejected_public_row["chain_state"], "rejected", "rejected block reports its chain state")
+if rejected_public_row["disconnected_at"] is not None:
+    raise SystemExit("rejected block must not report a reorg disconnect time")
+assert_equal(
+    replacement.confirm_accepted_block(
+        block_hash="46" * 32,
+        active_tip_height=9,
+    ),
+    {"backend": "postgres-psql", "confirmed_count": -1},
+    "rejected block confirmation reports the superseded disposition",
+)
 
 try:
     replacement._run_json("SELECT json_build_object('count', qbit_reverse_immature_pool_block('" + "44" * 32 + "', 7));")
@@ -961,15 +1472,62 @@ else:
 
 inactive_count = replacement.mark_pool_block_inactive(block_hash="44" * 32, active_tip_height=7)["inactive_count"]
 assert_equal(inactive_count, 1, "inactive block quarantine count")
+assert_equal(
+    replacement.mark_pool_block_inactive(
+        block_hash="44" * 32,
+        active_tip_height=7,
+    )["inactive_count"],
+    0,
+    "repeated inactive transition is count-zero",
+)
+assert_equal(
+    replacement.confirm_accepted_block(
+        block_hash="44" * 32,
+        active_tip_height=7,
+    ),
+    {"backend": "postgres-psql", "confirmed_count": -1},
+    "inactive block confirmation reports the superseded disposition",
+)
 assert_equal(replacement.current_owed_balances(), [], "inactive owed balances are excluded")
-reactivated_count = replacement.reactivate_pool_block(block_hash="44" * 32, active_tip_height=7)["reactivated_count"]
-assert_equal(reactivated_count, 1, "inactive block reactivation count")
+reactivated = replacement.reactivate_pool_block(block_hash="44" * 32, active_tip_height=7)
+assert_equal(reactivated["reactivated_count"], 1, "inactive block reactivation count")
+reactivated_publication_sequence = int(reactivated["audit_publication_sequence"])
+assert_equal(
+    reactivated_publication_sequence,
+    first_publication_sequence,
+    "reactivated block preserves its published ordinal",
+)
+reactivated_confirmation = replacement.confirm_accepted_block(
+    block_hash="44" * 32,
+    active_tip_height=7,
+)
+# Reactivation restores 'confirmed' without returning the row to 'prepared',
+# so a confirmation arriving after it is an idempotent replay too -- and it
+# still addresses the ordinal the original flip allocated.
+assert_equal(
+    reactivated_confirmation["confirmed_count"],
+    2,
+    "confirmation after reactivation reports the idempotent disposition",
+)
+assert_equal(
+    int(reactivated_confirmation["audit_publication_sequence"]),
+    first_publication_sequence,
+    "confirmation after reactivation preserves the published ordinal",
+)
 if not replacement.current_owed_balances():
     raise SystemExit("reactivated block did not restore owed balances")
 inactive_count = replacement.mark_pool_block_inactive(block_hash="44" * 32, active_tip_height=7)["inactive_count"]
 assert_equal(inactive_count, 1, "inactive block can be quarantined again before final reversal")
 reversed_count = replacement.reverse_immature_block(block_hash="44" * 32, active_tip_height=7)["reversed_count"]
 assert_equal(reversed_count, 6, "reverse immature block/payout/carry/fanout row count")
+assert_equal(
+    replacement.confirm_accepted_block(
+        block_hash="44" * 32,
+        active_tip_height=7,
+    ),
+    {"backend": "postgres-psql", "confirmed_count": -1},
+    "reversed block confirmation reports the superseded disposition",
+)
 assert_equal(replacement.current_owed_balances(), [], "reversed owed balances are excluded")
 
 replacement.persist_accepted_block(
@@ -980,20 +1538,52 @@ replacement.persist_accepted_block(
     audit_report=report,
 )
 replacement.confirm_accepted_block(block_hash="66" * 32, active_tip_height=8)
+
+# Issue #224: the reconciliation-owned mutations below (inactive quarantine,
+# the maturation sweep, reactivation) move pool-block, payout-entry and carry
+# state, and the coordinator relies on their never writing qbit_share_ledger
+# to answer a confirmed mutation with a prior-balances reread instead of a
+# full window rescan. Capture the share ledger's exact identity here and
+# require it back after every transition, while the owed balance proves each
+# transition actually happened.
+share_ledger_identity_before = share_ledger_identity(replacement)
+
+
+def assert_share_ledger_untouched(transition: str) -> None:
+    assert_equal(
+        share_ledger_identity(replacement),
+        share_ledger_identity_before,
+        f"qbit_share_ledger identity after {transition} (#224)",
+    )
+
+
+def owed_balances() -> list[tuple[str, int]]:
+    return [(row["recipient_id"], row["balance_sats"]) for row in replacement.current_owed_balances()]
+
+
+assert_equal(owed_balances(), [("miner-a", 1000)], "confirmed block 66 owes its accrued balance")
 inactive_count = replacement.mark_pool_block_inactive(block_hash="66" * 32, active_tip_height=8)["inactive_count"]
 assert_equal(inactive_count, 1, "inactive block 66 quarantine count")
+assert_equal(owed_balances(), [], "inactive block 66 owes nothing")
+assert_share_ledger_untouched("inactive quarantine")
 matured_while_inactive = replacement._run_json("SELECT json_build_object('count', qbit_mark_mature_pool_payouts(1008));")["count"]
 assert_equal(matured_while_inactive, 0, "mature payout sweep ignores inactive blocks")
+assert_share_ledger_untouched("maturation sweep over an inactive block")
 inactive_count = replacement.mark_pool_block_inactive(block_hash="66" * 32, active_tip_height=1008)["inactive_count"]
 assert_equal(inactive_count, 0, "height-mature inactive block quarantine is idempotent")
 reactivated_count = replacement.reactivate_pool_block(block_hash="66" * 32, active_tip_height=1008)["reactivated_count"]
 assert_equal(reactivated_count, 1, "height-mature inactive block reactivation count")
+assert_equal(owed_balances(), [("miner-a", 1000)], "reactivated block 66 owes its accrued balance again")
+assert_share_ledger_untouched("reactivation")
 inactive_count = replacement.mark_pool_block_inactive(block_hash="66" * 32, active_tip_height=1008)["inactive_count"]
 assert_equal(inactive_count, 1, "height-mature immature confirmed block can be quarantined")
+assert_share_ledger_untouched("second inactive quarantine")
 reactivated_count = replacement.reactivate_pool_block(block_hash="66" * 32, active_tip_height=1008)["reactivated_count"]
 assert_equal(reactivated_count, 1, "height-mature re-quarantined block reactivation count")
+assert_share_ledger_untouched("second reactivation")
 matured_count = replacement._run_json("SELECT json_build_object('count', qbit_mark_mature_pool_payouts(1008));")["count"]
 assert_equal(matured_count, 2, "mature payout entry count")
+assert_share_ledger_untouched("maturation")
 carry_states = replacement._run_json(
     """
 SELECT COALESCE(json_agg(DISTINCT maturity_state ORDER BY maturity_state), '[]'::json)
@@ -1429,6 +2019,129 @@ WHERE block_hash = '""" + external_block_hash + """';
         "externalized conflicting duplicate does not write an orphan body file",
     )
 
+external_successor.release_writer_lease()
+
+# A pre-ordinal writer confirms with a plain chain_state UPDATE that never
+# mentions the publication ordinal. The BEFORE INSERT OR UPDATE trigger must
+# assign the next ordinal for that write so the validated CHECK constraint
+# stays satisfiable under a code-only rollback, while an ordinal-aware
+# confirmation that assigns nextval() explicitly stays untouched.
+legacy_confirm_hash = "e9" * 32
+replacement._run_sql(
+    """
+INSERT INTO qbit_pool_blocks (
+    block_hash,
+    block_height,
+    parent_hash,
+    coinbase_txid,
+    payout_manifest_sha256,
+    chain_state
+) VALUES (
+    '""" + legacy_confirm_hash + """',
+    95,
+    '""" + "ab" * 32 + """',
+    '""" + "4a" * 32 + """',
+    '""" + "4b" * 32 + """',
+    'prepared'
+);
+"""
+)
+legacy_before = replacement._run_json(
+    """
+SELECT json_build_object(
+    'ordinal', (
+        SELECT audit_publication_sequence
+        FROM qbit_pool_blocks
+        WHERE block_hash = '""" + legacy_confirm_hash + """'
+    ),
+    'max_ordinal', (
+        SELECT COALESCE(MAX(audit_publication_sequence), 0)
+        FROM qbit_pool_blocks
+    )
+);
+"""
+)
+assert_equal(legacy_before["ordinal"], None, "prepared legacy block carries no ordinal")
+replacement._run_sql(
+    """
+UPDATE qbit_pool_blocks
+SET chain_state = 'confirmed'
+WHERE block_hash = '""" + legacy_confirm_hash + """';
+"""
+)
+legacy_after = replacement._run_json(
+    """
+SELECT json_build_object(
+    'ordinal', (
+        SELECT audit_publication_sequence
+        FROM qbit_pool_blocks
+        WHERE block_hash = '""" + legacy_confirm_hash + """'
+    ),
+    'duplicate_ordinals', (
+        SELECT count(*)
+        FROM (
+            SELECT audit_publication_sequence
+            FROM qbit_pool_blocks
+            WHERE audit_publication_sequence IS NOT NULL
+            GROUP BY audit_publication_sequence
+            HAVING count(*) > 1
+        ) AS duplicated
+    )
+);
+"""
+)
+if legacy_after["ordinal"] is None:
+    raise SystemExit("legacy ordinal-less confirmation was not assigned an ordinal")
+legacy_ordinal = int(legacy_after["ordinal"])
+if legacy_ordinal <= int(legacy_before["max_ordinal"]):
+    raise SystemExit("legacy confirmation ordinal did not extend publication order")
+assert_equal(
+    legacy_after["duplicate_ordinals"],
+    0,
+    "publication ordinals stay unique after a legacy confirmation",
+)
+explicit_confirm_hash = "e8" * 32
+replacement._run_sql(
+    """
+INSERT INTO qbit_pool_blocks (
+    block_hash,
+    block_height,
+    parent_hash,
+    coinbase_txid,
+    payout_manifest_sha256,
+    chain_state
+) VALUES (
+    '""" + explicit_confirm_hash + """',
+    96,
+    '""" + legacy_confirm_hash + """',
+    '""" + "4c" * 32 + """',
+    '""" + "4d" * 32 + """',
+    'prepared'
+);
+
+UPDATE qbit_pool_blocks
+SET chain_state = 'confirmed',
+    audit_publication_sequence = nextval('qbit_audit_publication_sequence_seq')
+WHERE block_hash = '""" + explicit_confirm_hash + """';
+"""
+)
+explicit_after = replacement._run_json(
+    """
+SELECT json_build_object(
+    'ordinal', (
+        SELECT audit_publication_sequence
+        FROM qbit_pool_blocks
+        WHERE block_hash = '""" + explicit_confirm_hash + """'
+    )
+);
+"""
+)
+assert_equal(
+    int(explicit_after["ordinal"]),
+    legacy_ordinal + 1,
+    "explicit ordinal-aware confirmation continues the same allocation order",
+)
+
 # Everything above runs on fixtures far smaller than one 4096-row cutoff page,
 # so the recursive page step of the bounded window readers never executes.
 # Seed enough unit-difficulty shares that the paged cutoff walk must cross page
@@ -1517,6 +2230,113 @@ for network_difficulty, expected_len in [(512, 4096), (1024, 8192), (1025, 8200)
         f"multi-page audit window crossing row at network difficulty {network_difficulty}",
     )
 
-print("prism postgres ledger PASS shares=14 lease=replay startup-retry persist-fence sql-window maturity=reorg carry-replay integrity multipage-window=9000")
+# Issue #236: both payout-window reads now return one JSON object per row,
+# decoded by the psql backend line by line from a spooled result instead of
+# one json_agg value. The selection did not change, so the pre-#236 aggregate
+# statement is the oracle: same rows, same order, same field values, across
+# the 9000-row fixture (17 batches of 512, a boundary inside the crossing
+# page), every exact weighted cutoff above, the unbounded full history, an
+# empty window, and the delta's disjoint eligibility branches.
+assert_equal(replacement.execution_backend, "psql-subprocess", "oracle check runs on the psql backend")
+for weight, expected_len in [(4095, 4095), (4096, 4096), (4097, 4097), (8192, 8192), (9000, 9000), (12000, 9000)]:
+    assert_rows_match_aggregate(
+        replacement,
+        lambda: replacement.snapshot_at_job_issue(bulk_anchor_ms, window_weight=weight),
+        label=f"per-row bounded snapshot at window weight {weight}",
+        expected_len=expected_len,
+    )
+assert_rows_match_aggregate(
+    replacement,
+    lambda: replacement.snapshot_at_job_issue(bulk_anchor_ms),
+    label="per-row unbounded snapshot",
+    expected_len=9000,
+)
+assert_rows_match_aggregate(
+    replacement,
+    lambda: replacement.snapshot_at_job_issue(0, window_weight=64),
+    label="per-row empty window",
+    expected_len=0,
+)
+assert_rows_match_aggregate(
+    replacement,
+    lambda: replacement.snapshot_at_job_issue(1_700_000_000_001, window_weight=1),
+    label="per-row single-row window",
+    expected_len=1,
+)
+assert_rows_match_aggregate(
+    replacement,
+    lambda: replacement.snapshot_between_job_issues(1_700_000_004_000, 1_700_000_006_000),
+    label="per-row delta inside the bulk fixture",
+    expected_len=2000,
+)
+assert_rows_match_aggregate(
+    replacement,
+    lambda: replacement.snapshot_between_job_issues(0, bulk_anchor_ms),
+    label="per-row delta over the whole history",
+)
+
+# A read-only ledger against this writable primary. Everything above proved
+# the database accepts writes, which is exactly what makes it the right target:
+# a standby would refuse these writes whoever asked, so it can never show that
+# read_only=True is what refused them.
+read_only_ledger = PsqlShareLedger(
+    psql_command=psql_with_env,
+    writer_id="public-read",
+    writer_epoch=1,
+    read_only=True,
+)
+
+# release_writer_lease_fresh_connection issues an UPDATE over a one-shot psql
+# connection, taking neither the writer gate nor the pool. The in-process gate
+# cannot refuse it, so the server must.
+try:
+    read_only_ledger.release_writer_lease_fresh_connection()
+except RuntimeError as exc:
+    if "read-only transaction" not in str(exc):
+        raise
+else:
+    raise SystemExit("read-only ledger wrote to a writable primary")
+
+# The read tier still reads: the session is read-only, not unusable. This goes
+# through a read slot, which is the gate every public route takes; all_shares()
+# and the other O(n) reads take the writer gate and are refused in-process,
+# which is the pre-existing half of the promise.
+assert_equal(
+    read_only_ledger.accepted_share_stats()["accepted_share_count"] > 0,
+    True,
+    "read-only ledger still serves reads",
+)
+read_only_ledger.close()
+
+# The same statement, the same identity, the same database, differing only in
+# read_only: it lands. So the refusal above is the read-only session and not
+# the statement, the schema, or the state of the lease row.
+control_writer = PsqlShareLedger(
+    psql_command=psql_with_env,
+    writer_id="public-read",
+    writer_epoch=1,
+)
+assert_equal(
+    control_writer.release_writer_lease_fresh_connection(),
+    True,
+    "writable ledger of the same identity still releases its own lease",
+)
+control_writer.close()
+
+print("prism postgres ledger PASS shares=14 lease=replay startup-retry persist-fence sql-window bulk-abandon=fenced maturity=reorg carry-replay integrity multipage-window=9000 window-rows=oracle read-only-session share-ledger-identity=inactive+reactivate+mature")
 PY
+
+  PRISM_PSQL_COMMAND="${PSQL_COMMAND}" \
+    python3 -m tests.prism_postgres_a1_gate
+
+  PRISM_PSQL_COMMAND="${PSQL_COMMAND}" \
+    python3 -m tests.prism_postgres_a1_migration_gate
+
+  PRISM_PSQL_COMMAND="${PSQL_COMMAND}" \
+    python3 -m tests.prism_postgres_a1_revert_gate
+
+  PRISM_PSQL_COMMAND="${PSQL_COMMAND}" \
+  QBIT_PRISM_GATE_IMAGE="${GATE_IMAGE}" \
+  QBIT_PRISM_GATE_IMAGE_DIGEST="${GATE_IMAGE_DIGEST}" \
+    python3 -m tests.prism_postgres_a1_process_gate
 )

@@ -59,7 +59,7 @@ compose_env_value() { \
 	};
 endef
 
-.PHONY: doctor prism-self-check require-lab-mode test-builder test-builder-regtest test-prism-regtest test-prism-postgres-ledger test-prism-postgres-scale test-prism-postgres-native-ledger test-prism-postgres-throughput test-prism-stratum-regtest-live test-prism-stratum-postgres-regtest-live test-prism-combined-regtest test-compose-prism-config up up-permissionless up-permissionless-pool test-permissionless test-permissionless-p2mr test-ckpool-bip310 up-real-miner up-permissionless-real test-real-miner up-auxpow up-auxpow-bridge up-auxpow-pool up-prism up-prism-pool up-dual-pools test-auxpow test-auxpow-stratum test-auxpow-stratum-bip310 test-auxpow-stratum-age smoke-all down purge-local-volumes
+.PHONY: doctor prism-self-check require-lab-mode test-builder test-builder-regtest test-prism-regtest test-prism-postgres-ledger test-prism-postgres-scale test-prism-postgres-native-ledger test-prism-postgres-seed-guard test-prism-postgres-throughput test-prism-public-read-replica test-prism-stratum-regtest-live test-prism-stratum-postgres-regtest-live test-prism-combined-regtest test-compose-prism-config up up-permissionless up-permissionless-pool test-permissionless test-permissionless-p2mr test-ckpool-bip310 up-real-miner up-permissionless-real test-real-miner up-auxpow up-auxpow-bridge up-auxpow-pool up-prism up-prism-pool up-dual-pools test-auxpow test-auxpow-stratum test-auxpow-stratum-bip310 test-auxpow-stratum-age smoke-all down purge-local-volumes
 
 require-lab-mode:
 	@bash scripts/check-env.sh --require-lab
@@ -99,8 +99,17 @@ test-prism-postgres-scale:
 test-prism-postgres-native-ledger:
 	bash test/test-prism-postgres-native-ledger.sh
 
+test-prism-postgres-candidate-storage:
+	bash test/test-prism-postgres-candidate-storage.sh
+
+test-prism-postgres-seed-guard:
+	bash test/test-prism-postgres-seed-guard.sh
+
 test-prism-postgres-throughput:
 	bash test/test-prism-postgres-throughput.sh
+
+test-prism-public-read-replica:
+	bash test/test-prism-public-read-replica.sh
 
 test-prism-stratum-regtest-live:
 	@$(WITH_RESOLVED_QBIT) \
@@ -269,14 +278,15 @@ up-prism-pool:
 	@$(WITH_RESOLVED_QBIT) \
 	$(COMPOSE_ENV_HELPERS) \
 	missing=0; \
-	for name in PRISM_MANIFEST_SIGNING_SEED_HEX PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX; do \
-		if [ -z "$$(compose_env_value "$$name")" ]; then \
+	for name in PRISM_MANIFEST_SIGNING_SEED_HEX PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX PRISM_PUBLIC_STRATUM_URL; do \
+		value="$$(compose_env_value "$$name")"; \
+		if [[ -z "$${value//[[:space:]]/}" ]]; then \
 			printf 'prism operator env: %s is required\n' "$$name" >&2; \
 			missing=1; \
 		fi; \
 	done; \
 	if [ "$${missing}" -ne 0 ]; then \
-		printf 'prism operator env: set real PRISM signing keys in .env before running make up-prism-pool\n' >&2; \
+		printf 'prism operator env: set PRISM signing keys and PRISM_PUBLIC_STRATUM_URL in .env or DEPLOY_ENV_FILE before running make up-prism-pool\n' >&2; \
 		printf 'prism operator env: keep PRISM_ALLOW_TEST_SIGNING_SEEDS=0 and PRISM_ALLOW_BUNDLE_EMBEDDED_LEDGER_KEY=0 for deploys\n' >&2; \
 		exit 1; \
 	fi; \
@@ -292,9 +302,9 @@ up-prism-pool:
 	fi; \
 	printf 'audit HTTP stays inside the coordinator namespace at %s:%s\n' "$$(compose_env_value PRISM_AUDIT_BIND 127.0.0.1)" "$$(compose_env_value PRISM_AUDIT_PORT 3341)"; \
 	if [[ "$$(operator_build_mode)" == no-build ]]; then \
-		$(PRODUCTION_COMPOSE) --profile prism up -d --no-build --pull never qbitd prism-postgres prism-coordinator; \
+		$(PRODUCTION_COMPOSE) --profile prism up -d --no-build --pull never qbitd prism-postgres prism-coordinator prism-public-api; \
 	else \
-		$(COMPOSE) --profile prism up --build qbitd prism-postgres prism-coordinator; \
+		$(COMPOSE) --profile prism up --build qbitd prism-postgres prism-coordinator prism-public-api; \
 	fi
 
 up-dual-pools: export MINING_LANES=ckpool,auxpow

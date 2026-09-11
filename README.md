@@ -89,9 +89,9 @@ configuration. It exits non-zero on hard failures.
 
 ### Run PRISM Pool
 
-Direct PRISM Stratum requires Postgres and three key values before
-`make up-prism-pool` starts. Generate unique deployment seeds and derive the
-trusted ledger public key from the ledger attestation seed:
+Direct PRISM Stratum requires Postgres, three key values, and an advertised
+Stratum URL before `make up-prism-pool` starts. Generate unique deployment
+seeds and derive the trusted ledger public key from the ledger attestation seed:
 
 ```bash
 PRISM_MANIFEST_SIGNING_SEED_HEX="$(openssl rand -hex 32)"
@@ -112,7 +112,15 @@ rejected, and the vardiff bounds must satisfy `minimum <= start <= maximum`.
 The public ledger key must be distributed to verifiers out of band; do not ask
 verifiers to trust a key copied from the audit bundle they are checking.
 
-Then start and validate the pool:
+Also set `PRISM_PUBLIC_STRATUM_URL` in the same environment file to the endpoint
+miners can reach. Replace the example hostname and port with your pool's:
+
+```dotenv
+PRISM_PUBLIC_STRATUM_URL=stratum+tcp://pool.example:3340
+```
+
+The target rejects a missing or blank URL before starting services. Then start
+and validate the pool:
 
 ```bash
 make up-prism-pool
@@ -120,8 +128,8 @@ make prism-self-check
 ```
 
 `make up-prism-pool` prints the Stratum URL. Miners authorize with
-`<qbit-payout-address>[.<worker>]` usernames. The coordinator serves `/public/v1`
-from its audit HTTP listener for dashboard-safe read models. Keep `/audit/*`,
+`<qbit-payout-address>[.<worker>]` usernames. The separate `prism-public-api`
+service serves `/public/v1` on port `3342` by default. Keep `/audit/*`,
 `/metrics`, `/healthz`, Postgres, qbit RPC, ckpool command sockets, and Docker
 volumes private unless you intentionally proxy them with access controls. See
 [`docs/prism-storage-sizing.md`](docs/prism-storage-sizing.md) for PRISM
@@ -201,8 +209,8 @@ shape, and receives explicit `CKPOOL_MINDIFF` and `CKPOOL_STARTDIFF` values.
 Regtest keeps the lab-only `1/256` difficulty floor.
 
 The one launch-only exception is explicitly authorized mainnet prelaunch. It
-requires the five authorization values below plus the explicit mainnet daemon
-selector; missing, invalid, or mismatched values fail closed:
+requires the authorization values, explicit mainnet daemon selector and mask
+policy below; missing, invalid, or mismatched values fail closed:
 
 ```bash
 QBIT_CHAIN=mainnet
@@ -211,13 +219,18 @@ QBIT_PRODUCTION=1
 QBIT_TOOLS_PRODUCTION=1
 CKPOOL_NON_TEST_READINESS_GATE=0
 QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED=0
+CKPOOL_VERSION_MASK_MODE=static
+CKPOOL_VERSION_MASK=1fffe000
 ```
 
 Preflight still checks the RPC chain, the mandatory mainnet genesis hash, static qbit
 assumptions, difficulty policy, and P2MR payout address, but defers launch-only
 IBD, peer, live-template, freshness, and active-tip checks. CKPool remains
 running with its Stratum listener bound and retries GBT until qbitd can serve
-work. At launch, set both readiness flags to `1` and restart or redeploy CKPool;
+work. This requires the explicit static mask above while templates are
+unavailable; dynamic mode aborts startup without a successful template. At
+launch, set both readiness flags to `1`, restore
+`CKPOOL_VERSION_MASK_MODE=dynamic`, and restart or redeploy CKPool;
 the new supervisor then checks IBD, peer count, live-template freshness, and
 active-tip agreement continuously. Runtime environment changes are not
 hot-reloaded by an already-running supervisor.
@@ -270,7 +283,7 @@ exceeds `AUXPOW_TEMPLATE_MAX_AGE_SECONDS` (default 120), or after
 sits below qbit's default 60 minute `-auxpowtemplateexpiry`, so both parent work
 and the cached qbit candidate receive bounded replacement.
 
-The AuxPoW Stratum bridge advertises parent-chain work, enables per-miner vardiff by default, and uses `AUXPOW_STRATUM_VERSION_MASK=1fffe000` for BIP310 version rolling. qbit child candidates still come from `createauxblock`; permissionless qbit, ckpool, and direct PRISM Stratum prefer the connected qbit node's `getblocktemplate.versionrollingmask` when present. Older or unavailable GBT probes fall back to each service's configured mask: `CKPOOL_VERSION_MASK` for ckpool and `PRISM_VERSION_ROLLING_MASK` for direct PRISM. For byte-order investigations, set `AUXPOW_STRATUM_DIAG_VARIANTS=1` and optionally `AUXPOW_STRATUM_DIAG_JSONL=1`; normal operation uses `AUXPOW_STRATUM_HEADER_VARIANT=canonical`.
+The AuxPoW Stratum bridge advertises parent-chain work, enables per-miner vardiff by default, and uses `AUXPOW_STRATUM_VERSION_MASK=1fffe000` for BIP310 version rolling. qbit child candidates still come from `createauxblock`; permissionless qbit, ckpool, and direct PRISM Stratum prefer the connected qbit node's `getblocktemplate.versionrollingmask` when present. Nodes that answer but do not advertise the field fall back to each service's configured mask: `CKPOOL_VERSION_MASK` for ckpool and `PRISM_VERSION_ROLLING_MASK` for direct PRISM. ckpool's dynamic mode fails closed when `getblocktemplate` cannot be retrieved at all. For byte-order investigations, set `AUXPOW_STRATUM_DIAG_VARIANTS=1` and optionally `AUXPOW_STRATUM_DIAG_JSONL=1`; normal operation uses `AUXPOW_STRATUM_HEADER_VARIANT=canonical`.
 
 Vardiff defaults target one accepted share every 5 seconds, start miners at difficulty 8192, clamp the minimum advertised difficulty to 1024, and retarget every 120 seconds using share-weighted work with EWMA smoothing. By default retargets send `mining.set_difficulty` and defer the new share target until the next natural job refresh (`AUXPOW_STRATUM_VARDIFF_APPLY_MODE=next_job`), which avoids sending clean replacement jobs with identical header space. Set `AUXPOW_STRATUM_VARDIFF_APPLY_MODE=clean_job` only for miners that require immediate clean-job difficulty enforcement.
 
@@ -334,13 +347,26 @@ make up-permissionless-pool
 That starts `qbitd + ckpool` and prints the local Stratum endpoint. Point any compatible SHA256d Stratum miner at that port and use a qbit payout address as the username. If `QBIT_MINER_ADDRESS=auto`, the compose helpers derive the chain-default payout address from the node first. On public chains that resolves to P2MR.
 
 By default, ckpool starts with `CKPOOL_VERSION_MASK_MODE=dynamic`: it asks qbitd
-for `getblocktemplate` and uses the advertised `versionrollingmask` when the
-connected node exposes it. Older qbitd builds that do not expose the field fall back to
-the configured `CKPOOL_VERSION_MASK`; the sample env uses `1fffe000` because
-current qbitd permissionless templates advertise that mask. The selected mask is
-logged and rendered into `/etc/ckpool/ckpool.conf`. If qbitd advertises
+for `getblocktemplate` and uses the advertised `versionrollingmask`. The probe
+runs only after the startup supervisor's readiness gate and live-template checks
+have passed, so the mask reflects a node that is actually serving templates
+rather than one that is still starting up. Dynamic mode fails closed: if
+`getblocktemplate` cannot be retrieved after
+`CKPOOL_VERSION_MASK_PROBE_ATTEMPTS` tries (spaced by
+`CKPOOL_VERSION_MASK_PROBE_RETRY_SECONDS`), startup aborts before any config is
+written instead of freezing a fallback mask for the life of the process.
+
+A node that answers successfully but omits `versionrollingmask` is an older
+qbitd build that does not advertise one; ckpool then uses the configured
+`CKPOOL_VERSION_MASK`. The sample env uses `1fffe000` because current qbitd
+permissionless templates advertise that mask. If qbitd advertises
 `versionrollingmask=00000000`, ckpool disables BIP310 version rolling for that
-node.
+node. The selected mask is logged and rendered into `/etc/ckpool/ckpool.conf`.
+
+Set `CKPOOL_VERSION_MASK_MODE=static` to skip the probe entirely and use
+`CKPOOL_VERSION_MASK` as configured. That is the explicit escape for deployments
+that must start while `getblocktemplate` is unavailable, including authorized
+mainnet prelaunch.
 
 CKPool also exposes its private command socket below `CKPOOL_SOCK_DIR`
 (`/tmp/qbitlab` by default). Override that path only to share the Unix socket
@@ -445,6 +471,8 @@ qbit has its own JSON-RPC defaults. The qbit-specific `8355` value is the mainne
 
 ## Operator Notes
 
+- Release preparation, publication, and development-branch synchronization are
+  documented in [Publishing a release](docs/releasing.md).
 - Public qbit networks use P2MR-only wallet output types. Use default wallet-generated payout addresses, and keep payout transactions inside qbit's allowed output policy.
 - Direct PRISM Stratum accepts `<qbit-payout-address>[.<worker>]` usernames. On qbit test chains, an invalid username payout falls back to `tq1zlsq9dpxz8mennhdpr9nf9s0f2tjtq6gxs9m84k6xglhkfp92q2zszzu4m3` unless `PRISM_USERNAME_FALLBACK_ADDRESS` is set.
 - Direct PRISM Stratum tags its coinbase scriptSig with `PRISM_COINBASE_TAG` before the Stratum extranonce. The default is `/PRISM/`; set `PRISM_COINBASE_TAG=` to disable it or set another short printable ASCII tag.

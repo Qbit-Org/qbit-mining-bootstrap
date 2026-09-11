@@ -3,6 +3,20 @@
 -- Invariant: only one logical writer inserts into qbit_share_ledger. Stratum
 -- frontends may scale horizontally, but they must feed that writer through a
 -- queue instead of inserting shares independently.
+--
+-- The whole file applies inside exactly one transaction, enforced by the
+-- BEGIN/COMMIT wrapper below rather than by any caller's flags. This is what
+-- makes the apply atomic everywhere it runs: the coordinator's psql backend
+-- (which additionally passes --single-transaction), the native psycopg client
+-- (whose single script execution wraps the string in the simple-query
+-- protocol), and a manual operator apply with plain autocommit psql. Without
+-- it, a failure or interruption mid-file commits some statements -- the
+-- carry-forward summary sync triggers -- while later statements, including
+-- the summary seed near the end of the file, never run; a live writer
+-- mutating carry state in that gap leaves a permanently partial summary
+-- (#124). A per-statement autocommit apply of this file is a bug regardless
+-- of who performs it.
+BEGIN;
 
 CREATE TABLE IF NOT EXISTS qbit_ledger_writer_lease (
     singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
@@ -137,6 +151,7 @@ ALTER TABLE qbit_payout_carry_forward
 
 CREATE TABLE IF NOT EXISTS qbit_pool_blocks (
     block_hash text PRIMARY KEY,
+    audit_publication_sequence bigint,
     block_height bigint NOT NULL CHECK (block_height >= 0),
     parent_hash text NOT NULL,
     coinbase_txid text NOT NULL,
@@ -169,6 +184,628 @@ ALTER TABLE qbit_pool_blocks
 ALTER TABLE qbit_pool_blocks
     ADD CONSTRAINT qbit_pool_blocks_chain_state_check
     CHECK (chain_state IN ('prepared', 'confirmed', 'inactive', 'rejected', 'reversed'));
+
+-- Artifact order is allocated at the durable prepared -> confirmed boundary.
+-- Exact confirmed replay and a later inactive -> confirmed transition reuse it,
+-- independent of block height. Upgrade existing confirmed and inactive rows
+-- deterministically and advance the sequence beyond any value already installed
+-- by a partial migration.
+--
+-- This serialized phase relies on the whole-file BEGIN/COMMIT wrapper: the
+-- transaction-scoped advisory lock is held from here until the end of the
+-- entire apply, serializing concurrent appliers of this migration.
+SELECT pg_advisory_xact_lock(
+    hashtext('qbit_audit_publication_sequence_migration')
+);
+DO $$
+DECLARE
+    table_namespace text := current_schema();
+    table_oid oid;
+BEGIN
+    SELECT pool_blocks.oid
+    INTO table_oid
+    FROM pg_class pool_blocks
+    JOIN pg_namespace namespace ON namespace.oid = pool_blocks.relnamespace
+    WHERE namespace.nspname = table_namespace
+      AND pool_blocks.relname = 'qbit_pool_blocks'
+      AND pool_blocks.relkind = 'r';
+    IF table_oid IS NULL THEN
+        RAISE EXCEPTION 'missing qbit_pool_blocks in current schema';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_class relation
+        JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = table_namespace
+          AND relation.relname = 'qbit_audit_publication_sequence_seq'
+    ) THEN
+        EXECUTE format(
+            'CREATE SEQUENCE %I.qbit_audit_publication_sequence_seq',
+            table_namespace
+        );
+    END IF;
+END;
+$$;
+
+DO $$
+DECLARE
+    sequence_definition record;
+BEGIN
+    SELECT
+        sequence.seqtypid,
+        sequence.seqstart,
+        sequence.seqincrement,
+        sequence.seqmax,
+        sequence.seqmin,
+        sequence.seqcache,
+        sequence.seqcycle,
+        relation.relnamespace AS sequence_namespace,
+        relation.relpersistence AS sequence_persistence,
+        relation.relowner AS sequence_owner,
+        pool_blocks.relnamespace AS table_namespace,
+        pool_blocks.relowner AS table_owner,
+        EXISTS (
+            SELECT 1
+            FROM pg_depend dependency
+            WHERE dependency.classid = 'pg_class'::regclass
+              AND dependency.objid = relation.oid
+              AND dependency.refclassid = 'pg_class'::regclass
+              AND dependency.refobjsubid > 0
+              AND dependency.deptype IN ('a', 'i')
+        ) AS owned_by_column
+    INTO sequence_definition
+    FROM pg_class pool_blocks
+    JOIN pg_namespace table_namespace
+      ON table_namespace.oid = pool_blocks.relnamespace
+    JOIN pg_class relation
+      ON relation.relnamespace = pool_blocks.relnamespace
+     AND relation.relname = 'qbit_audit_publication_sequence_seq'
+    JOIN pg_sequence sequence ON sequence.seqrelid = relation.oid
+    WHERE relation.relkind = 'S'
+      AND table_namespace.nspname = current_schema()
+      AND pool_blocks.relname = 'qbit_pool_blocks'
+      AND pool_blocks.relkind = 'r';
+    IF NOT FOUND
+       OR sequence_definition.seqtypid <> 'bigint'::regtype
+       OR sequence_definition.seqstart <> 1
+       OR sequence_definition.seqincrement <> 1
+       OR sequence_definition.seqmax <> 9223372036854775807
+       OR sequence_definition.seqmin <> 1
+       OR sequence_definition.seqcache <> 1
+       OR sequence_definition.seqcycle
+       OR sequence_definition.sequence_namespace <>
+          sequence_definition.table_namespace
+       OR sequence_definition.sequence_persistence <> 'p'
+       OR sequence_definition.sequence_owner <> sequence_definition.table_owner
+       OR sequence_definition.owned_by_column THEN
+        RAISE EXCEPTION 'invalid audit publication sequence definition';
+    END IF;
+END;
+$$;
+
+DO $$
+DECLARE
+    table_namespace text := current_schema();
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_class pool_blocks
+        JOIN pg_namespace namespace
+          ON namespace.oid = pool_blocks.relnamespace
+        WHERE namespace.nspname = table_namespace
+          AND pool_blocks.relname = 'qbit_pool_blocks'
+          AND pool_blocks.relkind = 'r'
+    ) THEN
+        RAISE EXCEPTION 'missing qbit_pool_blocks in current schema';
+    END IF;
+    EXECUTE format(
+        'ALTER TABLE %I.qbit_pool_blocks '
+        'ADD COLUMN IF NOT EXISTS audit_publication_sequence bigint',
+        table_namespace
+    );
+END;
+$$;
+
+DO $$
+DECLARE
+    table_oid oid;
+BEGIN
+    SELECT pool_blocks.oid
+    INTO table_oid
+    FROM pg_class pool_blocks
+    JOIN pg_namespace namespace
+      ON namespace.oid = pool_blocks.relnamespace
+    WHERE namespace.nspname = current_schema()
+      AND pool_blocks.relname = 'qbit_pool_blocks'
+      AND pool_blocks.relkind = 'r';
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_attribute
+        WHERE attrelid = table_oid
+          AND attname = 'audit_publication_sequence'
+          AND attnum > 0
+          AND NOT attisdropped
+          AND atttypid = 'bigint'::regtype
+          AND NOT attnotnull
+          AND NOT atthasdef
+          AND attidentity = ''
+          AND attgenerated = ''
+          AND attcollation = 0
+    ) THEN
+        RAISE EXCEPTION 'invalid audit publication sequence column definition';
+    END IF;
+END;
+$$;
+
+DO $$
+DECLARE
+    pending record;
+    assigned_sequence numeric;
+    assignment_start numeric;
+    invalid_sequence boolean;
+    duplicate_sequence boolean;
+    maximum_sequence bigint;
+    pending_count bigint;
+    raw_next_sequence numeric;
+    sequence_last bigint;
+    sequence_called boolean;
+    sequence_relation regclass;
+    table_namespace text := current_schema();
+    table_oid oid;
+BEGIN
+    -- Serialize partial/concurrent schema initialization and exclude live
+    -- confirmation updates while setval/backfill establish the ordinal floor.
+    SELECT pool_blocks.oid
+    INTO table_oid
+    FROM pg_class pool_blocks
+    JOIN pg_namespace namespace
+      ON namespace.oid = pool_blocks.relnamespace
+    WHERE namespace.nspname = table_namespace
+      AND pool_blocks.relname = 'qbit_pool_blocks'
+      AND pool_blocks.relkind = 'r';
+    IF table_oid IS NULL THEN
+        RAISE EXCEPTION 'missing qbit_pool_blocks in current schema';
+    END IF;
+    EXECUTE format(
+        'LOCK TABLE %I.qbit_pool_blocks IN SHARE ROW EXCLUSIVE MODE',
+        table_namespace
+    );
+    EXECUTE format(
+        'SELECT EXISTS ('
+        'SELECT 1 FROM %I.qbit_pool_blocks '
+        'WHERE audit_publication_sequence IS NOT NULL '
+        'AND audit_publication_sequence <= 0)',
+        table_namespace
+    ) INTO invalid_sequence;
+    IF invalid_sequence THEN
+        RAISE EXCEPTION 'invalid non-positive audit publication sequence';
+    END IF;
+    EXECUTE format(
+        'SELECT EXISTS ('
+        'SELECT audit_publication_sequence '
+        'FROM %I.qbit_pool_blocks '
+        'WHERE audit_publication_sequence IS NOT NULL '
+        'GROUP BY audit_publication_sequence HAVING count(*) > 1)',
+        table_namespace
+    ) INTO duplicate_sequence;
+    IF duplicate_sequence THEN
+        RAISE EXCEPTION 'duplicate audit publication sequence';
+    END IF;
+    EXECUTE format(
+        'SELECT COALESCE(MAX(audit_publication_sequence), 0) '
+        'FROM %I.qbit_pool_blocks',
+        table_namespace
+    ) INTO maximum_sequence;
+    SELECT sequence.oid::regclass
+    INTO sequence_relation
+    FROM pg_class sequence
+    WHERE sequence.relnamespace = (
+              SELECT oid FROM pg_namespace
+              WHERE nspname = table_namespace
+          )
+      AND sequence.relname = 'qbit_audit_publication_sequence_seq'
+      AND sequence.relkind = 'S';
+    EXECUTE format(
+        'SELECT last_value, is_called '
+        'FROM %I.qbit_audit_publication_sequence_seq',
+        table_namespace
+    ) INTO sequence_last, sequence_called;
+    raw_next_sequence := sequence_last::numeric
+        + CASE WHEN sequence_called THEN 1 ELSE 0 END;
+    EXECUTE format(
+        'SELECT count(*) FROM %I.qbit_pool_blocks '
+        'WHERE chain_state IN (''confirmed'', ''inactive'') '
+        'AND audit_publication_sequence IS NULL',
+        table_namespace
+    ) INTO pending_count;
+    assignment_start := GREATEST(
+        raw_next_sequence,
+        maximum_sequence::numeric + 1
+    );
+    IF pending_count > 0
+       AND (
+           assignment_start < 1
+           OR assignment_start + pending_count::numeric - 1
+              > 9223372036854775807::numeric
+       ) THEN
+        RAISE EXCEPTION 'audit publication sequence exhausted';
+    END IF;
+    assigned_sequence := assignment_start;
+    FOR pending IN EXECUTE format(
+        'SELECT block_hash FROM %I.qbit_pool_blocks '
+        'WHERE chain_state IN (''confirmed'', ''inactive'') '
+        'AND audit_publication_sequence IS NULL '
+        'ORDER BY found_at, block_hash',
+        table_namespace
+    )
+    LOOP
+        EXECUTE format(
+            'UPDATE %I.qbit_pool_blocks '
+            'SET audit_publication_sequence = $1 '
+            'WHERE block_hash = $2 '
+            'AND audit_publication_sequence IS NULL',
+            table_namespace
+        ) USING assigned_sequence::bigint, pending.block_hash;
+        assigned_sequence := assigned_sequence + 1;
+    END LOOP;
+END;
+$$;
+
+DO $$
+DECLARE
+    index_name constant text :=
+        'qbit_pool_blocks_audit_publication_sequence_idx';
+    canonical_index_oid oid;
+    table_namespace text := current_schema();
+    table_oid oid;
+BEGIN
+    SELECT pool_blocks.oid
+    INTO table_oid
+    FROM pg_class pool_blocks
+    JOIN pg_namespace namespace
+      ON namespace.oid = pool_blocks.relnamespace
+    WHERE namespace.nspname = table_namespace
+      AND pool_blocks.relname = 'qbit_pool_blocks'
+      AND pool_blocks.relkind = 'r';
+    IF table_oid IS NULL THEN
+        RAISE EXCEPTION 'missing qbit_pool_blocks in current schema';
+    END IF;
+    SELECT index_relation.oid
+    INTO canonical_index_oid
+    FROM pg_class index_relation
+    WHERE index_relation.relnamespace = (
+              SELECT oid FROM pg_namespace
+              WHERE nspname = table_namespace
+          )
+      AND index_relation.relname = index_name;
+    IF canonical_index_oid IS NULL THEN
+        EXECUTE format(
+            'CREATE UNIQUE INDEX %I '
+            'ON %I.qbit_pool_blocks (audit_publication_sequence)',
+            index_name,
+            table_namespace
+        );
+        SELECT index_relation.oid
+        INTO canonical_index_oid
+        FROM pg_class index_relation
+        WHERE index_relation.relnamespace = (
+                  SELECT oid FROM pg_namespace
+                  WHERE nspname = table_namespace
+              )
+          AND index_relation.relname = index_name;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_index index_definition
+        JOIN pg_class index_relation
+          ON index_relation.oid = index_definition.indexrelid
+        JOIN pg_am access_method
+          ON access_method.oid = index_relation.relam
+        JOIN pg_attribute ordinal_attribute
+          ON ordinal_attribute.attrelid = index_definition.indrelid
+         AND ordinal_attribute.attname = 'audit_publication_sequence'
+         AND NOT ordinal_attribute.attisdropped
+        JOIN pg_opclass operator_class
+          ON index_definition.indclass::text = operator_class.oid::text
+        WHERE index_definition.indexrelid = canonical_index_oid
+          AND index_definition.indrelid = table_oid
+          AND access_method.amname = 'btree'
+          AND index_relation.relkind = 'i'
+          AND index_relation.relnamespace = (
+              SELECT relnamespace
+              FROM pg_class
+              WHERE oid = index_definition.indrelid
+          )
+          AND index_relation.relpersistence = 'p'
+          AND index_relation.relowner = (
+              SELECT relowner
+              FROM pg_class
+              WHERE oid = index_definition.indrelid
+          )
+          AND index_definition.indisunique
+          AND index_definition.indisvalid
+          AND index_definition.indisready
+          AND index_definition.indislive
+          AND index_definition.indimmediate
+          AND NOT index_definition.indisprimary
+          AND NOT index_definition.indisexclusion
+          AND NOT index_definition.indisclustered
+          AND NOT index_definition.indisreplident
+          AND NOT index_definition.indnullsnotdistinct
+          AND index_definition.indnkeyatts = 1
+          AND index_definition.indnatts = 1
+          AND index_definition.indkey::text = ordinal_attribute.attnum::text
+          AND index_definition.indcollation::text = '0'
+          AND index_definition.indoption::text = '0'
+          AND operator_class.opcname = 'int8_ops'
+          AND operator_class.opcmethod = index_relation.relam
+          AND operator_class.opcnamespace = 'pg_catalog'::regnamespace
+          AND operator_class.opcintype = 'bigint'::regtype
+          AND operator_class.opcdefault
+          AND index_definition.indexprs IS NULL
+          AND index_definition.indpred IS NULL
+    ) THEN
+        RAISE EXCEPTION 'invalid audit publication sequence index definition';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+        FROM pg_index index_definition
+        JOIN pg_class index_relation
+          ON index_relation.oid = index_definition.indexrelid
+        JOIN pg_am access_method
+          ON access_method.oid = index_relation.relam
+        JOIN pg_attribute ordinal_attribute
+          ON ordinal_attribute.attrelid = index_definition.indrelid
+         AND ordinal_attribute.attname = 'audit_publication_sequence'
+         AND NOT ordinal_attribute.attisdropped
+        JOIN pg_opclass operator_class
+          ON index_definition.indclass::text = operator_class.oid::text
+        WHERE index_definition.indrelid = table_oid
+          AND index_definition.indexrelid <> canonical_index_oid
+          AND access_method.amname = 'btree'
+          AND index_relation.relkind = 'i'
+          AND index_relation.relnamespace = (
+              SELECT relnamespace
+              FROM pg_class
+              WHERE oid = index_definition.indrelid
+          )
+          AND index_relation.relpersistence = 'p'
+          AND index_relation.relowner = (
+              SELECT relowner
+              FROM pg_class
+              WHERE oid = index_definition.indrelid
+          )
+          AND index_definition.indisunique
+          AND index_definition.indisvalid
+          AND index_definition.indisready
+          AND index_definition.indnkeyatts = 1
+          AND index_definition.indnatts = 1
+          AND index_definition.indkey::text = ordinal_attribute.attnum::text
+          AND index_definition.indcollation::text = '0'
+          AND index_definition.indoption::text = '0'
+          AND operator_class.opcname = 'int8_ops'
+          AND operator_class.opcmethod = index_relation.relam
+          AND operator_class.opcnamespace = 'pg_catalog'::regnamespace
+          AND operator_class.opcintype = 'bigint'::regtype
+          AND operator_class.opcdefault
+          AND index_definition.indexprs IS NULL
+          AND index_definition.indpred IS NULL
+    ) THEN
+        RAISE EXCEPTION 'duplicate audit publication sequence index definition';
+    END IF;
+END;
+$$;
+
+DO $$
+DECLARE
+    constraint_definition text;
+    constraint_validated boolean;
+    table_namespace text := current_schema();
+    table_oid oid;
+BEGIN
+    SELECT pool_blocks.oid
+    INTO table_oid
+    FROM pg_class pool_blocks
+    JOIN pg_namespace namespace
+      ON namespace.oid = pool_blocks.relnamespace
+    WHERE namespace.nspname = table_namespace
+      AND pool_blocks.relname = 'qbit_pool_blocks'
+      AND pool_blocks.relkind = 'r';
+    IF table_oid IS NULL THEN
+        RAISE EXCEPTION 'missing qbit_pool_blocks in current schema';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = table_oid
+          AND conname = 'qbit_pool_blocks_audit_publication_sequence_check'
+    ) THEN
+        EXECUTE format(
+            'ALTER TABLE %I.qbit_pool_blocks '
+            'ADD CONSTRAINT '
+            'qbit_pool_blocks_audit_publication_sequence_check '
+            'CHECK ((audit_publication_sequence IS NULL '
+            'OR audit_publication_sequence > 0) '
+            'AND (chain_state <> ''confirmed'' '
+            'OR audit_publication_sequence IS NOT NULL))',
+            table_namespace
+        );
+    END IF;
+    SELECT
+        regexp_replace(
+            regexp_replace(
+                pg_get_constraintdef(oid, true),
+                '[[:space:]]+',
+                ' ',
+                'g'
+            ),
+            ' NOT VALID$',
+            ''
+        ),
+        convalidated
+    INTO constraint_definition, constraint_validated
+    FROM pg_constraint
+    WHERE conrelid = table_oid
+      AND conname = 'qbit_pool_blocks_audit_publication_sequence_check'
+      AND contype = 'c'
+      AND NOT condeferrable
+      AND NOT condeferred
+      AND NOT connoinherit
+      AND conislocal
+      AND coninhcount = 0
+      AND cardinality(conkey) = 2
+      AND conkey @> ARRAY[
+          (
+              SELECT attnum::smallint
+              FROM pg_attribute
+              WHERE attrelid = table_oid
+                AND attname = 'audit_publication_sequence'
+                AND NOT attisdropped
+          ),
+          (
+              SELECT attnum::smallint
+              FROM pg_attribute
+              WHERE attrelid = table_oid
+                AND attname = 'chain_state'
+                AND NOT attisdropped
+          )
+      ]::smallint[];
+    IF constraint_definition IS NULL
+       OR constraint_definition <>
+          'CHECK ((audit_publication_sequence IS NULL OR audit_publication_sequence > 0) AND (chain_state <> ''confirmed''::text OR audit_publication_sequence IS NOT NULL))' THEN
+        RAISE EXCEPTION 'invalid audit publication sequence constraint definition';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = table_oid
+          AND conname <> 'qbit_pool_blocks_audit_publication_sequence_check'
+          AND contype = 'c'
+          AND regexp_replace(
+              regexp_replace(
+                  pg_get_constraintdef(oid, true),
+                  '[[:space:]]+',
+                  ' ',
+                  'g'
+              ),
+              ' NOT VALID$',
+              ''
+          ) = constraint_definition
+    ) THEN
+        RAISE EXCEPTION 'duplicate audit publication sequence constraint definition';
+    END IF;
+    IF NOT constraint_validated THEN
+        EXECUTE format(
+            'ALTER TABLE %I.qbit_pool_blocks '
+            'VALIDATE CONSTRAINT '
+            'qbit_pool_blocks_audit_publication_sequence_check',
+            table_namespace
+        );
+    END IF;
+END;
+$$;
+
+-- The validated CHECK above requires every confirmed row to carry a
+-- publication ordinal, but a pre-ordinal writer confirms with a plain
+-- chain_state UPDATE and a column DEFAULT only fires on INSERT. Assign the
+-- ordinal here for any confirming write that omits it so the constraint
+-- stays satisfiable under a code-only rollback; ordinal-aware writers set
+-- the value explicitly in the same UPDATE, making this a no-op for them.
+CREATE OR REPLACE FUNCTION qbit_pool_blocks_assign_publication_ordinal()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    publication_sequence pg_catalog.regclass;
+BEGIN
+    IF NEW.chain_state = 'confirmed'
+       AND NEW.audit_publication_sequence IS NULL
+    THEN
+        SELECT sequence.oid::pg_catalog.regclass
+        INTO publication_sequence
+        FROM pg_catalog.pg_class pool_blocks
+        JOIN pg_catalog.pg_class sequence
+          ON sequence.relnamespace = pool_blocks.relnamespace
+         AND sequence.relname = 'qbit_audit_publication_sequence_seq'
+         AND sequence.relkind = 'S'
+        WHERE pool_blocks.oid = TG_RELID;
+        IF publication_sequence IS NULL THEN
+            RAISE EXCEPTION 'missing audit publication sequence';
+        END IF;
+        NEW.audit_publication_sequence :=
+            pg_catalog.nextval(publication_sequence);
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DO $$
+DECLARE
+    table_namespace text := current_schema();
+BEGIN
+    EXECUTE format(
+        'DROP TRIGGER IF EXISTS '
+        'qbit_pool_blocks_assign_publication_ordinal '
+        'ON %I.qbit_pool_blocks',
+        table_namespace
+    );
+    EXECUTE format(
+        'CREATE TRIGGER qbit_pool_blocks_assign_publication_ordinal '
+        'BEFORE INSERT OR UPDATE ON %I.qbit_pool_blocks '
+        'FOR EACH ROW '
+        'EXECUTE FUNCTION %I.qbit_pool_blocks_assign_publication_ordinal()',
+        table_namespace,
+        table_namespace
+    );
+END;
+$$;
+
+-- Sequence operations are nontransactional in PostgreSQL: a setval against a
+-- pre-existing sequence is NOT undone by a rollback of this transaction (only
+-- a sequence created inside it disappears with it). The sole allocator
+-- mutation therefore still runs last, after every row and catalog validation,
+-- so a rejected apply leaves an existing sequence's exact state untouched;
+-- if a later statement of the apply fails, the row assignments roll back but
+-- the setval persists. That residue is benign: this block only ever advances
+-- the sequence, so the next apply assigns higher ordinals, leaving gaps that
+-- no validation rejects. Do not move validation after the setval.
+DO $$
+DECLARE
+    maximum_sequence bigint;
+    raw_next_sequence numeric;
+    sequence_called boolean;
+    sequence_last bigint;
+    sequence_relation regclass;
+    table_namespace text := current_schema();
+BEGIN
+    SELECT sequence.oid::regclass
+    INTO sequence_relation
+    FROM pg_class sequence
+    JOIN pg_namespace namespace
+      ON namespace.oid = sequence.relnamespace
+    WHERE namespace.nspname = table_namespace
+      AND sequence.relname = 'qbit_audit_publication_sequence_seq'
+      AND sequence.relkind = 'S';
+    IF sequence_relation IS NULL THEN
+        RAISE EXCEPTION 'missing audit publication sequence';
+    END IF;
+    EXECUTE format(
+        'SELECT COALESCE(MAX(audit_publication_sequence), 0) '
+        'FROM %I.qbit_pool_blocks',
+        table_namespace
+    ) INTO maximum_sequence;
+    EXECUTE format(
+        'SELECT last_value, is_called '
+        'FROM %I.qbit_audit_publication_sequence_seq',
+        table_namespace
+    ) INTO sequence_last, sequence_called;
+    raw_next_sequence := sequence_last::numeric
+        + CASE WHEN sequence_called THEN 1 ELSE 0 END;
+    IF maximum_sequence::numeric >= raw_next_sequence THEN
+        PERFORM setval(sequence_relation, maximum_sequence, true);
+    END IF;
+END;
+$$;
 
 CREATE TABLE IF NOT EXISTS qbit_pool_audit_bundles (
     block_hash text PRIMARY KEY REFERENCES qbit_pool_blocks(block_hash),
@@ -876,27 +1513,6 @@ CREATE TRIGGER qbit_pool_blocks_carry_forward_current_truncate_sync
     FOR EACH STATEMENT
     EXECUTE FUNCTION qbit_carry_forward_current_truncate_sync();
 
--- Seed the summary exactly once when this schema is applied to a database
--- that already holds active carry history (the summary can only be empty
--- while active rows exist before the triggers above have ever run).
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM qbit_payout_carry_forward_current)
-       AND EXISTS (
-           SELECT 1
-           FROM qbit_payout_carry_forward carry
-           JOIN qbit_pool_blocks block
-             ON block.block_hash = carry.block_hash
-           WHERE carry.maturity_state <> 'reversed'
-             AND block.chain_state = 'confirmed'
-             AND block.maturity_state <> 'reversed'
-       )
-    THEN
-        PERFORM qbit_rebuild_carry_forward_current_balances();
-    END IF;
-END
-$$;
-
 CREATE OR REPLACE FUNCTION qbit_current_carry_forward_balances()
 RETURNS TABLE (
     miner_id text,
@@ -1001,6 +1617,47 @@ AS $$
        OR current_row.miner_id IS DISTINCT FROM recomputed_row.miner_id
        OR current_row.payout_order_key IS DISTINCT FROM recomputed_row.payout_order_key
     ORDER BY 1;
+$$;
+
+-- Seed or repair the summary from carry history whenever the summary
+-- disagrees with what it summarizes. This must run after the drift function
+-- above and after the sync triggers earlier in the file. A non-atomic apply
+-- (a per-statement autocommit psql run) can commit those triggers before
+-- this block runs; a live writer mutating carry state in that gap leaves a
+-- partial summary holding only post-trigger deltas. The previous guard
+-- seeded only when the summary was empty, so it treated that partial
+-- summary as already seeded and locked the damage in permanently on this
+-- apply and every later one, silently under-reporting every miner's balance
+-- by their pre-upgrade carry. Comparing the summary's active row-count
+-- total against the active carry history -- plus the drift check for
+-- balance-only divergence -- makes this a repair instead: an
+-- already-poisoned deployment is rebuilt from history by the next apply.
+-- Both counts come from one statement, so a concurrent commit cannot
+-- manufacture a false mismatch between them; a rebuild it triggers is
+-- correct by construction (it is the same recomputation the truncate
+-- triggers perform).
+DO $$
+DECLARE
+    summary_active_rows bigint;
+    ledger_active_rows bigint;
+BEGIN
+    SELECT
+        (SELECT COALESCE(SUM(active_row_count), 0)
+           FROM qbit_payout_carry_forward_current),
+        (SELECT COUNT(*)
+           FROM qbit_payout_carry_forward carry
+           JOIN qbit_pool_blocks block
+             ON block.block_hash = carry.block_hash
+          WHERE carry.maturity_state <> 'reversed'
+            AND block.chain_state = 'confirmed'
+            AND block.maturity_state <> 'reversed')
+    INTO summary_active_rows, ledger_active_rows;
+    IF summary_active_rows <> ledger_active_rows
+       OR EXISTS (SELECT 1 FROM qbit_carry_forward_current_drift())
+    THEN
+        PERFORM qbit_rebuild_carry_forward_current_balances();
+    END IF;
+END
 $$;
 
 CREATE OR REPLACE FUNCTION qbit_current_owed_balances()
@@ -1518,7 +2175,20 @@ AS $$
 DECLARE
     lease_count integer;
     confirmed_count integer;
+    publication_sequence pg_catalog.regclass;
 BEGIN
+    SELECT sequence.oid::pg_catalog.regclass
+    INTO publication_sequence
+    FROM pg_catalog.pg_class pool_blocks
+    JOIN pg_catalog.pg_class sequence
+      ON sequence.relnamespace = pool_blocks.relnamespace
+     AND sequence.relname = 'qbit_audit_publication_sequence_seq'
+     AND sequence.relkind = 'S'
+    WHERE pool_blocks.oid = 'qbit_pool_blocks'::pg_catalog.regclass
+      AND pool_blocks.relkind = 'r';
+    IF publication_sequence IS NULL THEN
+        RAISE EXCEPTION 'missing audit publication sequence';
+    END IF;
     UPDATE qbit_ledger_writer_lease
     SET lease_expires_at = clock_timestamp() + lease_duration,
         updated_at = clock_timestamp()
@@ -1533,13 +2203,27 @@ BEGIN
     END IF;
 
     UPDATE qbit_pool_blocks
-    SET chain_state = 'confirmed'
+    SET chain_state = 'confirmed',
+        audit_publication_sequence = pg_catalog.nextval(publication_sequence)
     WHERE block_hash = confirmed_block_hash
       AND block_height = active_tip_height
       AND chain_state = 'prepared'
       AND maturity_state = 'immature';
     GET DIAGNOSTICS confirmed_count = ROW_COUNT;
 
+    -- The row is already confirmed at this (hash, height): this call changed
+    -- nothing. Report the distinct idempotent disposition (2) rather than 1.
+    -- 1 means exactly "this call flipped a prepared row", and only a flip
+    -- allocates an audit publication ordinal through the nextval above; the
+    -- replay below returns with the ordinal its original flip assigned and no
+    -- sequence burned. A caller must be able to tell the two apart: a
+    -- genuinely new confirmation has to publish payout state, while a replay
+    -- is already covered by the publication its flip produced, and
+    -- republishing it bumps the payout generation, wipes the job-bundle
+    -- cache, and aborts in-flight refreshes for identical state (issue #61).
+    -- This is the durable form of that distinction -- it is recorded in the
+    -- row, not inferred from process state -- so it survives reorg corners
+    -- that no in-memory discriminator can cover.
     IF confirmed_count = 0
        AND EXISTS (
            SELECT 1
@@ -1549,7 +2233,26 @@ BEGIN
              AND chain_state = 'confirmed'
              AND maturity_state <> 'reversed'
        ) THEN
-        RETURN 1;
+        RETURN 2;
+    END IF;
+
+    -- The candidate row was terminally disposed before this confirmation
+    -- arrived (reorg quarantine, rejection, or reversal). That is a routine
+    -- race, not corruption: report it as the distinct superseded disposition
+    -- (-1) so the caller can abandon the candidate without treating the
+    -- ledger as unexplained. A plain 0 keeps meaning: no row, or a live row
+    -- this confirmation does not match.
+    IF confirmed_count = 0
+       AND EXISTS (
+           SELECT 1
+           FROM qbit_pool_blocks
+           WHERE block_hash = confirmed_block_hash
+             AND (
+                 chain_state IN ('inactive', 'rejected', 'reversed')
+                 OR maturity_state = 'reversed'
+             )
+       ) THEN
+        RETURN -1;
     END IF;
 
     RETURN confirmed_count;
@@ -1646,6 +2349,34 @@ BEGIN
     GET DIAGNOSTICS reactivated_count = ROW_COUNT;
 
     RETURN reactivated_count;
+END;
+$$;
+
+-- PL/pgSQL plans relation references on first execution. Pin confirmation
+-- ordinal allocation and reactivation to their installation schema, and list
+-- pg_temp last so a caller
+-- cannot redirect the lease, pool-block, or sequence names through its own
+-- search path or a temporary relation.
+DO $$
+DECLARE
+    installation_schema pg_catalog.text := pg_catalog.current_schema();
+BEGIN
+    EXECUTE pg_catalog.format(
+        'ALTER FUNCTION %I.qbit_confirm_pool_block('
+        'pg_catalog.text, pg_catalog.int8, pg_catalog.text, '
+        'pg_catalog.int8, pg_catalog.text, pg_catalog.interval) '
+        'SET search_path TO pg_catalog, %I, pg_temp',
+        installation_schema,
+        installation_schema
+    );
+    EXECUTE pg_catalog.format(
+        'ALTER FUNCTION %I.qbit_reactivate_pool_block('
+        'pg_catalog.text, pg_catalog.int8, pg_catalog.text, '
+        'pg_catalog.int8, pg_catalog.text, pg_catalog.interval) '
+        'SET search_path TO pg_catalog, %I, pg_temp',
+        installation_schema,
+        installation_schema
+    );
 END;
 $$;
 
@@ -1796,3 +2527,96 @@ BEGIN
     RETURN block_count + payout_count + carry_count + fanout_count;
 END;
 $$;
+
+-- Durable retention of the last delivered, safe per-worker vardiff wire
+-- difficulty, keyed by listener lane plus exact Stratum username. Rows are
+-- operational preload hints for reconnecting sessions only: they never join
+-- share accounting or payout artifacts, and pruning them loses no canonical
+-- state. Exact usernames are public identities, not authentication secrets.
+--
+-- difficulty is an unconstrained numeric so the decimal wire value survives
+-- without lossy integer conversion; the CHECK pins it to a positive finite
+-- value (numeric NaN compares greater than every value including zero, and
+-- only the < 'Infinity' comparison excludes it, so both guards are
+-- load-bearing). evidence_at records when share-backed evidence last
+-- validated the value — the writer's upsert keeps it monotonic per key —
+-- while updated_at records the last write of any kind. The single index
+-- serves both the bounded newest-first preload (its column order matches the
+-- preload ORDER BY exactly) and the evidence_at range scan the prune uses.
+-- The key columns collate as "C": preload/prune tie-breaks are byte order,
+-- identical across deployments and to the in-memory store's code-point
+-- ordering, instead of drifting with the database's locale collation.
+-- This DDL block must stay byte-identical to WORKER_DIFFICULTY_SCHEMA_SQL in
+-- lab/prism/worker_difficulty_store.py; a contract test pins the match.
+CREATE TABLE IF NOT EXISTS qbit_worker_difficulty (
+    listener text COLLATE "C" NOT NULL CHECK (listener <> ''),
+    worker_username text COLLATE "C" NOT NULL CHECK (worker_username <> ''),
+    difficulty numeric NOT NULL CHECK (
+        difficulty > 0 AND difficulty < 'Infinity'::numeric
+    ),
+    evidence_at timestamptz NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (listener, worker_username)
+);
+
+CREATE INDEX IF NOT EXISTS qbit_worker_difficulty_evidence_idx
+    ON qbit_worker_difficulty (evidence_at DESC, listener, worker_username);
+
+-- Incremental hashrate rollups for the public dashboard hashrate-series
+-- endpoint. qbit_share_ledger rows are immutable after insert and share_seq
+-- is append-only, so a single monotonically advancing watermark
+-- (qbit_hashrate_rollup_progress.last_share_seq) makes per-bucket
+-- accumulation exact: every share is folded into its (grain, bucket) rows
+-- exactly once, regardless of accepted_at ordering. Buckets are keyed by
+-- floor(extract(epoch FROM accepted_at) / grain)::bigint * grain -- the
+-- exact expression the serving query uses -- so rollup and raw bucketing
+-- can never disagree. Only the lease-holding coordinator maintains these
+-- tables; the public read tier only reads them. accepted_share_difficulty
+-- is unconstrained numeric: source rows are numeric(78, 0), but a bucket
+-- total sums many of them and may need more digits than any single share --
+-- a constrained aggregate column would make the maintenance upsert overflow
+-- on every retry and wedge the watermark. sum(numeric) in the raw scan is
+-- likewise unconstrained, so text renderings stay byte-identical.
+CREATE TABLE IF NOT EXISTS qbit_hashrate_rollup_pool (
+    grain_seconds integer NOT NULL CHECK (grain_seconds IN (300, 3600, 86400)),
+    bucket_epoch bigint NOT NULL CHECK (bucket_epoch >= 0),
+    accepted_share_count bigint NOT NULL CHECK (accepted_share_count >= 0),
+    accepted_share_difficulty numeric NOT NULL CHECK (accepted_share_difficulty >= 0),
+    PRIMARY KEY (grain_seconds, bucket_epoch)
+);
+
+CREATE TABLE IF NOT EXISTS qbit_hashrate_rollup_miner (
+    grain_seconds integer NOT NULL CHECK (grain_seconds IN (300, 3600, 86400)),
+    bucket_epoch bigint NOT NULL CHECK (bucket_epoch >= 0),
+    miner_id text NOT NULL,
+    accepted_share_count bigint NOT NULL CHECK (accepted_share_count >= 0),
+    accepted_share_difficulty numeric NOT NULL CHECK (accepted_share_difficulty >= 0),
+    PRIMARY KEY (grain_seconds, bucket_epoch, miner_id)
+);
+
+-- Databases that applied the earlier constrained definition are widened in
+-- place; from numeric(78, 0) to unconstrained numeric this is a
+-- catalog-only change, and it is a no-op once the column is unconstrained.
+ALTER TABLE qbit_hashrate_rollup_pool
+    ALTER COLUMN accepted_share_difficulty TYPE numeric;
+ALTER TABLE qbit_hashrate_rollup_miner
+    ALTER COLUMN accepted_share_difficulty TYPE numeric;
+
+CREATE INDEX IF NOT EXISTS qbit_hashrate_rollup_miner_series_idx
+    ON qbit_hashrate_rollup_miner (miner_id, grain_seconds, bucket_epoch);
+
+-- Single-row watermark. A missing row means the rollups have never run:
+-- the serving query then degrades to the raw ledger scan, so a
+-- pre-migration database or a half-deployed writer stays correct. The
+-- first maintenance pass seeds the row itself and starts from sequence 0,
+-- which is also how a grown ledger backfills -- there is no separate
+-- migration path.
+CREATE TABLE IF NOT EXISTS qbit_hashrate_rollup_progress (
+    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    last_share_seq bigint NOT NULL CHECK (last_share_seq >= 0),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+-- Pairs with the BEGIN at the top of the file: the apply is one transaction
+-- no matter which client performs it.
+COMMIT;

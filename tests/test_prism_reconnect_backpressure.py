@@ -13,12 +13,14 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from lab.auxpow import vardiff
-from lab.prism.prism_coordinator import (
-    ClientState,
-    PendingInitialJob,
+from lab.prism.job_delivery import (
     PRISM_DELIVERY_PRIORITY_INITIAL,
     PRISM_DELIVERY_PRIORITY_NEW_TIP,
     PRISM_DELIVERY_PRIORITY_SAME_TIP,
+)
+from lab.prism.prism_coordinator import (
+    ClientState,
+    PendingInitialJob,
     PrismCoordinator,
     StratumError,
     StratumListenerProfile,
@@ -295,6 +297,14 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
             payout_state_generation=0,
         )
         server.note_tip_work_delivered(state, "bb" * 32)
+        # The health refresh owns the fleet coverage census; delivery no
+        # longer repeats it per job (#159). The refresh that follows the
+        # delivery observes restored coverage and closes the gap, so the next
+        # tip's gap starts fresh instead of inheriting this one.
+        restored = server.mining_delivery_snapshot(now=101.0)
+        self.assertTrue(restored["mining_ready"])
+        self.assertEqual(restored["current_tip_coverage_gap_age_seconds"], 0.0)
+
         server.current_tip_first_seen = ("cc" * 32, 106.0)
         second_gap = server.mining_delivery_snapshot(now=106.0)
         self.assertTrue(second_gap["mining_ready"])
@@ -305,6 +315,10 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
             payout_state_generation=0,
         )
         server.note_tip_work_delivered(state, "cc" * 32)
+        recovered = server.mining_delivery_snapshot(now=107.0)
+        self.assertTrue(recovered["mining_ready"])
+        self.assertEqual(recovered["current_tip_coverage_gap_age_seconds"], 0.0)
+
         server.current_tip_first_seen = ("dd" * 32, 112.0)
         third_gap = server.mining_delivery_snapshot(now=112.0)
         self.assertTrue(third_gap["mining_ready"])
@@ -560,7 +574,7 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
             requested_monotonic=time.monotonic() - 2,
             deadline_monotonic=time.monotonic() - 1,
         )
-        server.pending_initial_jobs[state] = request
+        server.pending_initial_jobs = {state: request}
         server.ensure_reorg_reconciled_for_current_tip = (  # type: ignore[method-assign]
             lambda: preparation_started.set() or True
         )
@@ -594,7 +608,7 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
             requested_monotonic=0.0,
             deadline_monotonic=30.0,
         )
-        server.pending_initial_jobs[state] = old_request
+        server.pending_initial_jobs = {state: old_request}
         release = threading.Event()
         server._run_initial_job = lambda _request: release.wait(5)  # type: ignore[method-assign]
         server.resolve_worker = lambda username: worker(username)  # type: ignore[method-assign]
@@ -718,7 +732,7 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
             requested_monotonic=0.0,
             deadline_monotonic=1.0,
         )
-        server.pending_initial_jobs[state] = request
+        server.pending_initial_jobs = {state: request}
         disconnect_client = server.disconnect_client
         rescheduled: list[bool] = []
 
@@ -748,7 +762,7 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
             requested_monotonic=10.0,
             deadline_monotonic=40.0,
         )
-        server.pending_initial_jobs[waiting] = request
+        server.pending_initial_jobs = {waiting: request}
 
         self.assertFalse(server.schedule_initial_job(excess))
 
@@ -1083,14 +1097,16 @@ class PrismReconnectBackpressureTests(unittest.TestCase):
         server = coordinator(connection_limit=2, pending_limit=2)
         server.started_monotonic = 0.0
         first, second = client(server, 1), client(server, 2)
-        for state in (first, second):
-            server.pending_initial_jobs[state] = PendingInitialJob(
+        server.pending_initial_jobs = {
+            state: PendingInitialJob(
                 client=state,
                 authorization_generation=1,
                 worker=state.worker,
                 requested_monotonic=0.0,
                 deadline_monotonic=30.0,
             )
+            for state in (first, second)
+        }
 
         startup = server.mining_delivery_snapshot(now=10.0)
         failed = server.mining_delivery_snapshot(now=31.0)

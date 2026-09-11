@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -12,8 +13,8 @@ import urllib.parse
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
-from typing import Any, Callable
+from decimal import Decimal, InvalidOperation
+from typing import Any, Callable, Iterator
 
 from lab.prism.ctv_broadcaster import COINBASE_MATURITY
 from lab.prism import direct_stratum
@@ -27,6 +28,14 @@ HASHES_PER_QBIT_SCALED_DIFFICULTY = (
 )
 MAX_SEARCH_LENGTH = 128
 MAX_RECIPIENT_ID_LENGTH = 256
+BLOCKS_CHAIN_STATE_FILTERS = ("active", "all", "reversed")
+# getnetworkhashps window and lane. The pool's shares are credited against the
+# permissionless lane, so the ratio pool hashrate_ths / network hashrate_ths is
+# only meaningful against that lane's estimate, not the all-lanes aggregate.
+# 120 blocks and height -1 are the RPC's own documented defaults, passed
+# explicitly because the lane argument is positional after them.
+NETWORK_HASHRATE_BLOCK_WINDOW = 120
+NETWORK_HASHRATE_LANE = "permissionless"
 HASHRATE_SERIES_BUCKET_SECONDS = {"5m": 300, "1h": 3600, "1d": 86400}
 HASHRATE_SERIES_RANGE_SECONDS = {
     "1w": 7 * 86400,
@@ -34,13 +43,47 @@ HASHRATE_SERIES_RANGE_SECONDS = {
     "6m": 180 * 86400,
     "all": None,
 }
+# The bucket vocabulary each range may request. Chart resolution is a product
+# choice, but request cost is not: the ledger scan and the response both grow
+# with range/bucket, and the widest combinations (a 5m bucket over months of
+# history) exceed PRISM_PUBLIC_CACHE_MAX_RESPONSE_BYTES, so every such request
+# bypasses the response cache and re-scans -- an unbounded-cost endpoint any
+# stranger can hit. The static vocabulary closes that: coarse ranges admit only
+# buckets whose point counts stay dashboard-sized, and auto_bucket() always
+# resolves inside these sets, so `bucket=auto` is never rejected. Shared by
+# every bucketed public series endpoint, not just the hashrate series.
+HASHRATE_SERIES_ALLOWED_BUCKETS: dict[str, frozenset[str]] = {
+    "1w": frozenset({"5m", "1h", "1d"}),
+    "1m": frozenset({"1h", "1d"}),
+    "6m": frozenset({"1d"}),
+    "all": frozenset({"1d"}),
+}
 DEFAULT_HASHRATE_SMOOTHING_SECONDS = 30 * 60
+BLOCK_MARKERS_MAX_BLOCKS_PER_BUCKET = 3
 
 PUBLIC_ERROR_CODES = {
     "not_found": "not_found",
     "rate_limited": "rate_limited",
     "internal_error": "internal_error",
     "qbit_rpc_unavailable": "upstream_unavailable",
+    # A cached response outlived its staleness budget and the public read
+    # service refused to serve it. Reported as upstream_unavailable, which is
+    # already in the documented error enum, because the condition is exactly
+    # that: the data behind this route is too old to answer with.
+    "stale_read_model": "upstream_unavailable",
+    # The public read tier's replica is missing, writable, or its replication
+    # stream has gone silent past the configured bound, so this route has no
+    # data it is willing to answer with. Same documented wire code as
+    # stale_read_model for the same reason: from a client's side the two are
+    # one condition.
+    "replica_unavailable": "upstream_unavailable",
+    # A public origin computation hit its per-request statement deadline
+    # (PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS) before the ledger
+    # answered. Its own wire code rather than upstream_unavailable: the
+    # database is reachable, this particular read was too expensive, and a
+    # retry a moment later can succeed off the cache -- which is not what
+    # upstream_unavailable tells a client.
+    "read_timeout": "read_timeout",
 }
 
 
@@ -51,12 +94,37 @@ class PublicCachePolicy:
     immutable: bool = False
 
 
+@dataclass(frozen=True)
+class RawJsonBody:
+    """Pre-serialized JSON response body served byte-for-byte.
+
+    Content-addressed artifact responses must satisfy
+    sha256(response bytes) == the advertised artifact sha256, so the exact
+    canonical bytes bypass write_json's generic sorted-key re-serialization
+    and its trailing newline.
+    """
+
+    body: bytes
+
+
+@dataclass(frozen=True)
+class UncacheableJsonBody:
+    """JSON payload whose degraded provenance must not enter shared caches."""
+
+    payload: object
+    reason: str
+
+
 @dataclass
 class _PublicCacheEntry:
     status: int
     payload: object
     stored_at: float
     expires_at: float
+    # When the entry stops being servable even as a stale-while-revalidate
+    # answer. Recorded at store time so capacity reaping can honor the window
+    # this entry was stored under without re-deriving the route's policy.
+    stale_until: float
 
 
 @dataclass
@@ -64,6 +132,12 @@ class _PublicInflight:
     event: threading.Event
     result: tuple[int, object, str, int] | None = None
     exception: BaseException | None = None
+
+
+# Shared by every public response cache in this process. Admission is
+# nonblocking: excess stale hits keep their bounded-age response without
+# creating workers or queued refresh tasks behind the database read slots.
+_PUBLIC_REFRESH_SLOTS = threading.BoundedSemaphore(4)
 
 
 class PublicResponseCache:
@@ -86,64 +160,119 @@ class PublicResponseCache:
         key: tuple[str, tuple[tuple[str, tuple[str, ...]], ...]],
         ttl_seconds: int,
         compute: Callable[[], tuple[int, object]],
+        stale_while_revalidate_seconds: int = 0,
     ) -> tuple[int, object, str, int]:
         if ttl_seconds <= 0:
             status, payload = compute()
             return status, payload, "BYPASS", 0
 
         now = time.monotonic()
+        stale_result: tuple[int, object, str, int] | None = None
+        refresh: _PublicInflight | None = None
         with self._lock:
             entry = self._entries.get(key)
             if entry is not None:
                 if entry.expires_at > now:
                     self._entries.move_to_end(key)
                     return entry.status, entry.payload, "HIT", max(0, int(now - entry.stored_at))
-                # Expired: drop the stale slot so it cannot count toward the bound.
-                del self._entries[key]
-            inflight = self._inflight.get(key)
-            if inflight is None:
-                inflight = _PublicInflight(event=threading.Event())
-                self._inflight[key] = inflight
-                owner = True
-            else:
-                owner = False
+                if (
+                    stale_while_revalidate_seconds > 0
+                    and now <= entry.expires_at + stale_while_revalidate_seconds
+                ):
+                    # Inside the stale-while-revalidate window the expired
+                    # entry is served immediately -- with its honest age --
+                    # instead of blocking this requester on a recompute that
+                    # can take seconds. The entry stays in place: it remains
+                    # the answer for the rest of the window, including when
+                    # the refresh below fails. At most one background refresh
+                    # runs per key, deduped through the same inflight map that
+                    # coalesces blocking misses, so a stampede of stale hits
+                    # costs one origin call.
+                    self._entries.move_to_end(key)
+                    stale_result = (
+                        entry.status,
+                        entry.payload,
+                        "STALE",
+                        max(0, int(now - entry.stored_at)),
+                    )
+                    if key not in self._inflight and _PUBLIC_REFRESH_SLOTS.acquire(blocking=False):
+                        refresh = _PublicInflight(event=threading.Event())
+                        self._inflight[key] = refresh
+                else:
+                    # Expired past any revalidation window: drop the stale
+                    # slot so it cannot count toward the bound.
+                    del self._entries[key]
+            if stale_result is None:
+                inflight = self._inflight.get(key)
+                if inflight is None:
+                    inflight = _PublicInflight(event=threading.Event())
+                    self._inflight[key] = inflight
+                    owner = True
+                else:
+                    owner = False
+
+        if stale_result is not None:
+            if refresh is not None:
+                try:
+                    threading.Thread(
+                        target=self._refresh_entry_admitted,
+                        args=(key, ttl_seconds, stale_while_revalidate_seconds, compute, refresh),
+                        name="prism-public-cache-refresh",
+                        daemon=True,
+                    ).start()
+                except Exception:
+                    # Thread creation can fail under resource pressure, after
+                    # the refresh slot was already registered. Free the slot
+                    # and wake any coalesced waiter, or a burst of stale keys
+                    # would pin refreshes off forever and, past the window,
+                    # leave blocking requests waiting on an event nobody can
+                    # set. The stale answer below is still the right response;
+                    # the next stale hit simply retries the refresh.
+                    with self._lock:
+                        if self._inflight.get(key) is refresh:
+                            del self._inflight[key]
+                    refresh.event.set()
+                    _PUBLIC_REFRESH_SLOTS.release()
+            return stale_result
 
         if not owner:
             # Coalesce onto the owner's single origin call. Reuse its result even
             # when it was not cacheable (BYPASS), and re-raise its exception, so
-            # waiters never re-run an expensive or failing compute().
+            # waiters never re-run an expensive or failing compute(). The owner
+            # may be a background refresh whose stale entry has since aged past
+            # the revalidation window; waiting for it is the same bargain.
             inflight.event.wait()
-            if inflight.exception is not None:
-                raise inflight.exception
-            if inflight.result is not None:
-                return inflight.result
+            exception = inflight.exception
+            result = inflight.result
+            # Drop this frame's name for the flight before re-raising (#251).
+            # Raising prepends this frame to the shared exception's traceback,
+            # and a frame still naming the flight would close the cycle
+            # flight -> exception -> traceback -> frame -> flight, keeping the
+            # owner's failed compute frame and its locals alive until cyclic
+            # GC. The flight itself keeps the exception for later observers.
+            del inflight
+            if exception is not None:
+                try:
+                    raise exception
+                finally:
+                    # Unbind the local for the same reason: the traceback's
+                    # frame must not name the exception it belongs to.
+                    del exception
+            if result is not None:
+                return result
             # Owner finished without recording a result; recompute defensively.
             return self.get_or_compute(key=key, ttl_seconds=ttl_seconds, compute=compute)
 
         try:
             status, payload = compute()
             if 200 <= status < 300 and cacheable_payload_size(payload):
-                now = time.monotonic()
-                with self._lock:
-                    self._entries[key] = _PublicCacheEntry(
-                        status=status,
-                        payload=payload,
-                        stored_at=now,
-                        expires_at=now + ttl_seconds,
-                    )
-                    self._entries.move_to_end(key)
-                    max_entries = public_cache_max_entries()
-                    if len(self._entries) > max_entries:
-                        # Reap expired entries before LRU eviction so dead slots
-                        # never push out still-fresh keys.
-                        for stale_key in [
-                            stored_key
-                            for stored_key, stored in self._entries.items()
-                            if stored_key != key and stored.expires_at <= now
-                        ]:
-                            del self._entries[stale_key]
-                    while len(self._entries) > max_entries:
-                        self._entries.popitem(last=False)
+                self._store_entry(
+                    key,
+                    status=status,
+                    payload=payload,
+                    ttl_seconds=ttl_seconds,
+                    stale_while_revalidate_seconds=stale_while_revalidate_seconds,
+                )
                 inflight.result = (status, payload, "MISS", 0)
             else:
                 inflight.result = (status, payload, "BYPASS", 0)
@@ -155,6 +284,103 @@ class PublicResponseCache:
             with self._lock:
                 self._inflight.pop(key, None)
             inflight.event.set()
+            # Release the owner frame's reference last, after every waiter has
+            # been woken (#251). On failure the exception's traceback already
+            # holds this frame, so a frame that kept naming the flight would
+            # form flight -> exception -> traceback -> frame -> flight and pin
+            # the failed compute frame, with the origin call's locals, until
+            # cyclic GC. Waiters still hold the flight through their own
+            # frames until each has observed the recorded result or error.
+            del inflight
+
+    def _store_entry(
+        self,
+        key: tuple[str, tuple[tuple[str, tuple[str, ...]], ...]],
+        *,
+        status: int,
+        payload: object,
+        ttl_seconds: int,
+        stale_while_revalidate_seconds: int = 0,
+    ) -> None:
+        now = time.monotonic()
+        with self._lock:
+            self._entries[key] = _PublicCacheEntry(
+                status=status,
+                payload=payload,
+                stored_at=now,
+                expires_at=now + ttl_seconds,
+                stale_until=now + ttl_seconds + max(0, stale_while_revalidate_seconds),
+            )
+            self._entries.move_to_end(key)
+            max_entries = public_cache_max_entries()
+            if len(self._entries) > max_entries:
+                # Reap dead entries before LRU eviction so dead slots never
+                # push out still-fresh keys. Dead means past the entry's own
+                # recorded revalidation window, not merely past its TTL: an
+                # expired entry inside that window is still the promised
+                # instant answer for its next visitor, and discarding it here
+                # would turn that visitor's stale hit into a blocking miss.
+                for stale_key in [
+                    stored_key
+                    for stored_key, stored in self._entries.items()
+                    if stored_key != key and stored.stale_until <= now
+                ]:
+                    del self._entries[stale_key]
+            while len(self._entries) > max_entries:
+                self._entries.popitem(last=False)
+
+    def _refresh_entry_admitted(self, *args) -> None:
+        try:
+            self._refresh_entry(*args)
+        finally:
+            # A failed compute retains caller frames through f_back too. Drop
+            # the flight-bearing arguments before returning the admission slot.
+            del args
+            _PUBLIC_REFRESH_SLOTS.release()
+
+    def _refresh_entry(
+        self,
+        key: tuple[str, tuple[tuple[str, tuple[str, ...]], ...]],
+        ttl_seconds: int,
+        stale_while_revalidate_seconds: int,
+        compute: Callable[[], tuple[int, object]],
+        inflight: _PublicInflight,
+    ) -> None:
+        """Recompute one stale-served key off the request thread.
+
+        The same compute through the same status/size gates as a blocking
+        miss. Success replaces the entry; a failure or a non-cacheable result
+        leaves the stale entry exactly where it was -- still servable until
+        its revalidation window ends -- and the finally clause frees the
+        inflight slot either way, so a later stale hit can retry. A blocking
+        request that arrives beyond the window while this runs coalesces onto
+        it through the inflight map, exactly as it would onto a foreground
+        owner; the recorded result and exception exist for those waiters.
+        """
+        try:
+            status, payload = compute()
+            if 200 <= status < 300 and cacheable_payload_size(payload):
+                self._store_entry(
+                    key,
+                    status=status,
+                    payload=payload,
+                    ttl_seconds=ttl_seconds,
+                    stale_while_revalidate_seconds=stale_while_revalidate_seconds,
+                )
+                inflight.result = (status, payload, "MISS", 0)
+            else:
+                inflight.result = (status, payload, "BYPASS", 0)
+        except BaseException as exc:
+            inflight.exception = exc
+        finally:
+            with self._lock:
+                self._inflight.pop(key, None)
+            inflight.event.set()
+            # Same ownership rule as the foreground owner (#251): the swallowed
+            # exception's traceback captured this frame on arrival, so the
+            # frame must not keep naming the flight that stores it, or the
+            # completed refresh pins its failed compute locals until cyclic GC.
+            del inflight
 
 
 def _is_hex64(value: str) -> bool:
@@ -276,6 +502,10 @@ def cacheable_payload_size(payload: object) -> bool:
     max_bytes = env_nonnegative_int("PRISM_PUBLIC_CACHE_MAX_RESPONSE_BYTES", 1_048_576)
     if max_bytes <= 0:
         return False
+    if isinstance(payload, UncacheableJsonBody):
+        return False
+    if isinstance(payload, RawJsonBody):
+        return len(payload.body) <= max_bytes
     body_size = len(json.dumps(payload, sort_keys=True).encode()) + 1
     return body_size <= max_bytes
 
@@ -311,7 +541,14 @@ def dispatch(coordinator: Any, path: str, query: dict[str, list[str]]) -> tuple[
         return 200, pool_summary(coordinator)
     if path == "/public/v1/blocks":
         page, limit = pagination_params(query)
-        return 200, blocks(coordinator, page=page, limit=limit)
+        chain_state = first_query_value(query, "chain_state") or "active"
+        if chain_state not in BLOCKS_CHAIN_STATE_FILTERS:
+            raise PublicApiError(
+                400,
+                "invalid_chain_state",
+                "chain_state must be one of active, all, reversed",
+            )
+        return 200, blocks(coordinator, page=page, limit=limit, chain_state=chain_state)
     if path == "/public/v1/leaderboard":
         page, limit = pagination_params(query)
         search = search_param(query)
@@ -345,7 +582,12 @@ def dispatch(coordinator: Any, path: str, query: dict[str, list[str]]) -> tuple[
         subject = first_query_value(query, "subject") or "pool"
         range_id = first_query_value(query, "range") or "1m"
         bucket = first_query_value(query, "bucket") or "auto"
-        return 200, hashrate_series(coordinator, subject=subject, range_id=range_id, bucket=bucket)
+        view = first_query_value(query, "view")
+        return 200, hashrate_series(coordinator, subject=subject, range_id=range_id, bucket=bucket, view=view)
+    if path == "/public/v1/block-markers":
+        range_id = first_query_value(query, "range") or "1m"
+        bucket = first_query_value(query, "bucket") or "auto"
+        return 200, block_markers(coordinator, range_id=range_id, bucket=bucket)
     if path == "/public/v1/mining-configuration":
         return 200, mining_configuration(coordinator)
     if path.startswith("/public/v1/miners/"):
@@ -407,6 +649,10 @@ def error_payload(code: str, message: str) -> dict[str, object]:
 def pool_summary(coordinator: Any) -> dict[str, object]:
     generated_at = utc_now_iso()
     network = network_summary(coordinator)
+    # Looked up after network_summary so a missing-compact-bits 503 still
+    # short-circuits first; a failed hashrate lookup alone must never fail
+    # this endpoint (the field is nullable by contract).
+    network["hashrate_ths"] = network_hashrate_ths(coordinator)
     ledger_snapshot = coordinator.ledger.dashboard_pool_snapshot(
         current_network_difficulty=network["network_difficulty"],
         generated_at=generated_at,
@@ -421,6 +667,8 @@ def pool_summary(coordinator: Any) -> dict[str, object]:
             "participants_3h": ledger_snapshot["participants_3h"],
             "blocks_found_total": ledger_snapshot["blocks_found_total"],
             "prism_blocks_total": ledger_snapshot["prism_blocks_total"],
+            "blocks_reversed_total": ledger_snapshot["blocks_reversed_total"],
+            "blocks_inactive_total": ledger_snapshot["blocks_inactive_total"],
             "total_mined_bits": ledger_snapshot["total_mined_bits"],
             "expected_time_to_block_seconds": expected_time_to_block_seconds(
                 hashrate_ths=str(ledger_snapshot["hashrate_ths"]["h3"]),
@@ -432,9 +680,17 @@ def pool_summary(coordinator: Any) -> dict[str, object]:
     }
 
 
-def blocks(coordinator: Any, *, page: int, limit: int) -> dict[str, object]:
+def blocks(coordinator: Any, *, page: int, limit: int, chain_state: str = "active") -> dict[str, object]:
     generated_at = utc_now_iso()
-    payload = coordinator.ledger.dashboard_blocks(page=page, limit=limit)
+    if chain_state == "active":
+        # The default keeps today's read-model call and today's schema tag
+        # exactly: no chain_state argument reaches the ledger, so the default
+        # response stays byte-compatible with pre-filter consumers.
+        payload = coordinator.ledger.dashboard_blocks(page=page, limit=limit)
+        schema = "prism.dashboard.blocks.v1"
+    else:
+        payload = coordinator.ledger.dashboard_blocks(page=page, limit=limit, chain_state=chain_state)
+        schema = "prism.dashboard.blocks.v2"
     for row in payload["rows"]:
         row.setdefault("bits", "00000000")
         if row.get("bits") is None:
@@ -443,7 +699,7 @@ def blocks(coordinator: Any, *, page: int, limit: int) -> dict[str, object]:
         if row.get("network_difficulty") is None:
             row["network_difficulty"] = "0"
     return {
-        "schema": "prism.dashboard.blocks.v1",
+        "schema": schema,
         "generated_at": generated_at,
         "pagination": payload["pagination"],
         "rows": payload["rows"],
@@ -497,13 +753,21 @@ def reward_leaderboard(
     }
 
 
-def hashrate_series(coordinator: Any, *, subject: str, range_id: str, bucket: str) -> dict[str, object]:
+def hashrate_series(
+    coordinator: Any,
+    *,
+    subject: str,
+    range_id: str,
+    bucket: str,
+    view: str | None = None,
+) -> dict[str, object]:
     if range_id not in {"1w", "1m", "6m", "all"}:
         raise PublicApiError(400, "invalid_range", "range must be one of 1w, 1m, 6m, all")
     if bucket == "auto":
         bucket = auto_bucket(range_id)
     if bucket not in {"5m", "1h", "1d"}:
         raise PublicApiError(400, "invalid_bucket", "bucket must be one of auto, 5m, 1h, 1d")
+    allowed_hashrate_bucket(range_id, bucket)
     if subject == "pool":
         subject_type = "pool"
         subject_id = None
@@ -512,13 +776,34 @@ def hashrate_series(coordinator: Any, *, subject: str, range_id: str, bucket: st
         subject_id = subject.removeprefix("miner:")
     else:
         raise PublicApiError(400, "invalid_subject", "subject must be pool or miner:{recipient_id}")
-    generated_at = utc_now_iso()
+    # An absent view keeps the v1 response; only `both` opts into the dual-rate
+    # v2 contract. Anything else is rejected rather than silently
+    # served as v1, so a client that mistypes the view cannot mistake the
+    # legacy smoothed rate for the raw one it asked for.
+    if view is not None and view != "both":
+        raise PublicApiError(400, "invalid_view", "view must be both or omitted")
+    dual_rate = view == "both"
+    now = datetime.now(timezone.utc)
+    generated_at = iso_datetime(now)
+    generated_at_epoch = int(now.timestamp())
     bucket_seconds = HASHRATE_SERIES_BUCKET_SECONDS[bucket]
     window_seconds = public_hashrate_smoothing_seconds()
     range_seconds = HASHRATE_SERIES_RANGE_SECONDS[range_id]
     lookback_seconds = 0
     min_epoch: int | None = None
     range_anchor_epoch: int | None = None
+    if range_seconds is not None and (
+        dual_rate or window_seconds // bucket_seconds >= 2
+    ):
+        # V2 raw rates always divide by a full bucket, so trim a leading bucket
+        # that straddles the range boundary even when this coarse bucket has no
+        # trailing smoothing. V1 keeps its frozen no-smoothing behavior.
+        range_anchor_epoch = generated_at_epoch
+        min_epoch = hashrate_series_min_epoch(
+            range_anchor_epoch,
+            range_seconds,
+            bucket_seconds,
+        )
     if window_seconds // bucket_seconds >= 2 and range_seconds is not None:
         # Fetch one full smoothing window of pre-range history so the first
         # in-range points average over real data instead of artificial zeros,
@@ -526,8 +811,12 @@ def hashrate_series(coordinator: Any, *, subject: str, range_id: str, bucket: st
         # its range lower bound on the same epoch min_epoch derives from, so
         # the trim cannot disagree with the fetch under clock skew.
         lookback_seconds = (window_seconds // bucket_seconds) * bucket_seconds
-        range_anchor_epoch = int(datetime.now(timezone.utc).timestamp())
-        min_epoch = hashrate_series_min_epoch(range_anchor_epoch, range_seconds, bucket_seconds)
+        range_anchor_epoch = generated_at_epoch
+        min_epoch = hashrate_series_min_epoch(
+            range_anchor_epoch,
+            range_seconds,
+            bucket_seconds,
+        )
     points = coordinator.ledger.dashboard_hashrate_series(
         subject_type=subject_type,
         subject_id=subject_id,
@@ -536,6 +825,27 @@ def hashrate_series(coordinator: Any, *, subject: str, range_id: str, bucket: st
         lookback_seconds=lookback_seconds,
         range_anchor_epoch=range_anchor_epoch,
     )
+    subject_payload = {"type": subject_type, "id": subject_id}
+    if dual_rate:
+        smoothing = hashrate_series_smoothing(bucket_seconds=bucket_seconds, window_seconds=window_seconds)
+        return {
+            "schema": "prism.dashboard.hashrate-series.v2",
+            "generated_at": generated_at,
+            "subject": subject_payload,
+            "range": range_id,
+            "bucket": bucket,
+            "bucket_seconds": bucket_seconds,
+            "unit": "ths",
+            "rate_basis": "accepted_share_difficulty",
+            "smoothing": smoothing,
+            "points": dual_rate_hashrate_series_points(
+                points,
+                bucket_seconds=bucket_seconds,
+                window_seconds=window_seconds,
+                min_epoch=min_epoch,
+                generated_at_epoch=generated_at_epoch,
+            ),
+        }
     points = smooth_hashrate_series_points(
         points,
         bucket_seconds=bucket_seconds,
@@ -545,10 +855,72 @@ def hashrate_series(coordinator: Any, *, subject: str, range_id: str, bucket: st
     return {
         "schema": "prism.dashboard.hashrate-series.v1",
         "generated_at": generated_at,
-        "subject": {"type": subject_type, "id": subject_id},
+        "subject": subject_payload,
         "range": range_id,
         "bucket": bucket,
         "unit": "ths",
+        "points": points,
+    }
+
+
+def block_markers(coordinator: Any, *, range_id: str, bucket: str) -> dict[str, object]:
+    """Found-block markers pre-bucketed onto the hashrate chart's grid.
+
+    The dashboard draws markers over the hashrate series, so every bucket
+    epoch here is floor(epoch(found_at) / bucket_seconds) * bucket_seconds --
+    the identical arithmetic the hashrate buckets use -- and the bounded
+    ranges keep only fully covered buckets via the same
+    hashrate_series_min_epoch anchor the chart trims against. Paging
+    /public/v1/blocks cannot serve this: at hundreds of found blocks a day the
+    long timeframes would need hundreds of pages per chart render.
+    """
+    if range_id not in {"1w", "1m", "6m", "all"}:
+        raise PublicApiError(400, "invalid_range", "range must be one of 1w, 1m, 6m, all")
+    if bucket == "auto":
+        bucket = auto_bucket(range_id)
+    if bucket not in {"5m", "1h", "1d"}:
+        raise PublicApiError(400, "invalid_bucket", "bucket must be one of auto, 5m, 1h, 1d")
+    # Markers land on top of the hashrate chart, so the hashrate series'
+    # static bucket-per-range vocabulary is the markers' vocabulary too.
+    allowed_hashrate_bucket(range_id, bucket)
+    now = datetime.now(timezone.utc)
+    generated_at = iso_datetime(now)
+    bucket_seconds = HASHRATE_SERIES_BUCKET_SECONDS[bucket]
+    range_seconds = HASHRATE_SERIES_RANGE_SECONDS[range_id]
+    # Anchor the range lower bound on this process's clock, exactly as
+    # hashrate_series does, so marker buckets and hashrate buckets share one
+    # grid even when the database clock disagrees. `all` has no lower bound.
+    range_anchor_epoch = int(now.timestamp()) if range_seconds is not None else None
+    payload = coordinator.ledger.dashboard_block_markers(
+        range_id=range_id,
+        bucket=bucket,
+        range_anchor_epoch=range_anchor_epoch,
+    )
+    points: list[dict[str, object]] = []
+    for row in payload["points"]:
+        block_count = int(row["block_count"])
+        points.append(
+            {
+                "timestamp": row["timestamp"],
+                "block_count": block_count,
+                "blocks": [
+                    {
+                        "height": int(block["height"]),
+                        "hash": str(block["hash"]),
+                        "found_at": str(block["found_at"]),
+                    }
+                    for block in row["blocks"]
+                ],
+                "truncated": block_count > BLOCK_MARKERS_MAX_BLOCKS_PER_BUCKET,
+            }
+        )
+    return {
+        "schema": "prism.dashboard.block-markers.v1",
+        "generated_at": generated_at,
+        "range": range_id,
+        "bucket": bucket,
+        "bucket_seconds": bucket_seconds,
+        "total_blocks": int(payload["total_blocks"]),
         "points": points,
     }
 
@@ -865,6 +1237,17 @@ def settlement_artifacts(coordinator: Any, *, block_hash: str) -> dict[str, obje
 
 
 def direct_coinbase_settlement_payload(ledger: Any, *, block_hash: str) -> dict[str, object] | None:
+    read_model = getattr(ledger, "dashboard_direct_coinbase_settlement", None)
+    if callable(read_model):
+        try:
+            payload = read_model(block_hash=block_hash)
+        except RuntimeError as exc:
+            if audit_bundle_body_read_failed(exc):
+                return None
+            raise
+        return payload if isinstance(payload, dict) else None
+    # In-memory ledger only: audit_bundle() is a writer-lock read on the
+    # Postgres ledger, so a public settlement lookup must not reach it.
     getter = getattr(ledger, "audit_bundle", None)
     if not callable(getter):
         return None
@@ -949,6 +1332,26 @@ def fanout(coordinator: Any, *, fanout_txid: str) -> dict[str, object]:
 
 
 def artifact(coordinator: Any, *, sha256: str) -> object:
+    document = getattr(coordinator.ledger, "dashboard_public_artifact_document", None)
+    if callable(document):
+        row = document(sha256=sha256)
+        if not isinstance(row, dict):
+            raise PublicApiError(404, "not_found", "unknown public PRISM artifact")
+        canonical_json = row.get("canonical_json")
+        if isinstance(canonical_json, str):
+            body = canonical_json.encode()
+            if hashlib.sha256(body).hexdigest() == sha256:
+                return RawJsonBody(body=body)
+            # Stored canonical text that does not hash to its content address
+            # is a store-integrity fault; fall through to the re-serialized
+            # response rather than serve bytes that contradict the address.
+        payload = row.get("payload")
+        if payload is None:
+            raise PublicApiError(404, "not_found", "unknown public PRISM artifact")
+        fallback_reason = row.get("canonical_fallback_reason")
+        if isinstance(fallback_reason, str) and fallback_reason:
+            return UncacheableJsonBody(payload=payload, reason=fallback_reason)
+        return payload
     getter = getattr(coordinator.ledger, "dashboard_public_artifact", None)
     if not callable(getter):
         raise PublicApiError(404, "not_found", "unknown public PRISM artifact")
@@ -1147,6 +1550,34 @@ def network_summary(coordinator: Any) -> dict[str, object]:
     }
 
 
+def network_hashrate_ths(coordinator: Any) -> str | None:
+    """Chain-derived estimate of the permissionless-lane network hashrate, TH/s.
+
+    qbitd's getnetworkhashps answers in H/s over a trailing block window; the
+    permissionless lane is requested because that is the lane pool shares are
+    credited against, so consumers can divide a pool hashrate_ths window by
+    this value for an approximate share-of-network. Nullable and non-fatal by
+    contract: any RPC failure or non-numeric answer yields None, never an
+    error response -- pool-summary may only 503 over missing compact bits.
+    """
+    try:
+        raw = coordinator.rpc.call(
+            "getnetworkhashps",
+            [NETWORK_HASHRATE_BLOCK_WINDOW, -1, NETWORK_HASHRATE_LANE],
+        )
+    except Exception:
+        return None
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        hashes_per_second = Decimal(str(raw))
+    except (ArithmeticError, ValueError, TypeError):
+        return None
+    if not hashes_per_second.is_finite() or hashes_per_second < 0:
+        return None
+    return decimal_string(hashes_per_second / TERAHASH)
+
+
 def first_present(*values: object) -> object | None:
     for value in values:
         if value is not None:
@@ -1230,6 +1661,95 @@ def smooth_hashrate_series_points(
     if (bucket_count < 2 and min_epoch is None) or not points:
         return points
     effective_window_seconds = bucket_count * bucket_seconds
+    parsed_points = _parse_hashrate_series_points(points)
+    if bucket_count < 2:
+        return [point for epoch, _, point in parsed_points if min_epoch is None or epoch >= min_epoch]
+    smoothed: list[dict[str, object]] = []
+    for epoch, _, point, window_total in _trailing_window_totals(parsed_points, effective_window_seconds):
+        if min_epoch is not None and epoch < min_epoch:
+            continue
+        smoothed.append(
+            {
+                **point,
+                "hashrate_ths": hashrate_ths_from_difficulty(window_total, effective_window_seconds),
+            }
+        )
+    return smoothed
+
+
+def hashrate_series_smoothing(*, bucket_seconds: int, window_seconds: int) -> dict[str, object]:
+    """Describe the smoothing a dual-rate series was produced with.
+
+    Mirrors smooth_hashrate_series_points: a window shorter than two buckets
+    (including the smoothing kill switch at 0) leaves rates untouched, so the
+    method is reported as `none` and the effective window is the bucket
+    itself. Otherwise the trailing window is the whole number of buckets that
+    fit in the configured seconds.
+    """
+    bucket_count = window_seconds // bucket_seconds if bucket_seconds > 0 else 0
+    if bucket_count < 2:
+        return {"method": "none", "window_seconds": bucket_seconds}
+    return {"method": "trailing", "window_seconds": bucket_count * bucket_seconds}
+
+
+def dual_rate_hashrate_series_points(
+    points: list[dict[str, object]],
+    *,
+    bucket_seconds: int,
+    window_seconds: int,
+    min_epoch: int | None = None,
+    generated_at_epoch: int,
+) -> list[dict[str, object]]:
+    """Build v2 points carrying both the raw and the trailing-window rate.
+
+    raw_hashrate_ths is the bucket's credited difficulty over the full bucket
+    duration, recomputed here rather than trusting the ledger's per-bucket
+    rate so the documented definition holds for every backend.
+    smoothed_hashrate_ths is the same trailing-window estimate the v1 series
+    serves as hashrate_ths; when smoothing is off or shorter than two buckets
+    it equals the raw rate. A bucket is complete once generated_at has reached
+    its end, so the newest bucket is normally still accumulating credit and
+    its raw rate under-reads the true rate.
+
+    Pre-range lookback context and malformed points are handled exactly as in
+    smooth_hashrate_series_points. Points are returned ascending by timestamp.
+    """
+    smoothing = hashrate_series_smoothing(bucket_seconds=bucket_seconds, window_seconds=window_seconds)
+    trailing = smoothing["method"] == "trailing"
+    effective_window_seconds = int(smoothing["window_seconds"])
+    parsed_points = _parse_hashrate_series_points(points)
+    dual_rate: list[dict[str, object]] = []
+    for epoch, difficulty, point, window_total in _trailing_window_totals(parsed_points, effective_window_seconds):
+        if min_epoch is not None and epoch < min_epoch:
+            continue
+        try:
+            accepted_share_count = int(
+                Decimal(str(point.get("accepted_share_count", 0)))
+            )
+        except (ValueError, InvalidOperation, OverflowError):
+            accepted_share_count = 0
+        raw_hashrate_ths = hashrate_ths_from_difficulty(difficulty, bucket_seconds)
+        dual_rate.append(
+            {
+                "timestamp": point["timestamp"],
+                "raw_hashrate_ths": raw_hashrate_ths,
+                "smoothed_hashrate_ths": (
+                    hashrate_ths_from_difficulty(window_total, effective_window_seconds)
+                    if trailing
+                    else raw_hashrate_ths
+                ),
+                "accepted_share_count": accepted_share_count,
+                "accepted_share_difficulty": str(difficulty),
+                "complete": generated_at_epoch >= epoch + bucket_seconds,
+            }
+        )
+    return dual_rate
+
+
+def _parse_hashrate_series_points(
+    points: list[dict[str, object]],
+) -> list[tuple[int, int, dict[str, object]]]:
+    """Return (epoch, difficulty, point) ascending by epoch, dropping malformed points."""
     parsed_points: list[tuple[int, int, dict[str, object]]] = []
     for point in points:
         try:
@@ -1240,28 +1760,28 @@ def smooth_hashrate_series_points(
             continue
         parsed_points.append((epoch, difficulty, point))
     parsed_points.sort(key=lambda entry: entry[0])
-    smoothed: list[dict[str, object]] = []
+    return parsed_points
+
+
+def _trailing_window_totals(
+    parsed_points: list[tuple[int, int, dict[str, object]]],
+    window_seconds: int,
+) -> Iterator[tuple[int, int, dict[str, object], int]]:
+    """Yield each parsed point with the difficulty total of its trailing window.
+
+    The window covers buckets with epoch in (epoch - window_seconds, epoch];
+    buckets missing from the series contribute nothing, so gaps count as zero
+    difficulty.
+    """
     window: deque[tuple[int, int]] = deque()
     window_total = 0
     for epoch, difficulty, point in parsed_points:
-        if bucket_count < 2:
-            if min_epoch is None or epoch >= min_epoch:
-                smoothed.append(point)
-            continue
         window.append((epoch, difficulty))
         window_total += difficulty
-        while window and window[0][0] <= epoch - effective_window_seconds:
+        while window and window[0][0] <= epoch - window_seconds:
             _, expired_difficulty = window.popleft()
             window_total -= expired_difficulty
-        if min_epoch is not None and epoch < min_epoch:
-            continue
-        smoothed.append(
-            {
-                **point,
-                "hashrate_ths": hashrate_ths_from_difficulty(window_total, effective_window_seconds),
-            }
-        )
-    return smoothed
+        yield epoch, difficulty, point, window_total
 
 
 def pagination(page: int, limit: int, total_count: int) -> dict[str, int]:
@@ -1323,6 +1843,27 @@ def auto_bucket(range_id: str) -> str:
     if range_id == "1m":
         return "1h"
     return "1d"
+
+
+def allowed_hashrate_bucket(range_id: str, bucket: str) -> None:
+    """Reject a bucket outside the range's static vocabulary.
+
+    Called after auto resolution, so ``bucket`` is always concrete; auto
+    resolves inside every allowed set and can never be rejected here. A range
+    absent from HASHRATE_SERIES_ALLOWED_BUCKETS passes -- range validity is
+    the caller's own check, and this helper must stay reusable by every
+    bucketed public series endpoint, so it speaks only of buckets and ranges.
+    """
+    allowed = HASHRATE_SERIES_ALLOWED_BUCKETS.get(range_id)
+    if allowed is None or bucket in allowed:
+        return
+    ordered = sorted(allowed, key=HASHRATE_SERIES_BUCKET_SECONDS.__getitem__)
+    raise PublicApiError(
+        400,
+        "invalid_bucket",
+        f"bucket {bucket} is not allowed for range {range_id}; "
+        f"allowed: {', '.join(ordered)}",
+    )
 
 
 def qbit_gbt_rules(chain: str) -> list[str]:
@@ -1518,6 +2059,11 @@ def percent_string(part: int | str | Decimal, total: int | str | Decimal) -> str
 
 
 def owed_balance_for_recipient(ledger: Any, recipient_id: str) -> int:
+    read_model = getattr(ledger, "dashboard_miner_owed_balance_bits", None)
+    if callable(read_model):
+        return int(read_model(recipient_id=recipient_id))
+    # In-memory ledger only: current_owed_balances() is a writer-lock read on
+    # the Postgres ledger, and returns every recipient's balance to filter one.
     return sum(
         int(balance.get("balance_sats", 0))
         for balance in ledger.current_owed_balances()

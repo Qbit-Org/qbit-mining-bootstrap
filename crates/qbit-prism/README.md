@@ -19,12 +19,25 @@ defines:
 - `qbit_share_ledger`: append-only canonical share log ordered by `share_seq`
 - `qbit_ledger_writer_lease`: one-row coordination table for a single logical
   writer/failover epoch
+- `qbit_pool_blocks.audit_publication_sequence`: durable confirmation and
+  reactivation order for current audit evidence, independent of block height
 - `qbit_prism_window(...)`: deterministic newest-backward window query with
   partial oldest-share weighting
+
+The schema file is cumulative and idempotent. Existing deployments must rerun
+it before upgrading when automatic schema initialization is disabled; see the
+[ledger operations contract](../../docs/prism-ledger-ops.md#audit-publication-ordering-migration).
 
 Stratum frontends should enqueue share submissions outside this table. Only the
 active ledger writer inserts rows into `qbit_share_ledger`; that is what keeps
 all miners in the same reward universe.
+
+[`sql/001_share_ledger_revert_audit_publication_sequence.sql`](sql/001_share_ledger_revert_audit_publication_sequence.sql)
+returns `qbit_pool_blocks` to its pre-publication-ordinal shape for operators
+rolling back past that migration; it discards assigned ordinals, so read
+"Publication Ordinal Rollback And Schema Revert" in
+[`docs/prism-ledger-ops.md`](../../docs/prism-ledger-ops.md) before applying
+it.
 
 ## Reward Rule
 

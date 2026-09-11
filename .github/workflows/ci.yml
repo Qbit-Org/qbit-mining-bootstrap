@@ -2,15 +2,23 @@ name: CI
 
 on:
   pull_request:
+  # Pull requests are tested as their merge result; a push to a PR branch
+  # would run the same jobs a second time. Push runs cover direct commits
+  # to the long-lived branches only.
   push:
+    branches:
+      - main
+      - 1.x.x
+      - 2.x.x
+      - 3.x.x
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  checks:
-    name: Lint, compile, and test
+  lint-compile-compose:
+    name: Lint, compile, and Compose validation
     runs-on: blacksmith-2vcpu-ubuntu-2404
 
     steps:
@@ -20,10 +28,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+          python-version: "3.14"
 
       - name: Install lint tools
         run: |
@@ -31,7 +36,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends shellcheck
 
       - name: Check shell syntax
-        run: git ls-files '*.sh' | xargs bash -n
+        run: git ls-files -z '*.sh' | xargs -0 -n 1 bash -n
 
       - name: ShellCheck shell scripts
         run: |
@@ -41,20 +46,8 @@ jobs:
       - name: Compile Python sources
         run: python -m compileall -q docker lab tests examples scripts
 
-      - name: Run Python unit tests
-        run: python -m unittest discover -s tests -p 'test_*.py'
-
-      - name: Run Postgres ledger integration tests
-        run: make test-prism-postgres-ledger
-
-      - name: Run Postgres production-scale fixture tests
-        run: make test-prism-postgres-scale
-
       - name: Validate mainnet Compose contract
         run: python -m unittest tests.test_mainnet_compose_contract
-
-      - name: Run Rust tests
-        run: cargo test --locked --workspace --all-targets
 
       - name: Validate Docker Compose files
         run: |
@@ -70,6 +63,85 @@ jobs:
               config --quiet
           done
 
+  python-tests:
+    name: Python unit tests (shard ${{ matrix.shard }})
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Python unit test shard
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_COUNT: ${{ strategy.job-total }}
+        run: GIT_CONFIG_GLOBAL=/dev/null python scripts/run_python_test_shard.py --shard-index "$SHARD_INDEX" --shard-count "$SHARD_COUNT"
+
+  postgres-tests:
+    name: Postgres tests (${{ matrix.suite }})
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [ledger, scale, native-ledger, candidate-storage]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Run Postgres test suite
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: |
+          python -m pip install 'psycopg[binary]==3.2.*'
+          make "test-prism-postgres-$SUITE"
+
+  rust-tests:
+    name: Rust tests
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Rust tests
+        run: cargo test --locked --workspace --all-targets
+
+  checks:
+    # Preserve the existing check name for branch protection and consumers.
+    name: Lint, compile, and test
+    if: ${{ always() }}
+    needs: [lint-compile-compose, python-tests, postgres-tests, rust-tests]
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+
+    steps:
+      - name: Require every check to pass
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS"
+          echo "$RESULTS" | jq -e 'all(.[]; .result == "success")'
+
   ckpool-rejects-observability:
     name: ckpool rejects observability live suite
     runs-on: blacksmith-2vcpu-ubuntu-2404
@@ -82,7 +154,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Install ckpool build dependencies
         run: |
@@ -106,7 +178,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Install production PostgreSQL client dependency
         run: python -m pip install "psycopg[binary]==3.2.*"
@@ -116,6 +188,9 @@ jobs:
 
       - name: Run native PostgreSQL ledger integration tests
         run: make test-prism-postgres-native-ledger
+
+      - name: Run carry-forward seed guard regression tests
+        run: make test-prism-postgres-seed-guard
 
   docker-builds:
     name: Build lightweight Docker images
@@ -147,8 +222,31 @@ jobs:
           docker buildx build \
             --build-context qbit-src=/tmp/qbit-functional-fixture \
             --load \
+            --tag qbit-prism:ci \
             -f lab/prism/Dockerfile \
             .
+
+      - name: Run payout-window parity with Python adapter
+        run: |
+          docker run --rm \
+            --volume "$PWD:/workspace:ro" \
+            --workdir /workspace \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            --env PYTHONPATH=/workspace \
+            --env QBIT_WINDOW_PIPELINE_PARITY_ADAPTER=python \
+            qbit-prism:ci \
+            python3 -m tests.window_pipeline_parity_gate
+
+      - name: Run payout-window parity with real Rust daemon
+        run: |
+          docker run --rm \
+            --volume "$PWD:/workspace:ro" \
+            --workdir /workspace \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            --env PYTHONPATH=/workspace \
+            --env QBIT_WINDOW_PIPELINE_PARITY_ADAPTER=rust-daemon \
+            qbit-prism:ci \
+            python3 -m tests.window_pipeline_parity_gate
 
   qbit-runtime-image:
     name: Build and smoke real qbitd image
@@ -165,6 +263,14 @@ jobs:
 
       - name: Set up Blacksmith Docker builder
         uses: useblacksmith/setup-docker-builder@v1
+
+      # The runtime smoke derives its header-bits assertion from PRISM's own
+      # difficulty helpers, so this job needs the same interpreter the unit
+      # tests run under rather than whatever the runner image happens to ship.
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
 
       - name: Stage pinned qbit source
         run: |

@@ -11,16 +11,38 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Iterator
 from unittest.mock import patch
 
-from lab.prism import direct_stratum, public_api
-from lab.prism.prism_coordinator import make_audit_handler
-from lab.prism.share_ledger import PendingShare, PsqlShareLedger, SingleWriterShareLedger
+from lab.prism import direct_stratum, public_api, public_read_service
+from lab.prism.share_ledger import (
+    LedgerOperationTimeout,
+    PendingShare,
+    PsqlShareLedger,
+    SingleWriterShareLedger,
+    canonical_json_text,
+    sha256_json_hex,
+)
+
+
+def make_public_handler(coordinator: object) -> type:
+    """Serve /public/v1 through the process that owns it.
+
+    These routes left the coordinator's audit listener in issue #145, so the
+    handler under test here is the extracted public read service's. It wraps
+    the same public_api.dispatch behind the same PublicResponseCache, which is
+    what keeps these assertions meaningful across the move;
+    tests/test_prism_public_read_service.py pins that equivalence directly.
+    """
+
+    service = public_read_service.PublicReadService(coordinator)  # type: ignore[arg-type]
+    return public_read_service.make_handler(service)
 
 
 class FanoutPublicRowTests(unittest.TestCase):
@@ -61,11 +83,16 @@ class FakeRpc:
         template_bits: str | None = "207fffff",
         blockchain_info: dict[str, object] | None = None,
         network_info: dict[str, object] | None = None,
+        network_hashps: object = 2_500_000_000_000_000_000,
     ) -> None:
         self.template_difficulty = template_difficulty
         self.template_bits = template_bits
         self.blockchain_info = blockchain_info or {}
         self.network_info = network_info or {}
+        # H/s, as qbitd's getnetworkhashps reports. Pass an exception instance
+        # to simulate a node whose hashrate estimate is unavailable.
+        self.network_hashps = network_hashps
+        self.network_hashps_calls: list[list[object] | None] = []
 
     def call(self, method: str, params: list[object] | None = None) -> object:
         if method == "getblockchaininfo":
@@ -85,11 +112,29 @@ class FakeRpc:
             return template
         if method == "getnetworkinfo":
             return {"connections": 8, **self.network_info}
+        if method == "getnetworkhashps":
+            self.network_hashps_calls.append(params)
+            if isinstance(self.network_hashps, BaseException):
+                raise self.network_hashps
+            return self.network_hashps
         raise AssertionError(f"unexpected RPC method {method}")
 
 
 def _bucket_timestamp(epoch: int) -> str:
     return public_api.iso_datetime(datetime.fromtimestamp(epoch, timezone.utc))
+
+
+def _epoch_from_timestamp(timestamp: str) -> int:
+    parsed = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
+    return int(parsed.replace(tzinfo=timezone.utc).timestamp())
+
+
+FIXTURE_DIR = Path(__file__).resolve().parents[1] / "docs" / "public-dashboard-api" / "fixtures"
+
+
+def _load_fixture(name: str) -> dict[str, object]:
+    with (FIXTURE_DIR / name).open(encoding="utf-8") as fixture_file:
+        return json.load(fixture_file)
 
 
 class FakePublicLedger:
@@ -108,6 +153,26 @@ class FakePublicLedger:
         self.leaderboard_calls = 0
         self.reward_leaderboard_calls: list[dict[str, object]] = []
         self.pool_snapshot_calls = 0
+        self.hashrate_series_calls = 0
+        self.blocks_calls: list[dict[str, object]] = []
+        self.block_marker_calls = 0
+        self.last_block_markers_anchor: int | None = None
+        # Found blocks across two recent 1h buckets plus one ancient one, as
+        # (height, hash, found_at_epoch, chain_state). The newer bucket holds
+        # four accepted blocks (so the top-3 cap truncates), two of them tied
+        # on found_at (so the height tiebreak is observable), plus a reversed
+        # block that must never appear. The ancient block sits far outside
+        # every bounded range and is only reachable through range=all.
+        base_hour = int(time.time()) // 3600 * 3600
+        self.block_marker_records: list[tuple[int, str, int, str]] = [
+            (67440, "1a" * 32, base_hour - 7200 + 300, "confirmed"),
+            (67441, "1b" * 32, base_hour - 3600 + 60, "confirmed"),
+            (67442, "1c" * 32, base_hour - 3600 + 120, "confirmed"),
+            (67443, "1d" * 32, base_hour - 3600 + 240, "confirmed"),
+            (67444, "1e" * 32, base_hour - 3600 + 240, "confirmed"),
+            (67439, "1f" * 32, base_hour - 3600 + 240, "reversed"),
+            (60000, "2a" * 32, base_hour - 400 * 86400, "confirmed"),
+        ]
 
     def dashboard_pool_snapshot(self, *, current_network_difficulty: object, generated_at: str) -> dict[str, object]:
         self.pool_snapshot_calls += 1
@@ -118,6 +183,8 @@ class FakePublicLedger:
             "participants_3h": 2,
             "blocks_found_total": 3,
             "prism_blocks_total": 3,
+            "blocks_reversed_total": 1,
+            "blocks_inactive_total": 2,
             "total_mined_bits": 600,
             "latest_block": {
                 "height": 123450,
@@ -136,26 +203,52 @@ class FakePublicLedger:
             },
         }
 
-    def dashboard_blocks(self, *, page: int, limit: int) -> dict[str, object]:
+    def dashboard_blocks(self, *, page: int, limit: int, chain_state: str | None = None) -> dict[str, object]:
+        # chain_state=None records that the caller omitted the argument, which
+        # is what the default public /blocks path must do.
+        self.blocks_calls.append({"page": page, "limit": limit, "chain_state": chain_state})
+        active_row = {
+            "height": 123450,
+            "hash": "a" * 64,
+            "found_at": "2026-06-26T19:55:00Z",
+            "network_difficulty": "1000",
+            "bits": "207fffff",
+            "solver_recipient_id": "miner-a",
+            "solver_worker_name": None,
+            "solver_share_difficulty": "99",
+            "reward_window_weight": "792",
+            "coinbase_value_bits": 600,
+            "audit_bundle_sha256": "b" * 64,
+            "payout_manifest_sha256": "c" * 64,
+            "explorer_url": None,
+        }
+        if chain_state in (None, "active"):
+            rows = [active_row]
+        else:
+            reversed_row = {
+                **active_row,
+                "height": 123449,
+                "hash": "f" * 64,
+                "found_at": "2026-06-26T18:55:00Z",
+                "solver_recipient_id": "miner-b",
+                "solver_share_difficulty": None,
+                "audit_bundle_sha256": None,
+                "payout_manifest_sha256": None,
+                "chain_state": "reversed",
+                "disconnected_at": "2026-06-26T19:05:00Z",
+            }
+            if chain_state == "all":
+                rows = [
+                    {**active_row, "chain_state": "confirmed", "disconnected_at": None},
+                    reversed_row,
+                ]
+            elif chain_state == "reversed":
+                rows = [reversed_row]
+            else:
+                raise ValueError("chain_state must be one of active, all, reversed")
         return {
-            "pagination": {"page": page, "limit": limit, "total_count": 1, "total_pages": 1},
-            "rows": [
-                {
-                    "height": 123450,
-                    "hash": "a" * 64,
-                    "found_at": "2026-06-26T19:55:00Z",
-                    "network_difficulty": "1000",
-                    "bits": "207fffff",
-                    "solver_recipient_id": "miner-a",
-                    "solver_worker_name": None,
-                    "solver_share_difficulty": "99",
-                    "reward_window_weight": "792",
-                    "coinbase_value_bits": 600,
-                    "audit_bundle_sha256": "b" * 64,
-                    "payout_manifest_sha256": "c" * 64,
-                    "explorer_url": None,
-                }
-            ],
+            "pagination": {"page": page, "limit": limit, "total_count": len(rows), "total_pages": 1},
+            "rows": rows,
         }
 
     def dashboard_leaderboard(self, *, page: int, limit: int, search: str | None = None) -> dict[str, object]:
@@ -353,6 +446,7 @@ class FakePublicLedger:
         lookback_seconds: int = 0,
         range_anchor_epoch: int | None = None,
     ) -> list[dict[str, object]]:
+        self.hashrate_series_calls += 1
         self.last_hashrate_series_lookback = lookback_seconds
         self.last_hashrate_series_anchor = range_anchor_epoch
         if bucket == "5m":
@@ -381,6 +475,56 @@ class FakePublicLedger:
                 "accepted_share_difficulty": "100",
             }
         ]
+
+    def dashboard_block_markers(
+        self,
+        *,
+        range_id: str,
+        bucket: str,
+        range_anchor_epoch: int | None = None,
+    ) -> dict[str, object]:
+        # Mirrors the Postgres read model over the fixture records: reversed
+        # blocks excluded, floor bucketing on the hashrate grid, the
+        # hashrate_series_min_epoch lower bound for bounded ranges, per-bucket
+        # top-3 by found_at DESC then height DESC.
+        self.block_marker_calls += 1
+        self.last_block_markers_anchor = range_anchor_epoch
+        bucket_seconds = public_api.HASHRATE_SERIES_BUCKET_SECONDS[bucket]
+        range_seconds = public_api.HASHRATE_SERIES_RANGE_SECONDS[range_id]
+        min_epoch = None
+        if range_seconds is not None:
+            anchor = range_anchor_epoch if range_anchor_epoch is not None else int(time.time())
+            min_epoch = public_api.hashrate_series_min_epoch(anchor, range_seconds, bucket_seconds)
+        buckets: dict[int, list[tuple[int, str, int]]] = {}
+        total = 0
+        for height, block_hash, found_epoch, chain_state in self.block_marker_records:
+            if chain_state == "reversed":
+                continue
+            if min_epoch is not None and found_epoch < min_epoch:
+                continue
+            bucket_epoch = found_epoch // bucket_seconds * bucket_seconds
+            buckets.setdefault(bucket_epoch, []).append((height, block_hash, found_epoch))
+            total += 1
+        points: list[dict[str, object]] = []
+        for bucket_epoch in sorted(buckets):
+            records = sorted(buckets[bucket_epoch], key=lambda record: (-record[2], -record[0]))
+            points.append(
+                {
+                    "timestamp": _bucket_timestamp(bucket_epoch),
+                    "block_count": len(records),
+                    "blocks": [
+                        {
+                            "height": height,
+                            "hash": block_hash,
+                            "found_at": _bucket_timestamp(found_epoch),
+                        }
+                        for height, block_hash, found_epoch in records[
+                            : public_api.BLOCK_MARKERS_MAX_BLOCKS_PER_BUCKET
+                        ]
+                    ],
+                }
+            )
+        return {"total_blocks": total, "points": points}
 
     def all_shares(self) -> list[object]:
         return [
@@ -494,21 +638,67 @@ class RangeBoundaryPublicLedger(FakePublicLedger):
         # Derive the boundary from the caller-provided anchor, exactly as the
         # endpoint's min_epoch trim does, so this stub is deterministic.
         anchor_epoch = range_anchor_epoch if range_anchor_epoch is not None else int(time.time())
-        cutoff_epoch = public_api.hashrate_series_min_epoch(anchor_epoch, 7 * 86400, 300)
+        bucket_seconds = public_api.HASHRATE_SERIES_BUCKET_SECONDS[bucket]
+        cutoff_epoch = public_api.hashrate_series_min_epoch(
+            anchor_epoch,
+            7 * 86400,
+            bucket_seconds,
+        )
         return [
             {
-                "timestamp": _bucket_timestamp(cutoff_epoch - 300),
-                "hashrate_ths": public_api.hashrate_ths_from_difficulty(600, 300),
+                "timestamp": _bucket_timestamp(cutoff_epoch - bucket_seconds),
+                "hashrate_ths": public_api.hashrate_ths_from_difficulty(
+                    600,
+                    bucket_seconds,
+                ),
                 "accepted_share_count": 1,
                 "accepted_share_difficulty": "600",
             },
             {
-                "timestamp": _bucket_timestamp(cutoff_epoch + 1200),
-                "hashrate_ths": public_api.hashrate_ths_from_difficulty(1200, 300),
+                "timestamp": _bucket_timestamp(cutoff_epoch + 4 * bucket_seconds),
+                "hashrate_ths": public_api.hashrate_ths_from_difficulty(
+                    1200,
+                    bucket_seconds,
+                ),
                 "accepted_share_count": 1,
                 "accepted_share_difficulty": "1200",
             },
         ]
+
+
+class RangeBoundaryBlockMarkerLedger(FakePublicLedger):
+    """Serves one block just before the 1w marker cutoff and one just after.
+
+    The records are derived from the caller-provided anchor with the same
+    hashrate_series_min_epoch arithmetic the read models apply, so the test
+    can pin the trim boundary deterministically: the pre-cutoff block sits in
+    the straddling bucket that must be dropped whole, and the post-cutoff
+    block sits in the first fully covered bucket.
+    """
+
+    def dashboard_block_markers(
+        self,
+        *,
+        range_id: str,
+        bucket: str,
+        range_anchor_epoch: int | None = None,
+    ) -> dict[str, object]:
+        anchor_epoch = range_anchor_epoch if range_anchor_epoch is not None else int(time.time())
+        bucket_seconds = public_api.HASHRATE_SERIES_BUCKET_SECONDS[bucket]
+        cutoff_epoch = public_api.hashrate_series_min_epoch(
+            anchor_epoch,
+            7 * 86400,
+            bucket_seconds,
+        )
+        self.block_marker_records = [
+            (100, "aa" * 32, cutoff_epoch - 1, "confirmed"),
+            (101, "bb" * 32, cutoff_epoch + 60, "confirmed"),
+        ]
+        return super().dashboard_block_markers(
+            range_id=range_id,
+            bucket=bucket,
+            range_anchor_epoch=range_anchor_epoch,
+        )
 
 
 class BrokenPublicLedger(FakePublicLedger):
@@ -526,6 +716,112 @@ class MissingAuditBundleBodyLedger(FakePublicLedger):
         if sha256 == self.audit_bundle_sha256:
             return None
         return super().dashboard_public_artifact(sha256=sha256)
+
+
+def sample_ctv_manifest_set() -> dict[str, object]:
+    # Mirrors the tests/test_prism_share_ledger.py fixture: the minimal
+    # manifest set that passes ctv_fanout_recovery_payload validation.
+    parent_coinbase_txid = "11" * 32
+    precommitment = {
+        "chunk_index": 0,
+        "chunk_count": 1,
+        "block_height": 123450,
+        "settlement_mode": "ctv_fanout",
+        "fanout_tx_template_hex": "0300000001",
+        "fanout_output_sum_sats": 25_000,
+        "anchor_vout": 1,
+        "ctv_hash_hex": "33" * 32,
+    }
+    manifest = {
+        "schema": "qbit.prism.ctv-fanout-manifest.v1",
+        "precommitment": precommitment,
+        "precommitment_sha256_hex": "44" * 32,
+        "commitment_witness_leaf_hex": "55" * 32,
+        "parent_coinbase_txid": parent_coinbase_txid,
+        "parent_coinbase_tx_hex": "0200000001",
+        "parent_coinbase_vout": 2,
+        "covenant_output_value_sats": 25_000,
+        "fanout_tx_hex": "0300000002",
+        "fanout_txid": "22" * 32,
+    }
+    return {
+        "schema": "qbit.prism.ctv-fanout-manifest-set.v1",
+        "block_height": 123450,
+        "settlement_mode": "ctv_fanout",
+        "parent_coinbase_txid": parent_coinbase_txid,
+        "fanout_count": 1,
+        "fanout_output_sum_sats": 25_000,
+        "covenant_output_value_sats": 25_000,
+        "manifests": [manifest],
+    }
+
+
+class CanonicalArtifactPublicLedger(FakePublicLedger):
+    """Artifacts whose canonical text and advertised sha256 are genuine."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.manifest_set = sample_ctv_manifest_set()
+        self.manifest = self.manifest_set["manifests"][0]  # type: ignore[index]
+        self.manifest_sha256 = sha256_json_hex(self.manifest)
+        self.manifest_set_sha256 = sha256_json_hex(self.manifest_set)
+        self.audit_bundle = {
+            "schema": "qbit.prism.audit-bundle.v1",
+            "found_block": {"block_height": 123450},
+            "accepted_shares": [{"share_seq": 1}],
+        }
+        # Audit bundles are hashed over these exact canonical bytes. Production
+        # persists the same sequence beside the compact external-body pointer.
+        self.audit_bundle_sha256 = hashlib.sha256(
+            json.dumps(self.audit_bundle, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    def dashboard_public_artifact(self, *, sha256: str) -> dict[str, object] | None:
+        if sha256 == self.audit_bundle_sha256:
+            return self.audit_bundle
+        if sha256 == self.manifest_set_sha256:
+            return self.manifest_set
+        if sha256 == self.manifest_sha256:
+            return self.manifest
+        return None
+
+    def dashboard_public_artifact_document(self, *, sha256: str) -> dict[str, object] | None:
+        payload = self.dashboard_public_artifact(sha256=sha256)
+        if payload is None:
+            return None
+        canonical_json = None
+        if sha256 == self.audit_bundle_sha256:
+            canonical_json = json.dumps(self.audit_bundle, separators=(",", ":"))
+        if sha256 == self.manifest_set_sha256:
+            canonical_json = canonical_json_text(self.manifest_set)
+        if sha256 == self.manifest_sha256:
+            canonical_json = canonical_json_text(self.manifest)
+        return {"payload": payload, "canonical_json": canonical_json}
+
+
+class TamperedCanonicalArtifactPublicLedger(CanonicalArtifactPublicLedger):
+    def dashboard_public_artifact_document(self, *, sha256: str) -> dict[str, object] | None:
+        document = super().dashboard_public_artifact_document(sha256=sha256)
+        if document is None or document.get("canonical_json") is None:
+            return document
+        # Same document, different bytes: must never be served raw.
+        return {**document, "canonical_json": str(document["canonical_json"]) + " "}
+
+
+class MissingCanonicalArtifactPublicLedger(CanonicalArtifactPublicLedger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.audit_document_calls = 0
+
+    def dashboard_public_artifact_document(self, *, sha256: str) -> dict[str, object] | None:
+        if sha256 != self.audit_bundle_sha256:
+            return super().dashboard_public_artifact_document(sha256=sha256)
+        self.audit_document_calls += 1
+        return {
+            "payload": self.audit_bundle,
+            "canonical_json": None,
+            "canonical_fallback_reason": "missing",
+        }
 
 
 class DirectCoinbasePublicLedger(FakePublicLedger):
@@ -648,6 +944,33 @@ class SlowPublicLedger(FakePublicLedger):
         }
 
 
+class StatementTimeoutRecordingLedger(FakePublicLedger):
+    """Duck-typed operation_timeout scope, recording what the handler arms.
+
+    Mirrors PsqlShareLedger's contextmanager signature so the read service's
+    getattr + callable probe takes the same branch it takes in production.
+    The operation scope, not the statement scope: one budget must cover the
+    whole dispatch, however many ledger reads it performs.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.statement_timeout_budgets: list[float] = []
+
+    @contextmanager
+    def operation_timeout(self, timeout_seconds: float) -> Iterator[None]:
+        self.statement_timeout_budgets.append(timeout_seconds)
+        yield
+
+
+class TimingOutPublicLedger(StatementTimeoutRecordingLedger):
+    """Every hashrate query dies the way a server-cancelled statement does."""
+
+    def dashboard_hashrate_series(self, **kwargs: object) -> list[dict[str, object]]:
+        self.hashrate_series_calls += 1
+        raise LedgerOperationTimeout("postgres statement deadline expired")
+
+
 class FakeCoordinator:
     def __init__(self, ledger: FakePublicLedger | None = None, rpc: FakeRpc | None = None) -> None:
         self.ledger = ledger or FakePublicLedger()
@@ -664,7 +987,7 @@ class MemoryCoordinator:
 
 class PrismPublicDashboardApiTests(unittest.TestCase):
     def setUp(self) -> None:
-        handler = make_audit_handler(FakeCoordinator())  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator())  # type: ignore[arg-type]
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -748,7 +1071,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_missing_compact_bits_fail_endpoints_before_reward_ledger_reads(self) -> None:
         ledger = FakePublicLedger()
-        handler = make_audit_handler(
+        handler = make_public_handler(
             FakeCoordinator(ledger=ledger, rpc=FakeRpc(template_bits=None))
         )  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -809,6 +1132,266 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         # rates pass through untouched.
         self.assertEqual(series["points"][0]["hashrate_ths"], "2.5")
 
+    BLOCK_ROW_V1_KEYS = {
+        "height",
+        "hash",
+        "found_at",
+        "network_difficulty",
+        "bits",
+        "solver_recipient_id",
+        "solver_worker_name",
+        "solver_share_difficulty",
+        "reward_window_weight",
+        "coinbase_value_bits",
+        "audit_bundle_sha256",
+        "payout_manifest_sha256",
+        "explorer_url",
+    }
+
+    def test_blocks_default_response_keeps_v1_shape_and_omits_state_fields(self) -> None:
+        ledger = FakePublicLedger()
+        coordinator = FakeCoordinator(ledger=ledger)
+
+        for query in ({}, {"chain_state": ["active"]}):
+            with self.subTest(query=query):
+                status, payload = public_api.dispatch(coordinator, "/public/v1/blocks", query)
+
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["schema"], "prism.dashboard.blocks.v1")
+                for row in payload["rows"]:
+                    self.assertEqual(set(row), self.BLOCK_ROW_V1_KEYS)
+        # Both the implicit default and an explicit chain_state=active reach
+        # the read model without any chain_state argument, so a ledger that
+        # predates the filter keeps serving the default contract.
+        self.assertEqual(
+            ledger.blocks_calls,
+            [
+                {"page": 1, "limit": 15, "chain_state": None},
+                {"page": 1, "limit": 15, "chain_state": None},
+            ],
+        )
+
+    def test_blocks_chain_state_filter_returns_v2_rows_and_filtered_pagination(self) -> None:
+        ledger = FakePublicLedger()
+        coordinator = FakeCoordinator(ledger=ledger)
+
+        status, all_payload = public_api.dispatch(
+            coordinator, "/public/v1/blocks", {"chain_state": ["all"]}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(all_payload["schema"], "prism.dashboard.blocks.v2")
+        self.assertEqual(all_payload["pagination"]["total_count"], 2)
+        for row in all_payload["rows"]:
+            self.assertEqual(set(row), self.BLOCK_ROW_V1_KEYS | {"chain_state", "disconnected_at"})
+        self.assertEqual(all_payload["rows"][0]["chain_state"], "confirmed")
+        self.assertIsNone(all_payload["rows"][0]["disconnected_at"])
+        self.assertEqual(all_payload["rows"][1]["chain_state"], "reversed")
+        self.assertEqual(all_payload["rows"][1]["disconnected_at"], "2026-06-26T19:05:00Z")
+
+        status, reversed_payload = public_api.dispatch(
+            coordinator, "/public/v1/blocks", {"chain_state": ["reversed"]}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(reversed_payload["schema"], "prism.dashboard.blocks.v2")
+        self.assertEqual(reversed_payload["pagination"]["total_count"], 1)
+        self.assertEqual(
+            [row["chain_state"] for row in reversed_payload["rows"]],
+            ["reversed"],
+        )
+        self.assertEqual(
+            ledger.blocks_calls,
+            [
+                {"page": 1, "limit": 15, "chain_state": "all"},
+                {"page": 1, "limit": 15, "chain_state": "reversed"},
+            ],
+        )
+
+    def test_blocks_rejects_unknown_chain_state(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self.get_json("/public/v1/blocks?chain_state=orphaned")
+
+        self.assertEqual(raised.exception.code, 400)
+        payload = json.loads(raised.exception.read())
+        raised.exception.close()
+        self.assertEqual(payload["error"]["code"], "bad_request")
+
+    def test_origin_cache_separates_blocks_chain_states(self) -> None:
+        ledger = FakePublicLedger()
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch.dict(os.environ, {"PRISM_PUBLIC_CACHE_TTL_SECONDS": "30"}, clear=True):
+                base = f"http://127.0.0.1:{server.server_port}/public/v1/blocks"
+                for url in (base, base, f"{base}?chain_state=all"):
+                    with urllib.request.urlopen(url, timeout=5) as response:
+                        payload = json.loads(response.read())
+                with urllib.request.urlopen(base, timeout=5) as response:
+                    default_payload = json.loads(response.read())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        # chain_state partitions the origin cache automatically because the
+        # cache key carries the sorted query string: the repeated default
+        # requests share one entry while chain_state=all computes its own.
+        self.assertEqual(payload["schema"], "prism.dashboard.blocks.v2")
+        self.assertEqual(default_payload["schema"], "prism.dashboard.blocks.v1")
+        self.assertEqual(
+            [call["chain_state"] for call in ledger.blocks_calls],
+            [None, "all"],
+        )
+
+    def test_pool_summary_reports_reorg_counts_and_network_hashrate(self) -> None:
+        rpc = FakeRpc(network_hashps=2_500_000_000_000_000_000)
+        payload = public_api.pool_summary(FakeCoordinator(rpc=rpc))
+
+        self.assertEqual(payload["pool"]["blocks_reversed_total"], 1)
+        self.assertEqual(payload["pool"]["blocks_inactive_total"], 2)
+        # 2.5e18 H/s reported by the node is 2,500,000 TH/s, and the lookup
+        # asks for the permissionless lane the pool's shares are credited
+        # against, over the RPC's own default 120-block window at the tip.
+        self.assertEqual(payload["network"]["hashrate_ths"], "2500000")
+        self.assertEqual(rpc.network_hashps_calls, [[120, -1, "permissionless"]])
+
+    def test_pool_summary_network_hashrate_is_null_when_rpc_fails(self) -> None:
+        rpc = FakeRpc(network_hashps=RuntimeError("getnetworkhashps unavailable"))
+        payload = public_api.pool_summary(FakeCoordinator(rpc=rpc))
+
+        # The field is nullable and non-fatal: pool-summary still answers 200
+        # with everything else populated, and only compact-bits loss may 503.
+        self.assertIsNone(payload["network"]["hashrate_ths"])
+        self.assertEqual(payload["schema"], "prism.dashboard.pool-summary.v1")
+        self.assertEqual(payload["pool"]["blocks_found_total"], 3)
+
+    def test_network_hashrate_ths_rejects_non_numeric_estimates(self) -> None:
+        for network_hashps in (float("nan"), float("inf"), -1, True, "not-a-rate", None, {}):
+            with self.subTest(network_hashps=network_hashps):
+                coordinator = FakeCoordinator(rpc=FakeRpc(network_hashps=network_hashps))
+                self.assertIsNone(public_api.network_hashrate_ths(coordinator))
+        fractional = FakeCoordinator(rpc=FakeRpc(network_hashps=1_500_000_000_000.5))
+        self.assertEqual(public_api.network_hashrate_ths(fractional), "1.5000000000005")
+
+    def test_block_markers_shape_alignment_and_truncation(self) -> None:
+        markers = self.get_json("/public/v1/block-markers?range=1m&bucket=auto")
+
+        self.assertEqual(markers["schema"], "prism.dashboard.block-markers.v1")
+        self.assertEqual(markers["range"], "1m")
+        # auto resolves exactly as it does for hashrate-series: 1h for 1m.
+        self.assertEqual(markers["bucket"], "1h")
+        self.assertEqual(markers["bucket_seconds"], 3600)
+        # The reversed block and the out-of-range ancient block are excluded
+        # from the total; empty buckets are omitted rather than zero-filled.
+        self.assertEqual(markers["total_blocks"], 5)
+        points = markers["points"]
+        self.assertEqual(len(points), 2)
+        epochs = [_epoch_from_timestamp(str(point["timestamp"])) for point in points]
+        self.assertEqual(epochs, sorted(epochs))
+        for point, epoch in zip(points, epochs):
+            # Marker buckets sit on the hashrate chart's grid: the same floor
+            # arithmetic hashrate-series buckets use, so every timestamp is
+            # bucket-aligned and every block floors into its point's bucket.
+            self.assertEqual(epoch % 3600, 0)
+            for block in point["blocks"]:
+                found_epoch = _epoch_from_timestamp(str(block["found_at"]))
+                self.assertEqual(found_epoch // 3600 * 3600, epoch)
+        self.assertEqual(points[0]["block_count"], 1)
+        self.assertFalse(points[0]["truncated"])
+        self.assertEqual(points[0]["blocks"][0]["height"], 67440)
+        # Four accepted blocks in the newer bucket: only the three most recent
+        # survive, ordered found_at DESC with height DESC breaking the tie.
+        self.assertEqual(points[1]["block_count"], 4)
+        self.assertTrue(points[1]["truncated"])
+        self.assertEqual(
+            [block["height"] for block in points[1]["blocks"]],
+            [67444, 67443, 67442],
+        )
+        found_ats = [
+            _epoch_from_timestamp(str(block["found_at"]))
+            for block in points[1]["blocks"]
+        ]
+        self.assertEqual(found_ats, sorted(found_ats, reverse=True))
+        self.assertNotIn("1f" * 32, json.dumps(markers))
+
+    def test_block_markers_all_range_reaches_unbounded_history(self) -> None:
+        markers = self.get_json("/public/v1/block-markers?range=all&bucket=1d")
+
+        self.assertEqual(markers["bucket"], "1d")
+        self.assertEqual(markers["bucket_seconds"], 86400)
+        # `all` has no lower bound, so the ancient block joins the total.
+        self.assertEqual(markers["total_blocks"], 6)
+        points = markers["points"]
+        self.assertEqual(
+            sum(int(point["block_count"]) for point in points),
+            markers["total_blocks"],
+        )
+        self.assertEqual(points[0]["blocks"][0]["hash"], "2a" * 32)
+        for point in points:
+            self.assertEqual(_epoch_from_timestamp(str(point["timestamp"])) % 86400, 0)
+        # An unbounded range carries no anchor: there is no lower bound for
+        # the ledger to derive from it.
+        ledger = FakePublicLedger()
+        ledger.last_block_markers_anchor = -1
+        public_api.block_markers(FakeCoordinator(ledger=ledger), range_id="all", bucket="1d")
+        self.assertIsNone(ledger.last_block_markers_anchor)
+
+    def test_block_markers_pass_range_anchor_and_trim_straddling_bucket(self) -> None:
+        ledger = RangeBoundaryBlockMarkerLedger()
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_port}/public/v1/block-markers?range=1w&bucket=5m"
+            with urllib.request.urlopen(url, timeout=5) as response:
+                markers = json.loads(response.read())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        # The endpoint anchors the range on its own clock and the ledger keeps
+        # only fully covered buckets, so the block in the straddling bucket is
+        # dropped whole while the first in-range bucket survives -- the same
+        # boundary the hashrate series trims against.
+        self.assertIsNotNone(ledger.last_block_markers_anchor)
+        self.assertEqual(markers["total_blocks"], 1)
+        self.assertEqual(len(markers["points"]), 1)
+        self.assertEqual(markers["points"][0]["blocks"][0]["hash"], "bb" * 32)
+        self.assertNotIn("aa" * 32, json.dumps(markers))
+        cutoff_epoch = public_api.hashrate_series_min_epoch(
+            int(ledger.last_block_markers_anchor),
+            7 * 86400,
+            300,
+        )
+        self.assertEqual(
+            _epoch_from_timestamp(str(markers["points"][0]["timestamp"])),
+            cutoff_epoch,
+        )
+
+    def test_block_markers_reject_invalid_range_bucket_and_clamp_combos(self) -> None:
+        for path in (
+            "/public/v1/block-markers?range=2y",
+            "/public/v1/block-markers?range=1w&bucket=7m",
+            # Every clamped combination: finer buckets than the range's chart
+            # renders are rejected rather than served unboundedly long.
+            "/public/v1/block-markers?range=1m&bucket=5m",
+            "/public/v1/block-markers?range=6m&bucket=5m",
+            "/public/v1/block-markers?range=6m&bucket=1h",
+            "/public/v1/block-markers?range=all&bucket=5m",
+            "/public/v1/block-markers?range=all&bucket=1h",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    self.get_json(path)
+                self.assertEqual(raised.exception.code, 400)
+                payload = json.loads(raised.exception.read())
+                raised.exception.close()
+                self.assertEqual(payload["schema"], "prism.dashboard.error.v1")
+                self.assertEqual(payload["error"]["code"], "bad_request")
+
     def assert_hashrate_ths(self, actual: object, difficulty: int, seconds: int) -> None:
         # Hashrate strings are Decimal-context dependent (direct_stratum pins
         # prec=40 in the importing thread while HTTP handler threads use the
@@ -845,7 +1428,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_hashrate_series_fetches_lookback_and_trims_pre_range_points(self) -> None:
         ledger = RangeBoundaryPublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -947,6 +1530,330 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertEqual(len(smoothed), 1)
         self.assertEqual(smoothed[0]["timestamp"], _bucket_timestamp(cutoff_epoch))
 
+    V1_SERIES_KEYS = {"schema", "generated_at", "subject", "range", "bucket", "unit", "points"}
+    V1_POINT_KEYS = {"timestamp", "hashrate_ths", "accepted_share_count", "accepted_share_difficulty"}
+    V2_POINT_KEYS = {
+        "timestamp",
+        "raw_hashrate_ths",
+        "smoothed_hashrate_ths",
+        "accepted_share_count",
+        "accepted_share_difficulty",
+        "complete",
+    }
+
+    def test_hashrate_series_default_view_retains_exact_v1_shape(self) -> None:
+        fixture = _load_fixture("hashrate-series.json")
+        for suffix in ("",):
+            with urllib.request.urlopen(
+                f"{self.base_url}/public/v1/hashrate-series?subject=pool&range=1w&bucket=5m{suffix}",
+                timeout=5,
+            ) as response:
+                body = response.read()
+            series = json.loads(body)
+
+            self.assertEqual(series["schema"], "prism.dashboard.hashrate-series.v1")
+            self.assertEqual(set(series), self.V1_SERIES_KEYS)
+            self.assertEqual(set(series), set(fixture))
+            self.assertEqual(len(series["points"]), 2)
+            for point in series["points"]:
+                self.assertEqual(set(point), self.V1_POINT_KEYS)
+                self.assertEqual(set(point), set(fixture["points"][0]))
+            # The legacy body carries none of the dual-rate vocabulary.
+            for token in (b"raw_hashrate_ths", b"smoothed_hashrate_ths", b"bucket_seconds", b"rate_basis", b"smoothing", b"complete"):
+                self.assertNotIn(token, body)
+            # And still serves the trailing-window rate as hashrate_ths.
+            self.assert_hashrate_ths(series["points"][0]["hashrate_ths"], 600, 1800)
+            self.assert_hashrate_ths(series["points"][1]["hashrate_ths"], 1800, 1800)
+
+    def test_hashrate_series_both_view_returns_raw_and_smoothed_rates(self) -> None:
+        fixture = _load_fixture("hashrate-series-dual-rate.json")
+        series = self.get_json("/public/v1/hashrate-series?subject=pool&range=1w&bucket=5m&view=both")
+
+        self.assertEqual(series["schema"], "prism.dashboard.hashrate-series.v2")
+        self.assertEqual(set(series), set(fixture))
+        self.assertEqual(series["subject"], {"type": "pool", "id": None})
+        self.assertEqual(series["range"], "1w")
+        self.assertEqual(series["bucket"], "5m")
+        self.assertEqual(series["bucket_seconds"], 300)
+        self.assertEqual(series["unit"], "ths")
+        self.assertEqual(series["rate_basis"], "accepted_share_difficulty")
+        self.assertEqual(series["smoothing"], {"method": "trailing", "window_seconds": 1800})
+
+        points = series["points"]
+        self.assertEqual(len(points), 2)
+        for point in points:
+            self.assertEqual(set(point), self.V2_POINT_KEYS)
+            self.assertEqual(set(point), set(fixture["points"][0]))
+        self.assertEqual([point["accepted_share_difficulty"] for point in points], ["600", "1200"])
+        self.assertEqual([point["accepted_share_count"] for point in points], [2, 1])
+        # Raw divides the bucket's credit by the full 5m bucket; smoothed is the
+        # 30m trailing estimate v1 serves, so the two differ for the same point.
+        self.assert_hashrate_ths(points[0]["raw_hashrate_ths"], 600, 300)
+        self.assert_hashrate_ths(points[0]["smoothed_hashrate_ths"], 600, 1800)
+        self.assert_hashrate_ths(points[1]["raw_hashrate_ths"], 1200, 300)
+        self.assert_hashrate_ths(points[1]["smoothed_hashrate_ths"], 1800, 1800)
+        for point in points:
+            self.assertNotEqual(Decimal(point["raw_hashrate_ths"]), Decimal(point["smoothed_hashrate_ths"]))
+        # The older bucket ended before generated_at; the current one is still
+        # accumulating credit.
+        self.assertEqual([point["complete"] for point in points], [True, False])
+        generated_at_epoch = int(
+            datetime.strptime(series["generated_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+        )
+        for point in points:
+            point_epoch = int(
+                datetime.strptime(point["timestamp"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+            )
+            self.assertEqual(point["complete"], generated_at_epoch >= point_epoch + 300)
+
+    def test_hashrate_series_both_view_reports_no_smoothing_when_disabled(self) -> None:
+        with patch.dict(os.environ, {"PRISM_PUBLIC_HASHRATE_SMOOTHING_SECONDS": "0"}):
+            series = self.get_json("/public/v1/hashrate-series?subject=pool&range=1w&bucket=5m&view=both")
+
+        self.assertEqual(series["schema"], "prism.dashboard.hashrate-series.v2")
+        self.assertEqual(series["smoothing"], {"method": "none", "window_seconds": 300})
+        points = series["points"]
+        self.assertEqual(len(points), 2)
+        self.assert_hashrate_ths(points[0]["raw_hashrate_ths"], 600, 300)
+        self.assert_hashrate_ths(points[1]["raw_hashrate_ths"], 1200, 300)
+        for point in points:
+            self.assertEqual(point["smoothed_hashrate_ths"], point["raw_hashrate_ths"])
+
+    def test_hashrate_series_both_view_reports_no_smoothing_for_coarse_buckets(self) -> None:
+        # The default 30m window is shorter than two 1h buckets, so the v1
+        # series passes ledger rates through; v2 says so explicitly.
+        ledger = RangeBoundaryPublicLedger()
+        series = public_api.hashrate_series(
+            FakeCoordinator(ledger=ledger),  # type: ignore[arg-type]
+            subject="miner:miner-a",
+            range_id="1w",
+            bucket="auto",
+            view="both",
+        )
+
+        self.assertEqual(series["schema"], "prism.dashboard.hashrate-series.v2")
+        self.assertEqual(series["subject"], {"type": "miner", "id": "miner-a"})
+        self.assertEqual(series["bucket"], "1h")
+        self.assertEqual(series["bucket_seconds"], 3600)
+        self.assertEqual(series["smoothing"], {"method": "none", "window_seconds": 3600})
+        self.assertEqual(len(series["points"]), 1)
+        point = series["points"][0]
+        self.assertEqual(point["accepted_share_count"], 1)
+        self.assertEqual(point["accepted_share_difficulty"], "1200")
+        self.assert_hashrate_ths(point["raw_hashrate_ths"], 1200, 3600)
+        self.assertEqual(point["smoothed_hashrate_ths"], point["raw_hashrate_ths"])
+        self.assertTrue(point["complete"])
+
+    def test_hashrate_series_both_view_trims_partial_leading_coarse_bucket(self) -> None:
+        ledger = RangeBoundaryPublicLedger()
+        series = public_api.hashrate_series(
+            FakeCoordinator(ledger=ledger),  # type: ignore[arg-type]
+            subject="pool",
+            range_id="1w",
+            bucket="auto",
+            view="both",
+        )
+
+        self.assertEqual(series["smoothing"], {"method": "none", "window_seconds": 3600})
+        self.assertEqual(ledger.last_hashrate_series_lookback, 0)
+        self.assertIsNotNone(ledger.last_hashrate_series_anchor)
+        self.assertEqual(len(series["points"]), 1)
+        self.assertEqual(series["points"][0]["accepted_share_difficulty"], "1200")
+        self.assertTrue(series["points"][0]["complete"])
+
+    def test_hashrate_series_both_view_trims_lookback_but_keeps_its_smoothing(self) -> None:
+        ledger = RangeBoundaryPublicLedger()
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = (
+                f"http://127.0.0.1:{server.server_port}/public/v1/hashrate-series"
+                "?subject=pool&range=1w&bucket=5m&view=both"
+            )
+            with urllib.request.urlopen(url, timeout=5) as response:
+                series = json.loads(response.read())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(ledger.last_hashrate_series_lookback, 1800)
+        self.assertIsNotNone(ledger.last_hashrate_series_anchor)
+        points = series["points"]
+        # The pre-range bucket is trimmed from the response, but its credit
+        # still feeds the kept point's trailing window while the raw rate
+        # describes only the kept bucket.
+        self.assertEqual(len(points), 1)
+        self.assertEqual(points[0]["accepted_share_difficulty"], "1200")
+        self.assert_hashrate_ths(points[0]["raw_hashrate_ths"], 1200, 300)
+        self.assert_hashrate_ths(points[0]["smoothed_hashrate_ths"], 1800, 1800)
+        self.assertTrue(points[0]["complete"])
+
+    def test_hashrate_series_rejects_unknown_view(self) -> None:
+        for view in ("raw", "smoothed", "BOTH", "both,raw"):
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                self.get_json(f"/public/v1/hashrate-series?subject=pool&range=1w&bucket=5m&view={view}")
+
+            self.assertEqual(raised.exception.code, 400, view)
+            payload = json.loads(raised.exception.read())
+            raised.exception.close()
+            self.assertEqual(payload["schema"], "prism.dashboard.error.v1")
+            self.assertEqual(
+                payload["error"],
+                {"code": "bad_request", "message": "view must be both or omitted", "request_id": None},
+            )
+
+    def test_origin_cache_separates_hashrate_series_views(self) -> None:
+        path = "/public/v1/hashrate-series"
+        base_query = {"subject": ["pool"], "range": ["1w"], "bucket": ["5m"]}
+        self.assertNotEqual(
+            public_api.public_cache_key(path, base_query),
+            public_api.public_cache_key(path, {**base_query, "view": ["both"]}),
+        )
+
+        ledger = FakePublicLedger()
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch.dict(os.environ, {"PRISM_PUBLIC_AGGREGATE_CACHE_TTL_SECONDS": "30"}, clear=True):
+                schemas = []
+                for suffix in ("", "&view=both", ""):
+                    with urllib.request.urlopen(
+                        f"http://127.0.0.1:{server.server_port}{path}?subject=pool&range=1w&bucket=5m{suffix}",
+                        timeout=5,
+                    ) as response:
+                        schemas.append(json.loads(response.read())["schema"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(
+            schemas,
+            [
+                "prism.dashboard.hashrate-series.v1",
+                "prism.dashboard.hashrate-series.v2",
+                "prism.dashboard.hashrate-series.v1",
+            ],
+        )
+        # One origin computation per view; the repeated v1 request is a hit.
+        self.assertEqual(ledger.hashrate_series_calls, 2)
+
+    def test_hashrate_series_smoothing_descriptor_matches_smoother_threshold(self) -> None:
+        self.assertEqual(
+            public_api.hashrate_series_smoothing(bucket_seconds=300, window_seconds=1800),
+            {"method": "trailing", "window_seconds": 1800},
+        )
+        # Partial buckets are dropped from the effective window.
+        self.assertEqual(
+            public_api.hashrate_series_smoothing(bucket_seconds=300, window_seconds=899),
+            {"method": "trailing", "window_seconds": 600},
+        )
+        for bucket_seconds, window_seconds in ((300, 0), (300, 599), (3600, 1800), (86400, 86400)):
+            self.assertEqual(
+                public_api.hashrate_series_smoothing(bucket_seconds=bucket_seconds, window_seconds=window_seconds),
+                {"method": "none", "window_seconds": bucket_seconds},
+                (bucket_seconds, window_seconds),
+            )
+
+    def test_dual_rate_points_complete_flag_follows_bucket_end(self) -> None:
+        epoch = 1_750_000_000 // 300 * 300
+        point = {
+            "timestamp": _bucket_timestamp(epoch),
+            "hashrate_ths": "0",
+            "accepted_share_count": 4,
+            "accepted_share_difficulty": "900",
+        }
+        for generated_at_epoch, complete in ((epoch, False), (epoch + 299, False), (epoch + 300, True), (epoch + 301, True)):
+            points = public_api.dual_rate_hashrate_series_points(
+                [point],
+                bucket_seconds=300,
+                window_seconds=1800,
+                generated_at_epoch=generated_at_epoch,
+            )
+            self.assertEqual(len(points), 1)
+            self.assertEqual(points[0]["complete"], complete, generated_at_epoch - epoch)
+            self.assertEqual(points[0]["timestamp"], _bucket_timestamp(epoch))
+            self.assertEqual(points[0]["accepted_share_count"], 4)
+            self.assertEqual(points[0]["accepted_share_difficulty"], "900")
+            self.assertEqual(points[0]["raw_hashrate_ths"], public_api.hashrate_ths_from_difficulty(900, 300))
+
+    def test_dual_rate_points_match_v1_smoothing_and_trim_lookback(self) -> None:
+        base_epoch = 1_750_000_000 // 300 * 300
+        series = [
+            (base_epoch, 100),
+            (base_epoch + 300, 250),
+            (base_epoch + 900, 75),
+            (base_epoch + 1500, 500),
+            (base_epoch + 1800, 125),
+            (base_epoch + 3600, 900),
+        ]
+        malformed = {
+            "timestamp": "not-a-timestamp",
+            "hashrate_ths": "2.5",
+            "accepted_share_count": 1,
+            "accepted_share_difficulty": "100",
+        }
+        points = [
+            {
+                "timestamp": _bucket_timestamp(epoch),
+                "hashrate_ths": "0",
+                "accepted_share_count": 1,
+                "accepted_share_difficulty": str(difficulty),
+            }
+            for epoch, difficulty in series
+        ]
+        generated_at_epoch = base_epoch + 3600 + 150
+        smoothed = public_api.smooth_hashrate_series_points(
+            list(points), bucket_seconds=300, window_seconds=1800
+        )
+        dual_rate = public_api.dual_rate_hashrate_series_points(
+            [malformed, *reversed(points)],
+            bucket_seconds=300,
+            window_seconds=1800,
+            generated_at_epoch=generated_at_epoch,
+        )
+        self.assertEqual(len(dual_rate), len(series))
+        for (epoch, difficulty), v1_point, v2_point in zip(series, smoothed, dual_rate):
+            self.assertEqual(v2_point["timestamp"], _bucket_timestamp(epoch))
+            self.assertEqual(v2_point["smoothed_hashrate_ths"], v1_point["hashrate_ths"])
+            self.assertEqual(v2_point["raw_hashrate_ths"], public_api.hashrate_ths_from_difficulty(difficulty, 300))
+            self.assertEqual(v2_point["complete"], epoch != base_epoch + 3600)
+
+        # Trimming keeps the lookback credit inside the first kept window.
+        trimmed = public_api.dual_rate_hashrate_series_points(
+            points,
+            bucket_seconds=300,
+            window_seconds=1800,
+            min_epoch=base_epoch + 900,
+            generated_at_epoch=generated_at_epoch,
+        )
+        self.assertEqual([point["timestamp"] for point in trimmed], [_bucket_timestamp(epoch) for epoch, _ in series[2:]])
+        self.assertEqual(trimmed[0]["raw_hashrate_ths"], public_api.hashrate_ths_from_difficulty(75, 300))
+        self.assertEqual(trimmed[0]["smoothed_hashrate_ths"], public_api.hashrate_ths_from_difficulty(425, 1800))
+
+        # Below the two-bucket threshold the smoothed rate is the raw rate.
+        unsmoothed = public_api.dual_rate_hashrate_series_points(
+            points,
+            bucket_seconds=300,
+            window_seconds=300,
+            generated_at_epoch=generated_at_epoch,
+        )
+        for point in unsmoothed:
+            self.assertEqual(point["smoothed_hashrate_ths"], point["raw_hashrate_ths"])
+
+        count_as_decimal = public_api.dual_rate_hashrate_series_points(
+            [{**points[0], "accepted_share_count": "3.0"}],
+            bucket_seconds=300,
+            window_seconds=1800,
+            generated_at_epoch=generated_at_epoch,
+        )
+        self.assertEqual(count_as_decimal[0]["accepted_share_count"], 3)
+
     def test_omitted_leaderboard_window_retains_exact_legacy_v1_keys(self) -> None:
         payload = self.get_json("/public/v1/leaderboard")
 
@@ -1031,7 +1938,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_origin_cache_separates_legacy_and_reward_leaderboards(self) -> None:
         ledger = FakePublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1099,7 +2006,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_public_api_successes_emit_cache_headers_and_hit_origin_cache(self) -> None:
         ledger = FakePublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1136,13 +2043,13 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertEqual(first_age, "0")
         self.assertEqual(second_age, "0")
         self.assertEqual(first_browser_cache, "public, max-age=0, must-revalidate")
-        self.assertEqual(first_cdn_cache, "public, max-age=30, stale-while-revalidate=30")
+        self.assertEqual(first_cdn_cache, "public, max-age=15")
         self.assertEqual(second_cdn_cache, first_cdn_cache)
         self.assertEqual(ledger.leaderboard_calls, 1)
 
     def test_public_api_errors_are_no_store_and_not_cached(self) -> None:
         ledger = BrokenPublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1164,7 +2071,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_public_api_coalesces_concurrent_origin_cache_misses(self) -> None:
         ledger = SlowPublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1205,7 +2112,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         # An oversize (non-cacheable) response must still coalesce concurrent
         # waiters onto the owner's single origin call instead of re-running it.
         ledger = SlowPublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1315,7 +2222,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_public_api_cache_headers_use_route_specific_ttls(self) -> None:
         ledger = FakePublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1345,7 +2252,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
-        self.assertEqual(config_cache, "public, max-age=600, stale-while-revalidate=3600")
+        self.assertEqual(config_cache, "public, max-age=600, stale-while-revalidate=300")
         self.assertEqual(artifact_cache, "public, max-age=7200, stale-while-revalidate=86400, immutable")
 
     def test_public_api_errors_use_public_error_schema(self) -> None:
@@ -1425,7 +2332,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
             public_api.scaled_network_difficulty("00000000")
 
     def test_unexpected_public_api_errors_do_not_leak_internal_details(self) -> None:
-        handler = make_audit_handler(FakeCoordinator(BrokenPublicLedger()))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(BrokenPublicLedger()))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1450,7 +2357,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertEqual(payload["error"], {"code": "internal_error", "message": "internal server error", "request_id": None})
 
     def test_public_value_errors_do_not_leak_internal_details(self) -> None:
-        handler = make_audit_handler(FakeCoordinator(ValueErrorPublicLedger()))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ValueErrorPublicLedger()))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1503,7 +2410,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
 
     def test_settlement_artifacts_returns_direct_coinbase_bundle_without_fanouts(self) -> None:
         ledger = DirectCoinbasePublicLedger()
-        handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1541,7 +2448,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
     def test_settlement_artifacts_supports_externalized_direct_coinbase_audit_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ledger = ExternalizedDirectCoinbasePublicLedger(tmp)
-            handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+            handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
             server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -1568,7 +2475,7 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ledger = ExternalizedDirectCoinbasePublicLedger(tmp)
             ledger.body_uri.unlink()
-            handler = make_audit_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+            handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
             server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -2039,6 +2946,496 @@ class PrismPublicDashboardApiTests(unittest.TestCase):
         self.assertEqual(ledger.request, ("miner-a", 1_000))
 
 
+class PublicHandlerTestCase(unittest.TestCase):
+    """One extracted-handler server per ledger, torn down with the test."""
+
+    def serve(self, ledger: FakePublicLedger) -> str:
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop() -> None:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.addCleanup(stop)
+        return f"http://127.0.0.1:{server.server_port}"
+
+    def get_error(self, url: str) -> tuple[int, dict[str, object], dict[str, str]]:
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(url, timeout=5)
+        with raised.exception as error:
+            return error.code, json.loads(error.read()), dict(error.headers.items())
+
+
+# Every range/bucket pair outside HASHRATE_SERIES_ALLOWED_BUCKETS, and every
+# concrete pair inside it. Derived by hand rather than from the constant so a
+# vocabulary regression cannot rewrite the test that guards it.
+FORBIDDEN_BUCKET_COMBOS = (
+    ("1m", "5m"),
+    ("6m", "5m"),
+    ("6m", "1h"),
+    ("all", "5m"),
+    ("all", "1h"),
+)
+ALLOWED_BUCKET_COMBOS = (
+    ("1w", "5m"),
+    ("1w", "1h"),
+    ("1w", "1d"),
+    ("1m", "1h"),
+    ("1m", "1d"),
+    ("6m", "1d"),
+    ("all", "1d"),
+)
+
+
+class HashrateBucketClampTests(PublicHandlerTestCase):
+    """The static bucket-per-range vocabulary closes the unbounded-cost combos."""
+
+    def test_forbidden_combinations_are_rejected_before_any_ledger_call(self) -> None:
+        ledger = FakePublicLedger()
+        base = self.serve(ledger)
+        for range_id, bucket in FORBIDDEN_BUCKET_COMBOS:
+            with self.subTest(range=range_id, bucket=bucket):
+                status, payload, headers = self.get_error(
+                    f"{base}/public/v1/hashrate-series?range={range_id}&bucket={bucket}"
+                )
+                self.assertEqual(400, status)
+                self.assertEqual("prism.dashboard.error.v1", payload["schema"])
+                self.assertEqual("bad_request", payload["error"]["code"])
+                self.assertIn(
+                    f"bucket {bucket} is not allowed for range {range_id}",
+                    payload["error"]["message"],
+                )
+                self.assertEqual("no-store", headers.get("Cache-Control"))
+        self.assertEqual(0, ledger.hashrate_series_calls)
+
+    def test_the_refusal_names_the_allowed_buckets(self) -> None:
+        base = self.serve(FakePublicLedger())
+        _status, payload, _headers = self.get_error(
+            f"{base}/public/v1/hashrate-series?range=1m&bucket=5m"
+        )
+        self.assertIn("allowed: 1h, 1d", payload["error"]["message"])
+
+    def test_allowed_combinations_still_serve(self) -> None:
+        ledger = FakePublicLedger()
+        base = self.serve(ledger)
+        combos = ALLOWED_BUCKET_COMBOS + tuple(
+            (range_id, "auto") for range_id in public_api.HASHRATE_SERIES_RANGE_SECONDS
+        )
+        for range_id, bucket in combos:
+            with self.subTest(range=range_id, bucket=bucket):
+                url = f"{base}/public/v1/hashrate-series?range={range_id}&bucket={bucket}"
+                with urllib.request.urlopen(url, timeout=5) as response:
+                    payload = json.loads(response.read())
+                self.assertEqual("prism.dashboard.hashrate-series.v1", payload["schema"])
+        self.assertEqual(len(combos), ledger.hashrate_series_calls)
+
+    def test_every_auto_resolution_is_inside_the_allowed_vocabulary(self) -> None:
+        for range_id in public_api.HASHRATE_SERIES_RANGE_SECONDS:
+            resolved = public_api.auto_bucket(range_id)
+            self.assertIn(resolved, public_api.HASHRATE_SERIES_ALLOWED_BUCKETS[range_id])
+            # And the helper itself agrees: a resolved auto bucket never raises.
+            public_api.allowed_hashrate_bucket(range_id, resolved)
+
+
+class PublicReadStatementTimeoutTests(PublicHandlerTestCase):
+    """The per-request database deadline and its read_timeout refusal."""
+
+    def test_a_ledger_deadline_becomes_a_503_read_timeout_and_is_never_cached(self) -> None:
+        ledger = TimingOutPublicLedger()
+        base = self.serve(ledger)
+        # Patch only the deadline knob: clearing the whole environment also
+        # drops NO_PROXY, and on a proxy-configured machine urllib then routes
+        # this localhost request through the proxy instead of the test server.
+        with patch.dict(os.environ):
+            os.environ.pop("PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS", None)
+            for expected_origin_calls in (1, 2):
+                status, payload, headers = self.get_error(
+                    f"{base}/public/v1/hashrate-series"
+                )
+                self.assertEqual(503, status)
+                self.assertEqual("prism.dashboard.error.v1", payload["schema"])
+                self.assertEqual("read_timeout", payload["error"]["code"])
+                self.assertEqual("no-store", headers.get("Cache-Control"))
+                self.assertIsNone(headers.get("CDN-Cache-Control"))
+                # The second request re-ran the origin: a timeout stored no
+                # cache entry, so one expensive miss cannot poison the cache
+                # with a refusal.
+                self.assertEqual(expected_origin_calls, ledger.hashrate_series_calls)
+        self.assertEqual([20.0, 20.0], ledger.statement_timeout_budgets)
+
+    def test_the_scope_is_entered_with_the_configured_budget(self) -> None:
+        ledger = StatementTimeoutRecordingLedger()
+        base = self.serve(ledger)
+        with patch.dict(
+            os.environ,
+            {"PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS": "7"},
+        ):
+            with urllib.request.urlopen(
+                f"{base}/public/v1/hashrate-series", timeout=5
+            ) as response:
+                json.loads(response.read())
+        self.assertEqual([7.0], ledger.statement_timeout_budgets)
+        self.assertEqual(1, ledger.hashrate_series_calls)
+
+    def test_env_zero_disables_the_scope_entirely(self) -> None:
+        ledger = StatementTimeoutRecordingLedger()
+        base = self.serve(ledger)
+        with patch.dict(
+            os.environ,
+            {"PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS": "0"},
+        ):
+            with urllib.request.urlopen(
+                f"{base}/public/v1/hashrate-series", timeout=5
+            ) as response:
+                json.loads(response.read())
+        self.assertEqual([], ledger.statement_timeout_budgets)
+        self.assertEqual(1, ledger.hashrate_series_calls)
+
+
+class PublicResponseCacheStaleWhileRevalidateTests(unittest.TestCase):
+    """In-process stale-while-revalidate on PublicResponseCache.
+
+    Entry expiry is keyed on time.monotonic(), which is not injectable, so
+    these tests age entries by editing the stored bounds directly -- the
+    precedent tests/test_prism_public_read_service.py sets for the outage
+    contract -- rather than sleeping out real TTLs.
+    """
+
+    KEY = ("/swr", ())
+    TTL = 60
+
+    def prime(self, cache: public_api.PublicResponseCache, payload: object) -> None:
+        status, served, state, _age = cache.get_or_compute(
+            key=self.KEY, ttl_seconds=self.TTL, compute=lambda: (200, payload)
+        )
+        self.assertEqual((200, payload, "MISS"), (status, served, state))
+
+    def age_entry(
+        self,
+        cache: public_api.PublicResponseCache,
+        *,
+        age_seconds: float,
+        key: tuple[str, tuple[tuple[str, tuple[str, ...]], ...]] | None = None,
+        stale_while_revalidate_seconds: int = 30,
+    ) -> None:
+        entry = cache._entries[key if key is not None else self.KEY]
+        entry.stored_at = time.monotonic() - age_seconds
+        entry.expires_at = entry.stored_at + self.TTL
+        entry.stale_until = entry.expires_at + stale_while_revalidate_seconds
+
+    def lookup(
+        self,
+        cache: public_api.PublicResponseCache,
+        compute,
+    ) -> tuple[int, object, str, int]:
+        return cache.get_or_compute(
+            key=self.KEY,
+            ttl_seconds=self.TTL,
+            stale_while_revalidate_seconds=30,
+            compute=compute,
+        )
+
+    def wait_for_refresh_slot_to_clear(self, cache: public_api.PublicResponseCache) -> None:
+        # Bounded: the refresh thread frees the inflight slot in its finally
+        # clause, so a few milliseconds suffice and 5s is a hard failure.
+        deadline = time.monotonic() + 5
+        while self.KEY in cache._inflight and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertNotIn(self.KEY, cache._inflight)
+
+    def test_capacity_reaping_spares_stale_servable_entries(self) -> None:
+        """Reaping removes entries past their whole window, not merely expired.
+
+        A full cache receiving a new key must shed dead weight first: an entry
+        past TTL *and* its recorded revalidate window is gone, but one still
+        inside the window stays exactly as servable as the stale-serve path
+        promises -- reaping it would turn its next visitor's instant STALE
+        answer into a blocking recompute.
+        """
+        cache = public_api.PublicResponseCache()
+        keep_key = ("/swr-keep", ())
+        dead_key = ("/swr-dead", ())
+        for key in (keep_key, dead_key):
+            cache.get_or_compute(
+                key=key,
+                ttl_seconds=self.TTL,
+                stale_while_revalidate_seconds=30,
+                compute=lambda: (200, {"k": key[0]}),
+            )
+        # keep: expired 5s ago, inside its 30s window. dead: past the window.
+        self.age_entry(cache, age_seconds=65, key=keep_key)
+        self.age_entry(cache, age_seconds=100, key=dead_key)
+        with patch.dict(os.environ, {"PRISM_PUBLIC_CACHE_MAX_ENTRIES": "2"}):
+            cache.get_or_compute(
+                key=("/swr-new", ()),
+                ttl_seconds=self.TTL,
+                stale_while_revalidate_seconds=30,
+                compute=lambda: (200, {"k": "new"}),
+            )
+        self.assertNotIn(dead_key, cache._entries)
+        self.assertIn(keep_key, cache._entries)
+        status, payload, state, age = cache.get_or_compute(
+            key=keep_key,
+            ttl_seconds=self.TTL,
+            stale_while_revalidate_seconds=30,
+            compute=lambda: (200, {"k": "refreshed"}),
+        )
+        self.assertEqual((200, {"k": "/swr-keep"}, "STALE", 65), (status, payload, state, age))
+        deadline = time.monotonic() + 5
+        while keep_key in cache._inflight and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertNotIn(keep_key, cache._inflight)
+
+    def test_a_failed_refresh_thread_start_frees_the_slot(self) -> None:
+        """Thread creation failure must not strand the registered slot.
+
+        The refresh slot is registered before Thread.start() runs, and under
+        resource pressure start() can raise. Without cleanup no thread ever
+        frees the slot: later stale hits skip their refresh forever and,
+        past the window, blocking requests coalesce onto an event nobody can
+        set. The stale answer is still served; the slot is freed and the
+        event set so the next request proceeds normally.
+        """
+        cache = public_api.PublicResponseCache()
+        self.prime(cache, {"v": "stale"})
+        self.age_entry(cache, age_seconds=65)
+
+        with patch.object(
+            threading.Thread, "start", side_effect=RuntimeError("can't start new thread")
+        ):
+            status, payload, state, age = self.lookup(
+                cache, lambda: (200, {"v": "unused"})
+            )
+
+        self.assertEqual((200, {"v": "stale"}, "STALE", 65), (status, payload, state, age))
+        self.assertNotIn(self.KEY, cache._inflight)
+        # The next stale hit retries the refresh with a working thread...
+        refreshed = threading.Event()
+
+        def refresh() -> tuple[int, object]:
+            refreshed.set()
+            return 200, {"v": "fresh"}
+
+        status, payload, state, _age = self.lookup(cache, refresh)
+        self.assertEqual((200, {"v": "stale"}, "STALE"), (status, payload, state))
+        self.assertTrue(refreshed.wait(timeout=5))
+        self.wait_for_refresh_slot_to_clear(cache)
+        status, payload, state, _age = self.lookup(cache, lambda: (200, {"v": "wrong"}))
+        self.assertEqual((200, {"v": "fresh"}, "HIT"), (status, payload, state))
+
+    def test_a_fresh_entry_is_a_hit_with_the_window_armed(self) -> None:
+        cache = public_api.PublicResponseCache()
+        self.prime(cache, {"v": "fresh"})
+
+        status, payload, state, age = self.lookup(cache, lambda: (200, {"v": "wrong"}))
+
+        self.assertEqual((200, {"v": "fresh"}, "HIT", 0), (status, payload, state, age))
+
+    def test_a_stale_entry_is_served_while_one_background_refresh_recomputes(self) -> None:
+        cache = public_api.PublicResponseCache()
+        self.prime(cache, {"v": "stale"})
+        self.age_entry(cache, age_seconds=65)  # expired 5s ago, inside the 30s window
+        refreshed = threading.Event()
+
+        def refresh() -> tuple[int, object]:
+            refreshed.set()
+            return 200, {"v": "fresh"}
+
+        status, payload, state, age = self.lookup(cache, refresh)
+
+        # Served immediately, from the expired entry, with its honest age.
+        self.assertEqual((200, {"v": "stale"}, "STALE", 65), (status, payload, state, age))
+        self.assertTrue(refreshed.wait(timeout=5))
+        self.wait_for_refresh_slot_to_clear(cache)
+        status, payload, state, age = self.lookup(cache, lambda: (200, {"v": "wrong"}))
+        self.assertEqual((200, {"v": "fresh"}, "HIT", 0), (status, payload, state, age))
+
+    def test_a_failed_refresh_keeps_the_stale_entry_and_frees_the_slot(self) -> None:
+        cache = public_api.PublicResponseCache()
+        self.prime(cache, {"v": "stale"})
+        self.age_entry(cache, age_seconds=61)
+        failed = threading.Event()
+
+        def failing_refresh() -> tuple[int, object]:
+            failed.set()
+            raise RuntimeError("origin down")
+
+        status, payload, state, _age = self.lookup(cache, failing_refresh)
+
+        self.assertEqual((200, {"v": "stale"}, "STALE"), (status, payload, state))
+        self.assertTrue(failed.wait(timeout=5))
+        self.wait_for_refresh_slot_to_clear(cache)
+        # Still servable -- the failure deleted nothing -- and the freed slot
+        # lets this later stale hit start a second refresh, which succeeds.
+        recovered = threading.Event()
+
+        def recovering_refresh() -> tuple[int, object]:
+            recovered.set()
+            return 200, {"v": "fresh"}
+
+        status, payload, state, _age = self.lookup(cache, recovering_refresh)
+        self.assertEqual((200, {"v": "stale"}, "STALE"), (status, payload, state))
+        self.assertTrue(recovered.wait(timeout=5))
+        self.wait_for_refresh_slot_to_clear(cache)
+        _status, payload, state, _age = self.lookup(cache, lambda: (200, {"v": "wrong"}))
+        self.assertEqual(({"v": "fresh"}, "HIT"), (payload, state))
+
+    def test_beyond_the_window_the_next_request_blocks_and_recomputes(self) -> None:
+        cache = public_api.PublicResponseCache()
+        self.prime(cache, {"v": "stale"})
+        self.age_entry(cache, age_seconds=95)  # expired 35s ago, past the 30s window
+
+        status, payload, state, age = self.lookup(cache, lambda: (200, {"v": "fresh"}))
+
+        self.assertEqual((200, {"v": "fresh"}, "MISS", 0), (status, payload, state, age))
+
+    def test_concurrent_stale_hits_share_exactly_one_refresh(self) -> None:
+        cache = public_api.PublicResponseCache()
+        self.prime(cache, {"v": "stale"})
+        self.age_entry(cache, age_seconds=61)
+        release = threading.Event()
+        compute_calls: list[int] = []
+        compute_lock = threading.Lock()
+
+        def slow_refresh() -> tuple[int, object]:
+            with compute_lock:
+                compute_calls.append(1)
+            self.assertTrue(release.wait(timeout=5))
+            return 200, {"v": "fresh"}
+
+        results: list[tuple[int, object, str, int]] = []
+        results_lock = threading.Lock()
+
+        def stale_hit() -> None:
+            result = self.lookup(cache, slow_refresh)
+            with results_lock:
+                results.append(result)
+
+        workers = [threading.Thread(target=stale_hit) for _ in range(5)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5)
+
+        # Every requester was answered immediately from the stale entry; none
+        # blocked behind the (still running) refresh, and none started one of
+        # its own.
+        self.assertEqual(5, len(results))
+        for status, payload, state, _age in results:
+            self.assertEqual((200, {"v": "stale"}, "STALE"), (status, payload, state))
+        release.set()
+        self.wait_for_refresh_slot_to_clear(cache)
+        self.assertEqual([1], compute_calls)
+        _status, payload, state, _age = self.lookup(cache, lambda: (200, {"v": "wrong"}))
+        self.assertEqual(({"v": "fresh"}, "HIT"), (payload, state))
+
+
+class PublicArtifactByteExactnessTests(unittest.TestCase):
+    """GET /public/v1/artifacts/{sha256} must return the exact bytes the
+    advertised sha256 was computed over, or no external verifier can confirm
+    any artifact. This was the missing regression coverage: the hash side
+    serializes with canonical_json_text (compact separators) while the
+    generic write_json path re-serializes with default separators plus a
+    trailing newline."""
+
+    def serve(self, ledger: FakePublicLedger) -> str:
+        handler = make_public_handler(FakeCoordinator(ledger=ledger))  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop() -> None:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.addCleanup(stop)
+        return f"http://127.0.0.1:{server.server_port}"
+
+    def fetch_artifact(self, base_url: str, sha256: str) -> tuple[bytes, dict[str, str]]:
+        with urllib.request.urlopen(f"{base_url}/public/v1/artifacts/{sha256}", timeout=5) as response:
+            return response.read(), dict(response.headers)
+
+    def test_manifest_artifact_bytes_hash_to_advertised_sha256(self) -> None:
+        ledger = CanonicalArtifactPublicLedger()
+        base_url = self.serve(ledger)
+        for sha256, document in (
+            (ledger.manifest_sha256, ledger.manifest),
+            (ledger.manifest_set_sha256, ledger.manifest_set),
+        ):
+            with self.subTest(sha256=sha256):
+                body, headers = self.fetch_artifact(base_url, sha256)
+
+                self.assertEqual(hashlib.sha256(body).hexdigest(), sha256)
+                self.assertEqual(json.loads(body), document)
+                self.assertEqual(headers.get("Content-Type"), "application/json")
+                self.assertEqual(int(headers["Content-Length"]), len(body))
+
+    def test_artifact_bytes_stay_exact_across_cache_hits(self) -> None:
+        ledger = CanonicalArtifactPublicLedger()
+        base_url = self.serve(ledger)
+
+        first, first_headers = self.fetch_artifact(base_url, ledger.manifest_set_sha256)
+        second, second_headers = self.fetch_artifact(base_url, ledger.manifest_set_sha256)
+
+        self.assertEqual(first, second)
+        self.assertEqual(hashlib.sha256(second).hexdigest(), ledger.manifest_set_sha256)
+        for headers in (first_headers, second_headers):
+            self.assertIn("immutable", headers.get("CDN-Cache-Control", ""))
+
+    def test_uppercase_artifact_path_serves_the_same_exact_bytes(self) -> None:
+        ledger = CanonicalArtifactPublicLedger()
+        base_url = self.serve(ledger)
+
+        body, _headers = self.fetch_artifact(base_url, ledger.manifest_sha256.upper())
+
+        self.assertEqual(hashlib.sha256(body).hexdigest(), ledger.manifest_sha256)
+
+    def test_tampered_canonical_text_falls_back_to_reserialized_document(self) -> None:
+        # Stored canonical text that no longer hashes to its content address
+        # must never be served as the exact bytes; the endpoint keeps the
+        # legacy re-serialized response instead.
+        ledger = TamperedCanonicalArtifactPublicLedger()
+        base_url = self.serve(ledger)
+
+        body, _headers = self.fetch_artifact(base_url, ledger.manifest_sha256)
+
+        self.assertEqual(body, json.dumps(ledger.manifest, sort_keys=True).encode() + b"\n")
+        self.assertEqual(json.loads(body), ledger.manifest)
+
+    def test_audit_bundle_artifact_bytes_hash_to_advertised_sha256(self) -> None:
+        ledger = CanonicalArtifactPublicLedger()
+        base_url = self.serve(ledger)
+
+        body, _headers = self.fetch_artifact(base_url, ledger.audit_bundle_sha256)
+
+        self.assertEqual(hashlib.sha256(body).hexdigest(), ledger.audit_bundle_sha256)
+
+    def test_missing_canonical_audit_bundle_fallback_is_never_cached(self) -> None:
+        ledger = MissingCanonicalArtifactPublicLedger()
+        base_url = self.serve(ledger)
+
+        first, first_headers = self.fetch_artifact(base_url, ledger.audit_bundle_sha256)
+        second, second_headers = self.fetch_artifact(base_url, ledger.audit_bundle_sha256)
+
+        self.assertEqual(json.loads(first), ledger.audit_bundle)
+        self.assertEqual(second, first)
+        self.assertEqual(ledger.audit_document_calls, 2)
+        for headers in (first_headers, second_headers):
+            self.assertEqual(headers.get("Cache-Control"), "no-store")
+            self.assertEqual(
+                headers.get("X-Prism-Artifact-Canonical-State"),
+                "missing",
+            )
+            self.assertNotIn("CDN-Cache-Control", headers)
+            self.assertNotIn("Vercel-CDN-Cache-Control", headers)
+            self.assertNotIn("Age", headers)
+
+
 class PrismPublicDashboardMemoryLedgerTests(unittest.TestCase):
     def test_memory_ledger_public_read_models_are_empty_safe(self) -> None:
         coordinator = MemoryCoordinator()
@@ -2058,7 +3455,7 @@ class PrismPublicDashboardMemoryLedgerTests(unittest.TestCase):
                 ntime=1,
             )
         )
-        handler = make_audit_handler(coordinator)  # type: ignore[arg-type]
+        handler = make_public_handler(coordinator)  # type: ignore[arg-type]
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -2076,6 +3473,81 @@ class PrismPublicDashboardMemoryLedgerTests(unittest.TestCase):
         self.assertEqual(payload["schema"], "prism.dashboard.leaderboard.v1")
         self.assertEqual(payload["pagination"]["total_count"], 1)
         self.assertEqual(payload["rows"][0]["recipient_id"], "miner-a")
+
+    def test_memory_ledger_supports_blocks_chain_state_filter(self) -> None:
+        ledger = SingleWriterShareLedger()
+
+        for chain_state in ("active", "all", "reversed"):
+            with self.subTest(chain_state=chain_state):
+                payload = ledger.dashboard_blocks(page=1, limit=15, chain_state=chain_state)
+                self.assertEqual(payload["rows"], [])
+                self.assertEqual(payload["pagination"]["total_count"], 0)
+        with self.assertRaises(ValueError):
+            ledger.dashboard_blocks(page=1, limit=15, chain_state="orphaned")
+
+    def test_memory_ledger_pool_snapshot_reports_zero_reorg_counts(self) -> None:
+        snapshot = SingleWriterShareLedger().dashboard_pool_snapshot(
+            current_network_difficulty="1",
+            generated_at=public_api.utc_now_iso(),
+        )
+
+        self.assertEqual(snapshot["blocks_reversed_total"], 0)
+        self.assertEqual(snapshot["blocks_inactive_total"], 0)
+
+    def test_memory_ledger_block_markers_are_empty_safe(self) -> None:
+        # The in-memory backend records no found_at for its pool blocks, so
+        # the marker series degrades to an empty response rather than 500ing,
+        # the way its other dashboard read models degrade.
+        coordinator = MemoryCoordinator()
+        handler = make_public_handler(coordinator)  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_port}/public/v1/block-markers?range=1m&bucket=1h",
+                timeout=5,
+            ) as response:
+                payload = json.loads(response.read())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(payload["schema"], "prism.dashboard.block-markers.v1")
+        self.assertEqual(payload["total_blocks"], 0)
+        self.assertEqual(payload["points"], [])
+
+    def test_memory_ledger_artifact_responses_verify_end_to_end(self) -> None:
+        # Full path: the real record path persists the canonical text, and the
+        # HTTP response returns those exact bytes for every manifest kind.
+        coordinator = MemoryCoordinator()
+        manifest_set = sample_ctv_manifest_set()
+        manifest = manifest_set["manifests"][0]  # type: ignore[index]
+        manifest_set_sha256 = sha256_json_hex(manifest_set)
+        manifest_sha256 = sha256_json_hex(manifest)
+        coordinator.ledger.persist_ctv_fanout_manifest_set(
+            block_hash="aa" * 32,
+            manifest_set=manifest_set,
+            manifest_set_sha256=manifest_set_sha256,
+        )
+        handler = make_public_handler(coordinator)  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for sha256 in (manifest_set_sha256, manifest_sha256):
+                with self.subTest(sha256=sha256):
+                    with urllib.request.urlopen(
+                        f"http://127.0.0.1:{server.server_port}/public/v1/artifacts/{sha256}",
+                        timeout=5,
+                    ) as response:
+                        body = response.read()
+                    self.assertEqual(hashlib.sha256(body).hexdigest(), sha256)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
 
 if __name__ == "__main__":

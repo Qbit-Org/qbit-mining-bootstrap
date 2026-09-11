@@ -77,13 +77,20 @@ done
   cd "${ROOT_DIR}"
   PRISM_TEST_DATABASE_URL="${DATABASE_URL}" \
   PRISM_TEST_PSQL_COMMAND="docker exec -i ${POSTGRES_CONTAINER} psql -U qbit -d qbit" \
+  PRISM_TEST_PSQL_COMMAND_WITH_ENV="docker exec -i -e PGOPTIONS ${POSTGRES_CONTAINER} psql -U qbit -d qbit" \
     python3 <<'PY'
 from __future__ import annotations
 
 import os
 import threading
+import time
 
-from lab.prism.share_ledger import PendingShare, PsqlShareLedger
+from lab.prism.share_ledger import (
+    LedgerOperationTimeout,
+    PendingShare,
+    PsqlShareLedger,
+)
+from tests.prism_window_rows_reference import assert_rows_match_aggregate
 
 
 def pending(
@@ -114,6 +121,10 @@ def assert_equal(actual: object, expected: object, message: str) -> None:
 
 database_url = os.environ["PRISM_TEST_DATABASE_URL"]
 psql_command = os.environ["PRISM_TEST_PSQL_COMMAND"]
+# Session GUCs reach a psql subprocess through PGOPTIONS, and "docker exec"
+# does not forward the caller's environment, so the read-only assertions below
+# use a command that asks docker to pass the variable through.
+psql_command_with_env = os.environ["PRISM_TEST_PSQL_COMMAND_WITH_ENV"]
 
 ledger = PsqlShareLedger(
     psql_command=psql_command,
@@ -224,8 +235,130 @@ ledger._accepted_stats_cache_seconds = 60.0
 snapshot = ledger.snapshot_at_job_issue(1_700_000_002_000)
 assert_equal(len(snapshot), share_count, "snapshot returns all committed shares")
 
+
 metrics = ledger.metrics()
 assert_equal(metrics["shares"], share_count, "metrics share count from cached stats")
+
+# Issue #211: the replay enumeration is a read and must not queue on the
+# coordinator-local writer gate. This is the production call shape -- the real
+# statement, over the real pooled psycopg client, against a real server -- run
+# while an accounting-shaped writer holds that gate for longer than the whole
+# fast-call budget. Before the fix the page spent that budget on admission and
+# never reached PostgreSQL.
+candidate_hash = "ab" * 32
+second_candidate_hash = "cd" * 32
+candidate_intent = {
+    "schema": "qbit.prism.block-candidate-intent.v1",
+    "block_hash_hex": candidate_hash,
+    "block_hex": "00",
+}
+assert ledger.persist_block_candidate_intent(candidate_intent)
+assert ledger.persist_block_candidate_intent(
+    {**candidate_intent, "block_hash_hex": second_candidate_hash}
+)
+
+FAST_CALL_BUDGET_SECONDS = 1.0
+gate_taken = threading.Event()
+release_gate = threading.Event()
+holder_error: list[BaseException] = []
+
+
+def hold_writer_gate() -> None:
+    try:
+        with ledger._operation_gate(ledger._lock, "writer lock"):
+            gate_taken.set()
+            release_gate.wait(timeout=60)
+    except BaseException as exc:  # noqa: BLE001 - surfaced below
+        holder_error.append(exc)
+        gate_taken.set()
+
+
+holder = threading.Thread(target=hold_writer_gate, daemon=True)
+holder.start()
+if not gate_taken.wait(timeout=30):
+    raise SystemExit("the writer gate holder never acquired the gate")
+if holder_error:
+    raise holder_error[0]
+
+try:
+    started = time.monotonic()
+    with ledger.operation_timeout(FAST_CALL_BUDGET_SECONDS):
+        page = ledger.pending_block_candidate_rows(limit=1)
+    enumeration_seconds = time.monotonic() - started
+
+    # It completed, inside its own budget, with the gate still held.
+    assert_equal(
+        [row["block_hash"] for row in page],
+        [candidate_hash],
+        "pending page enumerated while the writer gate was held",
+    )
+    assert_equal(
+        [row["pool_block_exists"] for row in page],
+        [False],
+        "pending page carried the landed-block fact from the same snapshot",
+    )
+    if enumeration_seconds >= FAST_CALL_BUDGET_SECONDS:
+        raise SystemExit(
+            "pending page took "
+            f"{enumeration_seconds:.3f}s of a {FAST_CALL_BUDGET_SECONDS:g}s budget"
+        )
+
+    # Pagination stays exact across the same held gate: the cursor resumes
+    # strictly after its own row and the short page proves the end.
+    with ledger.operation_timeout(FAST_CALL_BUDGET_SECONDS):
+        second_page = ledger.pending_block_candidate_rows(
+            limit=1,
+            after_cursor=page[0]["cursor"],
+        )
+    assert_equal(
+        [row["block_hash"] for row in second_page],
+        [second_candidate_hash],
+        "pending page cursor resumed strictly after its own row",
+    )
+    with ledger.operation_timeout(FAST_CALL_BUDGET_SECONDS):
+        assert_equal(
+            ledger.pending_block_candidate_rows(
+                limit=1,
+                after_cursor=second_page[0]["cursor"],
+            ),
+            [],
+            "a cursor past every pending row proves the walk complete",
+        )
+
+    # The control. The same gate, the same budget, asked for writer admission
+    # instead: it times out, which is what the enumeration used to do.
+    try:
+        with ledger.operation_timeout(FAST_CALL_BUDGET_SECONDS):
+            ledger._acquire_operation_gate(ledger._lock, "writer lock")
+    except LedgerOperationTimeout as exc:
+        if "writer lock" not in str(exc):
+            raise
+    else:
+        ledger._lock.release()
+        raise SystemExit("the writer gate was not actually held")
+finally:
+    release_gate.set()
+    holder.join(timeout=30)
+if holder.is_alive():
+    raise SystemExit("the writer gate holder never released the gate")
+if holder_error:
+    raise holder_error[0]
+
+# The attribution the next budget exhaustion will be read from: no time on
+# local admission, real time in PostgreSQL, and neither timeout counter armed.
+read_gate_stats = ledger.ledger_read_gate_stats()["pending_block_candidate_headers"]
+assert_equal(int(read_gate_stats["calls_total"]), 3, "read-slot calls counted")
+assert_equal(int(read_gate_stats["gate_timeouts_total"]), 0, "no admission expiry")
+assert_equal(int(read_gate_stats["execute_timeouts_total"]), 0, "no statement expiry")
+if float(read_gate_stats["execute_seconds_total"]) <= 0.0:
+    raise SystemExit("pending page recorded no PostgreSQL execution time")
+if float(read_gate_stats["gate_wait_seconds_max"]) >= FAST_CALL_BUDGET_SECONDS:
+    raise SystemExit(
+        "pending page charged "
+        f"{read_gate_stats['gate_wait_seconds_max']}s to local admission"
+    )
+
+ledger._run_sql("DELETE FROM qbit_block_candidate_outbox;")
 
 try:
     PsqlShareLedger(
@@ -240,6 +373,129 @@ except RuntimeError as exc:
         raise
 else:
     raise SystemExit("second writer stole an unexpired lease over the native client")
+
+# Issue #236: the pooled client consumes the payout-window reads one JSON
+# object per row through fetchmany, in bounded batches, from one buffered
+# SELECT. A 3000-row fixture crosses several 512-row batch boundaries; the
+# pre-#236 json_agg statement over the same CTE is the oracle for every
+# variant, exactly as on the psql backend.
+ledger._run_script(
+    """
+INSERT INTO qbit_share_ledger (
+    share_id, miner_id, payout_order_key, p2mr_program,
+    share_difficulty, network_difficulty, template_height, job_id,
+    job_issued_at, ntime, accepted_at, accepted, writer_id, writer_epoch
+)
+SELECT
+    'bulk-' || g,
+    'miner-' || (g % 7),
+    lpad((g % 7)::text, 4, '0'),
+    decode(md5(g::text) || md5((g + 7)::text), 'hex'),
+    1 + (g % 3),
+    1000,
+    10,
+    'job-bulk',
+    to_timestamp(1700001000) + (g * interval '1 millisecond'),
+    1700001000,
+    to_timestamp(1700001000) + (g * interval '1 millisecond'),
+    TRUE,
+    'writer-native',
+    1
+FROM generate_series(1, 3000) AS g;
+ANALYZE qbit_share_ledger;
+"""
+)
+bulk_anchor_ms = 1_700_001_010_000
+assert_equal(ledger.execution_backend, "psycopg-pool", "oracle check runs on the pooled client")
+for weight in (1, 512, 1023, 1024, 1025, 3000, 6000, 10**9):
+    assert_rows_match_aggregate(
+        ledger,
+        lambda: ledger.snapshot_at_job_issue(bulk_anchor_ms, window_weight=weight),
+        label=f"native per-row bounded snapshot at window weight {weight}",
+    )
+full_history = assert_rows_match_aggregate(
+    ledger,
+    lambda: ledger.snapshot_at_job_issue(bulk_anchor_ms),
+    label="native per-row unbounded snapshot",
+    expected_len=share_count + 3000,
+)
+assert_rows_match_aggregate(
+    ledger,
+    lambda: ledger.snapshot_at_job_issue(0, window_weight=64),
+    label="native per-row empty window",
+    expected_len=0,
+)
+assert_rows_match_aggregate(
+    ledger,
+    lambda: ledger.snapshot_between_job_issues(1_700_001_001_000, 1_700_001_002_000),
+    label="native per-row delta inside the bulk fixture",
+    expected_len=1000,
+)
+with ledger.operation_timeout(30.0):
+    assert_rows_match_aggregate(
+        ledger,
+        lambda: ledger.snapshot_at_job_issue(bulk_anchor_ms, window_weight=2048),
+        label="native per-row bounded snapshot under an armed deadline",
+    )
+
+# One SELECT, one MVCC snapshot: a share appended while the rows are still
+# being converted (between the first and second 512-row batches) is not in
+# any part of that snapshot, and is in the next one. The between-batch hook
+# is the ledger's own; a second pooled connection lands the append.
+late_share = pending(share_count + 5000, share_id="appended-mid-decode")
+late_share = PendingShare(
+    **{
+        **late_share.__dict__,
+        "job_issued_at_ms": 1_700_001_005_000,
+        "accepted_at_ms": 1_700_001_005_000,
+    }
+)
+appended_during: list[object] = []
+original_hook = ledger._note_json_row_batch
+
+
+def append_on_first_batch() -> None:
+    if not appended_during:
+        appended_during.append(ledger.append(late_share))
+    original_hook()
+
+
+ledger._note_json_row_batch = append_on_first_batch  # type: ignore[method-assign]
+try:
+    during = ledger.snapshot_at_job_issue(bulk_anchor_ms)
+finally:
+    del ledger._note_json_row_batch
+assert_equal(len(appended_during), 1, "the append landed during row conversion")
+assert_equal(
+    [record.share_id for record in during],
+    [record.share_id for record in full_history],
+    "a share appended mid-decode is absent from the whole in-flight snapshot",
+)
+after = ledger.snapshot_at_job_issue(bulk_anchor_ms)
+assert_equal(len(after), len(full_history) + 1, "the next snapshot includes the appended share")
+assert_equal(after[-1].share_id, "appended-mid-decode", "the appended share is the newest row")
+assert_equal(
+    ledger.ledger_read_gate_stats()["payout_window_snapshot"]["execute_timeouts_total"],
+    0,
+    "no window read timed out",
+)
+print("prism postgres native ledger: OK window-rows=oracle mvcc=single-select", flush=True)
+
+# Restore the 32-share state the fallback and read-only checks below assert
+# on: the bulk fixture and the mid-decode append were this section's only
+# writes, and their sequence numbers sit above the contiguous 1..32 range.
+ledger._run_script(
+    """
+DELETE FROM qbit_share_ledger
+WHERE share_id LIKE 'bulk-%' OR share_id = 'appended-mid-decode';
+ANALYZE qbit_share_ledger;
+"""
+)
+assert_equal(
+    len(ledger.snapshot_at_job_issue(bulk_anchor_ms)),
+    share_count,
+    "window fixture rows removed again",
+)
 
 released = ledger.release_writer_lease()
 assert_equal(released, True, "writer lease released")
@@ -264,8 +520,86 @@ assert_equal(
 fallback.release_writer_lease()
 fallback.close()
 
-print("prism postgres native ledger: OK")
+# A read-only ledger against this writable primary. The database has accepted
+# every write above, which is what makes it the right target: a standby would
+# refuse these writes whoever asked, so it could never show that read_only=True
+# is what refused them.
+read_only_ledger = PsqlShareLedger(
+    psql_command=psql_command_with_env,
+    database_url=database_url,
+    native_client_mode="1",
+    writer_id="public-read",
+    writer_epoch=1,
+    read_only=True,
+)
+assert_equal(
+    read_only_ledger.execution_backend,
+    "psycopg-pool",
+    "read-only ledger uses the pooled native client",
+)
+
+# One instance, two kinds of connection. The pooled psycopg session runs the
+# writer-lease upsert -- production's own gate-free write, reached here
+# directly because a read-only ledger deliberately never runs it at startup.
+try:
+    read_only_ledger._try_acquire_writer_lease()
+except Exception as exc:
+    if "read-only transaction" not in str(exc):
+        raise
+else:
+    raise SystemExit("read-only pooled session wrote to a writable primary")
+
+# ...and the one-shot psql connection runs the lease release, which takes
+# neither the writer gate nor the pool, so nothing in-process can refuse it.
+try:
+    read_only_ledger.release_writer_lease_fresh_connection()
+except RuntimeError as exc:
+    if "read-only transaction" not in str(exc):
+        raise
+else:
+    raise SystemExit("read-only psql connection wrote to a writable primary")
+
+# Reads still work: the session is read-only, not unusable. A read slot is the
+# gate every public route takes; the O(n) reads take the writer gate and are
+# refused in-process, which is the pre-existing half of the promise.
+assert_equal(
+    read_only_ledger.accepted_share_stats()["accepted_share_count"],
+    share_count,
+    "read-only ledger still serves reads over the pool",
+)
+read_only_ledger.close()
+
+# The same two statements, the same identity, differing only in read_only.
+control_writer = PsqlShareLedger(
+    psql_command=psql_command_with_env,
+    database_url=database_url,
+    native_client_mode="1",
+    writer_id="public-read",
+    writer_epoch=1,
+)
+assert_equal(
+    control_writer._try_acquire_writer_lease()["acquired"],
+    True,
+    "writable pooled session still acquires the lease",
+)
+assert_equal(
+    control_writer.release_writer_lease_fresh_connection(),
+    True,
+    "writable psql connection still releases the lease",
+)
+control_writer.close()
+
+print("prism postgres native ledger: OK read-only-session")
 PY
+)
+
+(
+  cd "${ROOT_DIR}"
+  PRISM_RECOVERY_TEST_DATABASE_URL="${DATABASE_URL}" \
+    python3 -m unittest tests.test_prism_pending_block_recovery.NativeRecoveryTests -v
+  PRISM_TEST_DATABASE_URL="${DATABASE_URL}" \
+  PRISM_TEST_PSQL_COMMAND_WITH_ENV="docker exec -i -e PGOPTIONS ${POSTGRES_CONTAINER} psql -U qbit -d qbit" \
+    python3 -m unittest tests.test_prism_candidate_window tests.test_prism_statement_spool -v
 )
 
 echo "test-prism-postgres-native-ledger: PASS"

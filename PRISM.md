@@ -231,6 +231,9 @@ Operational knobs shared by the PRISM listeners:
 | `PRISM_STRATUM_STALE_GRACE_SECONDS` | `3` | after a tip flip, credits same-connection prior-tip shares until this long after that connection receives new-tip work (shares stay creditable while delivery is still pending); set `0` to reject all prior-tip shares |
 | `PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS` | `15` | cadence for checking zero-submitted, zero-accepted vardiff windows so over-diffed idle miners can step down; set `0` to disable |
 | `PRISM_WORKER_METRICS_LIMIT` | `100` | maximum distinct worker labels in private metrics before new workers aggregate into `_other` |
+| `PRISM_HASHRATE_ROLLUP_ENABLED` | `1` | coordinator background maintenance of the incremental hashrate rollups the public hashrate-series endpoint serves from; set `0` to fall back to raw share scans |
+| `PRISM_HASHRATE_ROLLUP_INTERVAL_SECONDS` | `15` | sleep between hashrate rollup maintenance passes once caught up |
+| `PRISM_HASHRATE_ROLLUP_BATCH_SHARES` | `50000` | shares folded into the hashrate rollups per pass; catch-up (including the initial backfill of a grown ledger) loops passes back to back |
 
 `/healthz` remains healthy across arbitrarily long periods without a new block
 when the observed template and payout generation are unchanged. It returns HTTP
@@ -260,8 +263,9 @@ are still counted under the existing rejection reason IDs. The one exception
 is a hash that solves a block while missing the share target (possible while
 the listener floor sits above network difficulty): its share credit lands only
 when qbitd accepts the block, as before. Audit bundles containing any
-`credit_policy` row use `qbit.prism.audit-bundle.v1.1`; upgrade mirrors and
-verifiers before enabling a non-zero stale-grace window in production.
+`credit_policy` row use `qbit.prism.audit-bundle.v1.1`; the stale-grace window
+is non-zero by default on every chain, so keep mirrors and verifiers on a
+release that accepts that schema.
 
 ## How Reward Accounting Works
 
@@ -519,10 +523,22 @@ API readers.
 
 ## HTTP Surfaces
 
-The coordinator exposes a private audit/ops listener and a dashboard-safe public
-API from the same process.
+PRISM serves two HTTP surfaces from two separate processes.
 
-Private/internal endpoints include:
+The **coordinator** (`prism-coordinator`) exposes only the private audit/ops
+listener. The **public read tier** (`prism-public-api`, `python3 -m
+lab.prism.public_read_service`) serves the dashboard-safe `/public/v1` API and
+nothing else. They were split because public read traffic scales with public
+interest rather than with hashrate: served in-process it put an uncontrolled
+workload on the same GIL that acknowledges shares and lands blocks, and on the
+same primary Postgres the lease-holding writer commits through.
+
+The public tier reads through bounded read slots only, never acquires a writer
+lease, and depends on Postgres rather than on the coordinator — so it keeps
+serving across coordinator restarts, and a surge of dashboard polling cannot
+slow block landing.
+
+Private/internal endpoints, served by the coordinator, include:
 
 - `/healthz`
 - `/metrics`
@@ -539,13 +555,40 @@ Private/internal endpoints include:
 Do not expose `/audit/*`, `/metrics`, `/healthz`, Postgres, qbit RPC, or Docker
 volumes directly to the internet.
 
-Dashboard-safe endpoints live under `/public/v1`. The public API contract is:
+Dashboard-safe endpoints live under `/public/v1`, served by `prism-public-api`
+on `PRISM_PUBLIC_API_PORT` (default `3342`). The public API contract is:
 
 - [docs/public-dashboard-api/README.md](docs/public-dashboard-api/README.md)
 - [docs/public-dashboard-api-v1.openapi.yaml](docs/public-dashboard-api-v1.openapi.yaml)
 
 Operators can expose only `/public/v1` through a reverse proxy or dashboard
-frontend.
+frontend. Because that surface now has its own process, the reverse proxy points
+at `prism-public-api` rather than at the coordinator's audit port, and the
+coordinator's listener need not be reachable from the proxy at all.
+
+The public tier also serves its own `/healthz` and `/metrics` describing that
+process (readiness, request counts, cache hit/miss, staleness refusals). These
+are operator surfaces like the coordinator's own — do not expose them publicly.
+
+`prism-public-api` refuses to start unless `PRISM_PUBLIC_STRATUM_URL` is set: it
+runs no Stratum listener, so it cannot infer the pool's endpoint, and the
+fallback would advertise `127.0.0.1` to miners. It also refuses to run on the
+in-memory ledger.
+
+### Hashrate rollups
+
+`/public/v1/hashrate-series` is served from incremental per-bucket rollups
+(`qbit_hashrate_rollup_pool` / `qbit_hashrate_rollup_miner`) rather than by
+re-aggregating raw share rows, so its cost tracks buckets in range instead of
+shares in range and long ranges (`1m`, `6m`, `all`) stay cheap as the ledger
+grows. The coordinator maintains the rollups in a background loop (the
+`PRISM_HASHRATE_ROLLUP_*` knobs above) that folds shares past a single durable
+watermark; a cold or pre-existing database backfills itself through the same
+loop with no separate migration, and the serving query merges a live tail of
+not-yet-rolled-up shares — mid-backfill included — so responses stay exactly
+equal to the raw aggregation. A database missing the rollup tables or
+watermark entirely is served from the unchanged raw scan. The public read
+tier only reads the rollups; it never maintains them.
 
 ## Run PRISM Locally
 
@@ -596,6 +639,11 @@ and explicit reviewed production values for `PRISM_STRATUM_SHARE_DIFF`,
 profile and requires `minimum <= start <= maximum`. Capacity qualification is
 optional and external to startup; see
 [docs/prism-capacity-readiness.md](docs/prism-capacity-readiness.md).
+
+Set `PRISM_PUBLIC_STRATUM_URL` in the same environment file to your pool's
+miner-facing endpoint, for example `stratum+tcp://pool.example:3340` with your
+actual hostname and port. The public API advertises this URL, and
+`make up-prism-pool` rejects a missing or blank value before starting services.
 
 Start the pool:
 

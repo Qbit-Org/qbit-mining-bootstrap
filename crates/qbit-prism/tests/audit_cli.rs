@@ -85,6 +85,27 @@ fn canonical_share_segment_bytes(
     .into_bytes()
 }
 
+fn canonicalize_cli_value(value: &serde_json::Value, label: &str) -> Vec<u8> {
+    let bundle_path = std::env::temp_dir().join(format!(
+        "qbit-prism-audit-canonicalize-{label}-{}.json",
+        std::process::id()
+    ));
+    fs::write(&bundle_path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_qbit-prism-audit-canonicalize"))
+        .arg("--input")
+        .arg(&bundle_path)
+        .output()
+        .unwrap();
+    let _ = fs::remove_file(&bundle_path);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
 #[test]
 fn verifier_cli_accepts_exported_power_law_bundle() {
     let fixture: Fixture = serde_json::from_str(include_str!(
@@ -154,6 +175,42 @@ fn verifier_cli_accepts_exported_power_law_bundle() {
 }
 
 #[test]
+fn canonicalizer_restores_typed_bytes_for_reordered_unicode_and_optional_input() {
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../fixtures/power-law-accrual.prism-fixture.json"
+    ))
+    .unwrap();
+    let bundle = build_audit_bundle(
+        fixture.shares,
+        fixture.found_block,
+        power_law_prior_balances(),
+        PayoutPolicy::day_one_default(),
+        &manifest_signing_key(),
+        &ledger_signing_key(),
+    )
+    .unwrap();
+    let canonical = canonical_audit_bundle_bytes(&bundle).unwrap();
+
+    // Value serialization uses map order rather than AuditBundle's typed field
+    // order. The adapter must restore the typed canonical representation.
+    let mut reordered = serde_json::to_value(&bundle).unwrap();
+    assert_eq!(canonicalize_cli_value(&reordered, "reordered"), canonical);
+
+    reordered["shares"][0]["credit_policy"] = serde_json::Value::Null;
+    assert_eq!(
+        canonicalize_cli_value(&reordered, "explicit-optional-null"),
+        canonical
+    );
+
+    reordered["shares"][0]["miner_id"] = serde_json::Value::String("miner-é".into());
+    let unicode_bundle: AuditBundle = serde_json::from_value(reordered.clone()).unwrap();
+    let unicode_canonical = canonical_audit_bundle_bytes(&unicode_bundle).unwrap();
+    let unicode_output = canonicalize_cli_value(&reordered, "unicode");
+    assert_eq!(unicode_output, unicode_canonical);
+    assert!(unicode_output.windows("miner-é".len()).any(|window| window == "miner-é".as_bytes()));
+}
+
+#[test]
 fn verifier_cli_accepts_live_testnet_scale_legacy_bundle() {
     let bundle = live_testnet_scale_bundle();
     let report = verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap();
@@ -173,8 +230,6 @@ fn verifier_cli_accepts_live_testnet_scale_legacy_bundle() {
         .arg(report.coinbase_value_sats.to_string())
         .output()
         .unwrap();
-    let _ = fs::remove_file(&bundle_path);
-
     assert!(
         output.status.success(),
         "stdout: {}\nstderr: {}",
@@ -184,6 +239,18 @@ fn verifier_cli_accepts_live_testnet_scale_legacy_bundle() {
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("qbit.prism.audit-verification-report.v1")
     );
+    let canonical_output = Command::new(env!("CARGO_BIN_EXE_qbit-prism-audit-canonicalize"))
+        .arg("--input")
+        .arg(&bundle_path)
+        .output()
+        .unwrap();
+    let _ = fs::remove_file(&bundle_path);
+    assert!(canonical_output.status.success());
+    assert_eq!(
+        canonical_output.stdout,
+        canonical_audit_bundle_bytes(&bundle).unwrap()
+    );
+    assert!(bundle.found_block.network_difficulty > u64::MAX as u128);
 }
 
 #[test]
@@ -1188,7 +1255,8 @@ fn build_audit_bundle_serve_mode_caches_parsed_windows() {
     stdout.read_line(&mut line).unwrap();
     let handshake: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(handshake["event"], "handshake");
-    assert_eq!(handshake["protocol"], 1);
+    // Protocol 2: prepare_window plus the append-invalidation epoch tag.
+    assert_eq!(handshake["protocol"], 2);
     assert_eq!(handshake["tool"], "qbit-prism-build-audit-bundle");
 
     let mut request_with_window = build_fields.clone();
@@ -1277,6 +1345,385 @@ fn build_audit_bundle_serve_mode_caches_parsed_windows() {
     let evicted: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(evicted["ok"], false);
     assert_eq!(evicted["needs_window"], true);
+
+    drop(stdin);
+    let status = daemon.wait().unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn prepare_window_declares_out_of_range_values_and_survives_them() {
+    // serde refuses an integer above its declared width with the same parse
+    // error a corrupt line gets. Answered as "malformed serve request", the
+    // coordinator read it as an anomaly and SIGKILLed a healthy daemon once
+    // per materialization for as long as the window held the value. The
+    // daemon now classifies such a request as out_of_range -- naming the
+    // field, its literal and the width -- keeps its state, and goes on
+    // serving; a genuinely malformed line is still malformed, and the two
+    // rejection shapes carry their stable category beside the message.
+    use std::io::{BufRead, BufReader as StdBufReader, Read as IoRead, Write as IoWrite};
+    use std::process::Stdio;
+
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_qbit-prism-build-audit-bundle"))
+        .arg("--serve")
+        .arg("--signing-key-seed-hex")
+        .arg("42".repeat(32))
+        .arg("--ledger-signing-key-seed-hex")
+        .arg("43".repeat(32))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = daemon.stdin.take().unwrap();
+    let mut stdout = StdBufReader::new(daemon.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()["event"],
+        "handshake"
+    );
+
+    // Literals above u128/u32 cannot be built with json!, so the request is
+    // written as text -- exactly as the coordinator's json.dumps sends it.
+    fn share_text(seq: u64, difficulty: &str, ntime: &str, ms: i64) -> String {
+        format!(
+            concat!(
+                "{{\"share_seq\":{seq},\"share_id\":\"share-{seq}\",\"miner_id\":\"miner-{m}\",",
+                "\"order_key\":\"{m:02}:miner\",\"p2mr_program_hex\":\"{hex}\",",
+                "\"share_difficulty\":{difficulty},\"network_difficulty\":1000,",
+                "\"template_height\":100,\"job_id\":\"job-{seq}\",",
+                "\"job_issued_at_ms\":{ms},\"accepted_at_ms\":{ms},\"ntime\":{ntime}}}"
+            ),
+            seq = seq,
+            m = seq % 3,
+            hex = format!("{:02x}", seq % 256).repeat(32),
+            difficulty = difficulty,
+            ms = ms,
+            ntime = ntime,
+        )
+    }
+    let prepare = |records: &[String], window_weight: &str| {
+        format!(
+            "{{\"request\":\"prepare_window\",\"mode\":\"full\",\"append_invalidation_epoch\":1,\
+             \"anchor_job_issued_at_ms\":1000003,\"window_weight\":{window_weight},\"records\":[{}]}}",
+            records.join(",")
+        )
+    };
+    fn answer(
+        stdin: &mut std::process::ChildStdin,
+        stdout: &mut StdBufReader<std::process::ChildStdout>,
+        request: &str,
+    ) -> serde_json::Value {
+        writeln!(stdin, "{request}").unwrap();
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap_or_else(|error| panic!("{error}: {line}"))
+    }
+
+    // share_difficulty one above u128 on the second record.
+    let beyond_u128 = answer(
+        &mut stdin,
+        &mut stdout,
+        &prepare(
+            &[
+                share_text(1, "1", "1700000000", 1_000_001),
+                share_text(
+                    2,
+                    "340282366920938463463374607431768211456",
+                    "1700000000",
+                    1_000_001,
+                ),
+            ],
+            "1000",
+        ),
+    );
+    assert_eq!(beyond_u128["ok"], false, "{beyond_u128}");
+    assert_eq!(beyond_u128["request"], "prepare_window");
+    assert_eq!(beyond_u128["out_of_range"], true);
+    assert_eq!(beyond_u128["field"], "records[1].share_difficulty");
+    assert_eq!(beyond_u128["width"], "u128");
+    assert!(beyond_u128.get("needs_window").is_none());
+    assert!(beyond_u128["error"]
+        .as_str()
+        .unwrap()
+        .contains("340282366920938463463374607431768211456"));
+
+    // ntime one above u32, and a window_weight one above u128.
+    let beyond_u32 = answer(
+        &mut stdin,
+        &mut stdout,
+        &prepare(&[share_text(1, "1", "4294967296", 1_000_001)], "1000"),
+    );
+    assert_eq!(beyond_u32["out_of_range"], true, "{beyond_u32}");
+    assert_eq!(beyond_u32["field"], "records[0].ntime");
+    assert_eq!(beyond_u32["width"], "u32");
+    let beyond_weight = answer(
+        &mut stdin,
+        &mut stdout,
+        &prepare(
+            &[share_text(1, "1", "1700000000", 1_000_001)],
+            "340282366920938463463374607431768211456",
+        ),
+    );
+    assert_eq!(beyond_weight["out_of_range"], true, "{beyond_weight}");
+    assert_eq!(beyond_weight["field"], "window_weight");
+
+    // Every input at its width, but the retained total leaves u128: the
+    // accumulator is declined, never saturated.
+    let overflow = answer(
+        &mut stdin,
+        &mut stdout,
+        &prepare(
+            &[
+                share_text(
+                    1,
+                    "170141183460469231731687303715884105728",
+                    "1700000000",
+                    1_000_001,
+                ),
+                share_text(
+                    2,
+                    "170141183460469231731687303715884105728",
+                    "1700000000",
+                    1_000_001,
+                ),
+            ],
+            "340282366920938463463374607431768211455",
+        ),
+    );
+    assert_eq!(overflow["out_of_range"], true, "{overflow}");
+    assert_eq!(overflow["field"], "total_difficulty");
+    assert_eq!(overflow["width"], "u128");
+
+    // A genuinely malformed line is still a malformed request.
+    let malformed = answer(&mut stdin, &mut stdout, "{\"request\":\"prepare_window\",\"mode\":\"full\",\"records\":[{\"share_difficulty\":1.5}]");
+    assert_eq!(malformed["ok"], false);
+    assert!(malformed["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("malformed serve request"));
+    assert!(malformed.get("out_of_range").is_none());
+
+    // Rejections name their condition in a stable category.
+    let duplicate = answer(
+        &mut stdin,
+        &mut stdout,
+        &prepare(
+            &[
+                share_text(1, "1", "1700000000", 1_000_001),
+                share_text(1, "2", "1700000000", 1_000_001),
+            ],
+            "1000",
+        ),
+    );
+    assert_eq!(duplicate["fold_invalid"], true, "{duplicate}");
+    assert_eq!(duplicate["rejection"], "duplicate_share_seq");
+    assert_eq!(
+        duplicate["error"],
+        "full payout window contains duplicate share_seq"
+    );
+
+    // The same process, afterwards, prepares and advances a window at the
+    // declared edges exactly: u64::MAX share_seq, u128::MAX window_weight,
+    // u32::MAX ntime, and difficulties whose retained total is exactly
+    // u128::MAX.
+    let edge = answer(
+        &mut stdin,
+        &mut stdout,
+        &prepare(
+            &[
+                share_text(
+                    1,
+                    "340282366920938463463374607431768211454",
+                    "4294967295",
+                    1_000_001,
+                ),
+                share_text(18446744073709551615, "1", "4294967295", 1_000_001),
+            ],
+            "340282366920938463463374607431768211455",
+        ),
+    );
+    assert_eq!(edge["ok"], true, "{edge}");
+    assert_eq!(edge["record_count"], 2);
+    let base_digest = edge["share_snapshot_sha256"].as_str().unwrap().to_string();
+    let items_len = edge["window_items_len"].as_u64().unwrap() as usize;
+    let mut raw = vec![0u8; items_len + 1];
+    stdout.read_exact(&mut raw).unwrap();
+    assert_eq!(raw[items_len], b'\n');
+    let items = String::from_utf8(raw[..items_len].to_vec()).unwrap();
+    assert!(items.contains("\"share_difficulty\":340282366920938463463374607431768211454"));
+    assert!(items.contains("\"share_seq\":18446744073709551615"));
+    assert!(items.contains("\"ntime\":4294967295"));
+
+    let advance = answer(
+        &mut stdin,
+        &mut stdout,
+        &format!(
+        "{{\"request\":\"prepare_window\",\"mode\":\"advance\",\"append_invalidation_epoch\":1,\
+         \"anchor_job_issued_at_ms\":1000004,\"base_digest\":\"{base_digest}\",\"records\":[]}}"
+    ),
+    );
+    assert_eq!(advance["ok"], true, "{advance}");
+    assert_eq!(advance["record_count"], 2);
+    let appended_len = advance["appended_items_len"].as_u64().unwrap() as usize;
+    let mut raw = vec![0u8; appended_len + 1];
+    stdout.read_exact(&mut raw).unwrap();
+
+    let not_append = answer(
+        &mut stdin,
+        &mut stdout,
+        &format!(
+        "{{\"request\":\"prepare_window\",\"mode\":\"advance\",\"append_invalidation_epoch\":1,\
+         \"anchor_job_issued_at_ms\":1000005,\"base_digest\":\"{base_digest}\",\"records\":[{}]}}",
+        share_text(3, "1", "1700000000", 1_000_005)
+    ),
+    );
+    assert_eq!(not_append["fallback"], true, "{not_append}");
+    assert_eq!(not_append["rejection"], "delta_not_append");
+
+    drop(stdin);
+    let status = daemon.wait().unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn prepare_window_advance_ignores_the_append_invalidation_epoch_tag() {
+    // The coordinator's late-append policy is finer than any tag this daemon
+    // could apply: it clears the incremental cache only when the late row
+    // predates the cached anchor, and otherwise RETAGS the window so the next
+    // delta build advances it in place. A daemon that demanded an exact tag
+    // match turned every such retag into a needs_full -- a full DB walk, fold
+    // and upload -- while catching nothing the coordinator had not already
+    // decided. The tag rides along for diagnostics and nothing else.
+    use std::io::{BufRead, BufReader as StdBufReader, Read as IoRead, Write as IoWrite};
+    use std::process::Stdio;
+
+    fn share(seq: u64) -> serde_json::Value {
+        serde_json::json!({
+            "share_seq": seq,
+            "share_id": format!("share-{seq}"),
+            "miner_id": format!("miner-{}", seq % 3),
+            "order_key": format!("{:02}:miner", seq % 3),
+            "p2mr_program_hex": format!("{:02x}", seq).repeat(32),
+            "share_difficulty": 1,
+            "network_difficulty": 1000,
+            "template_height": 100,
+            "job_id": format!("job-{seq}"),
+            "job_issued_at_ms": 1_000_000 + seq as i64,
+            "accepted_at_ms": 1_000_000 + seq as i64,
+            "ntime": 1_700_000_000u32,
+        })
+    }
+
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_qbit-prism-build-audit-bundle"))
+        .arg("--serve")
+        .arg("--signing-key-seed-hex")
+        .arg("42".repeat(32))
+        .arg("--ledger-signing-key-seed-hex")
+        .arg("43".repeat(32))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = daemon.stdin.take().unwrap();
+    let mut stdout = StdBufReader::new(daemon.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()["event"],
+        "handshake"
+    );
+
+    // A section reader that consumes the raw canonical-items payload plus its
+    // terminating newline, so the next envelope line starts clean.
+    let drain_section = |stdout: &mut StdBufReader<std::process::ChildStdout>, len: usize| {
+        let mut raw = vec![0u8; len + 1];
+        stdout.read_exact(&mut raw).unwrap();
+        assert_eq!(raw[len], b'\n');
+        raw.truncate(len);
+        raw
+    };
+
+    let prepared = serde_json::json!({
+        "request": "prepare_window",
+        "mode": "full",
+        "append_invalidation_epoch": 7,
+        "anchor_job_issued_at_ms": 1_000_003i64,
+        "window_weight": 1_000,
+        "records": [share(1), share(2), share(3)],
+    });
+    writeln!(stdin, "{}", serde_json::to_string(&prepared).unwrap()).unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let full: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(full["ok"], true, "full response: {line}");
+    assert_eq!(full["record_count"], 3);
+    let base_digest = full["share_snapshot_sha256"].as_str().unwrap().to_string();
+    drain_section(&mut stdout, full["window_items_len"].as_u64().unwrap() as usize);
+
+    // A build at a newer epoch must not evict the prepared window either.
+    let build = serde_json::json!({
+        "window_key": {"share_snapshot_sha256": base_digest},
+        "append_invalidation_epoch": 8,
+        "found_block": {
+            "block_height": 101,
+            "coinbase_value_sats": 5_000_000_000u64,
+            "network_difficulty": 1000,
+            "anchor_job_issued_at_ms": 1_000_003i64,
+        },
+        "prior_balances": [],
+    });
+    writeln!(stdin, "{}", serde_json::to_string(&build).unwrap()).unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let served: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(served["ok"], true, "build response: {line}");
+    assert_eq!(served["window_cache"]["hit"], true);
+
+    // The retag case: the base was prepared at epoch 7, the advance arrives
+    // at epoch 9, and it advances in place instead of answering needs_full.
+    let advance = serde_json::json!({
+        "request": "prepare_window",
+        "mode": "advance",
+        "append_invalidation_epoch": 9,
+        "anchor_job_issued_at_ms": 1_000_004i64,
+        "base_digest": base_digest,
+        "records": [share(4)],
+    });
+    writeln!(stdin, "{}", serde_json::to_string(&advance).unwrap()).unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let advanced: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(advanced["ok"], true, "advance response: {line}");
+    assert!(advanced.get("needs_full").is_none());
+    assert_eq!(advanced["record_count"], 4);
+    assert_eq!(advanced["added_rows"], 1);
+    // The tags are reported, never acted on.
+    assert_eq!(advanced["base_append_invalidation_epoch"], 7);
+    assert_eq!(advanced["append_invalidation_epoch"], 9);
+    let appended = drain_section(
+        &mut stdout,
+        advanced["appended_items_len"].as_u64().unwrap() as usize,
+    );
+    assert!(!appended.is_empty());
+
+    // An unheld digest is still the one thing that answers needs_full.
+    let unknown = serde_json::json!({
+        "request": "prepare_window",
+        "mode": "advance",
+        "append_invalidation_epoch": 9,
+        "anchor_job_issued_at_ms": 1_000_005i64,
+        "base_digest": "0".repeat(64),
+        "records": [],
+    });
+    writeln!(stdin, "{}", serde_json::to_string(&unknown).unwrap()).unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let missing: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(missing["ok"], false);
+    assert_eq!(missing["needs_full"], true);
 
     drop(stdin);
     let status = daemon.wait().unwrap();

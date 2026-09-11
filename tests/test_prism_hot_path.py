@@ -33,8 +33,8 @@ from lab.prism.prism_coordinator import (
     StratumError,
     TemplateRefreshBlocked,
     WorkerIdentity,
-    default_prism_coinbase_tag_hex,
 )
+from lab.prism.coordinator_config import default_prism_coinbase_tag_hex
 from lab.prism.share_ledger import AcceptedShareRecord, PendingShare
 
 PAYOUT_ADDRESS = "tq1z70ukpvs96kye6jmgvl3nttevtkrq8uu89snkpm6m8gwqukw8u5dsz32kwa"
@@ -377,6 +377,9 @@ def install_fake_bundle_builder(server: PrismCoordinator) -> dict[str, object]:
         }
 
     server.build_audit_bundle = fake_build_audit_bundle  # type: ignore[method-assign]
+    server._ensure_bundle_compiler().build_audit_bundle = (  # type: ignore[method-assign]
+        fake_build_audit_bundle
+    )
     return recorded
 
 
@@ -647,6 +650,7 @@ class HotPathLoggingTests(unittest.TestCase):
 class HotPathLockIsolationTests(unittest.TestCase):
     def test_first_touch_installs_one_hot_path_lock_set(self) -> None:
         server = PrismCoordinator.__new__(PrismCoordinator)
+        server.extranonce2_size = EXTRANONCE2_SIZE
         state = ClientState.__new__(ClientState)
         start = threading.Barrier(32)
 
@@ -656,7 +660,7 @@ class HotPathLockIsolationTests(unittest.TestCase):
             reserved = server._reserve_recent_share_key(("same", "header"))
             return (
                 vardiff_lock,
-                server._recent_share_lock,
+                server._ensure_share_submission_service().recent_shares,
                 server._share_accounting_lock,
                 reserved,
             )

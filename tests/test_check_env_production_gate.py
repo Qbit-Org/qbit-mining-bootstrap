@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -13,6 +14,12 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[1]
 CHECK_ENV = ROOT_DIR / "scripts" / "check-env.sh"
 class CheckEnvProductionGateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        # Policy tests stop at a predictable Docker boundary. The runner's
+        # daemon may still be starting, or may not be installed at all.
+        self.docker_bin = self.write_fake_docker(root, exit_code=1)
+
     def production_prism_env(self, root: Path) -> dict[str, str]:
         return {
             "MINING_LANES": "prism",
@@ -30,6 +37,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             "PRISM_POSTGRES_IMAGE": "registry.example.invalid/postgres@sha256:" + "e" * 64,
             "PRISM_POSTGRES_DATA_SOURCE": str(root / "postgres-data"),
             "PRISM_POSTGRES_WAL_SOURCE": str(root / "postgres-wal"),
+            "PRISM_POSTGRES_REPLICA_DATA_SOURCE": str(root / "postgres-replica"),
             "PRISM_AUDIT_DATA_SOURCE": str(root / "prism-audit"),
             "PRISM_DATABASE_URL": "postgresql://example.invalid/qbit",
             "PRISM_POSTGRES_PASSWORD": "not-default",
@@ -40,7 +48,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             "PRISM_LEDGER_WRITER_EPOCH": "7",
             "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
             "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
-            "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+            "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             "PRISM_STRATUM_SHARE_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF": "1",
             "PRISM_STRATUM_VARDIFF_TARGET_SECONDS": "15",
@@ -93,11 +101,11 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         ).strip()
         return checkout, commit
 
-    def write_fake_docker(self, root: Path) -> Path:
+    def write_fake_docker(self, root: Path, *, exit_code: int = 0) -> Path:
         fake_bin = root / "bin"
         fake_bin.mkdir()
         docker = fake_bin / "docker"
-        docker.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        docker.write_text(f"#!/bin/sh\nexit {exit_code}\n", encoding="utf-8")
         docker.chmod(0o755)
         return fake_bin
 
@@ -137,7 +145,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             "PRISM_LEDGER_WRITER_EPOCH": "7",
             "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
             "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
-            "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+            "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             "PRISM_STRATUM_SHARE_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF_MIN_DIFF": "1024",
             "PRISM_STRATUM_VARDIFF_START_DIFF": "4096",
@@ -153,6 +161,9 @@ class CheckEnvProductionGateTests(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.pop("QBIT_GIT_COMMIT", None)
+        env["PATH"] = f"{self.docker_bin}:{env['PATH']}"
+        # Tests exercising successful Docker checks or a minimal PATH supply
+        # their own controlled tool fixtures through overrides.
         env.update(overrides)
         return subprocess.run(
             ["/bin/bash", str(script), *arguments],
@@ -172,6 +183,9 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         shutil.copyfile(CHECK_ENV, script)
         shutil.copyfile(ROOT_DIR / ".env.example", root / ".env.example")
         shutil.copyfile(ROOT_DIR / "config" / "upstream.env.example", root / "config" / "upstream.env")
+        entrypoint = Path("docker/qbit/qbit-entrypoint.sh")
+        (root / entrypoint).parent.mkdir(parents=True)
+        shutil.copyfile(ROOT_DIR / entrypoint, root / entrypoint)
         return root, script
 
     def test_deploy_env_file_is_loaded_as_the_final_config_layer(self) -> None:
@@ -284,6 +298,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         self.assertNotIn("BITCOIN_CHAIN must", result.stderr)
         self.assertNotIn("BITCOIN_DNSSEED must", result.stderr)
         self.assertNotIn("BITCOIN_DISCOVER must", result.stderr)
+        self.assertIn("docker daemon is not reachable", result.stderr)
 
     def test_production_mode_rejects_regtest_before_docker_check(self) -> None:
         result = self.run_check_env(QBIT_PRODUCTION="1")
@@ -324,6 +339,8 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         self.assertNotIn("rejects CKPOOL_PUBLIC_DIFF_POLICY=permissive", result.stderr)
         self.assertNotIn("rejects PRISM_ALLOW_MEMORY_LEDGER=1", result.stderr)
         self.assertNotIn("rejects PRISM_ALLOW_TEST_SIGNING_SEEDS=1", result.stderr)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("docker daemon is not reachable", result.stderr)
 
     def test_production_mainnet_prelaunch_accepts_explicit_authorization(self) -> None:
         result = self.run_check_env(
@@ -730,6 +747,104 @@ class CheckEnvProductionGateTests(unittest.TestCase):
         self.assertIn("PRISM_POSTGRES_DATA_SOURCE and PRISM_POSTGRES_WAL_SOURCE must be distinct", result.stderr)
         self.assertNotIn("docker is required", result.stderr)
 
+    def test_production_validates_replica_storage_before_docker(self) -> None:
+        key = "PRISM_POSTGRES_REPLICA_DATA_SOURCE"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, script = self.isolated_check_env_root(Path(temp_dir))
+            env = self.production_prism_env(root)
+            env[key] = ""
+            fake_bin = self.write_fake_docker(root)
+            docker_log = root / "docker-calls.log"
+            (fake_bin / "docker").write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$*" >> "$DOCKER_CALL_LOG"\nexit 0\n',
+                encoding="utf-8",
+            )
+            deploy_env = root / "deployment.env"
+            env.update({
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "DOCKER_CALL_LOG": str(docker_log),
+                "DEPLOY_ENV_FILE": str(deploy_env),
+            })
+            cases = [
+                (None, "absolute host path"),
+                ("", "absolute host path"),
+                ("replica-volume", "absolute host path"),
+                ("./replica-data", "absolute host path"),
+            ]
+            for other in (
+                "QBIT_DATA_SOURCE",
+                "PRISM_POSTGRES_DATA_SOURCE",
+                "PRISM_POSTGRES_WAL_SOURCE",
+                "PRISM_AUDIT_DATA_SOURCE",
+            ):
+                cases.append((env[other] + "/", "must be distinct"))
+            for value, error in cases:
+                with self.subTest(value=value):
+                    deploy_env.write_text(
+                        "" if value is None else f"{key}={shlex.quote(value)}\n",
+                        encoding="utf-8",
+                    )
+                    result = self.run_check_env(script=script, cwd=root, **env)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(key, result.stderr)
+                    self.assertIn(error, result.stderr)
+                    self.assertFalse(docker_log.exists(), "validation called Docker")
+
+    def test_replica_storage_rejects_overlap_and_aliases_before_docker(self) -> None:
+        key = "PRISM_POSTGRES_REPLICA_DATA_SOURCE"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env = self.production_prism_env(root)
+            primary = Path(env["PRISM_POSTGRES_DATA_SOURCE"])
+            primary.mkdir(parents=True)
+            marker = primary / "PG_VERSION"
+            marker.write_text("16")
+            alias = root / "primary-alias"
+            alias.symlink_to(primary, target_is_directory=True)
+            cases = [
+                str(primary.parent), str(primary / "replica"),
+                str(primary) + "/../" + primary.name + "//",
+                str(alias), str(alias / "new-replica"),
+            ]
+            for value in cases:
+                with self.subTest(value=value):
+                    result = self.run_check_env(**{**env, key: value})
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("non-overlapping", result.stderr)
+                    self.assertNotIn("docker daemon", result.stderr)
+                    self.assertEqual(marker.read_text(), "16")
+            # Component boundaries matter: primary and primary-copy are siblings.
+            result = self.run_check_env(**{**env, key: str(primary) + "-copy"})
+            self.assertNotIn("non-overlapping", result.stderr)
+            self.assertIn("docker daemon", result.stderr)
+
+    def test_production_replica_storage_honors_configuration_precedence(self) -> None:
+        key = "PRISM_POSTGRES_REPLICA_DATA_SOURCE"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, script = self.isolated_check_env_root(Path(temp_dir))
+            checkout, commit = self.write_pinned_qbit_checkout(root)
+            fake_bin = self.write_fake_docker(root)
+            env = self.production_prism_env(root)
+            env.update({
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "QBIT_SRC_DIR": str(checkout),
+                "QBIT_SRC_DIR_OVERRIDE": str(checkout),
+                "QBIT_GIT_COMMIT": commit,
+            })
+            deploy_env = root / "deployment.env"
+            env["DEPLOY_ENV_FILE"] = str(deploy_env)
+            for file_value, shell_value in (
+                (str(root / "file-replica"), ""),
+                ("invalid-named-volume", str(root / "shell-replica")),
+            ):
+                with self.subTest(file_value=file_value, shell_value=shell_value):
+                    deploy_env.write_text(f"{key}={shlex.quote(file_value)}\n", encoding="utf-8")
+                    result = self.run_check_env(
+                        script=script, cwd=root, **{**env, key: shell_value}
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(f"qbit source checkout verified at {commit}", result.stdout)
+
     def test_qbit_mainnet_auxpow_requires_mainnet_parent(self) -> None:
         result = self.run_check_env(
             MINING_LANES="auxpow",
@@ -920,7 +1035,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             "BITCOIN_EXPECTED_GENESIS_HASH": (
                 "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
             ).upper(),
-            "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+            "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
         }
         for qbit_address, bitcoin_address, expected_name in (
             ("auto", "bc1explicit", "QBIT_MINER_ADDRESS"),
@@ -956,7 +1071,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
                     "PRISM_LEDGER_WRITER_EPOCH": "7",
                     "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
                     "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
-                    "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+                    "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
                     "CKPOOL_MINDIFF": "1024",
                     "CKPOOL_STARTDIFF": "65536",
                     "CKPOOL_REQUIRE_P2MR_PAYOUT": "1",
@@ -982,23 +1097,128 @@ class CheckEnvProductionGateTests(unittest.TestCase):
                 )
                 self.assertNotIn("docker is required", result.stderr)
 
-    def test_mainnet_requires_zero_stale_grace(self) -> None:
-        result = self.run_check_env(
-            MINING_LANES="prism",
-            QBIT_CHAIN="mainnet",
-            QBIT_CHAIN_FLAG="-chain=main",
-            QBIT_EXPECTED_GENESIS_HASH="11" * 32,
-            QBIT_GIT_COMMIT="41" * 20,
-            PRISM_STRATUM_STALE_GRACE_SECONDS="3",
-        )
+    def test_mainnet_accepts_bounded_stale_grace(self) -> None:
+        # Mainnet follows the same bounded-grace rule as every other chain:
+        # zero grace rejects every in-flight prior-tip share at each block,
+        # which miners read as pool failure. Run a complete mainnet production
+        # environment so a clean exit proves the gate accepts the window,
+        # rather than only that the old message is gone.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            checkout, commit = self.write_pinned_qbit_checkout(root)
+            fake_bin = self.write_fake_docker(root)
+            common = self.production_prism_env(root)
+            common.update({
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "QBIT_CHAIN": "mainnet",
+                "QBIT_CHAIN_FLAG": "-chain=main",
+                "QBIT_EXPECTED_GENESIS_HASH": "11" * 32,
+                "QBIT_GIT_COMMIT": commit,
+                "QBIT_SRC_DIR": str(checkout),
+                "QBIT_SRC_DIR_OVERRIDE": str(checkout),
+            })
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("mainnet requires PRISM_STRATUM_STALE_GRACE_SECONDS=0", result.stderr)
-        self.assertNotIn("docker is required", result.stderr)
+            for grace in ("3", "0.5", "0"):
+                with self.subTest(grace=grace):
+                    result = self.run_check_env(
+                        **{**common, "PRISM_STRATUM_STALE_GRACE_SECONDS": grace}
+                    )
+
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn("PRISM_STRATUM_STALE_GRACE_SECONDS", result.stderr)
+
+    def test_prism_stale_grace_python3_requirement_matches_prior_prerequisites(self) -> None:
+        # python3 was already required in production (production difficulty), but
+        # never for lab bring-up. Validating stale grace must not change that:
+        # production still fails loudly, lab skips the check instead.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            minimal_bin = root / "no-python-bin"
+            minimal_bin.mkdir()
+            for tool in (
+                "bash",
+                "sh",
+                "cat",
+                "dirname",
+                "docker",
+                "env",
+                "git",
+                "rm",
+                "sed",
+                "tr",
+                "uname",
+            ):
+                resolved = (
+                    str(self.docker_bin / "docker")
+                    if tool == "docker"
+                    else shutil.which(tool)
+                )
+                if resolved is not None:
+                    (minimal_bin / tool).symlink_to(resolved)
+            self.assertIsNone(
+                shutil.which("python3", path=str(minimal_bin)),
+                "the minimal PATH must not expose python3",
+            )
+
+            lab = self.run_check_env(
+                PATH=str(minimal_bin),
+                MINING_LANES="prism",
+                PRISM_STRATUM_STALE_GRACE_SECONDS="not-a-number",
+            )
+            self.assertNotIn("PRISM_STRATUM_STALE_GRACE_SECONDS", lab.stderr)
+            self.assertIn(
+                "python3 not found; skipping PRISM_STRATUM_STALE_GRACE_SECONDS validation",
+                lab.stdout,
+            )
+
+            production = self.run_check_env(
+                PATH=str(minimal_bin),
+                MINING_LANES="prism",
+                QBIT_PRODUCTION="1",
+                QBIT_CHAIN="signet",
+                QBIT_CHAIN_FLAG="-signet",
+                PRISM_STRATUM_STALE_GRACE_SECONDS="not-a-number",
+            )
+            self.assertNotEqual(production.returncode, 0)
+            self.assertIn(
+                "python3 is required to validate PRISM_STRATUM_STALE_GRACE_SECONDS",
+                production.stderr,
+            )
+
+    def test_prism_rejects_invalid_stale_grace_before_docker_check(self) -> None:
+        # The exported value is what Compose hands the coordinator, so the
+        # doctor validates it (not the .env.example default) in every mode,
+        # with the coordinator's own float syntax and range.
+        for grace in ("-1", "not-a-number", "nan", "inf", "1" + "0" * 400):
+            with self.subTest(grace=grace):
+                result = self.run_check_env(
+                    MINING_LANES="prism",
+                    PRISM_STRATUM_STALE_GRACE_SECONDS=grace,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "PRISM_STRATUM_STALE_GRACE_SECONDS must be a finite non-negative number",
+                    result.stderr,
+                )
+                self.assertNotIn("docker is required", result.stderr)
+
+    def test_prism_accepts_runtime_float_stale_grace_syntax(self) -> None:
+        for grace in ("0", "3", "0.5", "1e-1", ".5", "3."):
+            with self.subTest(grace=grace):
+                result = self.run_check_env(
+                    MINING_LANES="prism",
+                    PRISM_STRATUM_STALE_GRACE_SECONDS=grace,
+                )
+
+                self.assertNotIn("PRISM_STRATUM_STALE_GRACE_SECONDS", result.stderr)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("docker daemon is not reachable", result.stderr)
 
     def test_non_mainnet_production_accepts_bounded_stale_grace(self) -> None:
         # A public-chain production pool may credit shares that raced a block
-        # within a bounded grace window; only mainnet pins the strict zero.
+        # within a bounded grace window.
         result = self.run_check_env(
             MINING_LANES="prism",
             QBIT_PRODUCTION="1",
@@ -1215,7 +1435,7 @@ class CheckEnvProductionGateTests(unittest.TestCase):
             "PRISM_LEDGER_WRITER_EPOCH": "7",
             "PRISM_AUDIT_DIR": "/var/lib/qbit/prism/audit",
             "PRISM_EVIDENCE_PATH": "/var/lib/qbit/prism/evidence.json",
-            "PRISM_STRATUM_STALE_GRACE_SECONDS": "0",
+            "PRISM_STRATUM_STALE_GRACE_SECONDS": "3",
             "CKPOOL_MINDIFF": "1024",
             "CKPOOL_STARTDIFF": "65536",
         }

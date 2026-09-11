@@ -7,15 +7,14 @@ import threading
 import time
 import unittest
 
+from lab.prism.job_bundle import CachedJobBundle, CollectionIdentityUnavailable
 from lab.prism.prism_coordinator import (
-    CachedJobBundle,
     CachedTemplateArtifacts,
-    CollectionIdentityUnavailable,
     StratumError,
     TemplateRefreshBlocked,
     WorkerIdentity,
 )
-from tests.test_prism_coordinator_job_cache import (
+from tests.prism_coordinator_test_support import (
     FakeLedger,
     base_template,
     client,

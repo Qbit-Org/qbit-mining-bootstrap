@@ -27,6 +27,7 @@ ENV_QBIT_DATA_SOURCE="${QBIT_DATA_SOURCE:-}"
 ENV_BITCOIN_DATA_SOURCE="${BITCOIN_DATA_SOURCE:-}"
 ENV_PRISM_POSTGRES_DATA_SOURCE="${PRISM_POSTGRES_DATA_SOURCE:-}"
 ENV_PRISM_POSTGRES_WAL_SOURCE="${PRISM_POSTGRES_WAL_SOURCE:-}"
+ENV_PRISM_POSTGRES_REPLICA_DATA_SOURCE="${PRISM_POSTGRES_REPLICA_DATA_SOURCE:-}"
 ENV_PRISM_AUDIT_DATA_SOURCE="${PRISM_AUDIT_DATA_SOURCE:-}"
 ENV_QBIT_CHAIN="${QBIT_CHAIN:-}"
 ENV_QBIT_CHAIN_FLAG="${QBIT_CHAIN_FLAG:-}"
@@ -165,6 +166,7 @@ for name in \
   BITCOIN_DATA_SOURCE \
   PRISM_POSTGRES_DATA_SOURCE \
   PRISM_POSTGRES_WAL_SOURCE \
+  PRISM_POSTGRES_REPLICA_DATA_SOURCE \
   PRISM_AUDIT_DATA_SOURCE; do
   override_name="ENV_${name}"
   if [[ -n "${!override_name}" ]]; then
@@ -595,22 +597,40 @@ check_absolute_storage_source() {
 
 check_distinct_storage_sources() {
   local names=("$@")
-  local left right
-  local left_name right_name
-  local left_value right_value
-
-  for ((left = 0; left < ${#names[@]}; left++)); do
-    left_name="${names[left]}"
-    left_value="${!left_name}"
-    left_value="${left_value%/}"
-    for ((right = left + 1; right < ${#names[@]}; right++)); do
-      right_name="${names[right]}"
-      right_value="${!right_name}"
-      right_value="${right_value%/}"
-      [[ "${left_value}" != "${right_value}" ]] || \
-        fail "release provenance storage sources ${left_name} and ${right_name} must be distinct"
-    done
+  local args=() name output
+  command -v python3 >/dev/null 2>&1 || fail "python3 is required to validate storage paths"
+  for name in "${names[@]}"; do
+    args+=("${name}" "${!name}")
   done
+  if ! output="$(python3 - "${args[@]}" <<'PYTHON'
+from pathlib import Path
+import sys
+
+sources = []
+try:
+    for name, raw in zip(sys.argv[1::2], sys.argv[2::2]):
+        path = Path(raw).resolve()
+        identities = []
+        for parent in (path, *path.parents):
+            try:
+                stat = parent.stat()
+                identities.append((stat.st_dev, stat.st_ino))
+            except FileNotFoundError:
+                identities.append(None)
+        for other_name, other_path, other_ids in sources:
+            if (path == other_path or path in other_path.parents
+                    or other_path in path.parents
+                    or identities[0] is not None and identities[0] in other_ids
+                    or other_ids[0] is not None and other_ids[0] in identities):
+                sys.exit(f"release provenance storage sources {other_name} and {name} "
+                         "must be distinct and non-overlapping (including filesystem aliases)")
+        sources.append((name, path, identities))
+except (OSError, RuntimeError):
+    sys.exit(f"cannot safely resolve release provenance storage source {name}")
+PYTHON
+  )"; then
+    fail "${output}"
+  fi
 }
 
 check_production_deployment_inputs() {
@@ -632,10 +652,12 @@ check_production_deployment_inputs() {
     check_digest_image PRISM_POSTGRES_IMAGE
     check_absolute_storage_source PRISM_POSTGRES_DATA_SOURCE
     check_absolute_storage_source PRISM_POSTGRES_WAL_SOURCE
+    check_absolute_storage_source PRISM_POSTGRES_REPLICA_DATA_SOURCE
     check_absolute_storage_source PRISM_AUDIT_DATA_SOURCE
     storage_names+=(
       PRISM_POSTGRES_DATA_SOURCE
       PRISM_POSTGRES_WAL_SOURCE
+      PRISM_POSTGRES_REPLICA_DATA_SOURCE
       PRISM_AUDIT_DATA_SOURCE
     )
   fi
@@ -744,9 +766,6 @@ check_production_gate() {
         fail "production mode rejects ${name}=1"
       fi
     done
-    if [[ "${QBIT_CHAIN:-regtest}" == "mainnet" ]]; then
-      [[ "${PRISM_STRATUM_STALE_GRACE_SECONDS:-3}" == "0" ]] || fail "mainnet requires PRISM_STRATUM_STALE_GRACE_SECONDS=0"
-    fi
     [[ -n "${PRISM_DATABASE_URL:-}" || -n "${PRISM_POSTGRES_PSQL_COMMAND:-}" ]] || fail "production mode requires PRISM_DATABASE_URL or PRISM_POSTGRES_PSQL_COMMAND"
     [[ "${PRISM_POSTGRES_PASSWORD:-}" != "change-this" ]] || fail "production mode requires a non-default PRISM_POSTGRES_PASSWORD"
     [[ "${PRISM_DATABASE_URL:-}" != *"change-this"* ]] || fail "production mode requires a non-default PRISM_DATABASE_URL"
@@ -900,6 +919,35 @@ check_bitcoin_chain_selection() {
   esac
 }
 
+check_prism_stale_grace() {
+  mining_lane_enabled prism || return 0
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    # Production already requires python3 (check_prism_production_difficulty);
+    # lab bring-up does not, so skip rather than add a prerequisite there.
+    if production_mode_enabled; then
+      fail "python3 is required to validate PRISM_STRATUM_STALE_GRACE_SECONDS"
+    fi
+    printf 'doctor: python3 not found; skipping PRISM_STRATUM_STALE_GRACE_SECONDS validation\n'
+    return 0
+  fi
+  # Mirror the coordinator's env_nonnegative_float(): the runtime's float
+  # syntax and range, finite and non-negative.
+  if ! python3 - "${PRISM_STRATUM_STALE_GRACE_SECONDS:-3}" >/dev/null 2>&1 <<'PY'
+import math
+import sys
+
+try:
+    value = float(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if math.isfinite(value) and value >= 0 else 1)
+PY
+  then
+    fail "PRISM_STRATUM_STALE_GRACE_SECONDS must be a finite non-negative number"
+  fi
+}
+
 check_ctv_fee_config() {
   mining_lane_enabled prism || return 0
   is_true_env "${PRISM_CTV_SETTLEMENT_ENABLED:-0}" || return 0
@@ -965,6 +1013,7 @@ if mining_lane_enabled auxpow; then
   check_bool_env BITCOIN_DNSSEED
   check_bool_env BITCOIN_DISCOVER
 fi
+check_prism_stale_grace
 check_ctv_fee_config
 
 check_production_gate

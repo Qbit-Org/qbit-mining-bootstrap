@@ -4,26 +4,125 @@
 from __future__ import annotations
 
 import json
+import codecs
 import copy
 import hashlib
-import hmac
+import logging
 import os
 import math
 import shlex
 import subprocess
+import tempfile
 import time
 import traceback
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from threading import BoundedSemaphore, Lock, Thread, local
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, ClassVar, Iterator, Protocol, runtime_checkable
 
-from lab.prism.prism_tools import prism_tool_command
+from lab.prism.candidate_codec import (
+    CANDIDATE_BODY_STORAGE_VERSION,
+    INDEX_SPAN_ROWS,
+    LEGACY_CANDIDATE_STORAGE_VERSION,
+    CandidateBodyIntegrityError,
+    CandidateCodecError,
+    PreparedCandidateIntent,
+    SpoolCandidateBody,
+    SpoolFieldIndex,
+    prepare_candidate_intent,
+    prepared_intent_from_spool,
+    replay_header_from_fields,
+)
+from lab.prism.candidate_spool_view import is_spool_view, materialize_spool_views
+from lab.prism.candidate_store import (
+    BODY_READ_MAX_CHUNKS,
+    DEFAULT_SPOOL_RESERVATION_BYTES,
+    HEADER_PAGE_MAX_BYTES,
+    HEADER_PAGE_MAX_ROWS,
+    JANITOR_CHUNKS_PER_STEP,
+    LEGACY_HELPER_MEMORY_BYTES,
+    LEGACY_HELPER_TIMEOUT_SECONDS,
+    STALE_STAGING_SECONDS,
+    CandidateBodyHydrator,
+    CandidateBodyRef,
+    CandidateBodyUnavailable,
+    CandidateHeaderPage,
+    CandidateStorageError,
+    IncompatibleCandidateSchema,
+    LegacyCandidateHelper,
+    LegacyTransport,
+    SpoolAdmission,
+    body_chunk_sql,
+    body_index_rows_sql,
+    body_manifest_sql,
+    body_page_sql,
+    body_pages_sql,
+    body_spans_sql,
+    candidate_schema_refusal,
+    header_page_sql,
+    parse_body_page,
+    parse_manifest_row,
+    new_body_id,
+    reap_retired_chunks_sql,
+    retire_orphan_bodies_sql,
+    retire_staging_body_sql,
+    schema_capability_sql,
+    seal_body_sql,
+    stage_body_sql,
+)
+from lab.prism.audit_artifacts import (
+    AuditArtifactConfig,
+    AuditArtifactStore,
+    CanonicalAuditBundleCorrupt,
+    canonical_audit_bundle_bytes,
+)
+from lab.prism.audit_bundle_view import (
+    CanonicalAuditBundleView,
+    MappedSequence,
+    RawJsonDocument,
+    RawJsonRecord,
+    StreamedJsonString,
+    iter_json_chunks,
+    materialize_json,
+    streamed_sha256_json_hex,
+)
+from lab.prism.share_json_stream import (
+    canonical_share_items_bytes,
+    iter_json_object_text_chunks,
+)
+from lab.prism.writer_lease_timing import (  # noqa: F401 - compatibility re-export
+    DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
+    WRITER_LEASE_GUARD_STATEMENT_TIMEOUT_SECONDS,
+    WRITER_LEASE_VERIFICATION_MAX_STATEMENTS,
+)
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _text_stream_contains(chunks: Iterable[str], marker: str) -> bool:
+    """``marker in "".join(chunks)`` without joining the chunks."""
+    keep = max(0, len(marker) - 1)
+    tail = ""
+    for chunk in chunks:
+        window = tail + chunk
+        if marker in window:
+            return True
+        tail = window[-keep:] if keep else ""
+    return False
+
+
+def _default_bundle_canonicalizer() -> Callable[[dict[str, Any]], bytes]:
+    # Resolved at call time: bundle_compiler pulls in coordinator_config,
+    # whose CTV imports reach back into this module during initialization.
+    from lab.prism.bundle_compiler import canonical_bundle_bytes
+
+    return canonical_bundle_bytes
 
 AUDIT_BODY_REF_SCHEMA = "qbit.prism.audit-body-ref.v1"
 AUDIT_BUNDLE_V2_SCHEMA = "qbit.prism.audit-bundle.v2"
@@ -33,11 +132,67 @@ DEFAULT_AUDIT_SHARE_SEGMENT_SIZE = 10_000
 DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT = 20
 DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS = 300
 DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE = 512
+# Startup writer-lease acquisition runs each statement under this per-attempt
+# lock/statement deadline and gives up after this many timed-out attempts (see
+# _run_lease_acquisition_json). 5 attempts x 5s per attempt (~25s) is sized to
+# outlast a typical orphan reap rather than to guarantee one: the 15s
+# idle_in_transaction_session_timeout below runs on the blocking backend's own
+# clock, started when its transaction went idle and not when the successor
+# began retrying, so the two are not directly comparable. In the common case
+# the reap lands inside the budget and a later attempt acquires the lease with
+# no operator action; a budget that runs out reaches the fatal error, which is
+# still the point — a bounded visible failure instead of an unbounded wait.
+DEFAULT_LEASE_ACQUIRE_ATTEMPTS = 5
+DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS = 5.0
+# Session guards every coordinator Postgres session carries (see
+# PostgresSessionGuards). idle_in_transaction_session_timeout makes the server
+# abort a transaction whose client vanished between statements — the failure
+# that otherwise leaves the qbit_ledger_writer_lease row lock held until TCP
+# keepalive teardown (hours at OS defaults). The server-side tcp_keepalives_*
+# GUCs are the backstop for backends idle *outside* a transaction, where the
+# idle-in-transaction timer does not apply: on a TCP connection whose platform
+# implements them, the defaults bound the server's teardown of a socket toward
+# a vanished client at 30 + 3x10 = 60 seconds. Unix-socket connections ignore
+# them, leaving the idle-in-transaction timeout as the guard there.
+DEFAULT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS = 15.0
+# Records decoded per batch by the row-result read the payout-window snapshot
+# and delta run through (issue #236). Both production backends turn one
+# SELECT into one JSON value per row and convert those rows this many at a
+# time, rechecking the caller's deadline and stamping liveness between
+# batches, so no single decode call grows with the window. The figure bounds
+# the size of each C-level decode call and the gap between deadline checks,
+# not the result: the complete snapshot is still returned as one list, and
+# the driver still buffers the raw rows.
+PAYOUT_WINDOW_ROW_BATCH_SIZE = 512
+# read_replica_status() runs on the public read service's background probe
+# thread on a 5s cadence by default; a probe that outlives its own interval
+# tells the freshness gate nothing it does not already know from the previous
+# answer's age, so bound it well inside one interval.
+DEFAULT_READ_REPLICA_PROBE_TIMEOUT_SECONDS = 3.0
+DEFAULT_POSTGRES_TCP_KEEPALIVES_COUNT = 3
+DEFAULT_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS = 30
+DEFAULT_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS = 10
 # Only the coordinator assigns this prefix, and PsqlShareLedger preserves it
 # only after acquiring the writer/epoch advisory guard. Other ledger users and
 # psql-only deployments retain ordinary TTL fencing and are never treated as
 # fast-adoptable merely because they share an identity with a replacement.
 WRITER_LEASE_HEARTBEAT_SESSION_PREFIX = "heartbeat-v1:"
+# The third arm of _try_acquire_writer_lease's COALESCE. Both of the first two
+# arms are empty at once in exactly one reachable case: the first-ever
+# concurrent acquisition against an empty lease table, where the loser's
+# ON CONFLICT DO UPDATE affects no rows and the holder SELECT still reads the
+# statement snapshot it took before the winner committed. That is a retry
+# signal local to this one statement -- a fresh statement snapshot sees the
+# committed row -- so the statement names it instead of evaluating to SQL NULL
+# and reaching the generic no-JSON parser error.
+WRITER_LEASE_ACQUIRE_RETRY_KEY = "lease_snapshot_retry"
+WRITER_LEASE_ACQUIRE_RETRY_SUBJECT = "qbit ledger writer lease"
+# Attempts spent taking a fresh statement snapshot before the race is treated
+# as something other than the transient it is. Two attempts suffice under
+# READ COMMITTED (the second statement's snapshot postdates the winner's
+# commit); the third covers a re-raced row and bounds a caller that pinned an
+# older snapshot for the whole transaction, which no retry can advance.
+WRITER_LEASE_ACQUIRE_RETRY_ATTEMPTS = 3
 
 
 class WriterLeaseRenewalDeferred(RuntimeError):
@@ -57,19 +212,50 @@ class WriterLeaseRenewalDeferred(RuntimeError):
     """
 
 
-# Statements verify_writer_lease_guard_session may lawfully run inside one
-# guarded slot: the verification statement plus its single attribution
-# recheck. Callers that budget the verification's execution wall-clock must
-# cover this many server-side statement timeouts, or a lawful recheck under
-# moderate database latency is killed by the caller's deadline instead of
-# rescuing the coordinator.
-WRITER_LEASE_VERIFICATION_MAX_STATEMENTS = 2
-DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS = 1.0
+# WRITER_LEASE_VERIFICATION_MAX_STATEMENTS and
+# DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS now live in
+# lab.prism.writer_lease_timing, next to the rest of the heartbeat timing
+# policy they are terms of, and are re-exported above so every existing
+# import site keeps working.
 VALID_CREDIT_POLICIES = frozenset({"stale-grace"})
 
 
 class LedgerOperationTimeout(TimeoutError):
     """A caller-scoped PostgreSQL deadline expired before work completed."""
+
+
+class ReadOnlyLedgerError(RuntimeError):
+    """A read-only ledger was asked for the writer lock."""
+
+
+class _RefusingWriterGate:
+    """Stands in for the writer lock on a read-only ledger.
+
+    Every fenced statement and every writer-lock read in PsqlShareLedger --
+    appends, block landing, settlement, and the O(recipients) reads like
+    current_owed_balances() and audit_bundle() -- reaches the lock through
+    ``_operation_gate(self._lock, "writer lock")``. Substituting a gate that
+    refuses to be acquired makes "this process never fences" a property of the
+    object rather than of which methods its callers happen to use, so a future
+    public route that reached a fenced read would fail loudly here instead of
+    quietly serializing dashboard traffic against the block-landing path.
+    """
+
+    __slots__ = ()
+
+    _MESSAGE = "ledger is read-only: the writer lock is not available"
+
+    def acquire(self, timeout: float = -1.0) -> bool:
+        raise ReadOnlyLedgerError(self._MESSAGE)
+
+    def release(self) -> None:
+        raise ReadOnlyLedgerError(self._MESSAGE)
+
+    def __enter__(self) -> None:
+        raise ReadOnlyLedgerError(self._MESSAGE)
+
+    def __exit__(self, *exc_info: object) -> None:
+        raise ReadOnlyLedgerError(self._MESSAGE)
 
 
 def _is_postgres_deadline_error(error: BaseException | str) -> bool:
@@ -97,10 +283,6 @@ def _is_postgres_deadline_error(error: BaseException | str) -> bool:
             "operation timed out",
         )
     )
-
-
-class _AuditShareSegmentConflict(RuntimeError):
-    """A share sequence is bound to more than one audit payload."""
 
 
 def validate_credit_policy(credit_policy: str | None) -> str | None:
@@ -205,19 +387,13 @@ class _IncrementalShareWindowPage:
         records: tuple[AcceptedShareRecord, ...],
     ) -> _IncrementalShareWindowPage:
         prism_json_records = tuple(record.to_prism_json() for record in records)
+        # One bounded json.dumps per page (the page is at most one batch),
+        # byte-identical to encoding each record alone and joining with ",".
         return cls(
             records=records,
             total_difficulty=sum(int(record.share_difficulty) for record in records),
             prism_json_records=prism_json_records,
-            canonical_json_items=b",".join(
-                json.dumps(
-                    record,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    default=str,
-                ).encode()
-                for record in prism_json_records
-            ),
+            canonical_json_items=canonical_share_items_bytes(prism_json_records),
         )
 
 
@@ -360,6 +536,11 @@ class IncrementalShareWindow:
     def records(self) -> tuple[AcceptedShareRecord, ...]:
         return tuple(record for page in self.pages for record in page.records)
 
+    @property
+    def record_count(self) -> int:
+        """Retained record total; shared surface with DaemonShareWindowMirror."""
+        return sum(len(page.records) for page in self.pages)
+
     def json_records(self) -> IncrementalShareJsonSequence:
         return IncrementalShareJsonSequence(
             pages=self.pages,
@@ -487,6 +668,429 @@ class IncrementalShareWindow:
         )
 
 
+class DaemonWindowMirrorDivergence(RuntimeError):
+    """The coordinator's byte mirror disagrees with what the daemon reported.
+
+    Every mirror construction re-hashes the canonical items it holds against
+    the digest the daemon reported AND counts the records those bytes
+    actually contain against the count it reported, so a divergence between
+    the two implementations -- or a bug in the byte surgery itself -- becomes
+    a detected full-rescan instead of a silently wrong payout artifact.
+    Both checks are eager: nothing downstream may hold a mirror whose bytes
+    and metadata have not already been reconciled.
+    """
+
+
+# Bytes of one daemon canonical-items stream handed to the incremental UTF-8
+# decoder per call while the stream is walked. Read at call time so a test
+# can shrink it and drive record and multi-byte boundaries across chunks.
+CANONICAL_ITEMS_DECODE_CHUNK_BYTES = 64 * 1024
+
+
+def _walk_canonical_items(
+    fragment: bytes,
+    *,
+    chunk_bytes: int | None = None,
+    share_keys: bool = True,
+) -> Iterator[dict[str, object]]:
+    """Yield each record of one canonical items span; return the trailing flag.
+
+    The span is decoded in bounded chunks through an incremental UTF-8
+    decoder and parsed one record at a time with ``raw_decode``, which
+    reports where each record's JSON ends without re-encoding anything, so
+    no single C call covers more than one chunk or one record whatever the
+    window size (#236): the count comes from the bytes themselves rather
+    than from a number the daemon declared, and the interpreter can switch
+    threads between records. A span that is not a run of complete records
+    separated by ``,`` -- a truncated record, a doubled or leading
+    separator, junk between records, invalid UTF-8 -- raises
+    DaemonWindowMirrorDivergence where it is reached, never a parse the
+    caller may retry.
+
+    The generator's return value (``StopIteration.value``) is the trailing
+    flag, which distinguishes ``a,b`` from ``a,b,``: a dropped prefix
+    legitimately ends on a separator when records remain behind it, and a
+    complete stream never does. An empty span yields nothing and returns
+    False.
+
+    ``share_keys`` makes every yielded record reuse one string object per
+    distinct key, the way a single whole-array ``json.loads`` shares keys
+    through its scanner memo; ``raw_decode`` clears that memo per call, and
+    without the hook a 400k-record parse would carry 13 private key strings
+    per record (about 60% more resident memory, and a proportionally longer
+    release). A walk that only counts records passes False and skips the
+    rebuild.
+    """
+    total = len(fragment)
+    if not total:
+        return False
+    if chunk_bytes is None:
+        chunk_bytes = CANONICAL_ITEMS_DECODE_CHUNK_BYTES
+    chunk_bytes = max(1, int(chunk_bytes))
+    view = memoryview(fragment)
+    utf8 = codecs.getincrementaldecoder("utf-8")()
+    if share_keys:
+        shared_keys: dict[str, str] = {}
+
+        def rekey(record: dict[str, object]) -> dict[str, object]:
+            return {
+                shared_keys.setdefault(key, key): value
+                for key, value in record.items()
+            }
+
+        decoder = json.JSONDecoder(object_hook=rekey)
+    else:
+        decoder = json.JSONDecoder()
+    offset = 0
+    text = ""
+    position = 0
+
+    def refill(at_least: int = 0) -> bool:
+        """Decode the next chunk onto the unconsumed text; False once spent."""
+        nonlocal offset, text, position
+        if offset >= total:
+            return False
+        end = min(offset + max(chunk_bytes, at_least), total)
+        try:
+            decoded = utf8.decode(view[offset:end], end >= total)
+        except UnicodeDecodeError as exc:
+            raise DaemonWindowMirrorDivergence(
+                "daemon window mirror items are not valid UTF-8"
+            ) from exc
+        offset = end
+        text = text[position:] + decoded
+        position = 0
+        return True
+
+    after_separator = False
+    while True:
+        while position >= len(text):
+            if not refill():
+                # Spent where a record was required: only reachable right
+                # after a separator, so the span ended on one. (A non-empty
+                # span always decodes to at least one character, so the
+                # start never lands here.)
+                return after_separator
+        if text[position] != "{":
+            raise DaemonWindowMirrorDivergence(
+                "daemon window mirror items hold "
+                f"{text[position]!r} where a record was expected"
+            )
+        while True:
+            try:
+                record, end = decoder.raw_decode(text, position)
+            except ValueError as exc:
+                # The record may merely be cut by the chunk boundary: pull
+                # more bytes -- at least as many as are already pending, so
+                # a genuinely malformed record is found in logarithmically
+                # many retries rather than one per chunk -- and retry from
+                # the same position.
+                if refill(len(text) - position):
+                    continue
+                raise DaemonWindowMirrorDivergence(
+                    f"daemon window mirror items hold a malformed record: {exc}"
+                ) from exc
+            break
+        after_separator = False
+        yield record
+        position = end
+        while position >= len(text):
+            if not refill():
+                return False
+        if text[position] != ",":
+            raise DaemonWindowMirrorDivergence(
+                "daemon window mirror items hold "
+                f"{text[position]!r} where a record separator was expected"
+            )
+        position += 1
+        after_separator = True
+
+
+def _canonical_items_layout(fragment: bytes) -> tuple[int, bool]:
+    """Record count and trailing-separator flag for one canonical items span.
+
+    Walks the span record by record (see :func:`_walk_canonical_items`),
+    counting what the bytes actually hold and discarding each parsed record.
+    """
+    walker = _walk_canonical_items(fragment, share_keys=False)
+    count = 0
+    while True:
+        try:
+            next(walker)
+        except StopIteration as stop:
+            return count, bool(stop.value)
+        count += 1
+
+
+def _canonical_items_record_count(fragment: bytes) -> int:
+    """Record count of one complete canonical items stream."""
+    count, trailing = _canonical_items_layout(fragment)
+    if trailing:
+        raise DaemonWindowMirrorDivergence(
+            "daemon window mirror items end on a record separator"
+        )
+    return count
+
+
+class DaemonShareJsonSequence(Sequence):
+    """Lazy, byte-backed twin of :class:`IncrementalShareJsonSequence`.
+
+    When the daemon owns the payout-window fold, the coordinator holds only
+    the canonical items stream (every record's canonical JSON encoding joined
+    with ``,``) rather than materialized dicts. The routine build path needs
+    only the length, the digest, and this object's identity; the rare
+    consumers that genuinely need dicts (the found-block audit build, the
+    durable candidate intent, the one-shot builder fallback) force one
+    ``json.loads`` here, paying the parse exactly where the bytes are used.
+    Iteration order and the canonical digest are byte-identical to the paged
+    sequence by construction: both stream the same fragments in the same
+    order, and the digest framing is invariant to page layout.
+
+    The count check below is a floor, not the contract: a sequence handed
+    out by :class:`DaemonShareWindowMirror` had its count reconciled with
+    its bytes at construction, so no consumer of a mirror can be the first
+    to learn of a divergence.
+    """
+
+    __slots__ = ("canonical_items", "record_count", "_parse_lock", "_parsed")
+
+    def __init__(self, canonical_items: bytes, record_count: int) -> None:
+        self.canonical_items = bytes(canonical_items)
+        self.record_count = int(record_count)
+        self._parse_lock = Lock()
+        self._parsed: tuple[dict[str, object], ...] | None = None
+
+    def __len__(self) -> int:
+        return self.record_count
+
+    def _records(self) -> tuple[dict[str, object], ...]:
+        with self._parse_lock:
+            if self._parsed is None:
+                # Record at a time through the same strict walker that
+                # reconciled the mirror's count at construction: one
+                # ``raw_decode`` per record and one bounded UTF-8 decode per
+                # chunk, never a whole-window ``json.loads`` (#236). The
+                # parsed tuple is published only after every record parsed
+                # and the count matched, so a failure leaves nothing cached.
+                walker = _walk_canonical_items(self.canonical_items)
+                parsed: list[dict[str, object]] = []
+                while True:
+                    try:
+                        parsed.append(next(walker))
+                    except StopIteration as stop:
+                        trailing = bool(stop.value)
+                        break
+                if trailing:
+                    raise DaemonWindowMirrorDivergence(
+                        "daemon window mirror items end on a record separator"
+                    )
+                if len(parsed) != self.record_count:
+                    raise DaemonWindowMirrorDivergence(
+                        "daemon window mirror parsed "
+                        f"{len(parsed)} records where {self.record_count}"
+                        " were declared"
+                    )
+                self._parsed = tuple(parsed)
+            return self._parsed
+
+    def __iter__(self) -> Iterator[dict[str, object]]:
+        return iter(self._records())
+
+    def __getitem__(
+        self,
+        index: int | slice,
+    ) -> dict[str, object] | tuple[dict[str, object], ...]:
+        return self._records()[index]
+
+    def canonical_json_sha256(self) -> str:
+        digest = hashlib.sha256()
+        digest.update(b"[")
+        digest.update(self.canonical_items)
+        digest.update(b"]")
+        return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class DaemonShareWindowMirror:
+    """Coordinator-held opaque mirror of one daemon-prepared payout window.
+
+    Exposes the same identity surface as :class:`IncrementalShareWindow`
+    (anchor, weight, page size, ``record_count``) so the payout-state cache
+    policy code reads either interchangeably, while the window contents stay
+    pre-encoded bytes the daemon produced. Advancing applies the daemon's
+    reported byte surgery -- drop a prefix, append a suffix -- and every
+    construction verifies the resulting stream hashes to the daemon's digest
+    before anything downstream may consume it.
+    """
+
+    anchor_job_issued_at_ms: int
+    window_weight: int
+    page_size: int
+    record_count: int
+    canonical_items: bytes = field(repr=False)
+    share_snapshot_sha256: str
+
+    @staticmethod
+    def _verified_items_digest(canonical_items: bytes, declared_digest: str) -> None:
+        digest = hashlib.sha256()
+        digest.update(b"[")
+        digest.update(canonical_items)
+        digest.update(b"]")
+        if digest.hexdigest() != declared_digest:
+            raise DaemonWindowMirrorDivergence(
+                "daemon window mirror bytes do not hash to the daemon's digest"
+            )
+
+    @staticmethod
+    def _verified_record_count(counted: int, declared_count: int) -> None:
+        """Pin the declared count to one counted from the mirror's own bytes.
+
+        The digest above pins the bytes but says nothing about the count the
+        daemon reported alongside them, and the count is the one divergence
+        that would otherwise surface only when some consumer first parsed the
+        stream -- arbitrarily far from the materialization that produced it,
+        and after a partial request may already be on the daemon's stdin.
+        Counting eagerly here puts it beside the digest check, where every
+        construction pays it once and no consumer can be surprised.
+        """
+        if counted != int(declared_count):
+            raise DaemonWindowMirrorDivergence(
+                f"daemon window mirror holds {counted} records where "
+                f"{int(declared_count)} were declared"
+            )
+
+    @classmethod
+    def from_full_items(
+        cls,
+        *,
+        anchor_job_issued_at_ms: int,
+        window_weight: int,
+        page_size: int,
+        record_count: int,
+        canonical_items: bytes,
+        share_snapshot_sha256: str,
+    ) -> DaemonShareWindowMirror:
+        cls._verified_items_digest(canonical_items, share_snapshot_sha256)
+        cls._verified_record_count(
+            _canonical_items_record_count(canonical_items),
+            record_count,
+        )
+        return cls(
+            anchor_job_issued_at_ms=int(anchor_job_issued_at_ms),
+            window_weight=int(window_weight),
+            page_size=int(page_size),
+            record_count=int(record_count),
+            canonical_items=bytes(canonical_items),
+            share_snapshot_sha256=share_snapshot_sha256,
+        )
+
+    def _advanced_record_count(
+        self,
+        retained_drop_bytes: int,
+        appended_items: bytes,
+    ) -> int:
+        """Count an advance's records from the surgery, not the whole stream.
+
+        Only the dropped prefix and the appended suffix are walked, so this
+        costs what the byte surgery itself costs rather than what a rescan of
+        the retained window would. The already-verified count of this mirror
+        supplies the retained middle, and the separator placement at both
+        seams is checked: a drop or an append landing inside a record would
+        otherwise let a miscount masquerade as an aligned edit.
+        """
+        dropped, dropped_trailing = _canonical_items_layout(
+            self.canonical_items[:retained_drop_bytes]
+        )
+        retained_items = self.canonical_items[retained_drop_bytes:]
+        if retained_items:
+            if dropped and not dropped_trailing:
+                raise DaemonWindowMirrorDivergence(
+                    "daemon window advance dropped a partial record"
+                )
+        elif dropped_trailing:
+            raise DaemonWindowMirrorDivergence(
+                "daemon window advance dropped every record but kept a"
+                " separator"
+            )
+        retained = int(self.record_count) - dropped
+        if retained < 0:
+            raise DaemonWindowMirrorDivergence(
+                "daemon window advance dropped more records than the mirror"
+                " holds"
+            )
+        if not appended_items:
+            return retained
+        if retained_items:
+            # The retained span already ends on a record, so the suffix must
+            # carry the separator that rejoins the two.
+            if appended_items[:1] != b",":
+                raise DaemonWindowMirrorDivergence(
+                    "daemon window advance appended items without a record"
+                    " separator"
+                )
+            appended = _canonical_items_record_count(appended_items[1:])
+        else:
+            appended = _canonical_items_record_count(appended_items)
+        if not appended:
+            # A suffix that carried only a separator would leave the stream
+            # ending on one, which no complete window ever does.
+            raise DaemonWindowMirrorDivergence(
+                "daemon window advance appended a separator with no record"
+            )
+        return retained + appended
+
+    def advanced(
+        self,
+        *,
+        anchor_job_issued_at_ms: int,
+        record_count: int,
+        retained_drop_bytes: int,
+        appended_items: bytes,
+        share_snapshot_sha256: str,
+    ) -> DaemonShareWindowMirror:
+        retained_drop_bytes = int(retained_drop_bytes)
+        if retained_drop_bytes < 0 or retained_drop_bytes > len(self.canonical_items):
+            raise DaemonWindowMirrorDivergence(
+                "daemon window advance dropped more bytes than the mirror holds"
+            )
+        if retained_drop_bytes == 0 and not appended_items:
+            # Anchor-only advance: the stream is byte-identical, so a digest
+            # string comparison replaces the copy and the re-hash, and the
+            # count must be unchanged for the same reason.
+            canonical_items = self.canonical_items
+            if share_snapshot_sha256 != self.share_snapshot_sha256:
+                raise DaemonWindowMirrorDivergence(
+                    "daemon window advance changed the digest without bytes"
+                )
+            self._verified_record_count(self.record_count, record_count)
+        else:
+            canonical_items = (
+                self.canonical_items[retained_drop_bytes:] + bytes(appended_items)
+            )
+            self._verified_items_digest(canonical_items, share_snapshot_sha256)
+            self._verified_record_count(
+                self._advanced_record_count(
+                    retained_drop_bytes,
+                    bytes(appended_items),
+                ),
+                record_count,
+            )
+        return DaemonShareWindowMirror(
+            anchor_job_issued_at_ms=int(anchor_job_issued_at_ms),
+            window_weight=self.window_weight,
+            page_size=self.page_size,
+            record_count=int(record_count),
+            canonical_items=canonical_items,
+            share_snapshot_sha256=share_snapshot_sha256,
+        )
+
+    def json_records(self) -> DaemonShareJsonSequence:
+        return DaemonShareJsonSequence(
+            canonical_items=self.canonical_items,
+            record_count=self.record_count,
+        )
+
+
 @dataclass(frozen=True)
 class BlockCandidateIntentPersistResult:
     inserted: bool
@@ -496,6 +1100,69 @@ class BlockCandidateIntentPersistResult:
         return self.inserted
 
 
+def _block_candidate_cursor_parts(cursor: object) -> tuple[object, str]:
+    """Split one opaque pending-candidate cursor into its ordering parts.
+
+    The cursor is whatever ``pending_block_candidate_rows`` handed back on a
+    prior row and travels through the caller (and, for the Postgres backend,
+    through JSON) untouched, so it is validated on the way back in rather
+    than trusted. The shape is deliberately the two ordering columns and
+    nothing else: ordering by the creation stamp alone cannot resume, because
+    equal stamps would either re-emit or skip their peers.
+    """
+    if isinstance(cursor, str) or not isinstance(cursor, Sequence):
+        raise ValueError("pending block candidate cursor is not a two-element list")
+    parts = list(cursor)
+    if len(parts) != 2:
+        raise ValueError("pending block candidate cursor is not a two-element list")
+    created_at, block_hash = parts
+    if not isinstance(block_hash, str) or not block_hash:
+        raise ValueError("pending block candidate cursor has no block hash")
+    return created_at, block_hash
+
+
+def _normalized_block_candidate_hash_set(
+    block_hashes: Sequence[str],
+) -> tuple[str, ...]:
+    """Normalize a caller-supplied block-hash set for a batch outbox write.
+
+    Both backends key the outbox on the lowercase hash, so the same
+    lowercasing the single-hash terminal updates apply per call is applied
+    once here to the whole set. Duplicates collapse and the result is sorted
+    so a given input set always produces one identical target set --
+    including the generated SQL text, which a caller must be able to reason
+    about without knowing the caller's iteration order.
+    """
+    return tuple(sorted({str(block_hash).lower() for block_hash in block_hashes}))
+
+
+def _memory_block_candidate_row_key(row: dict[str, Any]) -> tuple[float, str]:
+    """Total-order key for one in-memory pending outbox row."""
+    return (float(row.get("created_monotonic", 0.0)), str(row["block_hash"]))
+
+
+def _memory_block_candidate_cursor_key(cursor: object) -> tuple[float, str]:
+    """Rebuild the in-memory ordering key from a returned cursor."""
+    created_monotonic, block_hash = _block_candidate_cursor_parts(cursor)
+    if isinstance(created_monotonic, bool) or not isinstance(
+        created_monotonic, (int, float)
+    ):
+        raise ValueError("pending block candidate cursor has no creation stamp")
+    return (float(created_monotonic), block_hash)
+
+
+class ShareReplayConflict(RuntimeError):
+    """A recovery row reused a share ID with a different durable payload."""
+
+
+@dataclass(frozen=True)
+class ShareReplayResult:
+    """Typed result for one legacy recovery-journal append."""
+
+    disposition: str
+    record: AcceptedShareRecord
+
+
 class SingleWriterShareLedger:
     """Assigns canonical share_seq values and returns immutable snapshots.
 
@@ -503,6 +1170,10 @@ class SingleWriterShareLedger:
     instance of this class. Later Postgres integration can keep this API shape
     while moving storage to `qbit_share_ledger`.
     """
+
+    # Bodies live in memory here, so a replay header row is hydrated at
+    # registration; the PostgreSQL ledger defers hydration to dequeue (#255).
+    candidate_hydration_deferred: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -529,6 +1200,10 @@ class SingleWriterShareLedger:
         self._ctv_fanout_sets: dict[str, dict[str, Any]] = {}
         self._ctv_fanout_statuses: dict[str, dict[str, Any]] = {}
         self._ctv_fanout_attempts: dict[str, list[dict[str, Any]]] = {}
+        self._audit_publication_sequences: dict[str, int | None] = {}
+        self._next_audit_publication_sequence = 1
+        self._inactive_audit_publications: set[str] = set()
+        self._memory_pool_blocks: dict[str, tuple[int, str, str]] = {}
         self._lock = Lock()
 
     def append(self, pending: PendingShare) -> AcceptedShareRecord:
@@ -563,6 +1238,49 @@ class SingleWriterShareLedger:
             self._shares_by_id[pending.share_id] = record
             self._next_share_seq += 1
             return record
+
+    def append_recovered_share(self, pending: PendingShare) -> ShareReplayResult:
+        """Append one recovery row with an explicit exact/conflict outcome."""
+        if pending.share_difficulty <= 0:
+            raise ValueError("share_difficulty must be positive")
+        if pending.network_difficulty <= 0:
+            raise ValueError("network_difficulty must be positive")
+        credit_policy = validate_credit_policy(pending.credit_policy)
+        with self._lock:
+            existing = self._shares_by_id.get(pending.share_id)
+            if existing is not None:
+                if not self._pending_matches_record(
+                    pending,
+                    existing,
+                    credit_policy=credit_policy,
+                ):
+                    raise ShareReplayConflict(
+                        f"recovered share payload conflicts with {pending.share_id}"
+                    )
+                return ShareReplayResult(
+                    "exact_existing",
+                    replace(existing, newly_inserted=False),
+                )
+            record = AcceptedShareRecord(
+                share_seq=self._next_share_seq,
+                share_id=pending.share_id,
+                miner_id=pending.miner_id,
+                order_key=pending.order_key,
+                p2mr_program_hex=pending.p2mr_program_hex,
+                share_difficulty=pending.share_difficulty,
+                network_difficulty=pending.network_difficulty,
+                template_height=pending.template_height,
+                job_id=pending.job_id,
+                job_issued_at_ms=pending.job_issued_at_ms,
+                accepted_at_ms=pending.accepted_at_ms,
+                ntime=pending.ntime,
+                credit_policy=credit_policy,
+            )
+            self._shares.append(record)
+            self._share_ids.add(pending.share_id)
+            self._shares_by_id[pending.share_id] = record
+            self._next_share_seq += 1
+            return ShareReplayResult("inserted", replace(record))
 
     @staticmethod
     def _pending_matches_record(
@@ -708,6 +1426,8 @@ class SingleWriterShareLedger:
             self._block_candidate_outbox[block_hash] = {
                 "block_hash": block_hash,
                 "share_id": None,
+                # Stored as handed in: a PreparedCandidateIntent keeps its
+                # immutable share sequence, never a list copy (#255).
                 "candidate": candidate,
                 "candidate_sha256": candidate_sha256,
                 "state": "pending",
@@ -726,9 +1446,122 @@ class SingleWriterShareLedger:
             for row in self.pending_block_candidate_rows(limit=limit)
         ]
 
-    def pending_block_candidate_rows(self, *, limit: int = 32) -> list[dict[str, Any]]:
-        """Return pending payloads together with their authoritative row keys."""
+    def pending_block_candidate_headers(
+        self,
+        *,
+        limit: int = HEADER_PAGE_MAX_ROWS,
+        after_cursor: object | None = None,
+        max_bytes: int = HEADER_PAGE_MAX_BYTES,
+    ) -> CandidateHeaderPage:
+        """Metadata-first page over the in-memory outbox (#255).
+
+        Same total order, cursor and configured row limit as
+        ``pending_block_candidate_rows`` (so the query shape and the
+        short-page exhaustion proof match what a caller configured), but
+        each row carries only the bounded typed replay header. There is no
+        transport here, so the byte cap that bounds the PostgreSQL page's
+        native decode does not apply: an in-memory page is row-bounded only
+        and never reports a byte truncation.
+        """
+        limit = max(1, min(int(limit), HEADER_PAGE_MAX_ROWS))
+        if after_cursor is None:
+            fetched = self.pending_block_candidate_rows(limit=limit)
+        else:
+            fetched = self.pending_block_candidate_rows(
+                limit=limit,
+                after_cursor=after_cursor,
+            )
+        rows: list[dict[str, Any]] = []
+        truncated_by_bytes = False
+        for row in fetched[:limit]:
+            candidate = row["candidate"]
+            header = replay_header_from_fields(candidate)
+            header_bytes = len(json.dumps(header, separators=(",", ":"), default=str))
+            with self._lock:
+                stored = self._block_candidate_outbox.get(str(row["block_hash"]))
+            rows.append(
+                {
+                    "block_hash": str(row["block_hash"]),
+                    "storage_version": (
+                        CANDIDATE_BODY_STORAGE_VERSION
+                        if isinstance(candidate, PreparedCandidateIntent)
+                        else LEGACY_CANDIDATE_STORAGE_VERSION
+                    ),
+                    "candidate_sha256": (
+                        str(stored["candidate_sha256"]) if stored is not None else ""
+                    ),
+                    "header": header,
+                    "header_bytes": header_bytes,
+                    "body": None,
+                    "pool_block_exists": bool(row["pool_block_exists"]),
+                    "cursor": row["cursor"],
+                }
+            )
+        return CandidateHeaderPage(
+            rows=tuple(rows),
+            next_cursor=rows[-1]["cursor"] if rows else after_cursor,
+            exhausted=len(fetched) < limit and not truncated_by_bytes,
+            fetched=len(fetched),
+            truncated_by_bytes=truncated_by_bytes,
+        )
+
+    def hydrate_block_candidate_intent(
+        self,
+        row: dict[str, Any],
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> Any:
+        """Return the stored intent mapping for one still-pending header row."""
+        block_hash = str(row["block_hash"]).lower()
         with self._lock:
+            stored = self._block_candidate_outbox.get(block_hash)
+            if stored is None or stored["state"] != "pending" or stored["candidate"] is None:
+                raise CandidateBodyUnavailable(
+                    f"block candidate {block_hash} is no longer pending"
+                )
+            return stored["candidate"]
+
+    def pending_block_candidate_rows(
+        self,
+        *,
+        limit: int = 32,
+        after_cursor: object | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return pending payloads together with their authoritative row keys.
+
+        Rows carry an opaque ``cursor`` the caller passes back verbatim as
+        ``after_cursor`` to resume strictly after that row. The order is the
+        total order ``(created, block_hash)``, so a page shorter than
+        ``limit`` proves no further pending row existed at query time and a
+        backlog of any size enumerates completely in bounded pages. The
+        block-hash tiebreak is what makes it a *total* order: creation
+        stamps collide (``time.monotonic`` here, one transaction's
+        ``clock_timestamp`` in Postgres), and a cursor on a colliding stamp
+        alone would either replay or skip its peers.
+
+        Each row also carries ``pool_block_exists``: whether a durable
+        ``qbit_pool_blocks`` row exists for that hash, i.e. whether the
+        candidate ever reached ``persist_accepted_block``. It is answered
+        inside this page read -- one bounded existence probe per returned row
+        -- because the alternative is one round trip per row, and a page is
+        read precisely when the backlog is large. The fact is advisory by the
+        time the caller holds it; the terminal batch update re-checks it under
+        the writer fence.
+        """
+        after = (
+            None
+            if after_cursor is None
+            else _memory_block_candidate_cursor_key(after_cursor)
+        )
+        with self._lock:
+            ordered = sorted(
+                (
+                    (_memory_block_candidate_row_key(row), row)
+                    for row in self._block_candidate_outbox.values()
+                    if row["state"] == "pending"
+                ),
+                key=lambda entry: entry[0],
+            )
             return [
                 {
                     "block_hash": str(row["block_hash"]),
@@ -737,9 +1570,13 @@ class SingleWriterShareLedger:
                         if isinstance(row["candidate"], dict)
                         else row["candidate"]
                     ),
+                    "pool_block_exists": (
+                        str(row["block_hash"]) in self._memory_pool_blocks
+                    ),
+                    "cursor": list(key),
                 }
-                for row in self._block_candidate_outbox.values()
-                if row["state"] == "pending"
+                for key, row in ordered
+                if after is None or key > after
             ][:limit]
 
     def block_candidate_pending_metrics(self) -> dict[str, int | float]:
@@ -794,6 +1631,46 @@ class SingleWriterShareLedger:
             row["last_error"] = error
             row["candidate"] = None
             return True
+
+    def mark_block_candidates_abandoned(
+        self,
+        *,
+        block_hashes: Sequence[str],
+        error: str,
+    ) -> tuple[str, ...]:
+        """Terminally abandon a caller-supplied page of pending rows at once.
+
+        Mirrors ``mark_block_candidate_abandoned`` for a set: only rows whose
+        current state is exactly ``pending`` transition, and the return value
+        is the normalized hashes this call actually transitioned rather than a
+        count, so the caller can restrict any follow-up cleanup to the rows it
+        won. Already-terminal and missing hashes are neither returned nor
+        mutated, and an empty set is a no-op.
+
+        A hash that owns a durable pool-block row is also left alone: that row
+        only exists for a candidate that was offered and landed, so it is not
+        a superseded sibling regardless of what the caller observed earlier.
+
+        The whole page runs under one lock acquisition so the returned set is
+        the outcome of a single atomic decision, matching the Postgres backend
+        where the same page is one fenced statement.
+        """
+        targets = _normalized_block_candidate_hash_set(block_hashes)
+        if not targets:
+            return ()
+        abandoned: list[str] = []
+        with self._lock:
+            for block_hash in targets:
+                row = self._block_candidate_outbox.get(block_hash)
+                if row is None or row["state"] != "pending":
+                    continue
+                if block_hash in self._memory_pool_blocks:
+                    continue
+                row["state"] = "abandoned"
+                row["last_error"] = error
+                row["candidate"] = None
+                abandoned.append(block_hash)
+        return tuple(abandoned)
 
     def snapshot_at_job_issue(
         self,
@@ -901,13 +1778,18 @@ class SingleWriterShareLedger:
         self,
         *,
         block_hash: str,
-        manifest_set: dict[str, Any],
+        manifest_set: Mapping[str, Any],
         manifest_set_sha256: str,
     ) -> dict[str, int | str]:
-        payload = ctv_fanout_recovery_payload(
-            block_hash=block_hash,
-            manifest_set=manifest_set,
-            manifest_set_sha256=manifest_set_sha256,
+        # The in-memory ledger holds its state as plain objects by design;
+        # a streamed payload (lazy manifests from a bounded artifact view)
+        # is materialized here, in this test-and-parity backend only.
+        payload = materialize_json(
+            ctv_fanout_recovery_payload(
+                block_hash=block_hash,
+                manifest_set=manifest_set,
+                manifest_set_sha256=manifest_set_sha256,
+            )
         )
         with self._lock:
             existing = self._ctv_fanout_sets.get(block_hash)
@@ -993,20 +1875,47 @@ class SingleWriterShareLedger:
         }
 
     def dashboard_public_artifact(self, *, sha256: str) -> dict[str, object] | None:
+        document = self.dashboard_public_artifact_document(sha256=sha256)
+        if document is None:
+            return None
+        return document.get("payload")
+
+    def dashboard_public_artifact_document(self, *, sha256: str) -> dict[str, object] | None:
+        """Artifact payload plus, for manifest kinds, its canonical text.
+
+        canonical_json is the exact serialized text the artifact's sha256 was
+        computed over, persisted at record time. Audit bundles are hashed
+        over Rust struct-order bytes that are not stored, so their
+        canonical_json is None and they keep the re-serialized response.
+        """
         with self._lock:
             for payload in self._ctv_fanout_sets.values():
                 if payload.get("audit_bundle_sha256") == sha256:
                     audit_bundle = payload.get("audit_bundle")
-                    return copy.deepcopy(audit_bundle) if isinstance(audit_bundle, dict) else None
+                    if not isinstance(audit_bundle, dict):
+                        return None
+                    return {"payload": copy.deepcopy(audit_bundle), "canonical_json": None}
                 if payload.get("manifest_set_sha256") == sha256:
                     manifest_set = payload.get("manifest_set")
-                    return copy.deepcopy(manifest_set) if isinstance(manifest_set, dict) else None
+                    if not isinstance(manifest_set, dict):
+                        return None
+                    manifest_set_json = payload.get("manifest_set_json")
+                    return {
+                        "payload": copy.deepcopy(manifest_set),
+                        "canonical_json": manifest_set_json if isinstance(manifest_set_json, str) else None,
+                    }
                 for artifact in payload.get("artifacts", []):
                     if not isinstance(artifact, dict):
                         continue
                     if artifact.get("manifest_sha256") == sha256:
                         manifest = artifact.get("manifest")
-                        return copy.deepcopy(manifest) if isinstance(manifest, dict) else None
+                        if not isinstance(manifest, dict):
+                            return None
+                        manifest_json = artifact.get("manifest_json")
+                        return {
+                            "payload": copy.deepcopy(manifest),
+                            "canonical_json": manifest_json if isinstance(manifest_json, str) else None,
+                        }
         return None
 
     def update_ctv_fanout_status(self, *, fanout_txid: str, settlement_status: str) -> dict[str, int | str]:
@@ -1144,6 +2053,8 @@ class SingleWriterShareLedger:
             ),
             "blocks_found_total": 0,
             "prism_blocks_total": 0,
+            "blocks_reversed_total": 0,
+            "blocks_inactive_total": 0,
             "total_mined_bits": 0,
             "latest_block": None,
             "reward_window": {
@@ -1184,9 +2095,11 @@ class SingleWriterShareLedger:
             "share_percent": share_percent,
         }
 
-    def dashboard_blocks(self, *, page: int, limit: int) -> dict[str, object]:
+    def dashboard_blocks(self, *, page: int, limit: int, chain_state: str = "active") -> dict[str, object]:
         from lab.prism import public_api
 
+        if chain_state not in public_api.BLOCKS_CHAIN_STATE_FILTERS:
+            raise ValueError("chain_state must be one of active, all, reversed")
         return {"pagination": public_api.pagination(page, limit, 0), "rows": []}
 
     def dashboard_miner_lifetime_earnings_bits(self, *, recipient_id: str) -> int:
@@ -1441,6 +2354,19 @@ class SingleWriterShareLedger:
             for bucket_epoch, entry in sorted(buckets.items())
         ]
 
+    def dashboard_block_markers(
+        self,
+        *,
+        range_id: str,
+        bucket: str,
+        range_anchor_epoch: int | None = None,
+    ) -> dict[str, object]:
+        # The in-memory backend records no found_at or solver detail for its
+        # pool blocks -- dashboard_blocks serves an empty page for the same
+        # reason -- so the marker series degrades to empty the way the other
+        # in-memory dashboard read models do.
+        return {"total_blocks": 0, "points": []}
+
     def persist_accepted_block(
         self,
         *,
@@ -1451,46 +2377,239 @@ class SingleWriterShareLedger:
         audit_report: dict[str, Any],
         canonical_bundle_path: Path | None = None,
     ) -> dict[str, int | str]:
+        block_hash = canonical_hex(block_hash, name="block_hash", expected_bytes=32)
+        with self._lock:
+            previous = self._memory_pool_blocks.get(block_hash)
+            if previous is not None and previous[0] != int(block_height):
+                raise RuntimeError("memory pool block height conflicts")
+            if previous is None:
+                self._memory_pool_blocks[block_hash] = (
+                    int(block_height),
+                    "prepared",
+                    str(parent_hash),
+                )
+            self._audit_publication_sequences.setdefault(block_hash, None)
+            share_count = len(self._shares)
         return {
             "backend": "memory",
-            "share_count": len(self),
+            "share_count": share_count,
             "block_count": 0,
             "payout_entry_count": 0,
             "carry_forward_count": 0,
         }
 
     def reverse_immature_block(self, *, block_hash: str, active_tip_height: int) -> dict[str, int | str]:
+        block_hash = canonical_hex(block_hash, name="block_hash", expected_bytes=32)
+        with self._lock:
+            block = self._memory_pool_blocks.get(block_hash)
+            if (
+                block is not None
+                and block[1] in {"confirmed", "inactive"}
+                and int(active_tip_height) >= block[0] + 1000
+            ):
+                raise RuntimeError(
+                    f"refusing to reverse mature pool block {block_hash}"
+                )
+            if block is None or block[1] not in {
+                "prepared",
+                "confirmed",
+                "inactive",
+            }:
+                count = 0
+            else:
+                self._memory_pool_blocks[block_hash] = (
+                    block[0],
+                    "reversed",
+                    block[2],
+                )
+                self._inactive_audit_publications.discard(block_hash)
+                count = 1
         return {
             "backend": "memory",
-            "reversed_count": 0,
+            "reversed_count": count,
         }
 
     def reject_prepared_block(self, *, block_hash: str, active_tip_height: int) -> dict[str, int | str]:
+        block_hash = canonical_hex(block_hash, name="block_hash", expected_bytes=32)
+        with self._lock:
+            block = self._memory_pool_blocks.get(block_hash)
+            if block is None or block[1] != "prepared":
+                count = 0
+            else:
+                self._memory_pool_blocks[block_hash] = (
+                    block[0],
+                    "rejected",
+                    block[2],
+                )
+                count = 1
         return {
             "backend": "memory",
-            "rejected_count": 0,
+            "rejected_count": count,
         }
 
     def confirm_accepted_block(self, *, block_hash: str, active_tip_height: int) -> dict[str, int | str]:
+        block_hash = canonical_hex(block_hash, name="block_hash", expected_bytes=32)
+        with self._lock:
+            block = self._memory_pool_blocks.get(block_hash)
+            if (
+                block is None
+                or block[0] != int(active_tip_height)
+                or block[1] not in {"prepared", "confirmed"}
+            ):
+                # Mirror the Postgres disposition split: a row already
+                # terminally disposed (reorg quarantine, rejection, or
+                # reversal) reports superseded (-1); 0 keeps meaning no row
+                # or a live row this confirmation does not match.
+                if block is not None and block[1] in {
+                    "inactive",
+                    "rejected",
+                    "reversed",
+                }:
+                    return {"backend": "memory", "confirmed_count": -1}
+                return {"backend": "memory", "confirmed_count": 0}
+            # Mirror the Postgres disposition split again: only a flip out of
+            # 'prepared' is a fresh confirmation (1). A row already confirmed
+            # at this height is an idempotent replay (2) that keeps the
+            # ordinal its flip allocated and burns none.
+            already_confirmed = block[1] == "confirmed"
+            publication_sequence = self._audit_publication_sequences.get(block_hash)
+            if publication_sequence is None:
+                publication_sequence = self._next_audit_publication_sequence
+                self._next_audit_publication_sequence += 1
+                self._audit_publication_sequences[block_hash] = publication_sequence
+            self._memory_pool_blocks[block_hash] = (
+                block[0],
+                "confirmed",
+                block[2],
+            )
         return {
             "backend": "memory",
-            "confirmed_count": 1,
+            "confirmed_count": 2 if already_confirmed else 1,
+            "audit_publication_sequence": publication_sequence,
         }
 
     def reorg_watch_blocks(self, *, active_tip_height: int) -> list[dict[str, object]]:
         return []
 
+    def stranded_prepared_blocks(
+        self,
+        *,
+        active_tip_height: int,
+        min_depth: int,
+        limit: int = 64,
+    ) -> list[dict[str, object]]:
+        """Return deeply buried rows still parked in the prepared state.
+
+        ``reorg_watch_blocks`` deliberately watches only confirmed/inactive
+        rows, and a prepared row is normally resolved by the live
+        submit/replay path that owns it. A row whose outbox entry is gone
+        (quarantined, or completed by a process that died before confirming)
+        therefore has nothing left to re-examine it, and stays prepared
+        forever. This read finds those rows; the caller decides, against the
+        active chain, which ones are provably orphaned.
+        """
+        with self._lock:
+            rows = [
+                {
+                    "block_hash": block_hash,
+                    "block_height": int(block[0]),
+                    "parent_hash": str(block[2]),
+                }
+                for block_hash, block in self._memory_pool_blocks.items()
+                # The memory backend derives maturity_state from chain_state
+                # (see pool_block_state): 'prepared' is always 'immature'.
+                if block[1] == "prepared"
+                and int(block[0]) <= int(active_tip_height) - int(min_depth)
+            ]
+        rows.sort(key=lambda row: (int(row["block_height"]), str(row["block_hash"])))
+        return rows[: max(0, int(limit))]
+
     def mark_pool_block_inactive(self, *, block_hash: str, active_tip_height: int) -> dict[str, int | str]:
+        block_hash = canonical_hex(block_hash, name="block_hash", expected_bytes=32)
+        with self._lock:
+            block = self._memory_pool_blocks.get(block_hash)
+            if block is None or block[1] != "confirmed":
+                count = 0
+            else:
+                self._inactive_audit_publications.add(block_hash)
+                self._memory_pool_blocks[block_hash] = (
+                    block[0],
+                    "inactive",
+                    block[2],
+                )
+                count = 1
         return {
             "backend": "memory",
-            "inactive_count": 0,
+            "inactive_count": count,
         }
 
     def reactivate_pool_block(self, *, block_hash: str, active_tip_height: int) -> dict[str, int | str]:
+        block_hash = canonical_hex(block_hash, name="block_hash", expected_bytes=32)
+        with self._lock:
+            block = self._memory_pool_blocks.get(block_hash)
+            if (
+                block is None
+                or block[0] > int(active_tip_height)
+                or block[1] != "inactive"
+                or block_hash not in self._inactive_audit_publications
+            ):
+                count = 0
+                sequence = None
+            else:
+                sequence = self._audit_publication_sequences.get(block_hash)
+                if sequence is None:
+                    raise RuntimeError(
+                        "inactive pool block has no audit publication sequence"
+                    )
+                self._inactive_audit_publications.remove(block_hash)
+                self._memory_pool_blocks[block_hash] = (
+                    block[0],
+                    "confirmed",
+                    block[2],
+                )
+                count = 1
         return {
             "backend": "memory",
-            "reactivated_count": 0,
+            "reactivated_count": count,
+            **(
+                {"audit_publication_sequence": int(sequence)}
+                if sequence is not None
+                else {}
+            ),
         }
+
+    def pool_block_state(self, *, block_hash: str) -> dict[str, object] | None:
+        block_hash = canonical_hex(block_hash, name="block_hash", expected_bytes=32)
+        with self._lock:
+            block = self._memory_pool_blocks.get(block_hash)
+            if block is None:
+                return None
+            publication_sequence = self._audit_publication_sequences.get(block_hash)
+            return {
+                "block_hash": block_hash,
+                "block_height": block[0],
+                "parent_hash": block[2],
+                "chain_state": block[1],
+                "maturity_state": (
+                    "reversed"
+                    if block[1] in {"rejected", "reversed"}
+                    else "immature"
+                ),
+                "audit_publication_sequence": publication_sequence,
+            }
+
+    def audit_publication_sequence_floor(self) -> int:
+        """Return the newest ordinal attached to any durable pool-block row."""
+
+        with self._lock:
+            return max(
+                (
+                    sequence
+                    for sequence in self._audit_publication_sequences.values()
+                    if sequence is not None
+                ),
+                default=0,
+            )
 
     def mark_mature_pool_payouts(self, *, active_tip_height: int) -> dict[str, int | str]:
         return {
@@ -1636,6 +2755,172 @@ def _writer_lease_advisory_lock_key(writer_id: str, writer_epoch: int) -> int:
     return int.from_bytes(digest[:8], "big", signed=True)
 
 
+@runtime_checkable
+class LedgerSqlPort(Protocol):
+    """The pooled statement-execution seam `PsqlShareLedger` writes through.
+
+    `_NativePostgresClient` is the production implementation. Naming the
+    contract lets a test substitute a whole PostgreSQL model at construction
+    time (see `sql_backend_factory`) instead of reassigning bound methods on
+    a live ledger, which is what the lease and landing concurrency tests
+    need: statement timing, tuple-lock waits and transaction lifetime are
+    properties of this seam, not of any single method.
+
+    Two statement shapes cross it. ``run_json`` runs a statement that
+    evaluates to one JSON value (every mutation, lease statement and
+    aggregate read). ``run_json_rows`` runs a read-only statement that
+    yields one JSON value per row and hands the rows back in bounded
+    batches (issue #236): the payout-window snapshot and delta, whose
+    single ``json_agg`` value used to be decoded in one GIL-held call the
+    size of the whole window.
+    """
+
+    def run_json(
+        self,
+        sql: str,
+        *,
+        retry_safe: bool = False,
+        timeout_seconds: float | None = None,
+        on_statement_start: Callable[[], None] | None = None,
+    ) -> Any: ...
+
+    def run_json_rows(
+        self,
+        sql: str,
+        *,
+        retry_safe: bool = False,
+        timeout_seconds: float | None = None,
+        on_statement_start: Callable[[], None] | None = None,
+        row_converter: Callable[[Any], Any] | None = None,
+        batch_size: int = PAYOUT_WINDOW_ROW_BATCH_SIZE,
+        on_batch: Callable[[], None] | None = None,
+    ) -> list[Any]: ...
+
+    def run_script(self, sql: str) -> None: ...
+
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class LeaseGuardPort(Protocol):
+    """The dedicated writer-lease guard session seam.
+
+    `_NativePostgresLeaseGuard` is the production implementation. Unlike
+    `LedgerSqlPort` this session is never transparently replaced: losing it
+    loses the advisory lock and must fence the owning coordinator, so the
+    heartbeat's liveness proof depends on the session's identity surviving.
+    A substitute must honour the same contract, including the serialized
+    query slot that `on_query_start` marks, the per-statement round trip
+    `on_statement_end` marks, the per-statement parsed result
+    `on_statement_result` hands back (issue #227: how a statement's own
+    server-side execution time reaches the caller), and the in-slot
+    `followup` statement the attribution recheck relies on.
+    """
+
+    def try_acquire(self) -> bool: ...
+
+    @property
+    def held(self) -> bool: ...
+
+    def run_json(
+        self,
+        sql: str,
+        *,
+        on_query_start: Callable[[], None] | None = None,
+        on_statement_end: Callable[[], None] | None = None,
+        on_statement_result: Callable[[Any], None] | None = None,
+        followup: Callable[[Any], str | None] | None = None,
+    ) -> Any: ...
+
+    def close(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class PostgresSessionGuards:
+    """Session-level GUCs this ledger sets on every connection it opens.
+
+    Two guarantees ride the one libpq ``options`` carrier, because a setting
+    delivered at connect time covers every statement the session can run —
+    including the autocommit ones — rather than being re-asserted per
+    transaction by code that a future caller might bypass.
+
+    The first is orphan reaping. A coordinator client that disappears without
+    an RST — network partition, SIGSTOP, VM pause — can leave its backend idle
+    in transaction, still holding every row lock the transaction took. The
+    writer-lease landing CTE row-locks the qbit_ledger_writer_lease singleton,
+    so one such orphan blocks a successor's startup lease upsert until the
+    kernel's TCP keepalive teardown (hours at OS defaults). These GUCs make the
+    *server* resolve that on its own: idle_in_transaction_session_timeout
+    aborts the orphaned transaction and releases its locks, and the
+    server-side tcp_keepalives_* settings (all PGC_USERSET, settable per
+    session) bound how long the server keeps a dead socket alive for backends
+    the idle-in-transaction timer cannot cover.
+
+    The second is read-only enforcement. ``read_only`` adds
+    default_transaction_read_only=on, so PostgreSQL refuses the write itself
+    for a ledger built with ``read_only=True``. The refusing writer gate is
+    the in-process half of that promise and remains defense in depth, but it
+    only covers paths that take the gate; the GUC covers every statement the
+    session can issue, wherever the ledger points. Without it the guarantee
+    came from the deployment topology — a hot standby refusing writes — which
+    is absent whenever the read tier is aimed at a writable primary.
+
+    Constructed once in PsqlShareLedger.__init__ and shared by all three
+    connection paths — the pooled native client, the dedicated lease-guard
+    session, and the psql subprocess backend. The orphan coverage is real but
+    bounded: the tcp_keepalives_* settings are silently ignored on
+    Unix-socket connections and on platforms that do not implement them, so
+    idle_in_transaction_session_timeout is the guard that always applies;
+    and these are session settings, so they reach only the sessions *this*
+    coordinator opens. A foreign session already holding the lease row —
+    another deployment's coordinator, an operator's psql — is bounded only
+    by the caller-side acquisition deadline in _run_lease_acquisition_json.
+    """
+
+    idle_in_transaction_timeout_seconds: float
+    tcp_keepalives_idle_seconds: int
+    tcp_keepalives_interval_seconds: int
+    tcp_keepalives_count: int
+    read_only: bool = False
+
+    def options_fragment(self) -> str:
+        """Render the guards as libpq ``options`` / PGOPTIONS ``-c`` flags.
+
+        The read-only setting goes last so that it wins over any earlier
+        duplicate, the same way the whole fragment is placed after an
+        operator's DSN-level options by _merged_session_options.
+        """
+        idle_ms = max(1, int(self.idle_in_transaction_timeout_seconds * 1000))
+        fragment = (
+            f"-c idle_in_transaction_session_timeout={idle_ms}ms "
+            f"-c tcp_keepalives_idle={self.tcp_keepalives_idle_seconds} "
+            f"-c tcp_keepalives_interval={self.tcp_keepalives_interval_seconds} "
+            f"-c tcp_keepalives_count={self.tcp_keepalives_count}"
+        )
+        if self.read_only:
+            fragment += " -c default_transaction_read_only=on"
+        return fragment
+
+
+def _merged_session_options(
+    psycopg_module: Any,
+    conninfo: str,
+    *coordinator_fragments: str,
+) -> str:
+    """Merge the coordinator's session options with the conninfo's own.
+
+    Passing ``options`` as a connect kwarg replaces any ``options`` value the
+    operator embedded in the DSN outright, so that value must be read back
+    out of the conninfo and kept. The coordinator's fragments go last: libpq
+    applies ``-c`` settings left to right with the last duplicate winning, so
+    a DSN-level default can never silently disable the session guards.
+    """
+    existing = psycopg_module.conninfo.conninfo_to_dict(conninfo).get("options")
+    fragments = [str(existing).strip()] if existing else []
+    fragments.extend(coordinator_fragments)
+    return " ".join(fragment for fragment in fragments if fragment)
+
+
 class _NativePostgresClient:
     """Persistent pooled psycopg client for the share ledger.
 
@@ -1656,18 +2941,26 @@ class _NativePostgresClient:
     (see ``verify_writer_lease_guard_session``).
     """
 
+    # The clock ``run_json_rows`` budgets its local decoding against. A class
+    # attribute so a test built through ``__new__`` can drive the
+    # between-batch deadline with a virtual clock; ``run_json``'s
+    # single-value path is unchanged and keeps reading time.monotonic.
+    _monotonic: Callable[[], float] = staticmethod(time.monotonic)
+
     def __init__(
         self,
         conninfo: str,
         *,
         pool_size: int,
         application_name: str | None = None,
+        session_guards: PostgresSessionGuards | None = None,
     ):
         import psycopg  # deferred: the subprocess backend must work without it
 
         self._psycopg = psycopg
         self._conninfo = conninfo
         self._application_name = application_name
+        self._session_guards = session_guards
         self._pool_size = max(1, int(pool_size))
         self._slots = BoundedSemaphore(self._pool_size)
         self._idle: list[Any] = []
@@ -1687,6 +2980,16 @@ class _NativePostgresClient:
             kwargs["connect_timeout"] = max(1, math.ceil(timeout_seconds))
         if self._application_name is not None:
             kwargs["application_name"] = self._application_name
+        session_guards = getattr(self, "_session_guards", None)
+        if session_guards is not None:
+            # Every pooled session carries the orphan-reaping guards, merged
+            # so an operator's DSN-level options value survives with the
+            # guard fragment last (last -c duplicate wins).
+            kwargs["options"] = _merged_session_options(
+                self._psycopg,
+                self._conninfo,
+                session_guards.options_fragment(),
+            )
         return self._psycopg.connect(self._conninfo, **kwargs)
 
     @contextmanager
@@ -1743,6 +3046,7 @@ class _NativePostgresClient:
         *,
         retry_safe: bool = False,
         timeout_seconds: float | None = None,
+        on_statement_start: Callable[[], None] | None = None,
     ) -> Any:
         """Run one JSON-returning statement.
 
@@ -1773,6 +3077,8 @@ class _NativePostgresClient:
                 )
                 with connection as conn:
                     if deadline is None:
+                        if on_statement_start is not None:
+                            on_statement_start()
                         row = conn.execute(sql).fetchone()
                     else:
                         remaining = deadline - time.monotonic()
@@ -1780,6 +3086,8 @@ class _NativePostgresClient:
                             raise LedgerOperationTimeout(
                                 "postgres statement deadline expired"
                             )
+                        if on_statement_start is not None:
+                            on_statement_start()
                         timeout_ms = max(1, int(remaining * 1000))
                         # SET LOCAL confines both guards to this explicit
                         # transaction, so pooled connections cannot leak a
@@ -1801,6 +3109,156 @@ class _NativePostgresClient:
                 if attempt + 1 >= attempts:
                     raise RuntimeError(f"postgres query failed: {exc}") from exc
         raise AssertionError("unreachable")
+
+    def run_json_rows(
+        self,
+        sql: str,
+        *,
+        retry_safe: bool = False,
+        timeout_seconds: float | None = None,
+        on_statement_start: Callable[[], None] | None = None,
+        row_converter: Callable[[Any], Any] | None = None,
+        batch_size: int = PAYOUT_WINDOW_ROW_BATCH_SIZE,
+        on_batch: Callable[[], None] | None = None,
+    ) -> list[Any]:
+        """Run one read-only statement that yields one JSON value per row.
+
+        The row-result counterpart of ``run_json`` (issue #236). ``run_json``
+        returns a single JSON value, which for the payout-window snapshot
+        meant one ``json_agg`` over the whole window: the driver decoded
+        every record in one C call that never released the GIL, and the
+        lease monitor thread went unscheduled for the duration. Here the
+        statement projects one JSON object per row and the result is
+        consumed with ``fetchmany`` in ``batch_size`` slices, so the driver
+        decodes at most one slice per call and the interpreter can switch
+        threads between slices.
+
+        Same connection borrowing, same deadline transaction shape (``SET
+        LOCAL statement_timeout`` / ``lock_timeout`` when a deadline is
+        armed), same ``OperationalError`` translation and the same
+        once-only retry for ``retry_safe`` statements as ``run_json``. Two
+        properties are specific to this path:
+
+        * One SELECT, one snapshot. The complete result is received from
+          the server before the first row is decoded, and the deadline
+          transaction commits before local decoding starts, so a long
+          decode never holds a server transaction open against
+          ``idle_in_transaction_session_timeout``. A concurrent append
+          cannot appear in part of a snapshot, and a retry after a
+          connection loss discards every partially converted row and
+          re-executes the complete statement inside the original deadline.
+        * The deadline covers decoding. It is rechecked before every
+          batch, so a budget that expires while rows are still being
+          converted raises ``LedgerOperationTimeout`` and publishes
+          nothing, rather than returning late with a complete list.
+
+        ``row_converter`` runs on each row's JSON value inside the batch
+        loop (the ledger passes its record constructor), so one batch's
+        intermediate dicts are released before the next is fetched.
+        ``on_batch`` fires after each converted batch; the ledger uses it to
+        recheck its own operation deadline and stamp liveness. The batch
+        size bounds each decode call and the interval between checks, not
+        client memory: psycopg's client-side cursor still buffers the raw
+        result, exactly as it did under ``run_json``.
+        """
+        attempts = 2 if retry_safe else 1
+        batch_size = max(1, int(batch_size))
+        deadline = (
+            None
+            if timeout_seconds is None
+            else self._monotonic() + max(0.0, timeout_seconds)
+        )
+        for attempt in range(attempts):
+            try:
+                remaining = (
+                    None
+                    if deadline is None
+                    else max(0.0, deadline - self._monotonic())
+                )
+                if remaining is not None and remaining <= 0:
+                    raise LedgerOperationTimeout("postgres statement deadline expired")
+                connection = (
+                    self.connection()
+                    if remaining is None
+                    else self.connection(timeout_seconds=remaining)
+                )
+                with connection as conn:
+                    if deadline is None:
+                        if on_statement_start is not None:
+                            on_statement_start()
+                        cursor = conn.execute(sql)
+                    else:
+                        remaining = deadline - self._monotonic()
+                        if remaining <= 0:
+                            raise LedgerOperationTimeout(
+                                "postgres statement deadline expired"
+                            )
+                        if on_statement_start is not None:
+                            on_statement_start()
+                        timeout_ms = max(1, int(remaining * 1000))
+                        # Same SET LOCAL scoping as run_json. The block ends,
+                        # and the server transaction commits, before any
+                        # row is decoded: the client-side cursor already
+                        # holds the complete result, and a long decode must
+                        # not keep a server transaction open.
+                        with conn.transaction():
+                            conn.execute(
+                                f"SET LOCAL statement_timeout = '{timeout_ms}ms'"
+                            )
+                            conn.execute(
+                                f"SET LOCAL lock_timeout = '{timeout_ms}ms'"
+                            )
+                            cursor = conn.execute(sql)
+                    try:
+                        return self._consume_json_rows(
+                            cursor,
+                            deadline=deadline,
+                            row_converter=row_converter,
+                            batch_size=batch_size,
+                            on_batch=on_batch,
+                        )
+                    finally:
+                        cursor.close()
+            except self._psycopg.OperationalError as exc:
+                if timeout_seconds is not None and _is_postgres_deadline_error(exc):
+                    raise LedgerOperationTimeout(
+                        f"postgres operation exceeded {timeout_seconds:g}s"
+                    ) from exc
+                if attempt + 1 >= attempts:
+                    raise RuntimeError(f"postgres query failed: {exc}") from exc
+        raise AssertionError("unreachable")
+
+    def _consume_json_rows(
+        self,
+        cursor: Any,
+        *,
+        deadline: float | None,
+        row_converter: Callable[[Any], Any] | None,
+        batch_size: int,
+        on_batch: Callable[[], None] | None,
+    ) -> list[Any]:
+        """Convert a buffered row result in bounded batches.
+
+        A NULL row is rejected the way ``run_json`` rejects a NULL value;
+        a text row (a ``::text``-cast projection) is decoded here so both
+        column types produce the same Python objects.
+        """
+        results: list[Any] = []
+        while True:
+            if deadline is not None and self._monotonic() >= deadline:
+                raise LedgerOperationTimeout(
+                    "postgres statement deadline expired while decoding rows"
+                )
+            batch = cursor.fetchmany(batch_size)
+            if not batch:
+                return results
+            for row in batch:
+                value = parse_single_json_value(row[0] if row else None)
+                results.append(
+                    value if row_converter is None else row_converter(value)
+                )
+            if on_batch is not None:
+                on_batch()
 
     def run_script(self, sql: str) -> None:
         """Run a multi-statement script (schema initialization)."""
@@ -1826,14 +3284,40 @@ class _NativePostgresLeaseGuard:
     coordinator. The lease heartbeat runs on this same isolated session.
     """
 
-    def __init__(self, conninfo: str, advisory_lock_key: int):
+    def __init__(
+        self,
+        conninfo: str,
+        advisory_lock_key: int,
+        *,
+        session_guards: PostgresSessionGuards | None = None,
+    ):
         import psycopg  # deferred: psql-only users retain TTL fencing
 
+        # The short statement_timeout stays: the guard session must never
+        # queue behind a fenced write (see verify_writer_lease_guard_session).
+        # It is also the dominant term in the heartbeat's staleness envelope
+        # (WriterLeaseHeartbeatPolicy.max_healthy_server_gap_seconds), so the
+        # value is taken from the timing policy rather than written twice.
+        # The session guards ride the same options string so this dedicated
+        # connection carries the same orphan bounds as every pooled one.
+        # Merged with any operator DSN-level options, coordinator fragments
+        # last so they win.
+        statement_timeout_ms = int(
+            round(WRITER_LEASE_GUARD_STATEMENT_TIMEOUT_SECONDS * 1000)
+        )
+        options = f"-c statement_timeout={statement_timeout_ms}"
+        if session_guards is not None:
+            options = _merged_session_options(
+                psycopg,
+                conninfo,
+                options,
+                session_guards.options_fragment(),
+            )
         self._connection = psycopg.connect(
             conninfo,
             autocommit=True,
             connect_timeout=2,
-            options="-c statement_timeout=500",
+            options=options,
         )
         self._advisory_lock_key = advisory_lock_key
         self._query_lock = Lock()
@@ -1856,6 +3340,8 @@ class _NativePostgresLeaseGuard:
         sql: str,
         *,
         on_query_start: Callable[[], None] | None = None,
+        on_statement_end: Callable[[], None] | None = None,
+        on_statement_result: Callable[[Any], None] | None = None,
         followup: Callable[[Any], str | None] | None = None,
     ) -> Any:
         with self._query_lock:
@@ -1869,6 +3355,19 @@ class _NativePostgresLeaseGuard:
                 raise RuntimeError("postgres writer lease guard is not held")
             row = self._connection.execute(sql).fetchone()
             result = parse_single_json_value(row[0] if row else None)
+            # Every completed round trip is server-proven liveness, and the
+            # boundary the caller's phase attribution charges guard SQL
+            # against. It fires after the result is parsed so a malformed
+            # response is not counted as a healthy round trip.
+            # ``on_statement_result`` then hands the same round trip's parsed
+            # result to the caller, which is how a statement that reports
+            # its own server-side execution time (issue #227) gets that
+            # figure back per statement without a second round trip. The
+            # guard stays agnostic about the result's shape.
+            if on_statement_end is not None:
+                on_statement_end()
+            if on_statement_result is not None:
+                on_statement_result(result)
             # A followup runs inside this same serialized slot: no second
             # queue wait behind other guard callers can be charged to the
             # caller's execution budget. Each execute on this autocommit
@@ -1881,6 +3380,10 @@ class _NativePostgresLeaseGuard:
                     break
                 row = self._connection.execute(next_sql).fetchone()
                 result = parse_single_json_value(row[0] if row else None)
+                if on_statement_end is not None:
+                    on_statement_end()
+                if on_statement_result is not None:
+                    on_statement_result(result)
             return result
 
     def close(self) -> None:
@@ -1893,6 +3396,39 @@ class _NativePostgresLeaseGuard:
             self._connection.close()
         except Exception:
             pass
+
+
+# The JSON key both guard statements use to report their own server-side
+# execution time (issue #227): ``clock_timestamp() - statement_timestamp()``
+# evaluated by the statement itself, so it costs no extra round trip and
+# takes no lock. It is timing metadata only; nothing about liveness,
+# identity, or the server-proven edge is read from it.
+GUARD_SERVER_EXECUTION_SECONDS_KEY = "server_execution_seconds"
+GUARD_SERVER_EXECUTION_SECONDS_SQL = (
+    "extract(epoch FROM clock_timestamp() - statement_timestamp())"
+)
+
+
+def guard_server_execution_seconds(result: object) -> float | None:
+    """Server-reported execution seconds of one guard round trip, if any.
+
+    ``None`` for a result that does not carry the key (an older statement
+    shape, a test fake) or carries something that is not a finite
+    non-negative number; callers then keep their conservative client-side
+    attribution rather than trusting a malformed figure.
+    """
+    if not isinstance(result, dict):
+        return None
+    value = result.get(GUARD_SERVER_EXECUTION_SECONDS_KEY)
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds) or seconds < 0.0:
+        return None
+    return seconds
 
 
 def parse_single_json_value(value: object) -> Any:
@@ -1909,6 +3445,28 @@ def parse_single_json_value(value: object) -> Any:
     return value
 
 
+# The per-row JSON projection both payout-window reads return (issue #236):
+# one object per accepted share, decoded row by row by either backend, rather
+# than aggregated server-side with json_agg into a single value the client
+# then had to decode in one call the size of the window. Same keys and value
+# expressions the aggregate carried, so a record parses exactly as before.
+_ACCEPTED_SHARE_JSON_ROW_SQL = """json_build_object(
+    'share_seq', share_seq,
+    'share_id', share_id,
+    'miner_id', miner_id,
+    'order_key', payout_order_key,
+    'p2mr_program_hex', encode(p2mr_program, 'hex'),
+    'share_difficulty', share_difficulty::text,
+    'network_difficulty', network_difficulty::text,
+    'template_height', template_height,
+    'job_id', job_id,
+    'job_issued_at_ms', round(extract(epoch FROM job_issued_at) * 1000)::bigint,
+    'accepted_at_ms', round(extract(epoch FROM accepted_at) * 1000)::bigint,
+    'ntime', ntime,
+    'credit_policy', credit_policy
+)"""
+
+
 class PsqlShareLedger:
     """Postgres-backed implementation of the coordinator share-ledger API.
 
@@ -1918,6 +3476,22 @@ class PsqlShareLedger:
     """
 
     durable_payout_state = True
+
+    # The lease lifecycle's clock, as a class attribute so an instance built
+    # without __init__ (several tests exercise one statement that way) still
+    # reads a working clock. __init__ overrides it per instance with whatever
+    # was injected. Declaring it here rather than resolving it through getattr
+    # at each call site means a rename fails loudly at the assignment instead
+    # of silently reverting every scenario to wall-clock time.
+    _monotonic: Callable[[], float] = staticmethod(time.monotonic)
+
+    # Guards the one-time creation of the per-instance read-timing state for
+    # ledgers built through __new__ (several focused tests exercise a single
+    # statement that way). A class attribute, so the check-then-set inside
+    # _ensure_ledger_read_timings cannot let two threads each publish their
+    # own dict and lose one of them; __init__ builds the state directly and
+    # never reaches it.
+    _ledger_read_timings_bootstrap: ClassVar[Lock] = Lock()
 
     @staticmethod
     def _resolve_lease_authority_margin_seconds(
@@ -1976,21 +3550,50 @@ class PsqlShareLedger:
         initialize_schema: bool = False,
         schema_path: Path | None = None,
         lease_retry_sleep: Callable[[float], None] | None = None,
+        monotonic: Callable[[], float] | None = None,
+        pool_application_name: str | None = None,
+        sql_backend_factory: Callable[..., LedgerSqlPort | None] | None = None,
+        lease_guard_factory: Callable[..., LeaseGuardPort | None] | None = None,
         lease_retry_max_sleep_seconds: float = 15.0,
         lease_ttl_seconds: float = 60.0,
         lease_authority_margin_seconds: float | None = None,
         lease_adoption_silence_seconds: float = DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
+        lease_acquire_lock_timeout_seconds: float = DEFAULT_LEASE_ACQUIRE_LOCK_TIMEOUT_SECONDS,
+        lease_acquire_attempts: int = DEFAULT_LEASE_ACQUIRE_ATTEMPTS,
+        postgres_idle_in_transaction_timeout_seconds: float = DEFAULT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS,
+        postgres_tcp_keepalives_idle_seconds: int = DEFAULT_POSTGRES_TCP_KEEPALIVES_IDLE_SECONDS,
+        postgres_tcp_keepalives_interval_seconds: int = DEFAULT_POSTGRES_TCP_KEEPALIVES_INTERVAL_SECONDS,
+        postgres_tcp_keepalives_count: int = DEFAULT_POSTGRES_TCP_KEEPALIVES_COUNT,
+        read_only: bool = False,
         read_concurrency: int = 4,
         accepted_stats_cache_seconds: float = 60.0,
         reward_window_cache_seconds: float = 30.0,
         audit_body_dir: str | Path | None = None,
         audit_bundle_canonicalizer: Callable[[dict[str, Any]], bytes] | None = None,
         audit_share_segment_size: int = 0,
+        audit_artifact_store: AuditArtifactStore | None = None,
         ctv_broadcast_attempt_detail_limit: int = DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT,
         ctv_broadcast_retry_backoff_seconds: int = DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS,
+        candidate_storage_version: int = CANDIDATE_BODY_STORAGE_VERSION,
+        candidate_spool_dir: str | Path | None = None,
+        candidate_spool_reservation_bytes: int = DEFAULT_SPOOL_RESERVATION_BYTES,
+        candidate_schema_path: Path | None = None,
+        legacy_candidate_helper_timeout_seconds: float = LEGACY_HELPER_TIMEOUT_SECONDS,
+        legacy_candidate_helper_memory_bytes: int = LEGACY_HELPER_MEMORY_BYTES,
     ):
         if writer_epoch < 0:
             raise ValueError("writer_epoch must be >= 0")
+        candidate_storage_version = int(candidate_storage_version)
+        if candidate_storage_version not in (
+            LEGACY_CANDIDATE_STORAGE_VERSION,
+            CANDIDATE_BODY_STORAGE_VERSION,
+        ):
+            raise ValueError(
+                f"unsupported candidate storage version {candidate_storage_version}"
+            )
+        read_only = bool(read_only)
+        if read_only and initialize_schema:
+            raise ValueError("a read-only ledger cannot initialize the schema")
         accepted_stats_cache_seconds = float(accepted_stats_cache_seconds)
         if not math.isfinite(accepted_stats_cache_seconds) or accepted_stats_cache_seconds < 0:
             raise ValueError("accepted_stats_cache_seconds must be finite and non-negative")
@@ -2015,6 +3618,40 @@ class PsqlShareLedger:
             or lease_adoption_silence_seconds <= 0
         ):
             raise ValueError("lease_adoption_silence_seconds must be finite and positive")
+        # Validated here, not only in load_config: run_ctv_broadcaster_daemon
+        # and backfill_ctv_fanouts construct this class directly and must not
+        # be able to disarm the lease-acquisition bound or the session guards
+        # with a zero or negative value.
+        lease_acquire_lock_timeout_seconds = float(lease_acquire_lock_timeout_seconds)
+        if (
+            not math.isfinite(lease_acquire_lock_timeout_seconds)
+            or lease_acquire_lock_timeout_seconds <= 0
+        ):
+            raise ValueError("lease_acquire_lock_timeout_seconds must be finite and positive")
+        lease_acquire_attempts = int(lease_acquire_attempts)
+        if lease_acquire_attempts <= 0:
+            raise ValueError("lease_acquire_attempts must be positive")
+        postgres_idle_in_transaction_timeout_seconds = float(
+            postgres_idle_in_transaction_timeout_seconds
+        )
+        if (
+            not math.isfinite(postgres_idle_in_transaction_timeout_seconds)
+            or postgres_idle_in_transaction_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "postgres_idle_in_transaction_timeout_seconds must be finite and positive"
+            )
+        postgres_tcp_keepalives_idle_seconds = int(postgres_tcp_keepalives_idle_seconds)
+        if postgres_tcp_keepalives_idle_seconds <= 0:
+            raise ValueError("postgres_tcp_keepalives_idle_seconds must be positive")
+        postgres_tcp_keepalives_interval_seconds = int(
+            postgres_tcp_keepalives_interval_seconds
+        )
+        if postgres_tcp_keepalives_interval_seconds <= 0:
+            raise ValueError("postgres_tcp_keepalives_interval_seconds must be positive")
+        postgres_tcp_keepalives_count = int(postgres_tcp_keepalives_count)
+        if postgres_tcp_keepalives_count <= 0:
+            raise ValueError("postgres_tcp_keepalives_count must be positive")
         read_concurrency = int(read_concurrency)
         if read_concurrency <= 0:
             raise ValueError("read_concurrency must be positive")
@@ -2030,7 +3667,9 @@ class PsqlShareLedger:
         # than a competing expiry claim. Unique per ledger instance: a
         # predecessor or replacement process never shares it, so their
         # in-flight writes still fence this session out.
-        self._pool_application_name = f"qbit-prism-writer-{uuid.uuid4().hex}"
+        self._pool_application_name = (
+            pool_application_name or f"qbit-prism-writer-{uuid.uuid4().hex}"
+        )
         self._lease_ttl_seconds = lease_ttl_seconds
         # SQL fragment for the writer-lease expiry. The lease is refreshed on
         # every append (the dominant liveness signal during active mining), so a
@@ -2047,19 +3686,96 @@ class PsqlShareLedger:
             f"make_interval(secs => {lease_authority_margin_seconds})"
         )
         self._lease_retry_sleep = lease_retry_sleep or time.sleep
+        # The lease lifecycle's only clock. Every interval this process
+        # measures itself — adoption silence from guard acquisition, caller
+        # deadlines, lease refresh age — reads through here, so a test can
+        # supply a virtual clock and drive an interleaving by advancing it
+        # rather than by sleeping and hoping. Production passes None and gets
+        # time.monotonic.
+        # Resolved at construction, not at each call: an instance built the
+        # ordinary way binds whichever clock is in force now, while the class
+        # attribute above still covers instances built without __init__.
+        self._monotonic = monotonic or time.monotonic
+        self._sql_backend_factory = sql_backend_factory
+        self._lease_guard_factory = lease_guard_factory
         self._lease_retry_max_sleep_seconds = lease_retry_max_sleep_seconds
         self._lease_retry_min_sleep_seconds = min(0.25, self._lease_retry_max_sleep_seconds)
         self._lease_adoption_silence_seconds = lease_adoption_silence_seconds
+        self._lease_acquire_lock_timeout_seconds = lease_acquire_lock_timeout_seconds
+        self._lease_acquire_attempts = lease_acquire_attempts
+        # One immutable guard set shared by all three connection paths (the
+        # pooled native client, the dedicated lease-guard session, and the
+        # psql subprocess backend), so a session this coordinator opens is
+        # disowned by the server instead of holding the lease row on after
+        # its client vanishes. See PostgresSessionGuards for what the guards
+        # do and do not reach.
+        self._session_guards = PostgresSessionGuards(
+            idle_in_transaction_timeout_seconds=postgres_idle_in_transaction_timeout_seconds,
+            tcp_keepalives_idle_seconds=postgres_tcp_keepalives_idle_seconds,
+            tcp_keepalives_interval_seconds=postgres_tcp_keepalives_interval_seconds,
+            tcp_keepalives_count=postgres_tcp_keepalives_count,
+            # Fail closed at connect time rather than transaction by
+            # transaction: a read-only ledger tells the server it is read-only
+            # once, and every connection it can create -- pool slots, read
+            # slots, the psql subprocess, autocommit statements included --
+            # inherits the refusal.
+            read_only=read_only,
+        )
         self._operation_timeout_local = local()
         self._statement_timeout_local = local()
-        self._lock = Lock()
+        # Created here, not lazily in operation_progress: that scope's
+        # check-then-set is not atomic, so two block-work threads entering
+        # their first-ever scope on a fresh ledger can each build a local()
+        # and have one assignment win. The loser's hook would then live on an
+        # orphaned object and its admission wait would silently fall back to
+        # the heartbeat-silent path -- the exact failure the hook exists to
+        # remove. The scope keeps its lazy fallback for ledgers built through
+        # __new__ in focused tests; the production path must not race.
+        self._operation_progress_local = local()
+        self._read_only = read_only
+        # A read-only ledger never holds the writer lock, so it is not given
+        # one: see _RefusingWriterGate. Read-slot traffic is unaffected.
+        self._lock = _RefusingWriterGate() if read_only else Lock()
         self._read_semaphore = BoundedSemaphore(read_concurrency)
-        self._audit_body_dir = Path(audit_body_dir) if audit_body_dir else None
-        self._audit_bundle_canonicalizer = audit_bundle_canonicalizer
+        # Issue #255: chunked candidate bodies. Staging and hydration take
+        # this one-slot gate rather than the writer lock, because neither
+        # touches the lease row and both move body-sized data.
+        self._candidate_storage_version = candidate_storage_version
+        self._candidate_body_gate = BoundedSemaphore(1)
+        self._candidate_spool = SpoolAdmission(
+            candidate_spool_dir,
+            limit_bytes=int(candidate_spool_reservation_bytes),
+        )
+        self._candidate_schema_path = candidate_schema_path
+        self._legacy_candidate_helper = LegacyCandidateHelper(
+            LegacyTransport(
+                psql_command=psql_command,
+                database_url=database_url or database_url_from_psql_command(self._command),
+            ),
+            memory_limit_bytes=int(legacy_candidate_helper_memory_bytes),
+            timeout_seconds=float(legacy_candidate_helper_timeout_seconds),
+        )
         audit_share_segment_size = int(audit_share_segment_size)
         if audit_share_segment_size < 0:
             raise ValueError("audit_share_segment_size must be non-negative")
-        self._audit_share_segment_size = audit_share_segment_size
+        if audit_artifact_store is None and audit_body_dir is not None:
+            body_root = Path(audit_body_dir)
+            audit_artifact_store = AuditArtifactStore(
+                AuditArtifactConfig(
+                    root=body_root,
+                    evidence_path=body_root / "prism-live-stratum-evidence.json",
+                    share_segment_size=audit_share_segment_size,
+                ),
+                # Legacy direct-ledger construction is an explicit adapter.
+                # Coordinator production wiring injects the shared A1 store.
+                canonicalizer=(
+                    audit_bundle_canonicalizer or _default_bundle_canonicalizer()
+                ),
+            )
+        self._audit_artifact_store = audit_artifact_store
+        self._audit_bundle_canonicalizer = (
+            audit_bundle_canonicalizer or _default_bundle_canonicalizer()
+        )
         ctv_broadcast_attempt_detail_limit = int(ctv_broadcast_attempt_detail_limit)
         if ctv_broadcast_attempt_detail_limit < 0:
             raise ValueError("ctv_broadcast_attempt_detail_limit must be non-negative")
@@ -2084,18 +3800,39 @@ class PsqlShareLedger:
         self._prior_balances_reads_total = 0
         self._prior_balances_read_last_seconds = 0.0
         self._prior_balances_read_max_seconds = 0.0
+        # Attribution for read-slot operations: local admission and server
+        # execution are recorded separately (see _run_attributed_read_json).
+        # Built here so the production path never reaches the __new__
+        # bootstrap in _ensure_ledger_read_timings; the dict is published
+        # before the lock that guards it, so a reader that observes the lock
+        # observes the dict too.
+        self._ledger_read_timings: dict[str, dict[str, float | int]] = {}
+        self._ledger_read_timings_lock = Lock()
         self._native = self._make_native_client(
             native_client_mode,
             database_url,
             read_concurrency=read_concurrency,
         )
-        self._writer_lease_guard: _NativePostgresLeaseGuard | None = None
+        self._writer_lease_guard: LeaseGuardPort | None = None
         try:
-            self._initialize_writer_lease_guard(database_url)
-            if initialize_schema:
-                path = schema_path or Path(__file__).resolve().parents[2] / "crates/qbit-prism/sql/001_share_ledger.sql"
-                self._run_script(path.read_text(encoding="utf-8"))
-            self._ensure_writer_lease()
+            if not read_only:
+                # Constructing an ordinary ledger claims the single-writer
+                # lease. A read-only ledger must not, or a second process
+                # opening one would contend with -- and could adopt -- the
+                # lease the coordinator lands blocks under.
+                self._initialize_writer_lease_guard(database_url)
+                if initialize_schema:
+                    path = schema_path or Path(__file__).resolve().parents[2] / "crates/qbit-prism/sql/001_share_ledger.sql"
+                    self._run_script(path.read_text(encoding="utf-8"))
+                    # Additive #255 migration, applied after the base schema
+                    # on every start; every statement in it is idempotent.
+                    candidate_path = (
+                        candidate_schema_path
+                        or Path(__file__).resolve().parents[2]
+                        / "crates/qbit-prism/sql/002_candidate_bodies.sql"
+                    )
+                    self._run_script(candidate_path.read_text(encoding="utf-8"))
+                self._ensure_writer_lease()
         except BaseException:
             self.close()
             raise
@@ -2106,7 +3843,7 @@ class PsqlShareLedger:
         database_url: str | None,
         *,
         read_concurrency: int,
-    ) -> _NativePostgresClient | None:
+    ) -> LedgerSqlPort | None:
         mode = (native_client_mode or "auto").strip().lower()
         if mode in {"0", "false", "no", "off", "psql"}:
             return None
@@ -2121,35 +3858,65 @@ class PsqlShareLedger:
                     "postgres:// DSN inside PRISM_POSTGRES_PSQL_COMMAND"
                 )
             return None
+        # One pooled connection per concurrent reader plus one for the
+        # serialized write path (the coordinator's share writer thread).
+        pool_size = read_concurrency + 1
+        if self._sql_backend_factory is not None:
+            # An injected backend is authoritative: it stands in for the
+            # whole server, so psycopg's availability is irrelevant and a
+            # None return means the same thing it does below (fall back to
+            # the psql subprocess path).
+            return self._sql_backend_factory(
+                conninfo,
+                pool_size=pool_size,
+                application_name=self._pool_application_name,
+            )
         try:
-            # One pooled connection per concurrent reader plus one for the
-            # serialized write path (the coordinator's share writer thread).
             return _NativePostgresClient(
                 conninfo,
-                pool_size=read_concurrency + 1,
+                pool_size=pool_size,
                 application_name=self._pool_application_name,
+                session_guards=getattr(self, "_session_guards", None),
             )
         except ImportError:
             if required:
                 raise ValueError(
                     "PRISM_POSTGRES_NATIVE_CLIENT=1 requires the psycopg package"
                 ) from None
-            # Silent fallback: which execution backend is active is reported
-            # by the owning daemon's startup line via execution_backend.
+            # The daemon's startup line reports the active execution backend,
+            # but this silent capability loss is worth its own line too: the
+            # psql fallback applies the schema through a subprocess whose
+            # atomicity contract every operator relies on.
+            print(
+                "prism ledger native PostgreSQL client unavailable: "
+                "psycopg import failed; falling back to the psql subprocess "
+                "backend",
+                flush=True,
+            )
             return None
 
     def _make_writer_lease_guard(
         self,
         database_url: str | None,
-    ) -> _NativePostgresLeaseGuard | None:
+    ) -> LeaseGuardPort | None:
         if self._native is None:
             return None
         conninfo = database_url or database_url_from_psql_command(self._command)
         if conninfo is None:
             return None
+        advisory_lock_key = _writer_lease_advisory_lock_key(
+            self._writer_id,
+            self._writer_epoch,
+        )
+        if self._lease_guard_factory is not None:
+            return self._lease_guard_factory(
+                conninfo,
+                advisory_lock_key=advisory_lock_key,
+            )
         return _NativePostgresLeaseGuard(
             conninfo,
-            _writer_lease_advisory_lock_key(self._writer_id, self._writer_epoch),
+            advisory_lock_key,
+            session_guards=getattr(self, "_session_guards", None),
         )
 
     def _initialize_writer_lease_guard(self, database_url: str | None) -> None:
@@ -2184,7 +3951,7 @@ class PsqlShareLedger:
                 # failure budget; counting from acquisition guarantees it
                 # that time even when its lease row is already stale because
                 # a long fenced transaction withheld updated_at refreshes.
-                self._writer_lease_guard_acquired_monotonic = time.monotonic()
+                self._writer_lease_guard_acquired_monotonic = self._monotonic()
                 return
             guard.close()
             if not warned:
@@ -2241,6 +4008,62 @@ class PsqlShareLedger:
     def backend_name(self) -> str:
         return "postgres-psql"
 
+    def read_replica_status(
+        self,
+        *,
+        timeout_seconds: float = DEFAULT_READ_REPLICA_PROBE_TIMEOUT_SECONDS,
+    ) -> dict[str, object]:
+        """Replication-state probe backing the public read staleness contract.
+
+        Returns:
+
+        - ``in_recovery`` -- true only on a hot standby;
+        - ``replay_lag_seconds`` -- wall clock minus the newest replayed
+          transaction's commit time (None before any replay). This is an
+          informational staleness *indicator*, not a freshness proof: on an
+          idle primary it grows with wall time even though the replica is
+          fully caught up;
+        - ``receiver_heartbeat_age_seconds`` -- wall clock minus the newest
+          message from the primary's WAL sender (None when the walreceiver
+          is not connected). Heartbeats flow every
+          ``wal_receiver_status_interval`` (default 10s) even when the
+          primary is idle, so this is the replica-side liveness proof the
+          public read service enforces;
+        - ``apply_backlog_bytes`` -- WAL bytes received but not yet replayed.
+
+        The extracted public read service (issue #145) polls this to enforce
+        its bounded-staleness contract and to refuse serving from a writable
+        primary. Reads run through the ordinary read pool, so the probe never
+        touches the writer lease.
+
+        Bounded by default: this runs on the service's background probe
+        thread, and an unbounded probe against a wedged standby would leave
+        the freshness gate holding its last answer indefinitely rather than
+        ageing out into a refusal.
+        """
+        sql = """
+SELECT json_build_object(
+    'in_recovery', pg_is_in_recovery(),
+    'replay_lag_seconds', CASE
+        WHEN pg_last_xact_replay_timestamp() IS NULL THEN NULL
+        ELSE extract(epoch FROM (clock_timestamp() - pg_last_xact_replay_timestamp()))
+    END,
+    'receiver_heartbeat_age_seconds', CASE
+        WHEN (SELECT last_msg_receipt_time FROM pg_stat_wal_receiver) IS NULL THEN NULL
+        ELSE extract(epoch FROM (clock_timestamp() - (SELECT last_msg_receipt_time FROM pg_stat_wal_receiver)))
+    END,
+    'apply_backlog_bytes', CASE
+        WHEN pg_last_wal_receive_lsn() IS NULL OR pg_last_wal_replay_lsn() IS NULL THEN NULL
+        ELSE pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn())
+    END
+);
+"""
+        with self.operation_timeout(timeout_seconds):
+            row = self._run_read_json(sql)
+        if not isinstance(row, dict):
+            raise RuntimeError("read replica status probe did not return an object")
+        return row
+
     @contextmanager
     def operation_timeout(self, timeout_seconds: float) -> Iterator[None]:
         """Bound PostgreSQL and local admission for the current thread.
@@ -2257,7 +4080,7 @@ class PsqlShareLedger:
             timeout_local = local()
             self._operation_timeout_local = timeout_local
         previous = getattr(timeout_local, "deadline", None)
-        deadline = time.monotonic() + timeout_seconds
+        deadline = self._monotonic() + timeout_seconds
         timeout_local.deadline = (
             deadline if previous is None else min(float(previous), deadline)
         )
@@ -2305,6 +4128,102 @@ class PsqlShareLedger:
             else:
                 timeout_local.timeout_seconds = previous
 
+    @contextmanager
+    def operation_progress(
+        self,
+        on_progress: Callable[[], None],
+        *,
+        slice_seconds: float,
+    ) -> Iterator[None]:
+        """Stamp caller liveness while a ledger admission wait is blocked.
+
+        A landing-class caller runs its ledger step directly on a
+        watchdog-monitored block-work thread. Waiting for the writer lock or
+        the read semaphore is not database work: no statement has been sent,
+        so neither ``statement_timeout`` nor any server-side cancellation
+        bounds it, and the ledger has nothing to report until admission
+        succeeds. Without this hook the whole admission budget is
+        heartbeat-silent, and a coordinator that is merely queued behind
+        another writer is hard-exited by its own watchdog mid-landing --
+        which loses the escalation state the retry depended on and restarts
+        the same doomed cycle.
+
+        The hook fires between acquire slices, so it never runs while this
+        thread holds the gate, and it never replaces the caller's deadline:
+        ``_operation_gate`` still raises at the deadline
+        ``_remaining_operation_timeout`` reports. An exception from
+        ``on_progress`` propagates to the caller; a liveness stamp that
+        cannot be taken is a real failure, not something to swallow inside a
+        lock wait.
+
+        Nesting merges the way ``operation_timeout``/``statement_timeout``
+        merge: the effective slice is the minimum of the enclosing slices, so
+        an inner scope can only tighten the stamp cadence, never widen it. A
+        nested scope carrying a larger slice would otherwise lengthen the
+        heartbeat gaps its enclosing caller had already sized against its own
+        monitor. The callback itself does replace -- the innermost caller is
+        the one whose liveness is at stake -- and the outer pair is restored
+        on exit.
+        """
+        slice_seconds = float(slice_seconds)
+        if not math.isfinite(slice_seconds) or slice_seconds <= 0:
+            raise ValueError("operation progress slice must be finite and positive")
+        progress_local = getattr(self, "_operation_progress_local", None)
+        if progress_local is None:
+            progress_local = local()
+            self._operation_progress_local = progress_local
+        previous = getattr(progress_local, "hook", None)
+        progress_local.hook = (
+            (on_progress, slice_seconds)
+            if previous is None
+            else (on_progress, min(float(previous[1]), slice_seconds))
+        )
+        try:
+            yield
+        finally:
+            if previous is None:
+                try:
+                    del progress_local.hook
+                except AttributeError:
+                    pass
+            else:
+                progress_local.hook = previous
+
+    def _operation_progress_hook(self) -> tuple[Callable[[], None], float] | None:
+        progress_local = getattr(self, "_operation_progress_local", None)
+        if progress_local is None:
+            return None
+        return getattr(progress_local, "hook", None)
+
+    def _note_operation_progress(self) -> None:
+        """Report liveness between the statements of one gate-holding step.
+
+        ``_acquire_operation_gate`` stamps only while a caller is *waiting*
+        for a gate, which is all a single-statement operation needs: once the
+        gate opens the caller is inside one server-side statement, and its
+        liveness monitor is sized for exactly that. An operation that issues
+        a second statement without releasing the gate breaks that sizing.
+        No admission slice runs between the two -- the gate is already held --
+        so the monitor sees one unbroken silence of two statement budgets
+        where it was promised one. That is indistinguishable from a wedged
+        operation, and a watchdog with any tolerance below twice the budget
+        hard-exits a coordinator that is in fact making normal progress
+        (issue #125). Reporting here restores the contract: the first
+        statement's full round trip has completed, which is precisely the
+        evidence a liveness monitor watches for, while a genuinely stuck
+        statement still produces no report at all.
+
+        With no hook installed this does nothing; an ordinary ledger caller
+        has no monitor to satisfy. An exception from the hook propagates,
+        matching ``_acquire_operation_gate``: a liveness stamp that cannot be
+        taken is a real failure, not something to swallow mid-operation.
+        """
+        hook = self._operation_progress_hook()
+        if hook is None:
+            return
+        on_progress, _slice_seconds = hook
+        on_progress()
+
     def _remaining_operation_timeout(self) -> float | None:
         timeout_local = getattr(self, "_operation_timeout_local", None)
         deadline = (
@@ -2328,24 +4247,56 @@ class PsqlShareLedger:
                 if statement_timeout_seconds is None
                 else float(statement_timeout_seconds)
             )
-        remaining = float(deadline) - time.monotonic()
+        remaining = float(deadline) - self._monotonic()
         if remaining <= 0:
             raise LedgerOperationTimeout("postgres operation deadline expired")
         if statement_timeout_seconds is not None:
             remaining = min(remaining, float(statement_timeout_seconds))
         return remaining
 
+    def _acquire_operation_gate(self, gate: Any, name: str) -> None:
+        """Wait for one ledger gate inside the caller's remaining deadline.
+
+        With no progress hook installed this is a single blocking acquire, as
+        it has always been: an ordinary caller has no liveness monitor to
+        satisfy and gains nothing from waking up. With a hook installed the
+        same total wait is served in slices so the caller can stamp its
+        heartbeat between them (see ``operation_progress`` for why an
+        admission wait would otherwise be silent). Slicing never widens the
+        wait: the deadline derived from ``_remaining_operation_timeout`` stays
+        authoritative and still produces the same timeout error.
+        """
+        remaining = self._remaining_operation_timeout()
+        hook = self._operation_progress_hook()
+        if hook is None:
+            acquired = (
+                gate.acquire()
+                if remaining is None
+                else gate.acquire(timeout=max(0.0, remaining))
+            )
+            if not acquired:
+                raise LedgerOperationTimeout(f"timed out waiting for postgres {name}")
+            return
+        on_progress, slice_seconds = hook
+        deadline = (
+            None if remaining is None else self._monotonic() + max(0.0, remaining)
+        )
+        while True:
+            wait_seconds = slice_seconds
+            if deadline is not None:
+                wait_seconds = min(wait_seconds, deadline - self._monotonic())
+            # An expired budget still gets one non-blocking attempt, so a
+            # zero or negative remaining fails exactly where it always did.
+            if gate.acquire(timeout=max(0.0, wait_seconds)):
+                return
+            if deadline is not None and self._monotonic() >= deadline:
+                raise LedgerOperationTimeout(f"timed out waiting for postgres {name}")
+            on_progress()
+
     @contextmanager
     def _operation_gate(self, gate: Any, name: str) -> Iterator[None]:
         """Acquire a ledger lock/semaphore within the caller's deadline."""
-        remaining = self._remaining_operation_timeout()
-        acquired = (
-            gate.acquire()
-            if remaining is None
-            else gate.acquire(timeout=max(0.0, remaining))
-        )
-        if not acquired:
-            raise LedgerOperationTimeout(f"timed out waiting for postgres {name}")
+        self._acquire_operation_gate(gate, name)
         try:
             yield
         finally:
@@ -2467,19 +4418,41 @@ END;
             )
             return record
 
-    def append_batch(
+    def _append_batch_with_replay_outcomes(
         self,
-        entries: list[tuple[PendingShare, dict[str, Any] | None]],
-    ) -> list[AcceptedShareRecord]:
+        entries: list[tuple[PendingShare, Any]],
+    ) -> list[ShareReplayResult]:
         """Commit accepted shares and optional block intents in one transaction.
 
         Replaying the exact same payload is idempotent.  Reusing a share ID or
-        block hash with different content fails the whole batch.  Postgres
-        assigns the share sequence and makes every row visible before this
-        method returns, which is the coordinator's Stratum ACK boundary.
+        block hash with different content fails the whole batch — a share-ID
+        payload mismatch raises the typed :class:`ShareReplayConflict`.
+        Postgres assigns the share sequence and makes every row visible before
+        this method returns, which is the coordinator's Stratum ACK boundary.
+        Each entry's outcome reports whether its row was ``inserted`` by this
+        statement or was an ``exact_existing`` durable duplicate.
+
+        A batch with no candidate keeps the historical statement. A batch
+        carrying candidates takes the chunked-body route (#255) unless the
+        ledger was constructed in legacy storage mode, in which case the
+        candidate is materialized and written as the historical jsonb.
         """
         if not entries:
             return []
+        if any(candidate is not None for _, candidate in entries):
+            if self._candidate_storage_version_value() == CANDIDATE_BODY_STORAGE_VERSION:
+                return self._append_batch_with_replay_outcomes_v2(entries)
+            entries = [
+                (pending, self._legacy_candidate_document(candidate))
+                for pending, candidate in entries
+            ]
+        return self._append_batch_with_replay_outcomes_v1(entries)
+
+    def _append_batch_with_replay_outcomes_v1(
+        self,
+        entries: list[tuple[PendingShare, dict[str, Any] | None]],
+    ) -> list[ShareReplayResult]:
+        """The historical whole-jsonb batch statement (storage version 1)."""
         payloads: list[dict[str, Any]] = []
         share_ids: set[str] = set()
         block_hashes: set[str] = set()
@@ -2669,6 +4642,7 @@ SELECT CASE
     WHEN EXISTS (SELECT 1 FROM share_mismatch) THEN
         json_build_object(
             'error', 'duplicate share_id payload mismatch',
+            'error_kind', 'share_replay_conflict',
             'share_ids', (SELECT json_agg(share_id ORDER BY share_id) FROM share_mismatch)
         )
     WHEN EXISTS (SELECT 1 FROM candidate_mismatch) THEN
@@ -2704,6 +4678,8 @@ END;
         with self._operation_gate(self._lock, "writer lock"):
             result = self._run_json(sql)
             if "error" in result:
+                if result.get("error_kind") == "share_replay_conflict":
+                    raise ShareReplayConflict(str(result["error"]))
                 raise RuntimeError(str(result["error"]))
             records = result.get("records")
             if not isinstance(records, list) or len(records) != len(entries):
@@ -2719,13 +4695,1146 @@ END;
                         record,
                         new_miner=bool(payload.get("new_miner", False)),
                     )
-            return parsed
+            return [
+                ShareReplayResult(
+                    (
+                        "inserted"
+                        if bool(payload.get("newly_inserted", True))
+                        else "exact_existing"
+                    ),
+                    record,
+                )
+                for payload, record in zip(records, parsed, strict=True)
+            ]
+
+    # -- chunked candidate bodies (#255) -----------------------------------
+
+    def _candidate_storage_version_value(self) -> int:
+        return int(
+            getattr(self, "_candidate_storage_version", CANDIDATE_BODY_STORAGE_VERSION)
+        )
+
+    def _ensure_candidate_store_state(self) -> None:
+        """Backfill #255 state for ledgers built without ``__init__``."""
+        if not hasattr(self, "_candidate_body_gate"):
+            self._candidate_body_gate = BoundedSemaphore(1)
+        if not hasattr(self, "_candidate_spool"):
+            self._candidate_spool = SpoolAdmission()
+        if not hasattr(self, "_legacy_candidate_helper"):
+            command = getattr(self, "_command", None) or []
+            self._legacy_candidate_helper = LegacyCandidateHelper(
+                LegacyTransport(
+                    psql_command=" ".join(shlex.quote(part) for part in command) or None,
+                    database_url=database_url_from_psql_command(list(command)),
+                )
+            )
+
+    @staticmethod
+    def _legacy_candidate_document(candidate: Any) -> Any:
+        """Materialize an intent for the legacy whole-jsonb route only.
+
+        Storage version 1 is the compatibility/rollback mode; its statement
+        inlines the whole document, so the share sequence is copied here
+        and nowhere else. A candidate-only intent keeps no share member,
+        and a hydrated replay (the rollback floor re-persisting a version-2
+        row) has its streamed views decoded, because this route writes
+        plain JSON.
+        """
+        if candidate is None or not isinstance(candidate, PreparedCandidateIntent):
+            return candidate
+        document = materialize_spool_views(candidate.facts)
+        if candidate.has_shares:
+            document["shares_json"] = [
+                materialize_spool_views(share) if is_spool_view(share) else share
+                for share in candidate.shares
+            ]
+        return document
+
+    def _writer_identity_payload(self) -> dict[str, Any]:
+        return {
+            "writer_id": self._writer_id,
+            "writer_epoch": int(self._writer_epoch),
+            "writer_session_token": self._writer_session_token,
+        }
+
+    def _observe_candidate_outbox_row(self, block_hash: str) -> dict[str, Any] | None:
+        """One read-slot snapshot of an outbox row's publication facts.
+
+        This is the version the precomparison binds to: ``state``,
+        ``share_id``, ``candidate_sha256``, ``storage_version`` and
+        ``body_id`` are re-asserted by the fenced statement, so any change
+        between this read and the commit fails that statement closed and
+        the caller redoes the comparison.
+        """
+        sql = f"""
+SELECT json_build_object(
+    'found', EXISTS (
+        SELECT 1 FROM qbit_block_candidate_outbox WHERE block_hash = {self._text_literal(block_hash)}
+    ),
+    'state', (SELECT state FROM qbit_block_candidate_outbox WHERE block_hash = {self._text_literal(block_hash)}),
+    'share_id', (SELECT share_id FROM qbit_block_candidate_outbox WHERE block_hash = {self._text_literal(block_hash)}),
+    'candidate_sha256', (SELECT candidate_sha256 FROM qbit_block_candidate_outbox WHERE block_hash = {self._text_literal(block_hash)}),
+    'storage_version', (SELECT storage_version FROM qbit_block_candidate_outbox WHERE block_hash = {self._text_literal(block_hash)}),
+    'body_id', (SELECT body_id FROM qbit_block_candidate_outbox WHERE block_hash = {self._text_literal(block_hash)}),
+    'body_state', (
+        SELECT body.state
+        FROM qbit_block_candidate_body body
+        JOIN qbit_block_candidate_outbox outbox ON outbox.body_id = body.body_id
+        WHERE outbox.block_hash = {self._text_literal(block_hash)}
+    )
+);
+"""
+        observed = self._run_attributed_read_json(
+            sql,
+            operation="observe_block_candidate_outbox_row",
+            gate=self._read_semaphore,
+            gate_name="read slot",
+        )
+        if not isinstance(observed, dict) or not observed.get("found"):
+            return None
+        return {
+            "state": str(observed.get("state")),
+            "share_id": (
+                None if observed.get("share_id") is None else str(observed["share_id"])
+            ),
+            "candidate_sha256": str(observed.get("candidate_sha256")),
+            "storage_version": int(observed.get("storage_version") or 1),
+            "body_id": (
+                None if observed.get("body_id") is None else str(observed["body_id"])
+            ),
+            "body_state": (
+                None if observed.get("body_state") is None else str(observed["body_state"])
+            ),
+        }
+
+    def verify_candidate_schema(self) -> dict[str, Any]:
+        """Refuse a database whose candidate storage is newer than this code.
+
+        Reads what the schema declares (``qbit_prism_schema_capabilities``)
+        and whether the chunked-body tables exist. A declared storage
+        version above the one this process understands raises
+        :class:`IncompatibleCandidateSchema`; so does a database without
+        the 002 migration, whichever storage version is configured (replay
+        and the terminal outbox statements use its columns), before any
+        candidate is staged. Cached after the first successful check; the
+        coordinator also calls it at boot.
+        """
+        cached = getattr(self, "_candidate_schema_verified", None)
+        if cached is not None:
+            return cached
+        presence = self._run_json(
+            """
+SELECT json_build_object(
+    'has_body_table', to_regclass('qbit_block_candidate_body') IS NOT NULL,
+    'has_capabilities', to_regclass('qbit_prism_schema_capabilities') IS NOT NULL
+);
+"""
+        )
+        has_body_table = bool(isinstance(presence, dict) and presence.get("has_body_table"))
+        declared: int | None = None
+        if isinstance(presence, dict) and presence.get("has_capabilities"):
+            capability = self._run_json(schema_capability_sql())
+            if isinstance(capability, dict) and capability.get("declared") is not None:
+                declared = int(capability["declared"])
+        refusal = candidate_schema_refusal(declared, has_body_table)
+        if refusal is not None:
+            raise IncompatibleCandidateSchema(refusal)
+        verdict = {"declared": declared, "has_body_table": has_body_table}
+        self._candidate_schema_verified = verdict
+        return verdict
+
+    def stage_candidate_body(self, prepared: PreparedCandidateIntent) -> str:
+        """Upload and seal one immutable body; returns its ``body_id``.
+
+        Runs under the one-slot body gate, never the writer lock: staging
+        touches no lease row and grants no credit. One statement per chunk
+        (each bounded by the chunk size), index rows in batches of at most
+        256 pages / 64 spans, then one seal statement that locks the
+        manifest, proves completeness from the rows and re-hashes every
+        chunk on the server. A failure retires the staging manifest so the
+        janitor reclaims it. The schema-capability refusal runs at
+        coordinator boot (``verify_candidate_schema``), not here.
+        """
+        self._ensure_candidate_store_state()
+        manifest = prepared.manifest
+        body_id = new_body_id()
+        identity = self._writer_identity_payload()
+        with self._operation_gate(self._candidate_body_gate, "candidate body slot"):
+            staged = self._run_json(
+                stage_body_sql(
+                    {
+                        **manifest.to_json(),
+                        "body_id": body_id,
+                        "block_hash": prepared.block_hash,
+                        **identity,
+                    },
+                    jsonb=self._jsonb_literal,
+                )
+            )
+            if not isinstance(staged, dict) or staged.get("state") != "staging":
+                raise CandidateStorageError(
+                    f"candidate body staging was not created: {staged!r}"
+                )
+            try:
+                pending_spans: list[dict[str, Any]] = []
+
+                def flush_index(spans: list[dict[str, Any]], pages: list[list[Any]]) -> None:
+                    if not spans and not pages:
+                        return
+                    outcome = self._run_json(
+                        body_index_rows_sql(
+                            {"body_id": body_id, **identity, "spans": spans, "pages": pages},
+                            jsonb=self._jsonb_literal,
+                        )
+                    )
+                    if not isinstance(outcome, dict) or not outcome.get("owned"):
+                        raise CandidateStorageError(
+                            "candidate body staging lost its producer session"
+                        )
+
+                def upload(chunk: Any) -> None:
+                    outcome = self._run_json(
+                        body_chunk_sql(
+                            {
+                                "body_id": body_id,
+                                "ordinal": chunk.ordinal,
+                                "chunk_sha256": chunk.sha256,
+                                "length": len(chunk.data),
+                                **identity,
+                            },
+                            chunk.data,
+                            jsonb=self._jsonb_literal,
+                        )
+                    )
+                    if not isinstance(outcome, dict) or not outcome.get("owned"):
+                        raise CandidateStorageError(
+                            "candidate body staging lost its producer session"
+                        )
+
+                def on_span(span: Any) -> None:
+                    pending_spans.append(span.to_json())
+                    if len(pending_spans) >= INDEX_SPAN_ROWS:
+                        flush_index(list(pending_spans), [])
+                        pending_spans.clear()
+
+                def on_page(batch: Any) -> None:
+                    flush_index(
+                        [],
+                        [
+                            [entry.field, entry.ordinal, entry.offset, entry.record_index]
+                            for entry in batch
+                        ],
+                    )
+
+                prepared.body.write_chunks(upload, on_span=on_span, on_page=on_page)
+                flush_index(list(pending_spans), [])
+                pending_spans.clear()
+                sealed = self._run_json(
+                    seal_body_sql(
+                        {
+                            "body_id": body_id,
+                            "candidate_sha256": manifest.candidate_sha256,
+                            **identity,
+                        },
+                        jsonb=self._jsonb_literal,
+                    )
+                )
+                if not isinstance(sealed, dict) or int(sealed.get("sealed", 0)) != 1:
+                    raise CandidateStorageError(
+                        f"candidate body could not be sealed: {sealed!r}"
+                    )
+            except BaseException:
+                self._retire_staging_body(body_id)
+                raise
+        return body_id
+
+    def _retire_staging_body(self, body_id: str) -> None:
+        """Best-effort: hand a failed staging body to the janitor."""
+        try:
+            self._run_json(retire_staging_body_sql(body_id, text=self._text_literal))
+        except Exception:  # noqa: BLE001 - the janitor retires stale staging anyway
+            pass
+
+    def compare_candidate_body(
+        self,
+        body_id: str,
+        prepared: PreparedCandidateIntent,
+    ) -> bool:
+        """The historical content comparator for a stored chunked body.
+
+        Historically an existing row was accepted only when its identity
+        digest matched *and* its normalized jsonb equalled the new intent's.
+        The caller has already matched the digest; this is the second
+        check, kept as a comparison of content rather than of any digest:
+
+        1. the actual stored bytes are read back one bounded page at a time
+           (at most three chunks per statement) and compared with our
+           re-encoded bytes chunk by chunk, holding one page at a time;
+        2. if the bytes differ, the normalized jsonb-equivalence fallback
+           runs in the isolated helper (numeric and key-order differences
+           that jsonb treats as equal), exactly the equality PostgreSQL
+           applied to the two jsonb documents before.
+
+        A forced digest collision between distinct documents is therefore
+        rejected here, and a jsonb-equivalent retry with a different
+        encoding still passes. The result is bound to the body version the
+        fenced statement re-asserts (compare-and-swap).
+        """
+        self._ensure_candidate_store_state()
+        manifest_row = self.read_candidate_body_manifest(body_id)
+        try:
+            manifest, state, _referenced = parse_manifest_row(manifest_row)
+        except (CandidateBodyUnavailable, CandidateBodyIntegrityError):
+            return False
+        if state != "sealed":
+            return False
+        bytes_equal = (
+            manifest.byte_count == prepared.manifest.byte_count
+            and manifest.chunk_count == prepared.manifest.chunk_count
+        )
+        if bytes_equal:
+
+            class _Mismatch(Exception):
+                pass
+
+            page: dict[int, bytes] = {}
+
+            def consumer(chunk: Any) -> None:
+                if chunk.ordinal not in page:
+                    page.clear()
+                    page_state, _referenced, stored = parse_body_page(
+                        self.read_candidate_body_page(body_id, chunk.ordinal, BODY_READ_MAX_CHUNKS),
+                        max_chunks=BODY_READ_MAX_CHUNKS,
+                    )
+                    if page_state != "sealed":
+                        raise _Mismatch()
+                    for entry in stored:
+                        page[entry.ordinal] = entry.data
+                stored_bytes = page.get(chunk.ordinal)
+                if stored_bytes is None or stored_bytes != chunk.data:
+                    raise _Mismatch()
+
+            try:
+                prepared.body.write_chunks(consumer)
+            except _Mismatch:
+                bytes_equal = False
+        if bytes_equal:
+            return True
+        return bool(
+            self._legacy_candidate_helper.compare_stored_body(
+                body_id, prepared.block_hash, prepared.body
+            )
+        )
+
+    def read_candidate_body_manifest(self, body_id: str) -> Any:
+        return self._run_attributed_read_json(
+            body_manifest_sql(body_id, text=self._text_literal),
+            operation="read_block_candidate_body_manifest",
+            gate=self._read_semaphore,
+            gate_name="read slot",
+        )
+
+    def read_candidate_body_spans(self, body_id: str, after_field: str | None) -> Any:
+        return self._run_attributed_read_json(
+            body_spans_sql(body_id, after_field, text=self._text_literal),
+            operation="read_block_candidate_body_spans",
+            gate=self._read_semaphore,
+            gate_name="read slot",
+        )
+
+    def read_candidate_body_pages(self, body_id: str, field_name: str, from_ordinal: int) -> Any:
+        return self._run_attributed_read_json(
+            body_pages_sql(body_id, field_name, from_ordinal, text=self._text_literal),
+            operation="read_block_candidate_body_pages",
+            gate=self._read_semaphore,
+            gate_name="read slot",
+        )
+
+    def read_candidate_body_page(self, body_id: str, from_ordinal: int, max_chunks: int) -> Any:
+        return self._run_attributed_read_json(
+            body_page_sql(body_id, from_ordinal, max_chunks, text=self._text_literal),
+            operation="read_block_candidate_body_page",
+            gate=self._read_semaphore,
+            gate_name="read slot",
+        )
+
+    def _bind_candidate_publication(
+        self,
+        prepared: PreparedCandidateIntent,
+        share_id: str,
+    ) -> dict[str, Any]:
+        """Precompare and stage outside the lease-row critical section.
+
+        Returns the observed version the fenced statement must find
+        unchanged. A missing row means the body is staged and sealed now; an
+        existing row is compared exactly -- digest, share linkage, and for a
+        pending row the full body (server chunk re-hash for a chunked body,
+        the isolated compatibility helper for a legacy jsonb body). Terminal
+        rows compare on digest and linkage only, exactly as the historical
+        statement did once their payload had been deleted.
+        """
+        observed = self._observe_candidate_outbox_row(prepared.block_hash)
+        if observed is None:
+            return {
+                "found": False,
+                "state": None,
+                "share_id": None,
+                "storage_version": None,
+                "body_id": self.stage_candidate_body(prepared),
+            }
+        if observed["candidate_sha256"] != prepared.candidate_sha256:
+            raise RuntimeError("block candidate payload mismatch")
+        if observed["share_id"] is not None and observed["share_id"] != share_id:
+            raise RuntimeError("block candidate payload mismatch")
+        if observed["state"] == "pending":
+            if observed["storage_version"] == CANDIDATE_BODY_STORAGE_VERSION:
+                if observed["body_id"] is None or not self.compare_candidate_body(
+                    observed["body_id"], prepared
+                ):
+                    raise RuntimeError("block candidate payload mismatch")
+            else:
+                self._ensure_candidate_store_state()
+                if not self._legacy_candidate_helper.compare(
+                    prepared.block_hash, prepared.body
+                ):
+                    raise RuntimeError("block candidate payload mismatch")
+        return {
+            "found": True,
+            "state": observed["state"],
+            "share_id": observed["share_id"],
+            "storage_version": observed["storage_version"],
+            "body_id": observed["body_id"],
+        }
+
+    def _append_batch_with_replay_outcomes_v2(
+        self,
+        entries: list[tuple[PendingShare, Any]],
+    ) -> list[ShareReplayResult]:
+        """Chunked-body batch: stage outside the fence, publish inside it.
+
+        Same lease fence, durability setting, share comparator, ordering
+        and ACK boundary as the historical statement. The candidate half
+        differs only in *where* body-sized work happens: precomparison and
+        staging run before the writer gate is taken, and the fenced
+        statement re-asserts the observed row version (compare-and-swap)
+        and requires a sealed manifest carrying the same digest before it
+        publishes a reference. If the version moved, nothing is committed
+        and the whole bind/publish is redone under the same call.
+        """
+        prepared_entries: list[tuple[PendingShare, PreparedCandidateIntent | None]] = []
+        share_ids: set[str] = set()
+        block_hashes: set[str] = set()
+        for pending, candidate in entries:
+            if pending.share_difficulty <= 0:
+                raise ValueError("share_difficulty must be positive")
+            if pending.network_difficulty <= 0:
+                raise ValueError("network_difficulty must be positive")
+            if pending.share_id in share_ids:
+                raise ValueError("duplicate share_id in append batch")
+            share_ids.add(pending.share_id)
+            prepared: PreparedCandidateIntent | None = None
+            if candidate is not None:
+                prepared = prepare_candidate_intent(candidate)
+                if prepared.block_hash in block_hashes:
+                    raise ValueError("duplicate block candidate in append batch")
+                block_hashes.add(prepared.block_hash)
+            prepared_entries.append((pending, prepared))
+        attempts = 0
+        while True:
+            attempts += 1
+            payloads: list[dict[str, Any]] = []
+            for pending, prepared in prepared_entries:
+                candidate_payload: dict[str, Any] | None = None
+                if prepared is not None:
+                    candidate_payload = {
+                        "block_hash_hex": prepared.block_hash,
+                        "candidate_sha256": prepared.candidate_sha256,
+                        "header": prepared.replay_header(),
+                        "expected": self._bind_candidate_publication(
+                            prepared, pending.share_id
+                        ),
+                    }
+                    candidate_payload["body_id"] = candidate_payload["expected"]["body_id"]
+                payloads.append(
+                    {
+                        "share": {
+                            **pending.__dict__,
+                            "credit_policy": validate_credit_policy(pending.credit_policy),
+                        },
+                        "candidate": candidate_payload,
+                    }
+                )
+            outcome = self._publish_candidate_batch(payloads, len(prepared_entries))
+            if outcome is not None:
+                return outcome
+            if attempts >= 3:
+                raise RuntimeError(
+                    "block candidate outbox changed repeatedly during publication"
+                )
+
+    def _publish_candidate_batch(
+        self,
+        payloads: list[dict[str, Any]],
+        expected_count: int,
+    ) -> list[ShareReplayResult] | None:
+        payload = {"entries": payloads, **self._writer_identity_payload()}
+        sql = f"""
+WITH input AS (
+    SELECT
+        {self._jsonb_literal(payload)} AS root,
+        set_config('synchronous_commit', 'on', true) AS durability
+),
+payload AS (
+    SELECT
+        item->'share' AS data,
+        NULLIF(item->'candidate', 'null'::jsonb) AS candidate,
+        ordinality
+    FROM input,
+         jsonb_array_elements(root->'entries') WITH ORDINALITY AS rows(item, ordinality)
+),
+lease AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    FROM input
+    WHERE qbit_ledger_writer_lease.singleton
+      AND qbit_ledger_writer_lease.writer_id = root->>'writer_id'
+      AND qbit_ledger_writer_lease.writer_epoch = (root->>'writer_epoch')::bigint
+      AND qbit_ledger_writer_lease.writer_session_token = root->>'writer_session_token'
+    RETURNING qbit_ledger_writer_lease.writer_id
+),
+share_mismatch AS (
+    SELECT data->>'share_id' AS share_id
+    FROM payload
+    JOIN qbit_share_ledger ledger ON ledger.share_id = data->>'share_id'
+    WHERE ledger.miner_id IS DISTINCT FROM data->>'miner_id'
+       OR ledger.payout_order_key IS DISTINCT FROM data->>'order_key'
+       OR ledger.p2mr_program IS DISTINCT FROM decode(data->>'p2mr_program_hex', 'hex')
+       OR ledger.share_difficulty IS DISTINCT FROM (data->>'share_difficulty')::numeric
+       OR ledger.network_difficulty IS DISTINCT FROM (data->>'network_difficulty')::numeric
+       OR ledger.template_height IS DISTINCT FROM (data->>'template_height')::bigint
+       OR ledger.job_id IS DISTINCT FROM data->>'job_id'
+       OR ledger.job_issued_at IS DISTINCT FROM to_timestamp((data->>'job_issued_at_ms')::double precision / 1000.0)
+       OR ledger.ntime IS DISTINCT FROM (data->>'ntime')::bigint
+       OR ledger.credit_policy IS DISTINCT FROM data->>'credit_policy'
+),
+candidate_mismatch AS (
+    -- Compare-and-swap against the version the precomparison observed.
+    SELECT payload.candidate->>'block_hash_hex' AS block_hash
+    FROM payload
+    LEFT JOIN qbit_block_candidate_outbox outbox
+      ON outbox.block_hash = payload.candidate->>'block_hash_hex'
+    WHERE payload.candidate IS NOT NULL
+      AND (
+          (outbox.block_hash IS NOT NULL) IS DISTINCT FROM (payload.candidate->'expected'->>'found')::boolean
+          OR (
+              outbox.block_hash IS NOT NULL
+              AND (
+                  outbox.state IS DISTINCT FROM payload.candidate->'expected'->>'state'
+                  OR outbox.share_id IS DISTINCT FROM payload.candidate->'expected'->>'share_id'
+                  OR outbox.candidate_sha256 IS DISTINCT FROM payload.candidate->>'candidate_sha256'
+                  OR outbox.storage_version IS DISTINCT FROM (payload.candidate->'expected'->>'storage_version')::integer
+                  OR outbox.body_id IS DISTINCT FROM payload.candidate->'expected'->>'body_id'
+                  OR (outbox.share_id IS NOT NULL AND outbox.share_id IS DISTINCT FROM payload.data->>'share_id')
+              )
+          )
+      )
+),
+sealed_bodies AS (
+    -- The bodies this statement may reference, locked FOR SHARE so an
+    -- orphan retirement (FOR UPDATE) serializes against this publication
+    -- and whichever side loses the lock re-evaluates and fails closed.
+    SELECT body.body_id
+    FROM qbit_block_candidate_body body
+    WHERE body.body_id IN (
+        SELECT payload.candidate->>'body_id'
+        FROM payload
+        WHERE payload.candidate IS NOT NULL
+          AND NOT (payload.candidate->'expected'->>'found')::boolean
+    )
+      AND body.state = 'sealed'
+      AND EXISTS (
+          SELECT 1 FROM payload
+          WHERE payload.candidate->>'body_id' = body.body_id
+            AND body.candidate_sha256 = payload.candidate->>'candidate_sha256'
+            AND body.block_hash = payload.candidate->>'block_hash_hex'
+      )
+    FOR SHARE
+),
+candidate_unsealed AS (
+    -- A new reference may point only at a complete sealed body with the
+    -- same digest and block hash.
+    SELECT payload.candidate->>'block_hash_hex' AS block_hash
+    FROM payload
+    WHERE payload.candidate IS NOT NULL
+      AND NOT (payload.candidate->'expected'->>'found')::boolean
+      AND NOT EXISTS (
+          SELECT 1 FROM sealed_bodies
+          WHERE sealed_bodies.body_id = payload.candidate->>'body_id'
+      )
+),
+candidate_states AS (
+    SELECT
+        payload.ordinality,
+        CASE
+            WHEN payload.candidate IS NULL THEN NULL
+            ELSE COALESCE(outbox.state, 'pending')
+        END AS candidate_outbox_state
+    FROM payload
+    LEFT JOIN qbit_block_candidate_outbox outbox
+      ON outbox.block_hash = payload.candidate->>'block_hash_hex'
+),
+batch_ok AS (
+    SELECT 1 AS ok
+    WHERE EXISTS (SELECT 1 FROM lease)
+      AND NOT EXISTS (SELECT 1 FROM share_mismatch)
+      AND NOT EXISTS (SELECT 1 FROM candidate_mismatch)
+      AND NOT EXISTS (SELECT 1 FROM candidate_unsealed)
+),
+inserted_shares AS (
+    INSERT INTO qbit_share_ledger (
+        share_id, miner_id, payout_order_key, p2mr_program,
+        share_difficulty, network_difficulty, template_height, job_id,
+        job_issued_at, ntime, accepted_at, credit_policy, accepted,
+        writer_id, writer_epoch
+    )
+    SELECT
+        data->>'share_id', data->>'miner_id', data->>'order_key',
+        decode(data->>'p2mr_program_hex', 'hex'),
+        (data->>'share_difficulty')::numeric,
+        (data->>'network_difficulty')::numeric,
+        (data->>'template_height')::bigint, data->>'job_id',
+        to_timestamp((data->>'job_issued_at_ms')::double precision / 1000.0),
+        (data->>'ntime')::bigint,
+        to_timestamp((data->>'accepted_at_ms')::double precision / 1000.0),
+        data->>'credit_policy', true, root->>'writer_id',
+        (root->>'writer_epoch')::bigint
+    FROM payload, input, batch_ok
+    WHERE NOT EXISTS (
+        SELECT 1 FROM qbit_share_ledger existing
+        WHERE existing.share_id = payload.data->>'share_id'
+    )
+    ORDER BY payload.ordinality
+    ON CONFLICT (share_id) DO NOTHING
+    RETURNING qbit_share_ledger.*
+),
+inserted_candidates AS (
+    INSERT INTO qbit_block_candidate_outbox (
+        block_hash, share_id, candidate, candidate_sha256,
+        storage_version, body_id, replay_header, parent_hash, expected_height
+    )
+    SELECT
+        payload.candidate->>'block_hash_hex', payload.data->>'share_id',
+        NULL, payload.candidate->>'candidate_sha256',
+        {CANDIDATE_BODY_STORAGE_VERSION}, payload.candidate->>'body_id',
+        payload.candidate->'header',
+        payload.candidate->'header'->>'parent_hash',
+        NULLIF(payload.candidate->'header'->>'expected_height', '')::bigint
+    FROM payload, batch_ok
+    WHERE payload.candidate IS NOT NULL
+      AND NOT (payload.candidate->'expected'->>'found')::boolean
+    ON CONFLICT (block_hash) DO UPDATE
+    SET share_id = EXCLUDED.share_id,
+        updated_at = clock_timestamp()
+    WHERE qbit_block_candidate_outbox.share_id IS NULL
+      AND qbit_block_candidate_outbox.state = 'pending'
+      AND qbit_block_candidate_outbox.candidate_sha256 = EXCLUDED.candidate_sha256
+    RETURNING block_hash
+),
+linked_candidates AS (
+    -- Credit-on-accept: the standalone intent already published this body;
+    -- the share joins the same identity without re-uploading anything.
+    UPDATE qbit_block_candidate_outbox
+    SET share_id = payload.data->>'share_id',
+        updated_at = clock_timestamp()
+    FROM payload, batch_ok
+    WHERE payload.candidate IS NOT NULL
+      AND (payload.candidate->'expected'->>'found')::boolean
+      AND qbit_block_candidate_outbox.block_hash = payload.candidate->>'block_hash_hex'
+      AND qbit_block_candidate_outbox.share_id IS NULL
+      AND qbit_block_candidate_outbox.state = 'pending'
+      AND qbit_block_candidate_outbox.candidate_sha256 = payload.candidate->>'candidate_sha256'
+    RETURNING qbit_block_candidate_outbox.block_hash
+),
+records AS (
+    SELECT
+        ledger.*, payload.ordinality, false AS newly_inserted,
+        false AS new_miner, candidate_states.candidate_outbox_state
+    FROM payload
+    JOIN qbit_share_ledger ledger ON ledger.share_id = payload.data->>'share_id'
+    JOIN candidate_states ON candidate_states.ordinality = payload.ordinality
+    UNION ALL
+    SELECT
+        inserted_shares.*, payload.ordinality, true AS newly_inserted,
+        NOT EXISTS (
+            SELECT 1
+            FROM qbit_share_ledger existing_miner
+            WHERE existing_miner.accepted
+              AND existing_miner.miner_id = inserted_shares.miner_id
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM inserted_shares earlier_insert
+            WHERE earlier_insert.miner_id = inserted_shares.miner_id
+              AND earlier_insert.share_seq < inserted_shares.share_seq
+        ) AS new_miner,
+        candidate_states.candidate_outbox_state
+    FROM inserted_shares
+    JOIN payload ON payload.data->>'share_id' = inserted_shares.share_id
+    JOIN candidate_states ON candidate_states.ordinality = payload.ordinality
+)
+SELECT CASE
+    WHEN NOT EXISTS (SELECT 1 FROM lease) THEN
+        json_build_object('error', 'writer lease is not active')
+    WHEN EXISTS (SELECT 1 FROM share_mismatch) THEN
+        json_build_object(
+            'error', 'duplicate share_id payload mismatch',
+            'error_kind', 'share_replay_conflict',
+            'share_ids', (SELECT json_agg(share_id ORDER BY share_id) FROM share_mismatch)
+        )
+    WHEN EXISTS (SELECT 1 FROM candidate_mismatch) THEN
+        json_build_object(
+            'error', 'block candidate outbox changed during publication',
+            'error_kind', 'candidate_version_changed',
+            'block_hashes', (SELECT json_agg(block_hash ORDER BY block_hash) FROM candidate_mismatch)
+        )
+    WHEN EXISTS (SELECT 1 FROM candidate_unsealed) THEN
+        json_build_object(
+            'error', 'block candidate body is not sealed',
+            'error_kind', 'candidate_body_unsealed',
+            'block_hashes', (SELECT json_agg(block_hash ORDER BY block_hash) FROM candidate_unsealed)
+        )
+    ELSE json_build_object(
+        'records', (
+            SELECT json_agg(json_build_object(
+                'share_seq', records.share_seq,
+                'share_id', records.share_id,
+                'miner_id', records.miner_id,
+                'order_key', records.payout_order_key,
+                'p2mr_program_hex', encode(records.p2mr_program, 'hex'),
+                'share_difficulty', records.share_difficulty::text,
+                'network_difficulty', records.network_difficulty::text,
+                'template_height', records.template_height,
+                'job_id', records.job_id,
+                'job_issued_at_ms', round(extract(epoch FROM records.job_issued_at) * 1000)::bigint,
+                'accepted_at_ms', round(extract(epoch FROM records.accepted_at) * 1000)::bigint,
+                'ntime', records.ntime,
+                'credit_policy', records.credit_policy,
+                'newly_inserted', records.newly_inserted,
+                'new_miner', records.new_miner,
+                'candidate_outbox_state', records.candidate_outbox_state
+            ) ORDER BY records.ordinality)
+            FROM records
+        )
+    )
+END;
+"""
+        with self._operation_gate(self._lock, "writer lock"):
+            result = self._run_json(sql)
+            if "error" in result:
+                if result.get("error_kind") == "share_replay_conflict":
+                    raise ShareReplayConflict(str(result["error"]))
+                if result.get("error_kind") in {"candidate_version_changed", "candidate_body_unsealed"}:
+                    return None
+                raise RuntimeError(str(result["error"]))
+            records = result.get("records")
+            if not isinstance(records, list) or len(records) != expected_count:
+                raise RuntimeError("Postgres share batch returned an incomplete result")
+            parsed = [self._record_from_json(record) for record in records]
+            committed = sorted(
+                zip(records, parsed, strict=True),
+                key=lambda item: item[1].share_seq,
+            )
+            for record_payload, record in committed:
+                if bool(record_payload.get("newly_inserted", True)):
+                    self._note_appended_share(
+                        record,
+                        new_miner=bool(record_payload.get("new_miner", False)),
+                    )
+            return [
+                ShareReplayResult(
+                    (
+                        "inserted"
+                        if bool(record_payload.get("newly_inserted", True))
+                        else "exact_existing"
+                    ),
+                    record,
+                )
+                for record_payload, record in zip(records, parsed, strict=True)
+            ]
+
+    def append_batch(
+        self,
+        entries: list[tuple[PendingShare, Any]],
+    ) -> list[AcceptedShareRecord]:
+        return [
+            outcome.record
+            for outcome in self._append_batch_with_replay_outcomes(entries)
+        ]
+
+    def append_recovered_share(self, pending: PendingShare) -> ShareReplayResult:
+        """Use the exact batch comparator for one typed recovery outcome."""
+        outcomes = self._append_batch_with_replay_outcomes([(pending, None)])
+        if len(outcomes) != 1:
+            raise RuntimeError("Postgres recovery append returned an incomplete result")
+        return outcomes[0]
 
     def persist_block_candidate_intent(
         self,
+        candidate: Any,
+    ) -> BlockCandidateIntentPersistResult:
+        """Persist candidate work that is not yet eligible for share credit.
+
+        Historically only the identity digest is compared against an
+        existing row, and that is preserved. The chunked route stages and
+        seals the body outside the writer gate first; the fenced insert then
+        publishes a reference only when a sealed manifest with the same
+        digest and block hash exists, and leaves a colliding row alone.
+        """
+        if not isinstance(candidate, PreparedCandidateIntent):
+            if not isinstance(candidate, dict):
+                raise TypeError("block candidate intent must be an object")
+            if not str(candidate.get("block_hash_hex", "")).lower():
+                raise ValueError("block candidate is missing block_hash_hex")
+        if self._candidate_storage_version_value() != CANDIDATE_BODY_STORAGE_VERSION:
+            return self._persist_block_candidate_intent_v1(
+                self._legacy_candidate_document(candidate)
+            )
+        try:
+            prepared = prepare_candidate_intent(candidate)
+        except CandidateCodecError as exc:
+            raise ValueError(str(exc)) from exc
+        block_hash = prepared.block_hash
+        candidate_sha256 = prepared.candidate_sha256
+        observed = self._observe_candidate_outbox_row(block_hash)
+        if observed is not None:
+            if observed["candidate_sha256"] != candidate_sha256:
+                raise RuntimeError("block candidate payload mismatch")
+            return BlockCandidateIntentPersistResult(
+                inserted=False,
+                state=observed["state"],
+            )
+        body_id = self.stage_candidate_body(prepared)
+        header = prepared.replay_header()
+        sql = f"""
+WITH durability AS (
+    SELECT set_config('synchronous_commit', 'on', true)
+),
+lease AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    FROM durability
+    WHERE singleton
+      AND writer_id = {self._text_literal(self._writer_id)}
+      AND writer_epoch = {int(self._writer_epoch)}
+      AND writer_session_token = {self._text_literal(self._writer_session_token)}
+    RETURNING writer_id
+),
+existing AS (
+    SELECT candidate_sha256, state
+    FROM qbit_block_candidate_outbox
+    WHERE block_hash = {self._text_literal(block_hash)}
+),
+sealed_body AS (
+    -- Locked FOR SHARE: an orphan retirement's FOR UPDATE serializes
+    -- against this publication, and the loser re-evaluates and fails closed.
+    SELECT body_id
+    FROM qbit_block_candidate_body
+    WHERE body_id = {self._text_literal(body_id)}
+      AND state = 'sealed'
+      AND candidate_sha256 = {self._text_literal(candidate_sha256)}
+      AND block_hash = {self._text_literal(block_hash)}
+    FOR SHARE
+),
+inserted AS (
+    INSERT INTO qbit_block_candidate_outbox (
+        block_hash, share_id, candidate, candidate_sha256,
+        storage_version, body_id, replay_header, parent_hash, expected_height
+    )
+    SELECT
+        {self._text_literal(block_hash)}, NULL, NULL,
+        {self._text_literal(candidate_sha256)},
+        {CANDIDATE_BODY_STORAGE_VERSION}, sealed_body.body_id,
+        {self._jsonb_literal(header)},
+        {self._jsonb_literal(header)}->>'parent_hash',
+        NULLIF({self._jsonb_literal(header)}->>'expected_height', '')::bigint
+    FROM lease, sealed_body
+    WHERE NOT EXISTS (SELECT 1 FROM existing)
+    ON CONFLICT (block_hash) DO NOTHING
+    RETURNING block_hash
+)
+SELECT CASE
+    WHEN NOT EXISTS (SELECT 1 FROM lease) THEN
+        json_build_object('error', 'writer lease is not active')
+    WHEN EXISTS (
+        SELECT 1 FROM existing
+        WHERE candidate_sha256 <> {self._text_literal(candidate_sha256)}
+    ) THEN
+        json_build_object('error', 'block candidate payload mismatch')
+    WHEN NOT EXISTS (SELECT 1 FROM existing) AND NOT EXISTS (SELECT 1 FROM sealed_body) THEN
+        json_build_object('error', 'block candidate body is not sealed')
+    ELSE
+        json_build_object(
+            'inserted', (SELECT count(*) FROM inserted),
+            'state', COALESCE((SELECT state FROM existing), 'pending')
+        )
+END;
+"""
+        result = self._run_fenced_json(sql)
+        if "error" in result:
+            raise RuntimeError(str(result["error"]))
+        return BlockCandidateIntentPersistResult(
+            inserted=int(result.get("inserted", 0)) > 0,
+            state=str(result.get("state", "pending")),
+        )
+
+    def pending_block_candidate_headers(
+        self,
+        *,
+        limit: int = HEADER_PAGE_MAX_ROWS,
+        after_cursor: object | None = None,
+        max_bytes: int = HEADER_PAGE_MAX_BYTES,
+    ) -> CandidateHeaderPage:
+        """Metadata-first pending page (#255): typed headers, explicit exhaustion.
+
+        Same keyset, order, cursor precision and read-slot gating as
+        ``pending_block_candidate_rows``; what differs is what one row
+        carries (a fixed projection of the replay header plus the body
+        reference, never the candidate) and what the page proves: the
+        statement fetches one row beyond the row cap, so ``exhausted`` is
+        answered by the outbox, and a page cut short by the byte cap is
+        reported as such rather than mistaken for the end.
+        """
+        limit = max(1, min(int(limit), HEADER_PAGE_MAX_ROWS))
+        cursor_parts: tuple[str, str] | None = None
+        if after_cursor is not None:
+            created_at_text, cursor_block_hash = _block_candidate_cursor_parts(after_cursor)
+            if not isinstance(created_at_text, str):
+                raise ValueError("pending block candidate cursor has no creation stamp")
+            cursor_parts = (created_at_text, cursor_block_hash)
+        sql = header_page_sql(limit, cursor_parts, max_bytes, text=self._text_literal)
+        read_gate = getattr(self, "_read_semaphore", None)
+        if read_gate is None:
+            # A ledger built without __init__ (focused tests) has no read
+            # slot; the statement itself is what those tests observe.
+            result = self._run_retry_safe_read_json(sql)
+        else:
+            result = self._run_attributed_read_json(
+                sql,
+                operation="pending_block_candidate_headers",
+                gate=read_gate,
+                gate_name="read slot",
+            )
+        if not isinstance(result, dict) or not isinstance(result.get("rows"), list):
+            raise RuntimeError("pending block candidate header page is malformed")
+        rows: list[dict[str, Any]] = []
+        for row in result["rows"]:
+            if not isinstance(row, dict) or "pool_block_exists" not in row:
+                raise RuntimeError(
+                    "pending block candidate header row is missing pool block existence"
+                )
+            row["pool_block_exists"] = bool(row["pool_block_exists"])
+            row["storage_version"] = int(row.get("storage_version") or 1)
+            rows.append(row)
+        fetched = int(result.get("fetched", len(rows)))
+        returned = int(result.get("returned", len(rows)))
+        truncated_by_bytes = returned < min(fetched, limit)
+        return CandidateHeaderPage(
+            rows=tuple(rows),
+            next_cursor=rows[-1]["cursor"] if rows else after_cursor,
+            exhausted=fetched <= limit and not truncated_by_bytes,
+            fetched=fetched,
+            truncated_by_bytes=truncated_by_bytes,
+        )
+
+    def hydrate_block_candidate_intent(
+        self,
+        row: dict[str, Any],
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> PreparedCandidateIntent:
+        """Materialize one header row's body to a spool and return the intent.
+
+        Storage version 2 reads bounded chunk pages through the read slot,
+        verifying manifest state, referencing outbox row and every chunk
+        digest as it goes. Storage version 1 delegates the unavoidable
+        whole-document decode to the isolated compatibility helper, which
+        writes the spool itself. Neither path holds the writer gate.
+        """
+        self._ensure_candidate_store_state()
+        block_hash = str(row["block_hash"]).lower()
+        header = row.get("header") if isinstance(row.get("header"), dict) else {}
+        pending_share = header.get("pending_share") if isinstance(header, dict) else None
+        accepted_at_present = bool(header.get("accepted_at_present")) if isinstance(header, dict) else False
+        accepted_at_ms = (
+            pending_share.get("accepted_at_ms")
+            if isinstance(pending_share, dict)
+            else None
+        )
+        storage_version = int(row.get("storage_version") or 1)
+        with self._operation_gate(self._candidate_body_gate, "candidate body slot"):
+            if storage_version == CANDIDATE_BODY_STORAGE_VERSION:
+                body_row = row.get("body")
+                if not isinstance(body_row, dict):
+                    raise CandidateBodyUnavailable(
+                        f"block candidate {block_hash} carries no body reference"
+                    )
+                ref = CandidateBodyRef.from_row(body_row)
+                hydrator = CandidateBodyHydrator(
+                    read_manifest=self.read_candidate_body_manifest,
+                    read_spans=self.read_candidate_body_spans,
+                    read_pages=self.read_candidate_body_pages,
+                    read_page=self.read_candidate_body_page,
+                    admission=self._candidate_spool,
+                    cancelled=cancelled,
+                )
+                return hydrator.hydrate(
+                    ref,
+                    block_hash=block_hash,
+                    accepted_at_present=accepted_at_present,
+                    accepted_at_ms=accepted_at_ms,
+                )
+            if storage_version != LEGACY_CANDIDATE_STORAGE_VERSION:
+                raise CandidateStorageError(
+                    f"unsupported candidate storage version {storage_version}"
+                )
+            helper = self._legacy_candidate_helper
+            if cancelled is not None:
+                helper = helper.with_cancellation(cancelled)
+            admission = self._candidate_spool.snapshot()
+            available = admission["limit_bytes"] - admission["reserved_bytes"]
+            if available <= 0:
+                raise CandidateStorageError("legacy candidate spool reservation exhausted")
+            release = self._candidate_spool.reserve(available)
+            paths: tuple[str, ...] = ()
+            body = None
+            try:
+                paths = self._candidate_spool.new_spool_paths(block_hash)
+                path, index_path = paths
+                converted = helper.convert(block_hash, path, index_path, spool_limit_bytes=available)
+                actual_bytes = converted.manifest.byte_count + converted.manifest.page_count * 16
+                release()
+                release = self._candidate_spool.reserve(actual_bytes)
+                index = SpoolFieldIndex.open_written(index_path, converted.spans)
+                if not converted.identity_matches_row:
+                    print(
+                        "prism ledger: legacy block candidate identity re-encoded with a "
+                        f"different digest hash={block_hash} row={converted.row_candidate_sha256} "
+                        f"body={converted.manifest.candidate_sha256}",
+                        flush=True,
+                    )
+                body = SpoolCandidateBody(path, converted.manifest, index, release=release)
+                return prepared_intent_from_spool(
+                    body,
+                    accepted_at_present=converted.accepted_at_present,
+                    accepted_at_ms=converted.accepted_at_ms,
+                )
+            except BaseException:
+                if body is not None:
+                    body.close()
+                else:
+                    for path in paths:
+                        try:
+                            os.unlink(path)
+                        except FileNotFoundError:
+                            pass
+                release()
+                raise
+
+    def retire_orphan_candidate_bodies(
+        self,
+        *,
+        stale_staging_seconds: float = STALE_STAGING_SECONDS,
+    ) -> tuple[str, ...]:
+        """Tiny fenced compare-and-swap: one orphaned body becomes ``retired``.
+
+        Under the writer fence so a deposed session retires nothing, but it
+        touches one manifest row and no chunk. ``retired`` is permanent and
+        publication references only sealed bodies, so nothing revives it.
+        """
+        result = self._run_fenced_json(
+            retire_orphan_bodies_sql(
+                {
+                    **self._writer_identity_payload(),
+                    "stale_staging_seconds": float(stale_staging_seconds),
+                },
+                jsonb=self._jsonb_literal,
+            )
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("candidate body orphan retirement returned no result")
+        if "error" in result:
+            raise RuntimeError(str(result["error"]))
+        return tuple(str(value) for value in result.get("retired", ()))
+
+    def reap_retired_candidate_chunks(
+        self,
+        *,
+        max_chunks: int = JANITOR_CHUNKS_PER_STEP,
+    ) -> dict[str, Any]:
+        """One lease-free bounded deletion of a retired body's chunks.
+
+        No lease row is read or written: reclaiming a permanently retired
+        body's bytes needs no fence, and a deposed session doing it harms
+        nobody. Takes the body gate so it never competes with a staging or
+        hydration for the same connection budget.
+        """
+        self._ensure_candidate_store_state()
+        with self._operation_gate(self._candidate_body_gate, "candidate body slot"):
+            result = self._run_json(
+                reap_retired_chunks_sql(
+                    {"max_chunks": max(1, int(max_chunks))},
+                    jsonb=self._jsonb_literal,
+                )
+            )
+        if not isinstance(result, dict):
+            raise RuntimeError("candidate body janitor returned no result")
+        remaining = result.get("remaining") if isinstance(result.get("remaining"), dict) else {}
+        return {
+            "body_id": result.get("body_id"),
+            "deleted_chunks": int(result.get("deleted_chunks", 0)),
+            "deleted_pages": int(result.get("deleted_pages", 0)),
+            "deleted_spans": int(result.get("deleted_spans", 0)),
+            "deleted_bodies": int(result.get("deleted_bodies", 0)),
+            # True while this body still has work for a later step.
+            "pending": result.get("body_id") is not None
+            and int(result.get("deleted_bodies", 0)) == 0,
+            "remaining": {
+                "chunks": bool(remaining.get("chunks")),
+                "pages": bool(remaining.get("pages")),
+                "spans": bool(remaining.get("spans")),
+            },
+        }
+
+    def reap_retired_candidate_bodies(
+        self,
+        *,
+        max_chunks: int = JANITOR_CHUNKS_PER_STEP,
+        stale_staging_seconds: float = STALE_STAGING_SECONDS,
+    ) -> dict[str, Any]:
+        """One janitor step: retire one orphan (fenced), then reap one page.
+
+        Two statements by design (#255 review): the fenced transition is a
+        single-row compare-and-swap, and the body-sized deletion that
+        follows never holds the lease row.
+        """
+        retired = self.retire_orphan_candidate_bodies(
+            stale_staging_seconds=stale_staging_seconds
+        )
+        outcome = self.reap_retired_candidate_chunks(max_chunks=max_chunks)
+        outcome["retired"] = retired
+        return outcome
+
+    def candidate_spool_snapshot(self) -> dict[str, int]:
+        self._ensure_candidate_store_state()
+        return self._candidate_spool.snapshot()
+
+    def _persist_block_candidate_intent_v1(
+        self,
         candidate: dict[str, Any],
     ) -> BlockCandidateIntentPersistResult:
-        """Persist candidate work that is not yet eligible for share credit."""
+        """The historical whole-jsonb standalone persist (storage version 1)."""
         block_hash = str(candidate.get("block_hash_hex", "")).lower()
         if not block_hash:
             raise ValueError("block candidate is missing block_hash_hex")
@@ -2792,28 +5901,186 @@ END;
             for row in self.pending_block_candidate_rows(limit=limit)
         ]
 
-    def pending_block_candidate_rows(self, *, limit: int = 32) -> list[dict[str, Any]]:
-        """Return pending payloads together with their authoritative row keys."""
+    def pending_block_candidate_rows(
+        self,
+        *,
+        limit: int = 32,
+        after_cursor: object | None = None,
+    ) -> list[dict[str, Any]]:
+        """Compatibility view with owned lazy payloads, never aggregate JSON.
+
+        New replay uses header descriptors directly. Callers of this older
+        interface still receive its four fields; each payload is hydrated
+        separately through the same bounded reader. Fill byte-truncated header
+        pages until the requested row limit or explicit exhaustion.
+        """
+        if (getattr(self._run_json, "__func__", None) is not PsqlShareLedger._run_json
+                or getattr(self._run_sql, "__func__", None) is not PsqlShareLedger._run_sql):
+            return self._legacy_pending_block_candidate_rows(limit=limit, after_cursor=after_cursor)
+        limit = max(1, min(int(limit), HEADER_PAGE_MAX_ROWS))
+        rows: list[dict[str, Any]] = []
+        cursor = after_cursor
+        while len(rows) < limit:
+            page = self.pending_block_candidate_headers(limit=limit - len(rows), after_cursor=cursor)
+            for row in page.rows:
+                rows.append({
+                    "block_hash": row["block_hash"],
+                    "candidate": self.hydrate_block_candidate_intent(row),
+                    "pool_block_exists": row["pool_block_exists"],
+                    "cursor": row["cursor"],
+                })
+            if page.exhausted:
+                break
+            if not page.rows or page.next_cursor == cursor:
+                raise CandidateStorageError("candidate header enumeration did not advance")
+            cursor = page.next_cursor
+        return rows
+
+    def _legacy_pending_block_candidate_rows(
+        self,
+        *,
+        limit: int = 32,
+        after_cursor: object | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return pending payloads together with their authoritative row keys.
+
+        Rows carry an opaque ``cursor`` the caller passes back verbatim as
+        ``after_cursor`` to resume strictly after that row, so a backlog
+        larger than one window enumerates completely in bounded pages
+        instead of forcing an ever-wider single query. The keyset predicate
+        and the ordering both stay on ``(created_at, block_hash)``, which is
+        exactly the partial index
+        ``qbit_block_candidate_outbox_pending_idx``: every page is one
+        bounded index range scan regardless of how far in the backlog it
+        starts.
+
+        The cursor stamp is rendered at microsecond precision with an
+        explicit UTC marker because ``created_at`` is a ``timestamptz`` whose
+        stored resolution is microseconds: a second-precision stamp (the
+        format the public API endpoints use) would truncate, and the
+        resulting predicate would re-emit or skip whole sub-second groups.
+
+        Each row also carries ``pool_block_exists``: whether a durable
+        ``qbit_pool_blocks`` row exists for that hash, i.e. whether the
+        candidate ever reached ``persist_accepted_block``. It is answered
+        inside this page read -- one bounded existence probe per returned row
+        -- because the alternative is one round trip per row, and a page is
+        read precisely when the backlog is large. The fact is advisory by the
+        time the caller holds it; the terminal batch update re-checks it under
+        the writer fence.
+
+        **Gate.** This is one read-only statement, and it takes the bounded
+        read slot rather than the global writer lock (issue #211). Waiting for
+        writer admission bought this page nothing: the query already crosses
+        no in-process state, and every fact it returns is advisory the instant
+        the statement commits -- a candidate can land, or be terminalized by
+        another path, between the snapshot and anything the caller does with
+        it. What holding the lock did buy was a convoy. During accepted-block
+        accounting the enumeration spent most or all of its bounded budget
+        queued behind an unrelated long write, and on ``union-mainnet`` that
+        cost the fast-call budget outright while PostgreSQL was idle: the
+        outer call reported ``exceeded 5s`` with only ~0.4-1.3s of the inner
+        statement deadline consumed, and accepted candidates converged in
+        79-186s with ``qbit_prism_accepted_parent_unresolved_oldest_seconds``
+        reaching ~101s.
+
+        Nothing downstream weakens as a result, because nothing downstream
+        ever trusted this snapshot:
+
+        * ``mark_block_candidates_abandoned`` re-asks ``qbit_pool_blocks``
+          *inside* the fenced ``UPDATE``, under the writer-id/epoch/
+          session-token lease predicate, and returns the exact hash set it
+          transitioned -- so a row that acquired a pool block after this read
+          is silently absent instead of abandoned.
+        * ``mark_block_candidate_attempted`` and ``_finish_block_candidate``
+          carry the same lease fence and additionally require
+          ``state = 'pending'``, so a row another path terminalized between
+          the snapshot and the write transitions nobody.
+        * The node-offer path re-reads ``pool_block_state`` and the chain at
+          dequeue rather than reusing a page fact
+          (``_skip_superseded_block_candidate_at_dequeue``).
+
+        Capacity is unchanged too: the read semaphore admits
+        ``read_concurrency`` callers and the pooled client holds
+        ``read_concurrency + 1`` connections, so moving this statement from
+        the writer-lock class to the read-slot class still cannot demand more
+        connections than the pool has, and it opens no connection and starts
+        no thread of its own.
+        """
         if limit <= 0:
             return []
+        after_predicate = ""
+        if after_cursor is not None:
+            created_at_text, cursor_block_hash = _block_candidate_cursor_parts(
+                after_cursor
+            )
+            if not isinstance(created_at_text, str):
+                raise ValueError(
+                    "pending block candidate cursor has no creation stamp"
+                )
+            after_predicate = (
+                "\n      AND (created_at, block_hash) > "
+                f"({self._text_literal(created_at_text)}::timestamptz, "
+                f"{self._text_literal(cursor_block_hash)})"
+            )
         sql = f"""
 SELECT COALESCE(
     json_agg(
-        json_build_object('block_hash', block_hash, 'candidate', candidate)
-        ORDER BY created_at, block_hash
+        json_build_object(
+            'block_hash', pending.block_hash,
+            'candidate', pending.candidate,
+            'storage_version', pending.storage_version,
+            'candidate_sha256', pending.candidate_sha256,
+            'pool_block_exists', EXISTS (
+                SELECT 1
+                FROM qbit_pool_blocks pool
+                WHERE pool.block_hash = pending.block_hash
+            ),
+            'cursor', json_build_array(
+                pending.cursor_created_at,
+                pending.block_hash
+            )
+        )
+        ORDER BY pending.created_at, pending.block_hash
     ),
     '[]'::json
 )
 FROM (
-    SELECT candidate, created_at, block_hash
+    SELECT
+        candidate,
+        storage_version,
+        candidate_sha256,
+        created_at,
+        to_char(
+            created_at AT TIME ZONE 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+        ) AS cursor_created_at,
+        block_hash
     FROM qbit_block_candidate_outbox
-    WHERE state = 'pending'
+    WHERE state = 'pending'{after_predicate}
     ORDER BY created_at, block_hash
     LIMIT {int(limit)}
 ) pending;
 """
-        with self._operation_gate(self._lock, "writer lock"):
-            return list(self._run_retry_safe_read_json(sql))
+        rows = list(
+            self._run_attributed_read_json(
+                sql,
+                operation="pending_block_candidate_rows",
+                gate=self._read_semaphore,
+                gate_name="read slot",
+            )
+        )
+        # A row whose existence fact did not arrive is not a row with no pool
+        # block: reading a missing key as false would hand a caller a false
+        # negative on the one fact that keeps an offered, landed candidate out
+        # of a terminal set. Fail the page instead.
+        for row in rows:
+            if not isinstance(row, dict) or "pool_block_exists" not in row:
+                raise RuntimeError(
+                    "pending block candidate row is missing pool block existence"
+                )
+            row["pool_block_exists"] = bool(row["pool_block_exists"])
+        return rows
 
     def block_candidate_pending_metrics(self) -> dict[str, int | float]:
         """Return aggregate pending ages using the existing outbox index."""
@@ -2887,6 +6154,95 @@ END;
     def mark_block_candidate_abandoned(self, *, block_hash: str, error: str) -> bool:
         return self._finish_block_candidate(block_hash=block_hash, state="abandoned", error=error)
 
+    def mark_block_candidates_abandoned(
+        self,
+        *,
+        block_hashes: Sequence[str],
+        error: str,
+    ) -> tuple[str, ...]:
+        """Abandon a caller-supplied page of pending rows in one fenced write.
+
+        Same writer-id/epoch/session-token fence as the single-hash terminal
+        updates, and the same terminal column set, but the row predicate is
+        set-oriented: one ``block_hash = ANY(...)`` statement for the whole
+        page rather than one statement per hash. At the storm cardinalities
+        this exists for, the per-row form is the cost.
+
+        ``RETURNING`` feeds the result, so the value is the exact set of
+        hashes this fenced statement transitioned -- not a count, and not the
+        requested set. Rows that were already terminal, that another writer
+        won, or that do not exist are silently absent from it, which is what
+        lets the caller confine follow-up cleanup to rows it actually won.
+        An empty request performs no query at all, so no degenerate
+        ``ANY(ARRAY[])`` statement is ever generated.
+
+        The predicate re-checks ``qbit_pool_blocks`` rather than trusting the
+        ``pool_block_exists`` the caller read on a prior page: a candidate can
+        land between that read and this write, and a pool-block row is the
+        durable evidence that it did. Re-asking under the writer fence closes
+        that window inside the statement that does the transition, so a row
+        that acquired one is silently absent from the returned set instead of
+        being abandoned after it was won.
+        """
+        targets = _normalized_block_candidate_hash_set(block_hashes)
+        if not targets:
+            return ()
+        sql = f"""
+WITH lease AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    WHERE singleton
+      AND writer_id = {self._text_literal(self._writer_id)}
+      AND writer_epoch = {int(self._writer_epoch)}
+      AND writer_session_token = {self._text_literal(self._writer_session_token)}
+    RETURNING writer_id
+),
+updated AS (
+    UPDATE qbit_block_candidate_outbox
+    SET state = 'abandoned',
+        last_error = {self._text_literal(error)},
+        updated_at = clock_timestamp(),
+        completed_at = clock_timestamp(),
+        candidate = NULL,
+        body_id = NULL,
+        retired_body_id = COALESCE(qbit_block_candidate_outbox.body_id, retired_body_id)
+    FROM lease
+    WHERE block_hash = ANY({self._text_array_literal(targets)})
+      AND state = 'pending'
+      AND NOT EXISTS (
+          SELECT 1
+          FROM qbit_pool_blocks pool
+          WHERE pool.block_hash = qbit_block_candidate_outbox.block_hash
+      )
+    RETURNING block_hash, retired_body_id
+),
+retired_bodies AS (
+    -- Detach only: the chunks are reclaimed later by the bounded janitor.
+    UPDATE qbit_block_candidate_body
+    SET state = 'retired', retired_at = clock_timestamp()
+    WHERE body_id IN (SELECT retired_body_id FROM updated WHERE retired_body_id IS NOT NULL)
+      AND state <> 'retired'
+    RETURNING body_id
+)
+SELECT CASE
+    WHEN NOT EXISTS (SELECT 1 FROM lease) THEN
+        json_build_object('error', 'writer lease is not active')
+    ELSE
+        json_build_object(
+            'abandoned',
+            COALESCE(
+                (SELECT json_agg(block_hash ORDER BY block_hash) FROM updated),
+                '[]'::json
+            )
+        )
+END;
+"""
+        result = self._run_fenced_json(sql)
+        if "error" in result:
+            raise RuntimeError(str(result["error"]))
+        return tuple(str(value) for value in result.get("abandoned", ()))
+
     def _finish_block_candidate(self, *, block_hash: str, state: str, error: str | None) -> bool:
         if state not in {"submitted", "abandoned"}:
             raise ValueError("invalid block candidate terminal state")
@@ -2907,11 +6263,21 @@ updated AS (
         last_error = {self._text_literal(error) if error is not None else 'NULL'},
         updated_at = clock_timestamp(),
         completed_at = clock_timestamp(),
-        candidate = NULL
+        candidate = NULL,
+        body_id = NULL,
+        retired_body_id = COALESCE(qbit_block_candidate_outbox.body_id, retired_body_id)
     FROM lease
     WHERE block_hash = {self._text_literal(block_hash.lower())}
       AND state = 'pending'
-    RETURNING block_hash
+    RETURNING block_hash, retired_body_id
+),
+retired_bodies AS (
+    -- Detach only: the chunks are reclaimed later by the bounded janitor.
+    UPDATE qbit_block_candidate_body
+    SET state = 'retired', retired_at = clock_timestamp()
+    WHERE body_id IN (SELECT retired_body_id FROM updated WHERE retired_body_id IS NOT NULL)
+      AND state <> 'retired'
+    RETURNING body_id
 )
 SELECT CASE
     WHEN NOT EXISTS (SELECT 1 FROM lease) THEN
@@ -3028,31 +6394,33 @@ rows AS (
     FROM ranked
     WHERE cumulative_difficulty - share_difficulty < {int(window_weight)}::numeric
 )"""
-        sql = rows_cte + """
-SELECT COALESCE(json_agg(json_build_object(
-    'share_seq', share_seq,
-    'share_id', share_id,
-    'miner_id', miner_id,
-    'order_key', payout_order_key,
-    'p2mr_program_hex', encode(p2mr_program, 'hex'),
-    'share_difficulty', share_difficulty::text,
-    'network_difficulty', network_difficulty::text,
-    'template_height', template_height,
-    'job_id', job_id,
-    'job_issued_at_ms', round(extract(epoch FROM job_issued_at) * 1000)::bigint,
-    'accepted_at_ms', round(extract(epoch FROM accepted_at) * 1000)::bigint,
-    'ntime', ntime,
-    'credit_policy', credit_policy
-) ORDER BY share_seq ASC), '[]'::json)
-FROM rows;
+        # One JSON object per row, in the same final order the json_agg
+        # projection imposed (#236). The selection above is untouched: only
+        # the outer projection changed, so the window's membership, the
+        # weighted crossing row and the ascending share_seq order are the
+        # same rows, decoded in bounded batches instead of one call.
+        sql = rows_cte + f"""
+SELECT {_ACCEPTED_SHARE_JSON_ROW_SQL}
+FROM rows
+ORDER BY share_seq ASC;
 """
         # Job construction is a retry-safe MVCC read. Use the independent read
         # pool so an accepted block's fenced bulk write cannot stall replacement
         # work behind the single-writer connection lock.
-        return [
-            self._record_from_json(item)
-            for item in self._run_read_json(sql)
-        ]
+        #
+        # Attributed (#224) as ``payout_window_snapshot``: this fold is the
+        # payout-window read an accepted preview waits behind, and the alert
+        # could not say whether a slow one was queued for a read slot or slow
+        # inside PostgreSQL. The slot taken is the same slot ``_run_read_json``
+        # takes, in the same order, under the same deadline; only the
+        # bookkeeping is new.
+        return self._run_attributed_read_json_rows(
+            sql,
+            operation="payout_window_snapshot",
+            gate=self._read_semaphore,
+            gate_name="read slot",
+            row_converter=self._record_from_json,
+        )
 
     def snapshot_between_job_issues(
         self,
@@ -3093,27 +6461,22 @@ WITH rows AS (
       AND ledger.job_issued_at <= {anchor}
       AND ledger.accepted_at <= {previous_anchor}
 )
-SELECT COALESCE(json_agg(json_build_object(
-    'share_seq', share_seq,
-    'share_id', share_id,
-    'miner_id', miner_id,
-    'order_key', payout_order_key,
-    'p2mr_program_hex', encode(p2mr_program, 'hex'),
-    'share_difficulty', share_difficulty::text,
-    'network_difficulty', network_difficulty::text,
-    'template_height', template_height,
-    'job_id', job_id,
-    'job_issued_at_ms', round(extract(epoch FROM job_issued_at) * 1000)::bigint,
-    'accepted_at_ms', round(extract(epoch FROM accepted_at) * 1000)::bigint,
-    'ntime', ntime,
-    'credit_policy', credit_policy
-) ORDER BY share_seq ASC), '[]'::json)
-FROM rows;
+SELECT {_ACCEPTED_SHARE_JSON_ROW_SQL}
+FROM rows
+ORDER BY share_seq ASC;
 """
-        return [
-            self._record_from_json(item)
-            for item in self._run_read_json(sql)
-        ]
+        # Attributed (#224) as ``payout_window_delta``, apart from the whole
+        # snapshot above: an incremental advance and a full fold are different
+        # amounts of work, and folding them into one series would hide which
+        # of the two a landing actually paid for. Same read slot as before,
+        # and the same per-row projection as the snapshot (#236).
+        return self._run_attributed_read_json_rows(
+            sql,
+            operation="payout_window_delta",
+            gate=self._read_semaphore,
+            gate_name="read slot",
+            row_converter=self._record_from_json,
+        )
 
     def all_shares(self) -> list[AcceptedShareRecord]:
         sql = """
@@ -3346,6 +6709,49 @@ WHERE owed_balance_sats > 0;
             balance["balance_sats"] = int(balance["balance_sats"])
         return balances
 
+    def dashboard_readiness_probe(self) -> bool:
+        """Cheapest possible proof that Postgres is reachable through a read slot.
+
+        The extracted public read tier's /healthz needs to answer "can I still
+        reach the database" without running any aggregate: a health check that
+        scans the share ledger turns a liveness probe into load, and the
+        compose healthcheck runs it on an interval forever. This is a constant
+        select -- it touches no PRISM table -- taken through the same bounded
+        read slot as every other public read, so a saturated read pool shows up
+        as an unhealthy service rather than as a probe that jumps the queue.
+        """
+        payload = self._run_read_json("SELECT json_build_object('ok', true);")
+        return bool(isinstance(payload, dict) and payload.get("ok"))
+
+    def dashboard_miner_owed_balance_bits(self, *, recipient_id: str) -> int:
+        """One recipient's owed balance, read without the writer lock.
+
+        The same total as summing current_owed_balances() for this recipient,
+        but filtered in SQL and taken through the bounded read slot instead of
+        the writer gate. current_owed_balances() returns every recipient's
+        balance under the writer lock, so serving the most-polled public route
+        (/public/v1/miners/{recipient_id}) from it made a dashboard poll
+        serialize against the lease-holding writer. The predicates match that
+        method exactly -- rows from qbit_current_owed_balances() with
+        owed_balance_sats > 0, restricted to this miner_id -- so the integer
+        returned here is the integer the Python sum produced.
+        """
+        if not recipient_id:
+            raise ValueError("recipient_id is required")
+        sql = f"""
+SELECT json_build_object(
+    'owed_balance_bits',
+    COALESCE((
+        SELECT sum(owed_balance_sats)
+        FROM qbit_current_owed_balances()
+        WHERE owed_balance_sats > 0
+          AND miner_id = {self._text_literal(recipient_id)}
+    ), 0)::text
+);
+"""
+        payload = self._run_read_json(sql)
+        return int(payload["owed_balance_bits"])
+
     def prior_balances_after_pool_block(
         self,
         *,
@@ -3386,7 +6792,17 @@ SELECT COALESCE(json_agg(json_build_object(
 ) ORDER BY payout_order_key, miner_id, encode(p2mr_program, 'hex')), '[]'::json)
 FROM balances;
 """
-        balances = list(self._run_read_json(sql))
+        # Attributed (#224). Still the read slot: this is a retry-safe MVCC
+        # read of already-confirmed rows, and the audit path that asks for it
+        # never needed writer serialization.
+        balances = list(
+            self._run_attributed_read_json(
+                sql,
+                operation="prior_balances_after_pool_block",
+                gate=self._read_semaphore,
+                gate_name="read slot",
+            )
+        )
         for balance in balances:
             balance["balance_sats"] = int(balance["balance_sats"])
         return balances
@@ -3401,9 +6817,28 @@ SELECT COALESCE(json_agg(json_build_object(
 ) ORDER BY payout_order_key, miner_id, encode(p2mr_program, 'hex')), '[]'::json)
 FROM qbit_current_carry_forward_balances();
 """
+        # Attributed (#224) without changing the primitive. This reread stays
+        # on the *writer lock*, which is where the landing's prior-balances
+        # check has always taken it: it must observe the fenced state a payout
+        # mutation leaves behind, so it serializes against that mutation
+        # rather than running beside it on a read slot. The attribution is the
+        # only thing added, and it is exactly the split the alert lacked --
+        # whether a slow reread was queued behind a landing or slow inside
+        # PostgreSQL.
+        #
+        # The legacy aggregate below is left as it was: one duration covering
+        # admission and execution together, recorded only on success.
+        # ``qbit_prism_prior_balances_*`` is an existing operator-facing
+        # series and a reader comparing it across this change must not find
+        # its meaning quietly redefined, so it duplicates part of the new
+        # per-operation sample on purpose.
         started = time.monotonic()
-        with self._operation_gate(self._lock, "writer lock"):
-            balances = self._run_retry_safe_read_json(sql)
+        balances = self._run_attributed_read_json(
+            sql,
+            operation="current_prior_balances",
+            gate=self._lock,
+            gate_name="writer lock",
+        )
         self._note_prior_balances_read(max(0.0, time.monotonic() - started))
         for balance in balances:
             balance["balance_sats"] = int(balance["balance_sats"])
@@ -3431,6 +6866,12 @@ FROM qbit_current_carry_forward_balances();
         sql = "SELECT qbit_carry_forward_integrity_report();"
         with self._operation_gate(self._lock, "writer lock"):
             report = self._run_retry_safe_read_json(sql)
+            # The audit head is a second statement under the same held lock:
+            # the two reads must observe one another's rows, so the gate
+            # cannot be released between them. Report the first statement's
+            # completed round trip so the pair costs a monitor one budget of
+            # silence at a time (see _note_operation_progress).
+            self._note_operation_progress()
             audit_head = self._carry_forward_audit_head_locked()
         report["backend"] = "postgres-psql"
         report.update(audit_head)
@@ -3488,6 +6929,28 @@ FROM (
             "audit_row_count": len(rows),
             "audit_head_sha256": previous.hex() if rows else "00" * 32,
         }
+
+    def candidate_window_covers(
+        self,
+        shares: Iterable[Any],
+        *,
+        anchor_job_issued_at_ms: int,
+        network_difficulty: int,
+    ) -> bool:
+        """Check replay omissions without returning or retaining a full window.
+
+        This coordinator-only read uses connection-private temporary storage;
+        it is deliberately unavailable to the enforced read-only API ledger.
+        """
+        from lab.prism.candidate_window import postgres_window_covers
+
+        if self._read_only:
+            raise ReadOnlyLedgerError("candidate window checks require temporary storage")
+        return postgres_window_covers(
+            self, shares,
+            anchor_job_issued_at_ms=anchor_job_issued_at_ms,
+            network_difficulty=network_difficulty,
+        )
 
     def audit_share_window(
         self,
@@ -4093,6 +7556,91 @@ SELECT COALESCE(
             row = self._run_retry_safe_read_json(sql)
         return self._resolve_audit_bundle_row(row)
 
+    def dashboard_direct_coinbase_settlement(
+        self,
+        *,
+        block_hash: str,
+    ) -> dict[str, object] | None:
+        """Public settlement facts for a direct-coinbase block, without fencing.
+
+        /public/v1/blocks/{block_hash}/settlement-artifacts serves CTV blocks
+        from audit_ctv_fanout_manifest_set() (a read slot), but a
+        direct-coinbase block fell through to audit_bundle(), which reads the
+        same row under the writer lock. This is that read taken through the
+        bounded read slot instead, returning exactly the dict
+        public_api.direct_coinbase_settlement_payload() builds today.
+
+        The row is resolved through _resolve_audit_bundle_row, so an
+        externalized body is read from body_uri on disk and sha256-verified
+        against audit_bundle_sha256 by the same helper the fenced path uses.
+        A body that is unretrievable, hash-mismatched, or not valid JSON is
+        reported as None rather than raised, matching what
+        public_api.audit_bundle_body_read_failed() already tolerates.
+
+        Returns None when the block has no audit bundle, or when the bundle
+        settled in any mode other than direct_coinbase.
+        """
+        from lab.prism import public_api
+
+        sql = f"""
+SELECT COALESCE(
+    (
+        SELECT json_build_object(
+            'block_hash', bundle.block_hash,
+            'block_height', block.block_height,
+            'payout_manifest_sha256', block.payout_manifest_sha256,
+            'audit_bundle_sha256', bundle.audit_bundle_sha256,
+            'audit_bundle', bundle.audit_bundle,
+            'body_uri', bundle.body_uri
+        )
+        FROM qbit_pool_audit_bundles bundle
+        JOIN qbit_pool_blocks block
+          ON block.block_hash = bundle.block_hash
+        WHERE bundle.block_hash = {self._text_literal(block_hash)}
+    ),
+    'null'::json
+);
+"""
+        row = self._run_read_json(sql)
+        try:
+            resolved = self._resolve_audit_bundle_row(row)
+        except RuntimeError as exc:
+            if public_api.audit_bundle_body_read_failed(exc):
+                return None
+            raise
+        if not isinstance(resolved, dict):
+            return None
+        bundle = resolved.get("audit_bundle")
+        if not isinstance(bundle, dict):
+            return None
+        if public_api.audit_bundle_settlement_mode(bundle) != "direct_coinbase":
+            return None
+        return {
+            "block_hash": public_api.optional_hex_hash(resolved.get("block_hash"))
+            or block_hash,
+            "block_height": public_api.first_int(
+                resolved.get("block_height"),
+                public_api.audit_bundle_section_value(
+                    bundle, "found_block", "block_height"
+                ),
+                public_api.audit_bundle_section_value(
+                    bundle, "reward_manifest", "block_height"
+                ),
+                public_api.audit_bundle_section_value(
+                    bundle, "ledger_window_attestation", "block_height"
+                ),
+                default=0,
+            ),
+            "settlement_mode": "direct_coinbase",
+            "audit_bundle_sha256": public_api.nullable_str(
+                resolved.get("audit_bundle_sha256")
+            ),
+            "payout_manifest_sha256": public_api.nullable_str(
+                resolved.get("payout_manifest_sha256")
+            ),
+            "artifacts": [],
+        }
+
     def audit_bundle_by_commitment(self, *, commitment_leaf_hex: str) -> dict[str, object] | None:
         leaf = self._text_literal(commitment_leaf_hex)
         sql = f"""
@@ -4128,7 +7676,7 @@ SELECT COALESCE(
         self,
         *,
         block_hash: str,
-        manifest_set: dict[str, Any],
+        manifest_set: Mapping[str, Any],
         manifest_set_sha256: str,
     ) -> dict[str, int | str]:
         payload = {
@@ -4141,11 +7689,7 @@ SELECT COALESCE(
             "writer_epoch": self._writer_epoch,
             "writer_session_token": self._writer_session_token,
         }
-        sql = f"""
-WITH payload AS (
-    SELECT {self._jsonb_literal(payload)} AS data
-),
-lease AS (
+        sql_body = f"""lease AS (
     UPDATE qbit_ledger_writer_lease
     SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
         updated_at = clock_timestamp()
@@ -4342,7 +7886,7 @@ SELECT CASE
         )
 END;
 """
-        result = self._run_fenced_json(sql)
+        result = self._run_candidate_payload_json(payload, sql_body)
         if "error" in result:
             raise RuntimeError(str(result["error"]))
         return {
@@ -4587,7 +8131,7 @@ SELECT json_build_object(
                         'error', attempt.error
                     ) ORDER BY attempt.attempt_seq ASC)
                     FROM qbit_ctv_fanout_broadcast_attempts attempt
-                    WHERE attempt.fanout_txid = fanout_txid
+                    WHERE attempt.fanout_txid = page_rows.fanout_txid
                 ),
                 '[]'::json
             )
@@ -4603,36 +8147,63 @@ SELECT json_build_object(
         }
 
     def dashboard_public_artifact(self, *, sha256: str) -> dict[str, object] | None:
+        document = self.dashboard_public_artifact_document(sha256=sha256)
+        if document is None:
+            return None
+        return document.get("payload")
+
+    def dashboard_public_artifact_document(self, *, sha256: str) -> dict[str, object] | None:
+        """Artifact payload plus its stored canonical text when available.
+
+        canonical_json is the manifest_set_json/manifest_json text persisted
+        at record time next to the JSONB copies — the exact byte sequence the
+        artifact's sha256 was computed over. Audit bundles use the immutable
+        compressed canonical artifact beside the external body. One statement
+        serves both database reads so a request touches each artifact table at
+        most once.
+
+        Replica ordering is intentionally simple. A visible row plus a missing
+        canonical file is legacy history and falls back to the JSONB/external
+        body. A file that reached shared storage before this replica replays its
+        row remains invisible and returns no match until replay catches up.
+        """
         sha256 = str(sha256).lower()
         lit = self._text_literal(sha256)
         sql = f"""
 WITH audit AS (
-    SELECT audit_bundle, audit_bundle_sha256, body_uri
+    SELECT block_hash, audit_bundle, audit_bundle_sha256, body_uri
     FROM qbit_pool_audit_bundles
     WHERE audit_bundle_sha256 = {lit}
     ORDER BY created_at DESC
     LIMIT 1
+),
+set_row AS (
+    SELECT manifest_set, manifest_set_json
+    FROM qbit_ctv_fanout_sets
+    WHERE manifest_set_sha256 = {lit}
+    ORDER BY created_at DESC
+    LIMIT 1
+),
+artifact_row AS (
+    SELECT manifest, manifest_json
+    FROM qbit_ctv_fanout_artifacts
+    WHERE manifest_sha256 = {lit}
+    ORDER BY updated_at DESC
+    LIMIT 1
 )
 SELECT json_build_object(
+    'block_hash', (SELECT block_hash FROM audit),
     'audit_bundle', (SELECT audit_bundle FROM audit),
     'audit_bundle_sha256', (SELECT audit_bundle_sha256 FROM audit),
     'body_uri', (SELECT body_uri FROM audit),
     'has_audit_row', (SELECT count(*) FROM audit) > 0,
     'fallback', COALESCE(
-        (
-            SELECT manifest_set
-            FROM qbit_ctv_fanout_sets
-            WHERE manifest_set_sha256 = {lit}
-            ORDER BY created_at DESC
-            LIMIT 1
-        ),
-        (
-            SELECT manifest
-            FROM qbit_ctv_fanout_artifacts
-            WHERE manifest_sha256 = {lit}
-            ORDER BY updated_at DESC
-            LIMIT 1
-        )
+        (SELECT manifest_set FROM set_row),
+        (SELECT manifest FROM artifact_row)
+    ),
+    'fallback_canonical', COALESCE(
+        (SELECT manifest_set_json FROM set_row),
+        (SELECT manifest_json FROM artifact_row)
     )
 );
 """
@@ -4640,20 +8211,64 @@ SELECT json_build_object(
         if not isinstance(row, dict):
             return None
         if row.get("has_audit_row"):
+            block_hash = row.get("block_hash")
+            if isinstance(block_hash, str):
+                canonical_bytes = self._stored_canonical_audit_bundle_bytes(
+                    block_hash,
+                    sha256,
+                )
+                if canonical_bytes is not None:
+                    try:
+                        canonical_payload = json.loads(canonical_bytes)
+                        canonical_json = canonical_bytes.decode("utf-8")
+                    except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+                        LOGGER.error(
+                            "canonical audit bundle unavailable reason=corrupt "
+                            "block_hash=%s audit_bundle_sha256=%s",
+                            block_hash,
+                            sha256,
+                        )
+                        raise CanonicalAuditBundleCorrupt(
+                            "canonical audit bundle is not valid UTF-8 JSON"
+                        ) from exc
+                    if not isinstance(canonical_payload, dict):
+                        LOGGER.error(
+                            "canonical audit bundle unavailable reason=corrupt "
+                            "block_hash=%s audit_bundle_sha256=%s",
+                            block_hash,
+                            sha256,
+                        )
+                        raise CanonicalAuditBundleCorrupt(
+                            "canonical audit bundle JSON is not an object"
+                        )
+                    return {
+                        "payload": canonical_payload,
+                        "canonical_json": canonical_json,
+                    }
             body = row.get("audit_bundle")
             if body is None:
                 body = self._read_external_body(row.get("body_uri"), expected_sha256=sha256)
             if body is not None:
-                return body
+                return {
+                    "payload": body,
+                    "canonical_json": None,
+                    "canonical_fallback_reason": "missing",
+                }
         fallback = row.get("fallback")
-        return fallback if isinstance(fallback, dict) else None
+        if not isinstance(fallback, dict):
+            return None
+        fallback_canonical = row.get("fallback_canonical")
+        return {
+            "payload": fallback,
+            "canonical_json": fallback_canonical if isinstance(fallback_canonical, str) else None,
+        }
 
     def dashboard_public_artifact_exists(self, *, sha256: str) -> bool:
         sha256 = str(sha256).lower()
         lit = self._text_literal(sha256)
         sql = f"""
 WITH audit AS (
-    SELECT audit_bundle, body_uri
+    SELECT block_hash, audit_bundle, audit_bundle_sha256, body_uri
     FROM qbit_pool_audit_bundles
     WHERE audit_bundle_sha256 = {lit}
     ORDER BY created_at DESC
@@ -4661,6 +8276,8 @@ WITH audit AS (
 )
 SELECT json_build_object(
     'has_audit_row', (SELECT count(*) FROM audit) > 0,
+    'block_hash', (SELECT block_hash FROM audit),
+    'audit_bundle_sha256', (SELECT audit_bundle_sha256 FROM audit),
     'audit_bundle_inline', (SELECT audit_bundle IS NOT NULL FROM audit),
     'body_uri', (SELECT body_uri FROM audit),
     'fallback_exists',
@@ -4680,6 +8297,13 @@ SELECT json_build_object(
         if not isinstance(row, dict):
             return False
         if row.get("has_audit_row"):
+            block_hash = row.get("block_hash")
+            if (
+                isinstance(block_hash, str)
+                and self._stored_canonical_audit_bundle_bytes(block_hash, sha256)
+                is not None
+            ):
+                return True
             if row.get("audit_bundle_inline"):
                 return True
             body_uri = row.get("body_uri")
@@ -5000,6 +8624,8 @@ SELECT json_build_object(
     'participants_3h', (SELECT participants_3h FROM rollups),
     'blocks_found_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state <> 'reversed'),
     'prism_blocks_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state <> 'reversed'),
+    'blocks_reversed_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'reversed'),
+    'blocks_inactive_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'inactive'),
     'total_mined_bits', COALESCE((
         SELECT sum(carry.gross_amount_sats)
         FROM qbit_payout_carry_forward carry
@@ -5035,6 +8661,8 @@ SELECT json_build_object(
             "participants_3h": int(row["participants_3h"]),
             "blocks_found_total": int(row["blocks_found_total"]),
             "prism_blocks_total": int(row["prism_blocks_total"]),
+            "blocks_reversed_total": int(row["blocks_reversed_total"]),
+            "blocks_inactive_total": int(row["blocks_inactive_total"]),
             "total_mined_bits": int(row["total_mined_bits"]),
             "latest_block": row["latest_block"],
             "reward_window": {
@@ -5046,25 +8674,53 @@ SELECT json_build_object(
             },
         }
 
-    def dashboard_blocks(self, *, page: int, limit: int) -> dict[str, object]:
+    def dashboard_blocks(self, *, page: int, limit: int, chain_state: str = "active") -> dict[str, object]:
         from lab.prism import public_api
 
+        # The default filter is exactly the pre-filter read (hide reversed
+        # rows), and the default emits exactly the pre-filter SQL and row
+        # shape so the v1 response stays byte-compatible. The non-default
+        # filters additionally surface chain_state and disconnected_at, which
+        # the public v2 block row reports.
+        state_predicates = {
+            "active": "{column} <> 'reversed'",
+            "all": "true",
+            "reversed": "{column} = 'reversed'",
+        }
+        if chain_state not in state_predicates:
+            raise ValueError("chain_state must be one of active, all, reversed")
+        total_predicate = state_predicates[chain_state].format(column="chain_state")
+        page_predicate = state_predicates[chain_state].format(column="block.chain_state")
+        include_state = chain_state != "active"
+        state_columns = "\n        block.chain_state,\n        block.disconnected_at," if include_state else ""
+        # disconnected_at is a reorg disconnect time in the public contract,
+        # null for every non-reversed row. The ledger also stamps the column
+        # on rejected rows (their maturity_state 'reversed' requires it), so
+        # it is masked to reversed chain states rather than serialized as
+        # recorded.
+        state_json_fields = (
+            "\n            'chain_state', rows.chain_state,"
+            "\n            'disconnected_at', CASE WHEN rows.chain_state = 'reversed'"
+            " THEN to_char(rows.disconnected_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') END,"
+            if include_state
+            else ""
+        )
         offset = (page - 1) * limit
         explorer_prefix = os.environ.get("PRISM_PUBLIC_EXPLORER_BLOCK_URL_PREFIX")
         sql = f"""
 WITH total AS (
     SELECT count(*) AS total_count
     FROM qbit_pool_blocks
-    WHERE chain_state <> 'reversed'
+    WHERE {total_predicate}
 ),
 page_blocks AS (
     SELECT
         block.block_hash,
         block.block_height,
-        block.found_at,
+        block.found_at,{state_columns}
         block.payout_manifest_sha256
     FROM qbit_pool_blocks block
-    WHERE block.chain_state <> 'reversed'
+    WHERE {page_predicate}
     ORDER BY block.block_height DESC, block.found_at DESC
     LIMIT {int(limit)} OFFSET {int(offset)}
 ),
@@ -5072,7 +8728,7 @@ rows AS (
     SELECT
         block.block_hash,
         block.block_height,
-        block.found_at,
+        block.found_at,{state_columns}
         block.payout_manifest_sha256,
         COALESCE(bundle.found_block_network_difficulty::text, bundle.audit_bundle#>>'{{found_block,network_difficulty}}') AS audit_network_difficulty,
         COALESCE(bundle.found_block_bits, bundle.audit_bundle#>>'{{found_block,bits}}') AS audit_bits,
@@ -5113,7 +8769,7 @@ SELECT json_build_object(
             END,
             'coinbase_value_bits', COALESCE(rows.audit_coinbase_value_sats::bigint, 0),
             'audit_bundle_sha256', rows.audit_bundle_sha256,
-            'payout_manifest_sha256', rows.payout_manifest_sha256,
+            'payout_manifest_sha256', rows.payout_manifest_sha256,{state_json_fields}
             'explorer_url', null
         ) ORDER BY rows.block_height DESC, rows.found_at DESC)
         FROM rows
@@ -5464,6 +9120,37 @@ CROSS JOIN window_summary;
         lookback_seconds: int = 0,
         range_anchor_epoch: int | None = None,
     ) -> list[dict[str, object]]:
+        """Serve the per-bucket credited hashrate series in O(buckets).
+
+        The series is answered from the incremental rollup tables plus a
+        live tail over the shares the maintenance watermark has not folded
+        in yet, so its cost tracks the number of buckets in range rather
+        than the number of shares. The rollup path must stay byte-identical
+        to the historical raw ``qbit_share_ledger`` aggregation for the same
+        underlying shares -- same buckets, counts, difficulty strings, and
+        ordering -- which pins three invariants:
+
+        - The watermark, the rollup rows, and the tail scan are read inside
+          one statement, so they share one snapshot. Reading the watermark
+          in a separate statement would let a concurrent maintenance pass
+          advance it in between and double-count the shares it folded in.
+        - A range lower bound that is not bucket-aligned makes the raw scan
+          emit a partial leading bucket (only the shares at or after the
+          bound), and the bucket containing the statement's upper bound can
+          hold a rollup-folded share whose coordinator-assigned accepted_at
+          runs ahead of the database clock -- a share the raw scan's
+          ``accepted_at <= ended_at`` excludes until the clocks catch up.
+          Neither partial end can be served from full rollup buckets, so
+          both are re-aggregated from the ledger over the already-rolled-up
+          sequence range; each scan is bounded by one bucket span of shares
+          regardless of the requested range.
+        - An absent progress row gates the rollup and boundary branches off
+          and widens the tail to the whole ledger (``share_seq > -1``), so
+          the merged output degrades to exactly the raw scan; a database
+          missing the rollup tables entirely runs the raw statement
+          unchanged. Both keep pre-migration and mid-backfill states
+          correct without operator action.
+        """
         from lab.prism import public_api
 
         bucket_seconds = {"5m": 300, "1h": 3600, "1d": 86400}[bucket]
@@ -5475,6 +9162,7 @@ CROSS JOIN window_summary;
             "all": None,
         }[range_id]
         range_filter = ""
+        range_start_sql: str | None = None
         if range_interval is not None:
             # Anchor the range lower bound on the caller's clock when provided
             # so it agrees with the caller's min_epoch trim even when the
@@ -5484,15 +9172,17 @@ CROSS JOIN window_summary;
                 if range_anchor_epoch is not None
                 else "bounds.ended_at"
             )
-            range_filter = f"AND ledger.accepted_at >= {range_anchor_sql} - interval '{range_interval}'"
+            range_start_sql = f"{range_anchor_sql} - interval '{range_interval}'"
             if lookback_seconds > 0:
                 # Pre-range context requested by the smoother; the caller trims
                 # these buckets from the response after windowing.
-                range_filter += f" - interval '{int(lookback_seconds)} seconds'"
+                range_start_sql += f" - interval '{int(lookback_seconds)} seconds'"
+            range_filter = f"AND ledger.accepted_at >= {range_start_sql}"
         subject_filter = ""
         if subject_type == "miner":
             subject_filter = f"AND ledger.miner_id = {self._text_literal(str(subject_id))}"
-        sql = f"""
+        if not self._hashrate_rollup_schema_present():
+            sql = f"""
 	WITH bounds AS (
 	    SELECT clock_timestamp() AS ended_at
 	),
@@ -5515,6 +9205,137 @@ SELECT COALESCE(json_agg(json_build_object(
 ) ORDER BY bucket_epoch ASC), '[]'::json)
 FROM bucketed;
 """
+            rows = self._run_read_json(sql)
+            return [
+                {
+                    "timestamp": row["timestamp"],
+                    "hashrate_ths": public_api.hashrate_ths_from_difficulty(row["accepted_share_difficulty"], bucket_seconds),
+                    "accepted_share_count": int(row["accepted_share_count"]),
+                    "accepted_share_difficulty": str(row["accepted_share_difficulty"]),
+                }
+                for row in rows
+            ]
+        if subject_type == "miner":
+            rollup_table = "qbit_hashrate_rollup_miner"
+            rollup_subject_filter = (
+                f"\n      AND rollup.miner_id = {self._text_literal(str(subject_id))}"
+            )
+        else:
+            rollup_table = "qbit_hashrate_rollup_pool"
+            rollup_subject_filter = ""
+        # The bucket containing bounds.ended_at is never served from its
+        # rollup row: maintenance folds by sequence, so a coordinator clock
+        # running ahead of the database clock can put a share into that
+        # bucket's rollup that the raw scan's accepted_at <= ended_at would
+        # exclude. Like the partial lower-bound bucket, it is re-aggregated
+        # from the already-rolled-up sequence range -- one bucket span of
+        # shares, whatever the requested range.
+        if range_start_sql is not None:
+            range_buckets_cte = f"""range_buckets AS (
+    SELECT
+        range_bounds.range_started_at,
+        (ceil(extract(epoch FROM range_bounds.range_started_at) / {int(bucket_seconds)}))::bigint * {int(bucket_seconds)} AS first_full_bucket_epoch
+    FROM (SELECT {range_start_sql} AS range_started_at FROM bounds) range_bounds
+),
+"""
+            rollup_lower_bound = (
+                "\n      AND rollup.bucket_epoch >= (SELECT first_full_bucket_epoch FROM range_buckets)"
+            )
+            boundary_window = """(
+        ledger.accepted_at < to_timestamp((SELECT first_full_bucket_epoch FROM range_buckets))
+        OR ledger.accepted_at >= to_timestamp((SELECT bucket_epoch FROM current_bucket))
+      )"""
+            boundary_range_filter = (
+                "\n      AND ledger.accepted_at >= (SELECT range_started_at FROM range_buckets)"
+            )
+            tail_range_filter = (
+                "\n      AND ledger.accepted_at >= (SELECT range_started_at FROM range_buckets)"
+            )
+        else:
+            range_buckets_cte = ""
+            rollup_lower_bound = ""
+            boundary_window = (
+                "ledger.accepted_at >= to_timestamp((SELECT bucket_epoch FROM current_bucket))"
+            )
+            boundary_range_filter = ""
+            tail_range_filter = ""
+        boundary_cte = f"""boundary AS (
+    SELECT
+        floor(extract(epoch FROM ledger.accepted_at) / {int(bucket_seconds)})::bigint * {int(bucket_seconds)} AS bucket_epoch,
+        count(*) AS accepted_share_count,
+        sum(ledger.share_difficulty) AS accepted_share_difficulty
+    FROM qbit_share_ledger ledger, bounds
+    WHERE (SELECT rollups_ready FROM watermark)
+      AND ledger.accepted
+      AND ledger.share_seq <= (SELECT last_share_seq FROM watermark)
+      AND ledger.accepted_at <= bounds.ended_at
+      AND {boundary_window}{boundary_range_filter}
+      {subject_filter}
+    GROUP BY bucket_epoch
+),
+"""
+        boundary_union = """        UNION ALL
+        SELECT bucket_epoch, accepted_share_count, accepted_share_difficulty FROM boundary
+"""
+        sql = f"""
+WITH bounds AS (
+    SELECT clock_timestamp() AS ended_at
+),
+progress AS (
+    SELECT last_share_seq
+    FROM qbit_hashrate_rollup_progress
+    WHERE singleton
+),
+watermark AS (
+    SELECT
+        COALESCE((SELECT last_share_seq FROM progress), -1) AS last_share_seq,
+        EXISTS (SELECT 1 FROM progress) AS rollups_ready
+),
+current_bucket AS (
+    SELECT floor(extract(epoch FROM bounds.ended_at) / {int(bucket_seconds)})::bigint * {int(bucket_seconds)} AS bucket_epoch
+    FROM bounds
+),
+{range_buckets_cte}rolled AS (
+    SELECT
+        rollup.bucket_epoch,
+        rollup.accepted_share_count,
+        rollup.accepted_share_difficulty
+    FROM {rollup_table} rollup, bounds
+    WHERE (SELECT rollups_ready FROM watermark)
+      AND rollup.grain_seconds = {int(bucket_seconds)}
+      AND rollup.bucket_epoch < (SELECT bucket_epoch FROM current_bucket){rollup_lower_bound}{rollup_subject_filter}
+),
+{boundary_cte}tail AS (
+    SELECT
+        floor(extract(epoch FROM ledger.accepted_at) / {int(bucket_seconds)})::bigint * {int(bucket_seconds)} AS bucket_epoch,
+        count(*) AS accepted_share_count,
+        sum(ledger.share_difficulty) AS accepted_share_difficulty
+    FROM qbit_share_ledger ledger, bounds
+    WHERE ledger.accepted
+      AND ledger.share_seq > (SELECT last_share_seq FROM watermark)
+      AND ledger.accepted_at <= bounds.ended_at{tail_range_filter}
+      {subject_filter}
+    GROUP BY bucket_epoch
+),
+merged AS (
+    SELECT
+        parts.bucket_epoch,
+        sum(parts.accepted_share_count)::bigint AS accepted_share_count,
+        sum(parts.accepted_share_difficulty) AS accepted_share_difficulty
+    FROM (
+        SELECT bucket_epoch, accepted_share_count, accepted_share_difficulty FROM rolled
+{boundary_union}        UNION ALL
+        SELECT bucket_epoch, accepted_share_count, accepted_share_difficulty FROM tail
+    ) parts
+    GROUP BY parts.bucket_epoch
+)
+SELECT COALESCE(json_agg(json_build_object(
+    'timestamp', to_char(to_timestamp(bucket_epoch) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    'accepted_share_count', accepted_share_count,
+    'accepted_share_difficulty', accepted_share_difficulty::text
+) ORDER BY bucket_epoch ASC), '[]'::json)
+FROM merged;
+"""
         rows = self._run_read_json(sql)
         return [
             {
@@ -5526,443 +9347,413 @@ FROM bucketed;
             for row in rows
         ]
 
-    def _externalize_audit_body(
-        self,
-        block_hash: str,
-        audit_bundle_sha256: str,
-        final_bundle: dict[str, Any],
-    ) -> str | None:
-        """Write the audit-bundle body to the external store and return its path.
+    def _hashrate_rollup_schema_present(self) -> bool:
+        """Report whether the incremental hashrate rollup tables exist.
 
-        Returns None when no body store is configured, in which case the caller
-        keeps the body inline in Postgres (legacy behavior). Externalizing the
-        body is what stops the per-block audit_bundle JSONB from growing with the
-        full accepted-share history.
+        The serving statement cannot even parse against a database that
+        predates the rollup DDL, so table existence has to be settled before
+        choosing a statement. A positive answer is cached for the life of
+        this instance: the rollup tables are only ever created (by the
+        writer's idempotent schema apply), never dropped. A negative answer
+        is deliberately not cached, so a read tier pointed at a database
+        whose writer applies the DDL mid-flight picks up the rollup path
+        without a restart.
         """
-        if self._audit_body_dir is None:
-            return None
-        block_hash = canonical_hex(block_hash, name="block_hash", expected_bytes=32)
-        audit_bundle_sha256 = canonical_hex(
-            str(audit_bundle_sha256),
-            name="audit_bundle_sha256",
-            expected_bytes=32,
+        if getattr(self, "_hashrate_rollup_schema_ready", False):
+            return True
+        row = self._run_read_json(
+            """
+SELECT json_build_object(
+    'rollup_schema_ready',
+    to_regclass('qbit_hashrate_rollup_progress') IS NOT NULL
+    AND to_regclass('qbit_hashrate_rollup_pool') IS NOT NULL
+    AND to_regclass('qbit_hashrate_rollup_miner') IS NOT NULL
+);
+"""
         )
-        body_bytes = self._canonical_audit_body_bytes_for_sha(final_bundle, audit_bundle_sha256)
-        return self._write_external_audit_body(block_hash, audit_bundle_sha256, body_bytes)
+        ready = bool(row["rollup_schema_ready"])
+        if ready:
+            self._hashrate_rollup_schema_ready = True
+        return ready
 
-    def _canonical_audit_body_bytes_for_sha(
-        self,
-        final_bundle: dict[str, Any],
-        audit_bundle_sha256: str,
-    ) -> bytes:
-        body_bytes = self._canonical_audit_bundle_bytes(final_bundle)
-        actual_sha256 = sha256_bytes_hex(body_bytes)
-        if actual_sha256 != str(audit_bundle_sha256).lower():
+    def advance_hashrate_rollups(self, *, batch_limit: int) -> dict[str, object]:
+        """Fold the next watermarked share batch into the hashrate rollups.
+
+        One statement, one transaction. ``qbit_share_ledger`` rows are
+        immutable and ``share_seq`` is append-only, so scanning strictly
+        above the stored watermark in sequence order folds every share into
+        its (grain, bucket) rows exactly once -- a late-clocked share still
+        lands in its correct ``accepted_at`` bucket, and no re-aggregation
+        window is needed. Rejected rows are read only to advance the
+        watermark. The first pass seeds the progress row itself and starts
+        from sequence 0, which is also how a grown ledger backfills.
+
+        The watermark advance is a guarded upsert: it only applies while the
+        progress row still holds the value this statement read, and the
+        rollup upserts are gated on that advance having won. A concurrent
+        advance therefore leaves this pass writing nothing at all -- the
+        guarded upsert matches no row and both rollup inserts see an empty
+        gate -- and the caller raises instead of double-counting, because
+        two live maintenance passes mean the single-writer invariant is
+        already broken.
+
+        The whole pass is additionally fenced on the writer lease, exactly
+        like every other mutation of ledger-derived state: the statement
+        renews the exact ``(writer_id, writer_epoch, writer_session_token)``
+        lease tuple and the advance applies only when that renewal matched,
+        so a coordinator whose lease expired or was taken over cannot keep
+        mutating the rollups on the strength of its process-local lock
+        alone. A fenced-out pass writes nothing and raises.
+        """
+        batch_limit = int(batch_limit)
+        if batch_limit <= 0:
+            raise ValueError("hashrate rollup batch limit must be positive")
+        sql = f"""
+WITH lease AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    WHERE singleton
+      AND writer_id = {self._text_literal(self._writer_id)}
+      AND writer_epoch = {int(self._writer_epoch)}
+      AND writer_session_token = {self._text_literal(self._writer_session_token)}
+    RETURNING writer_id
+),
+progress AS (
+    SELECT COALESCE((
+        SELECT last_share_seq
+        FROM qbit_hashrate_rollup_progress
+        WHERE singleton
+    ), 0) AS last_share_seq
+),
+batch AS (
+    SELECT
+        ledger.share_seq,
+        ledger.accepted,
+        ledger.accepted_at,
+        ledger.miner_id,
+        ledger.share_difficulty
+    FROM qbit_share_ledger ledger
+    WHERE ledger.share_seq > (SELECT last_share_seq FROM progress)
+    ORDER BY ledger.share_seq ASC
+    LIMIT {batch_limit}
+),
+batch_stats AS (
+    SELECT
+        count(*) AS scanned,
+        COALESCE(max(batch.share_seq), (SELECT last_share_seq FROM progress)) AS next_share_seq
+    FROM batch
+),
+advance AS (
+    INSERT INTO qbit_hashrate_rollup_progress (singleton, last_share_seq)
+    SELECT true, (SELECT next_share_seq FROM batch_stats)
+    WHERE EXISTS (SELECT 1 FROM lease)
+    ON CONFLICT (singleton) DO UPDATE
+        SET last_share_seq = EXCLUDED.last_share_seq,
+            updated_at = clock_timestamp()
+        WHERE qbit_hashrate_rollup_progress.last_share_seq = (SELECT last_share_seq FROM progress)
+    RETURNING last_share_seq
+),
+grains AS (
+    SELECT grain_seconds
+    FROM (VALUES (300), (3600), (86400)) AS grain(grain_seconds)
+),
+pool_rollup AS (
+    INSERT INTO qbit_hashrate_rollup_pool (
+        grain_seconds,
+        bucket_epoch,
+        accepted_share_count,
+        accepted_share_difficulty
+    )
+    SELECT
+        grains.grain_seconds,
+        floor(extract(epoch FROM batch.accepted_at) / grains.grain_seconds)::bigint * grains.grain_seconds AS bucket_epoch,
+        count(*) AS accepted_share_count,
+        sum(batch.share_difficulty) AS accepted_share_difficulty
+    FROM batch, grains
+    WHERE batch.accepted
+      AND EXISTS (SELECT 1 FROM advance)
+    GROUP BY grains.grain_seconds, bucket_epoch
+    ON CONFLICT (grain_seconds, bucket_epoch) DO UPDATE
+        SET accepted_share_count = qbit_hashrate_rollup_pool.accepted_share_count
+                + EXCLUDED.accepted_share_count,
+            accepted_share_difficulty = qbit_hashrate_rollup_pool.accepted_share_difficulty
+                + EXCLUDED.accepted_share_difficulty
+    RETURNING 1
+),
+miner_rollup AS (
+    INSERT INTO qbit_hashrate_rollup_miner (
+        grain_seconds,
+        bucket_epoch,
+        miner_id,
+        accepted_share_count,
+        accepted_share_difficulty
+    )
+    SELECT
+        grains.grain_seconds,
+        floor(extract(epoch FROM batch.accepted_at) / grains.grain_seconds)::bigint * grains.grain_seconds AS bucket_epoch,
+        batch.miner_id,
+        count(*) AS accepted_share_count,
+        sum(batch.share_difficulty) AS accepted_share_difficulty
+    FROM batch, grains
+    WHERE batch.accepted
+      AND EXISTS (SELECT 1 FROM advance)
+    GROUP BY grains.grain_seconds, bucket_epoch, batch.miner_id
+    ON CONFLICT (grain_seconds, bucket_epoch, miner_id) DO UPDATE
+        SET accepted_share_count = qbit_hashrate_rollup_miner.accepted_share_count
+                + EXCLUDED.accepted_share_count,
+            accepted_share_difficulty = qbit_hashrate_rollup_miner.accepted_share_difficulty
+                + EXCLUDED.accepted_share_difficulty
+    RETURNING 1
+)
+SELECT CASE
+    WHEN NOT EXISTS (SELECT 1 FROM lease) THEN
+        json_build_object('error', 'writer lease is not active')
+    ELSE
+        json_build_object(
+            'scanned', (SELECT scanned FROM batch_stats),
+            'last_share_seq', (SELECT next_share_seq FROM batch_stats),
+            'advanced', (SELECT count(*) FROM advance),
+            'caught_up', (SELECT scanned FROM batch_stats) < {batch_limit}
+        )
+END;
+"""
+        result = self._run_fenced_json(sql)
+        if "error" in result:
+            raise RuntimeError(str(result["error"]))
+        if int(result["advanced"]) != 1:
             raise RuntimeError(
-                "audit bundle sha256 mismatch: "
-                f"expected {str(audit_bundle_sha256).lower()}, got {actual_sha256}"
+                "hashrate rollup watermark advanced concurrently; "
+                "this pass wrote nothing (writer-fencing bug)"
             )
-        return body_bytes
-
-    def _external_audit_storage_bytes(
-        self,
-        *,
-        block_hash: str,
-        audit_bundle_sha256: str,
-        final_bundle: dict[str, Any],
-        canonical_body_bytes: bytes,
-    ) -> bytes:
-        v2_bundle = self._audit_bundle_v2(
-            block_hash=block_hash,
-            audit_bundle_sha256=audit_bundle_sha256,
-            final_bundle=final_bundle,
-        )
-        if v2_bundle is not None:
-            return self._storage_json_bytes(v2_bundle)
-        body_ref = self._audit_body_ref(
-            block_hash=block_hash,
-            audit_bundle_sha256=audit_bundle_sha256,
-            final_bundle=final_bundle,
-        )
-        if body_ref is None:
-            return canonical_body_bytes
-        return self._storage_json_bytes(body_ref)
-
-    def _audit_body_ref(
-        self,
-        *,
-        block_hash: str,
-        audit_bundle_sha256: str,
-        final_bundle: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        if self._audit_body_dir is None or self._audit_share_segment_size <= 0:
-            return None
-        shares = final_bundle.get("shares")
-        if not isinstance(shares, list) or not shares:
-            return None
-        share_parts = self._audit_share_parts(shares)
-        if share_parts is None or not any(part.get("kind") == "segment" for part in share_parts):
-            return None
-        shares_key_index = list(final_bundle).index("shares")
-        # Persistence only reads this immutable build result.  A shallow outer
-        # mapping avoids recursively copying both the top-level shares and the
-        # reward-manifest share window merely to remove one key.
-        bundle_without_shares = {
-            key: value for key, value in final_bundle.items() if key != "shares"
-        }
         return {
-            "schema": AUDIT_BODY_REF_SCHEMA,
-            "block_hash": block_hash,
-            "audit_bundle_sha256": audit_bundle_sha256,
-            "audit_bundle_schema": str(final_bundle.get("schema") or ""),
-            "share_count": len(shares),
-            "share_segment_size": self._audit_share_segment_size,
-            "shares_key_index": shares_key_index,
-            "bundle_without_shares": bundle_without_shares,
-            "share_parts": share_parts,
+            "scanned": int(result["scanned"]),
+            "last_share_seq": int(result["last_share_seq"]),
+            "caught_up": bool(result["caught_up"]),
         }
 
-    def _audit_bundle_v2(
+    def dashboard_block_markers(
         self,
         *,
+        range_id: str,
+        bucket: str,
+        range_anchor_epoch: int | None = None,
+    ) -> dict[str, object]:
+        from lab.prism import public_api
+
+        bucket_seconds = {"5m": 300, "1h": 3600, "1d": 86400}[bucket]
+        range_seconds = {
+            "1w": 7 * 86400,
+            "1m": 30 * 86400,
+            "6m": 180 * 86400,
+            "all": None,
+        }[range_id]
+        range_filter = ""
+        if range_seconds is not None:
+            # Anchor the range lower bound on the caller's clock when provided
+            # so marker buckets sit on exactly the grid the hashrate series is
+            # trimmed against, even when the database clock disagrees with the
+            # application clock. Only fully covered buckets are kept: a bucket
+            # straddling the range start is dropped whole, the same boundary
+            # hashrate_series_min_epoch draws for the chart's points. `all`
+            # carries no lower bound.
+            anchor_epoch = (
+                int(range_anchor_epoch)
+                if range_anchor_epoch is not None
+                else int(datetime.now(timezone.utc).timestamp())
+            )
+            min_epoch = public_api.hashrate_series_min_epoch(
+                anchor_epoch,
+                range_seconds,
+                bucket_seconds,
+            )
+            range_filter = f"AND block.found_at >= to_timestamp({int(min_epoch)})"
+        # qbit_pool_blocks holds ~10^4 rows, so one grouped scan is cheap and
+        # no index beyond the primary key is needed. Reversed blocks are
+        # excluded by the same predicate dashboard_blocks applies.
+        sql = f"""
+WITH in_range AS (
+    SELECT
+        floor(extract(epoch FROM block.found_at) / {int(bucket_seconds)})::bigint * {int(bucket_seconds)} AS bucket_epoch,
+        block.block_hash,
+        block.block_height,
+        block.found_at
+    FROM qbit_pool_blocks block
+    WHERE block.chain_state <> 'reversed'
+      AND block.found_at <= clock_timestamp()
+      {range_filter}
+),
+ranked AS (
+    SELECT
+        in_range.*,
+        row_number() OVER (
+            PARTITION BY bucket_epoch
+            ORDER BY found_at DESC, block_height DESC
+        ) AS bucket_rank
+    FROM in_range
+),
+points AS (
+    SELECT
+        bucket_epoch,
+        count(*) AS block_count,
+        json_agg(json_build_object(
+            'height', block_height,
+            'hash', block_hash,
+            'found_at', to_char(found_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+        ) ORDER BY found_at DESC, block_height DESC)
+            FILTER (WHERE bucket_rank <= {int(public_api.BLOCK_MARKERS_MAX_BLOCKS_PER_BUCKET)}) AS blocks
+    FROM ranked
+    GROUP BY bucket_epoch
+)
+SELECT json_build_object(
+    'total_blocks', COALESCE((SELECT sum(block_count)::bigint FROM points), 0),
+    'points', COALESCE((
+        SELECT json_agg(json_build_object(
+            'timestamp', to_char(to_timestamp(bucket_epoch) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+            'block_count', block_count,
+            'blocks', blocks
+        ) ORDER BY bucket_epoch ASC)
+        FROM points
+    ), '[]'::json)
+);
+"""
+        payload = self._run_read_json(sql)
+        return {
+            "total_blocks": int(payload["total_blocks"]),
+            "points": payload["points"],
+        }
+
+    def _audit_store(self) -> AuditArtifactStore:
+        store = getattr(self, "_audit_artifact_store", None)
+        if store is None:
+            raise RuntimeError("audit body store is not configured")
+        return store
+
+    def _stored_canonical_audit_bundle_bytes(
+        self,
         block_hash: str,
         audit_bundle_sha256: str,
-        final_bundle: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        if self._audit_body_dir is None or self._audit_share_segment_size <= 0:
+    ) -> bytes | None:
+        """Return a verified stored canonical bundle, or permit missing fallback.
+
+        Missing artifacts are expected for history predating issue #158.
+        Present-but-corrupt or unreadable artifacts fail closed instead of
+        silently serving a non-byte-exact legacy reconstruction.
+        """
+        store = getattr(self, "_audit_artifact_store", None)
+        reader = getattr(store, "read_canonical_audit_bundle", None)
+        if not callable(reader):
+            LOGGER.warning(
+                "canonical audit bundle unavailable reason=missing "
+                "block_hash=%s audit_bundle_sha256=%s",
+                block_hash,
+                audit_bundle_sha256,
+            )
             return None
-        shares = final_bundle.get("shares")
-        if not isinstance(shares, list) or not shares:
+        try:
+            canonical_bytes = reader(block_hash, audit_bundle_sha256)
+        except CanonicalAuditBundleCorrupt:
+            LOGGER.error(
+                "canonical audit bundle unavailable reason=corrupt "
+                "block_hash=%s audit_bundle_sha256=%s",
+                block_hash,
+                audit_bundle_sha256,
+            )
+            raise
+        except (OSError, RuntimeError, TypeError, ValueError):
+            LOGGER.exception(
+                "canonical audit bundle unavailable reason=read_error "
+                "block_hash=%s audit_bundle_sha256=%s",
+                block_hash,
+                audit_bundle_sha256,
+            )
+            raise
+        if canonical_bytes is None:
+            LOGGER.warning(
+                "canonical audit bundle unavailable reason=missing "
+                "block_hash=%s audit_bundle_sha256=%s",
+                block_hash,
+                audit_bundle_sha256,
+            )
             return None
-        share_parts = self._audit_share_range_parts(shares)
-        if share_parts is None:
+        if not isinstance(canonical_bytes, bytes):
+            LOGGER.error(
+                "canonical audit bundle unavailable reason=read_error "
+                "block_hash=%s audit_bundle_sha256=%s",
+                block_hash,
+                audit_bundle_sha256,
+            )
+            raise TypeError("canonical audit bundle reader returned non-bytes")
+        return canonical_bytes
+
+    def _audit_reader(self, body_uri: object) -> AuditArtifactStore:
+        del body_uri
+        store = getattr(self, "_audit_artifact_store", None)
+        if store is not None:
+            return store
+        # Compatibility-only dashboard resolvers historically initialized a
+        # read-only PsqlShareLedger subclass with just `_audit_body_dir`.  Keep
+        # that explicit adapter working while routing every read through A1.
+        legacy_root = getattr(self, "_audit_body_dir", None)
+        if legacy_root is not None:
+            root = Path(legacy_root)
+            store = AuditArtifactStore(
+                AuditArtifactConfig(
+                    root=root,
+                    evidence_path=root / "prism-live-stratum-evidence.json",
+                ),
+                canonicalizer=(
+                    getattr(self, "_audit_bundle_canonicalizer", None)
+                    or _default_bundle_canonicalizer()
+                ),
+            )
+            self._audit_artifact_store = store
+            return store
+        raise RuntimeError(
+            "audit bundle body is not retrievable: audit body store is not configured"
+        )
+
+    def _externalize_audit_body(self, block_hash: str, audit_bundle_sha256: str, final_bundle: Mapping[str, Any]) -> str | None:
+        if self._audit_artifact_store is None:
             return None
-        shares_key_index = list(final_bundle).index("shares")
-        bundle_without_shares = {
-            key: value for key, value in final_bundle.items() if key != "shares"
-        }
-        reward_manifest = final_bundle.get("reward_manifest")
-        proof: dict[str, Any] = {
-            "schema": AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA,
-            "share_segment_size": self._audit_share_segment_size,
-            "first_share_seq": int(shares[0]["share_seq"]),
-            "last_share_seq": int(shares[-1]["share_seq"]),
-            "share_count": len(shares),
-            "share_parts_digest_hex": sha256_bytes_hex(
-                self._storage_json_bytes({"share_parts": share_parts})
-            ),
-            "share_parts": share_parts,
-        }
-        if isinstance(reward_manifest, dict):
-            for key in (
-                "anchor_job_issued_at_ms",
-                "anchor_share_seq",
-                "newest_share_seq",
-                "oldest_share_seq",
-                "included_share_count",
-                "requested_window_weight",
-                "counted_window_weight",
-                "share_slice_digest_hex",
-            ):
-                if key in reward_manifest:
-                    proof[key] = reward_manifest[key]
-        return {
-            "schema": AUDIT_BUNDLE_V2_SCHEMA,
-            "block_hash": block_hash,
-            "audit_bundle_sha256": audit_bundle_sha256,
-            "logical_audit_bundle_schema": str(final_bundle.get("schema") or ""),
-            "share_count": len(shares),
-            "shares_key_index": shares_key_index,
-            "bundle_without_shares": bundle_without_shares,
-            "share_window_proof": proof,
-        }
+        return self._audit_store().externalize_audit_body(block_hash, audit_bundle_sha256, final_bundle)
+
+    def _canonical_audit_body_bytes_for_sha(self, final_bundle: Mapping[str, Any], audit_bundle_sha256: str) -> bytes:
+        return self._audit_store().canonical_audit_body_bytes_for_sha(final_bundle, audit_bundle_sha256)
+
+    def _audit_body_ref(self, **kwargs: Any) -> dict[str, Any] | None:
+        return self._audit_store().audit_body_ref(**kwargs)
+
+    def _audit_bundle_v2(self, **kwargs: Any) -> dict[str, Any] | None:
+        kwargs.setdefault("load_missing_range", self._load_audit_share_ledger_range)
+        return self._audit_store().audit_bundle_v2(**kwargs)
 
     def _audit_share_parts(self, shares: list[Any]) -> list[dict[str, Any]] | None:
-        share_seqs: list[int] = []
-        for share in shares:
-            if not isinstance(share, dict):
-                return None
-            try:
-                share_seq = int(share["share_seq"])
-            except (KeyError, TypeError, ValueError):
-                return None
-            share_seqs.append(share_seq)
-        if any(current + 1 != nxt for current, nxt in zip(share_seqs, share_seqs[1:])):
-            return None
-
-        parts: list[dict[str, Any]] = []
-        index = 0
-        segment_size = self._audit_share_segment_size
-        while index < len(shares):
-            first_seq = share_seqs[index]
-            segment_start = ((first_seq - 1) // segment_size) * segment_size + 1
-            segment_end = segment_start + segment_size - 1
-            end = index
-            while end < len(shares) and share_seqs[end] <= segment_end:
-                end += 1
-            chunk = shares[index:end]
-            chunk_seqs = share_seqs[index:end]
-            if len(chunk) == segment_size and chunk_seqs[0] == segment_start and chunk_seqs[-1] == segment_end:
-                segment_uri, segment_sha256 = self._write_audit_share_segment(
-                    first_share_seq=segment_start,
-                    last_share_seq=segment_end,
-                    shares=chunk,
-                )
-                parts.append(
-                    {
-                        "kind": "segment",
-                        "first_share_seq": segment_start,
-                        "last_share_seq": segment_end,
-                        "share_count": len(chunk),
-                        "sha256": segment_sha256,
-                        "body_uri": segment_uri,
-                    }
-                )
-            else:
-                parts.append(
-                    {
-                        "kind": "inline",
-                        "first_share_seq": chunk_seqs[0],
-                        "last_share_seq": chunk_seqs[-1],
-                        "share_count": len(chunk),
-                        "shares": chunk,
-                    }
-                )
-            index = end
-        return parts
+        return self._audit_store().audit_share_parts(shares)
 
     def _audit_share_range_parts(self, shares: list[Any]) -> list[dict[str, Any]] | None:
-        share_seqs: list[int] = []
-        for share in shares:
-            if not isinstance(share, dict):
-                return None
-            try:
-                share_seq = int(share["share_seq"])
-            except (KeyError, TypeError, ValueError):
-                return None
-            share_seqs.append(share_seq)
-        if any(current + 1 != nxt for current, nxt in zip(share_seqs, share_seqs[1:])):
-            return None
-
-        parts: list[dict[str, Any]] = []
-        index = 0
-        segment_size = self._audit_share_segment_size
-        while index < len(shares):
-            first_seq = share_seqs[index]
-            segment_start = ((first_seq - 1) // segment_size) * segment_size + 1
-            segment_end = segment_start + segment_size - 1
-            end = index
-            while end < len(shares) and share_seqs[end] <= segment_end:
-                end += 1
-            chunk = shares[index:end]
-            chunk_seqs = share_seqs[index:end]
-            segment_uri, range_sha256 = self._write_audit_share_segment_range(
-                segment_first_share_seq=segment_start,
-                segment_last_share_seq=segment_end,
-                first_share_seq=chunk_seqs[0],
-                last_share_seq=chunk_seqs[-1],
-                shares=chunk,
-            )
-            parts.append(
-                {
-                    "kind": "segment_range",
-                    "segment_first_share_seq": segment_start,
-                    "segment_last_share_seq": segment_end,
-                    "first_share_seq": chunk_seqs[0],
-                    "last_share_seq": chunk_seqs[-1],
-                    "share_count": len(chunk),
-                    "range_sha256": range_sha256,
-                    "body_uri": segment_uri,
-                }
-            )
-            index = end
-        return parts
-
-    def _audit_share_segment_payload(self, *, first_share_seq: int, last_share_seq: int, shares: list[Any]) -> dict[str, Any]:
-        return {
-            "schema": AUDIT_SHARE_SEGMENT_SCHEMA,
-            "first_share_seq": first_share_seq,
-            "last_share_seq": last_share_seq,
-            "share_count": len(shares),
-            "shares": shares,
-        }
-
-    def _write_audit_share_segment(
-        self,
-        *,
-        first_share_seq: int,
-        last_share_seq: int,
-        shares: list[Any],
-    ) -> tuple[str, str]:
-        if self._audit_body_dir is None:
-            raise RuntimeError("audit body store is not configured")
-        segment = self._audit_share_segment_payload(
-            first_share_seq=first_share_seq,
-            last_share_seq=last_share_seq,
-            shares=shares,
+        return self._audit_store().audit_share_range_parts(
+            shares,
+            load_missing_range=self._load_audit_share_ledger_range,
         )
-        segment_bytes = self._storage_json_bytes(segment)
-        segment_sha256 = sha256_bytes_hex(segment_bytes)
-        segment_path = self._audit_body_dir.resolve() / (
-            f"prism-audit-share-segment-{first_share_seq}-{last_share_seq}-{segment_sha256}.json"
-        )
-        if segment_path.exists():
-            if not self._file_matches_bytes(segment_path, segment_bytes):
-                raise RuntimeError(f"existing audit share segment does not match payload at {segment_path}")
-        else:
-            self._write_bytes_atomically(segment_path, segment_bytes)
-        return str(segment_path), segment_sha256
 
-    def _write_audit_share_segment_range(
-        self,
-        *,
-        segment_first_share_seq: int,
-        segment_last_share_seq: int,
-        first_share_seq: int,
-        last_share_seq: int,
-        shares: list[Any],
-    ) -> tuple[str, str]:
-        if self._audit_body_dir is None:
-            raise RuntimeError("audit body store is not configured")
-        if not shares:
-            raise RuntimeError("audit share segment range cannot be empty")
-        segment_path = self._audit_body_dir.resolve() / (
-            f"prism-audit-share-segment-slot-{segment_first_share_seq}-{segment_last_share_seq}.json"
-        )
-        range_payload = self._audit_share_segment_payload(
-            first_share_seq=first_share_seq,
-            last_share_seq=last_share_seq,
-            shares=shares,
-        )
-        # Encode the incoming range once.  Completed 10k slots dominate normal
-        # block persistence; byte equality lets them return without parsing,
-        # merging, deep-copying, or serializing the existing slot tree.
-        range_bytes = self._storage_json_bytes(range_payload)
-        range_sha256 = sha256_bytes_hex(range_bytes)
-        if segment_path.exists() and self._file_matches_bytes(segment_path, range_bytes):
-            return str(segment_path), range_sha256
+    def _audit_share_segment_payload(self, **kwargs: Any) -> dict[str, Any]:
+        return self._audit_store().audit_share_segment_payload(**kwargs)
 
-        merged_shares = shares
-        existing_bytes: bytes | None = None
-        if segment_path.exists():
-            try:
-                existing_bytes = segment_path.read_bytes()
-                existing = json.loads(existing_bytes)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise RuntimeError(f"existing audit share segment is not valid JSON at {segment_path}") from exc
-            if not isinstance(existing, dict) or existing.get("schema") != AUDIT_SHARE_SEGMENT_SCHEMA:
-                raise RuntimeError(f"existing audit share segment has invalid schema at {segment_path}")
-            existing_shares = existing.get("shares")
-            if not isinstance(existing_shares, list):
-                raise RuntimeError(f"existing audit share segment has no shares at {segment_path}")
-            merged_shares = self._merge_audit_share_ranges(
-                existing_shares,
-                shares,
-                segment_path=segment_path,
-            )
-            if merged_shares is None:
-                # Keep prior body_uri references valid at the stable slot path,
-                # while the new bundle uses an immutable incoming-only segment.
-                fresh_uri, fresh_sha256 = self._write_audit_share_segment(
-                    first_share_seq=first_share_seq,
-                    last_share_seq=last_share_seq,
-                    shares=shares,
-                )
-                if fresh_sha256 != range_sha256:
-                    raise RuntimeError("audit share segment range hash changed during fallback")
-                try:
-                    self._quarantine_audit_share_segment(
-                        segment_path,
-                        expected_bytes=existing_bytes,
-                    )
-                except OSError:
-                    # The stable slot already preserves the old range, and the
-                    # immutable file preserves the incoming one. A quarantine
-                    # snapshot failure must not wedge block finalization.
-                    pass
-                return fresh_uri, range_sha256
-        segment_first = int(merged_shares[0]["share_seq"])
-        segment_last = int(merged_shares[-1]["share_seq"])
-        if (
-            segment_first == first_share_seq
-            and segment_last == last_share_seq
-            and len(merged_shares) == len(shares)
-        ):
-            segment_bytes = range_bytes
-        else:
-            segment = self._audit_share_segment_payload(
-                first_share_seq=segment_first,
-                last_share_seq=segment_last,
-                shares=merged_shares,
-            )
-            segment_bytes = self._storage_json_bytes(segment)
-        if existing_bytes != segment_bytes:
-            self._write_bytes_atomically(segment_path, segment_bytes)
-        return str(segment_path), range_sha256
+    def _write_audit_share_segment(self, **kwargs: Any) -> tuple[str, str]:
+        return self._audit_store().write_audit_share_segment(**kwargs)
 
-    def _merge_audit_share_ranges(
-        self,
-        existing_shares: list[Any],
-        incoming_shares: list[Any],
-        *,
-        segment_path: Path,
-    ) -> list[Any] | None:
-        if not existing_shares:
-            return list(incoming_shares)
-        existing_by_seq = self._audit_shares_by_seq(existing_shares, segment_path=segment_path)
-        incoming_by_seq = self._audit_shares_by_seq(incoming_shares, segment_path=segment_path)
-        for share_seq, incoming in incoming_by_seq.items():
-            existing = existing_by_seq.get(share_seq)
-            if existing is not None and existing != incoming:
-                raise _AuditShareSegmentConflict(
-                    f"existing audit share segment conflicts at share_seq {share_seq} in {segment_path}"
-                )
-        merged_by_seq = {**existing_by_seq, **incoming_by_seq}
-        ordered_seqs = sorted(merged_by_seq)
-        if any(current + 1 != nxt for current, nxt in zip(ordered_seqs, ordered_seqs[1:])):
-            # A skipped finalize can leave an otherwise valid slot behind the
-            # incoming range. Repair that hole from the append-only ledger.
-            gap_before, gap_after = next(
-                (current, nxt)
-                for current, nxt in zip(ordered_seqs, ordered_seqs[1:])
-                if current + 1 != nxt
-            )
-            missing_first = gap_before + 1
-            missing_last = gap_after - 1
-            try:
-                durable_shares = self._load_audit_share_ledger_range(
-                    first_share_seq=missing_first,
-                    last_share_seq=missing_last,
-                )
-            except _AuditShareSegmentConflict:
-                raise
-            except Exception:
-                # This read is a recovery aid; its failure must not turn the
-                # original slot gap into another permanent finalize failure.
-                durable_shares = None
-            if durable_shares is not None:
-                try:
-                    durable_by_seq = self._audit_shares_by_seq(
-                        durable_shares,
-                        segment_path=segment_path,
-                        require_contiguous=False,
-                    )
-                except _AuditShareSegmentConflict:
-                    raise
-                except RuntimeError:
-                    durable_by_seq = {}
-                if sorted(durable_by_seq) == list(range(missing_first, missing_last + 1)):
-                    merged_by_seq.update(durable_by_seq)
-                    ordered_seqs = sorted(merged_by_seq)
-                    if not any(
-                        current + 1 != nxt
-                        for current, nxt in zip(ordered_seqs, ordered_seqs[1:])
-                    ):
-                        return [merged_by_seq[share_seq] for share_seq in ordered_seqs]
-            # The incoming range is independently complete and remains usable.
-            # The caller preserves this slot and gives that range a fresh URI.
-            return None
-        return [merged_by_seq[share_seq] for share_seq in ordered_seqs]
+    def _write_audit_share_segment_range(self, **kwargs: Any) -> tuple[str, str]:
+        kwargs.setdefault("load_missing_range", self._load_audit_share_ledger_range)
+        return self._audit_store().write_audit_share_segment_range(**kwargs)
+
+    def _merge_audit_share_ranges(self, existing_shares: list[Any], incoming_shares: list[Any], *, segment_path: Path) -> list[Any] | None:
+        return self._audit_store().merge_audit_share_ranges(
+            existing_shares,
+            incoming_shares,
+            segment_path=segment_path,
+            load_missing_range=self._load_audit_share_ledger_range,
+        )
 
     def _load_audit_share_ledger_range(
         self,
@@ -5995,202 +9786,33 @@ WHERE accepted
             raise RuntimeError("audit share ledger backfill did not return a list")
         return [self._record_from_json(row).to_prism_json() for row in rows]
 
-    def _quarantine_audit_share_segment(
-        self,
-        segment_path: Path,
-        *,
-        expected_bytes: bytes,
-    ) -> Path:
-        for existing_path in segment_path.parent.glob(f"{segment_path.name}.conflict-*"):
-            if self._file_matches_bytes(existing_path, expected_bytes):
-                return existing_path
-        timestamp = time.time_ns()
-        quarantine_path = segment_path.with_name(f"{segment_path.name}.conflict-{timestamp}")
-        while quarantine_path.exists():
-            timestamp += 1
-            quarantine_path = segment_path.with_name(f"{segment_path.name}.conflict-{timestamp}")
-        # Snapshot rather than move: previously finalized bundles retain this
-        # stable slot URI, so it must remain readable across crashes and retries.
-        self._write_bytes_atomically(quarantine_path, expected_bytes)
-        return quarantine_path
-
-    def _audit_shares_by_seq(
-        self,
-        shares: list[Any],
-        *,
-        segment_path: Path,
-        require_contiguous: bool = True,
-    ) -> dict[int, Any]:
-        by_seq: dict[int, Any] = {}
-        for share in shares:
-            if not isinstance(share, dict):
-                raise RuntimeError(f"audit share segment has invalid share payload at {segment_path}")
-            try:
-                share_seq = int(share["share_seq"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise RuntimeError(f"audit share segment has invalid share_seq at {segment_path}") from exc
-            existing = by_seq.get(share_seq)
-            if existing is not None and existing != share:
-                raise _AuditShareSegmentConflict(
-                    f"audit share segment has duplicate conflicting share_seq {share_seq} at {segment_path}"
-                )
-            by_seq[share_seq] = share
-        ordered = sorted(by_seq)
-        if require_contiguous and any(current + 1 != nxt for current, nxt in zip(ordered, ordered[1:])):
-            raise RuntimeError(f"audit share segment has non-contiguous share_seq values at {segment_path}")
-        return by_seq
+    def _audit_shares_by_seq(self, shares: list[Any], *, segment_path: Path, require_contiguous: bool = True) -> dict[int, Any]:
+        return self._audit_store().audit_shares_by_seq(
+            shares,
+            segment_path=segment_path,
+            require_contiguous=require_contiguous,
+        )
 
     def _storage_json_bytes(self, payload: dict[str, Any]) -> bytes:
-        return json.dumps(payload, separators=(",", ":")).encode("utf-8")
-
-    @staticmethod
-    def _file_matches_bytes(path: Path, expected: bytes) -> bool:
-        try:
-            if path.stat().st_size != len(expected):
-                return False
-            offset = 0
-            view = memoryview(expected)
-            with path.open("rb") as handle:
-                while offset < len(expected):
-                    chunk = handle.read(min(1024 * 1024, len(expected) - offset))
-                    if not chunk or chunk != view[offset : offset + len(chunk)]:
-                        return False
-                    offset += len(chunk)
-                return not handle.read(1)
-        except OSError:
-            return False
-
-    def _write_bytes_atomically(self, path: Path, payload: bytes) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-        try:
-            with tmp_path.open("xb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            tmp_path.replace(path)
-        finally:
-            try:
-                tmp_path.unlink()
-            except FileNotFoundError:
-                pass
-
-    def _write_json_atomically(self, path: Path, payload: dict[str, Any]) -> None:
-        """Stream compact JSON through the existing fsync-and-rename boundary."""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-        encoder = json.JSONEncoder(separators=(",", ":"))
-        try:
-            with tmp_path.open("xb") as handle:
-                for chunk in encoder.iterencode(payload):
-                    handle.write(chunk.encode("utf-8"))
-                handle.flush()
-                os.fsync(handle.fileno())
-            tmp_path.replace(path)
-        finally:
-            try:
-                tmp_path.unlink()
-            except FileNotFoundError:
-                pass
-
-    def _file_matches_json_payload(self, path: Path, payload: dict[str, Any]) -> bool:
-        """Compare compact JSON exactly without materializing expected bytes."""
-        expected_digest = hashlib.sha256()
-        expected_length = 0
-        encoder = json.JSONEncoder(separators=(",", ":"))
-        for chunk in encoder.iterencode(payload):
-            encoded = chunk.encode("utf-8")
-            expected_digest.update(encoded)
-            expected_length += len(encoded)
-        try:
-            return (
-                path.stat().st_size == expected_length
-                and hmac.compare_digest(
-                    self._file_sha256_hex(path),
-                    expected_digest.hexdigest(),
-                )
-            )
-        except OSError:
-            return False
-
-    def _copy_file_atomically(self, path: Path, source: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-        try:
-            with source.open("rb") as input_handle, tmp_path.open("xb") as output_handle:
-                while chunk := input_handle.read(1024 * 1024):
-                    output_handle.write(chunk)
-                output_handle.flush()
-                os.fsync(output_handle.fileno())
-            tmp_path.replace(path)
-        finally:
-            try:
-                tmp_path.unlink()
-            except FileNotFoundError:
-                pass
+        return self._audit_store().storage_json_bytes(payload)
 
     @staticmethod
     def _file_sha256_hex(path: Path) -> str:
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            while chunk := handle.read(1024 * 1024):
-                digest.update(chunk)
-        return digest.hexdigest()
-
-    def _write_external_audit_body(
-        self,
-        block_hash: str,
-        audit_bundle_sha256: str,
-        body_bytes: bytes,
-    ) -> str | None:
-        if self._audit_body_dir is None:
-            return None
-        self._audit_body_dir.mkdir(parents=True, exist_ok=True)
-        body_path = self._audit_body_path(block_hash, audit_bundle_sha256)
-        if body_path.exists():
-            existing = body_path.read_bytes()
-            if existing != body_bytes:
-                raise RuntimeError(f"existing audit bundle body does not match payload at {body_path}")
-            return str(body_path)
-        self._write_bytes_atomically(body_path, body_bytes)
-        return str(body_path)
+        return AuditArtifactStore.file_sha256_hex(path)
 
     def _canonical_audit_bundle_bytes(self, final_bundle: dict[str, Any]) -> bytes:
-        if self._audit_bundle_canonicalizer is not None:
-            canonical = self._audit_bundle_canonicalizer(final_bundle)
-            return canonical.encode() if isinstance(canonical, str) else bytes(canonical)
-        completed = subprocess.run(
-            prism_tool_command("qbit-prism-audit-canonicalize")
-            + [
-                "--input",
-                "-",
-            ],
-            input=json.dumps(final_bundle).encode(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        if completed.returncode != 0:
-            stderr = completed.stderr.decode(errors="replace").strip()
-            raise RuntimeError(f"qbit-prism-audit-canonicalize failed: {stderr}")
-        return completed.stdout
+        if self._audit_artifact_store is None:
+            return canonical_audit_bundle_bytes(
+                final_bundle,
+                self._audit_bundle_canonicalizer,
+            )
+        return self._audit_store().canonical_audit_bundle_bytes(final_bundle)
 
     def _audit_body_path(self, block_hash: str, audit_bundle_sha256: str) -> Path:
-        if self._audit_body_dir is None:
-            raise RuntimeError("audit body store is not configured")
-        root = self._audit_body_dir.resolve()
-        body_path = root / f"prism-audit-bundle-body-{block_hash}-{audit_bundle_sha256}.json"
-        return self._resolve_audit_body_path(body_path)
+        return self._audit_store().body_path(block_hash, audit_bundle_sha256)
 
     def _resolve_audit_body_path(self, body_uri: object) -> Path:
-        body_path = Path(str(body_uri)).expanduser().resolve()
-        if self._audit_body_dir is not None:
-            root = self._audit_body_dir.resolve()
-            try:
-                body_path.relative_to(root)
-            except ValueError as exc:
-                raise RuntimeError(f"audit bundle body path escapes audit body store: {body_uri}") from exc
-        return body_path
+        return self._audit_store().resolve_owned_path(body_uri)
 
     def _external_audit_body_write_plan(self, payload: dict[str, Any]) -> str | None:
         """Refresh the writer lease and decide whether this persist may write a body.
@@ -6200,7 +9822,7 @@ WHERE accepted
         writers from creating artifacts by requiring the DB lease to be current
         before any filesystem side effect.
         """
-        if self._audit_body_dir is None:
+        if self._audit_artifact_store is None:
             return None
         sql = f"""
 WITH payload AS (
@@ -6272,450 +9894,213 @@ END;
             return None
         return str(self._audit_body_path(payload["block_hash"], payload["audit_bundle_sha256"]))
 
-    def _audit_body_byte_len(
+    def preflight_canonical_bundle_publication(
         self,
-        body_uri: object | None,
-        final_bundle: dict[str, Any],
-        canonical_bundle_path: Path | None = None,
-    ) -> int:
-        if body_uri:
-            return self._resolve_audit_body_path(body_uri).stat().st_size
-        if canonical_bundle_path is not None:
-            return canonical_bundle_path.stat().st_size
-        return len(self._canonical_audit_bundle_bytes(final_bundle))
-
-    def _prepare_external_audit_body(
-        self,
-        payload: dict[str, Any],
-        final_bundle: dict[str, Any],
         *,
-        canonical_bundle_path: Path | None = None,
-    ) -> str | None:
-        if self._audit_body_dir is None:
-            return None
+        block_hash: str,
+        audit_bundle_sha256: str,
+    ) -> dict[str, object]:
+        """Refresh the writer lease and confirm one block/digest row identity.
+
+        The standalone canonical-bundle backfill calls this immediately before
+        each publication. It is the same fence `_external_audit_body_write_plan`
+        applies to the live path: a writer whose lease has lapsed must not keep
+        creating artifacts under the audit root, and the digest it is about to
+        publish must be the one the ledger row already advertises. Reads the
+        audit tables only; the sole mutation is the writer's own lease
+        heartbeat, so no schema changes.
+
+        Returns the row's `body_uri` (None for legacy inline rows) and whether
+        an inline body is still present, which is what the backfill needs to
+        choose its byte source. Raises when the lease is not active or the
+        block/digest identity does not match.
+        """
+
+        block_hash = canonical_hex(str(block_hash), name="block_hash", expected_bytes=32)
+        digest = canonical_hex(
+            str(audit_bundle_sha256),
+            name="audit_bundle_sha256",
+            expected_bytes=32,
+        )
         payload = {
+            "block_hash": block_hash,
+            "audit_bundle_sha256": digest,
+            "writer_id": self._writer_id,
+            "writer_epoch": self._writer_epoch,
+            "writer_session_token": self._writer_session_token,
+        }
+        sql = f"""
+WITH payload AS (
+    SELECT {self._jsonb_literal(payload)} AS data
+),
+lease AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    FROM payload
+    WHERE qbit_ledger_writer_lease.singleton
+      AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+      AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+      AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
+    RETURNING qbit_ledger_writer_lease.writer_id
+),
+bundle AS (
+    SELECT
+        block_hash,
+        audit_bundle_sha256,
+        body_uri,
+        audit_bundle IS NOT NULL AS has_inline_bundle
+    FROM qbit_pool_audit_bundles
+    WHERE block_hash = (SELECT data->>'block_hash' FROM payload)
+),
+matching_bundle AS (
+    SELECT bundle.*
+    FROM bundle, payload
+    WHERE bundle.audit_bundle_sha256 = data->>'audit_bundle_sha256'
+)
+SELECT CASE
+    WHEN (SELECT count(*) FROM lease) = 0 THEN
+        json_build_object('error', 'writer lease is not active')
+    WHEN (SELECT count(*) FROM bundle) = 0 THEN
+        json_build_object('error', 'audit bundle row does not exist')
+    WHEN (SELECT count(*) FROM matching_bundle) = 0 THEN
+        json_build_object('error', 'audit bundle digest does not match the stored row')
+    ELSE
+        json_build_object(
+            'block_hash', (SELECT block_hash FROM matching_bundle LIMIT 1),
+            'audit_bundle_sha256', (SELECT audit_bundle_sha256 FROM matching_bundle LIMIT 1),
+            'body_uri', (SELECT body_uri FROM matching_bundle LIMIT 1),
+            'has_inline_bundle', (SELECT has_inline_bundle FROM matching_bundle LIMIT 1)
+        )
+END;
+"""
+        result = self._run_fenced_json(sql)
+        if not isinstance(result, dict):
+            raise RuntimeError("canonical bundle preflight returned no row")
+        if "error" in result:
+            raise RuntimeError(str(result["error"]))
+        body_uri = result.get("body_uri")
+        return {
+            "block_hash": block_hash,
+            "audit_bundle_sha256": digest,
+            "body_uri": str(body_uri) if body_uri else None,
+            "has_inline_bundle": bool(result.get("has_inline_bundle")),
+        }
+
+    def canonical_bundle_bytes_for_backfill(
+        self,
+        *,
+        block_hash: str,
+        audit_bundle_sha256: str,
+        body_uri: object,
+    ) -> bytes:
+        """Recover verified canonical bytes for an already published body.
+
+        Binds the ledger's append-only share loader to the store helper so the
+        standalone backfill can repair share segments that have left the disk
+        without reaching into ledger internals. Every recovered range is checked
+        against the digest the body already commits to, and the assembled bundle
+        against the advertised bundle digest.
+        """
+
+        return self._audit_store().canonical_bundle_bytes_from_external_body(
+            block_hash=block_hash,
+            audit_bundle_sha256=audit_bundle_sha256,
+            body_uri=body_uri,
+            load_missing_range=self._load_audit_share_ledger_range,
+        )
+
+    def publish_canonical_bundle_bytes(
+        self,
+        *,
+        block_hash: str,
+        audit_bundle_sha256: str,
+        canonical_bytes: bytes,
+    ) -> str:
+        """Publish canonical bytes under the store's ownership checks.
+
+        Callers must run `preflight_canonical_bundle_publication` immediately
+        before this so the writer lease is current when the artifact lands.
+        """
+
+        return str(
+            self._audit_store().write_canonical_audit_bundle(
+                block_hash,
+                audit_bundle_sha256,
+                canonical_bytes,
+            )
+        )
+
+    def _audit_body_byte_len(self, body_uri: object | None, final_bundle: Mapping[str, Any], canonical_bundle_path: Path | None = None) -> int:
+        if self._audit_artifact_store is None:
+            if isinstance(final_bundle, CanonicalAuditBundleView):
+                # The artifact's own length: no canonicalizer round trip and
+                # no whole-body copy for the inline compatibility lane.
+                final_bundle.verify_identity()
+                return final_bundle.byte_length
+            return len(self._canonical_audit_bundle_bytes(final_bundle))
+        return self._audit_store().audit_body_byte_len(body_uri, final_bundle, canonical_bundle_path)
+
+    def _prepare_external_audit_body(self, payload: dict[str, Any], final_bundle: Mapping[str, Any], *, canonical_bundle_path: Path | None = None) -> str | None:
+        if self._audit_artifact_store is None:
+            return None
+        normalized = {
             **payload,
             "block_hash": canonical_hex(str(payload["block_hash"]), name="block_hash", expected_bytes=32),
-            "audit_bundle_sha256": canonical_hex(
-                str(payload["audit_bundle_sha256"]),
-                name="audit_bundle_sha256",
-                expected_bytes=32,
-            ),
+            "audit_bundle_sha256": canonical_hex(str(payload["audit_bundle_sha256"]), name="audit_bundle_sha256", expected_bytes=32),
         }
-        expected_sha256 = str(payload["audit_bundle_sha256"])
-        body_bytes: bytes | None = None
         if canonical_bundle_path is not None:
-            canonical_bundle_path = canonical_bundle_path.resolve()
-            try:
-                actual_sha256 = self._file_sha256_hex(canonical_bundle_path)
-            except OSError as exc:
-                raise RuntimeError(
-                    f"canonical audit bundle is not retrievable at {canonical_bundle_path}: {exc}"
-                ) from exc
-            if actual_sha256 != expected_sha256:
-                raise RuntimeError(
-                    "audit bundle sha256 mismatch: "
-                    f"expected {expected_sha256}, got {actual_sha256}"
-                )
-        else:
-            body_bytes = self._canonical_audit_body_bytes_for_sha(
+            self._audit_store().validate_canonical_source(
+                canonical_bundle_path,
+                str(normalized["audit_bundle_sha256"]),
                 final_bundle,
-                expected_sha256,
             )
-        body_uri = self._external_audit_body_write_plan(payload)
-        if body_uri is None:
-            return None
-        body_path = self._resolve_audit_body_path(body_uri)
-        storage_payload = self._audit_bundle_v2(
-            block_hash=str(payload["block_hash"]),
-            audit_bundle_sha256=expected_sha256,
-            final_bundle=final_bundle,
+        body_uri = self._external_audit_body_write_plan(normalized)
+        return self._audit_store().prepare_external_audit_body(
+            normalized,
+            final_bundle,
+            body_uri=body_uri,
+            canonical_bundle_path=canonical_bundle_path,
+            load_missing_range=self._load_audit_share_ledger_range,
         )
-        if storage_payload is None:
-            storage_payload = self._audit_body_ref(
-                block_hash=str(payload["block_hash"]),
-                audit_bundle_sha256=expected_sha256,
-                final_bundle=final_bundle,
-            )
-        if body_path.exists():
-            if storage_payload is not None and self._file_matches_json_payload(
-                body_path, storage_payload
-            ):
-                return str(body_path)
-            if (
-                storage_payload is None
-                and canonical_bundle_path is not None
-                and self._file_sha256_hex(body_path) == expected_sha256
-            ):
-                return str(body_path)
-            # Preserve compatibility with bodies written by an older storage
-            # layout. This expensive reconstruction is only the mismatch path;
-            # same-version crash retries take the bounded exact-match path.
-            if not self._external_body_matches_sha(body_path, expected_sha256):
-                raise RuntimeError(f"existing audit bundle body does not match payload at {body_path}")
-            return str(body_path)
-        canonical_body_path = self._audit_body_path(
-            str(payload["block_hash"]),
-            str(payload["audit_bundle_sha256"]),
-        )
-        if body_path != canonical_body_path:
-            raise RuntimeError(
-                "existing audit bundle body pointer does not match canonical external path: "
-                f"{body_uri}"
-            )
-        if storage_payload is not None:
-            self._write_json_atomically(body_path, storage_payload)
-        elif canonical_bundle_path is not None:
-            self._copy_file_atomically(body_path, canonical_bundle_path)
-        else:
-            assert body_bytes is not None
-            self._write_bytes_atomically(body_path, body_bytes)
-        return str(body_path)
 
-    def _read_external_body(
-        self,
-        body_uri: object,
-        *,
-        expected_sha256: object | None = None,
-    ) -> dict[str, object] | None:
-        if not body_uri:
-            return None
-        try:
-            body_path = self._resolve_audit_body_path(body_uri)
-            body_bytes = body_path.read_bytes()
-        except OSError as exc:
-            raise RuntimeError(
-                f"audit bundle body is not retrievable at {body_uri}: {exc}"
-            ) from exc
-        try:
-            body = json.loads(body_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: {exc}") from exc
-        if isinstance(body, dict) and body.get("schema") == AUDIT_BODY_REF_SCHEMA:
-            return self._resolve_audit_body_ref(body, expected_sha256=expected_sha256, body_uri=body_uri)
-        if isinstance(body, dict) and body.get("schema") == AUDIT_BUNDLE_V2_SCHEMA:
-            return self._resolve_audit_bundle_v2(body, expected_sha256=expected_sha256, body_uri=body_uri)
-        if expected_sha256:
-            expected = str(expected_sha256).lower()
-            actual = sha256_bytes_hex(body_bytes)
-            if actual != expected:
-                raise RuntimeError(
-                    f"audit bundle body hash mismatch at {body_uri}: expected {expected}, got {actual}"
-                )
-        return body
+    def _read_external_body(self, body_uri: object, *, expected_sha256: object | None = None) -> dict[str, object] | None:
+        return self._audit_reader(body_uri).read_external_body(body_uri, expected_sha256=expected_sha256)
 
     def _external_body_matches_sha(self, body_path: Path, expected_sha256: str) -> bool:
-        try:
-            self._read_external_body(str(body_path), expected_sha256=expected_sha256)
-        except RuntimeError:
-            return False
-        return True
+        return self._audit_reader(body_path).external_body_matches_sha(body_path, expected_sha256)
 
     def _external_body_available_for_sha(self, body_uri: object, expected_sha256: str) -> bool:
         try:
-            body_path = self._resolve_audit_body_path(body_uri)
-            body_bytes = body_path.read_bytes()
-        except (OSError, RuntimeError):
+            reader = self._audit_reader(body_uri)
+        except RuntimeError:
             return False
-        try:
-            body = json.loads(body_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            body = None
-        if isinstance(body, dict) and body.get("schema") == AUDIT_BODY_REF_SCHEMA:
-            if str(body.get("audit_bundle_sha256") or "").lower() != expected_sha256:
-                return False
-            bundle_without_shares = body.get("bundle_without_shares")
-            share_parts = body.get("share_parts")
-            if not isinstance(bundle_without_shares, dict) or not isinstance(share_parts, list):
-                return False
-            expected_share_count = int(body.get("share_count") or 0)
-            actual_share_count = 0
-            for part in share_parts:
-                if not isinstance(part, dict):
-                    return False
-                kind = part.get("kind")
-                if kind == "segment":
-                    if not self._audit_share_segment_available(part, parent_body_uri=body_uri):
-                        return False
-                elif kind in {"segment_range", "segment_prefix"}:
-                    if not self._audit_share_segment_available(part, parent_body_uri=body_uri):
-                        return False
-                elif kind == "inline":
-                    inline_shares = part.get("shares")
-                    if not isinstance(inline_shares, list) or len(inline_shares) != int(part.get("share_count") or 0):
-                        return False
-                else:
-                    return False
-                actual_share_count += int(part.get("share_count") or 0)
-            return actual_share_count == expected_share_count
-        if isinstance(body, dict) and body.get("schema") == AUDIT_BUNDLE_V2_SCHEMA:
-            try:
-                self._resolve_audit_bundle_v2(body, expected_sha256=expected_sha256, body_uri=body_uri)
-            except RuntimeError:
-                return False
-            return True
-        return sha256_bytes_hex(body_bytes) == expected_sha256
+        return reader.external_body_available_for_sha(body_uri, expected_sha256)
 
     def _audit_share_segment_available(self, part: dict[str, Any], *, parent_body_uri: object) -> bool:
         try:
-            self._read_audit_share_segment(part, parent_body_uri=parent_body_uri)
-        except RuntimeError:
+            self._audit_store().read_audit_share_segment(part, parent_body_uri=parent_body_uri)
+        except (OSError, RuntimeError, TypeError, ValueError):
             return False
         return True
 
-    def _resolve_audit_body_ref(
-        self,
-        body_ref: dict[str, Any],
-        *,
-        expected_sha256: object | None,
-        body_uri: object,
-    ) -> dict[str, object]:
-        expected = str(expected_sha256).lower() if expected_sha256 else None
-        declared_sha256 = str(body_ref.get("audit_bundle_sha256") or "").lower()
-        if expected and declared_sha256 != expected:
-            raise RuntimeError(
-                f"audit bundle body hash mismatch at {body_uri}: expected {expected}, got {declared_sha256}"
-            )
-        bundle_without_shares = body_ref.get("bundle_without_shares")
-        if not isinstance(bundle_without_shares, dict):
-            raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: missing bundle_without_shares")
-        share_parts = body_ref.get("share_parts")
-        if not isinstance(share_parts, list):
-            raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: missing share_parts")
-        shares: list[Any] = []
-        for part in share_parts:
-            if not isinstance(part, dict):
-                raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: invalid share part")
-            kind = part.get("kind")
-            if kind == "segment":
-                shares.extend(self._read_audit_share_segment(part, parent_body_uri=body_uri))
-            elif kind in {"segment_range", "segment_prefix"}:
-                shares.extend(self._read_audit_share_segment(part, parent_body_uri=body_uri))
-            elif kind == "inline":
-                inline_shares = part.get("shares")
-                if not isinstance(inline_shares, list):
-                    raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: invalid inline shares")
-                if len(inline_shares) != int(part.get("share_count") or 0):
-                    raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: inline share count mismatch")
-                # The body was freshly parsed for this request; transfer its
-                # share objects into the reconstructed bundle without cloning.
-                shares.extend(inline_shares)
-            else:
-                raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: invalid share part kind")
-        expected_share_count = int(body_ref.get("share_count") or 0)
-        if len(shares) != expected_share_count:
-            raise RuntimeError(
-                f"audit bundle body is not valid JSON at {body_uri}: expected "
-                f"{expected_share_count} shares, reconstructed {len(shares)}"
-            )
-        shares_key_index_raw = body_ref.get("shares_key_index")
-        shares_key_index = len(bundle_without_shares) if shares_key_index_raw is None else int(shares_key_index_raw)
-        bundle: dict[str, object] = {}
-        shares_inserted = False
-        for index, (key, value) in enumerate(bundle_without_shares.items()):
-            if index == shares_key_index:
-                bundle["shares"] = shares
-                shares_inserted = True
-            bundle[str(key)] = value
-        if not shares_inserted:
-            bundle["shares"] = shares
-        if expected:
-            actual = sha256_bytes_hex(self._canonical_audit_bundle_bytes(bundle))
-            if actual != expected:
-                raise RuntimeError(
-                    f"audit bundle body hash mismatch at {body_uri}: expected {expected}, got {actual}"
-                )
-        return bundle
+    def _resolve_audit_body_ref(self, body_ref: dict[str, Any], *, expected_sha256: object | None, body_uri: object) -> dict[str, object]:
+        return self._audit_store().resolve_audit_body_ref(body_ref, expected_sha256=expected_sha256, body_uri=body_uri)
 
-    def _resolve_audit_bundle_v2(
-        self,
-        body: dict[str, Any],
-        *,
-        expected_sha256: object | None,
-        body_uri: object,
-    ) -> dict[str, object]:
-        expected = str(expected_sha256).lower() if expected_sha256 else None
-        declared_sha256 = str(body.get("audit_bundle_sha256") or "").lower()
-        if expected and declared_sha256 != expected:
-            raise RuntimeError(
-                f"audit bundle body hash mismatch at {body_uri}: expected {expected}, got {declared_sha256}"
-            )
-        bundle_without_shares = body.get("bundle_without_shares")
-        if not isinstance(bundle_without_shares, dict):
-            raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: missing bundle_without_shares")
-        proof = body.get("share_window_proof")
-        if not isinstance(proof, dict) or proof.get("schema") != AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA:
-            raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: missing share_window_proof")
-        share_parts = proof.get("share_parts")
-        if not isinstance(share_parts, list):
-            raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: missing share_parts")
-        expected_parts_digest = str(proof.get("share_parts_digest_hex") or "").lower()
-        if expected_parts_digest:
-            actual_parts_digest = sha256_bytes_hex(self._storage_json_bytes({"share_parts": share_parts}))
-            if actual_parts_digest != expected_parts_digest:
-                raise RuntimeError(
-                    f"audit bundle body is not valid JSON at {body_uri}: share_parts_digest_hex mismatch"
-                )
-        shares: list[Any] = []
-        for part in share_parts:
-            if not isinstance(part, dict):
-                raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: invalid share part")
-            shares.extend(self._read_audit_share_segment(part, parent_body_uri=body_uri))
-        expected_share_count = int(body.get("share_count") or proof.get("share_count") or 0)
-        if len(shares) != expected_share_count:
-            raise RuntimeError(
-                f"audit bundle body is not valid JSON at {body_uri}: expected "
-                f"{expected_share_count} shares, reconstructed {len(shares)}"
-            )
-        if shares:
-            first_share_seq = int(shares[0].get("share_seq")) if isinstance(shares[0], dict) else None
-            last_share_seq = int(shares[-1].get("share_seq")) if isinstance(shares[-1], dict) else None
-            if int(proof.get("first_share_seq") or 0) != first_share_seq:
-                raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: proof first_share_seq mismatch")
-            if int(proof.get("last_share_seq") or 0) != last_share_seq:
-                raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: proof last_share_seq mismatch")
-        reward_manifest = bundle_without_shares.get("reward_manifest")
-        proof_share_digest = str(proof.get("share_slice_digest_hex") or "")
-        if proof_share_digest and isinstance(reward_manifest, dict):
-            reward_share_digest = str(reward_manifest.get("share_slice_digest_hex") or "")
-            if not proof_share_digest.lower() == reward_share_digest.lower():
-                raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: proof share digest mismatch")
-        shares_key_index_raw = body.get("shares_key_index")
-        shares_key_index = len(bundle_without_shares) if shares_key_index_raw is None else int(shares_key_index_raw)
-        bundle: dict[str, object] = {}
-        shares_inserted = False
-        for index, (key, value) in enumerate(bundle_without_shares.items()):
-            if index == shares_key_index:
-                bundle["shares"] = shares
-                shares_inserted = True
-            bundle[str(key)] = value
-        if not shares_inserted:
-            bundle["shares"] = shares
-        actual = sha256_bytes_hex(self._canonical_audit_bundle_bytes(bundle))
-        if declared_sha256 and actual != declared_sha256:
-            raise RuntimeError(
-                f"audit bundle body hash mismatch at {body_uri}: expected {declared_sha256}, got {actual}"
-            )
-        return bundle
+    def _resolve_audit_bundle_v2(self, body: dict[str, Any], *, expected_sha256: object | None, body_uri: object) -> dict[str, object]:
+        return self._audit_store().resolve_audit_bundle_v2(body, expected_sha256=expected_sha256, body_uri=body_uri)
 
     def _read_audit_share_segment(self, part: dict[str, Any], *, parent_body_uri: object) -> list[Any]:
-        body_uri = part.get("body_uri")
-        kind = str(part.get("kind") or "")
-        try:
-            body_path = self._resolve_audit_body_path(body_uri)
-            segment_bytes = body_path.read_bytes()
-        except OSError as exc:
-            raise RuntimeError(
-                f"audit bundle body is not retrievable at {parent_body_uri}: share segment {body_uri}: {exc}"
-            ) from exc
-        expected_sha256 = str(part.get("sha256") or "").lower()
-        if kind == "segment" and sha256_bytes_hex(segment_bytes) != expected_sha256:
-            raise RuntimeError(
-                f"audit bundle body hash mismatch at {parent_body_uri}: "
-                f"share segment {body_uri} expected {expected_sha256}, got {sha256_bytes_hex(segment_bytes)}"
-            )
-        try:
-            segment = json.loads(segment_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise RuntimeError(
-                f"audit bundle body is not valid JSON at {parent_body_uri}: share segment {body_uri}: {exc}"
-            ) from exc
-        if not isinstance(segment, dict) or segment.get("schema") != AUDIT_SHARE_SEGMENT_SCHEMA:
-            raise RuntimeError(
-                f"audit bundle body is not valid JSON at {parent_body_uri}: invalid share segment {body_uri}"
-            )
-        shares = segment.get("shares")
-        if not isinstance(shares, list):
-            raise RuntimeError(
-                f"audit bundle body is not valid JSON at {parent_body_uri}: share segment {body_uri} has no shares"
-            )
-        expected_count = int(part.get("share_count") or 0)
-        first_share_seq = int(part.get("first_share_seq") or 0)
-        last_share_seq = int(part.get("last_share_seq") or 0)
-        selected_shares = self._select_audit_share_segment_range(
+        return self._audit_store().read_audit_share_segment(part, parent_body_uri=parent_body_uri)
+
+    def _select_audit_share_segment_range(self, shares: list[Any], *, first_share_seq: int, last_share_seq: int, parent_body_uri: object, body_uri: object) -> list[Any]:
+        return self._audit_store().select_audit_share_segment_range(
             shares,
             first_share_seq=first_share_seq,
             last_share_seq=last_share_seq,
             parent_body_uri=parent_body_uri,
             body_uri=body_uri,
         )
-        if len(selected_shares) != expected_count:
-            raise RuntimeError(
-                f"audit bundle body is not valid JSON at {parent_body_uri}: share segment {body_uri} "
-                f"expected {expected_count} shares, found {len(selected_shares)}"
-            )
-        if kind == "segment_range":
-            expected_range_sha256 = str(part.get("range_sha256") or "").lower()
-            actual_range_sha256 = sha256_bytes_hex(
-                self._storage_json_bytes(
-                    self._audit_share_segment_payload(
-                        first_share_seq=first_share_seq,
-                        last_share_seq=last_share_seq,
-                        shares=selected_shares,
-                    )
-                )
-            )
-            if actual_range_sha256 != expected_range_sha256:
-                raise RuntimeError(
-                    f"audit bundle body hash mismatch at {parent_body_uri}: "
-                    f"share segment range {body_uri} expected {expected_range_sha256}, got {actual_range_sha256}"
-                )
-        elif kind == "segment_prefix":
-            expected_prefix_sha256 = str(part.get("prefix_sha256") or "").lower()
-            actual_prefix_sha256 = sha256_bytes_hex(
-                self._storage_json_bytes(
-                    self._audit_share_segment_payload(
-                        first_share_seq=first_share_seq,
-                        last_share_seq=last_share_seq,
-                        shares=selected_shares,
-                    )
-                )
-            )
-            if actual_prefix_sha256 != expected_prefix_sha256:
-                raise RuntimeError(
-                    f"audit bundle body hash mismatch at {parent_body_uri}: "
-                    f"share segment prefix {body_uri} expected {expected_prefix_sha256}, got {actual_prefix_sha256}"
-                )
-        elif kind != "segment":
-            raise RuntimeError(f"audit bundle body is not valid JSON at {parent_body_uri}: invalid share part kind")
-        # selected_shares references a freshly parsed, request-local segment.
-        return selected_shares
-
-    def _select_audit_share_segment_range(
-        self,
-        shares: list[Any],
-        *,
-        first_share_seq: int,
-        last_share_seq: int,
-        parent_body_uri: object,
-        body_uri: object,
-    ) -> list[Any]:
-        selected: list[Any] = []
-        previous_seq: int | None = None
-        for share in shares:
-            if not isinstance(share, dict):
-                raise RuntimeError(
-                    f"audit bundle body is not valid JSON at {parent_body_uri}: share segment {body_uri} has invalid share"
-                )
-            share_seq = int(share.get("share_seq") or 0)
-            if previous_seq is not None and previous_seq + 1 != share_seq:
-                raise RuntimeError(
-                    f"audit bundle body is not valid JSON at {parent_body_uri}: share segment {body_uri} is not contiguous"
-                )
-            previous_seq = share_seq
-            if first_share_seq <= share_seq <= last_share_seq:
-                selected.append(share)
-        if selected:
-            if int(selected[0].get("share_seq") or 0) != first_share_seq:
-                selected = []
-            elif int(selected[-1].get("share_seq") or 0) != last_share_seq:
-                selected = []
-        if not selected and first_share_seq <= last_share_seq:
-            raise RuntimeError(
-                f"audit bundle body is not valid JSON at {parent_body_uri}: "
-                f"share segment {body_uri} does not contain requested range"
-            )
-        return selected
 
     def _resolve_audit_bundle_row(self, row: object) -> dict[str, object] | None:
         """Return an audit-bundle row with its body resolved inline.
@@ -6739,16 +10124,60 @@ END;
         result["audit_bundle"] = body
         return result
 
+    @staticmethod
+    def _accepted_block_payload_literal_pieces(payload: Mapping[str, Any]) -> Iterator[str]:
+        """The accepted-block payload as a dollar-quoted JSONB literal, streamed.
+
+        Equivalent to ``_jsonb_literal(payload)`` for a payload of plain
+        values, but built from bounded chunks: recipient-scaled members
+        (the payout accounts) and transaction-scaled members (the leaf
+        arrays) stream from their lazy views, and on the legacy inline lane
+        (no audit body store configured) the verified canonical artifact is
+        spliced verbatim from its descriptor rather than decoded and
+        re-encoded. The dollar-quote tag is chosen with the same collision
+        rule as ``_jsonb_literal``, checked by streaming. The statement text
+        itself still scales with those members: this method bounds the
+        Python object graph and the number of copies, not the size of the
+        one statement the schema requires (#255).
+        """
+
+        def chunks() -> Iterator[str]:
+            return iter_json_chunks(payload)
+
+        tag = "qbit_prism_json"
+        for _attempt in range(64):
+            if not _text_stream_contains(chunks(), f"${tag}$"):
+                break
+            tag += "_x"
+        else:
+            raise RuntimeError("accepted-block payload cannot be dollar-quoted")
+        yield f"${tag}$"
+        yield from chunks()
+        yield f"${tag}$::jsonb"
+
     def persist_accepted_block(
         self,
         *,
         block_hash: str,
         block_height: int,
         parent_hash: str,
-        final_bundle: dict[str, Any],
+        final_bundle: Mapping[str, Any],
         audit_report: dict[str, Any],
         canonical_bundle_path: Path | None = None,
     ) -> dict[str, int | str]:
+        """Persist one accepted block, its audit bundle and payout rows.
+
+        ``final_bundle`` is either a dictionary (compatibility builders and
+        the memory ledger's callers) or the bundle compiler's bounded view
+        of the canonical artifact.  Only header members are read here; the
+        external body publication streams the artifact and the row carries
+        the body pointer, so no window-sized structure enters the statement
+        on the production (externalized) path.  What the statement still
+        carries per accepted block, bounded by recipient and transaction
+        cardinality rather than by the share window: the payout accounts
+        array (one row per recipient), the audit-commitment leaves and the
+        witness merkle leaves (one per block transaction).
+        """
         manifest = final_bundle["signed_coinbase_manifest"]["manifest"]
         found_block = final_bundle.get("found_block") or {}
         audit_bundle_sha256 = canonical_hex(
@@ -6780,26 +10209,35 @@ END;
             final_bundle,
             canonical_bundle_path,
         )
+        # A bounded artifact view (the canonical build's result) has no
+        # dictionary form to embed; the legacy inline lane splices its
+        # canonical bytes into the statement literal instead (#255).
+        inline_bundle: object
+        if body_uri is not None:
+            inline_bundle = None
+        elif isinstance(final_bundle, CanonicalAuditBundleView):
+            final_bundle.verify_identity()
+            inline_bundle = RawJsonDocument(final_bundle.source)
+        else:
+            inline_bundle = final_bundle
         payload = {
             **payload,
             # Externalized rows store the body in body_uri and NULL here; legacy
             # rows (no body store configured) keep the inline body.
-            "audit_bundle": None if body_uri is not None else final_bundle,
+            "audit_bundle": inline_bundle,
             "body_uri": body_uri,
             "audit_body_byte_len": audit_body_byte_len,
             "schema_version": str(final_bundle.get("schema") or "qbit.prism.audit-bundle.v1"),
             "found_block_network_difficulty": found_block.get("network_difficulty"),
             "found_block_bits": found_block.get("bits"),
             "found_block_coinbase_value_sats": found_block.get("coinbase_value_sats"),
+            # The leaf arrays and the payout accounts stay lazy on a bounded
+            # artifact view; the statement literal streams them below.
             "audit_commitment_leaves_hex": final_bundle.get("audit_commitment_leaves_hex"),
             "witness_merkle_leaves_hex": final_bundle.get("witness_merkle_leaves_hex"),
             "accounts": final_bundle["payout_policy_manifest"]["accounts"],
         }
-        sql = f"""
-WITH payload AS (
-    SELECT {self._jsonb_literal(payload)} AS data
-),
-lease AS (
+        sql_body = f"""lease AS (
     UPDATE qbit_ledger_writer_lease
     SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
         updated_at = clock_timestamp()
@@ -7084,7 +10522,7 @@ SELECT CASE
         )
 END;
 """
-        result = self._run_fenced_json(sql)
+        result = self._run_candidate_payload_json(payload, sql_body)
         if "error" in result:
             raise RuntimeError(str(result["error"]))
         return {
@@ -7158,13 +10596,59 @@ SELECT json_build_object(
     )
 );
 """
-        result = self._run_fenced_json(sql)
-        if "error" in result:
-            raise RuntimeError(str(result["error"]))
-        return {
+        with self._operation_gate(self._lock, "writer lock"):
+            result = self._run_json(sql)
+            if "error" in result:
+                raise RuntimeError(str(result["error"]))
+            confirmed_count = int(result["confirmed_count"])
+            publication_sequence: object | None = None
+            if confirmed_count in {1, 2}:
+                # Both confirming dispositions leave a confirmed row carrying
+                # an ordinal: 1 allocated one in the statement above, and 2 --
+                # the idempotent replay -- returns the one its original flip
+                # allocated. The caller needs the ordinal either way to
+                # address this block's audit publication, so read it for
+                # both. Non-confirming dispositions (0, -1) have no row to
+                # read and stay a single statement.
+                #
+                # A data-modifying PL/pgSQL function runs under the statement's
+                # command snapshot, so a join in that same statement cannot see
+                # the freshly assigned ordinal. Read it in the next statement
+                # while retaining the ledger writer lock.
+                #
+                # Holding the lock across both statements is what makes this
+                # step's heartbeat-silent span two statement budgets rather
+                # than one: no admission slice runs in between, so a landing
+                # caller's liveness monitor gets nothing until the second
+                # statement returns. Report the completed first round trip
+                # before starting the second (see _note_operation_progress).
+                self._note_operation_progress()
+                state = self._run_retry_safe_read_json(
+                    f"""
+SELECT json_build_object(
+    'audit_publication_sequence', (
+        SELECT audit_publication_sequence
+        FROM qbit_pool_blocks
+        WHERE block_hash = {self._text_literal(block_hash)}
+          AND block_height = {int(active_tip_height)}
+          AND chain_state = 'confirmed'
+          AND maturity_state <> 'reversed'
+    )
+);
+"""
+                )
+                publication_sequence = state.get("audit_publication_sequence")
+                if publication_sequence is None:
+                    raise RuntimeError(
+                        "confirmed pool block has no audit publication sequence"
+                    )
+        response: dict[str, int | str] = {
             "backend": str(result["backend"]),
-            "confirmed_count": int(result["confirmed_count"]),
+            "confirmed_count": confirmed_count,
         }
+        if publication_sequence is not None:
+            response["audit_publication_sequence"] = int(publication_sequence)
+        return response
 
     def pool_block_state(self, *, block_hash: str) -> dict[str, object] | None:
         block_hash = canonical_hex(block_hash, name="block_hash", expected_bytes=32)
@@ -7176,7 +10660,8 @@ SELECT json_build_object(
             'block_height', block_height,
             'parent_hash', parent_hash,
             'chain_state', chain_state,
-            'maturity_state', maturity_state
+            'maturity_state', maturity_state,
+            'audit_publication_sequence', audit_publication_sequence
         )
         FROM qbit_pool_blocks
         WHERE block_hash = {self._text_literal(block_hash)}
@@ -7195,8 +10680,29 @@ SELECT json_build_object(
         state["block_height"] = int(state["block_height"])
         return state
 
+    def audit_publication_sequence_floor(self) -> int:
+        """Return MAX durable pool-block ordinal, excluding sequence gaps."""
+
+        sql = """
+SELECT json_build_object(
+    'audit_publication_sequence_floor',
+    COALESCE(MAX(audit_publication_sequence), 0)
+)
+FROM qbit_pool_blocks;
+"""
+        with self._operation_gate(self._lock, "writer lock"):
+            result = self._run_retry_safe_read_json(sql)
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                "audit publication sequence floor query returned non-object JSON"
+            )
+        value = result.get("audit_publication_sequence_floor")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError("audit publication sequence floor is invalid")
+        return value
+
     def reorg_watch_blocks(self, *, active_tip_height: int) -> list[dict[str, object]]:
-        sql = f"""
+        sql = """
 SELECT COALESCE(json_agg(json_build_object(
     'block_hash', block_hash,
     'block_height', block_height,
@@ -7208,6 +10714,54 @@ FROM qbit_pool_blocks
 WHERE chain_state IN ('confirmed', 'inactive')
   AND maturity_state = 'immature'
 ;
+"""
+        with self._operation_gate(self._lock, "writer lock"):
+            rows = self._run_retry_safe_read_json(sql)
+        for row in rows:
+            row["block_height"] = int(row["block_height"])
+        return rows
+
+    def stranded_prepared_blocks(
+        self,
+        *,
+        active_tip_height: int,
+        min_depth: int,
+        limit: int = 64,
+    ) -> list[dict[str, object]]:
+        """Return deeply buried rows still parked in the prepared state.
+
+        ``reorg_watch_blocks`` deliberately watches only confirmed/inactive
+        rows, and a prepared row is normally resolved by the live
+        submit/replay path that owns it through its outbox entry. A row
+        whose outbox entry is gone (quarantined, or completed by a process
+        that died before confirming) therefore has nothing left to
+        re-examine it, and stays prepared forever — holding immature payout
+        entries, carry-forward, and CTV fanout artifacts open with it. This
+        read finds those rows; the caller decides, against the active chain,
+        which ones are provably orphaned.
+
+        The predicate leads with ``maturity_state`` and ``block_height`` so
+        it rides ``qbit_pool_blocks_maturity_idx``, and the depth floor
+        keeps the scan to rows the caller could actually act on.
+        """
+        if limit <= 0:
+            return []
+        depth_ceiling = int(active_tip_height) - int(min_depth)
+        sql = f"""
+SELECT COALESCE(json_agg(json_build_object(
+    'block_hash', block_hash,
+    'block_height', block_height,
+    'parent_hash', parent_hash
+) ORDER BY block_height ASC, block_hash ASC), '[]'::json)
+FROM (
+    SELECT block_hash, block_height, parent_hash
+    FROM qbit_pool_blocks
+    WHERE maturity_state = 'immature'
+      AND block_height <= {depth_ceiling}
+      AND chain_state = 'prepared'
+    ORDER BY block_height ASC, block_hash ASC
+    LIMIT {int(limit)}
+) stranded;
 """
         with self._operation_gate(self._lock, "writer lock"):
             rows = self._run_retry_safe_read_json(sql)
@@ -7251,13 +10805,46 @@ SELECT json_build_object(
     )
 );
 """
-        result = self._run_fenced_json(sql)
-        if "error" in result:
-            raise RuntimeError(str(result["error"]))
-        return {
+        with self._operation_gate(self._lock, "writer lock"):
+            result = self._run_json(sql)
+            if "error" in result:
+                raise RuntimeError(str(result["error"]))
+            reactivated_count = int(result["reactivated_count"])
+            publication_sequence: object | None = None
+            if reactivated_count == 1:
+                # Same two-statements-under-one-gate shape as
+                # confirm_accepted_block: the mutating statement's command
+                # snapshot cannot see the ordinal it just assigned, so the
+                # read runs next while the writer lock is still held. Report
+                # the completed first statement so a landing caller's monitor
+                # is not asked to sit through both budgets in silence.
+                self._note_operation_progress()
+                state = self._run_retry_safe_read_json(
+                    f"""
+SELECT json_build_object(
+    'audit_publication_sequence', (
+        SELECT audit_publication_sequence
+        FROM qbit_pool_blocks
+        WHERE block_hash = {self._text_literal(block_hash)}
+          AND block_height <= {int(active_tip_height)}
+          AND chain_state = 'confirmed'
+          AND maturity_state = 'immature'
+    )
+);
+"""
+                )
+                publication_sequence = state.get("audit_publication_sequence")
+                if publication_sequence is None:
+                    raise RuntimeError(
+                        "reactivated pool block has no audit publication sequence"
+                    )
+        response: dict[str, int | str] = {
             "backend": str(result["backend"]),
-            "reactivated_count": int(result["reactivated_count"]),
+            "reactivated_count": reactivated_count,
         }
+        if publication_sequence is not None:
+            response["audit_publication_sequence"] = int(publication_sequence)
+        return response
 
     def mark_mature_pool_payouts(self, *, active_tip_height: int) -> dict[str, int | str]:
         sql = f"""
@@ -7294,6 +10881,24 @@ END;
         with self._operation_gate(self._lock, "writer lock"):
             return int(self._run_retry_safe_read_json(sql)["count"])
 
+    def _run_candidate_payload_json(self, payload: Mapping[str, Any], sql_body: str) -> Any:
+        def pieces() -> Iterator[str]:
+            yield "\nWITH payload AS (\n    SELECT "
+            yield from self._accepted_block_payload_literal_pieces(payload)
+            yield " AS data\n),\n"
+            yield sql_body
+
+        # Existing in-memory SQL test/embedding adapters explicitly replace
+        # execution; preserve their string-based seam. Real backends spool.
+        if (getattr(self._run_fenced_json, "__func__", None) is not PsqlShareLedger._run_fenced_json
+                or getattr(self._run_json, "__func__", None) is not PsqlShareLedger._run_json
+                or getattr(self._run_sql, "__func__", None) is not PsqlShareLedger._run_sql
+                or (getattr(self, "_native", None) is not None
+                    and not isinstance(self._native, _NativePostgresClient))):
+            return self._run_fenced_json("".join(pieces()))
+        from lab.prism.statement_spool import run_fenced_statement
+        return run_fenced_statement(self, pieces())
+
     def _run_fenced_json(self, sql: str) -> Any:
         with self._operation_gate(self._lock, "writer lock"):
             return self._run_json(sql)
@@ -7302,22 +10907,491 @@ END;
         with self._operation_gate(self._read_semaphore, "read slot"):
             return self._run_retry_safe_read_json(sql)
 
-    def _run_retry_safe_read_json(self, sql: str) -> Any:
+    def _run_attributed_read_json(
+        self,
+        sql: str,
+        *,
+        operation: str,
+        gate: Any,
+        gate_name: str,
+    ) -> Any:
+        """Run one gated single-value read, timing admission apart from execution.
+
+        See ``_run_attributed_read`` for the bookkeeping; this is that helper
+        with ``_run_retry_safe_read_json`` as the statement.
+        """
+        return self._run_attributed_read(
+            sql,
+            operation=operation,
+            gate=gate,
+            gate_name=gate_name,
+            execute=self._run_retry_safe_read_json,
+        )
+
+    def _run_attributed_read_json_rows(
+        self,
+        sql: str,
+        *,
+        operation: str,
+        gate: Any,
+        gate_name: str,
+        row_converter: Callable[[Any], Any] | None = None,
+    ) -> list[Any]:
+        """Run one gated row-result read, timing admission apart from execution.
+
+        The row-result twin of ``_run_attributed_read_json`` (issue #236):
+        the same gate, taken and released the same way, the same admission
+        and execution samples under the same ``operation`` name, with
+        ``_run_retry_safe_read_json_rows`` as the statement. Execution time
+        still covers the whole statement including local decoding, exactly
+        as the single-value read's did when its decoding was one call.
+        """
+
+        def execute(
+            statement: str,
+            *,
+            on_statement_start: Callable[[], None] | None = None,
+        ) -> list[Any]:
+            return self._run_retry_safe_read_json_rows(
+                statement,
+                row_converter=row_converter,
+                on_statement_start=on_statement_start,
+            )
+
+        return self._run_attributed_read(
+            sql,
+            operation=operation,
+            gate=gate,
+            gate_name=gate_name,
+            execute=execute,
+        )
+
+    def _run_attributed_read(
+        self,
+        sql: str,
+        *,
+        operation: str,
+        gate: Any,
+        gate_name: str,
+        execute: Callable[..., Any],
+    ) -> Any:
+        """Run one gated read query, timing admission apart from execution.
+
+        Identical to wrapping ``_operation_gate(gate, gate_name)`` around
+        ``execute`` (``_run_retry_safe_read_json`` or its row-result twin)
+        in what it acquires and what it executes -- the caller's own
+        admission primitive, the same retry-safe statement, no extra
+        connection and no extra thread -- and different only in what it
+        records.
+
+        The gate is the caller's and stays the caller's. A read that takes the
+        bounded read semaphore keeps taking it; a read that takes the writer
+        lock keeps taking it. Attribution is a measurement, and a measurement
+        that quietly moved a statement between admission classes would change
+        which writes it serializes against -- the one property the rest of the
+        ledger reasons about. ``gate_name`` is the same string
+        ``_operation_gate`` would have been given, so an admission that
+        expires still names the primitive it was waiting for.
+
+        ``operation`` is written at each call site as a bare string literal
+        taken from ``PRISM_LEDGER_READ_OPERATIONS`` in
+        ``lab.prism.accepted_preview_telemetry``, and deliberately not as an
+        imported constant: ``tests.test_prism_accepted_preview_telemetry``
+        harvests these literals out of this file's source to fail the moment
+        a call site attributes a read under a name the closed vocabulary does
+        not carry. Importing the names instead would leave that check with
+        nothing to read. A name that escaped anyway is still bounded --
+        ``fold_ledger_read_stats`` folds it into ``other`` before rendering,
+        so a drifted call site costs an attribution, never a new series.
+
+        That record is the point. Issue #211 was diagnosed against an outer
+        call reporting ``replay-outbox-query exceeded 5s`` while the inner
+        PostgreSQL deadline still had seconds left and the server showed zero
+        blocked backends: the budget had gone to coordinator-local admission,
+        and nothing on ``/metrics`` said so. One duration covering both halves
+        cannot answer "database or convoy?", so the halves are counted
+        separately here and exported per operation.
+
+        Execution time is measured across the whole statement including the
+        tail a server-cancelled statement spends returning, so a deadline that
+        expires inside PostgreSQL is attributed to PostgreSQL (cancel lag
+        included) rather than to the gate.
+
+        Every exit path records, so a timed-out read is counted rather than
+        lost, and the gate is released in ``finally`` exactly as
+        ``_operation_gate`` releases it.
+        """
+        gate_started = self._monotonic()
+        try:
+            self._acquire_operation_gate(gate, gate_name)
+        except BaseException as exc:
+            # Admission itself expired: no statement was ever sent, so there
+            # is no execution sample to record and the call counts as a gate
+            # timeout rather than a database one.
+            self._note_ledger_read_timing(
+                operation,
+                gate_wait_seconds=max(0.0, self._monotonic() - gate_started),
+                execute_seconds=None,
+                timed_out=isinstance(exc, TimeoutError),
+            )
+            raise
+        gate_wait_seconds = max(0.0, self._monotonic() - gate_started)
+        execute_started: float | None = None
+
+        def on_statement_start() -> None:
+            nonlocal execute_started
+            # A retry-safe native read may dispatch more than once after an
+            # ambiguous connection loss. Execution attribution begins at the
+            # first dispatch and includes the retry tail rather than resetting
+            # the clock for each attempt.
+            if execute_started is None:
+                execute_started = self._monotonic()
+
+        timed_out = False
+        try:
+            return execute(
+                sql,
+                on_statement_start=on_statement_start,
+            )
+        except BaseException as exc:
+            timed_out = isinstance(exc, TimeoutError)
+            raise
+        finally:
+            execute_seconds = (
+                None
+                if execute_started is None
+                else max(0.0, self._monotonic() - execute_started)
+            )
+            # Released before the record is taken: a bookkeeping failure must
+            # never leak the gate it was measuring.
+            gate.release()
+            self._note_ledger_read_timing(
+                operation,
+                gate_wait_seconds=gate_wait_seconds,
+                execute_seconds=execute_seconds,
+                timed_out=timed_out,
+            )
+
+    def _ensure_ledger_read_timings(self) -> Lock:
+        """Return the lock guarding this instance's read-timing record."""
+        stats_lock = getattr(self, "_ledger_read_timings_lock", None)
+        if stats_lock is not None:
+            return stats_lock
+        with PsqlShareLedger._ledger_read_timings_bootstrap:
+            stats_lock = getattr(self, "_ledger_read_timings_lock", None)
+            if stats_lock is None:
+                self._ledger_read_timings = {}
+                stats_lock = Lock()
+                # Published last, so a caller that observes the lock also
+                # observes the dict the lock guards.
+                self._ledger_read_timings_lock = stats_lock
+        return stats_lock
+
+    def _note_ledger_read_timing(
+        self,
+        operation: str,
+        *,
+        gate_wait_seconds: float,
+        execute_seconds: float | None,
+        timed_out: bool,
+    ) -> None:
+        stats_lock = self._ensure_ledger_read_timings()
+        gate_wait_seconds = max(0.0, float(gate_wait_seconds))
+        with stats_lock:
+            stats = self._ledger_read_timings.setdefault(
+                operation,
+                {
+                    "calls_total": 0,
+                    "gate_wait_seconds_total": 0.0,
+                    "gate_wait_seconds_max": 0.0,
+                    "gate_timeouts_total": 0,
+                    "execute_seconds_total": 0.0,
+                    "execute_seconds_max": 0.0,
+                    "execute_timeouts_total": 0,
+                },
+            )
+            stats["calls_total"] = int(stats["calls_total"]) + 1
+            stats["gate_wait_seconds_total"] = (
+                float(stats["gate_wait_seconds_total"]) + gate_wait_seconds
+            )
+            stats["gate_wait_seconds_max"] = max(
+                float(stats["gate_wait_seconds_max"]), gate_wait_seconds
+            )
+            if execute_seconds is None:
+                if timed_out:
+                    stats["gate_timeouts_total"] = (
+                        int(stats["gate_timeouts_total"]) + 1
+                    )
+                return
+            execute_seconds = max(0.0, float(execute_seconds))
+            stats["execute_seconds_total"] = (
+                float(stats["execute_seconds_total"]) + execute_seconds
+            )
+            stats["execute_seconds_max"] = max(
+                float(stats["execute_seconds_max"]), execute_seconds
+            )
+            if timed_out:
+                stats["execute_timeouts_total"] = (
+                    int(stats["execute_timeouts_total"]) + 1
+                )
+
+    def ledger_read_gate_stats(self) -> dict[str, dict[str, float | int]]:
+        """Read-slot admission wait against SQL execution, by operation.
+
+        The series this feeds exist so the *next* budget exhaustion is
+        attributable without a live debugging session: a rising
+        ``gate_wait_seconds_max`` is coordinator-local contention, a rising
+        ``execute_seconds_max`` is PostgreSQL. See
+        ``_run_attributed_read_json``.
+        """
+        stats_lock = self._ensure_ledger_read_timings()
+        with stats_lock:
+            return {
+                operation: dict(stats)
+                for operation, stats in self._ledger_read_timings.items()
+            }
+
+    def _run_retry_safe_read_json(
+        self,
+        sql: str,
+        *,
+        on_statement_start: Callable[[], None] | None = None,
+    ) -> Any:
         native = getattr(self, "_native", None)
         if native is not None:
             timeout_seconds = self._remaining_operation_timeout()
+            run_kwargs: dict[str, Any] = {"retry_safe": True}
+            if on_statement_start is not None:
+                # The native client borrows or creates its connection before
+                # firing this signal, and rechecks the deadline afterward.
+                # Connection setup expiry is therefore local admission, not
+                # statement execution that never happened.
+                run_kwargs["on_statement_start"] = on_statement_start
             if timeout_seconds is None:
-                return native.run_json(sql, retry_safe=True)
-            return native.run_json(
-                sql,
-                retry_safe=True,
-                timeout_seconds=timeout_seconds,
+                return native.run_json(sql, **run_kwargs)
+            run_kwargs["timeout_seconds"] = timeout_seconds
+            return native.run_json(sql, **run_kwargs)
+        run_json = self._run_json
+        if getattr(run_json, "__func__", None) is PsqlShareLedger._run_json:
+            return run_json(sql, on_statement_start=on_statement_start)
+        # Test and embedding subclasses have historically overridden this
+        # private seam with the one-argument signature. Preserve that
+        # compatibility while treating entry into their replacement as the
+        # only observable statement-start boundary they expose.
+        if on_statement_start is not None:
+            on_statement_start()
+        return run_json(sql)
+
+    # Batch size for the row-result read path; an instance attribute so a
+    # test can shrink it to exercise batch boundaries with a handful of rows.
+    _json_row_batch_size: int = PAYOUT_WINDOW_ROW_BATCH_SIZE
+
+    # Replay header rows describe bodies that live in storage; the block
+    # submitter hydrates them one at a time at dequeue, never during the
+    # startup enumeration (#255).
+    candidate_hydration_deferred: ClassVar[bool] = True
+
+    def _run_retry_safe_read_json_rows(
+        self,
+        sql: str,
+        *,
+        row_converter: Callable[[Any], Any] | None = None,
+        on_statement_start: Callable[[], None] | None = None,
+    ) -> list[Any]:
+        """Run one read-only statement that yields one JSON value per row.
+
+        The row-result counterpart of ``_run_retry_safe_read_json`` (issue
+        #236), and the only way the payout-window snapshot and delta reach a
+        backend. The statement is one SELECT; each backend decodes its rows
+        in ``_json_row_batch_size`` batches and, between batches, rechecks
+        the caller's absolute operation deadline and stamps liveness
+        (``_note_json_row_batch``), so a window of any size is decoded in
+        bounded calls and a deadline that expires mid-decode fails the read
+        rather than returning late.
+
+        Backend selection mirrors ``_run_retry_safe_read_json`` seam for
+        seam, so no backend keeps a whole-window aggregate by accident:
+
+        * the native client runs ``run_json_rows`` (retry-safe, under the
+          same remaining deadline, with the same statement-start signal);
+        * a subclass that overrides the private ``_run_json`` seam stands in
+          for the whole server and answers a row-result statement with the
+          list of row values -- the same Python shape ``json_agg`` decoded
+          to, which is what the existing fakes already return -- converted
+          here in batches;
+        * a subclass that overrides the private ``_run_sql`` seam returns
+          psql's text, one JSON value per line, parsed line by line;
+        * the shipped subprocess backend spools psql's output and parses it
+          line by line (``_run_psql_json_rows``).
+        """
+        native = getattr(self, "_native", None)
+        if native is not None:
+            timeout_seconds = self._remaining_operation_timeout()
+            run_kwargs: dict[str, Any] = {
+                "retry_safe": True,
+                "row_converter": row_converter,
+                "batch_size": self._json_row_batch_size,
+                "on_batch": self._note_json_row_batch,
+            }
+            if on_statement_start is not None:
+                run_kwargs["on_statement_start"] = on_statement_start
+            if timeout_seconds is not None:
+                run_kwargs["timeout_seconds"] = timeout_seconds
+            return native.run_json_rows(sql, **run_kwargs)
+        run_json = self._run_json
+        if getattr(run_json, "__func__", None) is not PsqlShareLedger._run_json:
+            timeout_seconds = self._remaining_operation_timeout()
+            deadline = (
+                None
+                if timeout_seconds is None
+                else self._monotonic() + timeout_seconds
             )
-        return self._run_json(sql)
+            if on_statement_start is not None:
+                on_statement_start()
+            rows = run_json(sql)
+            if not isinstance(rows, list):
+                raise RuntimeError(
+                    "row-result statement seam returned a non-list value: "
+                    f"{type(rows).__name__}"
+                )
+            return self._convert_json_rows(
+                rows,
+                row_converter=row_converter,
+                deadline=deadline,
+            )
+        run_sql = self._run_sql
+        if getattr(run_sql, "__func__", None) is not PsqlShareLedger._run_sql:
+            timeout_seconds = self._remaining_operation_timeout()
+            deadline = (
+                None
+                if timeout_seconds is None
+                else self._monotonic() + timeout_seconds
+            )
+            if on_statement_start is not None:
+                on_statement_start()
+            output = run_sql(sql)
+            return self._decode_json_lines(
+                output.splitlines(),
+                row_converter=row_converter,
+                deadline=deadline,
+            )
+        return self._run_psql_json_rows(
+            sql,
+            row_converter=row_converter,
+            on_statement_start=on_statement_start,
+        )
+
+    def _note_json_row_batch(self) -> None:
+        """Between two decode batches: recheck the deadline, stamp liveness.
+
+        The native client's ``on_batch`` hook. ``_remaining_operation_timeout``
+        raises once the caller's absolute operation deadline has passed, so
+        a decode that outlives its budget fails at the next batch boundary
+        instead of completing late; the progress stamp is the same one a
+        multi-statement gate body makes between statements, and tells a
+        liveness monitor the read is advancing rather than wedged.
+        """
+        self._remaining_operation_timeout()
+        self._note_operation_progress()
+
+    def _check_json_row_deadline(self, deadline: float | None) -> None:
+        """Raise once the statement deadline or the operation deadline has passed.
+
+        Called before local decoding starts, between batches, and before a
+        result is published -- including after a trailing partial batch and
+        for a result smaller than one batch -- so a read never returns
+        successfully after its budget merely because the last batch was
+        short. ``deadline`` is the per-statement absolute deadline computed
+        at dispatch from the same remaining budget the statement ran under;
+        ``_remaining_operation_timeout`` covers the caller's absolute
+        operation deadline, which is the same instant in production and can
+        differ only under a test's virtual clock.
+        """
+        if deadline is not None and self._monotonic() >= deadline:
+            raise LedgerOperationTimeout(
+                "statement deadline expired while decoding rows"
+            )
+        self._remaining_operation_timeout()
+
+    def _convert_json_rows(
+        self,
+        rows: Sequence[Any],
+        *,
+        row_converter: Callable[[Any], Any] | None,
+        deadline: float | None,
+    ) -> list[Any]:
+        """Convert already-decoded row values in bounded batches.
+
+        Deadline-checked before the first batch, between batches (where
+        liveness is also stamped) and before the result is returned.
+        """
+        batch_size = max(1, int(self._json_row_batch_size))
+        results: list[Any] = []
+        self._check_json_row_deadline(deadline)
+        for start in range(0, len(rows), batch_size):
+            if start:
+                self._check_json_row_deadline(deadline)
+                self._note_operation_progress()
+            batch = rows[start : start + batch_size]
+            if row_converter is None:
+                results.extend(batch)
+            else:
+                results.extend(row_converter(value) for value in batch)
+        self._check_json_row_deadline(deadline)
+        return results
+
+    def _decode_json_lines(
+        self,
+        lines: Iterable[bytes | str],
+        *,
+        row_converter: Callable[[Any], Any] | None,
+        deadline: float | None,
+    ) -> list[Any]:
+        """Parse one JSON value per line, in bounded batches.
+
+        Blank lines are skipped: psql prints nothing at all for an empty
+        result and a trailing newline otherwise. Every other line must be
+        one complete JSON value -- with ``--tuples-only --no-align`` a row is
+        one line, and PostgreSQL's JSON output escapes control characters,
+        so no row spans lines -- and the values are never reassembled into
+        an array for a single ``json.loads``. The statement deadline computed
+        at dispatch and the caller's operation deadline are both checked
+        before decoding starts, between batches (where liveness is stamped)
+        and before the result is returned, so a trailing partial batch or a
+        result shorter than one batch cannot publish after the budget; the
+        native client keeps the same cadence.
+        """
+        batch_size = max(1, int(self._json_row_batch_size))
+        results: list[Any] = []
+        in_batch = 0
+        line_number = 0
+        self._check_json_row_deadline(deadline)
+        for raw_line in lines:
+            line_number += 1
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                if isinstance(line, bytes):
+                    line = line.decode("utf-8")
+                value = json.loads(line)
+            except ValueError as exc:
+                raise RuntimeError(
+                    "psql row-result statement returned malformed JSON on "
+                    f"output line {line_number}: {exc}"
+                ) from exc
+            results.append(value if row_converter is None else row_converter(value))
+            in_batch += 1
+            if in_batch >= batch_size:
+                in_batch = 0
+                self._check_json_row_deadline(deadline)
+                self._note_operation_progress()
+        self._check_json_row_deadline(deadline)
+        return results
 
     def _ensure_writer_lease(self) -> None:
         while True:
-            acquire_started_monotonic = time.monotonic()
+            acquire_started_monotonic = self._monotonic()
             result = self._try_acquire_writer_lease()
             if result.get("acquired"):
                 self._writer_lease_last_refresh_monotonic = (
@@ -7326,7 +11400,7 @@ END;
                 return
             if self._can_adopt_writer_lease(result):
                 observed_session = str(result["writer_session_token"])
-                adoption_started_monotonic = time.monotonic()
+                adoption_started_monotonic = self._monotonic()
                 adoption = self._try_adopt_writer_lease(result)
                 if adoption.get("acquired"):
                     self._writer_lease_last_refresh_monotonic = (
@@ -7368,7 +11442,85 @@ END;
             )
             self._lease_retry_sleep(sleep_seconds)
 
+    def _run_lease_acquisition_json(self, sql: str, description: str) -> Any:
+        """Run one lease-acquisition statement under a bounded lock deadline.
+
+        The startup lease upsert and the adoption CAS both row-lock the
+        qbit_ledger_writer_lease singleton. Unbounded, either statement
+        queues behind whatever transaction already holds that row — in the
+        worst case an orphaned idle-in-transaction backend of a vanished
+        predecessor — inside PsqlShareLedger.__init__, before the
+        coordinator's watchdog arms, for as long as the kernel keeps the
+        dead peer's socket alive. Each attempt therefore runs under the
+        configured lock/statement deadline (statement_timeout arms both
+        SET LOCAL statement_timeout and lock_timeout on the native backend,
+        and the PGOPTIONS equivalents plus a subprocess timeout on psql).
+
+        The retry budget (5 attempts x 5s by default) is sized to outlast a
+        typical orphan reap rather than to guarantee one: the session guards'
+        idle_in_transaction_session_timeout runs from the moment the blocking
+        transaction went idle, not from the moment this process started
+        retrying, so an orphan frequently clears partway through the budget
+        and a later attempt lands the lease with no operator action. A
+        statement still hitting its deadline on every attempt becomes the
+        fatal RuntimeError, which __init__'s close-and-reraise turns into a
+        visible process exit the supervisor can restart, instead of a silent
+        multi-hour hang.
+
+        A deadline expiry names the lock conflict first because it is by far
+        the most common cause, but it is not proof of one: a connect timeout,
+        an exhausted pool slot, and a healthy-but-overloaded server all
+        surface as the same LedgerOperationTimeout. Both the per-attempt line
+        and the fatal error therefore quote the underlying exception and the
+        fatal error chains it, so the operator diagnoses from the cause rather
+        than from this layer's guess.
+        """
+        attempts = self._lease_acquire_attempts
+        lock_timeout_seconds = self._lease_acquire_lock_timeout_seconds
+        cause: LedgerOperationTimeout | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                with self.statement_timeout(lock_timeout_seconds):
+                    return self._run_json(sql)
+            except LedgerOperationTimeout as exc:
+                cause = exc
+                print(
+                    f"prism ledger {description}: attempt {attempt}/{attempts} "
+                    f"did not complete within its {lock_timeout_seconds:g}s "
+                    "deadline (commonly the qbit_ledger_writer_lease row is "
+                    "lock-blocked by another transaction, but an unreachable "
+                    f"or overloaded server produces the same signal): {exc}",
+                    flush=True,
+                )
+                if attempt < attempts:
+                    self._lease_retry_sleep(self._lease_retry_min_sleep_seconds)
+        raise RuntimeError(
+            f"qbit ledger {description} did not complete within its "
+            f"{lock_timeout_seconds:g}s deadline on any of {attempts} attempts "
+            "(commonly the qbit_ledger_writer_lease row is lock-blocked by "
+            "another transaction, but an unreachable or overloaded server "
+            f"produces the same signal): {cause}; the coordinator is exiting "
+            "rather than blocking startup indefinitely"
+        ) from cause
+
     def _try_acquire_writer_lease(self) -> dict[str, Any]:
+        """Claim, renew, or observe the writer lease in one statement.
+
+        The statement is total: every outcome is a JSON object, so nothing
+        here can reach ``parse_single_json_value``'s NULL branch and surface a
+        raw driver error out of ``PsqlShareLedger.__init__``. Two arms are the
+        ordinary ones -- this identity took the lease, or someone else holds
+        it -- and the third exists because both can be empty at once during
+        the first-ever concurrent acquisition (see
+        WRITER_LEASE_ACQUIRE_RETRY_KEY).
+
+        That third arm is handled here rather than by the caller because the
+        remedy is local to this statement: it carries no holder to wait on or
+        adopt, and only re-running gets the fresh READ COMMITTED snapshot in
+        which the winner's committed row is visible. The retry therefore
+        converges to one of the two ordinary arms, and ``_ensure_writer_lease``
+        never sees the sentinel.
+        """
         payload = {
             "writer_id": self._writer_id,
             "writer_epoch": self._writer_epoch,
@@ -7436,13 +11588,37 @@ SELECT COALESCE(
         )
         FROM qbit_ledger_writer_lease
         WHERE singleton
+    ),
+    json_build_object(
+        'acquired', false,
+        '{WRITER_LEASE_ACQUIRE_RETRY_KEY}', true,
+        'lease', '{WRITER_LEASE_ACQUIRE_RETRY_SUBJECT}',
+        'retry_reason',
+        'the {WRITER_LEASE_ACQUIRE_RETRY_SUBJECT} row was committed by a concurrent first acquisition after this statement snapshot'
     )
 );
 """
-        result = self._run_json(sql)
-        if not isinstance(result, dict):
-            raise RuntimeError("psql writer lease query returned non-object JSON")
-        return result
+        for attempt in range(1, WRITER_LEASE_ACQUIRE_RETRY_ATTEMPTS + 1):
+            result = self._run_lease_acquisition_json(
+                sql,
+                "writer lease acquisition",
+            )
+            if not isinstance(result, dict):
+                raise RuntimeError("psql writer lease query returned non-object JSON")
+            if not result.get(WRITER_LEASE_ACQUIRE_RETRY_KEY):
+                return result
+            print(
+                "prism ledger writer lease acquisition raced a concurrent first "
+                f"acquisition (attempt {attempt}/{WRITER_LEASE_ACQUIRE_RETRY_ATTEMPTS}); "
+                "retrying on a fresh statement snapshot",
+                flush=True,
+            )
+        raise RuntimeError(
+            f"{WRITER_LEASE_ACQUIRE_RETRY_SUBJECT} acquisition still could not see "
+            "the lease row committed by a concurrent first acquisition after "
+            f"{WRITER_LEASE_ACQUIRE_RETRY_ATTEMPTS} fresh statement snapshots; "
+            "the coordinator is exiting rather than starting without the lease"
+        )
 
     def _can_adopt_writer_lease(self, result: dict[str, Any]) -> bool:
         wait_seconds = self._writer_lease_adoption_wait_seconds(result)
@@ -7503,7 +11679,7 @@ SELECT COALESCE(
         )
         guard_held_seconds = max(
             0.0,
-            time.monotonic() - guard_acquired_monotonic,
+            self._monotonic() - guard_acquired_monotonic,
         )
         guard_wait_seconds = max(
             0.0,
@@ -7580,7 +11756,7 @@ SELECT COALESCE(
     )
 );
 """
-        result = self._run_json(sql)
+        result = self._run_lease_acquisition_json(sql, "writer lease adoption")
         if not isinstance(result, dict):
             raise RuntimeError("psql writer lease adoption query returned non-object JSON")
         return result
@@ -7608,11 +11784,188 @@ SELECT COALESCE(
         """
         return self._renew_writer_lease_with(self._run_fenced_json)
 
+    def prove_writer_lease_guard_session(
+        self,
+        *,
+        on_query_start: Callable[[], None] | None = None,
+        on_statement_end: Callable[[], None] | None = None,
+        on_statement_server_seconds: Callable[[float | None], None] | None = None,
+    ) -> dict[str, Any]:
+        """Prove ownership on one cheap read-only statement; never renew.
+
+        The frequent half of the split issue #212 asked for.  Ownership and
+        TTL renewal are two different questions asked at two very different
+        rates: the heartbeat must prove *ownership* several times inside one
+        adoption-silence window, but the lease TTL is 60s and only needs a
+        writer-side refresh well before it lapses (every fenced write
+        refreshes it too).  Paying for the renewal question on every beat is
+        what made the frequent statement expensive: ``FOR NO KEY UPDATE SKIP
+        LOCKED`` on the hot lease tuple, a ``pg_stat_activity`` scan to
+        attribute the tuple's locker, and — in the ambiguous case — a second
+        statement.  Under a rapid-block burst that statement approached the
+        guard's 500ms statement timeout, which is exactly how a healthy
+        coordinator ran out of server-proven envelope.
+
+        This statement asks only the ownership question, and asks it with
+        two ``EXISTS`` reads:
+
+        * PostgreSQL still shows *this* backend holding the writer/epoch
+          advisory lock, and
+        * the last committed lease row still names this exact
+          ``(writer_id, writer_epoch, writer_session_token)``.
+
+        Those are the same two conditions
+        :meth:`verify_writer_lease_guard_session` raises on, evaluated the
+        same way, so the exact-session guarantee is unchanged: a guard
+        session that died, or an identity that was fenced out, still raises
+        here and still hard-exits the coordinator.  What is *not* asked is
+        anything that can block or that needs live backend state, so the
+        statement takes no row lock, never queues behind a fenced write, and
+        never needs an attribution recheck — it is one round trip, always.
+
+        The lease-expiry guarantee is preserved by escalation rather than by
+        renewal.  The result reports ``lease_renewal_due`` whenever the
+        committed row's remaining validity has fallen to the own-write
+        authority margin (which ``_resolve_lease_authority_margin_seconds``
+        keeps at or above half the TTL, and strictly below it), and
+        ``lease_expired`` when it has lapsed outright — an expired row is
+        always also renewal-due.  The heartbeat answers either flag by
+        running the full renewing verification immediately, on the same
+        beat.  So the cheap proof short-circuits only while the lease is
+        comfortably valid, which is precisely the window in which the full
+        verification had nothing to decide; the moment renewal actually
+        matters — including for the whole of a long own fenced write that
+        keeps skipping renewals — every beat runs the same fail-closed
+        verification it ran before this split existed.
+
+        Never call this in place of the verification before an external
+        side effect.  A proof is liveness and identity, not authority: it
+        deliberately does not renew, so it cannot distinguish a row this
+        writer's own in-flight write will refresh from one it will roll
+        back.  :meth:`require_fresh_lease_for_external_side_effect` keeps
+        using the full verification for that reason.
+
+        ``on_query_start`` fires once the guarded session's serialized query
+        slot is acquired and ``on_statement_end`` once the round trip
+        returns, so a caller can attribute queue wait and server time
+        separately.
+
+        ``on_statement_server_seconds`` receives, for the same round trip,
+        the execution time the statement measured on the server
+        (``clock_timestamp() - statement_timestamp()``, returned as a
+        column of the statement itself, so it costs no extra round trip
+        and takes no lock), or ``None`` when the answer did not carry one.
+        Issue #227: ``on_statement_end`` is a client-side instant, so a GIL
+        stall between PostgreSQL answering and this thread resuming is
+        indistinguishable from database time without it.  It is timing
+        metadata only — the server-proven edge is still the send edge.
+        """
+        if not self.writer_lease_fast_adoption_capable:
+            raise RuntimeError("writer session is not heartbeat-capable")
+        guard = self._writer_lease_guard
+        if guard is None:
+            raise RuntimeError("postgres writer lease guard is not held")
+        payload = {
+            "writer_id": self._writer_id,
+            "writer_epoch": self._writer_epoch,
+            "writer_session_token": self._writer_session_token,
+        }
+        lock_key = _writer_lease_advisory_lock_key(
+            self._writer_id,
+            self._writer_epoch,
+        )
+        lock_classid = (lock_key >> 32) & 0xFFFFFFFF
+        lock_objid = lock_key & 0xFFFFFFFF
+        sql = f"""
+WITH payload AS (
+    SELECT {self._jsonb_literal(payload)} AS data
+)
+SELECT json_build_object(
+    'backend', 'postgres-psql',
+    'guard_advisory_lock_held', EXISTS (
+        SELECT 1
+        FROM pg_locks
+        WHERE locktype = 'advisory'
+          AND granted
+          AND pid = pg_backend_pid()
+          AND classid = {lock_classid}::oid
+          AND objid = {lock_objid}::oid
+          AND objsubid = 1
+    ),
+    'writer_session_token_current', EXISTS (
+        SELECT 1
+        FROM qbit_ledger_writer_lease, payload
+        WHERE qbit_ledger_writer_lease.singleton
+          AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+          AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+          AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
+    ),
+    'lease_expired', EXISTS (
+        SELECT 1
+        FROM qbit_ledger_writer_lease, payload
+        WHERE qbit_ledger_writer_lease.singleton
+          AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+          AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+          AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
+          AND qbit_ledger_writer_lease.lease_expires_at <= clock_timestamp()
+    ),
+    'lease_renewal_due', EXISTS (
+        SELECT 1
+        FROM qbit_ledger_writer_lease, payload
+        WHERE qbit_ledger_writer_lease.singleton
+          AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+          AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+          AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
+          AND qbit_ledger_writer_lease.lease_expires_at
+              <= clock_timestamp() + {self._lease_authority_margin_sql}
+    ),
+    '{GUARD_SERVER_EXECUTION_SECONDS_KEY}', {GUARD_SERVER_EXECUTION_SECONDS_SQL}
+);
+"""
+        run_kwargs: dict[str, Callable[..., None]] = {}
+        if on_query_start is not None:
+            run_kwargs["on_query_start"] = on_query_start
+        if on_statement_end is not None:
+            run_kwargs["on_statement_end"] = on_statement_end
+        if on_statement_server_seconds is not None:
+            run_kwargs["on_statement_result"] = (
+                lambda statement_result: on_statement_server_seconds(
+                    guard_server_execution_seconds(statement_result)
+                )
+            )
+        result = guard.run_json(sql, **run_kwargs)
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                "psql writer lease guard proof returned non-object JSON"
+            )
+        if not result.get("guard_advisory_lock_held"):
+            raise RuntimeError(
+                "postgres writer lease guard advisory lock is no longer held"
+            )
+        if not result.get("writer_session_token_current"):
+            raise RuntimeError("writer lease is not active")
+        # An expired row is renewal-due by construction, but state it
+        # explicitly: a caller must never be able to read a stale committed
+        # row as "proved and nothing to do".
+        renewal_due = bool(
+            result.get("lease_renewal_due") or result.get("lease_expired")
+        )
+        return {
+            "backend": str(result["backend"]),
+            "verified_count": 1,
+            "renewed_count": 0,
+            "proof_only": True,
+            "lease_expired": bool(result.get("lease_expired")),
+            "lease_renewal_due": renewal_due,
+        }
+
     def verify_writer_lease_guard_session(
         self,
         *,
         on_query_start: Callable[[], None] | None = None,
         on_statement_progress: Callable[[], None] | None = None,
+        on_statement_end: Callable[[], None] | None = None,
+        on_statement_server_seconds: Callable[[float | None], None] | None = None,
     ) -> dict[str, int | str]:
         """Prove the guard session live; renew the TTL only without waiting.
 
@@ -7730,6 +12083,23 @@ SELECT COALESCE(
         stamp progress here so a lawful two-statement verification is not
         mistaken for a wedged heartbeat, while a genuinely stuck statement
         still produces no progress at all.
+
+        ``on_statement_end`` is the general form of the same signal: it
+        fires after *every* completed round trip, including the last one,
+        which is what a caller attributing guard SQL time per phase needs.
+        A caller that supplies it does not also need
+        ``on_statement_progress``.
+
+        ``on_statement_server_seconds`` fires alongside ``on_statement_end``
+        for every completed round trip with the execution time that
+        statement measured on the server (``clock_timestamp() -
+        statement_timestamp()``, one more column of the same statement —
+        no extra round trip, no lock), or ``None`` when the answer did not
+        carry one.  Issue #227: the end mark is a client-side instant, so
+        without the server's own figure a GIL stall between the answer
+        leaving PostgreSQL and this thread resuming is booked as database
+        time.  Timing metadata only: the server-proven edge is still the
+        conservative send edge, never a server clock reading.
         """
         if not self.writer_lease_fast_adoption_capable:
             raise RuntimeError("writer session is not heartbeat-capable")
@@ -7818,7 +12188,8 @@ SELECT json_build_object(
           AND pg_stat_activity.application_name = data->>'pool_application_name'
           AND pg_stat_activity.backend_xid IS NOT NULL
           AND pg_stat_activity.backend_xid = qbit_ledger_writer_lease.xmax
-    )
+    ),
+    '{GUARD_SERVER_EXECUTION_SECONDS_KEY}', {GUARD_SERVER_EXECUTION_SECONDS_SQL}
 );
 """
         attribution_rechecks_left = WRITER_LEASE_VERIFICATION_MAX_STATEMENTS - 1
@@ -7846,14 +12217,18 @@ SELECT json_build_object(
                 return sql
             return None
 
-        if on_query_start is None:
-            result = guard.run_json(sql, followup=attribution_recheck)
-        else:
-            result = guard.run_json(
-                sql,
-                on_query_start=on_query_start,
-                followup=attribution_recheck,
+        run_kwargs: dict[str, Any] = {"followup": attribution_recheck}
+        if on_query_start is not None:
+            run_kwargs["on_query_start"] = on_query_start
+        if on_statement_end is not None:
+            run_kwargs["on_statement_end"] = on_statement_end
+        if on_statement_server_seconds is not None:
+            run_kwargs["on_statement_result"] = (
+                lambda statement_result: on_statement_server_seconds(
+                    guard_server_execution_seconds(statement_result)
+                )
             )
+        result = guard.run_json(sql, **run_kwargs)
         if not isinstance(result, dict):
             raise RuntimeError(
                 "psql writer lease guard verification returned non-object JSON"
@@ -8032,14 +12407,36 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
             raise RuntimeError("psql query returned no JSON")
         return json.loads(output.splitlines()[-1])
 
-    def _run_json(self, sql: str) -> Any:
+    def _run_json(
+        self,
+        sql: str,
+        *,
+        on_statement_start: Callable[[], None] | None = None,
+    ) -> Any:
         native = getattr(self, "_native", None)
         if native is not None:
             timeout_seconds = self._remaining_operation_timeout()
+            run_kwargs: dict[str, Any] = {}
+            if on_statement_start is not None:
+                run_kwargs["on_statement_start"] = on_statement_start
             if timeout_seconds is None:
-                return native.run_json(sql)
-            return native.run_json(sql, timeout_seconds=timeout_seconds)
-        output = self._run_sql(sql).strip()
+                return native.run_json(sql, **run_kwargs)
+            run_kwargs["timeout_seconds"] = timeout_seconds
+            return native.run_json(sql, **run_kwargs)
+        run_sql = self._run_sql
+        if getattr(run_sql, "__func__", None) is PsqlShareLedger._run_sql:
+            output = run_sql(
+                sql,
+                on_statement_start=on_statement_start,
+            ).strip()
+        else:
+            # The A1 gate and embedders historically override this private
+            # seam with the one-argument signature. Their replacement owns
+            # the full execution boundary, so entry is the only statement-
+            # start signal the base class can expose without breaking them.
+            if on_statement_start is not None:
+                on_statement_start()
+            output = run_sql(sql).strip()
         if not output:
             raise RuntimeError("psql query returned no JSON")
         return json.loads(output.splitlines()[-1])
@@ -8051,38 +12448,18 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
             return
         self._run_sql(sql)
 
-    def _run_sql(self, sql: str) -> str:
-        cmd = [
-            *self._command,
-            "--no-psqlrc",
-            "--set",
-            "ON_ERROR_STOP=1",
-            "--set",
-            "VERBOSITY=verbose",
-            "--tuples-only",
-            "--no-align",
-            "--quiet",
-        ]
-        timeout_seconds = self._remaining_operation_timeout()
-        run_kwargs: dict[str, Any] = {}
-        if timeout_seconds is not None:
-            timeout_ms = max(1, int(timeout_seconds * 1000))
-            subprocess_env = dict(os.environ)
-            existing_options = subprocess_env.get("PGOPTIONS", "").strip()
-            timeout_options = (
-                f"-c statement_timeout={timeout_ms}ms "
-                f"-c lock_timeout={timeout_ms}ms"
-            )
-            subprocess_env["PGOPTIONS"] = " ".join(
-                option for option in (existing_options, timeout_options) if option
-            )
-            subprocess_env["PGCONNECT_TIMEOUT"] = str(
-                max(1, math.ceil(timeout_seconds))
-            )
-            run_kwargs = {
-                "env": subprocess_env,
-                "timeout": timeout_seconds,
-            }
+    def _run_sql(
+        self,
+        sql: str,
+        *,
+        on_statement_start: Callable[[], None] | None = None,
+    ) -> str:
+        cmd, run_kwargs, timeout_seconds = self._psql_invocation()
+        # All local deadline validation is complete. Only now does this
+        # invocation count as execution: an expiry raised above never starts
+        # psql and must remain attributed to coordinator-local admission.
+        if on_statement_start is not None:
+            on_statement_start()
         try:
             completed = subprocess.run(
                 cmd,
@@ -8097,17 +12474,168 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
             raise LedgerOperationTimeout(
                 f"psql operation exceeded {timeout_seconds:g}s"
             ) from exc
-        if completed.returncode != 0:
-            stderr = completed.stderr.strip()
-            if timeout_seconds is not None and _is_postgres_deadline_error(stderr):
+        self._check_psql_exit(completed.returncode, completed.stderr, timeout_seconds)
+        return completed.stdout
+
+    def _run_psql_json_rows(
+        self,
+        sql: str,
+        *,
+        row_converter: Callable[[Any], Any] | None,
+        on_statement_start: Callable[[], None] | None,
+    ) -> list[Any]:
+        """Row-result counterpart of ``_run_sql`` for the subprocess backend.
+
+        The identical psql invocation (``_psql_invocation``: same flags,
+        session guards, statement/lock deadline, connect timeout and
+        subprocess timeout), with two differences (issue #236). psql's
+        stdout goes to an unnamed temporary file instead of being captured
+        into one string, so no whole-window text ever becomes a single
+        Python object; and the rows are read back from that spool one line
+        at a time and decoded in bounded batches (``_decode_json_lines``).
+
+        The spool is validated before a single row is read from it. The exit
+        status and stderr are translated exactly as ``_run_sql`` translates
+        them, a subprocess timeout kills and reaps the child before raising
+        ``LedgerOperationTimeout``, and the temporary file closes on every
+        exit path, so no record is ever published from a psql run that did
+        not complete successfully.
+        """
+        cmd, run_kwargs, timeout_seconds = self._psql_invocation()
+        decode_deadline = (
+            None
+            if timeout_seconds is None
+            else self._monotonic() + timeout_seconds
+        )
+        # Same boundary as _run_sql: deadline validation is done, execution
+        # starts here.
+        if on_statement_start is not None:
+            on_statement_start()
+        with tempfile.TemporaryFile(mode="w+b") as spool:
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=spool,
+                stderr=subprocess.PIPE,
+                env=run_kwargs.get("env"),
+            )
+            try:
+                _, stderr_bytes = process.communicate(
+                    input=sql.encode("utf-8"),
+                    timeout=run_kwargs.get("timeout"),
+                )
+            except subprocess.TimeoutExpired as exc:
+                process.kill()
+                process.communicate()
                 raise LedgerOperationTimeout(
                     f"psql operation exceeded {timeout_seconds:g}s"
-                )
-            raise RuntimeError(
-                "psql command failed "
-                f"(exit {completed.returncode}): {stderr}"
+                ) from exc
+            except BaseException:
+                process.kill()
+                process.wait()
+                raise
+            self._check_psql_exit(
+                process.returncode,
+                stderr_bytes.decode("utf-8", errors="replace"),
+                timeout_seconds,
             )
-        return completed.stdout
+            spool.seek(0)
+            return self._decode_json_lines(
+                spool,
+                row_converter=row_converter,
+                deadline=decode_deadline,
+            )
+
+    @staticmethod
+    def _check_psql_exit(
+        returncode: int,
+        stderr: str,
+        timeout_seconds: float | None,
+    ) -> None:
+        """Translate a psql exit status the way every subprocess call does."""
+        if returncode == 0:
+            return
+        stderr = stderr.strip()
+        if timeout_seconds is not None and _is_postgres_deadline_error(stderr):
+            raise LedgerOperationTimeout(
+                f"psql operation exceeded {timeout_seconds:g}s"
+            )
+        raise RuntimeError(
+            "psql command failed "
+            f"(exit {returncode}): {stderr}"
+        )
+
+    def _psql_invocation(self) -> tuple[list[str], dict[str, Any], float | None]:
+        """Build the psql argv, subprocess keywords and deadline for one statement.
+
+        Shared by the single-value ``_run_sql`` and the row-result
+        ``_run_psql_json_rows`` so the two cannot drift: the same
+        ``--single-transaction`` / ``ON_ERROR_STOP`` invocation, the same
+        session guards on PGOPTIONS, and the same per-statement deadline
+        (statement_timeout / lock_timeout, PGCONNECT_TIMEOUT and the
+        subprocess timeout) derived from ``_remaining_operation_timeout``.
+        A deadline that has already expired raises here, before any process
+        is spawned, so it stays attributed to coordinator-local admission.
+        """
+        cmd = [
+            *self._command,
+            "--no-psqlrc",
+            # One transaction per invocation. For the multi-statement schema
+            # script this is belt-and-braces alongside the BEGIN/COMMIT
+            # wrapper inside the script itself (psql tolerates the nested
+            # BEGIN with a warning): without atomicity, a failure or
+            # interruption mid-script can commit trigger definitions while
+            # later statements -- including the carry-forward summary seed --
+            # never run, and a live writer mutating carry state in that gap
+            # leaves a permanently partial summary. For single-statement
+            # queries this is semantically identical to autocommit. The SQL
+            # sent here contains no \connect and no commands that cannot run
+            # inside a transaction block; --no-psqlrc means no ON_ERROR_
+            # ROLLBACK can be injected from a psqlrc either.
+            "--single-transaction",
+            "--set",
+            "ON_ERROR_STOP=1",
+            "--set",
+            "VERBOSITY=verbose",
+            "--tuples-only",
+            "--no-align",
+            "--quiet",
+        ]
+        timeout_seconds = self._remaining_operation_timeout()
+        run_kwargs: dict[str, Any] = {}
+        # The session guards ride every psql invocation, deadline or not: an
+        # orphaned idle-in-transaction backend is exactly the failure that
+        # occurs when no deadline-scoped work is running, so building
+        # PGOPTIONS only for deadline-bearing statements would leave the
+        # unbounded sessions — the dangerous ones — unguarded. A deadline,
+        # when armed, appends its per-statement bounds after the guards.
+        session_guards = getattr(self, "_session_guards", None)
+        option_fragments: list[str] = []
+        if session_guards is not None:
+            option_fragments.append(session_guards.options_fragment())
+        if timeout_seconds is not None:
+            timeout_ms = max(1, int(timeout_seconds * 1000))
+            option_fragments.append(
+                f"-c statement_timeout={timeout_ms}ms "
+                f"-c lock_timeout={timeout_ms}ms"
+            )
+        if option_fragments:
+            subprocess_env = dict(os.environ)
+            # Operator-supplied PGOPTIONS stay, ahead of the coordinator's
+            # fragments so a later -c duplicate resolves in our favor.
+            existing_options = subprocess_env.get("PGOPTIONS", "").strip()
+            subprocess_env["PGOPTIONS"] = " ".join(
+                option
+                for option in (existing_options, *option_fragments)
+                if option
+            )
+            run_kwargs["env"] = subprocess_env
+        if timeout_seconds is not None:
+            run_kwargs["env"]["PGCONNECT_TIMEOUT"] = str(
+                max(1, math.ceil(timeout_seconds))
+            )
+            run_kwargs["timeout"] = timeout_seconds
+        return cmd, run_kwargs, timeout_seconds
 
     @staticmethod
     def _record_from_json(payload: dict[str, Any]) -> AcceptedShareRecord:
@@ -8148,6 +12676,18 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
     @staticmethod
     def _text_literal(value: str) -> str:
         return "'" + value.replace("'", "''") + "'"
+
+    @classmethod
+    def _text_array_literal(cls, values: Sequence[str]) -> str:
+        """Render a non-empty text set as one array literal for ``= ANY``.
+
+        Each element goes through the same quoting the scalar literals use.
+        The cast is explicit because an empty ``ARRAY[]`` has no inferable
+        element type; callers never build one, and the cast keeps that a
+        parse-time guarantee rather than a convention.
+        """
+        elements = ", ".join(cls._text_literal(value) for value in values)
+        return f"ARRAY[{elements}]::text[]"
 
 
 CTV_FANOUT_STATUSES = {
@@ -8260,14 +12800,26 @@ def ctv_fanout_recovery_payload(
         expected_bytes=32,
     )
     manifests_raw = manifest_set.get("manifests")
-    if not isinstance(manifests_raw, list) or not manifests_raw:
+    streamed = _is_lazy_manifest_sequence(manifests_raw)
+    if not streamed and (not isinstance(manifests_raw, list) or not manifests_raw):
+        raise ValueError("manifest_set.manifests must be a non-empty array")
+    if streamed and not len(manifests_raw):
         raise ValueError("manifest_set.manifests must be a non-empty array")
 
-    manifests = sorted(
-        (require_mapping(manifest, "manifest") for manifest in manifests_raw),
-        key=lambda item: int(require_mapping(item.get("precommitment"), "precommitment")["chunk_index"]),
-    )
-    first_precommitment = require_mapping(manifests[0].get("precommitment"), "precommitment")
+    if streamed:
+        # A bounded artifact view keeps the manifests on disk. They are
+        # walked once here in their canonical (chunk-ordered) sequence for
+        # validation and again, on demand, when the statement literal is
+        # streamed; the whole set is never sorted or copied (#255).
+        manifests: Sequence[Any] = MappedSequence(manifests_raw, _manifest_record)
+        first_manifest = manifests[0]
+    else:
+        manifests = sorted(
+            (require_mapping(manifest, "manifest") for manifest in manifests_raw),
+            key=lambda item: int(require_mapping(item.get("precommitment"), "precommitment")["chunk_index"]),
+        )
+        first_manifest = manifests[0]
+    first_precommitment = require_mapping(first_manifest.get("precommitment"), "precommitment")
     block_height_value = manifest_set.get("block_height", first_precommitment.get("block_height"))
     block_height = int(block_height_value) if block_height_value is not None else None
     fanout_count = int(manifest_set.get("fanout_count", len(manifests)))
@@ -8277,19 +12829,18 @@ def ctv_fanout_recovery_payload(
     if settlement_mode not in {"hybrid_coinbase_ctv_fanout", "ctv_fanout"}:
         raise ValueError("manifest_set.settlement_mode must be a CTV settlement mode")
     parent_coinbase_txid = canonical_hex(
-        str(manifest_set.get("parent_coinbase_txid", manifests[0].get("parent_coinbase_txid", ""))),
+        str(manifest_set.get("parent_coinbase_txid", first_manifest.get("parent_coinbase_txid", ""))),
         name="parent_coinbase_txid",
         expected_bytes=32,
     )
     parent_coinbase_tx_hex = canonical_hex(
-        str(manifests[0].get("parent_coinbase_tx_hex", "")),
+        str(first_manifest.get("parent_coinbase_tx_hex", "")),
         name="parent_coinbase_tx_hex",
     )
     fanout_output_sum_sats = int(manifest_set.get("fanout_output_sum_sats", 0))
     covenant_output_value_sats = int(manifest_set.get("covenant_output_value_sats", 0))
 
-    artifacts: list[dict[str, Any]] = []
-    for expected_index, manifest in enumerate(manifests):
+    def artifact_for(expected_index: int, manifest: Mapping[str, Any]) -> dict[str, Any]:
         precommitment = require_mapping(manifest.get("precommitment"), "precommitment")
         precommitment_block_height = precommitment.get("block_height")
         if block_height is not None and precommitment_block_height is not None and int(precommitment_block_height) != block_height:
@@ -8319,9 +12870,22 @@ def ctv_fanout_recovery_payload(
                 name="fanout_txid",
                 expected_bytes=32,
             ),
-            "manifest_json": canonical_json_text(manifest),
-            "manifest": copy.deepcopy(manifest),
-            "manifest_sha256": sha256_json_hex(manifest),
+            # One manifest is bounded by one fanout transaction (its
+            # recipients are capped per transaction by the settlement
+            # configuration), so its canonical text and digest are
+            # per-manifest allocations; a decoded record is used directly
+            # instead of being deep-copied.
+            "manifest_json": (
+                canonical_json_text(manifest)
+                if isinstance(manifest, dict) and not streamed
+                else "".join(iter_json_chunks(manifest, sort_keys=True))
+            ),
+            "manifest": copy.deepcopy(manifest) if not streamed else manifest,
+            "manifest_sha256": (
+                sha256_json_hex(manifest)
+                if isinstance(manifest, dict) and not streamed
+                else streamed_sha256_json_hex(manifest)
+            ),
             "precommitment_sha256": canonical_hex(
                 str(manifest["precommitment_sha256_hex"]),
                 name="precommitment_sha256_hex",
@@ -8352,25 +12916,47 @@ def ctv_fanout_recovery_payload(
         }
         if block_height is not None:
             artifact["block_height"] = block_height
-        artifacts.append(artifact)
+        return artifact
 
-    if sum(int(artifact["fanout_output_sum_sats"]) for artifact in artifacts) != fanout_output_sum_sats:
+    # One validating walk; the sums never hold the artifacts.
+    output_sum = 0
+    covenant_sum = 0
+    for expected_index, manifest in enumerate(manifests):
+        artifact = artifact_for(expected_index, manifest)
+        output_sum += int(artifact["fanout_output_sum_sats"])
+        covenant_sum += int(artifact["covenant_output_value_sats"])
+    if output_sum != fanout_output_sum_sats:
         raise ValueError("CTV fanout output sum mismatch")
-    if sum(int(artifact["covenant_output_value_sats"]) for artifact in artifacts) != covenant_output_value_sats:
+    if covenant_sum != covenant_output_value_sats:
         raise ValueError("CTV covenant output value sum mismatch")
+
+    artifacts: Sequence[Any]
+    if streamed:
+        artifacts = MappedSequence(
+            _EnumeratedSequence(manifests),
+            lambda item: artifact_for(item[0], item[1]),
+        )
+        manifest_set_json: object = StreamedJsonString(
+            lambda: iter_json_chunks(manifest_set, sort_keys=True)
+        )
+        manifest_set_member: object = manifest_set
+    else:
+        artifacts = [artifact_for(index, manifest) for index, manifest in enumerate(manifests)]
+        manifest_set_json = canonical_json_text(manifest_set)
+        manifest_set_member = copy.deepcopy(manifest_set)
 
     payload = {
         "schema": "qbit.prism.ctv-fanout-recovery.v1",
         "block_hash": block_hash,
         "manifest_set_sha256": manifest_set_sha256,
-        "manifest_set_json": canonical_json_text(manifest_set),
+        "manifest_set_json": manifest_set_json,
         "settlement_mode": settlement_mode,
         "parent_coinbase_txid": parent_coinbase_txid,
         "parent_coinbase_tx_hex": parent_coinbase_tx_hex,
         "fanout_count": fanout_count,
         "fanout_output_sum_sats": fanout_output_sum_sats,
         "covenant_output_value_sats": covenant_output_value_sats,
-        "manifest_set": copy.deepcopy(manifest_set),
+        "manifest_set": manifest_set_member,
         "artifacts": artifacts,
     }
     if block_height is not None:
@@ -8388,10 +12974,57 @@ def ctv_fanout_recovery_payload(
     return payload
 
 
+def _is_lazy_manifest_sequence(value: object) -> bool:
+    """A replayable, non-list manifest sequence (a bounded view member)."""
+    return isinstance(value, Sequence) and not isinstance(
+        value,
+        (list, tuple, str, bytes, bytearray),
+    )
+
+
+def _manifest_record(manifest: object) -> Mapping[str, Any]:
+    """One manifest as a mapping; an isolated record is decoded in-process.
+
+    A manifest is bounded by one fanout transaction, whose recipients are
+    capped per transaction by the settlement configuration, so it never
+    reaches the isolated-decode limit in practice; the fallback keeps an
+    unexpected one usable rather than refusing it.
+    """
+    if isinstance(manifest, RawJsonRecord):
+        manifest = materialize_json(manifest)
+    if not isinstance(manifest, Mapping):
+        raise ValueError("manifest must be an object")
+    return manifest
+
+
+class _EnumeratedSequence(Sequence):
+    """``enumerate`` as a replayable sequence of ``(index, item)`` pairs."""
+
+    __slots__ = ("_base",)
+
+    def __init__(self, base: Sequence[Any]) -> None:
+        self._base = base
+
+    def __len__(self) -> int:
+        return len(self._base)
+
+    def __iter__(self) -> Iterator[tuple[int, Any]]:
+        for index, item in enumerate(self._base):
+            yield index, item
+
+    def __getitem__(self, index: int | slice) -> Any:
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self._base))
+            return [(position, self._base[position]) for position in range(start, stop, step)]
+        if index < 0:
+            index += len(self._base)
+        return index, self._base[index]
+
+
 def require_mapping(value: object, name: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
+    if not isinstance(value, Mapping):
         raise ValueError(f"{name} must be an object")
-    return value
+    return value  # type: ignore[return-value]
 
 
 def sha256_json_hex(payload: object) -> str:
@@ -8417,8 +13050,37 @@ def block_candidate_identity(candidate: dict[str, Any]) -> dict[str, Any]:
     return candidate
 
 
-def block_candidate_identity_sha256(candidate: dict[str, Any]) -> str:
-    return sha256_json_hex(block_candidate_identity(candidate))
+def block_candidate_identity_sha256(candidate: Any) -> str:
+    """``sha256_json_hex`` of the candidate identity, streamed.
+
+    The candidate carries the whole payout window under ``shares_json``, so
+    one ``json.dumps`` over it is exactly the whole-window C call the
+    writer-lease monitor must never wait behind (#236). The digest is
+    byte-identical to ``sha256_json_hex(block_candidate_identity(candidate))``;
+    the share array feeds it batch by batch.
+
+    A :class:`PreparedCandidateIntent` already carries this digest (its
+    body *is* the identity JSON), and a mapping whose share sequence is not
+    a plain list (a page-backed window, a daemon mirror, a spool sequence)
+    is digested through the same bounded codec rather than materialized.
+    """
+    if isinstance(candidate, PreparedCandidateIntent):
+        return prepare_candidate_intent(candidate).candidate_sha256
+    if isinstance(candidate, dict) and not isinstance(
+        candidate.get("shares_json"), (list, tuple)
+    ) and "shares_json" in candidate:
+        return prepare_candidate_intent(candidate).candidate_sha256
+    identity = block_candidate_identity(candidate)
+    if not isinstance(identity, dict):
+        return sha256_json_hex(identity)
+    digest = hashlib.sha256()
+    for chunk in iter_json_object_text_chunks(
+        identity,
+        array_keys=("shares_json",),
+        sort_keys=True,
+    ):
+        digest.update(chunk.encode("utf-8"))
+    return digest.hexdigest()
 
 
 def sha256_bytes_hex(payload: bytes) -> str:

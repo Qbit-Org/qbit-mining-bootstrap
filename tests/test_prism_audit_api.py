@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import threading
 import unittest
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 
-from lab.prism.prism_coordinator import make_audit_handler
+from lab.prism.prism_coordinator import PrismCoordinator, make_audit_handler
 
 
 class FakeLedger:
@@ -225,6 +227,22 @@ class UnhealthyCoordinator(FakeCoordinator):
         }
 
 
+class CachedMetricsCoordinator(FakeCoordinator):
+    def cached_metrics_payload(self) -> tuple[int, str]:
+        return 200, "qbit_prism_cached_snapshot 1\n"
+
+    def metrics_payload(self) -> str:
+        raise AssertionError("HTTP scrape reached the live metrics renderer")
+
+
+class UninitializedCachedMetricsCoordinator(FakeCoordinator):
+    def cached_metrics_payload(self) -> tuple[int, str]:
+        return 503, "qbit_prism_metrics_snapshot_age_seconds -1\n"
+
+    def metrics_payload(self) -> str:
+        return "qbit_prism_direct_compatibility 1\n"
+
+
 class PrismAuditApiTests(unittest.TestCase):
     def setUp(self) -> None:
         handler = make_audit_handler(FakeCoordinator())  # type: ignore[arg-type]
@@ -271,6 +289,89 @@ class PrismAuditApiTests(unittest.TestCase):
         self.assertIn("qbit_prism_ctv_fanouts_pending 1", metrics)
         self.assertIn("qbit_prism_ctv_fanouts_broadcastable 1", metrics)
         self.assertIn("qbit_prism_ctv_fanouts_failed 0", metrics)
+
+    def test_metrics_endpoint_reads_only_the_cached_complete_snapshot(self) -> None:
+        handler = make_audit_handler(CachedMetricsCoordinator())  # type: ignore[arg-type]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_port}/metrics",
+                timeout=5,
+            ) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(
+                    response.read().decode(),
+                    "qbit_prism_cached_snapshot 1\n",
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_metrics_endpoint_falls_back_when_compatibility_cache_is_uninitialized(
+        self,
+    ) -> None:
+        handler = make_audit_handler(  # type: ignore[arg-type]
+            UninitializedCachedMetricsCoordinator()
+        )
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_port}/metrics",
+                timeout=5,
+            ) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(
+                    response.read().decode(),
+                    "qbit_prism_direct_compatibility 1\n",
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_coordinator_latest_audit_endpoint_preserves_none_and_snapshot_payload(self) -> None:
+        coordinator = PrismCoordinator.__new__(PrismCoordinator)
+        coordinator.latest_evidence = None
+        with tempfile.TemporaryDirectory() as audit_root:
+            coordinator.audit_dir = Path(audit_root) / "artifacts"
+            coordinator.evidence_path = Path(audit_root) / "evidence.json"
+            handler = make_audit_handler(coordinator)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            try:
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(base_url + "/audit/latest", timeout=5)
+                self.assertEqual(raised.exception.code, 404)
+                raised.exception.close()
+
+                seed = {"schema": "test", "nested": {"value": 1}}
+                coordinator.latest_evidence = seed
+                seed["nested"]["value"] = 2
+                with urllib.request.urlopen(
+                    base_url + "/audit/latest",
+                    timeout=5,
+                ) as response:
+                    payload = json.loads(response.read())
+                self.assertEqual(payload, {"schema": "test", "nested": {"value": 1}})
+                payload["nested"]["value"] = 3
+                self.assertEqual(
+                    coordinator.latest_evidence_payload(),
+                    {"schema": "test", "nested": {"value": 1}},
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+                store = coordinator.__dict__.get("_audit_artifact_store")
+                if store is not None:
+                    store.close()
 
     def test_unhealthy_progress_returns_http_503_and_bounded_reason(self) -> None:
         handler = make_audit_handler(UnhealthyCoordinator())  # type: ignore[arg-type]

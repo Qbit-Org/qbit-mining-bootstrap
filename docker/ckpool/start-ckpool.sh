@@ -26,6 +26,8 @@ fi
 : "${CKPOOL_VERSION_MASK:=1fffe000}"
 : "${CKPOOL_VERSION_MASK_MODE:=dynamic}"
 : "${CKPOOL_VERSION_MASK_RPC_TIMEOUT_SECONDS:=5}"
+: "${CKPOOL_VERSION_MASK_PROBE_ATTEMPTS:=3}"
+: "${CKPOOL_VERSION_MASK_PROBE_RETRY_SECONDS:=2}"
 : "${QBIT_MINER_WALLET_NAME:=ckpool}"
 : "${CKPOOL_BIN:=/usr/local/bin/ckpool}"
 : "${CKPOOL_CONFIG_FILE:=/etc/ckpool/ckpool.conf}"
@@ -61,6 +63,7 @@ fi
 export QBIT_RPC_USER QBIT_RPC_PASSWORD QBIT_RPC_HOST QBIT_RPC_PORT QBIT_CHAIN QBIT_MINER_WALLET_NAME
 export QBIT_PRODUCTION QBIT_TOOLS_PRODUCTION CKPOOL_STRATUM_PORT
 export CKPOOL_VERSION_MASK CKPOOL_VERSION_MASK_MODE CKPOOL_VERSION_MASK_RPC_TIMEOUT_SECONDS
+export CKPOOL_VERSION_MASK_PROBE_ATTEMPTS CKPOOL_VERSION_MASK_PROBE_RETRY_SECONDS
 export CKPOOL_PUBLIC_DIFF_POLICY CKPOOL_NON_TEST_READINESS_GATE CKPOOL_MIN_PEERS
 export CKPOOL_PREFLIGHT_RPC_TIMEOUT_SECONDS CKPOOL_PREFLIGHT_READINESS_TIMEOUT_SECONDS
 export CKPOOL_TEMPLATE_MAX_AGE_SECONDS CKPOOL_TEMPLATE_MAX_FUTURE_SECONDS
@@ -255,8 +258,10 @@ if [[ "${SUPERVISED_CHILD}" == "0" ]]; then
   # state, or configuration creation can hide how values were supplied.
   qbit-ckpool-preflight --production-gate-only
 
-  CKPOOL_VERSION_MASK="$(ckpool-version-mask)"
-  export CKPOOL_VERSION_MASK
+  # Reject a malformed mask mode or configured mask now, without an RPC probe.
+  # The mask itself is resolved in the supervised child so that it reflects a
+  # template from a node the readiness gate has already accepted.
+  ckpool-version-mask --validate-config
 
   if [[ "${QBIT_MINER_ADDRESS_FILE_WAIT}" == "1" ]]; then
     for _ in $(seq 1 30); do
@@ -273,6 +278,14 @@ if [[ "${SUPERVISED_CHILD}" == "0" ]]; then
 fi
 
 : "${QBIT_MINER_ADDRESS:?QBIT_MINER_ADDRESS is required in supervised child}"
+
+# The supervisor only starts this child once its readiness gate and live
+# template checks have passed, so a dynamic probe here reads the mask the node
+# actually advertises instead of freezing a fallback chosen during cold start.
+# Dynamic mode fails closed, which aborts startup before any config is written.
+CKPOOL_VERSION_MASK="$(ckpool-version-mask)"
+export CKPOOL_VERSION_MASK
+
 mkdir -p "$(dirname "${CKPOOL_CONFIG_FILE}")" "${CKPOOL_LOG_DIR}" "${CKPOOL_SOCK_DIR}" "${CKPOOL_STATE_DIR}"
 mkdir -p "$(dirname "${QBIT_MINER_ADDRESS_FILE}")"
 printf '%s\n' "${QBIT_MINER_ADDRESS}" > "${QBIT_MINER_ADDRESS_FILE}"
