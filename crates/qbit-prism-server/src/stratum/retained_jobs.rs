@@ -16,6 +16,10 @@ impl<C> Default for RetainedJobs<C> {
 }
 
 impl<C> RetainedJobs<C> {
+    pub(super) fn is_empty(&self) -> bool {
+        self.jobs.is_empty()
+    }
+
     pub(super) fn get(&self, id: &str) -> Option<&IssuedJob<C>> {
         self.jobs.get(id)
     }

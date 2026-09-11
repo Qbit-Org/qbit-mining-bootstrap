@@ -385,3 +385,6 @@ async fn slow_resume_crossing_absolute_expiry_is_rejected_before_coordinator_sub
 
 #[path = "retained_tests.rs"]
 mod retained_tests;
+
+#[path = "session_timer_tests.rs"]
+mod session_timer_tests;
