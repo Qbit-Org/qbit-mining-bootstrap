@@ -6,6 +6,9 @@ members = [
     "crates/qbit-prism-server",
 ]
 
+[workspace.package]
+version = "3.0.0"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
