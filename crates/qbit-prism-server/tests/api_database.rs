@@ -272,11 +272,14 @@ async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
     scoped_url
         .query_pairs_mut()
         .append_pair("options", &format!("-csearch_path={schema}"));
+    // The hand-applied schema above stops at migration 003. A start without
+    // initialize refuses anything below the required version, so this
+    // connect brings the schema forward (every migration is idempotent).
     let ledger = qbit_prism_server::ledger::Ledger::connect(
         scoped_url.as_str(),
         "api-hydration".into(),
         4,
-        false,
+        true,
     )
     .await
     .unwrap();

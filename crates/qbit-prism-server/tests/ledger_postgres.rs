@@ -6,7 +6,7 @@ use qbit_prism::{
     build_audit_bundle, verify_audit_bundle_with_ledger_public_key, AcceptedShare, FoundBlock,
     PayoutPolicy,
 };
-use qbit_prism_server::ledger::{BlockObservation, Candidate, Ledger, Snapshot};
+use qbit_prism_server::ledger::{BlockObservation, Candidate, Ledger, Snapshot, SourceState};
 use qbit_prism_test_gate as gate;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -816,9 +816,7 @@ async fn migration_refuses_an_active_legacy_writer() -> Result<()> {
         return Ok(());
     };
     let pool = PgPool::connect(&db.url).await?;
-    sqlx::raw_sql(include_str!("../../qbit-prism/sql/001_share_ledger.sql"))
-        .execute(&pool)
-        .await?;
+    two_x::apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
     sqlx::query("INSERT INTO qbit_ledger_writer_lease(singleton,writer_id,writer_epoch,writer_session_token,lease_expires_at) VALUES(true,'python',1,'session',clock_timestamp()+interval '1 hour')").execute(&pool).await?;
     let result = db.ledger("a").await;
     assert!(result.is_err());
@@ -839,11 +837,8 @@ async fn migration_refuses_undrained_legacy_block_candidates() -> Result<()> {
         return Ok(());
     };
     let pool = PgPool::connect(&db.url).await?;
-    sqlx::raw_sql(include_str!("../../qbit-prism/sql/001_share_ledger.sql"))
-        .execute(&pool)
-        .await?;
-    sqlx::query("INSERT INTO qbit_block_candidate_outbox(block_hash,candidate,candidate_sha256) VALUES($1,$2,$3)")
-        .bind("77".repeat(32)).bind(json!({"block_hex":"legacy-python-payload"})).bind("88".repeat(32)).execute(&pool).await?;
+    two_x::apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    two_x::insert_v1_pending(&pool, &"77".repeat(32)).await?;
     let error = db
         .ledger("a")
         .await
@@ -859,7 +854,7 @@ async fn migration_refuses_undrained_legacy_block_candidates() -> Result<()> {
     .fetch_one(&pool)
     .await?;
     assert_eq!(pending, 1, "failed migration changed legacy state");
-    sqlx::query("UPDATE qbit_block_candidate_outbox SET state='submitted',candidate=NULL,completed_at=clock_timestamp()").execute(&pool).await?;
+    two_x::drain_2x_row(&pool, &"77".repeat(32), false).await?;
     let a = db.ledger("a").await?;
     pool.close().await;
     db.close(vec![a]).await

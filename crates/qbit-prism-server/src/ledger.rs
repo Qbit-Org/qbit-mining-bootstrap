@@ -31,6 +31,9 @@ mod fanout;
 mod jobs;
 pub use jobs::{IssuedJobSave, PreparedDependency};
 mod migration;
+pub use migration::{
+    MigrationSource, SourceState, SourceStateRule, REQUIRED_SCHEMA_VERSION, SOURCE_STATES,
+};
 mod window;
 pub use difficulty::WorkerDifficulty;
 use window::{read_prior_balances, share_from_row};

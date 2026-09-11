@@ -114,7 +114,21 @@ pub async fn run() -> Result<()> {
                 true,
             )
             .await?;
-            println!("PRISM PostgreSQL schema ready");
+            let source = ledger
+                .migration_source()
+                .await?
+                .map(|source| {
+                    format!(
+                        "{} (2.x.x release {})",
+                        source.source_state,
+                        source.source_release.as_deref().unwrap_or("none")
+                    )
+                })
+                .unwrap_or_else(|| "unrecorded".to_owned());
+            println!(
+                "PRISM PostgreSQL schema version {} ready; database source: {source}",
+                crate::ledger::REQUIRED_SCHEMA_VERSION
+            );
             ledger.pool.close().await;
             Ok(())
         }
