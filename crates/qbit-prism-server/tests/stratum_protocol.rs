@@ -319,7 +319,7 @@ impl Client {
         .unwrap();
         let merkle = qbit_prism_server::codec::double_sha256(&coinbase);
         let mut previous = hex::decode(p[1].as_str().unwrap()).unwrap();
-        for word in previous.chunks_exact_mut(4) {
+        for word in previous.as_chunks_mut::<4>().0 {
             word.reverse();
         }
         let target = qbit_prism_server::codec::difficulty_target(self.difficulty).unwrap();
@@ -367,7 +367,7 @@ impl Client {
         .unwrap();
         let merkle = qbit_prism_server::codec::double_sha256(&coinbase);
         let mut previous = hex::decode(p[1].as_str().unwrap()).unwrap();
-        for word in previous.chunks_exact_mut(4) {
+        for word in previous.as_chunks_mut::<4>().0 {
             word.reverse();
         }
         for nonce in nonce_start..nonce_start + 1000 {

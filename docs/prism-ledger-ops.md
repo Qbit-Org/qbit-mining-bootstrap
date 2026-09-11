@@ -297,9 +297,11 @@ QBITD_BIN=/path/to/qbitd bash test/prism-native-tests.sh live
 ```
 
 The database test wrapper starts a private local cluster unless
-`PRISM_TEST_DATABASE_URL` is supplied. Its default mode runs all targets, then
-the ignored database collector test explicitly, as CI does. Live tests add actual
-qbitd regtest and bounded CPU mining. Use an isolated database for tests. The native builder
+`PRISM_TEST_DATABASE_URL` is supplied. Its default mode runs the whole workspace
+and the two explicit `--ignored` database runs, as CI does, and checks the
+integration gate's manifest so no gated test passes without running (see
+[the integration test gate](prism-integration-test-gate.md)). Live tests add
+actual qbitd regtest and bounded CPU mining. Use an isolated database for tests. The native builder
 benchmark measures CPU build/verify work, not end-to-end accepted-share capacity;
 see [measurement](prism-payout-artifact-measurement.md) and
 [optional qualification](prism-capacity-readiness.md).

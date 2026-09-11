@@ -1,0 +1,9 @@
+# The one source of the Rust toolchain pin. rustup reads this file, so every
+# cargo invocation in the checkout, and every CI job, uses exactly this
+# version. scripts/check_toolchain_pin.py holds [workspace.package].rust-version
+# in Cargo.toml and the builder image in lab/prism/Dockerfile to the same
+# version; bump all three together.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

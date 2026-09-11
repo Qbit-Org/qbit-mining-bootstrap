@@ -128,7 +128,7 @@ impl HighdiffClient {
             merkle = double_sha256(&[merkle.as_slice(), sibling.as_slice()].concat());
         }
         let mut previous = hex::decode(field(1)?)?;
-        for word in previous.chunks_exact_mut(4) {
+        for word in previous.as_chunks_mut::<4>().0 {
             word.reverse();
         }
         let bits = parse_u32_hex(field(6)?)?;

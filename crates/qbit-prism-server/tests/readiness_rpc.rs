@@ -6,6 +6,7 @@ use qbit_prism_server::{
     config::Config, coordinator::Coordinator, ledger::Candidate, readiness, rpc::Rpc,
     stratum::MiningBackend,
 };
+use qbit_prism_test_gate as gate;
 use serde_json::{json, Value};
 use std::{sync::Arc, time::Duration};
 use tokio::{
@@ -273,8 +274,7 @@ async fn coordinator_reports_wrap_exhaustion_truthfully() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn observed_readiness_failure_closes_cached_work_and_candidate_settlement() -> Result<()> {
-    let Ok(raw) = std::env::var("PRISM_TEST_DATABASE_URL") else {
-        eprintln!("skipping coordinator readiness integration; set PRISM_TEST_DATABASE_URL");
+    let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
     let admin = sqlx::PgPool::connect(&raw).await?;
@@ -555,8 +555,7 @@ async fn observed_readiness_failure_closes_cached_work_and_candidate_settlement(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn another_frontend_payout_revision_retires_same_parent_work_and_preserves_parent_grace(
 ) -> Result<()> {
-    let Ok(raw) = std::env::var("PRISM_TEST_DATABASE_URL") else {
-        eprintln!("set PRISM_TEST_DATABASE_URL for shared payout revision regression");
+    let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
     let admin = sqlx::PgPool::connect(&raw).await?;
@@ -676,8 +675,7 @@ async fn another_frontend_payout_revision_retires_same_parent_work_and_preserves
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cached_ctv_work_revalidates_live_floors_and_fences_old_underfunded_jobs() -> Result<()> {
-    let Ok(raw) = std::env::var("PRISM_TEST_DATABASE_URL") else {
-        eprintln!("skipping coordinator fee integration; set PRISM_TEST_DATABASE_URL");
+    let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
     let admin = sqlx::PgPool::connect(&raw).await?;

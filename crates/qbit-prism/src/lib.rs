@@ -258,18 +258,13 @@ pub struct PayoutPolicy {
 /// `PoolFeeFirst` reserves one direct settlement slot for a positive pool fee,
 /// keeps the fee out of CTV fanout chunks, and emits the fee output at
 /// coinbase vout 0 while every other output keeps canonical ordering after it.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub enum CoinbaseOutputPolicy {
+    #[default]
     #[serde(rename = "canonical")]
     Canonical,
     #[serde(rename = "pool-fee-first")]
     PoolFeeFirst,
-}
-
-impl Default for CoinbaseOutputPolicy {
-    fn default() -> Self {
-        Self::Canonical
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -337,17 +332,12 @@ pub struct PoolFeeManifest {
     pub p2mr_program_hex: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PayoutPolicyAccountType {
+    #[default]
     Miner,
     PoolFee,
-}
-
-impl Default for PayoutPolicyAccountType {
-    fn default() -> Self {
-        Self::Miner
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -838,7 +828,7 @@ pub fn compute_prism_window(
         .windows(2)
         .all(|pair| pair[0].share_seq > pair[1].share_seq)
     {
-        eligible.sort_by(|left, right| right.share_seq.cmp(&left.share_seq));
+        eligible.sort_by_key(|share| std::cmp::Reverse(share.share_seq));
     }
 
     let mut remaining = requested_window_weight;
@@ -1012,7 +1002,7 @@ fn parse_audit_commitment_leaf(raw: &str, index: usize) -> Result<[u8; 32], Pris
 fn merkle_root(mut hashes: Vec<[u8; 32]>) -> [u8; 32] {
     debug_assert!(!hashes.is_empty());
     while hashes.len() > 1 {
-        let mut next = Vec::with_capacity((hashes.len() + 1) / 2);
+        let mut next = Vec::with_capacity(hashes.len().div_ceil(2));
         for pair in hashes.chunks(2) {
             let left = pair[0];
             let right = if pair.len() == 2 { pair[1] } else { pair[0] };
@@ -1655,6 +1645,8 @@ pub fn build_audit_bundle_body_with_coinbase_script_sig_suffix(
 
 /// Owning form of [`build_audit_bundle_body_with_coinbase_options`]. The window
 /// moves into the bundle unchanged; it is not copied.
+// The parameter list mirrors the borrowed form it forwards to, so callers see one signature.
+#[allow(clippy::too_many_arguments)]
 pub fn build_audit_bundle_with_coinbase_options(
     shares: Vec<AcceptedShare>,
     found_block: FoundBlock,
@@ -1750,6 +1742,8 @@ pub fn build_audit_bundle_body_with_coinbase_options(
 
 /// Owning form of [`build_audit_bundle_body_with_ctv_settlement_options`]. The
 /// window moves into the bundle unchanged; it is not copied.
+// The parameter list mirrors the borrowed form it forwards to, so callers see one signature.
+#[allow(clippy::too_many_arguments)]
 pub fn build_audit_bundle_with_ctv_settlement_options(
     shares: Vec<AcceptedShare>,
     found_block: FoundBlock,

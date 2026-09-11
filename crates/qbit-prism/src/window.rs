@@ -879,7 +879,7 @@ mod tests {
             job_issued_at_ms: job_ms,
             accepted_at_ms: accepted_ms,
             ntime: 1_700_000_000,
-            credit_policy: if seq % 4 == 0 {
+            credit_policy: if seq.is_multiple_of(4) {
                 Some("stale-grace".to_string())
             } else {
                 None

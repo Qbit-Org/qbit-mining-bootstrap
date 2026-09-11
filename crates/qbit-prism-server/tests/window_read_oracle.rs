@@ -36,6 +36,7 @@
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use qbit_prism::AcceptedShare;
 use qbit_prism_server::ledger::{Ledger, Snapshot};
+use qbit_prism_test_gate as gate;
 use serde::Deserialize;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -43,62 +44,16 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 // Integration guard
 // ---------------------------------------------------------------------------
-
-/// Decides whether this file's tests run, fail or skip.
-///
-/// | `PRISM_TEST_DATABASE_URL` | other variables | result |
-/// | --- | --- | --- |
-/// | set and non-empty | -- | run against that database |
-/// | unset or empty | `PRISM_TEST_REQUIRE_INTEGRATION=1` | fail, naming the variable |
-/// | unset or empty | `GITHUB_JOB=prism-native-postgres` | fail, naming the variable |
-/// | unset or empty | -- | print a skip line and return |
-///
-/// The three variables play different roles. This repository sets
-/// `PRISM_TEST_DATABASE_URL` itself, in the `prism-native-postgres` job of
-/// `.github/workflows/ci.yml`. GitHub sets `GITHUB_JOB` to the running job's
-/// id, so matching it on `prism-native-postgres` means a database outage in
-/// that job surfaces as a failure instead of a silent pass, even though
-/// nothing in the repository writes that variable. Nothing sets
-/// `PRISM_TEST_REQUIRE_INTEGRATION` yet: it is an opt-in switch proposed by
-/// #286 for a run that wants every integration test to be mandatory, honoured
-/// here in advance so that adopting it needs no change to this file.
-///
-/// Keying on `CI` instead would be wrong: GitHub sets `CI=true` in every job,
-/// including `rust-tests`, which builds and runs the whole workspace with no
-/// database at all.
-///
-/// An empty or whitespace-only URL counts as unset. A non-empty but malformed
-/// URL is deliberately not second-guessed here; it reaches `sqlx` and fails
-/// the test with the connection error, which is the diagnostic an operator
-/// needs.
-fn database_url(test_name: &str) -> Result<Option<String>> {
-    let configured = std::env::var("PRISM_TEST_DATABASE_URL").unwrap_or_default();
-    let configured = configured.trim();
-    if !configured.is_empty() {
-        return Ok(Some(configured.to_owned()));
-    }
-    let required_by = if matches!(
-        std::env::var("PRISM_TEST_REQUIRE_INTEGRATION").as_deref(),
-        Ok("1")
-    ) {
-        Some("PRISM_TEST_REQUIRE_INTEGRATION=1")
-    } else if matches!(
-        std::env::var("GITHUB_JOB").as_deref(),
-        Ok("prism-native-postgres")
-    ) {
-        Some("GITHUB_JOB=prism-native-postgres")
-    } else {
-        None
-    };
-    if let Some(signal) = required_by {
-        bail!(
-            "{test_name} requires PostgreSQL: PRISM_TEST_DATABASE_URL is unset or empty while \
-             {signal} demands the integration suite"
-        );
-    }
-    eprintln!("skipping {test_name}: PRISM_TEST_DATABASE_URL is not set");
-    Ok(None)
-}
+//
+// Every test here takes `PRISM_TEST_DATABASE_URL` through the workspace's
+// shared integration gate (`qbit_prism_test_gate`), whose decision table this
+// file's original guard was the model for: present, run; missing while
+// `PRISM_TEST_REQUIRE_INTEGRATION=1` or `GITHUB_JOB=prism-native-postgres`,
+// fail naming the variable and the test; missing otherwise, print one
+// prefixed skip line and return. The `prism-native-postgres` job sets the
+// switch, and these eight tests are listed in `test/prism-gated-tests.txt`,
+// so the job's execution manifest proves they ran. See
+// `docs/prism-integration-test-gate.md`.
 
 // ---------------------------------------------------------------------------
 // Schema harness
@@ -180,12 +135,12 @@ where
 
 /// The integration guard followed by `in_fresh_schema`, for a test that wants
 /// exactly one schema. Returns without running the body when the guard skips.
-async fn with_schema<F, Fut>(test_name: &str, body: F) -> Result<()>
+async fn with_schema<F, Fut>(body: F) -> Result<()>
 where
     F: FnOnce(Ledger) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    let Some(raw) = database_url(test_name)? else {
+    let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
     in_fresh_schema(&raw, body).await
@@ -874,37 +829,34 @@ fn credited_sequences(snapshot: &Snapshot) -> Result<Vec<i64>> {
 /// enough to need a third page, and past the end of history.
 #[tokio::test]
 async fn window_matches_the_oracle_across_page_boundaries() -> Result<()> {
-    with_schema(
-        "window_matches_the_oracle_across_page_boundaries",
-        |ledger| async move {
-            let anchor_ms = derived_anchor(&ledger.pool, 0).await?;
-            // 12000 rows one millisecond apart, the newest a minute before the
-            // anchor.
-            insert_run(&ledger.pool, 12_000, anchor_ms * 1_000 - 60_000_000).await?;
+    with_schema(|ledger| async move {
+        let anchor_ms = derived_anchor(&ledger.pool, 0).await?;
+        // 12000 rows one millisecond apart, the newest a minute before the
+        // anchor.
+        insert_run(&ledger.pool, 12_000, anchor_ms * 1_000 - 60_000_000).await?;
 
-            for (label, network_difficulty, expected_len) in [
-                ("page-boundary-minus-one", 4_095_u128, 4_095_usize),
-                ("page-boundary-exact", 4_096, 4_096),
-                ("page-boundary-plus-one", 4_097, 4_097),
-                ("three-pages", 9_000, 9_000),
-                ("weight-exceeds-history", 20_000, 12_000),
-            ] {
-                let snapshot = check_scenario(
-                    &format!("a:{label}"),
-                    &ledger,
-                    anchor_ms,
-                    network_difficulty,
-                )
-                .await?;
-                ensure!(
-                    snapshot.shares.len() == expected_len,
-                    "a:{label}: expected a {expected_len}-row window, got {}",
-                    snapshot.shares.len()
-                );
-            }
-            Ok(())
-        },
-    )
+        for (label, network_difficulty, expected_len) in [
+            ("page-boundary-minus-one", 4_095_u128, 4_095_usize),
+            ("page-boundary-exact", 4_096, 4_096),
+            ("page-boundary-plus-one", 4_097, 4_097),
+            ("three-pages", 9_000, 9_000),
+            ("weight-exceeds-history", 20_000, 12_000),
+        ] {
+            let snapshot = check_scenario(
+                &format!("a:{label}"),
+                &ledger,
+                anchor_ms,
+                network_difficulty,
+            )
+            .await?;
+            ensure!(
+                snapshot.shares.len() == expected_len,
+                "a:{label}: expected a {expected_len}-row window, got {}",
+                snapshot.shares.len()
+            );
+        }
+        Ok(())
+    })
     .await
 }
 
@@ -916,32 +868,29 @@ async fn window_matches_the_oracle_across_page_boundaries() -> Result<()> {
 /// the next older row is not.
 #[tokio::test]
 async fn the_row_that_crosses_the_weight_boundary_is_credited() -> Result<()> {
-    with_schema(
-        "the_row_that_crosses_the_weight_boundary_is_credited",
-        |ledger| async move {
-            let anchor_ms = derived_anchor(&ledger.pool, 0).await?;
-            let base_us = anchor_ms * 1_000 - 60_000_000;
-            // Newest first the difficulties are 3, 7, 5, 1, 1. A weight of 8
-            // leaves 5 after the newest row, and the difficulty-7 row
-            // overshoots that.
-            let mut seqs = Vec::new();
-            for (index, difficulty) in [1_u128, 1, 5, 7, 3].into_iter().enumerate() {
-                let index = u64::try_from(index)?;
-                let spec = ShareSpec::new(index + 1, base_us + i64::try_from(index)? * 1_000)
-                    .difficulty(difficulty);
-                seqs.push(insert_share(&ledger.pool, &spec).await?);
-            }
+    with_schema(|ledger| async move {
+        let anchor_ms = derived_anchor(&ledger.pool, 0).await?;
+        let base_us = anchor_ms * 1_000 - 60_000_000;
+        // Newest first the difficulties are 3, 7, 5, 1, 1. A weight of 8
+        // leaves 5 after the newest row, and the difficulty-7 row
+        // overshoots that.
+        let mut seqs = Vec::new();
+        for (index, difficulty) in [1_u128, 1, 5, 7, 3].into_iter().enumerate() {
+            let index = u64::try_from(index)?;
+            let spec = ShareSpec::new(index + 1, base_us + i64::try_from(index)? * 1_000)
+                .difficulty(difficulty);
+            seqs.push(insert_share(&ledger.pool, &spec).await?);
+        }
 
-            let snapshot = check_scenario("b:crossing-row", &ledger, anchor_ms, 1).await?;
-            let credited = credited_sequences(&snapshot)?;
-            ensure!(
-                credited == vec![seqs[3], seqs[4]],
-                "b:crossing-row: expected the difficulty-7 crossing row and the newest row, got \
+        let snapshot = check_scenario("b:crossing-row", &ledger, anchor_ms, 1).await?;
+        let credited = credited_sequences(&snapshot)?;
+        ensure!(
+            credited == vec![seqs[3], seqs[4]],
+            "b:crossing-row: expected the difficulty-7 crossing row and the newest row, got \
                  {credited:?}"
-            );
-            Ok(())
-        },
-    )
+        );
+        Ok(())
+    })
     .await
 }
 
@@ -949,32 +898,29 @@ async fn the_row_that_crosses_the_weight_boundary_is_credited() -> Result<()> {
 /// trip and closes the window on the row that carries it.
 #[tokio::test]
 async fn a_u128_maximum_difficulty_is_decoded_and_closes_the_window() -> Result<()> {
-    with_schema(
-        "a_u128_maximum_difficulty_is_decoded_and_closes_the_window",
-        |ledger| async move {
-            let anchor_ms = derived_anchor(&ledger.pool, 0).await?;
-            let base_us = anchor_ms * 1_000 - 60_000_000;
-            insert_share(&ledger.pool, &ShareSpec::new(1, base_us)).await?;
-            let crossing = insert_share(
-                &ledger.pool,
-                &ShareSpec::new(2, base_us + 1_000).difficulty(u128::MAX),
-            )
-            .await?;
-            let mut newest = ShareSpec::new(3, base_us + 2_000);
-            newest.network_difficulty = u128::MAX;
-            let newest = insert_share(&ledger.pool, &newest).await?;
+    with_schema(|ledger| async move {
+        let anchor_ms = derived_anchor(&ledger.pool, 0).await?;
+        let base_us = anchor_ms * 1_000 - 60_000_000;
+        insert_share(&ledger.pool, &ShareSpec::new(1, base_us)).await?;
+        let crossing = insert_share(
+            &ledger.pool,
+            &ShareSpec::new(2, base_us + 1_000).difficulty(u128::MAX),
+        )
+        .await?;
+        let mut newest = ShareSpec::new(3, base_us + 2_000);
+        newest.network_difficulty = u128::MAX;
+        let newest = insert_share(&ledger.pool, &newest).await?;
 
-            let snapshot =
-                check_scenario("b:u128-maximum-difficulty", &ledger, anchor_ms, 1_000).await?;
-            let credited = credited_sequences(&snapshot)?;
-            ensure!(
-                credited == vec![crossing, newest],
-                "b:u128-maximum-difficulty: expected the saturating row and the newest row, got \
+        let snapshot =
+            check_scenario("b:u128-maximum-difficulty", &ledger, anchor_ms, 1_000).await?;
+        let credited = credited_sequences(&snapshot)?;
+        ensure!(
+            credited == vec![crossing, newest],
+            "b:u128-maximum-difficulty: expected the saturating row and the newest row, got \
                  {credited:?}"
-            );
-            Ok(())
-        },
-    )
+        );
+        Ok(())
+    })
     .await
 }
 
@@ -1126,8 +1072,7 @@ const WRITER_INDEX_BASE: u64 = 1_000;
 /// millisecond past it are not.
 #[tokio::test]
 async fn rows_on_the_anchor_are_credited_and_rows_after_it_are_not() -> Result<()> {
-    let Some(url) = database_url("rows_on_the_anchor_are_credited_and_rows_after_it_are_not")?
-    else {
+    let Some(url) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
     check_anchor_boundary(
@@ -1153,7 +1098,7 @@ async fn rows_on_the_anchor_are_credited_and_rows_after_it_are_not() -> Result<(
 /// covered by `writer_rows_follow_integer_milliseconds_past_2_43` instead.
 #[tokio::test]
 async fn the_anchor_barrier_holds_at_large_millisecond_values() -> Result<()> {
-    let Some(url) = database_url("the_anchor_barrier_holds_at_large_millisecond_values")? else {
+    let Some(url) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
     for (label, anchor) in [
@@ -1225,7 +1170,7 @@ async fn the_anchor_barrier_holds_at_large_millisecond_values() -> Result<()> {
 /// -- which is every row a writer can produce -- to an exact read-back.
 #[tokio::test]
 async fn writer_rows_follow_integer_milliseconds_past_2_43() -> Result<()> {
-    let Some(url) = database_url("writer_rows_follow_integer_milliseconds_past_2_43")? else {
+    let Some(url) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
     for (label, anchor_ms) in [
@@ -1339,58 +1284,54 @@ async fn writer_rows_follow_integer_milliseconds_past_2_43() -> Result<()> {
 /// the newest of them does not move the cutoff.
 #[tokio::test]
 async fn rejected_rows_are_excluded_and_consume_no_weight() -> Result<()> {
-    with_schema(
-        "rejected_rows_are_excluded_and_consume_no_weight",
-        |ledger| async move {
-            let anchor_ms = derived_anchor(&ledger.pool, 0).await?;
-            let base_us = anchor_ms * 1_000 - 60_000_000;
-            let huge = 1_000_000_000_000_000_000_000_000_000_000_u128;
-            let mut accepted_seqs = Vec::new();
-            let mut rejected_seqs = Vec::new();
-            for index in 0..8_u64 {
-                let accepted_at_us = base_us + i64::try_from(index)? * 1_000;
-                let spec = ShareSpec::new(index + 1, accepted_at_us);
-                if index % 2 == 0 {
-                    accepted_seqs.push(insert_share(&ledger.pool, &spec).await?);
-                } else {
-                    let spec = spec.difficulty(huge).rejected();
-                    rejected_seqs.push(insert_share(&ledger.pool, &spec).await?);
-                }
+    with_schema(|ledger| async move {
+        let anchor_ms = derived_anchor(&ledger.pool, 0).await?;
+        let base_us = anchor_ms * 1_000 - 60_000_000;
+        let huge = 1_000_000_000_000_000_000_000_000_000_000_u128;
+        let mut accepted_seqs = Vec::new();
+        let mut rejected_seqs = Vec::new();
+        for index in 0..8_u64 {
+            let accepted_at_us = base_us + i64::try_from(index)? * 1_000;
+            let spec = ShareSpec::new(index + 1, accepted_at_us);
+            if index % 2 == 0 {
+                accepted_seqs.push(insert_share(&ledger.pool, &spec).await?);
+            } else {
+                let spec = spec.difficulty(huge).rejected();
+                rejected_seqs.push(insert_share(&ledger.pool, &spec).await?);
             }
-            // The highest sequence in the table belongs to a rejected row, so the
-            // cutoff has to fall back to the newest accepted row.
-            rejected_seqs.push(
-                insert_share(
-                    &ledger.pool,
-                    &ShareSpec::new(9, base_us + 9_000)
-                        .difficulty(huge)
-                        .rejected(),
-                )
-                .await?,
-            );
+        }
+        // The highest sequence in the table belongs to a rejected row, so the
+        // cutoff has to fall back to the newest accepted row.
+        rejected_seqs.push(
+            insert_share(
+                &ledger.pool,
+                &ShareSpec::new(9, base_us + 9_000)
+                    .difficulty(huge)
+                    .rejected(),
+            )
+            .await?,
+        );
 
-            // Weight 24 credits exactly three difficulty-8 accepted rows. Had the
-            // rejected rows consumed weight, the window would be a single row.
-            let snapshot = check_scenario("d:rejected-interleaved", &ledger, anchor_ms, 3).await?;
-            let credited = credited_sequences(&snapshot)?;
-            for seq in &rejected_seqs {
-                ensure!(
-                    !credited.contains(seq),
-                    "d:rejected-interleaved: rejected row {seq} appeared in the window"
-                );
-            }
+        // Weight 24 credits exactly three difficulty-8 accepted rows. Had the
+        // rejected rows consumed weight, the window would be a single row.
+        let snapshot = check_scenario("d:rejected-interleaved", &ledger, anchor_ms, 3).await?;
+        let credited = credited_sequences(&snapshot)?;
+        for seq in &rejected_seqs {
             ensure!(
-                credited.as_slice() == &accepted_seqs[accepted_seqs.len() - 3..],
-                "d:rejected-interleaved: expected the three newest accepted rows, got {credited:?}"
+                !credited.contains(seq),
+                "d:rejected-interleaved: rejected row {seq} appeared in the window"
             );
-            ensure!(
-                i64::try_from(snapshot.share_seq)?
-                    == *accepted_seqs.last().context("accepted rows")?,
-                "d:rejected-interleaved: the cutoff followed a rejected row"
-            );
-            Ok(())
-        },
-    )
+        }
+        ensure!(
+            credited.as_slice() == &accepted_seqs[accepted_seqs.len() - 3..],
+            "d:rejected-interleaved: expected the three newest accepted rows, got {credited:?}"
+        );
+        ensure!(
+            i64::try_from(snapshot.share_seq)? == *accepted_seqs.last().context("accepted rows")?,
+            "d:rejected-interleaved: the cutoff followed a rejected row"
+        );
+        Ok(())
+    })
     .await
 }
 
@@ -1402,7 +1343,7 @@ async fn rejected_rows_are_excluded_and_consume_no_weight() -> Result<()> {
 /// accepted rows that all sit after the anchor.
 #[tokio::test]
 async fn empty_windows_return_no_shares() -> Result<()> {
-    with_schema("empty_windows_return_no_shares", |ledger| async move {
+    with_schema(|ledger| async move {
         let anchor_ms = derived_anchor(&ledger.pool, 0).await?;
 
         let snapshot = check_scenario("f:no-rows", &ledger, anchor_ms, 1_000).await?;
