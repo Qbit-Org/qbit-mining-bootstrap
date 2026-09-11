@@ -252,10 +252,11 @@ and 006, and refuses before any DDL when such a row is pending, naming the
 rows as above:
 
 ```
-refusing to apply migration 006 to a native schema 5 database: an earlier 3.x.x build migrated it
-before the drain rule covered these rows, and the legacy Python block outbox is not drained: 1 pending
-2.x.x candidate row(s) cannot be replayed natively (block_hash=... storage_version=2 ...). Nothing was
-changed. Restore the pre-migration 2.x.x backup and drain them with the pinned 2.x.x release ...
+refusing to apply migration 006 to a native database at schema migrations 2, 3, 4, 5, 9: an earlier
+3.x.x build migrated it before the drain rule covered these rows, and the legacy Python block outbox is
+not drained: 1 pending 2.x.x candidate row(s) cannot be replayed natively (block_hash=...
+storage_version=2 ...). Nothing was changed. Restore the pre-migration 2.x.x backup and drain them with
+the pinned 2.x.x release ...
 ```
 
 Native pending rows the earlier build wrote carry the native fields and are
