@@ -5,7 +5,11 @@ Two contracts over every tracked file under ``docs/``:
 
 a. No runnable ``python -m lab.…`` or ``python lab/….py`` command invokes a
    module or script absent from the branch, however it is wrapped across shell
-   backslash continuation lines. There is no allowlist.
+   backslash continuation lines. There is no allowlist. The check is lexical:
+   it reads direct ``python``/``python3``/``python3.N`` invocations with their
+   CPython option forms, quoted targets and ``./`` prefixes, and does not
+   follow ``cd``, ``PYTHONPATH`` or other environment indirection, aliases,
+   or shell variables.
 b. Every ``lab/prism/…`` path or ``lab.prism.…`` module reference resolves to a
    tracked file or directory. GitHub links pinned to a 40-hex commit SHA are
    stable history and exempt. Pre-existing residue that #303 declares out of
@@ -54,8 +58,29 @@ PYTHON_OPTION = (
     r"|--check-hash-based-pycs\s+(?:always|default|never)"
 )
 PYTHON_COMMAND = rf"\bpython(?:3(?:\.\d+)?)?(?:\s+(?:{PYTHON_OPTION}))*"
-MODULE_COMMAND = re.compile(rf"{PYTHON_COMMAND}\s+-m\s+(lab(?:\.[A-Za-z_][A-Za-z0-9_]*)+)\b")
-SCRIPT_COMMAND = re.compile(rf"{PYTHON_COMMAND}\s+(lab/[A-Za-z0-9_./\-]+\.py)\b")
+# `-m` may close a flag cluster and take its module attached: CPython 3.12 runs
+# `-mlab.x`, `-Im lab.x`, `-OOm lab.x` and `-Imlab.x` alike, while `-Wm lab.x`
+# hands `m` to `-W` and treats `lab.x` as a script path.
+MODULE_OPTION = rf"-{PYTHON_FLAG}*m\s*"
+
+
+def quoted(target: str) -> str:
+    """``target`` bare or in matching single or double quotes, which the shell strips.
+
+    A mismatched quote is a shell syntax error: the line runs nothing and
+    matches nothing.
+    """
+    return rf"(?P<quote>['\"]?){target}\b(?P=quote)"
+
+
+# `python3 -m 'lab.a.b'` and `python3 "./lab/a/b.py"`. CPython resolves any
+# `./` prefixes on a script path, so ``target`` holds the normalised path.
+MODULE_COMMAND = re.compile(
+    rf"{PYTHON_COMMAND}\s+{MODULE_OPTION}" + quoted(r"(?P<target>lab(?:\.[A-Za-z_][A-Za-z0-9_]*)+)")
+)
+SCRIPT_COMMAND = re.compile(
+    rf"{PYTHON_COMMAND}\s+" + quoted(r"(?:\./)*(?P<target>lab/[A-Za-z0-9_./\-]+\.py)")
+)
 PINNED_GITHUB_URL = re.compile(
     r"github\.com/[^/\s]+/[^/\s]+/(?:blob|tree|raw)/[0-9a-f]{40}/$"
 )
@@ -95,12 +120,12 @@ def dead_commands(text: str, tracked: frozenset[str]) -> list[tuple[int, str, st
     found = []
     for number, line in shell_lines(text):
         for match in MODULE_COMMAND.finditer(line):
-            candidates = module_candidates(match.group(1))[:2]
+            candidates = module_candidates(match.group("target"))[:2]
             if not any(candidate in tracked for candidate in candidates):
                 found.append((number, match.group(0), candidates[0]))
         for match in SCRIPT_COMMAND.finditer(line):
-            if match.group(1) not in tracked:
-                found.append((number, match.group(0), match.group(1)))
+            if match.group("target") not in tracked:
+                found.append((number, match.group(0), match.group("target")))
     return found
 
 
@@ -294,6 +319,65 @@ class ScannerTests(unittest.TestCase):
                 self.assertEqual(self.located(text), [(1, "lab/prism/process_telemetry.py")])
                 text = f"python3.12 {wrapped} \\\n  lab/prism/storm.py \\\n  --decide"
                 self.assertEqual(self.located(text), [(1, "lab/prism/storm.py")])
+
+    def test_quoted_targets_with_missing_targets_are_caught(self) -> None:
+        for quote in ("'", '"'):
+            with self.subTest(quote=quote):
+                self.assertEqual(
+                    self.commands(f"python3 -m {quote}lab.prism.process_telemetry{quote} rss-bound"),
+                    ["lab/prism/process_telemetry.py"],
+                )
+                self.assertEqual(
+                    self.commands(f"python3 {quote}lab/prism/storm.py{quote} --decide"),
+                    ["lab/prism/storm.py"],
+                )
+
+    def test_dot_relative_scripts_are_caught_as_the_bare_path(self) -> None:
+        for script in ("./lab/prism/storm.py", '"./lab/prism/storm.py"', "././lab/prism/storm.py"):
+            with self.subTest(script=script):
+                self.assertEqual(self.commands(f"python3 {script} --decide"), ["lab/prism/storm.py"])
+
+    # Every `-m` spelling here ran `json.tool` on CPython 3.12; `-Wm json.tool`
+    # and `-Xm json.tool` did not, opening `json.tool` as a script instead.
+    ADJACENT_MODULE_OPTIONS = ("-m{}", "-m'{}'", "-Im {}", "-OOm {}", "-Im{}")
+
+    def test_adjacent_module_options_with_missing_targets_are_caught(self) -> None:
+        for option in self.ADJACENT_MODULE_OPTIONS:
+            with self.subTest(option=option):
+                text = f"python3 {option.format('lab.prism.process_telemetry')} rss-bound"
+                self.assertEqual(self.commands(text), ["lab/prism/process_telemetry.py"])
+        self.assertEqual(self.commands("python3 -Wm lab.prism.process_telemetry"), [])
+        self.assertEqual(self.commands("python3 -Xm lab.prism.process_telemetry"), [])
+
+    def test_adjacent_module_options_with_existing_targets_pass(self) -> None:
+        tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py"}
+        for option in self.ADJACENT_MODULE_OPTIONS:
+            with self.subTest(option=option):
+                text = f"python3 {option.format('lab.prism.tool')}\npython3.12 {option.format('lab.pkg')}"
+                self.assertEqual(dead_commands(text, tracked), [])
+
+    def test_quoted_and_dot_relative_forms_with_existing_targets_pass(self) -> None:
+        tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py"}
+        text = (
+            "python3 -m 'lab.prism.tool'\npython -m \"lab.pkg\"\npython3 'lab/prism/tool.py'\n"
+            "python3 \"./lab/prism/tool.py\"\npython3 ./lab/prism/tool.py"
+        )
+        self.assertEqual(dead_commands(text, tracked), [])
+
+    def test_wrapped_quoted_targets_with_missing_targets_are_caught(self) -> None:
+        text = "python3 -m \\\n  'lab.prism.process_telemetry' \\\n  rss-bound"
+        self.assertEqual(self.located(text), [(1, "lab/prism/process_telemetry.py")])
+        text = "python3 \\\n  \"./lab/prism/storm.py\" \\\n  --decide"
+        self.assertEqual(self.located(text), [(1, "lab/prism/storm.py")])
+
+    def test_mismatched_quotes_are_not_a_command(self) -> None:
+        # The shell rejects an unterminated quote before anything runs, so the
+        # line is not a runnable command and is left to the prose contract,
+        # which still sees the reference, as it does inside `-c` strings.
+        text = "python3 -m 'lab.prism.x\""
+        self.assertEqual(self.commands(text), [])
+        self.assertEqual(self.references(text), ["lab.prism.x"])
+        self.assertEqual(self.commands("python3 \"lab/prism/x.py'"), [])
 
     def test_version_suffixed_interpreters_are_scanned(self) -> None:
         self.assertEqual(
