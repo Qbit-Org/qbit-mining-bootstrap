@@ -1,9 +1,680 @@
+//! The frozen 2.x.x source schema, and every upgrade test that starts from it.
+//!
+//! The fixtures under `tests/fixtures/schema_2x` are byte-exact copies of the
+//! 2.x.x release SQL (see the README there). Upgrade tests build their source
+//! from those copies, never from the live in-tree files, so a DDL edit to the
+//! live `001_share_ledger.sql` cannot be absorbed silently: the digest tests
+//! below pin the fixtures, pin the live file, and compare the two.
 use super::*;
-use qbit_prism_server::ledger::audit_canonical_bytes;
+use qbit_prism_server::ledger::{
+    audit_canonical_bytes, MigrationSource, SourceState, REQUIRED_SCHEMA_VERSION, SOURCE_STATES,
+};
 use sqlx::Row;
 use std::io::Write;
 
-const LEGACY_SCHEMA: &str = include_str!("../../../qbit-prism/sql/001_share_ledger.sql");
+/// `crates/qbit-prism/sql/001_share_ledger.sql` at 2.x.x v2.0.2 (`504846c`);
+/// byte-identical at v2.0.1 (`95ffe06`) and v2.0.0 (`f6854a0`).
+pub const FROZEN_2X_001: &str = include_str!("../fixtures/schema_2x/001_share_ledger.sql");
+/// `crates/qbit-prism/sql/002_candidate_bodies.sql` at 2.x.x v2.0.2 (`504846c`, #258).
+pub const FROZEN_2X_002: &str = include_str!("../fixtures/schema_2x/002_candidate_bodies.sql");
+pub const FROZEN_2X_001_SHA256: &str =
+    "9dfdad0651cb92d8a007fd62f50184d9bfdb9d41fda22f8be657ed6c2da92aca";
+pub const FROZEN_2X_002_SHA256: &str =
+    "e36b2056a993543bb360c2a81ef961c96a6277a2c2b3c31a2723acafaab34b19";
+const RELEASE_COMMIT_2_0_2: &str = "504846cc0b72e8f86ed17f896d4ccbbe196a31dc";
+
+/// The live in-tree files the migrator applies (001) and carries (002).
+const LIVE_001: &str = include_str!("../../../qbit-prism/sql/001_share_ledger.sql");
+const LIVE_002: &str = include_str!("../../../qbit-prism/sql/002_candidate_bodies.sql");
+/// The live 001 differs from the release only in comments (#244). Its digest
+/// is pinned so that any edit is a reviewed act; the statement comparison in
+/// `live_sql_stays_pinned_to_the_frozen_2x_release` proves the DDL is still
+/// the release DDL.
+pub const LIVE_001_SHA256: &str =
+    "a5ce618f0010f34336ba6c77fb5c3f873425b136f1957a73264c7ddaed2c0848";
+
+fn sha256_hex(text: &str) -> String {
+    hex::encode(Sha256::digest(text.as_bytes()))
+}
+
+/// The lines of a SQL file with `--` comments removed, both full-line and
+/// trailing ones, leaving `--` inside single-quoted strings alone. Blank
+/// lines are dropped, so two files with the same statements compare equal
+/// whatever their comments say.
+fn sql_statements(sql: &str) -> Vec<String> {
+    sql.lines()
+        .filter_map(|line| {
+            let mut kept = String::new();
+            let mut quoted = false;
+            let mut chars = line.chars().peekable();
+            while let Some(character) = chars.next() {
+                if character == '\'' {
+                    quoted = !quoted;
+                } else if !quoted && character == '-' && chars.peek() == Some(&'-') {
+                    break;
+                }
+                kept.push(character);
+            }
+            let kept = kept.trim_end();
+            (!kept.is_empty()).then(|| kept.to_owned())
+        })
+        .collect()
+}
+
+#[test]
+fn frozen_2x_fixtures_match_their_pinned_release_digests() {
+    for (name, text, pinned) in [
+        ("001_share_ledger.sql", FROZEN_2X_001, FROZEN_2X_001_SHA256),
+        (
+            "002_candidate_bodies.sql",
+            FROZEN_2X_002,
+            FROZEN_2X_002_SHA256,
+        ),
+    ] {
+        assert_eq!(
+            sha256_hex(text),
+            pinned,
+            "tests/fixtures/schema_2x/{name} is a byte-exact copy of the 2.x.x v2.0.2 release file \
+             and must never be edited. Restore it with: git show {RELEASE_COMMIT_2_0_2}:crates/qbit-prism/sql/{name} \
+             > crates/qbit-prism-server/tests/fixtures/schema_2x/{name}"
+        );
+    }
+}
+
+#[test]
+fn live_sql_stays_pinned_to_the_frozen_2x_release() {
+    assert_eq!(
+        sql_statements("SELECT '--' -- trailing\n  -- whole line\n\nSELECT 1;\n"),
+        vec!["SELECT '--'", "SELECT 1;"]
+    );
+    let (live, frozen) = (sql_statements(LIVE_001), sql_statements(FROZEN_2X_001));
+    let first_difference = live
+        .iter()
+        .zip(&frozen)
+        .position(|(live, frozen)| live != frozen)
+        .or_else(|| (live.len() != frozen.len()).then_some(live.len().min(frozen.len())));
+    if let Some(index) = first_difference {
+        panic!(
+            "crates/qbit-prism/sql/001_share_ledger.sql no longer matches the 2.x.x v2.0.2 release \
+             statement for statement; the first difference is at statement line {} (live: {:?}, \
+             release: {:?}). The migrator applies this file to every 2.x.x database, so its DDL \
+             must stay identical to tests/fixtures/schema_2x/001_share_ledger.sql. Revert the DDL \
+             change here and put it in a new numbered migration under \
+             crates/qbit-prism-server/migrations/ (007 is next), then bump REQUIRED_SCHEMA_VERSION \
+             in src/ledger/migration.rs",
+            index + 1,
+            live.get(index).map(String::as_str).unwrap_or("<end of file>"),
+            frozen.get(index).map(String::as_str).unwrap_or("<end of file>")
+        );
+    }
+    let live_001 = sha256_hex(LIVE_001);
+    assert_eq!(
+        live_001, LIVE_001_SHA256,
+        "crates/qbit-prism/sql/001_share_ledger.sql changed. Its statements still match the frozen \
+         v2.0.2 release, so only comments changed: if that is intended, set LIVE_001_SHA256 in \
+         tests/support/ledger_2x.rs to {live_001}. A DDL change belongs in a new numbered migration \
+         under crates/qbit-prism-server/migrations/, never in this file"
+    );
+    assert_eq!(
+        sha256_hex(LIVE_002),
+        FROZEN_2X_002_SHA256,
+        "crates/qbit-prism/sql/002_candidate_bodies.sql is carried as the frozen 2.x.x v2.0.2 \
+         artifact; 3.x.x never applies it and the migrator pins the objects it created. Restore it \
+         with: git show {RELEASE_COMMIT_2_0_2}:crates/qbit-prism/sql/002_candidate_bodies.sql \
+         > crates/qbit-prism/sql/002_candidate_bodies.sql. A native schema change belongs in a new \
+         numbered migration under crates/qbit-prism-server/migrations/"
+    );
+}
+
+#[test]
+fn source_state_table_is_the_pinned_data() {
+    let rows: Vec<(&str, &str)> = SOURCE_STATES
+        .iter()
+        .map(|rule| (rule.name, rule.verdict))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("fresh", "accept"),
+            ("pre-#258", "accept after the drain check"),
+            ("#258 applied", "accept after the drain check"),
+            ("partial 002", "refuse, naming the missing object"),
+            ("newer", "refuse before any DDL"),
+        ]
+    );
+    assert_eq!(SourceState::Pre258.release().map(|r| r.0), Some("2.0.1"));
+    assert_eq!(
+        SourceState::Applied258.release().map(|r| r.1),
+        Some(RELEASE_COMMIT_2_0_2)
+    );
+    assert_eq!(REQUIRED_SCHEMA_VERSION, 6);
+}
+
+/// Build a 2.x.x source from the frozen release files. Each file is the
+/// standalone 2.x.x SQL: 001 carries its own BEGIN/COMMIT, 002 is applied by
+/// the 2.x.x ledger in a separate script call after it.
+pub async fn apply_frozen_2x_schema(pool: &PgPool, state: SourceState) -> Result<()> {
+    match state {
+        SourceState::Fresh => {}
+        SourceState::Pre258 => {
+            sqlx::raw_sql(FROZEN_2X_001).execute(pool).await?;
+        }
+        SourceState::Applied258 => {
+            sqlx::raw_sql(FROZEN_2X_001).execute(pool).await?;
+            sqlx::raw_sql(FROZEN_2X_002).execute(pool).await?;
+        }
+    }
+    Ok(())
+}
+
+pub fn legacy_hash(byte: u8) -> String {
+    format!("{byte:02x}").repeat(32)
+}
+
+/// A pending v1 row as the 2.x.x writer leaves it: a JSONB body without the
+/// native `payout_revision`/`bundle`/`block_hash` fields.
+pub async fn insert_v1_pending(pool: &PgPool, hash: &str) -> Result<()> {
+    sqlx::query("INSERT INTO qbit_block_candidate_outbox(block_hash,candidate,candidate_sha256) VALUES($1,$2,$3)")
+        .bind(hash).bind(json!({"block_hex":"legacy-python-payload"})).bind("88".repeat(32)).execute(pool).await?;
+    Ok(())
+}
+
+pub async fn insert_v1_terminal(pool: &PgPool, hash: &str, state: &str) -> Result<()> {
+    sqlx::query("INSERT INTO qbit_block_candidate_outbox(block_hash,candidate,candidate_sha256,state,completed_at) VALUES($1,NULL,$2,$3,clock_timestamp())")
+        .bind(hash).bind("88".repeat(32)).bind(state).execute(pool).await?;
+    Ok(())
+}
+
+/// A pending v2 row as #258's writer leaves it: `candidate` NULL, a sealed
+/// chunk-body manifest, and `body_id` pointing at it. An empty body seals
+/// under 002's completeness trigger, so no chunk rows are needed.
+pub async fn insert_v2_pending(pool: &PgPool, hash: &str) -> Result<String> {
+    let body_id = Uuid::new_v4().simple().to_string();
+    let digest = "99".repeat(32);
+    sqlx::query("INSERT INTO qbit_block_candidate_body(body_id,storage_version,block_hash,candidate_sha256,byte_count,chunk_count,chunk_bytes,share_count,shares_offset,shares_end,staging_writer_id,staging_writer_epoch,staging_session_token) VALUES($1,2,$2,$3,0,0,1,0,0,0,'python',1,'session')")
+        .bind(&body_id).bind(hash).bind(&digest).execute(pool).await?;
+    sqlx::query("UPDATE qbit_block_candidate_body SET state='sealed',sealed_at=clock_timestamp() WHERE body_id=$1")
+        .bind(&body_id).execute(pool).await?;
+    sqlx::query("INSERT INTO qbit_block_candidate_outbox(block_hash,candidate,candidate_sha256,storage_version,body_id) VALUES($1,NULL,$2,2,$3)")
+        .bind(hash).bind(&digest).bind(&body_id).execute(pool).await?;
+    Ok(body_id)
+}
+
+/// A terminal v2 row: the body was detached and retired at terminalization.
+pub async fn insert_v2_terminal(pool: &PgPool, hash: &str, state: &str) -> Result<()> {
+    sqlx::query("INSERT INTO qbit_block_candidate_outbox(block_hash,candidate,candidate_sha256,storage_version,body_id,retired_body_id,state,completed_at) VALUES($1,NULL,$2,2,NULL,$3,$4,clock_timestamp())")
+        .bind(hash).bind("99".repeat(32)).bind(Uuid::new_v4().simple().to_string()).bind(state).execute(pool).await?;
+    Ok(())
+}
+
+/// Terminalize a pending row the way the 2.x.x submitter does when it
+/// finishes the candidate: clear the JSONB body, detach and retire any
+/// chunk body. This stands in for the drain the guide requires.
+pub async fn drain_2x_row(pool: &PgPool, hash: &str, v2: bool) -> Result<()> {
+    if v2 {
+        let body_id: Option<String> = sqlx::query_scalar("UPDATE qbit_block_candidate_outbox SET state='submitted',candidate=NULL,body_id=NULL,retired_body_id=body_id,completed_at=clock_timestamp(),updated_at=clock_timestamp() WHERE block_hash=$1 RETURNING retired_body_id")
+            .bind(hash).fetch_one(pool).await?;
+        sqlx::query("UPDATE qbit_block_candidate_body SET state='retired',retired_at=clock_timestamp() WHERE body_id=$1")
+            .bind(body_id).execute(pool).await?;
+    } else {
+        sqlx::query("UPDATE qbit_block_candidate_outbox SET state='submitted',candidate=NULL,completed_at=clock_timestamp(),updated_at=clock_timestamp() WHERE block_hash=$1")
+            .bind(hash).execute(pool).await?;
+    }
+    Ok(())
+}
+
+async fn native_tables_absent(pool: &PgPool) -> Result<bool> {
+    Ok(sqlx::query_scalar("SELECT to_regclass('qbit_prism_schema_migrations') IS NULL AND to_regclass('qbit_prism_cluster') IS NULL AND to_regclass('qbit_prism_migration_source') IS NULL")
+        .fetch_one(pool).await?)
+}
+
+async fn pending_rows(pool: &PgPool) -> Result<i64> {
+    Ok(
+        sqlx::query_scalar(
+            "SELECT count(*) FROM qbit_block_candidate_outbox WHERE state='pending'",
+        )
+        .fetch_one(pool)
+        .await?,
+    )
+}
+
+async fn capability(pool: &PgPool) -> Result<Option<i32>> {
+    Ok(sqlx::query_scalar("SELECT capability_value FROM qbit_prism_schema_capabilities WHERE capability='candidate_storage_version'")
+        .fetch_optional(pool).await?)
+}
+
+async fn schema_version(pool: &PgPool) -> Result<i32> {
+    Ok(
+        sqlx::query_scalar("SELECT max(version) FROM qbit_prism_schema_migrations")
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+/// The writers still work over the migrated schema: a native candidate is
+/// persisted, claimed, landed and finished as a version 1 row.
+async fn exercise_native_writers(ledger: &Ledger, share_id: u64, nonce: u32) -> Result<String> {
+    ledger.append(share(share_id), None).await?;
+    let block = candidate(&ledger.snapshot(100).await?, nonce)?;
+    ledger.enqueue_candidate(block.clone()).await?;
+    let claim = ledger
+        .claim_candidate(60)
+        .await?
+        .context("native candidate not claimed")?;
+    assert_eq!(claim.candidate.block_hash, block.block_hash);
+    ledger
+        .land_candidate(&claim, &keys().1.public_key_hex())
+        .await?;
+    ledger.finish_candidate(&claim, true, None).await?;
+    let row = sqlx::query("SELECT state,storage_version,candidate IS NULL AS detached FROM qbit_block_candidate_outbox WHERE block_hash=$1")
+        .bind(&block.block_hash).fetch_one(&ledger.pool).await?;
+    assert_eq!(row.try_get::<String, _>("state")?, "submitted");
+    assert_eq!(row.try_get::<i32, _>("storage_version")?, 1);
+    assert!(row.try_get::<bool, _>("detached")?);
+    Ok(block.block_hash)
+}
+
+#[tokio::test]
+async fn frozen_258_source_refuses_pending_v1_and_v2_rows_and_migrates_terminal_rows() -> Result<()>
+{
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    apply_frozen_2x_schema(&pool, SourceState::Applied258).await?;
+    let (v1_pending, v2_pending) = (legacy_hash(0x11), legacy_hash(0x22));
+    let (v1_terminal, v2_terminal) = (legacy_hash(0x33), legacy_hash(0x44));
+    insert_v1_pending(&pool, &v1_pending).await?;
+    let v2_body = insert_v2_pending(&pool, &v2_pending).await?;
+    insert_v1_terminal(&pool, &v1_terminal, "submitted").await?;
+    insert_v2_terminal(&pool, &v2_terminal, "abandoned").await?;
+    assert_eq!(capability(&pool).await?, Some(2));
+
+    // Both pending rows block, and the refusal names them and the drain.
+    let error = db
+        .ledger("a")
+        .await
+        .err()
+        .context("migration accepted an undrained #258 outbox")?
+        .to_string();
+    assert!(error.contains("outbox is not drained"), "{error}");
+    assert!(
+        error.contains("2 pending 2.x.x candidate row(s)"),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("block_hash={v1_pending} storage_version=1")),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("block_hash={v2_pending} storage_version=2")),
+        "{error}"
+    );
+    assert!(
+        error.contains("lab.prism.recover_pending_blocks"),
+        "{error}"
+    );
+    assert!(error.contains("v2.0.2"), "{error}");
+    assert!(native_tables_absent(&pool).await?, "refusal ran DDL");
+    assert_eq!(pending_rows(&pool).await?, 2, "refusal changed 2.x.x rows");
+
+    // The v2 row alone still blocks: the capability row says 002 ran, the
+    // rows say whether v2 work is pending.
+    drain_2x_row(&pool, &v1_pending, false).await?;
+    let error = db
+        .ledger("a")
+        .await
+        .err()
+        .context("migration accepted an undrained v2 row")?
+        .to_string();
+    assert!(
+        error.contains("1 pending 2.x.x candidate row(s)"),
+        "{error}"
+    );
+    assert!(
+        error.contains(&v2_pending) && !error.contains(&v1_pending),
+        "{error}"
+    );
+    drain_2x_row(&pool, &v2_pending, true).await?;
+
+    let ledger = db.ledger("a").await?;
+    assert_eq!(schema_version(&pool).await?, REQUIRED_SCHEMA_VERSION);
+    assert_eq!(capability(&pool).await?, Some(2), "capability row lost");
+    let source = ledger
+        .migration_source()
+        .await?
+        .context("migration source not recorded")?;
+    assert_eq!(source.source_state, "258_applied");
+    assert_eq!(source.source_release.as_deref(), Some("2.0.2"));
+    assert_eq!(source.source_commit.as_deref(), Some(RELEASE_COMMIT_2_0_2));
+    assert_eq!(source.candidate_storage_version, Some(2));
+    assert_eq!(source.prior_schema_version, 0);
+    assert_eq!(source.migrated_by, "a");
+    let terminal: Vec<(String, String, i32, Option<String>)> = sqlx::query_as("SELECT block_hash,state,storage_version,retired_body_id FROM qbit_block_candidate_outbox ORDER BY block_hash")
+        .fetch_all(&pool).await?;
+    assert_eq!(
+        terminal
+            .iter()
+            .map(|(hash, state, version, _)| (hash.as_str(), state.as_str(), *version))
+            .collect::<Vec<_>>(),
+        vec![
+            (v1_pending.as_str(), "submitted", 1),
+            (v2_pending.as_str(), "submitted", 2),
+            (v1_terminal.as_str(), "submitted", 1),
+            (v2_terminal.as_str(), "abandoned", 2),
+        ]
+    );
+    assert_eq!(terminal[1].3.as_deref(), Some(v2_body.as_str()));
+    assert_eq!(pending_rows(&pool).await?, 0);
+
+    // The writers work over 001 + 002, and a second instance starts without
+    // initialize because the schema is at the required version.
+    exercise_native_writers(&ledger, 1, 5001).await?;
+    let follower = Ledger::connect(&db.url, "b".into(), 8, false).await?;
+    assert_eq!(
+        follower.migration_source().await?,
+        Some(source.clone()),
+        "later starts see what was migrated"
+    );
+    let again = db.ledger("c").await?;
+    assert_eq!(
+        again.migration_source().await?,
+        Some(source),
+        "a repeated migrate rewrote the source record"
+    );
+
+    pool.close().await;
+    db.close(vec![ledger, follower, again]).await
+}
+
+#[tokio::test]
+async fn frozen_pre_258_source_refuses_pending_v1_cleanly_and_migrates_terminal_rows() -> Result<()>
+{
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    let (pending, terminal) = (legacy_hash(0x11), legacy_hash(0x33));
+    insert_v1_pending(&pool, &pending).await?;
+    insert_v1_terminal(&pool, &terminal, "abandoned").await?;
+    let error = db
+        .ledger("a")
+        .await
+        .err()
+        .context("migration accepted an undrained pre-#258 outbox")?
+        .to_string();
+    assert!(error.contains("outbox is not drained"), "{error}");
+    assert!(
+        error.contains(&format!("block_hash={pending} storage_version=1")),
+        "{error}"
+    );
+    assert!(
+        !error.contains("does not exist") && !error.contains("column"),
+        "pre-#258 refusal was a SQL error: {error}"
+    );
+    assert!(native_tables_absent(&pool).await?, "refusal ran DDL");
+    assert_eq!(pending_rows(&pool).await?, 1);
+    drain_2x_row(&pool, &pending, false).await?;
+
+    let ledger = db.ledger("a").await?;
+    assert_eq!(schema_version(&pool).await?, REQUIRED_SCHEMA_VERSION);
+    let source = ledger
+        .migration_source()
+        .await?
+        .context("migration source not recorded")?;
+    assert_eq!(
+        source,
+        MigrationSource {
+            source_state: "pre_258".into(),
+            source_release: Some("2.0.1".into()),
+            source_commit: Some("95ffe063846d51f83999a66cc654da5f7476fdef".into()),
+            candidate_storage_version: None,
+            prior_schema_version: 0,
+            migrated_by: "a".into(),
+            migrated_at: source.migrated_at,
+        }
+    );
+    // 006 declares the version 1 capability and the storage_version column
+    // for the claim lane; the chunk tables are not carried.
+    assert_eq!(capability(&pool).await?, Some(1));
+    assert!(sqlx::query_scalar::<_,bool>("SELECT to_regclass('qbit_block_candidate_body') IS NULL AND EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass('qbit_block_candidate_outbox') AND attname='storage_version' AND NOT attisdropped)").fetch_one(&pool).await?);
+    let rows: Vec<(String, String, i32)> = sqlx::query_as(
+        "SELECT block_hash,state,storage_version FROM qbit_block_candidate_outbox ORDER BY block_hash",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        rows,
+        vec![
+            (pending.clone(), "submitted".into(), 1),
+            (terminal.clone(), "abandoned".into(), 1)
+        ]
+    );
+    exercise_native_writers(&ledger, 1, 5101).await?;
+    let follower = Ledger::connect(&db.url, "b".into(), 8, false).await?;
+    pool.close().await;
+    db.close(vec![ledger, follower]).await
+}
+
+#[tokio::test]
+async fn partial_002_source_is_refused_naming_the_missing_object() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    apply_frozen_2x_schema(&pool, SourceState::Applied258).await?;
+    // Body tables and the capability row, but one 002 object missing.
+    sqlx::raw_sql(
+        "DROP TRIGGER qbit_block_candidate_publication_guard ON qbit_block_candidate_outbox",
+    )
+    .execute(&pool)
+    .await?;
+    let error = db
+        .ledger("a")
+        .await
+        .err()
+        .context("migration accepted a partial 002 source")?
+        .to_string();
+    assert!(error.contains("partial 002"), "{error}");
+    assert!(
+        error.contains(
+            "missing trigger qbit_block_candidate_publication_guard on qbit_block_candidate_outbox"
+        ),
+        "{error}"
+    );
+    assert!(error.contains("v2.0.2"), "{error}");
+    assert!(native_tables_absent(&pool).await?, "refusal ran DDL");
+    // Body tables without the capability row.
+    sqlx::raw_sql(FROZEN_2X_002).execute(&pool).await?;
+    sqlx::raw_sql("DELETE FROM qbit_prism_schema_capabilities")
+        .execute(&pool)
+        .await?;
+    let error = db.ledger("a").await.err().context("accepted")?.to_string();
+    assert!(
+        error.contains(
+            "missing row candidate_storage_version = 2 in qbit_prism_schema_capabilities"
+        ),
+        "{error}"
+    );
+    // Finishing 002 with the 2.x.x release makes the source acceptable.
+    sqlx::raw_sql(FROZEN_2X_002).execute(&pool).await?;
+    let ledger = db.ledger("a").await?;
+    assert_eq!(
+        ledger.migration_source().await?.map(|s| s.source_state),
+        Some("258_applied".into())
+    );
+    pool.close().await;
+    db.close(vec![ledger]).await?;
+
+    // The reverse: the capability row without the body tables.
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    sqlx::raw_sql("CREATE TABLE qbit_prism_schema_capabilities(capability text PRIMARY KEY,capability_value integer NOT NULL,updated_at timestamptz NOT NULL DEFAULT clock_timestamp()); INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',2)")
+        .execute(&pool).await?;
+    let error = db.ledger("a").await.err().context("accepted")?.to_string();
+    assert!(error.contains("partial 002"), "{error}");
+    assert!(
+        error.contains("missing table qbit_block_candidate_body,"),
+        "{error}"
+    );
+    assert!(
+        error.contains("column qbit_block_candidate_outbox.storage_version"),
+        "{error}"
+    );
+    assert!(native_tables_absent(&pool).await?, "refusal ran DDL");
+    pool.close().await;
+    db.close(vec![]).await
+}
+
+#[tokio::test]
+async fn newer_storage_version_or_capability_is_refused_at_migrate_and_at_connect() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    apply_frozen_2x_schema(&pool, SourceState::Applied258).await?;
+    sqlx::raw_sql("UPDATE qbit_prism_schema_capabilities SET capability_value=3 WHERE capability='candidate_storage_version'")
+        .execute(&pool).await?;
+    let error = db
+        .ledger("a")
+        .await
+        .err()
+        .context("migration accepted candidate_storage_version = 3")?
+        .to_string();
+    assert!(error.contains("newer source before any DDL"), "{error}");
+    assert!(
+        error.contains("candidate_storage_version = 3, but this server understands candidate_storage_version 1 to 2"),
+        "{error}"
+    );
+    assert!(native_tables_absent(&pool).await?, "refusal ran DDL");
+    sqlx::raw_sql("UPDATE qbit_prism_schema_capabilities SET capability_value=2; INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('sealed_share_pages',1)")
+        .execute(&pool).await?;
+    let error = db.ledger("a").await.err().context("accepted")?.to_string();
+    assert!(
+        error.contains("capability sealed_share_pages = 1, which this server does not understand"),
+        "{error}"
+    );
+    assert!(native_tables_absent(&pool).await?, "refusal ran DDL");
+    sqlx::raw_sql(
+        "DELETE FROM qbit_prism_schema_capabilities WHERE capability='sealed_share_pages'",
+    )
+    .execute(&pool)
+    .await?;
+    let ledger = db.ledger("a").await?;
+
+    // The same refusal at connect, with and without initialize, on the
+    // migrated database.
+    sqlx::raw_sql("UPDATE qbit_prism_schema_capabilities SET capability_value=3 WHERE capability='candidate_storage_version'")
+        .execute(&pool).await?;
+    for initialize in [false, true] {
+        let error = Ledger::connect(&db.url, "b".into(), 8, initialize)
+            .await
+            .err()
+            .with_context(|| {
+                format!("connect(initialize={initialize}) accepted candidate_storage_version = 3")
+            })?
+            .to_string();
+        assert!(error.contains("candidate_storage_version = 3"), "{error}");
+    }
+    sqlx::raw_sql("UPDATE qbit_prism_schema_capabilities SET capability_value=2; INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('sealed_share_pages',1)")
+        .execute(&pool).await?;
+    let error = Ledger::connect(&db.url, "b".into(), 8, false)
+        .await
+        .err()
+        .context("connect accepted an unknown capability")?
+        .to_string();
+    assert!(error.contains("sealed_share_pages"), "{error}");
+    sqlx::raw_sql(
+        "DELETE FROM qbit_prism_schema_capabilities WHERE capability='sealed_share_pages'",
+    )
+    .execute(&pool)
+    .await?;
+    let follower = Ledger::connect(&db.url, "b".into(), 8, false).await?;
+    pool.close().await;
+    db.close(vec![ledger, follower]).await
+}
+
+#[tokio::test]
+async fn startup_without_initialize_requires_the_current_schema_version() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    // A 2.x.x database the native migrate has not seen.
+    let error = Ledger::connect(&db.url, "cold".into(), 8, false)
+        .await
+        .err()
+        .context("a non-initializing start accepted a 2.x.x database")?
+        .to_string();
+    assert!(
+        error.contains(&format!(
+            "requires schema version {REQUIRED_SCHEMA_VERSION}"
+        )),
+        "{error}"
+    );
+    assert!(error.contains("qbit-prism-server migrate"), "{error}");
+    assert!(
+        native_tables_absent(&pool).await?,
+        "a non-initializing start ran DDL"
+    );
+
+    // An older native schema: everything but the newest migration.
+    let ledger = db.ledger("init").await?;
+    sqlx::query("DELETE FROM qbit_prism_schema_migrations WHERE version=$1")
+        .bind(REQUIRED_SCHEMA_VERSION)
+        .execute(&pool)
+        .await?;
+    let error = Ledger::connect(&db.url, "cold".into(), 8, false)
+        .await
+        .err()
+        .context("a non-initializing start accepted an older schema")?
+        .to_string();
+    assert!(
+        error.contains(&format!(
+            "schema version {} is below the version {REQUIRED_SCHEMA_VERSION} this server requires",
+            REQUIRED_SCHEMA_VERSION - 1
+        )),
+        "{error}"
+    );
+    assert!(error.contains("qbit-prism-server migrate"), "{error}");
+    // Initializing brings it forward again, without rewriting the source record.
+    let repaired = db.ledger("init-again").await?;
+    assert_eq!(schema_version(&pool).await?, REQUIRED_SCHEMA_VERSION);
+    assert_eq!(
+        repaired.migration_source().await?.map(|s| s.migrated_by),
+        Some("init".into())
+    );
+
+    // A newer schema: a later release migrated it.
+    sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES($1)")
+        .bind(REQUIRED_SCHEMA_VERSION + 1)
+        .execute(&pool)
+        .await?;
+    let error = Ledger::connect(&db.url, "cold".into(), 8, false)
+        .await
+        .err()
+        .context("a start accepted a newer schema")?
+        .to_string();
+    assert!(
+        error.contains(&format!(
+            "schema version {} is newer than the version {REQUIRED_SCHEMA_VERSION} this server supports",
+            REQUIRED_SCHEMA_VERSION + 1
+        )),
+        "{error}"
+    );
+    sqlx::query("DELETE FROM qbit_prism_schema_migrations WHERE version=$1")
+        .bind(REQUIRED_SCHEMA_VERSION + 1)
+        .execute(&pool)
+        .await?;
+    let follower = Ledger::connect(&db.url, "cold".into(), 8, false).await?;
+    pool.close().await;
+    db.close(vec![ledger, repaired, follower]).await
+}
 
 async fn seed_legacy_carry(pool: &PgPool) -> Result<()> {
     sqlx::raw_sql("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256,chain_state) VALUES(repeat('aa',32),100,repeat('00',32),repeat('ab',32),repeat('ac',32),'confirmed'),(repeat('ee',32),101,repeat('aa',32),repeat('ef',32),repeat('e0',32),'prepared'); INSERT INTO qbit_payout_carry_forward(block_height,block_hash,miner_id,payout_order_key,p2mr_program,gross_amount_sats,prior_balance_sats,candidate_balance_sats,onchain_amount_sats,carry_forward_balance_sats,action) VALUES(100,repeat('aa',32),'miner-a','a',decode(repeat('11',32),'hex'),1000,0,1000,0,1000,'accrued'),(101,repeat('ee',32),'miner-b','b',decode(repeat('22',32),'hex'),500,0,500,0,500,'accrued'); DELETE FROM qbit_payout_carry_forward_current; UPDATE qbit_pool_blocks SET chain_state='confirmed' WHERE block_hash=repeat('ee',32);")
@@ -24,7 +695,7 @@ async fn legacy_2x_upgrade_repairs_partial_carry_seed_and_preserves_shared_state
     let pool = PgPool::connect(&db.url).await?;
     // This is the standalone 2.x schema, with its own BEGIN/COMMIT and no
     // native tables. Reproduce the interrupted legacy apply's partial seed.
-    sqlx::raw_sql(LEGACY_SCHEMA).execute(&pool).await?;
+    apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
     seed_legacy_carry(&pool).await?;
     assert_eq!(
         carry_summary(&pool).await?,
@@ -48,11 +719,10 @@ async fn legacy_2x_upgrade_repairs_partial_carry_seed_and_preserves_shared_state
             .await?,
         0
     );
+    assert_eq!(schema_version(&pool).await?, REQUIRED_SCHEMA_VERSION);
     assert_eq!(
-        sqlx::query_scalar::<_, i32>("SELECT max(version) FROM qbit_prism_schema_migrations")
-            .fetch_one(&pool)
-            .await?,
-        9
+        ledger.migration_source().await?.map(|s| s.source_state),
+        Some("pre_258".into())
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT last_share_seq FROM qbit_hashrate_rollup_progress")
@@ -87,7 +757,7 @@ async fn legacy_2x_failed_native_migration_rolls_back_seed_repair_and_all_ddl() 
         return Ok(());
     };
     let pool = PgPool::connect(&db.url).await?;
-    sqlx::raw_sql(LEGACY_SCHEMA).execute(&pool).await?;
+    apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
     seed_legacy_carry(&pool).await?;
     // Balance-only damage exercises the guard's drift comparison even when
     // active row counts match. Failure is deliberately after the base schema.
