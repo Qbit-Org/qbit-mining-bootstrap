@@ -503,5 +503,13 @@ mod tests {
         for name in fixture["unmapped_fields"].as_array().unwrap() {
             assert!(health.get(name.as_str().unwrap()).is_none());
         }
+        assert!(fixture["intentional_differences"]
+            .as_object()
+            .unwrap()
+            .contains_key("ready_miner_count"));
+        assert!(fixture["intentional_differences"]
+            .as_object()
+            .unwrap()
+            .contains_key("max_blocks"));
     }
 }
