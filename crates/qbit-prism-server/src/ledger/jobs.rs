@@ -51,6 +51,7 @@ impl Ledger {
     /// Save compact miner work only while its immutable prepared dependency is
     /// durable through the same absolute deadline. Repair is a cold-path retry;
     /// the expected current revision never replaces the dependency's revision.
+    #[allow(clippy::too_many_arguments)]
     pub async fn save_issued_job(
         &self,
         job_id: &str,

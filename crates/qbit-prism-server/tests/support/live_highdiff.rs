@@ -114,7 +114,8 @@ impl HighdiffClient {
     async fn wait_for_parent(&mut self, parent: &str) -> Result<()> {
         let mut wire_parent = hex::decode(parent)?;
         wire_parent.reverse();
-        for word in wire_parent.chunks_exact_mut(4) {
+        let (words, _) = wire_parent.as_chunks_mut::<4>();
+        for word in words {
             word.reverse();
         }
         let expected = hex::encode(wire_parent);

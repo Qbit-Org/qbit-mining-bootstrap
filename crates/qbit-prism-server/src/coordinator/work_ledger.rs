@@ -27,6 +27,7 @@ pub(super) trait WorkLedger: Send + Sync {
         parent: &'a str,
         ttl: i64,
     ) -> BoxFuture<'a, Result<()>>;
+    #[allow(clippy::too_many_arguments)]
     fn save_issued_job<'a>(
         &'a self,
         id: &'a str,

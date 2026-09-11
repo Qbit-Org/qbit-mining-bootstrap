@@ -148,7 +148,7 @@ fn seconds(name: &str, default: f64) -> Result<Duration> {
 fn seconds_allow_zero(name: &str, default: f64) -> Result<Duration> {
     let n = number(name, default)?;
     ensure!(
-        n.is_finite() && n >= 0.0 && n <= 86400.0,
+        n.is_finite() && (0.0..=86400.0).contains(&n),
         "{name} must be between 0 and 86400 seconds"
     );
     Ok(Duration::from_secs_f64(n))
