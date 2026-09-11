@@ -99,7 +99,9 @@ in #291** in each rule's `basis` and provisioned description. This includes RSS
 critical coverage 50%, and timing/sample windows. Native implementation evidence
 supports the strict 95% coverage boundary, two-second blocked-poll budget,
 30-second collector expiry, and #277 freshness calculation; it does not establish
-production latency or memory SLOs. #291 must exercise each signal, recovery,
+production latency or memory SLOs. Preserve the 400k regression and 500k headroom
+qualification targets in #291; this rule migration does not establish capacity.
+#291 must exercise each signal, recovery,
 startup, scrape loss, stale publisher and collector failure before cutover.
 
 `qbit_prism_public_requests_total` counts `/healthz`, `/metrics` and other routed
@@ -149,9 +151,13 @@ or beyond the primary's durable position; unknown positions, duplicate identity,
 and NULL latency with outstanding WAL remain -1. This follows the documented
 [PostgreSQL replay-lag semantics](https://www.postgresql.org/docs/16/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION-VIEW).
 
-Expose `pg_stat_replication_{primary_flush_lsn_hi,primary_flush_lsn_lo,replay_lsn_hi,replay_lsn_lo,count,replay_lag}`
+Expose `pg_stat_replication_{primary_flush_lsn_hi,primary_flush_lsn_lo,replay_lsn_hi,replay_lsn_lo,count,replay_lag,async}`
 with `application_name="prism_standby_1"`. The count query always emits a row,
-including zero when disconnected. `up`, `pg_up` and
+including zero when disconnected. The `async` gauge is 1 only for the required
+asynchronous topology with no primary `synchronous_standby_names` requirement,
+0 for a synchronous/quorum requirement (even on another standby), and -1 when unknown
+or ambiguous; its absent, stale, negative or zero state triggers the D3 lag rule
+without discarding valid measured WAL positions. `up`, `pg_up` and
 `pg_exporter_last_scrape_error` must describe the same primary target, using
 `job="qbit-postgres-primary"`, `instance`, and `network`; exactly one primary
 exporter target per network is required. Query failure, exporter failure,
@@ -162,7 +168,8 @@ is also included in the review-only diff.
 
 The disposable SQL test executes that exact query against one primary and one
 asynchronous standby, feeds the observed positions into promtool, and checks
-idle NULL, paused replay, one-minute dwell, recovery, disconnection, and a query
+idle NULL, paused replay, one-minute dwell, recovery, synchronous misconfiguration,
+asynchronous recovery, disconnection, and a query
 run against the wrong database role. Separate PromQL fixtures cover failed or
 missing exporter/query observations and precise LSN boundaries. No deployment
 exporter is started by these tests; its integration remains a #281/#291 check.

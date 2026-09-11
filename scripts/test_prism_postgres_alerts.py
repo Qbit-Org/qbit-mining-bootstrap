@@ -83,7 +83,7 @@ def main():
 
         def start(data, port):
             options = (f"-h 127.0.0.1 -p {port} -k {root} -c wal_level=replica "
-                       "-c max_wal_senders=4 -c synchronous_standby_names= "
+                       "-c max_wal_senders=4 "
                        "-c wal_receiver_status_interval=1s -c checkpoint_timeout=1h -c autovacuum=off")
             run("pg_ctl", "-D", data, "-l", root / (data.name + ".log"), "-o", options, "-w", "start")
             active.append(data)
@@ -122,6 +122,39 @@ def main():
                     break
             assert samples[-1]["metrics"]["replay_lag"] == 0
             checkpoint("SQL resumed replay is caught up despite old reported latency", (0, 0), (False, False))
+            # A synchronous configuration violates the async ACK contract even
+            # while replay is caught up; preserve actual positions and expose
+            # the invalid topology separately instead of fabricating unknown WAL.
+            sql(primary_port, "ALTER SYSTEM SET synchronous_standby_names = 'FIRST 1 (prism_standby_1)'")
+            sql(primary_port, "SELECT pg_reload_conf()")
+            for _ in range(10):
+                collect(1)
+                if sql(primary_port, "SELECT sync_state FROM pg_stat_replication WHERE application_name='prism_standby_1'") == "sync":
+                    break
+            else:
+                raise AssertionError("standby did not become synchronous")
+            collect(1)
+            assert samples[-1]["metrics"]["async"] == 0
+            checkpoint("SQL synchronous standby violates required asynchronous topology", (1, 0))
+            sql(primary_port, "ALTER SYSTEM SET synchronous_standby_names = 'FIRST 1 (another_standby)'")
+            sql(primary_port, "SELECT pg_reload_conf()")
+            for _ in range(10):
+                collect(1)
+                if sql(primary_port, "SELECT sync_state FROM pg_stat_replication WHERE application_name='prism_standby_1'") == "async":
+                    break
+            else:
+                raise AssertionError("dedicated standby did not return to async state")
+            collect(1)
+            assert samples[-1]["metrics"]["async"] == 0
+            checkpoint("SQL primary waiting for another standby also violates topology", (1, 0))
+            sql(primary_port, "ALTER SYSTEM RESET synchronous_standby_names")
+            sql(primary_port, "SELECT pg_reload_conf()")
+            for _ in range(10):
+                collect(1)
+                if samples[-1]["metrics"]["async"] == 1:
+                    break
+            assert samples[-1]["metrics"]["async"] == 1
+            checkpoint("SQL asynchronous topology restored", (0, 0), (False, False))
             # The same primary-only query must fail on a recovery server, rather
             # than silently produce a healthy zero when deployed to the wrong role.
             try:

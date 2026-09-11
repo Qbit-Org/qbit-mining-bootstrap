@@ -10,6 +10,7 @@ pg_stat_replication:
       SELECT pg_wal_lsn_diff(pg_current_wal_flush_lsn(), '0/0') AS durable_position
     ), standby AS (
       SELECT COUNT(*) AS count,
+             BOOL_AND(sync_state = 'async') AS is_async,
              COUNT(*) = 1 AND BOOL_AND(state = 'streaming' AND replay_lsn IS NOT NULL) AS known,
              MIN(pg_wal_lsn_diff(replay_lsn, '0/0')) AS replay_position,
              MAX(EXTRACT(EPOCH FROM replay_lag)) AS reported_lag
@@ -18,6 +19,9 @@ pg_stat_replication:
     )
     SELECT 'prism_standby_1' AS application_name,
            count::double precision,
+           CASE WHEN count <> 1 THEN -1
+                WHEN BTRIM(current_setting('synchronous_standby_names')) <> '' THEN 0
+                ELSE COALESCE(is_async::int, -1) END::double precision AS async,
            FLOOR(durable_position / 4294967296)::double precision AS primary_flush_lsn_hi,
            MOD(durable_position, 4294967296)::double precision AS primary_flush_lsn_lo,
            CASE WHEN known THEN FLOOR(replay_position / 4294967296) ELSE -1 END::double precision AS replay_lsn_hi,
@@ -36,6 +40,9 @@ pg_stat_replication:
     - replay_lag:
         usage: GAUGE
         description: Diagnostic last-reported latency; zero only with caught-up WAL proof, -1 if unknown
+    - async:
+        usage: GAUGE
+        description: One async standby with no primary synchronous requirement is 1, invalid topology is 0, unknown or ambiguous is -1
     - primary_flush_lsn_hi:
         usage: GAUGE
         description: High 32 bits of primary durable WAL position, exact in Prometheus float64

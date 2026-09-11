@@ -226,7 +226,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "6m",
     "expect": {
@@ -245,7 +246,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "6m",
     "expect": {
@@ -264,7 +266,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "6m",
     "expect": {
@@ -283,7 +286,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 99
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 99,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "6m",
     "expect": {
@@ -306,7 +310,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 0,
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097152,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 4294967295
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 4294967295,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "6m",
     "expect": {
@@ -325,7 +330,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097152,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 4294967295,
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 0
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 0,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "6m",
     "expect": {
@@ -344,7 +350,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": "100+1x360",
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": "95+1x360"
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": "95+1x360",
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "6m",
     "expect": {
@@ -363,7 +370,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": "100+1x360",
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": "94+1x360"
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": "94+1x360",
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "6m",
     "expect": {
@@ -382,7 +390,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": -1,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": -1
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": -1,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "6m",
     "expect": {
@@ -405,7 +414,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": -1,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": -1
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": -1,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "6m",
     "expect": {
@@ -424,7 +434,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "6m",
     "expect": {
@@ -443,7 +454,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "6m",
     "expect": {
@@ -462,7 +474,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "6m",
     "expect": {
@@ -492,7 +505,8 @@
       "pg_stat_replication_replay_lag{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 0,
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
-      "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153
+      "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "6m",
     "expect": {
@@ -511,7 +525,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": -1
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": -1,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "6m",
     "expect": {
@@ -529,7 +544,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "6m",
     "expect": {
@@ -548,7 +564,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "6m",
     "expect": {
@@ -567,7 +584,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "6m",
     "expect": {
@@ -586,7 +604,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": "100+0x357 _ _ _"
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": "100+0x357 _ _ _",
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "6m",
     "expect": {
@@ -605,7 +624,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": "100+0x352 _ _ _ _ _ _ 100 100",
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "6m",
     "expect": {
@@ -624,7 +644,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "3s",
     "expect": {
@@ -647,7 +668,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 99
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 99,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "59s",
     "expect": {
@@ -670,7 +692,8 @@
       "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
       "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
       "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
-      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 99
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 99,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1
     },
     "eval_time": "60s",
     "expect": {
@@ -680,6 +703,85 @@
     "alerts": {
       "PrismHAStandbyReplayLagHigh": true,
       "PrismHAStandbyDisconnected": false
+    }
+  },
+  {
+    "name": "D3 synchronous standby violates topology",
+    "series": {
+      "up{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\"}": 1,
+      "pg_up{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\"}": 1,
+      "pg_exporter_last_scrape_error{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\"}": 0,
+      "pg_stat_replication_count{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1,
+      "pg_stat_replication_replay_lag{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 0,
+      "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
+      "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
+      "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 0
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismHAStandbyReplayLagHigh": 1,
+      "PrismHAStandbyDisconnected": 0
+    }
+  },
+  {
+    "name": "D3 unknown async status",
+    "series": {
+      "up{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\"}": 1,
+      "pg_up{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\"}": 1,
+      "pg_exporter_last_scrape_error{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\"}": 0,
+      "pg_stat_replication_count{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1,
+      "pg_stat_replication_replay_lag{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 0,
+      "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
+      "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
+      "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": -1
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismHAStandbyReplayLagHigh": 1,
+      "PrismHAStandbyDisconnected": 0
+    }
+  },
+  {
+    "name": "D3 stale async status",
+    "series": {
+      "up{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\"}": 1,
+      "pg_up{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\"}": 1,
+      "pg_exporter_last_scrape_error{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\"}": 0,
+      "pg_stat_replication_count{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1,
+      "pg_stat_replication_replay_lag{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 0,
+      "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
+      "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
+      "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
+      "pg_stat_replication_async{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": "1+0x357 _ _ _"
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismHAStandbyReplayLagHigh": 1,
+      "PrismHAStandbyDisconnected": 0
+    }
+  },
+  {
+    "name": "D3 missing async status",
+    "series": {
+      "up{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\"}": 1,
+      "pg_up{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\"}": 1,
+      "pg_exporter_last_scrape_error{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\"}": 0,
+      "pg_stat_replication_count{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 1,
+      "pg_stat_replication_replay_lag{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 0,
+      "pg_stat_replication_primary_flush_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
+      "pg_stat_replication_primary_flush_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100,
+      "pg_stat_replication_replay_lsn_hi{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 2097153,
+      "pg_stat_replication_replay_lsn_lo{job=\"qbit-postgres-primary\",instance=\"primary\",network=\"mainnet\",application_name=\"prism_standby_1\"}": 100
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismHAStandbyReplayLagHigh": 1,
+      "PrismHAStandbyDisconnected": 0
     }
   }
 ]

@@ -51,6 +51,7 @@ def postgres_rules():
               f"({replay_lo} < bool on({identity}) {old_lo}))")
     lag_terms = common + [unknown(value) for value in [primary_hi, primary_lo, replay_hi, replay_lo]]
     lag_terms += [unknown(value, 5) for value in [old_hi, old_lo]]
+    lag_terms += [unknown(metric("async")), f"(max({metric('async')} != bool 1) or vector(1))"]
     lag_terms += [f"(max({behind}) or vector(1))"]
     disconnected_terms = common + [f"(max({metric('count')} != bool 1) or vector(1))"]
     original = load("docs/prism-postgres-alert-rules.json")["rules"]
@@ -58,7 +59,7 @@ def postgres_rules():
         rule["expr"] = "clamp_max(" + " + ".join(terms) + ", 1)"
     original[0]["description"] = (
         "D3: standby replay has not reached the primary durable WAL prefix observed five seconds earlier, "
-        "or position/history/exporter observations are unknown, stale or failed. "
+        "or position/history/exporter observations are unknown, stale or failed, or the required async topology is invalid. "
         "Deployment-provided: requires primary SQL query metrics and one-second scrapes; verify in #281/#291. "
         "Idle caught-up positions are healthy even when PostgreSQL reports NULL replay_lag. "
         "The five-second comparison is sampled, with up to one scrape interval of timing uncertainty.")
