@@ -136,7 +136,8 @@ Landings follow `--cadence-gaps`, repeated cyclically. The first is at 5 s into
 the phase, and a landing is only placed if 15 s still fit after it, so the last
 landing's windows are measured inside the phase rather than truncated by its
 end. At the default gaps a 240 s phase holds 15 landings; a phase shorter than
-170 s cannot hold ten and is refused at entry.
+150 s cannot hold ten and is refused at entry, and the refusal says which
+length would do.
 
 Each landing uses the same `Control::ScheduledBlock` path a
 `--scheduled-blocks` run uses: the harness asks one session to search its
