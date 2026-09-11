@@ -513,9 +513,17 @@ mod tests {
             .unwrap()
             .contains_key("max_blocks"));
         let unmapped: std::collections::BTreeSet<_> = fixture["unmapped_fields"]
-            .as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
         let explained: std::collections::BTreeSet<_> = fixture["intentional_differences"]
-            .as_object().unwrap().keys().map(String::as_str).collect();
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert_eq!(unmapped, explained);
     }
 }
