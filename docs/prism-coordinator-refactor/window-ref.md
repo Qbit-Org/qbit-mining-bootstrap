@@ -19,10 +19,10 @@ definitions, the range predicate and the immutability trigger; the second
 confirmed every earlier fix, that the CHECK accepts exactly three states and
 the 131 citations it checked, and found one blocker, five should-fix items
 and six nits, all resolved below. The operator has confirmed the shape
-below; djh58's agreement (#273) is required before merge, and the module
-location waits on Anatolie (#283). The parts API (PR 2) is merged as #296.
-Code citations are at the 3.x.x base `1398bbc` (the #244 merge), which
-predates #296; `srv/` is `crates/qbit-prism-server/`.
+below; djh58's agreement (#273) is required before merge, and the one
+question left for Anatolie (#283) is narrowed below. The parts API (PR 2) is
+merged as #296. Code citations are at 3.x.x `41a2afd`, after #283 landed the
+`ledger.rs` split (#300); `srv/` is `crates/qbit-prism-server/`.
 
 ## Problem
 
@@ -39,7 +39,7 @@ than one copy:
 | Document | Copies | Where |
 | --- | --- | --- |
 | `StoredPrepared` (`srv/src/coordinator.rs:46`) | 3 | `snapshot.shares`, `bundle.shares`, `bundle.reward_manifest.shares`; written at `:641` |
-| `Candidate` (`srv/src/ledger.rs:39`) | 2 | `bundle.shares`, `bundle.reward_manifest.shares`; written at `:695-696` |
+| `Candidate` (`srv/src/ledger/candidates.rs:4`) | 2 | `bundle.shares`, `bundle.reward_manifest.shares`; written at `:182-183` |
 | legacy audit import (`srv/src/ledger/migration.rs:117`) | 2 + 2 | the inline bundle as JSONB, and both copies again in `canonical_audit_bytes` (bytea) |
 | landed audit body (`srv/src/ledger/blocks.rs:140`) | 1 | `reward_manifest.shares` survives `remove("shares")` |
 
@@ -51,7 +51,7 @@ base, the window reaches three: `qbit_prism_jobs.payload` at refresh,
 ## `WindowRef`
 
 ```rust
-// qbit-prism-server; planned `ledger/window.rs` after #283 (pending Anatolie)
+// qbit-prism-server; goes in `ledger/window.rs`, the module #283 landed (#300)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowRef {
     pub anchor_ms: i64,                   // Snapshot.anchor_ms, the predicate's cutoff
@@ -70,7 +70,7 @@ pub struct ShareRange {
 }
 ```
 
-A reference is built from a `Snapshot` (`srv/src/ledger.rs:64-70`):
+A reference is built from a `Snapshot` (`srv/src/ledger/window.rs:10-16`):
 `anchor_ms` is copied, the digests are computed as in [Digests](#digests),
 and `shares` is `None` when `snapshot.shares` is empty, otherwise the
 sequence numbers of its first and last share, `shares.len()` and the snapshot
@@ -90,8 +90,8 @@ cheap typed error before any hashing, as `srv/src/ledger/audit.rs:63-66`
 already does for audit snapshots. `payout_revision` stays outside the
 reference: the `qbit_prism_jobs.payout_revision` column for 008
 (`srv/migrations/002_multi_instance.sql:52`) and the `Candidate.payout_revision`
-field for 007 (`srv/src/ledger.rs:43`); `read_window` returns the current
-value for the caller's fence ([Revision fence and reorgs](#revision-fence-and-reorgs)).
+field for 007 (`srv/src/ledger/candidates.rs:8`); `read_window` returns the
+current value for the caller's fence ([Revision fence and reorgs](#revision-fence-and-reorgs)).
 
 **An empty window is routine, not an edge case.** `refresh_once`
 (`srv/src/coordinator.rs:468`) sets `bundle = None` when `snapshot.shares` is
@@ -118,7 +118,7 @@ reuses:
 | `audit_body_ref` | `WindowRef` | Note |
 | --- | --- | --- |
 | `first_share_seq`, `last_share_seq`, `share_count` | the same names in `ShareRange` | same meaning: inclusive bounds and the matched count |
-| `share_slice_digest_hex` | not reused; `snapshot_sha256` instead | it hashes `CountedShare` fields (`crates/qbit-prism/src/lib.rs:2113-2131`), a build output (`:632`, carried at `:422`) that omits `network_difficulty`, `template_height`, `job_id` and `ntime`. A reference must authenticate the builder's *input* before the build runs, so `snapshot_sha256` is over `AcceptedShare` JSON, the bytes `qbit_prism_audit_snapshots` already stores |
+| `share_slice_digest_hex` | not reused; `snapshot_sha256` instead | it hashes `CountedShare` fields (`crates/qbit-prism/src/lib.rs:2616-2634`), a build output (`:915`, carried at `:705`) that omits `network_difficulty`, `template_height`, `job_id` and `ntime`. A reference must authenticate the builder's *input* before the build runs, so `snapshot_sha256` is over `AcceptedShare` JSON, the bytes `qbit_prism_audit_snapshots` already stores |
 | `bundle_without_shares`, a `Value` with the top-level `shares` removed | `AuditBundleBody`, typed | the shape landing already stores (`srv/src/ledger/blocks.rs:136-140`); it still embeds `reward_manifest.shares`, so the [caveat](#bundle-ownership) applies to the v2 file format too |
 
 ### Columns (migration 007 and migration 008)
@@ -196,16 +196,18 @@ ALTER TABLE qbit_block_candidate_outbox ADD CONSTRAINT qbit_block_candidate_outb
 The reference lives in both places on both tables, uniformly:
 
 - The row's small JSON document embeds `window: WindowRef`, digests as
-  lowercase hex through the `hex32` adapter ([`WindowRef`](#windowref)): the `Candidate` for 007 (`srv/src/ledger.rs:39-49`), the
+  lowercase hex through the `hex32` adapter ([`WindowRef`](#windowref)): the
+  `Candidate` for 007 (`srv/src/ledger/candidates.rs:4-14`), the
   `StoredPrepared` for 008 (`srv/src/coordinator.rs:46-55`). For 007,
   `candidate_sha256` keeps covering the whole document including the
-  reference, as it covers the candidate today (`srv/src/ledger.rs:695-696` at
-  enqueue, `:549-555` at claim).
+  reference, as it covers the candidate today
+  (`srv/src/ledger/candidates.rs:182-183` at enqueue, `:73-79` at claim).
 - The six columns are a typed duplicate for the CHECK and the future
   retention index, written in the same statement as the document.
 - Decode reads the document, then compares it with the columns returned by
-  the same statement: the claim `UPDATE … RETURNING` (`srv/src/ledger.rs:640`)
-  and `Ledger::job` (`:490-494`) gain the six columns. Any disagreement,
+  the same statement: the claim `UPDATE … RETURNING`
+  (`srv/src/ledger/candidates.rs:160`) and `Ledger::job`
+  (`srv/src/ledger/jobs.rs:34-38`) gain the six columns. Any disagreement,
   including a document with a range and NULL range columns, is a decode
   error, surfaced like corruption (`Decode` below).
 
@@ -244,7 +246,7 @@ the caller action ([Errors and callers](#errors-and-callers)).
 
 ### Read
 
-`Ledger` has one pool, the primary (`srv/src/ledger.rs:33-36`); there is no
+`Ledger` has one pool, the primary (`srv/src/ledger.rs:43-46`); there is no
 replica pool, and `read_window` must never be given one, because the balances
 and the revision must be current for the fence. One transaction on that pool,
 `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY` as its first
@@ -254,7 +256,7 @@ that disagrees with the balances. In order:
 
 1. `SELECT payout_revision FROM qbit_prism_cluster WHERE singleton`.
 2. The balances, through the `read_prior_balances` statement
-   `Ledger::snapshot` uses (`srv/src/ledger.rs:715-723`), then the
+   `Ledger::snapshot` uses (`srv/src/ledger/window.rs:244-252`), then the
    prior-balances digest, else `PriorBalancesChanged`. It costs microseconds,
    so a reference whose balances moved never pays for the window. The digest
    sorts internally (`prior_balances_digest`, `crates/qbit-prism/src/lib.rs`),
@@ -278,7 +280,7 @@ that disagrees with the balances. In order:
    same transaction:
 
 ```sql
--- SELECT_SHARE (srv/src/ledger.rs:734) with the predicate of read_range (srv/src/ledger/audit.rs:150)
+-- SELECT_SHARE (srv/src/ledger.rs:40) with the predicate of read_range (srv/src/ledger/audit.rs:150)
 SELECT share_seq,share_id,miner_id,payout_order_key,encode(p2mr_program,'hex') AS program,
        share_difficulty::text AS difficulty,network_difficulty::text AS network_difficulty,
        template_height,job_id,job_issued_at,accepted_at,ntime,credit_policy
@@ -290,8 +292,8 @@ SELECT share_seq,share_id,miner_id,payout_order_key,encode(p2mr_program,'hex') A
 ```
 
    `Ledger::snapshot` is the precedent for keyset paging over this predicate
-   (`srv/src/ledger.rs:434-435`), not for the direction: it pages descending
-   from the cutoff and reverses at `:449` because it learns the start only
+   (`srv/src/ledger/window.rs:217-218`), not for the direction: it pages descending
+   from the cutoff and reverses at `:232` because it learns the start only
    when the weight is spent. `read_window` knows both bounds, so it pages
    ascending, rows arrive in canonical order and the digest streams.
 6. Per page, `shares.len()` may not exceed `share_count` (more rows is also
@@ -320,13 +322,13 @@ same bytes.
 
 `prior_balances_digest` is the digest already carried as
 `ledger_window_attestation.prior_balances_digest_hex`
-(`crates/qbit-prism/src/lib.rs:423`), computed at build (`:1213`) and checked
-at verify (`:2082`). Its definition, `prior_balances_digest_hex`
-(`:2133-2150`): sort the balances by `(order_key, recipient_id,
+(`crates/qbit-prism/src/lib.rs:706`), computed at build (`:1519`) and checked
+at verify (`:2585`). Its definition, `prior_balances_digest_hex`
+(`:2651-2672`): sort the balances by `(order_key, recipient_id,
 p2mr_program_hex)`, then for each balance feed SHA-256 with `recipient_id`,
 `order_key` and `p2mr_program_hex` as a big-endian `u64` length followed by the
-UTF-8 bytes (`update_string`, `:2152-2155`), then `balance_sats` as a
-big-endian `i128` (`update_i128`, `:2165-2167`). The function is private
+UTF-8 bytes (`update_string`, `:2674-2677`), then `balance_sats` as a
+big-endian `i128` (`update_i128`, `:2687-2689`). The function is private
 today; the parts API exports it as
 `prior_balances_digest(&[CarryForwardBalance]) -> [u8; 32]`, so the server
 computes the reference and `read_window` checks it with the same code.
@@ -338,7 +340,7 @@ thread issues the statements and receives each page as sqlx wire buffers; it
 runs no serde, no hashing and no `share_from_row`. For each page it moves the
 rows, the running `Vec<AcceptedShare>` and the hasher into one
 `tokio::task::spawn_blocking` task, which maps the rows (`share_from_row`,
-`srv/src/ledger.rs:736-756`: two `u128` parses, five required `String`s plus
+`srv/src/ledger/window.rs:263-283`: two `u128` parses, five required `String`s plus
 an optional sixth for `credit_policy`, two timestamps), updates the hash and
 hands the state back; the balances digest runs the same way. **Callers must
 not wrap `read_window` in `spawn_blocking`**; they await it on the runtime.
@@ -393,29 +395,29 @@ forbids.
 
 **Deadlines.** `read_window` takes no deadline of its own. Each statement,
 so each page, runs under the connection's `statement_timeout`, 15 s by
-default (`srv/src/ledger.rs:92-102`) and overridable through
-`PRISM_DATABASE_STATEMENT_TIMEOUT_MS` up to 600000 ms (`:80-93`); a timeout
+default (`srv/src/ledger/connect.rs:23-33`) and overridable through
+`PRISM_DATABASE_STATEMENT_TIMEOUT_MS` up to 600000 ms (`:11-24`); a timeout
 surfaces as `Database` with SQLSTATE 57014, and pool acquisition adds its own
-15 s (`:96`). The worst case is bounded by `pages × statement_timeout` plus
+15 s (`:27`). The worst case is bounded by `pages × statement_timeout` plus
 page CPU, about 98 pages at 400k; the expected total is 2 to 5 s, which the
 #264 harness must measure before #265 and #273 rely on it. Each caller puts
 one `tokio::time::timeout` around `read_window` plus the rebuild:
 
 | Caller | Deadline | On expiry |
 | --- | --- | --- |
-| claim (#265) | **60 s** for the whole call. The candidate lease is not a deadline: its heartbeat renews it every 30 s for as long as processing runs (`srv/src/coordinator.rs:887-907`), and only a failed renewal drops the work (`:950-963`). Against the estimate, 60 s is twelve times the 5 s upper bound and four statement timeouts at the 15 s default, so a rebuild that needs longer is a harness finding, not a reason to raise it | fail the attempt through `retry_candidate` (`srv/src/ledger.rs:590`) with an alert; the lease was renewed within the last 30 s of a 120 s term, so the `claim_expires_at > clock_timestamp()` condition holds and the row is rescheduled after `LEAST(60, attempt_count)` seconds (`:594`), never abandoned |
-| resume (#273) | strictly shorter than the caller's: `resume_job`'s only caller already wraps it in `timeout(initial_job_timeout_seconds, …)` and maps expiry to the backend error "job resume timed out" (`srv/src/stratum.rs:1215-1220`). Proposed: from the `Duration` the caller already builds, `outer = Duration::from_secs_f64(initial_job_timeout_seconds)`, the inner deadline is `outer - (outer / 2).min(Duration::from_secs(5))`, that is `outer − min(5 s, outer / 2)`: 25 s at the 30 s default (`srv/src/config.rs:195`), 2 s at a 4 s setting, always positive, strictly shorter than the outer timeout and free of `Duration` underflow, so it adds no failure mode the outer `from_secs_f64` does not already have. A plain `− 5 s` would be zero or negative for any setting at or below 5 s, which validation allows: production only requires `> 0.0` (`srv/src/config.rs:194-197`) and `srv/src/stratum.rs:449-452` parses the value without a range check. Tunable by #273 | cache miss: log and return `Ok(None)`; the share is then rejected as `unknown-job` (`srv/src/stratum.rs:1239-1243`), not answered with fresh work |
+| claim (#265) | **60 s** for the whole call. The candidate lease is not a deadline: its heartbeat renews it every 30 s for as long as processing runs (`srv/src/coordinator.rs:887-907`), and only a failed renewal drops the work (`:950-963`). Against the estimate, 60 s is twelve times the 5 s upper bound and four statement timeouts at the 15 s default, so a rebuild that needs longer is a harness finding, not a reason to raise it | fail the attempt through `retry_candidate` (`srv/src/ledger/candidates.rs:114`) with an alert; the lease was renewed within the last 30 s of a 120 s term, so the `claim_expires_at > clock_timestamp()` condition holds and the row is rescheduled after `LEAST(60, attempt_count)` seconds (`:118`), never abandoned |
+| resume (#273) | strictly shorter than the caller's: `resume_job`'s only caller already wraps it in `timeout(initial_job_timeout_seconds, …)` and maps expiry to the backend error "job resume timed out" (`srv/src/stratum.rs:1227-1232`). Proposed: from the `Duration` the caller already builds, `outer = Duration::from_secs_f64(initial_job_timeout_seconds)`, the inner deadline is `outer - (outer / 2).min(Duration::from_secs(5))`, that is `outer − min(5 s, outer / 2)`: 25 s at the 30 s default (`srv/src/config.rs:195`), 2 s at a 4 s setting, always positive, strictly shorter than the outer timeout and free of `Duration` underflow, so it adds no failure mode the outer `from_secs_f64` does not already have. A plain `− 5 s` would be zero or negative for any setting at or below 5 s, which validation allows: production only requires `> 0.0` (`srv/src/config.rs:194-197`) and `srv/src/stratum.rs:449-452` parses the value without a range check. Tunable by #273 | cache miss: log and return `Ok(None)`; the share is then rejected as `unknown-job` (`srv/src/stratum.rs:1251-1255`), not answered with fresh work |
 
 ### Errors and callers
 
 | Outcome | Meaning | Claim (#265) | Resume (#273) | Landing (#265, #267) | Import (#265) |
 | --- | --- | --- | --- | --- | --- |
-| stored `audit_builder_version` or `signer_keys` differ from this binary's (caller check before `read_window`, not a variant) | a builder or signing keys this binary does not have built the reference; the upgrade and rotation refusals ([Builder version](#builder-version), [Signing keys](#signing-keys)) keep a drained deployment from reaching it | `retry_candidate` (`srv/src/ledger.rs:590`) with an alert naming both values; never abandon, never rebuild with the current builder or keys | cache miss: `Ok(None)`; the next refresh writes a job at the current version | not a caller; landing uses the claim's bundle | n/a |
+| stored `audit_builder_version` or `signer_keys` differ from this binary's (caller check before `read_window`, not a variant) | a builder or signing keys this binary does not have built the reference; the upgrade and rotation refusals ([Builder version](#builder-version), [Signing keys](#signing-keys)) keep a drained deployment from reaching it | `retry_candidate` (`srv/src/ledger/candidates.rs:114`) with an alert naming both values; never abandon, never rebuild with the current builder or keys | cache miss: `Ok(None)`; the next refresh writes a job at the current version | not a caller; landing uses the claim's bundle | n/a |
 | `Window.payout_revision != row revision` (caller check, not a variant) | the revision moved since the reference was written: a landing, a reorg, a resettlement, or the pool's own block reaching the tip | a hint only, like the cached tip and revision at `srv/src/coordinator.rs:972-973`: run `observe_candidate` (`:978`) and finish through `finish_candidate_at_revision` (`:979-988`) only when the block is not active and the revision or parent changed; an active block continues and lands at the observed revision (`:1039-1046`); #289 owns old-epoch candidates | cache miss: return `Ok(None)`, as the revision check at `srv/src/coordinator.rs:1483-1488` does | not a caller; landing keeps its own fence (`srv/src/ledger/blocks.rs:124-127`) | n/a |
-| `PriorBalancesChanged` | the balances moved: the candidate is superseded, or it is the pool's own block, already landed | not reached when `qbit_pool_audit_bundles` already holds the block's audit, because the claim then finishes from the landed row's digest columns without `read_window`; otherwise run `observe_candidate`: not active and changed is `finish_candidate_at_revision`; active is `retry_candidate` with an alert, the outcome today's `prior == bundle.prior_balances` failure has (`srv/src/ledger/blocks.rs:128-132`, reaching `submit_loop`'s retry at `srv/src/coordinator.rs:1123-1131`) | cache miss: `Ok(None)` | as above | n/a |
-| `Incomplete` | rows pruned or missing; D6 violated, or a wrong predicate | fail the attempt through `retry_candidate` (`srv/src/ledger.rs:590`) with the error in `last_error`; never abandon automatically, #268 owns recovery | cache miss: log and return `Ok(None)`; the share is then rejected as `unknown-job` (`srv/src/stratum.rs:1239-1243`) | as above | the legacy window is not in the ledger: keep the bytes-only import |
+| `PriorBalancesChanged` | the balances moved: the candidate is superseded, or it is the pool's own block, already landed | not reached when `qbit_pool_audit_bundles` already holds the block's audit, because the claim then finishes from the landed row's columns, authenticated against the block's coinbase, without `read_window`; otherwise run `observe_candidate`: not active and changed is `finish_candidate_at_revision`; active is `retry_candidate` with an alert, the outcome today's `prior == bundle.prior_balances` failure has (`srv/src/ledger/blocks.rs:128-132`, reaching `submit_loop`'s retry at `srv/src/coordinator.rs:1123-1131`) | cache miss: `Ok(None)` | as above | n/a |
+| `Incomplete` | rows pruned or missing; D6 violated, or a wrong predicate | fail the attempt through `retry_candidate` (`srv/src/ledger/candidates.rs:114`) with the error in `last_error`; never abandon automatically, #268 owns recovery | cache miss: log and return `Ok(None)`; the share is then rejected as `unknown-job` (`srv/src/stratum.rs:1251-1255`) | as above | the legacy window is not in the ledger: keep the bytes-only import |
 | `SnapshotDigestMismatch`, `Decode` | corruption, a reference built from different bytes, or payload/column disagreement | same as `Incomplete`, with an alert | same as `Incomplete` | as above | same as `Incomplete` |
-| `Database` (incl. 57014) | transient | propagate: `submit_loop` hands the error to `retry_candidate` (`srv/src/coordinator.rs:1123-1131`), which releases the claim and reschedules the row after `LEAST(60, attempt_count)` seconds (`srv/src/ledger.rs:594`); lease expiry recovers the row only if that write itself fails | propagate; the reconnect fails and retries | as above | propagate |
+| `Database` (incl. 57014) | transient | propagate: `submit_loop` hands the error to `retry_candidate` (`srv/src/coordinator.rs:1123-1131`), which releases the claim and reschedules the row after `LEAST(60, attempt_count)` seconds (`srv/src/ledger/candidates.rs:118`); lease expiry recovers the row only if that write itself fails | propagate; the reconnect fails and retries | as above | propagate |
 | landing equality failure after a successful `read_window` (`srv/src/ledger/audit.rs:132-138`) | the landing transaction read a different range than the claim did, which immutability forbids | like `SnapshotDigestMismatch`: `retry_candidate` with an alert, never abandon; the error already reaches `submit_loop`'s retry path (`srv/src/coordinator.rs:1123-1131`) | n/a | the check stays | n/a |
 | caller deadline expired | `read_window` plus the rebuild outran the deadline in the table above | 60 s: `retry_candidate` with an alert | `outer − min(5 s, outer / 2)`: `Ok(None)`; the share is rejected as `unknown-job` | n/a | n/a |
 | empty window (`shares: None`) | not an error | rebuild from `vec![bootstrap_share]` | rebuild the bootstrap bundle per miner with the builders directly, from the stored policy inputs, never `build_bundle` | lands through `inline_shares` (`srv/src/ledger/audit.rs:124-131`), unchanged | n/a |
@@ -427,7 +429,7 @@ DELETE, so the range is always rebuildable and `Incomplete` never means "the
 chain moved". What moves is the revision and, sometimes, the balances, and
 neither is a supersession test on its own. `observe_chain_view` bumps
 `payout_revision` on every tip with more work, the pool's own block included
-(`srv/src/ledger.rs:283-285`); an ambiguous `submitblock` timeout makes that
+(`srv/src/ledger/window.rs:66-68`); an ambiguous `submitblock` timeout makes that
 routine, because the attempt fails with "block submission outcome
 unresolved" (`srv/src/coordinator.rs:1085-1092`, `:1107`) while the block can
 still reach the tip, and the timed-out request is never resent
@@ -451,22 +453,41 @@ that the comparison and the digest describe one moment:
   claim, shows that landing at the candidate's revision fails, and lands at
   the observed one. If `qbit_pool_audit_bundles` **already holds the block's
   audit**, because an earlier claim landed it and lost its lease after
-  `land_candidate` (`:1052-1054`, `:1065-1069`) or a reconcile has confirmed
-  it, the balances have legitimately moved: the claim skips `read_window` and
-  finishes from the landed row's columns alone. Today's landing already does
-  this for an existing audit: `srv/src/ledger/blocks.rs:95-117` compares
-  `audit_bundle_sha256` and `found_block_bits` and returns without reading
-  the body. `share_snapshot_sha256` must equal `window_snapshot_sha256`; for
-  an empty window that is the digest of `[bootstrap_share]`, which the landed
-  `inline_shares` hash to. `found_block_bits` must match the header, and the
-  claim then finishes. It never calls `materialize_audit_row`
-  (`srv/src/ledger/audit.rs:42-87`) on the submit loop: that function reads
-  the whole range in one unpaged query, serializes and clones it on the
-  runtime, and builds an owned `AuditBundle`. At 400k that is two share arrays
-  the cooperative 60 s deadline cannot interrupt. If #265 ever needs the
-  landed body on this path, it needs #267's parts-based, paged reader under
-  `spawn_blocking` first, which makes #267 a prerequisite for that path. `PriorBalancesChanged` on an active candidate
-  with no landed audit has the outcome today's landing check has when
+  `land_candidate` (`srv/src/coordinator.rs:1052-1054`,
+  `srv/src/coordinator.rs:1065-1069`) or a reconcile has confirmed it, the
+  balances have legitimately moved: the claim skips `read_window` and
+  finishes from the landed row's columns alone, authenticated against the
+  block the candidate found instead of a stored digest. The candidate keeps no
+  expected `audit_bundle_sha256`: computing one at submit would serialize the
+  whole bundle on the share path, which [Stored bundle inputs](#stored-bundle-inputs)
+  rules out. The block is the expectation, and every check is O(1):
+
+  - the landed `coinbase_tx_hex` equals the coinbase in the candidate's
+    `block_hex`, parsed with the segwit-aware parser that
+    `codec::witness_merkle_leaves_from_block` uses;
+  - `audit_commitment_root_hex` (`crates/qbit-prism/src/lib.rs:975`) over the
+    landed `audit_commitment_leaves_hex` equals that coinbase's witness
+    reserved value, which the builder sets to the audit commitment root
+    (`:1711-1724`). The single leaf commits to the reward manifest and the
+    payout policy manifest (`:960`);
+  - `share_snapshot_sha256` equals `window_snapshot_sha256`. For an empty
+    window that column is NULL under the three-state CHECK, so the comparison
+    is against `sha256(serde_json::to_vec(&[bootstrap_share]))`, computed from
+    the stored `bootstrap_share`: the digest `persist_audit_snapshot` writes
+    for inline shares;
+  - `found_block_bits` matches the header, as today's landing checks for an
+    existing audit (`srv/src/ledger/blocks.rs:95-117`).
+
+  Only then does the claim finish. It never calls `materialize_audit_row`
+  (`srv/src/ledger/audit.rs:42-87`) on the submit loop. That function reads the
+  whole range in one unpaged query, serializes and clones it on the runtime,
+  and builds an owned `AuditBundle`: at 400k, two share arrays that the
+  cooperative 60 s deadline cannot interrupt. If #265 ever needs the landed body
+  on this path, it needs #267's parts-based, paged reader under
+  `spawn_blocking` first, which makes #267 a prerequisite for that path.
+
+  `PriorBalancesChanged` on an active candidate with no landed audit has the
+  outcome today's landing check has when
   `prior == bundle.prior_balances` fails (`srv/src/ledger/blocks.rs:128-132`):
   the error propagates to `submit_loop`, which logs "candidate remains
   recoverable" and calls `retry_candidate` (`srv/src/coordinator.rs:1123-1131`);
@@ -488,9 +509,9 @@ A `WindowRef` is valid only while its rows exist unchanged. Today that holds
 because `qbit_share_ledger` rows are immutable (the statement-level trigger at
 `srv/migrations/002_multi_instance.sql:127-135` raises on UPDATE, DELETE and
 TRUNCATE, so no pruning exists), `share_seq` is assigned by the insert under
-`ORDER_LOCK` (`srv/src/ledger.rs:316,386`) so no row can later appear inside
+`ORDER_LOCK` (`srv/src/ledger/window.rs:99,169`) so no row can later appear inside
 a written range, and the anchor predicate is stable because `accepted_at` and
-`job_issued_at` never change and the ledger clock only moves forward (`:381`).
+`job_issued_at` never change and the ledger clock only moves forward (`:164`).
 
 `finish_candidate_at_revision` sets `candidate=NULL` in its terminal UPDATE
 (`srv/src/ledger/blocks.rs:214`); after 007 the same UPDATE also sets the six
@@ -508,14 +529,16 @@ row, or any `qbit_prism_audit_snapshots` row without `inline_shares`.*
 
 D6 (#260) must honour that floor. A future prune runs in one transaction that
 takes `SETTLEMENT_LOCK` and then `ORDER_LOCK`, the order every existing
-dual-lock site uses (`srv/src/ledger.rs:121-122,413-414`,
-`srv/src/ledger/blocks.rs:181-182,248-249`), so it cannot form an advisory-lock
-cycle with a refresh snapshot or a candidate finalization. Those are the locks
-under which references are written (`save_job` under `SETTLEMENT_LOCK`,
-`srv/src/ledger.rs:470`; enqueue under `ORDER_LOCK`, `:316` and `:505`). The
+dual-lock site uses (`srv/src/ledger/connect.rs:52-53`,
+`srv/src/ledger/window.rs:196-197`, `srv/src/ledger/blocks.rs:181-182,248-249`),
+so it cannot form an advisory-lock cycle with a refresh snapshot or a
+candidate finalization. Those are the locks under which references are written
+(`save_job` under `SETTLEMENT_LOCK`, `srv/src/ledger/jobs.rs:14`; enqueue under
+`ORDER_LOCK`, `srv/src/ledger/window.rs:99` and
+`srv/src/ledger/candidates.rs:29`). The
 prune computes the floor, and deletes strictly below it. It must also keep a horizon at least as wide as the window the next
 `Ledger::snapshot` could select, because a rise in network difficulty moves
-the window start earlier (`srv/src/ledger.rs:407-449`). A read that began
+the window start earlier (`srv/src/ledger/window.rs:190-232`). A read that began
 before such a commit still sees its snapshot; one that begins after it fails
 with `Incomplete` at the existence probe.
 
@@ -530,7 +553,7 @@ and `config.ctv_config` from local configuration
 builder (`:1003`). The fee policy is revalidated on every refresh because
 relay floors change (`:525-527`). The cluster fingerprint
 (`srv/src/config.rs:479-491`, pinned once in `qbit_prism_cluster` by
-`configure`, `srv/src/ledger.rs:195-207`) keeps live instances on one policy,
+`configure`, `srv/src/ledger/connect.rs:128-140`) keeps live instances on one policy,
 so the drift is across time, a fingerprint reset between the refresh that
 built the row and its claim, not across instances. If a claiming frontend
 re-derives any signed input differently, the canonical bundle changes:
@@ -538,14 +561,14 @@ re-derives any signed input differently, the canonical bundle changes:
 candidate", or a non-matching body lands. #265 removes the drift by storing
 every builder input except the window:
 
-| Builder input (`crates/qbit-prism/src/lib.rs:1365-1376`) | At refresh (`srv/src/coordinator.rs`) | At claim today | With `WindowRef` | Size |
+| Builder input (`crates/qbit-prism/src/lib.rs:1753-1764`) | At refresh (`srv/src/coordinator.rs`) | At claim today | With `WindowRef` | Size |
 | --- | --- | --- | --- | --- |
-| `shares` | `snapshot.shares` (`:747`) or the bootstrap share (`:727-745`) | `source.shares` | `read_window`, or `vec![bootstrap_share]` | the window, never stored |
+| `shares` | `snapshot.shares` (`srv/src/coordinator.rs:747`) or the bootstrap share (`:727-745`) | `source.shares` | `read_window`, or `vec![bootstrap_share]` | the window, never stored |
 | `found_block` | from the template (`:719-726`) | `source.found_block` | **stored verbatim** in the candidate JSON | 4 scalars |
 | `prior_balances` | `snapshot.prior_balances` (`:759`) | `source.prior_balances` | `read_window`, digest-checked and sorted with the digest's comparator ([Read](#read)) | per recipient with a balance; read, not stored |
 | `payout_policy` | `config.payout_policy` (`:760`) | `source.payout_policy` | **stored verbatim** | O(1) |
 | `direct_floor_sats`, `settlement_config`, `ctv_fanout_fee_policy` | `config.ctv_direct_floor`, `config.ctv_config`, `fee` (`:761-763`) | `config.*` (`:1009-1010`), the drift, and `source.ctv_fanout_fee_policy` | **stored verbatim** as one nested `ctv: Option<{ direct_floor_sats, settlement_config, fanout_fee_policy }>`, whose presence also selects the CTV builder in place of `config.ctv_enabled` (`:755`, `:1003`) | O(1) |
-| `coinbase_script_sig_suffix_hex` | `Some(suffix)` (`:764`) | `claim.candidate.coinbase_suffix_hex` (`:992`) | already stored, **required after 007**: submit always writes `Some` (`:1697`); the `Option` with `serde(default)` (`srv/src/ledger.rs:45-46`) exists for pre-007 rows, so post-007 decode rejects `None`, and the `else` branch that lands the stored bundle when the suffix is absent (`:1036-1038`) is removed with the bundle | O(1) |
+| `coinbase_script_sig_suffix_hex` | `Some(suffix)` (`:764`) | `claim.candidate.coinbase_suffix_hex` (`:992`) | already stored, **required after 007**: submit always writes `Some` (`:1697`); the `Option` with `serde(default)` (`srv/src/ledger/candidates.rs:10-11`) exists for pre-007 rows, so post-007 decode rejects `None`, and the `else` branch that lands the stored bundle when the suffix is absent (`srv/src/coordinator.rs:1036-1038`) is removed with the bundle | O(1) |
 | `witness_merkle_leaves_hex` | `codec::witness_merkle_leaves_hex` over the template's transactions (`:749-750`) | `source.witness_merkle_leaves_hex` | **re-derived** from the stored `block_hex` by `codec::witness_merkle_leaves_from_block`, below | not stored twice |
 | signing keys | `config.manifest_seed`, `config.ledger_seed` (`:751-752`) | `config.*` (`:1001-1002`) | local: the seeds are the signer, not a field; both public keys are **stored** as `signer_keys` and checked ([Signing keys](#signing-keys)) | about 130 B |
 | builder logic | the linked `qbit-prism` | the linked `qbit-prism`, possibly a newer release | **stored** as `audit_builder_version` and checked, never re-derived ([Builder version](#builder-version)) | 2 B |
@@ -559,7 +582,7 @@ claiming frontend does not have, and it sits in `shares` and
 forbids. Submit sets it when `context.prepared.bundle.is_none()`
 (`srv/src/coordinator.rs:27`; the `None` arm at `:1343` is where the
 per-worker bootstrap bundle was built). `deferred_share`
-(`srv/src/ledger.rs:47-48`) is the precedent for one inline share. Decode
+(`srv/src/ledger/candidates.rs:12-13`) is the precedent for one inline share. Decode
 requires `bootstrap_share.is_some() == window.shares.is_none()` and
 `found_block.anchor_job_issued_at_ms == window.anchor_ms`, because
 `persist_audit_snapshot` takes the anchor from the bundle
@@ -583,7 +606,7 @@ transaction scales with the block and would break the row-size bound below.
 
 Every stored input is O(1), about 1 KB in total, and `candidate_sha256`
 covers all of them. The one input that scales is `block_hex`, already stored
-today (`srv/src/ledger.rs:41`): it grows with the block, hex doubling the
+today (`srv/src/ledger/candidates.rs:6`): it grows with the block, hex doubling the
 serialized size, not with the window. #265's "outbox row under 1 MB"
 criterion must therefore be stated net of `block_hex`, or as "independent of
 the window size".
@@ -633,7 +656,7 @@ bundle embeds both public keys and their signatures
 original bytes only under the original keys. With unchanged seeds it does, as
 the golden test's digests for fixed seeds show. The cluster fingerprint binds
 both public keys (`srv/src/config.rs:479-491`), and `configure` pins it once
-and refuses a mismatch (`srv/src/ledger.rs:195-215`). The code has no reset
+and refuses a mismatch (`srv/src/ledger/connect.rs:128-148`). The code has no reset
 path, so rotating either key takes an operator resetting
 `qbit_prism_cluster.config_fingerprint`. A candidate still pending across
 that reset would be rebuilt and signed with the new keys, into bytes its
@@ -661,33 +684,33 @@ coinbase does not commit to.
   `candidate IS NULL` and are untouched. 007 refuses to apply while any
   `state='pending'` row still holds an inline candidate (`candidate ? 'bundle'`),
   naming the rows: one-way per D5, modelled on the `version < 3`
-  pending-shape check at `srv/src/ledger.rs:143-144`. After 007 there
+  pending-shape check at `srv/src/ledger/connect.rs:74-75`. After 007 there
   is no compatibility decode: a pending row with a NULL `window_anchor_ms` is
   a hard claim error telling the operator to stop the pre-007 frontend.
 - **Rows written before 008.** Legacy inline prepared rows stay in place.
   Resume treats a payload with `snapshot` or `bundle` keys, or a NULL
   `window_anchor_ms` on a `prepared:` row, as a cache miss (`Ok(None)`)
   because prepared work is regenerable; the rows expire under their TTL and
-  `prune_expired_jobs` (`srv/src/ledger.rs:608-609`) removes them. This is
+  `prune_expired_jobs` (`srv/src/ledger/jobs.rs:43-44`) removes them. This is
   unambiguous now: an empty window is not NULL.
 - **Mixed versions.** 3.x.x does not support a pre-007/008 and a post-007/008
   frontend on one database: the old frontend would keep writing inline
   documents the new claim path rejects and would fail to decode a reference
   job on cross-frontend resume. The one-way model is the one `Ledger::connect`
-  already enforces for the legacy writer lease (`:135`) and
+  already enforces for the legacy writer lease (`srv/src/ledger/connect.rs:66`) and
   [prism-rust-migration](../prism-rust-migration.md) documents; #285 gates
   startup on the schema version.
 - **Upgrade procedure.** A `state='pending'` outbox row is cleared only by a
   frontend claiming and landing it: the CHECK at
   `crates/qbit-prism/sql/001_share_ledger.sql:97-104` keeps `candidate`
   non-NULL until the row is terminal, and `retry_candidate`
-  (`srv/src/ledger.rs:590-602`) only backs off, never abandons. So "refuse
+  (`srv/src/ledger/candidates.rs:114-126`) only backs off, never abandons. So "refuse
   while pending inline rows exist" plus "apply with every frontend stopped"
   would deadlock. There are two starting points. From a **native pre-007
   3.x.x deployment**, the native `submit_loop` drains the outbox, step 1
   below. From **production 2.x.x**, the 2.x.x submitter drains it before the
   cutover, and leftovers are refused twice: by the `version < 3` gate
-  (`srv/src/ledger.rs:143-144`) on the first native connect and by #285's
+  (`srv/src/ledger/connect.rs:74-75`) on the first native connect and by #285's
   006; #265's migration test covers "a 2.x.x schema with only terminal
   rows". The order, with the 2.x.x frontends doing step 1 and any repeat in
   that case, is:
@@ -695,7 +718,7 @@ coinbase does not commit to.
      (`srv/src/coordinator.rs:1112-1135`) polls every 100 ms and claims each
      pending row; a row whose revision or parent is superseded is finished by
      `finish_candidate_at_revision` (`:979-988`); a failed attempt is retried
-     after `LEAST(60, attempt_count)` seconds (`srv/src/ledger.rs:594`). A row
+     after `LEAST(60, attempt_count)` seconds (`srv/src/ledger/candidates.rs:118`). A row
      that keeps failing is #268's escape hatch; the procedure never abandons
      it. No switch stops candidate production while keeping `submit_loop`, so
      a block can be found at any moment until the frontends stop, and a zero
@@ -707,7 +730,7 @@ coinbase does not commit to.
      and the stop: start the pre-007 frontends again, let `submit_loop` drain
      it, and repeat from step 2.
   4. Start one post-008 frontend. `Ledger::connect` applies migrations in one
-     transaction (the base schema at `srv/src/ledger.rs:146-149`, versioned
+     transaction (the base schema at `srv/src/ledger/connect.rs:77-80`, versioned
      steps after it), so it applies 006 (#285), then 007, then 008, each
      refusal predicate running in that transaction and naming the rows it
      found. Then start the rest; #285's startup gate keeps a pre-007/008
@@ -720,9 +743,9 @@ coinbase does not commit to.
   qbit_block_candidate_outbox WHERE state='pending' AND candidate ? 'bundle')`.
   Each predicate runs inside its own `version < N` step of the migration
   transaction, in migration order and one-way, never unconditionally at
-  startup. The pending-shape check at `srv/src/ledger.rs:143-144` is the
+  startup. The pending-shape check at `srv/src/ledger/connect.rs:74-75` is the
   model for the shape only: it sits inside `if version.unwrap_or(0) < 3`
-  (`:118-164`), runs before the base schema (`:146-149`) on the first native
+  (`:49-95`), runs before the base schema (`:77-80`) on the first native
   connect after 2.x.x, and never runs at version 7 or above, so #265 leaves
   it alone.
 - **Canonical hashes.** Under one `AUDIT_BUILDER_VERSION` and one pair of
@@ -735,14 +758,26 @@ coinbase does not commit to.
 
 ## Where the code lives
 
-Planned: `srv/src/ledger/window.rs`, owned by workstream B per #283, holding
-`WindowRef`, `ShareRange`, `Window`, `WindowError`, `read_window`, and the
-shared `SELECT_SHARE`, `share_from_row` and `read_range` that `ledger.rs` and
-`ledger/audit.rs` define today; `audit.rs` (A) and `jobs.rs` (B) then import
-them. Moving `read_range` out of `ledger/audit.rs` (`srv/src/ledger/audit.rs:144-152`)
-edits an A-owned file, and `SELECT_SHARE` and `share_from_row` leave
-`ledger.rs` (`srv/src/ledger.rs:734-756`). **Pending confirmation with
-Anatolie on #283**; this record does not claim the location is settled.
+#283 landed the `ledger.rs` split (#300), and `srv/src/ledger/window.rs`
+exists and belongs to workstream B. It already holds `Snapshot`
+(`srv/src/ledger/window.rs:10-16`), `AppendResult` (`:4-7`), the `append*`
+family (`:74-185`), `snapshot` (`:190-241`), `observe_chain_view` (`:21-72`),
+`read_prior_balances` (`:244-252`), `share_header_hash` (`:254-261`) and
+`share_from_row` (`:263-283`). `WindowRef`, `ShareRange`, `Window`,
+`WindowError` and `read_window` go there too: every one of them is B-owned
+code that only B-owned callers and A's #265 claim path use, and the file
+already owns the window read they extend.
+
+`SELECT_SHARE` needs no move. It stays a `const` in the module root
+(`srv/src/ledger.rs:40`), where `window.rs` and `ledger/audit.rs` both reach
+it through `use super::*`. `read_range` likewise stays in A-owned
+`ledger/audit.rs` (`srv/src/ledger/audit.rs:144-152`).
+
+One question is left, and it is narrower than before the split: whether
+`read_window` reuses `read_range` from `audit.rs` as it stands, or
+`read_range` moves into `window.rs` so both readers share one paged
+implementation. Only the second edits an A-owned file. **Pending confirmation
+with Anatolie on #283**; this record does not claim that choice is settled.
 
 ## Bundle ownership
 
@@ -752,11 +787,11 @@ Anatolie on #283**; this record does not claim the location is settled.
 | Entry point | Purpose |
 | --- | --- |
 | `AuditBundleBody` | every `AuditBundle` field except the top-level `shares`; `#[serde(deny_unknown_fields)]`, so a full bundle cannot decode as a body |
-| `build_audit_bundle_body`, `build_audit_bundle_body_with_coinbase_script_sig_suffix`, `build_audit_bundle_body_with_coinbase_options`, `build_audit_bundle_body_with_ctv_settlement_options`, each taking `&[AcceptedShare]` | borrowing builders mirroring the four `build_audit_bundle*` functions (`:1258`, `:1277`, `:1298`, `:1365`) |
+| `build_audit_bundle_body`, `build_audit_bundle_body_with_coinbase_script_sig_suffix`, `build_audit_bundle_body_with_coinbase_options`, `build_audit_bundle_body_with_ctv_settlement_options`, each taking `&[AcceptedShare]` | borrowing builders mirroring the four `build_audit_bundle*` functions (`crates/qbit-prism/src/lib.rs:1567`, `:1611`, `:1658`, `:1753`) |
 | `verify_audit_parts(&AuditBundleBody, &[AcceptedShare], …)` and its `verify_audit_parts*` variants | verification without an owned bundle |
 | `canonical_audit_bundle_bytes_from_parts(&AuditBundleBody, &[AcceptedShare])`, `write_canonical_audit_bundle_from_parts` | canonical bytes without splicing |
 | `AuditBundleBody::into_bundle(Vec<AcceptedShare>)`, `AuditBundle::into_parts()` | lossless conversion both ways |
-| `prior_balances_digest(&[CarryForwardBalance]) -> [u8; 32]` | the private `prior_balances_digest_hex` (`:2133`) made public for `WindowRef` |
+| `prior_balances_digest(&[CarryForwardBalance]) -> [u8; 32]` | the private `prior_balances_digest_hex` (`crates/qbit-prism/src/lib.rs:2670`) made public for `WindowRef` |
 
 An earlier draft called the body `AuditBody`; it is `AuditBundleBody` so it
 reads next to `AuditBundle` and is not mistaken for the `audit_body_ref` file
@@ -810,14 +845,14 @@ not on every refresh.
 | Step | #265, migration 007, candidates and import | #273, migration 008, prepared work and job rows |
 | --- | --- | --- |
 | columns | the six on `qbit_block_candidate_outbox` | the six on `qbit_prism_jobs`; per-worker `StoredJob` rows keep them NULL |
-| document | `Candidate` (`srv/src/ledger.rs:39-49`) drops `bundle: AuditBundle` for `window: WindowRef`, `bootstrap_share: Option<AcceptedShare>`, `found_block`, `payout_policy`, `ctv: Option<{ direct_floor_sats, settlement_config, fanout_fee_policy }>`, `audit_builder_version` and `signer_keys`; it keeps `block_hash`, `block_hex`, `job_id`, `payout_revision`, `deferred_share` and `coinbase_suffix_hex`, now required. The rebuilt `AuditBundle` lives in `CandidateClaim` (`srv/src/ledger.rs:52-55`), absent until the rebuild fills it where `:1032-1034` replaces `candidate.bundle` today; landing reads it there instead of `claim.candidate.bundle.*` (`srv/src/ledger/blocks.rs:61-153`), and `observe_candidate` reads the stored `found_block.block_height` from the candidate instead of through the bundle (`srv/src/coordinator.rs:829`) | `StoredPrepared` (`srv/src/coordinator.rs:46-55`) drops `snapshot` and `bundle` for `window: WindowRef` plus the `Snapshot` scalars the reference does not carry: `share_seq`, the newest sequence at snapshot time (`srv/src/ledger.rs:453`), which the cached-work equivalence test compares (`srv/src/coordinator.rs:612`), and `payout_revision`, which `save_job` fences (`srv/src/ledger.rs:472-479`) and resume compares (`srv/src/coordinator.rs:1485`). It stores the policy inputs `build_bundle` reads from `config` at `:760-762`: `payout_policy` and the same nested `ctv` field, which also covers the `config.ctv_enabled` choice at `:755` and absorbs today's `fee` (`:50`; `fee_policy` is `None` when CTV is off, `:319-322`). It stores `audit_builder_version` and `signer_keys` too, and keeps `template`, `fingerprint`, `generation`, `parent_of_tip` and `coinbase_suffix`, so a cross-frontend resume builds the bundle the issuing frontend would have built. `Prepared` (`:32-43`) and `JobContext` (`:26-30`) keep the in-memory `snapshot: Arc<Snapshot>`, the only owned window, and hold `Arc<AuditBundleBody>` instead of `Arc<AuditBundle>` (`:29`, `:35`), built by borrowing (`:747` stops cloning), so neither the local frontend nor a resume keeps a second copy of the window. `Prepared` also keeps `window: WindowRef`, the reference `refresh_once` computed or the resume decoded, so both documents take the same small value |
-| write | submit (`srv/src/coordinator.rs:1691-1699`) clones `Prepared.window`, the `WindowRef` `refresh_once` already computed, a few hundred bytes, so a found block never re-digests the window on the share path (the 0.7 to 1.4 s the cost table budgets once per refresh), and sets `bootstrap_share` when `context.prepared.bundle.is_none()` (`:27`; the `None` arm at `:1343` is where the per-worker bootstrap bundle was built); persist (`srv/src/ledger.rs:695-696`) serializes and digests the small row before the append transaction opens and writes the columns with it | `refresh_once` (`srv/src/coordinator.rs:468`, the store at `:627-641`) computes the reference once per non-cached refresh and keeps it as `Prepared.window`, which submit clones (#265) and a resume takes from `StoredPrepared`; `save_job` writes the columns and a payload with no `shares` key; an empty snapshot writes an empty-window reference |
-| read | claim decode (`srv/src/ledger.rs:549-555`) checks the digest and the columns | resume (`srv/src/coordinator.rs:1447-1470`) decodes the small payload inline; `:1469-1470` no longer needs `spawn_blocking` |
+| document | `Candidate` (`srv/src/ledger/candidates.rs:4-14`) drops `bundle: AuditBundle` for `window: WindowRef`, `bootstrap_share: Option<AcceptedShare>`, `found_block`, `payout_policy`, `ctv: Option<{ direct_floor_sats, settlement_config, fanout_fee_policy }>`, `audit_builder_version` and `signer_keys`; it keeps `block_hash`, `block_hex`, `job_id`, `payout_revision`, `deferred_share` and `coinbase_suffix_hex`, now required. The rebuilt `AuditBundle` lives in `CandidateClaim` (`srv/src/ledger/candidates.rs:17-20`), absent until the rebuild fills it where `srv/src/coordinator.rs:1032-1034` replaces `candidate.bundle` today; landing reads it there instead of `claim.candidate.bundle.*` (`srv/src/ledger/blocks.rs:61-153`), and `observe_candidate` reads the stored `found_block.block_height` from the candidate instead of through the bundle (`srv/src/coordinator.rs:829`) | `StoredPrepared` (`srv/src/coordinator.rs:46-55`) drops `snapshot` and `bundle` for `window: WindowRef` plus the `Snapshot` scalars the reference does not carry: `share_seq`, the newest sequence at snapshot time (`srv/src/ledger/window.rs:236`), which the cached-work equivalence test compares (`srv/src/coordinator.rs:612`), and `payout_revision`, which `save_job` fences (`srv/src/ledger/jobs.rs:16-23`) and resume compares (`srv/src/coordinator.rs:1485`). It stores the policy inputs `build_bundle` reads from `config` at `:760-762`: `payout_policy` and the same nested `ctv` field, which also covers the `config.ctv_enabled` choice at `:755` and absorbs today's `fee` (`:50`; `fee_policy` is `None` when CTV is off, `:319-322`). It stores `audit_builder_version` and `signer_keys` too, and keeps `template`, `fingerprint`, `generation`, `parent_of_tip` and `coinbase_suffix`, so a cross-frontend resume builds the bundle the issuing frontend would have built. `Prepared` (`:32-43`) and `JobContext` (`:26-30`) keep the in-memory `snapshot: Arc<Snapshot>`, the only owned window, and hold `Arc<AuditBundleBody>` instead of `Arc<AuditBundle>` (`:29`, `:35`), built by borrowing (`:747` stops cloning), so neither the local frontend nor a resume keeps a second copy of the window. `Prepared` also keeps `window: WindowRef`, the reference `refresh_once` computed or the resume decoded, so both documents take the same small value |
+| write | submit (`srv/src/coordinator.rs:1691-1699`) clones `Prepared.window`, the `WindowRef` `refresh_once` already computed, a few hundred bytes, so a found block never re-digests the window on the share path (the 0.7 to 1.4 s the cost table budgets once per refresh), and sets `bootstrap_share` when `context.prepared.bundle.is_none()` (`:27`; the `None` arm at `:1343` is where the per-worker bootstrap bundle was built); persist (`srv/src/ledger/candidates.rs:182-183`) serializes and digests the small row before the append transaction opens and writes the columns with it | `refresh_once` (`srv/src/coordinator.rs:468`, the store at `:627-641`) computes the reference once per non-cached refresh and keeps it as `Prepared.window`, which submit clones (#265) and a resume takes from `StoredPrepared`; `save_job` writes the columns and a payload with no `shares` key; an empty snapshot writes an empty-window reference |
+| read | claim decode (`srv/src/ledger/candidates.rs:73-79`) checks the digest and the columns | resume (`srv/src/coordinator.rs:1447-1470`) decodes the small payload inline; `:1469-1470` no longer needs `spawn_blocking` |
 | fence | `process_candidate_inner` (`srv/src/coordinator.rs:966`) keeps `:972-979`; `Window.payout_revision != candidate.payout_revision` is a second hint for the same `observe_candidate` probe and never a supersession by itself ([Revision fence and reorgs](#revision-fence-and-reorgs)) | `:1483-1488` stays, then `Window.payout_revision` against the row's `payout_revision`; any inequality is `Ok(None)` |
-| rebuild | under a `build_slots` permit (`:997`) and the 60 s whole-call deadline: if `qbit_pool_audit_bundles` already holds the block's audit, finish from that row's digest columns without `read_window`, never through `materialize_audit_row` ([Revision fence and reorgs](#revision-fence-and-reorgs)); else await `read_window`, re-derive the witness leaves from `block_hex`, run `build_audit_bundle_body_*(&window.shares, …)` directly in `spawn_blocking` (`:998-1031`; never `build_bundle`, which takes a second permit at `:712`), and put `into_bundle(window.shares)` in `CandidateClaim` for landing | under one `build_slots` permit, the single-flight entry for the `storage_key` and the inner timeout: await `read_window`, move its `Vec` into the `Snapshot` and rebuild `Prepared` as `(Arc<Snapshot>, Arc<AuditBundleBody>)` through the borrowing builders called directly, never `build_bundle`, or use the local incremental window once #274 lands |
+| rebuild | under a `build_slots` permit (`:997`) and the 60 s whole-call deadline: if `qbit_pool_audit_bundles` already holds the block's audit, finish from that row's columns, authenticated against the block's coinbase ([Revision fence and reorgs](#revision-fence-and-reorgs)), without `read_window` and never through `materialize_audit_row`; else await `read_window`, re-derive the witness leaves from `block_hex`, run `build_audit_bundle_body_*(&window.shares, …)` directly in `spawn_blocking` (`:998-1031`; never `build_bundle`, which takes a second permit at `:712`), and put `into_bundle(window.shares)` in `CandidateClaim` for landing | under one `build_slots` permit, the single-flight entry for the `storage_key` and the inner timeout: await `read_window`, move its `Vec` into the `Snapshot` and rebuild `Prepared` as `(Arc<Snapshot>, Arc<AuditBundleBody>)` through the borrowing builders called directly, never `build_bundle`, or use the local incremental window once #274 lands |
 | empty window | build over `&[bootstrap_share]` | the single-flight entry carries `bundle: None`; each miner gets its own bootstrap bundle, built with the builders directly under a fresh `build_slots` permit taken after the entry's permit is released, from the synthetic share `build_bundle` fabricates from the worker today (`:727-745`, reached from `:1498-1510`), the stored template, anchor, `payout_policy` and `ctv`, and the returned balances and revision; never `build_bundle`, which reads `config` for signed fields (`:755`, `:760-762`) |
 | import | `srv/src/ledger/migration.rs:117` stores `canonical_audit_bytes` plus non-share metadata and no inline body. The same PR makes both readers decode `canonical_audit_bytes`, digest-checked against `audit_bundle_sha256` and under `spawn_blocking` (a two-copy body is about 470 MB at 400k), before any `body_uri` fallback, as `audit_canonical_bytes` already does (`srv/src/ledger/audit.rs:12-23`): `Ledger::audit_bundle` (`:92-107`), which today returns only the JSON column, so `backfill-ctv` would stop on imported rows with "import legacy audits first" (`srv/src/ledger/migration.rs:133-136`); and the bundle endpoint's fallback (`srv/src/api/read_models.rs:196-231`), which today reads only `body_uri`, so every frontend would still need the legacy filesystem. Keeping the inline body instead would bring back the two-copy JSONB document this design removes | n/a |
-| must not | serialize a share array into the outbox; re-digest the window at submit instead of cloning `Prepared.window`; hydrate a landed audit on the submit loop through `materialize_audit_row`; hold `ORDER_LOCK` across `read_window`; decode inline candidates on a post-007 schema; read local configuration for any stored input; rebuild a reference whose `audit_builder_version` or `signer_keys` differ from this binary's; accept a new fingerprint in `configure` while a pending row stores other `signer_keys`; wrap `read_window` in `spawn_blocking`; call `build_bundle` under a held `build_slots` permit; leave an imported audit readable only through `body_uri` | write a share array into `payload`; wrap `read_window` in `spawn_blocking`; run whole-window serde on a runtime thread; call `build_bundle` for any resume rebuild, empty window included (it takes a second permit and reads `config` for signed fields); hold an owned `AuditBundle` beside the `Snapshot` in `Prepared` or `JobContext`; resume a job whose `audit_builder_version` or `signer_keys` differ from this binary's; change the `save_job` revision fence (`srv/src/ledger.rs:472-479`) or the cached-work reuse conditions (`srv/src/coordinator.rs:528-533`) |
+| must not | serialize a share array into the outbox; re-digest the window at submit instead of cloning `Prepared.window`; hydrate a landed audit on the submit loop through `materialize_audit_row`; finish a recovered claim without checking the landed coinbase and audit root against `block_hex`; hold `ORDER_LOCK` across `read_window`; decode inline candidates on a post-007 schema; read local configuration for any stored input; rebuild a reference whose `audit_builder_version` or `signer_keys` differ from this binary's; accept a new fingerprint in `configure` while a pending row stores other `signer_keys`; wrap `read_window` in `spawn_blocking`; call `build_bundle` under a held `build_slots` permit; leave an imported audit readable only through `body_uri` | write a share array into `payload`; wrap `read_window` in `spawn_blocking`; run whole-window serde on a runtime thread; call `build_bundle` for any resume rebuild, empty window included (it takes a second permit and reads `config` for signed fields); hold an owned `AuditBundle` beside the `Snapshot` in `Prepared` or `JobContext`; resume a job whose `audit_builder_version` or `signer_keys` differ from this binary's; change the `save_job` revision fence (`srv/src/ledger/jobs.rs:16-23`) or the cached-work reuse conditions (`srv/src/coordinator.rs:528-533`) |
 | text to amend on merge | "reconstructs … through `Ledger::read_window` in `spawn_blocking`": `read_window` is awaited, only the builder runs in `spawn_blocking`; the closed field list ("stores the `WindowRef` … plus … not the bundle"): it is the [Stored bundle inputs](#stored-bundle-inputs) table, `found_block`, `payout_policy`, `ctv`, `bootstrap_share`, `audit_builder_version`, `signer_keys` and the required `coinbase_suffix_hex`; and "outbox row under 1 MB", to be stated net of `block_hex` | the five-field reference list: it is `anchor_ms`, `prior_balances_digest` and an optional range of four (`first_share_seq`, `last_share_seq`, `share_count`, `snapshot_sha256`) |
 
 **#267, audit bodies.** Uses `AuditBundleBody`, `verify_audit_parts` and
@@ -834,12 +869,14 @@ normalizes `reward_manifest.shares` out of the stored body; the
   `outer − min(5 s, outer / 2)` and the single-flight map; storing the
   policy inputs in `StoredPrepared`; and whether 0.7 to 1.4 s of digest CPU
   per non-cached refresh is acceptable until #274.
-- **Anatolie (#283).** Confirm `ledger/window.rs` as the home of `WindowRef`,
-  `read_window`, `SELECT_SHARE`, `share_from_row` and `read_range`, owned by
-  B while A's #265 and B's #273 both call it. The move edits A-owned
-  `ledger/audit.rs` (`read_range`) as well as `ledger.rs`; either A signs off
-  on that one edit or B lands `window.rs` first and A switches `audit.rs`
-  over in #265.
+- **Anatolie (#283).** Narrowed by #300, not settled. `ledger/window.rs`
+  exists under B and already holds `share_from_row`, so `WindowRef`,
+  `read_window`, `Window` and `WindowError` land there with no cross-workstream
+  edit, and `SELECT_SHARE` stays in the module root. What is left is only
+  `read_range`: whether `read_window` reuses it where it is, in A-owned
+  `ledger/audit.rs`, or it moves into `window.rs` so both readers share one
+  paged implementation. Only the move edits an A-owned file; either A signs
+  off on that one edit or #265 keeps calling `audit.rs`.
 - **D1 (#260).** The cost section assumes 400k shares. A single share array
   has 3 to 13 % headroom under the JSONB ceiling there, and an
   `AuditBundleBody` crosses it at about 483k counted shares; a target above
