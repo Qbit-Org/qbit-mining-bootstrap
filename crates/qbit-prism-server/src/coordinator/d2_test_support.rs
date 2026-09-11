@@ -28,62 +28,22 @@ pub(super) fn unix_now() -> Result<u64> {
 // Integration guard
 // ---------------------------------------------------------------------------
 
-/// Decides whether a D2 test runs, fails or skips.
-///
-/// | `PRISM_TEST_DATABASE_URL` | other variables | result |
-/// | --- | --- | --- |
-/// | set and non-empty | -- | run against that database |
-/// | unset or empty | `PRISM_TEST_REQUIRE_INTEGRATION=1` | fail, naming the variable |
-/// | unset or empty | `GITHUB_JOB=prism-native-postgres` | fail, naming the variable |
-/// | unset or empty | -- | print a skip line and return |
-///
-/// The three variables play different roles. This repository sets
-/// `PRISM_TEST_DATABASE_URL` itself, in the `prism-native-postgres` job of
-/// `.github/workflows/ci.yml`. GitHub sets `GITHUB_JOB` to the running job's
-/// id, so matching it on `prism-native-postgres` means a database outage in
-/// that job surfaces as a failure instead of a silent pass, even though
-/// nothing in the repository writes that variable. Nothing sets
-/// `PRISM_TEST_REQUIRE_INTEGRATION` yet: it is an opt-in switch proposed by
-/// #286 for a run that wants every integration test to be mandatory, honoured
-/// here in advance so that adopting it needs no change to this file.
-///
-/// Keying on `CI` instead would be wrong: GitHub sets `CI=true` in every job,
-/// including `rust-tests`, which builds and runs the whole workspace with no
-/// database at all.
-///
-/// An empty or whitespace-only URL counts as unset. A non-empty but malformed
-/// URL is deliberately not second-guessed here; it reaches `sqlx` and fails
-/// the test with the connection error, which is the diagnostic an operator
-/// needs.
-///
-/// This is the same guard as `tests/window_read_oracle.rs` `database_url`.
-pub(super) fn database_url(test_name: &str) -> Result<Option<String>> {
-    let configured = std::env::var("PRISM_TEST_DATABASE_URL").unwrap_or_default();
-    let configured = configured.trim();
-    if !configured.is_empty() {
-        return Ok(Some(configured.to_owned()));
-    }
-    let required_by = if matches!(
-        std::env::var("PRISM_TEST_REQUIRE_INTEGRATION").as_deref(),
-        Ok("1")
-    ) {
-        Some("PRISM_TEST_REQUIRE_INTEGRATION=1")
-    } else if matches!(
-        std::env::var("GITHUB_JOB").as_deref(),
-        Ok("prism-native-postgres")
-    ) {
-        Some("GITHUB_JOB=prism-native-postgres")
-    } else {
-        None
-    };
-    if let Some(signal) = required_by {
-        anyhow::bail!(
-            "{test_name} requires PostgreSQL: PRISM_TEST_DATABASE_URL is unset or empty while \
-             {signal} demands the integration suite"
-        );
-    }
-    eprintln!("skipping {test_name}: PRISM_TEST_DATABASE_URL is not set");
-    Ok(None)
+/// Decides whether a D2 test runs, fails or skips, through the workspace's
+/// shared integration gate (`qbit_prism_test_gate`), which every
+/// environment-gated test takes its inputs from: with `PRISM_TEST_DATABASE_URL`
+/// set and non-empty the test runs; with it unset while
+/// `PRISM_TEST_REQUIRE_INTEGRATION=1` or `GITHUB_JOB=prism-native-postgres`
+/// demands the suite the test fails, naming the variable and the test; and
+/// otherwise the gate prints one prefixed skip line and the test returns.
+/// The `prism-native-postgres` job sets the switch, and the nine D2 tests are
+/// listed in `test/prism-gated-tests.txt`, so the job's execution manifest
+/// proves they ran. The gate identifies the test by the thread libtest runs
+/// it on, so it must be called at the top of the test body, as every caller
+/// here does. See `docs/prism-integration-test-gate.md`.
+pub(super) fn database_url() -> Result<Option<String>> {
+    Ok(qbit_prism_test_gate::database_url(
+        qbit_prism_test_gate::site!(),
+    )?)
 }
 
 // ---------------------------------------------------------------------------

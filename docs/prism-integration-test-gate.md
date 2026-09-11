@@ -13,7 +13,7 @@ without running.
 
 | variable | what it carries | tests that need it |
 | --- | --- | --- |
-| `PRISM_TEST_DATABASE_URL` | a disposable PostgreSQL the test may write to (each test creates and drops its own schema) | ledger, API, rollups, readiness, authorization, migration, JSONB ceiling, window oracle, candidate lease, the two explicit `#[ignore]` runs, and the live suite |
+| `PRISM_TEST_DATABASE_URL` | a disposable PostgreSQL the test may write to (each test creates and drops its own schema) | ledger, API, rollups, readiness, authorization, migration, JSONB ceiling, window oracle, candidate lease, the D2 payout rules, the explicit `#[ignore]` runs, and the live suite |
 | `PRISM_TEST_PG_BIN_DIR` | a directory holding `initdb`, `pg_ctl` and `pg_basebackup` | the physical failover and public read replica tests, which run their own clusters |
 | `QBITD_BIN` | a `qbitd` executable | the live regtest suite (`live_regtest`, with its high-difficulty and CTV/CPFP modules) |
 
@@ -103,7 +103,8 @@ one line; the checker counts it once. An unwritable manifest fails the test.
 ## The expected list and the proof
 
 `test/prism-gated-tests.txt` lists every gated test the `prism-native-postgres`
-job must execute, one id per line, sorted. Its length is the minimum count.
+job must execute, one id per line, sorted; 81 today. Its length is the minimum
+count.
 After the job's three `cargo test` invocations (the whole workspace with
 `--nocapture`, then the two explicit `--ignored` runs), it runs
 
