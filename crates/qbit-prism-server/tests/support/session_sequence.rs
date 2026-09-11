@@ -55,7 +55,19 @@ async fn initialize_false_allows_read_only_pre009_connection() -> Result<()> {
         return Ok(());
     };
     let pool = PgPool::connect(&db.url).await?;
-    sqlx::raw_sql("CREATE TABLE qbit_prism_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp()); INSERT INTO qbit_prism_schema_migrations(version) VALUES(2),(3),(4),(5)")
+    sqlx::raw_sql(include_str!("../../../qbit-prism/sql/001_share_ledger.sql"))
+        .execute(&pool).await?;
+    for sql in [
+        include_str!("../../migrations/002_multi_instance.sql"),
+        include_str!("../../migrations/003_2x_compatibility.sql"),
+        include_str!("../../migrations/004_cpfp_retired_funding.sql"),
+        include_str!("../../migrations/005_candidate_dispatch.sql"),
+    ] {
+        sqlx::raw_sql(sql).execute(&pool).await?;
+    }
+    sqlx::raw_sql("CREATE TABLE qbit_prism_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())")
+        .execute(&pool).await?;
+    sqlx::raw_sql("INSERT INTO qbit_prism_schema_migrations(version) VALUES(2),(3),(4),(5)")
         .execute(&pool).await?;
     let ledger = Ledger::connect(&db.url, "pre009".into(), 4, false).await?;
     ledger.pool.close().await;
