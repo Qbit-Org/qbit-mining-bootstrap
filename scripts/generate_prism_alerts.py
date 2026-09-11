@@ -106,30 +106,7 @@ def jinja_rules(rules):
     # Documentation-only fields never enter the Grafana provisioning contract.
     rows = [{key: value for key, value in rule.items()
              if key not in {"role", "basis", "producer_refs"}} for rule in rules]
-    text = json.dumps(rows, indent=2).replace("__NETWORK__", '" ~ qbit_monitoring_stack_network ~ "')
-    # Preserve the deployment's per-network tuning surface for the native
-    # rules whose operational bounds were configurable in 2.x.x.  The JSON
-    # contract keeps the current defaults; the generated Jinja expression
-    # resolves overrides at render time.
-    overrides = {
-        "qbit-prism-connected-clients": ("qbit_monitoring_stack_prism_alert_connected_clients_threshold", "qbit_monitoring_stack_prism_alert_connected_clients_for", "10"),
-        "qbit-prism-candidate-oldest": ("qbit_monitoring_stack_prism_alert_candidate_oldest_warning_seconds", "qbit_monitoring_stack_prism_alert_candidate_oldest_warning_for", "15"),
-        "qbit-prism-candidate-oldest-critical": ("qbit_monitoring_stack_prism_alert_candidate_oldest_critical_seconds", "qbit_monitoring_stack_prism_alert_candidate_oldest_critical_for", "60"),
-        "qbit-prism-semantic-work-coverage": ("qbit_monitoring_stack_prism_alert_semantic_coverage_warning_ratio", "qbit_monitoring_stack_prism_alert_semantic_coverage_warning_for", "0.95"),
-        "qbit-prism-semantic-coverage-critical": ("qbit_monitoring_stack_prism_alert_semantic_coverage_critical_ratio", "qbit_monitoring_stack_prism_alert_semantic_coverage_critical_for", "0.5"),
-    }
-    for uid, (threshold_var, for_var, literal) in overrides.items():
-        marker = '\"uid\": \"' + uid + '\"'
-        start = text.find(marker)
-        if start < 0:
-            continue
-        end = text.find('\"uid\": \"', start + len(marker))
-        block_end = end if end >= 0 else len(text)
-        block = text[start:block_end]
-        block = block.replace(literal, '{{ ' + threshold_var + ' | default(' + literal + ') }}', 1)
-        block = block.replace('\"for\": \"3m\"', '\"for\": \"{{ ' + for_var + ' | default(\"3m\") }}\"', 1)
-        text = text[:start] + block + text[block_end:]
-    return text
+    return json.dumps(rows, indent=2).replace("__NETWORK__", '" ~ qbit_monitoring_stack_network ~ "')
 
 
 def deployment_template(snapshot):
