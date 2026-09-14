@@ -347,7 +347,10 @@ exits `0` on pass, `1` on fail, `2` on unusable input. The span floor is the
 Python tool's default: `min_span=82800` refuses a series that spans less than
 23 hours from its first sample to its last, not one shorter than the soak. The
 tool's source recorded the hour of slack as tolerance for a late first sample;
-the run itself is still the 24 h that step 2 below asks for. The span floor
+the run itself is still the 24 h that step 2 below asks for, and step 3's loop
+ends the run only when its samples span that, by writing a marker that step 6
+requires before this check is run, so the hour of slack does not pass a run
+that was cut short in its last hour, however it was cut. The span floor
 sees only the first and last samples, so it cannot see a hole between them:
 two samples 23 hours apart satisfy it, and so does a series with an hour
 missing after the warm-up. `max_gap=360` refuses a series in which two
@@ -445,7 +448,10 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    the previous one and that it is still reading the process the run
    started with, after the sample's reads it reads the identity again, and
    it stops the run as invalid when any of these checks fails or when one
-   of its appends to the run's files does:
+   of its appends to the run's files does. It ends the run itself, as
+   complete, after the first sample taken 86,400 s or more after the
+   first, once that sample has passed every check, by writing
+   `soak-complete` and returning `0`:
 
    ```sh
    c=<prism-coordinator-container>
@@ -459,6 +465,7 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    capture() {
      first=$(process)
      prev=
+     start=
      mkdir "$run" || return
      while true; do
        now=$(date +%s)
@@ -467,6 +474,7 @@ two-hour cutover soak, which reads its own criteria from the same registry.
          return 1
        fi
        prev=$now
+       if [ -z "$start" ]; then start=$now; fi
        current=$(process)
        if ! echo "$now $current" >> "$run/soak-process.log"; then
          echo "$(date -u +%FT%TZ): soak invalid, could not append the reading at $now to $run/soak-process.log" | invalid
@@ -539,6 +547,14 @@ two-hour cutover soak, which reads its own criteria from the same registry.
          } | invalid
          return 1
        fi
+       if [ $((now - start)) -ge 86400 ]; then
+         printf '%s\n' "$(date -u +%FT%TZ): soak complete, the samples from $start to $now span $((now - start)) s" > "$run/soak-complete.tmp" \
+           && mv "$run/soak-complete.tmp" "$run/soak-complete" || {
+           echo "$(date -u +%FT%TZ): soak invalid, could not write $run/soak-complete after the sample at $now" | invalid
+           return 1
+         }
+         return 0
+       fi
        sleep 300
      done
    }
@@ -561,12 +577,15 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    restart between the check and the reads would record the replacement's
    RSS and metrics under the original identity in `soak-process.log`. Every
    later iteration's check would catch that, but the last iteration of a
-   valid run has no later iteration, because the operator ends the run after
-   24 h, so a restart in that window on the last sample would leave a
-   directory with no `soak-invalid` that reads as a single-process run. So
-   the identity is read again after the two reads, and a change ends the run
-   as invalid; that sample's rows are already in the files, which is fine,
-   because the marker keeps the directory from being judged, as step 6 says.
+   valid run has no later iteration, because `capture` ends the run after
+   the sample that completes the 24 h, so a restart in that window on the
+   last sample would leave a directory with no `soak-invalid` that reads as
+   a single-process run. So the identity is read again after the two reads,
+   and a change ends the run as invalid; that sample's rows are already in
+   the files, which is fine, because the marker keeps the directory from
+   being judged, as step 6 says. The completion check comes after this
+   one, so `soak-complete` is written only when the sample that completes
+   the 24 h has passed it.
    Any change during the soak invalidates the run: keep the run directory,
    whose `soak-invalid` holds the message, attach `docker logs "$c"` (the
    container keeps the exited process's output), and start over from step 2.
@@ -678,9 +697,9 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    to say the run was cut short; a wrapper that ran the fence as a script,
    or an operator who kept the directory and lost the shell's scrollback,
    would have judged it and passed it. So the directory records why it is
-   invalid on its own, and the status says that it is: the only way
-   `capture` returns by itself is an invalidation, because a valid run is
-   ended by the operator after 24 h and leaves no `soak-invalid`. The fence
+   invalid on its own, and the status says that it is: `capture` returns
+   `1` only through `invalid`, and `0` only once it has written the
+   completion marker the next paragraph describes, `soak-complete`. The fence
    defines `capture` and calls it in the operator's interactive shell,
    which is why the stop paths `return` rather than `exit`, which would end
    the shell that steps 4 to 7 read `$run` from, and why `run=` is set
@@ -688,6 +707,42 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    not be written; `tee` says so on stderr and still copies the message
    there, so it reaches the operator either way, and the run starts over
    from step 2 as before.
+
+   A valid run ends with a marker too, for the same reason. The judge's
+   span floor is 82,800 s, an hour short of the soak, and a loop that ran
+   until something outside it ended the run left that hour to whatever
+   did: a `SIGHUP` from a closed terminal, a `SIGTERM` from a host going
+   down or an operator's interrupt in the 24th hour runs none of the stop
+   paths, writes no `soak-invalid`, and leaves a CSV whose first and last
+   samples are 23 h apart, which the floor accepts. Nothing in that
+   directory told it apart from a run the operator had ended after 24 h,
+   and a directory judged on its files alone passed. So the loop keeps the
+   time of its first sample, the first row of the CSV, and ends the run
+   itself: after the first sample taken 86,400 s or more after it, once
+   that sample's reads, appends and both identity checks have passed, it
+   writes one line, the time and the span the samples cover, to
+   `$run/soak-complete.tmp`, renames that to `$run/soak-complete`, and
+   returns `0`. The marker is published by the rename, so it appears whole
+   or not at all. A redirect straight to the marker's name would create
+   the file before the first byte is written, and a write that then
+   failed, on a full disk, could keep `invalid` from writing
+   `soak-invalid` on the same disk in the same moment, leaving an empty
+   `soak-complete` and no `soak-invalid`, which is the one directory the
+   gate must never accept. The rename is a single operation inside the run
+   directory: a write or rename that fails, or an interruption between the
+   two, leaves at most `soak-complete.tmp`, which step 6 does not read, and
+   a write or rename that fails also ends the run as invalid through
+   `invalid`, like a failed append, so the run is invalid whether or not
+   that message reaches the disk. Step 6 reads the two markers before the
+   CSV: `soak-invalid` makes the run invalid whatever else the directory
+   holds, neither marker is a run cut short before it was complete, and
+   only `soak-complete` with no `soak-invalid` reaches the bound check. The
+   marker is written by the loop that took every sample in the directory
+   and by nothing else: `capture` returns on the `mkdir` that finds the
+   directory already there, so a marker an earlier run left cannot be
+   found by a later one, and an operator does not write one by hand. A run
+   cut short is invalid and starts over from step 2, keeping its directory
+   as the restart rule asks.
 
    `VmRSS` in `/proc/1/status` is the field the registry's process collector
    reads, so the CSV and the gauge agree up to collector cadence. The log also
@@ -712,14 +767,39 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    and the body at the breach is what the correlated reading works from.
 5. **Trim** is retired with `malloc_trim`; there is nothing to send at hour 23.
 6. **Judge** each run with the `awk` bound check above against its own
-   `$run/soak-rss.csv`; the check names `soak-rss.csv`, so run it inside the
-   run directory or substitute the path. A run directory that holds
-   `soak-invalid` is not judged, whatever its CSV would say: `capture`
+   `$run/soak-rss.csv`, and only once this gate has accepted the run
+   directory:
+
+   ```sh
+   completed() {
+     if [ -e "$run/soak-invalid" ]; then
+       echo "not judged: $run/soak-invalid says why the run is invalid" >&2
+       return 1
+     fi
+     if [ ! -f "$run/soak-complete" ]; then
+       echo "not judged: $run has no soak-complete, capture did not end the run after 24 h of samples" >&2
+       return 1
+     fi
+     cat "$run/soak-complete"
+   }
+   completed
+   ```
+
+   The gate prints the completion line and exits `0` for a directory that
+   holds `soak-complete` and no `soak-invalid`; then run the bound check
+   inside the run directory, or substitute the path, since the check names
+   `soak-rss.csv`. It exits `1`, and the run is not judged whatever its CSV
+   would say, when the directory holds `soak-invalid`, because `capture`
    stopped the run on a gap between samples, a process change, a missing
-   RSS sample, an append that failed or a metrics scrape that failed, was
-   not fresh, had its process collector unavailable or carried no usable
-   RSS value, the marker says which, and the run is invalid and is run
-   again from step 2.
+   RSS sample, an append that failed, a metrics scrape that failed, was not
+   fresh, had its process collector unavailable or carried no usable RSS
+   value, or a completion marker it could not write, and the marker says
+   which; and when the directory holds no `soak-complete`, because then
+   `capture` did not end the run itself after 24 h of samples, so whatever
+   did, a signal, a reboot, a closed terminal or an interrupt, did so before
+   the run was complete, however far its CSV reaches. Either run is invalid
+   and is run again from step 2. The marker is `capture`'s to write; do not
+   write one by hand.
    Pass: exit `0`, and share-ack p99 at hour 24 within the
    alert threshold configured for the deployment (the native rules are
    #279's). Fail: exit `1`, or a share-ack regression between hour 1 and hour
@@ -728,9 +808,9 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    that coincides with an RSS excursion is the first thing to explain.
 7. **Record** on issue #291, which owns cutover qualification: the verdict
    line, the run directory (`soak-process.log`, `soak-rss.csv`,
-   `soak-metrics.log`, the three share-ack histograms, and the hour-1,
-   hour-24 and breach snapshots), the image ID, and the redacted deploy
-   dotenv. The glibc version inside the image
+   `soak-metrics.log`, `soak-complete`, the three share-ack histograms, and
+   the hour-1, hour-24 and breach snapshots), the image ID, and the redacted
+   deploy dotenv. The glibc version inside the image
    (`docker exec "$c" ldd --version`) still belongs in the record, because
    the process uses it as its allocator.
 8. **The post-storm drain re-run** on #185 is retired; the storm rig was a
