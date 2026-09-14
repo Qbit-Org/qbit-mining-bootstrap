@@ -972,7 +972,7 @@ async fn a_queued_offer_is_recorded_under_the_phase_that_offered_it() -> Result<
 fn the_server_revision_is_established_from_cargo_dep_info_or_not_at_all() -> Result<()> {
     use qbit_prism_load::provenance::{
         dep_info_path, parse_dep_info, server_revision_evidence, RevisionEvidence,
-        SERVER_CRATE_ROOT,
+        SERVER_CRATE_ROOT, SERVER_MANIFEST,
     };
     use std::time::{Duration, SystemTime};
 
@@ -989,6 +989,13 @@ fn the_server_revision_is_established_from_cargo_dep_info_or_not_at_all() -> Res
     }
     std::fs::write(root.join("Cargo.lock"), b"# lock")?;
     std::fs::write(root.join("Cargo.toml"), b"[workspace]")?;
+    let manifests = [
+        root.join(SERVER_MANIFEST),
+        root.join("crates/qbit-prism/Cargo.toml"),
+    ];
+    for manifest in &manifests {
+        std::fs::write(manifest, b"[package]")?;
+    }
     let release = root.join("target/release");
     std::fs::create_dir_all(&release)?;
     let binary = release.join("qbit-prism-server");
@@ -1015,6 +1022,9 @@ fn the_server_revision_is_established_from_cargo_dep_info_or_not_at_all() -> Res
     }
     set_modified(&root.join("Cargo.lock"), base)?;
     set_modified(&root.join("Cargo.toml"), base)?;
+    for manifest in &manifests {
+        set_modified(manifest, base)?;
+    }
     set_modified(&binary, base + Duration::from_secs(60))?;
 
     // Every source is older than the binary and the server crate root is
@@ -1024,8 +1034,8 @@ fn the_server_revision_is_established_from_cargo_dep_info_or_not_at_all() -> Res
             sources_checked, ..
         } => assert_eq!(
             sources_checked,
-            sources.len() + 2,
-            "sources plus lock and manifest"
+            sources.len() + 2 + manifests.len(),
+            "sources plus lock, workspace manifest and the two crate manifests"
         ),
         RevisionEvidence::Unestablished { reason } => panic!("should be established: {reason}"),
     }
@@ -1087,6 +1097,127 @@ fn the_server_revision_is_established_from_cargo_dep_info_or_not_at_all() -> Res
     );
     assert!(parse_dep_info("/t/bin:\n")?.is_empty());
     assert!(parse_dep_info("\n").is_err());
+    Ok(())
+}
+
+/// A package manifest can change what the tree builds without touching a
+/// source or the lock file: enabling a feature of a dependency already in the
+/// lock. Cargo's dep-info lists no manifests, so with only the sources, the
+/// lock and the workspace manifest checked, a binary built before such a
+/// change reads as Established and the artifact names a HEAD that did not
+/// build it. The server's manifest and those of its path dependencies -- the
+/// crates whose sources Cargo listed -- are inputs too.
+#[test]
+fn a_package_manifest_newer_than_the_binary_leaves_the_revision_unestablished() -> Result<()> {
+    use qbit_prism_load::provenance::{
+        crate_manifests, dep_info_path, server_revision_evidence, RevisionEvidence,
+        SERVER_CRATE_ROOT, SERVER_MANIFEST,
+    };
+    use std::time::{Duration, SystemTime};
+
+    let dir = ScratchDir::new("provenance-manifests");
+    let root = dir.path().join("checkout");
+    let sources = [
+        root.join(SERVER_CRATE_ROOT),
+        root.join("crates/qbit-prism/src/lib.rs"),
+        root.join("crates/qbit-pool-builder/src/lib.rs"),
+        root.join("crates/qbit-pool-builder/src/nested/deep.rs"),
+    ];
+    let server_manifest = root.join(SERVER_MANIFEST);
+    let prism_manifest = root.join("crates/qbit-prism/Cargo.toml");
+    let builder_manifest = root.join("crates/qbit-pool-builder/Cargo.toml");
+    let files = [
+        root.join("Cargo.lock"),
+        root.join("Cargo.toml"),
+        server_manifest.clone(),
+        prism_manifest.clone(),
+        builder_manifest.clone(),
+    ];
+    for path in sources.iter().chain(&files) {
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(path, b"#")?;
+    }
+    let release = root.join("target/release");
+    std::fs::create_dir_all(&release)?;
+    let binary = release.join("qbit-prism-server");
+    std::fs::write(&binary, b"ELF")?;
+    let listed = sources
+        .iter()
+        .map(|source| source.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    std::fs::write(
+        dep_info_path(&binary),
+        format!("{}: {listed}\n", binary.display()),
+    )?;
+    let set_modified = |path: &std::path::Path, at: SystemTime| -> Result<()> {
+        std::fs::File::options()
+            .write(true)
+            .open(path)?
+            .set_modified(at)?;
+        Ok(())
+    };
+    let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    for path in sources.iter().chain(&files) {
+        set_modified(path, base)?;
+    }
+    set_modified(&binary, base + Duration::from_secs(60))?;
+
+    // The path-dependency manifests are derived from the listed sources, one
+    // per crate however many of its sources are listed, and never the
+    // workspace manifest itself, which is an input in its own right.
+    let derived = crate_manifests(
+        &sources
+            .iter()
+            .map(|source| std::fs::canonicalize(source).unwrap())
+            .collect::<Vec<_>>(),
+        &std::fs::canonicalize(&root)?,
+    );
+    let expected: std::collections::BTreeSet<_> =
+        [&server_manifest, &prism_manifest, &builder_manifest]
+            .into_iter()
+            .map(|manifest| std::fs::canonicalize(manifest).unwrap())
+            .collect();
+    assert_eq!(derived, expected);
+
+    // Everything is older than the binary: established, with every manifest
+    // among the inputs.
+    match server_revision_evidence(&binary, &root) {
+        RevisionEvidence::Established {
+            sources_checked, ..
+        } => assert_eq!(sources_checked, sources.len() + files.len()),
+        RevisionEvidence::Unestablished { reason } => panic!("should be established: {reason}"),
+    }
+
+    // The server's own manifest changed after the build -- a dependency
+    // feature enabled, no source and no lock entry touched. The binary is not
+    // what the tree builds now.
+    set_modified(&server_manifest, base + Duration::from_secs(120))?;
+    let RevisionEvidence::Unestablished { reason } = server_revision_evidence(&binary, &root)
+    else {
+        panic!("a newer server manifest must leave the revision unestablished");
+    };
+    assert!(reason.contains("qbit-prism-server/Cargo.toml"), "{reason}");
+    assert!(reason.contains("newer than the binary"), "{reason}");
+    set_modified(&server_manifest, base)?;
+
+    // The same for a path dependency's manifest.
+    set_modified(&builder_manifest, base + Duration::from_secs(120))?;
+    let RevisionEvidence::Unestablished { reason } = server_revision_evidence(&binary, &root)
+    else {
+        panic!("a newer path-dependency manifest must leave the revision unestablished");
+    };
+    assert!(reason.contains("qbit-pool-builder/Cargo.toml"), "{reason}");
+    set_modified(&builder_manifest, base)?;
+
+    // A checkout without the server manifest is not one the binary can be
+    // tied to, whatever the dep-info lists.
+    std::fs::remove_file(&server_manifest)?;
+    let RevisionEvidence::Unestablished { reason } = server_revision_evidence(&binary, &root)
+    else {
+        panic!("a missing server manifest must leave the revision unestablished");
+    };
+    assert!(reason.contains("qbit-prism-server/Cargo.toml"), "{reason}");
     Ok(())
 }
 

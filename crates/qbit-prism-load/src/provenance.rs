@@ -12,14 +12,23 @@
 //! way Cargo itself decides whether a binary is fresh: from the dep-info file
 //! Cargo writes beside it, which lists every workspace source the binary was
 //! compiled from. If every listed source belongs to this checkout and none is
-//! newer than the binary -- and neither are the lock file and the workspace
-//! manifest, which Cargo's list omits -- then the binary is what this tree
-//! builds, and with a clean tree that is HEAD. Otherwise the revision cannot
-//! be established and the harness says so instead of guessing.
+//! newer than the binary -- and neither are the manifests, which Cargo's
+//! list omits: the lock file, the workspace manifest, the server package's
+//! own and those of every crate a listed source belongs to -- then the
+//! binary is what this tree builds, and with a clean tree that is HEAD.
+//! Otherwise the revision cannot be established and the harness says so
+//! instead of guessing.
+//!
+//! The manifests matter because a package `Cargo.toml` can change what is
+//! built without touching a `.rs` file or the lock file: enabling a feature
+//! of a dependency already in the lock, say. A binary built before such a
+//! change is not what the tree builds now, and every listed source would
+//! still be older than it.
 
 use anyhow::{ensure, Context, Result};
 use serde::Serialize;
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -28,16 +37,45 @@ use std::{
 /// this checkout and not to a binary built elsewhere.
 pub const SERVER_CRATE_ROOT: &str = "crates/qbit-prism-server/src/main.rs";
 
+/// The server package's own manifest: always an input, whatever the dep-info
+/// lists.
+pub const SERVER_MANIFEST: &str = "crates/qbit-prism-server/Cargo.toml";
+
 /// Inputs Cargo's dep-info does not list but which change what the tree
 /// builds.
 pub const WORKSPACE_INPUTS: &[&str] = &["Cargo.lock", "Cargo.toml"];
+
+/// The manifest of every crate a listed source belongs to: the nearest
+/// `Cargo.toml` above each source, searched no further up than `repo_root`.
+/// Cargo's list covers the server's path dependencies transitively, so this
+/// is the server's path-dependency manifests derived from Cargo's own record
+/// rather than a list that could drift from the manifest. A source outside
+/// the checkout contributes nothing here; its own timestamp is still checked.
+pub fn crate_manifests(sources: &[PathBuf], repo_root: &Path) -> BTreeSet<PathBuf> {
+    let mut manifests = BTreeSet::new();
+    for source in sources {
+        for directory in source.ancestors().skip(1) {
+            if !directory.starts_with(repo_root) {
+                break;
+            }
+            let manifest = directory.join("Cargo.toml");
+            if manifest.is_file() {
+                manifests.insert(manifest);
+                break;
+            }
+        }
+    }
+    manifests
+}
 
 /// Whether the binary can be tied to the checkout's HEAD, and how.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RevisionEvidence {
-    /// Every source Cargo recorded for the binary is in this checkout and no
-    /// newer than the binary, so the binary is what this tree builds.
+    /// Every source Cargo recorded for the binary, and every manifest that
+    /// governs how they are built, is in this checkout and no newer than the
+    /// binary, so the binary is what this tree builds. `sources_checked`
+    /// counts the distinct inputs, manifests included.
     Established {
         dep_info: String,
         sources_checked: usize,
@@ -150,10 +188,12 @@ fn check(binary: &Path, repo_root: &Path) -> Result<RevisionEvidence> {
         dep_info.display(),
         crate_root.display()
     );
-    let inputs: Vec<PathBuf> = sources
+    let inputs: BTreeSet<PathBuf> = sources
         .iter()
         .cloned()
         .chain(WORKSPACE_INPUTS.iter().map(|input| repo_root.join(input)))
+        .chain(std::iter::once(repo_root.join(SERVER_MANIFEST)))
+        .chain(crate_manifests(&sources, &repo_root))
         .collect();
     let mut checked = 0usize;
     for source in &inputs {
