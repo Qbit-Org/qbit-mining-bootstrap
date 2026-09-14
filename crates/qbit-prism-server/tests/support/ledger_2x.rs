@@ -1831,6 +1831,76 @@ async fn executable_extra_column_is_refused_naming_it_and_rolls_back() -> Result
     Ok(())
 }
 
+/// Rewrite rules run before triggers and can suppress native INSERT RETURNING.
+#[tokio::test]
+async fn extra_rewrite_rule_is_refused_naming_it_and_rolls_back() -> Result<()> {
+    for state in [SourceState::Pre258, SourceState::Applied258] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let pool = PgPool::connect(&db.url).await?;
+        apply_frozen_2x_schema(&pool, state).await?;
+        insert_share_as_writer(&pool, "legacy:1", 1).await?;
+        sqlx::raw_sql("CREATE RULE operator_suppress_share AS ON INSERT TO qbit_share_ledger DO INSTEAD NOTHING; CREATE TABLE operator_notes(note text); CREATE RULE operator_suppress_note AS ON INSERT TO operator_notes DO INSTEAD NOTHING")
+            .execute(&pool).await?;
+        let refused = sqlx::query("INSERT INTO qbit_share_ledger SELECT * FROM qbit_share_ledger WHERE false RETURNING share_seq")
+            .execute(&pool).await.err().context("rewrite rule accepted INSERT RETURNING")?.to_string();
+        assert!(refused.contains("RETURNING"), "{refused}");
+        let objects = schema_objects(&pool).await?;
+        let rows: Vec<Value> = sqlx::query_scalar("SELECT to_jsonb(s) FROM qbit_share_ledger s")
+            .fetch_all(&pool)
+            .await?;
+        let rules_sql = "SELECT pg_get_ruledef(r.oid) || ':' || r.ev_enabled::text FROM pg_rewrite r JOIN pg_class c ON c.oid=r.ev_class WHERE c.relnamespace=current_schema()::regnamespace ORDER BY 1";
+        let rules: Vec<String> = sqlx::query_scalar(rules_sql).fetch_all(&pool).await?;
+        let error = db
+            .ledger("a")
+            .await
+            .err()
+            .context("migration accepted an extra rewrite rule")?
+            .to_string();
+        assert!(
+            error.contains("refusing to migrate a drifted 001 source"),
+            "{error}"
+        );
+        assert!(
+            error.contains("rule operator_suppress_share on qbit_share_ledger"),
+            "{error}"
+        );
+        assert!(!error.contains("operator_suppress_note"), "{error}");
+        assert!(error.contains("Nothing was changed"), "{error}");
+        assert!(native_tables_absent(&pool).await?);
+        assert_eq!(schema_objects(&pool).await?, objects);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(rules_sql)
+                .fetch_all(&pool)
+                .await?,
+            rules
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Value>("SELECT to_jsonb(s) FROM qbit_share_ledger s")
+                .fetch_all(&pool)
+                .await?,
+            rows
+        );
+        sqlx::raw_sql("DROP RULE operator_suppress_share ON qbit_share_ledger")
+            .execute(&pool)
+            .await?;
+        let ledger = db.ledger("a").await?;
+        assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+        exercise_native_writers(&ledger, 1, 6801).await?;
+        assert_eq!(
+            sqlx::query("INSERT INTO operator_notes VALUES('suppressed')")
+                .execute(&pool)
+                .await?
+                .rows_affected(),
+            0
+        );
+        pool.close().await;
+        db.close(vec![ledger]).await?;
+    }
+    Ok(())
+}
+
 /// The operator's own triggers, as `table.trigger=state`.
 async fn operator_triggers(pool: &PgPool) -> Result<Vec<String>> {
     Ok(sqlx::query_scalar("SELECT c.relname::text||'.'||t.tgname::text||'='||t.tgenabled::text FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid WHERE c.relnamespace=current_schema()::regnamespace AND NOT t.tgisinternal AND t.tgname LIKE 'operator%' ORDER BY 1")

@@ -233,7 +233,11 @@ native share insert, which writes epoch 0, so it is named with what it runs
 operator_epoch_guard BEFORE INSERT ON qbit_share_ledger FOR EACH ROW EXECUTE
 FUNCTION operator_reject_epoch_zero(); the release has no trigger on this
 table`); a trigger on a table the release does not create is the operator's
-own and is kept. An extra constraint on a release table is also drift:
+own and is kept. Rewrite rules on release tables are compared by definition
+and enabled state too. An extra rule is refused even when disabled: an
+`ON INSERT DO INSTEAD` rule can suppress or redirect native inserts before
+triggers run. Rules on operator-only tables are kept.
+An extra constraint on a release table is also drift:
 `CHECK (writer_epoch > 0)` accepts legacy shares but rejects native shares,
 so migration refuses it by name and definition, regardless of validation or
 enforcement state. Constraints on the operator's own tables are kept.

@@ -658,6 +658,13 @@ struct TriggerDefinition {
     enabled: String,
 }
 
+/// A rewrite rule can replace or add to a statement before triggers run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuleDefinition {
+    definition: String,
+    enabled: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FunctionDefinition {
     arguments: String,
@@ -731,8 +738,9 @@ struct SequenceDefinition {
     cycle: bool,
 }
 
-/// Every table, column, constraint, index, trigger, function, sequence and
-/// row-level security policy of one schema, as the server renders them,
+/// Every table, column, constraint, index, trigger, function, sequence,
+/// rewrite rule and row-level security policy of one schema, as the server
+/// renders them,
 /// without schema qualification. Columns are keyed by name, so their
 /// physical order is irrelevant; constraints are keyed per table by
 /// definition, so an auto-generated name is irrelevant; comments are not
@@ -750,6 +758,8 @@ struct SchemaFingerprint {
     indexes: BTreeMap<String, IndexDefinition>,
     /// Keyed by table, then trigger name.
     triggers: BTreeMap<(String, String), TriggerDefinition>,
+    /// Keyed by table, then rewrite rule name.
+    rules: BTreeMap<(String, String), RuleDefinition>,
     /// Keyed by table, then policy name.
     policies: BTreeMap<(String, String), PolicyDefinition>,
     /// Keyed by name, then identity arguments.
@@ -1031,6 +1041,18 @@ async fn fingerprint_schema(
         fingerprint.triggers.insert(
             (row.try_get("table_name")?, row.try_get("name")?),
             TriggerDefinition {
+                definition: strip_schema_qualification(&definition, namespace),
+                enabled: row.try_get("enabled")?,
+            },
+        );
+    }
+    let rows = sqlx::query("SELECT c.relname::text AS table_name,r.rulename::text AS name,pg_get_ruledef(r.oid) AS definition,r.ev_enabled::text AS enabled FROM pg_rewrite r JOIN pg_class c ON c.oid=r.ev_class JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 ORDER BY 1,2")
+        .bind(namespace).fetch_all(&mut **tx).await?;
+    for row in &rows {
+        let definition: String = row.try_get("definition")?;
+        fingerprint.rules.insert(
+            (row.try_get("table_name")?, row.try_get("name")?),
+            RuleDefinition {
                 definition: strip_schema_qualification(&definition, namespace),
                 enabled: row.try_get("enabled")?,
             },
@@ -1696,6 +1718,31 @@ fn compare_fingerprints(
                 "has no trigger on this table"
             }
         ));
+    }
+    for ((table, name), rule) in &expected.rules {
+        if !found.tables.contains_key(table) {
+            continue;
+        }
+        match found.rules.get(&(table.clone(), name.clone())) {
+            None => comparison
+                .drift
+                .push(format!("missing rule {name} on {table}")),
+            Some(actual) if actual != rule => comparison.drift.push(format!(
+                "rule {name} on {table} differs: expected {} (enabled {}), found {} (enabled {})",
+                rule.definition, rule.enabled, actual.definition, actual.enabled
+            )),
+            Some(_) => {}
+        }
+    }
+    for ((table, name), rule) in &found.rules {
+        if expected.tables.contains_key(table)
+            && !expected.rules.contains_key(&(table.clone(), name.clone()))
+        {
+            comparison.drift.push(format!(
+                "rule {name} on {table}: {}; the release does not create it",
+                rule.definition
+            ));
+        }
     }
     for ((table, name), policy) in &expected.policies {
         if !found.tables.contains_key(table) {
@@ -3078,6 +3125,61 @@ mod tests {
         let comparison = compare_fingerprints(&expected, &found);
         assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
         assert_eq!(comparison.extra, vec!["table operator_notes"]);
+    }
+
+    #[test]
+    fn rewrite_rules_are_compared_and_extra_release_table_rules_are_drift() {
+        let mut expected = SchemaFingerprint::default();
+        expected
+            .tables
+            .insert("t".into(), table(&[("a", column("bigint", true))]));
+        let key = ("t".to_owned(), "operator_rule".to_owned());
+        let rule = RuleDefinition {
+            definition: "CREATE RULE operator_rule AS ON INSERT TO t DO INSTEAD NOTHING".into(),
+            enabled: "O".into(),
+        };
+        let mut found = SchemaFingerprint {
+            tables: expected.tables.clone(),
+            ..SchemaFingerprint::default()
+        };
+        found
+            .rules
+            .insert(("operator_notes".into(), "own_rule".into()), rule.clone());
+        assert!(compare_fingerprints(&expected, &found).drift.is_empty());
+        for enabled in ["O", "D", "R", "A"] {
+            found.rules.insert(
+                key.clone(),
+                RuleDefinition {
+                    enabled: enabled.into(),
+                    ..rule.clone()
+                },
+            );
+            assert_eq!(
+                compare_fingerprints(&expected, &found).drift,
+                vec![format!(
+                    "rule operator_rule on t: {}; the release does not create it",
+                    rule.definition
+                )]
+            );
+        }
+        expected.rules.insert(key.clone(), rule.clone());
+        found.rules.insert(key.clone(), rule.clone());
+        assert!(compare_fingerprints(&expected, &found).drift.is_empty());
+        found.rules.get_mut(&key).unwrap().enabled = "D".into();
+        assert!(compare_fingerprints(&expected, &found).drift[0].contains("enabled D"));
+        found.rules.insert(
+            key.clone(),
+            RuleDefinition {
+                definition: "changed".into(),
+                ..rule
+            },
+        );
+        assert!(compare_fingerprints(&expected, &found).drift[0].contains("found changed"));
+        found.rules.remove(&key);
+        assert_eq!(
+            compare_fingerprints(&expected, &found).drift,
+            vec!["missing rule operator_rule on t"]
+        );
     }
 
     #[test]
