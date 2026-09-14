@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Measure server-wide WAL generated during one caller-controlled operation."""
+"""Measure server-wide WAL for one caller-controlled operation.
+
+Each psql invocation has its own finite timeout; the measurement as a whole
+may contain four bounded calls. WAL is server-wide for the bracket interval,
+and operation_seconds ends immediately after the operation call. A timeout or
+connection loss after an attempted operation leaves side effects uncertain;
+this helper never retries or claims rollback.
+"""
 from __future__ import annotations
 import argparse, json, os, subprocess, time
 from urllib.parse import urlparse
@@ -32,11 +39,12 @@ def measure(dsn: str, sql: str, source: str, config: str, timeout_seconds: float
         psql(dsn, sql, timeout_seconds)
     except RuntimeError as exc:
         return {"outcome":"operation_failed", "execution_stage":"operation", "side_effect_status":"unknown", "measurement_scope":"server-wide", "source":source, "config":config, "operation_seconds":time.monotonic()-began, "setup_seconds":setup_seconds, "error":str(exc)}
+    operation_seconds = time.monotonic()-began
     try: end = psql(dsn, "select pg_current_wal_lsn()", timeout_seconds)
-    except RuntimeError as exc: return {"outcome":"measurement_failed", "operation_status":"succeeded", "measurement_status":"failed", "execution_stage":"post-operation", "measurement_scope":"server-wide", "source":source, "config":config, "operation_seconds":time.monotonic()-began, "setup_seconds":setup_seconds, "error":str(exc)}
+    except RuntimeError as exc: return {"outcome":"measurement_failed", "operation_status":"succeeded", "measurement_status":"failed", "execution_stage":"post-operation", "measurement_scope":"server-wide", "source":source, "config":config, "operation_seconds":operation_seconds, "setup_seconds":setup_seconds, "error":str(exc)}
     try: delta = float(psql(dsn, f"select pg_wal_lsn_diff('{end}','{start}')", timeout_seconds))
-    except RuntimeError as exc: return {"outcome":"measurement_failed", "operation_status":"succeeded", "measurement_status":"failed", "execution_stage":"post-operation", "measurement_scope":"server-wide", "source":source, "config":config, "operation_seconds":time.monotonic()-began, "setup_seconds":setup_seconds, "error":str(exc)}
-    return {"outcome":"ok", "operation_status":"succeeded", "measurement_status":"succeeded", "measurement_scope":"server-wide", "source":source, "config":config, "start_lsn":start, "end_lsn":end, "wal_bytes":delta, "operation_seconds":time.monotonic()-began, "setup_seconds":setup_seconds}
+    except RuntimeError as exc: return {"outcome":"measurement_failed", "operation_status":"succeeded", "measurement_status":"failed", "execution_stage":"post-operation", "measurement_scope":"server-wide", "source":source, "config":config, "operation_seconds":operation_seconds, "setup_seconds":setup_seconds, "error":str(exc)}
+    return {"outcome":"ok", "operation_status":"succeeded", "measurement_status":"succeeded", "measurement_scope":"server-wide", "source":source, "config":config, "start_lsn":start, "end_lsn":end, "wal_bytes":delta, "operation_seconds":operation_seconds, "setup_seconds":setup_seconds}
 
 def main() -> int:
     ap=argparse.ArgumentParser(); ap.add_argument("--dsn", required=True); ap.add_argument("--sql", required=True); ap.add_argument("--source", default="caller-operation"); ap.add_argument("--config", required=True); ap.add_argument("--timeout-seconds", type=float, default=10.0)
