@@ -151,6 +151,10 @@ pub(super) fn test_config(
         snapshot_interval: Duration::from_secs(60),
         health_timeout: Duration::from_secs(60),
         share_commit_timeout,
+        share_commit_grace: Duration::from_secs(5),
+        // Block-only acknowledgements keep the bound these harnesses were
+        // written against.
+        block_only_ack_timeout: share_commit_timeout,
         extranonce2_size: EXTRANONCE2_SIZE,
         coinbase_tag: "/PRISM/".into(),
         manifest_seed: "11".repeat(32),
