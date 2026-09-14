@@ -581,7 +581,7 @@ two-hour cutover soak, which reads its own criteria from the same registry.
        fi
        prev_accepted=$(printf '%s\n' "$metrics" | awk '$1 == "qbit_prism_share_ack_seconds_count{result=\"accepted\"}" { print $2 }')
        lines=$(printf '%s\n' "$metrics" \
-         | grep -E '^(x-prism-metrics-state:|qbit_prism_share_ack_seconds_count\{result="accepted"\} |qbit_prism_(process_resident_memory_bytes|collector_available|collector_age_seconds|runtime_lag_seconds|runtime_task_stalled|runtime_poll_lag_seconds|database_pool_acquire_seconds(_bucket|_sum|_count)|connections|authorized_clients|accepted_shares_total|block_candidates_pending)[ {])' \
+         | grep -E '^(x-prism-metrics-state:|qbit_prism_(share_ack_seconds(_bucket|_sum|_count)|process_resident_memory_bytes|collector_available|collector_age_seconds|runtime_lag_seconds|runtime_task_stalled|runtime_poll_lag_seconds|database_pool_acquire_seconds(_bucket|_sum|_count)|connections|authorized_clients|accepted_shares_total|block_candidates_pending)[ {])' \
          | sed "s/^/$now /")
        printf '%s\n' "$lines" >> "$run/soak-metrics.log" || {
          echo "$(date -u +%FT%TZ): soak invalid, could not append the sample at $now to $run/soak-metrics.log" | invalid
@@ -798,7 +798,8 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    sample, and the authorized count must match `expected_authorized_clients`;
    missing, malformed, frozen or decreasing evidence invalidates the run
    before completion can be published. Both counts are retained in
-   `soak-metrics.log`. The other families
+   `soak-metrics.log`, together with every share-ACK bucket, sum and count for
+   both results from that same scrape. The other families
    in the filter are not required, because a histogram bucket or a
    `runtime_task_stalled{task}` series can legitimately be absent from a
    given scrape. The step-2 gate proves the body fresh and the collector
@@ -868,8 +869,9 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    reads, so the CSV and the gauge agree up to collector cadence. The log also
    carries the runtime and pool series item 3 of the reading order cites, so a
    breach found after the run can be read back at its own five-minute sample
-   instead of from the hour-1 or hour-24 snapshot. `capture` also keeps the
-   share-ack histogram at hours 1, 12 and 24 for the latency comparison,
+   instead of from the hour-1 or hour-24 snapshot. The per-cadence share-ACK
+   histograms support interval latency comparisons. `capture` also keeps
+   cumulative share-ACK snapshots at hours 1, 12 and 24 for inspection,
    through this function:
 
    ```sh
@@ -916,7 +918,7 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    histogram is not accepted-share latency evidence; the capture loop separately
    checks that accepted ACKs keep progressing. It publishes the snapshot by
    renaming a completed temporary file; a failed write leaves no partial snapshot at the final
-   name. Use only the final `.txt` files for the latency comparison. If any
+   name. Use only the final `.txt` files for snapshot inspection. If any
    call fails, the run lacks usable latency evidence, so `capture` ends it
    as invalid through `invalid`: keep its directory and repeat the soak from
    step 2.
@@ -1016,10 +1018,34 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    the run was complete, however far its CSV reaches. Either run is invalid
    and is run again from step 2. The marker is `capture`'s to write; do not
    write one by hand.
-   Pass: exit `0`, and share-ack p99 at hour 24 within the
-   alert threshold configured for the deployment (the native rules are
-   #279's). Fail: exit `1`, or a share-ack regression between hour 1 and hour
-   24 that the operator would alert on. Record every
+   For latency, use `soak-metrics.log`: subtract the previous cadence's
+   bucket and count values from the hour-1 cadence and, separately, from the
+   hour-24 cadence. Match series by their labels and buckets by `le`, never
+   line order; require complete, unchanged bucket boundaries, including
+   `+Inf`, and counts that agree with `+Inf`. Compute p99 from each interval's
+   cumulative bucket deltas, summing accepted and rejected results before
+   taking the quantile. A single hour snapshot is cumulative since process
+   start; its p99 can hide a slow final interval behind earlier fast ACKs.
+   Missing or malformed evidence, counter decreases/resets, inconsistent
+   bucket deltas or fewer than 100 interval observations make latency
+   **inconclusive**, so the run cannot pass the combined verdict.
+
+   These are adjacent-sample intervals, nominally 300 s with up to 60 s of
+   read overhead and scrape-time variation, not exact Prometheus `[5m]`
+   windows. The shipped `PrismShareAckP99High` rule in
+   `docs/prism-native-alert-rules.json` takes p99 over `rate(..._bucket[5m])`,
+   combines both results per target, requires `increase(..._count[5m]) >= 100`
+   and a fresh, available snapshot, and fires only after p99 stays **above
+   1 second** for `3m`. Use the deployment's actual rule and archived
+   Prometheus evaluations to establish that alert verdict; two soak samples
+   cannot establish the exact five-minute estimate or its dwell.
+
+   Pass: RSS check exit `0` and usable hour-1 and hour-24 interval evidence,
+   with hour-24 p99 within the deployment's configured ACK threshold.
+   Fail: RSS check exit `1` or hour-24 interval p99 above that threshold.
+   Record both interval p99 values, observation counts, elapsed times and the
+   threshold; report any alert firing separately from this interval verdict.
+   Record every
    `qbit_prism_runtime_task_stalled` sample at 1 with its timestamp; a stall
    that coincides with an RSS excursion is the first thing to explain.
 7. **Record** on issue #291, which owns cutover qualification: the verdict

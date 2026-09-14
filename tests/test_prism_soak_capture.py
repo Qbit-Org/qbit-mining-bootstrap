@@ -41,7 +41,7 @@ POPULATION_PLACEHOLDER = "expected_authorized_clients=<ordinary-load-authorized-
 RUN = "soak-20260914T000000Z"
 RSS_KB = 102400
 SAMPLES_24H = 86400 // 300 + 1
-METRICS_LINES_PER_SAMPLE = 6
+METRICS_LINES_PER_SAMPLE = 7
 
 # `sleep` moves the clock; `date` reads it; `docker` counts its `inspect` calls
 # so a test can change the identity, or run a snippet in the run directory, at
@@ -124,6 +124,7 @@ docker() {
       else
         printf 'qbit_prism_share_ack_seconds_count{result="accepted"} %s\n' "$stub_accepted"
       fi
+      if [ -f "$STUB/ack-histogram" ]; then cat "$STUB/ack-histogram"; fi
       printf 'qbit_prism_share_ack_seconds_count{result="rejected"} %s\n' "$((stub_value + 100))" ;;
     *) echo "docker $*" >> "$STUB/unexpected"; return 1 ;;
   esac
@@ -438,7 +439,7 @@ class SoakCaptureTests(unittest.TestCase):
                 self.assertEqual((result.returncode, result.stderr, soak.unexpected()), (-signal.SIGTERM, "", ""))
                 metrics = soak.lines("soak-metrics.log")
                 self.assertEqual(
-                    [line for line in metrics if "share_ack_seconds_count" in line],
+                    [line for line in metrics if 'share_ack_seconds_count{result="accepted"}' in line],
                     ['0 qbit_prism_share_ack_seconds_count{result="accepted"} 0',
                      '300 qbit_prism_share_ack_seconds_count{result="accepted"} 1'],
                 )
@@ -449,6 +450,56 @@ class SoakCaptureTests(unittest.TestCase):
                 self.assertEqual(len(metrics), 2 * METRICS_LINES_PER_SAMPLE)
                 self.assertEqual((soak.stub / "scrapes").read_text(), "2\n")
                 self.assert_gate_refuses_for_want_of_marker(soak)
+
+    def test_cadence_histograms_preserve_slow_interval_after_fast_history(self) -> None:
+        # One million fast historical ACKs hide a final five-minute interval
+        # of slow accepted/rejected ACKs in the cumulative p99. Keep every
+        # bucket and both sums/counts so interval deltas expose it instead.
+        prefix = "qbit_prism_share_ack_seconds_"
+
+        def histogram(result: str, fast: int, total: int) -> str:
+            return "".join(
+                f'{prefix}bucket{{result="{result}",le="{bound}"}} {count}\n'
+                for bound, count in (("1", fast), ("2", total), ("+Inf", total))
+            ) + f'{prefix}sum{{result="{result}"}} {2 * total - fast}\n'
+
+        initial = histogram("accepted", 1_000_000, 1_000_000) + histogram("rejected", 100, 100)
+        final = histogram("accepted", 1_000_000, 1_001_000) + histogram("rejected", 100, 400)
+        for shell in ("sh", "bash"):
+            with self.subTest(shell=shell):
+                soak = SoakRun(
+                    shell, STUB_INTERRUPT_AT="600", STUB_ACCEPTED_BASE="1000000",
+                    STUB_ACCEPTED_FAULT_AT="300",
+                    STUB_ACCEPTED_BODY=f'{prefix}count{{result="accepted"}} 1001000\n',
+                    STUB_SNIPPET_AT_INSPECT="4",
+                    STUB_SNIPPET=f"printf '%s' '{final}' > \"$STUB/ack-histogram\"",
+                )
+                (soak.stub / "ack-histogram").write_text(initial)
+                result = soak.capture()
+                self.assertEqual((result.returncode, result.stderr, soak.unexpected()), (-signal.SIGTERM, "", ""))
+                recorded = {}
+                for line in soak.lines("soak-metrics.log"):
+                    timestamp, metric, value = line.split(maxsplit=2)
+                    if metric.startswith(prefix):
+                        recorded.setdefault(int(timestamp), {})[metric] = int(value)
+                for timestamp, body, accepted, rejected in (
+                    (0, initial, 1_000_000, 100), (300, final, 1_001_000, 400),
+                ):
+                    expected = dict(line.split() for line in body.splitlines())
+                    expected[f'{prefix}count{{result="accepted"}}'] = str(accepted)
+                    expected[f'{prefix}count{{result="rejected"}}'] = str(rejected)
+                    self.assertEqual(recorded[timestamp], {key: int(value) for key, value in expected.items()})
+
+                def combined(timestamp: int, bound: str) -> int:
+                    return sum(recorded[timestamp][f'{prefix}bucket{{result="{result}",le="{bound}"}}']
+                               for result in ("accepted", "rejected"))
+
+                self.assertGreaterEqual(combined(300, "1") / combined(300, "+Inf"), 0.99)
+                observations = combined(300, "+Inf") - combined(0, "+Inf")
+                self.assertEqual(observations, 1300)
+                self.assertEqual(combined(300, "1") - combined(0, "1"), 0)
+                self.assertEqual(combined(300, "2") - combined(0, "2"), observations)
+                self.assertEqual((soak.stub / "scrapes").read_text(), "2\n")
 
     def test_frozen_or_decreasing_accepted_counts_invalidate_the_run(self) -> None:
         prefix = 'qbit_prism_share_ack_seconds_count{result="accepted"}'
