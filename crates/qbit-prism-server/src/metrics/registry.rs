@@ -78,6 +78,7 @@ families! {
     SnapshotAvailable: Gauge, "metrics_snapshot_available", "Whether a complete metrics snapshot has been published.";
     SnapshotStale: Gauge, "metrics_snapshot_stale", "Whether the metrics snapshot is missing or exceeds the health freshness budget.";
     SnapshotAge: Gauge, "metrics_snapshot_age_seconds", "Monotonic age of the metrics snapshot, or -1 before the first publication.";
+    LateConfirmed: Counter, "late_confirmed_shares_total", "Shares accepted after the share commit deadline because their in-flight ledger commit was confirmed within the grace period.";
 }
 
 impl Family {

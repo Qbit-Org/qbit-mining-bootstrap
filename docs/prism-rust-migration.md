@@ -385,6 +385,9 @@ All vectors use the day-one floor of 14720 sats.
     - The Stratum acknowledgement waits for that credit row.
     - A block that is abandoned instead fails the submission with "block-only
       proof was not accepted on the active chain".
+    - The acknowledgement waits at most `block_only_ack_timeout`
+      (`max(60 s, share_commit_timeout)`), and a candidate still pending then
+      is answered `ledger-outcome-unknown` while its credit can still land.
   - On both versions a credited share survives a later reorg.
   - **Modeling assumption:** the `3.x.x` next-block payout assumes the
     deferred credit lands before the next block's anchor, because the credit
