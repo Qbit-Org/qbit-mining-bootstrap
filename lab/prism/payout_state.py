@@ -1968,11 +1968,22 @@ class PayoutStateService:
                     getattr(runtime.ledger, "spool_snapshot_at_job_issue", None)
                 )
                 if isolated:
-                    checked = self._isolated_window_oracle(
-                        snapshot_anchor_ms,
-                        live_window_weight if recenter_oversized else cached_window_weight,
-                        append_invalidation_epoch, comparison_weight=cached_window_weight,
-                    )
+                    # Timed in a finally, like the in-process read below: a
+                    # helper read that dies with the ledger or times out is
+                    # exactly the slow read the phase family exists to
+                    # attribute, and a matched check owns its read time too.
+                    oracle_started = time.monotonic()
+                    try:
+                        checked = self._isolated_window_oracle(
+                            snapshot_anchor_ms,
+                            live_window_weight if recenter_oversized else cached_window_weight,
+                            append_invalidation_epoch, comparison_weight=cached_window_weight,
+                        )
+                    finally:
+                        self._note_window_build_phase(
+                            "ledger_read",
+                            time.monotonic() - oracle_started,
+                        )
                     full_window = checked.window
                     shares_json = full_window.json_records()
                     digest = full_window.share_snapshot_sha256

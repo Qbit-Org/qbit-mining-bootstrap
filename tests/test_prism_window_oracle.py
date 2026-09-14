@@ -357,6 +357,85 @@ class WindowOracleTests(unittest.TestCase):
                 self.assertIsNone(checked.shares_json._parsed)
                 self.assertFalse(hasattr(checked.shares_json, "pages"))
 
+    def test_periodic_helper_scan_keeps_its_ledger_read_time(self):
+        # Review finding (PR 335): the isolated periodic self-check called
+        # the helper with no ``ledger_read`` timing at all, even on success,
+        # while the legacy in-process branch beside it timed its read in a
+        # finally. The helper read must own its wall-clock on every exit: a
+        # matched check and a timed-out one keep their build outcome and
+        # both attribute the time the helper spent.
+        fixture = recenter_tests.DaemonRecenterTests()
+        with patch.dict(os.environ, {"PRISM_WINDOW_PIPELINE_RUST": "1"}):
+            server, ledger, artifacts, daemon = fixture._server()
+            service = server._ensure_payout_state_service()
+            difficulty = int(artifacts.network_difficulty)
+            clock = FakeClock()
+            read_seconds = 2.5
+            real_helper = service._isolated_window_oracle
+            helper_calls = []
+
+            def slow_helper(error):
+                def read(*args, **kwargs):
+                    helper_calls.append(kwargs.get("comparison_weight"))
+                    clock.now += read_seconds
+                    if error is not None:
+                        raise error
+                    return real_helper(*args, **kwargs)
+                return read
+
+            family = "qbit_prism_payout_window_build_phase_seconds"
+
+            def ledger_read_completed(product):
+                prefix = f'{family}_{product}{{phase="ledger_read",outcome="completed"}} '
+                values = [
+                    entry for entry in server.payout_state_metrics_lines()
+                    if entry.startswith(prefix)
+                ]
+                self.assertEqual(len(values), 1, prefix)
+                return float(values[0].split()[-1])
+
+            clock_ms = [1_000_000]
+            with patch.object(payout_state_module, "time", clock), patch(
+                "lab.prism.prism_coordinator.now_ms", side_effect=lambda: clock_ms[0],
+            ):
+                initial = server._build_payout_ledger_artifact(0, 0, difficulty)
+                self.assertIsNotNone(initial)
+                self.assertEqual(initial.window_build_mode, "full_rescan")
+                # Every later build runs the periodic runtime-check: the
+                # debounce and the check interval are both disarmed, as in
+                # the mirror self-check test above.
+                server.payout_artifact_min_build_interval_seconds = 0
+                server.payout_artifact_full_rescan_seconds = 0
+                for error, mode, reason in (
+                    (None, "self_check_match", "periodic_self_check"),
+                    (
+                        TimeoutError("window oracle helper timed out"),
+                        "incremental_self_check_failed",
+                        "periodic_self_check_failed",
+                    ),
+                ):
+                    with self.subTest(mode=mode):
+                        clock_ms[0] += 20
+                        count_before = ledger_read_completed("count")
+                        sum_before = ledger_read_completed("sum")
+                        del helper_calls[:]
+                        with patch.object(
+                            service, "_isolated_window_oracle", side_effect=slow_helper(error),
+                        ):
+                            checked = server._build_payout_ledger_artifact(0, 0, difficulty)
+                        # The check went through the helper once, and its
+                        # classification is unchanged: a failed check still
+                        # completes the build on the validated delta.
+                        self.assertEqual(len(helper_calls), 1)
+                        self.assertIsNotNone(checked)
+                        self.assertEqual(checked.window_build_mode, mode)
+                        self.assertEqual(checked.window_full_rescan_reason, reason)
+                        # The completed build owns the helper's wall-clock.
+                        self.assertEqual(ledger_read_completed("count") - count_before, 1)
+                        elapsed = ledger_read_completed("sum") - sum_before
+                        self.assertGreaterEqual(elapsed, read_seconds)
+                        self.assertLess(elapsed, read_seconds + 0.01)
+
 
 class WindowOwnershipTests(unittest.TestCase):
     def test_gc_retirement_can_reenter_the_accounting_lock(self):
