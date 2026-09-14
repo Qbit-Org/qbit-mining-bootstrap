@@ -523,8 +523,9 @@ struct FanoutState {
 }
 
 async fn fanout(fixture: &PgPool, txid: &str) -> Result<FanoutState> {
+    // Scheduling is relative to the durable write, independent of test delays.
     let (status, claim_token, claim_live, attempt_count, journal_rows, next_attempt_scheduled, last_attempt_status) =
-        sqlx::query_as("SELECT settlement_status,claim_token,COALESCE(claim_expires_at>clock_timestamp(),false),broadcast_attempt_count,(SELECT count(*) FROM qbit_ctv_fanout_broadcast_attempts WHERE fanout_txid=$1),COALESCE(next_broadcast_attempt_at>clock_timestamp(),false),last_broadcast_attempt_status FROM qbit_ctv_fanout_artifacts WHERE fanout_txid=$1")
+        sqlx::query_as("SELECT settlement_status,claim_token,COALESCE(claim_expires_at>clock_timestamp(),false),broadcast_attempt_count,(SELECT count(*) FROM qbit_ctv_fanout_broadcast_attempts WHERE fanout_txid=$1),COALESCE(next_broadcast_attempt_at>updated_at,false),last_broadcast_attempt_status FROM qbit_ctv_fanout_artifacts WHERE fanout_txid=$1")
             .bind(txid)
             .fetch_one(fixture)
             .await?;
@@ -1301,13 +1302,17 @@ async fn broadcast_retry_body(db: &Database) -> Result<()> {
         "a dead token changed the artifact"
     );
 
+    // The state checks above verify the real backoff before the fixture makes
+    // eligibility independent of elapsed wall-clock time.
+    sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET next_broadcast_attempt_at='infinity'::timestamptz WHERE fanout_txid=$1")
+        .bind(&txid).execute(&fixture).await?;
     // Before the scheduled attempt nobody can claim it.
     assert!(
         b.claim_fanout(60).await?.is_none(),
         "claimed inside its backoff"
     );
-    // The backoff elapses.
-    sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET next_broadcast_attempt_at=clock_timestamp() WHERE fanout_txid=$1")
+    // Make the next attempt due without waiting for the backoff to elapse.
+    sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET next_broadcast_attempt_at='-infinity'::timestamptz WHERE fanout_txid=$1")
         .bind(&txid).execute(&fixture).await?;
     let fresh = b
         .claim_fanout(60)
@@ -1404,8 +1409,9 @@ async fn distinct_hashes_body(db: &Database) -> Result<()> {
     .await?;
     let held_before = outbox(&fixture, &held_hash).await?;
     let revision = b.payout_revision().await?;
-    // The other hash lands and finishes within a bound while the first is
-    // held; the short settlement lock is the only serialization it meets.
+    // The other hash lands and finishes while the sibling outbox row stays
+    // locked. This proves row independence; candidate dispositions still
+    // acquire the shared settlement and order locks.
     bounded(b.land_candidate(&progressing, &key)).await?;
     bounded(b.finish_candidate_at_revision(&progressing, true, None, revision)).await?;
     assert_eq!(
