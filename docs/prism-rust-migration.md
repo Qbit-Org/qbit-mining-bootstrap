@@ -428,6 +428,11 @@ A database at 6 must declare its capabilities: 006 created
 nothing native removes them, so a start refuses a database missing either,
 naming the remedy, rather than reading the absence as a legacy state, and
 `migrate` refuses the same database before any DDL.
+The capability table must also have row-level security disabled, including
+its `FORCE` flag. Startup and migration check the catalog before trusting
+its rows, because a policy could hide an unknown capability while exposing
+the required candidate-version declaration. Nothing disables a policy
+automatically; operators must review the table before retrying.
 A migration this release does not know is accepted with a warning that names
 it: native migrations are additive, and a release whose format an older
 binary must not touch declares a capability. With the native default

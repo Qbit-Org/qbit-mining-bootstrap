@@ -2595,6 +2595,95 @@ async fn migrate_role_without_create_on_the_database_is_told_the_grant_it_needs(
 }
 
 #[tokio::test]
+async fn native_capabilities_with_row_level_security_are_refused_before_writes() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let database: String = sqlx::query_scalar("SELECT current_database()::text")
+        .fetch_one(&pool)
+        .await?;
+    let role = format!("prism_cap_rls_{}", Uuid::new_v4().simple());
+    sqlx::raw_sql(&format!("CREATE ROLE {role} LOGIN PASSWORD 'rls'; GRANT USAGE, CREATE ON SCHEMA {} TO {role}; GRANT CREATE ON DATABASE {database} TO {role}", db.schema))
+        .execute(&pool).await?;
+    let mut limited = url::Url::parse(&db.url)?;
+    limited.set_username(&role).ok().context("role username")?;
+    limited
+        .set_password(Some("rls"))
+        .ok()
+        .context("role password")?;
+    let limited_pool = PgPool::connect(limited.as_str()).await?;
+    let ledger = Ledger::connect(limited.as_str(), "init".into(), 8, true).await?;
+    sqlx::raw_sql("INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('sealed_share_pages',1); ALTER TABLE qbit_prism_schema_capabilities ENABLE ROW LEVEL SECURITY; ALTER TABLE qbit_prism_schema_capabilities FORCE ROW LEVEL SECURITY; CREATE POLICY hide_newer ON qbit_prism_schema_capabilities USING (capability='candidate_storage_version')")
+        .execute(&limited_pool).await?;
+    let rows: Vec<Value> = sqlx::query_scalar(
+        "SELECT to_jsonb(c) FROM qbit_prism_schema_capabilities c ORDER BY capability",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM qbit_prism_schema_capabilities")
+            .fetch_one(&limited_pool)
+            .await?,
+        1,
+        "the policy must hide the unknown capability from the ordinary owner"
+    );
+    let objects = schema_objects(&pool).await?;
+    for initialize in [false, true] {
+        let error = Ledger::connect(limited.as_str(), "cold".into(), 8, initialize)
+            .await
+            .err()
+            .context("startup trusted a filtered capability table")?
+            .to_string();
+        assert!(error.contains("qbit_prism_schema_capabilities"), "{error}");
+        assert!(error.contains("row-level security"), "{error}");
+        assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+        assert_eq!(schema_objects(&pool).await?, objects);
+    }
+    undo_009(&pool).await?;
+    let objects = schema_objects(&pool).await?;
+    let error = Ledger::connect(limited.as_str(), "later".into(), 8, true)
+        .await
+        .err()
+        .context("migration trusted a filtered capability table")?
+        .to_string();
+    assert!(error.contains("row-level security"), "{error}");
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 8]);
+    assert_eq!(schema_objects(&pool).await?, objects);
+    assert_eq!(
+        sqlx::query_scalar::<_, Value>(
+            "SELECT to_jsonb(c) FROM qbit_prism_schema_capabilities c ORDER BY capability"
+        )
+        .fetch_all(&pool)
+        .await?,
+        rows
+    );
+    sqlx::raw_sql("ALTER TABLE qbit_prism_schema_capabilities NO FORCE ROW LEVEL SECURITY; ALTER TABLE qbit_prism_schema_capabilities DISABLE ROW LEVEL SECURITY")
+        .execute(&limited_pool).await?;
+    let error = Ledger::connect(limited.as_str(), "later".into(), 8, true)
+        .await
+        .err()
+        .context("migration accepted the now-visible unknown capability")?
+        .to_string();
+    assert!(error.contains("sealed_share_pages"), "{error}");
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 8]);
+    sqlx::query("DELETE FROM qbit_prism_schema_capabilities WHERE capability='sealed_share_pages'")
+        .execute(&limited_pool)
+        .await?;
+    let migrated = Ledger::connect(limited.as_str(), "later".into(), 8, true).await?;
+    exercise_native_writers(&migrated, 1, 6301).await?;
+    ledger.pool.close().await;
+    migrated.pool.close().await;
+    limited_pool.close().await;
+    sqlx::raw_sql(&format!("DROP OWNED BY {role}; DROP ROLE {role}"))
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+    db.close(vec![]).await
+}
+
+#[tokio::test]
 async fn newer_storage_version_or_capability_is_refused_at_migrate_and_at_connect() -> Result<()> {
     let Some(db) = Database::open().await? else {
         return Ok(());

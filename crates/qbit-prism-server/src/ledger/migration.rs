@@ -477,10 +477,20 @@ pub(super) fn classify_source(inventory: &SourceInventory) -> SourceVerdict {
 
 async fn read_capabilities<'e, E>(executor: E) -> Result<Vec<(String, i32)>>
 where
-    E: sqlx::Executor<'e, Database = Postgres>,
+    E: sqlx::Acquire<'e, Database = Postgres>,
 {
+    let mut connection = executor.acquire().await?;
+    let (enabled, forced): (bool, bool) = sqlx::query_as(
+        "SELECT relrowsecurity,relforcerowsecurity FROM pg_class WHERE oid='qbit_prism_schema_capabilities'::regclass",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    ensure!(
+        !enabled && !forced,
+        "qbit_prism_schema_capabilities has row-level security enabled or forced; refusing to trust possibly hidden capability rows. Review and disable row-level security before starting or migrating this database"
+    );
     let rows = sqlx::query("SELECT capability,capability_value FROM qbit_prism_schema_capabilities ORDER BY capability")
-        .fetch_all(executor).await?;
+        .fetch_all(&mut *connection).await?;
     rows.iter()
         .map(|row| Ok((row.try_get("capability")?, row.try_get("capability_value")?)))
         .collect()
