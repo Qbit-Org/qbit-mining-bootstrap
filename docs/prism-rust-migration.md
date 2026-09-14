@@ -250,7 +250,9 @@ fail. Extra defaults, identities and generated expressions are also refused:
 PostgreSQL can evaluate them during native writes, and migration cannot prove
 that they will succeed (for example, a generated `10 / writer_epoch` fails
 for native epoch-zero shares). Only plain nullable extra columns remain
-accepted; columns on operator-only tables are unaffected. Extra unique, expression or partial indexes on release tables are
+accepted, and their types must not be domains. Domain defaults, constraints
+and nullability can reject an omitted value even when the column itself
+looks nullable. Columns on operator-only tables are unaffected. Extra unique, expression or partial indexes on release tables are
 drift too: a unique index on `((1)) WHERE writer_epoch = 0` permits legacy
 rows but rejects the second native share, and expressions or predicates
 can fail when evaluated for native writes. Migration names the index and

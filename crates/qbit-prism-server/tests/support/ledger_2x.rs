@@ -1831,6 +1831,66 @@ async fn executable_extra_column_is_refused_naming_it_and_rolls_back() -> Result
     Ok(())
 }
 
+/// Domain checks and nullability are not represented by attnotnull.
+#[tokio::test]
+async fn domain_extra_column_is_refused_naming_it_and_rolls_back() -> Result<()> {
+    for state in [SourceState::Pre258, SourceState::Applied258] {
+        for constraint in ["CHECK (VALUE IS NOT NULL)", "NOT NULL"] {
+            let Some(db) = Database::open().await? else {
+                return Ok(());
+            };
+            let pool = PgPool::connect(&db.url).await?;
+            apply_frozen_2x_schema(&pool, state).await?;
+            sqlx::raw_sql(&format!("CREATE DOMAIN operator_required AS text {constraint}; ALTER TABLE qbit_share_ledger ADD COLUMN operator_note operator_required; CREATE TABLE operator_notes(note operator_required); INSERT INTO operator_notes VALUES('kept')"))
+                .execute(&pool).await?;
+            let refused = insert_share_as_writer(&pool, "native:0", 0)
+                .await
+                .err()
+                .context("domain accepted an omitted native value")?
+                .to_string();
+            assert!(refused.contains("operator_required"), "{refused}");
+            let objects = schema_objects(&pool).await?;
+            let error = db
+                .ledger("a")
+                .await
+                .err()
+                .context("migration accepted a domain-typed extra column")?
+                .to_string();
+            assert!(
+                error.contains("refusing to migrate a drifted 001 source"),
+                "{error}"
+            );
+            assert!(
+                error.contains("column qbit_share_ledger.operator_note has an extra domain type"),
+                "{error}"
+            );
+            assert!(!error.contains("operator_notes"), "{error}");
+            assert!(error.contains("Nothing was changed"), "{error}");
+            assert!(native_tables_absent(&pool).await?);
+            assert_eq!(schema_objects(&pool).await?, objects);
+            assert!(sqlx::query_scalar::<_, bool>("SELECT a.atttypid='operator_required'::regtype FROM pg_attribute a WHERE a.attrelid='qbit_share_ledger'::regclass AND a.attname='operator_note'").fetch_one(&pool).await?);
+            sqlx::raw_sql("ALTER TABLE qbit_share_ledger ALTER COLUMN operator_note TYPE text")
+                .execute(&pool)
+                .await?;
+            let ledger = db.ledger("a").await?;
+            exercise_native_writers(&ledger, 1, 7101).await?;
+            assert_eq!(
+                sqlx::query_scalar::<_, String>("SELECT note::text FROM operator_notes")
+                    .fetch_one(&pool)
+                    .await?,
+                "kept"
+            );
+            assert!(sqlx::query("INSERT INTO operator_notes VALUES(NULL)")
+                .execute(&pool)
+                .await
+                .is_err());
+            pool.close().await;
+            db.close(vec![ledger]).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Rewrite rules run before triggers and can suppress native INSERT RETURNING.
 #[tokio::test]
 async fn extra_rewrite_rule_is_refused_naming_it_and_rolls_back() -> Result<()> {

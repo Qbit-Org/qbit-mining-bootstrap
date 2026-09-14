@@ -43,6 +43,7 @@ qbit-prism-server::ledger_postgres::two_x::audit_range_query_uses_deadline_remai
 qbit-prism-server::ledger_postgres::two_x::canonical_2x_sidecar_import_preserves_exact_bytes_and_fails_closed
 qbit-prism-server::ledger_postgres::two_x::compact_bits_metadata_comes_from_durable_header_and_recovers_without_audit_changes
 qbit-prism-server::ledger_postgres::two_x::corrupt_imported_canonical_bytes_are_refused_not_served_from_the_legacy_file
+qbit-prism-server::ledger_postgres::two_x::domain_extra_column_is_refused_naming_it_and_rolls_back
 qbit-prism-server::ledger_postgres::two_x::drifted_002_object_is_refused_on_a_258_source
 qbit-prism-server::ledger_postgres::two_x::drifted_pre_258_source_is_refused_naming_each_object_and_rolls_back
 qbit-prism-server::ledger_postgres::two_x::durable_worker_hints_order_by_shared_evidence_and_keep_original_ttl

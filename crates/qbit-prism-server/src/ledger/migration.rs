@@ -566,7 +566,7 @@ async fn require_pre_006_storage_version(
     tx: &mut Transaction<'_, Postgres>,
     versions: &[i32],
 ) -> Result<()> {
-    let row = sqlx::query("SELECT format_type(a.atttypid,a.atttypmod) AS data_type,a.attnotnull AS not_null,pg_get_expr(d.adbin,d.adrelid) AS default_expr,a.attidentity::text AS identity,a.attgenerated::text AS generated FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid=to_regclass('qbit_block_candidate_outbox') AND a.attname='storage_version' AND a.attnum>0 AND NOT a.attisdropped")
+    let row = sqlx::query("SELECT format_type(a.atttypid,a.atttypmod) AS data_type,(SELECT typtype='d' FROM pg_type WHERE oid=a.atttypid) AS is_domain,a.attnotnull AS not_null,pg_get_expr(d.adbin,d.adrelid) AS default_expr,a.attidentity::text AS identity,a.attgenerated::text AS generated FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid=to_regclass('qbit_block_candidate_outbox') AND a.attname='storage_version' AND a.attnum>0 AND NOT a.attisdropped")
         .fetch_optional(&mut **tx).await?;
     let Some(row) = row else {
         // The unmodified pre-258 native path: 006 creates the definition.
@@ -574,6 +574,7 @@ async fn require_pre_006_storage_version(
     };
     let expected = ColumnDefinition {
         data_type: "integer".into(),
+        is_domain: false,
         not_null: true,
         default: Some("1".into()),
         identity: String::new(),
@@ -582,6 +583,7 @@ async fn require_pre_006_storage_version(
     };
     let actual = ColumnDefinition {
         data_type: row.try_get("data_type")?,
+        is_domain: row.try_get("is_domain")?,
         not_null: row.try_get("not_null")?,
         default: row.try_get("default_expr")?,
         identity: row.try_get("identity")?,
@@ -671,6 +673,7 @@ const SCHEMA_PLACEHOLDER: &str = "<schema>";
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ColumnDefinition {
     data_type: String,
+    is_domain: bool,
     not_null: bool,
     default: Option<String>,
     identity: String,
@@ -1026,7 +1029,7 @@ async fn fingerprint_schema(
             },
         );
     }
-    let rows = sqlx::query("SELECT c.relname::text AS table_name,a.attname::text AS column_name,format_type(a.atttypid,a.atttypmod) AS data_type,a.attnotnull AS not_null,pg_get_expr(d.adbin,d.adrelid) AS default_expr,a.attidentity::text AS identity,a.attgenerated::text AS generated,CASE WHEN a.attcollation<>t.typcollation THEN col.collname::text END AS collation FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped JOIN pg_type t ON t.oid=a.atttypid LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum LEFT JOIN pg_collation col ON col.oid=a.attcollation WHERE n.nspname=$1 AND c.relkind='r' ORDER BY 1,2")
+    let rows = sqlx::query("SELECT c.relname::text AS table_name,a.attname::text AS column_name,format_type(a.atttypid,a.atttypmod) AS data_type,(SELECT typtype='d' FROM pg_type WHERE oid=a.atttypid) AS is_domain,a.attnotnull AS not_null,pg_get_expr(d.adbin,d.adrelid) AS default_expr,a.attidentity::text AS identity,a.attgenerated::text AS generated,CASE WHEN a.attcollation<>t.typcollation THEN col.collname::text END AS collation FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped JOIN pg_type t ON t.oid=a.atttypid LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum LEFT JOIN pg_collation col ON col.oid=a.attcollation WHERE n.nspname=$1 AND c.relkind='r' ORDER BY 1,2")
         .bind(namespace).fetch_all(&mut **tx).await?;
     for row in &rows {
         let table: String = row.try_get("table_name")?;
@@ -1040,6 +1043,7 @@ async fn fingerprint_schema(
             row.try_get("column_name")?,
             ColumnDefinition {
                 data_type: row.try_get("data_type")?,
+                is_domain: row.try_get("is_domain")?,
                 not_null: row.try_get("not_null")?,
                 default: default.map(|expr| strip_schema_qualification(&expr, namespace)),
                 identity: row.try_get("identity")?,
@@ -1591,7 +1595,11 @@ fn compare_fingerprints(
         }
         for (column, definition) in found_columns {
             if !columns.contains_key(column) {
-                if definition.default.is_some()
+                if definition.is_domain {
+                    comparison.drift.push(format!(
+                        "column {table}.{column} has an extra domain type; domain constraints or defaults can affect omitted native values"
+                    ));
+                } else if definition.default.is_some()
                     || !definition.identity.is_empty()
                     || !definition.generated.is_empty()
                 {
@@ -2837,6 +2845,7 @@ mod tests {
     fn column(data_type: &str, not_null: bool) -> ColumnDefinition {
         ColumnDefinition {
             data_type: data_type.to_owned(),
+            is_domain: false,
             not_null,
             default: None,
             identity: String::new(),
@@ -3314,6 +3323,16 @@ mod tests {
             assert_eq!(comparison.drift, vec!["column t.extra has an extra default, identity or generated expression; native writes can evaluate it"]);
             assert_eq!(comparison.extra, vec!["table operator_notes"]);
         }
+        let mut domain = column("operator_required", false);
+        domain.is_domain = true;
+        found
+            .tables
+            .get_mut("t")
+            .unwrap()
+            .columns
+            .insert("extra".into(), domain);
+        assert_eq!(compare_fingerprints(&expected, &found).drift,
+            vec!["column t.extra has an extra domain type; domain constraints or defaults can affect omitted native values"]);
         found
             .tables
             .get_mut("t")
