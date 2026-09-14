@@ -3305,6 +3305,86 @@ async fn startup_without_initialize_requires_the_current_schema_version() -> Res
         .await
 }
 
+#[tokio::test]
+async fn native_migration_gap_collisions_are_refused_before_any_ddl() -> Result<()> {
+    for (collision, object, remedy) in [
+        ("CREATE TABLE qbit_prism_candidate_dispatch_sequence(note text); INSERT INTO qbit_prism_candidate_dispatch_sequence VALUES('preserve me')",
+         "table qbit_prism_candidate_dispatch_sequence", "ALTER TABLE qbit_prism_candidate_dispatch_sequence RENAME TO operator_saved_sequence"),
+        ("CREATE INDEX qbit_prism_candidate_fresh_idx ON qbit_block_candidate_outbox(block_hash)",
+         "index qbit_prism_candidate_fresh_idx", "ALTER INDEX qbit_prism_candidate_fresh_idx RENAME TO operator_saved_index"),
+    ] {
+        let Some(db) = Database::open().await? else { return Ok(()); };
+        let pool = PgPool::connect(&db.url).await?;
+        let earlier = db.ledger("earlier-build").await?;
+        let source = earlier.migration_source().await?;
+        let later_applied = applied_at(&pool, 10).await?;
+        undo_009(&pool).await?;
+        sqlx::raw_sql("DELETE FROM qbit_prism_schema_migrations WHERE version=5; DROP SEQUENCE qbit_prism_candidate_dispatch_sequence; DROP INDEX qbit_prism_candidate_fresh_idx")
+            .execute(&pool).await?;
+        sqlx::raw_sql(collision).execute(&pool).await?;
+        let before = schema_objects(&pool).await?;
+        let error = db.ledger("gap-repair").await.err()
+            .with_context(|| format!("accepted a native migration gap with {object}"))?.to_string();
+        assert!(error.contains("migration 5"), "{error}");
+        assert!(error.contains(object), "{error}");
+        assert!(error.contains("before any DDL"), "{error}");
+        assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 6, 8, 10]);
+        assert_eq!(schema_objects(&pool).await?, before);
+        assert_eq!(earlier.migration_source().await?, source);
+        sqlx::raw_sql(remedy).execute(&pool).await?;
+        let repaired = db.ledger("gap-repair").await?;
+        assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+        assert_eq!(applied_at(&pool, 10).await?, later_applied);
+        assert_eq!(repaired.migration_source().await?, source);
+        exercise_native_writers(&repaired, 1, 6501).await?;
+        if object.starts_with("table") {
+            assert_eq!(sqlx::query_scalar::<_, String>("SELECT note FROM operator_saved_sequence").fetch_one(&pool).await?, "preserve me");
+        }
+        pool.close().await;
+        db.close(vec![earlier, repaired]).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_migration_gaps_refuse_existing_tables_columns_and_constraints() -> Result<()> {
+    for (version, collision, object, remedy) in [
+        (4, "CREATE TABLE qbit_prism_cpfp_retired_funding(note text)", "table qbit_prism_cpfp_retired_funding", "ALTER TABLE qbit_prism_cpfp_retired_funding RENAME TO operator_saved_table"),
+        (8, "ALTER TABLE qbit_prism_jobs ADD COLUMN window_anchor_ms text", "column qbit_prism_jobs.window_anchor_ms", "ALTER TABLE qbit_prism_jobs RENAME COLUMN window_anchor_ms TO operator_saved_column"),
+        (8, "ALTER TABLE qbit_prism_jobs ADD CONSTRAINT qbit_prism_jobs_window_check CHECK (true)", "constraint qbit_prism_jobs_window_check on qbit_prism_jobs", "ALTER TABLE qbit_prism_jobs RENAME CONSTRAINT qbit_prism_jobs_window_check TO operator_saved_constraint"),
+        (10, "ALTER TABLE qbit_prism_cluster ADD COLUMN fatal_error_set_at text", "column qbit_prism_cluster.fatal_error_set_at", "ALTER TABLE qbit_prism_cluster RENAME COLUMN fatal_error_set_at TO operator_saved_column"),
+    ] {
+        let Some(db) = Database::open().await? else { return Ok(()); };
+        let pool = PgPool::connect(&db.url).await?;
+        apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+        sqlx::raw_sql(include_str!("../../migrations/002_multi_instance.sql")).execute(&pool).await?;
+        sqlx::raw_sql(include_str!("../../migrations/003_2x_compatibility.sql")).execute(&pool).await?;
+        sqlx::raw_sql("CREATE TABLE qbit_prism_schema_migrations(version integer PRIMARY KEY,applied_at timestamptz NOT NULL DEFAULT clock_timestamp()); INSERT INTO qbit_prism_schema_migrations(version) VALUES(2),(3)")
+            .execute(&pool).await?;
+        // Generated names retained by an operator table are harmless:
+        // CREATE TABLE chooses fresh index/identity-sequence names.
+        sqlx::raw_sql("CREATE TABLE operator_events(event_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY); ALTER SEQUENCE operator_events_event_id_seq RENAME TO qbit_prism_fatal_state_events_event_id_seq; ALTER INDEX operator_events_pkey RENAME TO qbit_prism_fatal_state_events_pkey")
+            .execute(&pool).await?;
+        sqlx::raw_sql(collision).execute(&pool).await?;
+        let before = schema_objects(&pool).await?;
+        let error = db.ledger("gap-repair").await.err()
+            .with_context(|| format!("accepted a native migration gap with {object}"))?.to_string();
+        assert!(error.contains(&format!("migration {version}")), "{error}");
+        assert!(error.contains(object), "{error}");
+        assert!(error.contains("before any DDL"), "{error}");
+        assert_eq!(schema_versions(&pool).await?, [2, 3]);
+        assert_eq!(schema_objects(&pool).await?, before);
+        sqlx::raw_sql(remedy).execute(&pool).await?;
+        let repaired = db.ledger("gap-repair").await?;
+        assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+        exercise_native_writers(&repaired, 1, 6601).await?;
+        assert_eq!(sqlx::query_scalar::<_, i64>("INSERT INTO operator_events DEFAULT VALUES RETURNING event_id").fetch_one(&pool).await?, 1);
+        pool.close().await;
+        db.close(vec![repaired]).await?;
+    }
+    Ok(())
+}
+
 /// When a migration was recorded, as text, to prove a step was not re-run.
 async fn applied_at(pool: &PgPool, version: i32) -> Result<String> {
     Ok(sqlx::query_scalar(

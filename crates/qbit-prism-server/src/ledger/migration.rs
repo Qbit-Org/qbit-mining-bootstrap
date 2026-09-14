@@ -2008,6 +2008,8 @@ struct ReleaseDefinitions {
     /// What the native migrations create and the release does not; a
     /// source that already has any of it is refused.
     reserved: ReservedObjects,
+    /// Objects introduced by each requested, missing native migration.
+    native_gaps: BTreeMap<i32, ReservedObjects>,
     /// The schema the source lives in.
     source_schema: String,
 }
@@ -2025,6 +2027,9 @@ struct ReservedObjects {
     /// partial-001 check shares `objects_present`, refuses on a present
     /// table, and would only be cluttered by that table's columns.
     columns: BTreeMap<String, BTreeSet<String>>,
+    /// Named constraints added to existing tables, whose IF NOT EXISTS
+    /// guards also preserve an unrelated constraint under the same name.
+    constraints: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// The frozen release's definitions, the objects the native migrations
@@ -2041,6 +2046,7 @@ async fn release_fingerprint(
     tx: &mut Transaction<'_, Postgres>,
     state: SourceState,
     base_schema: &str,
+    missing_native_versions: &[i32],
 ) -> Result<ReleaseDefinitions> {
     let row = sqlx::query("SELECT current_schema()::text AS schema,current_setting('search_path') AS search_path,current_database()::text AS database,current_user::text AS role")
         .fetch_one(&mut **tx).await?;
@@ -2081,8 +2087,40 @@ async fn release_fingerprint(
         "release schema was applied in {applied_in}, not in scratch schema {scratch}"
     );
     let expected = fingerprint_schema(tx, &scratch).await?;
-    for (_, sql) in NATIVE_MIGRATIONS {
+    let mut native_gaps = BTreeMap::new();
+    for (version, sql) in NATIVE_MIGRATIONS {
+        let before = if missing_native_versions.contains(version) {
+            Some(fingerprint_schema(tx, &scratch).await?)
+        } else {
+            None
+        };
         sqlx::raw_sql(sql).execute(&mut **tx).await?;
+        if let Some(before) = before {
+            let after = fingerprint_schema(tx, &scratch).await?;
+            let mut reserved = reserved_objects(&after, &before);
+            // These migrations leave new tables' constraint indexes and
+            // identity/serial sequences unnamed. PostgreSQL chooses another
+            // name if an operator's renamed table retained the default one;
+            // unlike explicit CREATE names, those names cannot cause a skip.
+            reserved.objects.other_relations.retain(|_, relation| {
+                !relation
+                    .constraint_table
+                    .as_ref()
+                    .is_some_and(|table| reserved.objects.tables.contains_key(table))
+            });
+            let owned_sequences: Vec<(String, String)> = sqlx::query_as(
+                "SELECT s.relname::text,t.relname::text FROM pg_class s JOIN pg_depend d ON d.classid='pg_class'::regclass AND d.objid=s.oid JOIN pg_class t ON d.refclassid='pg_class'::regclass AND d.refobjid=t.oid WHERE s.relnamespace=$1::regnamespace AND s.relkind='S' AND d.refobjsubid>0 AND d.deptype IN ('a','i')",
+            )
+            .bind(&scratch)
+            .fetch_all(&mut **tx)
+            .await?;
+            for (sequence, table) in owned_sequences {
+                if reserved.objects.tables.contains_key(&table) {
+                    reserved.objects.sequences.remove(&sequence);
+                }
+            }
+            native_gaps.insert(*version, reserved);
+        }
     }
     let native = fingerprint_schema(tx, &scratch).await?;
     sqlx::raw_sql("ROLLBACK TO SAVEPOINT qbit_prism_release_schema; RELEASE SAVEPOINT qbit_prism_release_schema")
@@ -2105,6 +2143,7 @@ async fn release_fingerprint(
     Ok(ReleaseDefinitions {
         release: expected,
         reserved,
+        native_gaps,
         source_schema,
     })
 }
@@ -2121,6 +2160,7 @@ async fn release_fingerprint(
 fn reserved_objects(native: &SchemaFingerprint, release: &SchemaFingerprint) -> ReservedObjects {
     let mut objects = SchemaFingerprint::default();
     let mut columns = BTreeMap::new();
+    let mut constraints = BTreeMap::new();
     for (table, definition) in &native.tables {
         if table == "qbit_prism_schema_migrations" {
             continue;
@@ -2169,7 +2209,77 @@ fn reserved_objects(native: &SchemaFingerprint, release: &SchemaFingerprint) -> 
                 .insert(name.clone(), relation.clone());
         }
     }
-    ReservedObjects { objects, columns }
+    for (table, definitions) in &native.constraints {
+        if !release.tables.contains_key(table) {
+            continue;
+        }
+        let existing: BTreeSet<&str> = release
+            .constraints
+            .get(table)
+            .into_iter()
+            .flat_map(|definitions| {
+                definitions
+                    .values()
+                    .map(|definition| definition.name.as_str())
+            })
+            .collect();
+        let added: BTreeSet<String> = definitions
+            .values()
+            .filter(|definition| !existing.contains(definition.name.as_str()))
+            .map(|definition| definition.name.clone())
+            .collect();
+        if !added.is_empty() {
+            constraints.insert(table.clone(), added);
+        }
+    }
+    ReservedObjects {
+        objects,
+        columns,
+        constraints,
+    }
+}
+
+/// A recorded native migration owns its objects, but a missing step must
+/// not silently adopt a pre-existing object. Derive each missing step's
+/// names from the same scratch replay used for fresh/2.x sources. Start
+/// with the #258 release: its capability table and storage_version column
+/// may legitimately predate 006, whose dedicated gates validate them.
+async fn require_no_native_gap_collisions(
+    tx: &mut Transaction<'_, Postgres>,
+    versions: &[i32],
+) -> Result<()> {
+    let missing: Vec<i32> = NATIVE_MIGRATIONS
+        .iter()
+        .map(|(version, _)| *version)
+        .filter(|version| !versions.contains(version))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let base_schema =
+        base_schema_transaction_body(include_str!("../../../qbit-prism/sql/001_share_ledger.sql"))?;
+    let definitions =
+        release_fingerprint(tx, SourceState::Applied258, &base_schema, &missing).await?;
+    let found = source_fingerprint(tx, &definitions.source_schema).await?;
+    for (version, reserved) in definitions.native_gaps {
+        let mut present = objects_present(&reserved.objects, &found);
+        present.extend(columns_present(&reserved.columns, &found));
+        for (table, names) in &reserved.constraints {
+            if let Some(constraints) = found.constraints.get(table) {
+                for definition in constraints.values() {
+                    if names.contains(&definition.name) {
+                        present.push(format!("constraint {} on {table}", definition.name));
+                    }
+                }
+            }
+        }
+        ensure!(
+            present.is_empty(),
+            "refusing to repair native migration {version} before any DDL: the database already holds objects this missing migration creates ({}), so applying it could preserve objects it did not build. Nothing was changed. Restore the full backup, or review and move the existing objects aside before migrating again",
+            named_objects(&present)
+        );
+    }
+    Ok(())
 }
 
 /// The source schema as it is now, without the migrator's own version
@@ -2501,7 +2611,8 @@ pub(super) async fn migrate_schema(
             release: expected,
             reserved,
             source_schema,
-        } = release_fingerprint(tx, state, &base_schema).await?;
+            ..
+        } = release_fingerprint(tx, state, &base_schema, &[]).await?;
         let found = source_fingerprint(tx, &source_schema).await?;
         if state == SourceState::Fresh {
             // No share ledger and no 002 object: fresh only if nothing else
@@ -2580,6 +2691,7 @@ pub(super) async fn migrate_schema(
             refuse_undrained_outbox(tx, &inventory, Some(&versions)).await?;
             source = (None, inventory.capability("candidate_storage_version"));
         }
+        require_no_native_gap_collisions(tx, &versions).await?;
     }
     if !versions.contains(&4) {
         sqlx::raw_sql(native_migration(4))
