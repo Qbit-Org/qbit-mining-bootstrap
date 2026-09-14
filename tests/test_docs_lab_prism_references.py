@@ -416,7 +416,7 @@ SHELLS = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
 LAUNCHERS = frozenset({"env", "sudo", "nohup", "command", "exec", "docker", "podman"})
 WRAPPER_ARGUMENTS = {
     "env": {"-u", "--unset", "-C", "--chdir"},
-    "sudo": {"-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "--close-from", "-T", "--command-timeout"},
+    "sudo": {"-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "--close-from", "-D", "--chdir", "-T", "--command-timeout"},
     "exec": {"-a"},
     "docker": {"-e", "--env", "--env-file", "-u", "--user", "-w", "--workdir", "--detach-keys"},
 }
@@ -2095,6 +2095,35 @@ class ScannerTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(self.commands(text), [])
                 self.assertEqual(self.commands(text + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+
+    def test_sudo_chdir_arguments_before_commands_are_consumed(self) -> None:
+        for options in (
+            "-D /tmp", "--chdir /tmp", "-D/tmp", "--chdir=/tmp",
+            "'-D' '/tmp/work dir'", "-u prism -D /tmp --", "-D /tmp -n",
+        ):
+            for command, missing in (
+                ("python3 -m lab.example.deleted", "lab/example/deleted.py or lab/example/deleted/__main__.py"),
+                ("python3 lab/example/deleted.py", "lab/example/deleted.py"),
+            ):
+                with self.subTest(options=options, command=command):
+                    text = f"sudo {options} {command}"
+                    self.assertEqual(self.located(text), [(1, missing)])
+                    self.assertEqual(dead_commands(text, {"lab/example/deleted.py"}), [])
+        text = "```sh\nsudo -D \\\n  /tmp \\\n  python3 lab/example/deleted.py\n```"
+        self.assertEqual(self.located(text), [(2, "lab/example/deleted.py")])
+        self.assertEqual(
+            self.commands("env sudo --chdir /tmp sh -c 'python3 lab/prism/storm.py'"),
+            ["lab/prism/storm.py"],
+        )
+
+    def test_sudo_chdir_arguments_are_not_executable_words(self) -> None:
+        for option in ("-D", "--chdir"):
+            for arguments in (
+                "python3 -m lab.example.deleted", "'python3 -m lab.example.deleted' true",
+                "",
+            ):
+                with self.subTest(option=option, arguments=arguments):
+                    self.assertEqual(self.commands(f"sudo {option} {arguments}"), [])
 
     def test_multiline_quoted_arguments_remain_data(self) -> None:
         for quote in ("'", '"'):
