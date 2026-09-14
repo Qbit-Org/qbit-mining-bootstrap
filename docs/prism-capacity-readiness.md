@@ -442,7 +442,8 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    reads run inside the container; the parsing runs on the host. The loop
    also checks, before every sample, that no more than 360 s have passed
    since the previous one and that it is still reading the process the run
-   started with, and stops the run as invalid when either check fails:
+   started with, and stops the run as invalid when either check fails or
+   when one of its appends to the run's files does:
 
    ```sh
    c=<prism-coordinator-container>
@@ -461,7 +462,10 @@ two-hour cutover soak, which reads its own criteria from the same registry.
      fi
      prev=$now
      current=$(process)
-     echo "$now $current" >> "$run/soak-process.log"
+     if ! echo "$now $current" >> "$run/soak-process.log"; then
+       echo "$(date -u +%FT%TZ): soak invalid, could not append the reading at $now to $run/soak-process.log" >&2
+       break
+     fi
      if [ "$current" != "$first" ]; then
        echo "$(date -u +%FT%TZ): soak invalid, the coordinator is not the process the run started with" >&2
        echo "  at start: $first" >&2
@@ -474,7 +478,11 @@ two-hour cutover soak, which reads its own criteria from the same registry.
        /^VmRSS:/ && $2 ~ /^[0-9]+$/ && $3 == "kB" { n++; row = now "," $2 * 1024 }
        END { if (n == 1) print row }')
      case $rss in
-       "$now",[0-9]*) echo "$rss" >> "$run/soak-rss.csv" ;;
+       "$now",[0-9]*)
+         echo "$rss" >> "$run/soak-rss.csv" || {
+           echo "$(date -u +%FT%TZ): soak invalid, could not append the sample at $now to $run/soak-rss.csv" >&2
+           break
+         } ;;
        *)
          echo "$(date -u +%FT%TZ): soak invalid, no RSS sample at $now" >&2
          if [ "$rc" -ne 0 ]; then echo "  docker exec exited $rc" >&2; fi
@@ -503,9 +511,13 @@ two-hour cutover soak, which reads its own criteria from the same registry.
        printf '%s\n' "$metrics" | awk 'NF == 0 { exit } { print "    " $0 }' >&2
        break
      fi
-     printf '%s\n' "$metrics" \
+     lines=$(printf '%s\n' "$metrics" \
        | grep -E '^(x-prism-metrics-state:|qbit_prism_(process_resident_memory_bytes|collector_available|collector_age_seconds|runtime_lag_seconds|runtime_task_stalled|runtime_poll_lag_seconds|database_pool_acquire_seconds(_bucket|_sum|_count)|connections|authorized_clients|accepted_shares_total|block_candidates_pending)[ {])' \
-       | sed "s/^/$now /" >> "$run/soak-metrics.log"
+       | sed "s/^/$now /")
+     printf '%s\n' "$lines" >> "$run/soak-metrics.log" || {
+       echo "$(date -u +%FT%TZ): soak invalid, could not append the sample at $now to $run/soak-metrics.log" >&2
+       break
+     }
      sleep 300
    done
    ```
@@ -555,6 +567,27 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    `VmRSS:` (the body is printed), ends the run. A transient `docker exec`
    failure is therefore not skipped: the run is invalid and starts over from
    step 2.
+
+   An append that fails is a missing sample the loop itself caused, and it
+   invalidates the run for the same reason. The run directory can fill, or
+   the filesystem under it can return an I/O error, at any hour of the soak,
+   and a shell that is not running under `set -e` goes on past a failed
+   redirection as if it had succeeded, so a loop that did not look at the
+   status of its appends would keep reading and keep failing to write. Once
+   the rows already on disk spanned the 82,800 s the judge's floor asks for,
+   they would pass the judge, and the hours after the disk filled, with the
+   process readings and metrics lines that should explain them, would not
+   be in the record. So the loop checks the status of each of its three
+   appends, to `soak-process.log`, `soak-rss.csv` and `soak-metrics.log`,
+   and stops the run as invalid on the first that fails, naming the file
+   and the sample time. The metrics lines are read into a variable before
+   they are appended, for the reason the body and the response are: the
+   status of a pipeline is its last command's, which here would be `sed`,
+   and what a failed write does to `sed`'s exit status is each
+   implementation's own affair, whereas the shell builtin `printf` reports
+   one as `1` in `sh`, `bash` and `zsh` alike, so the same guard reads all
+   three appends in the shell's own terms. The run is invalid and starts
+   over from step 2.
 
    A gap between samples invalidates the run for the same reason, and it is
    the hole no read can report. A host that is suspended for an hour, or a
@@ -626,10 +659,10 @@ two-hour cutover soak, which reads its own criteria from the same registry.
 6. **Judge** each run with the `awk` bound check above against its own
    `$run/soak-rss.csv`; the check names `soak-rss.csv`, so run it inside the
    run directory or substitute the path. A run whose capture loop stopped on
-   a gap between samples, a process change, a missing RSS sample or a
-   metrics scrape that failed, was not fresh, had its process collector
-   unavailable or carried no usable RSS value is not judged: it is invalid
-   and is run again from step 2.
+   a gap between samples, a process change, a missing RSS sample, an append
+   that failed or a metrics scrape that failed, was not fresh, had its
+   process collector unavailable or carried no usable RSS value is not
+   judged: it is invalid and is run again from step 2.
    Pass: exit `0`, and share-ack p99 at hour 24 within the
    alert threshold configured for the deployment (the native rules are
    #279's). Fail: exit `1`, or a share-ack regression between hour 1 and hour
