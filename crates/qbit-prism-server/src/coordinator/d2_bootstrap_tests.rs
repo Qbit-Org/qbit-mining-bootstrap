@@ -47,7 +47,7 @@ use tokio::task::JoinHandle;
 /// The ledger's advisory locks (`ORDER_LOCK`, `SETTLEMENT_LOCK`) are
 /// cluster-wide constants, not schema-scoped, so a private schema does not
 /// isolate these tests from each other.
-static TEST_LOCK: Mutex<()> = Mutex::const_new(());
+use super::test_serial::TEST_LOCK;
 
 // ---------------------------------------------------------------------------
 // Harness constants

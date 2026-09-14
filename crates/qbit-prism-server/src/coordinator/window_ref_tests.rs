@@ -30,7 +30,7 @@ use tokio::task::JoinHandle;
 
 /// The ledger's advisory locks are cluster-wide constants, not schema-scoped,
 /// so a private schema does not isolate these tests from each other.
-static TEST_LOCK: Mutex<()> = Mutex::const_new(());
+use super::test_serial::TEST_LOCK;
 
 const TEMPLATE_VERSION: u32 = 0x2000_0000;
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";

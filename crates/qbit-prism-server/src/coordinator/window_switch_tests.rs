@@ -14,7 +14,7 @@ use sqlx::PgPool;
 use tokio::task::JoinHandle;
 
 /// The ledger's advisory locks are cluster-wide constants, not schema-scoped.
-static TEST_LOCK: Mutex<()> = Mutex::const_new(());
+use super::test_serial::TEST_LOCK;
 
 const PARENT: &str = "aa";
 const ORDER_LOCK: i64 = 0x505249534d000002;
