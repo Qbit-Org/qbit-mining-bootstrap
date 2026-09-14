@@ -279,8 +279,9 @@ and `qbit_prism_runtime_task_stalled`. Refresh impact uses
 `qbit_prism_stratum_current_tip_coverage_gap_seconds`; pending-candidate age and
 count retain their names. Guard body-based rules with #277's
 `qbit_prism_metrics_snapshot_available` / `qbit_prism_metrics_snapshot_stale`
-and database/RSS rules with `qbit_prism_collector_available` so unknown -1 is
-never healthy zero. The first-offer histogram is declared without samples
+and candidate count/age and RSS rules with `qbit_prism_collector_available` so
+unknown -1 is never healthy zero. The pool-wait histogram rule retains snapshot
+availability/freshness guards but does not require collector availability. The first-offer histogram is declared without samples
 (A/#266); advisory-lock waits are recorded since #328; rules for both remain
 deferred. D3's dedicated standby alerts require the
 primary's deployment-provided PostgreSQL exporter, not public read replica data.
