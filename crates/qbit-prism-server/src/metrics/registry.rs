@@ -83,6 +83,10 @@ families! {
 }
 
 impl Family {
+    pub(super) fn is_live(self) -> bool {
+        self.is_collection() || self == Self::PoolAcquire
+    }
+
     pub(super) fn is_collection(self) -> bool {
         matches!(
             self,
@@ -95,15 +99,22 @@ impl Family {
         )
     }
 }
-pub(super) fn is_collection_line(line: &str) -> bool {
+pub(super) fn is_live_line(line: &str) -> bool {
     let line = line
         .strip_prefix("# HELP ")
         .or_else(|| line.strip_prefix("# TYPE "))
         .unwrap_or(line);
     let name = line.split([' ', '{']).next().unwrap_or_default();
-    Family::ALL
-        .iter()
-        .any(|family| family.is_collection() && family.descriptor().name == name)
+    Family::ALL.iter().any(|family| {
+        let descriptor = family.descriptor();
+        family.is_live()
+            && (descriptor.name == name
+                || (descriptor.kind == Kind::Histogram
+                    && matches!(
+                        name.strip_prefix(descriptor.name),
+                        Some("_bucket" | "_count" | "_sum")
+                    )))
+    })
 }
 
 #[derive(Clone)]

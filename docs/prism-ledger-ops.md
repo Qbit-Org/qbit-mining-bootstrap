@@ -178,6 +178,107 @@ Automatic replacement fee bumps and abandoned-reservation release are not
 implemented; retain and reconcile the durable reservation when handling those
 cases manually.
 
+## Retry, replay and deadline contract
+
+The ledger never replays SQL automatically. After a `statement_timeout`
+(`PRISM_DATABASE_STATEMENT_TIMEOUT_MS`, default 15000), a `lock_timeout`
+(`PRISM_DATABASE_LOCK_TIMEOUT_MS`, default 5000), a closed connection or a lost
+acknowledgement, the error reaches the caller and the ledger neither re-sends
+the statement nor re-runs the transaction. This is distinct from normal
+traversal: a paged read sends its page query repeatedly by design, and audit
+materialization reads the snapshot row and its share range through separate
+pool checkouts. A statement cancelled or a socket closed before `COMMIT`
+aborts the open transaction, so the claim and state that authorized the call
+remain as they were; that holds only when the transaction did not commit. A
+`CommandComplete` received before `COMMIT` proves execution, not durability. A
+`COMMIT` whose acknowledgement is lost leaves the outcome unknown to the
+caller: the transaction may or may not have committed. The caller's next
+observation must come from the durable claim and state, never from a replay.
+Every later attempt is a separate public operation with its own claim.
+
+| Operation (public API) | Class | Automatic re-execution | What runs later, and who authorizes it | Coverage |
+| --- | --- | --- | --- | --- |
+| Candidate terminal disposition: `finish_candidate`, `finish_candidate_at_revision` | never-retried mutation | none | The same live claim may invoke again after a reported error; otherwise the worker calls `retry_candidate`. A consumed claim is rejected and writes nothing. | dynamic: `candidate_terminal_timeout_executes_once` |
+| Candidate backoff: `retry_candidate` | explicit later operation | none | Releases the claim, records the error and advances `next_attempt_at` by `min(60, attempt_count)` seconds. It does not re-run the failed terminal write. A fresh `claim_candidate` after that time is the next attempt, with a new token; the old token stays rejected. | dynamic: `candidate_backoff_requires_new_claim` |
+| CTV attempt journal: `finish_fanout` | never-retried mutation; one journal row per authorized claim | none | Every recorded attempt, `failed` included, releases the claim and schedules `next_broadcast_attempt_at` (10 s per attempt, at most 3600 s). A fresh `claim_fanout` after that time is the next attempt and its own journal row; the old token stays rejected. | dynamic: `fanout_journal_timeout_executes_once`, `broadcast_retry_requires_new_claim` |
+| Claims: `claim_candidate`, `claim_fanout`, `renew_candidate_claim`, `renew_fanout_claim` | public reinvocation | none | One token per block hash or fanout. Distinct hashes have independent leases. Candidate terminal dispositions acquire the shared `SETTLEMENT_LOCK`, then `ORDER_LOCK`. The cited test verifies that a disposition does not touch a sibling candidate's locked outbox row; it does not establish concurrent execution of dispositions. | dynamic: `distinct_hashes_hold_independent_claims` |
+| Landing: `land_candidate`, `land_candidate_at_revision` | dependency reread, idempotent for an identical audit | none | Re-invocation re-reads the stored audit digest and header bits and accepts only an identical audit. A superseded payout revision is a reported error with no block, audit, payout, carry or fanout row written; recovery at a proven newer revision is an explicit call. | dynamic: `superseded_landing_reports_failure`; existing `ledger_postgres::active_candidate_can_land_at_proven_new_chain_revision` |
+| Expired or lost claim across a halt | never revived | none | Clearing `fatal_error` restores authority for new work only; the token that expired during the halt is still rejected by every operation and a new claim is required. | dynamic: `restored_authority_requires_fresh_claim` |
+| Share append: `append`, `append_at_revision` | public reinvocation, idempotent by share identity | none | A miner or frontend resubmission is a new call; the share identity and proof-hash registry return the existing row without a second credit. | inventory: `ledger_postgres::global_duplicates_idempotence_and_config_fencing`, `postgres_failover` |
+| Page traversal: `read_window`, `snapshot`, audit materialization | normal page traversal | none | A page is not a retry. `read_window` pages inside one `REPEATABLE READ READ ONLY` transaction and reports an incomplete range as an error instead of a partial window. `snapshot` fixes its anchor and revision in one short transaction, then pages immutable rows at or before that anchor in a second one. Audit materialization reads the snapshot row and the share range through separate checkouts; the share count, snapshot digest and bundle digest authenticate the result, and a mismatch is an error. | inventory: `window_reference`, `window_read_oracle` |
+| Dependency reread or repair: `save_issued_job` with a repair payload, `backfill_ctv`, `import_legacy_audits` | dependency reread/repair | none | Cold-path calls that re-read the durable dependency and verify its identity, or rebuild a missing row idempotently. None replays a failed write. | inventory: `issued_job_dependency`, `ledger_postgres::ctv_artifacts_wait_for_maturity_and_claims_are_fenced`, `ledger_postgres::legacy_audit_import_validates_envelope_hash_and_pinned_key` |
+| Reconciliation: `pool_blocks_for_reconcile`, `reconcile_blocks`, `reconcile_blocks_at_revision`, `observe_fanout` | public reinvocation, revision fenced | none | Periodic calls. `pool_blocks_for_reconcile` is one query. A stale expected revision (for `observe_fanout`, when the observation carries one) is an error that changes nothing. | inventory: `ledger_postgres::verified_landing_reconstructs_audit_and_reorgs_are_revision_fenced` |
+| Session reservation release: `SessionId::release`, drop cleanup | best-effort cleanup | none | A lost cleanup reply leaves the outcome unknown: the reservation may have been deleted or retained. A retained reservation is reclaimed once its owner is recorded as stopped. | inventory: `ledger_postgres::session_sequence` |
+
+"Dynamic" rows are exercised by
+`crates/qbit-prism-server/tests/ledger_single_execution.rs` against a disposable
+PostgreSQL. The two timeout tests route one ledger pool through a test-only
+protocol proxy that frames both directions of the wire and counts the
+targeted statement in `Execute` and `Query` frames across every connection,
+including a same-text replay the aborted transaction rejects and a second
+copy of the statement inside one simple `Query` frame. Server rejections are
+recorded separately from executions and every one in the observed window
+must be the targeted statement's own failure, so a replay under a different
+statement text, which the server refuses at `Parse` without any `Execute`,
+also fails the test. An execution whose statement text the proxy did not
+learn fails the test instead of escaping the count. The targeted statement
+is identified while it runs by a marker NOTICE from a statement-level
+fixture trigger on the durable table, not by its SQL text or its position.
+They seed a real server `statement_timeout` on the terminal write and a lost
+acknowledgement before and after `COMMIT`, and read the durable outcome back
+directly; a re-invocation after a lost acknowledgement is checked to run on
+a connection other than the one the fault closed. The durability of the
+lost-`COMMIT` case is proven by the proxy observing the server's `COMMIT`
+completion and by reading the state back, not by the caller's view.
+"Inventory" rows are a static review of the code, backed by the existing
+tests named; they were not re-tested for this contract.
+
+```sh
+PRISM_TEST_DATABASE_URL=postgresql://test_user@127.0.0.1:5432/test_db \
+  cargo test --locked -p qbit-prism-server --test ledger_single_execution -- --nocapture
+```
+
+### Deadlines
+
+The legacy writer's final-partial-batch and progress-between-batches deadline
+workflow has no native counterpart. There is no batch writer: each accepted
+share commits in its own transaction, so no deadline can expire inside a
+batch and no batch is retried as a unit. Two native mechanisms stand in for
+it:
+
+- Issued-job late expiry. `save_issued_job` checks the job's absolute
+  deadline after taking the shared settlement lock and before locking its
+  dependency row, and again just before commit, so a deadline that elapsed
+  while waiting on row locks is a reported error that retrying cannot reset,
+  and the job is not saved. `prune_expired_jobs` removes expired
+  rows in bounded batches.
+- Per-item import failure and restart. `import-audits` processes one legacy
+  audit at a time, each verified off the runtime threads and stored in its
+  own transaction. A failing item stops the command with an error; earlier
+  items stay imported, there is no partially imported item, and rerunning the
+  command resumes with the rows that still lack canonical bytes.
+
+### Native snapshot rejection and legacy segments
+
+A native audit body references an immutable share snapshot in
+`qbit_prism_audit_snapshots`. Landing rejects a snapshot that is empty, out of
+canonical order, or different from the ledger's rows for its range, before any
+obligation is recorded. Materialization verifies the share count, the
+reconstructed share digest and the canonical bundle digest, and returns an
+error instead of a repaired or substituted body. Imported canonical bytes are
+checked on both read paths: raw canonical-byte serving requires the declared
+digest and a JSON object, and materialization into a logical body
+additionally rejects an audit envelope and parses the bytes as a flat bundle.
+
+The legacy `audit-body-ref` and v2 segment envelopes are still parsed by the
+shared audit parser and the offline loaders, for import and verification. The
+legacy segment lifecycle (gap backfill from the ledger, quarantine of a
+segment when the ledger has no rows, and the conflicting-duplicate raise)
+belonged to the retired filesystem audit store and is not a native lifecycle:
+natively, a body is either reconstructed exactly from immutable rows or served
+from imported canonical bytes, and a mismatch is a read error to investigate,
+never a repair or quarantine step.
+
 ## HA database and shutdown
 
 Point every instance at the same writable primary endpoint. Do not route ledger
@@ -212,6 +313,227 @@ external audit bodies/segments. Use independent base backups plus WAL archives
 for point-in-time recovery; replication is not a replacement for backups.
 Restore into isolation and verify share order, audit hashes, carry-forward
 integrity, CTV state, and API reads before declaring recovery complete.
+
+## Fatal-state recovery
+
+A disconnected mature pool block or deep confirmed CTV fanout records a shared
+fatal state in `qbit_prism_cluster.fatal_error`. The message names the
+`block_hash` or `fanout_txid`, says `manual reconciliation required`, and names
+`qbit-prism-server fatal-state clear --reason <text>` as the recovery command. Every
+ledger write transaction then fails with `cluster halted: ...`, and commands
+that open the ledger for writing fail at startup. Only the audited command below
+ends the halt; there is no public API route and no force flag.
+
+Clearing restores authority for new work only. It does not approve or forgive
+accounting, and claims that expired during the halt still require fresh claims.
+
+### Recovery commands
+
+```sh
+qbit-prism-server migrate
+qbit-prism-server fatal-state show
+qbit-prism-server fatal-state clear --reason "<nonblank explanation>"
+```
+
+Apply migration 010 with `migrate` before recovery. It adds the
+`qbit_prism_fatal_state_events` audit table, works while the cluster is halted,
+and does not register a frontend. Confirm on the writer:
+
+```sql
+SELECT version FROM qbit_prism_schema_migrations WHERE version = 10;
+```
+
+`fatal-state show` reads PostgreSQL only. It neither starts nor registers an
+instance and needs no signing configuration. It prints JSON with `fatal_error`,
+`set_at`, `block_hash`, `fanout_txid`, and `halted`, and exits nonzero while
+halted and zero otherwise. `set_at` is null for a state recorded before
+migration 010, whose set time is unknown. A database read failure is also a
+nonzero exit, so keep the JSON with the exit status.
+
+`fatal-state clear` uses the normal server configuration (database, qbit RPC,
+chain/genesis, payout, and signing settings) to verify cluster identity. Under
+the settlement, ordering, and instance locks it refuses unless:
+
+- every stored `qbit_prism_instances` row has `status.state` `stopped` or
+  `drained`;
+- no live legacy writer lease exists;
+- the current chain is stable and still contains every mature pool block and
+  every deep confirmed fanout checkpoint; and
+- normal block reconciliation leaves no unresolved disconnection and the
+  carry-forward integrity report passes.
+
+The clear and its audit `INSERT` commit in one transaction. Failures before
+commit roll both back and leave the cluster halted; a lost response during
+commit requires checking the durable state before retrying. The event records `fatal_error`,
+`fatal_error_set_at`, `reason`, `operator_identity` (PostgreSQL `session_user`),
+`database_role` (`current_user`), `cleared_at`, the `instances` snapshot, and
+`reconciliation` (`genesis_hash`, `tip_hash`, `tip_height`, `blocks_checked`,
+`deep_fanouts_checked`, and `integrity`).
+
+The event identifies a database login, not a person. Prefer an individual
+PostgreSQL login for `clear`. When a shared login is unavoidable, put the
+incident ID, operator identity, and evidence reference in the reason.
+
+### 1. Preserve evidence first
+
+Collect evidence before stopping, restarting, or reconfiguring anything, and
+store it with the incident record:
+
+1. The `fatal-state show` JSON and exit status.
+2. The disconnected block or fanout record, pool blocks at the affected heights,
+   and their stored audit bundle digests.
+3. The current qbit chain from every node the frontends use: tip hash, height,
+   chainwork, and the confirmations of the named block or fanout.
+4. The complete carry-forward integrity report and any reconciliation output.
+
+Query the writer endpoint, not a replica, in a read-only session (for example
+`PGOPTIONS='-c default_transaction_read_only=on' psql`). For a fanout, use its
+parent block's height as `<affected_height>`.
+
+```sql
+SELECT fatal_error, updated_at, payout_revision, best_tip_hash,
+       best_tip_height, best_chainwork
+FROM qbit_prism_cluster WHERE singleton;
+
+SELECT block_hash, block_height, parent_hash, coinbase_txid, chain_state,
+       maturity_state, matured_at, inactive_since, disconnected_at
+FROM qbit_pool_blocks WHERE block_hash = '<block_hash>';
+
+SELECT fanout_txid, block_hash, chunk_index, settlement_status,
+       confirmed_block_hash, confirmed_block_height, confirmed_depth, updated_at
+FROM qbit_ctv_fanout_artifacts WHERE fanout_txid = '<fanout_txid>';
+
+SELECT b.block_hash, b.block_height, b.chain_state, b.maturity_state,
+       a.audit_bundle_sha256
+FROM qbit_pool_blocks b
+LEFT JOIN qbit_pool_audit_bundles a USING (block_hash)
+WHERE b.block_height >= <affected_height>
+ORDER BY b.block_height, b.block_hash
+LIMIT 200;
+
+SELECT fanout_txid, confirmed_block_hash, confirmed_block_height,
+       confirmed_depth
+FROM qbit_ctv_fanout_artifacts
+WHERE settlement_status = 'confirmed' AND confirmed_depth >= 1000
+ORDER BY confirmed_block_height DESC, fanout_txid DESC
+LIMIT 20;
+
+SELECT qbit_carry_forward_integrity_report();
+```
+
+```sh
+qbit-cli getblockchaininfo
+qbit-cli getblockheader <block_hash>
+qbit-cli getrawtransaction <fanout_txid> true <confirmed_block_hash>
+```
+
+A header `confirmations` of -1 means the block is not in that node's active
+chain.
+
+### 2. Stop every frontend
+
+Stop every `run` frontend gracefully with SIGTERM (bundled stacks:
+`docker compose stop --timeout 45 prism-coordinator prism-coordinator-2`). Shutdown closes
+admission and drains tasks and sessions for up to 30 seconds. Only then does the
+server record `stopped`, and only if no session guard remains. If that marker
+fails, the process exits with an error and its row keeps its previous status.
+Keep deployment supervisors and automatic restart (Compose restart policies,
+systemd units, orchestrators, HA managers) disabled until the final
+verification.
+
+Inspect every instance row:
+
+```sql
+SELECT instance_id, started_at, heartbeat_at,
+       round(extract(epoch FROM clock_timestamp() - heartbeat_at)::numeric, 1)
+         AS age_seconds,
+       status->>'state' AS state, status->>'schema' AS schema,
+       status->'ready' AS ready
+FROM qbit_prism_instances
+ORDER BY instance_id
+LIMIT 200;
+```
+
+Every row must show `stopped` or `drained`. A running frontend's row holds its
+health payload (`qbit.prism.audit-health.v1`) and no `state`. A `starting` row
+never became ready. Stale does not mean stopped: a heartbeat older than the
+15-second `self-check` window shows only that reporting stopped. The process
+may be hung, paused, cut off from PostgreSQL, or on an unreachable host, and
+may resume. `clear` therefore rejects missing, `starting`, unready, unknown,
+and old live states, however old the heartbeat.
+
+Resolve each blocker by finding the process for that `instance_id` and stopping
+it gracefully so it records its own marker. Do not insert, update, or delete
+`qbit_prism_instances` rows, move `heartbeat_at`, or set or clear `fatal_error`
+with SQL. The crashed-owner step in
+[retained reservations](prism-session-sequence.md#retained-reservations-and-recovery)
+is a different procedure and does not authorize a marker for this recovery. If
+an instance cannot record `stopped` itself, stop and escalate for a separately
+reviewed decision.
+
+### 3. Reconcile before clearing
+
+Establish whether the halt reflects the canonical chain. Compare the evidence
+from independent nodes with `best_tip_hash` and `best_chainwork`. A node on a
+lower-work or minority branch is repaired at the node, never by clearing.
+
+If the block or fanout really is disconnected, resolve the chain and accounting
+discrepancy (affected payouts, carry-forward balances, and fanout settlement)
+through a separately reviewed reconciliation before running `clear`. This
+runbook provides no SQL for that change. `clear` is not approval to forgive a
+still-disconnected mature payout: it refuses while any mature pool block or deep
+checkpoint is missing from the chain, and success means only that its checks
+passed. Record the review reference, then repeat the evidence queries.
+
+### 4. Clear the fatal state
+
+Run `clear` from a host with the frontends' normal configuration, using the
+operator's own database login:
+
+```sh
+set -o pipefail
+qbit-prism-server fatal-state clear \
+  --reason "<incident>: <operator>; <block or fanout> reconciled per <review>; evidence <ref>" \
+  | tee fatal-state-clear.json
+```
+
+Save the success JSON with the incident record, along with the audit event:
+
+```sql
+SELECT cleared_at, operator_identity, database_role, reason, fatal_error,
+       fatal_error_set_at, instances, reconciliation
+FROM qbit_prism_fatal_state_events
+ORDER BY cleared_at DESC
+LIMIT 5;
+```
+
+A validation or reconciliation failure clears nothing and writes no event. Correct the reported blocker
+and rerun deliberately; do not loop. If the connection drops around commit, the
+outcome is unknown: check `fatal-state show` and the event table before
+rerunning.
+
+### 5. Restart and verify
+
+1. Confirm `qbit-prism-server fatal-state show` exits zero, and save its JSON.
+2. Record the ledger head before admitting traffic:
+
+   ```sql
+   SELECT share_seq, accepted_at FROM qbit_share_ledger
+   WHERE accepted ORDER BY share_seq DESC LIMIT 1;
+   ```
+
+3. Re-enable supervisors and start the frontends. Each `/healthz` must return
+   200 (see [health checks](#health-diagnostics-and-validation)), and each
+   instance row must carry a fresh, ready health payload.
+4. Confirm new accepted shares. The step 2 query must return a higher
+   `share_seq` with a later `accepted_at`, and each frontend's
+   `qbit_prism_accepted_shares_total` and
+   `qbit_prism_share_ack_seconds_count{result="accepted"}` must increase.
+5. Keep the evidence, reconciliation reference, clear JSON, audit event, and
+   these checks together.
+
+If a frontend reports `cluster halted` again, a new fatal state was recorded.
+Start again from evidence collection.
 
 ## Health, diagnostics, and validation
 

@@ -164,6 +164,31 @@ impl Ledger {
         initialize: bool,
         metrics: Option<std::sync::Arc<Metrics>>,
     ) -> Result<Self> {
+        Self::connect_inner(url, instance_id, max_connections, initialize, metrics, true).await
+    }
+
+    /// Operator tools must be usable during a halt without registering a
+    /// frontend. Ordinary ledger mutations still enforce the write guard.
+    pub async fn connect_operator(url: &str, initialize: bool) -> Result<Self> {
+        Self::connect_inner(
+            url,
+            "fatal-state-operator".into(),
+            2,
+            initialize,
+            None,
+            false,
+        )
+        .await
+    }
+
+    async fn connect_inner(
+        url: &str,
+        instance_id: String,
+        max_connections: u32,
+        initialize: bool,
+        metrics: Option<std::sync::Arc<Metrics>>,
+        register: bool,
+    ) -> Result<Self> {
         ensure!(!instance_id.is_empty(), "instance ID must not be empty");
         let timeout_setting = |name: &str, default: u64| -> Result<String> {
             let millis = std::env::var(name)
@@ -225,12 +250,14 @@ impl Ledger {
             prior_schema_version = source.prior_schema_version,
             "PRISM database source"
         );
-        let mut tx = ledger.begin().await?;
-        writable(&mut tx).await?;
-        tx.commit().await?;
-        ledger
-            .heartbeat(serde_json::json!({"state":"starting"}))
-            .await?;
+        if register {
+            let mut tx = ledger.begin().await?;
+            writable(&mut tx).await?;
+            tx.commit().await?;
+            ledger
+                .heartbeat(serde_json::json!({"state":"starting"}))
+                .await?;
+        }
         Ok(ledger)
     }
 

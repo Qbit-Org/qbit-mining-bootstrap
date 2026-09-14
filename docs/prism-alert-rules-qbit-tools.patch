@@ -106,7 +106,7 @@
 -  that never increment RestartCount, so planned work needs no maintenance
 -  flag; drills that crash the coordinator on purpose use a Grafana silence.
 +{# Native 3.x.x cutover draft, bootstrap #279. Apply only with the native image.
-+   Specification SHA-256: 0f2720de308ed6a0870a1e9e38ed31e2e490abe8619bdd1d235d5a4f411d9d04
++   Specification SHA-256: 941aeff968df6b59a57c8030e993d88e177bea1a3826f887a046d5b5b884dfc1
 +   Generated from the reviewed a007a142 snapshot; backup, sidecar and lifecycle rules retain their producers.
 +   Native numeric bounds marked provisional must be measured in #291 before production cutover.
 +   The D3 group requires PRIMARY postgres_exporter query metrics; see bootstrap docs/prism-alert-migration.md.
@@ -566,7 +566,7 @@
 +  {
 +    "uid": "qbit-prism-database-pool-wait",
 +    "title": "PrismDatabasePoolWaitHigh",
-+    "expr": "((histogram_quantile(0.99, sum by (job, instance, network, le) (rate(qbit_prism_database_pool_acquire_seconds_bucket{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m]))) > bool 0.5) and on(job, instance, network) (sum by (job, instance, network) (increase(qbit_prism_database_pool_acquire_seconds_count{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m])) >= 10)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0)) and on(job, instance, network) (qbit_prism_collector_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",collector=\"database\"} == 1)",
++    "expr": "((histogram_quantile(0.99, sum by (job, instance, network, le) (rate(qbit_prism_database_pool_acquire_seconds_bucket{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m]))) > bool 0.5) and on(job, instance, network) (sum by (job, instance, network) (increase(qbit_prism_database_pool_acquire_seconds_count{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m])) >= 10)) and on(job, instance, network) (up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1)",
 +    "condition_type": "threshold",
 +    "evaluator": "gt",
 +    "threshold": 0,
@@ -577,7 +577,7 @@
 +      "alert_class": "prism-runtime"
 +    },
 +    "summary": "PrismDatabasePoolWaitHigh",
-+    "description": "Collector PgPool::acquire attempts record one observation: success when acquired, or failure on acquisition error or cancellation, including the three-second collection deadline. Durations measure elapsed pool wait and exclude subsequent transaction work; collector availability remains a separate alert guard. No advisory-lock rule until #283/A/C populate it. Pool p99 >0.5 seconds from at least ten observed acquisition attempts in five minutes, combining success and failure; provisional, measure in #291.",
++    "description": "Actual PgPool::acquire waits from metrics collection and instrumented ledger transactions, including share processing. Each started collector acquisition records one observation: success when acquired, or failure on acquisition error or cancellation, including the three-second collection deadline. Durations measure elapsed pool wait; BEGIN, query execution and advisory-lock waits are outside this timer. Pool traffic outside these instrumented acquisition paths, including rollup worker transactions and public API queries, is not timed. Success and failure observations are combined. The histogram is read live at scrape time, so valid waits remain alertable during database collector failure or cached-body publication stalls; a successful scrape is required. Pool p99 >0.5 seconds from at least ten observed acquisition attempts in five minutes; provisional, measure in #291.",
 +    "no_data_state": "OK",
 +    "exec_err_state": "OK"
 +  },

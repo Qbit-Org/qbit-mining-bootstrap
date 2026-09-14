@@ -39,6 +39,11 @@ enum Command {
     },
     /// Check node identity, database integrity, API readiness and cluster settings.
     SelfCheck,
+    /// Inspect a cluster halt or reconcile and record an operator recovery.
+    FatalState {
+        #[command(subcommand)]
+        command: FatalStateCommand,
+    },
     /// Validate compact target bits and print Prism's exact scaled difficulty.
     HeaderDifficulty {
         #[arg(long)]
@@ -67,6 +72,17 @@ enum Command {
         iterations: usize,
         #[arg(long)]
         output_json: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum FatalStateCommand {
+    /// Print the stored halt; exits nonzero when the cluster is halted.
+    Show,
+    /// Reconcile a stopped/drained cluster and durably record why it was cleared.
+    Clear {
+        #[arg(long)]
+        reason: String,
     },
 }
 
@@ -99,6 +115,7 @@ pub async fn run() -> Result<()> {
         }
         Command::Healthcheck { url, public_api } => healthcheck(url, public_api).await,
         Command::SelfCheck => self_check().await,
+        Command::FatalState { command } => fatal_state(command).await,
         Command::HeaderDifficulty { bits } => {
             let compact = crate::codec::parse_u32_hex(&bits)?;
             let target = crate::codec::target_from_compact(compact)?;
@@ -107,13 +124,8 @@ pub async fn run() -> Result<()> {
         }
         Command::Migrate => {
             let config = Config::from_env()?;
-            let ledger = crate::ledger::Ledger::connect(
-                &config.database_url,
-                config.instance_id,
-                config.database_connections,
-                true,
-            )
-            .await?;
+            let ledger =
+                crate::ledger::Ledger::connect_operator(&config.database_url, true).await?;
             let source = ledger
                 .migration_source()
                 .await?
@@ -185,6 +197,36 @@ pub async fn run() -> Result<()> {
                 tokio::fs::write(path, &text).await?;
             }
             println!("{text}");
+            Ok(())
+        }
+    }
+}
+
+async fn fatal_state(command: FatalStateCommand) -> Result<()> {
+    match command {
+        FatalStateCommand::Show => {
+            let url =
+                config::optional("PRISM_DATABASE_URL").context("PRISM_DATABASE_URL is required")?;
+            let state = crate::ledger::Ledger::inspect_fatal_state(&url).await?;
+            println!("{}", serde_json::to_string_pretty(&state)?);
+            ensure!(
+                state["halted"] == false,
+                "cluster halted: {}",
+                state["fatal_error"].as_str().unwrap_or("unknown")
+            );
+            Ok(())
+        }
+        FatalStateCommand::Clear { reason } => {
+            ensure!(
+                !reason.trim().is_empty() && reason.len() <= 4096,
+                "--reason must contain 1 to 4096 bytes of nonblank text"
+            );
+            let config = Config::from_env()?;
+            let ledger =
+                crate::ledger::Ledger::connect_operator(&config.database_url, false).await?;
+            let result = ledger.clear_fatal_state(&config, &reason).await;
+            ledger.pool.close().await;
+            println!("{}", serde_json::to_string_pretty(&result?)?);
             Ok(())
         }
     }

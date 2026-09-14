@@ -614,7 +614,7 @@ async fn migration_preserves_legacy_payloads_and_applies_missing_008_below_009()
         sqlx::raw_sql(MIGRATION_008).execute(&db.pool).await?;
         let versions: Vec<i32> = sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations ORDER BY version")
             .fetch_all(&db.pool).await?;
-        ensure!(versions == [2,3,4,5,6,8,9], "migration membership/order wrong: {versions:?}");
+        ensure!(versions == [2,3,4,5,6,8,9,10], "migration membership/order wrong: {versions:?}");
         Ok(())
     })).await
 }
@@ -720,7 +720,7 @@ async fn landed_009_coexists_with_008_in_both_orders_under_runner() -> Result<()
                 .fetch_one(&db.pool).await?;
             ensure!(index.contains("lower(") && index.contains("extranonce1") && index.contains("expires_at"), "009 index changed");
             let versions: Vec<i32> = sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations ORDER BY version").fetch_all(&db.pool).await?;
-            ensure!(versions == [2,3,4,5,6,8,9], "008/009 order failed");
+            ensure!(versions == [2,3,4,5,6,8,9,10], "008/009 order failed");
             let cycle: bool = sqlx::query_scalar("SELECT seqcycle FROM pg_sequence WHERE seqrelid='qbit_prism_session_sequence'::regclass")
                 .fetch_one(&db.pool).await?;
             ensure!(cycle, "009 session sequence did not retain CYCLE");

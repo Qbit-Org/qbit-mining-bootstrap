@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 /// additive, and a release whose format an older binary must not touch
 /// declares a capability, which `migrate_schema` refuses before any DDL and
 /// `require_known_capabilities` refuses again at connect.
-pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 8, 9];
+pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 8, 9, 10];
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
 /// `none`.
@@ -1971,6 +1971,10 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
         9,
         include_str!("../../migrations/009_wrap_safe_sessions.sql"),
     ),
+    (
+        10,
+        include_str!("../../migrations/010_fatal_state_recovery.sql"),
+    ),
 ];
 
 /// The SQL of one native migration, by the version it records.
@@ -2535,6 +2539,14 @@ pub(super) async fn migrate_schema(
             .execute(&mut **tx)
             .await?;
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(9)")
+            .execute(&mut **tx)
+            .await?;
+    }
+    if !versions.contains(&10) {
+        sqlx::raw_sql(native_migration(10))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(10)")
             .execute(&mut **tx)
             .await?;
     }
