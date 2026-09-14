@@ -661,7 +661,7 @@ async fn verified_landing_reconstructs_audit_and_reorgs_are_revision_fenced() ->
         .is_err());
     a.land_candidate(&claim, &keys().1.public_key_hex()).await?;
     a.land_candidate(&claim, &keys().1.public_key_hex()).await?;
-    let compact:bool=sqlx::query_scalar("SELECT NOT(audit_bundle ? 'shares') AND share_snapshot_sha256 IS NOT NULL FROM qbit_pool_audit_bundles").fetch_one(&a.pool).await?;
+    let compact:bool=sqlx::query_scalar("SELECT NOT(audit_bundle ? 'shares') AND NOT(audit_bundle->'reward_manifest' ? 'shares') AND share_snapshot_sha256 IS NOT NULL FROM qbit_pool_audit_bundles").fetch_one(&a.pool).await?;
     assert!(compact);
     let hydrated = a.audit_bundle(&hash).await?.unwrap();
     assert_eq!(hydrated, serde_json::to_value(&block.bundle)?);
