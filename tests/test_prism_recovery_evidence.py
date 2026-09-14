@@ -114,13 +114,15 @@ class RecoveryEvidenceTests(unittest.TestCase):
     def test_fatal_state_and_recovery_history_change_summary_independently(self):
         baseline = module.summarize(iter(closing()))
         fatal = {"fatal_error": "fanout disconnected", "fatal_error_set_at": None}
+        checkpoint = {"best_chainwork": "2", "best_tip_hash": "aa" * 32, "best_tip_height": 7}
         event = {
             "event_id": 1, "cleared_at": "2026-09-14T21:00:00+00:00",
             "operator_identity": "operator", "database_role": "prism",
             "reason": "reconciled", **fatal,
             "instances": [], "reconciliation": {"blocks_checked": 1},
         }
-        for kind, row in (("fatal_state", fatal), ("fatal_state_events", event)):
+        for kind, row in (("fatal_state", fatal), ("fatal_state_events", event),
+                          ("chain_checkpoint", checkpoint)):
             with self.subTest(kind=kind):
                 self.assertEqual(baseline["records"][kind]["count"], 0)
                 added = module.summarize(iter([record(kind, row)] + closing()))

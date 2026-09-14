@@ -411,6 +411,14 @@ FROM qbit_prism_deferred_shares d ORDER BY block_hash COLLATE "C";
 SELECT jsonb_build_object('kind', 'fatal_state', 'row', jsonb_build_object(
     'fatal_error', fatal_error, 'fatal_error_set_at', to_jsonb(c)->'fatal_error_set_at'))
 FROM qbit_prism_cluster c WHERE fatal_error IS NOT NULL ORDER BY singleton;
+-- observe_chain_view rejects tips below this checkpoint. Migration defaults
+-- (zero work, no tip) are omitted so fresh and migrated evidence still match.
+SELECT jsonb_build_object('kind', 'chain_checkpoint', 'row', jsonb_build_object(
+    'best_chainwork', best_chainwork::text, 'best_tip_hash', best_tip_hash,
+    'best_tip_height', best_tip_height))
+FROM qbit_prism_cluster c
+WHERE best_chainwork <> 0 OR best_tip_hash IS NOT NULL OR best_tip_height IS NOT NULL
+ORDER BY singleton;
 \endif
 \if :has_fatal_state_events
 SELECT jsonb_build_object('kind', 'fatal_state_events', 'row', to_jsonb(e))

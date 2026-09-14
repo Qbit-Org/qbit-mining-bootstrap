@@ -307,6 +307,27 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         sqlx::query("UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1,updated_at=clock_timestamp()")
             .execute(&source.pool).await?;
         ensure!(recovery::evidence(&source, pg_bin).await? == prior);
+        // The chain-view checkpoint gates future tip acceptance, so each
+        // column must be fingerprinted once it leaves the migration default.
+        ensure!(prior["records"]["chain_checkpoint"]["count"] == 0);
+        for mutation in [
+            "best_chainwork=2",
+            "best_tip_hash=repeat('cc',32)",
+            "best_tip_height=7",
+            "best_chainwork=3",
+        ] {
+            sqlx::query(&format!("UPDATE qbit_prism_cluster SET {mutation}"))
+                .execute(&source.pool).await?;
+            let current = recovery::evidence(&source, pg_bin).await?;
+            ensure!(current["records"]["chain_checkpoint"]["count"] == 1);
+            ensure!(current["records"]["chain_checkpoint"]["sha256"]
+                != prior["records"]["chain_checkpoint"]["sha256"],
+                "chain checkpoint change was invisible to recovery evidence: {mutation}");
+            let mut unchanged = current.clone();
+            unchanged["records"]["chain_checkpoint"] = prior["records"]["chain_checkpoint"].clone();
+            ensure!(unchanged == prior, "unrelated accounting changed with chain checkpoint");
+            prior = current;
+        }
         let before_halt = prior.clone();
         for mutation in [
             "fatal_error='deep confirmed CTV fanout disconnected: test; manual reconciliation required'",
