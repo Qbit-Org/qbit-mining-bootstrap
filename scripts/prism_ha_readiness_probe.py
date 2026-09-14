@@ -4,7 +4,9 @@
 This is qualification evidence only; it performs no network I/O or routing.
 """
 from dataclasses import dataclass
+import argparse
 import json
+import math
 from typing import Any
 
 
@@ -16,6 +18,8 @@ class ProbeConfig:
     rise: int = 2
 
     def __post_init__(self) -> None:
+        if not math.isfinite(self.interval_s) or not math.isfinite(self.timeout_s):
+            raise ValueError("probe interval and timeout must be finite")
         if self.interval_s <= 0 or self.timeout_s <= 0:
             raise ValueError("probe interval and timeout must be positive")
         if self.fall < 1 or self.rise < 1:
@@ -33,7 +37,7 @@ class ReadinessProbe:
 
     @staticmethod
     def classify(response: Any, elapsed_s: float, timeout_s: float) -> bool:
-        if elapsed_s > timeout_s or not isinstance(response, dict):
+        if not math.isfinite(elapsed_s) or elapsed_s < 0 or elapsed_s > timeout_s or not isinstance(response, dict):
             return False
         return response.get("status") == 200 and response.get("ok") is True
 
@@ -75,7 +79,13 @@ def run_timeline(
 def main() -> None:
     # JSON-lines adapter for reproducible qualification, intentionally no I/O
     # beyond stdin/stdout and no claim of real load-balancer behavior.
-    config = ProbeConfig()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--interval-s", type=float, default=2.0)
+    parser.add_argument("--timeout-s", type=float, default=1.0)
+    parser.add_argument("--fall", type=int, default=6)
+    parser.add_argument("--rise", type=int, default=2)
+    args = parser.parse_args()
+    config = ProbeConfig(args.interval_s, args.timeout_s, args.fall, args.rise)
     probe = ReadinessProbe(config)
     for line in __import__("sys").stdin:
         item = json.loads(line)

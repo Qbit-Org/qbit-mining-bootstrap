@@ -1,4 +1,8 @@
 import unittest
+import json
+import math
+import subprocess
+import sys
 
 from scripts.prism_ha_readiness_probe import ProbeConfig, ReadinessProbe, run, run_timeline
 
@@ -16,6 +20,8 @@ class ReadinessProbeTests(unittest.TestCase):
         for response, elapsed in [(BAD, 0), (OK, 1.01), (None, 0), ({"status": 200}, 0)]:
             self.assertEqual(p.observe(response, elapsed), "unknown")
         self.assertEqual(p.failures, 4)
+        for elapsed in (-1.0, math.nan, math.inf):
+            self.assertNotEqual(p.observe(OK, elapsed), "up")
 
     def test_six_failures_eject_and_two_successes_recover(self):
         p = ReadinessProbe()
@@ -46,10 +52,17 @@ class ReadinessProbeTests(unittest.TestCase):
         self.assertEqual(p.state, "up")
 
     def test_nondefaults_and_invalid_config(self):
-        self.assertEqual(run([(BAD, 0)] * 3 + [(OK, 0)] * 3, ProbeConfig(fall=3, rise=3)), ["unknown", "unknown", "down", "down", "down", "up"])
-        for kwargs in ({"interval_s": 0}, {"timeout_s": 0}, {"fall": 0}, {"rise": 0}):
+        config = ProbeConfig(interval_s=0.5, timeout_s=0.25, fall=3, rise=3)
+        self.assertEqual(run_timeline([(i * 0.5, BAD, 0) for i in range(3)], config), ["unknown", "unknown", "down"])
+        self.assertEqual(run([(BAD, 0)] * 3 + [(OK, 0)] * 3, config), ["unknown", "unknown", "down", "down", "down", "up"])
+        for kwargs in ({"interval_s": 0}, {"timeout_s": 0}, {"fall": 0}, {"rise": 0}, {"timeout_s": math.nan}, {"interval_s": math.inf}):
             with self.assertRaises(ValueError):
                 ProbeConfig(**kwargs)
+
+    def test_cli_preserves_state_across_multiple_json_lines(self):
+        rows = "\n".join(json.dumps({"response": OK, "elapsed_s": value}) for value in (0.0, 1.0)) + "\n"
+        result = subprocess.run([sys.executable, "scripts/prism_ha_readiness_probe.py"], input=rows, text=True, capture_output=True, check=True)
+        self.assertEqual([json.loads(line)["state"] for line in result.stdout.splitlines()], ["unknown", "up"])
 
 
 if __name__ == "__main__":
