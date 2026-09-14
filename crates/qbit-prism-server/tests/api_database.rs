@@ -316,8 +316,15 @@ async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
         serde_json::to_vec(&snapshot.shares).unwrap(),
     ));
     let logical = serde_json::to_value(&audit).unwrap();
+    // The native row as `land_candidate` writes it since #267: the logical
+    // bundle minus the top-level `shares` and minus `reward_manifest.shares`.
     let mut metadata = logical.clone();
     metadata.as_object_mut().unwrap().remove("shares");
+    metadata["reward_manifest"]
+        .as_object_mut()
+        .unwrap()
+        .remove("shares")
+        .unwrap();
     sqlx::query("INSERT INTO qbit_prism_audit_snapshots(snapshot_sha256,first_share_seq,last_share_seq,anchor_ms,share_count) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING").bind(&share_digest).bind(snapshot.shares.first().unwrap().share_seq as i64).bind(snapshot.shares.last().unwrap().share_seq as i64).bind(snapshot.anchor_ms).bind(snapshot.shares.len()as i64).execute(&pool).await.unwrap();
     let native_hash = "3".repeat(64);
     sqlx::query("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256,chain_state) VALUES($1,12,$2,$3,$4,'confirmed')").bind(&native_hash).bind(&ctv_hash).bind("2".repeat(64)).bind("1".repeat(64)).execute(&pool).await.unwrap();
@@ -342,6 +349,19 @@ async fn shared_database_serves_all_contracts_and_global_reward_ranks() {
         "native HTTP body must retain canonical field ordering"
     );
     assert_eq!(hex::encode(Sha256::digest(&bytes)), digest);
+    let (status, hydrated) = get(&app, &format!("/audit/blocks/{native_hash}/bundle")).await;
+    assert_eq!(status, StatusCode::OK, "{hydrated}");
+    assert_eq!(hydrated["audit_bundle"], logical);
+    // A native row written before #267 still carries `reward_manifest.shares`
+    // and is served through the same routes with the same bytes.
+    sqlx::query("UPDATE qbit_pool_audit_bundles SET audit_bundle=jsonb_set(audit_bundle,'{reward_manifest,shares}',$2) WHERE block_hash=$1").bind(&native_hash).bind(&logical["reward_manifest"]["shares"]).execute(&pool).await.unwrap();
+    let (status, restored) = get(&app, &format!("/public/v1/artifacts/{digest}")).await;
+    assert_eq!(status, StatusCode::OK, "{restored}");
+    assert_eq!(restored, logical);
+    let (status, hydrated) = get(&app, &format!("/audit/blocks/{native_hash}/bundle")).await;
+    assert_eq!(status, StatusCode::OK, "{hydrated}");
+    assert_eq!(hydrated["audit_bundle"], logical);
+    sqlx::query("UPDATE qbit_pool_audit_bundles SET audit_bundle=audit_bundle #- '{reward_manifest,shares}' WHERE block_hash=$1").bind(&native_hash).execute(&pool).await.unwrap();
     sqlx::query("UPDATE qbit_pool_audit_bundles SET audit_bundle=jsonb_set(audit_bundle,'{found_block,coinbase_value_sats}','1') WHERE block_hash=$1").bind(&native_hash).execute(&pool).await.unwrap();
     let (status, corrupt) = get(&app, &format!("/public/v1/artifacts/{digest}")).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);

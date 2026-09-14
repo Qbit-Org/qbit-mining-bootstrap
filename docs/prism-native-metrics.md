@@ -6,7 +6,7 @@ observations, with #277 freshness, collector age/availability, and runtime state
 Scraping performs no database, node, or filesystem I/O. Public-api metrics retain
 their existing contract.
 
-The generated table below is the sole inventory for both roles: **38 coordinator
+The generated table below is the sole inventory for both roles: **39 coordinator
 families and 14 public families**. Names, types and meanings for `run` come from
 [registry.rs](../crates/qbit-prism-server/src/metrics/registry.rs#L42), with bounded
 label values from [labels.rs](../crates/qbit-prism-server/src/metrics/labels.rs#L15).
@@ -54,13 +54,14 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_collector_available` | gauge | `collector=database,process` | run | Whether a collector has a complete successful observation. | none |
 | `qbit_prism_collector_success` | gauge | `collector=database,process` | run | Whether the latest collector attempt succeeded, or -1 before an attempt. | none |
 | `qbit_prism_connections` | gauge | none | run | Current local Stratum connections. | `qbit_prism_connected_clients`, `qbit_prism_stratum_active_connections` |
-| `qbit_prism_database_advisory_lock_wait_seconds` | histogram | `lock=migration,order,settlement`; `result=success,failure` | run | Database advisory transaction lock wait by lock and outcome. Declared, rule deferred to #283 and A/C accounting-lock owners; no production observations yet. | none |
-| `qbit_prism_database_pool_acquire_seconds` | histogram | `result=success,failure` | run | Actual database pool acquisition wait by outcome. Collector acquisitions only; ledger hot paths remain unwired. | none |
+| `qbit_prism_database_advisory_lock_wait_seconds` | histogram | `lock=migration,order,settlement`; `result=success,failure` | run | Database advisory transaction lock wait by lock and outcome. Client-observed duration of the `pg_advisory_xact_lock` statement, including one database round trip, recorded by the coordinator's ledger for the migration, order and settlement locks; the migration lock is taken only when the coordinator initializes the schema. `failure` includes lock timeout (`PRISM_DATABASE_LOCK_TIMEOUT_MS`, default 5 seconds), statement timeout, deadlock and connection errors, and waits abandoned by cancellation. The CPFP funding lock is not observed (#328). Series appear on their first observation, so a restart's first failure is not visible to `increase()`. | none |
+| `qbit_prism_database_pool_acquire_seconds` | histogram | `result=success,failure` | run | Actual database pool acquisition wait by outcome. Client-observed `PgPool::acquire` time: waiting for a pool permit, the idle-connection liveness ping and, when the pool grows, connection setup; excludes transaction BEGIN and the queries that follow. Recorded by the metrics collector, including its own cancellations, and since #328 by every ledger transaction; queries run directly on the pool outside a transaction are not timed. `failure` includes acquire errors, the 15-second acquire timeout and acquisitions abandoned by cancellation, recorded with the elapsed wait. | none |
 | `qbit_prism_duplicate_shares_total` | counter | none | run | Duplicate share rejections. | `qbit_prism_duplicate_shares_total` |
 | `qbit_prism_grace_credited_shares_total` | counter | none | run | Durably accepted shares credited by stale grace. | `qbit_prism_grace_credited_shares_total` |
 | `qbit_prism_health_state` | gauge | none | run | Whether this instance is ready to serve mining work. | none |
 | `qbit_prism_job_delivery_failures_total` | counter | none | run | Failed local job deliveries. | none |
 | `qbit_prism_job_delivery_successes_total` | counter | none | run | Successful local job deliveries. | none |
+| `qbit_prism_late_confirmed_shares_total` | counter | none | run | Shares accepted after the share commit deadline once their in-flight ledger commit was confirmed. | none |
 | `qbit_prism_low_difficulty_shares_total` | counter | none | run | Low difficulty share rejections. | `qbit_prism_low_difficulty_shares_total` |
 | `qbit_prism_metrics_snapshot_age_seconds` | gauge | none | run | Monotonic age of the metrics snapshot, or -1 before the first publication. | `qbit_prism_metrics_snapshot_age_seconds` |
 | `qbit_prism_metrics_snapshot_available` | gauge | none | run | Whether a complete metrics snapshot has been published. | `qbit_prism_metrics_snapshot_available` |
@@ -82,7 +83,7 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_public_responses_total` | counter | `status` (HTTP status code) | public-api | HTTP responses by status, including health probes; appears after the first response. | `qbit_prism_public_responses_total` |
 | `qbit_prism_public_staleness_refusals_total` | counter | none | public-api | Responses refused for exceeding an endpoint cache-age budget. | `qbit_prism_public_staleness_refusals_total` |
 | `qbit_prism_rejected_shares_total` | counter | none | run | Shares rejected by this instance since process start. | none |
-| `qbit_prism_rejections_total` | counter | `reason_id=stale-job,duplicate-share,low-difficulty,malformed-submit,unauthorized-worker,unknown-job,invalid-extranonce,invalid-ntime-or-nonce,backend-rpc-unavailable,internal-error,pool-closed,ledger-confirmation-failed` | run | Share rejections by canonical bounded reason ID. | `qbit_prism_rejections_total` |
+| `qbit_prism_rejections_total` | counter | `reason_id=stale-job,duplicate-share,low-difficulty,malformed-submit,unauthorized-worker,unknown-job,invalid-extranonce,invalid-ntime-or-nonce,backend-rpc-unavailable,internal-error,pool-closed,ledger-confirmation-failed,ledger-outcome-unknown` | run | Share rejections by canonical bounded reason ID. | `qbit_prism_rejections_total` |
 | `qbit_prism_runtime_lag_seconds` | gauge | none | run | Latest observed runtime sampler wake lateness, or -1 before the first observation. Runtime-stall intent replaces lease wake delay; no native writer lease. | `qbit_prism_lease_heartbeat_monitor_wake_delay_window_max_seconds` |
 | `qbit_prism_runtime_poll_lag_seconds` | gauge | `task=refresh,submit,block_wait,broadcast,rollup,health_publisher,stratum_listener,stratum_session,collector` | run | Maximum active poll duration or completed poll duration retained for 60 to 61 seconds, by task. | none |
 | `qbit_prism_runtime_progress_age_seconds` | gauge | `task=refresh,submit,block_wait,broadcast,rollup,health_publisher,stratum_listener,stratum_session,collector` | run | Oldest active operation time since progress; zero when idle. | none |
@@ -120,6 +121,30 @@ neither event. Existing accepted/rejected totals keep their original Stratum
 accounting boundary. The grace hook does not reinterpret the caller's grace
 hint; it uses the coordinator's stale decision after the database confirms credit.
 
+Share acknowledgements follow the ledger outcome (#324). A share-pass append
+whose COMMIT was already in flight at `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS` can
+still be accepted within `share_commit_grace` (5 s); each such acceptance
+increments `qbit_prism_late_confirmed_shares_total`. A share-pass submission
+carrying a found-block candidate is never refused, so it can be confirmed later
+still, up to `block_only_ack_timeout`; those acceptances are counted the same
+way. The counter is keyed on when the append itself finished, not on when the
+acknowledgement was processed. Three outcomes are answered
+`ledger-outcome-unknown`, never `ledger-confirmation-failed`: a COMMIT still in
+flight after the grace period, a COMMIT failure other than a severity-ERROR
+reply, and, under the sync-rep guard, a COMMIT that took at least the ledger
+sessions' `statement_timeout`, because that may be a synchronous-replication
+wait cancelled after local commit. Such a share may still be credited, and the
+warning log names its `share_id`. Unknown answers are rejections under the
+protocol, so they count in `qbit_prism_rejected_shares_total`,
+`qbit_prism_rejections_total{reason_id="ledger-outcome-unknown"}` and
+`qbit_prism_share_ack_seconds{result="rejected"}`. Block-only proofs wait for
+their candidate's disposition, and share-pass appends that carry a found block
+wait for their append, up to `block_only_ack_timeout`
+(`max(60 s, PRISM_SHARE_COMMIT_TIMEOUT_SECONDS)`); either is answered
+`ledger-outcome-unknown` if still pending then. Such an ACK between 30 and 60
+seconds lands only in the `+Inf` bucket. Neither `share_commit_grace` nor
+`block_only_ack_timeout` is an environment variable.
+
 Collectors run every ten seconds. Database collection uses a read-only,
 repeatable-read transaction with a three-second overall deadline, a two-second
 statement timeout, and a 500 ms lock timeout. Failure or cancellation makes the
@@ -129,10 +154,14 @@ new attempt finishes. A newer collection attempt supersedes an older result;
 late completion or cancellation cannot replace the newer publication. A real
 zero count, age, or RSS remains valid after successful collection.
 
-Pool timing pre-registers both result labels at count zero and records
-observations only for acquisition attempts that complete, including completed
-acquisition errors. Overall collector cancellation during acquisition
-does not invent a completed wait. The collector status records that failure.
+Pool timing pre-registers both result labels at count zero. Each started
+collector acquisition records one observation: success when acquired, or failure
+on acquisition error or cancellation, including the three-second overall
+deadline. Since #328 every ledger transaction's acquisition records the same way,
+including one abandoned by cancellation; queries run directly on the pool outside
+a transaction are not timed. Duration is the monotonic elapsed pool wait until
+acquisition completes or is cancelled; subsequent transaction work is excluded.
+Collector status also records collection failure or cancellation separately.
 Candidate count and age describe database time; this is not a monotonic latency
 measurement. A/#266 must update the pending predicate if outbox states change.
 
@@ -156,10 +185,23 @@ and landing-phase instrumentation are outside this trimmed change.
 
 ## Follow-up ownership
 
-First-offer and advisory-lock timing remain **declared, not yet populated**.
-The native alert specification attaches no firing rules to these families. Pool timing covers
-only the collector, not ledger hot paths. A/C wire the remaining timing sites
-after #283/#266; this PR references #278 rather than closing it.
+First-offer timing remains **declared, not yet populated**; A/#266 wires it.
+Since #328, every ledger transaction records into
+`database_pool_acquire_seconds`, and the coordinator's migration, order and
+settlement advisory-lock acquisitions record into
+`database_advisory_lock_wait_seconds`; the CPFP funding lock and
+non-transaction pool queries are not timed. The native alert specification
+attaches no firing rule to first-offer or advisory-lock timing.
+`PrismDatabasePoolWaitHigh` now evaluates ledger acquisitions as well as the
+collector's, and its description predates #328. That rule is also still gated on
+`collector_available{collector="database"} == 1`. The collector acquires from the
+same pool as the ledger, so sustained pool exhaustion times out its own
+acquisition, zeroes that gauge, and suppresses the rule exactly while the ledger
+histogram is recording the waits that should fire it. Before #328 the gate cost
+nothing, because the family carried no samples during such an outage. Removing or
+revising it means regenerating the alert specification and the deployment patch
+together, which #336 tracks. #328 references
+#278 rather than closing it.
 
 The #280 rebase must preserve the narrow hooks in `stratum::request` (complete
 frame time, rejection decision, and successful write) and the durable

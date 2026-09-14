@@ -20,7 +20,8 @@ dashboard/API surfaces should use these IDs instead of parsing human messages.
 | `internal-error` | An internal coordinator failure prevented normal classification. |
 | `pool-closed` | The coordinator was no longer accepting shares. |
 | `block-stale` | The block candidate height was stale against the active qbit tip. |
-| `ledger-confirmation-failed` | The ledger did not confirm a block that qbit appeared to accept. |
+| `ledger-confirmation-failed` | The ledger did not record the share. For share-pass submissions, the commit was not sent or was rolled back. For block-only proofs, the block was not on the active chain when its candidate was abandoned; a later reorg or late landing can still credit it. |
+| `ledger-outcome-unknown` | The ledger outcome was not known by the acknowledgement deadline; the share may still be credited (logged with `share_id`). |
 
 The coordinator exposes these IDs in:
 

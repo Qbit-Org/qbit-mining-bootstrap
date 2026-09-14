@@ -684,10 +684,12 @@ async fn a_bootstrap_block_still_pays_carried_forward_balances() -> Result<()> {
 /// An empty payout window beside a non-zero carry is not reachable through any
 /// 3.x.x write path within one schema, and all three exits are closed:
 ///
-/// * A block that *accrues* must carry real ledger shares.
-///   `persist_audit_snapshot` (`ledger/audit.rs:124-138`) re-reads the
-///   bundle's share range out of `qbit_share_ledger` and requires it to match,
-///   exempting only a single synthetic `bootstrap-share`.
+/// * A block that *accrues* must carry real ledger shares. `verify_durable_range`
+///   (`ledger/audit.rs`) re-reads the bundle's share range out of
+///   `qbit_share_ledger` page by page before the settlement lock and requires
+///   it to match, and `persist_audit_snapshot` re-counts the same anchored
+///   range inside the transaction; both exempt only a single synthetic
+///   `bootstrap-share`.
 /// * A bootstrap-shaped block cannot accrue at all. With one share there is
 ///   one entitlement, and `apply_payout_policy`
 ///   (`crates/qbit-prism/src/lib.rs:1079-1090`) rejects the block outright

@@ -118,9 +118,10 @@ observed results.
 ## JSONB ceiling gate and 400k-share baselines
 
 PostgreSQL refuses a JSONB container whose elements exceed 268,435,455 bytes.
-Three native writes still embed the whole payout window and therefore grow
+Two native writes still embed the whole payout window and therefore grow
 linearly with the share count, so the payout window has a hard storage ceiling
-that arrives well before any capacity limit. The gate at
+that arrives well before any capacity limit. The landing write was a third until
+#267 normalized the stored audit body; it is now flat in the window. The gate at
 `crates/qbit-prism-server/tests/jsonb_ceiling_gate.rs` measures those writes and
 holds the line while they are being removed. The legacy audit import was a
 fourth until #265. It now stores only the canonical bytes, as `bytea`, and

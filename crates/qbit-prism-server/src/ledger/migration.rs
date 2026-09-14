@@ -2,6 +2,7 @@
 //! start passes, and the explicit one-time migration of Python filesystem
 //! artifacts. Validation is performed before any write; operator files and
 //! historical rows are retained.
+use super::connect::lock;
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -2319,8 +2320,9 @@ async fn require_release_schema(
 pub(super) async fn migrate_schema(
     tx: &mut Transaction<'_, Postgres>,
     instance_id: &str,
+    metrics: Option<&crate::metrics::Metrics>,
 ) -> Result<()> {
-    lock(tx, MIGRATION_LOCK).await?;
+    lock(tx, MIGRATION_LOCK, metrics).await?;
     require_source_schema_resolution(tx).await?;
     sqlx::raw_sql("CREATE TABLE IF NOT EXISTS qbit_prism_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())").execute(&mut **tx).await?;
     // Each applied migration is tracked on its own, not as a high-water mark:
@@ -2342,8 +2344,8 @@ pub(super) async fn migrate_schema(
     if !versions.contains(&3) {
         // Existing native writers use this same lock order. Keep the
         // schema repair and cutover atomic with their accounting.
-        lock(tx, SETTLEMENT_LOCK).await?;
-        lock(tx, ORDER_LOCK).await?;
+        lock(tx, SETTLEMENT_LOCK, metrics).await?;
+        lock(tx, ORDER_LOCK, metrics).await?;
         let lease_exists: bool =
             sqlx::query_scalar("SELECT to_regclass('qbit_ledger_writer_lease') IS NOT NULL")
                 .fetch_one(&mut **tx)
@@ -2700,8 +2702,8 @@ impl Ledger {
                     ))
                 })
                 .await??;
-            let mut tx = self.pool.begin().await?;
-            lock(&mut tx, SETTLEMENT_LOCK).await?;
+            let mut tx = self.begin().await?;
+            self.lock(&mut tx, SETTLEMENT_LOCK).await?;
             writable(&mut tx).await?;
             // Store the exact canonical bytes and the non-share metadata only;
             // readers decode the bytes. A two-copy inline JSONB body would cross
@@ -2746,8 +2748,8 @@ impl Ledger {
             let Some(set) = bundle.ctv_fanout_manifest_set else {
                 continue;
             };
-            let mut tx = self.pool.begin().await?;
-            lock(&mut tx, SETTLEMENT_LOCK).await?;
+            let mut tx = self.begin().await?;
+            self.lock(&mut tx, SETTLEMENT_LOCK).await?;
             writable(&mut tx).await?;
             let before: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM qbit_ctv_fanout_artifacts WHERE block_hash=$1",

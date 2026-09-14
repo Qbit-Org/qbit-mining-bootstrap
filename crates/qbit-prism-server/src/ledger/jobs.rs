@@ -27,8 +27,8 @@ impl Ledger {
         ttl_seconds: i64,
     ) -> Result<()> {
         ensure!(ttl_seconds > 0, "job TTL must be positive");
-        let mut tx = self.pool.begin().await?;
-        lock(&mut tx, SETTLEMENT_LOCK).await?;
+        let mut tx = self.begin().await?;
+        self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         writable(&mut tx).await?;
         let revision: i64 =
             sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton")
@@ -86,8 +86,8 @@ impl Ledger {
             .checked_add(DEPENDENCY_HEADROOM_MS)
             .and_then(DateTime::<Utc>::from_timestamp_millis)
             .context("prepared dependency expiry overflow")?;
-        let mut tx = self.pool.begin().await?;
-        lock(&mut tx, SETTLEMENT_LOCK).await?;
+        let mut tx = self.begin().await?;
+        self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         writable(&mut tx).await?;
         require_revision(&mut tx, expected_current_revision).await?;
         let live: bool = sqlx::query_scalar("SELECT $1::timestamptz > clock_timestamp()")

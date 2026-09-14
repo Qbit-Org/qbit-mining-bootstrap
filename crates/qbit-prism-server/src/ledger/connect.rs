@@ -1,4 +1,5 @@
 use super::*;
+use crate::metrics::{LockKind, Metrics, Outcome};
 
 const SESSION_ALLOCATION_ATTEMPTS: usize = 1024;
 
@@ -124,13 +125,44 @@ impl Ledger {
             pool,
             instance_id,
             session_owner: std::sync::Arc::new(SessionOwner::new_for_tests()),
+            metrics: None,
         }
     }
+
+    /// Begin a ledger transaction, recording this ledger's pool acquisition.
+    pub(super) async fn begin(&self) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
+        begin(&self.pool, self.metrics.as_deref()).await
+    }
+
+    /// Take one advisory lock, recording this ledger's wait for it.
+    pub(super) async fn lock(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        key: i64,
+    ) -> Result<(), sqlx::Error> {
+        lock(tx, key, self.metrics.as_deref()).await
+    }
+
+    /// Connect without native telemetry: nothing is recorded and behaviour is
+    /// identical to [`Ledger::connect_with_metrics`] with `None`.
     pub async fn connect(
         url: &str,
         instance_id: String,
         max_connections: u32,
         initialize: bool,
+    ) -> Result<Self> {
+        Self::connect_with_metrics(url, instance_id, max_connections, initialize, None).await
+    }
+
+    /// Connect and, when a registry is supplied, record every advisory-lock
+    /// wait and transaction pool acquisition this ledger performs. Passing
+    /// `None` records nothing and leaves behaviour and results identical.
+    pub async fn connect_with_metrics(
+        url: &str,
+        instance_id: String,
+        max_connections: u32,
+        initialize: bool,
+        metrics: Option<std::sync::Arc<Metrics>>,
     ) -> Result<Self> {
         ensure!(!instance_id.is_empty(), "instance ID must not be empty");
         let timeout_setting = |name: &str, default: u64| -> Result<String> {
@@ -164,8 +196,8 @@ impl Ledger {
             .connect(url)
             .await?;
         if initialize {
-            let mut tx = pool.begin().await?;
-            migration::migrate_schema(&mut tx, &instance_id).await?;
+            let mut tx = begin(&pool, metrics.as_deref()).await?;
+            migration::migrate_schema(&mut tx, &instance_id, metrics.as_deref()).await?;
             tx.commit().await?;
         }
         // The startup gate. Every start, with or without `initialize`, reads
@@ -184,6 +216,7 @@ impl Ledger {
                 token: Uuid::new_v4().to_string(),
                 state: std::sync::Mutex::default(),
             }),
+            metrics,
         };
         if let Some(source) = ledger.migration_source().await? {
             tracing::info!(
@@ -193,7 +226,7 @@ impl Ledger {
                 "PRISM database source"
             );
         }
-        let mut tx = ledger.pool.begin().await?;
+        let mut tx = ledger.begin().await?;
         writable(&mut tx).await?;
         tx.commit().await?;
         ledger
@@ -205,7 +238,7 @@ impl Ledger {
     /// Every server in a cluster must agree on consensus, payout and signing
     /// configuration. The fingerprint excludes local ports and instance IDs.
     pub async fn configure(&self, fingerprint: &str) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin().await?;
         writable(&mut tx).await?;
         let saved: Option<String> = sqlx::query_scalar(
             "SELECT config_fingerprint FROM qbit_prism_cluster WHERE singleton FOR UPDATE",
@@ -263,7 +296,7 @@ impl Ledger {
         for _ in 0..SESSION_ALLOCATION_ATTEMPTS {
             // Each attempt has its own short transaction. The unique key,
             // rather than an extra global lock, arbitrates wrapped candidates.
-            let mut tx = self.pool.begin().await?;
+            let mut tx = self.begin().await?;
             let id: i64 = sqlx::query_scalar("SELECT nextval('qbit_prism_session_sequence')")
                 .fetch_one(&mut *tx)
                 .await?;
@@ -301,12 +334,129 @@ impl Ledger {
     }
 }
 
-pub(super) async fn lock(tx: &mut Transaction<'_, Postgres>, key: i64) -> Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+/// Which wait a [`WaitGuard`] is timing, and the label it records under.
+#[derive(Clone, Copy)]
+enum WaitKind {
+    AdvisoryLock(LockKind),
+    PoolAcquire,
+}
+
+/// Times one wait and records exactly one observation for it.
+///
+/// A wait that ends normally is recorded by [`WaitGuard::complete`], which also
+/// disarms the guard. A wait whose future is dropped first — a cancelled share
+/// append, a `tokio::time::timeout` that elapses — is recorded as a failure
+/// with the time actually spent waiting, so cancellation stays distinct from
+/// "no wait happened". The guard itself allocates nothing; the labels are
+/// allocated inside the metrics API when it records. The metrics mutex is
+/// taken only after the wait has ended, never across an `.await`.
+struct WaitGuard<'a> {
+    metrics: Option<&'a Metrics>,
+    kind: WaitKind,
+    started: std::time::Instant,
+}
+
+impl<'a> WaitGuard<'a> {
+    /// Start the clock. Callers construct a guard only when a handle exists,
+    /// so an unattached ledger reads no clock and records nothing.
+    fn arm(metrics: &'a Metrics, kind: WaitKind) -> Self {
+        Self {
+            metrics: Some(metrics),
+            kind,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// Record the completed wait and disarm. Taking the handle out first makes
+    /// the disarm unconditional, so `Drop` cannot record a second observation.
+    fn complete(mut self, result: Outcome) {
+        let elapsed = self.started.elapsed();
+        if let Some(metrics) = self.metrics.take() {
+            record(metrics, self.kind, result, elapsed);
+        }
+    }
+}
+
+impl Drop for WaitGuard<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        if let Some(metrics) = self.metrics.take() {
+            record(metrics, self.kind, Outcome::Failure, elapsed);
+        }
+    }
+}
+
+fn record(metrics: &Metrics, kind: WaitKind, result: Outcome, elapsed: std::time::Duration) {
+    match kind {
+        WaitKind::AdvisoryLock(lock) => metrics.observe_advisory_lock(lock, result, elapsed),
+        WaitKind::PoolAcquire => metrics.observe_pool_acquire(result, elapsed),
+    }
+}
+
+/// The `LockKind` each advisory lock key records under, or `None` for a key
+/// that is deliberately not observed.
+fn lock_kind(key: i64) -> Option<LockKind> {
+    match key {
+        MIGRATION_LOCK => Some(LockKind::Migration),
+        ORDER_LOCK => Some(LockKind::Order),
+        SETTLEMENT_LOCK => Some(LockKind::Settlement),
+        // not observed: no LockKind value; see #328
+        super::fanout::CPFP_FUNDING_LOCK => None,
+        _ => {
+            debug_assert!(false, "advisory lock key {key:#018x} has no LockKind");
+            None
+        }
+    }
+}
+
+/// The error type is `sqlx::Error`, exactly what the raw statement returns, so
+/// every call site's `?` converts as it did before this helper existed.
+pub(super) async fn lock(
+    tx: &mut Transaction<'_, Postgres>,
+    key: i64,
+    metrics: Option<&Metrics>,
+) -> Result<(), sqlx::Error> {
+    // Time the advisory lock statement and nothing else: the clock starts
+    // immediately before the wait begins.
+    let guard = match (metrics, lock_kind(key)) {
+        (Some(metrics), Some(kind)) => Some(WaitGuard::arm(metrics, WaitKind::AdvisoryLock(kind))),
+        _ => None,
+    };
+    let acquired = sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(key)
         .execute(&mut **tx)
-        .await?;
+        .await;
+    if let Some(guard) = guard {
+        guard.complete(if acquired.is_ok() {
+            Outcome::Success
+        } else {
+            Outcome::Failure
+        });
+    }
+    acquired?;
     Ok(())
+}
+
+/// Begin a ledger transaction, timing the pool acquisition.
+///
+/// This is `Pool::begin` split in two around the timer (sqlx 0.8.6,
+/// `pool/mod.rs`), so it is a drop-in replacement down to the error type. Only
+/// `acquire` is timed: the `BEGIN` round trip stays outside the timer, so these
+/// observations keep the same meaning as the metrics collector's own.
+async fn begin(
+    pool: &PgPool,
+    metrics: Option<&Metrics>,
+) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
+    let guard = metrics.map(|metrics| WaitGuard::arm(metrics, WaitKind::PoolAcquire));
+    let acquired = pool.acquire().await;
+    if let Some(guard) = guard {
+        guard.complete(if acquired.is_ok() {
+            Outcome::Success
+        } else {
+            Outcome::Failure
+        });
+    }
+    Transaction::begin(acquired?, None).await
 }
 
 pub(super) async fn writable(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
@@ -335,4 +485,19 @@ pub(super) async fn require_revision(
         "payout revision changed while observing chain state"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod lock_kind_tests {
+    use super::*;
+
+    /// Every key the ledger takes maps to its own label, and the one key with
+    /// no label value stays unobserved rather than borrowing another's.
+    #[test]
+    fn every_advisory_lock_key_maps_to_its_own_label_or_to_none() {
+        assert_eq!(lock_kind(MIGRATION_LOCK), Some(LockKind::Migration));
+        assert_eq!(lock_kind(ORDER_LOCK), Some(LockKind::Order));
+        assert_eq!(lock_kind(SETTLEMENT_LOCK), Some(LockKind::Settlement));
+        assert_eq!(lock_kind(super::super::fanout::CPFP_FUNDING_LOCK), None);
+    }
 }

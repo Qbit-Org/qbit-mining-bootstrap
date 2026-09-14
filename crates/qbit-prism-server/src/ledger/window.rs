@@ -11,6 +11,19 @@ pub struct AppendResult {
     pub inserted: bool,
 }
 
+/// The pre-commit hook of [`Ledger::append_at_revision_gated`] refused COMMIT.
+/// COMMIT was never sent and the transaction was rolled back.
+#[derive(Debug)]
+pub struct CommitGateClosed;
+
+impl std::fmt::Display for CommitGateClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("share commit gate closed before COMMIT")
+    }
+}
+
+impl std::error::Error for CommitGateClosed {}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub anchor_ms: i64,
@@ -134,7 +147,7 @@ impl Ledger {
         balances: BalanceSource,
     ) -> Result<Window, WindowError> {
         let bounds = window.shares.map(ShareRange::bounds).transpose()?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin().await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .execute(&mut *tx)
             .await?;
@@ -236,8 +249,8 @@ impl Ledger {
         let work = work.to_str_radix(10);
         let height = i64::try_from(height)?;
         let tip = tip.to_ascii_lowercase();
-        let mut tx = self.pool.begin().await?;
-        lock(&mut tx, SETTLEMENT_LOCK).await?;
+        let mut tx = self.begin().await?;
+        self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         writable(&mut tx).await?;
         let row=sqlx::query("SELECT payout_revision,best_chainwork=$1::text::numeric AS same_work,best_chainwork<$1::text::numeric AS more_work,best_tip_hash,best_tip_height FROM qbit_prism_cluster WHERE singleton FOR UPDATE")
             .bind(&work).fetch_one(&mut *tx).await?;
@@ -269,7 +282,7 @@ impl Ledger {
         share: AcceptedShare,
         candidate: Option<Candidate>,
     ) -> Result<AppendResult> {
-        self.append_checked(share, candidate, None).await
+        self.append_checked(share, candidate, None, None).await
     }
 
     pub async fn append_at_revision(
@@ -278,7 +291,26 @@ impl Ledger {
         candidate: Option<Candidate>,
         expected_revision: i64,
     ) -> Result<AppendResult> {
-        self.append_checked(share, candidate, Some(expected_revision))
+        self.append_checked(share, candidate, Some(expected_revision), None)
+            .await
+    }
+
+    /// [`Ledger::append_at_revision`] with a last-moment veto over COMMIT.
+    ///
+    /// `pre_commit` is called at most once, only after every statement,
+    /// including `persist_candidate`, has succeeded, while `ORDER_LOCK` is
+    /// held, and immediately before COMMIT. It must not block or await. If it
+    /// returns `false`, COMMIT is never sent: the transaction is rolled back
+    /// and the call fails with [`CommitGateClosed`]. Nothing fallible runs
+    /// between a `true` return and `tx.commit()`.
+    pub async fn append_at_revision_gated(
+        &self,
+        share: AcceptedShare,
+        candidate: Option<Candidate>,
+        expected_revision: i64,
+        pre_commit: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<AppendResult> {
+        self.append_checked(share, candidate, Some(expected_revision), Some(pre_commit))
             .await
     }
 
@@ -287,9 +319,10 @@ impl Ledger {
         share: AcceptedShare,
         candidate: Option<Candidate>,
         expected_revision: Option<i64>,
+        pre_commit: Option<&(dyn Fn() -> bool + Send + Sync)>,
     ) -> Result<AppendResult> {
-        let mut tx = self.pool.begin().await?;
-        lock(&mut tx, ORDER_LOCK).await?;
+        let mut tx = self.begin().await?;
+        self.lock(&mut tx, ORDER_LOCK).await?;
         writable(&mut tx).await?;
         if let Some(expected) = expected_revision {
             let revision:i64=sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL FOR SHARE").fetch_one(&mut *tx).await?;
@@ -305,6 +338,13 @@ impl Ledger {
                 "credited candidates cannot also contain a deferred share"
             );
             persist_candidate(&mut tx, &candidate, Some(&result.share.share_id)).await?;
+        }
+        if pre_commit.is_some_and(|allow| !allow()) {
+            // Release ORDER_LOCK before the refusal is observed.
+            if let Err(error) = tx.rollback().await {
+                tracing::debug!(%error, "rollback after a closed commit gate failed");
+            }
+            return Err(CommitGateClosed.into());
         }
         tx.commit().await?;
         Ok(result)
@@ -385,9 +425,9 @@ impl Ledger {
             .checked_mul(8)
             .context("window difficulty overflow")?;
         ensure!(weight > 0, "network difficulty must be positive");
-        let mut tx = self.pool.begin().await?;
-        lock(&mut tx, SETTLEMENT_LOCK).await?;
-        lock(&mut tx, ORDER_LOCK).await?;
+        let mut tx = self.begin().await?;
+        self.lock(&mut tx, SETTLEMENT_LOCK).await?;
+        self.lock(&mut tx, ORDER_LOCK).await?;
         writable(&mut tx).await?;
         let row = sqlx::query("UPDATE qbit_prism_cluster SET ledger_clock_ms=GREATEST(ledger_clock_ms,floor(extract(epoch FROM clock_timestamp())*1000)::bigint)+1 WHERE singleton RETURNING ledger_clock_ms-1 AS anchor_ms,payout_revision").fetch_one(&mut *tx).await?;
         let anchor_ms: i64 = row.try_get("anchor_ms")?;
@@ -402,7 +442,7 @@ impl Ledger {
         // Ledger rows are immutable and later commits receive a timestamp
         // strictly greater than this anchor. Release the ordering barrier
         // before scanning a potentially large payout window.
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin().await?;
         let mut shares = Vec::new();
         let mut remaining = weight;
         let mut cursor = cutoff.checked_add(1).context("share sequence exhausted")?;
