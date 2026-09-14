@@ -18,7 +18,11 @@
 //!
 //! Window size: `PRISM_WINDOW_QUALIFY_SHARES` (default 20,000) for the gated
 //! tests, `PRISM_WINDOW_QUALIFY_FULL_SHARES` (default 400,000) for the
-//! `#[ignore]`d full-size variants, which need gigabytes of RAM:
+//! `#[ignore]`d full-size variants, which need gigabytes of RAM. The count
+//! must divide the window weight exactly, and until #273 stops the job
+//! payload copying the window it must also stay under about 150,000: the
+//! payload holds three copies, which cross PostgreSQL's 256 MiB jsonb object
+//! limit at 400,000. 125,000 is the largest count that satisfies both today.
 //!
 //! ```text
 //! PRISM_TEST_DATABASE_URL=... cargo test -p qbit-prism-server --lib window_incident_tests -- --nocapture
@@ -487,7 +491,7 @@ async fn incident_1_lease_renewal_is_not_delayed_by_a_large_window_claim() -> Re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "full-size 400k-share window; gigabytes of RAM, run by the coordinator on a larger host with --ignored --exact"]
+#[ignore = "full-size window: needs gigabytes of RAM, and cannot reach 400k until #273 stops the job payload copying the window: three copies cross PostgreSQL's 256 MiB jsonb limit above about 150k shares. The coordinator runs it with --ignored, at a PRISM_WINDOW_QUALIFY_FULL_SHARES that divides the window weight; 125000 is the largest that fits today"]
 async fn incident_1_lease_renewal_at_full_size() -> Result<()> {
     let raw = qbit_prism_test_gate::required_database_url(qbit_prism_test_gate::site!())?;
     let _serial = TEST_LOCK.lock().await;
@@ -593,7 +597,7 @@ async fn claim_rebuild_has_the_canonical_bytes_refresh_built_for_the_job() -> Re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "full-size 400k-share window; gigabytes of RAM, run by the coordinator on a larger host with --ignored --exact"]
+#[ignore = "full-size window: needs gigabytes of RAM, and cannot reach 400k until #273 stops the job payload copying the window: three copies cross PostgreSQL's 256 MiB jsonb limit above about 150k shares. The coordinator runs it with --ignored, at a PRISM_WINDOW_QUALIFY_FULL_SHARES that divides the window weight; 125000 is the largest that fits today"]
 async fn claim_rebuild_canonical_bytes_at_full_size() -> Result<()> {
     let raw = qbit_prism_test_gate::required_database_url(qbit_prism_test_gate::site!())?;
     let _serial = TEST_LOCK.lock().await;
