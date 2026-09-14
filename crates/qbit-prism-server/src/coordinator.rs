@@ -3,8 +3,8 @@ use crate::{
     config::Config,
     ledger::{
         authenticate_landed_audit, build_claim_parts, header_bits_hex, BalanceSource,
-        BlockObservation, Candidate, CandidateClaim, CandidateCtv, ClaimParts, Ledger, SignerKeys,
-        Snapshot, Window, WindowError, WindowRef,
+        BlockObservation, Candidate, CandidateClaim, CandidateCtv, ClaimParts, HeartbeatHealth,
+        Ledger, SignerKeys, Snapshot, Window, WindowError, WindowRef,
     },
     rpc::Rpc,
     stratum::{MiningBackend, MiningJob, StaleGrace, StratumError, Worker},
@@ -1723,7 +1723,11 @@ impl Coordinator {
                         .is_some_and(|(fee, floor)| validate_fee_floor(fee, floor).is_ok()))
         }) && poll_age
             .is_some_and(|age| age < self.config.health_timeout.as_secs_f64());
-        json!({"schema":"qbit.prism.audit-health.v1","ok":ready,"ready":ready,"status":if ready {"ok"} else {"unavailable"},"backend":"postgres","instance_id":self.config.instance_id,"runtime_workers":self.config.runtime_workers,"tip_poll_age_seconds":poll_age,"accepted_share_count":self.accepted.load(Ordering::Relaxed),"found_block_count":self.blocks.load(Ordering::Relaxed),"template_generation":prepared.as_ref().map(|p|p.generation),"template_age_seconds":prepared.as_ref().map(|p|p.created.elapsed().as_secs_f64()),"observed_tip":observed,"payout_state_generation":prepared.as_ref().map(|p|p.snapshot.payout_revision)})
+        let Value::Object(fields) = json!({"ok":ready,"status":if ready {"ok"} else {"unavailable"},"backend":"postgres","instance_id":self.config.instance_id,"runtime_workers":self.config.runtime_workers,"tip_poll_age_seconds":poll_age,"accepted_share_count":self.accepted.load(Ordering::Relaxed),"found_block_count":self.blocks.load(Ordering::Relaxed),"template_generation":prepared.as_ref().map(|p|p.generation),"template_age_seconds":prepared.as_ref().map(|p|p.created.elapsed().as_secs_f64()),"observed_tip":observed,"payout_state_generation":prepared.as_ref().map(|p|p.snapshot.payout_revision)})
+        else {
+            unreachable!("coordinator health fields are an object");
+        };
+        HeartbeatHealth::new(ready, fields).into_value()
     }
 }
 
