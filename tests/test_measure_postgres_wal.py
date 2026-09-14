@@ -10,5 +10,10 @@ class WalHelperTests(unittest.TestCase):
         p = subprocess.run(["python3", "scripts/measure_postgres_wal.py", "--dsn", "postgresql://127.0.0.1/db", "--sql", " ", "--config", "test"], capture_output=True, text=True)
         self.assertEqual(p.returncode, 1)
         self.assertIn("invalid_input", p.stdout)
+    def test_password_and_query_dsn_rejected(self):
+        for dsn in ("postgresql://u:p@127.0.0.1/db", "postgresql://127.0.0.1/db?hostaddr=evil"):
+            p = subprocess.run(["python3", "scripts/measure_postgres_wal.py", "--dsn", dsn, "--sql", "select 1", "--config", "test"], capture_output=True, text=True)
+            self.assertEqual(p.returncode, 1)
+            self.assertIn("invalid_input", p.stdout)
 
 if __name__ == "__main__": unittest.main()
