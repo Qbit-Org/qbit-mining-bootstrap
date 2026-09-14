@@ -193,7 +193,14 @@ settlement advisory-lock acquisitions record into
 non-transaction pool queries are not timed. The native alert specification
 attaches no firing rule to first-offer or advisory-lock timing.
 `PrismDatabasePoolWaitHigh` now evaluates ledger acquisitions as well as the
-collector's, and its description predates #328 (follow-up). #328 references
+collector's, and its description predates #328. That rule is also still gated on
+`collector_available{collector="database"} == 1`. The collector acquires from the
+same pool as the ledger, so sustained pool exhaustion times out its own
+acquisition, zeroes that gauge, and suppresses the rule exactly while the ledger
+histogram is recording the waits that should fire it. Before #328 the gate cost
+nothing, because the family carried no samples during such an outage. Removing or
+revising it means regenerating the alert specification and the deployment patch
+together, which #336 tracks. #328 references
 #278 rather than closing it.
 
 The #280 rebase must preserve the narrow hooks in `stratum::request` (complete
