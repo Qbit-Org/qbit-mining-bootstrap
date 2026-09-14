@@ -61,7 +61,7 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_health_state` | gauge | none | run | Whether this instance is ready to serve mining work. | none |
 | `qbit_prism_job_delivery_failures_total` | counter | none | run | Failed local job deliveries. | none |
 | `qbit_prism_job_delivery_successes_total` | counter | none | run | Successful local job deliveries. | none |
-| `qbit_prism_late_confirmed_shares_total` | counter | none | run | Shares accepted after the share commit deadline because their in-flight ledger commit was confirmed within the grace period. | none |
+| `qbit_prism_late_confirmed_shares_total` | counter | none | run | Shares accepted after the share commit deadline once their in-flight ledger commit was confirmed. | none |
 | `qbit_prism_low_difficulty_shares_total` | counter | none | run | Low difficulty share rejections. | `qbit_prism_low_difficulty_shares_total` |
 | `qbit_prism_metrics_snapshot_age_seconds` | gauge | none | run | Monotonic age of the metrics snapshot, or -1 before the first publication. | `qbit_prism_metrics_snapshot_age_seconds` |
 | `qbit_prism_metrics_snapshot_available` | gauge | none | run | Whether a complete metrics snapshot has been published. | `qbit_prism_metrics_snapshot_available` |
@@ -124,7 +124,11 @@ hint; it uses the coordinator's stale decision after the database confirms credi
 Share acknowledgements follow the ledger outcome (#324). A share-pass append
 whose COMMIT was already in flight at `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS` can
 still be accepted within `share_commit_grace` (5 s); each such acceptance
-increments `qbit_prism_late_confirmed_shares_total`. Three outcomes are answered
+increments `qbit_prism_late_confirmed_shares_total`. A share-pass submission
+carrying a found-block candidate is never refused, so it can be confirmed later
+still, up to `block_only_ack_timeout`; those acceptances are counted the same
+way. The counter is keyed on when the append itself finished, not on when the
+acknowledgement was processed. Three outcomes are answered
 `ledger-outcome-unknown`, never `ledger-confirmation-failed`: a COMMIT still in
 flight after the grace period, a COMMIT failure other than a severity-ERROR
 reply, and, under the sync-rep guard, a COMMIT that took at least the ledger

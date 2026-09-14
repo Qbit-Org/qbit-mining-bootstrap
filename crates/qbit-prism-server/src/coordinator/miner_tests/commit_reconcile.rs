@@ -101,6 +101,39 @@ async fn commit_reconcile_commit_confirmed_within_grace_is_accepted_late() {
 }
 
 #[tokio::test]
+async fn commit_reconcile_confirmation_before_the_deadline_is_not_counted_late() {
+    // The counter is for confirmations that land after the share deadline. A
+    // commit confirmed well inside it is an ordinary accept, however late this
+    // task is polled afterwards.
+    let fixture = fixture(
+        |config| {
+            config.share_commit_timeout = MS(600);
+            config.share_commit_grace = MS(400);
+        },
+        None,
+    )
+    .await;
+    let commit = Arc::new(Gate::default());
+    *fixture.store.commit_gate.lock().unwrap() = Some(commit.clone());
+    let started = TokioInstant::now();
+    let (submitted, _log) = submit(&fixture, proof(&fixture, false));
+    commit.entered.notified().await;
+    tokio::time::sleep_until(started + MS(150)).await;
+    commit.release.notify_one();
+    submitted
+        .await
+        .unwrap()
+        .expect("a COMMIT confirmed inside the deadline is accepted");
+    assert!(
+        started.elapsed() < MS(600),
+        "the confirmation was not on time"
+    );
+    assert_eq!(records(&fixture), 1);
+    assert_eq!(late_confirmed(&fixture), 0);
+    assert_eq!(fixture.coordinator.accepted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn commit_reconcile_append_before_commit_is_refused_and_aborted_at_the_deadline() {
     let fixture = fixture(|config| config.share_commit_timeout = MS(300), None).await;
     let append = Arc::new(Gate::default());

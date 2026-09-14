@@ -127,10 +127,11 @@ pub(super) fn enqueue_failed_before_commit(error: &anyhow::Error) -> bool {
 /// A spawned share append. If the submission itself is cancelled first, an
 /// append that may still be refused is closed and aborted, as dropping it
 /// did before; one already committing, or carrying a block, runs on.
-/// An append's result together with how long COMMIT took. The duration is
-/// measured inside the task, so a late poll of this handle cannot count
-/// scheduler delay as database time.
-type AppendJoin = (Result<bool>, Option<Duration>);
+/// An append's result, how long COMMIT took, and when the append finished.
+/// Both times are taken inside the task, so a late poll of this handle can
+/// neither count scheduler delay as database time nor make an on-time
+/// confirmation look late.
+type AppendJoin = (Result<bool>, Option<Duration>, tokio::time::Instant);
 
 struct AppendTask {
     handle: Option<JoinHandle<AppendJoin>>,
@@ -167,7 +168,7 @@ impl AppendTask {
         };
         tokio::spawn(async move {
             match handle.await {
-                Ok((Ok(true), _)) => {
+                Ok((Ok(true), _, _)) => {
                     tracing::warn!(
                         share_id,
                         path,
@@ -176,7 +177,7 @@ impl AppendTask {
                         "unknown share outcome resolved"
                     )
                 }
-                Ok((Ok(false), _)) => {
+                Ok((Ok(false), _, _)) => {
                     tracing::warn!(
                         share_id,
                         path,
@@ -185,7 +186,7 @@ impl AppendTask {
                         "unknown share outcome resolved"
                     )
                 }
-                Ok((Err(error), _)) => {
+                Ok((Err(error), _, _)) => {
                     tracing::warn!(share_id, path, phase, outcome = "error", %error, "unknown share outcome resolved")
                 }
                 Err(error) => {
@@ -367,11 +368,6 @@ impl Coordinator {
         match outcome {
             SaveOutcome::Accepted => {
                 self.accepted.fetch_add(1, Ordering::Relaxed);
-                if share_pass
-                    && tokio::time::Instant::now() >= start + self.config.share_commit_timeout
-                {
-                    self.metrics.record_late_confirmation();
-                }
                 if grace {
                     self.metrics.record_grace_credit();
                 }
@@ -442,7 +438,7 @@ impl Coordinator {
                 // Measured here, not at the join: a coordinator task that is
                 // scheduled late must not turn a durable commit into unknown.
                 let commit_elapsed = task_gate.committing_since().map(|since| since.elapsed());
-                (result, commit_elapsed)
+                (result, commit_elapsed, tokio::time::Instant::now())
             })),
             gate: gate.clone(),
             refusable,
@@ -477,11 +473,23 @@ impl Coordinator {
                 detail: "the append had not finished by the acknowledgement deadline".into(),
             };
         };
-        let (joined, commit_elapsed) = match joined {
-            Ok((result, commit_elapsed)) => (Ok(result), commit_elapsed),
-            Err(error) => (Err(error), None),
+        let (joined, commit_elapsed, finished_at) = match joined {
+            Ok((result, commit_elapsed, finished_at)) => {
+                (Ok(result), commit_elapsed, Some(finished_at))
+            }
+            Err(error) => (Err(error), None, None),
         };
-        classify_share_append(joined, gate.state(), commit_elapsed, self.statement_timeout)
+        let outcome =
+            classify_share_append(joined, gate.state(), commit_elapsed, self.statement_timeout);
+        // Count the confirmation from when the append finished. Classifying
+        // here can happen arbitrarily later, and an on-time confirmation must
+        // not be reported as a late one.
+        if matches!(outcome, SaveOutcome::Accepted)
+            && finished_at.is_some_and(|at| at >= start + self.config.share_commit_timeout)
+        {
+            self.metrics.record_late_confirmation();
+        }
+        outcome
     }
 
     /// Credit a block-only proof once its candidate is confirmed on the active
