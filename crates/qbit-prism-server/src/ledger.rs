@@ -24,7 +24,7 @@ mod candidates;
 use candidates::persist_candidate;
 pub use candidates::{Candidate, CandidateClaim};
 mod connect;
-use connect::{lock, require_revision, writable};
+use connect::{require_revision, writable};
 pub use connect::{SessionAllocationExhausted, SessionId};
 mod difficulty;
 mod fanout;
@@ -49,4 +49,8 @@ pub struct Ledger {
     pub pool: PgPool,
     pub instance_id: String,
     session_owner: std::sync::Arc<connect::SessionOwner>,
+    /// Native wait telemetry, when the process has a registry to record into.
+    /// Without a handle nothing is recorded and behaviour is identical, so
+    /// tools and tests keep using [`Ledger::connect`].
+    metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
 }

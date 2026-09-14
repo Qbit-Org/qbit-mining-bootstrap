@@ -521,10 +521,10 @@
         "alert_class": "prism-runtime"
       },
       "summary": "PrismDatabasePoolWaitHigh",
-      "description": "Collector PgPool::acquire attempts record one observation: success when acquired, or failure on acquisition error or cancellation, including the three-second collection deadline. Durations measure elapsed pool wait and exclude subsequent transaction work; collector availability remains a separate alert guard. No advisory-lock rule until #283/A/C populate it. Pool p99 >0.5 seconds from at least ten observed acquisition attempts in five minutes, combining success and failure; provisional, measure in #291.",
+      "description": "Actual PgPool::acquire waits from metrics collection and instrumented ledger transactions, including share processing. Each started collector acquisition records one observation: success when acquired, or failure on acquisition error or cancellation, including the three-second collection deadline. Durations measure elapsed pool wait; BEGIN, query execution and advisory-lock waits are outside this timer. Pool traffic outside these instrumented acquisition paths, including rollup worker transactions and public API queries, is not timed. Success and failure observations are combined. Valid published pool waits remain alertable when the database collector is unavailable; snapshot availability and freshness are still required. Pool p99 >0.5 seconds from at least ten observed acquisition attempts in five minutes; provisional, measure in #291.",
       "no_data_state": "OK",
       "exec_err_state": "OK",
-      "basis": "Pool p99 >0.5 seconds from at least ten observed acquisition attempts in five minutes, combining success and failure; provisional, measure in #291.",
+      "basis": "Collector and instrumented ledger transaction pool-acquire p99 >0.5 seconds, combining success and failure, from at least ten observed acquisition attempts in five minutes; provisional, measure in #291.",
       "producer_refs": [
         "crates/qbit-prism-server/src/metrics/registry.rs#L68",
         "crates/qbit-prism-server/src/metrics/registry.rs#L70",

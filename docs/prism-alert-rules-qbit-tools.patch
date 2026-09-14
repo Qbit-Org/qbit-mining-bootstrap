@@ -106,7 +106,7 @@
 -  that never increment RestartCount, so planned work needs no maintenance
 -  flag; drills that crash the coordinator on purpose use a Grafana silence.
 +{# Native 3.x.x cutover draft, bootstrap #279. Apply only with the native image.
-+   Specification SHA-256: 957da37a34b3f4618ecb96ae17057a6767302be929c918d3cac7a27753e9f080
++   Specification SHA-256: 3cfb45464f8a4dd6b0429ee5c7bc362e397494438f45823a8cf64cd6f8066bc3
 +   Generated from the reviewed a007a142 snapshot; backup, sidecar and lifecycle rules retain their producers.
 +   Native numeric bounds marked provisional must be measured in #291 before production cutover.
 +   The D3 group requires PRIMARY postgres_exporter query metrics; see bootstrap docs/prism-alert-migration.md.
@@ -577,7 +577,7 @@
 +      "alert_class": "prism-runtime"
 +    },
 +    "summary": "PrismDatabasePoolWaitHigh",
-+    "description": "Collector PgPool::acquire attempts record one observation: success when acquired, or failure on acquisition error or cancellation, including the three-second collection deadline. Durations measure elapsed pool wait and exclude subsequent transaction work; collector availability remains a separate alert guard. No advisory-lock rule until #283/A/C populate it. Pool p99 >0.5 seconds from at least ten observed acquisition attempts in five minutes, combining success and failure; provisional, measure in #291.",
++    "description": "Actual PgPool::acquire waits from metrics collection and instrumented ledger transactions, including share processing. Each started collector acquisition records one observation: success when acquired, or failure on acquisition error or cancellation, including the three-second collection deadline. Durations measure elapsed pool wait; BEGIN, query execution and advisory-lock waits are outside this timer. Pool traffic outside these instrumented acquisition paths, including rollup worker transactions and public API queries, is not timed. Success and failure observations are combined. Valid published pool waits remain alertable when the database collector is unavailable; snapshot availability and freshness are still required. Pool p99 >0.5 seconds from at least ten observed acquisition attempts in five minutes; provisional, measure in #291.",
 +    "no_data_state": "OK",
 +    "exec_err_state": "OK"
 +  },
