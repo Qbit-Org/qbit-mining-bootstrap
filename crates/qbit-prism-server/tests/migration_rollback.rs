@@ -884,6 +884,26 @@ async fn assert_native_metadata_required(
         ensure!(recovery::evidence(source, pg_bin).await? == *native);
     }
 
+    let cluster: serde_json::Value =
+        sqlx::query_scalar("SELECT to_jsonb(c) FROM qbit_prism_cluster c WHERE singleton")
+            .fetch_one(&source.pool)
+            .await?;
+    sqlx::query("DELETE FROM qbit_prism_cluster WHERE singleton")
+        .execute(&source.pool)
+        .await?;
+    let missing_cluster = recovery::evidence(source, pg_bin).await;
+    sqlx::query("INSERT INTO qbit_prism_cluster SELECT * FROM jsonb_populate_record(NULL::qbit_prism_cluster,$1)")
+        .bind(cluster).execute(&source.pool).await?;
+    ensure!(
+        missing_cluster.is_err(),
+        "missing cluster singleton was accepted"
+    );
+    ensure!(missing_cluster
+        .unwrap_err()
+        .to_string()
+        .contains("exactly one singleton row"));
+    ensure!(recovery::evidence(source, pg_bin).await? == *native);
+
     // The restored ledger later in search_path has complete metadata. It
     // must neither change intact evidence nor stand in for a lost table.
     let layered = recovery::Database {

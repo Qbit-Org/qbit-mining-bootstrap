@@ -100,6 +100,10 @@ BEGIN
     ELSIF source.types <> 'text,text,text,integer,integer,text,timestamp with time zone' OR source.incomplete THEN
         RAISE EXCEPTION 'qbit_prism_migration_source has an unreadable singleton row (column types %, required value missing: %)', source.types, source.incomplete USING HINT = hint;
     END IF;
+    SELECT count(*) INTO source_rows FROM qbit_prism_cluster WHERE singleton;
+    IF source_rows <> 1 THEN
+        RAISE EXCEPTION 'qbit_prism_cluster must contain exactly one singleton row' USING HINT = hint;
+    END IF;
 END
 $metadata$;
 
