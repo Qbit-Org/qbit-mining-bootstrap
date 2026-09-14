@@ -11,13 +11,13 @@ use std::path::{Path, PathBuf};
 /// own. Add every new migration file here. `Ledger::connect` refuses a
 /// database missing any of them even without `initialize`, so a newer binary
 /// never reaches the claim path on a database it has not migrated, and a
-/// later number never hides an earlier gap: 007 and 008 are reserved by
-/// independent workstreams and may land after 009. A migration this binary
-/// does not know is accepted with a warning: native migrations are additive,
-/// and a release whose format an older binary must not touch declares a
-/// capability, which `migrate_schema` refuses before any DDL and
+/// later number never hides an earlier gap: 007 is reserved by an
+/// independent workstream and may land after 008 and 009. A migration this
+/// binary does not know is accepted with a warning: native migrations are
+/// additive, and a release whose format an older binary must not touch
+/// declares a capability, which `migrate_schema` refuses before any DDL and
 /// `require_known_capabilities` refuses again at connect.
-pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 9];
+pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 8, 9];
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
 /// `none`.
@@ -486,8 +486,9 @@ pub(super) fn refuse_unknown_capabilities(rows: &[(String, i32)]) -> Result<()> 
 /// The native path's "newer" verdict: refuse a database an earlier 3.x.x
 /// build migrated and a newer release then wrote, before any DDL, as
 /// `classify_source` refuses a 2.x.x source. Without this, 004, 005 and
-/// 006, or 009, would alter that database and record their versions, and
-/// only `require_known_capabilities` would refuse it, after the commit.
+/// 006, or 008 and 009, would alter that database and record their
+/// versions, and only `require_known_capabilities` would refuse it, after
+/// the commit.
 /// `versions` is the recorded migration set, named in the refusal.
 fn refuse_newer_native_database(versions: &[i32], inventory: &SourceInventory) -> Result<()> {
     if let Some(rows) = &inventory.capabilities {
@@ -506,11 +507,12 @@ fn refuse_newer_native_database(versions: &[i32], inventory: &SourceInventory) -
 /// not consulted: 002 upserts it whatever the writer stored, so only rows say
 /// whether v2 work is pending. `native_versions` is the recorded migration
 /// set of a database an earlier 3.x.x build migrated to native schema 3, 4
-/// or 5, with or without 009, whose drain check never counted a v2 row; that
-/// path gets its own wording and remedy. Native pending rows carry the native
-/// `payout_revision`, `bundle` and `block_hash` fields, so the predicate
-/// never flags them; only a v2 body, a `body_id`, a `storage_version` other
-/// than 1, or a v1 body without those fields is refused.
+/// or 5, with or without 008 and 009, whose drain check never counted a v2
+/// row; that path gets its own wording and remedy. Native pending rows carry
+/// the native `payout_revision`, `bundle` and `block_hash` fields, so the
+/// predicate never flags them; only a v2 body, a `body_id`, a
+/// `storage_version` other than 1, or a v1 body without those fields is
+/// refused.
 pub(super) async fn refuse_undrained_outbox(
     tx: &mut Transaction<'_, Postgres>,
     inventory: &SourceInventory,
@@ -1516,6 +1518,10 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
     ),
     (6, include_str!("../../migrations/006_source_schema.sql")),
     (
+        8,
+        include_str!("../../migrations/008_prepared_window_reference.sql"),
+    ),
+    (
         9,
         include_str!("../../migrations/009_wrap_safe_sessions.sql"),
     ),
@@ -1879,8 +1885,8 @@ pub(super) async fn migrate_schema(
     lock(tx, MIGRATION_LOCK).await?;
     sqlx::raw_sql("CREATE TABLE IF NOT EXISTS qbit_prism_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())").execute(&mut **tx).await?;
     // Each applied migration is tracked on its own, not as a high-water mark:
-    // 007 and 008 are reserved by independent workstreams, so a later number
-    // must not hide an earlier gap. Every step runs when its own version is
+    // 007 is reserved by an independent workstream, so a later number must
+    // not hide an earlier gap. Every step runs when its own version is
     // missing, in order.
     let versions: Vec<i32> =
         sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations ORDER BY version")
@@ -1970,16 +1976,16 @@ pub(super) async fn migrate_schema(
         // A native database, one an earlier 3.x.x build migrated. Its
         // capability rows are refused first, before any DDL, exactly as
         // `classify_source` refuses them on a 2.x.x source: otherwise 004,
-        // 005 and 006, or 009, would alter a database a newer release wrote
-        // and record their versions, and only the connect-time gate, after
-        // the commit, would refuse it.
+        // 005 and 006, or 008 and 009, would alter a database a newer
+        // release wrote and record their versions, and only the connect-time
+        // gate, after the commit, would refuse it.
         let inventory = inspect_source_schema(tx).await?;
         refuse_newer_native_database(&versions, &inventory)?;
         if !versions.contains(&6) {
-            // Native schema 3, 4 or 5, with or without 009. That build's
-            // drain check used the v1-only predicate, which never counted a
-            // v2 row (`candidate ?& ...` is NULL for a NULL body), so a
-            // pending v2 candidate can still be there. The column-aware
+            // Native schema 3, 4 or 5, with or without 008 and 009. That
+            // build's drain check used the v1-only predicate, which never
+            // counted a v2 row (`candidate ?& ...` is NULL for a NULL body),
+            // so a pending v2 candidate can still be there. The column-aware
             // check runs here, before 004, 005 or 006 touch anything, so a
             // refusal on this path is before any DDL too.
             refuse_undrained_outbox(tx, &inventory, Some(&versions)).await?;
@@ -2020,6 +2026,14 @@ pub(super) async fn migrate_schema(
         if let Some(state) = state {
             tracing::info!(source=state.rule().name, release=?release, "migrated PRISM database source");
         }
+    }
+    if !versions.contains(&8) {
+        sqlx::raw_sql(native_migration(8))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(8)")
+            .execute(&mut **tx)
+            .await?;
     }
     if !versions.contains(&9) {
         sqlx::raw_sql(native_migration(9))

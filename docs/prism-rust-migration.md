@@ -285,7 +285,7 @@ and 006, and refuses before any DDL when such a row is pending, naming the
 rows as above:
 
 ```
-refusing to apply migration 006 to a native database at schema migrations 2, 3, 4, 5, 9: an earlier
+refusing to apply migration 006 to a native database at schema migrations 2, 3, 4, 5, 8, 9: an earlier
 3.x.x build migrated it before the drain rule covered these rows, and the legacy Python block outbox is
 not drained: 1 pending 2.x.x candidate row(s) cannot be replayed natively (block_hash=...
 storage_version=2 ...). Nothing was changed. Restore the pre-migration 2.x.x backup and drain them with
@@ -307,11 +307,11 @@ The capability rows of that database are checked before the drain check, so
 one that declares `candidate_storage_version > 2` or a capability this
 release does not know is refused before any DDL, the "newer" verdict of the
 table above, and nothing is recorded for it. A database already at 6 gets
-the same check before 009. The remedy is the startup gate's: upgrade the
+the same check before 008 and 009. The remedy is the startup gate's: upgrade the
 server.
 
 ```
-refusing to migrate a native database at schema migrations 2, 3, 4, 5, 9 before any DDL: database declares
+refusing to migrate a native database at schema migrations 2, 3, 4, 5, 8, 9 before any DDL: database declares
 candidate_storage_version = 3, but this server understands candidate_storage_version 1 to 2 only: a newer
 PRISM release wrote this database; upgrade the server before starting it here
 ```
@@ -326,10 +326,10 @@ every start logs it, and a repeated `migrate` never rewrites it.
 
 **Startup gate.** Every start reads `qbit_prism_schema_migrations` and
 `qbit_prism_schema_capabilities`, with or without
-`PRISM_POSTGRES_INIT_SCHEMA`. This release requires migrations 2, 3, 4, 5, 6
-and 9, each checked on its own rather than as a high-water mark: 007 and 008
-are reserved by other workstreams, so 009 being present never stands in for
-a missing 006. A database missing any of them is refused at connect, naming
+`PRISM_POSTGRES_INIT_SCHEMA`. This release requires migrations 2, 3, 4, 5, 6,
+8 and 9, each checked on its own rather than as a high-water mark: 007 is
+reserved by another workstream, so 008 or 009 being present never stands in
+for a missing 006. A database missing any of them is refused at connect, naming
 the gap, before any accounting statement runs, and so is one declaring a
 capability or `candidate_storage_version` this release does not understand.
 A migration this release does not know is accepted with a warning that names

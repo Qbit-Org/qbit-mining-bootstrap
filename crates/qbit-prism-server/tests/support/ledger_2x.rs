@@ -102,7 +102,7 @@ fn live_sql_stays_pinned_to_the_frozen_2x_release() {
              release: {:?}). The migrator applies this file to every 2.x.x database, so its DDL \
              must stay identical to tests/fixtures/schema_2x/001_share_ledger.sql. Revert the DDL \
              change here and put it in a new numbered migration under \
-             crates/qbit-prism-server/migrations/ (007 is next; 009 is taken), then add it to \
+             crates/qbit-prism-server/migrations/ (007 is next; 008 and 009 are taken), then add it to \
              REQUIRED_SCHEMA_VERSIONS in src/ledger/migration.rs",
             index + 1,
             live.get(index).map(String::as_str).unwrap_or("<end of file>"),
@@ -244,7 +244,7 @@ fn source_state_table_is_the_pinned_data() {
         SourceState::Applied258.release().map(|r| r.1),
         Some(RELEASE_COMMIT_2_0_2)
     );
-    assert_eq!(REQUIRED_SCHEMA_VERSIONS, [2, 3, 4, 5, 6, 9]);
+    assert_eq!(REQUIRED_SCHEMA_VERSIONS, [2, 3, 4, 5, 6, 8, 9]);
 }
 
 /// Build a 2.x.x source from the frozen release files. Each file is the
@@ -1632,7 +1632,7 @@ async fn undo_009(pool: &PgPool) -> Result<()> {
     assert_eq!(schema_versions(pool).await?, REQUIRED_SCHEMA_VERSIONS);
     sqlx::raw_sql("DELETE FROM qbit_prism_schema_migrations WHERE version=9; DROP TABLE qbit_prism_session_reservations; DROP INDEX qbit_prism_jobs_extranonce1_expiry_idx; ALTER SEQUENCE qbit_prism_session_sequence NO CYCLE")
         .execute(pool).await?;
-    assert_eq!(schema_versions(pool).await?, [2, 3, 4, 5, 6]);
+    assert_eq!(schema_versions(pool).await?, [2, 3, 4, 5, 6, 8]);
     Ok(())
 }
 
@@ -1650,7 +1650,7 @@ async fn startup_without_initialize_requires_the_current_schema_version() -> Res
         .context("a non-initializing start accepted a 2.x.x database")?
         .to_string();
     assert!(
-        error.contains("requires schema migrations 2, 3, 4, 5, 6, 9"),
+        error.contains("requires schema migrations 2, 3, 4, 5, 6, 8, 9"),
         "{error}"
     );
     assert!(error.contains("qbit-prism-server migrate"), "{error}");
@@ -1671,14 +1671,14 @@ async fn startup_without_initialize_requires_the_current_schema_version() -> Res
         .to_string();
     assert!(
         error.contains(
-            "missing migration(s) 9; this server requires 2, 3, 4, 5, 6, 9 and found 2, 3, 4, 5, 6"
+            "missing migration(s) 9; this server requires 2, 3, 4, 5, 6, 8, 9 and found 2, 3, 4, 5, 6, 8"
         ),
         "{error}"
     );
     assert!(error.contains("qbit-prism-server migrate"), "{error}");
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6],
+        [2, 3, 4, 5, 6, 8],
         "a non-initializing start ran a migration"
     );
     // Initializing brings it forward again, without rewriting the source record.
@@ -1703,13 +1703,13 @@ async fn startup_without_initialize_requires_the_current_schema_version() -> Res
         .context("a start refused an additive unknown migration")?;
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 9],
+        [2, 3, 4, 5, 6, 7, 8, 9],
         "a non-initializing start rewrote the newer schema"
     );
     // Initializing on it is a no-op too: no migration is reapplied and the
     // source record stands.
     let initializer = db.ledger("init-on-newer").await?;
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 7, 9]);
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 7, 8, 9]);
     assert_eq!(
         initializer.migration_source().await?.map(|s| s.migrated_by),
         Some("init".into())
@@ -1730,7 +1730,7 @@ async fn applied_at(pool: &PgPool, version: i32) -> Result<String> {
 }
 
 /// A database a build with 009 but without 006 left at migrations 2, 3, 4,
-/// 5 and 9: the next migrate applies 006 alone, in its place, and leaves
+/// 5, 8 and 9: the next migrate applies 006 alone, in its place, and leaves
 /// 009 as it found it.
 #[tokio::test]
 async fn pre_006_native_schema_with_009_applies_006_on_the_next_migrate() -> Result<()> {
@@ -1785,13 +1785,13 @@ async fn startup_without_initialize_refuses_a_pre_006_native_schema_with_009() -
         .to_string();
     assert!(
         error.contains(
-            "missing migration(s) 6; this server requires 2, 3, 4, 5, 6, 9 and found 2, 3, 4, 5, 9"
+            "missing migration(s) 6; this server requires 2, 3, 4, 5, 6, 8, 9 and found 2, 3, 4, 5, 8, 9"
         ),
         "{error}"
     );
     assert!(error.contains("qbit-prism-server migrate"), "{error}");
     // Nothing ran: the same rows, and none of 006's objects.
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 9]);
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 8, 9]);
     assert!(objects_006_absent(&pool, SourceState::Pre258).await?);
     pool.close().await;
     db.close(vec![earlier]).await
@@ -1868,7 +1868,7 @@ async fn undo_006(pool: &PgPool, state: SourceState) -> Result<()> {
         sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox DROP COLUMN storage_version; DROP TABLE qbit_prism_schema_capabilities")
             .execute(pool).await?;
     }
-    assert_eq!(schema_versions(pool).await?, [2, 3, 4, 5, 9]);
+    assert_eq!(schema_versions(pool).await?, [2, 3, 4, 5, 8, 9]);
     assert!(objects_006_absent(pool, state).await?);
     Ok(())
 }
@@ -1911,7 +1911,7 @@ async fn pre_006_native_schema_on_a_258_source_refuses_a_pending_v2_row_before_a
         .context("migration 006 accepted a pre-006 native database with a pending v2 row")?
         .to_string();
     assert!(
-        error.contains("refusing to apply migration 006 to a native database at schema migrations 2, 3, 4, 5, 9: an earlier 3.x.x build migrated it before the drain rule covered these rows, and the legacy Python block outbox is not drained: 1 pending 2.x.x candidate row(s) cannot be replayed natively"),
+        error.contains("refusing to apply migration 006 to a native database at schema migrations 2, 3, 4, 5, 8, 9: an earlier 3.x.x build migrated it before the drain rule covered these rows, and the legacy Python block outbox is not drained: 1 pending 2.x.x candidate row(s) cannot be replayed natively"),
         "{error}"
     );
     assert!(
@@ -1925,8 +1925,8 @@ async fn pre_006_native_schema_on_a_258_source_refuses_a_pending_v2_row_before_a
             && error.contains("Do not delete pending rows"),
         "{error}"
     );
-    // Unchanged: migrations 2, 3, 4, 5, 9, no 006 object, the schema and the rows as they were.
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 9]);
+    // Unchanged: migrations 2, 3, 4, 5, 8, 9, no 006 object, the schema and the rows as they were.
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 8, 9]);
     assert!(objects_006_absent(&pool, SourceState::Applied258).await?);
     assert_eq!(schema_objects(&pool).await?, before);
     assert_eq!(pending_rows(&pool).await?, 1);
@@ -1979,7 +1979,7 @@ async fn pre_006_native_schema_declaring_a_newer_capability_is_refused_before_an
         )?
         .to_string();
     assert!(
-        error.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 9 before any DDL"),
+        error.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 8, 9 before any DDL"),
         "{error}"
     );
     assert!(
@@ -1987,9 +1987,9 @@ async fn pre_006_native_schema_declaring_a_newer_capability_is_refused_before_an
         "{error}"
     );
     assert!(error.contains("upgrade the server"), "{error}");
-    // Unchanged: migrations 2, 3, 4, 5, 9, no 006 object, the schema and
+    // Unchanged: migrations 2, 3, 4, 5, 8, 9, no 006 object, the schema and
     // the row as they were.
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 9]);
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 8, 9]);
     assert!(objects_006_absent(&pool, SourceState::Applied258).await?);
     assert_eq!(schema_objects(&pool).await?, before);
     assert_eq!(capability(&pool).await?, Some(3));
@@ -2004,7 +2004,7 @@ async fn pre_006_native_schema_declaring_a_newer_capability_is_refused_before_an
         error.contains("missing migration(s) 6") || error.contains("candidate_storage_version = 3"),
         "{error}"
     );
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 9]);
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 8, 9]);
     assert_eq!(schema_objects(&pool).await?, before);
     // Back at 2, a capability this release does not know is refused the
     // same way, naming it.
@@ -2017,14 +2017,14 @@ async fn pre_006_native_schema_declaring_a_newer_capability_is_refused_before_an
         .context("migrate accepted a pre-006 native database declaring an unknown capability")?
         .to_string();
     assert!(
-        error.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 9 before any DDL"),
+        error.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 8, 9 before any DDL"),
         "{error}"
     );
     assert!(
         error.contains("capability sealed_share_pages = 1, which this server does not understand"),
         "{error}"
     );
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 9]);
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 8, 9]);
     assert!(objects_006_absent(&pool, SourceState::Applied258).await?);
     assert_eq!(schema_objects(&pool).await?, before);
     assert_eq!(capability(&pool).await?, Some(2));
@@ -2121,7 +2121,7 @@ async fn pre_006_native_schema_on_a_pre_258_source_refuses_an_undrained_v1_row_w
         .context("migration 006 accepted a pre-006 native database with an undrained v1 row")?
         .to_string();
     assert!(
-        error.contains("refusing to apply migration 006 to a native database at schema migrations 2, 3, 4, 5, 9"),
+        error.contains("refusing to apply migration 006 to a native database at schema migrations 2, 3, 4, 5, 8, 9"),
         "{error}"
     );
     assert!(
@@ -2132,7 +2132,7 @@ async fn pre_006_native_schema_on_a_pre_258_source_refuses_an_undrained_v1_row_w
         !error.contains("does not exist"),
         "pre-#258 native refusal was a SQL error: {error}"
     );
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 9]);
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 8, 9]);
     assert!(objects_006_absent(&pool, SourceState::Pre258).await?);
     assert_eq!(pending_rows(&pool).await?, 1);
     drain_2x_row(&pool, &pending, false).await?;
@@ -2195,14 +2195,6 @@ async fn legacy_2x_upgrade_repairs_partial_carry_seed_and_preserves_shared_state
         0
     );
     assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
-    assert_eq!(
-        sqlx::query_scalar::<_, i32>(
-            "SELECT version FROM qbit_prism_schema_migrations ORDER BY version"
-        )
-        .fetch_all(&pool)
-        .await?,
-        vec![2, 3, 4, 5, 8, 9]
-    );
     assert_eq!(
         ledger.migration_source().await?.map(|s| s.source_state),
         Some("pre_258".into())
