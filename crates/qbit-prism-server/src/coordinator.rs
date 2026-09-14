@@ -95,8 +95,8 @@ pub struct Prepared {
     pub template: Value,
     pub snapshot: Arc<Snapshot>,
     /// The reference for `snapshot`'s window, computed once per non-cached
-    /// refresh and carried with the work instead of being re-derived. #265's
-    /// next PR clones it at submit, so a found block never re-digests the
+    /// refresh and carried with the work instead of being re-derived. Submit
+    /// clones it into the candidate, so a found block never re-digests the
     /// window on the share path.
     pub window: WindowRef,
     /// What `bundle` was built with, other than the window. A per-worker
@@ -2221,3 +2221,6 @@ mod d2_test_support;
 
 #[cfg(test)]
 mod window_ref_tests;
+
+#[cfg(test)]
+mod window_switch_tests;
