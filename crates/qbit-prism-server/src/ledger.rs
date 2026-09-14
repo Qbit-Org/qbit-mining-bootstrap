@@ -24,8 +24,11 @@ pub use audit::{
     AuditCompleteness,
 };
 mod candidates;
-use candidates::persist_candidate;
-pub use candidates::{Candidate, CandidateClaim};
+use candidates::prepare_candidate;
+pub use candidates::{
+    authenticate_landed_audit, build_claim_parts, coinbase_witness_reserved_value, header_bits_hex,
+    Candidate, CandidateClaim, CandidateCtv, ClaimParts, LandedAudit, SignerKeys,
+};
 mod connect;
 use connect::{require_revision, writable};
 pub use connect::{SessionAllocationExhausted, SessionId};
@@ -36,7 +39,10 @@ mod instances;
 pub(crate) use instances::{live_instances, unavailable_live_instances, LiveInstancesReport};
 pub use instances::{HeartbeatHealth, HeartbeatStatus};
 mod jobs;
-pub use jobs::{IssuedJobSave, PreparedDependency};
+pub use jobs::{
+    CompactDependency, CompactPrepared, CompactRepair, IssuedJobSave, PreparedAuditHashes,
+    PreparedDependency, PreparedTemplate, StoredCompactPrepared,
+};
 mod migration;
 pub use migration::{
     schema_version_list, MigrationSource, SourceState, SourceStateRule, NOT_VALID_EXEMPT,
@@ -45,10 +51,11 @@ pub use migration::{
 mod window;
 pub use difficulty::WorkerDifficulty;
 pub use window::CommitGateClosed;
-use window::{read_prior_balances, share_from_row};
 pub use window::{
-    AppendResult, BalanceSource, PayoutState, ShareRange, Snapshot, Window, WindowError, WindowRef,
+    probe_share_rows, put_balance_snapshot, read_range_paged, AppendResult, BalanceSource,
+    PayoutState, ShareRange, Snapshot, Window, WindowError, WindowRef,
 };
+use window::{read_prior_balances, share_from_row};
 
 const MIGRATION_LOCK: i64 = 0x505249534d000001;
 const ORDER_LOCK: i64 = 0x505249534d000002;
@@ -64,4 +71,10 @@ pub struct Ledger {
     /// Without a handle nothing is recorded and behaviour is identical, so
     /// tools and tests keep using [`Ledger::connect`].
     metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
+    /// The cluster fingerprint [`Ledger::configure`] pinned or verified, read
+    /// back through [`Ledger::config_fingerprint`]. Shared across clones, so
+    /// every handle to one frontend's ledger sees the same pinned value: the
+    /// writer fence re-reads `qbit_prism_cluster.config_fingerprint` `FOR
+    /// SHARE` in its own transaction and compares it against this.
+    config_fingerprint: std::sync::Arc<std::sync::OnceLock<String>>,
 }

@@ -106,31 +106,44 @@ one line; the checker counts it once. An unwritable manifest fails the test.
 
 ## The expected list and the proof
 
-`test/prism-gated-tests.txt` lists every gated test the `prism-native-postgres`
-job must execute, one id per line, sorted; 114 today. Its length is the minimum
-count.
-After the job's three `cargo test` invocations (the whole workspace with
-`--nocapture`, then the two explicit `--ignored` runs), it runs
+[test/prism-gated-tests.txt](../test/prism-gated-tests.txt) lists every gated
+test the `prism-native-postgres` job must execute, one id per line, sorted.
+The number of test ids in that file is the minimum count; see the file for
+the current list and the `check-gate-manifest` success line from
+[scripts/check_gate_manifest.py](../scripts/check_gate_manifest.py) for the
+count verified in a green run.
+
+The job has four shards, each with its own PostgreSQL service and qbitd.
+[scripts/run_rust_test_shard.py](../scripts/run_rust_test_shard.py) discovers
+all workspace targets from Cargo metadata, sorts by package, kind, and name,
+and assigns them round-robin. Each test binary stays intact, preserving its
+fixtures and process-wide locks. New workspace targets join automatically.
+The two explicit `--ignored` contracts run on the shards owning their targets.
+Use `--shard-index 0 --shard-count 4 --dry-run` to inspect a shard's commands.
+
+Each shard uploads its manifest and test log as `prism-gate-shard-<index>`.
+The `prism-integration-proof` job requires every shard to succeed, downloads
+and combines their manifests and logs, then runs
 
 ```sh
 python3 scripts/check_gate_manifest.py \
-  --manifest "$PRISM_TEST_GATE_MANIFEST" \
+  --manifest prism-gate-manifest.txt \
   --expected test/prism-gated-tests.txt \
-  --log "$PRISM_TEST_LOG"
+  --log prism-native-tests.log
 ```
 
 which fails when any expected test has no `executed` line, any `skipped` or
 `failed` line appears, fewer distinct tests executed than the list holds, a
 test executed that is not in the list, or the log shows a skip line. It
 prints the manifest to the log and to the job summary, and the job uploads
-the manifest as the `prism-gate-manifest` artifact. The job sets
+the combined manifest as the `prism-gate-manifest` artifact. Every shard sets
 `PRISM_TEST_REQUIRE_INTEGRATION=1`, so an input that goes missing fails the
 tests themselves before the checker runs.
 
 `rust-tests` runs the same workspace with no inputs, where every gated test
 prints its skip line and passes; nothing there asserts execution, which is
-why the native job is in the required `checks` list and `rust-tests` is not
-the proof.
+why both the native matrix and its combined proof are in the required
+`checks` list; `rust-tests` is not the proof.
 
 ## Running locally
 

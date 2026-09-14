@@ -12,13 +12,12 @@ use std::path::{Path, PathBuf};
 /// own. Add every new migration file here. `Ledger::connect` refuses a
 /// database missing any of them even without `initialize`, so a newer binary
 /// never reaches the claim path on a database it has not migrated, and a
-/// later number never hides an earlier gap: 007 is reserved by an
-/// independent workstream and may land after 008 and 009. A migration this
+/// later number never hides an earlier gap: 007 landed after 008, 009 and 010. A migration this
 /// binary does not know is accepted with a warning: native migrations are
 /// additive, and a release whose format an older binary must not touch
 /// declares a capability, which `migrate_schema` refuses before any DDL and
 /// `require_known_capabilities` refuses again at connect.
-pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 8, 9, 10];
+pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[2, 3, 4, 5, 6, 7, 8, 9, 10];
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
 /// `none`.
@@ -653,10 +652,10 @@ async fn require_pre_006_storage_version(
 /// set of a database an earlier 3.x.x build migrated to native schema 3, 4
 /// or 5, with or without 008 and 009, whose drain check never counted a v2
 /// row; that path gets its own wording and remedy. Native pending rows carry
-/// the native `payout_revision`, `bundle` and `block_hash` fields, so the
-/// predicate never flags them; only a v2 body, a `body_id`, a
-/// `storage_version` other than 1, or a v1 body without those fields is
-/// refused.
+/// `payout_revision`, `block_hash` and either an inline `bundle` (pre-007) or
+/// a `window` reference (007 and later), so the predicate never flags them;
+/// only a v2 body, a `body_id`, a `storage_version` other than 1, or a v1 body
+/// without those fields is refused.
 pub(super) async fn refuse_undrained_outbox(
     tx: &mut Transaction<'_, Postgres>,
     inventory: &SourceInventory,
@@ -687,7 +686,13 @@ pub(super) async fn refuse_undrained_outbox(
     if inventory.has_outbox_column("body_id") {
         clauses.push("body_id IS NOT NULL");
     }
-    clauses.push("NOT (candidate ?& ARRAY['payout_revision','bundle','block_hash'])");
+    // A native pending row is recognised by the fields its own writer stores.
+    // Before 007 that was an inline `bundle`; since 007 the candidate holds a
+    // `window` reference instead, so both shapes must count as native or this
+    // check would refuse rows this server wrote itself as undrained 2.x.x work.
+    clauses.push(
+        "NOT (candidate ?& ARRAY['payout_revision','block_hash'] AND (candidate ? 'bundle' OR candidate ? 'window'))",
+    );
     let predicate = clauses.join(" OR ");
     let version = if inventory.has_outbox_column("storage_version") {
         "storage_version"
@@ -1979,6 +1984,10 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
     ),
     (6, include_str!("../../migrations/006_source_schema.sql")),
     (
+        7,
+        include_str!("../../migrations/007_candidate_window_reference.sql"),
+    ),
+    (
         8,
         include_str!("../../migrations/008_prepared_window_reference.sql"),
     ),
@@ -2727,6 +2736,45 @@ pub(super) async fn migrate_schema(
         if let Some(state) = state {
             tracing::info!(source=state.rule().name, release=?release, "migrated PRISM database source");
         }
+    }
+    if !versions.contains(&7) {
+        // 007's own drain check, which is not the one `refuse_undrained_outbox`
+        // performs and cannot be folded into it. That helper exists to refuse a
+        // row this server cannot decode at all, and its predicate deliberately
+        // passes a native pending row carrying `payout_revision`, `bundle` and
+        // `block_hash`: for 006 such a row is perfectly readable. 007 is what
+        // removes the inline claim path, so for 007 that very row is the
+        // blocking shape. Refusing it here, before any of 007's DDL runs,
+        // leaves the schema exactly as it was.
+        //
+        // `candidate IS NULL` and `storage_version <> 1` are #258's chunked
+        // version-2 shape, named both ways because native schemas have no
+        // `storage_version` column; the disjunct is added only where it exists.
+        let versioned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='qbit_block_candidate_outbox' AND column_name='storage_version')",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        let undrained: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT block_hash FROM qbit_block_candidate_outbox WHERE state='pending' AND (candidate IS NULL OR candidate ? 'bundle'{}) ORDER BY block_hash",
+            if versioned { " OR storage_version<>1" } else { "" }
+        ))
+        .fetch_all(&mut **tx)
+        .await?;
+        ensure!(
+            undrained.is_empty(),
+            "migration 007 refuses undrained pre-007 block candidates: {}. \
+             Drain the outbox with the pre-007 frontends running, then stop every \
+             frontend, verify that SELECT count(*) FROM qbit_block_candidate_outbox \
+             WHERE state='pending' is 0, and only then start the post-007 binary",
+            named_objects(&undrained)
+        );
+        sqlx::raw_sql(native_migration(7))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(7)")
+            .execute(&mut **tx)
+            .await?;
     }
     if !versions.contains(&8) {
         sqlx::raw_sql(native_migration(8))

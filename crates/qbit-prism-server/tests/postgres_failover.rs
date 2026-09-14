@@ -2,7 +2,7 @@
 //! Set PRISM_TEST_PG_BIN_DIR to the directory containing initdb/pg_ctl/pg_basebackup.
 use anyhow::{ensure, Context, Result};
 use qbit_prism::AcceptedShare;
-use qbit_prism_server::ledger::Ledger;
+use qbit_prism_server::ledger::{Ledger, SignerKeys};
 use qbit_prism_test_gate as gate;
 use sqlx::PgPool;
 use std::{
@@ -119,7 +119,15 @@ async fn acknowledged_shares_survive_synchronous_primary_loss_and_pool_reconnect
         .to_owned();
     let primary_url = format!("postgresql://{username}@127.0.0.1:{primary_port}/postgres");
     let bootstrap = Ledger::connect(&primary_url, "bootstrap".into(), 4, true).await?;
-    bootstrap.configure("failover-test").await?;
+    bootstrap
+        .configure(
+            "failover-test",
+            &SignerKeys {
+                manifest_key_hex: "aa".repeat(32),
+                ledger_key_hex: "bb".repeat(32),
+            },
+        )
+        .await?;
     bootstrap.pool.close().await;
     standby.command(
         "pg_basebackup",

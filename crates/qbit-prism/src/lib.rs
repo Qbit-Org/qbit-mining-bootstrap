@@ -95,6 +95,25 @@ pub const QBIT_COINBASE_MATURITY_BLOCKS: u64 = 1_000;
 pub const PRISM_AUDIT_COMMITMENT_LEAF_TAG: &str = "qbit.prism.audit.commitment.v1";
 pub const AUDIT_BUNDLE_SCHEMA_V1: &str = "qbit.prism.audit-bundle.v1";
 pub const AUDIT_BUNDLE_SCHEMA_V1_1: &str = "qbit.prism.audit-bundle.v1.1";
+/// The version of the audit-bundle builders themselves, as distinct from the
+/// `schema` strings above, which the share shape chooses rather than the
+/// builder logic.
+///
+/// A stored window reference reproduces its bundle only under the builder that
+/// first built it, so a candidate and a prepared job store this value beside
+/// their other inputs and a rebuild refuses a reference whose stored version
+/// differs from this binary's, rather than rebuilding it with the current
+/// builder.
+///
+/// **Bump rule: any change that alters `canonical_audit_bundle_bytes` for the
+/// same inputs bumps this constant, in the same commit.** A new reward rule, a
+/// new manifest field or a canonical-schema change all qualify. The golden
+/// digests in `tests/audit_cli.rs` are keyed by this constant, so a new output
+/// is recorded as a new entry beside the old one, never by overwriting one;
+/// review then sees both. A release that bumps it ships a migration step whose
+/// refusal predicate counts `state='pending'` outbox rows at the old value, and
+/// the operator drains them with the old frontends first.
+pub const AUDIT_BUILDER_VERSION: u16 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PrismError {

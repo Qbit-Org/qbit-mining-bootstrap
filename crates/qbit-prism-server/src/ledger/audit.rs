@@ -253,13 +253,22 @@ impl Ledger {
     }
 }
 
-/// The synthetic window an empty ledger pays its solver through. It has no
-/// ledger rows, so the durable-range checks exempt it and the snapshot keeps
-/// it inline.
-fn is_bootstrap_window(shares: &[AcceptedShare]) -> bool {
-    shares.len() == 1
-        && shares[0].share_id == "bootstrap-share"
-        && shares[0].job_id == "bootstrap-job"
+/// What landing writes to `qbit_prism_audit_snapshots`, produced off the
+/// runtime from the claim's parts: the digest, the reference's range, and the
+/// shares the range must be proved against.
+pub(super) struct AuditSnapshotWrite {
+    pub digest: String,
+    pub first_share_seq: i64,
+    pub last_share_seq: i64,
+    pub anchor_ms: i64,
+    pub share_count: i64,
+    /// The bootstrap window's one synthetic share, which is not in the ledger
+    /// and so is stored inline rather than referenced. This is `Some` exactly
+    /// when the candidate's window reference carries no share range, so the
+    /// exemption below is decided by the reference the block committed to
+    /// rather than by a share's id and job id.
+    pub inline: Option<Value>,
+    pub shares: std::sync::Arc<Vec<AcceptedShare>>,
 }
 
 /// Rows per page of [`verify_durable_range`]. The same page the window reader
@@ -268,30 +277,36 @@ fn is_bootstrap_window(shares: &[AcceptedShare]) -> bool {
 /// page of decoded rows, never a second copy of the window.
 const VERIFY_PAGE_ROWS: i64 = 4096;
 
-/// Prove the candidate's window is exactly what the immutable ledger holds
-/// for its anchored range. This is the read that used to sit inside the
-/// settlement transaction; it now runs before the lock is taken, and page by
-/// page. The predicate, the `share_seq` ordering and the full equality over
-/// every field are unchanged: the pages are compared in order against the
-/// same positions of `bundle.shares`, a longer or shorter durable range is a
-/// mismatch, and the first mismatched page fails the landing. The bootstrap
-/// window has no ledger rows and is exempt, as before. Each page is decoded
-/// and compared on a blocking thread.
+/// Prove the candidate's window is exactly what the immutable ledger holds for
+/// its anchored range, before the settlement lock is taken.
+///
+/// The predicate, the `share_seq` ordering and the full equality over every
+/// field are unchanged from the read that used to sit inside the settlement
+/// transaction: pages are compared in order against the same positions of the
+/// claim's shares, a longer or shorter durable range is a mismatch, and the
+/// first mismatched page fails the landing. Each page is decoded and compared
+/// on the blocking thread that mapped it, so neither the lock nor a runtime
+/// thread ever carries a window-sized read.
 ///
 /// The anchored set is frozen once the anchor is issued and ledger rows never
 /// change, so nothing this proves can change before the transaction; the
 /// in-transaction count guard in [`persist_audit_snapshot`] covers the range
 /// again under the lock.
-pub(super) async fn verify_durable_range(pool: &PgPool, bundle: &AuditBundle) -> Result<()> {
-    let shares = &bundle.shares;
-    ensure!(!shares.is_empty(), "audit share snapshot cannot be empty");
-    if is_bootstrap_window(shares) {
+pub(super) async fn verify_durable_range(
+    pool: &PgPool,
+    snapshot: &AuditSnapshotWrite,
+) -> Result<()> {
+    ensure!(
+        snapshot.share_count > 0,
+        "audit share snapshot cannot be empty"
+    );
+    if snapshot.inline.is_some() {
         return Ok(());
     }
-    let first = i64::try_from(shares[0].share_seq)?;
-    let last = i64::try_from(shares[shares.len() - 1].share_seq)?;
-    let anchor = bundle.found_block.anchor_job_issued_at_ms;
-    let mut cursor = first - 1;
+    let shares = &snapshot.shares;
+    let last = snapshot.last_share_seq;
+    let anchor = snapshot.anchor_ms;
+    let mut cursor = snapshot.first_share_seq - 1;
     let mut matched = 0usize;
     while cursor < last {
         let rows = sqlx::query(&format!("{SELECT_SHARE} WHERE accepted AND share_seq>$1 AND share_seq<=$2 AND accepted_at<=to_timestamp($3::double precision/1000) AND job_issued_at<=to_timestamp($3::double precision/1000) ORDER BY share_seq LIMIT $4"))
@@ -325,43 +340,35 @@ pub(super) async fn verify_durable_range(pool: &PgPool, bundle: &AuditBundle) ->
     Ok(())
 }
 
+/// Persist the share snapshot inside the landing transaction.
+///
+/// The full-equality proof ran before the lock, in [`verify_durable_range`].
+/// Under the lock only the row count of the same anchored predicate is
+/// re-read: no share payload crosses this transaction, so the settlement lock
+/// is never held for a window-sized read.
 pub(super) async fn persist_audit_snapshot(
     tx: &mut Transaction<'_, Postgres>,
-    bundle: &AuditBundle,
+    snapshot: &AuditSnapshotWrite,
 ) -> Result<String> {
-    let shares = &bundle.shares;
-    ensure!(!shares.is_empty(), "audit share snapshot cannot be empty");
     ensure!(
-        shares.windows(2).all(|s| s[0].share_seq < s[1].share_seq),
-        "audit share snapshot must be ordered canonically"
+        snapshot.share_count > 0,
+        "audit share snapshot cannot be empty"
     );
-    let digest = hex::encode(Sha256::digest(serde_json::to_vec(shares)?));
-    let first = i64::try_from(shares[0].share_seq)?;
-    let last = i64::try_from(shares[shares.len() - 1].share_seq)?;
-    let anchor = bundle.found_block.anchor_job_issued_at_ms;
-    let bootstrap = is_bootstrap_window(shares);
-    let inline: Option<Value> = if bootstrap {
-        Some(serde_json::to_value(shares)?)
-    } else {
-        None
-    };
-    if !bootstrap {
-        // The full-equality proof ran before the settlement lock
-        // (`verify_durable_range`). Under the lock only the row count of the
-        // same anchored predicate is re-read: no share payload, so the lock is
-        // not held for a window-sized read.
+    if snapshot.inline.is_none() {
         let durable: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_share_ledger WHERE accepted AND share_seq BETWEEN $1 AND $2 AND accepted_at<=to_timestamp($3::double precision/1000) AND job_issued_at<=to_timestamp($3::double precision/1000)")
-            .bind(first).bind(last).bind(anchor).fetch_one(&mut **tx).await?;
+            .bind(snapshot.first_share_seq).bind(snapshot.last_share_seq).bind(snapshot.anchor_ms).fetch_one(&mut **tx).await?;
         ensure!(
-            durable == i64::try_from(shares.len())?,
+            durable == snapshot.share_count,
             "audit share snapshot count differs from canonical database history"
         );
     }
     sqlx::query("INSERT INTO qbit_prism_audit_snapshots(snapshot_sha256,first_share_seq,last_share_seq,anchor_ms,share_count,inline_shares) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING")
-        .bind(&digest).bind(first).bind(last).bind(anchor).bind(i64::try_from(shares.len())?).bind(inline).execute(&mut **tx).await?;
-    Ok(digest)
+        .bind(&snapshot.digest).bind(snapshot.first_share_seq).bind(snapshot.last_share_seq).bind(snapshot.anchor_ms).bind(snapshot.share_count).bind(&snapshot.inline).execute(&mut **tx).await?;
+    Ok(snapshot.digest.clone())
 }
 
+/// The unpaged range read the API's `materialize_audit_row` keeps. Landing no
+/// longer uses it; its re-read is paged.
 async fn read_range<'e>(
     executor: impl sqlx::Executor<'e, Database = Postgres>,
     first: i64,
