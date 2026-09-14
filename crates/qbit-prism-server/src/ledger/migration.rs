@@ -2712,10 +2712,29 @@ where
 
 async fn read_migration_source<'e, E>(executor: E) -> Result<Option<MigrationSource>>
 where
-    E: sqlx::Executor<'e, Database = Postgres>,
+    E: sqlx::Acquire<'e, Database = Postgres>,
 {
-    let row = sqlx::query("SELECT source_state,source_release,source_commit,candidate_storage_version,prior_schema_version,migrated_by,migrated_at FROM qbit_prism_migration_source WHERE singleton")
-        .fetch_optional(executor).await?;
+    // Keep resolution and the read on one connection, and qualify the read
+    // with the verified schema so provenance cannot come from another ledger.
+    let mut connection = executor.acquire().await?;
+    let relation = sqlx::query("SELECT n.nspname::text AS schema,current_schema()::text AS current,c.relkind::text AS kind,format('%I.%I',n.nspname,c.relname) AS qualified FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=to_regclass('qbit_prism_migration_source')")
+        .fetch_optional(&mut *connection).await?
+        .context("qbit_prism_migration_source is missing from the current schema")?;
+    let schema: String = relation.try_get("schema")?;
+    let current: Option<String> = relation.try_get("current")?;
+    ensure!(
+        current.as_deref() == Some(schema.as_str()),
+        "qbit_prism_migration_source resolves to {schema}.qbit_prism_migration_source, outside the current schema {} whose migration history was verified; refusing to trust another schema's migration provenance. Restore the full backup, including the current schema's original source metadata table and singleton row, then start or migrate again",
+        current.as_deref().unwrap_or("(none)")
+    );
+    let kind: String = relation.try_get("kind")?;
+    ensure!(
+        kind == "r",
+        "qbit_prism_migration_source must be an ordinary table (found relation kind {kind}); restore the original source metadata table from the full backup before starting or migrating this database"
+    );
+    let qualified: String = relation.try_get("qualified")?;
+    let row = sqlx::query(&format!("SELECT source_state,source_release,source_commit,candidate_storage_version,prior_schema_version,migrated_by,migrated_at FROM {qualified} WHERE singleton"))
+        .fetch_optional(&mut *connection).await?;
     row.map(|row| {
         Ok(MigrationSource {
             source_state: row.try_get("source_state")?,
@@ -2736,7 +2755,7 @@ where
 /// again before any accounting statement, with or without initialization.
 pub(super) async fn require_migration_source<'e, E>(executor: E) -> Result<MigrationSource>
 where
-    E: sqlx::Executor<'e, Database = Postgres>,
+    E: sqlx::Acquire<'e, Database = Postgres>,
 {
     read_migration_source(executor)
         .await

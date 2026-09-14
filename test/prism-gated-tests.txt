@@ -90,6 +90,7 @@ qbit-prism-server::ledger_postgres::two_x::migrate_role_without_create_on_the_da
 qbit-prism-server::ledger_postgres::two_x::migrated_database_without_its_capability_declaration_is_refused_at_connect_and_at_migrate
 qbit-prism-server::ledger_postgres::two_x::migrated_database_without_readable_source_metadata_is_refused_before_later_ddl
 qbit-prism-server::ledger_postgres::two_x::migration_refuses_source_objects_resolved_from_a_later_schema
+qbit-prism-server::ledger_postgres::two_x::migration_source_resolved_from_a_later_schema_is_refused
 qbit-prism-server::ledger_postgres::two_x::native_candidate_version_two_is_refused_without_claiming_or_migrating
 qbit-prism-server::ledger_postgres::two_x::native_capabilities_resolved_from_a_later_schema_are_refused
 qbit-prism-server::ledger_postgres::two_x::native_capabilities_with_row_level_security_are_refused_before_writes

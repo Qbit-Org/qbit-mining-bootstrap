@@ -3072,6 +3072,79 @@ async fn migrated_database_without_its_capability_declaration_is_refused_at_conn
     db.close(vec![ledger, follower, migrated]).await
 }
 
+/// Provenance belongs to the same schema as the verified migration history.
+#[tokio::test]
+async fn migration_source_resolved_from_a_later_schema_is_refused() -> Result<()> {
+    for kind in ["TABLE", "VIEW"] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let pool = PgPool::connect(&db.url).await?;
+        let earlier = db.ledger("original-source").await?;
+        let source = earlier.migration_source().await?;
+        let later = format!("{}_later", db.schema);
+        sqlx::raw_sql(&format!("CREATE SCHEMA {later}; ALTER TABLE qbit_prism_migration_source RENAME TO operator_original_source; CREATE {kind} {later}.qbit_prism_migration_source AS SELECT * FROM operator_original_source"))
+            .execute(&pool).await?;
+        let objects = schema_objects(&pool).await?;
+        let mut url = url::Url::parse(&db.url)?;
+        let base_query: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(key, _)| key != "options")
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        url.query_pairs_mut()
+            .clear()
+            .extend_pairs(base_query)
+            .append_pair("options", &format!("-csearch_path={},{later}", db.schema));
+        for initialize in [false, true] {
+            let error = Ledger::connect(url.as_str(), "source-check".into(), 8, initialize)
+                .await
+                .err()
+                .with_context(|| {
+                    format!(
+                        "trusted provenance from a later schema's {kind} (initialize={initialize})"
+                    )
+                })?;
+            let error = format!("{error:#}");
+            assert!(
+                error.contains(&format!("{later}.qbit_prism_migration_source")),
+                "{error}"
+            );
+            assert!(error.contains(&db.schema), "{error}");
+            if !initialize {
+                assert!(error.contains("outside the current schema"), "{error}");
+                assert!(error.contains("Restore the full backup"), "{error}");
+            }
+            assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+            assert_eq!(schema_objects(&pool).await?, objects);
+        }
+        // Restoring the original table makes both startup modes read its
+        // original singleton even while the later relation remains visible.
+        sqlx::raw_sql("ALTER TABLE operator_original_source RENAME TO qbit_prism_migration_source")
+            .execute(&pool)
+            .await?;
+        let mut ledgers = vec![earlier];
+        for initialize in [false, true] {
+            let restored =
+                Ledger::connect(url.as_str(), "source-check".into(), 8, initialize).await?;
+            assert_eq!(restored.migration_source().await?, source);
+            ledgers.push(restored);
+        }
+        let foreign_source: (String, i64) = sqlx::query_as(&format!(
+            "SELECT min(migrated_by),count(*) FROM {later}.qbit_prism_migration_source"
+        ))
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(foreign_source, ("original-source".into(), 1));
+        sqlx::raw_sql(&format!("DROP SCHEMA {later} CASCADE"))
+            .execute(&pool)
+            .await?;
+        pool.close().await;
+        db.close(ledgers).await?;
+    }
+    Ok(())
+}
+
 /// Source metadata is mandatory once 006 is recorded. Refuse missing or
 /// unreadable metadata before committing a later migration, and preserve
 /// the original record when the operator restores it from a full backup.
