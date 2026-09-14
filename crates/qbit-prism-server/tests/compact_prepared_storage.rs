@@ -189,7 +189,7 @@ async fn empty_and_nonempty_prepared_records_round_trip_original_inputs_and_exac
             let expires = db.expires().await?;
             ensure!(db.ledger.save_compact_prepared(&key, &record, &template, &balances, 0, expires).await?);
             let stored = db.ledger.compact_prepared(&key).await?.context("not found")?;
-            ensure!(stored.record == record && stored.template == value && stored.expires_at_ms == expires);
+            ensure!(stored.record == record && stored.template == value && stored.expires_at_ms == expires && stored.original_expires_at_ms == expires);
             let mut sorted = balances.clone(); sorted.reverse();
             ensure!(stored.prior_balances == sorted);
             let row = sqlx::query("SELECT j.payload,j.window_first_share_seq,j.window_last_share_seq,j.window_share_count,t.template_bytes,b.balances FROM qbit_prism_jobs j JOIN qbit_prism_templates t USING(template_sha256) JOIN qbit_prism_balance_snapshots b ON b.prior_balances_digest=j.window_prior_balances_sha256 WHERE j.job_id=$1")
@@ -197,7 +197,9 @@ async fn empty_and_nonempty_prepared_records_round_trip_original_inputs_and_exac
             ensure!(row.try_get::<Vec<u8>,_>("template_bytes")? == exact.as_bytes());
             ensure!(row.try_get::<Vec<u8>,_>("balances")? == serde_json::to_vec(&sorted)?);
             let payload: Value = row.try_get("payload")?;
-            ensure!(payload == serde_json::to_value(&record)?);
+            let mut expected_payload = serde_json::to_value(&record)?;
+            expected_payload["original_expires_at_ms"] = json!(expires);
+            ensure!(payload == expected_payload);
             for field in ["template", "snapshot", "bundle", "prior_balances"] { ensure!(payload.get(field).is_none()); }
             ensure!(!payload["window"]["shares"].is_array());
             ensure!(row.try_get::<Option<i64>,_>("window_first_share_seq")? == nonempty.then_some(1));
@@ -241,6 +243,52 @@ async fn retries_preserve_original_identity_expiry_and_transaction_fence() -> Re
                     .save_compact_prepared("retry", &record, &template, &[], 0, expires)
                     .await?
             );
+            let original_payload = db.ledger.job("retry").await?.unwrap();
+            let child_expires = expires + 60_000;
+            let child = json!({"prepared_key": "retry", "expires_at_ms": child_expires});
+            ensure!(
+                db.ledger
+                    .save_issued_job(
+                        "renewing-child",
+                        &child,
+                        0,
+                        &record.parent_hash,
+                        child_expires,
+                        PreparedDependency {
+                            key: "retry",
+                            original_revision: 0,
+                            parent: &record.parent_hash
+                        },
+                        None,
+                    )
+                    .await?
+                    == IssuedJobSave::Saved
+            );
+            let retained = db.ledger.compact_prepared("retry").await?.unwrap();
+            ensure!(
+                retained.original_expires_at_ms == expires
+                    && retained.expires_at_ms >= child_expires
+            );
+            // A lost-ack retry reconciles even after a real child extended
+            // retention, without changing either deadline or the payload.
+            ensure!(
+                !db.ledger
+                    .save_compact_prepared("retry", &record, &template, &[], 0, expires)
+                    .await?
+            );
+            let retried = db.ledger.compact_prepared("retry").await?.unwrap();
+            ensure!(
+                retried.original_expires_at_ms == expires
+                    && retried.expires_at_ms == retained.expires_at_ms
+            );
+            ensure!(db.ledger.job("retry").await? == Some(original_payload));
+            ensure!(db.ledger.job("renewing-child").await? == Some(child));
+            let child_column: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+                "SELECT expires_at FROM qbit_prism_jobs WHERE job_id='renewing-child'",
+            )
+            .fetch_one(&db.ledger.pool)
+            .await?;
+            ensure!(child_column.timestamp_millis() == child_expires);
             for changed in [expires - 1, expires + 1] {
                 let error = db
                     .ledger
@@ -251,6 +299,31 @@ async fn retries_preserve_original_identity_expiry_and_transaction_fence() -> Re
                     .to_string()
                     .contains("immutable compact prepared conflict"));
             }
+            // The immutable baseline also authenticates retention metadata.
+            // Keep the damaged column live so lookup cannot classify it a miss.
+            sqlx::query("UPDATE qbit_prism_jobs SET expires_at=$1 WHERE job_id='retry'")
+                .bind(chrono::DateTime::<chrono::Utc>::from_timestamp_millis(expires - 1).unwrap())
+                .execute(&db.ledger.pool)
+                .await?;
+            ensure!(db
+                .ledger
+                .compact_prepared("retry")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("retention precedes original expiry"));
+            ensure!(db
+                .ledger
+                .save_compact_prepared("retry", &record, &template, &[], 0, expires)
+                .await
+                .is_err());
+            sqlx::query("UPDATE qbit_prism_jobs SET expires_at=$1 WHERE job_id='retry'")
+                .bind(
+                    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(retained.expires_at_ms)
+                        .unwrap(),
+                )
+                .execute(&db.ledger.pool)
+                .await?;
             let mut other = record.clone();
             other.generation += 1;
             ensure!(db
@@ -273,11 +346,15 @@ async fn retries_preserve_original_identity_expiry_and_transaction_fence() -> Re
                     .await?
             );
             let stored = db.ledger.compact_prepared("original").await?.unwrap();
-            ensure!(stored.record.payout_revision == 0 && stored.expires_at_ms == expires);
+            ensure!(
+                stored.record.payout_revision == 0
+                    && stored.expires_at_ms == expires
+                    && stored.original_expires_at_ms == expires
+            );
             let count: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_jobs")
                 .fetch_one(&db.ledger.pool)
                 .await?;
-            ensure!(count == 2);
+            ensure!(count == 3);
             Ok(())
         })
     })
@@ -464,15 +541,27 @@ async fn old_inline_callers_remain_unchanged_and_only_explicit_legacy_rows_miss(
         let template = PreparedTemplate::encode(&template())?;
         let record = record(&template, &[], false);
         db.ledger.save_compact_prepared("modern", &record, &template, &[], 0, expires).await?;
+        let original_payload = db.ledger.job("modern").await?.unwrap();
         for mutation in [
             "jsonb_set(payload,'{format_version}','99')", "payload - 'format_version'",
             "payload || '{\"bundle\":null}'::jsonb", "payload || '{\"snapshot\":{}}'::jsonb",
             "jsonb_set(payload,'{window}','null')", "jsonb_set(payload,'{payout_policy,unknown}','1')",
+            "payload - 'original_expires_at_ms'", "jsonb_set(payload,'{original_expires_at_ms}','null')",
+            "jsonb_set(payload,'{original_expires_at_ms}','1.5')",
+            "jsonb_set(payload,'{original_expires_at_ms}','9223372036854775807')",
         ] {
             sqlx::query(&format!("UPDATE qbit_prism_jobs SET payload={mutation} WHERE job_id='modern'")).execute(&db.ledger.pool).await?;
             ensure!(db.ledger.compact_prepared("modern").await.is_err(), "accepted {mutation}");
-            sqlx::query("UPDATE qbit_prism_jobs SET payload=$1 WHERE job_id='modern'").bind(serde_json::to_value(&record)?).execute(&db.ledger.pool).await?;
+            sqlx::query("UPDATE qbit_prism_jobs SET payload=$1 WHERE job_id='modern'").bind(&original_payload).execute(&db.ledger.pool).await?;
         }
+        // A historically expired reservation may still be retained for a live
+        // child. Hydration is an observation, not authority to renew or publish.
+        let past_original = db.now_ms().await? - 1;
+        sqlx::query("UPDATE qbit_prism_jobs SET payload=jsonb_set(payload,'{original_expires_at_ms}',to_jsonb($1::bigint)) WHERE job_id='modern'")
+            .bind(past_original).execute(&db.ledger.pool).await?;
+        let retained = db.ledger.compact_prepared("modern").await?.unwrap();
+        ensure!(retained.original_expires_at_ms == past_original && retained.expires_at_ms == expires);
+        ensure!(db.ledger.save_compact_prepared("modern", &record, &template, &[], 0, past_original).await.unwrap_err().to_string().contains("prepared deadline elapsed"));
         sqlx::query("UPDATE qbit_prism_jobs SET expires_at=clock_timestamp()-interval '1 second' WHERE job_id='modern'").execute(&db.ledger.pool).await?;
         ensure!(db.ledger.compact_prepared("modern").await?.is_none());
         Ok(())

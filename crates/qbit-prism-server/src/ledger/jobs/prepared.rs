@@ -96,6 +96,11 @@ pub struct StoredCompactPrepared {
     /// Original stored order, authenticated by the semantic balance digest.
     /// Writes use the shared balance helper's canonical byte encoding.
     pub prior_balances: Vec<CarryForwardBalance>,
+    /// Immutable deadline supplied to the original storage reservation. A
+    /// retry must reuse this value, even if issued work extended retention.
+    pub original_expires_at_ms: i64,
+    /// Current dependency retention deadline, which may outlive the original
+    /// reservation. This is not an issued job's publication/submit deadline.
     pub expires_at_ms: i64,
 }
 
@@ -155,6 +160,8 @@ impl Ledger {
     /// This does not issue a miner job or grant a replacement lease. The caller
     /// authorizes the original identity and supplies a separately revalidated
     /// current revision. Retry with the SAME absolute expiry; no retry renews it.
+    /// The original expiry is immutable payload identity. A separate issued
+    /// writer may extend the row's retention deadline without changing it.
     /// No timeout is introduced here: the caller owns its operation deadline.
     /// The caller supplies a prepared-dependency key, never an issued-job key;
     /// storage does not define or authenticate the coordinator's key namespace.
@@ -177,7 +184,8 @@ impl Ledger {
         let expires = DateTime::<Utc>::from_timestamp_millis(expires_at_ms)
             .context("prepared expiry out of range")?;
         let owned = record.clone();
-        let payload = tokio::task::spawn_blocking(move || encode_record(&owned)).await??;
+        let payload =
+            tokio::task::spawn_blocking(move || encode_record(&owned, expires_at_ms)).await??;
         let mut tx = self.begin().await?;
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         writable(&mut tx).await?;
@@ -230,7 +238,7 @@ impl Ledger {
                 .bind(key).fetch_one(&mut *tx).await?;
             ensure!(
                 row.try_get::<Value, _>("payload")? == payload
-                    && row.try_get::<DateTime<Utc>, _>("expires_at")? == expires,
+                    && row.try_get::<DateTime<Utc>, _>("expires_at")? >= expires,
                 "immutable compact prepared conflict"
             );
             check_columns(&row, record)?;
@@ -290,13 +298,15 @@ async fn require_live(tx: &mut Transaction<'_, Postgres>, expires: DateTime<Utc>
     Ok(())
 }
 
-fn encode_record(record: &CompactPrepared) -> Result<Value> {
-    let bytes = serde_json::to_vec(record)?;
+fn encode_record(record: &CompactPrepared, original_expires_at_ms: i64) -> Result<Value> {
+    let mut payload = serde_json::to_value(record)?;
+    payload["original_expires_at_ms"] = Value::from(original_expires_at_ms);
+    let bytes = serde_json::to_vec(&payload)?;
     ensure!(
         bytes.len() < MAX_PREPARED_BYTES,
         "compact prepared payload reaches 1 MB"
     );
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok(payload)
 }
 
 fn digest_text(digest: &str) -> Result<()> {
@@ -360,16 +370,32 @@ fn decode_row(row: PgRow) -> Result<Option<StoredCompactPrepared>> {
         && payload.get("format_version").is_none()
         && payload.get("window").is_none()
         && payload.get("template_sha256").is_none()
+        && payload.get("original_expires_at_ms").is_none()
         && payload.get("snapshot").is_some()
         && payload.get("template").is_some()
     {
         return Ok(None);
     }
+    let original_expires_at_ms = payload["original_expires_at_ms"]
+        .as_i64()
+        .context("invalid compact prepared payload: original expiry missing or invalid")?;
+    let original_expires = DateTime::<Utc>::from_timestamp_millis(original_expires_at_ms)
+        .context("prepared original expiry out of range")?;
+    let retained_until: DateTime<Utc> = row.try_get("expires_at")?;
+    ensure!(
+        retained_until >= original_expires,
+        "prepared retention precedes original expiry"
+    );
+    let mut inputs = payload.clone();
+    inputs
+        .as_object_mut()
+        .context("invalid compact prepared payload")?
+        .remove("original_expires_at_ms");
     let record: CompactPrepared =
-        serde_json::from_value(payload.clone()).context("invalid compact prepared payload")?;
+        serde_json::from_value(inputs).context("invalid compact prepared payload")?;
     record.validate()?;
     ensure!(
-        encode_record(&record)? == payload,
+        encode_record(&record, original_expires_at_ms)? == payload,
         "noncanonical compact prepared payload"
     );
     check_columns(&row, &record)?;
@@ -397,8 +423,7 @@ fn decode_row(row: PgRow) -> Result<Option<StoredCompactPrepared>> {
         record,
         template,
         prior_balances,
-        expires_at_ms: row
-            .try_get::<DateTime<Utc>, _>("expires_at")?
-            .timestamp_millis(),
+        original_expires_at_ms,
+        expires_at_ms: retained_until.timestamp_millis(),
     }))
 }
