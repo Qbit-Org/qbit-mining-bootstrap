@@ -314,6 +314,224 @@ for point-in-time recovery; replication is not a replacement for backups.
 Restore into isolation and verify share order, audit hashes, carry-forward
 integrity, CTV state, and API reads before declaring recovery complete.
 
+## Fatal-state recovery
+
+A disconnected mature pool block or deep confirmed CTV fanout records a shared
+fatal state in `qbit_prism_cluster.fatal_error`. The message names the
+`block_hash` or `fanout_txid` and ends `manual reconciliation required`. Every
+ledger write transaction then fails with `cluster halted: ...`, and commands
+that open the ledger for writing fail at startup. Only the audited command below
+ends the halt; there is no public API route and no force flag.
+
+Clearing restores authority for new work only. It does not approve or forgive
+accounting, and claims that expired during the halt still require fresh claims.
+
+### Recovery commands
+
+```sh
+qbit-prism-server migrate
+qbit-prism-server fatal-state show
+qbit-prism-server fatal-state clear --reason "<nonblank explanation>"
+```
+
+Apply migration 010 with `migrate` before recovery. It adds the
+`qbit_prism_fatal_state_events` audit table, works while the cluster is halted,
+and does not register a frontend. Confirm on the writer:
+
+```sql
+SELECT version FROM qbit_prism_schema_migrations WHERE version = 10;
+```
+
+`fatal-state show` reads PostgreSQL only. It neither starts nor registers an
+instance and needs no signing configuration. It prints JSON with `fatal_error`,
+`set_at`, `block_hash`, `fanout_txid`, and `halted`, and exits nonzero while
+halted and zero otherwise. `set_at` is null for a state recorded before
+migration 010, whose set time is unknown. A database read failure is also a
+nonzero exit, so keep the JSON with the exit status.
+
+`fatal-state clear` uses the normal server configuration (database, qbit RPC,
+chain/genesis, payout, and signing settings) to verify cluster identity. Under
+the settlement, ordering, and instance locks it refuses unless:
+
+- every stored `qbit_prism_instances` row has `status.state` `stopped` or
+  `drained`;
+- no live legacy writer lease exists;
+- the current chain is stable and still contains every mature pool block and
+  every deep confirmed fanout checkpoint; and
+- normal block reconciliation leaves no unresolved disconnection and the
+  carry-forward integrity report passes.
+
+The clear and its audit `INSERT` commit in one transaction. An error or timeout
+rolls both back and leaves the cluster halted. The event records `fatal_error`,
+`fatal_error_set_at`, `reason`, `operator_identity` (PostgreSQL `session_user`),
+`database_role` (`current_user`), `cleared_at`, the `instances` snapshot, and
+`reconciliation` (`genesis_hash`, `tip_hash`, `tip_height`, `blocks_checked`,
+`deep_fanouts_checked`, and `integrity`).
+
+The event identifies a database login, not a person. Prefer an individual
+PostgreSQL login for `clear`. When a shared login is unavoidable, put the
+incident ID, operator identity, and evidence reference in the reason.
+
+### 1. Preserve evidence first
+
+Collect evidence before stopping, restarting, or reconfiguring anything, and
+store it with the incident record:
+
+1. The `fatal-state show` JSON and exit status.
+2. The disconnected block or fanout record, pool blocks at the affected heights,
+   and their stored audit bundle digests.
+3. The current qbit chain from every node the frontends use: tip hash, height,
+   chainwork, and the confirmations of the named block or fanout.
+4. The complete carry-forward integrity report and any reconciliation output.
+
+Query the writer endpoint, not a replica, in a read-only session (for example
+`PGOPTIONS='-c default_transaction_read_only=on' psql`). For a fanout, use its
+parent block's height as `<affected_height>`.
+
+```sql
+SELECT fatal_error, updated_at, payout_revision, best_tip_hash,
+       best_tip_height, best_chainwork
+FROM qbit_prism_cluster WHERE singleton;
+
+SELECT block_hash, block_height, parent_hash, coinbase_txid, chain_state,
+       maturity_state, matured_at, inactive_since, disconnected_at
+FROM qbit_pool_blocks WHERE block_hash = '<block_hash>';
+
+SELECT fanout_txid, block_hash, chunk_index, settlement_status,
+       confirmed_block_hash, confirmed_block_height, confirmed_depth, updated_at
+FROM qbit_ctv_fanout_artifacts WHERE fanout_txid = '<fanout_txid>';
+
+SELECT b.block_hash, b.block_height, b.chain_state, b.maturity_state,
+       a.audit_bundle_sha256
+FROM qbit_pool_blocks b
+LEFT JOIN qbit_pool_audit_bundles a USING (block_hash)
+WHERE b.block_height >= <affected_height>
+ORDER BY b.block_height, b.block_hash
+LIMIT 200;
+
+SELECT fanout_txid, confirmed_block_hash, confirmed_block_height,
+       confirmed_depth
+FROM qbit_ctv_fanout_artifacts
+WHERE settlement_status = 'confirmed' AND confirmed_depth >= 1000
+ORDER BY confirmed_block_height DESC, fanout_txid DESC
+LIMIT 20;
+
+SELECT qbit_carry_forward_integrity_report();
+```
+
+```sh
+qbit-cli getblockchaininfo
+qbit-cli getblockheader <block_hash>
+qbit-cli getrawtransaction <fanout_txid> true <confirmed_block_hash>
+```
+
+A header `confirmations` of -1 means the block is not in that node's active
+chain.
+
+### 2. Stop every frontend
+
+Stop every `run` frontend gracefully with SIGTERM (bundled stacks:
+`docker compose stop prism-coordinator prism-coordinator-2`). Shutdown closes
+admission and drains tasks and sessions for up to 30 seconds. Only then does the
+server record `stopped`, and only if no session guard remains. If that marker
+fails, the process exits with an error and its row keeps its previous status.
+Keep deployment supervisors and automatic restart (Compose restart policies,
+systemd units, orchestrators, HA managers) disabled until the final
+verification.
+
+Inspect every instance row:
+
+```sql
+SELECT instance_id, started_at, heartbeat_at,
+       round(extract(epoch FROM clock_timestamp() - heartbeat_at)::numeric, 1)
+         AS age_seconds,
+       status->>'state' AS state, status->>'schema' AS schema,
+       status->'ready' AS ready
+FROM qbit_prism_instances
+ORDER BY instance_id
+LIMIT 200;
+```
+
+Every row must show `stopped` or `drained`. A running frontend's row holds its
+health payload (`qbit.prism.audit-health.v1`) and no `state`. A `starting` row
+never became ready. Stale does not mean stopped: a heartbeat older than the
+15-second `self-check` window shows only that reporting stopped. The process
+may be hung, paused, cut off from PostgreSQL, or on an unreachable host, and
+may resume. `clear` therefore rejects missing, `starting`, unready, unknown,
+and old live states, however old the heartbeat.
+
+Resolve each blocker by finding the process for that `instance_id` and stopping
+it gracefully so it records its own marker. Do not insert, update, or delete
+`qbit_prism_instances` rows, move `heartbeat_at`, or set or clear `fatal_error`
+with SQL. The crashed-owner step in
+[retained reservations](prism-session-sequence.md#retained-reservations-and-recovery)
+is a different procedure and does not authorize a marker for this recovery. If
+an instance cannot record `stopped` itself, stop and escalate for a separately
+reviewed decision.
+
+### 3. Reconcile before clearing
+
+Establish whether the halt reflects the canonical chain. Compare the evidence
+from independent nodes with `best_tip_hash` and `best_chainwork`. A node on a
+lower-work or minority branch is repaired at the node, never by clearing.
+
+If the block or fanout really is disconnected, resolve the chain and accounting
+discrepancy (affected payouts, carry-forward balances, and fanout settlement)
+through a separately reviewed reconciliation before running `clear`. This
+runbook provides no SQL for that change. `clear` is not approval to forgive a
+still-disconnected mature payout: it refuses while any mature pool block or deep
+checkpoint is missing from the chain, and success means only that its checks
+passed. Record the review reference, then repeat the evidence queries.
+
+### 4. Clear the fatal state
+
+Run `clear` from a host with the frontends' normal configuration, using the
+operator's own database login:
+
+```sh
+qbit-prism-server fatal-state clear \
+  --reason "<incident>: <operator>; <block or fanout> reconciled per <review>; evidence <ref>" \
+  | tee fatal-state-clear.json
+```
+
+Save the success JSON with the incident record, along with the audit event:
+
+```sql
+SELECT cleared_at, operator_identity, database_role, reason, fatal_error,
+       fatal_error_set_at, instances, reconciliation
+FROM qbit_prism_fatal_state_events
+ORDER BY cleared_at DESC
+LIMIT 5;
+```
+
+A nonzero exit clears nothing and writes no event. Correct the reported blocker
+and rerun deliberately; do not loop. If the connection drops around commit, the
+outcome is unknown: check `fatal-state show` and the event table before
+rerunning.
+
+### 5. Restart and verify
+
+1. Confirm `qbit-prism-server fatal-state show` exits zero, and save its JSON.
+2. Record the ledger head before admitting traffic:
+
+   ```sql
+   SELECT share_seq, accepted_at FROM qbit_share_ledger
+   WHERE accepted ORDER BY share_seq DESC LIMIT 1;
+   ```
+
+3. Re-enable supervisors and start the frontends. Each `/healthz` must return
+   200 (see [health checks](#health-diagnostics-and-validation)), and each
+   instance row must carry a fresh, ready health payload.
+4. Confirm new accepted shares. The step 2 query must return a higher
+   `share_seq` with a later `accepted_at`, and each frontend's
+   `qbit_prism_accepted_shares_total` and
+   `qbit_prism_share_ack_seconds_count{result="accepted"}` must increase.
+5. Keep the evidence, reconciliation reference, clear JSON, audit event, and
+   these checks together.
+
+If a frontend reports `cluster halted` again, a new fatal state was recorded.
+Start again from evidence collection.
+
 ## Health, diagnostics, and validation
 
 `/healthz` returns 200 only when the process has fresh work for its observed tip
