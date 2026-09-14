@@ -1267,11 +1267,11 @@ async fn pipeline_body(
     };
     // Observed before any substitute exists, so only production writes are
     // attributed to enqueue.
-    writes.append(
-        &mut inventory
-            .observe(&pool, Observe::Phase(PHASE_ENQUEUE))
-            .await?,
-    );
+    let mut enqueue_writes = inventory
+        .observe(&pool, Observe::Phase(PHASE_ENQUEUE))
+        .await?;
+    ensure_enqueue_writes_no_window(n, status, &enqueue_writes)?;
+    writes.append(&mut enqueue_writes);
     let mut substitutes: BTreeMap<WriteKey, PhaseWrite> = BTreeMap::new();
     let note = if status == PhaseStatus::Rejected {
         scaffold_outbox(&pool, &candidate).await?;
@@ -1530,6 +1530,62 @@ async fn pipeline_body(
         rewritten_unchanged: inventory.rewritten_unchanged.clone(),
         jsonb_columns,
     })
+}
+
+/// The candidate outbox document's ceiling at every measured size (#265): a
+/// window reference and stored inputs, never a window value.
+const OUTBOX_DOCUMENT_CEILING: i64 = 1_048_576;
+
+/// #265: the enqueue is accepted at every size, writes the outbox
+/// `candidate` document, and every JSONB value it writes stays under 1 MiB,
+/// so no window value is among them.
+fn ensure_enqueue_writes_no_window(
+    n: u64,
+    status: PhaseStatus,
+    enqueue_writes: &BTreeMap<WriteKey, PhaseWrite>,
+) -> Result<()> {
+    ensure!(
+        status == PhaseStatus::Ran,
+        "[n={n}] PostgreSQL refused the candidate enqueue; the reference row must be accepted at every size"
+    );
+    let outbox = WriteKey {
+        table: "qbit_block_candidate_outbox".into(),
+        column: "candidate".into(),
+        phase: PHASE_ENQUEUE,
+    };
+    ensure!(
+        enqueue_writes.contains_key(&outbox),
+        "[n={n}] no {} value was attributed to the enqueue",
+        label(&outbox)
+    );
+    for (key, write) in enqueue_writes {
+        ensure!(
+            write.uncompressed < OUTBOX_DOCUMENT_CEILING && write.text_len < OUTBOX_DOCUMENT_CEILING,
+            "[n={n}] the enqueue wrote {} at {} B uncompressed ({} B of text), not under {OUTBOX_DOCUMENT_CEILING} B",
+            label(key),
+            write.uncompressed,
+            write.text_len
+        );
+    }
+    Ok(())
+}
+
+/// #265: at the reduced sizes the enqueue, the claim and the landing all run;
+/// none is refused and none is unreached.
+fn ensure_reference_phases_ran(pipeline: &Pipeline) -> Result<()> {
+    for phase in [PHASE_ENQUEUE, PHASE_CLAIM, PHASE_LANDING] {
+        let status = pipeline
+            .phases
+            .iter()
+            .find(|stat| stat.name == phase)
+            .map(|stat| stat.status);
+        ensure!(
+            status == Some(PhaseStatus::Ran),
+            "[n={}] the {phase} phase did not run to completion: {status:?}",
+            pipeline.n
+        );
+    }
+    Ok(())
 }
 
 /// Only used when PostgreSQL refused the production enqueue write. The
@@ -2614,6 +2670,8 @@ async fn jsonb_ceiling_ratchet_at_reduced_sizes() -> Result<()> {
         high.seconds,
         low.seconds + high.seconds
     );
+    ensure_reference_phases_ran(&low)?;
+    ensure_reference_phases_ran(&high)?;
     assert_ratchet(
         &rows,
         RatchetMode::Projected {
