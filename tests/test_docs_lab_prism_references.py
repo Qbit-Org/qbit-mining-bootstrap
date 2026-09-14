@@ -104,6 +104,13 @@ PATH_ROOT_PREFIX = re.compile(
     r"|\]\([<`'\"]*(?:\./)?"
     r"|https?://github\.com/[^/\s]+/[^/\s]+/(?:blob|tree|raw)/[^/\s]+/)$"
 )
+# A dotted `lab.prism` module is the repository's own only where a token
+# starts, as `PATH_ROOT_PREFIX` reads it but with no `./` or URL form: a module
+# name is never a path. A shell `$'` or `$"` may open the token, so the prose
+# net still reads `-m $'lab.prism.x"`. `\b` alone matched inside
+# `vendor.lab.prism`, `my-lab.prism`, `../lab.prism`, `/tmp/lab.prism` and
+# `https://example.com/lab.prism`, which name other modules or paths.
+MODULE_ROOT_PREFIX = re.compile(r"(?:(?:^|\s)[(\[{<*|]*(?:\$['\"])?[`'\"]*|\]\([<`'\"]*)$")
 # `python3 -OO -X dev -m lab.a.b` and `python3.12 -Werror lab/a/b.py`. Every
 # option form `python3 --help` lists may sit between the interpreter and its
 # target: clustered flag letters, `-W`/`-X` with an attached or following
@@ -867,6 +874,8 @@ def dangling_references(text: str, tracked: frozenset[str]) -> list[tuple[int, s
                     continue
             found.append((number, reference))
         for match in MODULE_REFERENCE.finditer(line):
+            if not MODULE_ROOT_PREFIX.search(line[: match.start("literal" if match.group("literal") else "bare")]):
+                continue
             reference = match.group("literal") or match.group("bare").rstrip(PROSE_TRAILING_PUNCTUATION)
             if not any(c in tracked for c in module_candidates(reference)):
                 found.append((number, reference))
@@ -1054,9 +1063,37 @@ class ScannerTests(unittest.TestCase):
                 for quote in ("", "`", "'", '"'):
                     with self.subTest(root=root, prefix=prefix, quote=quote):
                         self.assertEqual(self.references(f"See {quote}{prefix}{root}{quote}."), [])
-        for prefix in ("", "./", "../", "/"):
-            with self.subTest(prefix=prefix):
-                self.assertEqual(self.references(f"See `{prefix}lab.prism.deleted`."), ["lab.prism.deleted"])
+
+    def test_module_references_start_at_a_token_root(self) -> None:
+        root = "lab.prism.deleted"
+        for text in (
+            f"See {root}.", f"See `{root}`.", f"See '{root}'.", f'See "{root}".', f"{root} is gone.",
+            f"[old]({root})", f"[{root}](https://example.com)", f"[{root}][old]", f"<{root}>", f"**{root}**",
+            f"|{root}|", f"[old](<{root}>)", f"(`{root}`)", f'["{root}"]', f'See `"{root}"`.',
+            f"Don't lose the students' `{root}`.", f"It's {root}, isn't it?", f"Run `python3 -m {root}`.",
+            f"(**`{root}`**)", f"from {root} import main", f"Run `python3 -m $'{root}'`.", f'See $"{root}".',
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.references(text), [root])
+                self.assertEqual(dangling_references(text, self.TRACKED | {"lab/prism/deleted.py"}), [])
+        for prefix in (
+            "vendor.", "a.", "_", "my-", "my*", "my(", "my=", "my[", "my|", "my<", "--module=", "vendor/",
+            "/tmp/", "./", "../", "/", "~/", "$HOME/", "@", "+", "C:\\", "https://example.com/",
+            "https://example.com/?m=", "https://github.com/o/r/blob/main/",
+        ):
+            for quote in ("", "`", "'", '"'):
+                for text in (f"See {quote}{prefix}{root}{quote}.", f"See {prefix}{quote}{root}{quote}."):
+                    with self.subTest(text=text):
+                        self.assertEqual(self.references(text), [])
+        for text in (f"See ${root}.", f"See `${root}`.", f"See my$'{root}'."):
+            with self.subTest(text=text):
+                self.assertEqual(self.references(text), [])
+        for text in (
+            f"See `vendor.{root}` and `{root}`.", f"See https://example.com/{root} and {root}.",
+            f'See vendor."{root}" and "{root}".', f"[old](https://example.com/{root}) and [{root}](x)",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.references(text), [root])
 
     def test_path_references_start_at_the_repository_root(self) -> None:
         root = "lab/prism/deleted.py"
