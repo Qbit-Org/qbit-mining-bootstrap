@@ -350,6 +350,18 @@ impl SessionHandle {
     /// Offer one share to this session if it is under its outstanding limit.
     /// `phase` is the phase making the offer; the record the session
     /// eventually reports carries it whatever the phase is by then.
+    ///
+    /// This must stay synchronous, and the counter must stay private to the run
+    /// task. The session task can receive and finish the work between the
+    /// `try_send` and the `fetch_add` below, and its `fetch_sub` then takes the
+    /// counter through `usize::MAX`. That is harmless only because the wrapping
+    /// add and sub commute, so the settled value is exact, and because nothing
+    /// can read the counter in between: the only reader is this function and the
+    /// quiesce, restart and teardown checks, all on the one run task, and there
+    /// is no await point here for a cancellation to land in.
+    ///
+    /// Making this `async`, or reading `outstanding` from a spawned task, breaks
+    /// that and lets a session sit permanently over its limit.
     pub fn try_offer(&self, limit: usize, phase: &Arc<str>) -> bool {
         if self.outstanding.load(Ordering::Relaxed) >= limit {
             return false;

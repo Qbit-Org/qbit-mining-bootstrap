@@ -124,13 +124,24 @@ fn check(binary: &Path, repo_root: &Path) -> Result<RevisionEvidence> {
             dep_info.display()
         )
     })?;
-    let sources =
+    let listed =
         parse_dep_info(&text).with_context(|| format!("parsing {}", dep_info.display()))?;
     ensure!(
-        !sources.is_empty(),
+        !listed.is_empty(),
         "{} lists no sources",
         dep_info.display()
     );
+    // Cargo writes the paths it was invoked with, which are not canonical: on
+    // macOS a checkout under /tmp or /var is really /private/tmp or /private/var,
+    // and a symlinked home or work directory does the same on any platform.
+    // `repo_root` above is canonical, so comparing the two verbatim would refuse
+    // a binary that was in fact built from this checkout. A path that cannot be
+    // resolved is kept as written: it is about to be reported as missing, and the
+    // message should name what the file actually said.
+    let sources: Vec<PathBuf> = listed
+        .into_iter()
+        .map(|source| std::fs::canonicalize(&source).unwrap_or(source))
+        .collect();
     let crate_root = repo_root.join(SERVER_CRATE_ROOT);
     ensure!(
         sources.contains(&crate_root),
