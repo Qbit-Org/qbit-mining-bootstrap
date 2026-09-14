@@ -727,6 +727,14 @@ async fn assert_share_hash_fingerprints(raw: &str, pg_bin: &std::path::Path) -> 
             let archive = recovery::backup(&source, pg_bin).await?;
             recovery::restore(&archive, &source, &restored, pg_bin).await?;
             ensure!(recovery::evidence(&restored, pg_bin).await? == native);
+            // A complete restored ledger later in search_path cannot replace
+            // a missing source relation, even when its rows would match.
+            let layered = recovery::Database {
+                admin: source.admin.clone(), pool: source.pool.clone(),
+                schema: format!("{}, {}", source.schema, restored.schema),
+                url: source.url.clone(),
+            };
+            ensure!(recovery::evidence(&layered, pg_bin).await? == native);
             // Losing any native evidence table must fail closed, including
             // empty tables that would otherwise match an older restore.
             for table in [
@@ -737,14 +745,28 @@ async fn assert_share_hash_fingerprints(raw: &str, pg_bin: &std::path::Path) -> 
                 "qbit_prism_audit_snapshots",
                 "qbit_prism_cluster",
                 "qbit_prism_fatal_state_events",
+                "qbit_prism_balance_snapshots",
+                "qbit_share_ledger",
+                "qbit_pool_blocks",
+                "qbit_pool_audit_bundles",
+                "qbit_payout_carry_forward",
+                "qbit_pool_payout_entries",
+                "qbit_block_candidate_outbox",
+                "qbit_ctv_fanout_sets",
+                "qbit_ctv_fanout_artifacts",
+                "qbit_ctv_fanout_broadcast_attempts",
             ] {
                 sqlx::query(&format!("ALTER TABLE {table} RENAME TO missing_recovery_table"))
                     .execute(&source.pool).await?;
                 let missing = recovery::evidence(&source, pg_bin).await;
+                let fallback = recovery::evidence(&layered, pg_bin).await;
                 sqlx::query(&format!("ALTER TABLE missing_recovery_table RENAME TO {table}"))
                     .execute(&source.pool).await?;
                 ensure!(missing.is_err(), "missing native evidence table must fail export: {table}");
                 ensure!(missing.unwrap_err().to_string().contains(table));
+                let error = fallback.expect_err("foreign recovery table must fail export").to_string();
+                ensure!(error.contains(&format!("{}.{table}", restored.schema)), "{error}");
+                ensure!(error.contains("outside the current schema"), "{error}");
                 ensure!(recovery::evidence(&source, pg_bin).await? == native);
             }
             assert_native_metadata_required(&source, &restored, pg_bin, &native).await?;
@@ -972,10 +994,8 @@ async fn assert_native_metadata_required(
             Err(error) => error.to_string(),
         };
         ensure!(
-            error.contains(&format!(
-                "resolves to {}.{table}, outside the current schema {}",
-                restored.schema, source.schema
-            )),
+            error.contains(&format!("{}.{table}", restored.schema))
+                && error.contains(&format!("outside the current schema {}", source.schema)),
             "{error}"
         );
     }

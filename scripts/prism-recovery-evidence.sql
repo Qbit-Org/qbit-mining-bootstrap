@@ -7,6 +7,29 @@ BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
 SET LOCAL TIME ZONE 'UTC';
 SET LOCAL bytea_output = 'hex';
 
+
+-- Match startup's source-resolution guard before any evidence query. A later
+-- ledger (or temporary table) must not replace a missing local relation.
+DO $source_schema$
+DECLARE
+    source_schema text := current_schema();
+    foreign_objects text[];
+BEGIN
+    IF source_schema IS NULL THEN
+        RAISE EXCEPTION 'recovery search_path has no current schema';
+    END IF;
+    SELECT array_agg(format('%I.%I', n.nspname, c.relname) ORDER BY n.nspname, c.relname)
+    INTO foreign_objects
+    FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname <> source_schema AND left(c.relname, 5) = 'qbit_'
+      AND pg_catalog.pg_table_is_visible(c.oid);
+    IF foreign_objects IS NOT NULL THEN
+        RAISE EXCEPTION 'recovery search_path resolves relations % outside the current schema %', foreign_objects, source_schema
+            USING HINT = 'Set search_path to the intended ledger schema and restore its missing tables and sequences before exporting again.';
+    END IF;
+END
+$source_schema$;
+
 -- Startup requires every declared migration and refuses a database whose
 -- capability declaration or source record is missing or unreadable
 -- (require_schema_version, require_known_capabilities, require_migration_source). Refuse it here
