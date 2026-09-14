@@ -13,14 +13,17 @@ def psql(dsn: str, sql: str) -> str:
         raise RuntimeError("PostgreSQL command failed") from exc
 
 def measure(dsn: str, sql: str, source: str, config: str) -> dict:
-    if urlparse(dsn).hostname not in (None, "localhost", "127.0.0.1", "::1"):
-        raise ValueError("refusing non-local DSN; use throwaway local PostgreSQL")
+    parsed = urlparse(dsn)
+    if not sql.strip():
+        raise ValueError("SQL operation must not be empty")
+    if parsed.query or parsed.hostname not in (None, "localhost", "127.0.0.1", "::1"):
+        raise ValueError("refusing non-local or ambiguous DSN; use explicit loopback target")
     setup = time.monotonic(); start = psql(dsn, "select pg_current_wal_lsn()"); setup_seconds = time.monotonic()-setup
     began = time.monotonic()
     try:
         psql(dsn, sql)
-    except subprocess.CalledProcessError as exc:
-        return {"outcome":"failed", "measurement_scope":"server-wide", "source":source, "config":config, "operation_seconds":time.monotonic()-began, "setup_seconds":setup_seconds, "error":str(exc)}
+    except RuntimeError as exc:
+        return {"outcome":"operation_failed", "measurement_scope":"server-wide", "source":source, "config":config, "operation_seconds":time.monotonic()-began, "setup_seconds":setup_seconds, "error":str(exc)}
     end = psql(dsn, "select pg_current_wal_lsn()")
     delta = float(psql(dsn, f"select pg_wal_lsn_diff('{end}','{start}')"))
     return {"outcome":"ok", "measurement_scope":"server-wide", "source":source, "config":config, "start_lsn":start, "end_lsn":end, "wal_bytes":delta, "operation_seconds":time.monotonic()-began, "setup_seconds":setup_seconds}
@@ -28,6 +31,7 @@ def measure(dsn: str, sql: str, source: str, config: str) -> dict:
 def main() -> int:
     ap=argparse.ArgumentParser(); ap.add_argument("--dsn", required=True); ap.add_argument("--sql", required=True); ap.add_argument("--source", default="caller-operation"); ap.add_argument("--config", required=True)
     try: result=measure(**vars(ap.parse_args()))
-    except (RuntimeError, ValueError) as exc: print(json.dumps({"outcome":"failed", "error":str(exc)})); return 1
+    except RuntimeError as exc: print(json.dumps({"outcome":"connection_failed", "error":str(exc)})); return 1
+    except ValueError as exc: print(json.dumps({"outcome":"invalid_input", "error":str(exc)})); return 1
     print(json.dumps(result, sort_keys=True)); return 0 if result["outcome"] == "ok" else 1
 if __name__ == "__main__": raise SystemExit(main())
