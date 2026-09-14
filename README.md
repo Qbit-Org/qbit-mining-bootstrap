@@ -104,8 +104,9 @@ procedure](docs/prism-rust-migration.md); the old and new runtimes must not writ
 to the same database together. See the [native server
 commands](crates/qbit-prism-server/README.md) for deployment and operator tools.
 
-Direct PRISM Stratum requires Postgres and three key values before
-`make up-prism-pool` starts. Generate unique deployment seeds and derive the
+Direct PRISM Stratum requires Postgres, two signing seeds, and the trusted
+ledger public key before `make up-prism-pool` starts. Generate unique
+deployment seeds and derive the
 trusted ledger public key from the ledger attestation seed:
 
 ```bash
@@ -118,8 +119,13 @@ PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX="$(
 )"
 ```
 
-Store those values in `.env`, keep all `PRISM_ALLOW_*` flags at `0`, and set
-`QBIT_PRODUCTION=1` for non-regtest deployments. Production also requires
+Store `PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX` in `.env`, keep all `PRISM_ALLOW_*`
+flags at `0`, and set `QBIT_PRODUCTION=1` for non-regtest deployments.
+Production reads the seeds only from files in the directory named by
+`PRISM_SECRETS_SOURCE`, readable by the image's UID 10001, and rejects the
+direct seed variables; see [PRISM signing
+secrets](docs/mainnet-deployment.md#prism-signing-secrets). A local lab may
+store both seeds in `.env` instead. Production also requires
 explicit, reviewed, positive values for `PRISM_STRATUM_SHARE_DIFF` and the
 `PRISM_STRATUM_VARDIFF_MIN_DIFF`, `PRISM_STRATUM_VARDIFF_START_DIFF`, and
 `PRISM_STRATUM_VARDIFF_MAX_DIFF` bounds. The local-lab `1e-9` values are

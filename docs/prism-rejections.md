@@ -97,9 +97,9 @@ accepting shares against a frozen snapshot.
 Rejections are counted, never logged per share or written to the ledger.
 Diagnose reject spikes from `qbit_prism_rejections_total`, the
 `qbit_prism_job_build_seconds` histogram, and the
-`qbit_prism_tip_refresh_seconds` histograms. Per-share/per-job stdout logging
-exists only behind `PRISM_HOT_PATH_LOG=1` for debugging and must stay off in
-production. Prepared fanout passes validate tip and chain-view trust once per
+`qbit_prism_tip_refresh_seconds` histograms. The native runtime has no
+per-share or per-job stdout logging; it does not read the retired Python
+`PRISM_HOT_PATH_LOG` <!-- retired-setting: PRISM_HOT_PATH_LOG --> debugging switch. Prepared fanout passes validate tip and chain-view trust once per
 pass (minting a validation token; per-client deliveries consult only
 in-memory token state) plus a post-fanout re-validation, so per-client RPC
 round trips never return to the delivery path.
@@ -117,5 +117,5 @@ Additional private metrics relevant to attribution and grace behavior:
 - `qbit_prism_evicted_job_expirations_total{class="same_tip|stale_grace"}`
 - `qbit_prism_evicted_job_capacity_evictions_total{scope="connection"}`
 
-`PRISM_WORKER_METRICS_LIMIT` caps distinct worker labels. New workers beyond
-the cap aggregate into `_other`.
+The native runtime does not read the retired Python worker-label cap
+`PRISM_WORKER_METRICS_LIMIT` <!-- retired-setting: PRISM_WORKER_METRICS_LIMIT -->.

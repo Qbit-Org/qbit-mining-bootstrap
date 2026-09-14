@@ -53,6 +53,7 @@ enum Command {
     Migrate,
     /// Import legacy filesystem audit bodies into shared PostgreSQL storage.
     ImportAudits {
+        /// Audit root, defaulting to PRISM_AUDIT_DIR when nonempty.
         #[arg(long)]
         root: Option<PathBuf>,
     },
@@ -104,9 +105,12 @@ pub async fn run() -> Result<()> {
             }
         }
         Command::CheckConfig => {
+            config::check_environment()?;
             let config = Config::from_env()?;
             crate::rollups::settings_from_env()?;
             crate::stratum::StratumConfig::from_env()?.highdiff_config()?;
+            crate::api::ApiConfig::from_env()?;
+            crate::api::public_service::ServiceConfig::from_env()?;
             println!(
                 "PRISM configuration valid; {} runtime workers",
                 config.runtime_workers
@@ -123,15 +127,31 @@ pub async fn run() -> Result<()> {
             Ok(())
         }
         Command::Migrate => {
-            let config = Config::from_env()?;
+            let config = config::DatabaseConfig::from_env()?;
             let ledger =
                 crate::ledger::Ledger::connect_operator(&config.database_url, true).await?;
-            println!("PRISM PostgreSQL schema ready");
+            let source = ledger
+                .migration_source()
+                .await?
+                .map(|source| {
+                    format!(
+                        "{} (2.x.x release {})",
+                        source.source_state,
+                        source.source_release.as_deref().unwrap_or("none")
+                    )
+                })
+                .unwrap_or_else(|| "unrecorded".to_owned());
+            println!(
+                "PRISM PostgreSQL schema migrations {} ready; database source: {source}",
+                crate::ledger::schema_version_list(crate::ledger::REQUIRED_SCHEMA_VERSIONS)
+            );
             ledger.pool.close().await;
             Ok(())
         }
         Command::ImportAudits { root } => {
-            let config = Config::from_env()?;
+            let root = audit_root(root);
+            let config = config::DatabaseConfig::from_env()?;
+            let ledger_public_key = config::DatabaseConfig::ledger_public_key()?;
             let ledger = crate::ledger::Ledger::connect(
                 &config.database_url,
                 config.instance_id,
@@ -140,13 +160,14 @@ pub async fn run() -> Result<()> {
             )
             .await?;
             let count = ledger
-                .import_legacy_audits(root.as_deref(), &config.ledger_public_key)
+                .import_legacy_audits(root.as_deref(), &ledger_public_key)
                 .await?;
             println!("Imported {count} audit bodies");
             Ok(())
         }
         Command::BackfillCtv => {
-            let config = Config::from_env()?;
+            let config = config::DatabaseConfig::from_env()?;
+            let ledger_public_key = config::DatabaseConfig::ledger_public_key()?;
             let ledger = crate::ledger::Ledger::connect(
                 &config.database_url,
                 config.instance_id,
@@ -154,7 +175,7 @@ pub async fn run() -> Result<()> {
                 false,
             )
             .await?;
-            let count = ledger.backfill_ctv(&config.ledger_public_key).await?;
+            let count = ledger.backfill_ctv(&ledger_public_key).await?;
             println!("Backfilled {count} CTV manifest sets");
             Ok(())
         }
@@ -188,14 +209,16 @@ pub async fn run() -> Result<()> {
     }
 }
 
+fn audit_root(root: Option<PathBuf>) -> Option<PathBuf> {
+    root.or_else(|| config::optional("PRISM_AUDIT_DIR").map(PathBuf::from))
+}
+
 async fn fatal_state(command: FatalStateCommand) -> Result<()> {
     match command {
         FatalStateCommand::Show => {
             let url =
                 config::optional("PRISM_DATABASE_URL").context("PRISM_DATABASE_URL is required")?;
-            let ledger = crate::ledger::Ledger::connect_operator(&url, false).await?;
-            let state = ledger.fatal_state().await?;
-            ledger.pool.close().await;
+            let state = crate::ledger::Ledger::inspect_fatal_state(&url).await?;
             println!("{}", serde_json::to_string_pretty(&state)?);
             ensure!(
                 state["halted"] == false,
@@ -241,12 +264,18 @@ async fn healthcheck(url: Option<String>, public_api: bool) -> Result<()> {
     }
     let host = diagnostic_host(&config::value(bind_name, "127.0.0.1"));
     let url = url.unwrap_or_else(|| format!("http://{host}:{port}/healthz"));
-    let response = reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
-        .build()?
-        .get(url)
-        .send()
-        .await?;
+        // A readiness endpoint must not redirect a bearer credential elsewhere.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let mut request = client.get(url);
+    if !public_api {
+        if let Some(token) = config::secret("PRISM_OPERATOR_BEARER_TOKEN")? {
+            request = request.bearer_auth(token);
+        }
+    }
+    let response = request.send().await?;
     ensure!(
         response.status().is_success(),
         "PRISM is unhealthy (HTTP {})",
@@ -316,14 +345,17 @@ async fn self_check() -> Result<()> {
         live_instances: unavailable_live_instances(
             "unknown",
             "Heartbeat not sampled because configuration is unavailable; HA is unknown",
+            crate::api::ApiConfig::default().health_stale_after(),
         ),
     };
     let result = async {
         let config = Config::from_env()?;
+        let freshness =
+            crate::api::health_stale_after(crate::api::health_refresh_interval_from_env()?);
         report.instance_id = Some(config.instance_id.clone());
         // Snapshot before Coordinator::new: Ledger::connect writes a "starting"
         // heartbeat, which must not manufacture an additional live frontend.
-        report.live_instances = live_instances(&config.database_url).await;
+        report.live_instances = live_instances(&config.database_url, freshness).await;
         // A failed heartbeat sample must not suppress the remaining local checks.
         self_check_local(config, &mut report).await?;
         ensure!(
@@ -446,4 +478,58 @@ fn benchmark(count: usize, miners: usize, iterations: usize) -> Result<Value> {
     Ok(
         json!({"schema":"qbit.prism.native-builder-benchmark.v1","shares":count,"miners":miners,"iterations":iterations,"build_and_verify_p50_ms":milliseconds[iterations/2],"build_and_verify_p99_ms":milliseconds[(iterations*99/100).min(iterations-1)],"canonical_audit_bytes":last_bytes,"engine":"in-process-rust"}),
     )
+}
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::*;
+
+    #[test]
+    fn audit_root_env_and_cli_precedence() {
+        if let Ok(case) = std::env::var("AUDIT_ROOT_TEST_CASE") {
+            let args = if case == "cli" {
+                vec!["prism", "import-audits", "--root", "/explicit/audits"]
+            } else {
+                vec!["prism", "import-audits"]
+            };
+            let Some(Command::ImportAudits { root }) = Cli::try_parse_from(args).unwrap().command
+            else {
+                panic!("wrong command");
+            };
+            let expected = match case.as_str() {
+                "unset" | "empty" | "blank" => None,
+                "env" => Some(PathBuf::from("/mounted/audits")),
+                "cli" => Some(PathBuf::from("/explicit/audits")),
+                _ => panic!("unknown case"),
+            };
+            assert_eq!(audit_root(root), expected);
+            return;
+        }
+        for case in ["unset", "empty", "blank", "env", "cli"] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "tools::configuration_tests::audit_root_env_and_cli_precedence",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("AUDIT_ROOT_TEST_CASE", case);
+            if case != "unset" {
+                let value = match case {
+                    "empty" => "",
+                    "blank" => "  ",
+                    _ => "/mounted/audits",
+                };
+                command.env("PRISM_AUDIT_DIR", value);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 }

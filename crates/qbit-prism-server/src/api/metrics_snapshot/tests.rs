@@ -414,7 +414,7 @@ async fn expired_publication_fails_closed_through_the_router_and_recovers() {
     );
     state.publish_health(json!({"ok":true}));
     state.publish_metrics(HEALTHY.into()).unwrap();
-    let expired_at = Instant::now() - health_stale_after() - Duration::from_secs(1);
+    let expired_at = Instant::now() - state.config.health_stale_after() - Duration::from_secs(1);
     *state.health_published_at.write().unwrap() = expired_at;
     state.metrics.write().unwrap().published_at = Some(expired_at);
     let app = router(state.clone());
@@ -450,7 +450,7 @@ async fn expired_publication_fails_closed_through_the_router_and_recovers() {
                 .unwrap()
                 .parse::<u64>()
                 .unwrap()
-                >= health_stale_after().as_secs()
+                >= state.config.health_stale_after().as_secs()
         );
         let text = body(response).await;
         if method == "HEAD" {
@@ -460,7 +460,7 @@ async fn expired_publication_fails_closed_through_the_router_and_recovers() {
             assert_eq!(sample(&text, "qbit_prism_metrics_snapshot_stale"), 1.);
             assert!(
                 sample(&text, "qbit_prism_metrics_snapshot_age_seconds")
-                    > health_stale_after().as_secs_f64()
+                    > state.config.health_stale_after().as_secs_f64()
             );
         }
     }

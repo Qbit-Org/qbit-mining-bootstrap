@@ -68,20 +68,25 @@ async fn check_live_pool_scrapes(ledger: &Ledger, metrics: Arc<Metrics>) -> Resu
     let publisher_state = state.clone();
     let publisher_metrics = metrics.clone();
     // Exercise the real SQL dependencies in server::publish_health order:
-    // health's payout_revision read, publication, heartbeat, then pruning.
+    // health's payout_revision read, publication, then heartbeat on each tick.
     // Under exhaustion each acquisition waits up to 15 seconds. This isolates
     // that publisher dependency without requiring a node or mining work.
     let publisher = tokio::spawn(async move {
-        let _ = publisher_ledger.payout_revision().await;
-        publisher_state.publish_metrics(publisher_metrics.render())?;
-        let _ = publisher_ledger
-            .heartbeat(HeartbeatStatus::Health(HeartbeatHealth::new(
-                false,
-                serde_json::Map::from_iter([("ok".into(), false.into())]),
-            )))
-            .await;
-        let _ = publisher_ledger.prune_expired_jobs().await;
-        anyhow::Ok(())
+        let mut tick = tokio::time::interval(publisher_state.config.health_refresh_interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let _ = publisher_ledger.payout_revision().await;
+            publisher_state
+                .publish_metrics(publisher_metrics.render())
+                .expect("publish fixture metrics");
+            let _ = publisher_ledger
+                .heartbeat(HeartbeatStatus::Health(HeartbeatHealth::new(
+                    false,
+                    serde_json::Map::from_iter([("ok".into(), false.into())]),
+                )))
+                .await;
+        }
     });
     let result = async {
         let initial = client.get(&endpoint).send().await?.error_for_status()?.text().await?;

@@ -55,14 +55,35 @@ services:
         bind:
           create_host_path: false
 
+  # Signing seeds reach each mining frontend only as files in an operator-owned,
+  # read-only secrets directory (#260 D4); the direct seed variables are cleared
+  # so a stale .env value cannot win. The image runs as UID/GID 10001, which
+  # must be able to read both seed files. docs/mainnet-deployment.md covers
+  # provisioning.
   prism-coordinator: &prism-coordinator-production
     image: ${PRISM_COORDINATOR_IMAGE:-invalid.invalid/qbit-mining-bootstrap/prism:production-image-not-configured}
     pull_policy: always
     restart: unless-stopped
+    ulimits:
+      core:
+        soft: 0
+        hard: 0
+    environment:
+      PRISM_MANIFEST_SIGNING_SEED_HEX: ""
+      PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX: ""
+      PRISM_ALLOW_TEST_SIGNING_SEEDS: "0"
+      PRISM_MANIFEST_SIGNING_SEED_HEX_FILE: /run/secrets/qbit-prism/manifest-signing-seed-hex
+      PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX_FILE: /run/secrets/qbit-prism/ledger-attestation-signing-seed-hex
     volumes:
       - type: bind
         source: ${PRISM_AUDIT_DATA_SOURCE:-/production-source-not-configured/prism/audit}
         target: ${PRISM_AUDIT_DIR:-/var/lib/qbit-prism/audit}
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PRISM_SECRETS_SOURCE:-/production-source-not-configured/prism/secrets}
+        target: /run/secrets/qbit-prism
+        read_only: true
         bind:
           create_host_path: false
 
@@ -84,11 +105,16 @@ services:
         bind:
           create_host_path: false
 
-  # The public process serves canonical audit bytes from PostgreSQL.
+  # The public process serves canonical audit bytes from PostgreSQL. It is
+  # seedless: it receives neither the secrets mount nor any signing variable.
   prism-public-api:
     image: ${PRISM_COORDINATOR_IMAGE:-invalid.invalid/qbit-mining-bootstrap/prism:production-image-not-configured}
     pull_policy: always
     restart: unless-stopped
+    ulimits:
+      core:
+        soft: 0
+        hard: 0
 
   permissionless-miner:
     profiles: !override ["production-disabled"]

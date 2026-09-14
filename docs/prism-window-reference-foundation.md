@@ -168,7 +168,7 @@ the actual membership runner and restart. The first combined run exposed
 PR319's whole-row comparison expecting no new columns; its expected result now
 includes exactly 008's seven null columns and still compares every original
 field, including payload/extranonce/expiry. Both existing migration tests now
-require `[2, 3, 4, 5, 8, 9]`; no assertion was reduced to a maximum version or
+require `[2, 3, 4, 5, 6, 8, 9]`; no assertion was reduced to a maximum version or
 subset. Migration009 and the session/candidate implementation are unchanged.
 
 ```sh

@@ -1,11 +1,13 @@
 //! Compatibility HTTP API. Every accounting read uses the shared PostgreSQL ledger.
 mod charts;
 mod metrics_snapshot;
+mod operator_auth;
 mod public;
 pub mod public_service;
 mod read_models;
 mod response_cache;
 
+use crate::config;
 use axum::{
     body::{Body, Bytes},
     extract::{OriginalUri, State},
@@ -44,53 +46,236 @@ pub struct ApiConfig {
     pub cache_enabled: bool,
     pub cache_max_entries: usize,
     pub cache_max_bytes: usize,
+    pub cache_lifetimes: CacheLifetimes,
+    pub cache_debug_headers: bool,
     pub read_timeout: Duration,
+    pub read_concurrency: u32,
+    pub public_stratum_url: Option<String>,
+    pub public_stratum_highdiff_url: Option<String>,
+    pub stratum_highdiff_port: Option<u16>,
+    pub configuration_label: String,
+    pub configuration_description: String,
+    pub block_template_policy: String,
+    pub hashrate_smoothing_seconds: i64,
+    /// Operator health publication cadence; freshness budgets derive from it.
+    pub health_refresh_interval: Duration,
+    /// Required on every operator route when set; the public service ignores it.
+    pub operator_bearer_token: Option<String>,
 }
-impl ApiConfig {
-    pub fn from_env() -> Self {
-        let (rpc_url, rpc_user, rpc_password) = crate::config::rpc_connection_from_env();
+/// CDN lifetimes, in seconds, for one class of public responses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheLifetime {
+    pub ttl: u64,
+    pub stale_while_revalidate: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheLifetimes {
+    pub default: CacheLifetime,
+    pub configuration: CacheLifetime,
+    pub artifact: CacheLifetime,
+    pub aggregate: CacheLifetime,
+}
+impl Default for CacheLifetimes {
+    fn default() -> Self {
+        let lifetime = |ttl, stale_while_revalidate| CacheLifetime {
+            ttl,
+            stale_while_revalidate,
+        };
         Self {
-            rpc_url,
-            rpc_user,
-            rpc_password,
-            stratum_host: std::env::var("PRISM_PUBLIC_STRATUM_HOST")
-                .ok()
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| env("PRISM_STRATUM_BIND", "127.0.0.1")),
-            stratum_port: env_num("PRISM_STRATUM_PORT", 3340).min(u16::MAX as u64) as u16,
-            instance_id: env("PRISM_INSTANCE_ID", "prism"),
-            pool_name: env("PRISM_PUBLIC_POOL_NAME", "PRISM"),
-            pool_fee_bps: env_num("PRISM_PUBLIC_POOL_FEE_BPS", 0).min(10000) as u16,
-            minimum_payout_bits: [
-                "PRISM_PUBLIC_MINIMUM_PAYOUT_BITS",
-                "PRISM_PAYOUT_MIN_OUTPUT_BITS",
-                "PRISM_PAYOUT_MIN_OUTPUT_SATS",
-            ]
-            .iter()
-            .find_map(|k| std::env::var(k).ok()?.parse::<u64>().ok())
-            .unwrap_or(0),
-            explorer_block_url: std::env::var("PRISM_PUBLIC_EXPLORER_BLOCK_URL_PREFIX")
-                .ok()
-                .filter(|v| !v.is_empty()),
-            explorer_tx_url: std::env::var("PRISM_PUBLIC_EXPLORER_TX_URL_PREFIX")
-                .ok()
-                .filter(|v| !v.is_empty()),
-            read_timeout: Duration::from_secs(env_num(
-                "PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS",
-                20,
-            )),
-            cache_enabled: env_bool("PRISM_PUBLIC_CACHE_ENABLED", true),
-            cache_max_entries: env_num("PRISM_PUBLIC_CACHE_MAX_ENTRIES", 1024).max(1) as usize,
-            cache_max_bytes: env_num(
-                "PRISM_PUBLIC_CACHE_MAX_RESPONSE_BYTES",
-                env_num("PRISM_PUBLIC_CACHE_MAX_PAYLOAD_BYTES", 1024 * 1024),
-            ) as usize,
+            default: lifetime(5, 30),
+            configuration: lifetime(300, 3600),
+            artifact: lifetime(86400, 86400),
+            aggregate: lifetime(30, 30),
         }
     }
 }
+impl CacheLifetimes {
+    fn from_env() -> anyhow::Result<Self> {
+        let defaults = Self::default();
+        let lifetime = |kind: &str, default: CacheLifetime| -> anyhow::Result<CacheLifetime> {
+            Ok(CacheLifetime {
+                ttl: config::number(
+                    &format!("PRISM_PUBLIC_{kind}CACHE_TTL_SECONDS"),
+                    default.ttl,
+                )?,
+                stale_while_revalidate: config::number(
+                    &format!("PRISM_PUBLIC_{kind}CACHE_STALE_WHILE_REVALIDATE_SECONDS"),
+                    default.stale_while_revalidate,
+                )?,
+            })
+        };
+        Ok(Self {
+            default: lifetime("", defaults.default)?,
+            configuration: lifetime("CONFIG_", defaults.configuration)?,
+            artifact: lifetime("ARTIFACT_", defaults.artifact)?,
+            aggregate: lifetime("AGGREGATE_", defaults.aggregate)?,
+        })
+    }
+}
+/// Parse one numeric setting and reject values outside its inclusive range.
+fn bounded<T>(name: &str, default: T, minimum: T, maximum: T) -> anyhow::Result<T>
+where
+    T: std::str::FromStr + PartialOrd + std::fmt::Display,
+{
+    let value = config::number(name, default)?;
+    anyhow::ensure!(
+        value >= minimum && value <= maximum,
+        "{name} must be {minimum}..{maximum}"
+    );
+    Ok(value)
+}
+/// The operator health publisher cadence. Readers derive staleness from the
+/// same value, so a slower publisher never reports its own snapshots stale.
+pub fn health_refresh_interval_from_env() -> anyhow::Result<Duration> {
+    Ok(Duration::from_secs(bounded(
+        "PRISM_HEALTH_REFRESH_SECONDS",
+        2u64,
+        1,
+        86400,
+    )?))
+}
+/// The optional operator credential, read only by the operator role.
+fn operator_bearer_token_from_env() -> anyhow::Result<Option<String>> {
+    let token = config::secret("PRISM_OPERATOR_BEARER_TOKEN")?;
+    if let Some(token) = &token {
+        anyhow::ensure!(
+            token.len() >= 16 && token.bytes().all(|byte| byte.is_ascii_graphic()),
+            "PRISM_OPERATOR_BEARER_TOKEN must be at least 16 visible ASCII characters without whitespace"
+        );
+    }
+    Ok(token)
+}
+impl ApiConfig {
+    /// Operator role: the shared API settings plus the operator credential.
+    pub fn from_env() -> anyhow::Result<Self> {
+        let mut config = Self::from_public_env()?;
+        config.operator_bearer_token = operator_bearer_token_from_env()?;
+        Ok(config)
+    }
+    /// Independent public role: never opens or validates operator credentials.
+    pub fn from_public_env() -> anyhow::Result<Self> {
+        let (rpc_url, rpc_user, rpc_password) = config::rpc_connection_from_env();
+        let defaults = Self::default();
+        let minimum_payout_bits = match [
+            "PRISM_PUBLIC_MINIMUM_PAYOUT_BITS",
+            "PRISM_PAYOUT_MIN_OUTPUT_BITS",
+            "PRISM_PAYOUT_MIN_OUTPUT_SATS",
+        ]
+        .into_iter()
+        .find(|name| config::optional(name).is_some())
+        {
+            Some(name) => config::number(name, 0u64)?,
+            None => 0,
+        };
+        let cache_max_entries =
+            config::number("PRISM_PUBLIC_CACHE_MAX_ENTRIES", defaults.cache_max_entries)?;
+        anyhow::ensure!(
+            cache_max_entries > 0,
+            "PRISM_PUBLIC_CACHE_MAX_ENTRIES must be positive"
+        );
+        Ok(Self {
+            rpc_url,
+            rpc_user,
+            rpc_password,
+            stratum_host: config::optional("PRISM_PUBLIC_STRATUM_HOST")
+                .unwrap_or_else(|| config::value("PRISM_STRATUM_BIND", "127.0.0.1")),
+            stratum_port: config::number("PRISM_STRATUM_PORT", defaults.stratum_port)?,
+            instance_id: config::value("PRISM_INSTANCE_ID", "prism"),
+            pool_name: config::value("PRISM_PUBLIC_POOL_NAME", "PRISM"),
+            pool_fee_bps: bounded("PRISM_PUBLIC_POOL_FEE_BPS", 0u16, 0, 10_000)?,
+            minimum_payout_bits,
+            explorer_block_url: config::optional("PRISM_PUBLIC_EXPLORER_BLOCK_URL_PREFIX"),
+            explorer_tx_url: config::optional("PRISM_PUBLIC_EXPLORER_TX_URL_PREFIX"),
+            cache_enabled: config::flag("PRISM_PUBLIC_CACHE_ENABLED", defaults.cache_enabled)?,
+            cache_max_entries,
+            cache_max_bytes: if config::optional("PRISM_PUBLIC_CACHE_MAX_RESPONSE_BYTES").is_some()
+            {
+                config::number("PRISM_PUBLIC_CACHE_MAX_RESPONSE_BYTES", 0usize)?
+            } else {
+                config::number(
+                    "PRISM_PUBLIC_CACHE_MAX_PAYLOAD_BYTES",
+                    defaults.cache_max_bytes,
+                )?
+            },
+            cache_lifetimes: CacheLifetimes::from_env()?,
+            cache_debug_headers: config::flag("PRISM_PUBLIC_CACHE_DEBUG_HEADERS", false)?,
+            // Zero keeps its established meaning: no whole-request deadline.
+            read_timeout: Duration::from_secs(bounded(
+                "PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS",
+                defaults.read_timeout.as_secs(),
+                0,
+                86400,
+            )?),
+            read_concurrency: bounded(
+                "PRISM_POSTGRES_READ_CONCURRENCY",
+                defaults.read_concurrency,
+                1,
+                1024,
+            )?,
+            public_stratum_url: config::optional("PRISM_PUBLIC_STRATUM_URL"),
+            public_stratum_highdiff_url: config::optional("PRISM_PUBLIC_STRATUM_HIGHDIFF_URL"),
+            stratum_highdiff_port: Some(config::number("PRISM_STRATUM_HIGHDIFF_PORT", 0u16)?)
+                .filter(|port| *port > 0),
+            configuration_label: config::value(
+                "PRISM_PUBLIC_CONFIGURATION_LABEL",
+                &defaults.configuration_label,
+            ),
+            configuration_description: config::value(
+                "PRISM_PUBLIC_CONFIGURATION_DESCRIPTION",
+                &defaults.configuration_description,
+            ),
+            block_template_policy: config::value(
+                "PRISM_PUBLIC_BLOCK_TEMPLATE_POLICY",
+                &defaults.block_template_policy,
+            ),
+            hashrate_smoothing_seconds: bounded(
+                "PRISM_PUBLIC_HASHRATE_SMOOTHING_SECONDS",
+                defaults.hashrate_smoothing_seconds,
+                0,
+                86400,
+            )?,
+            health_refresh_interval: health_refresh_interval_from_env()?,
+            operator_bearer_token: None,
+        })
+    }
+    /// Snapshots older than this are reported stale by health and metrics.
+    pub fn health_stale_after(&self) -> Duration {
+        metrics_snapshot::health_stale_after(self.health_refresh_interval)
+    }
+}
+/// Deterministic built-in defaults; never reads the process environment.
 impl Default for ApiConfig {
     fn default() -> Self {
-        Self::from_env()
+        Self {
+            rpc_url: "http://127.0.0.1:18452/".into(),
+            rpc_user: "qbit".into(),
+            rpc_password: "change-this".into(),
+            stratum_host: "127.0.0.1".into(),
+            stratum_port: 3340,
+            instance_id: "prism".into(),
+            pool_name: "PRISM".into(),
+            pool_fee_bps: 0,
+            minimum_payout_bits: 0,
+            explorer_block_url: None,
+            explorer_tx_url: None,
+            cache_enabled: true,
+            cache_max_entries: 1024,
+            cache_max_bytes: 1024 * 1024,
+            cache_lifetimes: CacheLifetimes::default(),
+            cache_debug_headers: false,
+            read_timeout: Duration::from_secs(20),
+            read_concurrency: 4,
+            public_stratum_url: None,
+            public_stratum_highdiff_url: None,
+            stratum_highdiff_port: None,
+            configuration_label: "PRISM default".into(),
+            configuration_description: "Default PRISM Stratum endpoint using the pool's current block template and payout policy.".into(),
+            block_template_policy:
+                "pool-selected qbit block template with PRISM payout settlement".into(),
+            hashrate_smoothing_seconds: 1800,
+            health_refresh_interval: Duration::from_secs(2),
+            operator_bearer_token: None,
+        }
     }
 }
 
@@ -135,10 +320,7 @@ impl Payload {
 }
 impl ApiState {
     pub fn new(pool: PgPool, config: ApiConfig, registry: Arc<crate::metrics::Metrics>) -> Self {
-        let (public_pool, audit_decodes) = read_limits(
-            &pool,
-            env_num("PRISM_POSTGRES_READ_CONCURRENCY", 4).clamp(1, 1024) as u32,
-        );
+        let (public_pool, audit_decodes) = read_limits(&pool, config.read_concurrency);
         Self {
             pool,
             public_pool,
@@ -168,6 +350,10 @@ impl ApiState {
     #[doc(hidden)]
     pub fn audit_decode_limit(&self) -> Arc<Semaphore> {
         self.audit_decodes.clone()
+    }
+    #[cfg(test)]
+    pub(crate) fn health_published_at_for_test(&self) -> &RwLock<Instant> {
+        &self.health_published_at
     }
     pub fn metrics(&self) -> Arc<crate::metrics::Metrics> {
         self.registry.clone()
@@ -301,6 +487,13 @@ async fn handle_inner(
     method: Method,
     headers: HeaderMap,
 ) -> Response {
+    if state.public_service.is_none() {
+        if let Some(token) = &state.config.operator_bearer_token {
+            if !operator_auth::authorized(&headers, token) {
+                return finish(operator_auth::challenge(), &method);
+            }
+        }
+    }
     let path = uri.path().trim_end_matches('/');
     let is_public = path == "/public/v1" || path.starts_with("/public/v1/");
     if let Some(service) = &state.public_service {
@@ -357,7 +550,7 @@ async fn handle_inner(
             (health.clone(), age)
         };
         payload["snapshot_age_seconds"] = json!(age.as_secs_f64());
-        if age > health_stale_after() {
+        if age > state.config.health_stale_after() {
             payload["ok"] = json!(false);
             payload["error"] = json!("health snapshot is stale");
         }
@@ -390,7 +583,7 @@ async fn handle_inner(
         return finish(
             snapshot.response_with_runtime(
                 Instant::now(),
-                health_stale_after(),
+                state.config.health_stale_after(),
                 Some(state.registry.runtime().snapshot()),
                 Some(&state.registry),
             ),
@@ -574,32 +767,36 @@ struct CachePolicy {
     ttl: u64,
     stale: u64,
     immutable: bool,
+    debug_headers: bool,
 }
 impl CachePolicy {
     fn for_path(path: &str, config: &ApiConfig) -> Self {
         if !config.cache_enabled {
-            return Self::default();
+            return Self {
+                debug_headers: config.cache_debug_headers,
+                ..Self::default()
+            };
         }
-        let (kind, ttl, stale) = if path == "/public/v1/mining-configuration" {
-            ("CONFIG_", 300, 3600)
-        } else if path.starts_with("/public/v1/artifacts/") {
-            ("ARTIFACT_", 86400, 86400)
+        let lifetimes = &config.cache_lifetimes;
+        let immutable = path.starts_with("/public/v1/artifacts/");
+        let lifetime = if path == "/public/v1/mining-configuration" {
+            lifetimes.configuration
+        } else if immutable {
+            lifetimes.artifact
         } else if matches!(
             path,
             "/public/v1/pool-summary" | "/public/v1/hashrate-series"
         ) || path.starts_with("/public/v1/miners/") && path.ends_with("/workers")
         {
-            ("AGGREGATE_", 30, 30)
+            lifetimes.aggregate
         } else {
-            ("", 5, 30)
+            lifetimes.default
         };
         Self {
-            ttl: env_num(&format!("PRISM_PUBLIC_{kind}CACHE_TTL_SECONDS"), ttl),
-            stale: env_num(
-                &format!("PRISM_PUBLIC_{kind}CACHE_STALE_WHILE_REVALIDATE_SECONDS"),
-                stale,
-            ),
-            immutable: kind == "ARTIFACT_",
+            ttl: lifetime.ttl,
+            stale: lifetime.stale_while_revalidate,
+            immutable,
+            debug_headers: config.cache_debug_headers,
         }
     }
     fn headers(&self, h: &mut HeaderMap, state: &str, age: u64) {
@@ -620,7 +817,7 @@ impl CachePolicy {
             h.insert("cdn-cache-control", value.clone());
             h.insert("vercel-cdn-cache-control", value);
         }
-        if env_bool("PRISM_PUBLIC_CACHE_DEBUG_HEADERS", false) {
+        if self.debug_headers {
             h.insert(
                 "x-prism-public-cache",
                 HeaderValue::from_str(state).unwrap(),
@@ -672,20 +869,6 @@ fn recipient(s: &str) -> ApiResult<String> {
 }
 fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
-}
-fn env(name: &str, default: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| default.into())
-}
-fn env_num(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(default)
-}
-fn env_bool(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .map(|s| matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(default)
 }
 
 async fn audit(state: &ApiState, path: &str, q: &Query) -> ApiResult<Value> {
