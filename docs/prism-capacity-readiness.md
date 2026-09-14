@@ -443,7 +443,8 @@ two-hour cutover soak, which reads its own criteria from the same registry.
 3. **Capture every 5 minutes** for the whole soak: RSS from `/proc/1/status`
    for the bound, and the correlated series for the reading order above. Both
    reads run inside the container; the parsing runs on the host. The fence
-   defines `capture`, which takes the samples in a loop, and then calls it.
+   defines `capture`, which takes the samples in a loop; the end of step 4
+   calls it, once the two snapshot functions it also calls are defined.
    Before every sample it checks that the clock has not moved backward since
    the previous sample ended, that no more than 360 s have passed since
    the previous one started and that it is still reading the process the run
@@ -451,9 +452,12 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    then the clock, which must not precede this sample's start or be more than
    360 s past the time the previous sample's reads ended, and it stops the run
    as invalid when any of these checks fails or one of its appends to the run's files
-   does. It ends the run itself, as complete, after the first sample taken
-   86,400 s or more after the first, once that sample has passed every
-   check, by writing `soak-complete` and returning `0`:
+   does. The first samples taken 3,600 s, 43,200 s and 86,400 s or more after
+   the first also take that hour's snapshots, below and in step 4, between the
+   sample's appends and its second identity read, and a snapshot that fails
+   stops the run the same way. It ends the run itself, as complete, after the
+   first sample taken 86,400 s or more after the first, once that sample has
+   passed every check, by writing `soak-complete` and returning `0`:
 
    ```sh
    c=<prism-coordinator-container>
@@ -468,6 +472,7 @@ two-hour cutover soak, which reads its own criteria from the same registry.
      prev=
      prev_end=
      start=
+     snapped=0
      mkdir "$run" || return
      if ! first=$(process) || [ -z "$first" ]; then
        echo "$(date -u +%FT%TZ): soak invalid, could not read the coordinator process identity at the start of the run" | invalid
@@ -551,6 +556,26 @@ two-hour cutover soak, which reads its own criteria from the same registry.
          echo "$(date -u +%FT%TZ): soak invalid, could not append the sample at $now to $run/soak-metrics.log" | invalid
          return 1
        }
+       for hour in 1 12 24; do
+         if [ "$hour" -gt "$snapped" ] && [ $((now - start)) -ge $((hour * 3600)) ]; then
+           snapped=$hour
+           name=h$(printf '%02d' "$hour").txt
+           if ! why=$(share_ack_snapshot "$run/share-ack-$name" 2>&1); then
+             {
+               echo "$(date -u +%FT%TZ): soak invalid, no hour-$hour share-ack snapshot at $now"
+               printf '%s\n' "$why" | sed 's/^/  /'
+             } | invalid
+             return 1
+           fi
+           if [ "$hour" -ne 12 ] && ! why=$(full_metrics_snapshot "$run/metrics-$name" 2>&1); then
+             {
+               echo "$(date -u +%FT%TZ): soak invalid, no hour-$hour full metrics snapshot at $now"
+               printf '%s\n' "$why" | sed 's/^/  /'
+             } | invalid
+             return 1
+           fi
+         fi
+       done
        if ! after=$(process) || [ -z "$after" ]; then
          echo "$(date -u +%FT%TZ): soak invalid, could not read the coordinator process identity after the sample at $now" | invalid
          return 1
@@ -584,7 +609,6 @@ two-hour cutover soak, which reads its own criteria from the same registry.
        sleep 300
      done
    }
-   capture
    ```
 
    The bound is evidence about one process. `compose.yaml` gives
@@ -758,7 +782,7 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    invalid on its own, and the status says that it is: `capture` returns
    `1` only through `invalid`, and `0` only once it has written the
    completion marker the next paragraph describes, `soak-complete`. The fence
-   defines `capture` and calls it in the operator's interactive shell,
+   defines `capture`, and step 4 calls it, in the operator's interactive shell,
    which is why the stop paths `return` rather than `exit`, which would end
    the shell that steps 4 to 7 read `$run` from, and why `run=` is set
    outside the function. When the fault is the disk itself the marker may
@@ -777,8 +801,8 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    and a directory judged on its files alone passed. So the loop keeps the
    time of its first sample, the first row of the CSV, and ends the run
    itself: after the first sample taken 86,400 s or more after it, once
-   that sample's reads, appends, both identity checks and the check on the
-   time its reads ended have passed, it writes one line, the time and the
+   that sample's reads, appends, hour-24 snapshots, both identity checks and
+   the check on the time its reads ended have passed, it writes one line, the time and the
    span the samples cover, to `$run/soak-complete.tmp`, renames that to
    `$run/soak-complete`, and returns `0`. The marker is published by the
    rename, so it appears whole or not at all. A redirect straight to the
@@ -806,8 +830,9 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    reads, so the CSV and the gauge agree up to collector cadence. The log also
    carries the runtime and pool series item 3 of the reading order cites, so a
    breach found after the run can be read back at its own five-minute sample
-   instead of from the hour-1 or hour-24 snapshot. Also keep the share-ack
-   histogram at hours 1, 12 and 24 for the latency comparison:
+   instead of from the hour-1 or hour-24 snapshot. `capture` also keeps the
+   share-ack histogram at hours 1, 12 and 24 for the latency comparison,
+   through this function:
 
    ```sh
    share_ack_snapshot() (
@@ -838,19 +863,20 @@ two-hour cutover soak, which reads its own criteria from the same registry.
        exit 1
      fi
    )
-   share_ack_snapshot "$run/share-ack-h01.txt"
    ```
 
-   At hours 12 and 24, call the same function with
-   `"$run/share-ack-h12.txt"` and `"$run/share-ack-h24.txt"`, respectively.
+   `capture` calls it with `"$run/share-ack-h01.txt"`,
+   `"$run/share-ack-h12.txt"` and `"$run/share-ack-h24.txt"` in the first
+   samples taken 3,600 s, 43,200 s and 86,400 s or more after its first.
    Each file keeps the response headers and the histogram from the same
    successful scrape. A cached response can return HTTP 200 with a `stale`
    or `unavailable` state, so the function requires the `fresh` header before
    writing anything. It publishes the snapshot by renaming a completed
    temporary file; a failed write leaves no partial snapshot at the final
    name. Use only the final `.txt` files for the latency comparison. If any
-   call fails, the run lacks usable latency evidence: keep its directory
-   and repeat the soak from step 2.
+   call fails, the run lacks usable latency evidence, so `capture` ends it
+   as invalid through `invalid`: keep its directory and repeat the soak from
+   step 2.
 
 4. **Snapshot** the full `/metrics` body, headers included, at hour 1 (the
    baseline), hour 24, and at any breach:
@@ -876,21 +902,41 @@ two-hour cutover soak, which reads its own criteria from the same registry.
        exit 1
      fi
    )
-   full_metrics_snapshot "$run/metrics-h01.txt"
    ```
 
-   At hour 24 call `full_metrics_snapshot "$run/metrics-h24.txt"`; at each
-   breach use a distinct name such as `"$run/metrics-breach-$(date +%s).txt"`.
+   `capture` calls it with `"$run/metrics-h01.txt"` and
+   `"$run/metrics-h24.txt"` in the samples that take the hour-1 and hour-24
+   share-ack snapshots, after them; at each breach call it with a distinct
+   name such as `"$run/metrics-breach-$(date +%s).txt"`.
+   For a manual breach snapshot while `capture` is running, use a second
+   shell, set `c` to the same container and `run` to the absolute path of the
+   existing run directory, and define `full_metrics_snapshot` there before
+   calling it.
    The function requires a successful scrape and a `fresh` response header,
    then renames the temporary file to publish the complete headers and body
    unchanged. HTTP errors, transport failures, cached responses and failed
    writes or renames return nonzero and publish no new final snapshot. Use
    only the final `.txt` files as evidence; a `.tmp` file may be partial or
-   stale. If a required snapshot fails, keep the run directory and repeat
-   the soak from step 2.
+   stale. If a scheduled snapshot fails, `capture` ends the run as invalid
+   through `invalid`; keep the run directory and repeat the soak from step 2.
+   If a manual breach snapshot fails, record the failure in
+   `$run/soak-invalid`, keep the directory, and repeat the soak from step 2.
 
    This replaces the census step: there is no heap walk on the native server,
    and the body at the breach is what the correlated reading works from.
+
+   The loop schedules the hour snapshots against its first sample's
+   timestamp. It takes them after appending the sample and before checking
+   process identity and read timing again, so a restart or delay during a
+   snapshot can invalidate the run. A failed scheduled snapshot writes
+   `soak-invalid` with the snapshot function's diagnostic; `soak-complete`
+   follows successful hour-24 snapshots. Define `capture`,
+   `share_ack_snapshot` and `full_metrics_snapshot` in the same shell before
+   starting the run:
+
+   ```sh
+   capture
+   ```
 5. **Trim** is retired with `malloc_trim`; there is nothing to send at hour 23.
 6. **Judge** each run with the `awk` bound check above against its own
    `$run/soak-rss.csv`, and only once this gate has accepted the run
@@ -919,7 +965,8 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    stopped the run on a gap between samples, a process change, a missing
    RSS sample, an append that failed, a metrics scrape that failed, was not
    fresh, had its process collector unavailable or carried no usable RSS
-   value, or a completion marker it could not write, and the marker says
+   value, an hour snapshot that failed, or a completion marker it could not
+   write, and the marker says
    which; and when the directory holds no `soak-complete`, because then
    `capture` did not end the run itself after 24 h of samples, so whatever
    did, a signal, a reboot, a closed terminal or an interrupt, did so before

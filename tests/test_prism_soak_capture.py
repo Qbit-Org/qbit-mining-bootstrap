@@ -13,7 +13,11 @@ sample, its post-read identity check and the check that its reads ended in
 cadence with the previous sample's have passed, and does so by a rename
 so that a failed or interrupted write leaves no marker; the gate judges a
 directory only when it holds that marker and no ``soak-invalid``, so a run
-cut short after the judge's 82,800 s floor cannot pass.
+cut short after the judge's 82,800 s floor cannot pass. The loop also takes
+the hour-1, hour-12 and hour-24 snapshots itself, at the first sample due for
+each counted from its first, so the baseline and intermediate snapshots
+precede the end state. A snapshot that fails leaves ``soak-invalid`` instead
+of a completion marker.
 """
 
 from __future__ import annotations
@@ -38,8 +42,11 @@ METRICS_LINES_PER_SAMPLE = 4
 
 # `sleep` moves the clock; `date` reads it; `docker` counts its `inspect` calls
 # so a test can change the identity, or run a snippet in the run directory, at
-# a chosen call. Anything the fences ask of a stub that it does not expect is
-# appended to `$STUB/unexpected`, which every test requires to stay absent.
+# a chosen call, and counts the snapshot functions' `curl -fsS` scrapes so a
+# test can answer one with a cached body; every scrape's share-ack histogram
+# carries the clock it was read at. Anything the fences ask of a stub that it
+# does not expect is appended to `$STUB/unexpected`, which every test requires
+# to stay absent.
 STUBS = r"""
 stub_read() { read -r stub_value < "$STUB/$1"; }
 stub_bump() {
@@ -86,15 +93,25 @@ docker() {
     'exec cat')
       printf 'Name:\tqbit-prism-server\nVmRSS:\t  %s kB\nThreads:\t8\n' "$STUB_RSS_KB" ;;
     'exec curl')
-      printf 'HTTP/1.1 200 OK\r\nx-prism-metrics-state: fresh\r\ncontent-type: text/plain\r\n\r\n'
+      stub_state=fresh
+      if [ "$4" = -fsS ]; then
+        stub_bump snapshots
+        if [ "$stub_value" = "$STUB_SNAPSHOT_STALE_AT" ]; then stub_state=stale; fi
+      fi
+      stub_read clock
+      printf 'HTTP/1.1 200 OK\r\nx-prism-metrics-state: %s\r\ncontent-type: text/plain\r\n\r\n' "$stub_state"
       printf 'qbit_prism_collector_available{collector="process"} 1\n'
       printf 'qbit_prism_process_resident_memory_bytes %s\n' "$((STUB_RSS_KB * 1024))"
-      printf 'qbit_prism_connections 3\n' ;;
+      printf 'qbit_prism_connections 3\n'
+      printf 'qbit_prism_share_ack_seconds_count{result="accepted"} %s\n' "$stub_value" ;;
     *) echo "docker $*" >> "$STUB/unexpected"; return 1 ;;
   esac
 }
 if [ -n "$STUB_INTERRUPT_ON_MV" ]; then
-  mv() { kill -s TERM $$; }
+  mv() {
+    case $2 in */"$STUB_INTERRUPT_ON_MV") kill -s TERM $$ ;; esac
+    command mv "$@"
+  }
 fi
 """
 
@@ -127,15 +144,22 @@ def fence_containing(needle: str) -> str:
     return matches[0]
 
 
+FENCES = shell_fences(DOC.read_text())
 CAPTURE = fence_containing("capture() {")
 GATE = fence_containing("completed() {")
 JUDGE = fence_containing("min_span=82800")
-SHARE_ACK = fence_containing('"$run/share-ack-h01.txt"')
+SHARE_ACK = fence_containing("share_ack_snapshot() (")
 FULL_METRICS = fence_containing("full_metrics_snapshot() (")
+START = "capture\n"
 assert CAPTURE.count(PLACEHOLDER) == 1
 assert GATE.endswith("}\ncompleted\n")
+# `capture` calls both snapshot functions, so the three fences only define
+# functions and the run starts in the fence after them.
+assert CAPTURE.endswith("\n}\n") and SHARE_ACK.endswith("\n)\n") and FULL_METRICS.endswith("\n)\n")
+assert FENCES.count(START) == 1
+assert FENCES[FENCES.index(CAPTURE) : FENCES.index(START) + 1] == [CAPTURE, SHARE_ACK, FULL_METRICS, START]
 
-CAPTURE_SCRIPT = STUBS + CAPTURE.replace(PLACEHOLDER, "c=stub-container\n")
+CAPTURE_SCRIPT = STUBS + CAPTURE.replace(PLACEHOLDER, "c=stub-container\n") + SHARE_ACK + FULL_METRICS + START
 GATE_SCRIPT = f"run={RUN}\n" + GATE
 # What step 6 tells the operator to do: judge inside the directory, and only
 # once the gate has accepted it.
@@ -149,6 +173,7 @@ class SoakRun:
         self.stub.mkdir()
         (self.stub / "clock").write_text("0\n")
         (self.stub / "inspects").write_text("0\n")
+        (self.stub / "snapshots").write_text("0\n")
         self.run = self.work / RUN
         self.shell = shell
         self.env = {**os.environ, "STUB": str(self.stub), "STUB_RSS_KB": str(RSS_KB), **env}
@@ -180,8 +205,22 @@ class SoakRun:
     def entries(self) -> list[str]:
         return sorted(entry.name for entry in self.run.iterdir())
 
+    def snapshot_clocks(self) -> dict[str, int]:
+        """The fake clock each published snapshot was scraped at."""
+        clocks = {}
+        for name in SNAPSHOTS:
+            if (self.run / name).exists():
+                (count,) = re.findall(
+                    r'^qbit_prism_share_ack_seconds_count\{result="accepted"\} (\d+)$', (self.run / name).read_text(), re.M,
+                )
+                clocks[name] = int(count)
+        return clocks
+
 
 COMPLETE_LINE = "T+86400: soak complete, the samples from 0 to 86400 span 86400 s"
+RUN_FILES = ["soak-metrics.log", "soak-process.log", "soak-rss.csv"]
+# In the order `capture` takes them, which is also the order of their scrapes.
+SNAPSHOTS = ["share-ack-h01.txt", "metrics-h01.txt", "share-ack-h12.txt", "share-ack-h24.txt", "metrics-h24.txt"]
 
 
 class ShareAckSnapshotTests(unittest.TestCase):
@@ -212,7 +251,7 @@ docker() {
 }
 c=stub-container
 run=.
-''' + SHARE_ACK
+''' + SHARE_ACK + 'share_ack_snapshot "$run/share-ack-h01.txt"\n'
             result = subprocess.run(
                 [shell, "-c", script], cwd=work, capture_output=True, text=True,
                 env={**os.environ, "SCRAPE_STATUS": str(status)}, timeout=10,
@@ -280,7 +319,7 @@ case $PUBLISH_FAULT in
 esac
 c=stub-container
 run=.
-''' + FULL_METRICS
+''' + FULL_METRICS + 'full_metrics_snapshot "$run/metrics-h01.txt"\n'
             result = subprocess.run(
                 [shell, "-c", script], cwd=work, capture_output=True, text=True,
                 env={**os.environ, "SCRAPE_STATUS": str(status), "PUBLISH_FAULT": fault}, timeout=10,
@@ -353,10 +392,16 @@ class SoakCaptureTests(unittest.TestCase):
                 soak = SoakRun(shell)
                 result = soak.capture()
                 self.assertEqual((result.returncode, result.stderr, soak.unexpected()), (0, "", ""))
+                self.assertEqual(soak.entries(), sorted([*SNAPSHOTS, "soak-complete", *RUN_FILES]))
+                # Each snapshot was scraped once, at the sample due for it, not at the end.
                 self.assertEqual(
-                    soak.entries(),
-                    ["soak-complete", "soak-metrics.log", "soak-process.log", "soak-rss.csv"],
+                    soak.snapshot_clocks(),
+                    {
+                        "share-ack-h01.txt": 3600, "metrics-h01.txt": 3600, "share-ack-h12.txt": 43200,
+                        "share-ack-h24.txt": 86400, "metrics-h24.txt": 86400,
+                    },
                 )
+                self.assertEqual((soak.stub / "snapshots").read_text(), "5\n")
                 self.assertTrue((soak.run / "soak-complete").is_file())
                 self.assertEqual(soak.lines("soak-complete"), [COMPLETE_LINE])
                 rss = soak.lines("soak-rss.csv")
@@ -381,7 +426,7 @@ class SoakCaptureTests(unittest.TestCase):
         soak = SoakRun("sh", STUB_INTERRUPT_AT="83100")
         result = soak.capture()
         self.assertEqual((result.returncode, result.stderr, soak.unexpected()), (-signal.SIGTERM, "", ""))
-        self.assertEqual(soak.entries(), ["soak-metrics.log", "soak-process.log", "soak-rss.csv"])
+        self.assertEqual(soak.entries(), sorted([*SNAPSHOTS[:3], *RUN_FILES]))
         rss = soak.lines("soak-rss.csv")
         self.assertEqual((len(rss), rss[-1]), (82800 // 300 + 1, f"82800,{RSS_KB * 1024}"))
         alone = soak.judge_alone()
@@ -395,7 +440,7 @@ class SoakCaptureTests(unittest.TestCase):
         soak = SoakRun("sh", STUB_RESTART_AT_INSPECT=str(2 * SAMPLES_24H + 1))
         result = soak.capture()
         self.assertEqual((result.returncode, soak.unexpected()), (1, ""))
-        self.assertEqual(soak.entries(), ["soak-invalid", "soak-metrics.log", "soak-process.log", "soak-rss.csv"])
+        self.assertEqual(soak.entries(), sorted([*SNAPSHOTS, "soak-invalid", *RUN_FILES]))
         invalid = soak.lines("soak-invalid")
         self.assertEqual(result.stderr, (soak.run / "soak-invalid").read_text())
         self.assertEqual(
@@ -461,7 +506,7 @@ class SoakCaptureTests(unittest.TestCase):
                 )
                 result = soak.capture()
                 self.assertEqual((result.returncode, soak.unexpected()), (1, ""))
-                self.assertEqual(soak.entries(), ["soak-invalid", "soak-metrics.log", "soak-process.log", "soak-rss.csv"])
+                self.assertEqual(soak.entries(), sorted([*SNAPSHOTS, "soak-invalid", *RUN_FILES]))
                 self.assertEqual(result.stderr, (soak.run / "soak-invalid").read_text())
                 self.assertEqual(
                     soak.lines("soak-invalid"),
@@ -490,22 +535,22 @@ class SoakCaptureTests(unittest.TestCase):
         soak = SoakRun("sh", STUB_SNIPPET_AT_INSPECT=final_pre_read, STUB_SNIPPET='echo 86460 > "$STUB/clock"')
         result = soak.capture()
         self.assertEqual((result.returncode, result.stderr, soak.unexpected()), (0, "", ""))
-        self.assertEqual(soak.entries(), ["soak-complete", "soak-metrics.log", "soak-process.log", "soak-rss.csv"])
+        self.assertEqual(soak.entries(), sorted([*SNAPSHOTS, "soak-complete", *RUN_FILES]))
         late_marker = "T+86460: soak complete, the samples from 0 to 86400 span 86400 s"
         self.assertEqual(soak.lines("soak-complete"), [late_marker])
         self.assertEqual(soak.lines("soak-rss.csv")[-1], f"86400,{RSS_KB * 1024}")
         gate = soak.gate()
         self.assertEqual((gate.returncode, gate.stdout, gate.stderr), (0, late_marker + "\n", ""))
 
-        for sample, ended, expected in (
-            (SAMPLES_24H, 86461, "T+86461: soak invalid, the reads for the sample at 86400 ended at 86461, 361 s after the previous sample's ended at 86100"),
-            (2, 361, "T+361: soak invalid, the reads for the sample at 300 ended at 361, 361 s after the previous sample's ended at 0"),
+        for sample, ended, snapshots, expected in (
+            (SAMPLES_24H, 86461, SNAPSHOTS, "T+86461: soak invalid, the reads for the sample at 86400 ended at 86461, 361 s after the previous sample's ended at 86100"),
+            (2, 361, [], "T+361: soak invalid, the reads for the sample at 300 ended at 361, 361 s after the previous sample's ended at 0"),
         ):
             with self.subTest(sample=sample):
                 soak = SoakRun("sh", STUB_SNIPPET_AT_INSPECT=str(2 * sample), STUB_SNIPPET=f'echo {ended} > "$STUB/clock"')
                 result = soak.capture()
                 self.assertEqual((result.returncode, soak.unexpected()), (1, ""))
-                self.assertEqual(soak.entries(), ["soak-invalid", "soak-metrics.log", "soak-process.log", "soak-rss.csv"])
+                self.assertEqual(soak.entries(), sorted([*snapshots, "soak-invalid", *RUN_FILES]))
                 self.assertEqual(soak.lines("soak-invalid"), [expected])
                 self.assertEqual(len(soak.lines("soak-rss.csv")), sample)
                 self.assert_no_marker_at_all(soak)
@@ -513,6 +558,68 @@ class SoakCaptureTests(unittest.TestCase):
                 self.assertEqual((gate.returncode, gate.stdout), (1, ""))
                 self.assertIn("soak-invalid says why the run is invalid", gate.stderr)
                 self.assertEqual(soak.gate_and_judge().returncode, 1)
+
+    def test_hour_snapshots_are_taken_at_the_first_sample_due_from_the_first(self) -> None:
+        # Codex's case: `capture` holds the shell for the whole soak, so
+        # snapshot calls typed after it all read the end state. The loop takes
+        # them itself. The run starts at 1234 and its first sample's reads end
+        # at 1279, so no later sample is a whole number of hours after the
+        # first or on the clock's own hour: each snapshot comes from the first
+        # sample at or past its hour, counted from the first sample.
+        for shell in ("sh", "bash"):
+            with self.subTest(shell=shell):
+                soak = SoakRun(shell, STUB_SNIPPET_AT_INSPECT="2", STUB_SNIPPET='echo 1279 > "$STUB/clock"')
+                (soak.stub / "clock").write_text("1234\n")
+                result = soak.capture()
+                self.assertEqual((result.returncode, result.stderr, soak.unexpected()), (0, "", ""))
+                self.assertEqual(
+                    soak.snapshot_clocks(),
+                    {
+                        "share-ack-h01.txt": 4879, "metrics-h01.txt": 4879, "share-ack-h12.txt": 44479,
+                        "share-ack-h24.txt": 87679, "metrics-h24.txt": 87679,
+                    },
+                )
+                self.assertEqual((soak.stub / "snapshots").read_text(), "5\n")
+                self.assertEqual(
+                    soak.lines("soak-complete"), ["T+87679: soak complete, the samples from 1234 to 87679 span 86445 s"],
+                )
+
+    def test_hour_snapshot_that_fails_invalidates_the_run(self) -> None:
+        # Snapshot scrapes 1 to 5 are SNAPSHOTS in order; the chosen one is
+        # answered with a cached body. The run stops at that sample, keeps the
+        # snapshots taken before it, publishes nothing under the failed name
+        # and, when the failure is an hour-24 snapshot, writes no marker.
+        share_ack = "  share-ack snapshot failed: fresh state header and histogram required"
+        full_metrics = "  full metrics snapshot failed: fresh state header required"
+        for shell in ("sh", "bash"):
+            for scrape, hour, kind, detail in (
+                (1, 1, "share-ack", share_ack),
+                (2, 1, "full metrics", full_metrics),
+                (3, 12, "share-ack", share_ack),
+                (4, 24, "share-ack", share_ack),
+                (5, 24, "full metrics", full_metrics),
+            ):
+                with self.subTest(shell=shell, scrape=scrape):
+                    now = hour * 3600
+                    soak = SoakRun(shell, STUB_SNAPSHOT_STALE_AT=str(scrape))
+                    result = soak.capture()
+                    self.assertEqual((result.returncode, soak.unexpected()), (1, ""))
+                    self.assertEqual(result.stderr, (soak.run / "soak-invalid").read_text())
+                    self.assertEqual(
+                        soak.lines("soak-invalid"), [f"T+{now}: soak invalid, no hour-{hour} {kind} snapshot at {now}", detail],
+                    )
+                    self.assertEqual((soak.stub / "snapshots").read_text(), f"{scrape}\n")
+                    # full_metrics_snapshot leaves its unpublished temporary file.
+                    temporary = [SNAPSHOTS[scrape - 1] + ".tmp"] if kind == "full metrics" else []
+                    self.assertEqual(
+                        soak.entries(), sorted([*SNAPSHOTS[: scrape - 1], *temporary, "soak-invalid", *RUN_FILES]),
+                    )
+                    self.assertEqual(len(soak.lines("soak-rss.csv")), now // 300 + 1)
+                    self.assert_no_marker_at_all(soak)
+                    gate = soak.gate()
+                    self.assertEqual((gate.returncode, gate.stdout), (1, ""))
+                    self.assertIn("soak-invalid says why the run is invalid", gate.stderr)
+                    self.assertEqual(soak.gate_and_judge().returncode, 1)
 
     def test_backward_clock_step_between_samples_is_invalid_before_recording(self) -> None:
         for shell in ("sh", "bash"):
@@ -581,10 +688,11 @@ class SoakCaptureTests(unittest.TestCase):
         self.assert_gate_refuses_for_want_of_marker(soak)
 
     def test_interruption_between_marker_write_and_rename_publishes_no_marker(self) -> None:
-        soak = SoakRun("sh", STUB_INTERRUPT_ON_MV="1")
+        # Only the marker's rename is interrupted; the snapshots' renames run.
+        soak = SoakRun("sh", STUB_INTERRUPT_ON_MV="soak-complete")
         result = soak.capture()
         self.assertEqual((result.returncode, result.stderr, soak.unexpected()), (-signal.SIGTERM, "", ""))
-        self.assertEqual(soak.entries(), ["soak-complete.tmp", "soak-metrics.log", "soak-process.log", "soak-rss.csv"])
+        self.assertEqual(soak.entries(), sorted([*SNAPSHOTS, "soak-complete.tmp", *RUN_FILES]))
         self.assertEqual(soak.lines("soak-complete.tmp"), [COMPLETE_LINE])
         self.assert_no_marker_at_all(soak)
         self.assert_gate_refuses_for_want_of_marker(soak)
