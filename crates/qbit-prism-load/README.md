@@ -514,13 +514,15 @@ The side report repeats all of this under `honest_value_notes`.
   executable's bytes. A validator run with `--expect-coordinator-image-digest`
   set to a real image digest will correctly reject it. Never fabricate a value
   that looks like an image digest.
-- **Retired configuration keys are left out, not explained** (#361).
-  `PRISM_SHARE_COMMIT_BATCH_SIZE`, `PRISM_SHARE_COMMIT_LINGER_MILLISECONDS` and
-  `PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS` are retired: the native server does
-  not read them, and the `v3` validator refuses evidence that names one as not
-  having measured the native binary. So the harness neither sets them on a
-  frontend nor records them, and lists them under `retired_configuration_keys`
-  in the side report. Under `v2` it carried them with the values the frontends
+- **Retired configuration keys are left out, not explained** (#361). Three keys
+  are retired: <!-- retired-setting: PRISM_SHARE_COMMIT_BATCH_SIZE -->
+  <!-- retired-setting: PRISM_SHARE_COMMIT_LINGER_MILLISECONDS -->
+  <!-- retired-setting: PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS -->
+  the batch size, the commit linger and the vardiff idle sweep. The native
+  server does not read them, and the `v3` validator refuses evidence that names
+  one as not having measured the native binary. So the harness neither sets them
+  on a frontend nor records them, and lists them under
+  `retired_configuration_keys` in the side report. Under `v2` it carried them with the values the frontends
   really used and annotated them as unread (#288); the server has since answered
   that question, so leaving them out is now the honest answer rather than the
   lossy one.
