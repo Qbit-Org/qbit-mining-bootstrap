@@ -15,7 +15,7 @@ struct SessionOwnerState {
 
 #[derive(Debug)]
 pub(super) struct SessionOwner {
-    token: String,
+    pub(super) token: String,
     state: std::sync::Mutex<SessionOwnerState>,
 }
 
@@ -37,7 +37,7 @@ impl SessionOwner {
         Ok(ActiveSession(self.clone()))
     }
 
-    fn stop(&self) -> Result<()> {
+    pub(super) fn stop(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         ensure!(
             state.active == 0,
@@ -338,9 +338,7 @@ impl Ledger {
             let mut tx = ledger.begin().await?;
             writable(&mut tx).await?;
             tx.commit().await?;
-            ledger
-                .heartbeat(serde_json::json!({"state":"starting"}))
-                .await?;
+            ledger.heartbeat(HeartbeatStatus::Starting).await?;
         }
         Ok(ledger)
     }
@@ -367,25 +365,6 @@ impl Ledger {
                 .await?;
         }
         tx.commit().await?;
-        Ok(())
-    }
-
-    pub async fn heartbeat(&self, mut status: Value) -> Result<()> {
-        // The stopped marker is proof about this process incarnation only.
-        // Closing admission and checking pending/active guards happen under
-        // one local mutex, before awaiting SQL; no new session can race it.
-        if status.get("state").and_then(Value::as_str) == Some("stopped") {
-            self.session_owner.stop()?;
-        }
-        status
-            .as_object_mut()
-            .context("heartbeat status must be an object")?
-            .insert(
-                "session_owner_token".into(),
-                self.session_owner.token.clone().into(),
-            );
-        sqlx::query("INSERT INTO qbit_prism_instances(instance_id,status) VALUES($1,$2) ON CONFLICT(instance_id) DO UPDATE SET heartbeat_at=clock_timestamp(),status=EXCLUDED.status")
-            .bind(&self.instance_id).bind(status).execute(&self.pool).await?;
         Ok(())
     }
 

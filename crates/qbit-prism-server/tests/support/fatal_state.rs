@@ -1,5 +1,8 @@
 use super::*;
-use qbit_prism_server::config::Config;
+use qbit_prism_server::{
+    config::Config,
+    ledger::{HeartbeatHealth, HeartbeatStatus},
+};
 use serde_json::Value;
 use std::{process::Output, time::Duration};
 use tokio::process::Command;
@@ -28,7 +31,7 @@ async fn halt(ledger: &Ledger, message: &str) -> Result<()> {
 }
 
 async fn stopped(ledger: &Ledger) -> Result<()> {
-    ledger.heartbeat(json!({"state":"stopped"})).await
+    ledger.heartbeat(HeartbeatStatus::Stopped).await
 }
 
 async fn block(ledger: &Ledger, hash: &str, height: i64, mature: bool) -> Result<()> {
@@ -195,7 +198,10 @@ async fn clear_refuses_live_starting_stale_and_unknown_instances() -> Result<()>
     let (ledger, node, _) = setup(&db).await?;
     halt(&ledger, "test halt").await?;
     ledger
-        .heartbeat(json!({"schema":"qbit.prism.audit-health.v1","ready":false}))
+        .heartbeat(HeartbeatStatus::Health(HeartbeatHealth::new(
+            false,
+            Default::default(),
+        )))
         .await?;
     sqlx::raw_sql("INSERT INTO qbit_prism_instances(instance_id,status,heartbeat_at) VALUES ('starting','{\"state\":\"starting\"}',clock_timestamp()),('stale-live','{\"ready\":true}',clock_timestamp()-interval '1 day'),('unknown','{}',clock_timestamp())").execute(&ledger.pool).await?;
     let before = ledger.fatal_state().await?;
@@ -573,7 +579,7 @@ async fn chain_change_rpc_timeout_and_cancellation_keep_the_halt() -> Result<()>
     assert!(clear.await.unwrap_err().is_cancelled());
     unchanged(&ledger, &before).await?;
     // Both transaction locks and the table lock must have been released.
-    ledger.heartbeat(json!({"state":"stopped"})).await?;
+    ledger.heartbeat(HeartbeatStatus::Stopped).await?;
     db.close(vec![ledger]).await
 }
 
