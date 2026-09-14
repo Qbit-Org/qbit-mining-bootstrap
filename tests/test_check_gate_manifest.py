@@ -183,7 +183,7 @@ class CheckGateManifestTests(unittest.TestCase):
         oracle = [i for i in ids if i.startswith("qbit-prism-server::window_read_oracle::")]
         self.assertEqual(len(oracle), 8, oracle)
 
-    def test_ci_runs_the_checker_in_the_native_job_and_uploads_the_manifest(self) -> None:
+    def test_ci_requires_shards_and_combined_proof_and_uploads_the_manifest(self) -> None:
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
         native = workflow.split("\n  prism-native-postgres:", 1)[1].split("\n  docker-builds:", 1)[0]
         self.assertIn('PRISM_TEST_REQUIRE_INTEGRATION: "1"', native)
@@ -191,7 +191,15 @@ class CheckGateManifestTests(unittest.TestCase):
         self.assertIn('>> "${GITHUB_ENV}"', native)
         self.assertIn("scripts/check_gate_manifest.py", native)
         self.assertIn("--expected test/prism-gated-tests.txt", native)
-        self.assertIn("cargo test --locked --workspace --all-targets -- --nocapture", native)
+        self.assertIn("scripts/run_rust_test_shard.py", native)
+        self.assertIn("fail-fast: false", native)
+        self.assertIn("SHARD_COUNT: ${{ strategy.job-total }}", native)
+        self.assertIn("name: prism-gate-shard-${{ matrix.shard }}", native)
+        self.assertIn("needs: [prism-native-postgres]", native)
+        self.assertIn('run: test "$SHARD_RESULT" = success', native)
+        self.assertIn("actions/download-artifact@", native)
+        checks = workflow.split("\n  checks:", 1)[1].split("\n  ckpool-rejects", 1)[0]
+        self.assertIn("prism-native-postgres, prism-integration-proof]", checks)
         self.assertIn("actions/upload-artifact@", native)
 
 
