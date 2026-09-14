@@ -169,11 +169,11 @@ what the native server exports in their place is the table further down.
 
 Retired. The `qbit_prism_process_allocated_blocks`, `qbit_prism_process_gc_*`,
 `qbit_prism_process_threads` and `qbit_prism_process_malloc_*` families, with
-the `PRISM_MALLOC_TELEMETRY` switch, read CPython allocator and collector
+the `PRISM_MALLOC_TELEMETRY` switch, read CPython allocator and collector <!-- retired-setting: PRISM_MALLOC_TELEMETRY -->
 state and glibc `mallinfo2` from the Python coordinator's process-telemetry
 module. The native server has no interpreter, no cycle collector, and does not
 bind `mallinfo2`, so none of those readings has a Rust analogue and none is
-planned. `PRISM_MALLOC_TELEMETRY` is not read by the native server and is no
+planned. `PRISM_MALLOC_TELEMETRY` is not read by the native server and is no <!-- retired-setting: PRISM_MALLOC_TELEMETRY -->
 longer in `compose.yaml` or `.env.example`.
 
 ### Component-cardinality families
@@ -257,7 +257,7 @@ runtime-independent and are re-anchored below.
 
 ### Running a census
 
-Retired. The heap census, its `SIGUSR1` arming and the `PRISM_HEAP_CENSUS*`
+Retired. The heap census, its `SIGUSR1` arming and the `PRISM_HEAP_CENSUS*` <!-- retired-setting: PRISM_HEAP_CENSUS -->
 settings applied to the retired Python coordinator (#244). The native server
 registers no census signal and reads none of those variables, `compose.yaml`
 and `.env.example` no longer pass them, and #288's acceptance includes a CI
@@ -275,8 +275,8 @@ state and has no native producer.
 
 ### `malloc_trim`
 
-Retired. The trimmer, `PRISM_MALLOC_TRIM_SIGNAL` and
-`PRISM_MALLOC_TRIM_INTERVAL_SECONDS` were a Python-process instrument (#244).
+Retired. The trimmer, `PRISM_MALLOC_TRIM_SIGNAL` and <!-- retired-setting: PRISM_MALLOC_TRIM_SIGNAL -->
+`PRISM_MALLOC_TRIM_INTERVAL_SECONDS` were a Python-process instrument (#244). <!-- retired-setting: PRISM_MALLOC_TRIM_INTERVAL_SECONDS -->
 The native server exposes no trim hook, and `SIGRTMIN+1` is unhandled there,
 so the same warning as for `SIGUSR1` applies.
 
