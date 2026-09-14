@@ -423,8 +423,50 @@ WRAPPER_ARGUMENTS = {
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*=")
 
 
-def executable_word(words: list[str]) -> int | None:
-    """Index of the executable after the supported literal launcher prefixes."""
+def env_split_words(source: str) -> list[tuple[str, int]] | None:
+    """Literal env -S arguments and their line offsets, without shell evaluation.
+
+    Quotes group words, and # comments begin only at an unquoted word start.
+    Shell operators are ordinary argv characters. Expansion and escape syntax
+    are outside this check, just as for literal shell words.
+    """
+    if "$" in source or "\\" in source:
+        return None
+    result = []
+    word = []
+    quote = ""
+    started = False
+    number = 0
+    first_line = 0
+    for character in source:
+        if not quote and character in " \t\n\r\v\f":
+            if started:
+                result.append(("".join(word), first_line))
+                word, started = [], False
+        elif not quote and not started and character == "#":
+            break
+        else:
+            if not started:
+                started, first_line = True, number
+            if quote:
+                if character == quote:
+                    quote = ""
+                else:
+                    word.append(character)
+            elif character in "'\"":
+                quote = character
+            else:
+                word.append(character)
+        number += character == "\n"
+    if quote:
+        return None
+    if started:
+        result.append(("".join(word), first_line))
+    return result
+
+
+def executable_word(words: list[str], offsets: list[int]) -> int | None:
+    """Find the executable, expanding literal env -S argv and line offsets in place."""
     index = 0
     # Reserved words are syntax only when unquoted in shell command position;
     # after an assignment or launcher they are ordinary executable arguments.
@@ -446,6 +488,29 @@ def executable_word(words: list[str]) -> int | None:
             index += 1
         while index < len(words):
             option = unquote(words[index])
+            if program == "env" and (
+                option in {"-S", "--split-string"}
+                or option.startswith(("-S", "--split-string="))
+            ):
+                separate = option in {"-S", "--split-string"}
+                argument = index + int(separate)
+                if argument >= len(words):
+                    return None
+                source = literal_word(words[argument])
+                if source is None:
+                    return None
+                if not separate:
+                    source = source[2 if option.startswith("-S") else len("--split-string="):]
+                split = env_split_words(source)
+                if split is None:
+                    return None
+                # Quote every argv word so operators and shell reserved words
+                # remain data when the expanded command is read below.
+                quoted = ["'" + word.replace("'", "'\"'\"'") + "'" for word, _ in split]
+                origin = offsets[argument]
+                words[index:argument + 1] = quoted
+                offsets[index:argument + 1] = [origin + offset for _, offset in split]
+                continue
             if option in {"--help", "--version"} or (program == "sudo" and option in {"-l", "-ll", "--list", "-V"}):
                 return None
             if program == "sudo" and (
@@ -533,25 +598,35 @@ def python_commands(line: str):
                 words.pop()  # the adjacent number is a file descriptor, not a word
             redirect = True
             continue
-        index = executable_word([line[a:b] for a, b in words])
+        command_words = [line[a:b] for a, b in words]
+        original_words = command_words.copy()
+        offsets = [line[:a].count("\n") for a, _ in words]
+        index = executable_word(command_words, offsets)
         if index is not None:
-            first, last = words[index]
-            interpreter = line[first:last]
-            match = INTERPRETER_CANDIDATE.match(line, first)
+            command_line, spans = line, words
+            if command_words != original_words:
+                command_line = " ".join(command_words)
+                spans = []
+                position = 0
+                for word in command_words:
+                    spans.append((position, position + len(word)))
+                    position += len(word) + 1
+            first, last = spans[index]
+            interpreter = command_line[first:last]
+            match = INTERPRETER_CANDIDATE.match(command_line, first)
             if runs_python(interpreter) and match is not None and match.end("interpreter") == last:
-                yield line[:first].count("\n"), line, match
+                yield offsets[index], command_line, match
             elif unquote(interpreter).rsplit("/", 1)[-1] in SHELLS:
-                arguments = words[index + 1:]
                 argument = shell_command_argument(
-                    [line[a:b] for a, b in arguments], unquote(interpreter).rsplit("/", 1)[-1]
+                    command_words[index + 1:], unquote(interpreter).rsplit("/", 1)[-1]
                 )
                 if argument is not None:
-                    a, b = arguments[argument]
-                    source = literal_word(line[a:b])
+                    argument += index + 1
+                    source = literal_word(command_words[argument])
                     if source is not None:
                         for number, nested in shell_lines(source, shell_source=True):
                             for offset, source_line, match in python_commands(nested):
-                                yield line[:a].count("\n") + number - 1 + offset, source_line, match
+                                yield offsets[argument] + number - 1 + offset, source_line, match
         words = []
         redirect = False
 
@@ -2115,6 +2190,74 @@ class ScannerTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(self.commands(text), [])
                 self.assertEqual(self.commands(text + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+
+    def test_env_split_string_runs_literal_argv(self) -> None:
+        for options in (
+            "-S 'python3 -m lab.example.deleted'",
+            "--split-string 'python3 -m lab.example.deleted'",
+            "--split-string='python3 -m lab.example.deleted'",
+            "-S'python3 -m lab.example.deleted'",
+            "-i -S 'python3 -m' lab.example.deleted",
+            "-S 'python3' -m lab.example.deleted",
+            "-S 'MODE=test python3 -m lab.example.deleted'",
+            "-S '-u MODE python3 -m lab.example.deleted'",
+            "-S 'sudo -u prism python3 -m lab.example.deleted'",
+            "-S 'nohup python3 -m lab.example.deleted'",
+            "-S '-S \"python3 -m\" lab.example.deleted'",
+            "-S 'env -S \"python3 -m\"' lab.example.deleted",
+            "-S 'python3 -m # ignored' lab.example.deleted",
+        ):
+            with self.subTest(options=options):
+                text = f"env {options}"
+                self.assertEqual(self.located(text), [(1, "lab/example/deleted.py or lab/example/deleted/__main__.py")])
+                self.assertEqual(dead_commands(text, {"lab/example/deleted.py"}), [])
+        for text in (
+            "env -S 'python3 lab/example/deleted.py'",
+            "sudo -u prism env -S 'python3' lab/example/deleted.py",
+            "docker exec container env -S 'python3 lab/example/deleted.py'",
+            "env -S 'sh -c \"python3 lab/example/deleted.py\"'",
+            "env -S 'sh -c' 'python3 lab/example/deleted.py'",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.commands(text), ["lab/example/deleted.py"])
+
+    def test_env_split_string_words_are_argv_not_shell_code(self) -> None:
+        for text in (
+            "env -S 'echo python3 -m lab.example.deleted'",
+            "env -S 'echo; python3 -m lab.example.deleted'",
+            "env -S 'echo | python3 -m lab.example.deleted'",
+            "env -S 'echo\npython3 -m lab.example.deleted'",
+            "env -S 'true # python3 -m lab.example.deleted'",
+            "env -S '\"python3 -m lab.example.deleted\"'",
+            "env -S 'if python3 -m lab.example.deleted'",
+            "env -S 'sh -nc \"python3 -m lab.example.deleted\"'",
+            "env -S 'sudo -v python3 -m lab.example.deleted'",
+            "env -S 'python3 -c \"python3 -m lab.example.deleted\"'",
+            "printf '%s' env -S 'python3 -m lab.example.deleted'",
+            "env -S '${INTERPRETER} -m lab.example.deleted'",
+            "env -S 'python3\\_ -m lab.example.deleted'",
+            "env -S 'python3 -m \"lab.example.deleted'",
+            "env -S",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.commands(text), [])
+                self.assertEqual(self.commands(text + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+        self.assertEqual(self.commands("env -S 'python3 lab/prism/deleted;name.py'"), ["lab/prism/deleted;name.py"])
+        self.assertEqual(self.commands("env -S 'python3 lab/prism/deleted#name.py'"), ["lab/prism/deleted#name.py"])
+        self.assertEqual(self.commands("env -S 'python3 lab/prism/deleted|name.py'"), ["lab/prism/deleted|name.py"])
+        self.assertEqual(self.commands("env -S 'python3 \"lab/prism/deleted name.py\"'"), ["lab/prism/deleted name.py"])
+
+    def test_env_split_string_preserves_empty_words_comments_and_locations(self) -> None:
+        self.assertEqual(self.commands("env -S '' python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+        self.assertEqual(self.commands("env -S '# ignored' python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+        self.assertEqual(self.commands("env -S '\"\" python3 lab/prism/storm.py'"), [])
+        self.assertEqual(env_split_words("one#two '#three' \"#four\" # ignored"), [("one#two", 0), ("#three", 0), ("#four", 0)])
+        text = "```sh\nenv -S '\npython3 lab/prism/storm.py'\n```"
+        self.assertEqual(self.located(text), [(3, "lab/prism/storm.py")])
+        text = "```sh\nenv -S 'sh -c \"true\npython3 lab/prism/storm.py\"'\n```"
+        self.assertEqual(self.located(text), [(3, "lab/prism/storm.py")])
+        text = "```sh\nenv -S 'sh -c'\n```"
+        self.assertEqual(self.commands(text), [])
 
     def test_sudo_chdir_arguments_before_commands_are_consumed(self) -> None:
         for options in (
