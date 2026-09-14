@@ -647,6 +647,9 @@ struct IndexDefinition {
     table: String,
     definition: String,
     valid: bool,
+    unique: bool,
+    expression: bool,
+    partial: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1005,7 +1008,7 @@ async fn fingerprint_schema(
                 enforcement: row.try_get("enforcement")?,
             });
     }
-    let rows = sqlx::query("SELECT c.relname::text AS table_name,i.relname::text AS name,pg_get_indexdef(x.indexrelid) AS definition,x.indisvalid AS valid FROM pg_index x JOIN pg_class i ON i.oid=x.indexrelid JOIN pg_class c ON c.oid=x.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' AND NOT EXISTS(SELECT 1 FROM pg_constraint k WHERE k.conindid=x.indexrelid AND k.contype IN ('p','u','x')) ORDER BY 1,2")
+    let rows = sqlx::query("SELECT c.relname::text AS table_name,i.relname::text AS name,pg_get_indexdef(x.indexrelid) AS definition,x.indisvalid AS valid,x.indisunique AS unique,x.indexprs IS NOT NULL AS expression,x.indpred IS NOT NULL AS partial FROM pg_index x JOIN pg_class i ON i.oid=x.indexrelid JOIN pg_class c ON c.oid=x.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' AND NOT EXISTS(SELECT 1 FROM pg_constraint k WHERE k.conindid=x.indexrelid AND k.contype IN ('p','u','x')) ORDER BY 1,2")
         .bind(namespace).fetch_all(&mut **tx).await?;
     for row in &rows {
         let definition: String = row.try_get("definition")?;
@@ -1015,6 +1018,9 @@ async fn fingerprint_schema(
                 table: row.try_get("table_name")?,
                 definition: strip_schema_qualification(&definition, namespace),
                 valid: row.try_get("valid")?,
+                unique: row.try_get("unique")?,
+                expression: row.try_get("expression")?,
+                partial: row.try_get("partial")?,
             },
         );
     }
@@ -1466,6 +1472,9 @@ fn sequence_differences(expected: &SequenceDefinition, found: &SequenceDefinitio
 /// reported. A release constraint must be validated in the source unless
 /// it is one of `NOT_VALID_EXEMPT`. Extra columns must allow native inserts
 /// to omit them: nullable, defaulted, identity or generated columns may stay.
+/// Extra unique, expression or partial indexes on release tables are drift:
+/// they can constrain or evaluate native writes, even when not query-valid.
+/// Nonunique plain column indexes remain tolerated extras.
 /// A sequence is compared by its structure only: the value it has reached
 /// is the source's data.
 fn compare_fingerprints(
@@ -1609,9 +1618,24 @@ fn compare_fingerprints(
     }
     for (name, index) in &found.indexes {
         if expected.tables.contains_key(&index.table) && !expected.indexes.contains_key(name) {
-            comparison
-                .extra
-                .push(format!("index {name} on {}", index.table));
+            let effects: Vec<_> = [
+                (index.unique, "unique"),
+                (index.expression, "expression"),
+                (index.partial, "partial"),
+            ]
+            .into_iter()
+            .filter_map(|(present, effect)| present.then_some(effect))
+            .collect();
+            if effects.is_empty() {
+                comparison
+                    .extra
+                    .push(format!("index {name} on {}", index.table));
+            } else {
+                comparison.drift.push(format!(
+                    "index {name} on {} is an extra {} index; it can constrain or evaluate native writes",
+                    index.table, effects.join(", ")
+                ));
+            }
         }
     }
     for ((table, name), trigger) in &expected.triggers {
@@ -3053,6 +3077,66 @@ mod tests {
     }
 
     #[test]
+    fn extra_indexes_that_can_constrain_or_evaluate_native_writes_are_drift() {
+        let mut expected = SchemaFingerprint::default();
+        expected.tables.insert(
+            "qbit_share_ledger".into(),
+            table(&[("writer_epoch", column("bigint", true))]),
+        );
+        let mut found = SchemaFingerprint {
+            tables: expected.tables.clone(),
+            ..SchemaFingerprint::default()
+        };
+        for (unique, expression, partial, reason) in [
+            (true, false, false, "unique"),
+            (false, true, false, "expression"),
+            (false, false, true, "partial"),
+            (true, true, true, "unique, expression, partial"),
+        ] {
+            for valid in [true, false] {
+                found.indexes.insert(
+                    "operator_epoch_idx".into(),
+                    IndexDefinition {
+                        table: "qbit_share_ledger".into(),
+                        definition: "operator index".into(),
+                        valid,
+                        unique,
+                        expression,
+                        partial,
+                    },
+                );
+                let comparison = compare_fingerprints(&expected, &found);
+                assert_eq!(comparison.drift, vec![format!(
+                    "index operator_epoch_idx on qbit_share_ledger is an extra {reason} index; it can constrain or evaluate native writes"
+                )]);
+                assert!(comparison.extra.is_empty(), "{:?}", comparison.extra);
+
+                // The release's own indexes still compare by definition.
+                expected.indexes = found.indexes.clone();
+                found.indexes.get_mut("operator_epoch_idx").unwrap().valid = true;
+                assert!(compare_fingerprints(&expected, &found).drift.is_empty());
+                expected.indexes.clear();
+
+                // Indexes on an operator-owned table do not govern native writes.
+                found.indexes.get_mut("operator_epoch_idx").unwrap().table =
+                    "operator_notes".into();
+                assert!(compare_fingerprints(&expected, &found).drift.is_empty());
+            }
+        }
+        let index = found.indexes.get_mut("operator_epoch_idx").unwrap();
+        index.table = "qbit_share_ledger".into();
+        index.unique = false;
+        index.expression = false;
+        index.partial = false;
+        let comparison = compare_fingerprints(&expected, &found);
+        assert!(comparison.drift.is_empty());
+        assert_eq!(
+            comparison.extra,
+            vec!["index operator_epoch_idx on qbit_share_ledger"]
+        );
+    }
+
+    #[test]
     fn comparison_refuses_missing_or_different_and_tolerates_extra() {
         let mut expected = SchemaFingerprint::default();
         expected.tables.insert(
@@ -3073,6 +3157,9 @@ mod tests {
                 table: "t".into(),
                 definition: "CREATE INDEX t_b_idx ON t USING btree (b)".into(),
                 valid: true,
+                unique: false,
+                expression: false,
+                partial: false,
             },
         );
         let mut found = SchemaFingerprint::default();
@@ -3100,6 +3187,9 @@ mod tests {
                 table: "t".into(),
                 definition: "CREATE INDEX t_b_idx ON t USING btree (b)".into(),
                 valid: true,
+                unique: false,
+                expression: false,
+                partial: false,
             },
         );
         found.indexes.insert(
@@ -3108,6 +3198,9 @@ mod tests {
                 table: "t".into(),
                 definition: "CREATE INDEX t_extra_idx ON t USING btree (extra)".into(),
                 valid: true,
+                unique: false,
+                expression: false,
+                partial: false,
             },
         );
         let comparison = compare_fingerprints(&expected, &found);
@@ -3211,6 +3304,9 @@ mod tests {
                     "CREATE INDEX qbit_pool_blocks_maturity_idx ON qbit_pool_blocks USING btree (a)"
                         .into(),
                 valid: true,
+                unique: false,
+                expression: false,
+                partial: false,
             },
         );
         expected.triggers.insert(
@@ -3322,6 +3418,9 @@ mod tests {
                 table: "operator_notes".into(),
                 definition: "CREATE INDEX qbit_audit_publication_sequence_seq ON operator_notes USING btree (note)".into(),
                 valid: true,
+                unique: false,
+                expression: false,
+                partial: false,
             },
         );
         assert_eq!(
@@ -3350,6 +3449,9 @@ mod tests {
                 table: "qbit_block_candidate_outbox".into(),
                 definition: "CREATE INDEX qbit_prism_candidate_claim_idx ON qbit_block_candidate_outbox USING btree (next_attempt_at)".into(),
                 valid: true,
+                unique: false,
+                expression: false,
+                partial: false,
             },
         );
         reserved.objects.other_relations.insert(
@@ -3376,6 +3478,9 @@ mod tests {
                     "CREATE INDEX qbit_prism_session_sequence ON operator_notes USING btree (note)"
                         .into(),
                 valid: true,
+                unique: false,
+                expression: false,
+                partial: false,
             },
         );
         found.other_relations.insert(
@@ -3394,6 +3499,9 @@ mod tests {
                     "CREATE INDEX qbit_prism_jobs_pkey ON operator_notes USING btree (note_id)"
                         .into(),
                 valid: true,
+                unique: false,
+                expression: false,
+                partial: false,
             },
         );
         assert_eq!(
@@ -4028,6 +4136,9 @@ mod tests {
                 table: "qbit_prism_jobs".into(),
                 definition: "CREATE INDEX qbit_prism_jobs_expiry_idx ON qbit_prism_jobs USING btree (expires_at)".into(),
                 valid: true,
+                unique: false,
+                expression: false,
+                partial: false,
             },
         );
         native.triggers.insert(

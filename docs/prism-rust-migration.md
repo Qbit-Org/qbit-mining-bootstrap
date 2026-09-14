@@ -240,9 +240,15 @@ enforcement state. Constraints on the operator's own tables are kept.
 An extra `NOT NULL` column on a release table without a default, identity
 or generated expression is also drift: native inserts omit it and would
 fail. Nullable, defaulted, identity and generated extra columns remain
-accepted. These columns and extra tables, indexes, functions and sequences
-are kept and logged at warning level. A missing or different object refuses
-the migration:
+accepted. Extra unique, expression or partial indexes on release tables are
+drift too: a unique index on `((1)) WHERE writer_epoch = 0` permits legacy
+rows but rejects the second native share, and expressions or predicates
+can fail when evaluated for native writes. Migration names the index and
+refuses it even if it is not valid for queries. Nonunique indexes on plain
+columns without a predicate remain accepted, as do indexes on the operator's
+own tables. These columns and extra tables, accepted indexes, functions and
+sequences are kept and logged at warning level. A missing or different object
+refuses the migration:
 
 ```
 refusing to migrate a drifted 001 source: after 001_share_ledger.sql ran, the database does not

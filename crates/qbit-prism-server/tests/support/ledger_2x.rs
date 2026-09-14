@@ -1600,6 +1600,120 @@ async fn extra_constraint_on_a_release_table_is_refused_naming_it_and_rolls_back
     Ok(())
 }
 
+/// Extra unique keys, expressions and predicates can accept legacy rows
+/// while rejecting native epoch-zero writes. Refusal preserves the source;
+/// plain column indexes and indexes on the operator's own tables survive.
+#[tokio::test]
+async fn extra_write_affecting_index_is_refused_naming_it_and_rolls_back() -> Result<()> {
+    for state in [SourceState::Pre258, SourceState::Applied258] {
+        for (ddl, reason, unique) in [
+            (
+                "CREATE UNIQUE INDEX operator_native_epoch ON qbit_share_ledger ((1)) WHERE writer_epoch = 0",
+                "unique, expression, partial",
+                true,
+            ),
+            (
+                "CREATE UNIQUE INDEX operator_native_epoch ON qbit_share_ledger (writer_epoch)",
+                "unique",
+                true,
+            ),
+            (
+                "CREATE INDEX operator_native_epoch ON qbit_share_ledger ((1 / writer_epoch))",
+                "expression",
+                false,
+            ),
+            (
+                "CREATE INDEX operator_native_epoch ON qbit_share_ledger (miner_id) WHERE 1 / writer_epoch > 0",
+                "partial",
+                false,
+            ),
+        ] {
+            let Some(db) = Database::open().await? else {
+                return Ok(());
+            };
+            let pool = PgPool::connect(&db.url).await?;
+            apply_frozen_2x_schema(&pool, state).await?;
+            insert_share_as_writer(&pool, "legacy:1", 1).await?;
+            sqlx::raw_sql(ddl).execute(&pool).await?;
+            sqlx::raw_sql("CREATE INDEX operator_miner_idx ON qbit_share_ledger (miner_id); CREATE TABLE operator_notes(note text NOT NULL); CREATE UNIQUE INDEX operator_notes_idx ON operator_notes ((lower(note))) WHERE note <> ''")
+                .execute(&pool).await?;
+            if unique {
+                insert_share_as_writer(&pool, "native:probe", 0).await?;
+            }
+            let refused = insert_share_as_writer(&pool, "native:refused", 0)
+                .await
+                .err()
+                .context("the extra index accepted the incompatible native write")?
+                .to_string();
+            assert!(
+                refused.contains(if unique { "duplicate key" } else { "division by zero" }),
+                "{refused}"
+            );
+            let objects = schema_objects(&pool).await?;
+            let rows: Vec<Value> = sqlx::query_scalar(
+                "SELECT to_jsonb(s) FROM qbit_share_ledger s ORDER BY share_seq",
+            )
+            .fetch_all(&pool)
+            .await?;
+            let definition: String = sqlx::query_scalar(
+                "SELECT pg_get_indexdef('operator_native_epoch'::regclass)",
+            )
+            .fetch_one(&pool)
+            .await?;
+            let error = db
+                .ledger("a")
+                .await
+                .err()
+                .context("migration accepted an extra index that rejects native writes")?
+                .to_string();
+            assert!(error.contains("refusing to migrate a drifted 001 source"), "{error}");
+            assert!(error.contains("1 object(s) differ"), "{error}");
+            assert!(error.contains(&format!(
+                "index operator_native_epoch on qbit_share_ledger is an extra {reason} index; it can constrain or evaluate native writes"
+            )), "{error}");
+            assert!(error.contains("Nothing was changed"), "{error}");
+            assert!(!error.contains("operator_notes"), "{error}");
+            assert!(!error.contains("operator_miner_idx"), "{error}");
+            assert!(native_tables_absent(&pool).await?, "refusal ran native DDL");
+            assert_eq!(schema_objects(&pool).await?, objects);
+            assert_eq!(
+                sqlx::query_scalar::<_, Value>(
+                    "SELECT to_jsonb(s) FROM qbit_share_ledger s ORDER BY share_seq"
+                ).fetch_all(&pool).await?,
+                rows
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, String>(
+                    "SELECT pg_get_indexdef('operator_native_epoch'::regclass)"
+                ).fetch_one(&pool).await?,
+                definition
+            );
+
+            // Only the operator removes the index; the migrator never does.
+            sqlx::raw_sql("DROP INDEX operator_native_epoch")
+                .execute(&pool).await?;
+            let ledger = db.ledger("a").await?;
+            assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+            assert_eq!(
+                ledger.migration_source().await?.map(|s| s.source_state),
+                Some(state.as_str().to_owned())
+            );
+            exercise_native_writers(&ledger, 1, 6701).await?;
+            ledger.append(share(2), None).await?;
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM qbit_share_ledger WHERE writer_epoch = 0")
+                    .fetch_one(&pool).await?,
+                if unique { 3 } else { 2 }
+            );
+            assert!(sqlx::query_scalar::<_, bool>("SELECT to_regclass('operator_miner_idx') IS NOT NULL AND to_regclass('operator_notes_idx') IS NOT NULL")
+                .fetch_one(&pool).await?);
+            pool.close().await;
+            db.close(vec![ledger]).await?;
+        }
+    }
+    Ok(())
+}
+
 /// A backfilled required column has no value for an omitted native insert.
 /// Accept it only after the operator makes omission possible again.
 #[tokio::test]
