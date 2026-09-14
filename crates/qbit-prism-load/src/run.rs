@@ -300,10 +300,9 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     let observed_replication = cluster::detect_replication(&side).await?;
 
     // --- delay proxy ------------------------------------------------------
-    let upstream: std::net::SocketAddr = host_port(&ctx.direct_url)?
-        .parse()
-        .context("the database host:port is not a socket address")?;
-    let delay_proxy = proxy::DelayProxy::open(upstream).await?;
+    // The upstream is `host:port` as the URL wrote it; a hostname is resolved
+    // by the proxy, the same way the SQLx connections above accepted it.
+    let delay_proxy = proxy::DelayProxy::open(&host_port(&ctx.direct_url)?).await?;
     let proxied_url = rewrite_host(&ctx.direct_url, &delay_proxy.url_host())?;
     let direct_rtt = proxy::measure_select1_millis(&ctx.direct_url, 21)
         .await
@@ -736,6 +735,9 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     let proxy_block = json!({
         "kind": "in-harness tokio TCP proxy",
         "delay_semantics": proxy::DELAY_SEMANTICS,
+        "upstream": delay_proxy.upstream,
+        "upstream_resolved": delay_proxy.upstream_resolved.iter()
+            .map(ToString::to_string).collect::<Vec<_>>(),
         "configured_slow_database_delay_milliseconds": args.slow_db_delay_ms,
         "direct_select1_median_milliseconds": direct_rtt,
         "proxied_select1_median_milliseconds_at_zero_delay": proxied_rtt_idle,

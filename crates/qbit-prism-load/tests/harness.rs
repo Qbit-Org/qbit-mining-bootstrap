@@ -1612,6 +1612,57 @@ fn database_urls_are_rewritten_onto_the_delay_proxy() -> Result<()> {
     Ok(())
 }
 
+/// `--database-url postgresql://user@postgres.example/db` is an ordinary URL,
+/// and the SQLx connections before the proxy accept the name, so the proxy
+/// has to as well: it resolves the host once at entry, tries every address
+/// it names, and refuses a host that does not resolve with its name.
+#[tokio::test]
+async fn the_delay_proxy_accepts_a_hostname_upstream() -> Result<()> {
+    use qbit_prism_load::proxy::{resolve_upstream, DelayProxy};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let echo = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buffer = [0u8; 5];
+        socket.read_exact(&mut buffer).await.unwrap();
+        socket.write_all(&buffer).await.unwrap();
+    });
+
+    let upstream = format!("localhost:{port}");
+    let resolved = resolve_upstream(&upstream).await?;
+    assert!(
+        resolved.iter().all(|address| address.port() == port),
+        "every resolved address carries the port: {resolved:?}"
+    );
+    assert!(
+        upstream.parse::<std::net::SocketAddr>().is_err(),
+        "the name is exactly what a SocketAddr parse refuses"
+    );
+    let proxy = DelayProxy::open(&upstream).await?;
+    assert_eq!(proxy.upstream, upstream);
+    assert_eq!(proxy.upstream_resolved, resolved);
+    let mut client = tokio::net::TcpStream::connect(proxy.url_host()).await?;
+    client.write_all(b"hello").await?;
+    let mut reply = [0u8; 5];
+    client.read_exact(&mut reply).await?;
+    assert_eq!(&reply, b"hello", "bytes reach the named upstream and back");
+    echo.await?;
+
+    let numeric = resolve_upstream("127.0.0.1:5432").await?;
+    assert_eq!(numeric, vec!["127.0.0.1:5432".parse()?]);
+
+    // A label that is not a valid host name is refused by the resolver
+    // without a network query, so the test does not wait on search-domain
+    // retries the way a plausible-looking unknown name would.
+    let refused = match DelayProxy::open("-no-such-host-.invalid.:5432").await {
+        Ok(_) => panic!("an unresolvable host is refused at entry"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(refused.contains("-no-such-host-.invalid."), "{refused}");
+    Ok(())
+}
+
 #[test]
 fn phase_durations_render_without_precision_loss() {
     assert_eq!(artifact::millis_as_seconds(60_000), "60.000");

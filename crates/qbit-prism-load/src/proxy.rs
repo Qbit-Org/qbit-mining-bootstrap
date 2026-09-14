@@ -5,7 +5,7 @@
 //! delay twice. The delay is a shared atomic, flipped per phase; it is 0
 //! everywhere except the `slow_database` phase.
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use std::{
     net::SocketAddr,
     sync::{
@@ -26,6 +26,10 @@ pub const DELAY_SEMANTICS: &str =
 
 pub struct DelayProxy {
     pub local: SocketAddr,
+    /// The `host:port` the proxy was asked to front, as written.
+    pub upstream: String,
+    /// Every address that host resolved to, tried in order per connection.
+    pub upstream_resolved: Vec<SocketAddr>,
     delay_micros: Arc<AtomicU64>,
     connections: Arc<AtomicUsize>,
     task: JoinHandle<()>,
@@ -38,7 +42,12 @@ impl Drop for DelayProxy {
 }
 
 impl DelayProxy {
-    pub async fn open(upstream: SocketAddr) -> Result<Self> {
+    /// Front `upstream`, a `host:port` where the host may be a name. It is
+    /// resolved here, once, so an unresolvable database host is refused at
+    /// the entry boundary with its name rather than failing on the first
+    /// frontend connection (EP-VALIDATION).
+    pub async fn open(upstream: &str) -> Result<Self> {
+        let upstream_resolved = resolve_upstream(upstream).await?;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .context("bind database delay proxy")?;
@@ -48,6 +57,7 @@ impl DelayProxy {
         let task = {
             let delay = delay_micros.clone();
             let counter = connections.clone();
+            let targets = Arc::new(upstream_resolved.clone());
             tokio::spawn(async move {
                 loop {
                     let Ok((client, _)) = listener.accept().await else {
@@ -55,9 +65,14 @@ impl DelayProxy {
                     };
                     let delay = delay.clone();
                     let counter = counter.clone();
+                    let targets = targets.clone();
                     counter.fetch_add(1, Ordering::Relaxed);
                     tokio::spawn(async move {
-                        if let Ok(server) = TcpStream::connect(upstream).await {
+                        // Every resolved address is tried in order, as
+                        // `TcpStream::connect` does for a name, so a host
+                        // that resolves to both address families works
+                        // whichever one PostgreSQL listens on.
+                        if let Ok(server) = TcpStream::connect(targets.as_slice()).await {
                             let _ = client.set_nodelay(true);
                             let _ = server.set_nodelay(true);
                             pump(client, server, delay).await;
@@ -69,6 +84,8 @@ impl DelayProxy {
         };
         Ok(Self {
             local,
+            upstream: upstream.to_owned(),
+            upstream_resolved,
             delay_micros,
             connections,
             task,
@@ -91,6 +108,24 @@ impl DelayProxy {
     pub fn open_connections(&self) -> usize {
         self.connections.load(Ordering::Relaxed)
     }
+}
+
+/// Resolve a `host:port` to every address it names. A numeric address needs
+/// no lookup; a name goes through the system resolver, which is what the
+/// SQLx connections before the proxy already accepted.
+pub async fn resolve_upstream(upstream: &str) -> Result<Vec<SocketAddr>> {
+    if let Ok(address) = upstream.parse::<SocketAddr>() {
+        return Ok(vec![address]);
+    }
+    let resolved: Vec<SocketAddr> = tokio::net::lookup_host(upstream)
+        .await
+        .with_context(|| format!("the database host in {upstream:?} does not resolve"))?
+        .collect();
+    ensure!(
+        !resolved.is_empty(),
+        "the database host in {upstream:?} resolved to no address"
+    );
+    Ok(resolved)
 }
 
 async fn pump(client: TcpStream, server: TcpStream, delay: Arc<AtomicU64>) {

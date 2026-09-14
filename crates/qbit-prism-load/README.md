@@ -70,7 +70,7 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--allow-dirty-tree` | off | Run with modified tracked files; forces `artifact_kind: example` |
 | `--example-artifact` | off | Emit `artifact_kind: example` from a clean tree |
 | `--pg-bin-dir` | `QBIT_PRISM_LOAD_PG_BIN_DIR`, then `pg_config --bindir` | PostgreSQL server binaries. The harness keeps its own variable rather than reading one of the shared test-gate variables, which belong to the gate crate (#322) |
-| `--database-url` | none | Use an existing database; no standby is managed and the replication mode is detected, never assumed |
+| `--database-url` | none | Use an existing database; no standby is managed and the replication mode is detected, never assumed. The host may be a name: the delay proxy resolves it once at entry and records the addresses in the side report's `delay_proxy` block |
 | `--replication` | `async` | `async`, `sync` or `none` |
 | `--frontends` | 1 | 1, 2 or 4 |
 | `--sessions` | 100 | Stratum sessions, round-robin across the frontends |
