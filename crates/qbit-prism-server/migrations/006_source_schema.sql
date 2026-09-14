@@ -113,9 +113,10 @@ CREATE TABLE IF NOT EXISTS qbit_prism_migration_source (
 );
 
 -- Every native database declares its capabilities, so a process refuses a
--- database newer than itself at connect. A #258 source keeps its row at 2;
--- every other source declares the version 1 JSONB candidates native writers
--- produce. DO NOTHING keeps whatever the source declared. Nothing native
+-- database newer than itself at connect. Every migrated source declares the
+-- version 1 JSONB candidates native writers can process; a #258 source's
+-- former declaration of 2 is retained in qbit_prism_migration_source.
+-- The migrator validates and drains the source before this update. Nothing native
 -- removes the table or the row: a database at 6 without either is refused
 -- at connect, and before any DDL at migrate, rather than read as a legacy
 -- state.
@@ -126,7 +127,7 @@ CREATE TABLE IF NOT EXISTS qbit_prism_schema_capabilities (
 );
 INSERT INTO qbit_prism_schema_capabilities (capability, capability_value)
 VALUES ('candidate_storage_version', 1)
-ON CONFLICT (capability) DO NOTHING;
+ON CONFLICT (capability) DO UPDATE SET capability_value=EXCLUDED.capability_value;
 
 -- The claim lane decodes a candidate by its storage version. 002 added this
 -- column on a #258 source; every other source gets the same column with the

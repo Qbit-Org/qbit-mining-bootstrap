@@ -92,7 +92,7 @@ release definition:
 | pre-#258 (v2.0.0, v2.0.1) | `001_share_ledger.sql` only: no `qbit_prism_schema_capabilities`, no `002_candidate_bodies.sql` object | accept after the drain check |
 | #258 applied (v2.0.2) | `candidate_storage_version = 2` and every `002_candidate_bodies.sql` object present | accept after the drain check |
 | partial 002 | some 002 objects or the capability row, but not all (v2.0.2 applies 001 and 002 as two script calls, and a restart between them leaves this) | refuse, naming the missing object; finish 002 with the v2.0.2 release (`PRISM_POSTGRES_INIT_SCHEMA=1`) or restore the backup |
-| newer | `candidate_storage_version > 2`, or a capability this release does not know | refuse before any DDL; a newer PRISM release wrote the database. A database that is already native gets the same check first, before 004, 005, 006 or 009 run, so `migrate` never alters a database a newer release wrote |
+| newer | `candidate_storage_version > 2`, or a capability this release does not know | refuse before any DDL; a newer PRISM release wrote the database. A native database also gets a capability check before later DDL; after migration 6, its candidate version must be 1, the format the native claim lane can process |
 | native collision | a table, sequence, index, trigger, function or column that a native migration (`002_multi_instance.sql` to `009_wrap_safe_sessions.sql`) creates and the `2.x.x` release does not is already present, in an empty database or a `2.x.x` one, or a reserved relation name is held by a relation of another kind (a view, an index backing an operator's constraint): a leftover of an earlier native attempt, a selective restore, or something installed by hand | refuse before any DDL, naming the objects; nothing is dropped; restore the full pre-migration backup, or check what the objects hold and remove them, then migrate again |
 | drifted 001 | a 001 (or 002) object whose definition, after 001 has run, differs from the frozen release: a table, column, index, sequence or named constraint that 001's `IF NOT EXISTS` skipped, or any 002 object, with a dropped constraint, a changed type, nullability or default, a different index definition, an altered sequence (a lowered maximum, a different increment), a table or sequence made `UNLOGGED` (or temporary), a release constraint left `NOT VALID` (other than the pinned `qbit_share_ledger_credit_policy_check`), a release foreign key whose enforcement triggers were disabled, row-level security enabled or forced on a release table or a policy on one, a child table created with `INHERITS` on a release table or a release table made a child or partition of another, a replaced function body, a disabled trigger or a trigger the release does not create on a release table | refuse transactionally, naming each object and what differs; the migration rolls back and the database is unchanged; restore the pre-migration backup or bring the database to the release schema with the `2.x.x` release, then migrate again |
 
@@ -286,9 +286,12 @@ migration record is unchanged by this check: `pre_258` still means the
 database is equivalent to the v2.0.1 release schema.
 
 `3.x.x` never applies `002_candidate_bodies.sql` and does not import #258's
-chunked candidate bodies. On a #258 source it keeps the 002 tables, triggers
-and the capability row untouched; native writers store version 1 JSONB
-candidates, which 002's dual-format rule accepts.
+chunked candidate bodies. On a #258 source it keeps the 002 tables and
+triggers; native writers store version 1 JSONB candidates, which 002's
+dual-format rule accepts. After validating and draining the source, 006
+records its former capability value of 2 in the source metadata and changes
+the live declaration to 1. Version 2 is accepted as legacy source evidence,
+never as native runtime support.
 
 **#258's rollback floor.** Once a `storage_version = 2` outbox row exists, a
 writer that predates v2.0.2 must not run against the database (see the header
@@ -383,8 +386,8 @@ The capability rows of that database are checked before the drain check, so
 one that declares `candidate_storage_version > 2` or a capability this
 release does not know is refused before any DDL, the "newer" verdict of the
 table above, and nothing is recorded for it. A database already at 6 gets
-the same check before 008 and 009. The remedy is the startup gate's: upgrade the
-server.
+the runtime check before 008 and 009: any candidate version above 1 is
+unsupported, even 2. The remedy is the startup gate's: upgrade the server.
 
 ```
 refusing to migrate a native database at schema migrations 2, 3, 4, 5, 8, 9 before any DDL: database declares
@@ -422,7 +425,10 @@ the migrator never invents provenance for an already-migrated database.
 reserved by another workstream, so 008 or 009 being present never stands in
 for a missing 006. A database missing any of them is refused at connect, naming
 the gap, before any accounting statement runs, and so is one declaring a
-capability or `candidate_storage_version` this release does not understand.
+capability or a runtime `candidate_storage_version` other than 1. A native
+version-2 declaration is refused before the server can claim and park a
+newer writer's candidate; a #258 migration records its source version of 2
+separately and declares runtime version 1 within the migration transaction.
 A database at 6 must declare its capabilities: 006 created
 `qbit_prism_schema_capabilities` and its `candidate_storage_version` row and
 nothing native removes them, so a start refuses a database missing either,

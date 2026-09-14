@@ -487,7 +487,7 @@ async fn frozen_258_source_refuses_pending_v1_and_v2_rows_and_migrates_terminal_
 
     let ledger = db.ledger("a").await?;
     assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
-    assert_eq!(capability(&pool).await?, Some(2), "capability row lost");
+    assert_eq!(capability(&pool).await?, Some(1), "native runtime format");
     let source = ledger
         .migration_source()
         .await?
@@ -2595,6 +2595,74 @@ async fn migrate_role_without_create_on_the_database_is_told_the_grant_it_needs(
 }
 
 #[tokio::test]
+async fn native_candidate_version_two_is_refused_without_claiming_or_migrating() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    apply_frozen_2x_schema(&pool, SourceState::Applied258).await?;
+    let ledger = db.ledger("cutover").await?;
+    let source = ledger.migration_source().await?.context("source record")?;
+    assert_eq!(source.candidate_storage_version, Some(2));
+    let cutover_capability = capability(&pool).await?;
+    // A newer native writer declares and produces version 2. This binary
+    // must refuse startup before it can claim and park that writer's block.
+    sqlx::query("UPDATE qbit_prism_schema_capabilities SET capability_value=2")
+        .execute(&pool)
+        .await?;
+    let hash = legacy_hash(0x77);
+    insert_v2_pending(&pool, &hash).await?;
+    let rows: Vec<Value> =
+        sqlx::query_scalar("SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o")
+            .fetch_all(&pool)
+            .await?;
+    for initialize in [false, true] {
+        let error = Ledger::connect(&db.url, "old-binary".into(), 8, initialize)
+            .await
+            .err()
+            .context("startup accepted unsupported runtime candidate version 2")?
+            .to_string();
+        assert!(error.contains("candidate_storage_version = 2"), "{error}");
+        assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    }
+    assert_eq!(cutover_capability, Some(1));
+    undo_009(&pool).await?;
+    let objects = schema_objects(&pool).await?;
+    let error = db
+        .ledger("old-binary")
+        .await
+        .err()
+        .context("migration accepted unsupported runtime candidate version 2")?
+        .to_string();
+    assert!(error.contains("candidate_storage_version = 2"), "{error}");
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 8]);
+    assert_eq!(schema_objects(&pool).await?, objects);
+    assert_eq!(capability(&pool).await?, Some(2));
+    assert_eq!(
+        sqlx::query_scalar::<_, Value>("SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o")
+            .fetch_all(&pool)
+            .await?,
+        rows
+    );
+    assert_eq!(
+        parked_row(&pool, &hash).await?,
+        (None, None, false, 0, "pending".into())
+    );
+    // Simulate the newer writer completing its candidate before an operator
+    // restores the supported runtime declaration. Historical source stays 2.
+    drain_2x_row(&pool, &hash, true).await?;
+    sqlx::query("UPDATE qbit_prism_schema_capabilities SET capability_value=1")
+        .execute(&pool)
+        .await?;
+    let migrated = db.ledger("old-binary").await?;
+    assert_eq!(migrated.migration_source().await?, Some(source));
+    assert_eq!(capability(&pool).await?, Some(1));
+    exercise_native_writers(&migrated, 1, 6401).await?;
+    pool.close().await;
+    db.close(vec![ledger, migrated]).await
+}
+
+#[tokio::test]
 async fn native_capabilities_with_row_level_security_are_refused_before_writes() -> Result<()> {
     let Some(db) = Database::open().await? else {
         return Ok(());
@@ -2733,7 +2801,7 @@ async fn newer_storage_version_or_capability_is_refused_at_migrate_and_at_connec
             .to_string();
         assert!(error.contains("candidate_storage_version = 3"), "{error}");
     }
-    sqlx::raw_sql("UPDATE qbit_prism_schema_capabilities SET capability_value=2; INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('sealed_share_pages',1)")
+    sqlx::raw_sql("UPDATE qbit_prism_schema_capabilities SET capability_value=1; INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('sealed_share_pages',1)")
         .execute(&pool).await?;
     let error = Ledger::connect(&db.url, "b".into(), 8, false)
         .await
@@ -3137,10 +3205,9 @@ async fn unknown_storage_version_row_is_parked_and_not_reclaimed_at_lease_expiry
 /// 5 and 9, before migration 006 existed, on a 2.x.x source of the given
 /// state. Built faithfully: the frozen release files, then the current
 /// migration, then 006 undone. The version 6 row is deleted and `qbit_prism_migration_source`
-/// is dropped. On a #258 source 006's other statements were no-ops, because
-/// 002 had already added `storage_version` and the capability row and 006's
-/// `ADD COLUMN IF NOT EXISTS` and `ON CONFLICT DO NOTHING` left them alone,
-/// so the 002 objects and the capability row stay exactly as 002 made them.
+/// is dropped. On a #258 source 002 had already added `storage_version` and
+/// the capability row, so restore the source declaration to 2 and retain
+/// the 002 objects exactly as the release made them.
 /// On a pre-#258 source 006 created the column and the capability table
 /// itself, so both are dropped again: that build saw an outbox without
 /// `storage_version`.
@@ -3150,6 +3217,9 @@ async fn undo_006(pool: &PgPool, state: SourceState) -> Result<()> {
         .execute(pool).await?;
     if state == SourceState::Pre258 {
         sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox DROP COLUMN storage_version; DROP TABLE qbit_prism_schema_capabilities")
+            .execute(pool).await?;
+    } else {
+        sqlx::query("UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='candidate_storage_version'")
             .execute(pool).await?;
     }
     assert_eq!(schema_versions(pool).await?, [2, 3, 4, 5, 8, 9]);
@@ -3230,7 +3300,7 @@ async fn pre_006_native_schema_on_a_258_source_refuses_a_pending_v2_row_before_a
     // The highest migration the earlier build had recorded: 009.
     assert_eq!(source.prior_schema_version, 9);
     assert_eq!(source.candidate_storage_version, Some(2));
-    assert_eq!(capability(&pool).await?, Some(2));
+    assert_eq!(capability(&pool).await?, Some(1));
     exercise_native_writers(&migrated, 1, 5501).await?;
     pool.close().await;
     db.close(vec![earlier, migrated]).await
@@ -3328,7 +3398,7 @@ async fn pre_006_native_schema_declaring_a_newer_capability_is_refused_before_an
     assert_eq!(source.source_state, "native");
     assert_eq!(source.prior_schema_version, 9);
     assert_eq!(source.candidate_storage_version, Some(2));
-    assert_eq!(capability(&pool).await?, Some(2));
+    assert_eq!(capability(&pool).await?, Some(1));
     exercise_native_writers(&migrated, 1, 6001).await?;
     pool.close().await;
     db.close(vec![earlier, migrated]).await
@@ -3624,7 +3694,7 @@ async fn pre_006_native_schema_with_only_native_pending_candidates_migrates_and_
             _ => None,
         };
         assert_eq!(source.candidate_storage_version, declared);
-        assert_eq!(capability(&pool).await?, Some(declared.unwrap_or(1)));
+        assert_eq!(capability(&pool).await?, Some(1));
         let claim = migrated
             .claim_candidate(60)
             .await?

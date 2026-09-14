@@ -33,14 +33,12 @@ pub fn schema_version_list(versions: &[i32]) -> String {
         .join(", ")
 }
 
-/// Capability rows this binary understands, with the highest value each may
-/// carry. #258's `002_candidate_bodies.sql` declares
-/// `candidate_storage_version = 2`; migration 006 declares 1 on every other
-/// source. Any other row or value is a database newer than this binary,
-/// refused before any DDL on every migrate path (`classify_source` on a
-/// 2.x.x source, `refuse_newer_native_database` on a native one) and again
-/// at connect by `require_known_capabilities`.
-const KNOWN_CAPABILITIES: &[(&str, i32)] = &[("candidate_storage_version", 2)];
+/// Legacy source formats the cutover can validate and drain. Version 2 is
+/// historical evidence from #258, never native runtime support.
+const SOURCE_CAPABILITIES: &[(&str, i32)] = &[("candidate_storage_version", 2)];
+/// Formats the native claim lane can process. Migration 006 records the
+/// old declaration as provenance and declares this runtime format atomically.
+const NATIVE_CAPABILITIES: &[(&str, i32)] = &[("candidate_storage_version", 1)];
 
 /// How many blocking outbox rows a drain refusal names.
 const BLOCKING_ROWS_NAMED: usize = 16;
@@ -456,7 +454,7 @@ pub(super) async fn inspect_source_schema(
 
 pub(super) fn classify_source(inventory: &SourceInventory) -> SourceVerdict {
     if let Some(rows) = &inventory.capabilities {
-        if let Err(error) = refuse_unknown_capabilities(rows) {
+        if let Err(error) = refuse_unknown_capabilities(rows, SOURCE_CAPABILITIES) {
             return SourceVerdict::Newer(error.to_string());
         }
     }
@@ -499,9 +497,12 @@ where
 /// A capability this binary does not know, or a known one beyond the value
 /// it understands, means a newer PRISM release wrote the database. Refused
 /// before any DDL on every migrate path, and again at connect.
-pub(super) fn refuse_unknown_capabilities(rows: &[(String, i32)]) -> Result<()> {
+pub(super) fn refuse_unknown_capabilities(
+    rows: &[(String, i32)],
+    supported: &[(&str, i32)],
+) -> Result<()> {
     for (name, value) in rows {
-        match KNOWN_CAPABILITIES.iter().find(|(known, _)| known == name) {
+        match supported.iter().find(|(known, _)| known == name) {
             None => bail!("database declares capability {name} = {value}, which this server does not understand: a newer PRISM release wrote this database; upgrade the server before starting it here"),
             Some((_, max)) => ensure!(
                 (1..=*max).contains(value),
@@ -524,11 +525,11 @@ const DECLARED_CAPABILITY: &str = "candidate_storage_version";
 /// recorded.
 fn require_declared_capabilities(rows: Option<&[(String, i32)]>) -> Result<()> {
     let Some(rows) = rows else {
-        bail!("database is at schema migration 6 but has no qbit_prism_schema_capabilities: 006 created it and nothing native drops it, so the table was dropped or restored selectively and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every candidate row is known to be one this server or the 2.x.x release wrote, re-create the table and its {DECLARED_CAPABILITY} row from migrations/006_source_schema.sql (1; 2 for a #258 source), then start or migrate again");
+        bail!("database is at schema migration 6 but has no qbit_prism_schema_capabilities: 006 created it and nothing native drops it, so the table was dropped or restored selectively and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every pending candidate is known to use this server's version 1 format, re-create the table and its {DECLARED_CAPABILITY} row from migrations/006_source_schema.sql (1), then start or migrate again");
     };
     ensure!(
         rows.iter().any(|(name, _)| name == DECLARED_CAPABILITY),
-        "database is at schema migration 6 but qbit_prism_schema_capabilities has no {DECLARED_CAPABILITY} row: 006 declared it and nothing native deletes it, so the row was deleted and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every candidate row is known to be one this server or the 2.x.x release wrote, declare it again with INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('{DECLARED_CAPABILITY}',1) (2 for a #258 source), then start or migrate again"
+        "database is at schema migration 6 but qbit_prism_schema_capabilities has no {DECLARED_CAPABILITY} row: 006 declared it and nothing native deletes it, so the row was deleted and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every pending candidate is known to use this server's version 1 format, declare it again with INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('{DECLARED_CAPABILITY}',1), then start or migrate again"
     );
     Ok(())
 }
@@ -560,7 +561,12 @@ fn refuse_undeclared_native_database(versions: &[i32], inventory: &SourceInvento
 /// `versions` is the recorded migration set, named in the refusal.
 fn refuse_newer_native_database(versions: &[i32], inventory: &SourceInventory) -> Result<()> {
     if let Some(rows) = &inventory.capabilities {
-        if let Err(reason) = refuse_unknown_capabilities(rows) {
+        let supported = if versions.contains(&6) {
+            NATIVE_CAPABILITIES
+        } else {
+            SOURCE_CAPABILITIES
+        };
+        if let Err(reason) = refuse_unknown_capabilities(rows, supported) {
             bail!(
                 "refusing to migrate a native database at schema migrations {} before any DDL: {reason}",
                 schema_version_list(versions)
@@ -2484,13 +2490,13 @@ pub(super) async fn migrate_schema(
             .await?;
     }
     if !versions.contains(&6) {
-        // 006 declares version 1 for a database that declared nothing; the
-        // record keeps what the database declared before it ran, read with
-        // the inventory above.
+        // 006 declares native runtime version 1; the record keeps the source
+        // declaration from before cutover, read with the inventory above.
         let (state, capability) = source;
         sqlx::raw_sql(native_migration(6))
             .execute(&mut **tx)
             .await?;
+        require_known_capabilities(&mut **tx).await?;
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(6)")
             .execute(&mut **tx)
             .await?;
@@ -2575,18 +2581,22 @@ pub(super) async fn require_schema_version(pool: &PgPool) -> Result<()> {
 /// `require_schema_version` has established that 006 ran, so a missing
 /// table or row is a dropped or deleted declaration, never a legacy state;
 /// `migrate_schema` refused the same database before any DDL.
-pub(super) async fn require_known_capabilities(pool: &PgPool) -> Result<()> {
+pub(super) async fn require_known_capabilities<'e, E>(executor: E) -> Result<()>
+where
+    E: sqlx::Acquire<'e, Database = Postgres>,
+{
+    let mut connection = executor.acquire().await?;
     let declared: bool =
         sqlx::query_scalar("SELECT to_regclass('qbit_prism_schema_capabilities') IS NOT NULL")
-            .fetch_one(pool)
+            .fetch_one(&mut *connection)
             .await?;
     let rows = if declared {
-        Some(read_capabilities(pool).await?)
+        Some(read_capabilities(&mut *connection).await?)
     } else {
         None
     };
     require_declared_capabilities(rows.as_deref())?;
-    refuse_unknown_capabilities(rows.as_deref().unwrap_or_default())
+    refuse_unknown_capabilities(rows.as_deref().unwrap_or_default(), NATIVE_CAPABILITIES)
 }
 
 async fn read_migration_source<'e, E>(executor: E) -> Result<Option<MigrationSource>>
