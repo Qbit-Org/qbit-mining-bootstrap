@@ -12,7 +12,7 @@ shared local filesystem.
 | Accepted shares and proof identity | Permanent immutable PostgreSQL rows |
 | Blocks, payouts, carry-forward, maturity/reorg state | Permanent PostgreSQL accounting history |
 | Native audit share snapshots | Permanent range/count/anchor/digest metadata referencing immutable shares |
-| Native audit bodies | Non-share JSON plus snapshot reference in PostgreSQL |
+| Native audit bodies | Non-share JSON plus snapshot reference in PostgreSQL: the logical bundle minus its top-level `shares` and minus `reward_manifest.shares`, both rebuilt on read. Rows landed before 3.x.x #267 still hold `reward_manifest.shares` and stay readable as they are |
 | Imported legacy audits | Digest-checked canonical bytes (bytea) plus non-share metadata in PostgreSQL; an inline body survives only on inline-only rows; original backup retained |
 | CTV manifests, transactions, outcomes | Durable PostgreSQL recovery and audit state |
 | CPFP funding reservations and signed child packages | Durable recovery records; retain until reconciled |
@@ -22,10 +22,52 @@ shared local filesystem.
 | qbit/Bitcoin chain data | Separate node storage, sized independently |
 
 Accepted ledger rows cannot be updated, deleted, or truncated. Native audits
-reconstruct their exact share slice from those rows and verify the digest and
-canonical bundle hash. Overlapping windows therefore share ledger storage
-instead of embedding another copy of every share in every accepted-block audit.
-There is no supported archive/prune command for this immutable history.
+reconstruct their exact share slice from those rows, rebuild the counted-share
+window of `reward_manifest` from that slice (the stored header must match the
+rebuilt one field for field), and verify the snapshot digest and the canonical
+bundle hash of the whole body. Overlapping windows therefore share ledger
+storage instead of embedding another copy of every share in every
+accepted-block audit. There is no supported archive/prune command for this
+immutable history.
+
+### Native audit body size
+
+Measured with `cargo test -p qbit-prism-server --test audit_body_normalization
+-- --ignored measure_landing_body_and_settlement_lock_hold` (release build, one
+landed block, the synthetic five-recipient window of
+`tests/support/window_fixture.rs` at about 581 B per share):
+
+| Window (counted shares) | Stored `audit_bundle` as JSON text | Stored on disk, `pg_column_size` (TOAST-compressed) | `audit_body_byte_len` (full canonical artifact) |
+| ---: | ---: | ---: | ---: |
+| 20,000, landed before #267 | 10,901,855 B | 353,091 B | 22,250,397 B |
+| 20,000, landed since #267 | 12,949 B | 3,087 B | 22,250,397 B |
+| 100,000, landed before #267 | 54,401,879 B | 1,707,134 B | 111,190,422 B |
+| 100,000, landed since #267 | 12,972 B | 3,088 B | 111,190,422 B |
+
+Before #267 the stored body kept `reward_manifest.shares`, one record per
+counted share, so it grew by about 545 B of JSON text per share: the production
+window of 372,257 shares measured about 235 MB as one JSONB value (issue #267),
+88% of PostgreSQL's 268,435,455-byte limit, and the reduced-size JSONB ceiling
+gate projected 233 MB at 400,000 synthetic shares. The body landed since #267
+does not grow with the window. Its residual size is O(distinct miners and payout accounts),
+not a fixed bound: `reward_manifest.entitlements`, the payout policy manifest's
+accounts, `prior_balances`, and the CTV fanout manifests scale with the number
+of distinct payout programs, and the synthetic window above has five. A pool
+paying thousands of distinct programs stores proportionally more per block.
+The synthetic window also compresses about 27:1 in TOAST, so the on-disk column
+is optimistic for production data; the JSON text column is not.
+
+Two lengths describe one native audit and neither is derivable from the other:
+`audit_body_byte_len` is the length of the full canonical artifact, both share
+copies included, exactly as `/public/v1/artifacts/<sha256>` serves it;
+`sum(pg_column_size(audit_bundle))` (the storage query below) is the stored,
+compressed length of the non-share body.
+
+Serving a native audit rebuilds the window on every request: the range read,
+the counted-window fold, and the canonical hash. The same harness measured that
+read at 1.0 s for 20,000 and 5.4 s for 100,000 shares (release build, one
+request, no contention); budget CPU and the public read deadline for it, and
+for the concurrency limit those decodes share with imported audits.
 
 Legacy external body refs and v2 segment files remain readable by the offline
 Rust tools. During [migration](prism-rust-migration.md), import these into the
@@ -170,8 +212,11 @@ FROM pg_replication_slots;
 
 `referenced_shares_with_reuse` counts references across snapshots, not unique
 stored share rows. `n_live_tup` is an estimate and can lag; exact counts can be
-expensive on a large ledger. Full logical audit response size is also different
-from stored non-share JSON size.
+expensive on a large ledger. `stored_audit_json_bytes` is the compressed
+non-share body; the full logical audit each native row serves is
+`audit_body_byte_len` bytes, orders of magnitude larger, and
+`sum(audit_body_byte_len)` is the size of the artifacts the public route can be
+asked for, not of anything stored.
 
 Inspect data/WAL/legacy artifact filesystems and container image/log usage:
 
