@@ -995,6 +995,16 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
         }));
     }
 
+    // A landing is granted an attribution span on its pool tip change alone
+    // (resolve), whatever its outcome, and a span is what a window is measured
+    // over. Deriving these two from the `landed` tally instead let them
+    // disagree with the windows the section actually carries: an
+    // accepted_without_node_submission landing whose tip is present gets a full
+    // per-frontend table and a contribution to summaries, and if it were the
+    // only one the section would have said landings 0, windows_available false
+    // and "every attempt failed" beside real windows and a real p99.
+    // landing_outcomes.landed is still reported, one key away.
+    let with_windows = resolved.iter().filter(|entry| entry.span.is_some()).count();
     let landed = *counts.get("landed").unwrap_or(&0);
     let unattributed_rejections = rejections.len().saturating_sub(attributed_rejections);
 
@@ -1014,7 +1024,7 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
         .filter(|share| inputs.committed.contains(**share))
         .map(|share| (*share).to_owned())
         .collect();
-    let no_landing_reason = no_landing_reason(inputs, &resolved, landed);
+    let no_landing_reason = no_landing_reason(inputs, &resolved, with_windows);
     let combined_p99 = optional_summary(&overall.combined_duration, millis_summary)
         .and_then(|summary| summary.p99);
     let count_p99 =
@@ -1038,7 +1048,7 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
         "scheduled_landing_offsets_seconds": inputs.offsets,
         "landing_budget": inputs.landing_budget,
         "schedule_slots_over_budget": inputs.slots_over_budget,
-        "landings": landed,
+        "landings": with_windows,
         // Every observed change of payout_revision, which is what
         // definitions.bump calls a bump. The split between the ones a
         // landing's span owns and the rest is in bump_attribution, two keys
@@ -1046,7 +1056,7 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
         // headline number mean something other than its own definition.
         "bumps": revisions.changes.len(),
         "landing_attempts": resolved.len(),
-        "windows_available": landed > 0,
+        "windows_available": with_windows > 0,
         "reason": no_landing_reason,
         "revision_sampler": {
             "source": "SELECT payout_revision, clock_timestamp() FROM qbit_prism_cluster WHERE singleton",
@@ -1148,9 +1158,9 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
 fn no_landing_reason(
     inputs: &ReportInputs<'_>,
     resolved: &[Resolved<'_>],
-    landed: usize,
+    with_windows: usize,
 ) -> Option<String> {
-    if landed > 0 {
+    if with_windows > 0 {
         return None;
     }
     if inputs.landing_budget == 0 {
@@ -1220,8 +1230,15 @@ pub fn definitions() -> Value {
                     tip moved to it. The block hash is the part of the share identifier after the \
                     colon, which is the same display hash the node records, so the match is exact \
                     rather than by time.",
-        "landings": "the number of landings that landed. landing_attempts counts every slot the \
-                     budget paid for, whatever happened to it.",
+        "landings": "the number of landings that were granted an attribution span, which is the \
+                     number that have a window: resolve grants a span on the landing's own pool \
+                     tip change, whatever the outcome, so this is exactly what \
+                     windows_available, the per-frontend tables and the summaries are built \
+                     over. It is usually the same as landing_outcomes.landed, and differs when a \
+                     landing's tip moved but the node's submission record is missing \
+                     (accepted_without_node_submission); the outcome tally is reported apart so \
+                     the two can be read against each other. landing_attempts counts every slot \
+                     the budget paid for, whatever happened to it.",
         "span": "a landing's attribution span runs from its own pool tip change to the next \
                  landing's pool tip change, and for the last landing to the end of the phase \
                  (span_truncated_at_phase_end is then true). The spans tile the phase, so every \

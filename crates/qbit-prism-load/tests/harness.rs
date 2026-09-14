@@ -2316,6 +2316,121 @@ fn rejections_and_bumps_are_attributed_to_the_landing_they_follow() {
 }
 
 #[test]
+fn a_landing_with_a_window_is_counted_as_having_one() {
+    // A span -- and therefore a window -- is granted on the landing's own pool
+    // tip change, whatever the outcome. Here the tip moved but the node's
+    // submission record is missing, so the outcome is
+    // accepted_without_node_submission and the `landed` tally is 0, while the
+    // section really does carry a per-frontend window table and a summary.
+    // Keying landings and windows_available on the tally let the two disagree.
+    use qbit_prism_load::cadence;
+    let base = std::time::Instant::now();
+    let gaps = cadence::parse_gaps(cadence::DEFAULT_GAPS).expect("the default gaps parse");
+    let offsets = cadence::landing_offsets(&gaps, 240.0);
+    let landings = vec![cadence::Landing {
+        index: 0,
+        scheduled_offset_seconds: 5.0,
+        requested_monotonic: at(base, 5_000),
+        requested_wall: chrono::Utc::now(),
+        session: 0,
+        frontend: 0,
+    }];
+    let submits = vec![
+        dense_submit(
+            HASH_ZERO,
+            0,
+            0,
+            at(base, 5_100),
+            at(base, 5_200),
+            client::Outcome::Accepted,
+            true,
+        ),
+        dense_submit(
+            &"7".repeat(64),
+            0,
+            0,
+            at(base, 7_100),
+            at(base, 7_200),
+            pending(classify::NEW_TIP_WORK_PENDING),
+            false,
+        ),
+    ];
+    // The tip moved to the landing's block; the node kept no record of it.
+    let tip_changes = vec![pool_tip(HASH_ZERO, 104, at(base, 7_000))];
+    let revisions = cadence::RevisionSeries {
+        interval_ms: 25,
+        samples: 9_000,
+        errors: 0,
+        first_error: None,
+        baseline: Some(bump(4, None, base)),
+        changes: Vec::new(),
+    };
+    let frontends = vec![health(0)];
+    let session_frontend = vec![0usize];
+    let committed = std::collections::BTreeSet::new();
+    let document = cadence::build(&cadence::ReportInputs {
+        cadence: cadence::Cadence::Dense,
+        gaps: &gaps,
+        offsets: &offsets,
+        phase_seconds: 240,
+        phase_rate: 50.0,
+        phase_started: base,
+        phase_started_wall: chrono::Utc::now(),
+        phase_ended: at(base, 240_000),
+        phase_duration_millis: 240_000,
+        landing_budget: 12,
+        slots_over_budget: 0,
+        landings: &landings,
+        revisions: Some(&revisions),
+        submits: &submits,
+        notifies: &[],
+        tips: &[],
+        node_submissions: &[],
+        tip_changes: &tip_changes,
+        session_frontend: &session_frontend,
+        frontends: &frontends,
+        failures: &[],
+        committed: &committed,
+        aborted: None,
+    });
+
+    assert_eq!(
+        document["landing_outcomes"]["accepted_without_node_submission"],
+        json!(1)
+    );
+    assert_eq!(
+        document["landing_outcomes"]["landed"],
+        json!(0),
+        "the outcome tally is unchanged and still reported"
+    );
+    // The window really is there, so the section says so.
+    assert_eq!(
+        document["landing_records"][0]["frontends"][0]["tip_pending_window"]["count"],
+        json!(1)
+    );
+    assert_eq!(
+        document["landings"],
+        json!(1),
+        "a landing with a window is counted as having one"
+    );
+    assert_eq!(document["windows_available"], json!(true));
+    assert_eq!(
+        document["reason"],
+        Value::Null,
+        "there is a window, so there is no no-landing reason beside it"
+    );
+    assert!(
+        document["proposed_budget_for_issue_291"]["rejections_per_landing_per_frontend_p99"]
+            .is_number(),
+        "the budget is built from this landing's window, so the count must agree"
+    );
+    assert!(document["definitions"]["landings"]
+        .as_str()
+        .expect("the definition")
+        .contains("attribution span"));
+}
+
+#[test]
 fn a_sampler_that_failed_after_its_baseline_reports_itself_blind() {
     use qbit_prism_load::cadence::RevisionSeries;
     let base = std::time::Instant::now();

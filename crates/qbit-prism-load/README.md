@@ -276,6 +276,14 @@ found by name.
 - Every rebuild-pending rejection and every bump belongs to exactly one landing
   or to `unattributed`; the counts are reconciled in
   `rejection_attribution` and `bump_attribution`.
+- `landings` and `windows_available` count the landings that were granted an
+  attribution span, which is exactly the ones that have a window: a span is
+  granted on the landing's own pool tip change, whatever its outcome. That is
+  usually the same as `landing_outcomes.landed` and differs when a landing's
+  tip moved but the node kept no submission record
+  (`accepted_without_node_submission`). The outcome tally is reported beside
+  them, so "a window exists" and "a window is reported as existing" cannot
+  disagree.
 
 ### Running it
 
