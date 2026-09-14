@@ -67,6 +67,10 @@ docker() {
   case "$1 $3" in
     'inspect '*)
       stub_bump inspects
+      if [ "$STUB_INSPECT_FAULT_AT" = all ] || [ "$stub_value" = "$STUB_INSPECT_FAULT_AT" ]; then
+        printf '%s' "$STUB_INSPECT_OUTPUT"
+        return "$STUB_INSPECT_STATUS"
+      fi
       if [ "$stub_value" = "$STUB_SNIPPET_AT_INSPECT" ]; then
         eval "$STUB_SNIPPET"
       fi
@@ -255,6 +259,39 @@ class SoakCaptureTests(unittest.TestCase):
         self.assertEqual((gate.returncode, gate.stdout), (1, ""))
         self.assertIn("soak-invalid says why the run is invalid", gate.stderr)
         self.assertEqual(soak.gate_and_judge().returncode, 1)
+
+    def test_failed_or_empty_identity_probes_invalidate_the_run(self) -> None:
+        # A denied inspect must not pass by comparing empty identities, and
+        # matching output from a failed command is not a successful probe.
+        identity = "running 2026-09-13T00:00:00.000000000Z 0\n"
+        for shell in ("sh", "bash"):
+            for fault_at, probe, stage in (
+                ("all", 1, "at the start of the run"),
+                ("2", 2, "before the sample at 0"),
+                ("3", 3, "after the sample at 0"),
+                (str(2 * SAMPLES_24H), 2 * SAMPLES_24H, "before the sample at 86400"),
+                (str(2 * SAMPLES_24H + 1), 2 * SAMPLES_24H + 1, "after the sample at 86400"),
+            ):
+                for status, output in (("1", ""), ("0", ""), ("1", identity)):
+                    with self.subTest(shell=shell, fault_at=fault_at, status=status, output=output):
+                        soak = SoakRun(
+                            shell,
+                            STUB_INSPECT_FAULT_AT=fault_at,
+                            STUB_INSPECT_STATUS=status,
+                            STUB_INSPECT_OUTPUT=output,
+                        )
+                        result = soak.capture()
+                        self.assertEqual((result.returncode, soak.unexpected()), (1, ""))
+                        self.assertEqual(result.stderr, (soak.run / "soak-invalid").read_text())
+                        self.assertIn(f"could not read the coordinator process identity {stage}", result.stderr)
+                        self.assertEqual((soak.stub / "inspects").read_text(), f"{probe}\n")
+                        rss = soak.run / "soak-rss.csv"
+                        self.assertEqual(len(rss.read_text().splitlines()) if rss.exists() else 0, (probe - 1) // 2)
+                        self.assert_no_marker_at_all(soak)
+                        gate = soak.gate()
+                        self.assertEqual((gate.returncode, gate.stdout), (1, ""))
+                        self.assertIn("soak-invalid says why the run is invalid", gate.stderr)
+                        self.assertEqual(soak.gate_and_judge().returncode, 1)
 
     def test_final_sample_whose_reads_stall_for_an_hour_is_invalid(self) -> None:
         # Codex's case: the 289th sample's pre-read inspect (call 578) stalls

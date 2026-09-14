@@ -464,11 +464,14 @@ two-hour cutover soak, which reads its own criteria from the same registry.
      tee -a "$run/soak-invalid" >&2
    }
    capture() {
-     first=$(process)
      prev=
      prev_end=
      start=
      mkdir "$run" || return
+     if ! first=$(process) || [ -z "$first" ]; then
+       echo "$(date -u +%FT%TZ): soak invalid, could not read the coordinator process identity at the start of the run" | invalid
+       return 1
+     fi
      while true; do
        now=$(date +%s)
        if [ -n "$prev" ] && [ $((now - prev)) -gt 360 ]; then
@@ -477,7 +480,10 @@ two-hour cutover soak, which reads its own criteria from the same registry.
        fi
        prev=$now
        if [ -z "$start" ]; then start=$now; fi
-       current=$(process)
+       if ! current=$(process) || [ -z "$current" ]; then
+         echo "$(date -u +%FT%TZ): soak invalid, could not read the coordinator process identity before the sample at $now" | invalid
+         return 1
+       fi
        if ! echo "$now $current" >> "$run/soak-process.log"; then
          echo "$(date -u +%FT%TZ): soak invalid, could not append the reading at $now to $run/soak-process.log" | invalid
          return 1
@@ -540,7 +546,10 @@ two-hour cutover soak, which reads its own criteria from the same registry.
          echo "$(date -u +%FT%TZ): soak invalid, could not append the sample at $now to $run/soak-metrics.log" | invalid
          return 1
        }
-       after=$(process)
+       if ! after=$(process) || [ -z "$after" ]; then
+         echo "$(date -u +%FT%TZ): soak invalid, could not read the coordinator process identity after the sample at $now" | invalid
+         return 1
+       fi
        if [ "$after" != "$first" ]; then
          {
            echo "$(date -u +%FT%TZ): soak invalid, the coordinator changed while the sample at $now was read"
@@ -579,7 +588,10 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    same across a Compose restart, so `docker inspect` on `$c` is the right
    probe: `StartedAt` moves on any restart, `RestartCount` counts the ones the
    policy made, and `Status` catches a process that exited and was not
-   restarted. `soak-process.log` keeps one reading per sample, so a later
+   restarted. Every identity probe must exit successfully and return a
+   nonempty value; a failed or empty probe invalidates the run, including
+   the initial probe before any samples are taken.
+   `soak-process.log` keeps one reading per sample, so a later
    reader can show the run was one process. That reading is taken before the
    sample's two reads, so it catches a restart since the previous sample; a
    restart between the check and the reads would record the replacement's
