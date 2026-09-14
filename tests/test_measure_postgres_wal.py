@@ -12,7 +12,6 @@ class WalHelperTests(unittest.TestCase):
     def test_invalid_dsn_fails_truthfully(self):
         p=subprocess.run([sys.executable, str(HELPER),"--dsn","postgresql://invalid.invalid/x","--sql","select 1","--config","test"], text=True, capture_output=True, cwd=ROOT)
         self.assertNotEqual(p.returncode, 0)
-    def test_shape_declares_total_wal(self):
     @patch("scripts.measure_postgres_wal.psql", side_effect=["0/10", "ok", "0/30", "32"])
     def test_success_reports_positive_delta_and_scope(self, _):
         result = measure("postgresql://127.0.0.1/db", "select 1", "unit", "test")
