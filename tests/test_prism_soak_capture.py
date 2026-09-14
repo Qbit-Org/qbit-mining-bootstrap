@@ -125,7 +125,8 @@ docker() {
         printf 'qbit_prism_share_ack_seconds_count{result="accepted"} %s\n' "$stub_accepted"
       fi
       if [ -f "$STUB/ack-histogram" ]; then cat "$STUB/ack-histogram"; fi
-      printf 'qbit_prism_share_ack_seconds_count{result="rejected"} %s\n' "$((stub_value + 100))" ;;
+      printf 'qbit_prism_share_ack_seconds_count{result="rejected"} %s\n' "$((stub_value + 100))"
+      if [ "$stub_value" = "$STUB_METRICS_FAULT_AT" ]; then return 28; fi ;;
     *) echo "docker $*" >> "$STUB/unexpected"; return 1 ;;
   esac
 }
@@ -600,7 +601,7 @@ class SoakCaptureTests(unittest.TestCase):
         for shell in ("sh", "bash"):
             with self.subTest(shell=shell):
                 soak = SoakRun(shell)
-                result = soak.capture()
+                result = soak.capture(script="set -e\n" + CAPTURE_SCRIPT)
                 self.assertEqual((result.returncode, result.stderr, soak.unexpected()), (0, "", ""))
                 self.assertEqual(soak.entries(), sorted([*SNAPSHOTS, "soak-complete", *RUN_FILES]))
                 # Each snapshot was scraped once, at the sample due for it, not at the end.
@@ -727,6 +728,27 @@ class SoakCaptureTests(unittest.TestCase):
                     self.assertEqual((gate.returncode, gate.stdout), (1, ""))
                     self.assertIn("soak-invalid says why the run is invalid", gate.stderr)
                     self.assertEqual(soak.gate_and_judge().returncode, 1)
+
+    def test_failed_reads_record_invalid_marker_with_errexit(self) -> None:
+        # A failing assignment must reach capture's diagnostic path even
+        # when the operator's shell exits on unhandled command failures.
+        for shell in ("sh", "bash"):
+            for now in (0, 300):
+                for kind, fault, status, detail in (
+                    ("RSS", "STUB_RSS_FAULT_AT", 1, f"VmRSS:\t  {RSS_KB} kB"),
+                    ("metrics", "STUB_METRICS_FAULT_AT", 28, "x-prism-metrics-state: fresh"),
+                ):
+                    with self.subTest(shell=shell, now=now, kind=kind):
+                        soak = SoakRun(shell, **{fault: str(now)})
+                        result = soak.capture(script="set -e\n" + CAPTURE_SCRIPT)
+                        self.assertTrue((soak.run / "soak-invalid").is_file(), result)
+                        self.assertEqual((result.returncode, soak.unexpected()), (1, ""))
+                        self.assertEqual(result.stderr, (soak.run / "soak-invalid").read_text())
+                        self.assertIn(f"no {kind} sample at {now}", result.stderr)
+                        self.assertIn(f"docker exec exited {status}", result.stderr)
+                        self.assertIn(detail, result.stderr)
+                        self.assert_no_marker_at_all(soak)
+                        self.assertEqual(soak.gate_and_judge().returncode, 1)
 
     def test_final_sample_whose_reads_stall_for_an_hour_is_invalid(self) -> None:
         # Codex's case: the 289th sample's pre-read inspect (call 578) stalls

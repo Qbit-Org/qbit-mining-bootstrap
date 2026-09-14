@@ -521,8 +521,8 @@ two-hour cutover soak, which reads its own criteria from the same registry.
          } | invalid
          return 1
        fi
-       body=$(docker exec "$c" cat /proc/1/status)
-       rc=$?
+       rc=0
+       body=$(docker exec "$c" cat /proc/1/status) || rc=$?
        rss=$(printf '%s\n' "$body" | awk -v now="$now" '
          /^VmRSS:/ && $2 ~ /^[0-9]+$/ && $3 == "kB" { n++; row = now "," $2 * 1024 }
          END { if (n == 1) print row }')
@@ -541,8 +541,8 @@ two-hour cutover soak, which reads its own criteria from the same registry.
            } | invalid
            return 1 ;;
        esac
-       metrics=$(docker exec "$c" curl -sS --max-time 5 -D - http://127.0.0.1:3341/metrics)
-       rc=$?
+       rc=0
+       metrics=$(docker exec "$c" curl -sS --max-time 5 -D - http://127.0.0.1:3341/metrics) || rc=$?
        metrics=$(printf '%s\n' "$metrics" | tr -d '\r')
        why=$(printf '%s\n' "$metrics" | awk -v rc="$rc" -v previous="$prev_accepted" -v expected="$expected_authorized_clients" '
          function canonical(n) { sub(/^0+/, "", n); return n == "" ? "0" : n }
