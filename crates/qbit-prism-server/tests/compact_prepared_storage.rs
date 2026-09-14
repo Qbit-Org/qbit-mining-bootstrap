@@ -148,9 +148,15 @@ fn record(
     }
 }
 
-async fn seed_prefix(db: &Database) -> Result<()> {
-    sqlx::query("INSERT INTO qbit_share_ledger(share_seq,share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,accepted,writer_id,writer_epoch) VALUES(1,'test-share','a','a',decode(repeat('11',32),'hex'),1,100,100,'test-job',to_timestamp(1),1,to_timestamp(1),true,'storage-test',0)")
-        .execute(&db.ledger.pool).await?;
+async fn seed_share(db: &Database, sequence: i64) -> Result<()> {
+    sqlx::query("INSERT INTO qbit_share_ledger(share_seq,share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,accepted,writer_id,writer_epoch) VALUES($1,$2,'a','a',decode(repeat('11',32),'hex'),1,100,100,'test-job',to_timestamp(1),1,to_timestamp(1),true,'storage-test',0)")
+        .bind(sequence).bind(format!("test-share-{sequence}")).execute(&db.ledger.pool).await?;
+    Ok(())
+}
+
+async fn seed_endpoints(db: &Database) -> Result<()> {
+    seed_share(db, 1).await?;
+    seed_share(db, 3).await?;
     Ok(())
 }
 
@@ -165,7 +171,7 @@ async fn assert_empty(db: &Database) -> Result<()> {
 async fn empty_and_nonempty_prepared_records_round_trip_original_inputs_and_exact_blobs(
 ) -> Result<()> {
     run(|db| Box::pin(async move {
-        seed_prefix(db).await?;
+        seed_endpoints(db).await?;
         // JSON numbers must survive without f64 rounding or JSONB normalization.
         let exact = format!(r#"{{"height":101,"number":18446744073709551616001,"previousblockhash":"{}","rate":0.000000000000000000001,"transactions":[]}}"#, "ab".repeat(32));
         let value: Value = serde_json::from_str(&exact)?;
@@ -346,7 +352,7 @@ async fn immutable_blob_conflicts_and_wrong_balance_digest_roll_back_atomically(
 #[tokio::test]
 async fn compact_reader_and_retry_reject_payload_column_disagreement() -> Result<()> {
     run(|db| Box::pin(async move {
-        seed_prefix(db).await?;
+        seed_endpoints(db).await?;
         let template = PreparedTemplate::encode(&template())?;
         let record = record(&template, &[], true);
         let expires = db.expires().await?;
@@ -451,6 +457,9 @@ async fn old_inline_callers_remain_unchanged_and_only_explicit_legacy_rows_miss(
         let child = json!({"prepared_key": "legacy", "expires_at_ms": expires, "extranonce1": "00000001"});
         ensure!(db.ledger.save_issued_job("child", &child, 0, &parent, expires, PreparedDependency { key: "legacy", original_revision: 0, parent: &parent }, Some(&inline)).await? == IssuedJobSave::Saved);
         ensure!(db.ledger.job("child").await? == Some(child));
+        // The caller must follow the dependency link. Misrouting an issued ID
+        // into the typed prepared lookup must remain an error, never a miss.
+        ensure!(db.ledger.compact_prepared("child").await.unwrap_err().to_string().contains("invalid compact prepared payload"));
         ensure!(db.ledger.compact_prepared("missing").await?.is_none());
         let template = PreparedTemplate::encode(&template())?;
         let record = record(&template, &[], false);
@@ -542,8 +551,33 @@ async fn invalid_references_and_oversize_metadata_publish_nothing() -> Result<()
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("prepared share prefix missing"));
+                .contains("prepared share endpoint missing"));
             assert_empty(db).await?;
+            // A retained first endpoint does not prove an arbitrary last
+            // endpoint was ever captured. Reject before publishing any blob.
+            seed_share(db, 1).await?;
+            ensure!(db
+                .ledger
+                .save_compact_prepared("beyond-ledger", &nonempty, &template, &[], 0, expires)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("prepared share endpoint missing"));
+            assert_empty(db).await?;
+            seed_share(db, 3).await?;
+            ensure!(
+                db.ledger
+                    .save_compact_prepared("retained", &nonempty, &template, &[], 0, expires)
+                    .await?
+            );
+            ensure!(
+                db.ledger
+                    .compact_prepared("retained")
+                    .await?
+                    .unwrap()
+                    .record
+                    == nonempty
+            );
             Ok(())
         })
     })

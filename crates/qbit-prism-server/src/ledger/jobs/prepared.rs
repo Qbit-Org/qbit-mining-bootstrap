@@ -5,6 +5,12 @@
 //! candidates. Apply the coordinated migrations, then start compatible binaries.
 //! This is not a rolling old/new-writer contract. The generic job APIs keep
 //! their existing inline representation until the caller integration lands.
+//!
+//! Before enabling blob GC, its transaction must acquire SETTLEMENT_LOCK then
+//! ORDER_LOCK before inspecting references and deleting blobs. Prepared writers
+//! use the former and candidate balance writers the latter. Retain blobs named
+//! by live prepared jobs or any candidate still requiring reconstruction; job
+//! expiry or candidate lease expiry alone is not a shared-blob deletion rule.
 use super::*;
 use qbit_prism::{FanoutFeeRatePolicy, PayoutPolicy};
 
@@ -36,6 +42,8 @@ pub struct CompactPrepared {
     pub template_sha256: String,
     pub parent_hash: String,
     pub parent_of_tip: String,
+    /// Original stable-template work fingerprint from the coordinator; this
+    /// is distinct from the frontend/cluster configuration fingerprint fence.
     pub fingerprint: String,
     pub generation: u64,
     pub coinbase_suffix_hex: String,
@@ -148,6 +156,8 @@ impl Ledger {
     /// authorizes the original identity and supplies a separately revalidated
     /// current revision. Retry with the SAME absolute expiry; no retry renews it.
     /// No timeout is introduced here: the caller owns its operation deadline.
+    /// The caller supplies a prepared-dependency key, never an issued-job key;
+    /// storage does not define or authenticate the coordinator's key namespace.
     #[allow(clippy::too_many_arguments)]
     pub async fn save_compact_prepared(
         &self,
@@ -187,14 +197,17 @@ impl Ledger {
         }
         require_live(&mut tx, expires).await?;
         if let Some(range) = record.window.shares {
+            // Prefix-only pruning preserves both endpoints of a valid captured
+            // range. Also reject an invented last endpoint beyond the ledger;
+            // this is still no substitute for read_window's count/digest checks.
             ensure!(
                 probe_share_rows(
                     &mut tx,
                     range.first_share_seq as i64,
-                    range.first_share_seq as i64
+                    range.last_share_seq as i64
                 )
                 .await?,
-                "prepared share prefix missing"
+                "prepared share endpoint missing"
             );
         }
         put_template(&mut tx, template).await?;
@@ -232,6 +245,9 @@ impl Ledger {
     /// Only an absent/expired row or an explicitly legacy inline prepared row
     /// is a miss. Partial columns, unknown formats, bad digests and missing
     /// blobs are errors. No fallback to current balances or configuration.
+    /// Callers must validate and follow the issued row's prepared-dependency
+    /// link before this lookup, not route a client-supplied issued-job ID here.
+    /// An issued payload at this key is an error, not a legacy prepared miss.
     pub async fn compact_prepared(&self, key: &str) -> Result<Option<StoredCompactPrepared>> {
         let row = sqlx::query("SELECT j.parent_hash,j.payout_revision,j.payload,j.expires_at,j.window_anchor_ms,j.window_prior_balances_sha256,j.window_first_share_seq,j.window_last_share_seq,j.window_share_count,j.window_snapshot_sha256,j.template_sha256,t.template_bytes,b.balances FROM qbit_prism_jobs j LEFT JOIN qbit_prism_templates t ON t.template_sha256=j.template_sha256 LEFT JOIN qbit_prism_balance_snapshots b ON b.prior_balances_digest=j.window_prior_balances_sha256 WHERE j.job_id=$1 AND j.expires_at>clock_timestamp()")
             .bind(key).fetch_optional(&self.pool).await?;
