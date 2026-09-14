@@ -648,6 +648,14 @@ The side report repeats all of this under `honest_value_notes`.
 - **Unknown is never zero.** A measurement that could not be taken is `null`
   with a reason. A peak RSS from Linux's `VmHWM` is labelled a kernel peak; on
   macOS it is a sampled maximum, and on other platforms it is `null`.
+- **Time to usable work stops at the next tip.** `time_to_usable_work`
+  credits a session with work on a tip only for a `mining.notify` that
+  arrived while that tip was the node's tip; each entry records
+  `replaced_after_milliseconds`. A notify for the tip after the node had
+  moved on is a late job for a replaced tip, and counting it credited the
+  tip with a session whose work really arrived under the next one. The
+  dense section's per-frontend `time_to_new_tip_work` stops at the
+  landing's span for the same reason.
 - **The share difficulty is a premise, and a frontend that disagrees with it
   ends the run.** Every session checks each `mining.set_difficulty` against
   the configured share difficulty. A disagreement is not a finding to note

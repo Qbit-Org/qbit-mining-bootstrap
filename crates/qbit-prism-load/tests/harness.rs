@@ -4886,6 +4886,63 @@ fn new_tip_work_is_never_borrowed_from_the_next_landing() {
     );
 }
 
+/// The run-level time-to-usable-work search had the same unbounded shape as
+/// the dense section's new-tip search: the first sighting of a tip at or
+/// after the tip's stamp, however late. A session whose first job on tip X
+/// arrived after the node had already moved to tip Y was credited to X, at
+/// a latency that ran into Y's reign, and X's all-sessions figure grew with
+/// it. The search now stops at the next tip change on the node.
+#[test]
+fn usable_work_is_never_credited_after_the_tip_was_replaced() {
+    let base = std::time::Instant::now();
+    let changes = vec![
+        pool_tip(HASH_ZERO, 104, at(base, 1_000)),
+        pool_tip(HASH_ONE, 105, at(base, 11_000)),
+    ];
+    let mut collected = run::Collected::default();
+    let sighting = |session: usize, tip: &str, millis: u64| client::TipSighting {
+        session,
+        frontend: 0,
+        tip: tip.to_owned(),
+        at: at(base, millis),
+    };
+    // Session 0 saw tip 104 at 1.3 s; session 1's first job on it arrived
+    // at 11.5 s, after the node had moved to tip 105 at 11.0 s.
+    collected.apply(client::Event::Tip(sighting(0, HASH_ZERO, 1_300)));
+    collected.apply(client::Event::Tip(sighting(1, HASH_ZERO, 11_500)));
+    collected.apply(client::Event::Tip(sighting(0, HASH_ONE, 11_200)));
+    collected.apply(client::Event::Tip(sighting(1, HASH_ONE, 11_900)));
+
+    let document = run::time_to_usable_work(&changes, &changes, &collected, 2);
+    let first = &document["tips"][0];
+    assert_eq!(first["tip"], json!(HASH_ZERO));
+    assert_eq!(first["replaced_after_milliseconds"], json!(10_000.0));
+    assert_eq!(
+        first["sessions_with_work"],
+        json!(1),
+        "session 1's job on tip 104 arrived under tip 105 and is not usable work on 104"
+    );
+    assert_eq!(first["sessions_without_work_before_replacement"], json!(1));
+    assert_eq!(first["latency_milliseconds"]["samples"], json!(1));
+    assert_eq!(first["latency_milliseconds"]["max"], json!(300.0));
+    assert_eq!(
+        first["all_sessions_milliseconds"],
+        json!(300.0),
+        "the all-sessions figure is over the sessions that got work in the reign"
+    );
+
+    // Tip 105 was never replaced: both sessions, the late one at 900 ms.
+    let second = &document["tips"][1];
+    assert!(second["replaced_after_milliseconds"].is_null());
+    assert_eq!(second["sessions_with_work"], json!(2));
+    assert_eq!(second["sessions_without_work_before_replacement"], json!(0));
+    assert_eq!(second["all_sessions_milliseconds"], json!(900.0));
+    assert!(document["definition"]
+        .as_str()
+        .expect("a definition")
+        .contains("before the node's next tip change"));
+}
+
 #[test]
 fn a_landing_with_a_window_is_counted_as_having_one() {
     // A span -- and therefore a window -- is granted on the landing's own pool

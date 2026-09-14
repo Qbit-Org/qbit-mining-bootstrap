@@ -1449,7 +1449,9 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                 "sample": attribution.outside_phases.iter().take(10).collect::<Vec<_>>(),
             },
         },
-        "time_to_usable_work": time_to_usable_work(&external_tips, &collected, args.sessions),
+        "time_to_usable_work": time_to_usable_work(
+            &external_tips, &tip_changes, &collected, args.sessions,
+        ),
         "dense_cadence": dense_cadence,
         "node": {
             "url": ctx.node_url,
@@ -2356,19 +2358,41 @@ fn mid_flight_report(
     })
 }
 
-fn time_to_usable_work(
+/// When each session first received work on each of `tips`, measured from
+/// the node's tip stamp, while the tip was still the tip.
+///
+/// `all_changes` is every tip change the node recorded, of any origin; a
+/// tip's reign ends at the first change after it. A notify for the tip that
+/// arrives after that is a late job for a replaced tip: real, but not usable
+/// work on this tip, and counting it credited the tip with a session whose
+/// work really arrived under the next one, at a time that belonged to the
+/// next one's reign -- the same borrowing the dense section's per-frontend
+/// search had (EP-STATE). A session with no work inside the reign is not
+/// counted, and the entry says how many sessions that was.
+pub fn time_to_usable_work(
     tips: &[crate::node::TipChange],
+    all_changes: &[crate::node::TipChange],
     collected: &Collected,
     sessions: usize,
 ) -> Value {
     let entries: Vec<Value> = tips
         .iter()
         .map(|tip| {
+            let replaced_at = all_changes
+                .iter()
+                .filter(|change| change.monotonic > tip.monotonic)
+                .map(|change| change.monotonic)
+                .min();
             let mut first: HashMap<usize, Instant> = HashMap::new();
             for sighting in &collected.tips {
-                if sighting.tip == tip.hash && sighting.at >= tip.monotonic {
-                    first.entry(sighting.session).or_insert(sighting.at);
+                if sighting.tip != tip.hash || sighting.at < tip.monotonic {
+                    continue;
                 }
+                if replaced_at.is_some_and(|end| sighting.at >= end) {
+                    continue;
+                }
+                let slot = first.entry(sighting.session).or_insert(sighting.at);
+                *slot = (*slot).min(sighting.at);
             }
             let deltas: Vec<f64> = first
                 .values()
@@ -2383,7 +2407,11 @@ fn time_to_usable_work(
                 "height": tip.height,
                 "origin": tip.origin,
                 "minted_at": tip.wall.to_rfc3339(),
+                "replaced_after_milliseconds": replaced_at.map(|end| {
+                    end.saturating_duration_since(tip.monotonic).as_secs_f64() * 1000.0
+                }),
                 "sessions_with_work": first.len(),
+                "sessions_without_work_before_replacement": sessions.saturating_sub(first.len()),
                 "sessions_total": sessions,
                 "latency_milliseconds": measure::summarize(
                     deltas,
@@ -2396,7 +2424,12 @@ fn time_to_usable_work(
         .collect();
     json!({
         "definition": "t1 - t0, where t0 is the fake node's tip stamp and t1 is the first \
-                       mining.notify whose prevhash resolves to that tip",
+                       mining.notify whose prevhash resolves to that tip and arrives before the \
+                       node's next tip change (replaced_after_milliseconds, null while the tip \
+                       was never replaced). A notify for the tip after it was replaced is a \
+                       late job for a replaced tip and is not counted, so sessions_with_work \
+                       is the number of sessions that got usable work while the tip was the \
+                       tip, and all_sessions_milliseconds is null unless every session did.",
         "tips": entries,
     })
 }
@@ -2475,8 +2508,12 @@ fn dense_cadence_report(
         })
         .cloned()
         .collect();
-    document["time_to_new_tip_work_all_sessions"] =
-        time_to_usable_work(&pool_tips, collected, dense.session_frontend.len());
+    document["time_to_new_tip_work_all_sessions"] = time_to_usable_work(
+        &pool_tips,
+        tip_changes,
+        collected,
+        dense.session_frontend.len(),
+    );
     document
 }
 
