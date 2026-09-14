@@ -29,7 +29,8 @@ labels!(RejectReason {
     InvalidNtimeOrNonce => "invalid-ntime-or-nonce",
     BackendRpcUnavailable => "backend-rpc-unavailable",
     InternalError => "internal-error", PoolClosed => "pool-closed",
-    LedgerConfirmationFailed => "ledger-confirmation-failed"
+    LedgerConfirmationFailed => "ledger-confirmation-failed",
+    LedgerOutcomeUnknown => "ledger-outcome-unknown"
 });
 
 impl RejectReason {

@@ -31,6 +31,13 @@ pub struct Config {
     pub snapshot_interval: Duration,
     pub health_timeout: Duration,
     pub share_commit_timeout: Duration,
+    /// How long a share whose COMMIT was already in flight at
+    /// `share_commit_timeout` may still be confirmed. Not an environment
+    /// variable.
+    pub share_commit_grace: Duration,
+    /// The acknowledgement bound for block-only proofs, measured from the same
+    /// instant as `share_commit_timeout`. Not an environment variable.
+    pub block_only_ack_timeout: Duration,
     pub extranonce2_size: usize,
     pub coinbase_tag: String,
     pub manifest_seed: String,
@@ -429,6 +436,15 @@ impl Config {
             16,
         )
         .context("invalid PRISM_VERSION_ROLLING_MASK")?;
+        let share_commit_timeout = seconds("PRISM_SHARE_COMMIT_TIMEOUT_SECONDS", 15.0)?;
+        // Neither bound below is an environment variable. A block-only bound
+        // never undercuts a raised share deadline.
+        let share_commit_grace = Duration::from_secs(5);
+        ensure!(
+            share_commit_grace > Duration::ZERO,
+            "share commit grace must be positive"
+        );
+        let block_only_ack_timeout = share_commit_timeout.max(Duration::from_secs(60));
         Ok(Self {
             database_url,
             instance_id,
@@ -451,7 +467,9 @@ impl Config {
             build_workers,
             snapshot_interval: seconds("PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS", 60.0)?,
             health_timeout: seconds("PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS", 15.0)?,
-            share_commit_timeout: seconds("PRISM_SHARE_COMMIT_TIMEOUT_SECONDS", 15.0)?,
+            share_commit_timeout,
+            share_commit_grace,
+            block_only_ack_timeout,
             extranonce2_size,
             coinbase_tag,
             manifest_seed,
@@ -541,6 +559,8 @@ mod tests {
             snapshot_interval: Duration::from_secs(60),
             health_timeout: Duration::from_secs(15),
             share_commit_timeout: Duration::from_secs(15),
+            share_commit_grace: Duration::from_secs(5),
+            block_only_ack_timeout: Duration::from_secs(60),
             extranonce2_size: 8,
             coinbase_tag: "/PRISM/".into(),
             manifest_seed: "11".repeat(32),

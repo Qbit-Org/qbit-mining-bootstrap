@@ -12,6 +12,14 @@ impl Metrics {
             .unwrap_or_else(|e| e.into_inner())
             .increment(Family::Grace, vec![]);
     }
+    /// Record a share accepted after its commit deadline, once the ledger
+    /// confirmed the in-flight commit.
+    pub fn record_late_confirmation(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .increment(Family::LateConfirmed, vec![]);
+    }
     pub fn record_rejection(&self, reason: RejectReason) {
         let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         registry.increment(Family::Rejections, label("reason_id", reason.as_str()));
