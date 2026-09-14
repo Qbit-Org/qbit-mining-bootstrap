@@ -184,8 +184,10 @@ fn event_exposition_matches_the_pre_allocation_change_byte_for_byte() {
     }
     increment_all(&metrics);
     let body = metrics.render();
-    // Captured with the registry/events/labels and initialization from 2914a629.
-    // This pins HELP, TYPE, ordering, escaping, cumulative buckets, count and sum.
+    // Captured with the registry/events/labels and initialization from 2914a629,
+    // and refreshed at e13051cf, which added the `ledger-outcome-unknown` reason.
+    // This pins HELP, TYPE, ordering, escaping, cumulative buckets, count and sum,
+    // so adding a value to a closed label set has to be recorded here too.
     let expected = include_str!("fixtures/metric_events.prom");
     let families: Vec<_> = expected
         .lines()

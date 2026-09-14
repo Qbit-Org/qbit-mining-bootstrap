@@ -86,9 +86,11 @@ The ACK p99 uses the native completed-response-write histogram. At least 100
 observations are required in five minutes so an idle miner does not create a
 quantile alarm. Reject ratios preserve canonical `reason_id` and use accepted
 plus canonical rejection decisions as their denominator; ACK timing is not a
-durable-credit counter. The collector pool histogram covers only completed
-`PgPool::acquire` calls; a cancelled acquisition is represented by collector
-failure, not a fabricated duration. **Proof-to-first-offer and advisory-lock
+durable-credit counter. The collector pool histogram records each started
+`PgPool::acquire` attempt once: success when acquired, or failure on acquisition
+error or cancellation, including the three-second collection deadline. Durations
+measure elapsed pool wait and exclude subsequent transaction work. Collector
+availability remains a separate alert guard. **Proof-to-first-offer and advisory-lock
 waits are declared, rule deferred to A/#266 and #283** respectively; neither has
 a firing rule.
 
