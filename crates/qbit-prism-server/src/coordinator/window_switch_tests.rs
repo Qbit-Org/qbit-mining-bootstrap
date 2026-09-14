@@ -8,6 +8,7 @@ use super::*;
 use crate::ledger::ShareRange;
 use anyhow::bail;
 use axum::{extract::State, routing::post, Json, Router};
+use miner_submit::enqueue_failed_before_commit;
 use qbit_prism_test_gate as gate;
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
@@ -1014,4 +1015,74 @@ async fn off_runtime_releases_its_value_on_a_blocking_thread() -> Result<()> {
         "a cancelled holder dropped on the runtime thread"
     );
     Ok(())
+}
+
+/// Every check `prepare_candidate` makes is a definite rejection, never an
+/// unknown outcome.
+///
+/// #324 decides what a miner is told when a block-only enqueue fails:
+/// `enqueue_failed_before_commit` answers a provably uncommitted failure with
+/// `ledger-confirmation-failed`, and anything else with
+/// `ledger-outcome-unknown`, which asks an operator to follow the outbox row.
+/// Slice 3 added the checks that guard the reference — the block's length, its
+/// header hash, its digest, the coinbase suffix, the reference invariants and a
+/// leased candidate's balances — and every one of them is raised before the
+/// enqueue takes a connection, so none carries an `sqlx::Error` and all
+/// classify as definite. A corrupt candidate must never send a miner chasing a
+/// row that was never written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_candidate_is_a_definite_rejection_not_an_unknown_outcome() -> Result<()> {
+    let _serial = TEST_LOCK.lock().await;
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        /// What a case does to a candidate the fixture just found.
+        type Corrupt = fn(&mut Candidate);
+        let cases: [(&str, &str, Corrupt); 3] = [
+            ("truncated block", "candidate block is truncated", |c| {
+                c.block_bytes.truncate(40);
+            }),
+            ("block digest", "candidate block digest mismatch", |c| {
+                c.block_sha256 = "ff".repeat(32);
+            }),
+            (
+                "coinbase suffix",
+                "candidate coinbase suffix must be non-empty hex",
+                |c| c.coinbase_suffix_hex.clear(),
+            ),
+        ];
+        for (index, (name, message, corrupt)) in cases.into_iter().enumerate() {
+            let mut found = fixture.found(20_000 * (index as u32 + 1))?;
+            let block_hash = found.candidate.block_hash.clone();
+            corrupt(&mut found.candidate);
+            let error = fixture
+                .coordinator
+                .ledger
+                .enqueue_candidate_once(found.candidate)
+                .await
+                .err()
+                .with_context(|| format!("{name}: the enqueue was accepted"))?;
+            ensure!(
+                error.to_string().contains(message),
+                "{name}: refused with {error}, expected {message}"
+            );
+            ensure!(
+                enqueue_failed_before_commit(&error),
+                "{name}: classified as an unknown outcome, so the miner would be told \
+                 ledger-outcome-unknown for a row that was never written: {error}"
+            );
+            let rows: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+            )
+            .bind(&block_hash)
+            .fetch_one(&fixture.coordinator.ledger.pool)
+            .await?;
+            ensure!(rows == 0, "{name}: the refused candidate left {rows} rows");
+        }
+        anyhow::Ok(())
+    }
+    .await;
+    fixture.close().await?;
+    result
 }
