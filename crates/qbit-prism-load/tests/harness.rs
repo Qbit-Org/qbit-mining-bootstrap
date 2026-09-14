@@ -792,10 +792,25 @@ struct FakeStratum {
     _task: tokio::task::JoinHandle<()>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct StratumOptions {
+    hold_authorize: bool,
+    /// A `mining.set_difficulty` to push after authorize, before the job.
+    advertised_difficulty: Option<f64>,
+}
+
 async fn fake_stratum(hold_authorize: bool) -> FakeStratum {
+    fake_stratum_with(StratumOptions {
+        hold_authorize,
+        ..Default::default()
+    })
+    .await
+}
+
+async fn fake_stratum_with(options: StratumOptions) -> FakeStratum {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
-    let (release_authorize, release) = tokio::sync::watch::channel(!hold_authorize);
+    let (release_authorize, release) = tokio::sync::watch::channel(!options.hold_authorize);
     let submits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = submits.clone();
     let task = tokio::spawn(async move {
@@ -803,7 +818,12 @@ async fn fake_stratum(hold_authorize: bool) -> FakeStratum {
             let Ok((socket, _)) = listener.accept().await else {
                 break;
             };
-            tokio::spawn(serve_stratum(socket, release.clone(), counter.clone()));
+            tokio::spawn(serve_stratum(
+                socket,
+                release.clone(),
+                counter.clone(),
+                options.advertised_difficulty,
+            ));
         }
     });
     FakeStratum {
@@ -818,6 +838,7 @@ async fn serve_stratum(
     socket: tokio::net::TcpStream,
     mut release: tokio::sync::watch::Receiver<bool>,
     submits: Arc<std::sync::atomic::AtomicUsize>,
+    advertised_difficulty: Option<f64>,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let (read, mut write) = socket.into_split();
@@ -863,6 +884,15 @@ async fn serve_stratum(
             return;
         }
         if authorized {
+            if let Some(difficulty) = advertised_difficulty {
+                let set = json!({"id": null, "method": "mining.set_difficulty",
+                                 "params": [difficulty]});
+                let mut bytes = serde_json::to_vec(&set).unwrap();
+                bytes.push(b'\n');
+                if write.write_all(&bytes).await.is_err() {
+                    return;
+                }
+            }
             let mut bytes = serde_json::to_vec(&notify).unwrap();
             bytes.push(b'\n');
             if write.write_all(&bytes).await.is_err() {
@@ -1025,6 +1055,138 @@ async fn a_reconnect_is_attributed_to_the_phase_that_asked_for_it() -> Result<()
     );
     let _ = handle.control.send(client::Control::Stop);
     tokio::time::timeout(std::time::Duration::from_secs(5), handle.task).await??;
+    Ok(())
+}
+
+/// The share difficulty is a premise of the whole measurement. A frontend
+/// that advertised another value was recorded under
+/// `client.difficulty_mismatches` and nothing read the list: with a lower
+/// advertised value the client goes on mining the harder configured target,
+/// its shares are still accepted, and the artifact validated while measuring
+/// less work per share than the configuration it names. A non-empty list now
+/// refuses qualification -- artifact withheld, exit 8 -- once every session
+/// holds work and again after the load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_advertised_difficulty_other_than_the_configured_one_refuses_qualification() -> Result<()>
+{
+    use qbit_prism_load::artifact::{write_or_withhold, Evidence, Withhold};
+    use qbit_prism_load::run::{
+        difficulty_premise_contradiction, premise_block, withhold_decision, RunOutcome,
+    };
+
+    // The observation: a session reports the disagreement with the values
+    // on both sides, and still connects and holds work.
+    let configured = session_config(0).share_difficulty;
+    let server = fake_stratum_with(StratumOptions {
+        advertised_difficulty: Some(configured / 2.0),
+        ..Default::default()
+    })
+    .await;
+    let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+    let shared = Arc::new(client::SessionShared {
+        phase: std::sync::RwLock::new("setup".to_owned()),
+        events,
+        record_notifies: std::sync::atomic::AtomicBool::new(false),
+    });
+    let handle = client::spawn_session(
+        session_config(0),
+        0,
+        server.address.clone(),
+        shared.clone(),
+        1,
+    );
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut mismatch = None;
+    let mut connected = false;
+    while !(mismatch.is_some() && connected) {
+        let event = tokio::time::timeout_at(deadline, inbox.recv())
+            .await
+            .expect("the session reports the mismatch and connects within the deadline")
+            .expect("the session is still running");
+        match event {
+            client::Event::DifficultyMismatch {
+                session,
+                advertised,
+                configured: seen,
+            } => {
+                assert_eq!(session, 0);
+                assert_eq!(seen, configured);
+                mismatch = Some((session, advertised, seen));
+            }
+            client::Event::Connected { .. } => connected = true,
+            _ => {}
+        }
+    }
+    let mismatch = mismatch.expect("reported");
+    assert!(
+        (mismatch.1 - configured / 2.0).abs() <= f64::EPSILON,
+        "the advertised value is reported as sent: {mismatch:?}"
+    );
+    let _ = handle.control.send(client::Control::Stop);
+    tokio::time::timeout(std::time::Duration::from_secs(5), handle.task).await??;
+
+    // The decision: agreement is nothing; one mismatch is a contradiction
+    // that names the session and both values.
+    assert_eq!(difficulty_premise_contradiction(&[]), None);
+    let reason =
+        difficulty_premise_contradiction(&[mismatch]).expect("a mismatch contradicts the premise");
+    assert!(reason.contains("session 0"), "{reason}");
+    assert!(reason.contains(&format!("{}", configured)), "{reason}");
+    assert!(
+        reason.contains(&format!("{}", configured / 2.0)),
+        "{reason}"
+    );
+    let block = premise_block(Some(&reason), &[mismatch]);
+    assert_eq!(block["contradicted"], json!(true));
+    assert_eq!(block["share_difficulty_agreed"], json!(false));
+    assert_eq!(block["difficulty_mismatches"][0]["session"], json!(0));
+    let agreed = premise_block(None, &[]);
+    assert_eq!(agreed["contradicted"], json!(false));
+    assert!(agreed["error"].is_null());
+
+    // The withholding: a contradicted premise withholds the artifact, ranks
+    // below a hard block and above an abort, and exits 8.
+    let withheld =
+        withhold_decision(None, Some(&reason), Some("load-fe-1 exited")).expect("withheld");
+    assert_eq!(withheld, Withhold::PremiseContradicted(reason.clone()));
+    assert!(
+        withheld.reason().contains("premise"),
+        "{}",
+        withheld.reason()
+    );
+    assert!(withheld.reason().contains(&reason), "{}", withheld.reason());
+    assert!(matches!(
+        withhold_decision(Some("jsonb exceeds the maximum of"), Some(&reason), None),
+        Some(Withhold::Blocked(_))
+    ));
+    let outcome = RunOutcome {
+        withhold: Some(&withheld),
+        durability_findings: 0,
+        harness_bug_rejections: 0,
+        divergences: 0,
+        unknown_outcome_commits: 0,
+    };
+    assert_eq!(outcome.exit_code(), run::EXIT_PREMISE_CONTRADICTED);
+    assert_ne!(run::EXIT_PREMISE_CONTRADICTED, run::EXIT_OK);
+    let explanation = outcome
+        .explanation(std::path::Path::new("r.json"))
+        .expect("a refused run says so");
+    assert!(explanation.contains("premise"), "{explanation}");
+    assert!(explanation.contains("withheld"), "{explanation}");
+
+    let dir = ScratchDir::new("premise");
+    let path = dir.path().join("capacity-evidence.json");
+    std::fs::write(&path, b"{\"schema\": \"stale artifact\"}")?;
+    let Evidence::Withheld {
+        reason: printed,
+        stale_artifact_removed,
+    } = write_or_withhold(&sample_inputs(), Some(&withheld), dir.path(), "srv")?
+    else {
+        panic!("a contradicted premise must not write an artifact");
+    };
+    assert!(printed.contains("session 0"), "{printed}");
+    assert!(stale_artifact_removed);
+    assert!(!path.exists());
     Ok(())
 }
 
@@ -1469,12 +1631,12 @@ fn a_hard_block_logged_after_startup_withholds_the_artifact_and_exits_blocked() 
     );
 
     // The decision: a late hard block withholds, and outranks an abort.
-    assert_eq!(withhold_decision(None, None), None);
+    assert_eq!(withhold_decision(None, None, None), None);
     assert_eq!(
-        withhold_decision(None, Some("load-fe-1 exited unexpectedly")),
+        withhold_decision(None, None, Some("load-fe-1 exited unexpectedly")),
         Some(Withhold::Aborted("load-fe-1 exited unexpectedly".into()))
     );
-    let blocked = withhold_decision(Some(ceiling), Some("load-fe-1 exited unexpectedly"))
+    let blocked = withhold_decision(Some(ceiling), None, Some("load-fe-1 exited unexpectedly"))
         .expect("a hard block withholds the artifact");
     assert_eq!(blocked, Withhold::Blocked(ceiling.to_owned()));
     assert!(blocked.reason().contains(ceiling), "{}", blocked.reason());

@@ -209,6 +209,12 @@ pub enum Withhold {
     /// scheduled-block rebuild, say -- when ordinary shares may have kept
     /// flowing and the numbers look complete.
     Blocked(String),
+    /// Something the measurement rests on was observed to be other than
+    /// configured -- a frontend advertised a share difficulty that is not
+    /// the one the artifact would name. The numbers may be complete and
+    /// still measure a different amount of work than the configuration
+    /// claims, so they are evidence of nothing.
+    PremiseContradicted(String),
 }
 
 impl Withhold {
@@ -219,6 +225,10 @@ impl Withhold {
             Self::Blocked(line) => format!(
                 "a frontend log showed a hard refusal of this window size, so the run is \
                  blocked and its numbers are not evidence for the size: {line}"
+            ),
+            Self::PremiseContradicted(reason) => format!(
+                "a premise of the measurement was contradicted, so its numbers do not mean \
+                 what the artifact would claim: {reason}"
             ),
         }
     }

@@ -355,6 +355,7 @@ target/release/qbit-prism-load \
 | 5 | An ACK/commit divergence: PostgreSQL holds a share the server refused, either with `ledger-confirmation-failed` or with `ledger-outcome-unknown` (#324) |
 | 6 | The run was aborted: the memory floor was crossed, a frontend exited, the `reconnect` phase's drained restart could not be performed because the frontend's sessions still had submits outstanding after the share-commit timeout plus a 5 s margin, a phase boundary could not change the proxy delay because the previous phase's submits were still outstanding after that same limit, or a delayed phase's round trip through the proxied URL did not pay the delay. No `capacity-evidence.json` is written (and an earlier run's was already removed when the invocation took `--out`), so an aborted run can never leave a self-validating artifact behind; the side report is still written, with `aborted` set, the cut-short phase marked `completed: false`, and `validator.artifact_written: false` with the reason |
 | 7 | Rejections classified as harness bugs |
+| 8 | A premise of the measurement was contradicted: a frontend advertised, in `mining.set_difficulty`, a share difficulty other than the one the harness configured in `PRISM_STRATUM_SHARE_DIFF`. The client mines the configured target either way, so with a lower advertised value its shares are still accepted and an artifact would validate while measuring a different amount of work per share than the configuration names. Checked once every session holds work, before any phase, and again after the load stops. The artifact is withheld and the side report's `premise` block carries every mismatch with its session, advertised and configured values |
 
 ## Outputs
 
@@ -631,6 +632,16 @@ The side report repeats all of this under `honest_value_notes`.
 - **Unknown is never zero.** A measurement that could not be taken is `null`
   with a reason. A peak RSS from Linux's `VmHWM` is labelled a kernel peak; on
   macOS it is a sampled maximum, and on other platforms it is `null`.
+- **The share difficulty is a premise, and a frontend that disagrees with it
+  ends the run.** Every session checks each `mining.set_difficulty` against
+  the configured share difficulty. A disagreement is not a finding to note
+  beside the numbers: the window arithmetic, each share's weight and the
+  artifact's rate all assume the configured target, and a frontend that
+  advertised another value was measured at a different amount of work per
+  share. The run refuses qualification -- the artifact is withheld, the
+  `premise` block says which sessions saw what, and the exit code is 8 --
+  once every session holds work, before a phase runs, and again after the
+  load in case the value moved mid-run.
 
 ## Reconciliation
 

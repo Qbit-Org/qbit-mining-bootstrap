@@ -47,6 +47,11 @@ pub const EXIT_ACK_COMMIT_DIVERGENCE: i32 = 5;
 pub const EXIT_ABORTED: i32 = 6;
 /// Rejections that can only happen if the harness offered bad work.
 pub const EXIT_HARNESS_BUG_REJECTIONS: i32 = 7;
+/// A premise of the measurement was contradicted by what a frontend
+/// advertised: the shares measured do not weigh what the configuration says.
+/// The artifact is withheld, because it would name a configuration the run
+/// did not measure.
+pub const EXIT_PREMISE_CONTRADICTED: i32 = 8;
 
 /// Added to the configured share-commit timeout to bound a drained restart's
 /// wait: the server answers a submit within the timeout, and its answer still
@@ -72,15 +77,81 @@ pub fn hard_block_line(blocked: &[BlockedLog]) -> Option<String> {
 
 /// Whether the artifact is withheld, and why, from what the run observed.
 ///
-/// A hard refusal in a frontend log outranks an abort: the refusal is a
-/// result about the size, the abort a fact about this run, and a run that
-/// did both is blocked first. Both stay in the side report whichever one
-/// names the withholding.
-pub fn withhold_decision(hard_block: Option<&str>, aborted: Option<&str>) -> Option<Withhold> {
+/// A hard refusal in a frontend log outranks the rest: the refusal is a
+/// result about the size. A contradicted premise outranks an abort: it
+/// says the numbers mean something else however complete they are, where an
+/// abort says they are incomplete. All three stay in the side report
+/// whichever one names the withholding.
+pub fn withhold_decision(
+    hard_block: Option<&str>,
+    premise_contradicted: Option<&str>,
+    aborted: Option<&str>,
+) -> Option<Withhold> {
     if let Some(line) = hard_block {
         return Some(Withhold::Blocked(line.to_owned()));
     }
+    if let Some(reason) = premise_contradicted {
+        return Some(Withhold::PremiseContradicted(reason.to_owned()));
+    }
     aborted.map(|reason| Withhold::Aborted(reason.to_owned()))
+}
+
+/// Why the share difficulty the frontends advertised contradicts the run's
+/// premise, when it does. `mismatches` is every `(session, advertised,
+/// configured)` the sessions reported; an empty list is agreement.
+///
+/// The share difficulty is a premise of the whole measurement: the window
+/// arithmetic, each share's weight and the artifact's rate all assume the
+/// frontends serve the configured target. A frontend that advertised a
+/// lower value is served by a client that goes on mining the harder
+/// configured target, whose shares are still accepted, so the artifact would
+/// validate while measuring less work than the frontend configuration
+/// claims. Recording the mismatch and going on used to be exactly that
+/// (EP-OBSERVABILITY).
+pub fn difficulty_premise_contradiction(mismatches: &[(usize, f64, f64)]) -> Option<String> {
+    if mismatches.is_empty() {
+        return None;
+    }
+    let sessions: BTreeSet<usize> = mismatches.iter().map(|(session, _, _)| *session).collect();
+    let examples: Vec<String> = mismatches
+        .iter()
+        .take(5)
+        .map(|(session, advertised, configured)| {
+            format!(
+                "session {session} was advertised {advertised} against the configured {configured}"
+            )
+        })
+        .collect();
+    Some(format!(
+        "{} session(s) were advertised a share difficulty other than the configured one \
+         ({} mismatch(es) in all): {}",
+        sessions.len(),
+        mismatches.len(),
+        examples.join("; ")
+    ))
+}
+
+/// What the side report says beside the difficulty mismatches.
+pub const PREMISE_NOTE: &str =
+    "the share difficulty is a premise of the whole measurement: the window arithmetic, each \
+     share's weight and the artifact's rate assume the frontends serve the configured target. \
+     A frontend that advertised another value was measured at a different amount of work per \
+     share, so its numbers are not evidence for the configuration the artifact would name: the \
+     artifact is withheld and the run exits 8. Checked once every session holds work, before \
+     any phase, and again after the load stops.";
+
+/// The side report's `premise` block.
+pub fn premise_block(contradiction: Option<&str>, mismatches: &[(usize, f64, f64)]) -> Value {
+    json!({
+        "share_difficulty_agreed": contradiction.is_none(),
+        "contradicted": contradiction.is_some(),
+        "error": contradiction,
+        "difficulty_mismatches": mismatches.iter()
+            .map(|(session, advertised, configured)| json!({
+                "session": session, "advertised": advertised, "configured": configured}))
+            .collect::<Vec<_>>(),
+        "note": PREMISE_NOTE,
+    })
 }
 
 /// What the run's exit code is decided from, once the side report is
@@ -97,11 +168,13 @@ pub struct RunOutcome<'a> {
 
 impl RunOutcome<'_> {
     /// The exit code, in order of precedence: a withheld artifact first
-    /// (blocked, then aborted), then the reconciliation findings, then the
-    /// harness-bug rejections, then the two divergence buckets.
+    /// (blocked, then a contradicted premise, then aborted), then the
+    /// reconciliation findings, then the harness-bug rejections, then the
+    /// two divergence buckets.
     pub fn exit_code(&self) -> i32 {
         match self.withhold {
             Some(Withhold::Blocked(_)) => return EXIT_BLOCKED,
+            Some(Withhold::PremiseContradicted(_)) => return EXIT_PREMISE_CONTRADICTED,
             Some(Withhold::Aborted(_)) => return EXIT_ABORTED,
             None => {}
         }
@@ -123,6 +196,9 @@ impl RunOutcome<'_> {
         let report = report_path.display();
         Some(match self.withhold {
             Some(Withhold::Blocked(line)) => format!("run blocked: {line}; see {report}"),
+            Some(Withhold::PremiseContradicted(reason)) => {
+                format!("premise contradicted, artifact withheld: {reason}; see {report}")
+            }
             Some(Withhold::Aborted(reason)) => format!("run aborted: {reason}"),
             None if self.durability_findings > 0 => {
                 format!("durability findings recorded; see {report}")
@@ -604,7 +680,14 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         if let Err(error) = ready {
             blocked.extend(scan_logs(&child.read_stderr()));
             frontends.push(child);
-            return finish_blocked(args, &ctx, frontends, blocked, error.to_string()).await;
+            return finish_early(
+                args,
+                &ctx,
+                frontends,
+                blocked,
+                EarlyExit::Blocked(error.to_string()),
+            )
+            .await;
         }
         frontends.push(child);
     }
@@ -612,7 +695,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         blocked.extend(scan_logs(&child.read_stderr()));
     }
     if let Some(text) = hard_block_line(&blocked) {
-        return finish_blocked(args, &ctx, frontends, blocked, text).await;
+        return finish_early(args, &ctx, frontends, blocked, EarlyExit::Blocked(text)).await;
     }
 
     // --- samplers ---------------------------------------------------------
@@ -738,9 +821,43 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             for sampler in &process_samplers {
                 sampler.stop();
             }
-            return finish_blocked(args, &ctx, frontends, blocked, text).await;
+            return finish_early(args, &ctx, frontends, blocked, EarlyExit::Blocked(text)).await;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Every session has its first job, and with it the difficulty its
+    // frontend advertised. A frontend that advertised something other than
+    // the configured value has already contradicted the premise every later
+    // number would rest on, so the run is refused here rather than ten
+    // minutes later; the same check runs again after the load, for a value
+    // that changes mid-run.
+    let early_mismatches = collected
+        .lock()
+        .expect("collector lock")
+        .difficulty_mismatches
+        .clone();
+    if let Some(reason) = difficulty_premise_contradiction(&early_mismatches) {
+        for session in &sessions {
+            let _ = session.control.send(client::Control::Stop);
+        }
+        lock_sampler.stop();
+        for sampler in &process_samplers {
+            sampler.stop();
+        }
+        for child in &frontends {
+            blocked.extend(scan_logs(&child.read_stderr()));
+        }
+        return finish_early(
+            args,
+            &ctx,
+            frontends,
+            blocked,
+            EarlyExit::PremiseContradicted {
+                reason,
+                difficulty_mismatches: early_mismatches,
+            },
+        )
+        .await;
     }
 
     // --- phases -----------------------------------------------------------
@@ -991,7 +1108,14 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     // blocked, as it would have at startup, with the whole side report
     // (EP-OBSERVABILITY).
     let late_hard_block = hard_block_line(&blocked);
-    let withhold = withhold_decision(late_hard_block.as_deref(), aborted.as_deref());
+    // The premise check again, over the whole run: a set_difficulty that
+    // arrived after the startup check is the same contradiction seen late.
+    let premise_contradiction = difficulty_premise_contradiction(&collected.difficulty_mismatches);
+    let withhold = withhold_decision(
+        late_hard_block.as_deref(),
+        premise_contradiction.as_deref(),
+        aborted.as_deref(),
+    );
     let window_at_end =
         window::observed_window_length(&side, solution.scaled_network_difficulty).await?;
 
@@ -1190,10 +1314,12 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     // An aborted run gets no artifact: its evidence is incomplete however
     // complete a partial phase looks, and `artifact::build` would refuse a
     // run that never reached all three required phases anyway. Neither does
-    // a run whose frontend logged a hard refusal of the size at any point:
-    // its numbers may be complete and still describe a size the server did
-    // not serve in full (EP-ERRORS). The side report below still carries
-    // every number, with the reason.
+    // a run whose frontend logged a hard refusal of the size at any point,
+    // nor one whose frontend advertised a share difficulty other than the
+    // configured one: their numbers may be complete and still describe a
+    // size the server did not serve in full, or work the configuration does
+    // not name (EP-ERRORS). The side report below still carries every
+    // number, with the reason.
     let evidence = artifact::write_or_withhold(
         &inputs,
         withhold.as_ref(),
@@ -1334,6 +1460,10 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             })).collect::<Vec<_>>(),
             "rpc_call_counts": ctx.node_state.rpc_call_counts(),
         },
+        "premise": premise_block(
+            premise_contradiction.as_deref(),
+            &collected.difficulty_mismatches,
+        ),
         "client": {
             "discarded_block_solutions": collected.discarded_block_solutions,
             "discarded_offers": collected.discarded_offers,
@@ -1341,6 +1471,8 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                 .map(|(session, advertised, configured)| json!({
                     "session": session, "advertised": advertised, "configured": configured}))
                 .collect::<Vec<_>>(),
+            "difficulty_mismatches_note": "repeated under premise, which says what they \
+                                           mean for the run",
             "failures": collected.failures.iter().take(200)
                 .map(|(session, error, _)| json!({"session": session, "error": error}))
                 .collect::<Vec<_>>(),
@@ -2541,22 +2673,57 @@ fn classify_gaps(
     (json!(findings), divergences, unknown_outcomes)
 }
 
-async fn finish_blocked(
+/// How a run ends before its first phase, with only the reduced side report
+/// to show for it.
+enum EarlyExit {
+    /// No frontend served work, or a log showed a hard refusal.
+    Blocked(String),
+    /// A frontend advertised a share difficulty other than the configured
+    /// one, so nothing that would have been measured could be evidence.
+    PremiseContradicted {
+        reason: String,
+        difficulty_mismatches: Vec<(usize, f64, f64)>,
+    },
+}
+
+async fn finish_early(
     args: &Args,
     ctx: &RunContext,
     mut frontends: Vec<Frontend>,
     blocked: Vec<BlockedLog>,
-    error: String,
+    exit: EarlyExit,
 ) -> Result<i32> {
     let report_path = args.out.join("load-harness-report.json");
+    let (blocked_error, premise, line, code) = match &exit {
+        EarlyExit::Blocked(error) => (
+            Some(error.as_str()),
+            premise_block(None, &[]),
+            format!("run blocked: {error}"),
+            EXIT_BLOCKED,
+        ),
+        EarlyExit::PremiseContradicted {
+            reason,
+            difficulty_mismatches,
+        } => (
+            None,
+            premise_block(Some(reason), difficulty_mismatches),
+            format!("premise contradicted, artifact withheld: {reason}"),
+            EXIT_PREMISE_CONTRADICTED,
+        ),
+    };
     let document = json!({
         "schema": report::SCHEMA,
         "run_id": ctx.run_id.to_string(),
         "blocked": {
-            "blocked": true,
-            "error": error,
+            "blocked": blocked_error.is_some(),
+            "error": blocked_error,
             "log_matches": blocked,
             "note": BLOCKED_NOTE,
+        },
+        "premise": premise,
+        "validator": {
+            "artifact_written": false,
+            "withheld_reason": line,
         },
         "topology": {
             "frontends": args.frontends,
@@ -2572,12 +2739,12 @@ async fn finish_blocked(
         "stale_outputs_removed": ctx.stale_outputs_removed,
     });
     report::write_json(&report_path, &document)?;
-    eprintln!("run blocked: {error}");
+    eprintln!("{line}");
     eprintln!("side report: {}", report_path.display());
     for child in frontends.iter_mut() {
         child.kill();
     }
-    Ok(EXIT_BLOCKED)
+    Ok(code)
 }
 
 /// The side report's `validator` block: the verdict and the reproducing
