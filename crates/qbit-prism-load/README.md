@@ -216,7 +216,17 @@ Every rebuild-pending rejection is a share the client had already proven
 against the share target, so each one is miner work the pool discarded. None of
 them is persisted, so none is a durability finding — and the report checks that
 against this run's committed share identifiers rather than asserting it
-(`lost_valid_shares_found_in_postgres`, which must be 0).
+(`shares_found_in_postgres`, which must be 0).
+
+The census covers **every** rebuild-pending rejection in the phase, not only
+the ones a landing's span owns. `lost_valid_work` publishes the split —
+`shares`, `shares_attributed`, `shares_unattributed` — and
+`shares_found_in_postgres` is checked over all of them. A landing whose pool tip
+change is missing leaves its rejections unattributed, and that is exactly the
+case the cross-check exists for: counting only the attributed subset would read
+as a clean pass in the one situation that would make it fail. The per-landing,
+per-frontend `lost_valid_shares` tables are unchanged and still count a span's
+rejections, so they sum to `shares_attributed`.
 
 ### Where the rebuild queues
 

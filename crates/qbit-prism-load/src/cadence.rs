@@ -716,8 +716,6 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut per_frontend: BTreeMap<usize, Distribution> = BTreeMap::new();
     let mut overall = Distribution::default();
-    let mut lost_total = 0usize;
-    let mut lost_in_postgres: Vec<String> = Vec::new();
     let mut attributed_rejections = 0usize;
 
     for entry in &resolved {
@@ -816,12 +814,6 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                     .iter()
                     .map(|rejection| rejection.record.share_id.as_str())
                     .collect();
-                lost_total += lost.len();
-                for share in &lost {
-                    if inputs.committed.contains(*share) {
-                        lost_in_postgres.push((*share).to_owned());
-                    }
-                }
 
                 let incomplete = health.trouble().or_else(|| {
                     inputs
@@ -958,6 +950,23 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
 
     let landed = *counts.get("landed").unwrap_or(&0);
     let unattributed_rejections = rejections.len().saturating_sub(attributed_rejections);
+
+    // Lost valid work is counted over every rebuild-pending rejection in the
+    // phase, not only the ones a landing's span owns. An unattributed
+    // rejection is just as much a proven share the pool discarded, and it is
+    // precisely the case the PostgreSQL cross-check exists for: a landing
+    // whose pool tip change is missing leaves its rejections unattributed, and
+    // a census that skipped them would read as a clean pass in the one
+    // situation that would make it fail (EP-STATE).
+    let lost_shares: Vec<&str> = rejections
+        .iter()
+        .map(|rejection| rejection.record.share_id.as_str())
+        .collect();
+    let lost_in_postgres: Vec<String> = lost_shares
+        .iter()
+        .filter(|share| inputs.committed.contains(**share))
+        .map(|share| (*share).to_owned())
+        .collect();
     let no_landing_reason = no_landing_reason(inputs, &resolved, landed);
     let combined_p99 =
         optional_summary(&overall.combined_duration, CLOCK).and_then(|summary| summary.p99);
@@ -1037,7 +1046,14 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                            rejected with new tip work is pending or new payout work is pending. \
                            It was never persisted, so it is not a durability finding, but it is \
                            miner work the pool discarded.",
-            "shares": lost_total,
+            "shares": lost_shares.len(),
+            "shares_attributed": attributed_rejections,
+            "shares_unattributed": unattributed_rejections,
+            "split_note": "shares counts every rebuild-pending rejection in the phase and is what \
+                           shares_found_in_postgres is checked over. shares_attributed is the \
+                           subset a landing's span owns, which is what the per-landing, \
+                           per-frontend lost_valid_shares tables sum to; the rest fell inside no \
+                           span and is counted here rather than leaving the census.",
             "shares_found_in_postgres": lost_in_postgres.len(),
             "shares_found_in_postgres_sample": lost_in_postgres.iter().take(10).collect::<Vec<_>>(),
         },
@@ -1182,7 +1198,10 @@ pub fn definitions() -> Value {
                               a nonce it has already checked against the share target, so each one \
                               is a valid share the pool discarded. None is persisted, which is \
                               verified against this run's committed share identifiers rather than \
-                              asserted.",
+                              asserted. The per-landing tables count a span's rejections; the \
+                              phase-wide lost_valid_work block counts every rebuild-pending \
+                              rejection, attributed or not, and its shares_found_in_postgres is \
+                              checked over all of them.",
         "bump": "an observed change of qbit_prism_cluster.payout_revision. Two bumps inside one \
                  sampling interval appear as one change with revision_delta above 1, so the delta \
                  is reported rather than assumed to be 1.",

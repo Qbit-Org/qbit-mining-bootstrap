@@ -2026,7 +2026,14 @@ fn rejections_and_bumps_are_attributed_to_the_landing_they_follow() {
     let session_frontend = vec![0usize, 0, 0, 0];
     let gaps = vec![9.0, 19.0];
     let offsets = vec![5.0, 14.0, 23.0];
-    let committed = std::collections::BTreeSet::new();
+    // The unattributed rejection's share, and only it, is in PostgreSQL. A
+    // census computed over the attributed subset would never look it up and
+    // would report a clean shares_found_in_postgres: 0 -- which is the one
+    // case the cross-check exists for.
+    let committed: std::collections::BTreeSet<String> =
+        [format!("pload1abc.s{:05}:{}", 2, "1".repeat(64))]
+            .into_iter()
+            .collect();
     let document = cadence::build(&cadence::ReportInputs {
         cadence: cadence::Cadence::Dense,
         gaps: &gaps,
@@ -2157,10 +2164,46 @@ fn rejections_and_bumps_are_attributed_to_the_landing_they_follow() {
         .contains("no block solution"));
     assert_eq!(last["frontends"], json!([]));
 
-    assert_eq!(document["lost_valid_work"]["shares"], json!(4));
+    // Lost work is counted over every rebuild-pending rejection in the phase,
+    // attributed or not: the fifth share is as much discarded miner work as
+    // the other four.
+    assert_eq!(document["lost_valid_work"]["shares"], json!(5));
+    assert_eq!(
+        document["lost_valid_work"]["shares_attributed"],
+        json!(4),
+        "the four a landing's span owns are still reported apart"
+    );
+    assert_eq!(
+        document["lost_valid_work"]["shares_unattributed"],
+        json!(1),
+        "the rejection before the first landing stays in the census"
+    );
+    assert_eq!(
+        document["lost_valid_work"]["shares_attributed"]
+            .as_u64()
+            .expect("attributed")
+            + document["lost_valid_work"]["shares_unattributed"]
+                .as_u64()
+                .expect("unattributed"),
+        document["lost_valid_work"]["shares"]
+            .as_u64()
+            .expect("shares"),
+        "the split reconciles with the total"
+    );
+    assert_eq!(
+        document["lost_valid_work"]["shares_attributed"],
+        document["rejection_attribution"]["attributed"],
+        "the attributed subset is exactly the rejections a span owns"
+    );
     assert_eq!(
         document["lost_valid_work"]["shares_found_in_postgres"],
-        json!(0)
+        json!(1),
+        "the unattributed lost share is checked against PostgreSQL and found"
+    );
+    assert_eq!(
+        document["lost_valid_work"]["shares_found_in_postgres_sample"][0],
+        json!(format!("pload1abc.s{:05}:{}", 2, "1".repeat(64))),
+        "the share is named, not just counted"
     );
     assert!(document["proposed_budget_for_issue_291"]["window_p99_millis"].is_number());
     assert!(document["definitions"]["combined_rebuild_pending_window"].is_string());
