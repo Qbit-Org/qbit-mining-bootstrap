@@ -1011,7 +1011,13 @@ pub struct AckSplit {
     pub start_of_next: MetricsScrape,
 }
 
-/// Bucket deltas between two scrapes of the same frontend.
+/// Bucket deltas over a phase for one frontend.
+///
+/// A frontend restart between the boundary scrapes resets its in-process
+/// counters, so a plain `after - before` is negative or, worse, a plausible
+/// small number. The delta is therefore assembled from one segment per
+/// process, each bracketed by its own scrapes, and a reset that no segment
+/// covers leaves the delta unknown -- never zero (EP-OBSERVABILITY).
 #[derive(Clone, Debug, Serialize)]
 pub struct ServerAckDelta {
     pub instance_id: String,
@@ -1021,50 +1027,164 @@ pub struct ServerAckDelta {
     pub counts: BTreeMap<String, f64>,
     pub sums: BTreeMap<String, f64>,
     pub bucket_deltas: BTreeMap<String, BTreeMap<String, f64>>,
+    /// Times the frontend's process was replaced during the phase, each of
+    /// which reset its counters.
+    pub counter_resets: usize,
+    /// Segments summed into `counts`: one per process that ran during the
+    /// phase. Zero when the delta is unavailable.
+    pub segments: usize,
+    /// Set when `counts` could not be assembled; `counts` is then empty,
+    /// which means unknown, not zero.
     pub unavailable_reason: Option<String>,
+    pub note: Option<String>,
 }
 
-pub fn ack_delta(before: &MetricsScrape, after: &MetricsScrape) -> ServerAckDelta {
-    let mut delta = ServerAckDelta {
-        instance_id: after.instance_id.clone(),
-        metric: "qbit_prism_share_ack_seconds",
-        boundary: "server-side: complete submit frame receipt to completed response write",
-        buckets_seconds: qbit_prism_server::metrics::BUCKETS.to_vec(),
-        counts: BTreeMap::new(),
-        sums: BTreeMap::new(),
-        bucket_deltas: BTreeMap::new(),
-        unavailable_reason: None,
+impl ServerAckDelta {
+    fn empty(instance_id: &str, counter_resets: usize) -> Self {
+        Self {
+            instance_id: instance_id.to_owned(),
+            metric: "qbit_prism_share_ack_seconds",
+            boundary: "server-side: complete submit frame receipt to completed response write",
+            buckets_seconds: qbit_prism_server::metrics::BUCKETS.to_vec(),
+            counts: BTreeMap::new(),
+            sums: BTreeMap::new(),
+            bucket_deltas: BTreeMap::new(),
+            counter_resets,
+            segments: 0,
+            unavailable_reason: None,
+            note: None,
+        }
+    }
+}
+
+/// One process's contribution: `to - from`, refused if either scrape failed
+/// or any counter went backwards, which is a reset nobody recorded.
+struct Segment {
+    counts: BTreeMap<String, f64>,
+    sums: BTreeMap<String, f64>,
+    buckets: BTreeMap<String, BTreeMap<String, f64>>,
+}
+
+fn segment(from: &MetricsScrape, to: &MetricsScrape) -> std::result::Result<Segment, String> {
+    if !from.ok || !to.ok {
+        return Err(to
+            .error
+            .clone()
+            .or_else(|| from.error.clone())
+            .unwrap_or_else(|| "a boundary scrape failed".into()));
+    }
+    let backwards = |what: &str, result: &str, before: f64, after: f64| {
+        format!(
+            "{what} for result {result:?} went from {before} to {after} between two scrapes \
+             without a recorded restart: the process was replaced, or the counters reset, and \
+             the delta cannot be attributed"
+        )
     };
-    if !before.ok || !after.ok {
-        delta.unavailable_reason = Some(
-            after
-                .error
-                .clone()
-                .or_else(|| before.error.clone())
-                .unwrap_or_else(|| "a boundary scrape failed".into()),
-        );
+    let mut counts = BTreeMap::new();
+    for (result, after_count) in &to.ack_counts {
+        let before_count = from.ack_counts.get(result).copied().unwrap_or(0.0);
+        if *after_count < before_count {
+            return Err(backwards("count", result, before_count, *after_count));
+        }
+        counts.insert(result.clone(), after_count - before_count);
+    }
+    let mut sums = BTreeMap::new();
+    for (result, after_sum) in &to.ack_sums {
+        let before_sum = from.ack_sums.get(result).copied().unwrap_or(0.0);
+        if *after_sum < before_sum {
+            return Err(backwards("sum", result, before_sum, *after_sum));
+        }
+        sums.insert(result.clone(), after_sum - before_sum);
+    }
+    let mut buckets: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+    for (result, after_buckets) in &to.ack_buckets {
+        let empty = BTreeMap::new();
+        let before_buckets = from.ack_buckets.get(result).unwrap_or(&empty);
+        let entry = buckets.entry(result.clone()).or_default();
+        for (le, value) in after_buckets {
+            let before = before_buckets.get(le).copied().unwrap_or(0.0);
+            if *value < before {
+                return Err(backwards(
+                    &format!("bucket le={le}"),
+                    result,
+                    before,
+                    *value,
+                ));
+            }
+            entry.insert(le.clone(), value - before);
+        }
+    }
+    Ok(Segment {
+        counts,
+        sums,
+        buckets,
+    })
+}
+
+/// The phase delta for a frontend that was not restarted.
+pub fn ack_delta(before: &MetricsScrape, after: &MetricsScrape) -> ServerAckDelta {
+    ack_delta_across_restarts(before, &[], after, 0)
+}
+
+/// The phase delta for a frontend restarted `restarts` times during the
+/// phase, with `splits` bracketing each restart in order. A restart without a
+/// split leaves the delta unavailable and says so.
+pub fn ack_delta_across_restarts(
+    before: &MetricsScrape,
+    splits: &[&AckSplit],
+    after: &MetricsScrape,
+    restarts: usize,
+) -> ServerAckDelta {
+    let mut delta = ServerAckDelta::empty(&after.instance_id, restarts);
+    if splits.len() != restarts {
+        delta.unavailable_reason = Some(format!(
+            "the frontend restarted {restarts} time(s) during the phase and its counters reset \
+             each time; {} of those restarts have a scrape on each side, so the delta cannot be \
+             assembled and is unknown",
+            splits.len()
+        ));
         return delta;
     }
-    for (result, after_count) in &after.ack_counts {
-        let before_count = before.ack_counts.get(result).copied().unwrap_or(0.0);
-        delta
-            .counts
-            .insert(result.clone(), after_count - before_count);
+    let mut starts: Vec<&MetricsScrape> = vec![before];
+    let mut ends: Vec<&MetricsScrape> = Vec::new();
+    for split in splits {
+        ends.push(&split.end_of_previous);
+        starts.push(&split.start_of_next);
     }
-    for (result, after_sum) in &after.ack_sums {
-        let before_sum = before.ack_sums.get(result).copied().unwrap_or(0.0);
-        delta.sums.insert(result.clone(), after_sum - before_sum);
-    }
-    for (result, buckets) in &after.ack_buckets {
-        let empty = BTreeMap::new();
-        let before_buckets = before.ack_buckets.get(result).unwrap_or(&empty);
-        let entry = delta.bucket_deltas.entry(result.clone()).or_default();
-        for (le, value) in buckets {
-            entry.insert(
-                le.clone(),
-                value - before_buckets.get(le).copied().unwrap_or(0.0),
-            );
+    ends.push(after);
+    for (from, to) in starts.iter().zip(ends.iter()) {
+        match segment(from, to) {
+            Ok(part) => {
+                for (result, value) in part.counts {
+                    *delta.counts.entry(result).or_insert(0.0) += value;
+                }
+                for (result, value) in part.sums {
+                    *delta.sums.entry(result).or_insert(0.0) += value;
+                }
+                for (result, buckets) in part.buckets {
+                    let entry = delta.bucket_deltas.entry(result).or_default();
+                    for (le, value) in buckets {
+                        *entry.entry(le).or_insert(0.0) += value;
+                    }
+                }
+                delta.segments += 1;
+            }
+            Err(reason) => {
+                delta.counts.clear();
+                delta.sums.clear();
+                delta.bucket_deltas.clear();
+                delta.segments = 0;
+                delta.unavailable_reason = Some(reason);
+                return delta;
+            }
         }
+    }
+    if restarts > 0 {
+        delta.note = Some(format!(
+            "the frontend restarted {restarts} time(s) during the phase; the counters were \
+             scraped on each side of every restart and the {} per-process segments summed",
+            delta.segments
+        ));
     }
     delta
 }

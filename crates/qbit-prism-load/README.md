@@ -379,6 +379,17 @@ per-frontend window tables, the run summaries and a `definitions` block stating
 exactly how each window and time is measured and on which clock. It is
 additive: every other key keeps its shape, and the artifact is untouched.
 
+Each phase's `server_share_ack_seconds` is the frontend's own
+`qbit_prism_share_ack_seconds` histogram over the phase, one entry per
+frontend. A frontend restarted during the phase resets its counters, so the
+entry says how: `counter_resets` is the number of times its process was
+replaced, `segments` the number of per-process segments summed into `counts`,
+and `drained_restarts` on the phase carries the timings and whether each side
+of the restart was scraped. A reset no scrape bracketed (a mid-flight kill)
+leaves `counts` empty with `unavailable_reason` set: unknown, which is not
+zero. A counter that went backwards between two scrapes with no recorded
+restart is reported the same way rather than as a negative number.
+
 The frontend environment is printed redacted, here and in
 `database-profile.json`: the RPC password and the signing seeds are replaced
 outright, and any URL-valued variable loses the password in its userinfo and

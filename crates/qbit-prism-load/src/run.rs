@@ -681,10 +681,24 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             shortfall: outcome.shortfall,
             locks,
             processes,
-            ack_deltas: before_scrapes
+            // A frontend restarted during the phase reset its counters; the
+            // delta is assembled from the scrapes on each side of every
+            // restart, and a restart no scrape bracketed (a mid-flight kill)
+            // leaves it unknown rather than negative or zero.
+            ack_deltas: frontends
                 .iter()
-                .zip(after_scrapes.iter())
-                .map(|(before, after)| measure::ack_delta(before, after))
+                .enumerate()
+                .zip(before_scrapes.iter().zip(after_scrapes.iter()))
+                .map(|((index, child), (before, after))| {
+                    let splits: Vec<&measure::AckSplit> = outcome
+                        .restart_records
+                        .iter()
+                        .filter(|record| record.index == index)
+                        .map(|record| &record.split)
+                        .collect();
+                    let restarts = child.restarts.saturating_sub(restarts_before[index]);
+                    measure::ack_delta_across_restarts(before, &splits, after, restarts)
+                })
                 .collect(),
             replication_start,
             replication_end,

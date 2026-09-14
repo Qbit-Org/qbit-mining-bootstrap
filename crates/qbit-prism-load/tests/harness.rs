@@ -2242,6 +2242,110 @@ qbit_prism_share_ack_seconds_count{result=\"accepted\"} 9
     assert!(delta.counts.is_empty());
 }
 
+/// A frontend restart between the two boundary scrapes resets its in-process
+/// counters, so `after - before` was negative: the coordinator saw the
+/// `reconnect` phase's `server_share_ack_seconds` for `load-fe-1` report
+/// `accepted` counts of -1273 and -1238 with every bucket negative. A reset
+/// must be visible as a reset -- not a negative, not a plausible small
+/// number, and not zero -- and with a scrape on each side of the restart the
+/// two per-process segments can be summed into the real number.
+#[test]
+fn a_counter_reset_between_boundary_scrapes_is_reported_not_subtracted() {
+    use qbit_prism_load::measure::{
+        ack_delta, ack_delta_across_restarts, parse_share_ack, AckSplit, MetricsScrape,
+    };
+    let scrape = |accepted: f64, bucket: f64| {
+        let mut scrape = MetricsScrape {
+            instance_id: "load-fe-1".into(),
+            ok: true,
+            ..Default::default()
+        };
+        parse_share_ack(
+            &format!(
+                "qbit_prism_share_ack_seconds_bucket{{result=\"accepted\",le=\"0.01\"}} {bucket}\n\
+                 qbit_prism_share_ack_seconds_sum{{result=\"accepted\"}} {}\n\
+                 qbit_prism_share_ack_seconds_count{{result=\"accepted\"}} {accepted}\n",
+                accepted / 100.0
+            ),
+            &mut scrape,
+        );
+        scrape
+    };
+    // The old process had answered 1300 shares at the phase start; the new
+    // one had answered 27 by the phase end.
+    let before = scrape(1300.0, 900.0);
+    let after = scrape(27.0, 20.0);
+
+    // No restart recorded, counters went backwards: unknown, never -1273.
+    let delta = ack_delta(&before, &after);
+    assert!(delta.counts.is_empty(), "{:?}", delta.counts);
+    assert!(delta.bucket_deltas.is_empty());
+    let reason = delta.unavailable_reason.clone().expect("a reason is given");
+    assert!(reason.contains("went from 1300 to 27"), "{reason}");
+    assert!(reason.contains("without a recorded restart"), "{reason}");
+    assert_eq!(delta.segments, 0);
+
+    // A restart the run knows about but did not bracket with scrapes: the
+    // delta is unknown and says why, and the reset count is visible.
+    let delta = ack_delta_across_restarts(&before, &[], &after, 1);
+    assert!(delta.counts.is_empty());
+    assert_eq!(delta.counter_resets, 1);
+    assert_eq!(delta.segments, 0);
+    let reason = delta.unavailable_reason.clone().expect("a reason is given");
+    assert!(reason.contains("restarted 1 time"), "{reason}");
+    assert!(reason.contains("0 of those restarts"), "{reason}");
+
+    // Scraped on each side of the restart: the old process reached 1500
+    // before the kill, the new one started from 0, so the phase saw
+    // (1500 - 1300) + (27 - 0) = 227 acknowledgements.
+    let split = AckSplit {
+        end_of_previous: scrape(1500.0, 1000.0),
+        start_of_next: scrape(0.0, 0.0),
+    };
+    let delta = ack_delta_across_restarts(&before, &[&split], &after, 1);
+    assert!(
+        delta.unavailable_reason.is_none(),
+        "{:?}",
+        delta.unavailable_reason
+    );
+    assert_eq!(delta.counts["accepted"], 227.0);
+    assert_eq!(delta.bucket_deltas["accepted"]["0.01"], 120.0);
+    assert!((delta.sums["accepted"] - 2.27).abs() < 1e-9);
+    assert_eq!(delta.counter_resets, 1);
+    assert_eq!(delta.segments, 2);
+    assert!(delta
+        .note
+        .as_deref()
+        .unwrap_or_default()
+        .contains("2 per-process segments"));
+
+    // A failed scrape on one side of the restart is a failed delta, and the
+    // other segment's number is not published as the phase's.
+    let split = AckSplit {
+        end_of_previous: scrape(1500.0, 1000.0),
+        start_of_next: MetricsScrape {
+            instance_id: "load-fe-1".into(),
+            ok: false,
+            error: Some("connection refused".into()),
+            ..Default::default()
+        },
+    };
+    let delta = ack_delta_across_restarts(&before, &[&split], &after, 1);
+    assert!(delta.counts.is_empty());
+    assert_eq!(delta.segments, 0);
+    assert_eq!(
+        delta.unavailable_reason.as_deref(),
+        Some("connection refused")
+    );
+
+    // No restart, counters only ever grew: the plain delta as before.
+    let delta = ack_delta(&before, &scrape(1400.0, 950.0));
+    assert_eq!(delta.counts["accepted"], 100.0);
+    assert_eq!(delta.counter_resets, 0);
+    assert_eq!(delta.segments, 1);
+    assert!(delta.note.is_none());
+}
+
 // --- the drained restart --------------------------------------------------
 
 /// The smallest HTTP server the restart driver's readiness probe and metrics
