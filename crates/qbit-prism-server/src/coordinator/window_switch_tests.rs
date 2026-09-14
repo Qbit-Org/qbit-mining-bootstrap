@@ -87,6 +87,11 @@ struct Fixture {
 
 impl Fixture {
     async fn open() -> Result<Option<Self>> {
+        Self::open_with(|_| {}).await
+    }
+
+    /// `open`, with the frontend's configuration adjusted before it starts.
+    async fn open_with(configure: impl FnOnce(&mut Config)) -> Result<Option<Self>> {
         let Some(raw) = gate::database_url(gate::site!())? else {
             return Ok(None);
         };
@@ -113,7 +118,7 @@ impl Fixture {
             .route("/", post(node_reply))
             .with_state(node.clone());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let config = Config {
+        let mut config = Config {
             database_url: url.to_string(),
             instance_id: "window-switch".into(),
             // clamp(6 - 2, 1, 1): one window read at a time, one build slot.
@@ -159,6 +164,7 @@ impl Fixture {
             audit_bind: "127.0.0.1".into(),
             audit_port: 0,
         };
+        configure(&mut config);
         let coordinator =
             Coordinator::new(config, Arc::new(crate::metrics::Metrics::default())).await?;
         coordinator
@@ -274,6 +280,86 @@ impl Fixture {
             },
             bundle,
         })
+    }
+
+    /// A CTV candidate found on the fixture's window with the stored
+    /// settlement inputs `ctv`, which need not be this frontend's
+    /// configuration: they are what the block's coinbase commits to.
+    fn found_ctv(&self, nonce_start: u32, ctv: CandidateCtv) -> Result<Found> {
+        let (manifest_key, ledger_key) = self.keys();
+        let bundle = self.ctv_bundle(&ctv)?;
+        let template = json!({"version":0x20000000u32,"bits":"207fffff","curtime":1_800_000_000u32,
+            "previousblockhash":PARENT.repeat(32),"transactions":[]});
+        let job = codec::Job::from_manifest(
+            "window-switch-ctv".into(),
+            &template,
+            &bundle.signed_coinbase_manifest.manifest,
+            "00000000",
+            8,
+            1e-12,
+            0.0,
+            true,
+        )?;
+        let proof = (nonce_start..nonce_start + 10_000)
+            .find_map(|nonce| {
+                let proof = job
+                    .assemble_submission(
+                        &"00".repeat(8),
+                        &format!("{:08x}", job.ntime),
+                        &format!("{nonce:08x}"),
+                        None,
+                        0,
+                    )
+                    .ok()?;
+                proof.block_pass.then_some(proof)
+            })
+            .context("constrained block proof missing")?;
+        let block_bytes = hex::decode(&proof.block_hex)?;
+        Ok(Found {
+            candidate: Candidate {
+                block_hash: proof.block_hash_hex,
+                block_sha256: Candidate::block_digest_hex(&block_bytes),
+                job_id: job.job_id,
+                payout_revision: self.snapshot.payout_revision,
+                window: WindowRef::from_snapshot(&self.snapshot)?,
+                bootstrap_share: None,
+                found_block: bundle.found_block.clone(),
+                payout_policy: qbit_prism::PayoutPolicy::day_one_default(),
+                ctv: Some(ctv),
+                audit_builder_version: qbit_prism::AUDIT_BUILDER_VERSION,
+                signer_keys: SignerKeys::of(&manifest_key, &ledger_key),
+                leased: false,
+                coinbase_suffix_hex: "00".repeat(12),
+                deferred_share: None,
+                block_bytes,
+                as_issued_balances: Vec::new(),
+            },
+            bundle,
+        })
+    }
+
+    /// The CTV bundle for the fixture's window under the settlement inputs
+    /// `ctv`, as the building frontend made it.
+    fn ctv_bundle(&self, ctv: &CandidateCtv) -> Result<AuditBundle> {
+        let (manifest_key, ledger_key) = self.keys();
+        Ok(qbit_prism::build_audit_bundle_with_ctv_settlement_options(
+            self.snapshot.shares.clone(),
+            FoundBlock {
+                block_height: 101,
+                coinbase_value_sats: 500_000_000,
+                network_difficulty: 100,
+                anchor_job_issued_at_ms: self.snapshot.anchor_ms,
+            },
+            self.snapshot.prior_balances.clone(),
+            qbit_prism::PayoutPolicy::day_one_default(),
+            ctv.direct_floor_sats,
+            ctv.settlement_config,
+            ctv.fanout_fee_policy,
+            Some("00".repeat(12)),
+            vec![],
+            &manifest_key,
+            &ledger_key,
+        )?)
     }
 
     async fn enqueue_and_claim(&self, found: &Found) -> Result<CandidateClaim> {
@@ -702,6 +788,82 @@ async fn the_rebuild_and_landing_never_wait_for_the_order_lock() -> Result<()> {
             fixture.coordinator.build_slots.available_permits() == 1
                 && fixture.coordinator.window_reads.available_permits() == 1,
             "a permit was kept after the claim finished"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    fixture.close().await?;
+    result
+}
+
+/// A CTV candidate is rebuilt from the settlement inputs it stores, never from
+/// this frontend's configuration. The fixture runs with CTV enabled and a
+/// 10,485,760-sat direct floor; the candidate stores a 400,000,000-sat floor,
+/// above both miners' payouts, so the two floors build different coinbases.
+/// A rebuild that read the configured floor would produce a coinbase the
+/// block does not commit to, and landing would refuse it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ctv_candidate_rebuilds_from_its_stored_settlement_inputs_not_configuration() -> Result<()>
+{
+    let _serial = TEST_LOCK.lock().await;
+    let fee = FanoutFeeRatePolicy::new(1000, 12000);
+    let Some(fixture) = Fixture::open_with(|config| {
+        config.ctv_enabled = true;
+        config.ctv_fee = Some(fee);
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let result = async {
+        let config = &fixture.coordinator.config;
+        let stored = CandidateCtv {
+            direct_floor_sats: 400_000_000,
+            settlement_config: config.ctv_config,
+            fanout_fee_policy: Some(fee),
+        };
+        let configured = CandidateCtv {
+            direct_floor_sats: config.ctv_direct_floor,
+            ..stored.clone()
+        };
+        ensure!(
+            stored.direct_floor_sats != configured.direct_floor_sats,
+            "the stored floor must differ from the configured one"
+        );
+        let found = fixture.found_ctv(0, stored)?;
+        let from_config = fixture.ctv_bundle(&configured)?;
+        ensure!(
+            serde_json::to_vec(&found.bundle.signed_coinbase_manifest.manifest)?
+                != serde_json::to_vec(&from_config.signed_coinbase_manifest.manifest)?,
+            "the stored and configured floors build the same coinbase, so this case proves nothing"
+        );
+        let hash = found.candidate.block_hash.clone();
+        let claim = fixture.enqueue_and_claim(&found).await?;
+        ensure!(claim.candidate.ctv == found.candidate.ctv);
+        tokio::time::timeout(Duration::from_secs(30), fixture.process(&claim)).await???;
+        let (state, _, error) = fixture.row(&hash).await?;
+        ensure!(
+            state == "submitted",
+            "the CTV candidate finished as {state}: {error:?}"
+        );
+        ensure!(
+            fixture.landed(&hash).await?,
+            "the CTV candidate did not land"
+        );
+        ensure!(fixture.submissions().await == 1);
+        let report = qbit_prism::verify_audit_bundle_with_ledger_public_key(
+            &found.bundle,
+            &config.ledger_public_key,
+        )?;
+        let landed: String = sqlx::query_scalar(
+            "SELECT audit_bundle_sha256 FROM qbit_pool_audit_bundles WHERE block_hash=$1",
+        )
+        .bind(&hash)
+        .fetch_one(&fixture.coordinator.ledger.pool)
+        .await?;
+        ensure!(
+            landed == report.audit_bundle_sha256_hex,
+            "the landed CTV audit is not the bundle the block was found on"
         );
         Ok::<_, anyhow::Error>(())
     }

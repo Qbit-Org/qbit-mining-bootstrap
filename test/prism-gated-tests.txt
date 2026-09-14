@@ -127,6 +127,7 @@ qbit-prism-server::qbit_prism_server::coordinator::window_ref_tests::a_refresh_p
 qbit-prism-server::qbit_prism_server::coordinator::window_ref_tests::the_entry_point_holds_a_window_read_permit_only_while_it_reads
 qbit-prism-server::qbit_prism_server::coordinator::window_ref_tests::the_entry_point_reads_without_occupying_a_blocking_thread
 qbit-prism-server::qbit_prism_server::coordinator::window_switch_tests::builder_version_or_signer_mismatch_retries_without_a_rebuild
+qbit-prism-server::qbit_prism_server::coordinator::window_switch_tests::ctv_candidate_rebuilds_from_its_stored_settlement_inputs_not_configuration
 qbit-prism-server::qbit_prism_server::coordinator::window_switch_tests::landed_audit_is_authenticated_and_the_claim_continues_to_submitblock
 qbit-prism-server::qbit_prism_server::coordinator::window_switch_tests::leased_candidate_submits_first_then_lands_as_issued_before_any_terminal_outcome
 qbit-prism-server::qbit_prism_server::coordinator::window_switch_tests::the_rebuild_and_landing_never_wait_for_the_order_lock
