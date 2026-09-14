@@ -74,6 +74,36 @@ impl BundleInputs {
             audit_builder_version: qbit_prism::AUDIT_BUILDER_VERSION,
         })
     }
+
+    /// Whether a bundle this frontend stored was built with these inputs.
+    ///
+    /// A resumed job reuses the bundle it was issued with but captures its
+    /// inputs from configuration now, so if configuration moved in between the
+    /// two disagree. That matters since the candidate stores the inputs rather
+    /// than the bundle: a claim would rebuild from the current ones and produce
+    /// a coinbase the block does not commit to, failing before `submitblock`
+    /// and retrying until the job expires. A disagreement is therefore a cache
+    /// miss, and the bundle is rebuilt rather than mislabelled.
+    ///
+    /// Compared here is everything the bundle itself records about how it was
+    /// built: the payout policy, and the public keys that actually signed its
+    /// coinbase manifest and its ledger attestation. The CTV settlement inputs
+    /// and `audit_builder_version` are not recorded in a bundle, so a change to
+    /// either between issue and resume is still undetectable here; closing that
+    /// needs the issued job to store its inputs, which is #273's format.
+    fn describes(&self, bundle: &AuditBundle) -> bool {
+        bundle.payout_policy == self.payout_policy
+            && bundle
+                .signed_coinbase_manifest
+                .signature
+                .public_key_hex
+                .eq_ignore_ascii_case(&self.signer_keys.manifest_key_hex)
+            && bundle
+                .ledger_window_attestation
+                .signature
+                .public_key_hex
+                .eq_ignore_ascii_case(&self.signer_keys.ledger_key_hex)
+    }
 }
 
 /// The public keys of this frontend's signing seeds.
@@ -1996,9 +2026,16 @@ impl MiningBackend for Coordinator {
             }
             self.ensure_job_fee_current(prepared.fee).await?;
             // Until #273 stores them, a resume takes the inputs from this
-            // frontend's configuration, as it always has.
+            // frontend's configuration, as it always has. The stored bundle is
+            // only reused when those inputs still describe it; otherwise this
+            // is a cache miss and the bundle is rebuilt, because the candidate
+            // stores the inputs and a claim rebuilds from them.
             let inputs = BundleInputs::capture(&self.config, prepared.fee)?;
-            let (bundle, bootstrap_share) = match prepared.bundle.as_ref() {
+            let reusable = prepared
+                .bundle
+                .as_ref()
+                .filter(|bundle| inputs.describes(bundle));
+            let (bundle, bootstrap_share) = match reusable {
                 Some(bundle) => (bundle.clone(), None),
                 None => {
                     let (bundle, bootstrap_share) = self
