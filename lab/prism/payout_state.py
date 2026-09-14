@@ -1162,10 +1162,15 @@ class PayoutStateService:
         if callable(getattr(runtime.ledger, "spool_snapshot_at_job_issue", None)):
             started = time.monotonic()
             generation = runtime._payout_state_generation
-            oracle = self._isolated_window_oracle(
-                snapshot_anchor_ms, snapshot_window_weight, append_invalidation_epoch,
-            )
-            self._note_window_build_phase("ledger_read", time.monotonic() - started)
+            # Timed in a finally, like the in-process read below: a helper
+            # read that dies with the ledger or times out is exactly the
+            # slow read the phase family exists to attribute.
+            try:
+                oracle = self._isolated_window_oracle(
+                    snapshot_anchor_ms, snapshot_window_weight, append_invalidation_epoch,
+                )
+            finally:
+                self._note_window_build_phase("ledger_read", time.monotonic() - started)
             mirror = oracle.window
             unprepared_reason = None
             if self._window_pipeline_rust_enabled():

@@ -14,7 +14,9 @@ import weakref
 from dataclasses import replace
 from unittest.mock import patch
 
+from lab.prism import payout_state as payout_state_module
 from lab.prism import window_oracle as oracle
+from lab.prism.accepted_preview_telemetry import FULL_RESCAN_PATH_HELPER
 from lab.prism.bundle_compiler import _iter_prepare_window_request_chunks
 from lab.prism.metrics import MetricsRenderer
 from lab.prism.payout_state import TemplateRefreshSuperseded
@@ -40,6 +42,24 @@ class StreamLedger:
 
     def snapshot_at_job_issue(self, *args, **kwargs):
         raise AssertionError("coordinator must not request materialized records")
+
+
+class FakeClock:
+    """A monotonic clock the test advances by hand.
+
+    Never frozen: every read moves it a microsecond so no deadline loop in
+    the build can spin forever. Every other ``time`` attribute is the real one.
+    """
+
+    def __init__(self):
+        self.now = time.monotonic()
+
+    def monotonic(self):
+        self.now += 1e-6
+        return self.now
+
+    def __getattr__(self, name):
+        return getattr(time, name)
 
 
 class WindowOracleTests(unittest.TestCase):
@@ -217,6 +237,87 @@ class WindowOracleTests(unittest.TestCase):
                         reason="cold_start", observed_monotonic=1, append_invalidation_epoch=0,
                     )
             self.assertIsNone(server._incremental_payout_artifact_window)
+
+    def test_full_scan_helper_failure_keeps_its_ledger_read_time(self):
+        # Review finding (PR 335): the helper branch noted ``ledger_read``
+        # only after the oracle returned, so a slow SQL failure or a helper
+        # timeout left the failed build with no ledger time. The in-process
+        # branch already timed its read in a finally; the helper read must too.
+        fixture = recenter_tests.DaemonRecenterTests()
+        server, ledger, artifacts, daemon = fixture._server()
+        service = server._ensure_payout_state_service()
+        ledger.spool_snapshot_at_job_issue = lambda *args, **kwargs: None
+        result = oracle.snapshot_window(StreamLedger([row_payload(1)]), anchor=9999, weight=4096)
+        clock = FakeClock()
+        read_seconds = 2.5
+
+        def slow_read(outcome):
+            def read(*args, **kwargs):
+                clock.now += read_seconds
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                return outcome
+            return read
+
+        def full_scan():
+            return service._full_payout_window_oracle(
+                snapshot_anchor_ms=9999, snapshot_window_weight=4096,
+                reason="cold_start", observed_monotonic=1, append_invalidation_epoch=0,
+            )
+
+        family = "qbit_prism_payout_window_build_phase_seconds"
+
+        def cell(metrics, phase, outcome, product):
+            prefix = f'{family}_{product}{{phase="{phase}",outcome="{outcome}"}} '
+            values = [entry for entry in metrics if entry.startswith(prefix)]
+            self.assertEqual(len(values), 1, prefix)
+            return float(values[0].split()[-1])
+
+        with patch.object(payout_state_module, "time", clock):
+            # A successful helper read keeps its attribution and its path.
+            phases = service._begin_window_build_phases()
+            try:
+                with patch.object(service, "_isolated_window_oracle", side_effect=slow_read(result)):
+                    materialized, path = full_scan()
+            finally:
+                service._finish_window_build_phases()
+            self.assertEqual(path, FULL_RESCAN_PATH_HELPER)
+            self.assertEqual(materialized.mode, "full_rescan")
+            self.assertGreaterEqual(phases["ledger_read"], read_seconds)
+            self.assertLess(phases["ledger_read"], read_seconds + 0.01)
+            self.assertIsNotNone(server._incremental_payout_artifact_window)
+
+            # A read that dies still raises its own error, publishes no
+            # window, and owns the wall-clock it spent.
+            for error in (
+                RuntimeError("postgres statement deadline expired"),
+                TimeoutError("window oracle helper timed out"),
+                oracle.WindowOracleError("window oracle deadline exceeded"),
+            ):
+                with self.subTest(error=type(error).__name__):
+                    server._incremental_payout_artifact_window = None
+                    phases = service._begin_window_build_phases()
+                    try:
+                        with patch.object(service, "_isolated_window_oracle", side_effect=slow_read(error)):
+                            with self.assertRaises(type(error)) as raised:
+                                full_scan()
+                    finally:
+                        service._finish_window_build_phases()
+                    self.assertIs(raised.exception, error)
+                    self.assertGreaterEqual(phases["ledger_read"], read_seconds)
+                    self.assertLess(phases["ledger_read"], read_seconds + 0.01)
+                    self.assertIsNone(server._incremental_payout_artifact_window)
+
+            # Through the whole build, that time lands under the failed outcome.
+            with patch.object(
+                service, "_isolated_window_oracle",
+                side_effect=slow_read(TimeoutError("window oracle helper timed out")),
+            ):
+                self.assertIsNone(server._build_payout_ledger_artifact(0, 0, int(artifacts.network_difficulty)))
+            metrics = server.payout_state_metrics_lines()
+            self.assertEqual(cell(metrics, "ledger_read", "failed", "count"), 1)
+            self.assertGreaterEqual(cell(metrics, "ledger_read", "failed", "sum"), read_seconds)
+            self.assertEqual(cell(metrics, "ledger_read", "completed", "count"), 0)
 
     def test_ready_fallback_and_seed_keep_the_canonical_view(self):
         server, rpc = support.coordinator()
