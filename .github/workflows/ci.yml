@@ -46,6 +46,23 @@ jobs:
       - name: Compile Python sources
         run: python -m compileall -q docker lab tests examples scripts
 
+      - name: Check native alert PromQL and pool-exhaustion regressions
+        run: |
+          set -euo pipefail
+          python -m pip install PyYAML==6.0.3
+          prism_prometheus_dir="${RUNNER_TEMP}/prism-prometheus"
+          mkdir -p "${prism_prometheus_dir}"
+          curl --fail --location --retry 3 \
+            --output "${prism_prometheus_dir}/prometheus.tar.gz" \
+            https://github.com/prometheus/prometheus/releases/download/v3.14.0/prometheus-3.14.0.linux-amd64.tar.gz
+          printf '%s  %s\n' \
+            f665c6da19eb7ba399c915d30c7d9793c9b417bf8a749b504bc470678631478d \
+            "${prism_prometheus_dir}/prometheus.tar.gz" | sha256sum --check
+          tar -xzf "${prism_prometheus_dir}/prometheus.tar.gz" -C "${prism_prometheus_dir}" \
+            prometheus-3.14.0.linux-amd64/promtool
+          python scripts/test_prism_alert_promql.py \
+            --promtool "${prism_prometheus_dir}/prometheus-3.14.0.linux-amd64/promtool"
+
       - name: Check that gated tests read their inputs only through the shared gate
         run: python3 scripts/check_gate_env_reads.py
 
