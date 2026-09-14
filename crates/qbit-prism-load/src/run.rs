@@ -140,6 +140,10 @@ struct PhaseRun {
     replication_start: cluster::ReplicationObservation,
     replication_end: cluster::ReplicationObservation,
     proxy_delay_configured_ms: u64,
+    /// Median `SELECT 1` round trip through the frontends' URL, timed just
+    /// before the phase was driven with its delay already applied; the
+    /// reason when it could not be timed. Unknown is not zero.
+    proxy_delay_observed_ms: std::result::Result<f64, String>,
     min_mem_available_kib: Option<u64>,
     scheduled_blocks: usize,
     frontend_restarts: usize,
@@ -398,6 +402,18 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         .await
         .ok();
     let proxied_rtt_idle = proxy::measure_select1_millis(&proxied_url, 21).await.ok();
+    // The proxied URL is what the frontends are given, so the proxy is shown
+    // to be on it rather than assumed to be: with the slow phase's delay set,
+    // a round trip through the URL exactly as written has to cost at least
+    // twice the delay. A URL the rewrite had left an endpoint in comes back
+    // in microseconds here, and would otherwise carry the run to a
+    // `slow_database` phase reporting a delay nothing applied.
+    delay_proxy.set_delay_millis(args.slow_db_delay_ms);
+    let proxied_rtt_delayed = proxy::measure_select1_millis(&proxied_url, 21)
+        .await
+        .context("timing a round trip through the delay proxy")?;
+    delay_proxy.set_delay_millis(0);
+    check_delay_observed(args.slow_db_delay_ms, proxied_rtt_delayed)?;
 
     // --- frontends --------------------------------------------------------
     let per_frontend = args.sessions.div_ceil(args.frontends);
@@ -590,6 +606,26 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     for plan in &plans {
         *shared_session.phase.write().expect("phase lock") = plan.name.clone();
         delay_proxy.set_delay_millis(plan.database_delay_ms);
+        // The delay this phase will report is observed through the frontends'
+        // URL before the phase is driven. A delayed phase whose trip did not
+        // pay it aborts the run: its numbers would describe a delay that was
+        // not there, and the artifact is withheld (EP-OBSERVABILITY).
+        let proxy_delay_observed_ms = proxy::measure_select1_millis(&proxied_url, 21)
+            .await
+            .map_err(|error| format!("{error:#}"));
+        if plan.database_delay_ms > 0 {
+            let checked = proxy_delay_observed_ms
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{error}"))
+                .and_then(|median| check_delay_observed(plan.database_delay_ms, *median));
+            if let Err(error) = checked {
+                aborted = Some(format!(
+                    "the {} phase's delay could not be shown to be applied: {error:#}",
+                    plan.name
+                ));
+                break;
+            }
+        }
         let replication_start = cluster::observe_replication(&side, &plan.name).await?;
         measure::reset_statement_stats(&side).await;
         let mut before_scrapes = Vec::new();
@@ -709,6 +745,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             replication_start,
             replication_end,
             proxy_delay_configured_ms: plan.database_delay_ms,
+            proxy_delay_observed_ms,
             min_mem_available_kib: outcome.min_mem_available_kib,
             scheduled_blocks: outcome.scheduled_blocks,
             frontend_restarts: outcome.frontend_restarts,
@@ -830,6 +867,13 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         "configured_slow_database_delay_milliseconds": args.slow_db_delay_ms,
         "direct_select1_median_milliseconds": direct_rtt,
         "proxied_select1_median_milliseconds_at_zero_delay": proxied_rtt_idle,
+        "proxied_select1_median_milliseconds_at_slow_database_delay": proxied_rtt_delayed,
+        "delayed_round_trip_floor_milliseconds": delay_floor_millis(args.slow_db_delay_ms),
+        "delay_verification": "before the run and again before every phase, a SELECT 1 round \
+                               trip is timed through the proxied URL exactly as the frontends \
+                               received it; a trip under a delay that costs less than twice the \
+                               delay means the connections bypass the proxy, and the run refuses \
+                               to report that phase",
         "measured_proxy_overhead_milliseconds": match (direct_rtt, proxied_rtt_idle) {
             (Some(direct), Some(proxied)) => Some(proxied - direct),
             _ => None,
@@ -1653,22 +1697,115 @@ pub fn with_application_name(url: &str, name: &str) -> String {
     format!("{url}{separator}application_name={name}")
 }
 
-/// Replace the authority of a `postgresql://` URL, keeping user info and path.
+/// The query parameters that name the endpoint SQLx dials. SQLx reads them
+/// after the authority and lets them win, so a URL carrying one connects
+/// wherever it says however the authority is rewritten.
+pub const ENDPOINT_PARAMETERS: [&str; 3] = ["host", "hostaddr", "port"];
+
+/// Replace the endpoint of a `postgresql://` URL with `host_port`, keeping the
+/// user info, the path and every option that does not name an endpoint.
+///
+/// The authority is rewritten, and the libpq-style `host`, `hostaddr` and
+/// `port` parameters are dropped from the query string, because SQLx applies
+/// those over the authority: with `postgresql:///db?host=db.internal` left
+/// intact every frontend would dial `db.internal` directly, the proxy would
+/// see no connection, and the `slow_database` phase would report a delay that
+/// nothing applied (EP-OBSERVABILITY). Everything else in the query --
+/// `sslmode`, `application_name`, `options` -- is kept as written.
 pub fn rewrite_host(url: &str, host_port: &str) -> Result<String> {
     let (scheme, rest) = url
         .split_once("://")
         .context("database URL has no scheme")?;
-    let (userinfo, hostrest) = match rest.rsplit_once('@') {
-        Some((user, host)) => (Some(user), host),
-        None => (None, rest),
-    };
-    let split = hostrest
+    // The authority ends at the first `/` or `?`. User info is looked for
+    // inside it only, so an `@` in the query cannot be taken for one.
+    let (authority, tail) = rest
         .find(['/', '?'])
-        .map_or((hostrest, ""), |at| hostrest.split_at(at));
-    Ok(match userinfo {
-        Some(user) => format!("{scheme}://{user}@{host_port}{}", split.1),
-        None => format!("{scheme}://{host_port}{}", split.1),
-    })
+        .map_or((rest, ""), |at| rest.split_at(at));
+    let userinfo = authority.rsplit_once('@').map(|(user, _)| user);
+    let (path, query) = match tail.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (tail, None),
+    };
+    let kept: Vec<&str> = query
+        .map(|query| {
+            query
+                .split('&')
+                .filter(|pair| !pair.is_empty() && !names_endpoint(pair))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut rewritten = match userinfo {
+        Some(user) => format!("{scheme}://{user}@{host_port}{path}"),
+        None => format!("{scheme}://{host_port}{path}"),
+    };
+    if !kept.is_empty() {
+        rewritten.push('?');
+        rewritten.push_str(&kept.join("&"));
+    }
+    Ok(rewritten)
+}
+
+/// Whether one `key=value` pair of a query string sets an endpoint parameter.
+/// The key is compared as SQLx reads it, percent-decoded, so `h%6Fst` is
+/// `host` here as it is there.
+fn names_endpoint(pair: &str) -> bool {
+    let key = pair.split_once('=').map_or(pair, |(key, _)| key);
+    let decoded = percent_decode(key);
+    ENDPOINT_PARAMETERS.contains(&decoded.as_str())
+}
+
+/// Decode `%XX` escapes and `+` in one query-string component, as a
+/// form-encoded reader does; an escape that is not two hex digits is kept
+/// as written, the way SQLx's decoder keeps it.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len()
+                && bytes[index + 1].is_ascii_hexdigit()
+                && bytes[index + 2].is_ascii_hexdigit() =>
+            {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).expect("ascii");
+                out.push(u8::from_str_radix(hex, 16).expect("two hex digits"));
+                index += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The least a round trip can cost under a one-way per-chunk delay: the
+/// request is held once on the way in and the reply once on the way out, and
+/// the proxy's sleep never returns early, so a trip that comes back sooner
+/// did not go through the proxy.
+pub fn delay_floor_millis(delay_ms: u64) -> f64 {
+    2.0 * delay_ms as f64
+}
+
+/// Refuse a delayed round-trip measurement that did not pay the delay. A
+/// phase's delay is believed only once a trip through the URL the frontends
+/// were given has been seen to cost it, so a bypass -- a rewrite that left
+/// the real endpoint in the URL, a proxy that lost its delay -- is refused
+/// with the numbers rather than reported as a measurement (EP-OBSERVABILITY).
+pub fn check_delay_observed(delay_ms: u64, observed_median_ms: f64) -> Result<()> {
+    let floor = delay_floor_millis(delay_ms);
+    ensure!(
+        observed_median_ms >= floor,
+        "a round trip through the proxied database URL took {observed_median_ms:.3} ms with a \
+         {delay_ms} ms one-way delay configured, below the {floor:.0} ms floor a proxied trip \
+         must pay; the frontends' connections are not going through the delay proxy"
+    );
+    Ok(())
 }
 
 fn scan_logs(text: &str) -> Vec<BlockedLog> {
@@ -2042,6 +2179,9 @@ fn phase_report(
         "settlement_lock": phase.locks.settlement,
         "processes": phase.processes,
         "database_delay_milliseconds_configured": phase.proxy_delay_configured_ms,
+        "database_delay_observed_select1_median_milliseconds": phase.proxy_delay_observed_ms.as_ref().ok(),
+        "database_delay_observation_error": phase.proxy_delay_observed_ms.as_ref().err(),
+        "database_delay_round_trip_floor_milliseconds": delay_floor_millis(phase.proxy_delay_configured_ms),
         "min_mem_available_kib": phase.min_mem_available_kib,
         "scheduled_blocks": phase.scheduled_blocks,
         "frontend_restarts": phase.frontend_restarts,

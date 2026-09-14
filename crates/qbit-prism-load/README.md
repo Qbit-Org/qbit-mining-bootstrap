@@ -89,7 +89,7 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--allow-unverified-server-revision` | off | Run a server binary that cannot be tied to this checkout's HEAD (no Cargo dep-info beside it, or a source or manifest newer than it); forces `artifact_kind: example` |
 | `--example-artifact` | off | Emit `artifact_kind: example` from a clean tree |
 | `--pg-bin-dir` | `QBIT_PRISM_LOAD_PG_BIN_DIR`, then `pg_config --bindir` | PostgreSQL server binaries. The harness keeps its own variable rather than reading one of the shared test-gate variables, which belong to the gate crate (#322) |
-| `--database-url` | none | Use an existing database; no standby is managed and the replication mode is detected, never assumed. The host may be a name: the delay proxy resolves it once at entry and records the addresses in the side report's `delay_proxy` block |
+| `--database-url` | none | Use an existing database; no standby is managed and the replication mode is detected, never assumed. The host may be a name: the delay proxy resolves it once at entry and records the addresses in the side report's `delay_proxy` block. The libpq-style `host`, `hostaddr` and `port` parameters are honoured for the proxy's upstream and dropped from the URL the frontends receive, because SQLx applies them over the authority and they would otherwise route every frontend around the proxy; every other option is kept |
 | `--replication` | `async` | `async`, `sync` or `none` |
 | `--frontends` | 1 | 1, 2 or 4 |
 | `--sessions` | 100 | Stratum sessions, round-robin across the frontends |
@@ -526,6 +526,17 @@ The side report repeats all of this under `honest_value_notes`.
 - **`database_delay_milliseconds` is the one-way per-chunk proxy delay.** A
   round trip pays it twice. The configured delay and the measured added
   round-trip time are both recorded under `delay_proxy`.
+- **A delay is reported only after it was seen to be paid.** Before the run,
+  with the `slow_database` delay set, and again before every phase with that
+  phase's delay set, a `SELECT 1` round trip is timed through the proxied URL
+  exactly as the frontends received it. Each direction is held once and the
+  proxy's sleep never returns early, so a proxied trip costs at least twice
+  the delay; one that comes back sooner did not go through the proxy. The
+  entry check refuses to start, and a phase that fails it aborts the run
+  (exit 6, artifact withheld) rather than reporting a delay nothing applied.
+  Every phase's observation is in its `phases[]` entry as
+  `database_delay_observed_select1_median_milliseconds`, with the floor beside
+  it, and the entry check's under `delay_proxy`.
 - **Two advisory locks are sampled, and reported apart.** Each phase carries an
   `order_lock` block and a `settlement_lock` block, same shape, same own/foreign
   split, from the same polls. `ORDER_LOCK` (`0x505249534d000002`) is what a

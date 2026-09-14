@@ -2289,6 +2289,103 @@ fn a_bracketed_ipv6_authority_keeps_or_gains_its_port() -> Result<()> {
     Ok(())
 }
 
+/// SQLx reads the libpq-style `host`, `hostaddr` and `port` parameters after
+/// the authority and lets them win. A rewrite that replaced the authority and
+/// kept the query string therefore left `postgresql:///db?host=db.internal`
+/// pointing at `db.internal`: every frontend dialled the database directly,
+/// the proxy carried nothing, and the `slow_database` phase reported a 10 ms
+/// delay nothing had applied. The endpoint parameters are dropped, whatever
+/// their spelling, and every other option is kept as written.
+#[test]
+fn endpoint_parameters_never_survive_the_rewrite() -> Result<()> {
+    use sqlx::postgres::PgConnectOptions;
+    // What SQLx would dial, read with SQLx's own parser: the only judge of
+    // whether the rewrite reaches the proxy.
+    let dialled = |url: &str| -> Result<(String, u16)> {
+        let options: PgConnectOptions = url.parse()?;
+        Ok((options.get_host().to_owned(), options.get_port()))
+    };
+    let proxy = "127.0.0.1:9999";
+
+    // The three parameters, alone and together, with and without an authority.
+    for url in [
+        "postgresql:///db?host=db.internal&port=5433",
+        "postgresql://db.internal:5433/db?host=db.internal&port=5433",
+        "postgresql://u:p@127.0.0.1:5432/db?hostaddr=10.0.0.5",
+        "postgresql://u@10.0.0.5/db?port=5433",
+        "postgresql:///db?h%6Fst=db.internal&p%6Frt=5433",
+    ] {
+        let rewritten = run::rewrite_host(url, proxy)?;
+        assert_eq!(
+            dialled(&rewritten)?,
+            ("127.0.0.1".to_owned(), 9999),
+            "{url} rewrote to {rewritten}, which SQLx would not dial through the proxy"
+        );
+        for parameter in run::ENDPOINT_PARAMETERS {
+            assert!(
+                !rewritten.contains(&format!("{parameter}=")),
+                "{rewritten} still carries {parameter}"
+            );
+        }
+    }
+
+    // Unrelated options survive in their order, and nothing is invented.
+    assert_eq!(
+        run::rewrite_host(
+            "postgresql://u:p@db.internal:5433/db?sslmode=disable&host=db.internal&\
+             application_name=x&port=5433&options=-c%20statement_timeout%3D5s",
+            proxy
+        )?,
+        "postgresql://u:p@127.0.0.1:9999/db?sslmode=disable&application_name=x&\
+         options=-c%20statement_timeout%3D5s"
+    );
+    assert_eq!(
+        run::rewrite_host("postgresql:///db?host=db.internal", proxy)?,
+        "postgresql://127.0.0.1:9999/db",
+        "a query left empty is dropped rather than left as a bare `?`"
+    );
+    assert_eq!(
+        run::rewrite_host("postgresql://u@h:1/db?hostname=x&porter=y", proxy)?,
+        "postgresql://u@127.0.0.1:9999/db?hostname=x&porter=y",
+        "only the exact names are endpoint parameters"
+    );
+    // An `@` inside the query is not user info.
+    assert_eq!(
+        run::rewrite_host("postgresql://h:1/db?options=-c%20a=b@c", proxy)?,
+        "postgresql://127.0.0.1:9999/db?options=-c%20a=b@c"
+    );
+    // The rewrite composes with the parameter the run adds afterwards.
+    assert_eq!(
+        run::with_application_name(
+            &run::rewrite_host("postgresql:///db?host=db.internal", proxy)?,
+            "load-fe-0"
+        ),
+        "postgresql://127.0.0.1:9999/db?application_name=load-fe-0"
+    );
+    Ok(())
+}
+
+/// The rewrite is checked at run time as well: a round trip through the URL
+/// the frontends were given, with a delay set, must cost at least twice the
+/// delay, because each direction is held once and the proxy's sleep never
+/// returns early. A trip that comes back sooner did not go through the proxy,
+/// and the run refuses to attribute a delay to it.
+#[test]
+fn a_round_trip_that_did_not_pay_the_delay_is_refused() {
+    assert_eq!(run::delay_floor_millis(10), 20.0);
+    assert_eq!(run::delay_floor_millis(0), 0.0);
+    assert!(run::check_delay_observed(10, 20.0).is_ok());
+    assert!(run::check_delay_observed(10, 23.7).is_ok());
+    assert!(run::check_delay_observed(0, 0.08).is_ok());
+    let refused = run::check_delay_observed(10, 0.31).unwrap_err();
+    let text = format!("{refused:#}");
+    assert!(text.contains("0.310 ms"), "{text}");
+    assert!(text.contains("10 ms one-way delay"), "{text}");
+    assert!(text.contains("20 ms floor"), "{text}");
+    assert!(text.contains("not going through the delay proxy"), "{text}");
+    assert!(run::check_delay_observed(10, 19.99).is_err());
+}
+
 /// `--database-url postgresql://user@postgres.example/db` is an ordinary URL,
 /// and the SQLx connections before the proxy accept the name, so the proxy
 /// has to as well: it resolves the host once at entry, tries every address
