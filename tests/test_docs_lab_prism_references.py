@@ -416,7 +416,7 @@ SHELLS = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
 LAUNCHERS = frozenset({"env", "sudo", "nohup", "command", "exec", "docker", "podman"})
 WRAPPER_ARGUMENTS = {
     "env": {"-u", "--unset", "-C", "--chdir"},
-    "sudo": {"-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "--close-from", "-D", "--chdir", "-T", "--command-timeout"},
+    "sudo": {"-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "--close-from", "-D", "--chdir", "-R", "--chroot", "-r", "--role", "-t", "--type", "-T", "--command-timeout"},
     "exec": {"-a"},
     "docker": {"-e", "--env", "--env-file", "-u", "--user", "-w", "--workdir", "--detach-keys"},
 }
@@ -2398,6 +2398,49 @@ class ScannerTests(unittest.TestCase):
             ):
                 with self.subTest(option=option, arguments=arguments):
                     self.assertEqual(self.commands(f"sudo {option} {arguments}"), [])
+
+    def test_sudo_chroot_role_and_type_arguments_before_commands_are_consumed(self) -> None:
+        for options in (
+            "-R /", "--chroot /", "-R/", "--chroot=/", "'-R' '/srv/chroot dir'",
+            "-r admin", "--role admin", "-radmin", "--role=admin", "\"-r\" 'admin'",
+            "-t unconfined_t", "--type unconfined_t", "-tunconfined_t", "--type=unconfined_t",
+            "'--type' unconfined_t", "-u prism -R / -r admin -t unconfined_t --", "-R / -n",
+            "-D /tmp -R /", "-r python3 -t python3", "-R -e", "-r -v", "-t -K",
+        ):
+            for command, missing in (
+                ("python3 -m lab.example.deleted", "lab/example/deleted.py or lab/example/deleted/__main__.py"),
+                ("python3 lab/example/deleted.py", "lab/example/deleted.py"),
+            ):
+                with self.subTest(options=options, command=command):
+                    text = f"sudo {options} {command}"
+                    self.assertEqual(self.located(text), [(1, missing)])
+                    self.assertEqual(dead_commands(text, {"lab/example/deleted.py"}), [])
+        text = "```sh\nsudo -r \\\n  python3 \\\n  python3 lab/example/deleted.py\n```"
+        self.assertEqual(self.located(text), [(2, "lab/example/deleted.py")])
+        text = "```sh\nenv -S 'sudo --type\npython3\npython3 lab/prism/storm.py'\n```"
+        self.assertEqual(self.located(text), [(4, "lab/prism/storm.py")])
+        for text in (
+            "env sudo --chroot / sh -c 'python3 lab/prism/storm.py'",
+            "env -S 'sudo -R / python3 lab/prism/storm.py'",
+            "sudo -r admin env -u MODE python3 lab/prism/storm.py",
+            "nohup sudo -t unconfined_t command -- python3 lab/prism/storm.py",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.commands(text), ["lab/prism/storm.py"])
+
+    def test_sudo_chroot_role_and_type_arguments_are_not_executable_words(self) -> None:
+        for option in ("-R", "--chroot", "-r", "--role", "-t", "--type"):
+            for arguments in (
+                "python3 -m lab.example.deleted", "python3 lab/example/deleted.py",
+                "'python3 -m lab.example.deleted' true", "",
+            ):
+                with self.subTest(option=option, arguments=arguments):
+                    self.assertEqual(self.commands(f"sudo {option} {arguments}"), [])
+        for options in ("-R / -e", "-r admin --validate", "-t -e -K", "--chroot=/ -nv"):
+            with self.subTest(options=options):
+                text = f"sudo {options} -- python3 -m lab.prism.deleted"
+                self.assertEqual(self.commands(text), [])
+                self.assertEqual(self.commands(text + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
 
     def test_sudo_edit_mode_arguments_are_not_commands(self) -> None:
         for options in (
