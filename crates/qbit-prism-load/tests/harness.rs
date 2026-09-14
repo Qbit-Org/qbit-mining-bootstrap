@@ -1899,6 +1899,83 @@ fn only_entitled_races_are_kept_out_of_the_offered_set() {
     assert!(!offered.contains("accepted"));
 }
 
+/// A refusal is not an acknowledgement. The server answers one in
+/// microseconds because it never reached PostgreSQL for it, so summarising
+/// refusals with the acknowledgements pulled a phase's p50 to 0.7 ms while
+/// every accepted share was taking seconds -- far enough for an artifact to
+/// pass the ACK p99 limit its accepted shares were over. The ACK summary is
+/// over accepted shares only, per phase and overall, and the refusals are
+/// summarised apart so their timing is still visible.
+#[test]
+fn ack_latency_is_the_latency_of_acknowledgements_only() {
+    use qbit_prism_load::client::Outcome;
+    let mut records: Vec<client::SubmitRecord> = Vec::new();
+    fn push(records: &mut Vec<client::SubmitRecord>, phase: &str, latency: f64, outcome: Outcome) {
+        let mut record = submit_record(phase, outcome);
+        record.share_id = format!("{phase}:{latency}");
+        record.latency_millis = Some(latency);
+        records.push(record);
+    }
+    // slow_database: two acknowledgements in the seconds, ninety-eight
+    // refusals under a millisecond, as #324's reproduction produced.
+    push(&mut records, "slow_database", 2_400.0, Outcome::Accepted);
+    push(&mut records, "slow_database", 3_100.0, Outcome::Accepted);
+    for index in 0..98 {
+        push(
+            &mut records,
+            "slow_database",
+            0.5 + index as f64 * 0.01,
+            Outcome::Rejected(rejection(
+                20,
+                Some("backend-unavailable"),
+                "current chain state is unavailable",
+            )),
+        );
+    }
+    // A submit that got no answer has no latency to report either way.
+    push(
+        &mut records,
+        "slow_database",
+        0.0,
+        Outcome::NoResponse {
+            reason: "socket closed".into(),
+        },
+    );
+    records.last_mut().unwrap().latency_millis = None;
+    // A re-offer's answer belongs to the kill scenario, not the phase.
+    push(&mut records, "slow_database", 9_000.0, Outcome::Accepted);
+    records.last_mut().unwrap().reoffer = true;
+    // Another phase, fast and clean.
+    push(&mut records, "steady_state", 4.0, Outcome::Accepted);
+    push(&mut records, "steady_state", 6.0, Outcome::Accepted);
+    push(
+        &mut records,
+        "steady_state",
+        0.2,
+        Outcome::Rejected(rejection(21, Some("stale-job"), "stale")),
+    );
+
+    let slow = run::ack_latency(&records, &["slow_database"]);
+    assert_eq!(slow.samples, 2, "two acknowledgements, nothing else");
+    assert_eq!(slow.p50, Some(2_400.0));
+    assert_eq!(slow.p99, Some(3_100.0));
+    assert_eq!(slow.max, Some(3_100.0));
+
+    let overall = run::ack_latency(&records, &["steady_state", "slow_database"]);
+    assert_eq!(overall.samples, 4);
+    assert_eq!(overall.max, Some(3_100.0));
+    assert!(
+        overall.p99.expect("a p99") >= 2_400.0,
+        "the overall p99 is an acknowledgement's latency, not a refusal's"
+    );
+    assert_eq!(run::ack_latency(&records, &["warm_up"]).samples, 0);
+
+    let refused = run::rejection_latency(&records, "slow_database");
+    assert_eq!(refused.samples, 98, "the refusals are summarised apart");
+    assert!(refused.max.expect("a max") < 2.0);
+    assert_eq!(run::rejection_latency(&records, "steady_state").samples, 1);
+}
+
 #[test]
 fn the_two_reconciliation_gaps_have_distinct_exit_codes() {
     // A loss and a divergence are different failures, and neither may be

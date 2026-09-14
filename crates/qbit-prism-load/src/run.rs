@@ -1048,18 +1048,12 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         });
         artifact_phase_names.push(phase.plan.name.clone());
     }
-    let artifact_submits: Vec<&SubmitRecord> = collected
-        .submits
-        .iter()
-        .filter(|record| artifact_phase_names.contains(&record.phase))
-        .collect();
-    let overall_latency = measure::summarize(
-        artifact_submits
+    let overall_latency = ack_latency(
+        &collected.submits,
+        &artifact_phase_names
             .iter()
-            .filter_map(|record| record.latency_millis)
-            .collect(),
-        measure::MILLISECONDS,
-        "client monotonic",
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
     );
     let union_ack: BTreeSet<String> = phase_evidence
         .iter()
@@ -1983,16 +1977,52 @@ pub fn offered_and_acknowledged(
     (offered, acknowledged)
 }
 
-fn phase_latency(records: &[SubmitRecord], phase: &str) -> measure::LatencySummary {
+/// Client ACK latency over the named phases: the time from writing a submit
+/// line to reading the response that *acknowledged* it. Only an accepted
+/// share is an acknowledgement. A refusal answers in microseconds -- the
+/// server never reached PostgreSQL for it -- and summarising it with the
+/// acknowledgements pulled a phase's p50 to 0.7 ms while accepted shares were
+/// taking seconds, far enough for an artifact to pass the ACK p99 limit that
+/// its accepted shares were over (EP-OBSERVABILITY). Re-offers are the
+/// mid-flight kill's, not the phase's. Refusals are summarised apart, in
+/// `rejection_latency`.
+pub fn ack_latency(records: &[SubmitRecord], phases: &[&str]) -> measure::LatencySummary {
     measure::summarize(
         records
             .iter()
-            .filter(|record| record.phase == phase && !record.reoffer)
+            .filter(|record| {
+                phases.contains(&record.phase.as_str())
+                    && !record.reoffer
+                    && matches!(record.outcome, Outcome::Accepted)
+            })
             .filter_map(|record| record.latency_millis)
             .collect(),
         measure::MILLISECONDS,
         "client monotonic",
     )
+}
+
+/// The same span for the shares the server refused, kept apart from the
+/// acknowledgements so a fast refusal is visible as a refusal and never as a
+/// quick acknowledgement.
+pub fn rejection_latency(records: &[SubmitRecord], phase: &str) -> measure::LatencySummary {
+    measure::summarize(
+        records
+            .iter()
+            .filter(|record| {
+                record.phase == phase
+                    && !record.reoffer
+                    && matches!(record.outcome, Outcome::Rejected(_))
+            })
+            .filter_map(|record| record.latency_millis)
+            .collect(),
+        measure::MILLISECONDS,
+        "client monotonic",
+    )
+}
+
+fn phase_latency(records: &[SubmitRecord], phase: &str) -> measure::LatencySummary {
+    ack_latency(records, &[phase])
 }
 
 fn describe_outcome(outcome: &Outcome) -> Value {
@@ -2270,6 +2300,11 @@ fn phase_report(
         "achieved_rate_shares_per_second": acknowledged as f64 / seconds.max(f64::MIN_POSITIVE),
         "offered_rate_shares_per_second": phase.dispatched as f64 / seconds.max(f64::MIN_POSITIVE),
         "client_ack_latency": latency,
+        "client_ack_latency_definition": "accepted shares only, from writing the submit line to \
+                                          reading the acknowledgement; a refusal is not an \
+                                          acknowledgement and is summarised under \
+                                          client_rejection_latency",
+        "client_rejection_latency": rejection_latency(&collected.submits, &phase.plan.name),
         "server_share_ack_seconds": phase.ack_deltas,
         "order_lock": phase.locks.order,
         "settlement_lock": phase.locks.settlement,

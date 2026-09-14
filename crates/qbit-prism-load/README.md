@@ -518,8 +518,15 @@ The side report repeats all of this under `honest_value_notes`.
   `rejected_valid_shares`. The artifact is then honestly invalid for that
   phase. Only the harness-bug classes — `low-difficulty`, `malformed-submit`,
   `duplicate-share`, every `invalid-*` and `unauthorized-worker` — exit 7.
-- **ACK latency is client-measured**, from writing the submit line to reading
-  its response line, on the client's monotonic clock. The server's own
+- **ACK latency is client-measured, over acknowledgements only**: from
+  writing the submit line to reading the response line that accepted it, on
+  the client's monotonic clock, per phase and overall. A refusal is not an
+  acknowledgement -- the server answers one in microseconds because it never
+  reached PostgreSQL for it -- so refusals are kept out of `ack_p50_millis`
+  and `ack_p99_millis`, where they once pulled a phase's p50 to 0.7 ms while
+  its accepted shares were taking seconds, and are summarised apart in each
+  phase's `client_rejection_latency`. A submit that got no response has no
+  latency in either. The server's own
   `qbit_prism_share_ack_seconds` histogram measures a narrower, server-side
   boundary (complete frame receipt to completed response write) with 10/25/50/
   100 ms buckets; it is reported separately as per-phase bucket deltas.
