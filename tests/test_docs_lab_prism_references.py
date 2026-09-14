@@ -88,8 +88,17 @@ MODULE_REFERENCE = re.compile(r"\blab\.prism(?:\.[A-Za-z_][A-Za-z0-9_]*)*\b")
 # the shell strips the quotes first. A bare argument therefore holds no quote
 # character at all: `-X 'dev"` is an unterminated shell string, not an option.
 # The flag letters are every single-letter option `python3 --help` lists on
-# CPython 3.14 other than `-c` and `-m`; `-?`, the alias of `-h`, is left out.
-PYTHON_FLAG = r"[bBdEhiIOPqRsSuvVx]"
+# CPython 3.14 other than `-c`, `-m`, `-h` with its alias `-?`, and `-V`.
+# `-h` and `-?` print the help text and `-V` the version, and CPython then
+# exits before it reads the target: on CPython 3.14, `python3 -h -m lab.x`,
+# `python3 -V lab/x.py`, `python3 -hm lab.x`, `python3 -Vm lab.x`, `python3
+# -Oh -m lab.x`, `python3 -hW error -m lab.x` and `python3 -VX dev -m lab.x`
+# all print and exit 0 without importing or opening anything, while `python3
+# -m lab.x` and `python3 lab/x.py` run it. A command carrying one of them
+# ahead of its target therefore runs nothing, so neither letter is a prefix
+# option nor may close a `-m` cluster, and the target after one is left to
+# the prose contract like the argument of `-c`.
+PYTHON_FLAG = r"[bBdEiIOPqRsSuvx]"
 # A word the shell hands over as one argument: runs of unquoted characters
 # alternating with matching-quoted strings (`'error'::Warning`, `"dev mode"`,
 # `"lab.prism."deleted`), non-empty. A quoted string may carry bash's `$`
@@ -1026,6 +1035,41 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(self.commands("python3 -OO -c 'import lab.prism.x'"), [])
         self.assertEqual(self.commands("python3 -c -m lab.prism.x"), [])
         self.assertEqual(self.commands("python3 -c lab/prism/x.py"), [])
+
+    # Verified on CPython 3.14 with a `lab/gone.py` and a `gone.py` that raise
+    # on import: each of these printed the help text or the version and exited
+    # 0 without running either, while `python3 -m lab.gone` and `python3
+    # gone.py` raised. `-h`, its alias `-?` and `-V` end the run before the
+    # target is read wherever they sit among the options, so a command
+    # carrying one runs nothing; the prose contract still sees the reference.
+    HELP_AND_VERSION_OPTIONS = (
+        "-h",
+        "-?",
+        "-V",
+        "-VV",
+        "-OO -h",
+        "-Oh",
+        "-hOO",
+        "-V -X dev",
+        "-VX dev",
+        "-hW error",
+    )
+
+    def test_help_and_version_options_are_not_a_command(self) -> None:
+        for options in self.HELP_AND_VERSION_OPTIONS:
+            with self.subTest(options=options):
+                text = f"python3 {options} -m lab.prism.x"
+                self.assertEqual(self.commands(text), [])
+                self.assertEqual(self.references(text), ["lab.prism.x"])
+                self.assertEqual(self.commands(f"python3 {options} lab/prism/x.py"), [])
+                self.assertEqual(self.commands(f"python3.12 {options} -m 'lab.prism.'x"), [])
+        self.assertEqual(self.commands("python3 -V -- lab/prism/x.py"), [])
+        # A cluster `-h` or `-V` closes with `m` prints and exits the same way.
+        for option in ("-hm", "-Vm", "-Ohm", "-hIm", "-VVm"):
+            with self.subTest(option=option):
+                self.assertEqual(self.commands(f"python3 {option} lab.prism.x"), [])
+                self.assertEqual(self.commands(f"python3 {option}lab.prism.x"), [])
+                self.assertEqual(self.references(f"python3 {option} lab.prism.x"), ["lab.prism.x"])
 
 
 if __name__ == "__main__":
