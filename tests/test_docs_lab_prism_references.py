@@ -1261,6 +1261,33 @@ class ScannerTests(unittest.TestCase):
                 self.assertEqual(self.commands(text), [])
                 self.assertEqual(self.references(text), [reference])
 
+    # The mode of `--check-hash-based-pycs` is a shell word like any other:
+    # bash 3.2 hands `$'always'`, `alwa"ys"`, `de'fault'`, `"al"ways` and
+    # `$'never'` to CPython 3.14 as the bare mode, and `python3
+    # --check-hash-based-pycs $'always' -m json.tool` ran `json.tool`. The
+    # word is therefore unquoted before it is checked against the three
+    # modes, so a mode spelled in pieces still runs, and reports, a missing
+    # target. A word that is no mode once unquoted (`"sometimes"`,
+    # `$'some'times`) is rejected by CPython before anything runs, and a
+    # mismatched quote is rejected by bash, so neither is a command.
+    HASH_MODE_WORDS = ("$'always'", 'alwa"ys"', "'never'", '$"default"', "de'fault'", '"al"ways')
+
+    def test_quoted_hash_mode_arguments_are_read_as_shell_words(self) -> None:
+        tracked = self.TRACKED | {"lab/prism/tool.py"}
+        for mode in self.HASH_MODE_WORDS:
+            with self.subTest(mode=mode):
+                text = f"python3 --check-hash-based-pycs {mode} -m lab.prism.process_telemetry rss-bound"
+                self.assertEqual(self.commands(text), [self.TELEMETRY])
+                self.assertEqual(
+                    self.commands(f"python --check-hash-based-pycs {mode} lab/prism/storm.py"), ["lab/prism/storm.py"]
+                )
+                self.assertEqual(dead_commands(f"python3 --check-hash-based-pycs {mode} -m lab.prism.tool", tracked), [])
+        for mode in ('"sometimes"', "$'some'times", "'always\"", "$'alwa'ys\""):
+            with self.subTest(mode=mode):
+                text = f"python3 --check-hash-based-pycs {mode} -m lab.prism.x"
+                self.assertEqual(self.commands(text), [])
+                self.assertEqual(self.references(text), ["lab.prism.x"])
+
 
 if __name__ == "__main__":
     unittest.main()
