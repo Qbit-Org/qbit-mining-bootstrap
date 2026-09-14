@@ -2686,6 +2686,152 @@ fn a_committed_row_that_no_phase_offered_is_a_durability_finding() {
     assert_eq!(findings, json!([]));
 }
 
+/// A rejection whose `reason_id` the classifier does not recognise already
+/// invalidated the artifact -- it is class `unknown`, so it stays in
+/// `rejected_valid_shares` -- and the run said nothing about it: exit 0,
+/// and the reader found it by reading the rejections JSON. An unrecognised
+/// reason means the harness's model of the server is out of date, which is
+/// the reader's problem to solve, so the printed summary names it and so
+/// does the validator's refusal reason. The exit code is deliberately
+/// unchanged: an unrecognised reason is not a harness bug (7) and not a
+/// loss (4), and exit codes are a contract other tooling reads.
+#[test]
+fn an_unrecognised_rejection_reason_is_named_in_the_summary_and_the_refusal() {
+    use qbit_prism_load::artifact::{Evidence, Verdict};
+    use qbit_prism_load::client::Outcome;
+    use qbit_prism_load::run::{
+        name_unrecognised_reasons, summary_text, unrecognised_reasons_line,
+        unrecognised_rejection_reasons, RunOutcome,
+    };
+    let novel = || rejection(29, Some("quantum-flux"), "share arrived from the future");
+    assert_eq!(classify::classify(&novel()), RejectionClass::Unknown);
+    let mut reoffered = submit_record("mid_flight_kill", Outcome::Rejected(novel()));
+    reoffered.reoffer = true;
+    let records = vec![
+        submit_record("steady_state", Outcome::Rejected(novel())),
+        submit_record("slow_database", Outcome::Rejected(novel())),
+        // A re-offer's unrecognised reason says the same thing about the
+        // harness's model of the server, so it counts.
+        reoffered,
+        submit_record(
+            "steady_state",
+            Outcome::Rejected(rejection(
+                21,
+                Some("stale-job"),
+                classify::NEW_TIP_WORK_PENDING,
+            )),
+        ),
+        submit_record(
+            "steady_state",
+            Outcome::Rejected(rejection(
+                20,
+                Some("backend-rpc-unavailable"),
+                "current chain state is unavailable",
+            )),
+        ),
+        submit_record("steady_state", Outcome::Accepted),
+    ];
+    let reasons = unrecognised_rejection_reasons(&records);
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert_eq!(reasons[0].reason_id, "quantum-flux");
+    assert_eq!(reasons[0].code, 29);
+    assert_eq!(reasons[0].message, "share arrived from the future");
+    assert_eq!(reasons[0].count, 3);
+    assert!(unrecognised_rejection_reasons(&records[3..]).is_empty());
+    assert_eq!(unrecognised_reasons_line(&[]), None);
+    let line = unrecognised_reasons_line(&reasons).expect("a line for the reasons");
+    assert!(line.contains("quantum-flux"), "{line}");
+    assert!(line.starts_with("3 rejection(s)"), "{line}");
+    assert!(line.contains("out of date"), "{line}");
+
+    // The refusal reason: a written artifact the validator refused ends
+    // its error chain with the line, so the printed INVALID verdict names
+    // the reason.
+    let written = |valid: bool| Evidence::Written {
+        path: "capacity-evidence.json".into(),
+        document: json!({}),
+        verdict: Verdict {
+            valid,
+            summary: valid.then(|| "rate=1 shares/s".to_owned()),
+            error_chain: if valid {
+                Vec::new()
+            } else {
+                vec![
+                    "phases.steady_state did not acknowledge every offered valid share: \
+                      offered=4 acknowledged=1 rejected=3"
+                        .to_owned(),
+                ]
+            },
+        },
+        command: "srv capacity-evidence capacity-evidence.json".into(),
+    };
+    let mut refused = written(false);
+    name_unrecognised_reasons(&mut refused, &reasons);
+    let Evidence::Written { verdict, .. } = &refused else {
+        unreachable!()
+    };
+    assert_eq!(verdict.error_chain.len(), 2, "{:?}", verdict.error_chain);
+    assert!(
+        verdict.error_chain[0].contains("did not acknowledge"),
+        "the validator's own reason stays first"
+    );
+    assert_eq!(verdict.error_chain[1], line);
+    let report = json!({"phases": []});
+    let text = summary_text(&report, &refused, &reasons);
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("artifact verdict: INVALID:") && l.contains("quantum-flux")),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("unrecognised rejection reasons:") && l.contains("quantum-flux")),
+        "{text}"
+    );
+
+    // A valid artifact stays valid -- its unrecognised reasons were in a
+    // side phase -- and the summary still names them on their own line. So
+    // does a withheld artifact's summary.
+    let mut valid = written(true);
+    name_unrecognised_reasons(&mut valid, &reasons);
+    let Evidence::Written { verdict, .. } = &valid else {
+        unreachable!()
+    };
+    assert!(verdict.valid && verdict.error_chain.is_empty());
+    let text = summary_text(&report, &valid, &reasons);
+    assert!(text.contains("artifact verdict: rate=1 shares/s"), "{text}");
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("unrecognised rejection reasons:") && l.contains("quantum-flux")),
+        "{text}"
+    );
+    let withheld = Evidence::Withheld {
+        reason: "the run aborted: load-fe-1 exited".into(),
+        stale_artifact_removed: false,
+    };
+    let text = summary_text(&report, &withheld, &reasons);
+    assert!(text.contains("artifact withheld:"), "{text}");
+    assert!(text.contains("quantum-flux"), "{text}");
+    // Nothing to say when there is nothing.
+    let mut clean = written(false);
+    name_unrecognised_reasons(&mut clean, &[]);
+    let Evidence::Written { verdict, .. } = &clean else {
+        unreachable!()
+    };
+    assert_eq!(verdict.error_chain.len(), 1);
+    assert!(!summary_text(&report, &clean, &[]).contains("unrecognised"));
+
+    // The exit code is untouched: unrecognised is neither 7 nor 4.
+    let outcome = RunOutcome {
+        withhold: None,
+        durability_findings: 0,
+        harness_bug_rejections: 0,
+        divergences: 0,
+        unknown_outcome_commits: 0,
+    };
+    assert_eq!(outcome.exit_code(), run::EXIT_OK);
+}
+
 #[test]
 fn only_entitled_races_are_kept_out_of_the_offered_set() {
     use qbit_prism_load::client::Outcome;

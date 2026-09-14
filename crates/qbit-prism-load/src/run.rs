@@ -1484,12 +1484,19 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     // size the server did not serve in full, or work the configuration does
     // not name (EP-ERRORS). The side report below still carries every
     // number, with the reason.
-    let evidence = artifact::write_or_withhold(
+    let mut evidence = artifact::write_or_withhold(
         &inputs,
         withhold.as_ref(),
         &args.out,
         &ctx.server_bin.display().to_string(),
     )?;
+    // A rejection whose reason the classifier does not recognise already
+    // invalidates the artifact, through rejected_valid_shares, and used to
+    // do so quietly: the reader found it by reading the rejections JSON.
+    // It means the harness's model of the server is out of date, which is
+    // the reader's problem to solve, so the refusal reason names it.
+    let unrecognised = unrecognised_rejection_reasons(&collected.submits);
+    name_unrecognised_reasons(&mut evidence, &unrecognised);
 
     // --- side report ------------------------------------------------------
     let slowest_rate = phase_evidence
@@ -1702,14 +1709,14 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "waited_seconds": drained_seconds,
             "submits_outstanding_at_stop": undrained,
         },
-        "validator": validator_block(&evidence, args, slowest_rate, worst_p99),
+        "validator": validator_block(&evidence, args, slowest_rate, worst_p99, &unrecognised),
         "stale_outputs_removed": ctx.stale_outputs_removed,
     });
     let report_path = args.out.join("load-harness-report.json");
     report::write_json(&report_path, &side_report)?;
 
     // --- exit code --------------------------------------------------------
-    println!("{}", summary_text(&side_report, &evidence));
+    println!("{}", summary_text(&side_report, &evidence, &unrecognised));
     for mut child in frontends {
         child.kill();
     }
@@ -3015,11 +3022,93 @@ async fn finish_early(
 
 /// The side report's `validator` block: the verdict and the reproducing
 /// command when an artifact was written, and the reason when it was not.
+/// One rejection reason the classifier does not recognise, as the run saw
+/// it, with how many rejections carried it.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct UnrecognisedReason {
+    pub reason_id: String,
+    pub code: i64,
+    pub message: String,
+    pub count: u64,
+}
+
+/// Every `(reason_id, code, message)` the classifier answered `Unknown` for,
+/// over every submit of the run including the mid-flight re-offers: an
+/// unrecognised reason on a re-offer says the same thing about the harness's
+/// model of the server as one on a first offer.
+pub fn unrecognised_rejection_reasons(records: &[SubmitRecord]) -> Vec<UnrecognisedReason> {
+    let mut by_key: BTreeMap<(String, i64, String), u64> = BTreeMap::new();
+    for rejection in records.iter().filter_map(rejection_of) {
+        if classify::classify(rejection) == RejectionClass::Unknown {
+            *by_key
+                .entry((
+                    rejection.reason_id.clone().unwrap_or_default(),
+                    rejection.code,
+                    rejection.message.clone(),
+                ))
+                .or_insert(0) += 1;
+        }
+    }
+    by_key
+        .into_iter()
+        .map(|((reason_id, code, message), count)| UnrecognisedReason {
+            reason_id,
+            code,
+            message,
+            count,
+        })
+        .collect()
+}
+
+/// The one line that says what the unrecognised reasons mean, or nothing
+/// when there are none.
+pub fn unrecognised_reasons_line(reasons: &[UnrecognisedReason]) -> Option<String> {
+    if reasons.is_empty() {
+        return None;
+    }
+    let total: u64 = reasons.iter().map(|reason| reason.count).sum();
+    let named: Vec<String> = reasons
+        .iter()
+        .map(|reason| {
+            format!(
+                "reason_id {:?} code {} message {:?} x{}",
+                reason.reason_id, reason.code, reason.message, reason.count
+            )
+        })
+        .collect();
+    Some(format!(
+        "{total} rejection(s) carried a reason the harness does not recognise ({}): the \
+         harness's model of the server's rejections is out of date, which is the reader's \
+         problem to solve; they are counted in rejected_valid_shares and the exit code is \
+         unchanged",
+        named.join("; ")
+    ))
+}
+
+/// Put the unrecognised reasons into the artifact's refusal reason, when the
+/// artifact was written and refused. A valid artifact is left valid: its
+/// unrecognised reasons were in a side phase, and the summary names them on
+/// their own line either way.
+pub fn name_unrecognised_reasons(
+    evidence: &mut artifact::Evidence,
+    reasons: &[UnrecognisedReason],
+) {
+    let Some(line) = unrecognised_reasons_line(reasons) else {
+        return;
+    };
+    if let artifact::Evidence::Written { verdict, .. } = evidence {
+        if !verdict.valid {
+            verdict.error_chain.push(line);
+        }
+    }
+}
+
 fn validator_block(
     evidence: &artifact::Evidence,
     args: &Args,
     slowest_rate: f64,
     worst_p99: Option<f64>,
+    unrecognised: &[UnrecognisedReason],
 ) -> Value {
     let mut block = match evidence {
         artifact::Evidence::Written {
@@ -3046,6 +3135,11 @@ fn validator_block(
         }),
     };
     let suggestions = json!({
+        "unrecognised_rejection_reasons": {
+            "count": unrecognised.iter().map(|reason| reason.count).sum::<u64>(),
+            "reasons": unrecognised,
+            "note": unrecognised_reasons_line(unrecognised),
+        },
         "forecast_used": args.forecast_peak_shares_per_second,
         "slowest_artifact_phase_rate_shares_per_second": slowest_rate,
         "suggested_forecast_for_a_valid_artifact": (slowest_rate / 2.0).max(0.0),
@@ -3065,7 +3159,12 @@ fn validator_block(
     block
 }
 
-fn summary_text(report: &Value, evidence: &artifact::Evidence) -> String {
+/// The text the run prints once the side report is written.
+pub fn summary_text(
+    report: &Value,
+    evidence: &artifact::Evidence,
+    unrecognised: &[UnrecognisedReason],
+) -> String {
     let mut text = String::new();
     text.push_str("=== qbit-prism-load ===\n");
     for phase in report["phases"].as_array().into_iter().flatten() {
@@ -3115,6 +3214,9 @@ fn summary_text(report: &Value, evidence: &artifact::Evidence) -> String {
         artifact::Evidence::Withheld { reason, .. } => {
             text.push_str(&format!("artifact withheld: {reason}\n"));
         }
+    }
+    if let Some(line) = unrecognised_reasons_line(unrecognised) {
+        text.push_str(&format!("unrecognised rejection reasons: {line}\n"));
     }
     text
 }

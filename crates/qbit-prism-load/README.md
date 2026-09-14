@@ -554,6 +554,17 @@ The side report repeats all of this under `honest_value_notes`.
   `rejected_valid_shares`. The artifact is then honestly invalid for that
   phase. Only the harness-bug classes — `low-difficulty`, `malformed-submit`,
   `duplicate-share`, every `invalid-*` and `unauthorized-worker` — exit 7.
+- **An unrecognised rejection reason is loud.** A rejection whose
+  `reason_id` the classifier does not recognise is class `unknown`: it stays
+  in `rejected_valid_shares`, so the artifact is already invalid, and it
+  means the harness's model of the server's rejections is out of date, which
+  is the reader's problem to solve. The summary the run prints names every
+  such reason with its code, message and count on its own line, the
+  validator's refusal reason ends with the same line when the artifact was
+  written and refused, and `validator.unrecognised_rejection_reasons` in the
+  side report lists them. The exit code is unchanged: an unrecognised reason
+  is not a harness bug (7) and not a loss (4), and exit codes are a contract
+  other tooling reads.
 - **ACK latency is client-measured, over acknowledgements only**: from
   writing the submit line to reading the response line that accepted it, on
   the client's monotonic clock, per phase and overall. A refusal is not an
