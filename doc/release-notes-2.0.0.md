@@ -113,14 +113,14 @@ have their own version tags.
   can preload recent converged values after restart. Resume is bounded
   assistance, not a guarantee that every active worker survives an abrupt
   exit with a retained difficulty.
-- `PRISM_WINDOW_PIPELINE_RUST` defaults to `0`. When enabled with the daemon
+- `PRISM_WINDOW_PIPELINE_RUST` defaults to `0`. When enabled with the daemon <!-- retired-setting: PRISM_WINDOW_PIPELINE_RUST -->
   transport, unsupported integer ranges and daemon anomalies fall back to the
   Python pipeline for that materialization. Qualify a deployment before
   changing this switch; the real-daemon parity gate is part of CI.
 - Rebuild service images for Python 3.14. The PRISM image sets
   `MALLOC_ARENA_MAX=2`; allocator telemetry defaults on, while heap census,
   tracemalloc, and malloc-trim controls default off. The optional
-  `PRISM_PYTHON_SWITCH_INTERVAL_SECONDS` override remains unset by default.
+  `PRISM_PYTHON_SWITCH_INTERVAL_SECONDS` override remains unset by default. <!-- retired-setting: PRISM_PYTHON_SWITCH_INTERVAL_SECONDS -->
   Follow the capacity and allocator runbooks before tuning these controls.
 - Update consumers of removed `qbit_prism_shares_per_second`
   telemetry to rates derived from the monotonic share counters. Review

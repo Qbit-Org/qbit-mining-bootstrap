@@ -578,10 +578,10 @@ three gauges at scrape time:
 
 The coordinator uses the same budget as `/healthz`:
 `max(3 * PRISM_HEALTH_REFRESH_SECONDS, 15)` seconds. The setting is read as an
-unsigned whole number of seconds, defaulting to 2 when absent or invalid;
-Compose supplies 5 by default. Both values give a 15-second freshness budget.
-The publisher still ticks every 2 seconds: this setting changes the staleness
-budget, not the publication interval.
+unsigned whole number of seconds from 1 through 86400, defaulting to 2 when
+absent; invalid values fail startup. Compose supplies 5 by default. Both values
+give a 15-second freshness budget. The publisher ticks at this configured
+interval, so publication cadence and the staleness budget stay aligned.
 Once the age exceeds that budget, a scrape sets `qbit_prism_health_state` to `0`
 while retaining the other cached samples. Collector age/availability and runtime
 state are overlaid from memory at scrape time; this does not refresh the cached

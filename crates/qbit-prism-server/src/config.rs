@@ -7,6 +7,11 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{env, time::Duration};
 
+mod database;
+mod environment;
+pub use database::DatabaseConfig;
+pub use environment::check_environment;
+
 #[derive(Clone)]
 pub struct Config {
     pub database_url: String,
@@ -63,6 +68,42 @@ pub fn value(name: &str, default: &str) -> String {
 }
 pub fn optional(name: &str) -> Option<String> {
     env::var(name).ok().filter(|s| !s.trim().is_empty())
+}
+
+/// Read a secret directly or from its mounted `_FILE`, never echoing its value.
+/// File reads are bounded and tolerate the trailing newline added by editors.
+pub fn secret(name: &str) -> Result<Option<String>> {
+    use std::io::Read;
+    let direct = optional(name);
+    let file_name = format!("{name}_FILE");
+    let path = optional(&file_name);
+    ensure!(
+        direct.is_none() || path.is_none(),
+        "configure only one of {name} and {file_name}"
+    );
+    let Some(path) = path else { return Ok(direct) };
+    let file = std::fs::File::open(path).map_err(|_| anyhow::anyhow!("cannot open {file_name}"))?;
+    let mut bytes = Vec::new();
+    file.take(16_385)
+        .read_to_end(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("cannot read {file_name}"))?;
+    ensure!(bytes.len() <= 16_384, "{file_name} exceeds 16384 bytes");
+    let text = String::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("{file_name} must contain UTF-8 text"))?;
+    let text = text.trim();
+    ensure!(!text.is_empty(), "{file_name} must not be empty");
+    Ok(Some(text.to_owned()))
+}
+
+pub fn production_mode() -> Result<bool> {
+    Ok(matches!(
+        value("QBIT_CHAIN", "regtest")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "main" | "mainnet"
+    ) || flag("QBIT_PRODUCTION", false)?
+        || flag("QBIT_TOOLS_PRODUCTION", false)?)
 }
 pub(crate) fn authority_host(host: &str) -> String {
     if host.parse::<std::net::Ipv6Addr>().is_ok() {
@@ -173,9 +214,7 @@ impl Config {
             _ => bail!("QBIT_CHAIN must name mainnet, testnet, testnet4, signet, or regtest"),
         }
         .to_string();
-        let production = matches!(chain.as_str(), "main" | "mainnet")
-            || flag("QBIT_PRODUCTION", false)?
-            || flag("QBIT_TOOLS_PRODUCTION", false)?;
+        let production = production_mode()?;
         if production {
             ensure!(
                 chain != "regtest",
@@ -233,21 +272,18 @@ impl Config {
         );
         ensure!(!flag("PRISM_ALLOW_FIXED_LEDGER_SESSION_TOKEN",false)? && optional("PRISM_LEDGER_WRITER_SESSION_TOKEN").is_none(),
             "fixed ledger writer sessions are retired; unset PRISM_LEDGER_WRITER_SESSION_TOKEN and PRISM_ALLOW_FIXED_LEDGER_SESSION_TOKEN");
-        let database_url = optional("PRISM_DATABASE_URL").context(
-            "PRISM_DATABASE_URL is required (Rust PRISM uses PostgreSQL for every instance)",
-        )?;
-        let parsed_database =
-            url::Url::parse(&database_url).context("invalid PRISM_DATABASE_URL")?;
-        ensure!(
-            matches!(parsed_database.scheme(), "postgres" | "postgresql"),
-            "PRISM_DATABASE_URL must use postgres or postgresql"
-        );
+        let database = DatabaseConfig::from_env()?;
+        let database_url = database.database_url;
         let allow_test = flag("PRISM_ALLOW_TEST_SIGNING_SEEDS", false)? && !production;
         let seed = |name: &str, byte: &str| -> Result<String> {
-            let s = optional(name)
+            ensure!(
+                !production || optional(name).is_none(),
+                "production requires mounted {name}_FILE; unset {name}"
+            );
+            let s = secret(name)?
                 .or_else(|| allow_test.then(|| byte.repeat(32)))
                 .with_context(|| format!("{name} is required"))?;
-            ManifestSigningKey::from_seed_hex(&s).with_context(|| format!("invalid {name}"))?;
+            ManifestSigningKey::from_seed_hex(&s).map_err(|_| anyhow::anyhow!("invalid {name}"))?;
             if !allow_test {
                 ensure!(
                     !["11", "22", "42", "43"]
@@ -379,13 +415,7 @@ impl Config {
             1,
             1024,
         )?;
-        let database_connections = u32::try_from(bounded_usize(
-            "PRISM_DATABASE_MAX_CONNECTIONS",
-            16,
-            4,
-            1024,
-        )?)
-        .context("database connection budget exceeds uint32")?;
+        let database_connections = database.database_connections;
         let build_workers = bounded_usize(
             "PRISM_JOB_BUILD_EXECUTOR_WORKERS",
             runtime_workers.min(4),
@@ -422,9 +452,7 @@ impl Config {
             ctv_config.reserved_coinbase_outputs < ctv_config.max_coinbase_settlement_outputs,
             "reserved coinbase outputs leave no settlement capacity"
         );
-        let instance_id =
-            optional("PRISM_INSTANCE_ID").unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        ensure!(instance_id.len()<=128 && !instance_id.chars().any(char::is_control) && !instance_id.starts_with("prepared:"),"PRISM_INSTANCE_ID must be at most 128 characters, without controls or the reserved prepared: prefix");
+        let instance_id = database.instance_id;
         let parsed_rpc = url::Url::parse(&rpc_url)
             .context("invalid QBIT_RPC_URL or QBIT_RPC_HOST/QBIT_RPC_PORT")?;
         ensure!(

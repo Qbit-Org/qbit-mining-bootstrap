@@ -46,7 +46,7 @@ Migration refuses a live legacy Python writer lease and prevents reacquisition.
 | `import-audits [--root PATH]` | Verify and import database-referenced legacy filesystem bundles |
 | `backfill-ctv` | Reconstruct missing fanout sets from verified database audits |
 | `broadcast-ctv` | Process one batch of mature fanout claims |
-| `capacity-evidence FILE [options]` | Validate the retained strict v2 load-evidence format |
+| `capacity-evidence FILE [options]` | Validate the strict v3 native load-evidence format |
 | `benchmark --shares N --miners N --iterations N [--output-json PATH]` | Measure synthetic native audit build and verification |
 | `header-difficulty --bits HEX` | Print the exact scaled difficulty of a compact block-header target |
 

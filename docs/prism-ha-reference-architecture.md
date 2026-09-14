@@ -366,7 +366,8 @@ endpoint-observation bound, not a guarantee that every 500k-share rebuild meets
 that budget. Measure the latter before sign-off; a longer ordinary rebuild must
 lead to an explicitly reviewed threshold and revised bound.
 
-HTTP health is normally published every 2 seconds. If publication stalls, the
+HTTP health is published every `PRISM_HEALTH_REFRESH_SECONDS` (2 seconds by
+default in the binary, 5 in Compose). If publication stalls, the
 HTTP handler rejects a snapshot older than `max(15, 3 * PRISM_HEALTH_REFRESH_SECONDS)`
 seconds (default 15); `ready` alone need not reflect that rejection. With these
 defaults, stale-publication detection plus LB hysteresis has a conservative

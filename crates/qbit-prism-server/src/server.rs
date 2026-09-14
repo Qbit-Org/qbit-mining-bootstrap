@@ -19,6 +19,7 @@ pub async fn run(config: Config) -> Result<()> {
     let stats = stratum_config.stats.clone();
     // Validate both listeners before coordinator startup can write cluster state.
     let highdiff = stratum_config.highdiff_config()?;
+    let mut api_config = ApiConfig::from_env()?;
     let registry = Arc::new(metrics::Metrics::default());
     let coordinator = Coordinator::new(config, registry.clone()).await?;
     let config = &coordinator.config;
@@ -43,7 +44,6 @@ pub async fn run(config: Config) -> Result<()> {
     } else {
         None
     };
-    let mut api_config = ApiConfig::from_env();
     api_config.rpc_url = config.rpc_url.clone();
     api_config.rpc_user = config.rpc_user.clone();
     api_config.rpc_password = config.rpc_password.clone();
@@ -218,8 +218,15 @@ async fn with_health_publication_progress<T>(
     let _progress = state
         .metrics()
         .runtime()
-        .start_operation(TaskKind::HealthPublisher, crate::api::health_stale_after());
+        .start_operation(TaskKind::HealthPublisher, state.config.health_stale_after());
     publication.await
+}
+
+/// Publish at the configured cadence that health and metrics readers age against.
+fn publication_ticks(state: &ApiState) -> tokio::time::Interval {
+    let mut tick = tokio::time::interval(state.config.health_refresh_interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tick
 }
 
 async fn publish_health(
@@ -228,8 +235,7 @@ async fn publish_health(
     stats: Arc<StratumStats>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let mut tick = tokio::time::interval(Duration::from_secs(2));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut tick = publication_ticks(&state);
     let mut missing_since = None::<Instant>;
     loop {
         tokio::select! {_=shutdown.changed()=>break,_=tick.tick()=>{}}
@@ -301,14 +307,14 @@ mod tests {
     use tower::ServiceExt;
 
     fn state() -> ApiState {
+        state_with(ApiConfig::default())
+    }
+
+    fn state_with(config: ApiConfig) -> ApiState {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgresql://invalid@127.0.0.1:1/invalid")
             .unwrap();
-        ApiState::new(
-            pool,
-            ApiConfig::default(),
-            Arc::new(metrics::Metrics::default()),
-        )
+        ApiState::new(pool, config, Arc::new(metrics::Metrics::default()))
     }
 
     async fn assert_healthy(state: ApiState) {
@@ -356,39 +362,104 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn publication_progress_uses_configured_freshness_budget() {
-        const CHILD: &str = "PRISM_PUBLICATION_BUDGET_TEST_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            // Exercise the real reader in an isolated process; never mutate
-            // configuration underneath parallel tests in this process.
-            let output = tokio::time::timeout(
-                Duration::from_secs(10),
-                tokio::process::Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "server::tests::publication_progress_uses_configured_freshness_budget",
-                        "--nocapture",
-                    ])
-                    .env(CHILD, "1")
-                    .env("PRISM_HEALTH_REFRESH_SECONDS", "6")
-                    .kill_on_drop(true)
-                    .output(),
+    async fn health_age(state: &ApiState) -> f64 {
+        let response = crate::api::router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
             )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["snapshot_age_seconds"]
+            .as_f64()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn publisher_ticks_reset_health_age_at_the_configured_cadence() {
+        const CADENCE: Duration = Duration::from_secs(3);
+        let state = state_with(ApiConfig {
+            health_refresh_interval: CADENCE,
+            ..ApiConfig::default()
+        });
+        let (stop, mut shutdown) = watch::channel(false);
+        let (published, mut publications) = tokio::sync::mpsc::unbounded_channel();
+        let publisher = tokio::spawn({
+            let state = state.clone();
+            async move {
+                // The runtime publisher's loop, without its coordinator inputs.
+                let mut tick = publication_ticks(&state);
+                loop {
+                    tokio::select! {_=shutdown.changed()=>break,_=tick.tick()=>{}}
+                    with_health_publication_progress(&state, async {
+                        state.publish_health(json!({"ok":true,"ready":true}));
+                        Ok(())
+                    })
+                    .await?;
+                    published.send(Instant::now()).unwrap();
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+        });
+        let bound = Duration::from_secs(10);
+        let first = tokio::time::timeout(bound, publications.recv())
             .await
             .unwrap()
             .unwrap();
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return;
-        }
-        let budget = crate::api::health_stale_after();
+        let fresh = health_age(&state).await;
+        assert!(fresh < 1.0, "first publication age {fresh}");
+        // Beyond the default 2-second cadence, no publication has reset the age.
+        tokio::time::sleep_until((first + Duration::from_millis(2200)).into()).await;
+        assert!(
+            publications.try_recv().is_err(),
+            "published before the configured cadence"
+        );
+        let aged = health_age(&state).await;
+        assert!(aged >= 2.1 && aged > fresh, "age did not rise: {aged}");
+        let second = tokio::time::timeout(bound, publications.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let interval = second - first;
+        assert!(
+            interval >= CADENCE - Duration::from_millis(100)
+                && interval < CADENCE + Duration::from_secs(1),
+            "publication interval {interval:?}"
+        );
+        let reset = health_age(&state).await;
+        assert!(reset < 1.0 && reset < aged, "age did not reset: {reset}");
+        stop.send_replace(true);
+        publisher.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn publication_progress_uses_configured_freshness_budget() {
+        let state = state_with(ApiConfig {
+            health_refresh_interval: Duration::from_secs(6),
+            ..ApiConfig::default()
+        });
+        assert_eq!(
+            publication_ticks(&state).period(),
+            Duration::from_secs(6),
+            "the publisher must run at the cadence readers age against"
+        );
+        assert_eq!(
+            publication_ticks(&self::state()).period(),
+            Duration::from_secs(2)
+        );
+        let budget = state.config.health_stale_after();
         assert_eq!(budget, Duration::from_secs(18));
-        let state = state();
+        // A snapshot older than the default 15 seconds is still fresh at this cadence.
+        state.publish_health(json!({"ok":true,"ready":true}));
+        *state.health_published_at_for_test().write().unwrap() =
+            Instant::now() - Duration::from_secs(16);
+        assert_healthy(state.clone()).await;
         let runtime = state.metrics().runtime();
         let task_state = state.clone();
         let (entered, publication_started) = tokio::sync::oneshot::channel();

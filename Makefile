@@ -59,6 +59,34 @@ compose_env_value() { \
 	};
 endef
 
+# Production mounts both signing seeds from PRISM_SECRETS_SOURCE (#260 D4);
+# a lab may set each seed directly or through its _FILE form.
+define PRISM_SIGNING_PREFLIGHT
+missing=0; \
+if [ -z "$$(compose_env_value PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX)" ]; then \
+	printf 'prism operator env: PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX is required\n' >&2; \
+	missing=1; \
+fi; \
+if [ "$$(operator_build_mode)" = no-build ]; then \
+	if [ -z "$$(compose_env_value PRISM_SECRETS_SOURCE)" ]; then \
+		printf 'prism operator env: PRISM_SECRETS_SOURCE is required; production mounts the signing seed files from it\n' >&2; \
+		missing=1; \
+	fi; \
+else \
+	for name in PRISM_MANIFEST_SIGNING_SEED_HEX PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX; do \
+		if [ -z "$$(compose_env_value "$$name")" ] && [ -z "$$(compose_env_value "$${name}_FILE")" ]; then \
+			printf 'prism operator env: %s or %s_FILE is required\n' "$$name" "$$name" >&2; \
+			missing=1; \
+		fi; \
+	done; \
+fi; \
+if [ "$${missing}" -ne 0 ]; then \
+	printf 'prism operator env: provide real PRISM signing seeds before running make up-prism-pool; see README.md\n' >&2; \
+	printf 'prism operator env: keep PRISM_ALLOW_TEST_SIGNING_SEEDS=0 and PRISM_ALLOW_BUNDLE_EMBEDDED_LEDGER_KEY=0 for deploys\n' >&2; \
+	exit 1; \
+fi;
+endef
+
 .PHONY: doctor prism-self-check check-version-skew require-lab-mode test-builder test-builder-regtest test-prism-regtest test-prism-postgres test-prism-postgres-throughput test-prism-public-read-replica test-compose-prism-config up up-permissionless up-permissionless-pool test-permissionless test-permissionless-p2mr test-ckpool-bip310 up-real-miner up-permissionless-real test-real-miner up-auxpow up-auxpow-bridge up-auxpow-pool up-prism up-prism-pool up-dual-pools test-auxpow test-auxpow-stratum test-auxpow-stratum-bip310 test-auxpow-stratum-age smoke-all down purge-local-volumes
 
 require-lab-mode:
@@ -255,18 +283,7 @@ up-prism-pool: export MINING_LANES=prism
 up-prism-pool:
 	@$(WITH_RESOLVED_QBIT) \
 	$(COMPOSE_ENV_HELPERS) \
-	missing=0; \
-	for name in PRISM_MANIFEST_SIGNING_SEED_HEX PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX; do \
-		if [ -z "$$(compose_env_value "$$name")" ]; then \
-			printf 'prism operator env: %s is required\n' "$$name" >&2; \
-			missing=1; \
-		fi; \
-	done; \
-	if [ "$${missing}" -ne 0 ]; then \
-		printf 'prism operator env: set real PRISM signing keys in .env before running make up-prism-pool\n' >&2; \
-		printf 'prism operator env: keep PRISM_ALLOW_TEST_SIGNING_SEEDS=0 and PRISM_ALLOW_BUNDLE_EMBEDDED_LEDGER_KEY=0 for deploys\n' >&2; \
-		exit 1; \
-	fi; \
+	$(PRISM_SIGNING_PREFLIGHT) \
 	printf 'PRISM operator mode: direct qbit Stratum with Postgres ledger\n'; \
 	printf 'connect to stratum+tcp://%s\n' "$$(stratum_endpoint "$$(compose_env_value PRISM_STRATUM_PORT_HOST 3340)")"; \
 	if [ -n "$$(compose_env_value PRISM_STRATUM_HIGHDIFF_PORT "")" ]; then \
