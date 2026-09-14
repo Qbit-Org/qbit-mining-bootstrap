@@ -727,7 +727,7 @@ async fn bootstrap_capture_uses_original_empty_window_even_after_worker_build() 
 }
 
 #[tokio::test]
-async fn original_build_capture_does_not_recapture_legacy_resumed_inputs() {
+async fn original_build_capture_retains_inputs_when_legacy_resume_rejects_changed_config() {
     let mut f = Fixture::new(Duration::from_secs(10)).await;
     f.coordinator.refresh_once().await.unwrap();
     let original = f.coordinator.prepared.read().await.clone().unwrap();
@@ -744,23 +744,20 @@ async fn original_build_capture_does_not_recapture_legacy_resumed_inputs() {
         .unwrap();
     let config = Arc::get_mut(&mut Arc::get_mut(&mut f.coordinator).unwrap().config).unwrap();
     config.payout_policy.safety_multiplier += 1;
-    let resumed = f
+    assert!(f
         .coordinator
         .resume_job(&worker, &job.wire.job_id)
         .await
         .unwrap()
-        .unwrap();
-    assert_ne!(
-        resumed.context.prepared.inputs.payout_policy,
-        original.inputs.payout_policy
-    );
+        .is_none());
+    let current_inputs = BundleInputs::capture(&f.coordinator.config, original.fee).unwrap();
+    assert_ne!(current_inputs.payout_policy, original.inputs.payout_policy);
     let captured = f
         .coordinator
         .capture_compact_prepared(source, 130_000)
         .await
         .unwrap();
     assert!(Arc::ptr_eq(&captured.original.stored, &original.stored));
-    assert!(!Arc::ptr_eq(&captured.original, &resumed.context.prepared));
     assert_eq!(captured.record.payout_policy, original.inputs.payout_policy);
     let report = qbit_prism::verify_audit_bundle(
         original.stored.bundle.as_ref().unwrap(),
