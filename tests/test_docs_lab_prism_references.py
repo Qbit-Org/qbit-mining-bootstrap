@@ -497,11 +497,11 @@ def executable_word(words: list[str], offsets: list[int]) -> int | None:
             index += 1
         while index < len(words):
             option = unquote(words[index])
-            if program == "env" and (
-                option in {"-S", "--split-string"}
-                or option.startswith(("-S", "--split-string="))
-            ):
-                separate = option in {"-S", "--split-string"}
+            # S takes the rest of a short cluster, or the next word, as its
+            # source; only argument-free flags may precede it in the cluster.
+            cluster = re.fullmatch(r"-[iv]*S(.*)", option, re.DOTALL) if program == "env" else None
+            if cluster or program == "env" and (option == "--split-string" or option.startswith("--split-string=")):
+                separate = option == "--split-string" or (cluster is not None and not cluster.group(1))
                 argument = index + int(separate)
                 if argument >= len(words):
                     return None
@@ -509,7 +509,7 @@ def executable_word(words: list[str], offsets: list[int]) -> int | None:
                 if source is None:
                     return None
                 if not separate:
-                    source = source[2 if option.startswith("-S") else len("--split-string="):]
+                    source = source[cluster.start(1) if cluster else len("--split-string="):]
                 split = env_split_words(source)
                 if split is None:
                     return None
@@ -2299,6 +2299,11 @@ class ScannerTests(unittest.TestCase):
             "-S '-S \"python3 -m\" lab.example.deleted'",
             "-S 'env -S \"python3 -m\"' lab.example.deleted",
             "-S 'python3 -m # ignored' lab.example.deleted",
+            "-vS 'python3 -m lab.example.deleted'",
+            "-iS 'python3 -m lab.example.deleted'",
+            "-ivS'python3 -m lab.example.deleted'",
+            "-viS 'python3 -m' lab.example.deleted",
+            "'-vS' 'python3 -m lab.example.deleted'",
         ):
             with self.subTest(options=options):
                 text = f"env {options}"
@@ -2331,6 +2336,15 @@ class ScannerTests(unittest.TestCase):
             "env -S 'python3\\_ -m lab.example.deleted'",
             "env -S 'python3 -m \"lab.example.deleted'",
             "env -S",
+            "env -vS",
+            "env -uS 'python3 -m lab.example.deleted'",
+            "env -u -vS 'python3 -m lab.example.deleted'",
+            "env -CS 'python3 -m lab.example.deleted'",
+            "env -C -iS 'python3 -m lab.example.deleted'",
+            "env -aS 'python3 -m lab.example.deleted'",
+            "env -xS 'python3 -m lab.example.deleted'",
+            "env --vS 'python3 -m lab.example.deleted'",
+            "env -vS '${INTERPRETER} -m lab.example.deleted'",
         ):
             with self.subTest(text=text):
                 self.assertEqual(self.commands(text), [])
@@ -2349,6 +2363,10 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(self.located(text), [(3, "lab/prism/storm.py")])
         text = "```sh\nenv -S 'sh -c \"true\npython3 lab/prism/storm.py\"'\n```"
         self.assertEqual(self.located(text), [(3, "lab/prism/storm.py")])
+        for options in ("-vS '", "-iS'"):
+            with self.subTest(options=options):
+                text = f"```sh\nenv {options}\npython3 lab/prism/storm.py'\n```"
+                self.assertEqual(self.located(text), [(3, "lab/prism/storm.py")])
         text = "```sh\nenv -S 'sh -c'\n```"
         self.assertEqual(self.commands(text), [])
 
