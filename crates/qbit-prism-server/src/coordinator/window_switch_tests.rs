@@ -550,8 +550,14 @@ async fn landed_audit_is_authenticated_and_the_claim_continues_to_submitblock() 
                 .await?;
             ensure!(fixture.landed(&hash).await?);
             let forgery = match case {
+                // Flip the digit to something it is not. Placing a literal
+                // would be a no-op whenever the digit already held that value,
+                // and the coinbase varies per run because the bundle's anchor
+                // comes from the ledger clock: the forgery would then change
+                // nothing and its acceptance would be correct, so the case
+                // would pass or fail at random.
                 "forged coinbase" => Some(
-                    "UPDATE qbit_pool_audit_bundles SET coinbase_tx_hex=overlay(coinbase_tx_hex placing '0' from length(coinbase_tx_hex)-8 for 1) WHERE block_hash=$1",
+                    "UPDATE qbit_pool_audit_bundles SET coinbase_tx_hex=overlay(coinbase_tx_hex placing CASE WHEN substr(coinbase_tx_hex,length(coinbase_tx_hex)-8,1)='0' THEN '1' ELSE '0' END from length(coinbase_tx_hex)-8 for 1) WHERE block_hash=$1",
                 ),
                 "forged audit root" => Some(
                     "UPDATE qbit_pool_audit_bundles SET audit_commitment_leaves_hex=to_jsonb(ARRAY[repeat('ab',32)]) WHERE block_hash=$1",
@@ -559,10 +565,26 @@ async fn landed_audit_is_authenticated_and_the_claim_continues_to_submitblock() 
                 _ => None,
             };
             if let Some(statement) = forgery {
+                // Read the row back rather than trusting the statement: a
+                // forgery that altered nothing would be accepted, and the case
+                // would then prove nothing while appearing to pass.
+                let before: Value = sqlx::query_scalar(
+                    "SELECT to_jsonb(b) FROM qbit_pool_audit_bundles b WHERE block_hash=$1",
+                )
+                .bind(&hash)
+                .fetch_one(&fixture.coordinator.ledger.pool)
+                .await?;
                 sqlx::query(statement)
                     .bind(&hash)
                     .execute(&fixture.coordinator.ledger.pool)
                     .await?;
+                let after: Value = sqlx::query_scalar(
+                    "SELECT to_jsonb(b) FROM qbit_pool_audit_bundles b WHERE block_hash=$1",
+                )
+                .bind(&hash)
+                .fetch_one(&fixture.coordinator.ledger.pool)
+                .await?;
+                ensure!(before != after, "case {case}: the forgery changed nothing");
             }
             fixture.expire(&hash).await?;
             let second = fixture
