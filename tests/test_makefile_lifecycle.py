@@ -181,6 +181,77 @@ class MakefileLifecycleTests(unittest.TestCase):
                     expected,
                 )
 
+    def run_prism_signing_preflight(self, **environment: str) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            compose_env = root / "compose.env"
+            compose_env.write_text(
+                "".join(f"{name}={value}\n" for name, value in environment.items()),
+                encoding="utf-8",
+            )
+            fake_compose = root / "fake-compose"
+            fake_compose.write_text(
+                "#!/bin/sh\n"
+                'if [ "${1:-}" = config ] && [ "${2:-}" = --environment ]; then\n'
+                f"  exec cat {shlex.quote(str(compose_env))}\n"
+                "fi\n"
+                "exit 9\n",
+                encoding="utf-8",
+            )
+            fake_compose.chmod(0o755)
+            wrapper = root / "Makefile"
+            wrapper.write_text(
+                f"include {ROOT / 'Makefile'}\n\n"
+                "check-prism-signing:\n"
+                "\t@$(COMPOSE_ENV_HELPERS) $(PRISM_SIGNING_PREFLIGHT) printf 'preflight passed\\n'\n",
+                encoding="utf-8",
+            )
+            return subprocess.run(
+                ["make", "--no-print-directory", "-s", "-f", str(wrapper),
+                 "check-prism-signing", f"COMPOSE={fake_compose}"],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+    def test_prism_signing_preflight_requires_mounted_seeds_only_in_production(self) -> None:
+        key = {"PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX": "44" * 32}
+        direct = {
+            "PRISM_MANIFEST_SIGNING_SEED_HEX": "42" * 32,
+            "PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX": "43" * 32,
+        }
+        for environment in (
+            {**key, **direct},
+            {
+                **key,
+                "PRISM_MANIFEST_SIGNING_SEED_HEX_FILE": "/run/secrets/manifest",
+                "PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX_FILE": "/run/secrets/ledger",
+            },
+            {**key, "QBIT_PRODUCTION": "1", "PRISM_SECRETS_SOURCE": "/srv/prism/secrets"},
+        ):
+            with self.subTest(environment=sorted(environment)):
+                result = self.run_prism_signing_preflight(**environment)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("preflight passed", result.stdout)
+
+        for environment, message in (
+            (
+                {**key, "PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX": "43" * 32},
+                "PRISM_MANIFEST_SIGNING_SEED_HEX or PRISM_MANIFEST_SIGNING_SEED_HEX_FILE is required",
+            ),
+            ({**key, **direct, "QBIT_PRODUCTION": "1"}, "PRISM_SECRETS_SOURCE is required"),
+            (
+                {"QBIT_CHAIN": "mainnet", "PRISM_SECRETS_SOURCE": "/srv/prism/secrets"},
+                "PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX is required",
+            ),
+        ):
+            with self.subTest(message=message):
+                result = self.run_prism_signing_preflight(**environment)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                self.assertNotIn("preflight passed", result.stdout)
+
     def test_host_entrypoint_scripts_avoid_bash_4_case_expansion(self) -> None:
         for relative_path in (
             "scripts/check-env.sh",

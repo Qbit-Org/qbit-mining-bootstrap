@@ -41,6 +41,10 @@ pub use jobs::{
     PreparedDependency, PreparedTemplate, StoredCompactPrepared,
 };
 mod migration;
+pub use migration::{
+    schema_version_list, MigrationSource, SourceState, SourceStateRule, NOT_VALID_EXEMPT,
+    REQUIRED_SCHEMA_VERSIONS, SOURCE_STATES,
+};
 mod window;
 pub use difficulty::WorkerDifficulty;
 pub use window::CommitGateClosed;

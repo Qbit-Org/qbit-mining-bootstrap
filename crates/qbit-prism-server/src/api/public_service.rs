@@ -67,12 +67,7 @@ impl Default for ServiceConfig {
 impl ServiceConfig {
     pub fn from_env() -> Result<Self> {
         let positive = |name: &str, default: f64| -> Result<Duration> {
-            let value = std::env::var(name)
-                .ok()
-                .map(|v| v.parse::<f64>())
-                .transpose()
-                .with_context(|| format!("invalid {name}"))?
-                .unwrap_or(default);
+            let value = config::number(name, default)?;
             ensure!(
                 value.is_finite() && value > 0.,
                 "{name} must be positive and finite"
@@ -82,29 +77,21 @@ impl ServiceConfig {
             ensure!(!duration.is_zero(), "{name} is below the timer resolution");
             Ok(duration)
         };
-        let mode = env("PRISM_PUBLIC_REPLICA_MODE", "off")
+        let mode = config::value("PRISM_PUBLIC_REPLICA_MODE", "off")
             .trim()
             .to_ascii_lowercase();
         ensure!(
             matches!(mode.as_str(), "off" | "require"),
             "PRISM_PUBLIC_REPLICA_MODE must be one of off, require"
         );
-        let concurrency = std::env::var("PRISM_POSTGRES_READ_CONCURRENCY")
-            .ok()
-            .map(|v| v.parse::<u32>())
-            .transpose()?
-            .unwrap_or(4);
+        let concurrency = config::number("PRISM_POSTGRES_READ_CONCURRENCY", 4u32)?;
         ensure!(
             concurrency > 0 && concurrency <= 1024,
             "PRISM_POSTGRES_READ_CONCURRENCY must be between 1 and 1024"
         );
         Ok(Self {
-            bind: env("PRISM_PUBLIC_API_BIND", "0.0.0.0"),
-            port: std::env::var("PRISM_PUBLIC_API_PORT")
-                .ok()
-                .map(|v| v.parse())
-                .transpose()?
-                .unwrap_or(3342),
+            bind: config::value("PRISM_PUBLIC_API_BIND", "0.0.0.0"),
+            port: config::number("PRISM_PUBLIC_API_PORT", 3342u16)?,
             replica_required: mode == "require",
             replica_max_lag: positive("PRISM_PUBLIC_REPLICA_MAX_LAG_SECONDS", 60.)?,
             probe_interval: positive("PRISM_PUBLIC_READINESS_PROBE_INTERVAL_SECONDS", 5.)?,
@@ -358,11 +345,13 @@ pub fn router(state: ApiState, config: ServiceConfig) -> (Router, Arc<ServiceSta
 
 pub async fn run_from_env(mut shutdown: watch::Receiver<bool>) -> Result<()> {
     ensure!(
-        !env_bool("PRISM_ALLOW_MEMORY_LEDGER", false),
+        !config::flag("PRISM_ALLOW_MEMORY_LEDGER", false)?,
         "public API requires PostgreSQL"
     );
-    let stratum = std::env::var("PRISM_PUBLIC_STRATUM_URL")
+    let stratum = config::optional("PRISM_PUBLIC_STRATUM_URL")
         .context("PRISM_PUBLIC_STRATUM_URL is required by the independent public service")?;
+    // Operator credentials are never opened by, nor authorize, the public role.
+    let api_config = ApiConfig::from_public_env()?;
     let parsed = url::Url::parse(&stratum).context("invalid PRISM_PUBLIC_STRATUM_URL")?;
     ensure!(
         parsed.scheme() == "stratum+tcp" && parsed.host_str().is_some(),
@@ -376,7 +365,7 @@ pub async fn run_from_env(mut shutdown: watch::Receiver<bool>) -> Result<()> {
     let (app, service) = router(
         ApiState::new(
             pool,
-            ApiConfig::from_env(),
+            api_config,
             std::sync::Arc::new(crate::metrics::Metrics::default()),
         ),
         config.clone(),

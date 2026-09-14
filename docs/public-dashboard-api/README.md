@@ -99,7 +99,7 @@ the window the next request blocks and recomputes as before. Error responses
 use `Cache-Control: no-store` and are not cached by that origin cache.
 Miner pages calculate reward-window aggregates directly in PostgreSQL and
 share the same response cache as the other public routes. The former Python
-`PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS` inner-cache setting is obsolete.
+`PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS` <!-- retired-setting: PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS --> inner-cache setting is obsolete.
 
 Every origin computation that takes a ledger read slot — the immutable
 artifact route included, on a cold request — runs under one per-request

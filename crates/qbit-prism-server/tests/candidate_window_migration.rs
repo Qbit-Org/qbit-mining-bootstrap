@@ -29,10 +29,12 @@ const BASE_SCHEMA: &str = include_str!("../../qbit-prism/sql/001_share_ledger.sq
 /// Every version the membership runner installs except 007, so a database can
 /// be built in exactly the pre-007 state the runner then completes.
 /// Every native migration except 007, so a connect applies exactly 007 and
-/// nothing else. #360's 010 belongs here for the same reason 008 and 009 do:
-/// leaving it out would make the connect apply two migrations, and the "only
-/// 007 ran" assertion would fail for a reason unrelated to 007.
-const PRE_007: [(i32, &str); 7] = [
+/// nothing else. #360's 010 and #321's 006 belong here for the same reason 008
+/// and 009 do: leaving one out makes the connect apply two migrations, and the
+/// "only 007 ran" assertion then fails for a reason unrelated to 007. 006
+/// matters most, because its own drain check refuses the very rows these tests
+/// hand to 007's, so without it the refusal under test never runs.
+const PRE_007: [(i32, &str); 8] = [
     (2, include_str!("../migrations/002_multi_instance.sql")),
     (3, include_str!("../migrations/003_2x_compatibility.sql")),
     (
@@ -40,6 +42,7 @@ const PRE_007: [(i32, &str); 7] = [
         include_str!("../migrations/004_cpfp_retired_funding.sql"),
     ),
     (5, include_str!("../migrations/005_candidate_dispatch.sql")),
+    (6, include_str!("../migrations/006_source_schema.sql")),
     (
         8,
         include_str!("../migrations/008_prepared_window_reference.sql"),
@@ -113,6 +116,12 @@ impl Database {
                 .execute(&mut *tx)
                 .await?;
         }
+        // 006's source row is written by the migration runner, not by its SQL,
+        // and every later start refuses a database at 6 without it. Seeding the
+        // file alone would therefore fail before 007 is reached.
+        sqlx::query("INSERT INTO qbit_prism_migration_source(source_state,prior_schema_version,migrated_by) VALUES('native',5,'candidate-window-migration-test') ON CONFLICT (singleton) DO NOTHING")
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -339,7 +348,7 @@ async fn legacy_2x_schema_with_terminal_outbox_rows_gains_007_and_keeps_every_ro
 
             let _ledger = db.ledger("legacy-upgrade").await?;
             ensure!(
-                db.versions().await? == [2, 3, 4, 5, 7, 8, 9, 10],
+                db.versions().await? == [2, 3, 4, 5, 6, 7, 8, 9, 10],
                 "007 did not join the applied set"
             );
             let after: Vec<Value> = sqlx::query_scalar(
@@ -434,15 +443,18 @@ async fn migration_007_refuses_every_pre007_pending_shape_and_applies_nothing() 
                         .bind(&hash).bind("11".repeat(32)).execute(&db.pool).await?;
                 }
                 PreSevenShape::StorageVersion => {
-                    sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox ADD COLUMN storage_version integer NOT NULL DEFAULT 1")
-                        .execute(&db.pool).await?;
+                    // #321's 006 already added the column, so only the row is
+                    // set up here.
                     sqlx::query("INSERT INTO qbit_block_candidate_outbox(block_hash,candidate,candidate_sha256,storage_version) VALUES($1,'{}'::jsonb,$2,2)")
                         .bind(&hash).bind("11".repeat(32)).execute(&db.pool).await?;
                 }
             }
-            let versioned = matches!(shape, PreSevenShape::StorageVersion);
+            // Since #321, 006 always adds `storage_version` and runs before
+            // 007, so every native schema reaching 007 has the column and the
+            // refusal's no-column branch is unreachable from here. The three
+            // shapes still differ as rows, which is what 007 refuses on.
             ensure!(
-                db.has_column("qbit_block_candidate_outbox", "storage_version").await? == versioned,
+                db.has_column("qbit_block_candidate_outbox", "storage_version").await?,
                 "{shape:?} did not set up the schema it means to test"
             );
 
@@ -473,7 +485,7 @@ async fn migration_007_refuses_every_pre007_pending_shape_and_applies_nothing() 
             sqlx::query("UPDATE qbit_block_candidate_outbox SET state='submitted',candidate=NULL,completed_at=clock_timestamp()")
                 .execute(&db.pool).await?;
             let _ledger = db.ledger("drained").await?;
-            ensure!(db.versions().await? == [2, 3, 4, 5, 7, 8, 9, 10], "007 did not apply after the drain");
+            ensure!(db.versions().await? == [2, 3, 4, 5, 6, 7, 8, 9, 10], "007 did not apply after the drain");
             Ok(())
         })).await?;
     }
@@ -481,7 +493,7 @@ async fn migration_007_refuses_every_pre007_pending_shape_and_applies_nothing() 
 }
 
 #[tokio::test]
-async fn migration_007_alone_is_applied_on_a_database_at_2_3_4_5_8_9_10() -> Result<()> {
+async fn migration_007_alone_is_applied_on_a_database_at_2_3_4_5_6_8_9_10() -> Result<()> {
     run(|db| {
         Box::pin(async move {
             db.apply_pre_007().await?;
@@ -501,7 +513,7 @@ async fn migration_007_alone_is_applied_on_a_database_at_2_3_4_5_8_9_10() -> Res
                     .iter()
                     .map(|(version, _)| *version)
                     .collect::<Vec<_>>()
-                    == [2, 3, 4, 5, 7, 8, 9, 10]
+                    == [2, 3, 4, 5, 6, 7, 8, 9, 10]
             );
             // Only 007 ran: every other version keeps the row it already had.
             ensure!(
@@ -521,7 +533,7 @@ async fn migration_007_alone_is_applied_on_a_database_at_2_3_4_5_8_9_10() -> Res
             }
             // A restart applies nothing further.
             let _restarted = db.ledger("membership-restart").await?;
-            ensure!(db.versions().await? == [2, 3, 4, 5, 7, 8, 9, 10]);
+            ensure!(db.versions().await? == [2, 3, 4, 5, 6, 7, 8, 9, 10]);
             Ok(())
         })
     })

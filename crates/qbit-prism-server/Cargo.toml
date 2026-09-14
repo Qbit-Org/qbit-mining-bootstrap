@@ -38,6 +38,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 qbit-prism-test-gate = { path = "../qbit-prism-test-gate" }
 tokio = { version = "1", features = ["test-util"] }

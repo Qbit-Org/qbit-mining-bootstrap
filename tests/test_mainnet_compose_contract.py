@@ -14,6 +14,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "mainnet-compose.env"
+SECRETS_TARGET = "/run/secrets/qbit-prism"
 OPERATOR_SERVICES = {
     "qbitd",
     "ckpool",
@@ -455,12 +456,64 @@ class MainnetComposeContractTests(unittest.TestCase):
         self.assertNotEqual(postgres_env["POSTGRES_PASSWORD"], "change-this")
         self.assertNotIn("change-this", prism_env["PRISM_DATABASE_URL"])
         self.assertNotIn("PRISM_LEDGER_WRITER_SESSION_TOKEN", prism_env)
-        self.assertEqual(len(prism_env["PRISM_MANIFEST_SIGNING_SEED_HEX"]), 64)
-        self.assertEqual(len(prism_env["PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX"]), 64)
-        self.assertNotEqual(
-            prism_env["PRISM_MANIFEST_SIGNING_SEED_HEX"],
-            prism_env["PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX"],
+        self.assertNotIn("d" * 64, json.dumps(self.config))
+        self.assertNotIn("e" * 64, json.dumps(self.config))
+
+    def test_frontends_read_signing_seeds_only_from_the_read_only_mount(self) -> None:
+        # Issue #260 D4: the fixture's stale direct seeds must not reach a
+        # production frontend, including the second HA frontend.
+        for config, name in (
+            (self.config, "prism-coordinator"),
+            (self.ha_config, "prism-coordinator"),
+            (self.ha_config, "prism-coordinator-2"),
+        ):
+            with self.subTest(service=name, ha=config is self.ha_config):
+                service = config["services"][name]
+                env = service["environment"]
+                self.assertEqual(env["PRISM_MANIFEST_SIGNING_SEED_HEX"], "")
+                self.assertEqual(env["PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX"], "")
+                self.assertEqual(env["PRISM_ALLOW_TEST_SIGNING_SEEDS"], "0")
+                self.assertEqual(
+                    env["PRISM_MANIFEST_SIGNING_SEED_HEX_FILE"],
+                    f"{SECRETS_TARGET}/manifest-signing-seed-hex",
+                )
+                self.assertEqual(
+                    env["PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX_FILE"],
+                    f"{SECRETS_TARGET}/ledger-attestation-signing-seed-hex",
+                )
+                mounts = [
+                    volume for volume in service["volumes"]
+                    if isinstance(volume, dict) and volume.get("target") == SECRETS_TARGET
+                ]
+                self.assertEqual(len(mounts), 1)
+                self.assertEqual(mounts[0]["type"], "bind")
+                self.assertEqual(
+                    mounts[0]["source"], "/srv/qbit-mining-bootstrap/mainnet/prism/secrets"
+                )
+                self.assertTrue(mounts[0].get("read_only"))
+                self.assertFalse(mounts[0].get("bind", {}).get("create_host_path", False))
+
+    def test_public_read_tier_is_seedless(self) -> None:
+        public = self.config["services"]["prism-public-api"]
+        self.assertFalse(
+            [name for name in public["environment"]
+             if "SIGNING_SEED" in name or "OPERATOR_BEARER_TOKEN" in name]
         )
+        self.assertFalse(public.get("volumes"))
+
+    def test_prism_containers_disable_core_dumps(self) -> None:
+        for config, name in (
+            (self.config, "prism-coordinator"),
+            (self.config, "prism-public-api"),
+            (self.ha_config, "prism-coordinator-2"),
+        ):
+            with self.subTest(service=name):
+                core = config["services"][name]["ulimits"]["core"]
+                # The rendered form omits zero-valued soft and hard limits.
+                limits = (
+                    (core.get("soft", 0), core.get("hard", 0)) if isinstance(core, dict) else (core, core)
+                )
+                self.assertEqual(limits, (0, 0))
 
     def test_bitcoin_build_uses_architecture_specific_checksums(self) -> None:
         args = self.config["services"]["bitcoind"]["build"]["args"]
@@ -578,6 +631,12 @@ class MainnetComposeContractTests(unittest.TestCase):
                 if isinstance(volume, dict)
             )
         )
+        secrets = [
+            volume for volume in config["services"]["prism-coordinator"]["volumes"]
+            if isinstance(volume, dict) and volume.get("target") == SECRETS_TARGET
+        ]
+        self.assertEqual(len(secrets), 1)
+        self.assertTrue(secrets[0]["source"].startswith("/production-source-not-configured/"))
 
     @staticmethod
     def _network_selectors(command: list[str]) -> list[str]:
