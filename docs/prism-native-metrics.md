@@ -129,10 +129,12 @@ new attempt finishes. A newer collection attempt supersedes an older result;
 late completion or cancellation cannot replace the newer publication. A real
 zero count, age, or RSS remains valid after successful collection.
 
-Pool timing pre-registers both result labels at count zero and records
-observations only for acquisition attempts that complete, including completed
-acquisition errors. Overall collector cancellation during acquisition
-does not invent a completed wait. The collector status records that failure.
+Pool timing pre-registers both result labels at count zero. Each started
+collector acquisition records one observation: success when acquired, or failure
+on acquisition error or cancellation, including the three-second overall
+deadline. Duration is the monotonic elapsed pool wait until acquisition
+completes or is cancelled; subsequent transaction work is excluded. Collector
+status also records collection failure or cancellation separately.
 Candidate count and age describe database time; this is not a monotonic latency
 measurement. A/#266 must update the pending predicate if outbox states change.
 
