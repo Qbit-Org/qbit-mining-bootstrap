@@ -21,8 +21,11 @@ pub use blocks::{BlockObservation, FanoutClaim, PoolBlock};
 mod audit;
 pub use audit::{audit_canonical_bytes, decode_canonical_audit_body, materialize_audit_row};
 mod candidates;
-use candidates::persist_candidate;
-pub use candidates::{Candidate, CandidateClaim};
+use candidates::prepare_candidate;
+pub use candidates::{
+    authenticate_landed_audit, build_claim_parts, coinbase_witness_reserved_value, header_bits_hex,
+    Candidate, CandidateClaim, CandidateCtv, ClaimParts, LandedAudit, SignerKeys,
+};
 mod connect;
 use connect::{lock, require_revision, writable};
 pub use connect::{SessionAllocationExhausted, SessionId};

@@ -13,7 +13,7 @@ use qbit_prism::{
 };
 use qbit_prism_server::ledger::{
     probe_share_rows, put_balance_snapshot, read_range_paged, BalanceSource, Candidate, Ledger,
-    ShareRange, Snapshot, WindowError, WindowRef,
+    ShareRange, SignerKeys, Snapshot, WindowError, WindowRef,
 };
 use qbit_prism_test_gate as gate;
 use serde_json::{json, Value};
@@ -170,6 +170,11 @@ fn keys() -> (ManifestSigningKey, ManifestSigningKey) {
     )
 }
 
+fn signer_keys() -> SignerKeys {
+    let (manifest_key, ledger_key) = keys();
+    SignerKeys::of(&manifest_key, &ledger_key)
+}
+
 fn appended_share(id: u64) -> AcceptedShare {
     AcceptedShare {
         share_seq: 0,
@@ -188,7 +193,9 @@ fn appended_share(id: u64) -> AcceptedShare {
     }
 }
 
-fn candidate_for(snapshot: &Snapshot, nonce: u32) -> Result<Candidate> {
+/// The slim candidate for `snapshot`'s window beside the bundle it was found
+/// on, whose parts a direct `land_candidate` takes.
+fn candidate_for(snapshot: &Snapshot, nonce: u32) -> Result<(Candidate, qbit_prism::AuditBundle)> {
     let (coinbase_key, ledger_key) = keys();
     let bundle = build_audit_bundle(
         snapshot.shares.clone(),
@@ -217,15 +224,25 @@ fn candidate_for(snapshot: &Snapshot, nonce: u32) -> Result<Candidate> {
     hash.reverse();
     block.push(1);
     block.extend(hex::decode(&report.coinbase_tx_hex)?);
-    Ok(Candidate {
+    let candidate = Candidate {
         block_hash: hex::encode(hash),
-        block_hex: hex::encode(block),
+        block_sha256: Candidate::block_digest_hex(&block),
         job_id: "job".into(),
         payout_revision: snapshot.payout_revision,
-        bundle,
+        window: WindowRef::from_snapshot(snapshot)?,
+        bootstrap_share: None,
+        found_block: bundle.found_block.clone(),
+        payout_policy: PayoutPolicy::day_one_default(),
+        ctv: None,
+        audit_builder_version: qbit_prism::AUDIT_BUILDER_VERSION,
+        signer_keys: signer_keys(),
+        leased: false,
+        coinbase_suffix_hex: "00".repeat(12),
         deferred_share: None,
-        coinbase_suffix_hex: None,
-    })
+        block_bytes: block,
+        as_issued_balances: Vec::new(),
+    };
+    Ok((candidate, bundle))
 }
 
 /// The share `seed_shares` writes for `share_seq`, built independently of the
@@ -570,19 +587,22 @@ async fn configure_retains_the_pinned_cluster_fingerprint() -> Result<()> {
                 first.config_fingerprint().is_none(),
                 "a ledger that has not configured must retain nothing"
             );
-            first.configure("fingerprint-one").await?;
+            first.configure("fingerprint-one", &signer_keys()).await?;
             ensure!(first.config_fingerprint() == Some("fingerprint-one"));
             // Every clone of one frontend's ledger sees the same pinned value.
             ensure!(first.clone().config_fingerprint() == Some("fingerprint-one"));
 
             // A second frontend verifies the pinned row and retains it too.
             let second = db.ledger("fingerprint-second").await?;
-            second.configure("fingerprint-one").await?;
+            second.configure("fingerprint-one", &signer_keys()).await?;
             ensure!(second.config_fingerprint() == Some("fingerprint-one"));
 
             // A mismatch is still refused, and nothing is retained from it.
             let third = db.ledger("fingerprint-third").await?;
-            ensure!(third.configure("fingerprint-two").await.is_err());
+            ensure!(third
+                .configure("fingerprint-two", &signer_keys())
+                .await
+                .is_err());
             ensure!(
                 third.config_fingerprint().is_none(),
                 "a refused configure retained a fingerprint"
@@ -635,13 +655,13 @@ async fn window_reference_from_snapshot_matches_the_landed_audit_snapshot_digest
             ensure!(range.share_count == 4);
 
             // Landing writes the same digest for the same window.
-            ledger
-                .enqueue_candidate(candidate_for(&snapshot, 11)?)
-                .await?;
+            let (candidate, bundle) = candidate_for(&snapshot, 11)?;
+            ledger.enqueue_candidate(candidate).await?;
             let claim = ledger
                 .claim_candidate(60)
                 .await?
-                .context("the enqueued candidate was not claimable")?;
+                .context("the enqueued candidate was not claimable")?
+                .with_bundle(bundle);
             ledger
                 .land_candidate(&claim, &keys().1.public_key_hex())
                 .await?;
