@@ -318,7 +318,8 @@ integrity, CTV state, and API reads before declaring recovery complete.
 
 A disconnected mature pool block or deep confirmed CTV fanout records a shared
 fatal state in `qbit_prism_cluster.fatal_error`. The message names the
-`block_hash` or `fanout_txid` and ends `manual reconciliation required`. Every
+`block_hash` or `fanout_txid`, says `manual reconciliation required`, and names
+`qbit-prism-server fatal-state clear --reason <text>` as the recovery command. Every
 ledger write transaction then fails with `cluster halted: ...`, and commands
 that open the ledger for writing fail at startup. Only the audited command below
 ends the halt; there is no public API route and no force flag.
@@ -361,8 +362,9 @@ the settlement, ordering, and instance locks it refuses unless:
 - normal block reconciliation leaves no unresolved disconnection and the
   carry-forward integrity report passes.
 
-The clear and its audit `INSERT` commit in one transaction. An error or timeout
-rolls both back and leaves the cluster halted. The event records `fatal_error`,
+The clear and its audit `INSERT` commit in one transaction. Failures before
+commit roll both back and leave the cluster halted; a lost response during
+commit requires checking the durable state before retrying. The event records `fatal_error`,
 `fatal_error_set_at`, `reason`, `operator_identity` (PostgreSQL `session_user`),
 `database_role` (`current_user`), `cleared_at`, the `instances` snapshot, and
 `reconciliation` (`genesis_hash`, `tip_hash`, `tip_height`, `blocks_checked`,
@@ -431,7 +433,7 @@ chain.
 ### 2. Stop every frontend
 
 Stop every `run` frontend gracefully with SIGTERM (bundled stacks:
-`docker compose stop prism-coordinator prism-coordinator-2`). Shutdown closes
+`docker compose stop --timeout 45 prism-coordinator prism-coordinator-2`). Shutdown closes
 admission and drains tasks and sessions for up to 30 seconds. Only then does the
 server record `stopped`, and only if no session guard remains. If that marker
 fails, the process exits with an error and its row keeps its previous status.
@@ -489,6 +491,7 @@ Run `clear` from a host with the frontends' normal configuration, using the
 operator's own database login:
 
 ```sh
+set -o pipefail
 qbit-prism-server fatal-state clear \
   --reason "<incident>: <operator>; <block or fanout> reconciled per <review>; evidence <ref>" \
   | tee fatal-state-clear.json
@@ -504,7 +507,7 @@ ORDER BY cleared_at DESC
 LIMIT 5;
 ```
 
-A nonzero exit clears nothing and writes no event. Correct the reported blocker
+A validation or reconciliation failure clears nothing and writes no event. Correct the reported blocker
 and rerun deliberately; do not loop. If the connection drops around commit, the
 outcome is unknown: check `fatal-state show` and the event table before
 rerunning.

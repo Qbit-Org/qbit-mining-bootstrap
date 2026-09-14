@@ -72,7 +72,7 @@ impl Ledger {
         require_fanout(&mut tx, claim).await?;
         require_revision(&mut tx, expected_revision).await?;
         sqlx::query("UPDATE qbit_prism_cluster SET fatal_error=$1,updated_at=clock_timestamp() WHERE singleton")
-            .bind(format!("deep confirmed CTV fanout disconnected: {}; manual reconciliation required",claim.fanout_txid)).execute(&mut *tx).await?;
+            .bind(format!("deep confirmed CTV fanout disconnected: {}; manual reconciliation required; after investigation run qbit-prism-server fatal-state clear --reason <text>",claim.fanout_txid)).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
     }

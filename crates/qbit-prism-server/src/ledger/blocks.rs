@@ -280,6 +280,24 @@ impl Ledger {
             revision == expected_revision,
             "payout revision changed while collecting chain observations"
         );
+        let fatal = self
+            .reconcile_blocks_in(&mut tx, observations, tip_height)
+            .await?;
+        tx.commit().await?;
+        if let Some(message) = fatal {
+            bail!(message);
+        }
+        Ok(())
+    }
+
+    // The caller owns settlement/order locks and decides whether a fatal result
+    // is committed (normal observer) or rolled back (operator recovery).
+    pub(super) async fn reconcile_blocks_in(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        observations: &[BlockObservation],
+        tip_height: u64,
+    ) -> Result<Option<String>> {
         let mut changed = false;
         let observed: std::collections::HashMap<&str, bool> = observations
             .iter()
@@ -290,7 +308,7 @@ impl Ledger {
             "duplicate block observations"
         );
         let hashes: Vec<&str> = observed.keys().copied().collect();
-        let rows = sqlx::query("SELECT block_hash,block_height,chain_state,maturity_state FROM qbit_pool_blocks WHERE chain_state IN ('prepared','confirmed','inactive') AND block_hash=ANY($1::text[]) ORDER BY block_height,block_hash FOR UPDATE").bind(&hashes).fetch_all(&mut *tx).await?;
+        let rows = sqlx::query("SELECT block_hash,block_height,chain_state,maturity_state FROM qbit_pool_blocks WHERE chain_state IN ('prepared','confirmed','inactive') AND block_hash=ANY($1::text[]) ORDER BY block_height,block_hash FOR UPDATE").bind(&hashes).fetch_all(&mut **tx).await?;
         for row in rows {
             let hash: String = row.try_get("block_hash")?;
             let Some(&active) = observed.get(hash.as_str()) else {
@@ -300,48 +318,46 @@ impl Ledger {
             let maturity: String = row.try_get("maturity_state")?;
             if !active && maturity == "mature" {
                 let message = format!(
-                    "mature pool block disconnected: {hash}; manual reconciliation required"
+                    "mature pool block disconnected: {hash}; manual reconciliation required; after investigation run qbit-prism-server fatal-state clear --reason <text>"
                 );
-                sqlx::query("UPDATE qbit_prism_cluster SET fatal_error=$1,updated_at=clock_timestamp() WHERE singleton").bind(&message).execute(&mut *tx).await?;
-                tx.commit().await?;
-                bail!(message);
+                sqlx::query("UPDATE qbit_prism_cluster SET fatal_error=$1,updated_at=clock_timestamp() WHERE singleton").bind(&message).execute(&mut **tx).await?;
+                return Ok(Some(message));
             }
             if active && state != "confirmed" {
                 sqlx::query(
                     "UPDATE qbit_pool_blocks SET chain_state='confirmed',inactive_since=NULL WHERE block_hash=$1",
                 )
                 .bind(&hash)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
                 // A crash may happen after submitblock but before the durable
                 // ACK. Reconciliation must credit its deferred share as part
                 // of the same confirmation transaction.
-                self.credit_deferred_share(&mut tx, &hash).await?;
-                sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET settlement_status='awaiting_maturity',claim_token=NULL,claim_expires_at=NULL,updated_at=clock_timestamp() WHERE block_hash=$1 AND settlement_status='reorged'").bind(&hash).execute(&mut *tx).await?;
+                self.credit_deferred_share(tx, &hash).await?;
+                sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET settlement_status='awaiting_maturity',claim_token=NULL,claim_expires_at=NULL,updated_at=clock_timestamp() WHERE block_hash=$1 AND settlement_status='reorged'").bind(&hash).execute(&mut **tx).await?;
                 changed = true;
             } else if !active && state == "confirmed" {
                 sqlx::query(
                     "UPDATE qbit_pool_blocks SET chain_state='inactive',inactive_since=clock_timestamp() WHERE block_hash=$1",
                 )
                 .bind(&hash)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
-                sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET settlement_status='reorged',claim_token=NULL,claim_expires_at=NULL,updated_at=clock_timestamp() WHERE block_hash=$1").bind(&hash).execute(&mut *tx).await?;
+                sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET settlement_status='reorged',claim_token=NULL,claim_expires_at=NULL,updated_at=clock_timestamp() WHERE block_hash=$1").bind(&hash).execute(&mut **tx).await?;
                 changed = true;
             }
         }
         if changed {
-            bump_revision(&mut tx).await?;
+            bump_revision(tx).await?;
         }
         let matured: i32 = sqlx::query_scalar("SELECT qbit_mark_mature_pool_payouts($1)")
             .bind(i64::try_from(tip_height)?)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
         if matured > 0 {
-            bump_revision(&mut tx).await?;
+            bump_revision(tx).await?;
         }
-        tx.commit().await?;
-        Ok(())
+        Ok(None)
     }
 
     pub async fn claim_fanout(&self, lease_seconds: i64) -> Result<Option<FanoutClaim>> {
