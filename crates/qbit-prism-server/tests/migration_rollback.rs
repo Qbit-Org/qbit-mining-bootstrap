@@ -142,6 +142,7 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         ensure!(source_evidence["records"]["audits"]["count"] == 3);
         ensure!(source_evidence["records"]["ctv_broadcast_attempts"]["count"] == 1);
         for kind in [
+            "audit_bodies", "audit_snapshots",
             "ctv_checkpoints", "cpfp_packages", "cpfp_retired_funding", "deferred_shares",
             "fatal_state", "fatal_state_events",
         ] {
@@ -330,6 +331,8 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         unchanged["records"]["fatal_state_events"] = before_halt["records"]["fatal_state_events"].clone();
         ensure!(unchanged == before_halt, "recovery history must independently distinguish a cleared halt");
 
+        assert_native_audit_payload_fingerprints(&source, pg_bin, &artifacts[0]).await?;
+
         // Restore a native database containing both an active halt and a prior
         // clear event; their exact evidence must survive the backup roundtrip.
         sqlx::query("UPDATE qbit_prism_cluster SET fatal_error='recurring halt'")
@@ -340,6 +343,18 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
             let archive = recovery::backup(&source, pg_bin).await?;
             recovery::restore(&archive, &source, &native_restore, pg_bin).await?;
             ensure!(recovery::evidence(&native_restore, pg_bin).await? == halted);
+            // pg_restore SQL changes its session's search_path. Verify reads
+            // through a fresh pool using the restored schema's connection URL.
+            let read_pool = PgPool::connect(&native_restore.url).await?;
+            let artifacts_result = async {
+                for artifact in &artifacts {
+                    ensure!(qbit_prism_server::ledger::audit_canonical_bytes(
+                        &read_pool, &artifact.block_hash).await? == Some(artifact.canonical.clone()));
+                }
+                Ok::<_, anyhow::Error>(())
+            }.await;
+            read_pool.close().await;
+            artifacts_result?;
             Ok::<_, anyhow::Error>(())
         }.await;
         native_restore.close().await?;
@@ -419,4 +434,129 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
     source.close().await?;
     restored.close().await?;
     result
+}
+
+async fn assert_native_audit_payload_fingerprints(
+    source: &recovery::Database,
+    pg_bin: &std::path::Path,
+    artifact: &recovery::Artifact,
+) -> Result<()> {
+    use qbit_prism_server::ledger::{audit_canonical_bytes, audit_completeness};
+    use sha2::{Digest, Sha256};
+
+    let bundle: qbit_prism::AuditBundle = serde_json::from_slice(&artifact.canonical)?;
+    let mut body = serde_json::to_value(&bundle)?;
+    body.as_object_mut().unwrap().remove("shares");
+    body["reward_manifest"] = serde_json::to_value(bundle.reward_manifest.clone().into_parts().0)?;
+
+    // Two valid ranges let the reference change without violating the foreign
+    // key or changing snapshot identities/payloads.
+    let mut snapshots = Vec::new();
+    for shares in [
+        &bundle.shares[..],
+        &bundle.shares[..bundle.shares.len() - 1],
+    ] {
+        let digest = hex::encode(Sha256::digest(serde_json::to_vec(shares)?));
+        sqlx::query("INSERT INTO qbit_prism_audit_snapshots(snapshot_sha256,first_share_seq,last_share_seq,anchor_ms,share_count) VALUES($1,$2,$3,$4,$5)")
+            .bind(&digest)
+            .bind(shares.first().unwrap().share_seq as i64)
+            .bind(shares.last().unwrap().share_seq as i64)
+            .bind(bundle.found_block.anchor_job_issued_at_ms)
+            .bind(shares.len() as i64)
+            .execute(&source.pool).await?;
+        snapshots.push(digest);
+    }
+    // Turn one authenticated fixture into the native compact layout after
+    // the frozen/imported equality assertions have passed.
+    sqlx::query("UPDATE qbit_pool_audit_bundles SET audit_bundle=$2,share_snapshot_sha256=$3,canonical_audit_bytes=NULL WHERE block_hash=$1")
+        .bind(&artifact.block_hash).bind(&body).bind(&snapshots[0])
+        .execute(&source.pool).await?;
+    ensure!(
+        audit_canonical_bytes(&source.pool, &artifact.block_hash).await?
+            == Some(artifact.canonical.clone())
+    );
+    audit_completeness(&source.pool).await?.require_complete()?;
+    let baseline = recovery::evidence(source, pg_bin).await?;
+    ensure!(baseline["records"]["audit_bodies"]["count"] == 1);
+    ensure!(baseline["records"]["audit_snapshots"]["count"] == 2);
+
+    let changed_reference = format!("share_snapshot_sha256='{}'", snapshots[1]);
+    for (kind, mutation) in [
+        (
+            "audit_bodies",
+            "audit_bundle=jsonb_set(audit_bundle,'{found_block,network_difficulty}','101')",
+        ),
+        (
+            "audit_bodies",
+            "audit_bundle=jsonb_set(audit_bundle,'{reward_manifest,included_share_count}','2')",
+        ),
+        ("audit_bodies", changed_reference.as_str()),
+        ("audit_snapshots", "first_share_seq=2"),
+        ("audit_snapshots", "last_share_seq=7"),
+        ("audit_snapshots", "anchor_ms=anchor_ms+1"),
+        ("audit_snapshots", "share_count=share_count+1"),
+        ("audit_snapshots", "inline_shares='[]'::jsonb"),
+    ] {
+        let (table, key, identity) = if kind == "audit_bodies" {
+            (
+                "qbit_pool_audit_bundles",
+                "block_hash",
+                &artifact.block_hash,
+            )
+        } else {
+            (
+                "qbit_prism_audit_snapshots",
+                "snapshot_sha256",
+                &snapshots[0],
+            )
+        };
+        sqlx::query(&format!("UPDATE {table} SET {mutation} WHERE {key}=$1"))
+            .bind(identity)
+            .execute(&source.pool)
+            .await?;
+
+        // Availability checks still pass; evidence must detect changed payloads
+        // independently of completeness and the unchanged declared digests.
+        audit_completeness(&source.pool).await?.require_complete()?;
+        let current = recovery::evidence(source, pg_bin).await?;
+        ensure!(current["records"][kind]["count"] == baseline["records"][kind]["count"]);
+        ensure!(
+            current["records"][kind]["sha256"] != baseline["records"][kind]["sha256"],
+            "native audit payload change was invisible: {mutation}"
+        );
+        let mut unchanged = current;
+        unchanged["records"][kind] = baseline["records"][kind].clone();
+        ensure!(
+            unchanged == baseline,
+            "unrelated evidence changed: {mutation}"
+        );
+
+        sqlx::query("UPDATE qbit_pool_audit_bundles SET audit_bundle=$2,share_snapshot_sha256=$3 WHERE block_hash=$1")
+            .bind(&artifact.block_hash).bind(&body).bind(&snapshots[0])
+            .execute(&source.pool).await?;
+        sqlx::query("UPDATE qbit_prism_audit_snapshots SET first_share_seq=$2,last_share_seq=$3,anchor_ms=$4,share_count=$5,inline_shares=NULL WHERE snapshot_sha256=$1")
+            .bind(&snapshots[0])
+            .bind(bundle.shares.first().unwrap().share_seq as i64)
+            .bind(bundle.shares.last().unwrap().share_seq as i64)
+            .bind(bundle.found_block.anchor_job_issued_at_ms)
+            .bind(bundle.shares.len() as i64)
+            .execute(&source.pool).await?;
+        ensure!(recovery::evidence(source, pg_bin).await? == baseline);
+    }
+    // Preserve a valid inline snapshot through the native backup as well.
+    sqlx::query("UPDATE qbit_prism_audit_snapshots SET inline_shares=$2 WHERE snapshot_sha256=$1")
+        .bind(&snapshots[0])
+        .bind(serde_json::to_value(&bundle.shares)?)
+        .execute(&source.pool)
+        .await?;
+    let inline = recovery::evidence(source, pg_bin).await?;
+    ensure!(
+        inline["records"]["audit_snapshots"]["sha256"]
+            != baseline["records"]["audit_snapshots"]["sha256"]
+    );
+    ensure!(
+        audit_canonical_bytes(&source.pool, &artifact.block_hash).await?
+            == Some(artifact.canonical.clone())
+    );
+    Ok(())
 }

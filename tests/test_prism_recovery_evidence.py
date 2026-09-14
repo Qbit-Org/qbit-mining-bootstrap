@@ -68,6 +68,10 @@ class RecoveryEvidenceTests(unittest.TestCase):
     def test_recovery_obligations_change_summary_without_share_or_ctv_state_changes(self):
         baseline = module.summarize(iter(closing()))
         for kind, row, change in (
+            ("audit_bodies", {"block_hash": "ab", "audit_bundle": {"schema": "native"}},
+             {"audit_bundle": {"schema": "corrupted"}}),
+            ("audit_snapshots", {"snapshot_sha256": "cd", "share_count": 3},
+             {"share_count": 2}),
             ("ctv_checkpoints", {"fanout_txid": "ab", "confirmed_depth": 999},
              {"confirmed_depth": 1000}),
             ("cpfp_packages", {"fanout_txid": "ab", "signed_child_hex": None},

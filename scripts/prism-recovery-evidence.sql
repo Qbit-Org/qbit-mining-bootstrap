@@ -19,6 +19,7 @@ SELECT jsonb_build_object('kind', 'blocks', 'row', jsonb_build_object(
 FROM qbit_pool_blocks ORDER BY block_hash COLLATE "C";
 
 -- Import adds body storage and derived metadata, never changes these identities.
+-- Native reconstruction inputs are fingerprinted separately below.
 SELECT jsonb_build_object('kind', 'audits', 'row', jsonb_build_object(
     'block_hash', block_hash, 'audit_bundle_sha256', audit_bundle_sha256,
     'coinbase_tx_hex', coinbase_tx_hex))
@@ -77,14 +78,30 @@ ORDER BY fanout_txid COLLATE "C";
 SELECT jsonb_build_object('kind', 'ctv_broadcast_attempts', 'row', to_jsonb(a))
 FROM qbit_ctv_fanout_broadcast_attempts a ORDER BY attempt_seq;
 
--- Frozen 2.x has no native reservations, deferred credit or fatal state. Skip absent
--- tables before parsing their queries; empty native tables hash identically.
+-- Frozen 2.x lacks these native tables. Skip absent tables before parsing
+-- their queries; empty native tables hash identically.
 SELECT to_regclass('qbit_prism_cpfp_packages') IS NOT NULL AS has_cpfp_packages,
        to_regclass('qbit_prism_cpfp_retired_funding') IS NOT NULL AS has_cpfp_retired_funding,
        to_regclass('qbit_prism_deferred_shares') IS NOT NULL AS has_deferred_shares,
+       to_regclass('qbit_prism_audit_snapshots') IS NOT NULL AS has_audit_snapshots,
        to_regclass('qbit_prism_cluster') IS NOT NULL AS has_cluster,
        to_regclass('qbit_prism_fatal_state_events') IS NOT NULL AS has_fatal_state_events
 \gset
+\if :has_audit_snapshots
+-- Imported legacy rows gain canonical bytes and normalized metadata, but no
+-- snapshot reference. Fingerprint native reconstruction inputs separately.
+SELECT jsonb_build_object('kind', 'audit_bodies', 'row', jsonb_build_object(
+    'block_hash', block_hash, 'audit_bundle', audit_bundle,
+    'share_snapshot_sha256', share_snapshot_sha256))
+FROM qbit_pool_audit_bundles WHERE share_snapshot_sha256 IS NOT NULL
+ORDER BY block_hash COLLATE "C";
+
+SELECT jsonb_build_object('kind', 'audit_snapshots', 'row', jsonb_build_object(
+    'snapshot_sha256', snapshot_sha256,
+    'first_share_seq', first_share_seq, 'last_share_seq', last_share_seq,
+    'anchor_ms', anchor_ms, 'share_count', share_count, 'inline_shares', inline_shares))
+FROM qbit_prism_audit_snapshots ORDER BY snapshot_sha256 COLLATE "C";
+\endif
 \if :has_cpfp_packages
 SELECT jsonb_build_object('kind', 'cpfp_packages', 'row', to_jsonb(p))
 FROM qbit_prism_cpfp_packages p ORDER BY fanout_txid COLLATE "C";
