@@ -144,6 +144,44 @@ enum WindowState {
     Prepared { window: PayoutWindow, epoch: u64 },
 }
 
+/// Metadata only: never retain an evicted window to explain its loss.
+#[derive(Default)]
+struct PreparedWindowHistory {
+    latest: Option<String>,
+    evicted: Vec<(String, &'static str)>,
+}
+
+impl PreparedWindowHistory {
+    fn trim(&mut self, cache: &mut Vec<(String, WindowState)>, cause: &'static str) {
+        while cache.len() > SERVE_WINDOW_CACHE_MAX_ENTRIES {
+            // A historical build must not evict the coordinator's newest
+            // prepared base and turn its next delta into a full ledger walk.
+            // This reserves one existing slot; the entry limit stays two.
+            let position = cache
+                .iter()
+                .rposition(|(key, _)| Some(key) != self.latest.as_ref())
+                .expect("at most one of the two cache slots is reserved");
+            let (digest, state) = cache.remove(position);
+            if matches!(state, WindowState::Prepared { .. }) {
+                self.evicted.retain(|(key, _)| key != &digest);
+                self.evicted.insert(0, (digest, cause));
+                self.evicted.truncate(8);
+            }
+        }
+    }
+
+    fn missing_reason(&self, cache: &[(String, WindowState)], digest: &str) -> &'static str {
+        if cache.iter().any(|(key, _)| key == digest) {
+            "uploaded_only"
+        } else {
+            self.evicted
+                .iter()
+                .find(|(key, _)| key == digest)
+                .map_or("not_held", |(_, cause)| *cause)
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct JobBuildSummary<'a> {
     found_block: &'a FoundBlock,
@@ -415,6 +453,7 @@ fn serve_requests(
     }
 
     let mut window_cache: Vec<(String, WindowState)> = Vec::new();
+    let mut prepared_history = PreparedWindowHistory::default();
     let mut cache_hits: u64 = 0;
     let mut cache_misses: u64 = 0;
 
@@ -464,6 +503,7 @@ fn serve_requests(
                     &stdout,
                     request,
                     &mut window_cache,
+                    &mut prepared_history,
                     input_deserialization_seconds,
                 )?;
                 continue;
@@ -601,7 +641,7 @@ fn serve_requests(
         } else {
             window_cache.insert(0, (window_sha, WindowState::Uploaded(bundle.shares)));
         }
-        window_cache.truncate(SERVE_WINDOW_CACHE_MAX_ENTRIES);
+        prepared_history.trim(&mut window_cache, "evicted_by_build");
         let response = ServeResponse {
             ok: true,
             summary: &summary_raw,
@@ -661,6 +701,7 @@ fn serve_prepare_window(
     stdout: &io::Stdout,
     request: ServeRequest,
     window_cache: &mut Vec<(String, WindowState)>,
+    prepared_history: &mut PreparedWindowHistory,
     input_deserialization_seconds: f64,
 ) -> Result<(), Box<dyn Error>> {
     let Some(request_epoch) = request.append_invalidation_epoch else {
@@ -746,7 +787,8 @@ fn serve_prepare_window(
                     },
                 ),
             );
-            window_cache.truncate(SERVE_WINDOW_CACHE_MAX_ENTRIES);
+            prepared_history.latest = Some(digest.clone());
+            prepared_history.trim(window_cache, "evicted_by_prepare");
             let mut out = stdout.lock();
             serde_json::to_writer(
                 &mut out,
@@ -780,8 +822,8 @@ fn serve_prepare_window(
                 key == &base_digest && matches!(state, WindowState::Prepared { .. })
             });
             let Some(position) = position else {
-                // Respawn or eviction dropped the base window; the
-                // coordinator re-sends a full preparation.
+                // Absence is an outcome, not proof of process death. History
+                // is deliberately bounded; "not_held" makes no causal claim.
                 let mut out = stdout.lock();
                 serde_json::to_writer(
                     &mut out,
@@ -789,6 +831,7 @@ fn serve_prepare_window(
                         "ok": false,
                         "request": "prepare_window",
                         "needs_full": true,
+                        "base_state": prepared_history.missing_reason(window_cache, &base_digest),
                         "error": format!("prepared window {base_digest} is not held"),
                     }),
                 )?;
@@ -797,23 +840,26 @@ fn serve_prepare_window(
                 return Ok(());
             };
             let fold_started = Instant::now();
-            let (advance_result, base_epoch) = match &window_cache[position].1 {
-                WindowState::Prepared { window, epoch } => (
-                    window.advance(request.records, anchor_job_issued_at_ms),
-                    *epoch,
-                ),
-                WindowState::Uploaded(_) => {
-                    // Only prepared entries can match the predicate above,
-                    // so this arm is dead -- answered rather than panicked
-                    // because the position came from request-derived data.
-                    respond_error(
-                        stdout,
-                        "prepare_window advance matched a non-prepared window",
-                        false,
-                    )?;
-                    return Ok(());
-                }
-            };
+            let (advance_result, base_epoch, base_anchor_ms, base_window_weight) =
+                match &window_cache[position].1 {
+                    WindowState::Prepared { window, epoch } => (
+                        window.advance(request.records, anchor_job_issued_at_ms),
+                        *epoch,
+                        window.anchor_job_issued_at_ms,
+                        window.window_weight,
+                    ),
+                    WindowState::Uploaded(_) => {
+                        // Only prepared entries can match the predicate above,
+                        // so this arm is dead -- answered rather than panicked
+                        // because the position came from request-derived data.
+                        respond_error(
+                            stdout,
+                            "prepare_window advance matched a non-prepared window",
+                            false,
+                        )?;
+                        return Ok(());
+                    }
+                };
             let (advanced, stats, byte_delta) = match advance_result {
                 Ok(result) => result,
                 Err(error) => {
@@ -839,6 +885,9 @@ fn serve_prepare_window(
                             "request": "prepare_window",
                             "fallback": true,
                             "rejection": rejection,
+                            "base_anchor_ms": base_anchor_ms,
+                            "base_window_weight": base_window_weight,
+                            "base_epoch": base_epoch,
                             "error": error.to_string(),
                         }),
                     )?;
@@ -880,8 +929,9 @@ fn serve_prepare_window(
                         },
                     ),
                 );
-                window_cache.truncate(SERVE_WINDOW_CACHE_MAX_ENTRIES);
             }
+            prepared_history.latest = Some(digest.clone());
+            prepared_history.trim(window_cache, "evicted_by_prepare");
             let mut out = stdout.lock();
             serde_json::to_writer(
                 &mut out,

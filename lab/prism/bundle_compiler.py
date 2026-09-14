@@ -44,6 +44,7 @@ from lab.prism.share_json_stream import (
     iter_json_object_text_chunks,
 )
 from lab.prism.share_ledger import DaemonWindowMirrorDivergence
+from lab.prism.window_lifecycle import WindowLifecycleTelemetry
 
 
 PRISM_BUILDER_PHASE_METRICS_PREFIX = "qbit-prism-build-phase-metrics "
@@ -682,6 +683,10 @@ class _PipeReadinessWaiter:
 class _ServeBuilderUnavailable(RuntimeError):
     """Daemon anomaly; the build must transparently use one-shot mode."""
 
+    def __init__(self, message: str, *, reason: str = "protocol") -> None:
+        super().__init__(message)
+        self.reason = reason
+
 
 @dataclass(frozen=True)
 class PreparedWindowOutcome:
@@ -733,6 +738,8 @@ class PreparedWindowOutcome:
     appended_items: bytes = field(default=b"", repr=False)
     error: str | None = None
     rejection: str | None = None
+    daemon_generation: int = 0
+    base_state: str | None = None
 
 
 @dataclass
@@ -740,6 +747,8 @@ class _ServeBuilderClient:
     """Line-oriented I/O state for one long-lived --serve audit builder."""
 
     process: subprocess.Popen[bytes]
+    generation: int = 0
+    prepared_window_digest: str | None = None
     stdout_buffer: bytearray = field(default_factory=bytearray, repr=False)
     # True from the first byte of a request until its terminating newline.
     # A request that escapes half-written leaves the daemon's stdin holding
@@ -758,7 +767,11 @@ class _ServeBuilderClient:
         self.uploaded_windows.pop(share_snapshot_sha256, None)
         self.uploaded_windows[share_snapshot_sha256] = None
         while len(self.uploaded_windows) > PRISM_SERVE_BUILDER_WINDOW_CACHE_ENTRIES:
-            self.uploaded_windows.popitem(last=False)
+            oldest = next(
+                key for key in self.uploaded_windows
+                if key != self.prepared_window_digest
+            )
+            self.uploaded_windows.pop(oldest)
 
     def close(self) -> None:
         # Tolerates lightweight process fakes used by embedders and tests,
@@ -826,6 +839,8 @@ class BundleCompiler:
         self._serve_builder_lock = threading.Lock()
         self._serve_builder: _ServeBuilderClient | None = None
         self._serve_builder_shutdown = False
+        self._serve_builder_generation = 0
+        self.window_lifecycle = WindowLifecycleTelemetry()
         # Counters get their own short-lived lock so a metrics scrape
         # never waits behind _serve_builder_lock, which one request can
         # hold for a whole daemon round trip.
@@ -873,11 +888,21 @@ class BundleCompiler:
             self._serve_builder_shutdown = True
             client, self._serve_builder = self._serve_builder, None
         if client is not None:
+            self._note_serve_builder_retired(client, "shutdown")
             client.close()
 
-    def _retire_serve_builder_locked(self) -> None:
+    def _note_serve_builder_retired(self, client: _ServeBuilderClient, reason: str) -> None:
+        poll = getattr(client.process, "poll", None)
+        self.window_lifecycle.note(
+            "retire", reason, daemon_generation=client.generation,
+            pid=getattr(client.process, "pid", None),
+            returncode=poll() if callable(poll) else None,
+        )
+
+    def _retire_serve_builder_locked(self, reason: str = "unknown") -> None:
         client, self._serve_builder = self._serve_builder, None
         if client is not None:
+            self._note_serve_builder_retired(client, reason)
             client.close()
 
     def _record_live_serve_builder_termination(
@@ -961,7 +986,7 @@ class BundleCompiler:
             )
         except OSError as exc:
             raise _ServeBuilderUnavailable(
-                f"audit-builder daemon spawn failed: {exc}"
+                f"audit-builder daemon spawn failed: {exc}", reason="io"
             ) from exc
         # The start (and any pending restart it satisfies) is recorded as
         # soon as the worker exists, exactly like the one-shot path: a
@@ -977,7 +1002,12 @@ class BundleCompiler:
         if restarted:
             with runtime._tip_refresh_metrics_lock:
                 runtime.tip_refresh_worker_restarts += 1
-        client = _ServeBuilderClient(process=process)
+        self._serve_builder_generation += 1
+        client = _ServeBuilderClient(process=process, generation=self._serve_builder_generation)
+        self.window_lifecycle.note(
+            "spawn", "started", daemon_generation=client.generation,
+            pid=getattr(process, "pid", None),
+        )
         try:
             assert process.stdin is not None and process.stdout is not None
             os.set_blocking(process.stdin.fileno(), False)
@@ -998,18 +1028,21 @@ class BundleCompiler:
                 raise _ServeBuilderUnavailable(
                     "audit-builder daemon announced an unsupported protocol"
                 )
-        except _ServeBuilderUnavailable:
+        except _ServeBuilderUnavailable as exc:
             self._record_live_serve_builder_termination(client)
+            self._note_serve_builder_retired(client, exc.reason)
             client.close()
             raise
         except (OSError, ValueError, AttributeError) as exc:
             self._record_live_serve_builder_termination(client)
+            self._note_serve_builder_retired(client, "handshake")
             client.close()
             raise _ServeBuilderUnavailable(
-                f"audit-builder daemon handshake failed: {exc}"
+                f"audit-builder daemon handshake failed: {exc}", reason="handshake"
             ) from exc
         except BaseException:
             self._record_live_serve_builder_termination(client)
+            self._note_serve_builder_retired(client, "cancelled")
             client.close()
             raise
         return client
@@ -1051,7 +1084,7 @@ class BundleCompiler:
                     # one-shot runs against this same exhausted deadline and
                     # its own timeout path records the failure exactly once.
                     raise _ServeBuilderUnavailable(
-                        "audit-builder daemon timed out"
+                        "audit-builder daemon timed out", reason="timeout"
                     )
                 try:
                     chunk = os.read(
@@ -1066,7 +1099,7 @@ class BundleCompiler:
                     continue
                 except OSError as exc:
                     raise _ServeBuilderUnavailable(
-                        f"audit-builder daemon read failed: {exc}"
+                        f"audit-builder daemon read failed: {exc}", reason="io"
                     ) from exc
                 if not chunk:
                     if (
@@ -1080,7 +1113,7 @@ class BundleCompiler:
                         runtime.job_build_worker_counts["crashes"] += 1
                         runtime._job_build_worker_restart_pending = True
                     raise _ServeBuilderUnavailable(
-                        "audit-builder daemon exited mid-request"
+                        "audit-builder daemon exited mid-request", reason="eof"
                     )
                 client.stdout_buffer += chunk
 
@@ -1121,7 +1154,7 @@ class BundleCompiler:
                     )
                 if time.monotonic() >= deadline:
                     raise _ServeBuilderUnavailable(
-                        "audit-builder daemon timed out"
+                        "audit-builder daemon timed out", reason="timeout"
                     )
                 try:
                     chunk = os.read(
@@ -1138,14 +1171,14 @@ class BundleCompiler:
                     continue
                 except OSError as exc:
                     raise _ServeBuilderUnavailable(
-                        f"audit-builder daemon read failed: {exc}"
+                        f"audit-builder daemon read failed: {exc}", reason="io"
                     ) from exc
                 if not chunk:
                     with runtime._job_build_scheduler_lock:
                         runtime.job_build_worker_counts["crashes"] += 1
                         runtime._job_build_worker_restart_pending = True
                     raise _ServeBuilderUnavailable(
-                        "audit-builder daemon exited mid-request"
+                        "audit-builder daemon exited mid-request", reason="eof"
                     )
                 out += chunk
         return bytes(out)
@@ -1179,7 +1212,7 @@ class BundleCompiler:
                     # one-shot runs against this same exhausted deadline and
                     # its own timeout path records the failure exactly once.
                     raise _ServeBuilderUnavailable(
-                        "audit-builder daemon timed out"
+                        "audit-builder daemon timed out", reason="timeout"
                     )
                 try:
                     written = os.write(file_descriptor, remaining)
@@ -1197,15 +1230,15 @@ class BundleCompiler:
                             "audit-builder daemon was terminated after supersession"
                         ) from exc
                     raise _ServeBuilderUnavailable(
-                        "audit-builder daemon input pipe closed"
+                        "audit-builder daemon input pipe closed", reason="io"
                     ) from exc
                 except OSError as exc:
                     raise _ServeBuilderUnavailable(
-                        f"audit-builder daemon write failed: {exc}"
+                        f"audit-builder daemon write failed: {exc}", reason="io"
                     ) from exc
                 if written <= 0:
                     raise _ServeBuilderUnavailable(
-                        "audit-builder daemon input pipe closed"
+                        "audit-builder daemon input pipe closed", reason="io"
                     )
                 written_total += written
                 remaining = remaining[written:]
@@ -1247,7 +1280,7 @@ class BundleCompiler:
                     # one-shot runs against this same exhausted deadline and
                     # its own timeout path records the failure exactly once.
                     raise _ServeBuilderUnavailable(
-                        "audit-builder daemon timed out"
+                        "audit-builder daemon timed out", reason="timeout"
                     )
                 try:
                     moved = os.splice(
@@ -1271,7 +1304,7 @@ class BundleCompiler:
                             "audit-builder daemon was terminated after supersession"
                         ) from exc
                     raise _ServeBuilderUnavailable(
-                        "audit-builder daemon input pipe closed"
+                        "audit-builder daemon input pipe closed", reason="io"
                     ) from exc
                 except OSError as exc:
                     if (
@@ -1290,11 +1323,11 @@ class BundleCompiler:
                     # incomplete.
                     share_serialization.mark_spool_failed()
                     raise _ServeBuilderUnavailable(
-                        f"audit-builder daemon spool transfer failed: {exc}"
+                        f"audit-builder daemon spool transfer failed: {exc}", reason="io"
                     ) from exc
                 if moved <= 0:
                     raise _ServeBuilderUnavailable(
-                        "audit-builder daemon input pipe closed"
+                        "audit-builder daemon input pipe closed", reason="io"
                     )
                 offset += moved
         return offset
@@ -1451,7 +1484,7 @@ class BundleCompiler:
         if response.get("ok") is not True:
             raise _ServeBuilderUnavailable(
                 "audit-builder daemon error: "
-                f"{response.get('error', 'unknown')}"
+                f"{response.get('error', 'unknown')}", reason="request_error"
             )
         summary = response.get("summary")
         if not isinstance(summary, dict):
@@ -1544,7 +1577,7 @@ class BundleCompiler:
                     with runtime._job_build_scheduler_lock:
                         runtime.job_build_worker_counts["crashes"] += 1
                         runtime._job_build_worker_restart_pending = True
-                    self._retire_serve_builder_locked()
+                    self._retire_serve_builder_locked("exited")
                     client = None
                 if client is None:
                     client = self._spawn_serve_builder_locked(
@@ -1581,24 +1614,24 @@ class BundleCompiler:
             except self._cancellation_error_types:
                 # The daemon stream is indeterminate mid-request; retire it
                 # so the replacement build starts clean.
-                self._retire_serve_builder_locked()
+                self._retire_serve_builder_locked("cancelled")
                 with runtime._job_build_scheduler_lock:
                     runtime.job_build_worker_counts["terminations"] += 1
                     runtime._job_build_worker_restart_pending = True
                 raise
-            except _ServeBuilderUnavailable:
+            except _ServeBuilderUnavailable as exc:
                 self._record_live_serve_builder_termination(
                     self._serve_builder
                 )
-                self._retire_serve_builder_locked()
+                self._retire_serve_builder_locked(exc.reason)
                 with self._serve_builder_metrics_lock:
                     self.serve_builder_counts["fallbacks"] += 1
                 return None
-            except (OSError, ValueError):
+            except (OSError, ValueError) as exc:
                 self._record_live_serve_builder_termination(
                     self._serve_builder
                 )
-                self._retire_serve_builder_locked()
+                self._retire_serve_builder_locked("io" if isinstance(exc, OSError) else "protocol")
                 with self._serve_builder_metrics_lock:
                     self.serve_builder_counts["fallbacks"] += 1
                 return None
@@ -1613,7 +1646,7 @@ class BundleCompiler:
                 # innocent later build.
                 if client is not None and client.request_incomplete:
                     self._record_live_serve_builder_termination(client)
-                    self._retire_serve_builder_locked()
+                    self._retire_serve_builder_locked("partial_request")
                     with self._serve_builder_metrics_lock:
                         self.serve_builder_counts["fallbacks"] += 1
                 raise
@@ -1704,11 +1737,15 @@ class BundleCompiler:
                     )
                     + 1
                 )
+            self.window_lifecycle.note("prepare_" + mode, "busy", base_digest=base_digest)
             return PreparedWindowOutcome(
                 status="busy",
                 error="audit-builder daemon is owned by another build",
             )
         deadline = time.monotonic() + budget
+        outcome = None
+        client = None
+        base_metadata = {}
         try:
             if self._serve_builder_shutdown:
                 return None
@@ -1718,7 +1755,7 @@ class BundleCompiler:
                     with runtime._job_build_scheduler_lock:
                         runtime.job_build_worker_counts["crashes"] += 1
                         runtime._job_build_worker_restart_pending = True
-                    self._retire_serve_builder_locked()
+                    self._retire_serve_builder_locked("exited")
                     client = None
                 if client is None:
                     client = self._spawn_serve_builder_locked(deadline, None)
@@ -1761,6 +1798,8 @@ class BundleCompiler:
                         "audit-builder daemon returned a malformed"
                         " prepare_window response"
                     )
+                base_metadata = {name: envelope.get(name) for name in (
+                    "base_anchor_ms", "base_window_weight", "base_epoch")}
                 if envelope.get("ok") is not True:
                     rejection = envelope.get("rejection")
                     if not isinstance(rejection, str):
@@ -1769,18 +1808,22 @@ class BundleCompiler:
                         outcome = PreparedWindowOutcome(
                             status="needs_full",
                             error=str(envelope.get("error", "")),
+                            base_state=str(envelope.get("base_state", "not_held")),
+                            daemon_generation=client.generation,
                         )
                     elif bool(envelope.get("fallback")):
                         outcome = PreparedWindowOutcome(
                             status="fallback",
                             error=str(envelope.get("error", "")),
                             rejection=rejection,
+                            daemon_generation=client.generation,
                         )
                     elif bool(envelope.get("fold_invalid")):
                         outcome = PreparedWindowOutcome(
                             status="fold_invalid",
                             error=str(envelope.get("error", "")),
                             rejection=rejection,
+                            daemon_generation=client.generation,
                         )
                     elif bool(envelope.get("out_of_range")):
                         # The daemon declined a value outside its declared
@@ -1800,11 +1843,12 @@ class BundleCompiler:
                         outcome = PreparedWindowOutcome(
                             status="out_of_range",
                             error=str(envelope.get("error", "")),
+                            daemon_generation=client.generation,
                         )
                     else:
                         raise _ServeBuilderUnavailable(
                             "audit-builder daemon prepare_window error: "
-                            f"{envelope.get('error', 'unknown')}"
+                            f"{envelope.get('error', 'unknown')}", reason="request_error"
                         )
                 else:
                     digest = envelope.get("share_snapshot_sha256")
@@ -1846,6 +1890,7 @@ class BundleCompiler:
                     # The prepared window doubles as the build cache entry;
                     # note it in the LRU mirror so the next build for this
                     # digest skips its window upload entirely.
+                    client.prepared_window_digest = digest
                     client.note_uploaded_window(digest)
                     outcome = PreparedWindowOutcome(
                         status="prepared",
@@ -1857,20 +1902,21 @@ class BundleCompiler:
                         window_items=window_items,
                         retained_drop_bytes=retained_drop_bytes,
                         appended_items=appended_items,
+                        daemon_generation=client.generation,
                     )
-            except _ServeBuilderUnavailable:
+            except _ServeBuilderUnavailable as exc:
                 self._record_live_serve_builder_termination(
                     self._serve_builder
                 )
-                self._retire_serve_builder_locked()
+                self._retire_serve_builder_locked(exc.reason)
                 with self._serve_builder_metrics_lock:
                     self.serve_builder_counts["fallbacks"] += 1
                 return None
-            except (OSError, ValueError, KeyError, TypeError):
+            except (OSError, ValueError, KeyError, TypeError) as exc:
                 self._record_live_serve_builder_termination(
                     self._serve_builder
                 )
-                self._retire_serve_builder_locked()
+                self._retire_serve_builder_locked("io" if isinstance(exc, OSError) else "protocol")
                 with self._serve_builder_metrics_lock:
                     self.serve_builder_counts["fallbacks"] += 1
                 return None
@@ -1883,7 +1929,7 @@ class BundleCompiler:
                 client = self._serve_builder
                 if client is not None and client.request_incomplete:
                     self._record_live_serve_builder_termination(client)
-                    self._retire_serve_builder_locked()
+                    self._retire_serve_builder_locked("partial_request")
                     with self._serve_builder_metrics_lock:
                         self.serve_builder_counts["fallbacks"] += 1
                 raise
@@ -1895,6 +1941,19 @@ class BundleCompiler:
                 return outcome
         finally:
             self._serve_builder_lock.release()
+            reason = outcome.status if outcome is not None else "unavailable"
+            if reason == "needs_full":
+                reason = outcome.base_state or "not_held"
+            self.window_lifecycle.note(
+                "prepare_" + mode, reason,
+                daemon_generation=client.generation if client is not None else self._serve_builder_generation,
+                base_digest=base_digest,
+                digest=outcome.share_snapshot_sha256 if outcome is not None else None,
+                anchor_ms=anchor_job_issued_at_ms,
+                append_epoch=append_invalidation_epoch,
+                rejection=outcome.rejection if outcome is not None else None,
+                **base_metadata,
+            )
 
     def build_audit_bundle(
         self,

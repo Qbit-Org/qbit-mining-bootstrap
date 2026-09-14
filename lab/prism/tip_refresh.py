@@ -1379,6 +1379,7 @@ class TipRefreshService:
                 ],
             ]
         )
+        lines.extend(runtime._ensure_bundle_compiler().window_lifecycle.metrics_lines())
         return lines
 
     def _tip_refresh_artifacts(

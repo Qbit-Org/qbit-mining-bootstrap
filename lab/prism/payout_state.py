@@ -45,6 +45,7 @@ from lab.prism.accepted_preview_telemetry import (
     ensure_accepted_preview_telemetry,
 )
 from lab.prism.window_oracle import snapshot_window
+from lab.prism.window_lifecycle import refuse_artifact_reuse
 from lab.prism.candidate_window import disk_window_covers, recorded_share_ids
 from lab.prism.coordinator_config import (
     DEFAULT_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX,
@@ -3032,25 +3033,25 @@ class PayoutStateService:
         runtime = self._runtime
         runtime._ensure_job_cache_state()
         if not runtime._payout_artifact_reuse_active():
-            return None
+            return refuse_artifact_reuse("disabled")
         with runtime._job_cache_lock:
             artifact = runtime._payout_ledger_artifact
             published_artifact = runtime._published_payout_state.artifact
             append_invalidation_epoch = (
                 runtime._payout_ledger_append_invalidation_epoch
             )
-        if (
-            artifact is None
-            or artifact.payout_state_generation != payout_state_generation
-            or artifact.network_difficulty != int(network_difficulty)
-            or artifact.append_invalidation_epoch
-            != append_invalidation_epoch
-        ):
-            return None
+        if artifact is None:
+            return refuse_artifact_reuse("absent")
+        if artifact.payout_state_generation != payout_state_generation:
+            return refuse_artifact_reuse("payout_generation")
+        if artifact.network_difficulty != int(network_difficulty):
+            return refuse_artifact_reuse("difficulty")
+        if artifact.append_invalidation_epoch != append_invalidation_epoch:
+            return refuse_artifact_reuse("append_epoch")
         if artifact.snapshot_anchor_ms is None:
             # Without a recorded anchor the artifact cannot declare the
             # anchor reused bundles must stamp; fail closed.
-            return None
+            return refuse_artifact_reuse("anchor_missing")
         anchor_age_ms = self._now_ms() - int(artifact.snapshot_anchor_ms)
         if anchor_age_ms > runtime._payout_artifact_max_anchor_age_ms():
             # The declared anchor crossed the audit ceiling; the window may
@@ -3063,7 +3064,7 @@ class PayoutStateService:
                     network_difficulty,
                 )
             runtime._record_payout_artifact_event("probe_rejected_ceiling")
-            return None
+            return refuse_artifact_reuse("audit_ceiling")
         if anchor_age_ms > runtime._payout_artifact_reanchor_seconds() * 1000.0:
             # Aging but valid: schedule the debounced background re-anchor
             # and keep serving. The delivery path must never pay the
@@ -3083,7 +3084,7 @@ class PayoutStateService:
             try:
                 published_artifact = runtime._current_payout_state_artifact()
             except Exception:
-                return None
+                return refuse_artifact_reuse("published_unavailable")
         balances_sha256 = artifact.prior_balances_sha256 or self._canonical_json_sha256(
             artifact.prior_balances
         )
@@ -3094,7 +3095,7 @@ class PayoutStateService:
                 or runtime._payout_ledger_append_invalidation_epoch
                 != artifact.append_invalidation_epoch
             ):
-                return None
+                return refuse_artifact_reuse("publication_race")
             latest = runtime._payout_ledger_artifact
             if latest is not artifact:
                 # An equal-window freshness restamp (already_current /
@@ -3121,14 +3122,14 @@ class PayoutStateService:
                     or latest.append_invalidation_epoch
                     != artifact.append_invalidation_epoch
                 ):
-                    return None
+                    return refuse_artifact_reuse("artifact_replaced")
                 artifact = latest
             if balances_sha256 != published_artifact.prior_balances_sha256:
                 # A candidate can carry a ledger snapshot prepared before its
                 # payout state is published. Never keep retrying that stale
                 # shortcut; the synchronous path will take a fresh snapshot.
                 self._disarm_payout_ledger_artifact_locked()
-                return None
+                return refuse_artifact_reuse("balances")
             served = artifact
         # Recorded outside the cache lock the event counter's own lock
         # ordering forbids nesting under.
