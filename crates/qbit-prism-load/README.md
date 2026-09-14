@@ -144,7 +144,11 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
    reconnect that lands on a paused session does not lift the pause. If the
    submits never settle the frontend is not killed and the run aborts
    (exit 6) rather than turning the harness's own in-flight submits into
-   lost acknowledgements.
+   lost acknowledgements. A reconnect is attributed to the phase that asked
+   for it: one started near the end of this phase and completed after the
+   next began is still counted in `reconnect_events`, not under the phase it
+   happened to finish in, the same way a submit belongs to the phase that
+   offered it.
 5. **`slow_database`**, at least 60 s at a delay of at least 10 ms.
 6. **`dense_cadence`**, only with `--cadence dense`. Side report only.
 7. **`mid_flight_kill`**, only with `--mid-flight-kill`. Side report only.

@@ -1480,6 +1480,7 @@ async fn drive_phase(
             if let Some(session) = sessions.get(reconnect_cursor % sessions.len()) {
                 let _ = session.control.send(client::Control::Reconnect {
                     reason: "client-initiated".into(),
+                    phase: phase.clone(),
                 });
             }
             reconnect_cursor += 1;

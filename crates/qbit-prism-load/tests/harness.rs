@@ -961,6 +961,73 @@ async fn a_queued_offer_is_recorded_under_the_phase_that_offered_it() -> Result<
     Ok(())
 }
 
+/// A reconnect belongs to the phase that asked for it. One started near the
+/// end of the `reconnect` phase and completed after `slow_database` began was
+/// stamped with the phase current at completion, so it went missing from
+/// `reconnect_events` and turned up under a phase that configured no
+/// reconnect at all. The initiating phase travels with the operation, as it
+/// does for a submit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnect_is_attributed_to_the_phase_that_asked_for_it() -> Result<()> {
+    let server = fake_stratum(false).await;
+    let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+    let shared = Arc::new(client::SessionShared {
+        phase: std::sync::RwLock::new("reconnect".to_owned()),
+        events,
+        record_notifies: std::sync::atomic::AtomicBool::new(false),
+    });
+    let handle = client::spawn_session(
+        session_config(0),
+        0,
+        server.address.clone(),
+        shared.clone(),
+        2,
+    );
+    // The first connection completes.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let event = tokio::time::timeout_at(deadline, inbox.recv())
+            .await
+            .expect("the session connects within the deadline")
+            .expect("the session is still running");
+        if matches!(event, client::Event::Connected { .. }) {
+            break;
+        }
+    }
+
+    // The reconnect phase asks for a reconnect, and the new connection is
+    // held inside its handshake while the run moves on to the next phase.
+    server.release_authorize.send(false)?;
+    let phase: Arc<str> = Arc::from("reconnect");
+    handle.control.send(client::Control::Reconnect {
+        reason: "client-initiated".into(),
+        phase: phase.clone(),
+    })?;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    *shared.phase.write().unwrap() = "slow_database".to_owned();
+    server.release_authorize.send(true)?;
+
+    let record = loop {
+        let event = tokio::time::timeout_at(deadline, inbox.recv())
+            .await
+            .expect("the reconnect completes within the deadline")
+            .expect("the session is still running");
+        if let client::Event::Reconnect(record) = event {
+            break record;
+        }
+    };
+    assert!(record.completed, "{record:?}");
+    assert_eq!(record.reason, "client-initiated");
+    assert_eq!(
+        record.phase, "reconnect",
+        "the reconnect was asked for in the reconnect phase and belongs there, not in the \
+         phase the run had reached when the handshake finally completed"
+    );
+    let _ = handle.control.send(client::Control::Stop);
+    tokio::time::timeout(std::time::Duration::from_secs(5), handle.task).await??;
+    Ok(())
+}
+
 // --- server revision evidence --------------------------------------------
 
 /// `coordinator_revision` is the checkout's HEAD; the binary has to be shown

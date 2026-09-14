@@ -190,6 +190,8 @@ pub struct SubmitRecord {
 pub struct ReconnectRecord {
     pub session: usize,
     pub frontend: usize,
+    /// The phase that asked for the reconnect, not the phase it completed
+    /// in.
     pub phase: String,
     pub reason: String,
     pub completed: bool,
@@ -279,9 +281,14 @@ pub enum Work {
 
 #[derive(Clone, Debug)]
 pub enum Control {
-    /// Quiesce outstanding submits, close, reconnect and re-authorize.
+    /// Quiesce outstanding submits, close, reconnect and re-authorize. The
+    /// record it produces is stamped with `phase`, the phase that asked for
+    /// it: a reconnect started near the end of the `reconnect` phase and
+    /// completed after the next one began is still that phase's reconnect,
+    /// the same way a submit belongs to the phase that offered it (EP-STATE).
     Reconnect {
         reason: String,
+        phase: Arc<str>,
     },
     /// Stop submitting but stay connected until retargeted. The sender sets
     /// `SessionHandle::paused` first, so the scheduler stops offering at once.
@@ -489,6 +496,14 @@ async fn run_session(
     let mut stopping = false;
     let mut connection: Option<Connection> = None;
     let mut reconnect_reason = String::from("initial");
+    // The phase the reconnect in progress belongs to, stamped when it was
+    // decided -- the phase that sent `Control::Reconnect`, or the run's
+    // phase when the socket closed or a retarget asked for a fresh
+    // connection. Every attempt's record carries it, however many phases
+    // pass before the reconnect completes; reading the run's phase at
+    // completion labelled a late reconnect with the next phase, and the
+    // phase that configured it lost the event (EP-STATE).
+    let mut reconnect_phase = String::new();
     while !stopping {
         if connection.is_none() {
             let started = Instant::now();
@@ -502,7 +517,7 @@ async fn run_session(
                         let _ = shared.events.send(Event::Reconnect(ReconnectRecord {
                             session: config.index,
                             frontend: frontend.load(Ordering::Relaxed),
-                            phase: shared.phase(),
+                            phase: reconnect_phase.clone(),
                             reason: reconnect_reason.clone(),
                             completed: true,
                             error: None,
@@ -512,10 +527,15 @@ async fn run_session(
                     connection = Some(fresh);
                 }
                 Err(error) => {
+                    // The initial connection has no phase to belong to: the
+                    // run stamps it "setup" until the first phase starts.
+                    if reconnect_reason == "initial" {
+                        reconnect_phase = shared.phase();
+                    }
                     let _ = shared.events.send(Event::Reconnect(ReconnectRecord {
                         session: config.index,
                         frontend: frontend.load(Ordering::Relaxed),
-                        phase: shared.phase(),
+                        phase: reconnect_phase.clone(),
                         reason: reconnect_reason.clone(),
                         completed: false,
                         error: Some(format!("{error:#}")),
@@ -564,13 +584,15 @@ async fn run_session(
                         address = next;
                         paused.store(false, Ordering::Relaxed);
                         if reconnect {
+                            reconnect_phase = shared.phase();
                             quiesce(active, &shared, &config, &frontend, &outstanding).await;
                             active.drop_reader();
                             connection = None;
                             reconnect_reason = "retarget".into();
                         }
                     }
-                    Some(Control::Reconnect { reason }) => {
+                    Some(Control::Reconnect { reason, phase }) => {
+                        reconnect_phase = phase.to_string();
                         // A pause outlives a reconnect that lands during it:
                         // the pause was decided for the frontend being
                         // restarted, and only the retarget that ends the
@@ -637,6 +659,7 @@ async fn run_session(
                             Some(Incoming::Closed(reason)) => reason_or_default(reason),
                             _ => "reader stopped".to_owned(),
                         };
+                        reconnect_phase = shared.phase();
                         fail_pending(active, &reason, &shared, &config, &outstanding);
                         let _ = shared.events.send(Event::Disconnected {
                             session: config.index,
