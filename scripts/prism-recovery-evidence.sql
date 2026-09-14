@@ -59,11 +59,13 @@ FROM qbit_ctv_fanout_artifacts ORDER BY fanout_txid COLLATE "C";
 SELECT jsonb_build_object('kind', 'ctv_broadcast_attempts', 'row', to_jsonb(a))
 FROM qbit_ctv_fanout_broadcast_attempts a ORDER BY attempt_seq;
 
--- Frozen 2.x has no native reservations or deferred credit. Skip absent
+-- Frozen 2.x has no native reservations, deferred credit or fatal state. Skip absent
 -- tables before parsing their queries; empty native tables hash identically.
 SELECT to_regclass('qbit_prism_cpfp_packages') IS NOT NULL AS has_cpfp_packages,
        to_regclass('qbit_prism_cpfp_retired_funding') IS NOT NULL AS has_cpfp_retired_funding,
-       to_regclass('qbit_prism_deferred_shares') IS NOT NULL AS has_deferred_shares
+       to_regclass('qbit_prism_deferred_shares') IS NOT NULL AS has_deferred_shares,
+       to_regclass('qbit_prism_cluster') IS NOT NULL AS has_cluster,
+       to_regclass('qbit_prism_fatal_state_events') IS NOT NULL AS has_fatal_state_events
 \gset
 \if :has_cpfp_packages
 SELECT jsonb_build_object('kind', 'cpfp_packages', 'row', to_jsonb(p))
@@ -77,6 +79,18 @@ ORDER BY funding_txid COLLATE "C", funding_vout;
 \if :has_deferred_shares
 SELECT jsonb_build_object('kind', 'deferred_shares', 'row', to_jsonb(d))
 FROM qbit_prism_deferred_shares d ORDER BY block_hash COLLATE "C";
+\endif
+\if :has_cluster
+-- A fresh migration has no halt. Exclude routine cluster metadata so that
+-- migrating an unchanged legacy backup still produces identical evidence.
+-- JSON extraction also supports native schemas predating the set-at column.
+SELECT jsonb_build_object('kind', 'fatal_state', 'row', jsonb_build_object(
+    'fatal_error', fatal_error, 'fatal_error_set_at', to_jsonb(c)->'fatal_error_set_at'))
+FROM qbit_prism_cluster c WHERE fatal_error IS NOT NULL ORDER BY singleton;
+\endif
+\if :has_fatal_state_events
+SELECT jsonb_build_object('kind', 'fatal_state_events', 'row', to_jsonb(e))
+FROM qbit_prism_fatal_state_events e ORDER BY event_id;
 \endif
 
 -- Exact row shape/order used by 2.x _carry_forward_audit_head_locked.

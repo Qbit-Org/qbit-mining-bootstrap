@@ -141,7 +141,10 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         ensure!(source_evidence["last_share_seq"] == 8);
         ensure!(source_evidence["records"]["audits"]["count"] == 3);
         ensure!(source_evidence["records"]["ctv_broadcast_attempts"]["count"] == 1);
-        for kind in ["cpfp_packages", "cpfp_retired_funding", "deferred_shares"] {
+        for kind in [
+            "cpfp_packages", "cpfp_retired_funding", "deferred_shares",
+            "fatal_state", "fatal_state_events",
+        ] {
             ensure!(source_evidence["records"][kind]["count"] == 0);
         }
         ensure!(source_evidence["carry_forward_integrity"]["mismatch_count"] == 0);
@@ -240,6 +243,62 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         }
         ensure!(recovery::evidence(&source, pg_bin).await? == prior);
         ensure!(recovery::evidence(&restored, pg_bin).await? == source_evidence);
+
+        // A halt can be the only durable change. Routine cluster activity must
+        // not count, but every halt and its immutable recovery decision must.
+        sqlx::query("UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1,updated_at=clock_timestamp()")
+            .execute(&source.pool).await?;
+        ensure!(recovery::evidence(&source, pg_bin).await? == prior);
+        let before_halt = prior.clone();
+        for mutation in [
+            "fatal_error='deep confirmed CTV fanout disconnected: test; manual reconciliation required'",
+            "fatal_error_set_at=NULL",
+            "fatal_error_set_at='2026-09-14T21:00:00Z'",
+            "fatal_error='mature pool block disconnected: test; manual reconciliation required'",
+        ] {
+            sqlx::query(&format!("UPDATE qbit_prism_cluster SET {mutation}"))
+                .execute(&source.pool).await?;
+            let current = recovery::evidence(&source, pg_bin).await?;
+            ensure!(current["records"]["fatal_state"]["count"] == 1);
+            ensure!(current["records"]["fatal_state"]["sha256"]
+                != prior["records"]["fatal_state"]["sha256"],
+                "fatal state change was invisible to recovery evidence: {mutation}");
+            let mut unchanged = current.clone();
+            unchanged["records"]["fatal_state"] = prior["records"]["fatal_state"].clone();
+            ensure!(unchanged == prior, "unrelated accounting changed with fatal state");
+            prior = current;
+        }
+        // Model the atomic clear-and-audit write, preserving the original halt
+        // payload while leaving the cluster in its default nonfatal state.
+        let mut tx = source.pool.begin().await?;
+        sqlx::query("INSERT INTO qbit_prism_fatal_state_events(reason,fatal_error,fatal_error_set_at,instances,reconciliation) SELECT 'reconciled test halt',fatal_error,fatal_error_set_at,'[]','{\"blocks_checked\":3}' FROM qbit_prism_cluster")
+            .execute(&mut *tx).await?;
+        sqlx::query("UPDATE qbit_prism_cluster SET fatal_error=NULL")
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
+        let cleared = recovery::evidence(&source, pg_bin).await?;
+        ensure!(cleared["records"]["fatal_state"] == before_halt["records"]["fatal_state"]);
+        ensure!(cleared["records"]["fatal_state_events"]["count"] == 1);
+        ensure!(cleared["records"]["fatal_state_events"]["sha256"]
+            != before_halt["records"]["fatal_state_events"]["sha256"]);
+        let mut unchanged = cleared.clone();
+        unchanged["records"]["fatal_state_events"] = before_halt["records"]["fatal_state_events"].clone();
+        ensure!(unchanged == before_halt, "recovery history must independently distinguish a cleared halt");
+
+        // Restore a native database containing both an active halt and a prior
+        // clear event; their exact evidence must survive the backup roundtrip.
+        sqlx::query("UPDATE qbit_prism_cluster SET fatal_error='recurring halt'")
+            .execute(&source.pool).await?;
+        let halted = recovery::evidence(&source, pg_bin).await?;
+        let native_restore = recovery::Database::open(raw).await?;
+        let restored_result = async {
+            let archive = recovery::backup(&source, pg_bin).await?;
+            recovery::restore(&archive, &source, &native_restore, pg_bin).await?;
+            ensure!(recovery::evidence(&native_restore, pg_bin).await? == halted);
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        native_restore.close().await?;
+        restored_result?;
 
         // Corrupt payload fields without changing the artifact's identity or
         // settlement status. Both native and frozen 2.x exports must detect

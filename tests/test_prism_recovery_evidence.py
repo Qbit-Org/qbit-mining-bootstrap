@@ -91,6 +91,31 @@ class RecoveryEvidenceTests(unittest.TestCase):
                     if other != kind:
                         self.assertEqual(baseline["records"][other], changed["records"][other])
 
+    def test_fatal_state_and_recovery_history_change_summary_independently(self):
+        baseline = module.summarize(iter(closing()))
+        fatal = {"fatal_error": "fanout disconnected", "fatal_error_set_at": None}
+        event = {
+            "event_id": 1, "cleared_at": "2026-09-14T21:00:00+00:00",
+            "operator_identity": "operator", "database_role": "prism",
+            "reason": "reconciled", **fatal,
+            "instances": [], "reconciliation": {"blocks_checked": 1},
+        }
+        for kind, row in (("fatal_state", fatal), ("fatal_state_events", event)):
+            with self.subTest(kind=kind):
+                self.assertEqual(baseline["records"][kind]["count"], 0)
+                added = module.summarize(iter([record(kind, row)] + closing()))
+                self.assertEqual(added["records"][kind]["count"], 1)
+                self.assertNotEqual(added, baseline)
+                for field in row:
+                    with self.subTest(field=field):
+                        changed = module.summarize(iter([
+                            record(kind, row | {field: "changed"})] + closing()))
+                        self.assertNotEqual(added["records"][kind]["sha256"],
+                                            changed["records"][kind]["sha256"])
+                for other in baseline["records"]:
+                    if other != kind:
+                        self.assertEqual(baseline["records"][other], added["records"][other])
+
 
 if __name__ == "__main__":
     unittest.main()
