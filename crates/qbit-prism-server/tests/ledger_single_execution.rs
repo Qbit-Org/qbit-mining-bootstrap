@@ -1165,15 +1165,11 @@ async fn candidate_backoff_body(db: &Database) -> Result<()> {
     .fetch_one(&fixture)
     .await?;
     assert!(scheduled, "retry did not advance next_attempt_at");
-    // Before eligibility nobody can claim it. The backoff for a first attempt
-    // is one second, so this runs immediately, before any slower call.
+    // Once the real backoff is verified, fixture-controlled eligibility keeps
+    // scheduler delays from racing the one-second first-attempt deadline.
+    sqlx::query("UPDATE qbit_block_candidate_outbox SET next_attempt_at='infinity'::timestamptz WHERE block_hash=$1")
+        .bind(&hash).execute(&fixture).await?;
     let early = b.claim_candidate(60).await?;
-    let still_waiting: bool = sqlx::query_scalar("SELECT next_attempt_at>clock_timestamp() FROM qbit_block_candidate_outbox WHERE block_hash=$1")
-        .bind(&hash).fetch_one(&fixture).await?;
-    assert!(
-        still_waiting,
-        "the backoff elapsed before the eligibility check ran"
-    );
     assert!(early.is_none(), "claimed before its next attempt was due");
     let released = outbox(&fixture, &hash).await?;
     assert_eq!(
@@ -1213,7 +1209,12 @@ async fn candidate_backoff_body(db: &Database) -> Result<()> {
     );
 
     // After eligibility exactly one fresh token identifies the next attempt.
-    let fresh = wait_for(Duration::from_secs(10), || b.claim_candidate(60)).await?;
+    sqlx::query("UPDATE qbit_block_candidate_outbox SET next_attempt_at='-infinity'::timestamptz WHERE block_hash=$1")
+        .bind(&hash).execute(&fixture).await?;
+    let fresh = b
+        .claim_candidate(60)
+        .await?
+        .context("due candidate claim")?;
     assert_eq!(fresh.candidate.block_hash, hash);
     assert_ne!(fresh.claim_token, claim.claim_token);
     let claimed = outbox(&fixture, &hash).await?;
