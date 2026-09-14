@@ -67,7 +67,7 @@ impl MetricsSnapshot {
             registered_body
         };
         if let Some(collections) = collections {
-            collections.overlay_collections(&mut body);
+            collections.overlay_live_observations(&mut body);
         }
         body.push_str(&crate::metrics::render_freshness(
             freshness.age_seconds,

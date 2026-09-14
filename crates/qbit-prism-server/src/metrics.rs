@@ -116,17 +116,16 @@ impl Metrics {
     pub fn render(&self) -> String {
         self.current_registry().render()
     }
-    pub(crate) fn overlay_collections(&self, body: &mut String) {
+    /// Overlay one coherent registry read without renewing cached-body freshness.
+    /// Pool waits remain observable when the health publisher waits on that pool.
+    pub(crate) fn overlay_live_observations(&self, body: &mut String) {
         let current = self.current_registry();
         let mut refreshed = String::new();
-        for line in body
-            .lines()
-            .filter(|line| !registry::is_collection_line(line))
-        {
+        for line in body.lines().filter(|line| !registry::is_live_line(line)) {
             refreshed.push_str(line);
             refreshed.push('\n');
         }
-        refreshed.push_str(&current.render_filtered(Family::is_collection));
+        refreshed.push_str(&current.render_filtered(Family::is_live));
         *body = refreshed;
     }
     fn current_registry(&self) -> Registry {

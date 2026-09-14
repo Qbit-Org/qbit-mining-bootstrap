@@ -31,6 +31,7 @@ use connect::{require_revision, writable};
 pub use connect::{SessionAllocationExhausted, SessionId};
 mod difficulty;
 mod fanout;
+mod fatal_state;
 mod jobs;
 pub use jobs::{
     CompactPrepared, IssuedJobSave, PreparedAuditHashes, PreparedDependency, PreparedTemplate,

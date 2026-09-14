@@ -92,9 +92,16 @@ error or cancellation, including the three-second collection deadline. Since #32
 instrumented coordinator ledger transactions record acquisition the same way.
 Rollup worker transactions, public API queries and other pool traffic outside
 these acquisition paths are not timed. Durations measure elapsed pool
-wait and exclude subsequent transaction work. Collector availability remains a
-separate alert guard. **Proof-to-first-offer waits are declared, rule deferred to
-A/#266; advisory-lock waits are recorded since #328 with no rule written yet**;
+wait and exclude subsequent transaction work. The pool histogram is overlaid from
+one live registry read per scrape, so new observations remain alertable when the
+shared pool blocks collection and the health publisher. This rule requires a
+successful scrape and the same per-instance sample minimum; cached-body freshness
+and collector availability do not gate these live events. Cached gauges retain
+their freshness guards and stale/missing snapshots retain their unknown-data
+alerts. Deploy #351's live-histogram producer to every coordinator target before
+activating the revised expression; older cached-histogram producers do not satisfy
+its freshness contract. **Proof-to-first-offer waits are declared,
+rule deferred to A/#266; advisory-lock waits are recorded since #328 with no rule written yet**;
 neither has a firing rule.
 
 Numeric bounds without native measurement are explicitly **provisional, measure

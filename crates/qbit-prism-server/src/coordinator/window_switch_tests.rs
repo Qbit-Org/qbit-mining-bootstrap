@@ -550,8 +550,14 @@ async fn landed_audit_is_authenticated_and_the_claim_continues_to_submitblock() 
                 .await?;
             ensure!(fixture.landed(&hash).await?);
             let forgery = match case {
+                // Flip the digit to something it is not. Placing a literal
+                // would be a no-op whenever the digit already held that value,
+                // and the coinbase varies per run because the bundle's anchor
+                // comes from the ledger clock: the forgery would then change
+                // nothing and its acceptance would be correct, so the case
+                // would pass or fail at random.
                 "forged coinbase" => Some(
-                    "UPDATE qbit_pool_audit_bundles SET coinbase_tx_hex=overlay(coinbase_tx_hex placing '0' from length(coinbase_tx_hex)-8 for 1) WHERE block_hash=$1",
+                    "UPDATE qbit_pool_audit_bundles SET coinbase_tx_hex=overlay(coinbase_tx_hex placing CASE WHEN substr(coinbase_tx_hex,length(coinbase_tx_hex)-8,1)='0' THEN '1' ELSE '0' END from length(coinbase_tx_hex)-8 for 1) WHERE block_hash=$1",
                 ),
                 "forged audit root" => Some(
                     "UPDATE qbit_pool_audit_bundles SET audit_commitment_leaves_hex=to_jsonb(ARRAY[repeat('ab',32)]) WHERE block_hash=$1",
@@ -559,10 +565,26 @@ async fn landed_audit_is_authenticated_and_the_claim_continues_to_submitblock() 
                 _ => None,
             };
             if let Some(statement) = forgery {
+                // Read the row back rather than trusting the statement: a
+                // forgery that altered nothing would be accepted, and the case
+                // would then prove nothing while appearing to pass.
+                let before: Value = sqlx::query_scalar(
+                    "SELECT to_jsonb(b) FROM qbit_pool_audit_bundles b WHERE block_hash=$1",
+                )
+                .bind(&hash)
+                .fetch_one(&fixture.coordinator.ledger.pool)
+                .await?;
                 sqlx::query(statement)
                     .bind(&hash)
                     .execute(&fixture.coordinator.ledger.pool)
                     .await?;
+                let after: Value = sqlx::query_scalar(
+                    "SELECT to_jsonb(b) FROM qbit_pool_audit_bundles b WHERE block_hash=$1",
+                )
+                .bind(&hash)
+                .fetch_one(&fixture.coordinator.ledger.pool)
+                .await?;
+                ensure!(before != after, "case {case}: the forgery changed nothing");
             }
             fixture.expire(&hash).await?;
             let second = fixture
@@ -1085,4 +1107,88 @@ async fn a_refused_candidate_is_a_definite_rejection_not_an_unknown_outcome() ->
     .await;
     fixture.close().await?;
     result
+}
+
+/// A resumed job reuses its stored bundle only while the current inputs still
+/// describe it.
+///
+/// The candidate stores the inputs rather than the bundle, and a claim rebuilds
+/// the audit from them, so a resume that paired an old bundle with today's
+/// configuration would produce a coinbase the block does not commit to: the
+/// claim fails its comparison before `submitblock` and retries until the job
+/// expires. Both halves matter — a change must be refused, and an unchanged
+/// configuration must still hit the cache, or every resume would rebuild.
+#[test]
+fn a_resume_reuses_a_stored_bundle_only_while_its_inputs_still_describe_it() -> Result<()> {
+    let manifest_key = ManifestSigningKey::from_seed_hex(&"42".repeat(32))?;
+    let ledger_key = ManifestSigningKey::from_seed_hex(&"43".repeat(32))?;
+    let bundle = qbit_prism::build_audit_bundle_with_coinbase_options(
+        vec![AcceptedShare {
+            share_seq: 1,
+            share_id: "resume:share".into(),
+            miner_id: "miner-a".into(),
+            order_key: "miner-a".into(),
+            p2mr_program_hex: "11".repeat(32),
+            share_difficulty: 100,
+            network_difficulty: 100,
+            template_height: 100,
+            job_id: "resume".into(),
+            job_issued_at_ms: 1,
+            accepted_at_ms: 2,
+            ntime: 1_800_000_000,
+            credit_policy: None,
+        }],
+        FoundBlock {
+            block_height: 101,
+            coinbase_value_sats: 500_000_000,
+            network_difficulty: 100,
+            anchor_job_issued_at_ms: 3,
+        },
+        vec![],
+        qbit_prism::PayoutPolicy::day_one_default(),
+        Some("00".repeat(12)),
+        vec![],
+        &manifest_key,
+        &ledger_key,
+    )?;
+
+    let issued = BundleInputs {
+        payout_policy: bundle.payout_policy.clone(),
+        ctv: None,
+        signer_keys: SignerKeys::of(&manifest_key, &ledger_key),
+        audit_builder_version: qbit_prism::AUDIT_BUILDER_VERSION,
+    };
+    ensure!(
+        issued.describes(&bundle),
+        "the inputs the bundle was built with did not describe it, so every resume would rebuild"
+    );
+
+    let mut rotated = issued.clone();
+    rotated.signer_keys = SignerKeys::of(
+        &ManifestSigningKey::from_seed_hex(&"52".repeat(32))?,
+        &ManifestSigningKey::from_seed_hex(&"53".repeat(32))?,
+    );
+    ensure!(
+        !rotated.describes(&bundle),
+        "a signer rotation still described a bundle signed with the old keys"
+    );
+
+    let mut one_key_rotated = issued.clone();
+    one_key_rotated.signer_keys.ledger_key_hex =
+        ManifestSigningKey::from_seed_hex(&"53".repeat(32))?.public_key_hex();
+    ensure!(
+        !one_key_rotated.describes(&bundle),
+        "rotating only the ledger key still described the stored bundle"
+    );
+
+    let mut repriced = issued.clone();
+    repriced.payout_policy.target_feerate_sats_per_byte = repriced
+        .payout_policy
+        .target_feerate_sats_per_byte
+        .wrapping_add(1);
+    ensure!(
+        !repriced.describes(&bundle),
+        "a payout-policy change still described a bundle built under the old policy"
+    );
+    Ok(())
 }
