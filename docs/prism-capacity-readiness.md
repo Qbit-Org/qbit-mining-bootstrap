@@ -439,10 +439,11 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    and the image ID beside each run.
 3. **Capture every 5 minutes** for the whole soak: RSS from `/proc/1/status`
    for the bound, and the correlated series for the reading order above. Both
-   reads run inside the container; the parsing runs on the host. The loop
-   also checks, before every sample, that no more than 360 s have passed
-   since the previous one and that it is still reading the process the run
-   started with, and stops the run as invalid when either check fails or
+   reads run inside the container; the parsing runs on the host. The fence
+   defines `capture`, which takes the samples in a loop, and then calls it.
+   Before every sample it checks that no more than 360 s have passed since
+   the previous one and that it is still reading the process the run
+   started with, and it stops the run as invalid when either check fails or
    when one of its appends to the run's files does:
 
    ```sh
@@ -451,75 +452,87 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    process() {
      docker inspect --format '{{.State.Status}} {{.State.StartedAt}} {{.RestartCount}}' "$c"
    }
-   first=$(process)
-   prev=
-   mkdir "$run" &&
-   while true; do
-     now=$(date +%s)
-     if [ -n "$prev" ] && [ $((now - prev)) -gt 360 ]; then
-       echo "$(date -u +%FT%TZ): soak invalid, no sample for $((now - prev)) s at $now, the last one was at $prev" >&2
-       break
-     fi
-     prev=$now
-     current=$(process)
-     if ! echo "$now $current" >> "$run/soak-process.log"; then
-       echo "$(date -u +%FT%TZ): soak invalid, could not append the reading at $now to $run/soak-process.log" >&2
-       break
-     fi
-     if [ "$current" != "$first" ]; then
-       echo "$(date -u +%FT%TZ): soak invalid, the coordinator is not the process the run started with" >&2
-       echo "  at start: $first" >&2
-       echo "  now:      $current" >&2
-       break
-     fi
-     body=$(docker exec "$c" cat /proc/1/status)
-     rc=$?
-     rss=$(printf '%s\n' "$body" | awk -v now="$now" '
-       /^VmRSS:/ && $2 ~ /^[0-9]+$/ && $3 == "kB" { n++; row = now "," $2 * 1024 }
-       END { if (n == 1) print row }')
-     case $rss in
-       "$now",[0-9]*)
-         echo "$rss" >> "$run/soak-rss.csv" || {
-           echo "$(date -u +%FT%TZ): soak invalid, could not append the sample at $now to $run/soak-rss.csv" >&2
-           break
-         } ;;
-       *)
-         echo "$(date -u +%FT%TZ): soak invalid, no RSS sample at $now" >&2
-         if [ "$rc" -ne 0 ]; then echo "  docker exec exited $rc" >&2; fi
-         echo "  read from /proc/1/status:" >&2
-         printf '%s\n' "$body" | sed 's/^/    /' >&2
-         break ;;
-     esac
-     metrics=$(docker exec "$c" curl -sS --max-time 5 -D - http://127.0.0.1:3341/metrics)
-     rc=$?
-     metrics=$(printf '%s\n' "$metrics" | tr -d '\r')
-     why=$(printf '%s\n' "$metrics" | awk -v rc="$rc" '
-       /^x-prism-metrics-state:/ { state = $0 }
-       $0 == "x-prism-metrics-state: fresh" { fresh = 1 }
-       /^qbit_prism_collector_available\{collector="process"\} / { up = $0 }
-       $0 == "qbit_prism_collector_available{collector=\"process\"} 1" { up_ok = 1 }
-       /^qbit_prism_process_resident_memory_bytes[ {]/ { rss = $0; if ($NF ~ /^[0-9]+$/) rss_ok = 1 }
-       END {
-         if (rc != 0) print "docker exec exited " rc
-         else if (!fresh) print (state ? "state header read \"" state "\"" : "no x-prism-metrics-state header")
-         else if (!up_ok) print (up ? "process collector gauge read \"" up "\"" : "no qbit_prism_collector_available{collector=\"process\"} sample")
-         else if (!rss_ok) print (rss ? "RSS gauge read \"" rss "\"" : "no qbit_prism_process_resident_memory_bytes sample") }')
-     if [ -n "$why" ]; then
-       echo "$(date -u +%FT%TZ): soak invalid, no metrics sample at $now" >&2
-       echo "  $why" >&2
-       echo "  headers read from /metrics:" >&2
-       printf '%s\n' "$metrics" | awk 'NF == 0 { exit } { print "    " $0 }' >&2
-       break
-     fi
-     lines=$(printf '%s\n' "$metrics" \
-       | grep -E '^(x-prism-metrics-state:|qbit_prism_(process_resident_memory_bytes|collector_available|collector_age_seconds|runtime_lag_seconds|runtime_task_stalled|runtime_poll_lag_seconds|database_pool_acquire_seconds(_bucket|_sum|_count)|connections|authorized_clients|accepted_shares_total|block_candidates_pending)[ {])' \
-       | sed "s/^/$now /")
-     printf '%s\n' "$lines" >> "$run/soak-metrics.log" || {
-       echo "$(date -u +%FT%TZ): soak invalid, could not append the sample at $now to $run/soak-metrics.log" >&2
-       break
-     }
-     sleep 300
-   done
+   invalid() {
+     tee -a "$run/soak-invalid" >&2
+   }
+   capture() {
+     first=$(process)
+     prev=
+     mkdir "$run" || return
+     while true; do
+       now=$(date +%s)
+       if [ -n "$prev" ] && [ $((now - prev)) -gt 360 ]; then
+         echo "$(date -u +%FT%TZ): soak invalid, no sample for $((now - prev)) s at $now, the last one was at $prev" | invalid
+         return 1
+       fi
+       prev=$now
+       current=$(process)
+       if ! echo "$now $current" >> "$run/soak-process.log"; then
+         echo "$(date -u +%FT%TZ): soak invalid, could not append the reading at $now to $run/soak-process.log" | invalid
+         return 1
+       fi
+       if [ "$current" != "$first" ]; then
+         {
+           echo "$(date -u +%FT%TZ): soak invalid, the coordinator is not the process the run started with"
+           echo "  at start: $first"
+           echo "  now:      $current"
+         } | invalid
+         return 1
+       fi
+       body=$(docker exec "$c" cat /proc/1/status)
+       rc=$?
+       rss=$(printf '%s\n' "$body" | awk -v now="$now" '
+         /^VmRSS:/ && $2 ~ /^[0-9]+$/ && $3 == "kB" { n++; row = now "," $2 * 1024 }
+         END { if (n == 1) print row }')
+       case $rss in
+         "$now",[0-9]*)
+           echo "$rss" >> "$run/soak-rss.csv" || {
+             echo "$(date -u +%FT%TZ): soak invalid, could not append the sample at $now to $run/soak-rss.csv" | invalid
+             return 1
+           } ;;
+         *)
+           {
+             echo "$(date -u +%FT%TZ): soak invalid, no RSS sample at $now"
+             if [ "$rc" -ne 0 ]; then echo "  docker exec exited $rc"; fi
+             echo "  read from /proc/1/status:"
+             printf '%s\n' "$body" | sed 's/^/    /'
+           } | invalid
+           return 1 ;;
+       esac
+       metrics=$(docker exec "$c" curl -sS --max-time 5 -D - http://127.0.0.1:3341/metrics)
+       rc=$?
+       metrics=$(printf '%s\n' "$metrics" | tr -d '\r')
+       why=$(printf '%s\n' "$metrics" | awk -v rc="$rc" '
+         /^x-prism-metrics-state:/ { state = $0 }
+         $0 == "x-prism-metrics-state: fresh" { fresh = 1 }
+         /^qbit_prism_collector_available\{collector="process"\} / { up = $0 }
+         $0 == "qbit_prism_collector_available{collector=\"process\"} 1" { up_ok = 1 }
+         /^qbit_prism_process_resident_memory_bytes[ {]/ { rss = $0; if ($NF ~ /^[0-9]+$/) rss_ok = 1 }
+         END {
+           if (rc != 0) print "docker exec exited " rc
+           else if (!fresh) print (state ? "state header read \"" state "\"" : "no x-prism-metrics-state header")
+           else if (!up_ok) print (up ? "process collector gauge read \"" up "\"" : "no qbit_prism_collector_available{collector=\"process\"} sample")
+           else if (!rss_ok) print (rss ? "RSS gauge read \"" rss "\"" : "no qbit_prism_process_resident_memory_bytes sample") }')
+       if [ -n "$why" ]; then
+         {
+           echo "$(date -u +%FT%TZ): soak invalid, no metrics sample at $now"
+           echo "  $why"
+           echo "  headers read from /metrics:"
+           printf '%s\n' "$metrics" | awk 'NF == 0 { exit } { print "    " $0 }'
+         } | invalid
+         return 1
+       fi
+       lines=$(printf '%s\n' "$metrics" \
+         | grep -E '^(x-prism-metrics-state:|qbit_prism_(process_resident_memory_bytes|collector_available|collector_age_seconds|runtime_lag_seconds|runtime_task_stalled|runtime_poll_lag_seconds|database_pool_acquire_seconds(_bucket|_sum|_count)|connections|authorized_clients|accepted_shares_total|block_candidates_pending)[ {])' \
+         | sed "s/^/$now /")
+       printf '%s\n' "$lines" >> "$run/soak-metrics.log" || {
+         echo "$(date -u +%FT%TZ): soak invalid, could not append the sample at $now to $run/soak-metrics.log" | invalid
+         return 1
+       }
+       sleep 300
+     done
+   }
+   capture
    ```
 
    The bound is evidence about one process. `compose.yaml` gives
@@ -534,9 +547,9 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    policy made, and `Status` catches a process that exited and was not
    restarted. `soak-process.log` keeps one reading per sample, so a later
    reader can show the run was one process. Any change during the soak
-   invalidates the run: keep the message and the run directory, attach
-   `docker logs "$c"` (the container keeps the exited process's output), and
-   start over from step 2.
+   invalidates the run: keep the run directory, whose `soak-invalid` holds
+   the message, attach `docker logs "$c"` (the container keeps the exited
+   process's output), and start over from step 2.
 
    A run that starts over must not write into the files of the run it
    replaces. The judge sorts the samples by timestamp before it reads them,
@@ -545,11 +558,11 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    baseline, and satisfy the span floor with the earlier run's first sample
    and the later run's last; the two logs would splice the same way. So
    every run writes into its own directory, named for its UTC start time,
-   and the loop is chained to the `mkdir` that creates it: `mkdir` without
-   `-p` refuses a name that already exists, and on that refusal the loop
-   does not run at all rather than append to whatever the name holds. The
-   earlier run's directory stays as it was, which is the record the restart
-   rule asks to keep.
+   and `capture` returns on the `mkdir` that creates it: `mkdir` without
+   `-p` refuses a name that already exists, and on that refusal `capture`
+   returns with `mkdir`'s status before its loop has run, rather than
+   append to whatever the name holds. The earlier run's directory stays as
+   it was, which is the record the restart rule asks to keep.
 
    A missing sample invalidates the run for the same reason. The bound assumes
    an unbroken five-minute series: its span floor only checks the first and
@@ -634,6 +647,28 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    publishing once, at the start; this check proves both, and a usable RSS
    value, at every sample.
 
+   Every stop path writes its message the same way, through `invalid`,
+   which copies what it is given to `$run/soak-invalid` and to stderr, and
+   then returns `1` from `capture`. The message on the terminal serves the
+   operator who is watching it and nobody else. A loop left with `break`
+   ends with status `0`, which is what a caller reads as success, and the
+   iteration that finds a bad metrics sample has already written its RSS
+   row, so a stop after 23 hours used to leave a directory whose CSV
+   satisfies the span floor and nothing, in the directory or in the status,
+   to say the run was cut short; a wrapper that ran the fence as a script,
+   or an operator who kept the directory and lost the shell's scrollback,
+   would have judged it and passed it. So the directory records why it is
+   invalid on its own, and the status says that it is: the only way
+   `capture` returns by itself is an invalidation, because a valid run is
+   ended by the operator after 24 h and leaves no `soak-invalid`. The fence
+   defines `capture` and calls it in the operator's interactive shell,
+   which is why the stop paths `return` rather than `exit`, which would end
+   the shell that steps 4 to 7 read `$run` from, and why `run=` is set
+   outside the function. When the fault is the disk itself the marker may
+   not be written; `tee` says so on stderr and still copies the message
+   there, so it reaches the operator either way, and the run starts over
+   from step 2 as before.
+
    `VmRSS` in `/proc/1/status` is the field the registry's process collector
    reads, so the CSV and the gauge agree up to collector cadence. The log also
    carries the runtime and pool series item 3 of the reading order cites, so a
@@ -658,11 +693,13 @@ two-hour cutover soak, which reads its own criteria from the same registry.
 5. **Trim** is retired with `malloc_trim`; there is nothing to send at hour 23.
 6. **Judge** each run with the `awk` bound check above against its own
    `$run/soak-rss.csv`; the check names `soak-rss.csv`, so run it inside the
-   run directory or substitute the path. A run whose capture loop stopped on
-   a gap between samples, a process change, a missing RSS sample, an append
-   that failed or a metrics scrape that failed, was not fresh, had its
-   process collector unavailable or carried no usable RSS value is not
-   judged: it is invalid and is run again from step 2.
+   run directory or substitute the path. A run directory that holds
+   `soak-invalid` is not judged, whatever its CSV would say: `capture`
+   stopped the run on a gap between samples, a process change, a missing
+   RSS sample, an append that failed or a metrics scrape that failed, was
+   not fresh, had its process collector unavailable or carried no usable
+   RSS value, the marker says which, and the run is invalid and is run
+   again from step 2.
    Pass: exit `0`, and share-ack p99 at hour 24 within the
    alert threshold configured for the deployment (the native rules are
    #279's). Fail: exit `1`, or a share-ack regression between hour 1 and hour
