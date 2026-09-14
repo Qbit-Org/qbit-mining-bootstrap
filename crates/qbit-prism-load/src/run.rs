@@ -2526,6 +2526,133 @@ fn reconnect_report(collected: &Collected) -> Value {
     })
 }
 
+/// What became of one of the mid-flight kill's indeterminate shares, from
+/// the server's answer to its re-offer and whether PostgreSQL holds it.
+///
+/// The two answers and the database's two states make the outcomes below;
+/// each is a different claim, and the two that say the server and the
+/// database disagree are possible losses. A re-offer that came back
+/// `duplicate-share` while the database does not hold the share used to be
+/// ignored: the server believes it has a share PostgreSQL does not
+/// (EP-OBSERVABILITY).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReofferOutcome {
+    /// The re-offer was accepted and PostgreSQL holds the share: the kill
+    /// destroyed the original before the server committed it, and the
+    /// re-offer got it in.
+    ReofferAcceptedAndCommitted,
+    /// The re-offer was accepted and PostgreSQL does not hold the share: an
+    /// acknowledged share with no row, a possible loss.
+    ReofferAcceptedNotInPostgres,
+    /// The server called the re-offer a duplicate and PostgreSQL holds the
+    /// share: the original had committed before the kill, and only its
+    /// acknowledgement was lost.
+    CommittedBeforeKill,
+    /// The server called the re-offer a duplicate and PostgreSQL does not
+    /// hold the share: the server believes it has a share the database does
+    /// not, a possible loss.
+    DuplicateNotInPostgres,
+    /// The re-offer was refused for some other reason; `in_postgres` says
+    /// whether the original landed anyway.
+    ReofferRejected,
+    /// The re-offer got no answer, or was never sent.
+    ReofferUnanswered,
+}
+
+impl ReofferOutcome {
+    /// Whether the outcome is one where the server and the database
+    /// disagree about the share.
+    pub fn is_possible_loss(self) -> bool {
+        matches!(
+            self,
+            Self::ReofferAcceptedNotInPostgres | Self::DuplicateNotInPostgres
+        )
+    }
+}
+
+/// Classify one indeterminate share from its re-offer's answer, if any, and
+/// whether PostgreSQL holds it.
+pub fn reoffer_outcome(reoffer: Option<&Outcome>, in_postgres: bool) -> ReofferOutcome {
+    match (reoffer, in_postgres) {
+        (Some(Outcome::Accepted), true) => ReofferOutcome::ReofferAcceptedAndCommitted,
+        (Some(Outcome::Accepted), false) => ReofferOutcome::ReofferAcceptedNotInPostgres,
+        (Some(Outcome::Rejected(rejection)), true) if classify::is_duplicate_share(rejection) => {
+            ReofferOutcome::CommittedBeforeKill
+        }
+        (Some(Outcome::Rejected(rejection)), false) if classify::is_duplicate_share(rejection) => {
+            ReofferOutcome::DuplicateNotInPostgres
+        }
+        (Some(Outcome::Rejected(_)), _) => ReofferOutcome::ReofferRejected,
+        (Some(Outcome::NoResponse { .. }), _) | (None, _) => ReofferOutcome::ReofferUnanswered,
+    }
+}
+
+/// The mid-flight kill's census: every indeterminate share with its
+/// re-offer's answer, whether PostgreSQL holds it and what that comes to,
+/// then the outcomes counted, with the possible losses and the duplicate
+/// case named on their own with their share ids.
+pub fn mid_flight_census(
+    indeterminate: &[SubmitRecord],
+    submits: &[SubmitRecord],
+    committed: &BTreeSet<String>,
+) -> Value {
+    let mut outcomes: BTreeMap<ReofferOutcome, u64> = BTreeMap::new();
+    let mut possible_losses: Vec<String> = Vec::new();
+    let mut duplicates_not_in_postgres: Vec<String> = Vec::new();
+    let shares: Vec<Value> = indeterminate
+        .iter()
+        .map(|record| {
+            let reoffer = submits
+                .iter()
+                .find(|other| other.reoffer && other.share_id == record.share_id);
+            let in_postgres = committed.contains(&record.share_id);
+            let outcome = reoffer_outcome(reoffer.map(|other| &other.outcome), in_postgres);
+            *outcomes.entry(outcome).or_insert(0) += 1;
+            if outcome.is_possible_loss() {
+                possible_losses.push(record.share_id.clone());
+            }
+            if outcome == ReofferOutcome::DuplicateNotInPostgres {
+                duplicates_not_in_postgres.push(record.share_id.clone());
+            }
+            json!({
+                "share_id": record.share_id,
+                "session": record.session,
+                "frontend": record.frontend,
+                "job_id": record.job_id,
+                "classification": "indeterminate",
+                "reoffer_answer": reoffer.map(|other| describe_outcome(&other.outcome)),
+                "in_postgres": in_postgres,
+                "outcome": outcome,
+            })
+        })
+        .collect();
+    json!({
+        "indeterminate_shares": shares.len(),
+        "shares": shares,
+        "outcomes": outcomes.iter()
+            .map(|(outcome, count)| json!({"outcome": outcome, "count": count}))
+            .collect::<Vec<_>>(),
+        "possible_losses": {
+            "count": possible_losses.len(),
+            "share_ids": possible_losses,
+            "definition": "an indeterminate share whose re-offer the server accepted while \
+                           PostgreSQL does not hold it, or called a duplicate while PostgreSQL \
+                           does not hold it: the server and the database disagree about the \
+                           share either way",
+        },
+        "duplicate_not_in_postgres": {
+            "count": duplicates_not_in_postgres.len(),
+            "share_ids": duplicates_not_in_postgres,
+            "note": "the server answered duplicate-share to a re-offer of a share PostgreSQL \
+                     does not hold, so it believes it has a share the database does not. This \
+                     is a possible loss and is reported as its own outcome; it does not change \
+                     the exit code, because the mid-flight kill is a deliberate side scenario in \
+                     which indeterminate shares are legitimate, but it is never dropped.",
+        },
+    })
+}
+
 fn mid_flight_report(
     runs: &[PhaseRun],
     collected: &Collected,
@@ -2534,35 +2661,29 @@ fn mid_flight_report(
     let Some(phase) = runs.iter().find(|phase| phase.plan.mid_flight_kill) else {
         return json!({"ran": false});
     };
-    let shares: Vec<Value> = phase
-        .mid_flight_indeterminate
-        .iter()
-        .map(|record| {
-            let reoffer = collected
-                .submits
-                .iter()
-                .find(|other| other.reoffer && other.share_id == record.share_id);
-            json!({
-                "share_id": record.share_id,
-                "session": record.session,
-                "frontend": record.frontend,
-                "job_id": record.job_id,
-                "classification": "indeterminate",
-                "reoffer_answer": reoffer.map(|other| describe_outcome(&other.outcome)),
-                "in_postgres": committed.contains(&record.share_id),
-            })
-        })
-        .collect();
-    json!({
-        "ran": true,
-        "phase": phase.plan.name,
-        "submits_outstanding_at_kill": phase.outstanding_at_kill,
-        "indeterminate_shares": shares.len(),
-        "note": "an indeterminate share is one whose acknowledgement the kill destroyed; it is \
+    let mut report = mid_flight_census(
+        &phase.mid_flight_indeterminate,
+        &collected.submits,
+        committed,
+    );
+    if let Some(object) = report.as_object_mut() {
+        object.insert("ran".into(), json!(true));
+        object.insert("phase".into(), json!(phase.plan.name));
+        object.insert(
+            "submits_outstanding_at_kill".into(),
+            json!(phase.outstanding_at_kill),
+        );
+        object.insert(
+            "note".into(),
+            json!(
+                "an indeterminate share is one whose acknowledgement the kill destroyed; it is \
                  re-offered with exactly the header it carried, and its final PostgreSQL outcome \
-                 is reported. Zero outstanding at the kill means the scenario did not exercise.",
-        "shares": shares,
-    })
+                 is reported under outcome. Zero outstanding at the kill means the scenario did \
+                 not exercise."
+            ),
+        );
+    }
+    report
 }
 
 /// When each session first received work on each of `tips`, measured from
@@ -3318,6 +3439,25 @@ pub fn summary_text(
     }
     if let Some(line) = unrecognised_reasons_line(unrecognised) {
         text.push_str(&format!("unrecognised rejection reasons: {line}\n"));
+    }
+    // The mid-flight kill's possible losses are visible here as well as in
+    // the JSON: they do not change the exit code, so nothing else says so.
+    let possible = &report["mid_flight_kill"]["possible_losses"];
+    if possible["count"].as_u64().unwrap_or_default() > 0 {
+        let duplicates = &report["mid_flight_kill"]["duplicate_not_in_postgres"];
+        text.push_str(&format!(
+            "mid-flight kill: {} re-offered share(s) the server and PostgreSQL disagree about \
+             ({} answered duplicate-share while not in PostgreSQL): {}\n",
+            possible["count"],
+            duplicates["count"],
+            possible["share_ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     text
 }

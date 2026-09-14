@@ -2540,6 +2540,163 @@ fn the_mid_flight_census_is_the_killed_frontend_s_own_no_responses() {
     );
 }
 
+/// In the mid-flight kill scenario a re-offered share that came back
+/// `duplicate-share` while `in_postgres` was false was recorded and ignored:
+/// the server believes it has a share the database does not, a possible
+/// loss, dropped between two fields of the same JSON object. Each
+/// indeterminate share now has an outcome of its own, the duplicate case is
+/// reported on its own with its share ids, and the printed summary names
+/// the possible losses. The exit code is unchanged: the mid-flight kill is
+/// a deliberate side scenario in which indeterminate shares are legitimate.
+#[test]
+fn a_re_offer_the_server_called_a_duplicate_that_postgres_lacks_is_its_own_outcome() {
+    use qbit_prism_load::artifact::Evidence;
+    use qbit_prism_load::client::Outcome;
+    use qbit_prism_load::run::{mid_flight_census, reoffer_outcome, summary_text, ReofferOutcome};
+    use std::collections::BTreeSet;
+    let duplicate = || {
+        Outcome::Rejected(rejection(
+            22,
+            Some(classify::DUPLICATE_SHARE),
+            "duplicate share",
+        ))
+    };
+    let stale = || {
+        Outcome::Rejected(rejection(
+            21,
+            Some("stale-job"),
+            classify::NEW_TIP_WORK_PENDING,
+        ))
+    };
+    let unanswered = || Outcome::NoResponse {
+        reason: "socket closed".into(),
+    };
+
+    // The classification, over both answers and both database states.
+    assert_eq!(
+        reoffer_outcome(Some(&duplicate()), false),
+        ReofferOutcome::DuplicateNotInPostgres
+    );
+    assert_eq!(
+        reoffer_outcome(Some(&duplicate()), true),
+        ReofferOutcome::CommittedBeforeKill
+    );
+    assert_eq!(
+        reoffer_outcome(Some(&Outcome::Accepted), true),
+        ReofferOutcome::ReofferAcceptedAndCommitted
+    );
+    assert_eq!(
+        reoffer_outcome(Some(&Outcome::Accepted), false),
+        ReofferOutcome::ReofferAcceptedNotInPostgres
+    );
+    assert_eq!(
+        reoffer_outcome(Some(&stale()), false),
+        ReofferOutcome::ReofferRejected
+    );
+    assert_eq!(
+        reoffer_outcome(Some(&unanswered()), true),
+        ReofferOutcome::ReofferUnanswered
+    );
+    assert_eq!(
+        reoffer_outcome(None, false),
+        ReofferOutcome::ReofferUnanswered
+    );
+    assert!(ReofferOutcome::DuplicateNotInPostgres.is_possible_loss());
+    assert!(ReofferOutcome::ReofferAcceptedNotInPostgres.is_possible_loss());
+    assert!(!ReofferOutcome::CommittedBeforeKill.is_possible_loss());
+    assert!(!ReofferOutcome::ReofferUnanswered.is_possible_loss());
+
+    // The census: four victims, re-offered. A's re-offer was a duplicate
+    // and A is not in PostgreSQL; B's was a duplicate and B is; C's was
+    // accepted and C is; D's was never answered.
+    let share = |tag: &str| format!("pload1abc.s00001:{}", tag.repeat(64));
+    let victim = |tag: &str| {
+        let mut record = submit_record("mid_flight_kill", unanswered());
+        record.share_id = share(tag);
+        record
+    };
+    let reoffer = |tag: &str, outcome: Outcome| {
+        let mut record = submit_record("mid_flight_kill", outcome);
+        record.share_id = share(tag);
+        record.reoffer = true;
+        record
+    };
+    let indeterminate = vec![victim("a"), victim("b"), victim("c"), victim("d")];
+    let submits = vec![
+        victim("a"),
+        victim("b"),
+        victim("c"),
+        victim("d"),
+        reoffer("a", duplicate()),
+        reoffer("b", duplicate()),
+        reoffer("c", Outcome::Accepted),
+    ];
+    let committed: BTreeSet<String> = [share("b"), share("c")].into_iter().collect();
+    let census = mid_flight_census(&indeterminate, &submits, &committed);
+    assert_eq!(census["indeterminate_shares"], json!(4));
+    let outcomes: Vec<&str> = census["shares"]
+        .as_array()
+        .expect("shares")
+        .iter()
+        .map(|entry| entry["outcome"].as_str().expect("an outcome per share"))
+        .collect();
+    assert_eq!(
+        outcomes,
+        vec![
+            "duplicate-not-in-postgres",
+            "committed-before-kill",
+            "reoffer-accepted-and-committed",
+            "reoffer-unanswered",
+        ]
+    );
+    assert_eq!(census["shares"][0]["in_postgres"], json!(false));
+    assert_eq!(
+        census["shares"][0]["reoffer_answer"]["reason_id"],
+        json!("duplicate-share")
+    );
+    assert!(census["shares"][3]["reoffer_answer"].is_null());
+    assert_eq!(census["duplicate_not_in_postgres"]["count"], json!(1));
+    assert_eq!(
+        census["duplicate_not_in_postgres"]["share_ids"],
+        json!([share("a")])
+    );
+    assert_eq!(census["possible_losses"]["count"], json!(1));
+    assert_eq!(census["possible_losses"]["share_ids"], json!([share("a")]));
+    assert!(
+        census["outcomes"]
+            .as_array()
+            .expect("outcomes")
+            .iter()
+            .any(
+                |entry| entry["outcome"] == json!("duplicate-not-in-postgres")
+                    && entry["count"] == json!(1)
+            ),
+        "{}",
+        census["outcomes"]
+    );
+
+    // Visible in the printed summary too, since the exit code does not
+    // say so.
+    let report = json!({"phases": [], "mid_flight_kill": census});
+    let withheld = Evidence::Withheld {
+        reason: "the run aborted: load-fe-1 exited".into(),
+        stale_artifact_removed: false,
+    };
+    let text = summary_text(&report, &withheld, &[]);
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("mid-flight kill:"))
+        .unwrap_or_else(|| panic!("the summary names the possible losses: {text}"));
+    assert!(line.contains(&share("a")), "{line}");
+    assert!(line.contains("duplicate-share"), "{line}");
+    assert!(!line.contains(&share("b")), "{line}");
+    // Nothing to say when there is nothing.
+    let clean = mid_flight_census(&indeterminate[1..3], &submits, &committed);
+    assert_eq!(clean["possible_losses"]["count"], json!(0));
+    let report = json!({"phases": [], "mid_flight_kill": clean});
+    assert!(!summary_text(&report, &withheld, &[]).contains("mid-flight kill:"));
+}
+
 #[test]
 fn a_committed_share_is_a_divergence_only_when_a_confirmation_failure_explains_it() {
     use qbit_prism_load::client::Outcome;

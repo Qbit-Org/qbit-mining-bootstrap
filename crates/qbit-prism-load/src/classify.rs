@@ -7,6 +7,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The server's answer to a submit whose share it already holds. Expected
+/// for a mid-flight re-offer whose original had committed before the kill,
+/// and a harness bug anywhere else.
+pub const DUPLICATE_SHARE: &str = "duplicate-share";
+
 /// Payout-revision and tip-rebuild rejections. Both share `reason_id`
 /// `stale-job` and code 21 with the retention cases, so only the message text
 /// separates them (`coordinator.rs`, `submit`).
@@ -61,7 +66,7 @@ pub fn classify(rejection: &Rejection) -> RejectionClass {
         return RejectionClass::HarnessBug;
     }
     match reason {
-        "low-difficulty" | "malformed-submit" | "duplicate-share" | "unauthorized-worker" => {
+        "low-difficulty" | "malformed-submit" | DUPLICATE_SHARE | "unauthorized-worker" => {
             RejectionClass::HarnessBug
         }
         "stale-job" => {
@@ -98,6 +103,10 @@ pub fn classify(rejection: &Rejection) -> RejectionClass {
 /// sqlx future is dropped mid-COMMIT, which PostgreSQL may still complete.
 pub const LEDGER_CONFIRMATION_FAILED: &str = "ledger-confirmation-failed";
 pub const NOT_CONFIRMED_BY_DATABASE: &str = "share was not confirmed by the database";
+
+pub fn is_duplicate_share(rejection: &Rejection) -> bool {
+    rejection.reason_id.as_deref() == Some(DUPLICATE_SHARE)
+}
 
 pub fn is_confirmation_failure(rejection: &Rejection) -> bool {
     rejection.reason_id.as_deref() == Some(LEDGER_CONFIRMATION_FAILED)

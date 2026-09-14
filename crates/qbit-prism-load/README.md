@@ -760,8 +760,21 @@ different failures, and the harness never reports them as one thing.
   so the artifact cannot hide them; and the run exits 5.
 
 Only the `mid_flight_kill` phase can legitimately produce an indeterminate
-share. Those are re-offered with the same header and their final database
-outcome is reported.
+share. Those are re-offered with the same header, and each carries an
+`outcome` in the side report's `mid_flight_kill.shares`, from the server's
+answer to the re-offer and whether PostgreSQL holds the share:
+`reoffer-accepted-and-committed`, `reoffer-accepted-not-in-postgres`,
+`committed-before-kill` (the re-offer was a `duplicate-share` and the row is
+there: only the acknowledgement was lost), `duplicate-not-in-postgres` (the
+re-offer was a `duplicate-share` and the row is not there: the server
+believes it has a share the database does not), `reoffer-rejected` and
+`reoffer-unanswered`. The two in which the server and the database disagree
+are `possible_losses`, and the duplicate case is also reported on its own
+under `duplicate_not_in_postgres` with its share ids; it used to be recorded
+and ignored. The printed summary names the possible losses. None of this
+changes the exit code, because the mid-flight kill is a deliberate side
+scenario in which indeterminate shares are legitimate, but it is never
+dropped.
 
 ## Measurement hygiene
 
