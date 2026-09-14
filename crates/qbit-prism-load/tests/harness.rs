@@ -12,7 +12,7 @@ use qbit_prism_load::{
     client, digest,
     frontend::{self, FrontendSpec, SharedEnvironment},
     node::{self, NodeState},
-    profile, run, window,
+    profile, proxy, run, window,
 };
 use qbit_prism_server::{
     capacity::{validate_capacity_evidence, CONFIGURATION_KEYS, REQUIRED_PHASES, SUBJECT_KEYS},
@@ -3801,6 +3801,42 @@ fn endpoint_parameters_never_survive_the_rewrite() -> Result<()> {
 /// delay, because each direction is held once and the proxy's sleep never
 /// returns early. A trip that comes back sooner did not go through the proxy,
 /// and the run refuses to attribute a delay to it.
+/// The round-trip measurement's connection error is written into the failure
+/// side report when the entry check cannot connect, and into a phase's
+/// `database_delay_observation_error` when the per-phase check cannot. It
+/// named the URL as written, password and all: a report meant to be attached
+/// to an issue carried the credential the environment block had already been
+/// redacted of. The error names the endpoint and never the password.
+#[tokio::test]
+async fn the_round_trip_measurement_error_never_carries_the_password() {
+    let password = "hunter2-Sup3r_Secret";
+    // Port 1 on the loopback interface refuses at once on every platform the
+    // harness runs on: nothing listens there.
+    let url = format!("postgresql://alex:{password}@127.0.0.1:1/qbit?sslmode=disable");
+    let error = proxy::measure_select1_millis(&url, 1)
+        .await
+        .expect_err("nothing listens on port 1");
+    let text = format!("{error:#}");
+    assert!(
+        !text.contains(password),
+        "the error carries the password: {text}"
+    );
+    assert!(
+        text.contains("postgresql://alex:<redacted>@127.0.0.1:1/qbit?sslmode=disable"),
+        "the error still names the endpoint it could not reach: {text}"
+    );
+    // The query-parameter form of the password goes the same way.
+    let url = format!("postgresql://127.0.0.1:1/qbit?password={password}");
+    let error = proxy::measure_select1_millis(&url, 1)
+        .await
+        .expect_err("nothing listens on port 1");
+    let text = format!("{error:#}");
+    assert!(
+        !text.contains(password),
+        "the error carries the password: {text}"
+    );
+}
+
 #[test]
 fn a_round_trip_that_did_not_pay_the_delay_is_refused() {
     assert_eq!(run::delay_floor_millis(10), 20.0);

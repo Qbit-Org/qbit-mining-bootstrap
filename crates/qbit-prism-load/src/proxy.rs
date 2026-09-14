@@ -164,11 +164,20 @@ where
 
 /// Median wall-clock cost of a trivial round trip, used to turn the configured
 /// delay into an observed one.
+///
+/// The connection error names the URL it could not reach with its password
+/// redacted: the error travels through the failure side report and the
+/// per-phase `database_delay_observation_error`, both files meant to be
+/// attached to an issue, and it used to carry the whole `--database-url`
+/// (EP-OBSERVABILITY).
 pub async fn measure_select1_millis(url: &str, samples: usize) -> Result<f64> {
     use sqlx::Connection;
-    let mut connection = sqlx::PgConnection::connect(url)
-        .await
-        .with_context(|| format!("connect for round-trip measurement: {url}"))?;
+    let mut connection = sqlx::PgConnection::connect(url).await.with_context(|| {
+        format!(
+            "connect for round-trip measurement: {}",
+            crate::frontend::redact_url_secrets(url)
+        )
+    })?;
     // Warm up: the first statement pays parse and plan costs.
     for _ in 0..3 {
         sqlx::query("SELECT 1").execute(&mut connection).await?;
