@@ -477,6 +477,7 @@ def shell_command_argument(words: list[str], shell: str) -> int | None:
     """Locate a literal shell's command string after consuming its option arguments."""
     index = 0
     command_string = False
+    noexec = False
     argument_flags = "oO" if shell in {"bash", "sh"} else "o"
     while index < len(words):
         option = unquote(words[index])
@@ -493,10 +494,20 @@ def shell_command_argument(words: list[str], shell: str) -> int | None:
             continue
         if re.fullmatch(r"[+-][A-Za-z]+", option) is None:
             break
-        flags = option[1:]
-        command_string |= "c" in flags
-        index += 1 + sum(flag in argument_flags for flag in flags)
-    return index if command_string and index < len(words) else None
+        index += 1
+        # Process flags in order: +n/+o noexec can undo an earlier -n,
+        # including options between -c and its command-string argument.
+        for flag in option[1:]:
+            command_string |= flag == "c"
+            if flag == "n":
+                noexec = option[0] == "-"
+            if flag in argument_flags:
+                if index >= len(words):
+                    return None
+                if flag == "o" and unquote(words[index]) == "noexec":
+                    noexec = option[0] == "-"
+                index += 1
+    return index if command_string and not noexec and index < len(words) else None
 
 
 def python_commands(line: str):
@@ -2305,6 +2316,44 @@ class ScannerTests(unittest.TestCase):
         text = 'docker exec "$c" bash -o pipefail -c \'true\npython3 lab/example/deleted.py\''
         self.assertEqual(self.located(text), [(2, "lab/example/deleted.py")])
         self.assertEqual(self.commands("sh -o errexit -c 'python3 lab/prism/storm.py'"), ["lab/prism/storm.py"])
+
+    def test_noexec_shell_command_strings_are_not_runnable(self) -> None:
+        for shell in ("bash", "sh", "dash", "ksh", "zsh"):
+            for options in (
+                "-n -c", "-nc", "-cn", "-c -n", "-en -c", "'-n' '-c'",
+                "-o noexec -c", "-co noexec", "-c -o noexec", "-o 'noexec' -c",
+                "+n -n -c", "+o noexec -n -c", "-n +n -o noexec -c",
+                "-n -o errexit -c", "-n +o errexit -c", "-n -c --",
+            ):
+                with self.subTest(shell=shell, options=options):
+                    text = f"{shell} {options} 'python3 -m lab.prism.deleted'"
+                    self.assertEqual(self.commands(text), [])
+                    self.assertEqual(self.references(text), ["lab.prism.deleted"])
+
+    def test_disabling_noexec_restores_shell_command_scanning(self) -> None:
+        for shell in ("bash", "sh", "dash", "ksh", "zsh"):
+            for options in (
+                "+n -c", "+o noexec -c", "-n +n -c", "-n +en -c",
+                "-n +o noexec -c", "-o noexec +n -c", "-o noexec +o noexec -c",
+                "-n -c +n", "-c -n +o noexec", "-co noexec +n",
+            ):
+                with self.subTest(shell=shell, options=options):
+                    text = f"{shell} {options} 'python3 lab/prism/storm.py'"
+                    self.assertEqual(self.commands(text), ["lab/prism/storm.py"])
+            text = f"{shell} -c 'python3 lab/prism/storm.py' -n"
+            self.assertEqual(self.commands(text), ["lab/prism/storm.py"])
+
+    def test_noexec_tracking_preserves_shell_option_arguments(self) -> None:
+        for options in (
+            "-o nounset -c", "--rcfile noexec -c", "--init-file noexec -c",
+            "-on noexec +n -c", "-no noexec +n -c", "-oo noexec errexit +n -c",
+        ):
+            with self.subTest(options=options):
+                text = f"bash {options} 'python3 lab/prism/storm.py'"
+                self.assertEqual(self.commands(text), ["lab/prism/storm.py"])
+        for options in ("-on errexit -c", "-oon errexit noexec -c"):
+            with self.subTest(options=options):
+                self.assertEqual(self.commands(f"bash {options} 'python3 lab/prism/storm.py'"), [])
 
     def test_shell_option_arguments_are_not_command_strings(self) -> None:
         command = "python3 -m lab.example.deleted"
