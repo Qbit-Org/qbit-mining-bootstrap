@@ -2754,6 +2754,72 @@ async fn migrated_database_without_its_capability_declaration_is_refused_at_conn
     db.close(vec![ledger, follower, migrated]).await
 }
 
+/// Source metadata is mandatory once 006 is recorded. Refuse missing or
+/// unreadable metadata before committing a later migration, and preserve
+/// the original record when the operator restores it from a full backup.
+#[tokio::test]
+async fn migrated_database_without_readable_source_metadata_is_refused_before_later_ddl(
+) -> Result<()> {
+    for state in [SourceState::Pre258, SourceState::Applied258] {
+        for statement in [
+            "DROP TABLE qbit_prism_migration_source",
+            "DELETE FROM qbit_prism_migration_source",
+            "ALTER TABLE qbit_prism_migration_source DROP COLUMN migrated_by",
+            "ALTER TABLE qbit_prism_migration_source ALTER COLUMN prior_schema_version TYPE bigint",
+            "ALTER TABLE qbit_prism_migration_source ALTER COLUMN migrated_at DROP NOT NULL; UPDATE qbit_prism_migration_source SET migrated_at=NULL",
+        ] {
+            let Some(db) = Database::open().await? else {
+                return Ok(());
+            };
+            let pool = PgPool::connect(&db.url).await?;
+            apply_frozen_2x_schema(&pool, state).await?;
+            let ledger = db.ledger("init").await?;
+            let source = ledger.migration_source().await?;
+            sqlx::raw_sql("CREATE TABLE operator_source_backup (LIKE qbit_prism_migration_source INCLUDING ALL); INSERT INTO operator_source_backup SELECT * FROM qbit_prism_migration_source")
+                .execute(&pool).await?;
+            sqlx::raw_sql(statement).execute(&pool).await?;
+            let before = schema_objects(&pool).await?;
+            for initialize in [false, true] {
+                let error = Ledger::connect(&db.url, "cold".into(), 8, initialize)
+                    .await
+                    .err()
+                    .with_context(|| format!("connect(initialize={initialize}) accepted invalid source metadata ({state:?}, {statement})"))?;
+                let error = format!("{error:#}");
+                assert!(error.contains("qbit_prism_migration_source"), "{error}");
+                assert_eq!(schema_objects(&pool).await?, before);
+                assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+            }
+            undo_009(&pool).await?;
+            let before = schema_objects(&pool).await?;
+            let error = db
+                .ledger("later-migration")
+                .await
+                .err()
+                .context("migrate applied 009 above invalid source metadata")?;
+            let error = format!("{error:#}");
+            assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 8]);
+            assert!(error.contains("qbit_prism_migration_source"), "{error}");
+            assert!(error.contains("before any DDL"), "{error}");
+            assert!(error.contains("Restore the full backup"), "{error}");
+            assert_eq!(schema_objects(&pool).await?, before);
+            assert!(!sqlx::query_scalar::<_, bool>("SELECT seqcycle FROM pg_sequence WHERE seqrelid='qbit_prism_session_sequence'::regclass")
+                .fetch_one(&pool).await?);
+            // Restore the original definition and row, including its timestamp.
+            sqlx::raw_sql("DROP TABLE IF EXISTS qbit_prism_migration_source; ALTER TABLE operator_source_backup RENAME TO qbit_prism_migration_source")
+                .execute(&pool).await?;
+            let migrated = db.ledger("later-migration").await?;
+            let follower = Ledger::connect(&db.url, "cold".into(), 8, false).await?;
+            assert_eq!(migrated.migration_source().await?, source);
+            assert_eq!(follower.migration_source().await?, source);
+            assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+            exercise_native_writers(&migrated, 1, 6251).await?;
+            pool.close().await;
+            db.close(vec![ledger, migrated, follower]).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Simulate the database a build without migration 009 left: the current
 /// migration, then 009 undone. Its table, its job index and the sequence
 /// cycle go with the version row, so 009 can run again.

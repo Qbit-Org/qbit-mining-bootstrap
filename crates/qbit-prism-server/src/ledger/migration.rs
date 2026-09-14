@@ -2426,6 +2426,16 @@ pub(super) async fn migrate_schema(
         // refused before 008 or 009 run above it, as connect refuses it.
         refuse_undeclared_native_database(&versions, &inventory)?;
         refuse_newer_native_database(&versions, &inventory)?;
+        if versions.contains(&6) {
+            // Startup reads this record after commit. Check it with the same
+            // decoder before any later migration can be applied or recorded.
+            if let Err(reason) = require_migration_source(&mut **tx).await {
+                bail!(
+                    "refusing to migrate a native database at schema migrations {} before any DDL: {reason:#}",
+                    schema_version_list(&versions)
+                );
+            }
+        }
         if !versions.contains(&6) {
             // Native schema 3, 4 or 5, with or without 008 and 009. That
             // build's drain check used the v1-only predicate, which never
@@ -2560,6 +2570,40 @@ pub(super) async fn require_known_capabilities(pool: &PgPool) -> Result<()> {
     refuse_unknown_capabilities(rows.as_deref().unwrap_or_default())
 }
 
+async fn read_migration_source<'e, E>(executor: E) -> Result<Option<MigrationSource>>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    let row = sqlx::query("SELECT source_state,source_release,source_commit,candidate_storage_version,prior_schema_version,migrated_by,migrated_at FROM qbit_prism_migration_source WHERE singleton")
+        .fetch_optional(executor).await?;
+    row.map(|row| {
+        Ok(MigrationSource {
+            source_state: row.try_get("source_state")?,
+            source_release: row.try_get("source_release")?,
+            source_commit: row.try_get("source_commit")?,
+            candidate_storage_version: row.try_get("candidate_storage_version")?,
+            prior_schema_version: row.try_get("prior_schema_version")?,
+            migrated_by: row.try_get("migrated_by")?,
+            migrated_at: row.try_get("migrated_at")?,
+        })
+    })
+    .transpose()
+}
+
+/// Once 006 is recorded, its source table and readable singleton row must
+/// exist. Never reconstruct provenance from the already-migrated database.
+/// Migrate checks inside its transaction before later DDL; startup checks
+/// again before any accounting statement, with or without initialization.
+pub(super) async fn require_migration_source<'e, E>(executor: E) -> Result<MigrationSource>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    read_migration_source(executor)
+        .await
+        .context("database is at schema migration 6 but qbit_prism_migration_source cannot be read. Restore the full backup, including the source metadata table and its original singleton row, then start or migrate again")?
+        .context("database is at schema migration 6 but qbit_prism_migration_source has no singleton row. Restore the full backup, including the original source metadata row, then start or migrate again")
+}
+
 /// The standalone 2.x SQL remains atomic under plain psql. SQLx already owns
 /// the encompassing transaction, which must also retain its migration/lease
 /// locks through the native migrations that follow it.
@@ -2584,20 +2628,7 @@ impl Ledger {
     /// What the database came from, as recorded by the migration that
     /// accepted it; `None` before migration 006 has run.
     pub async fn migration_source(&self) -> Result<Option<MigrationSource>> {
-        let row = sqlx::query("SELECT source_state,source_release,source_commit,candidate_storage_version,prior_schema_version,migrated_by,migrated_at FROM qbit_prism_migration_source WHERE singleton")
-            .fetch_optional(&self.pool).await?;
-        row.map(|row| {
-            Ok(MigrationSource {
-                source_state: row.try_get("source_state")?,
-                source_release: row.try_get("source_release")?,
-                source_commit: row.try_get("source_commit")?,
-                candidate_storage_version: row.try_get("candidate_storage_version")?,
-                prior_schema_version: row.try_get("prior_schema_version")?,
-                migrated_by: row.try_get("migrated_by")?,
-                migrated_at: row.try_get("migrated_at")?,
-            })
-        })
-        .transpose()
+        read_migration_source(&self.pool).await
     }
 
     pub async fn import_legacy_audits(

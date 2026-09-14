@@ -404,6 +404,11 @@ already on the Rust schema), the `2.x.x` release and commit that source
 corresponds to, the capability value the source declared, the highest
 schema migration recorded before this one, and which instance migrated it. `migrate` prints it,
 every start logs it, and a repeated `migrate` never rewrites it.
+Once migration 6 is recorded, both the table and its readable singleton row
+are required at startup and before applying later migrations. Missing or
+malformed metadata is refused without committing later DDL or migration
+versions. Restore the full backup, including the original source record;
+the migrator never invents provenance for an already-migrated database.
 
 **Startup gate.** Every start reads `qbit_prism_schema_migrations` and
 `qbit_prism_schema_capabilities`, with or without

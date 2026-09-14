@@ -218,14 +218,13 @@ impl Ledger {
             }),
             metrics,
         };
-        if let Some(source) = ledger.migration_source().await? {
-            tracing::info!(
-                state = %source.source_state,
-                release = ?source.source_release,
-                prior_schema_version = source.prior_schema_version,
-                "PRISM database source"
-            );
-        }
+        let source = migration::require_migration_source(&ledger.pool).await?;
+        tracing::info!(
+            state = %source.source_state,
+            release = ?source.source_release,
+            prior_schema_version = source.prior_schema_version,
+            "PRISM database source"
+        );
         let mut tx = ledger.begin().await?;
         writable(&mut tx).await?;
         tx.commit().await?;
