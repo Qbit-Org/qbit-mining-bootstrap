@@ -31,17 +31,57 @@ impl Ledger {
             "SELECT payout_revision FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL AND NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'",
         ).fetch_one(&mut *tx).await?;
         let rows = prior_balance_rows(&mut tx).await?;
-        let prior_balances_digest = tokio::task::spawn_blocking(move || {
-            let balances = decode_prior_balances(rows).map_err(WindowError::Decode)?;
-            // The shared digest sorts by its bytewise semantic comparator.
-            Ok::<_, WindowError>(qbit_prism::prior_balances_digest(&balances))
-        })
-        .await
-        .map_err(|error| WindowError::Decode(error.into()))??;
+        let prior_balances_digest = balance_digest(move || decode_prior_balances(rows)).await?;
         tx.commit().await?;
         Ok(PayoutState {
             payout_revision,
             prior_balances_digest,
         })
+    }
+}
+
+async fn balance_digest(
+    decode: impl FnOnce() -> Result<Vec<CarryForwardBalance>> + Send + 'static,
+) -> Result<[u8; 32], WindowError> {
+    tokio::task::spawn_blocking(move || {
+        let balances = decode().map_err(WindowError::Decode)?;
+        // The shared digest sorts by its bytewise semantic comparator.
+        Ok(qbit_prism::prior_balances_digest(&balances))
+    })
+    .await
+    .map_err(WindowError::TaskFailed)?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn blocking_panic_is_task_failed_not_corruption() {
+        let error = balance_digest(|| panic!("controlled balance decoder panic"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, WindowError::TaskFailed(join) if join.is_panic()));
+    }
+
+    #[tokio::test]
+    async fn corrupt_balance_is_decode_not_task_failed() {
+        let error = balance_digest(|| {
+            // The same numeric parse used by decode_prior_balances.
+            let balance_sats: i128 = "corrupt balance".parse()?;
+            Ok(vec![CarryForwardBalance {
+                recipient_id: "prior".into(),
+                order_key: "prior".into(),
+                p2mr_program_hex: "22".repeat(32),
+                balance_sats,
+            }])
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, WindowError::Decode(_)));
+        assert_eq!(
+            balance_digest(|| Ok(Vec::new())).await.unwrap(),
+            qbit_prism::prior_balances_digest(&[])
+        );
     }
 }
