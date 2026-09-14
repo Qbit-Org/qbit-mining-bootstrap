@@ -949,7 +949,7 @@ async fn incident_2_ack_latency_stays_flat_while_a_frontend_solves_a_large_windo
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "full-size 400k-share window; gigabytes of RAM, run by the coordinator on a larger host with --ignored --exact"]
+#[ignore = "full-size window: needs gigabytes of RAM, and cannot reach 400k until #273 stops the job payload copying the window: three copies cross PostgreSQL's 256 MiB jsonb limit above about 150k shares. The coordinator runs it with --ignored, at a PRISM_WINDOW_QUALIFY_FULL_SHARES that divides the window weight; 125000 is the largest that fits today"]
 async fn incident_2_ack_latency_at_full_size() -> Result<()> {
     let raw = gate::required_database_url(gate::site!())?;
     let _serial = TEST_LOCK.lock().await;
@@ -1218,7 +1218,7 @@ async fn order_lock_hold_on_a_solve_does_not_grow_with_the_window() -> Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "full-size 400k-share window; gigabytes of RAM, run by the coordinator on a larger host with --ignored --exact"]
+#[ignore = "full-size window: needs gigabytes of RAM, and cannot reach 400k until #273 stops the job payload copying the window: three copies cross PostgreSQL's 256 MiB jsonb limit above about 150k shares. The coordinator runs it with --ignored, at a PRISM_WINDOW_QUALIFY_FULL_SHARES that divides the window weight; 125000 is the largest that fits today"]
 async fn order_lock_hold_at_full_size() -> Result<()> {
     let raw = gate::required_database_url(gate::site!())?;
     let _serial = TEST_LOCK.lock().await;
