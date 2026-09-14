@@ -7,8 +7,8 @@ use crate::{
     classify::{self, BlockedLog, Rejection, RejectionClass},
     cli::{phases, Args, PhasePlan},
     client::{
-        self, Event, NotifySighting, Outcome, SessionConfig, SessionHandle, SessionShared,
-        SubmitRecord, TipSighting,
+        self, ClientFailure, Event, FailureKind, NotifySighting, Outcome, SessionConfig,
+        SessionHandle, SessionShared, SubmitRecord, TipSighting,
     },
     cluster::{self, ManagedPostgres, ObservedReplication, Replication},
     digest,
@@ -390,8 +390,10 @@ pub struct Collected {
     pub notifies: Vec<NotifySighting>,
     pub discarded_block_solutions: u64,
     pub discarded_offers: u64,
+    /// The discarded offers by the phase whose scheduler placed them.
+    pub discarded_offers_by_phase: BTreeMap<String, u64>,
     pub difficulty_mismatches: Vec<(usize, f64, f64)>,
-    pub failures: Vec<(usize, String, Instant)>,
+    pub failures: Vec<ClientFailure>,
     /// Every successful connection, including reconnects: a count of events,
     /// not of sessions.
     pub connects: u64,
@@ -410,7 +412,10 @@ impl Collected {
             Event::Tip(sighting) => self.tips.push(sighting),
             Event::Notify(sighting) => self.notifies.push(sighting),
             Event::DiscardedBlockSolution { .. } => self.discarded_block_solutions += 1,
-            Event::DiscardedOffer { .. } => self.discarded_offers += 1,
+            Event::DiscardedOffer { phase, .. } => {
+                self.discarded_offers += 1;
+                *self.discarded_offers_by_phase.entry(phase).or_insert(0) += 1;
+            }
             Event::DifficultyMismatch {
                 session,
                 advertised,
@@ -430,7 +435,7 @@ impl Collected {
                 self.holding_work.remove(&session);
                 self.disconnects.push((session, frontend, reason));
             }
-            Event::Failure { session, error, at } => self.failures.push((session, error, at)),
+            Event::Failure(failure) => self.failures.push(failure),
         }
     }
 
@@ -1655,9 +1660,15 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "difficulty_mismatches_note": "repeated under premise, which says what they \
                                            mean for the run",
             "failures": collected.failures.iter().take(200)
-                .map(|(session, error, _)| json!({"session": session, "error": error}))
+                .map(|failure| json!({
+                    "session": failure.session, "phase": failure.phase, "kind": failure.kind,
+                    "recorded_as_submit": failure.recorded, "error": failure.error,
+                }))
                 .collect::<Vec<_>>(),
             "failure_count": collected.failures.len(),
+            "failures_by_kind": failures_by_kind(&collected.failures),
+            "failures_note": "every failure is also in its phase's offer_accounting, which \
+                              says what it does to that phase's dispatched count",
             "connects": collected.connects,
             "disconnects": collected.disconnects.len(),
         },
@@ -2713,6 +2724,76 @@ fn dense_cadence_report(
     document
 }
 
+/// Failure counts by kind, for the side report.
+pub fn failures_by_kind(failures: &[ClientFailure]) -> Value {
+    let mut by_kind: BTreeMap<FailureKind, u64> = BTreeMap::new();
+    for failure in failures {
+        *by_kind.entry(failure.kind).or_insert(0) += 1;
+    }
+    json!(by_kind
+        .into_iter()
+        .map(|(kind, count)| json!({"kind": kind, "count": count}))
+        .collect::<Vec<_>>())
+}
+
+/// What a phase's `dispatched` count came to, and whether the failures
+/// explain the difference.
+///
+/// `dispatched` is what the scheduler placed. Every placed offer ends as a
+/// submit record, a discarded offer (the session was paused or stopped
+/// before it sent), or an offer that failed before a submit line was
+/// written; a write failure is a submit record already. The failures were
+/// collected and never read, so `dispatched` and the submits recorded could
+/// disagree with no account of why; now the account is beside the numbers,
+/// and what it does not explain is `unaccounted` rather than silent
+/// (EP-OBSERVABILITY).
+pub fn offer_accounting(phase: &str, dispatched: u64, collected: &Collected) -> Value {
+    let submits_recorded = collected
+        .submits
+        .iter()
+        .filter(|record| record.phase == phase && !record.reoffer && !record.scheduled_block)
+        .count() as u64;
+    let discarded = collected
+        .discarded_offers_by_phase
+        .get(phase)
+        .copied()
+        .unwrap_or(0);
+    let in_phase = || collected.failures.iter().filter(|f| f.phase == phase);
+    let failed_before_a_submit = in_phase()
+        .filter(|f| f.kind == FailureKind::Offer && !f.recorded)
+        .count() as u64;
+    let failed_at_the_write = in_phase()
+        .filter(|f| f.kind == FailureKind::Offer && f.recorded)
+        .count() as u64;
+    let failures: Vec<&ClientFailure> = in_phase().collect();
+    let unaccounted = dispatched as i64
+        - submits_recorded as i64
+        - discarded as i64
+        - failed_before_a_submit as i64;
+    json!({
+        "dispatched": dispatched,
+        "submits_recorded": submits_recorded,
+        "offers_discarded": discarded,
+        "offers_failed_before_a_submit": failed_before_a_submit,
+        "offers_failed_at_the_write": failed_at_the_write,
+        "unaccounted": unaccounted,
+        "client_failures": failures.len(),
+        "client_failures_by_kind": failures_by_kind(&failures.iter().map(|f| (*f).clone()).collect::<Vec<_>>()),
+        "client_failures_sample": failures.iter().take(20).map(|f| json!({
+            "session": f.session, "kind": f.kind, "recorded_as_submit": f.recorded, "error": f.error,
+        })).collect::<Vec<_>>(),
+        "note": "dispatched is what the scheduler placed. Every placed offer ends as a submit \
+                 record (accepted, rejected or no-response; re-offers and scheduled blocks are \
+                 not placed by the scheduler and are not counted here), a discarded offer (the \
+                 session was paused or stopped before it sent), or an offer that failed before \
+                 a submit line was written (no job to mine, no solution found). An offer whose \
+                 write failed is already a no-response submit record and is listed apart so it \
+                 is not counted twice. unaccounted is what none of those explains; it is 0 in a \
+                 run whose sessions all stopped cleanly, and anything else is reported rather \
+                 than assumed away.",
+    })
+}
+
 fn phase_report(
     phase: &PhaseRun,
     collected: &Collected,
@@ -2739,6 +2820,7 @@ fn phase_report(
         "offered_tokens": phase.tokens,
         "dispatched": phase.dispatched,
         "shortfall": phase.shortfall,
+        "offer_accounting": offer_accounting(&phase.plan.name, phase.dispatched, collected),
         "achieved_rate_shares_per_second": acknowledged as f64 / seconds.max(f64::MIN_POSITIVE),
         "offered_rate_shares_per_second": phase.dispatched as f64 / seconds.max(f64::MIN_POSITIVE),
         "client_ack_latency": latency,
@@ -3194,6 +3276,25 @@ pub fn summary_text(
                 .unwrap_or_default(),
             phase["shortfall"].as_u64().unwrap_or_default(),
         ));
+        // The offer accounting is presented on this line as offered=; when
+        // something it placed did not become a submit, the line says so.
+        let accounting = &phase["offer_accounting"];
+        let failures = accounting["client_failures"].as_u64().unwrap_or_default();
+        let unaccounted = accounting["unaccounted"].as_i64().unwrap_or_default();
+        if failures > 0 || unaccounted != 0 {
+            text.push_str(&format!(
+                "  offer accounting for {}: submits_recorded={} offers_discarded={} \
+                 offers_failed_before_a_submit={} client_failures={} unaccounted={}\n",
+                phase["name"].as_str().unwrap_or_default(),
+                accounting["submits_recorded"].as_u64().unwrap_or_default(),
+                accounting["offers_discarded"].as_u64().unwrap_or_default(),
+                accounting["offers_failed_before_a_submit"]
+                    .as_u64()
+                    .unwrap_or_default(),
+                failures,
+                unaccounted,
+            ));
+        }
     }
     match evidence {
         artifact::Evidence::Written {

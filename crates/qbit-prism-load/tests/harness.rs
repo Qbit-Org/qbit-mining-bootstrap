@@ -2832,6 +2832,173 @@ fn an_unrecognised_rejection_reason_is_named_in_the_summary_and_the_refusal() {
     assert_eq!(outcome.exit_code(), run::EXIT_OK);
 }
 
+/// Failed offers were collected under `client.failures` and never read, so a
+/// phase's `dispatched` could exceed the submits it recorded with no account
+/// of why: a silent discrepancy between two numbers in the same report. Each
+/// failure now carries its phase and what the session was doing, and every
+/// phase carries an `offer_accounting` that reconciles `dispatched` against
+/// the submits recorded, the offers discarded and the offers that failed
+/// before a submit line was written; what none of those explains is
+/// `unaccounted`, reported rather than assumed away, and the printed summary
+/// says so beside the phase's offered count whenever there is anything to
+/// say.
+#[test]
+fn dispatched_offers_are_accounted_for_failures_included() {
+    use qbit_prism_load::artifact::Evidence;
+    use qbit_prism_load::client::{ClientFailure, Event, FailureKind, Outcome};
+    use qbit_prism_load::run::{failures_by_kind, offer_accounting, summary_text, Collected};
+    let now = std::time::Instant::now();
+    let failure = |phase: &str, kind: FailureKind, recorded: bool, error: &str| {
+        Event::Failure(ClientFailure {
+            session: 1,
+            phase: phase.to_owned(),
+            kind,
+            recorded,
+            error: error.to_owned(),
+            at: now,
+        })
+    };
+    let submit = |record| Event::Submit(Box::new(record));
+    let mut collected = Collected::default();
+    // steady_state placed five offers. Two were submitted and answered; one's
+    // write failed, which is a no-response submit record and a failure; one
+    // was discarded when its session stopped; one found no solution.
+    collected.apply(submit(submit_record("steady_state", Outcome::Accepted)));
+    collected.apply(submit(submit_record(
+        "steady_state",
+        Outcome::Rejected(rejection(
+            21,
+            Some("stale-job"),
+            classify::NEW_TIP_WORK_PENDING,
+        )),
+    )));
+    collected.apply(submit(submit_record(
+        "steady_state",
+        Outcome::NoResponse {
+            reason: "write failed: broken pipe".into(),
+        },
+    )));
+    collected.apply(failure(
+        "steady_state",
+        FailureKind::Offer,
+        true,
+        "broken pipe",
+    ));
+    collected.apply(Event::DiscardedOffer {
+        session: 1,
+        phase: "steady_state".into(),
+    });
+    collected.apply(failure(
+        "steady_state",
+        FailureKind::Offer,
+        false,
+        "no share solution found under job job-1",
+    ));
+    // Not the scheduler's, so not in the account: a re-offer, a scheduled
+    // block and its failure, a line the session could not handle. Another
+    // phase's failures and discards are that phase's.
+    let mut reoffer = submit_record("steady_state", Outcome::Accepted);
+    reoffer.reoffer = true;
+    let mut block = submit_record("steady_state", Outcome::Accepted);
+    block.scheduled_block = true;
+    collected.apply(submit(reoffer));
+    collected.apply(submit(block));
+    collected.apply(failure(
+        "steady_state",
+        FailureKind::ScheduledBlock,
+        false,
+        "scheduled block: no block solution found under job job-1",
+    ));
+    collected.apply(failure(
+        "steady_state",
+        FailureKind::Line,
+        false,
+        "unparseable line",
+    ));
+    collected.apply(failure(
+        "slow_database",
+        FailureKind::Offer,
+        false,
+        "no current job to mine",
+    ));
+    collected.apply(Event::DiscardedOffer {
+        session: 2,
+        phase: "slow_database".into(),
+    });
+
+    let account = offer_accounting("steady_state", 5, &collected);
+    assert_eq!(account["dispatched"], json!(5));
+    assert_eq!(account["submits_recorded"], json!(3));
+    assert_eq!(account["offers_discarded"], json!(1));
+    assert_eq!(account["offers_failed_before_a_submit"], json!(1));
+    assert_eq!(
+        account["offers_failed_at_the_write"],
+        json!(1),
+        "listed apart: it is already a submit record"
+    );
+    assert_eq!(account["unaccounted"], json!(0), "{account}");
+    assert_eq!(account["client_failures"], json!(4));
+    assert_eq!(
+        account["client_failures_by_kind"],
+        json!([
+            {"kind": "offer", "count": 2},
+            {"kind": "scheduled-block", "count": 1},
+            {"kind": "line", "count": 1},
+        ])
+    );
+    assert_eq!(
+        account["client_failures_sample"].as_array().map(Vec::len),
+        Some(4)
+    );
+    // A dispatched count nothing explains is reported, not assumed away.
+    assert_eq!(
+        offer_accounting("steady_state", 7, &collected)["unaccounted"],
+        json!(2)
+    );
+    let other = offer_accounting("slow_database", 2, &collected);
+    assert_eq!(other["submits_recorded"], json!(0));
+    assert_eq!(other["offers_discarded"], json!(1));
+    assert_eq!(other["offers_failed_before_a_submit"], json!(1));
+    assert_eq!(other["unaccounted"], json!(0));
+    let clean = offer_accounting("warm_up", 0, &collected);
+    assert_eq!(clean["client_failures"], json!(0));
+    assert_eq!(clean["unaccounted"], json!(0));
+
+    // The run-wide count and kinds, for the client block.
+    assert_eq!(collected.failures.len(), 5);
+    assert_eq!(collected.discarded_offers, 2);
+    assert_eq!(
+        failures_by_kind(&collected.failures),
+        json!([
+            {"kind": "offer", "count": 3},
+            {"kind": "scheduled-block", "count": 1},
+            {"kind": "line", "count": 1},
+        ])
+    );
+
+    // The printed summary says so where the offered count is, and only
+    // when there is something to say.
+    let report = json!({"phases": [
+        {"name": "steady_state", "dispatched": 5, "offer_accounting": account},
+        {"name": "warm_up", "dispatched": 0, "offer_accounting": clean},
+    ]});
+    let withheld = Evidence::Withheld {
+        reason: "the run aborted: load-fe-1 exited".into(),
+        stale_artifact_removed: false,
+    };
+    let text = summary_text(&report, &withheld, &[]);
+    assert!(
+        text.lines()
+            .any(|line| line.contains("offer accounting for steady_state")
+                && line.contains("submits_recorded=3")
+                && line.contains("offers_failed_before_a_submit=1")
+                && line.contains("client_failures=4")
+                && line.contains("unaccounted=0")),
+        "{text}"
+    );
+    assert!(!text.contains("offer accounting for warm_up"), "{text}");
+}
+
 #[test]
 fn only_entitled_races_are_kept_out_of_the_offered_set() {
     use qbit_prism_load::client::Outcome;
@@ -4705,11 +4872,14 @@ fn rejections_and_bumps_are_attributed_to_the_landing_they_follow() {
             at: at(base, 7_400),
         },
     ];
-    let failures = vec![(
-        0usize,
-        "scheduled block: no block solution found under job job-0".to_owned(),
-        at(base, 23_100),
-    )];
+    let failures = vec![client::ClientFailure {
+        session: 0,
+        phase: "dense_cadence".to_owned(),
+        kind: client::FailureKind::ScheduledBlock,
+        recorded: false,
+        error: "scheduled block: no block solution found under job job-0".to_owned(),
+        at: at(base, 23_100),
+    }];
     let frontends = vec![health(0)];
     let session_frontend = vec![0usize, 0, 0, 0];
     let gaps = vec![9.0, 19.0];

@@ -565,6 +565,21 @@ The side report repeats all of this under `honest_value_notes`.
   side report lists them. The exit code is unchanged: an unrecognised reason
   is not a harness bug (7) and not a loss (4), and exit codes are a contract
   other tooling reads.
+- **Every dispatched offer is accounted for.** A phase's `dispatched` is what
+  its scheduler placed, and each placed offer ends as a submit record, a
+  discarded offer (the session was paused or stopped before it sent) or an
+  offer that failed before a submit line was written (no job to mine, no
+  solution found). Client failures used to be collected under
+  `client.failures` and read by nothing, so `dispatched` and the submits a
+  phase recorded could disagree with no account of why. Each failure now
+  carries its phase and what the session was doing (`offer`,
+  `scheduled-block`, `reoffer` or `line`), each phase carries an
+  `offer_accounting` that reconciles `dispatched` against those three
+  buckets, and what none of them explains is `unaccounted`, reported rather
+  than assumed away. An offer whose write failed is already a no-response
+  submit record and is listed apart so it is not counted twice. The printed
+  summary adds an `offer accounting` line under a phase whenever it had a
+  client failure or an unaccounted offer.
 - **ACK latency is client-measured, over acknowledgements only**: from
   writing the submit line to reading the response line that accepted it, on
   the client's monotonic clock, per phase and overall. A refusal is not an

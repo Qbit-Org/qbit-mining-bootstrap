@@ -29,7 +29,7 @@
 
 use crate::{
     classify::{self, Rejection},
-    client::{NotifySighting, Outcome, SubmitRecord, TipSighting},
+    client::{ClientFailure, FailureKind, NotifySighting, Outcome, SubmitRecord, TipSighting},
     measure,
     node::{SubmissionRecord, TipChange, TipOrigin},
 };
@@ -413,8 +413,8 @@ pub struct ReportInputs<'a> {
     /// Each session's frontend, snapshotted at the end of the phase.
     pub session_frontend: &'a [usize],
     pub frontends: &'a [FrontendHealth],
-    /// `(session, error, instant)` for every client failure of the run.
-    pub failures: &'a [(usize, String, Instant)],
+    /// Every client failure of the run.
+    pub failures: &'a [ClientFailure],
     /// This run's committed share identifiers, so "lost valid work" can be
     /// shown to be lost rather than asserted to be.
     pub committed: &'a BTreeSet<String>,
@@ -523,13 +523,13 @@ fn resolve<'a>(inputs: &ReportInputs<'a>) -> Vec<Resolved<'a>> {
         let failure = inputs
             .failures
             .iter()
-            .find(|(session, error, at)| {
-                *session == landing.session
-                    && error.starts_with("scheduled block:")
-                    && *at >= landing.requested_monotonic
-                    && *at < until
+            .find(|failure| {
+                failure.session == landing.session
+                    && failure.kind == FailureKind::ScheduledBlock
+                    && failure.at >= landing.requested_monotonic
+                    && failure.at < until
             })
-            .map(|(_, error, _)| error.as_str());
+            .map(|failure| failure.error.as_str());
         let block_hash = submit.and_then(block_hash_of);
         let node = block_hash.as_ref().and_then(|hash| {
             inputs

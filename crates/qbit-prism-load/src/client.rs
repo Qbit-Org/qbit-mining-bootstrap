@@ -238,10 +238,12 @@ pub enum Event {
         session: usize,
     },
     /// An offer the scheduler placed that this session never sent, because it
-    /// was paused or stopped first. Counted so `dispatched` and `offered` can
-    /// be reconciled against each other.
+    /// was paused or stopped first. Counted, with the phase whose scheduler
+    /// placed it, so `dispatched` and the submits recorded can be reconciled
+    /// against each other.
     DiscardedOffer {
         session: usize,
+        phase: String,
     },
     /// A `set_difficulty` whose value disagrees with the difficulty the
     /// harness configured.
@@ -259,13 +261,62 @@ pub enum Event {
         frontend: usize,
         reason: String,
     },
-    Failure {
-        session: usize,
-        error: String,
-        /// When the failure happened, so a scheduled-block failure can be
-        /// attributed to the landing that asked for it (EP-ERRORS).
-        at: Instant,
-    },
+    Failure(ClientFailure),
+}
+
+/// What a session was doing when it failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FailureKind {
+    /// An offer the scheduler placed and counted as dispatched that failed:
+    /// no job to mine, no solution found, or the submit line could not be
+    /// written.
+    Offer,
+    /// A scheduled block that could not be built or sent.
+    ScheduledBlock,
+    /// A mid-flight re-offer that could not be sent.
+    Reoffer,
+    /// A line from the server the session could not handle.
+    Line,
+}
+
+/// One client failure, as the collector keeps it.
+///
+/// The failures were collected and never read, so `dispatched` and the
+/// submits a phase recorded could disagree with no account of why. Each
+/// carries the phase it happened in and what the session was doing, so the
+/// phase's offer accounting can say (EP-OBSERVABILITY).
+#[derive(Clone, Debug)]
+pub struct ClientFailure {
+    pub session: usize,
+    /// The phase whose scheduler placed the offer, for an offer; the phase
+    /// the run was in, for the rest.
+    pub phase: String,
+    pub kind: FailureKind,
+    /// Whether a submit record already carries the failed submit. A write
+    /// failure is recorded as a no-response submit before it is reported
+    /// here, so the offer accounting must not count it twice.
+    pub recorded: bool,
+    pub error: String,
+    /// When the failure happened, so a scheduled-block failure can be
+    /// attributed to the landing that asked for it (EP-ERRORS).
+    pub at: Instant,
+}
+
+/// Why an offer produced nothing to acknowledge, and whether a submit record
+/// already carries it.
+pub struct OfferFailure {
+    pub error: anyhow::Error,
+    pub recorded: bool,
+}
+
+impl OfferFailure {
+    fn unrecorded(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            recorded: false,
+        }
+    }
 }
 
 /// Work and control messages a session accepts.
@@ -618,13 +669,16 @@ async fn run_session(
                         // path, which releases the slot exactly once.
                         outstanding.fetch_add(1, Ordering::Relaxed);
                         let phase = shared.phase();
-                        if let Err(error) = offer(active, &config, &shared, &frontend, true, phase).await {
+                        if let Err(failure) = offer(active, &config, &shared, &frontend, true, phase.clone()).await {
                             outstanding.fetch_sub(1, Ordering::Relaxed);
-                            let _ = shared.events.send(Event::Failure {
+                            let _ = shared.events.send(Event::Failure(ClientFailure {
                                 session: config.index,
-                                error: format!("scheduled block: {error:#}"),
+                                phase,
+                                kind: FailureKind::ScheduledBlock,
+                                recorded: failure.recorded,
+                                error: format!("scheduled block: {:#}", failure.error),
                                 at: Instant::now(),
-                            });
+                            }));
                         }
                     }
                     Some(Control::Reoffer {
@@ -643,11 +697,14 @@ async fn run_session(
                         .await
                         {
                             outstanding.fetch_sub(1, Ordering::Relaxed);
-                            let _ = shared.events.send(Event::Failure {
+                            let _ = shared.events.send(Event::Failure(ClientFailure {
                                 session: config.index,
+                                phase: shared.phase(),
+                                kind: FailureKind::Reoffer,
+                                recorded: false,
                                 error: format!("re-offer: {error:#}"),
                                 at: Instant::now(),
-                            });
+                            }));
                         }
                     }
                 }
@@ -656,11 +713,14 @@ async fn run_session(
                 match incoming {
                     Some(Incoming::Line(line)) => {
                         if let Err(error) = handle_line(active, &line, &config, &shared, &frontend, &outstanding) {
-                            let _ = shared.events.send(Event::Failure {
+                            let _ = shared.events.send(Event::Failure(ClientFailure {
                                 session: config.index,
+                                phase: shared.phase(),
+                                kind: FailureKind::Line,
+                                recorded: false,
                                 error: format!("{error:#}"),
                                 at: Instant::now(),
-                            });
+                            }));
                         }
                     }
                     other => {
@@ -686,13 +746,16 @@ async fn run_session(
                     None => { stopping = true; }
                     Some(Work::Submit { phase }) => {
                         let phase = phase.to_string();
-                        if let Err(error) = offer(active, &config, &shared, &frontend, false, phase).await {
+                        if let Err(failure) = offer(active, &config, &shared, &frontend, false, phase.clone()).await {
                             outstanding.fetch_sub(1, Ordering::Relaxed);
-                            let _ = shared.events.send(Event::Failure {
+                            let _ = shared.events.send(Event::Failure(ClientFailure {
                                 session: config.index,
-                                error: format!("{error:#}"),
+                                phase,
+                                kind: FailureKind::Offer,
+                                recorded: failure.recorded,
+                                error: format!("{:#}", failure.error),
                                 at: Instant::now(),
-                            });
+                            }));
                         }
                     }
                 }
@@ -713,9 +776,12 @@ fn drain_work(
     shared: &Arc<SessionShared>,
     session: usize,
 ) {
-    while work.try_recv().is_ok() {
+    while let Ok(Work::Submit { phase }) = work.try_recv() {
         outstanding.fetch_sub(1, Ordering::Relaxed);
-        let _ = shared.events.send(Event::DiscardedOffer { session });
+        let _ = shared.events.send(Event::DiscardedOffer {
+            session,
+            phase: phase.to_string(),
+        });
     }
 }
 
@@ -1158,12 +1224,13 @@ async fn offer(
     frontend: &Arc<AtomicUsize>,
     scheduled_block: bool,
     phase: String,
-) -> Result<()> {
+) -> std::result::Result<(), OfferFailure> {
     let job = connection
         .jobs
         .back()
         .cloned()
-        .context("no current job to mine")?;
+        .context("no current job to mine")
+        .map_err(OfferFailure::unrecorded)?;
     connection.extranonce2_counter = connection.extranonce2_counter.wrapping_add(1);
     let mut extranonce2 = vec![0u8; connection.extranonce2_size];
     let counter = connection.extranonce2_counter.to_be_bytes();
@@ -1177,7 +1244,8 @@ async fn offer(
         let job = job.clone();
         let extranonce2 = extranonce2.clone();
         tokio::task::spawn_blocking(move || search(&job, &extranonce1, &extranonce2, true, None))
-            .await?
+            .await
+            .map_err(|error| OfferFailure::unrecorded(error.into()))?
     } else {
         search(
             &job,
@@ -1188,11 +1256,11 @@ async fn offer(
         )
     };
     let Some((nonce, header)) = found else {
-        bail!(
+        return Err(OfferFailure::unrecorded(anyhow::anyhow!(
             "no {} solution found under job {}",
             if scheduled_block { "block" } else { "share" },
             job.job_id
-        );
+        )));
     };
     let extranonce2_hex = hex::encode(&extranonce2);
     let ntime_hex = format!("{:08x}", job.ntime);
@@ -1243,7 +1311,10 @@ async fn offer(
                 nonce_hex: pending.nonce_hex,
             })));
         }
-        return Err(error);
+        return Err(OfferFailure {
+            error,
+            recorded: true,
+        });
     }
     Ok(())
 }
