@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cancelled job builds must release producer and waiter references.
+"""Failed job builds must release producer and waiter references.
 
 A build that observes supersession or timeout raises from inside the executor
 task. The stored error's traceback reached the request through the finished
@@ -22,7 +22,7 @@ import threading
 import time
 import unittest
 import weakref
-from concurrent.futures import Future
+from concurrent.futures import CancelledError, Future
 from typing import Callable
 
 from lab.prism.job_bundle import (
@@ -140,6 +140,10 @@ class JobBuildExceptionRetentionTests(unittest.TestCase):
         gc.collect()
         self.gc_enabled = gc.isenabled()
         gc.disable()
+        self.initialize_scheduler()
+
+    def initialize_scheduler(self) -> None:
+        """Also used by the ordinary-GC workload, without changing GC policy."""
         self.ledger = WindowLedger()
         self.server, rpc = coordinator(ledger=self.ledger)
         install_fake_bundle_builder(self.server)
@@ -210,10 +214,10 @@ class JobBuildExceptionRetentionTests(unittest.TestCase):
                     mode="ready",
                     retry_superseded=retry_superseded,
                 )
-            except JobBuildCancelled as error:
+            except BaseException as error:  # noqa: BLE001 - asserted below
                 stored = stored_error()
                 outcome.update(
-                    kind="cancelled",
+                    kind="cancelled" if isinstance(error, JobBuildCancelled) else "unexpected",
                     type=type(error),
                     args=error.args,
                     names=traceback_names(error),
@@ -228,14 +232,6 @@ class JobBuildExceptionRetentionTests(unittest.TestCase):
                     suppress_context=error.__suppress_context__,
                     stored_is_error=stored is error,
                     stored_names=traceback_names(stored),
-                )
-            except BaseException as error:  # noqa: BLE001 - asserted below
-                stored = stored_error()
-                outcome.update(
-                    kind="unexpected",
-                    type=type(error),
-                    args=error.args,
-                    stored_is_error=stored is error,
                 )
             else:
                 outcome.update(kind="bundle")
@@ -503,27 +499,38 @@ class JobBuildExceptionRetentionTests(unittest.TestCase):
     def test_cancellation_with_suppressed_context_releases_nested_frames(self) -> None:
         self.check_chained_cancellation_releases_nested_frames("suppressed")
 
-    # -- unexpected failures keep their behavior ----------------------------
+    # -- ordinary failures must retire before GC too ------------------------
 
-    def test_unexpected_build_failure_still_raises_the_stored_instance(self) -> None:
+    def check_unexpected_build_failure_releases(self, count: int) -> None:
         def reject_row(index: int) -> None:
             raise ValueError(f"ledger row {index} rejected")
 
         reached, proceed = self.hold_first_conversion(after=reject_row)
-        threads, outcomes = self.run_waiters(1)
+        threads, outcomes = self.run_waiters(count)
         self.assertTrue(reached.wait(WAIT_SECONDS))
-        self.await_joined_flight(1)
+        self.await_joined_flight(count)
         proceed.set()
         self.join_all(threads)
-        self.assertEqual(outcomes[0]["kind"], "unexpected")
-        self.assertIs(outcomes[0]["type"], ValueError)
-        self.assertEqual(outcomes[0]["args"], (f"ledger row {CANCEL_ROW} rejected",))
-        self.assertTrue(outcomes[0]["stored_is_error"])
+        for outcome in outcomes:
+            self.assertEqual(outcome["kind"], "unexpected")
+            self.assertIs(outcome["type"], ValueError)
+            self.assertEqual(outcome["args"], (f"ledger row {CANCEL_ROW} rejected",))
+            self.assertFalse(outcome["stored_is_error"])
+            self.assertEqual(outcome["names"].count("_await_job_build_promise"), 1)
+            self.assertNotIn(WAITER_FRAME, outcome["stored_names"])
+            self.assertIn("to_prism_json", outcome["names"])
         self.assertEqual(self.service.shared_bundle_build_counts["failed"], 1)
-        # An unexpected failure keeps its full traceback for post-mortem
-        # inspection, so only collection reclaims that build.
-        gc.collect()
+        self.assertEqual(self.service.shared_bundle_build_counts["superseded"], 0)
+        self.assertIsNone(self.service._job_build_active)
+        self.assertIsNone(self.service._job_build_retiring)
+        self.assertIsNone(self.service._job_build_pending)
         self.assert_released(self.tracked_references())
+
+    def test_unexpected_build_failure_releases_for_one_waiter(self) -> None:
+        self.check_unexpected_build_failure_releases(1)
+
+    def test_unexpected_build_failure_releases_for_multiple_waiters(self) -> None:
+        self.check_unexpected_build_failure_releases(3)
 
 
 class WaiterCopyTests(unittest.TestCase):
@@ -562,7 +569,8 @@ class WaiterCopyTests(unittest.TestCase):
             self.assertEqual(error.args, stored.args)
             self.assertEqual(error.__notes__, ["compiler exit 137"])  # type: ignore[attr-defined]
             self.assertEqual(error.phase, "bundle_assembly")  # type: ignore[attr-defined]
-            self.assertIs(error.__cause__, stored.__cause__)
+            self.assertIsNot(error.__cause__, stored.__cause__)
+            self.assertEqual(describe(error.__cause__), describe(stored.__cause__))
             self.assertIs(error.__context__, stored.__context__)
             self.assertTrue(error.__suppress_context__)
             self.assertEqual(
@@ -595,9 +603,15 @@ class WaiterCopyTests(unittest.TestCase):
         try:
             _await_job_build_promise(failed, 1.0)
         except RuntimeError as error:
-            self.assertIs(error, failure)
+            self.assertIsNot(error, failure)
+            self.assertEqual(type(error), type(failure))
+            self.assertEqual(error.args, failure.args)
         else:
             self.fail("unexpected failure was not re-raised")
+        cancelled: Future[object] = Future()
+        cancelled.cancel()
+        with self.assertRaises(CancelledError):
+            _await_job_build_promise(cancelled, 1.0)
 
 
 if __name__ == "__main__":
