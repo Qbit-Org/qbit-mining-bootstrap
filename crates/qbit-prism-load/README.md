@@ -484,6 +484,18 @@ The side report repeats all of this under `honest_value_notes`.
   reported beside the numbers. When `pg_stat_statements` is loaded, the
   advisory-lock statement's `calls` and `total_exec_time` are recorded too, and
   the three PRISM locks share one normalized query text.
+- **Every distribution names its own unit.** A percentile summary carries
+  `unit` and `clock`. The five count distributions in the dense section —
+  `tip_pending_rejections_per_landing`,
+  `payout_pending_rejections_per_landing`,
+  `combined_rebuild_pending_rejections_per_landing`,
+  `rejected_before_new_revision_work_per_landing` and
+  `lost_valid_shares_per_landing` — carry `"unit": "count"`, because they count
+  shares. A consumer generic over the summary shape reads `unit`, so labelling
+  a count "milliseconds" renders 85 discarded shares as "85 ms"; a carried unit
+  that is wrong is worse than none. Their `clock` says what the sample is (one
+  per landing and frontend) and which clock the rejections it counts were
+  stamped on.
 - **Unknown is never zero.** A measurement that could not be taken is `null`
   with a reason. A peak RSS from Linux's `VmHWM` is labelled a kernel peak; on
   macOS it is a sampled maximum, and on other platforms it is `null`.

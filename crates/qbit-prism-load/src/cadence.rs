@@ -655,16 +655,16 @@ struct Distribution {
 impl Distribution {
     fn summarize(&self) -> Value {
         json!({
-            "tip_pending_window_duration_millis": measure::summarize(self.tip_duration.clone(), CLOCK),
-            "payout_pending_window_duration_millis": measure::summarize(self.payout_duration.clone(), CLOCK),
-            "combined_rebuild_pending_window_duration_millis": measure::summarize(self.combined_duration.clone(), CLOCK),
-            "tip_pending_rejections_per_landing": measure::summarize(self.tip_count.clone(), COUNT_CLOCK),
-            "payout_pending_rejections_per_landing": measure::summarize(self.payout_count.clone(), COUNT_CLOCK),
-            "combined_rebuild_pending_rejections_per_landing": measure::summarize(self.combined_count.clone(), COUNT_CLOCK),
-            "rejected_before_new_revision_work_per_landing": measure::summarize(self.before_revision.clone(), COUNT_CLOCK),
-            "lost_valid_shares_per_landing": measure::summarize(self.lost.clone(), COUNT_CLOCK),
-            "time_to_new_tip_work_max_millis": measure::summarize(self.tip_work_max.clone(), CLOCK),
-            "time_to_new_revision_work_max_millis": measure::summarize(self.revision_work_max.clone(), CLOCK),
+            "tip_pending_window_duration_millis": millis_summary(&self.tip_duration),
+            "payout_pending_window_duration_millis": millis_summary(&self.payout_duration),
+            "combined_rebuild_pending_window_duration_millis": millis_summary(&self.combined_duration),
+            "tip_pending_rejections_per_landing": count_summary(&self.tip_count),
+            "payout_pending_rejections_per_landing": count_summary(&self.payout_count),
+            "combined_rebuild_pending_rejections_per_landing": count_summary(&self.combined_count),
+            "rejected_before_new_revision_work_per_landing": count_summary(&self.before_revision),
+            "lost_valid_shares_per_landing": count_summary(&self.lost),
+            "time_to_new_tip_work_max_millis": millis_summary(&self.tip_work_max),
+            "time_to_new_revision_work_max_millis": millis_summary(&self.revision_work_max),
             // The label travels with the summarised numbers, because these are
             // the ones a reader quotes. The per-landing tables carry the same
             // sibling; the summaries used to carry nothing, and the
@@ -676,9 +676,24 @@ impl Distribution {
 }
 
 const CLOCK: &str = "harness monotonic";
-/// `measure::summarize` labels its unit as milliseconds, which a count is
-/// not; the clock string says so rather than letting the unit be misread.
-const COUNT_CLOCK: &str = "counts, not milliseconds; one sample per landing";
+/// A count distribution has one sample per landing and frontend. It is not on
+/// a clock of its own: the rejections it counts are stamped on the harness's
+/// monotonic clock, and the string says that rather than apologising for a
+/// wrong unit -- the unit is now `count`.
+const COUNT_CLOCK: &str = "one sample per landing and frontend; the rejections counted are \
+                           stamped on the harness monotonic clock";
+
+/// A distribution of milliseconds on the harness's monotonic clock.
+fn millis_summary(values: &[f64]) -> measure::LatencySummary {
+    measure::summarize(values.to_vec(), measure::MILLISECONDS, CLOCK)
+}
+
+/// A distribution of counts. These are shares, not milliseconds, and the unit
+/// field has to say so: a consumer generic over the summary shape reads `unit`
+/// and would render 85 discarded shares as "85 ms".
+fn count_summary(values: &[f64]) -> measure::LatencySummary {
+    measure::summarize(values.to_vec(), measure::COUNT, COUNT_CLOCK)
+}
 
 /// Build the `dense_cadence` section of the side report.
 ///
@@ -898,10 +913,9 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                         "server_timestamp": bump.server_timestamp.to_rfc3339(),
                         "millis_after_landing": millis_since(start, bump.monotonic),
                     })),
-                    "time_to_new_tip_work_millis": measure::summarize(tip_work.clone(), CLOCK),
+                    "time_to_new_tip_work_millis": millis_summary(&tip_work),
                     "sessions_with_new_tip_work": tip_work.len(),
-                    "time_to_new_revision_work_millis":
-                        measure::summarize(revision_work.clone(), CLOCK),
+                    "time_to_new_revision_work_millis": millis_summary(&revision_work),
                     "sessions_with_new_revision_work": revision_work.len(),
                     "new_revision_work_approximation": NEW_REVISION_APPROXIMATION,
                     "rejected_before_new_revision_work": rejected_before_new_revision_work,
@@ -1001,10 +1015,10 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
         .map(|share| (*share).to_owned())
         .collect();
     let no_landing_reason = no_landing_reason(inputs, &resolved, landed);
-    let combined_p99 =
-        optional_summary(&overall.combined_duration, CLOCK).and_then(|summary| summary.p99);
+    let combined_p99 = optional_summary(&overall.combined_duration, millis_summary)
+        .and_then(|summary| summary.p99);
     let count_p99 =
-        optional_summary(&overall.combined_count, COUNT_CLOCK).and_then(|summary| summary.p99);
+        optional_summary(&overall.combined_count, count_summary).and_then(|summary| summary.p99);
 
     json!({
         "ran": true,
@@ -1266,9 +1280,12 @@ pub fn definitions() -> Value {
 /// `measure::summarize` returns a summary even for an empty sample; this says
 /// "there was nothing to summarize" instead, so a budget proposal from no data
 /// is `null` rather than a number.
-fn optional_summary(values: &[f64], clock: &'static str) -> Option<measure::LatencySummary> {
+fn optional_summary(
+    values: &[f64],
+    summarize: fn(&[f64]) -> measure::LatencySummary,
+) -> Option<measure::LatencySummary> {
     if values.is_empty() {
         return None;
     }
-    Some(measure::summarize(values.to_vec(), clock))
+    Some(summarize(values))
 }

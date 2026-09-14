@@ -94,8 +94,13 @@ pub fn raise_file_descriptor_limit(required: u64) -> Result<(u64, u64)> {
     }
 }
 
-/// Percentile summary of a latency sample, in milliseconds on the client's
-/// monotonic clock.
+/// Unit labels for `summarize`. A consumer generic over `LatencySummary`
+/// reads `unit`, so a count summarized as milliseconds renders as a time:
+/// a carried unit that is wrong is worse than none (EP-OBSERVABILITY).
+pub const MILLISECONDS: &str = "milliseconds";
+pub const COUNT: &str = "count";
+
+/// Percentile summary of a sample, in the unit and on the clock it names.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct LatencySummary {
     pub unit: &'static str,
@@ -109,10 +114,10 @@ pub struct LatencySummary {
     pub unavailable_reason: Option<String>,
 }
 
-pub fn summarize(mut values: Vec<f64>, clock: &'static str) -> LatencySummary {
+pub fn summarize(mut values: Vec<f64>, unit: &'static str, clock: &'static str) -> LatencySummary {
     if values.is_empty() {
         return LatencySummary {
-            unit: "milliseconds",
+            unit,
             clock,
             samples: 0,
             unavailable_reason: Some("no samples were recorded".into()),
@@ -127,7 +132,7 @@ pub fn summarize(mut values: Vec<f64>, clock: &'static str) -> LatencySummary {
     };
     let sum: f64 = values.iter().sum();
     LatencySummary {
-        unit: "milliseconds",
+        unit,
         clock,
         samples: values.len(),
         p50: Some(quantile(0.50)),

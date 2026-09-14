@@ -1435,19 +1435,45 @@ fn the_shipped_profile_file_hashes_to_the_digest_the_artifact_names() -> Result<
 
 #[test]
 fn latency_percentiles_report_unknown_rather_than_zero() {
-    let empty = qbit_prism_load::measure::summarize(Vec::new(), "client monotonic");
+    use qbit_prism_load::measure::{summarize, MILLISECONDS};
+    let empty = summarize(Vec::new(), MILLISECONDS, "client monotonic");
     assert_eq!(empty.samples, 0);
     assert!(empty.p50.is_none() && empty.p99.is_none() && empty.max.is_none());
     assert!(empty.unavailable_reason.is_some());
-    let summary =
-        qbit_prism_load::measure::summarize((1..=100).map(f64::from).collect(), "client monotonic");
+    assert_eq!(
+        empty.unit, MILLISECONDS,
+        "an empty summary still names its unit"
+    );
+    let summary = summarize(
+        (1..=100).map(f64::from).collect(),
+        MILLISECONDS,
+        "client monotonic",
+    );
     assert_eq!(summary.p50, Some(50.0));
     assert_eq!(summary.p99, Some(99.0));
     assert_eq!(summary.max, Some(100.0));
     // A real zero is a measurement, not an absence.
-    let zeros = qbit_prism_load::measure::summarize(vec![0.0, 0.0], "client monotonic");
+    let zeros = summarize(vec![0.0, 0.0], MILLISECONDS, "client monotonic");
     assert_eq!(zeros.p50, Some(0.0));
     assert!(zeros.unavailable_reason.is_none());
+}
+
+#[test]
+fn a_count_distribution_is_not_published_as_milliseconds() {
+    // A consumer generic over the summary shape reads `unit`. Labelling a
+    // count "milliseconds" renders 85 discarded shares as "85 ms", and a clock
+    // string is not where such a consumer looks: a carried unit that is wrong
+    // is worse than none (EP-OBSERVABILITY).
+    use qbit_prism_load::measure::{summarize, COUNT, MILLISECONDS};
+    assert_ne!(COUNT, MILLISECONDS);
+    let counted = summarize(vec![3.0, 5.0, 85.0], COUNT, "one sample per landing");
+    assert_eq!(counted.unit, COUNT);
+    assert_eq!(counted.max, Some(85.0));
+    assert_eq!(
+        summarize(Vec::new(), COUNT, "one sample per landing").unit,
+        COUNT,
+        "an empty count summary is still a count"
+    );
 }
 
 #[test]
@@ -2205,6 +2231,43 @@ fn rejections_and_bumps_are_attributed_to_the_landing_they_follow() {
         json!(format!("pload1abc.s{:05}:{}", 2, "1".repeat(64))),
         "the share is named, not just counted"
     );
+    // Every distribution names its own unit. The five count distributions are
+    // counts of shares, not milliseconds.
+    for summary in [
+        &document["summaries"]["overall"],
+        &document["summaries"]["per_frontend"][0],
+    ] {
+        for key in [
+            "tip_pending_rejections_per_landing",
+            "payout_pending_rejections_per_landing",
+            "combined_rebuild_pending_rejections_per_landing",
+            "rejected_before_new_revision_work_per_landing",
+            "lost_valid_shares_per_landing",
+        ] {
+            assert_eq!(summary[key]["unit"], json!("count"), "{key}");
+            assert!(
+                !summary[key]["clock"]
+                    .as_str()
+                    .expect("a clock")
+                    .contains("not milliseconds"),
+                "{key}: the clock names the clock, it does not apologise for the unit"
+            );
+        }
+        for key in [
+            "tip_pending_window_duration_millis",
+            "payout_pending_window_duration_millis",
+            "combined_rebuild_pending_window_duration_millis",
+            "time_to_new_tip_work_max_millis",
+            "time_to_new_revision_work_max_millis",
+        ] {
+            assert_eq!(summary[key]["unit"], json!("milliseconds"), "{key}");
+        }
+    }
+    assert_eq!(
+        document["landing_records"][0]["frontends"][0]["time_to_new_tip_work_millis"]["unit"],
+        json!("milliseconds")
+    );
+
     // The approximation label travels with the summarised numbers too: those
     // are the ones a reader quotes.
     for summary in [

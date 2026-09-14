@@ -832,6 +832,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             .iter()
             .filter_map(|record| record.latency_millis)
             .collect(),
+        measure::MILLISECONDS,
         "client monotonic",
     );
     let union_ack: BTreeSet<String> = phase_evidence
@@ -1629,6 +1630,7 @@ fn phase_latency(records: &[SubmitRecord], phase: &str) -> measure::LatencySumma
             .filter(|record| record.phase == phase && !record.reoffer)
             .filter_map(|record| record.latency_millis)
             .collect(),
+        measure::MILLISECONDS,
         "client monotonic",
     )
 }
@@ -1703,7 +1705,11 @@ fn reconnect_report(collected: &Collected) -> Value {
     json!({
         "definition": "a completed reconnect is a close followed by a re-authorize and a job",
         "by_phase": by_phase.into_iter().map(|(phase, (completed, failed, seconds))| {
-            let summary = measure::summarize(seconds.iter().map(|s| s * 1000.0).collect(), "client monotonic");
+            let summary = measure::summarize(
+                seconds.iter().map(|s| s * 1000.0).collect(),
+                measure::MILLISECONDS,
+                "client monotonic",
+            );
             json!({"phase": phase, "completed": completed, "failed_attempts": failed,
                    "time_to_reconnect_milliseconds": summary})
         }).collect::<Vec<_>>(),
@@ -1780,7 +1786,11 @@ fn time_to_usable_work(
                 "minted_at": tip.wall.to_rfc3339(),
                 "sessions_with_work": first.len(),
                 "sessions_total": sessions,
-                "latency_milliseconds": measure::summarize(deltas, "client monotonic against the node's tip stamp"),
+                "latency_milliseconds": measure::summarize(
+                    deltas,
+                    measure::MILLISECONDS,
+                    "client monotonic against the node's tip stamp",
+                ),
                 "all_sessions_milliseconds": all_seen,
             })
         })
