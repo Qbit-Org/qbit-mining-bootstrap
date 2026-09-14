@@ -18,8 +18,12 @@ a. No runnable ``python -m lab.…`` or ``python lab/….py`` command invokes a
    ``"-m"lab.prism.deleted``, ``"lab.prism."deleted``) and equivalent POSIX
    script paths (``./``, ``..`` and repeated slashes),
    and does not follow ``cd``, ``PYTHONPATH`` or other environment
-   indirection, aliases, shell variables, or backslash escapes. A shell
-   comment runs nothing, so a command inside one is not read.
+   indirection, aliases, shell variables, or backslash escapes. Shell comments,
+   ordinary arguments and heredoc bodies run no command of their own. Command
+   positions include simple shell lists, the env/sudo/nohup/command/exec and
+   docker/podman exec wrappers, and literal sh/bash/dash/ksh/zsh ``-c`` strings.
+   Other launcher grammars, shell evaluation of stdin, and expansions inside
+   quoted arguments or heredocs are outside this lexical check.
 b. Every ``lab/prism/…`` path or ``lab.prism.…`` module reference resolves to a
    tracked file or directory. GitHub links pinned to a 40-hex commit SHA are
    stable history and exempt. Pre-existing residue that #303 declares out of
@@ -34,6 +38,7 @@ from __future__ import annotations
 
 import posixpath
 import re
+import shlex
 import subprocess
 import unittest
 from collections import Counter
@@ -212,12 +217,11 @@ NEXT_WORD = re.compile(rf"\s+(?P<word>{SHELL_WORD})")
 # unquoted word character precedes it, so `env python3 …`, `docker exec "$c"
 # python3 …`, `$(python3 …)`, inline-code `` `python3 …` `` and the inner
 # command of `sh -c "python3 …"` are read as before, while `mypython3` is
-# one word. A word may also start right after a closing quote, so
-# `"/usr/bin/"python3` and `"my"python3` are each one candidate and their
-# tail `python3` another; the candidate pattern is therefore a lookahead
-# that consumes nothing, every word is a candidate interpreter, and
-# ``python_commands`` drops a candidate that starts inside the interpreter
-# word of the one before it. A word that opens a quote and never closes it
+# one word. ``python_commands`` selects executable positions and requires a
+# candidate to cover its whole shell word, so the tail `python3` after the
+# closing quote of `"my"python3` cannot become another command. The candidate
+# remains a lookahead to expose the interpreter's start and end. A word that
+# opens a quote and never closes it
 # (`"python3' -m lab.a.b`) is a shell syntax error and matches nothing, as
 # before. ``command_target`` reads the words after a candidate that names
 # Python, and the reported command is the line from the interpreter word to
@@ -360,22 +364,148 @@ def runs_python(word: str) -> bool:
     return INTERPRETER.fullmatch(unquote(word).rsplit("/", 1)[-1]) is not None
 
 
-def python_commands(line: str):
-    """Each ``INTERPRETER_CANDIDATE`` match on ``line`` whose interpreter word names CPython.
+def shell_tokens(line: str):
+    """``(kind, start, end)`` for words and operators, without entering quoted data.
 
-    The pattern is a lookahead, so every word start is a candidate. One that
-    starts inside the interpreter word of the candidate before it is the tail
-    of that word after a closing quote (``python3`` in ``"/usr/bin/"python3``
-    or in ``"my"python3``), not a command of its own, and is dropped whether
-    or not the whole word named Python.
+    This lexer keeps escaped quotes inside their word, even though interpreting
+    escapes in executable names and targets remains outside the check. An
+    unmatched prose apostrophe ends at Markdown inline code; a quoted word
+    with a matching close keeps its literal backticks.
     """
-    end = 0
-    for match in INTERPRETER_CANDIDATE.finditer(line):
-        if match.start() < end:
+    position = 0
+    while position < len(line):
+        if line[position].isspace():
+            if line[position] == "\n":
+                yield "operator", position, position + 1
+            position += 1
             continue
-        end = match.end("interpreter")
-        if runs_python(match.group("interpreter")):
-            yield match
+        start = position
+        if line[position] in "|&;()<>`":
+            position += 1
+            if line[start] in "<>" and line.startswith(line[start], position):
+                position += 1
+                if line[start] == "<" and position < len(line) and line[position] in "<-":
+                    position += 1
+            yield "operator", start, position
+            continue
+        while position < len(line) and not re.fullmatch(rf"[{WORD_BREAK}]", line[position]):
+            character = line[position]
+            if character == "\\":
+                position += 2
+            elif character in "'\"":
+                quote_start = position
+                ansi = character == "'" and position > start and line[position - 1] == "$"
+                position += 1
+                while position < len(line) and line[position] != character:
+                    position += 2 if line[position] == "\\" and (character == '"' or ansi) else 1
+                if position >= len(line):
+                    backtick = line.find("`", quote_start)
+                    if backtick != -1:
+                        position = backtick
+                        break
+                    yield "unfinished", start, len(line)
+                    return
+                position += 1
+            else:
+                position += 1
+        yield "word", start, min(position, len(line))
+
+
+SHELLS = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
+LAUNCHERS = frozenset({"env", "sudo", "nohup", "command", "exec", "docker", "podman"})
+WRAPPER_ARGUMENTS = {
+    "env": {"-u", "--unset", "-C", "--chdir"},
+    "sudo": {"-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "--close-from", "-T", "--command-timeout"},
+    "exec": {"-a"},
+    "docker": {"-e", "--env", "--env-file", "-u", "--user", "-w", "--workdir", "--detach-keys"},
+}
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*=")
+
+
+def executable_word(words: list[str]) -> int | None:
+    """Index of the executable after the supported literal launcher prefixes."""
+    index = 0
+    while index < len(words):
+        word = unquote(words[index])
+        if ASSIGNMENT.match(words[index]) or words[index] in {"!", "if", "then", "elif", "else", "do"}:
+            index += 1
+            continue
+        program = word.rsplit("/", 1)[-1]
+        if program not in LAUNCHERS:
+            return index
+        index += 1
+        if program in {"docker", "podman"}:
+            if index == len(words) or unquote(words[index]) != "exec":
+                return None
+            program = "docker"
+            index += 1
+        while index < len(words):
+            option = unquote(words[index])
+            if option in {"--help", "--version"} or (program == "sudo" and option in {"-l", "-ll", "--list", "-V"}):
+                return None
+            if program == "command" and option in {"-v", "-V"}:
+                return None  # executable lookup prints information; it runs nothing
+            if option == "--":
+                index += 1
+                break
+            if not option.startswith("-"):
+                break
+            index += 2 if option in WRAPPER_ARGUMENTS.get(program, ()) else 1
+        if program == "docker":
+            index += 1  # container name
+        elif program == "env":
+            while index < len(words) and ASSIGNMENT.match(unquote(words[index])):
+                index += 1  # env receives quoted assignments as ordinary arguments
+    return None
+
+
+def python_commands(line: str):
+    """``(line offset, source, match)`` for Python in executable positions, including shell ``-c``.
+
+    Whole words keep ordinary arguments opaque. Only a supported shell's
+    literal command-string argument starts another shell context; Python's
+    ``-c`` argument and strings passed to printf, echo, etc. remain data.
+    """
+    words: list[tuple[int, int]] = []
+    redirect = False
+    for kind, start, end in [*shell_tokens(line), ("operator", len(line), len(line))]:
+        token = line[start:end]
+        if kind == "unfinished":
+            return
+        if kind == "word":
+            if not redirect:
+                words.append((start, end))
+            redirect = False
+            continue
+        if token.startswith(("<", ">")):
+            if words and words[-1][1] == start and line[words[-1][0]:start].isdigit():
+                words.pop()  # the adjacent number is a file descriptor, not a word
+            redirect = True
+            continue
+        index = executable_word([line[a:b] for a, b in words])
+        if index is not None:
+            first, last = words[index]
+            interpreter = line[first:last]
+            match = INTERPRETER_CANDIDATE.match(line, first)
+            if runs_python(interpreter) and match is not None and match.end("interpreter") == last:
+                yield line[:first].count("\n"), line, match
+            elif unquote(interpreter).rsplit("/", 1)[-1] in SHELLS:
+                for option_index in range(index + 1, len(words)):
+                    a, b = words[option_index]
+                    option = unquote(line[a:b])
+                    if not option.startswith("-") or option == "--":
+                        break
+                    if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", option):
+                        if option_index + 1 < len(words):
+                            a, b = words[option_index + 1]
+                            source = literal_word(line[a:b])
+                            if source is not None:
+                                for number, nested in shell_lines(source, shell_source=True):
+                                    for offset, source_line, match in python_commands(nested):
+                                        yield line[:a].count("\n") + number - 1 + offset, source_line, match
+                        break
+        words = []
+        redirect = False
 
 
 def shell_words(line: str, position: int):
@@ -475,7 +605,7 @@ def blank_comments(line: str, *, fenced: bool) -> str:
     return "".join(characters)
 
 
-def shell_lines(text: str) -> list[tuple[int, str]]:
+def shell_lines(text: str, *, shell_source: bool = False) -> list[tuple[int, str]]:
     """``(first line, text)`` per logical shell line, backslash continuations joined, comments blanked.
 
     Each joined line is blanked again as a whole, in the fence state of its
@@ -483,24 +613,58 @@ def shell_lines(text: str) -> list[tuple[int, str]]:
     ``a # b`` for ``echo "a \\`` followed by ``# b"``). A backslash that ends
     a comment is blanked with it, so it joins nothing and the next physical
     line is a command of its own. Every physical line, joined or not, may open
-    or close a fence, and a fence line itself is Markdown, not shell.
+    or close a fence, and a fence line itself is Markdown, not shell. Literal
+    shell command strings set ``shell_source``: their comments end at the
+    shell boundary and their backticks cannot open Markdown inline code.
     """
     lines: list[tuple[int, str]] = []
     fence = ""
+    fence_indent = ""
     fenced = False
+    heredocs: list[tuple[str, bool]] = []
+    quoted = False
     for number, line in enumerate(text.splitlines(), 1):
+        if heredocs:
+            delimiter, strip_tabs = heredocs[0]
+            body = line.removeprefix(fence_indent)
+            if (body.lstrip("\t") if strip_tabs else body) == delimiter:
+                heredocs.pop(0)
+            lines.append((number, ""))
+            continue
         marker = FENCE.match(line)
-        on_fence = marker is not None and (
+        on_fence = not shell_source and marker is not None and (
             not fence or (marker.group(1).startswith(fence) and not line[marker.end():].strip())
         )
         if lines and lines[-1][1].endswith("\\"):
             first, head = lines[-1]
             lines[-1] = (first, blank_comments(head[:-1] + line, fenced=fenced))
+        elif quoted and not on_fence:
+            first, head = lines[-1]
+            lines[-1] = (first, blank_comments(head + "\n" + line, fenced=fenced))
         else:
-            fenced = bool(fence) and not on_fence
+            fenced = shell_source or (bool(fence) and not on_fence)
             lines.append((number, blank_comments(line, fenced=fenced)))
         if on_fence:
+            fence_indent = "" if fence else line[:marker.start(1)]
             fence = "" if fence else marker.group(1)
+        logical = lines[-1][1]
+        tokens = list(shell_tokens(logical))
+        # A prose apostrophe in the first word is not a multiline shell
+        # argument. Fences and arguments after a command may carry quotes.
+        quoted = bool(tokens) and tokens[-1][0] == "unfinished" and (fenced or len(tokens) > 1)
+        if not quoted and not logical.endswith("\\"):
+            for token_index, (kind, start, end) in enumerate(tokens[:-1]):
+                operator = logical[start:end]
+                if kind == "operator" and operator in {"<<", "<<-"}:
+                    kind, start, end = tokens[token_index + 1]
+                    if kind == "word":
+                        # Delimiters undergo POSIX quote removal, not the
+                        # expansions required of ordinary shell arguments.
+                        try:
+                            delimiter = shlex.split(logical[start:end])[0]
+                        except ValueError:
+                            continue  # shell-specific quote decoding is outside this check
+                        heredocs.append((delimiter, operator == "<<-"))
     return lines
 
 
@@ -514,24 +678,24 @@ def dead_commands(text: str, tracked: frozenset[str]) -> list[tuple[int, str, st
     """
     found = []
     for number, line in shell_lines(text):
-        for match in python_commands(line):
-            target = command_target(line, match.end("interpreter"))
+        for offset, source, match in python_commands(line):
+            target = command_target(source, match.end("interpreter"))
             if target is None:
                 continue
             kind, word, end = target
-            command = line[match.start("interpreter"):end]
+            command = source[match.start("interpreter"):end]
             if kind == "module":
                 if not MODULE_TARGET.fullmatch(word):
                     continue
                 candidates = runnable_candidates(word)
                 if not any(candidate in tracked for candidate in candidates):
-                    found.append((number, command, " or ".join(candidates)))
+                    found.append((number + offset, command, " or ".join(candidates)))
             else:
                 if not word.endswith(".py"):
                     continue
                 script = posixpath.normpath(word)
                 if SCRIPT_TARGET.fullmatch(script) and script not in tracked:
-                    found.append((number, command, script))
+                    found.append((number + offset, command, script))
     return found
 
 
@@ -1840,6 +2004,124 @@ class ScannerTests(unittest.TestCase):
         # hide a command nor keep a comment open.
         self.assertEqual(self.commands("Don't run `true # python3 lab/prism/storm.py`"), [])
         self.assertEqual(self.commands("It's `python3 lab/prism/storm.py` # done"), ["lab/prism/storm.py"])
+
+    def test_ordinary_arguments_are_not_executable_commands(self) -> None:
+        for text in (
+            "printf '%s\\n' 'python3 -m lab.example.deleted'",
+            'echo "python3 -m lab.example.deleted"',
+            "printf '%s\\n' python3 -m lab.example.deleted",
+            "echo 'python3' -m lab.example.deleted",
+            "printf '%s\\n' sh -c 'python3 -m lab.example.deleted'",
+            "python3 -c 'python3 -m lab.example.deleted'",
+            "cat <<< 'python3 -m lab.example.deleted'",
+            "echo done > python3 -m lab.example.deleted",
+            "'python3 -m lab.example.deleted'",
+            '"python3 -m lab.example.deleted"',
+            "command -v python3 -m lab.example.deleted",
+            "command -V python3 -m lab.example.deleted",
+            "'X=1' python3 -m lab.example.deleted",
+            "'if' python3 -m lab.example.deleted",
+            "env --help python3 -m lab.example.deleted",
+            "sudo -l python3 -m lab.example.deleted",
+            "nohup --version python3 -m lab.example.deleted",
+            "docker exec --help container python3 -m lab.example.deleted",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.commands(text), [])
+                self.assertEqual(self.commands(text + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+
+    def test_multiline_quoted_arguments_remain_data(self) -> None:
+        for quote in ("'", '"'):
+            with self.subTest(quote=quote):
+                text = (
+                    f"printf '%s\\n' {quote}first line\n"
+                    "python3 -m lab.example.deleted\n"
+                    f"last line{quote}; python3 lab/prism/storm.py"
+                )
+                self.assertEqual(self.located(text), [(3, "lab/prism/storm.py")])
+
+    def test_heredoc_bodies_are_not_executable_commands(self) -> None:
+        for delimiter in ("EOF", "'EOF'", '"EOF"', "E'O'F", r"\EOF"):
+            for operator, indent in (("<<", ""), ("<<-", "\t")):
+                with self.subTest(delimiter=delimiter, operator=operator):
+                    text = (
+                        f"cat {operator}{delimiter}\n"
+                        f"{indent}python3 -m lab.example.deleted\n"
+                        f"{indent}python3 lab/example/deleted.py\n"
+                        f"{indent}EOF\n"
+                        "python3 lab/prism/storm.py"
+                    )
+                    self.assertEqual(self.located(text), [(5, "lab/prism/storm.py")])
+
+    def test_indented_fenced_heredocs_end_at_the_rendered_delimiter(self) -> None:
+        for operator, tabs in (("<<", ""), ("<<-", "\t")):
+            with self.subTest(operator=operator):
+                text = (
+                    f"- example\n\n  ```sh\n  cat {operator}'EOF'\n"
+                    "  python3 -m lab.example.deleted\n"
+                    f"  {tabs}EOF\n  python3 lab/prism/storm.py\n  ```"
+                )
+                self.assertEqual(self.located(text), [(7, "lab/prism/storm.py")])
+
+    def test_file_descriptor_redirections_are_not_executable_words(self) -> None:
+        for prefix in (
+            "2>/dev/null", "2>/dev/null env", "env 2>/dev/null", "command --",
+            "X='value'", "env 'X=1'",
+        ):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(self.commands(f"{prefix} python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+        self.assertEqual(self.commands("printf '%s\\n' 2>/dev/null python3 -m lab.example.deleted"), [])
+
+    def test_heredoc_data_cannot_change_comments_continuations_or_fences(self) -> None:
+        text = (
+            "```sh\ncat <<'EOF'\n"
+            "# quoted data \\\n"
+            "```\n"
+            "python3 -m lab.example.deleted\n"
+            "EOF\n"
+            "# python3 -m lab.example.deleted\n"
+            "python3 lab/prism/storm.py\n```"
+        )
+        self.assertEqual(self.located(text), [(8, "lab/prism/storm.py")])
+        # Only tabs are stripped by <<-; whitespace or trailing text cannot
+        # prematurely close a heredoc and turn its remaining body into code.
+        text = "cat <<-EOF\n EOF\nEOF extra\npython3 -m lab.example.deleted\n\tEOF\npython3 lab/prism/storm.py"
+        self.assertEqual(self.located(text), [(6, "lab/prism/storm.py")])
+
+    def test_multiple_heredocs_and_commands_on_the_opening_line(self) -> None:
+        text = (
+            "cat <<FIRST <<'SECOND'; python3 lab/prism/storm.py\n"
+            "python3 -m lab.example.deleted\nFIRST\n"
+            "python3 -m lab.example.deleted\nSECOND\n"
+            "python3 -m lab.prism.process_telemetry"
+        )
+        self.assertEqual(self.located(text), [(1, "lab/prism/storm.py"), (6, self.TELEMETRY)])
+        text = "python3 lab/prism/storm.py <<EOF\npython3 -m lab.example.deleted\nEOF"
+        self.assertEqual(self.located(text), [(1, "lab/prism/storm.py")])
+        text = "printf '%s\\n' 'cat <<EOF'\npython3 lab/prism/storm.py"
+        self.assertEqual(self.located(text), [(2, "lab/prism/storm.py")])
+
+    def test_shell_command_strings_are_scanned_in_their_own_context(self) -> None:
+        for prefix in ("sh -c", "bash -lc", 'docker exec "$c" sh -c'):
+            with self.subTest(prefix=prefix):
+                text = f'''{prefix} "printf '%s\\n' 'python3 -m lab.example.deleted'; python3 lab/prism/storm.py"'''
+                self.assertEqual(self.commands(text), ["lab/prism/storm.py"])
+                text = f'''{prefix} 'true # python3 -m lab.example.deleted' '''
+                self.assertEqual(self.commands(text), [])
+                text = f'''{prefix} '# `python3 -m lab.example.deleted`' '''
+                self.assertEqual(self.commands(text), [])
+        text = "sh -c 'true\npython3 lab/prism/storm.py'"
+        self.assertEqual(self.located(text), [(2, "lab/prism/storm.py")])
+        self.assertEqual(self.commands("sh -c python3 -m lab.example.deleted"), [])
+
+    def test_shell_data_still_counts_as_dangling_prose(self) -> None:
+        for text in (
+            "printf '%s\\n' 'python3 -m lab.prism.deleted'",
+            "cat <<'EOF'\npython3 -m lab.prism.deleted\nEOF",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.commands(text), [])
+                self.assertEqual(self.references(text), ["lab.prism.deleted"])
 
 
 if __name__ == "__main__":
