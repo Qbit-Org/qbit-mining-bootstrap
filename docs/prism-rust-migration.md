@@ -540,10 +540,12 @@ newest-first page walk and the landing count read; replaces
 [index inventory](prism-ledger-ops.md#share-ledger-indexes) maps every index
 to its readers and lists the measurements to take afterwards.
 
-On an empty ledger (a new deployment) it is applied inside the migration
-transaction like every other migration: there is no append to block. Once
-the ledger has rows it is the first migration the migrator applies outside
-its transaction. `CREATE INDEX CONCURRENTLY` cannot run in a transaction
+On a fresh deployment or an empty 2.x.x source it is applied inside the
+migration transaction while the cutover locks exclude writers. Existing
+native ledgers always apply it outside that transaction, even when no
+shares are visible: the first share may still be uncommitted, and native
+writers do not take the migration lock. Populated 2.x.x sources also use
+this online path. `CREATE INDEX CONCURRENTLY` cannot run in a transaction
 block, and a plain `CREATE INDEX` holds a SHARE lock on the ledger for the
 whole build, so every append would queue behind it. Inside the migration
 transaction the file is then applied only to the scratch schema, so the

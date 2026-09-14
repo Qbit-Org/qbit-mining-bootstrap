@@ -12,9 +12,11 @@
 //! drops each replaced one with `DROP INDEX CONCURRENTLY`, and records the
 //! version last, on a dedicated connection with no statement or lock
 //! timeout, under a session-level advisory lock keyed by the ledger's
-//! schema, so two starting frontends never build the same index twice. An
-//! empty ledger has nothing to block: there, `migrate_schema` applies the
-//! file inside its transaction like any other migration.
+//! schema, so two starting frontends never build the same index twice.
+//! Existing native ledgers always use this runner, even without visible
+//! shares: writers do not take the migration lock. Only fresh or empty
+//! 2.x.x sources apply the file inside `migrate_schema`'s transaction,
+//! while its cutover locks exclude writers.
 //!
 //! The runner is resumable. An interrupted build leaves an invalid index
 //! behind, still maintained by every insert; the next run drops it and
@@ -26,7 +28,7 @@
 //! every start refuses the database, as for every other required migration.
 use super::*;
 use sqlx::{Connection, PgConnection};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// What one online migration changes on the source, derived from the
 /// scratch apply: the indexes it creates, rendered by `pg_get_indexdef`,
@@ -122,10 +124,19 @@ async fn apply(
     )
     .execute(&mut *connection)
     .await?;
-    sqlx::query("SELECT pg_advisory_lock($1,hashtext(current_schema()))")
-        .bind(ONLINE_DDL_LOCK_CLASS)
-        .execute(&mut *connection)
-        .await?;
+    // A blocking advisory-lock SELECT keeps its statement snapshot while
+    // waiting. A concurrent partial-index build can wait for that snapshot
+    // to end, deadlocking with the next runner waiting for this lock. End
+    // each attempt before sleeping, outside any database transaction.
+    while !sqlx::query_scalar::<_, bool>(
+        "SELECT pg_try_advisory_lock($1,hashtext(current_schema()))",
+    )
+    .bind(ONLINE_DDL_LOCK_CLASS)
+    .fetch_one(&mut *connection)
+    .await?
+    {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     if recorded(connection, version).await? {
         tracing::info!(version, "online migration already recorded");
         return Ok(());

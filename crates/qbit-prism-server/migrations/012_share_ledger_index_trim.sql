@@ -38,13 +38,14 @@
 -- contract, and the predicate is what lets the frozen 001 function's walk
 -- stay index-only without carrying the column.
 --
--- Applied online once the ledger has rows (ONLINE_MIGRATIONS in
--- ledger/migration.rs). Inside its transaction the migrator runs this file
--- against the scratch schema, to learn the index definitions, and against
--- an empty ledger, where there is no append to block; with rows in the
--- ledger it runs each change after the commit as CREATE INDEX CONCURRENTLY
--- or DROP INDEX CONCURRENTLY, which cannot run in a transaction block, so
--- appends continue while the replacements are built, and it records 12
+-- Applied online for existing native ledgers and populated 2.x.x sources
+-- (ONLINE_MIGRATIONS in ledger/migration.rs). Inside its transaction the
+-- migrator runs this file against the scratch schema to learn the index
+-- definitions. Fresh or empty 2.x.x sources also apply it transactionally
+-- under the cutover locks that exclude writers. Every native upgrade runs
+-- each change after the commit as CREATE INDEX CONCURRENTLY or DROP INDEX
+-- CONCURRENTLY, even without visible shares, so appends continue while the
+-- replacements are built, and it records 12
 -- after the last drop. A replacement takes a new name: CREATE INDEX IF NOT
 -- EXISTS under the old name would keep the old definition.
 CREATE INDEX qbit_share_ledger_accepted_seq_walk_idx

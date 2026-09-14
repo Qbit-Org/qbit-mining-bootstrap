@@ -131,9 +131,9 @@ async fn share_count(pool: &PgPool) -> Result<i64> {
         .await?)
 }
 
-/// An empty ledger has no append to block, so 012 is applied inside the
-/// migration transaction like every other migration; the online runner is
-/// for a ledger with rows (the tests below).
+/// A fresh ledger is created while the cutover locks exclude writers, so
+/// 012 is applied inside the migration transaction. Existing native
+/// ledgers use the online runner even when they have no visible shares.
 #[tokio::test]
 async fn migration_012_trims_the_indexes_of_an_empty_ledger_in_the_transaction_and_a_restart_keeps_them(
 ) -> Result<()> {
@@ -201,10 +201,12 @@ async fn migration_012_builds_its_indexes_without_blocking_appends() -> Result<(
     let pool = PgPool::connect(&db.url).await?;
     let first = db.ledger("first").await?;
     undo_012(&pool).await?;
-    // A writer in the middle of its transaction. A plain CREATE INDEX
-    // would queue behind its row lock, and every later append behind that.
+    // The first share is still uncommitted, so the native ledger looks
+    // empty to the migrator. A plain CREATE INDEX would queue behind this
+    // writer's table lock, and every later append behind that.
     let mut writer = pool.begin().await?;
     insert_share(&mut *writer, 1, "alice").await?;
+    assert_eq!(share_count(&pool).await?, 0);
     // The migration runs on this task, polled alongside the observer below;
     // `finished` says whether it returned before the writer committed.
     let finished = AtomicBool::new(false);
@@ -218,7 +220,7 @@ async fn migration_012_builds_its_indexes_without_blocking_appends() -> Result<(
         // finish.
         timeout(Duration::from_secs(60), async {
             loop {
-                let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE query LIKE 'CREATE INDEX CONCURRENTLY%' AND wait_event_type='Lock')")
+                let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid WHERE a.query LIKE 'CREATE INDEX CONCURRENTLY%' AND a.wait_event_type='Lock' AND l.locktype='relation' AND l.relation='qbit_share_ledger'::regclass AND l.granted)")
                     .fetch_one(&pool)
                     .await?;
                 if waiting {
