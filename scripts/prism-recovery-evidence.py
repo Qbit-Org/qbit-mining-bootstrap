@@ -14,7 +14,7 @@ from pathlib import Path
 
 def summarize(lines):
     kinds = (
-        "shares", "share_sequence", "share_hashes", "blocks", "audits", "audit_bodies", "audit_snapshots",
+        "shares", "share_sequence", "sequences", "share_hashes", "blocks", "audits", "audit_bodies", "audit_snapshots",
         "carry", "payouts", "candidates", "candidate_balances",
         "ctv_sets", "ctv_artifacts", "ctv_checkpoints", "ctv_broadcast_attempts",
         "cpfp_packages", "cpfp_retired_funding", "deferred_shares",

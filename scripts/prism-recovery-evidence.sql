@@ -183,6 +183,21 @@ FROM qbit_share_ledger s ORDER BY share_seq;
 SELECT jsonb_build_object('kind', 'share_sequence', 'row', jsonb_build_object(
     'last_value', last_value, 'is_called', is_called))
 FROM qbit_share_ledger_share_seq_seq;
+-- Other durable allocators whose values appear in exported rows. Name them
+-- explicitly so a missing sequence fails the export. Session and candidate
+-- dispatch sequences only schedule work and are deliberately omitted.
+SELECT jsonb_build_object('kind', 'sequences', 'row', jsonb_build_object(
+    'sequence', name, 'last_value', last_value, 'is_called', is_called))
+FROM (
+    SELECT 'qbit_payout_carry_forward_carry_forward_seq_seq' AS name, last_value, is_called
+    FROM qbit_payout_carry_forward_carry_forward_seq_seq
+    UNION ALL SELECT 'qbit_pool_payout_entries_payout_entry_seq_seq', last_value, is_called
+    FROM qbit_pool_payout_entries_payout_entry_seq_seq
+    UNION ALL SELECT 'qbit_ctv_fanout_broadcast_attempts_attempt_seq_seq', last_value, is_called
+    FROM qbit_ctv_fanout_broadcast_attempts_attempt_seq_seq
+    UNION ALL SELECT 'qbit_audit_publication_sequence_seq', last_value, is_called
+    FROM qbit_audit_publication_sequence_seq
+) s ORDER BY name COLLATE "C";
 
 SELECT jsonb_build_object('kind', 'blocks', 'row', jsonb_build_object(
     'block_hash', block_hash, 'block_height', block_height,
@@ -400,6 +415,12 @@ FROM qbit_prism_cluster c WHERE fatal_error IS NOT NULL ORDER BY singleton;
 \if :has_fatal_state_events
 SELECT jsonb_build_object('kind', 'fatal_state_events', 'row', to_jsonb(e))
 FROM qbit_prism_fatal_state_events e ORDER BY event_id;
+-- Frozen 2.x has no such identity; omit its untouched native default so
+-- frozen, migrated and imported exports agree. Absent still fails.
+SELECT jsonb_build_object('kind', 'sequences', 'row', jsonb_build_object(
+    'sequence', 'qbit_prism_fatal_state_events_event_id_seq',
+    'last_value', last_value, 'is_called', is_called))
+FROM qbit_prism_fatal_state_events_event_id_seq WHERE is_called OR last_value <> 1;
 \endif
 
 -- Exact row shape/order used by 2.x _carry_forward_audit_head_locked.

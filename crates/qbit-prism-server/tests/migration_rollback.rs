@@ -134,6 +134,7 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         let before = recovery::accounting_state(&source.pool).await?;
         let source_evidence = recovery::evidence(&source, pg_bin).await?;
         assert_share_sequence_fingerprint(&source, pg_bin, &source_evidence).await?;
+        assert_allocator_sequence_fingerprints(&source, pg_bin, &source_evidence).await?;
         ensure!(
             recovery::evidence_with_bytea(&source, pg_bin, "escape").await? == source_evidence,
             "connection bytea defaults changed the recovery fingerprints"
@@ -167,6 +168,7 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         ensure!(recovery::evidence(&source, pg_bin).await? == source_evidence);
         assert_canonical_audit_fingerprints(&source, pg_bin, &artifacts, artifacts_dir.path()).await?;
         assert_share_sequence_fingerprint(&source, pg_bin, &source_evidence).await?;
+        assert_allocator_sequence_fingerprints(&source, pg_bin, &source_evidence).await?;
         assert_imported_audit_metadata_fingerprints(&source, pg_bin, &artifacts, artifacts_dir.path())
             .await?;
         recovery::restore(&archive, &source, &restored, pg_bin).await?;
@@ -244,6 +246,10 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
                     "{kind} obligation change was invisible to recovery evidence");
                 let mut unchanged = current.clone();
                 unchanged["records"][kind] = prior["records"][kind].clone();
+                if kind == "ctv_broadcast_attempts" && added == 1 {
+                    ensure!(current["records"]["sequences"] != prior["records"]["sequences"]);
+                    unchanged["records"]["sequences"] = prior["records"]["sequences"].clone();
+                }
                 ensure!(unchanged == prior, "unrelated accounting changed with {kind}");
                 prior = current;
             }
@@ -335,6 +341,8 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
             != before_halt["records"]["fatal_state_events"]["sha256"]);
         let mut unchanged = cleared.clone();
         unchanged["records"]["fatal_state_events"] = before_halt["records"]["fatal_state_events"].clone();
+        ensure!(cleared["records"]["sequences"] != before_halt["records"]["sequences"]);
+        unchanged["records"]["sequences"] = before_halt["records"]["sequences"].clone();
         ensure!(unchanged == before_halt, "recovery history must independently distinguish a cleared halt");
 
         assert_native_audit_payload_fingerprints(&source, pg_bin, &artifacts[0]).await?;
@@ -485,6 +493,78 @@ async fn assert_share_sequence_fingerprint(
         .execute(&db.pool)
         .await?;
     ensure!(missing.is_err(), "missing share allocator was accepted");
+    ensure!(recovery::evidence(db, pg_bin).await? == *baseline);
+    Ok(())
+}
+
+/// Row evidence alone cannot see a rewound allocator for exported serial
+/// columns; each named sequence must change only its own fingerprint.
+async fn assert_allocator_sequence_fingerprints(
+    db: &recovery::Database,
+    pg_bin: &std::path::Path,
+    baseline: &serde_json::Value,
+) -> Result<()> {
+    let mut sequences = vec![
+        "qbit_payout_carry_forward_carry_forward_seq_seq",
+        "qbit_pool_payout_entries_payout_entry_seq_seq",
+        "qbit_ctv_fanout_broadcast_attempts_attempt_seq_seq",
+        "qbit_audit_publication_sequence_seq",
+    ];
+    let native: bool =
+        sqlx::query_scalar("SELECT to_regclass('qbit_prism_schema_migrations') IS NOT NULL")
+            .fetch_one(&db.pool)
+            .await?;
+    if native {
+        sequences.push("qbit_prism_fatal_state_events_event_id_seq");
+    }
+    for sequence in sequences {
+        let original: (i64, bool) =
+            sqlx::query_as(&format!("SELECT last_value, is_called FROM {sequence}"))
+                .fetch_one(&db.pool)
+                .await?;
+        let rewound = if original.0 > 1 {
+            original.0 - 1
+        } else {
+            original.0 + 1
+        };
+        for (last_value, is_called) in [(rewound, original.1), (original.0, !original.1)] {
+            sqlx::query("SELECT setval($1::regclass,$2,$3)")
+                .bind(sequence)
+                .bind(last_value)
+                .bind(is_called)
+                .execute(&db.pool)
+                .await?;
+            let changed = recovery::evidence(db, pg_bin).await;
+            sqlx::query("SELECT setval($1::regclass,$2,$3)")
+                .bind(sequence)
+                .bind(original.0)
+                .bind(original.1)
+                .execute(&db.pool)
+                .await?;
+            let mut changed = changed?;
+            ensure!(
+                changed["records"]["sequences"] != baseline["records"]["sequences"],
+                "{sequence} change was invisible: {last_value}, {is_called}"
+            );
+            changed["records"]["sequences"] = baseline["records"]["sequences"].clone();
+            ensure!(
+                changed == *baseline,
+                "unrelated evidence changed with {sequence} state"
+            );
+        }
+        sqlx::query(&format!(
+            "ALTER SEQUENCE {sequence} RENAME TO saved_allocator_sequence"
+        ))
+        .execute(&db.pool)
+        .await?;
+        let missing = recovery::evidence(db, pg_bin).await;
+        sqlx::query(&format!(
+            "ALTER SEQUENCE saved_allocator_sequence RENAME TO {sequence}"
+        ))
+        .execute(&db.pool)
+        .await?;
+        ensure!(missing.is_err(), "missing {sequence} was accepted");
+    }
     ensure!(recovery::evidence(db, pg_bin).await? == *baseline);
     Ok(())
 }
