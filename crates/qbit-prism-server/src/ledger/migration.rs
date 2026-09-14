@@ -1464,8 +1464,10 @@ fn sequence_differences(expected: &SequenceDefinition, found: &SequenceDefinitio
 /// fails every native share insert, which writes epoch 0) or rewrite them.
 /// Policies and triggers on tables the release does not create are not
 /// reported. A release constraint must be validated in the source unless
-/// it is one of `NOT_VALID_EXEMPT`. A sequence is compared by its structure
-/// only: the value it has reached is the source's data.
+/// it is one of `NOT_VALID_EXEMPT`. Extra columns must allow native inserts
+/// to omit them: nullable, defaulted, identity or generated columns may stay.
+/// A sequence is compared by its structure only: the value it has reached
+/// is the source's data.
 fn compare_fingerprints(
     expected: &SchemaFingerprint,
     found: &SchemaFingerprint,
@@ -1496,9 +1498,19 @@ fn compare_fingerprints(
                 Some(_) => {}
             }
         }
-        for column in found_columns.keys() {
+        for (column, definition) in found_columns {
             if !columns.contains_key(column) {
-                comparison.extra.push(format!("column {table}.{column}"));
+                if definition.not_null
+                    && definition.default.is_none()
+                    && definition.identity.is_empty()
+                    && definition.generated.is_empty()
+                {
+                    comparison.drift.push(format!(
+                        "column {table}.{column} is an extra NOT NULL column without a default, identity or generated expression; native inserts omit it"
+                    ));
+                } else {
+                    comparison.extra.push(format!("column {table}.{column}"));
+                }
             }
         }
     }

@@ -1600,6 +1600,91 @@ async fn extra_constraint_on_a_release_table_is_refused_naming_it_and_rolls_back
     Ok(())
 }
 
+/// A backfilled required column has no value for an omitted native insert.
+/// Accept it only after the operator makes omission possible again.
+#[tokio::test]
+async fn required_extra_column_is_refused_naming_it_and_rolls_back() -> Result<()> {
+    for (state, nonce, repair) in [
+        (SourceState::Pre258, 6601, "SET DEFAULT 'native'"),
+        (SourceState::Applied258, 6602, "DROP NOT NULL"),
+    ] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let pool = PgPool::connect(&db.url).await?;
+        apply_frozen_2x_schema(&pool, state).await?;
+        insert_share_as_writer(&pool, "legacy:1", 1).await?;
+        sqlx::raw_sql("ALTER TABLE qbit_share_ledger ADD COLUMN operator_note text DEFAULT 'backfilled'; ALTER TABLE qbit_share_ledger ALTER COLUMN operator_note SET NOT NULL; ALTER TABLE qbit_share_ledger ALTER COLUMN operator_note DROP DEFAULT")
+            .execute(&pool).await?;
+        let refused = insert_share_as_writer(&pool, "native:0", 0)
+            .await
+            .err()
+            .context("the required column accepted an omitted value")?
+            .to_string();
+        assert!(refused.contains("operator_note"), "{refused}");
+        let objects = schema_objects(&pool).await?;
+        let rows: Vec<Value> = sqlx::query_scalar("SELECT to_jsonb(s) FROM qbit_share_ledger s")
+            .fetch_all(&pool)
+            .await?;
+        let error = db
+            .ledger("a")
+            .await
+            .err()
+            .context("migration accepted an unsatisfied required extra column")?
+            .to_string();
+        assert!(
+            error.contains("refusing to migrate a drifted 001 source"),
+            "{error}"
+        );
+        assert!(error.contains("1 object(s) differ"), "{error}");
+        assert!(error.contains("column qbit_share_ledger.operator_note is an extra NOT NULL column without a default, identity or generated expression; native inserts omit it"), "{error}");
+        assert!(error.contains("Nothing was changed"), "{error}");
+        assert!(native_tables_absent(&pool).await?, "refusal ran native DDL");
+        assert_eq!(schema_objects(&pool).await?, objects);
+        assert_eq!(
+            sqlx::query_scalar::<_, Value>("SELECT to_jsonb(s) FROM qbit_share_ledger s")
+                .fetch_all(&pool)
+                .await?,
+            rows
+        );
+        assert!(sqlx::query_scalar::<_, bool>("SELECT attnotnull AND NOT atthasdef FROM pg_attribute WHERE attrelid='qbit_share_ledger'::regclass AND attname='operator_note'")
+            .fetch_one(&pool).await?);
+
+        // Each way PostgreSQL can supply an omitted column remains supported.
+        sqlx::raw_sql(&format!("ALTER TABLE qbit_share_ledger ALTER COLUMN operator_note {repair}; ALTER TABLE qbit_share_ledger ADD COLUMN operator_nullable text, ADD COLUMN operator_default text NOT NULL DEFAULT 'defaulted', ADD COLUMN operator_identity bigint GENERATED ALWAYS AS IDENTITY, ADD COLUMN operator_generated bigint GENERATED ALWAYS AS (writer_epoch + 1) STORED NOT NULL"))
+            .execute(&pool).await?;
+        let ledger = db.ledger("a").await?;
+        assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+        assert_eq!(
+            ledger.migration_source().await?.map(|s| s.source_state),
+            Some(state.as_str().to_owned())
+        );
+        exercise_native_writers(&ledger, 1, nonce).await?;
+        let (note, supplied): (Option<String>, bool) = sqlx::query_as("SELECT operator_note, operator_nullable IS NULL AND operator_default='defaulted' AND operator_identity IS NOT NULL AND operator_generated=1 FROM qbit_share_ledger WHERE share_id=$1")
+            .bind(share(1).share_id).fetch_one(&pool).await?;
+        assert_eq!(
+            note.as_deref(),
+            if state == SourceState::Pre258 {
+                Some("native")
+            } else {
+                None
+            }
+        );
+        assert!(supplied);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT operator_note FROM qbit_share_ledger WHERE share_id='legacy:1'"
+            )
+            .fetch_one(&pool)
+            .await?,
+            "backfilled"
+        );
+        pool.close().await;
+        db.close(vec![ledger]).await?;
+    }
+    Ok(())
+}
+
 /// The operator's own triggers, as `table.trigger=state`.
 async fn operator_triggers(pool: &PgPool) -> Result<Vec<String>> {
     Ok(sqlx::query_scalar("SELECT c.relname::text||'.'||t.tgname::text||'='||t.tgenabled::text FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid WHERE c.relnamespace=current_schema()::regnamespace AND NOT t.tgisinternal AND t.tgname LIKE 'operator%' ORDER BY 1")

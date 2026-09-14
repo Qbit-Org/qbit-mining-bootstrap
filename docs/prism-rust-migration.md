@@ -237,8 +237,12 @@ own and is kept. An extra constraint on a release table is also drift:
 `CHECK (writer_epoch > 0)` accepts legacy shares but rejects native shares,
 so migration refuses it by name and definition, regardless of validation or
 enforcement state. Constraints on the operator's own tables are kept.
-Extra tables, columns, indexes, functions and sequences are kept and logged
-at warning level. A missing or different object refuses the migration:
+An extra `NOT NULL` column on a release table without a default, identity
+or generated expression is also drift: native inserts omit it and would
+fail. Nullable, defaulted, identity and generated extra columns remain
+accepted. These columns and extra tables, indexes, functions and sequences
+are kept and logged at warning level. A missing or different object refuses
+the migration:
 
 ```
 refusing to migrate a drifted 001 source: after 001_share_ledger.sql ran, the database does not
