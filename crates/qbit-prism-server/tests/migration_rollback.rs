@@ -240,6 +240,48 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         }
         ensure!(recovery::evidence(&source, pg_bin).await? == prior);
         ensure!(recovery::evidence(&restored, pg_bin).await? == source_evidence);
+
+        // Corrupt payload fields without changing the artifact's identity or
+        // settlement status. Both native and frozen 2.x exports must detect
+        // each change independently, even though the row count is unchanged.
+        for (db, schema) in [(&source, "native"), (&restored, "frozen 2.x")] {
+            let mut prior = recovery::evidence(db, pg_bin).await?;
+            for mutation in [
+                "manifest_json='{} '",
+                "manifest='{\"corrupted\":true}'",
+                "manifest_sha256=repeat('aa',32)",
+                "precommitment_sha256=repeat('bb',32)",
+                "ctv_hash=repeat('cc',32)",
+                "commitment_witness_leaf_hex='01'",
+                "chunk_count=2",
+                "chunk_index=1",
+                "parent_coinbase_txid=repeat('dd',32)",
+                "parent_coinbase_vout=1",
+                "fanout_tx_template_hex='02'",
+                "fanout_tx_hex='03'",
+                "anchor_vout=0",
+                "covenant_output_value_sats=1001",
+                "fanout_output_sum_sats=999",
+            ] {
+                sqlx::query(&format!(
+                    "UPDATE {}.qbit_ctv_fanout_artifacts SET {mutation} WHERE fanout_txid=repeat('33',32)",
+                    db.schema
+                ))
+                .execute(&db.pool)
+                .await?;
+                let current = recovery::evidence(db, pg_bin).await?;
+                ensure!(current["records"]["ctv_artifacts"]["count"] == 1);
+                ensure!(
+                    current["records"]["ctv_artifacts"]["sha256"]
+                        != prior["records"]["ctv_artifacts"]["sha256"],
+                    "{schema} CTV payload change was invisible to recovery evidence: {mutation}"
+                );
+                let mut unchanged = current.clone();
+                unchanged["records"]["ctv_artifacts"] = prior["records"]["ctv_artifacts"].clone();
+                ensure!(unchanged == prior, "unrelated accounting changed with {mutation}");
+                prior = current;
+            }
+        }
         ledger.pool.close().await;
         Ok::<_, anyhow::Error>(())
     }

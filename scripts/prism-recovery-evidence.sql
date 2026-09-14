@@ -36,9 +36,19 @@ SELECT jsonb_build_object('kind', 'ctv_sets', 'row', jsonb_build_object(
     'block_hash', block_hash, 'manifest_set_sha256', manifest_set_sha256,
     'parent_coinbase_txid', parent_coinbase_txid, 'fanout_count', fanout_count))
 FROM qbit_ctv_fanout_sets ORDER BY block_hash COLLATE "C";
+-- Keep the immutable payout payload in the fingerprint while excluding native
+-- claim/confirmation metadata that does not exist in the frozen 2.x schema.
 SELECT jsonb_build_object('kind', 'ctv_artifacts', 'row', jsonb_build_object(
     'fanout_txid', fanout_txid, 'block_hash', block_hash,
     'manifest_set_sha256', manifest_set_sha256,
+    'manifest_json', manifest_json, 'manifest', manifest,
+    'manifest_sha256', manifest_sha256, 'precommitment_sha256', precommitment_sha256,
+    'ctv_hash', ctv_hash, 'commitment_witness_leaf_hex', commitment_witness_leaf_hex,
+    'chunk_index', chunk_index, 'chunk_count', chunk_count,
+    'parent_coinbase_txid', parent_coinbase_txid, 'parent_coinbase_vout', parent_coinbase_vout,
+    'fanout_tx_template_hex', fanout_tx_template_hex, 'fanout_tx_hex', fanout_tx_hex,
+    'anchor_vout', anchor_vout, 'covenant_output_value_sats', covenant_output_value_sats,
+    'fanout_output_sum_sats', fanout_output_sum_sats,
     'settlement_status', settlement_status))
 FROM qbit_ctv_fanout_artifacts ORDER BY fanout_txid COLLATE "C";
 
