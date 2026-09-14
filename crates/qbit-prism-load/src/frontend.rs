@@ -271,8 +271,12 @@ impl BuildProfile {
     }
 }
 
+/// Inferred from the directory Cargo put the binary in, after following
+/// symlinks: a link into `target/release` is a release build, while a copied
+/// or installed binary has no Cargo directory to read and stays `Unknown`.
 pub fn build_profile(path: &Path) -> BuildProfile {
-    match path
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    match resolved
         .parent()
         .and_then(|parent| parent.file_name())
         .and_then(|name| name.to_str())
@@ -280,6 +284,36 @@ pub fn build_profile(path: &Path) -> BuildProfile {
         Some("debug") => BuildProfile::Debug,
         Some("release") => BuildProfile::Release,
         _ => BuildProfile::Unknown,
+    }
+}
+
+/// Whether a server of this profile may be driven. Only a build shown to be a
+/// release build measures capacity; a debug build and a build whose profile
+/// cannot be determined both need `--allow-debug-server`, because an unknown
+/// profile is not evidence of a release build.
+pub fn check_server_profile(profile: BuildProfile, allow_debug: bool, path: &Path) -> Result<()> {
+    match profile {
+        BuildProfile::Release => Ok(()),
+        BuildProfile::Debug => {
+            ensure!(
+                allow_debug,
+                "{} is a debug build, which does not measure capacity; pass \
+                 --allow-debug-server to run it anyway",
+                path.display()
+            );
+            Ok(())
+        }
+        BuildProfile::Unknown => {
+            ensure!(
+                allow_debug,
+                "the build profile of {} cannot be determined: it is not in a Cargo debug or \
+                 release directory, so it cannot be shown to be a release build; build it with \
+                 --release and point --server-bin at target/release, or pass \
+                 --allow-debug-server to run it anyway",
+                path.display()
+            );
+            Ok(())
+        }
     }
 }
 

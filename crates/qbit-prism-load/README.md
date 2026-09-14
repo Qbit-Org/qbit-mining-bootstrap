@@ -23,7 +23,10 @@ measure.
 
 - **Release builds.** A debug-profile server is not a capacity measurement; the
   harness refuses one unless `--allow-debug-server` is given, and records the
-  build profile of both binaries either way.
+  build profile of both binaries either way. The profile is read from the
+  Cargo directory the binary sits in, after following symlinks, so a copied
+  or installed binary has an unknown profile, and an unknown profile needs
+  the same override: it cannot be shown to be a release build.
 
   ```sh
   cargo build --locked --release -p qbit-prism-server -p qbit-prism-load
@@ -63,7 +66,7 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--server-bin` | the `qbit-prism-server` beside this binary | Frontend executable |
-| `--allow-debug-server` | off | Run a debug-profile server anyway |
+| `--allow-debug-server` | off | Run a server whose build profile is debug, or cannot be determined from its location, anyway |
 | `--allow-dirty-tree` | off | Run with modified tracked files; forces `artifact_kind: example` |
 | `--example-artifact` | off | Emit `artifact_kind: example` from a clean tree |
 | `--pg-bin-dir` | `QBIT_PRISM_LOAD_PG_BIN_DIR`, then `pg_config --bindir` | PostgreSQL server binaries. The harness keeps its own variable rather than reading one of the shared test-gate variables, which belong to the gate crate (#322) |

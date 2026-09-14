@@ -149,12 +149,7 @@ pub async fn execute(args: Args) -> Result<i32> {
     } else {
         "release"
     };
-    ensure!(
-        server_profile != frontend::BuildProfile::Debug || args.allow_debug_server,
-        "{} is a debug build, which does not measure capacity; pass --allow-debug-server to \
-         run it anyway",
-        server_bin.display()
-    );
+    frontend::check_server_profile(server_profile, args.allow_debug_server, &server_bin)?;
     let server_bytes =
         std::fs::read(&server_bin).with_context(|| format!("reading {}", server_bin.display()))?;
     let server_digest = format!("sha256:{}", hex::encode(Sha256::digest(&server_bytes)));

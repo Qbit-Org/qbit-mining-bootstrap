@@ -43,8 +43,8 @@ pub struct Args {
     /// `qbit-prism-server` executable. Defaults to the one beside this binary.
     #[arg(long)]
     pub server_bin: Option<PathBuf>,
-    /// Run a debug-profile server anyway. Debug builds are not a capacity
-    /// measurement.
+    /// Run a server whose build profile is debug, or cannot be determined
+    /// from its location, anyway. Neither is a capacity measurement.
     #[arg(long)]
     pub allow_debug_server: bool,
     /// Run with modified tracked files. Forces `artifact_kind: example`.

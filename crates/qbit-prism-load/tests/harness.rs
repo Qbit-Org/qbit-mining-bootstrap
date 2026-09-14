@@ -724,6 +724,61 @@ async fn a_stale_frontend_log_is_truncated_on_launch_and_kept_across_a_restart()
     Ok(())
 }
 
+/// The build profile is read from the Cargo directory the binary sits in,
+/// through symlinks. A binary at any other path has an unknown profile, and
+/// an unknown profile needs the same override a debug build does: it cannot
+/// be shown to be a release build, so letting it through silently would let a
+/// debug build at a copied path produce a qualification artifact.
+#[test]
+fn an_unknown_build_profile_needs_the_debug_override() -> Result<()> {
+    use qbit_prism_load::frontend::{build_profile, check_server_profile, BuildProfile};
+    let dir = ScratchDir::new("profile");
+    let release = dir.path().join("target").join("release");
+    let debug = dir.path().join("target").join("debug");
+    std::fs::create_dir_all(&release)?;
+    std::fs::create_dir_all(&debug)?;
+    let built = release.join("qbit-prism-server");
+    std::fs::write(&built, b"binary")?;
+    std::fs::write(debug.join("qbit-prism-server"), b"binary")?;
+    let copied = dir.path().join("qbit-prism-server");
+    std::fs::copy(&built, &copied)?;
+    let linked = dir.path().join("server-link");
+    std::os::unix::fs::symlink(&built, &linked)?;
+
+    assert_eq!(build_profile(&built), BuildProfile::Release);
+    assert_eq!(
+        build_profile(&debug.join("qbit-prism-server")),
+        BuildProfile::Debug
+    );
+    assert_eq!(
+        build_profile(&linked),
+        BuildProfile::Release,
+        "a symlink into target/release is shown to be a release build"
+    );
+    assert_eq!(build_profile(&copied), BuildProfile::Unknown);
+
+    check_server_profile(BuildProfile::Release, false, &built)?;
+    check_server_profile(BuildProfile::Debug, true, &built)?;
+    check_server_profile(BuildProfile::Unknown, true, &copied)?;
+    let refused = format!(
+        "{:#}",
+        check_server_profile(BuildProfile::Debug, false, &built)
+            .expect_err("a debug build needs the override")
+    );
+    assert!(refused.contains("--allow-debug-server"), "{refused}");
+    let refused = format!(
+        "{:#}",
+        check_server_profile(BuildProfile::Unknown, false, &copied)
+            .expect_err("an unknown profile needs the override too")
+    );
+    assert!(refused.contains("--allow-debug-server"), "{refused}");
+    assert!(
+        refused.contains("cannot be determined"),
+        "the refusal says why: {refused}"
+    );
+    Ok(())
+}
+
 // --- artifact -------------------------------------------------------------
 
 fn sample_inputs() -> ArtifactInputs {
