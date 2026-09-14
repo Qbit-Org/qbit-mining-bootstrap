@@ -562,9 +562,9 @@ async fn api_get(app: &axum::Router, path: &str) -> Result<(axum::http::StatusCo
     Ok((status, serde_json::from_slice(&bytes)?))
 }
 
-async fn land_confirmed(ledger: &Ledger, block: &Candidate) -> Result<()> {
-    ledger.enqueue_candidate(block.clone()).await?;
-    let claim = ledger.claim_candidate(60).await?.unwrap();
+async fn land_confirmed(ledger: &Ledger, block: &TestCandidate) -> Result<()> {
+    ledger.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(ledger.claim_candidate(60).await?.unwrap());
     ledger
         .land_candidate(&claim, &keys().1.public_key_hex())
         .await?;
@@ -575,7 +575,7 @@ async fn land_confirmed(ledger: &Ledger, block: &Candidate) -> Result<()> {
 /// in the `body_uri` file, as the legacy import finds it.
 async fn externalize(
     pool: &PgPool,
-    block: &Candidate,
+    block: &TestCandidate,
     dir: &std::path::Path,
 ) -> Result<std::path::PathBuf> {
     let path = dir.join(format!("legacy-audit-{}.json", block.block_hash));
@@ -623,7 +623,7 @@ fn ensure_ok(status: axum::http::StatusCode, body: &Value) -> Result<()> {
 async fn dashboard_row_with_inline_import(
     app: &axum::Router,
     pool: &PgPool,
-    block: &Candidate,
+    block: &TestCandidate,
 ) -> Result<Value> {
     let current: Option<Value> =
         sqlx::query_scalar("SELECT audit_bundle FROM qbit_pool_audit_bundles WHERE block_hash=$1")
@@ -682,7 +682,9 @@ async fn imported_external_audit_is_served_from_canonical_bytes_without_the_lega
     let snapshot = ledger.snapshot(100).await?;
     let block = candidate_with_bundle(
         settled_bundle(&snapshot, 0, Default::default())?,
+        WindowRef::from_snapshot(&snapshot)?,
         snapshot.payout_revision,
+        None,
         5001,
     )?;
     let hash = block.block_hash.clone();
@@ -875,7 +877,13 @@ async fn imported_ctv_audit_backfills_and_links_without_the_legacy_file() -> Res
             ..Default::default()
         },
     )?;
-    let block = candidate_with_bundle(bundle, snapshot.payout_revision, 5201)?;
+    let block = candidate_with_bundle(
+        bundle,
+        WindowRef::from_snapshot(&snapshot)?,
+        snapshot.payout_revision,
+        Some(test_ctv()),
+        5201,
+    )?;
     let hash = block.block_hash.clone();
     land_confirmed(&ledger, &block).await?;
     let dir = tempfile::tempdir()?;
@@ -1131,7 +1139,9 @@ async fn decode_limit_outlives_a_dropped_request() -> Result<()> {
     let snapshot = ledger.snapshot(100).await?;
     let block = candidate_with_bundle(
         settled_bundle(&snapshot, 0, Default::default())?,
+        WindowRef::from_snapshot(&snapshot)?,
         snapshot.payout_revision,
+        None,
         5501,
     )?;
     let hash = block.block_hash.clone();
