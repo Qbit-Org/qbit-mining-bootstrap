@@ -6,7 +6,7 @@ observations, with #277 freshness, collector age/availability, and runtime state
 Scraping performs no database, node, or filesystem I/O. Public-api metrics retain
 their existing contract.
 
-The generated table below is the sole inventory for both roles: **38 coordinator
+The generated table below is the sole inventory for both roles: **39 coordinator
 families and 14 public families**. Names, types and meanings for `run` come from
 [registry.rs](../crates/qbit-prism-server/src/metrics/registry.rs#L42), with bounded
 label values from [labels.rs](../crates/qbit-prism-server/src/metrics/labels.rs#L15).
@@ -61,6 +61,7 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_health_state` | gauge | none | run | Whether this instance is ready to serve mining work. | none |
 | `qbit_prism_job_delivery_failures_total` | counter | none | run | Failed local job deliveries. | none |
 | `qbit_prism_job_delivery_successes_total` | counter | none | run | Successful local job deliveries. | none |
+| `qbit_prism_late_confirmed_shares_total` | counter | none | run | Shares accepted after the share commit deadline once their in-flight ledger commit was confirmed. | none |
 | `qbit_prism_low_difficulty_shares_total` | counter | none | run | Low difficulty share rejections. | `qbit_prism_low_difficulty_shares_total` |
 | `qbit_prism_metrics_snapshot_age_seconds` | gauge | none | run | Monotonic age of the metrics snapshot, or -1 before the first publication. | `qbit_prism_metrics_snapshot_age_seconds` |
 | `qbit_prism_metrics_snapshot_available` | gauge | none | run | Whether a complete metrics snapshot has been published. | `qbit_prism_metrics_snapshot_available` |
@@ -82,7 +83,7 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_public_responses_total` | counter | `status` (HTTP status code) | public-api | HTTP responses by status, including health probes; appears after the first response. | `qbit_prism_public_responses_total` |
 | `qbit_prism_public_staleness_refusals_total` | counter | none | public-api | Responses refused for exceeding an endpoint cache-age budget. | `qbit_prism_public_staleness_refusals_total` |
 | `qbit_prism_rejected_shares_total` | counter | none | run | Shares rejected by this instance since process start. | none |
-| `qbit_prism_rejections_total` | counter | `reason_id=stale-job,duplicate-share,low-difficulty,malformed-submit,unauthorized-worker,unknown-job,invalid-extranonce,invalid-ntime-or-nonce,backend-rpc-unavailable,internal-error,pool-closed,ledger-confirmation-failed` | run | Share rejections by canonical bounded reason ID. | `qbit_prism_rejections_total` |
+| `qbit_prism_rejections_total` | counter | `reason_id=stale-job,duplicate-share,low-difficulty,malformed-submit,unauthorized-worker,unknown-job,invalid-extranonce,invalid-ntime-or-nonce,backend-rpc-unavailable,internal-error,pool-closed,ledger-confirmation-failed,ledger-outcome-unknown` | run | Share rejections by canonical bounded reason ID. | `qbit_prism_rejections_total` |
 | `qbit_prism_runtime_lag_seconds` | gauge | none | run | Latest observed runtime sampler wake lateness, or -1 before the first observation. Runtime-stall intent replaces lease wake delay; no native writer lease. | `qbit_prism_lease_heartbeat_monitor_wake_delay_window_max_seconds` |
 | `qbit_prism_runtime_poll_lag_seconds` | gauge | `task=refresh,submit,block_wait,broadcast,rollup,health_publisher,stratum_listener,stratum_session,collector` | run | Maximum active poll duration or completed poll duration retained for 60 to 61 seconds, by task. | none |
 | `qbit_prism_runtime_progress_age_seconds` | gauge | `task=refresh,submit,block_wait,broadcast,rollup,health_publisher,stratum_listener,stratum_session,collector` | run | Oldest active operation time since progress; zero when idle. | none |
@@ -119,6 +120,30 @@ ACK write fails; cancellation before a rejection or durable acceptance produces
 neither event. Existing accepted/rejected totals keep their original Stratum
 accounting boundary. The grace hook does not reinterpret the caller's grace
 hint; it uses the coordinator's stale decision after the database confirms credit.
+
+Share acknowledgements follow the ledger outcome (#324). A share-pass append
+whose COMMIT was already in flight at `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS` can
+still be accepted within `share_commit_grace` (5 s); each such acceptance
+increments `qbit_prism_late_confirmed_shares_total`. A share-pass submission
+carrying a found-block candidate is never refused, so it can be confirmed later
+still, up to `block_only_ack_timeout`; those acceptances are counted the same
+way. The counter is keyed on when the append itself finished, not on when the
+acknowledgement was processed. Three outcomes are answered
+`ledger-outcome-unknown`, never `ledger-confirmation-failed`: a COMMIT still in
+flight after the grace period, a COMMIT failure other than a severity-ERROR
+reply, and, under the sync-rep guard, a COMMIT that took at least the ledger
+sessions' `statement_timeout`, because that may be a synchronous-replication
+wait cancelled after local commit. Such a share may still be credited, and the
+warning log names its `share_id`. Unknown answers are rejections under the
+protocol, so they count in `qbit_prism_rejected_shares_total`,
+`qbit_prism_rejections_total{reason_id="ledger-outcome-unknown"}` and
+`qbit_prism_share_ack_seconds{result="rejected"}`. Block-only proofs wait for
+their candidate's disposition, and share-pass appends that carry a found block
+wait for their append, up to `block_only_ack_timeout`
+(`max(60 s, PRISM_SHARE_COMMIT_TIMEOUT_SECONDS)`); either is answered
+`ledger-outcome-unknown` if still pending then. Such an ACK between 30 and 60
+seconds lands only in the `+Inf` bucket. Neither `share_commit_grace` nor
+`block_only_ack_timeout` is an environment variable.
 
 Collectors run every ten seconds. Database collection uses a read-only,
 repeatable-read transaction with a three-second overall deadline, a two-second

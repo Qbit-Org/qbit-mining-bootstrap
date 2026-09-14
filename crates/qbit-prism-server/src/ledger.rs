@@ -33,6 +33,7 @@ pub use jobs::{IssuedJobSave, PreparedDependency};
 mod migration;
 mod window;
 pub use difficulty::WorkerDifficulty;
+pub use window::CommitGateClosed;
 use window::{read_prior_balances, share_from_row};
 pub use window::{
     AppendResult, BalanceSource, PayoutState, ShareRange, Snapshot, Window, WindowError, WindowRef,

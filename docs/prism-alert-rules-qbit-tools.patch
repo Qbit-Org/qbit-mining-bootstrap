@@ -106,7 +106,7 @@
 -  that never increment RestartCount, so planned work needs no maintenance
 -  flag; drills that crash the coordinator on purpose use a Grafana silence.
 +{# Native 3.x.x cutover draft, bootstrap #279. Apply only with the native image.
-+   Specification SHA-256: a92ac4ab3ed50f2a0373aa33f255789ea590f069c0c3547857d62e0e41ae57a2
++   Specification SHA-256: efcfb334ddf17222c86e3be2d34399c52e8a06c6a4d3b1e6a9004b811d7e7e4d
 +   Generated from the reviewed a007a142 snapshot; backup, sidecar and lifecycle rules retain their producers.
 +   Native numeric bounds marked provisional must be measured in #291 before production cutover.
 +   The D3 group requires PRIMARY postgres_exporter query metrics; see bootstrap docs/prism-alert-migration.md.
@@ -359,14 +359,14 @@
 +      "alert_class": "prism-runtime"
 +    },
 +    "summary": "PrismRejectRatioByReasonHigh",
-+    "description": "Preserves reason_id on each alert; rejected includes failed response writes. Diagnose ledger-confirmation-failed, backend-rpc-unavailable, stale-job, duplicate-share and low-difficulty separately. Five percent per canonical reason over five minutes, with at least 100 acceptance/rejection decisions. Provisional, measure in #291.",
++    "description": "Preserves reason_id on each alert; rejected includes failed response writes. Diagnose ledger-confirmation-failed, ledger-outcome-unknown, backend-rpc-unavailable, stale-job, duplicate-share and low-difficulty separately. Five percent per canonical reason over five minutes, with at least 100 acceptance/rejection decisions. Provisional, measure in #291.",
 +    "no_data_state": "OK",
 +    "exec_err_state": "OK"
 +  },
 +  {
 +    "uid": "qbit-prism-share-append-failures",
 +    "title": "PrismShareAppendFailures",
-+    "expr": "(sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",reason_id=\"ledger-confirmation-failed\"}[5m])) > bool 0) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0))",
++    "expr": "(sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",reason_id=~\"ledger-confirmation-failed|ledger-outcome-unknown\"}[5m])) > bool 0) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0))",
 +    "condition_type": "threshold",
 +    "evaluator": "gt",
 +    "threshold": 0,
@@ -377,7 +377,7 @@
 +      "alert_class": "prism-runtime"
 +    },
 +    "summary": "PrismShareAppendFailures",
-+    "description": "At least one share was rejected because its durable ledger confirmation failed in the five-minute window. This preserves the low-volume total-write-failure signal from the deployed rule while retaining the native reason_id and freshness guards.",
++    "description": "At least one share was rejected in the five-minute window because its ledger confirmation failed or outcome unknown (ledger-confirmation-failed or ledger-outcome-unknown). This preserves the low-volume total-write-failure signal from the deployed rule while retaining the native reason_id and freshness guards.",
 +    "no_data_state": "OK",
 +    "exec_err_state": "OK"
 +  },
@@ -577,7 +577,7 @@
 +      "alert_class": "prism-runtime"
 +    },
 +    "summary": "PrismDatabasePoolWaitHigh",
-+    "description": "Actual PgPool::acquire waits from metrics collection and instrumented ledger transactions, including share processing; BEGIN, query execution and advisory-lock waits are outside this timer. Non-transaction queries issued directly through the pool are not timed. Success and failure observations are combined; collector availability remains a separate guard. Pool p99 >0.5 seconds from at least ten observed acquisition attempts in five minutes; provisional, measure in #291.",
++    "description": "Actual PgPool::acquire waits from metrics collection and instrumented ledger transactions, including share processing; BEGIN, query execution and advisory-lock waits are outside this timer. Pool traffic outside these instrumented acquisition paths, including rollup worker transactions and public API queries, is not timed. Success and failure observations are combined; collector availability remains a separate guard. Pool p99 >0.5 seconds from at least ten observed acquisition attempts in five minutes; provisional, measure in #291.",
 +    "no_data_state": "OK",
 +    "exec_err_state": "OK"
 +  },

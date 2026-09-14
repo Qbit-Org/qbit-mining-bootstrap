@@ -186,9 +186,28 @@ commit outcome. A timeout therefore is not proof of rollback or a reliable
 "no positive ACK" policy. See PostgreSQL's
 [synchronous-wait cancellation handling](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/replication/syncrep.c).
 
-This overlay does not change the ledger's timeout/notice handling. #291 must
-exercise the actual PRISM share-ACK path with the standby stopped, through and
-beyond these timeouts, including lost client responses. **Strict standby-down
+This overlay changes nothing here, but #324 changes how the share-ACK path
+handles these timeouts and outcomes. A share-pass append passes a one-shot
+commit gate immediately before COMMIT. At `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS`
+the ACK path closes the gate if COMMIT has not been sent: the append rolls back
+and the miner gets `ledger-confirmation-failed`. If COMMIT is already in
+flight, the ACK path waits a further `share_commit_grace` (5 s) for its reply.
+Only a severity-ERROR reply counts as a rollback; any other failure, or no
+reply by then, is answered `ledger-outcome-unknown` and logged with the share
+ID. A sync-rep guard also answers `ledger-outcome-unknown`, not accepted, when
+COMMIT took at least the ledger sessions' effective `statement_timeout`,
+because that may be a synchronous-replication wait cancelled after local
+commit. Block-only proofs wait for their candidate's disposition up to
+`block_only_ack_timeout`.
+
+**Declared limitation:** under a synchronous standby, a block-only ACK within
+`block_only_ack_timeout` can follow a credit whose sync-rep wait was cancelled
+at `statement_timeout`. The credit is committed by the candidate submitter or
+by reconciliation, not by the ACK path, so the guard cannot see that wait.
+
+#291 must exercise the actual PRISM share-ACK path with the standby stopped,
+through and beyond these timeouts, including lost client responses. Its
+standby-down run must cover block-only proofs as well. **Strict standby-down
 ACK behavior is not certified by selecting `on` alone.** Resolve any required
 runtime changes with the ledger owner before adopting that D3 option. Increasing
 a finite timeout only postpones the question; do not claim an infinite wait.
