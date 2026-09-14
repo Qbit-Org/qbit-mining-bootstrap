@@ -130,7 +130,21 @@ pub async fn run() -> Result<()> {
             let config = config::DatabaseConfig::from_env()?;
             let ledger =
                 crate::ledger::Ledger::connect_operator(&config.database_url, true).await?;
-            println!("PRISM PostgreSQL schema ready");
+            let source = ledger
+                .migration_source()
+                .await?
+                .map(|source| {
+                    format!(
+                        "{} (2.x.x release {})",
+                        source.source_state,
+                        source.source_release.as_deref().unwrap_or("none")
+                    )
+                })
+                .unwrap_or_else(|| "unrecorded".to_owned());
+            println!(
+                "PRISM PostgreSQL schema migrations {} ready; database source: {source}",
+                crate::ledger::schema_version_list(crate::ledger::REQUIRED_SCHEMA_VERSIONS)
+            );
             ledger.pool.close().await;
             Ok(())
         }
@@ -204,9 +218,7 @@ async fn fatal_state(command: FatalStateCommand) -> Result<()> {
         FatalStateCommand::Show => {
             let url =
                 config::optional("PRISM_DATABASE_URL").context("PRISM_DATABASE_URL is required")?;
-            let ledger = crate::ledger::Ledger::connect_operator(&url, false).await?;
-            let state = ledger.fatal_state().await?;
-            ledger.pool.close().await;
+            let state = crate::ledger::Ledger::inspect_fatal_state(&url).await?;
             println!("{}", serde_json::to_string_pretty(&state)?);
             ensure!(
                 state["halted"] == false,

@@ -65,16 +65,409 @@ transaction lock. It preserves share sequence/history, balances, audit metadata,
 and settlement rows. New tables hold shared configuration/revision, instance
 heartbeats, expiring jobs, immutable audit snapshots, and durable claim state.
 Migration 3 retains `2.x.x` publication ordinals, retained worker difficulty,
-hashrate rollups, and their watermark. The base schema and native migrations
-apply in one transaction, including carry-forward summary repair.
-The migration is idempotent; a refusal due to an old active writer or unresolved
-legacy work must be resolved before admitting native traffic.
+hashrate rollups, and their watermark. Migration 6 pins the accepted `2.x.x`
+source schema, records what was migrated, and declares the schema capability
+every later start checks. The base schema and native migrations apply in one
+transaction, including carry-forward summary repair. The migration is
+idempotent; a refusal due to an old active writer, an unsupported source
+schema, or unresolved legacy work must be resolved before admitting native
+traffic.
 
-Specifically, a pending legacy candidate without the native bundle/hash/revision
-fields cannot be replayed by Rust. Migration refuses it transactionally without
-changing the schema. Drain it through the pinned legacy submitter first, then
-repeat the backup and migration boundary. Do not delete pending rows merely to
-bypass this check.
+### Supported 2.x.x source schemas
+
+The minimum supported source release is **v2.0.1** (`95ffe06`). A v2.0.0
+(`f6854a0`) database has the identical schema and migrates as the same source
+state, but drain it with the v2.0.1 or later image, because the offline
+recovery command below first shipped in v2.0.1. The newest supported source is
+**v2.0.2** (`504846c`, #258). The SQL those releases applied is frozen
+byte-for-byte under `crates/qbit-prism-server/tests/fixtures/schema_2x/`. The
+migrator classifies the database before it runs any DDL, and after
+`001_share_ledger.sql` has run it checks that what 001 left alone is the
+release definition:
+
+| Source state | Evidence | Verdict |
+| --- | --- | --- |
+| fresh | no `qbit_share_ledger`, no other object `001_share_ledger.sql` creates, no `002_candidate_bodies.sql` object: an empty database, with or without objects of the operator's own | accept |
+| partial 001 | no `qbit_share_ledger`, but some table, sequence, index, trigger or function that 001 creates is present: a selective restore, or part of the schema installed by hand | refuse before any DDL, naming the objects present; restore the full pre-migration backup or migrate into an empty database |
+| pre-#258 (v2.0.0, v2.0.1) | `001_share_ledger.sql` only: no `qbit_prism_schema_capabilities`, no `002_candidate_bodies.sql` object | accept after the drain check |
+| #258 applied (v2.0.2) | `candidate_storage_version = 2` and every `002_candidate_bodies.sql` object present | accept after the drain check |
+| partial 002 | some 002 objects or the capability row, but not all (v2.0.2 applies 001 and 002 as two script calls, and a restart between them leaves this) | refuse, naming the missing object; finish 002 with the v2.0.2 release (`PRISM_POSTGRES_INIT_SCHEMA=1`) or restore the backup |
+| newer | `candidate_storage_version > 2`, or a capability this release does not know | refuse before any DDL; a newer PRISM release wrote the database. A native database also gets a capability check before later DDL; after migration 6, its candidate version must be 1, the format the native claim lane can process |
+| native collision | a table, sequence, index, trigger, function or column that a native migration (`002_multi_instance.sql` to `009_wrap_safe_sessions.sql`) creates and the `2.x.x` release does not is already present, in an empty database or a `2.x.x` one, or a reserved relation name is held by a relation of another kind (a view, an index backing an operator's constraint): a leftover of an earlier native attempt, a selective restore, or something installed by hand | refuse before any DDL, naming the objects; nothing is dropped; restore the full pre-migration backup, or check what the objects hold and remove them, then migrate again |
+| drifted 001 | a 001 (or 002) object whose definition, after 001 has run, differs from the frozen release: a table, column, index, sequence or named constraint that 001's `IF NOT EXISTS` skipped, or any 002 object, with a dropped constraint, a changed type, nullability or default, a different index definition, an altered sequence (a lowered maximum, a different increment), a table or sequence made `UNLOGGED` (or temporary), a release constraint left `NOT VALID` (other than the pinned `qbit_share_ledger_credit_policy_check`), a release foreign key whose enforcement triggers were disabled, row-level security enabled or forced on a release table or a policy on one, a child table created with `INHERITS` on a release table or a release table made a child or partition of another, a replaced function body, a disabled trigger or a trigger the release does not create on a release table | refuse transactionally, naming each object and what differs; the migration rolls back and the database is unchanged; restore the pre-migration backup or bring the database to the release schema with the `2.x.x` release, then migrate again |
+
+Migration requires visible `qbit_` relations and functions to resolve in
+`current_schema()`, where its unqualified DDL creates objects. An empty first
+schema followed by a legacy ledger schema in `search_path` is refused before
+any DDL, preventing a parallel ledger from hiding accounting history.
+Set the intended ledger schema first and ensure no `qbit_` objects resolve
+from other schemas. A later empty schema or unrelated operator objects are
+allowed.
+
+**The release definitions.** They are not a stored fingerprint: before any
+DDL touches the source, inside the migration transaction, the migrator opens
+a savepoint, creates a scratch schema, applies the frozen 001 there (plus
+`002_candidate_bodies.sql` for a #258 source), reads every table, column,
+constraint, index, trigger, function and sequence that produced, and rolls
+the savepoint back, so the comparison is exact for the PostgreSQL version in
+use and nothing from the scratch apply survives. Both checks below use that
+one reading.
+
+**The fresh check.** A database without `qbit_share_ledger` and without any
+002 object is fresh only if it has none of the other objects 001 creates.
+Anything else, a `qbit_pool_blocks` restored on its own, a leftover
+`qbit_audit_publication_sequence_seq`, a hand-created function, is a partial
+001: 001's `IF NOT EXISTS` would keep it exactly as it is, so the migration
+is refused before any DDL, naming what is present:
+
+```
+refusing to migrate a partial 001 source before any DDL: the database has no qbit_share_ledger but
+holds 4 object(s) that the 2.x.x release's 001_share_ledger.sql creates (table qbit_pool_blocks;
+index qbit_pool_blocks_audit_publication_sequence_idx on qbit_pool_blocks; index
+qbit_pool_blocks_maturity_idx on qbit_pool_blocks; index qbit_pool_blocks_public_recent_idx on
+qbit_pool_blocks), so it is neither an empty database nor a 2.x.x ledger, and 001's IF NOT EXISTS
+would keep those objects whatever they hold. Nothing was changed. Restore the full pre-migration
+backup, or migrate into an empty database
+```
+
+Objects the release does not create, an operator's own table for instance,
+do not disqualify a fresh database; they are kept and logged at warning
+level.
+
+**The native-collision check.** The same scratch apply continues with the
+native migrations, in the order the migrator applies them, and is read
+again; the second reading minus the first is every table, sequence, index,
+trigger and function a native migration creates and the release does not
+(`qbit_prism_schema_migrations`, which the migrator creates itself, is never
+in it), and, per release table, every column a native migration adds to it
+(the claim columns 002 adds to the outbox and the fanout artifacts, for
+instance). A `2.x.x` database or an empty one that already has one of those
+objects or columns is refused before any DDL, whatever it holds: `CREATE
+TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS` and their kin would keep it
+as it is, the migration would then record a schema it did not build, and a
+writer would fail only afterwards. A reserved name held by a relation of
+another kind is the same collision, because `IF NOT EXISTS` looks at the
+name alone: a view under a native table's name, or an operator table whose
+unique constraint is named `qbit_prism_candidate_claim_idx` and whose index
+therefore owns that name, would make 002 skip the outbox index it meant to
+create and leave candidate polling to scan the outbox; each is named by
+what holds the name (`view qbit_prism_jobs`, `index
+qbit_prism_candidate_claim_idx backing constraint
+qbit_prism_candidate_claim_idx on operator_notes`). For example, a leftover
+`qbit_prism_cluster(singleton boolean PRIMARY KEY)` on an otherwise empty
+database is refused like this:
+
+```
+refusing to migrate a native collision source before any DDL: the empty database already holds
+1 object(s) that the native migrations create and the 2.x.x release does not (table
+qbit_prism_cluster), so a native migration's IF NOT EXISTS would keep each such table, sequence,
+index, trigger, function or column whatever it holds and the migration would record a schema it
+did not build. Nothing was changed. Restore the full pre-migration backup, or check what those
+objects hold and remove them yourself, then migrate again
+```
+
+A column already on a release table under a reserved name, a `claim_token
+integer` on the outbox say, is named as `column
+qbit_block_candidate_outbox.claim_token`. Nothing is dropped for you. An
+object or column in both readings, the capability table on a #258 source
+for instance, or the outbox's `storage_version` there (the release 002
+added it; on a pre-#258 source 006 adds it, so it is reserved), stays
+governed by the release checks.
+
+**The release-schema check.** 001 is the idempotent schema every `2.x.x`
+start re-applied, so the migrator applies it next: that repairs everything
+001 re-asserts (its functions, its triggers, the columns and constraints it
+alters or re-adds by name). What `CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF
+NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` skip is checked after it, before
+`002_multi_instance.sql` or any later native migration alters those tables.
+It runs on a fresh database too, where 001 has just created everything and
+it passes trivially. Each object needs an equivalent in the schema the
+migrator runs in: for every table and sequence its persistence (the release
+creates ordinary logged relations, and an `UNLOGGED` or temporary table is
+one whose rows PostgreSQL truncates after a crash, so it is drift whatever
+its columns say; a sequence follows its table's persistence on PostgreSQL 15
+and later); for every table its row-level security, both flags (`ENABLE ROW
+LEVEL SECURITY` and `FORCE ROW LEVEL SECURITY`) and every policy on it, by
+name, with its command, whether it is permissive or restrictive, its roles
+and its `USING` and `WITH CHECK` expressions (the release creates none of
+this; a policy that hides rows from the migrate role, or forced security
+with no policy at all, would make the drain check see an empty outbox and
+the native claim lane never see the legacy rows it left behind, so a policy
+on a release table is drift, not an extra: `table qbit_block_candidate_outbox
+differs: expected row-level security disabled, found enabled and forced`,
+`policy hide_pending on qbit_block_candidate_outbox: FOR ALL USING ((state
+<> 'pending'::text)); the release has no row-level security policy on this
+table`); for every table its inheritance, both ways (the release creates
+none: a child created with `INHERITS (qbit_share_ledger)` has its rows
+included in every query of the ledger, the share reads included, without
+the release constraints ever checking them, and a release table attached as
+a partition of or inheriting from another table is no longer the relation
+the release defined, so either is drift: `table qbit_share_ledger differs:
+expected no child table, found child table(s) qbit_share_ledger_2025`;
+inheritance among the operator's own tables is theirs to keep); column
+type, NOT NULL, default, identity and generated status, collation;
+constraints per table by definition, validation state and the enabled state
+of the internal triggers that enforce them; index definitions and validity;
+trigger definitions and enabled state; function arguments, result, language, body,
+volatility and settings; and for every sequence, the ones behind `bigserial`
+columns and the explicit `qbit_audit_publication_sequence_seq` alike, its
+data type, start, increment, minimum, maximum, cache and cycle. The value a
+sequence has reached is data and is not compared, so a ledger whose share
+sequence has advanced migrates and keeps its position. Schema qualification,
+column order, comments and the names of auto-generated constraints are
+ignored. A constraint's validation state is compared: a release constraint
+that is `NOT VALID` in the source, a foreign key or CHECK dropped and
+re-added without checking the rows that were there, is drift (`constraint
+qbit_block_candidate_outbox_share_id_fkey on qbit_block_candidate_outbox is
+NOT VALID; the release validates it`), because those rows may be orphaned
+or otherwise invalid. The one exemption is pinned:
+`qbit_share_ledger_credit_policy_check`, which the release 001 itself adds
+`NOT VALID` to a `qbit_share_ledger` upgraded from before the column
+existed and never validates, is accepted in either state. A test derives
+that list from the frozen release SQL, so it cannot drift from the release.
+The internal triggers that enforce a foreign key are compared the same way:
+a superuser's `ALTER TABLE ... DISABLE TRIGGER ALL` during a bulk load
+leaves the constraint's definition and validation state as they were while
+no new row is checked against it, and 001 never re-enables a trigger it did
+not create, so it is drift (`constraint
+qbit_block_candidate_outbox_share_id_fkey on qbit_block_candidate_outbox
+differs: enforcement triggers expected 4 enabled, found 4 disabled`).
+A trigger the release does not create on a release table is drift too, not
+an extra: it can refuse or rewrite rows the migrator and the native writers
+put there. A guard that rejects `writer_epoch =
+0`, say, lets the `2.x.x` writer's leased epochs through and fails every
+native share insert, which writes epoch 0, so it is named with what it runs
+(`trigger operator_epoch_guard on qbit_share_ledger: CREATE TRIGGER
+operator_epoch_guard BEFORE INSERT ON qbit_share_ledger FOR EACH ROW EXECUTE
+FUNCTION operator_reject_epoch_zero(); the release has no trigger on this
+table`); a trigger on a table the release does not create is the operator's
+own and is kept. Rewrite rules on release tables are compared by definition
+and enabled state too. An extra rule is refused even when disabled: an
+`ON INSERT DO INSTEAD` rule can suppress or redirect native inserts before
+triggers run. Rules on operator-only tables are kept.
+An extra constraint on a release table is also drift:
+`CHECK (writer_epoch > 0)` accepts legacy shares but rejects native shares,
+so migration refuses it by name and definition, regardless of validation or
+enforcement state. Foreign keys from operator tables into release tables are
+also refused, including owners in other schemas: their internal triggers can
+block native updates or deletes, such as pruning old fanout broadcast attempts.
+Constraints involving only operator tables are kept.
+An extra `NOT NULL` column on a release table without a default, identity
+or generated expression is also drift: native inserts omit it and would
+fail. Extra defaults, identities and generated expressions are also refused:
+PostgreSQL can evaluate them during native writes, and migration cannot prove
+that they will succeed (for example, a generated `10 / writer_epoch` fails
+for native epoch-zero shares). Only plain nullable extra columns remain
+accepted, and their types must not be domains. Domain defaults, constraints
+and nullability can reject an omitted value even when the column itself
+looks nullable. Columns on operator-only tables are unaffected. All extra
+indexes on release tables are refused, including plain nonunique indexes: an access method or custom operator
+class can execute code that rejects native writes. Unique, expression and
+partial indexes can also constrain or evaluate writes. The migrator reports
+the index without removing it; review and remove extra release-table indexes
+before migrating. Indexes on operator-only tables remain accepted.
+Accepted columns and extra tables, functions and sequences are kept and
+logged at warning level. A missing or different object refuses the migration:
+
+```
+refusing to migrate a drifted 001 source: after 001_share_ledger.sql ran, the database does not
+match the v2.0.x release schema (v2.0.1, 001_share_ledger.sql), 3 object(s) differ (column
+qbit_pool_blocks.parent_hash differs: expected NOT NULL, found nullable; sequence
+qbit_share_ledger_share_seq_seq differs: maximum expected 9223372036854775807, found 1000000;
+missing constraint qbit_block_candidate_outbox_share_id_fkey on qbit_block_candidate_outbox:
+FOREIGN KEY (share_id) REFERENCES qbit_share_ledger(share_id)). Nothing was changed: the migration
+rolled back. Restore the pre-migration backup, or bring the database to the release schema with the
+2.x.x release (v2.0.1 or later; v2.0.2 for a #258 database) and take a new backup, then migrate again
+```
+
+The check needs the migrate role to hold `CREATE` on the database, for the
+scratch schema; without it `migrate` refuses and names the grant. The
+migration record is unchanged by this check: `pre_258` still means the
+database is equivalent to the v2.0.1 release schema.
+
+`3.x.x` never applies `002_candidate_bodies.sql` and does not import #258's
+chunked candidate bodies. On a #258 source it keeps the 002 tables and
+triggers; native writers store version 1 JSONB candidates, which 002's
+dual-format rule accepts. After validating and draining the source, 006
+records its former capability value of 2 in the source metadata and changes
+the live declaration to 1. Version 2 is accepted as legacy source evidence,
+never as native runtime support.
+
+**#258's rollback floor.** Once a `storage_version = 2` outbox row exists, a
+writer that predates v2.0.2 must not run against the database (see the header
+of `002_candidate_bodies.sql`). The same floor applies to this cutover from the
+other side: `3.x.x` cannot replay a v2 row either, so every v2 row must be
+drained by the v2.0.2 coordinator before migration. Never roll a #258 database
+back below v2.0.2 to drain it.
+
+**The drain requirement covers v1 and v2 rows.** A pending v1 candidate
+(JSONB body without the native `payout_revision`, `bundle` and `block_hash`
+fields) and a pending v2 candidate (`candidate` NULL, body in the chunk
+tables) both cannot be replayed by Rust. `migrate` refuses them
+transactionally, without changing the schema, and names the blocking rows:
+
+```
+legacy Python block outbox is not drained: 2 pending 2.x.x candidate row(s) cannot be
+replayed natively (block_hash=... storage_version=1 ...; block_hash=... storage_version=2 ...).
+Drain them with the pinned 2.x.x release before migrating: ...
+```
+
+The check reads outbox rows, not the capability row: 002 declares
+`candidate_storage_version = 2` whatever the writer stored, so the row proves
+002 ran, not that v2 work is pending. Drain with the pinned `2.x.x` image:
+
+1. Start the `2.x.x` coordinator (v2.0.2 for a #258 database, v2.0.1 or later
+   otherwise) and let its block submitter finish every pending candidate; it
+   replays every durable pending row on start.
+2. For a block that is already accepted on the active chain but cannot complete
+   through normal replay, run the `2.x.x` offline recovery command from the
+   `2.x.x` image, with the managed coordinator stopped:
+
+   ```sh
+   python3 -m lab.prism.recover_pending_blocks --block-hash "$HASH"          # plan
+   python3 -m lab.prism.recover_pending_blocks --block-hash "$HASH" --apply  # drain
+   ```
+
+   That command was removed from `3.x.x` with the Python runtime; it only
+   exists in the `2.x.x` image.
+3. Confirm `qbit_block_candidate_outbox` has no `pending` rows, then repeat the
+   backup and migration boundary. Do not delete pending rows merely to bypass
+   this check.
+
+A v2 row that reaches the native claim lane anyway (one written after the
+drain, for instance) is parked, not retried: the lane records why in
+`last_error`, releases the claim, and sets `next_attempt_at` to `infinity`, so
+no lease expiry offers it again. Find parked rows with
+`SELECT block_hash, storage_version, last_error FROM qbit_block_candidate_outbox
+WHERE state = 'pending' AND next_attempt_at = 'infinity'` and drain them with
+the `2.x.x` image as above; resetting `next_attempt_at` re-offers a row.
+
+**A database an earlier 3.x.x build migrated before 006.** `3.x.x` is a
+development line with no supported production upgrade, but a database an
+earlier `3.x.x` build brought to native schema 3, 4 or 5 can still hold a
+pending v2 row: that build's drain check used the v1-only predicate, which
+never counted a row whose `candidate` is NULL. `migrate` therefore runs the
+same column-aware drain check on a native schema 3, 4 or 5 before 004, 005
+and 006, and refuses before any DDL when such a row is pending, naming the
+rows as above:
+
+```
+refusing to apply migration 006 to a native database at schema migrations 2, 3, 4, 5, 8, 9: an earlier
+3.x.x build migrated it before the drain rule covered these rows, and the legacy Python block outbox is
+not drained: 1 pending 2.x.x candidate row(s) cannot be replayed natively (block_hash=...
+storage_version=2 ...). Nothing was changed. Restore the pre-migration 2.x.x backup and drain them with
+the pinned 2.x.x release ...
+```
+
+Before the drain check or native DDL, an existing outbox `storage_version`
+column must match `integer NOT NULL DEFAULT 1`, with no identity or generated
+expression. Migration 006 uses `ADD COLUMN IF NOT EXISTS`, so it would keep a
+malformed column that breaks subsequent native candidate inserts or claims.
+A mismatch refuses the upgrade, names the differing properties, and leaves
+the database unchanged. An absent column is accepted and created by 006.
+The `qbit_prism_migration_source` name must also be absent when migration 6
+is not recorded. A partial, complete or populated metadata table is refused
+before native DDL: 006 must create its own record, never retain unverified
+provenance through `IF NOT EXISTS`. Restore the full backup, or review and
+move the existing object aside before retrying; migration removes nothing.
+The pre-006 native outbox must have neither row-level security (`ENABLE` or
+`FORCE`) nor policies, including inactive policies. The drain check reads
+these settings from the catalog before counting pending candidates, so a
+policy cannot hide a legacy row and make the database appear drained.
+Refusal preserves the rows and security settings for operator review.
+
+Native pending rows the earlier build wrote carry the native fields and are
+not counted; a v2 body, a `body_id`, a `storage_version` other than 1, or a
+v1 body without the native fields is. The remedy is the one in the recovery
+section below: the `2.x.x` release is not supported against a native schema
+(its revert script refuses one, and this guide never points it at a migrated
+database), so restore the pre-migration `2.x.x` backup, drain there with the
+pinned image, take a new backup and migrate again. If native traffic was
+admitted after the earlier migration, that restore discards it and needs the
+reconciliation decision the recovery section describes.
+
+The capability rows of that database are checked before the drain check, so
+`migrate` never applies 004, 005 and 006 to a database a newer release wrote:
+one that declares `candidate_storage_version > 2` or a capability this
+release does not know is refused before any DDL, the "newer" verdict of the
+table above, and nothing is recorded for it. A database already at 6 gets
+the runtime check before 008 and 009: any candidate version above 1 is
+unsupported, even 2. The remedy is the startup gate's: upgrade the server.
+
+```
+refusing to migrate a native database at schema migrations 2, 3, 4, 5, 8, 9 before any DDL: database declares
+candidate_storage_version = 3, but this server understands candidate_storage_version 1 to 2 only: a newer
+PRISM release wrote this database; upgrade the server before starting it here
+```
+
+A migration record with 3 and not 2 is refused before any DDL as well. Every
+native build records both in the one transaction that applies them, so such
+a record was edited or restored selectively; every start refuses the gap,
+and `migrate` neither re-runs `002_multi_instance.sql` on a database at 3
+nor records it unseen, which would vouch for objects it never checked, so
+004 to 009 are not applied above it either. Restore the full pre-migration
+backup, or, once every object 002 creates is verified present, record it by
+hand (`INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)`) and
+migrate again.
+
+Migration history itself is validated before its rows are trusted at startup
+or migration. `qbit_prism_schema_migrations` must retain its native logged-table,
+integer primary-key and timestamp definitions, without extra columns,
+constraints, indexes, triggers, rules, inheritance or row security. A fresh
+or 2.x.x source must not already hold this table without migration 3. Refusal
+leaves the database unchanged; restore the full backup or review and repair
+the history table (move a non-native object aside) before retrying.
+
+**What was migrated.** After a successful migration
+`qbit_prism_migration_source` holds one row: the accepted source state
+(`pre_258`, `258_applied`, `fresh`, or `native` for a database that was
+already on the Rust schema), the `2.x.x` release and commit that source
+corresponds to, the capability value the source declared, the highest
+schema migration recorded before this one, and which instance migrated it. `migrate` prints it,
+every start logs it, and a repeated `migrate` never rewrites it.
+Once migration 6 is recorded, both the table and its readable singleton row
+are required at startup and before applying later migrations. Missing or
+malformed metadata is refused without committing later DDL or migration
+versions. Restore the full backup, including the original source record;
+the migrator never invents provenance for an already-migrated database.
+
+**Startup gate.** Every start reads `qbit_prism_schema_migrations` and
+`qbit_prism_schema_capabilities`, with or without
+`PRISM_POSTGRES_INIT_SCHEMA`. This release requires migrations 2, 3, 4, 5, 6,
+8, 9 and 10, each checked on its own rather than as a high-water mark: 007 is
+reserved by another workstream, so 008 or 009 being present never stands in
+for a missing 006. A database missing any of them is refused at connect, naming
+the gap, before any accounting statement runs, and so is one declaring a
+capability or a runtime `candidate_storage_version` other than 1. A native
+version-2 declaration is refused before the server can claim and park a
+newer writer's candidate; a #258 migration records its source version of 2
+separately and declares runtime version 1 within the migration transaction.
+The capability relation must be an ordinary table; views, materialized
+views, foreign tables and partitioned relations cannot substitute for it.
+Its catalog kind is checked before any capability rows are read, at startup
+and before migration DDL. Restore the original table from the full backup
+if a selective restore replaced it.
+The declaration must also belong to the current schema, where the migration
+history was verified: `search_path` resolves an unqualified name past a
+schema that lost its table to a later schema's, and that declaration
+describes another ledger. Startup refuses it, naming both schemas, instead
+of trusting a version-1 row from elsewhere; `migrate` already refuses any
+`qbit_` object resolved from another schema before any DDL.
+A database at 6 must declare its capabilities: 006 created
+`qbit_prism_schema_capabilities` and its `candidate_storage_version` row and
+nothing native removes them, so a start refuses a database missing either,
+naming the remedy, rather than reading the absence as a legacy state, and
+`migrate` refuses the same database before any DDL.
+The capability table must also have row-level security disabled, including
+its `FORCE` flag. Startup and migration check the catalog before trusting
+its rows, because a policy could hide an unknown capability while exposing
+the required candidate-version declaration. Nothing disables a policy
+automatically; operators must review the table before retrying.
+A migration this release does not know is accepted with a warning that names
+it: native migrations are additive, and a release whose format an older
+binary must not touch declares a capability. With the native default
+`PRISM_POSTGRES_INIT_SCHEMA=0` that means a newer binary refuses to start
+until `migrate` has run, instead of failing later in the claim path.
 
 `import-audits` processes database rows whose audit body is external. It resolves
 full v1/v1.1 bodies, legacy body refs, and v2 proof bodies, verifies segment
@@ -153,6 +546,11 @@ Check these before restoring ordinary traffic:
 
 A subsequent rollout between compatible **Rust** versions may drain and replace
 one frontend at a time. Review each version's schema compatibility separately.
+Run the new release's `migrate` first; frontends still on the previous release
+keep starting on the newer schema while its migrations are additive and it
+declares no capability they do not understand, so they can be drained and
+replaced one at a time. A release that declares a new capability needs every
+frontend stopped first.
 
 ## HA durability and failover
 

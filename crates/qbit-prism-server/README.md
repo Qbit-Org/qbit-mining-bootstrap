@@ -31,7 +31,14 @@ and vardiff bounds and rejects the test-key allowances.
 
 `PRISM_POSTGRES_INIT_SCHEMA=1` enables additive migration at startup; its native
 default is false. Prefer an explicit `migrate` step for production cutover.
-Migration refuses a live legacy Python writer lease and prevents reacquisition.
+Migration refuses a live legacy Python writer lease and prevents reacquisition,
+accepts only the pinned `2.x.x` source schemas, and refuses an undrained
+candidate outbox. Every start, with or without initialization, refuses a
+schema missing any migration this release applies (2, 3, 4, 5, 6 and 9, each
+checked on its own) and refuses capabilities it does not understand; a
+migration it does not know is accepted with a warning, so a rollout can
+replace one frontend at a time. See the
+[migration guide](../../docs/prism-rust-migration.md).
 
 ## Commands
 
