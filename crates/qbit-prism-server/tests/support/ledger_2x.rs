@@ -2662,6 +2662,74 @@ async fn native_candidate_version_two_is_refused_without_claiming_or_migrating()
     db.close(vec![ledger, migrated]).await
 }
 
+/// A view or remote relation can advertise version 1 while hiding the real
+/// version-2 declaration. Reject its catalog kind before reading any rows.
+#[tokio::test]
+async fn native_capability_relation_must_be_an_ordinary_table() -> Result<()> {
+    for kind in ["VIEW", "MATERIALIZED VIEW", "FOREIGN TABLE"] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let pool = PgPool::connect(&db.url).await?;
+        let earlier = db.ledger("earlier").await?;
+        sqlx::raw_sql("UPDATE qbit_prism_schema_capabilities SET capability_value=2; ALTER TABLE qbit_prism_schema_capabilities RENAME TO operator_real_capabilities")
+            .execute(&pool).await?;
+        let remote = format!("prism_cap_{}", Uuid::new_v4().simple());
+        let definition = if kind == "FOREIGN TABLE" {
+            // No handler is installed: the gate must reject the catalog kind
+            // before a SELECT could invoke foreign data access.
+            format!("CREATE FOREIGN DATA WRAPPER {remote}; CREATE SERVER {remote} FOREIGN DATA WRAPPER {remote}; CREATE FOREIGN TABLE qbit_prism_schema_capabilities(capability text,capability_value integer) SERVER {remote}")
+        } else {
+            format!("CREATE {kind} qbit_prism_schema_capabilities AS SELECT 'candidate_storage_version'::text AS capability,1::integer AS capability_value")
+        };
+        sqlx::raw_sql(&definition).execute(&pool).await?;
+        let objects = schema_objects(&pool).await?;
+        for initialize in [false, true] {
+            let error = Ledger::connect(&db.url, "capability-check".into(), 8, initialize)
+                .await
+                .err()
+                .with_context(|| format!("accepted capability {kind}"))?;
+            let error = format!("{error:#}");
+            assert!(
+                error.contains("qbit_prism_schema_capabilities must be an ordinary table"),
+                "{error}"
+            );
+            assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+            assert_eq!(schema_objects(&pool).await?, objects);
+        }
+        undo_009(&pool).await?;
+        let objects = schema_objects(&pool).await?;
+        let error = db
+            .ledger("later")
+            .await
+            .err()
+            .context("migrated above a capability impostor")?;
+        assert!(format!("{error:#}").contains("must be an ordinary table"));
+        assert_eq!(schema_objects(&pool).await?, objects);
+        assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 8, 10]);
+        assert_eq!(sqlx::query_scalar::<_,i32>("SELECT capability_value FROM operator_real_capabilities WHERE capability='candidate_storage_version'").fetch_one(&pool).await?, 2);
+        sqlx::raw_sql(&format!("DROP {kind} qbit_prism_schema_capabilities; ALTER TABLE operator_real_capabilities RENAME TO qbit_prism_schema_capabilities"))
+            .execute(&pool).await?;
+        if kind == "FOREIGN TABLE" {
+            sqlx::raw_sql(&format!(
+                "DROP SERVER {remote}; DROP FOREIGN DATA WRAPPER {remote}"
+            ))
+            .execute(&pool)
+            .await?;
+        }
+        let error = db
+            .ledger("restored")
+            .await
+            .err()
+            .context("accepted the restored newer capability")?;
+        assert!(format!("{error:#}").contains("candidate_storage_version = 2"));
+        assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 8, 10]);
+        pool.close().await;
+        db.close(vec![earlier]).await?;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn native_capabilities_with_row_level_security_are_refused_before_writes() -> Result<()> {
     let Some(db) = Database::open().await? else {

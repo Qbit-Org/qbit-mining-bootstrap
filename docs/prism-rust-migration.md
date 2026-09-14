@@ -442,6 +442,11 @@ capability or a runtime `candidate_storage_version` other than 1. A native
 version-2 declaration is refused before the server can claim and park a
 newer writer's candidate; a #258 migration records its source version of 2
 separately and declares runtime version 1 within the migration transaction.
+The capability relation must be an ordinary table; views, materialized
+views, foreign tables and partitioned relations cannot substitute for it.
+Its catalog kind is checked before any capability rows are read, at startup
+and before migration DDL. Restore the original table from the full backup
+if a selective restore replaced it.
 A database at 6 must declare its capabilities: 006 created
 `qbit_prism_schema_capabilities` and its `candidate_storage_version` row and
 nothing native removes them, so a start refuses a database missing either,

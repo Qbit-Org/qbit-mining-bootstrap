@@ -478,11 +478,15 @@ where
     E: sqlx::Acquire<'e, Database = Postgres>,
 {
     let mut connection = executor.acquire().await?;
-    let (enabled, forced): (bool, bool) = sqlx::query_as(
-        "SELECT relrowsecurity,relforcerowsecurity FROM pg_class WHERE oid='qbit_prism_schema_capabilities'::regclass",
+    let (kind, enabled, forced): (String, bool, bool) = sqlx::query_as(
+        "SELECT relkind::text,relrowsecurity,relforcerowsecurity FROM pg_class WHERE oid='qbit_prism_schema_capabilities'::regclass",
     )
     .fetch_one(&mut *connection)
     .await?;
+    ensure!(
+        kind == "r",
+        "qbit_prism_schema_capabilities must be an ordinary table (found relation kind {kind}); refusing to trust substituted capability rows. Restore the original capability table from the full backup before starting or migrating this database"
+    );
     ensure!(
         !enabled && !forced,
         "qbit_prism_schema_capabilities has row-level security enabled or forced; refusing to trust possibly hidden capability rows. Review and disable row-level security before starting or migrating this database"

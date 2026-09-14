@@ -92,6 +92,7 @@ qbit-prism-server::ledger_postgres::two_x::migrated_database_without_readable_so
 qbit-prism-server::ledger_postgres::two_x::migration_refuses_source_objects_resolved_from_a_later_schema
 qbit-prism-server::ledger_postgres::two_x::native_candidate_version_two_is_refused_without_claiming_or_migrating
 qbit-prism-server::ledger_postgres::two_x::native_capabilities_with_row_level_security_are_refused_before_writes
+qbit-prism-server::ledger_postgres::two_x::native_capability_relation_must_be_an_ordinary_table
 qbit-prism-server::ledger_postgres::two_x::native_migration_history_drift_is_refused_before_later_ddl
 qbit-prism-server::ledger_postgres::two_x::native_publication_ordinal_survives_reactivation_and_excludes_rejected_candidates
 qbit-prism-server::ledger_postgres::two_x::native_record_with_3_and_not_2_is_refused_before_any_ddl_and_not_repaired
