@@ -426,6 +426,7 @@ pub async fn execute(args: Args) -> Result<i32> {
     // the directory, so the earlier outputs go now rather than on each exit
     // path separately.
     let stale_outputs_removed = report::claim_out_dir(&args.out)?;
+    let removed_at_entry = stale_outputs_removed.clone();
     let log_dir = args.out.join("logs");
     std::fs::create_dir_all(&log_dir)?;
 
@@ -537,6 +538,20 @@ pub async fn execute(args: Args) -> Result<i32> {
         cluster.stop();
     }
     drop(node);
+    // An error out of the run is the one exit that wrote no report of its
+    // own. The directory was taken at entry, so it would otherwise be left
+    // empty, as if nothing had run: the reason goes into it instead. The
+    // exit code is unchanged, and so is the error the caller sees.
+    if let Err(error) = &result {
+        match report::write_failure(&args.out, run_id, &format!("{error:#}"), &removed_at_entry) {
+            Ok(Some(path)) => eprintln!("run failed; the reason is recorded in {}", path.display()),
+            Ok(None) => {}
+            Err(write_error) => eprintln!(
+                "run failed, and the failure could not be recorded in {}: {write_error:#}",
+                args.out.display()
+            ),
+        }
+    }
     result
 }
 

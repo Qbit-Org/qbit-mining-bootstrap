@@ -1869,6 +1869,57 @@ fn a_hard_block_logged_after_startup_withholds_the_artifact_and_exits_blocked() 
     Ok(())
 }
 
+/// Every way out of a run writes a report that says how it ended, except an
+/// error: that returned through the caller with a line on stderr, and the
+/// directory the invocation had already claimed stayed empty, as if nothing
+/// had run. A failed run now leaves a report naming the failure and nothing
+/// that could be read as a measurement; a report the invocation already
+/// wrote stands.
+#[test]
+fn a_run_that_fails_after_taking_its_directory_leaves_the_reason_in_it() -> Result<()> {
+    use qbit_prism_load::report;
+    let dir = ScratchDir::new("failed");
+    let run_id = uuid::Uuid::new_v4();
+    let removed = vec!["capacity-evidence.json".to_owned()];
+    let path = report::write_failure(
+        dir.path(),
+        run_id,
+        "initialising the schema: connection refused",
+        &removed,
+    )?
+    .expect("the first report is written");
+    assert_eq!(path, dir.path().join("load-harness-report.json"));
+    let document: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    assert_eq!(document["schema"], json!(report::SCHEMA));
+    assert_eq!(document["run_id"], json!(run_id.to_string()));
+    assert_eq!(document["failed"]["failed"], json!(true));
+    assert_eq!(
+        document["failed"]["error"],
+        json!("initialising the schema: connection refused")
+    );
+    assert_eq!(document["validator"]["artifact_written"], json!(false));
+    assert!(document["validator"]["withheld_reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("connection refused")));
+    assert_eq!(document["stale_outputs_removed"], json!(removed));
+    assert!(
+        document.get("phases").is_none() && document.get("reconciliation").is_none(),
+        "nothing in a failure report reads as a measurement"
+    );
+    assert!(
+        !dir.path().join("capacity-evidence.json").exists(),
+        "no artifact accompanies a failure"
+    );
+
+    // A report already written by this invocation is not overwritten by a
+    // later failure: the failure is then not the whole story.
+    let again = report::write_failure(dir.path(), run_id, "a later error", &[])?;
+    assert_eq!(again, None);
+    let unchanged: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    assert_eq!(unchanged, document);
+    Ok(())
+}
+
 /// The abort path withholds the artifact and removes a stale one, but the
 /// blocked path writes only a side report, and a run that fails before it
 /// measures writes nothing. Reusing a default `--out` after a successful run

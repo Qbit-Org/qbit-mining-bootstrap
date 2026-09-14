@@ -2,8 +2,8 @@
 //! cannot carry.
 
 use anyhow::{Context, Result};
-use serde_json::Value;
-use std::path::Path;
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 
 pub const SCHEMA: &str = "qbit.prism.load-harness.v1";
 
@@ -86,10 +86,11 @@ pub const OUTPUTS: &[&str] = &[
 /// This happens once, at entry, rather than on each exit path, because every
 /// exit path has the same obligation and only the successful one rewrites all
 /// three documents. A blocked run writes only the side report, an aborted
-/// run withholds the artifact, and a run that fails before it measures
-/// writes nothing; each would otherwise leave an earlier run's artifact and
-/// profile standing beside this run's outcome, or beside no outcome, looking
-/// like evidence for a run that did not produce them (EP-OBSERVABILITY).
+/// run withholds the artifact, and a run that fails after taking the
+/// directory writes only a report naming the failure ([`write_failure`]);
+/// each would otherwise leave an earlier run's artifact and profile standing
+/// beside this run's outcome, or beside no outcome, looking like evidence
+/// for a run that did not produce them (EP-OBSERVABILITY).
 /// The frontend logs are not touched here: `Frontend::launch` starts each
 /// one empty itself.
 pub fn claim_out_dir(out: &Path) -> Result<Vec<String>> {
@@ -107,6 +108,46 @@ pub fn claim_out_dir(out: &Path) -> Result<Vec<String>> {
         }
     }
     Ok(removed)
+}
+
+/// The side report for a run that failed with an error after it took `out`:
+/// the reason, and nothing that could be read as a measurement.
+///
+/// Every other way out of a run writes a report that says how it ended. An
+/// error -- a schema that would not initialise, a frontend that would not
+/// launch, a reconciliation query that failed after the load -- returned
+/// through the caller with only a line on stderr, and the directory the
+/// invocation had already claimed stayed empty, as if nothing had run
+/// (EP-OBSERVABILITY). A report this invocation already wrote stands: the
+/// failure is then not the whole story, and `None` is returned.
+pub fn write_failure(
+    out: &Path,
+    run_id: uuid::Uuid,
+    error: &str,
+    stale_outputs_removed: &[String],
+) -> Result<Option<PathBuf>> {
+    let path = out.join("load-harness-report.json");
+    if path.exists() {
+        return Ok(None);
+    }
+    let document = json!({
+        "schema": SCHEMA,
+        "run_id": run_id.to_string(),
+        "failed": {
+            "failed": true,
+            "error": error,
+            "note": "the run failed with this error. Whatever it measured before failing is \
+                     not recoverable from this report: no number here is a measurement, and no \
+                     artifact was written.",
+        },
+        "validator": {
+            "artifact_written": false,
+            "withheld_reason": format!("the run failed: {error}"),
+        },
+        "stale_outputs_removed": stale_outputs_removed,
+    });
+    write_json(&path, &document)?;
+    Ok(Some(path))
 }
 
 /// Write a JSON document with a trailing newline.

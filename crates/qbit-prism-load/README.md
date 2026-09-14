@@ -362,7 +362,7 @@ target/release/qbit-prism-load \
 | Code | Meaning |
 |---|---|
 | 0 | The run completed and reconciled exactly |
-| 2 | The harness failed before it could measure anything |
+| 2 | The harness failed with an error: before it could measure anything, or, rarely, while reconciling or writing its outputs after the load. Once the invocation has taken `--out`, the side report is written with `failed.error` naming the failure and nothing that could be read as a measurement; a failure after the phases does not recover their numbers. No artifact is written |
 | 3 | Blocked: no frontend served work, or a frontend log showed a hard refusal of the size -- at startup, or at any later point in the run. A refusal logged after the startup check (a scheduled-block rebuild hitting the JSONB ceiling, say, while ordinary shares kept flowing) is re-checked once the load stops: the artifact is withheld, `blocked.blocked` is `true` with the line under `blocked.error`, and the side report carries every number the run produced. A run blocked at startup writes only the side report. Either way an earlier run's artifact and profile were already removed when the invocation took `--out` |
 | 4 | A durability loss: an acknowledged share is missing from PostgreSQL, or a committed share was never acknowledged and nothing explains it |
 | 5 | An ACK/commit divergence: PostgreSQL holds a share the server refused, either with `ledger-confirmation-failed` or with `ledger-outcome-unknown` (#324) |
@@ -377,9 +377,12 @@ first: any `capacity-evidence.json`, `database-profile.json` or
 `load-harness-report.json` an earlier run left there is removed before
 anything else happens, and the side report lists what was removed under
 `stale_outputs_removed`. So however this invocation ends -- blocked before a
-frontend served work, aborted mid-run, failed before it measured, or complete
--- the directory holds only this invocation's outputs, and never an earlier
+frontend served work, aborted mid-run, failed with an error, or complete --
+the directory holds only this invocation's outputs, and never an earlier
 run's self-validating artifact beside this run's blocked or aborted report.
+A run that fails with an error after taking the directory leaves a side
+report naming the failure under `failed.error` rather than an empty
+directory.
 
 ### 1. `capacity-evidence.json`
 
