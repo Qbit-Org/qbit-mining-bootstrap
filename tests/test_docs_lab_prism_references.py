@@ -17,7 +17,8 @@ a. No runnable ``python -m lab.…`` or ``python lab/….py`` command invokes a
    an option word and of the target (``"python"3``, ``'pyth'on3``, ``"-"O``,
    ``"-m"lab.prism.deleted``, ``"lab.prism."deleted``) and ``./`` prefixes,
    and does not follow ``cd``, ``PYTHONPATH`` or other environment
-   indirection, aliases, shell variables, or backslash escapes.
+   indirection, aliases, shell variables, or backslash escapes. A shell
+   comment runs nothing, so a command inside one is not read.
 b. Every ``lab/prism/…`` path or ``lab.prism.…`` module reference resolves to a
    tracked file or directory. GitHub links pinned to a 40-hex commit SHA are
    stable history and exempt. Pre-existing residue that #303 declares out of
@@ -228,6 +229,28 @@ SCRIPT_TARGET = re.compile(r"lab/[^\x00]+\.py")
 DOT_SEGMENTS = re.compile(r"^(?:\./)+")
 MATCHING_QUOTES = re.compile(QUOTED_STRING)
 WORD_PART = re.compile(rf"{QUOTED_STRING}|(?:{UNQUOTED_CHARACTER})+")
+# A `#` opens a shell comment only where a word starts: at the start of the
+# line or after whitespace or a metacharacter (`WORD_BREAK`), neither quoted
+# nor escaped. bash 5.2 runs nothing from `# echo NO`, `true;#echo NO` or the
+# tail of `echo a # echo NO`, while `echo '#'`, `echo "# x"`, `echo \#`,
+# `echo a#b`, `echo $#`, `echo ${#a[@]}`, `echo a\ #b`, `echo $'\'#'` and
+# `echo "\"#"` each print a `#` or a count and run the command after `;`.
+# Inside a fenced code block (`FENCE`) the comment ends as bash ends it: at the
+# end of the line, backticks included (`# was `echo NO`` and `echo ok # was
+# `echo NO`` ran no `echo NO`), unless it opened inside a backtick command
+# substitution, which it ends at the closing backtick (bash printed `RUN` for
+# `` out=`true # echo NO`; echo RUN ``). Outside a fence a backtick opens or
+# closes Markdown inline code, a shell context of its own: the comment ends at
+# the next backtick and no quote carries across one, so a heading, an issue
+# `#303`, a `(#anchor)` link or a "don't" hides no `` `python3 …` `` after it.
+# A backslash inside a comment is comment text and continues nothing: bash
+# ran the line after `# c \`.
+COMMENT_BOUNDARY = re.compile(rf"[{WORD_BREAK}]")
+# A line opening or closing a fenced code block: three or more backticks,
+# which an info string may not contain, or tildes, at any indentation so a
+# fence nested in a list item counts. A closing fence repeats the opening
+# character at least as many times, with nothing after it.
+FENCE = re.compile(r"\s*(`{3,}(?=[^`]*$)|~{3,})")
 PINNED_GITHUB_URL = re.compile(
     r"github\.com/[^/\s]+/[^/\s]+/(?:blob|tree|raw)/[0-9a-f]{40}/$"
 )
@@ -395,15 +418,74 @@ def command_target(line: str, position: int) -> tuple[str, str, int] | None:
     return None
 
 
+def blank_comments(line: str, *, fenced: bool) -> str:
+    """``line`` with each shell comment (see ``COMMENT_BOUNDARY``) turned to spaces.
+
+    ``fenced`` says whether the line sits in a fenced code block. Quotes are
+    followed as bash reads them: nothing escapes inside ``'…'``, a backslash
+    escapes the next character inside ``"…"`` and ``$'…'`` and outside
+    quotes. Columns are kept, so a command before a comment reads and reports
+    as before.
+    """
+    characters = list(line)
+    quote = ""
+    word_start = True
+    in_backticks = False
+    index = 0
+    while index < len(line):
+        character = line[index]
+        if quote and (fenced or character != "`"):
+            if character == "\\" and quote != "'":
+                index += 1
+            elif character == quote[-1]:
+                quote = ""
+        elif character == "#" and word_start:
+            end = line.find("`", index) if in_backticks or not fenced else -1
+            end = len(line) if end == -1 else end
+            characters[index:end] = " " * (end - index)
+            index = end
+            continue
+        elif character == "\\":
+            index += 1
+        elif character in "'\"":
+            quote = character
+        elif character == "$" and line.startswith("'", index + 1):
+            quote = "$'"
+            index += 1
+        elif character == "`":
+            quote = ""
+            in_backticks = not in_backticks
+        word_start = not quote and COMMENT_BOUNDARY.fullmatch(character) is not None
+        index += 1
+    return "".join(characters)
+
+
 def shell_lines(text: str) -> list[tuple[int, str]]:
-    """``(first line, text)`` per logical shell line, backslash continuations joined."""
+    """``(first line, text)`` per logical shell line, backslash continuations joined, comments blanked.
+
+    Each joined line is blanked again as a whole, in the fence state of its
+    first line, since a quote may carry across the continuation (bash printed
+    ``a # b`` for ``echo "a \\`` followed by ``# b"``). A backslash that ends
+    a comment is blanked with it, so it joins nothing and the next physical
+    line is a command of its own. Every physical line, joined or not, may open
+    or close a fence, and a fence line itself is Markdown, not shell.
+    """
     lines: list[tuple[int, str]] = []
+    fence = ""
+    fenced = False
     for number, line in enumerate(text.splitlines(), 1):
+        marker = FENCE.match(line)
+        on_fence = marker is not None and (
+            not fence or (marker.group(1).startswith(fence) and not line[marker.end():].strip())
+        )
         if lines and lines[-1][1].endswith("\\"):
             first, head = lines[-1]
-            lines[-1] = (first, head[:-1] + line)
+            lines[-1] = (first, blank_comments(head[:-1] + line, fenced=fenced))
         else:
-            lines.append((number, line))
+            fenced = bool(fence) and not on_fence
+            lines.append((number, blank_comments(line, fenced=fenced)))
+        if on_fence:
+            fence = "" if fence else marker.group(1)
     return lines
 
 
@@ -1483,6 +1565,151 @@ class ScannerTests(unittest.TestCase):
                 text = f"python3 --check-hash-based-pycs {mode} -m lab.prism.x"
                 self.assertEqual(self.commands(text), [])
                 self.assertEqual(self.references(text), ["lab.prism.x"])
+
+    # bash 5.2 ran nothing from a comment line or from the tail of a line
+    # after its comment opens (see ``COMMENT_BOUNDARY``); the prose contract
+    # still counts every reference a comment names.
+    def test_comment_lines_are_not_a_command(self) -> None:
+        for text in (
+            "# python3 -m lab.prism.process_telemetry rss-bound",
+            "#python3 lab/prism/storm.py",
+            "  # python3 -m lab.prism.process_telemetry",
+            "```bash\n# python3 -m lab.prism.process_telemetry\n```",
+            "`# python3 lab/prism/storm.py`",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.commands(text), [])
+                self.assertEqual(len(self.references(text)), 1)
+
+    def test_trailing_comments_are_not_a_command(self) -> None:
+        tracked = self.TRACKED | {"lab/prism/tool.py"}
+        for text in (
+            "python3 -m lab.prism.tool # python3 -m lab.prism.process_telemetry",
+            "echo done # python3 lab/prism/storm.py",
+            "true;# python3 -m lab.prism.process_telemetry",
+            "`echo done # python3 lab/prism/storm.py`",
+            "python3 -m # lab.prism.process_telemetry",
+            "python3 -X # dev -m lab.prism.process_telemetry",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(dead_commands(text, tracked), [])
+        self.assertEqual(
+            dangling_references("python3 -m lab.prism.tool # was lab/prism/storm.py", tracked),
+            [(1, "lab/prism/storm.py")],
+        )
+
+    def test_commands_before_comments_are_still_caught(self) -> None:
+        self.assertEqual(
+            dead_commands("python3 -m lab.prism.process_telemetry # retired in #244", self.TRACKED),
+            [(1, "python3 -m lab.prism.process_telemetry", self.TELEMETRY)],
+        )
+        # A comment ends at the backtick that closes its inline code, and a
+        # `#` inside a nested shell string is the inner shell's business.
+        for text in (
+            "python3 lab/prism/storm.py --decide  # see the runbook",
+            "sh -c 'python3 lab/prism/storm.py' # nested",
+            'sh -c "python3 lab/prism/storm.py # inner"',
+            "## Run `python3 lab/prism/storm.py`",
+            "Issue #303: `python3 lab/prism/storm.py`",
+            "See [the runbook](#run) and `python3 lab/prism/storm.py`",
+            "`true # comment` then `python3 lab/prism/storm.py`",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.commands(text), ["lab/prism/storm.py"])
+
+    def test_quoted_escaped_and_in_word_hashes_open_no_comment(self) -> None:
+        # Each prefix printed its `#` or a count on bash 5.2 and then ran the
+        # command after `;`, so the missing target there is still dead.
+        for prefix in (
+            "echo '#'",
+            'echo "# x"',
+            "echo \\#",
+            "echo a#b",
+            "echo $#",
+            "echo ${#a[@]}",
+            "echo a\\ #b",
+            "echo $'\\'#'",
+            'echo "\\"#"',
+            "curl https://example.com/runbook#step",
+        ):
+            for command, missing in (
+                ("python3 -m lab.prism.process_telemetry", self.TELEMETRY),
+                ("python3 lab/prism/storm.py", "lab/prism/storm.py"),
+            ):
+                text = f"{prefix}; {command}"
+                with self.subTest(text=text):
+                    self.assertEqual(dead_commands(text, self.TRACKED), [(1, command, missing)])
+
+    def test_backslash_ending_a_comment_continues_nothing(self) -> None:
+        # bash 5.2 ran the line after `# c \` and after `echo a # c \`.
+        text = "```bash\n# retired: python3 -m lab.prism.process_telemetry \\\npython3 lab/prism/storm.py\n```"
+        self.assertEqual(
+            dead_commands(text, self.TRACKED), [(3, "python3 lab/prism/storm.py", "lab/prism/storm.py")]
+        )
+        self.assertEqual(
+            dangling_references(text, self.TRACKED),
+            [(2, "lab.prism.process_telemetry"), (3, "lab/prism/storm.py")],
+        )
+        text = "python3 -m lab.prism.tool # wrapped \\\n  python3 -m lab.prism.process_telemetry"
+        self.assertEqual(
+            dead_commands(text, self.TRACKED | {"lab/prism/tool.py"}),
+            [(2, "python3 -m lab.prism.process_telemetry", self.TELEMETRY)],
+        )
+        # A continuation into a comment joins it and the comment ends the
+        # command there; the next line runs on its own as `-m …`.
+        self.assertEqual(self.commands("python3 \\\n  # retired\n  -m lab.prism.process_telemetry"), [])
+        text = "python3 \\\n  -m lab.prism.process_telemetry \\\n  rss-bound # python3 lab/prism/storm.py"
+        self.assertEqual(self.located(text), [(1, self.TELEMETRY)])
+        # An escaped, in-word or quoted `#` opens no comment, so the backslash
+        # after it still continues the line, and a quote carried across a
+        # continuation keeps its `#` literal: bash printed `a # b` for
+        # `echo "a \` followed by `# b"` and ran the command after `;`.
+        for text in (
+            "echo \\# \\\n  && python3 lab/prism/storm.py",
+            "echo \\\\#x \\\n  && python3 lab/prism/storm.py",
+            "echo '#' \\\n  && python3 lab/prism/storm.py",
+            'echo "a \\\n# b"; python3 lab/prism/storm.py',
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.located(text), [(1, "lab/prism/storm.py")])
+
+    def test_fenced_comments_hide_their_backticks(self) -> None:
+        # bash 5.2 ran no `echo NO` from `# was `echo NO`` or `echo ok # was
+        # `echo NO``: in a fence the comment runs to the end of the line.
+        tracked = self.TRACKED | {"lab/prism/tool.py"}
+        for text in (
+            "```sh\n# historical `python3 -m lab.prism.process_telemetry`\n```",
+            "```bash\npython3 -m lab.prism.tool # was `python3 lab/prism/storm.py`\n```",
+            "- step\n\n  ~~~bash\n  # `python3 lab/prism/storm.py` and `python3 -m lab.prism.process_telemetry`\n  ~~~",
+            "````sh\n```\n# `python3 lab/prism/storm.py`\n````",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(dead_commands(text, tracked), [])
+        self.assertEqual(
+            self.references("```sh\n# historical `python3 -m lab.prism.process_telemetry`\n```"),
+            ["lab.prism.process_telemetry"],
+        )
+        # A comment inside a command substitution ends at its closing backtick:
+        # bash printed `RUN` for `` out=`true # echo NO`; echo RUN ``.
+        text = "```sh\nout=`true # python3 lab/prism/storm.py`; python3 -m lab.prism.process_telemetry\n```"
+        self.assertEqual(self.located(text), [(2, self.TELEMETRY)])
+
+    def test_prose_after_a_fence_ends_comments_at_inline_code(self) -> None:
+        text = (
+            "```sh\n# `python3 -m lab.prism.process_telemetry`\n```\n"
+            "## Run `python3 lab/prism/storm.py`\n"
+            "```python3 lab/prism/storm.py```\n"
+            "# `python3 -m lab.prism.process_telemetry`"
+        )
+        # The fenced comment on line 2 hides its inline code; the same text as
+        # a prose heading on line 6 does not.
+        self.assertEqual(
+            self.located(text), [(4, "lab/prism/storm.py"), (5, "lab/prism/storm.py"), (6, self.TELEMETRY)]
+        )
+        # No quote carries across inline code, so prose apostrophes neither
+        # hide a command nor keep a comment open.
+        self.assertEqual(self.commands("Don't run `true # python3 lab/prism/storm.py`"), [])
+        self.assertEqual(self.commands("It's `python3 lab/prism/storm.py` # done"), ["lab/prism/storm.py"])
 
 
 if __name__ == "__main__":
