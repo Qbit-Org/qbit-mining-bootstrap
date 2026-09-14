@@ -99,6 +99,10 @@ FROM qbit_pool_blocks ORDER BY block_hash COLLATE "C";
 -- Import authenticates added bytes against the declared digest. Normalize
 -- absent bytes to that digest so frozen, migrated and imported rows agree.
 -- Hash bytea directly rather than copying potentially large bodies into JSON.
+-- Import derives reader metadata from those bytes. Once they authenticate,
+-- export the stored metadata only if it disagrees, so valid imports and
+-- pre-import rows agree. Parse text json: bundles can exceed jsonb limits.
+-- No bundle field determines bits, so every schema exports them as stored.
 -- Native reconstruction inputs are fingerprinted separately below.
 SELECT EXISTS (
     SELECT 1 FROM pg_catalog.pg_attribute
@@ -108,15 +112,41 @@ SELECT EXISTS (
 \gset
 \if :has_canonical_audit_bytes
 SELECT jsonb_build_object('kind', 'audits', 'row', jsonb_build_object(
-    'block_hash', block_hash, 'audit_bundle_sha256', audit_bundle_sha256,
-    'coinbase_tx_hex', coinbase_tx_hex,
-    'canonical_audit_bytes_sha256', COALESCE(
-        encode(pg_catalog.sha256(canonical_audit_bytes), 'hex'), audit_bundle_sha256)))
-FROM qbit_pool_audit_bundles ORDER BY block_hash COLLATE "C";
+    'block_hash', a.block_hash, 'audit_bundle_sha256', a.audit_bundle_sha256,
+    'coinbase_tx_hex', a.coinbase_tx_hex, 'found_block_bits', a.found_block_bits,
+    'canonical_audit_bytes_sha256', COALESCE(a.canonical_sha256, a.audit_bundle_sha256))
+    || CASE WHEN a.canonical_sha256 IS DISTINCT FROM a.audit_bundle_sha256
+        OR (a.schema_version, a.found_block_network_difficulty,
+            a.found_block_coinbase_value_sats::numeric,
+            a.audit_commitment_leaves_hex, a.witness_merkle_leaves_hex)
+        IS NOT DISTINCT FROM (c.schema, (c.found_block->>'network_difficulty')::numeric,
+            (c.found_block->>'coinbase_value_sats')::numeric,
+            -- Canonical JSON omits empty leaf arrays; import stores [].
+            COALESCE(c.audit_commitment_leaves_hex, '[]'),
+            COALESCE(c.witness_merkle_leaves_hex, '[]'))
+    THEN '{}'::jsonb ELSE jsonb_build_object('mismatched_metadata', jsonb_build_object(
+        'schema_version', a.schema_version,
+        'found_block_network_difficulty', a.found_block_network_difficulty,
+        'found_block_coinbase_value_sats', a.found_block_coinbase_value_sats,
+        'audit_commitment_leaves_hex', a.audit_commitment_leaves_hex,
+        'witness_merkle_leaves_hex', a.witness_merkle_leaves_hex)) END)
+FROM (
+    SELECT block_hash, audit_bundle_sha256, coinbase_tx_hex, found_block_bits,
+        schema_version, found_block_network_difficulty, found_block_coinbase_value_sats,
+        audit_commitment_leaves_hex, witness_merkle_leaves_hex, canonical_audit_bytes,
+        encode(pg_catalog.sha256(canonical_audit_bytes), 'hex') AS canonical_sha256
+    FROM qbit_pool_audit_bundles OFFSET 0
+) a
+-- Decode only authenticated bytes; corrupt bytes can be invalid UTF-8.
+LEFT JOIN LATERAL json_to_record(CASE WHEN a.canonical_sha256 = a.audit_bundle_sha256
+    THEN convert_from(a.canonical_audit_bytes, 'UTF8')::json END)
+    AS c(schema text, found_block json, audit_commitment_leaves_hex jsonb,
+        witness_merkle_leaves_hex jsonb) ON true
+ORDER BY a.block_hash COLLATE "C";
 \else
 SELECT jsonb_build_object('kind', 'audits', 'row', jsonb_build_object(
     'block_hash', block_hash, 'audit_bundle_sha256', audit_bundle_sha256,
-    'coinbase_tx_hex', coinbase_tx_hex,
+    'coinbase_tx_hex', coinbase_tx_hex, 'found_block_bits', found_block_bits,
     'canonical_audit_bytes_sha256', audit_bundle_sha256))
 FROM qbit_pool_audit_bundles ORDER BY block_hash COLLATE "C";
 \endif

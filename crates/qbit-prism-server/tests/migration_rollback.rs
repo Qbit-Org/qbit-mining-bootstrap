@@ -165,6 +165,8 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         ensure!(recovery::accounting_state(&source.pool).await? == before);
         ensure!(recovery::evidence(&source, pg_bin).await? == source_evidence);
         assert_canonical_audit_fingerprints(&source, pg_bin, &artifacts, artifacts_dir.path()).await?;
+        assert_imported_audit_metadata_fingerprints(&source, pg_bin, &artifacts, artifacts_dir.path())
+            .await?;
         recovery::restore(&archive, &source, &restored, pg_bin).await?;
         ensure!(recovery::accounting_state(&restored.pool).await? == before);
         ensure!(recovery::evidence(&restored, pg_bin).await? == source_evidence);
@@ -497,6 +499,110 @@ async fn assert_canonical_audit_fingerprints(
             ensure!(
                 audit_canonical_bytes(&source.pool, &artifact.block_hash).await?
                     == Some(artifact.canonical.clone())
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn assert_imported_audit_metadata_fingerprints(
+    source: &recovery::Database,
+    pg_bin: &std::path::Path,
+    artifacts: &[recovery::Artifact],
+    artifacts_dir: &std::path::Path,
+) -> Result<()> {
+    use qbit_prism_server::ledger::{audit_canonical_bytes, audit_completeness};
+
+    const METADATA: &str = "schema_version,found_block_network_difficulty,\
+        found_block_coinbase_value_sats,audit_commitment_leaves_hex,\
+        witness_merkle_leaves_hex,found_block_bits";
+    let baseline = recovery::evidence(source, pg_bin).await?;
+    let accounting = recovery::accounting_state(&source.pool).await?;
+    for artifact in artifacts {
+        let original: serde_json::Value = sqlx::query_scalar(&format!(
+            "SELECT to_jsonb(m) FROM (SELECT {METADATA} FROM qbit_pool_audit_bundles WHERE block_hash=$1) m"
+        ))
+        .bind(&artifact.block_hash)
+        .fetch_one(&source.pool)
+        .await?;
+        // Import fills all but bits, including a leaf array canonical JSON omits.
+        for column in [
+            "schema_version",
+            "found_block_network_difficulty",
+            "found_block_coinbase_value_sats",
+        ] {
+            ensure!(!original[column].is_null(), "import left {column} empty");
+        }
+        ensure!(original["audit_commitment_leaves_hex"]
+            .as_array()
+            .is_some_and(|leaves| !leaves.is_empty()));
+        ensure!(original["witness_merkle_leaves_hex"] == serde_json::json!([]));
+        ensure!(original["found_block_bits"].is_null());
+        for pair in [
+            ["schema_version='qbit.prism.audit-bundle.v0'", "schema_version=NULL"],
+            [
+                "found_block_network_difficulty=found_block_network_difficulty+1",
+                "found_block_network_difficulty=NULL",
+            ],
+            [
+                "found_block_coinbase_value_sats=found_block_coinbase_value_sats-1",
+                "found_block_coinbase_value_sats=NULL",
+            ],
+            [
+                "audit_commitment_leaves_hex=audit_commitment_leaves_hex||jsonb_build_array(repeat('00',32))",
+                "audit_commitment_leaves_hex=NULL",
+            ],
+            [
+                "witness_merkle_leaves_hex=jsonb_build_array(repeat('00',32))",
+                "witness_merkle_leaves_hex=NULL",
+            ],
+            ["found_block_bits='1d00ffff'", "found_block_bits='207fffff'"],
+        ] {
+            let mut fingerprints = Vec::new();
+            for mutation in pair {
+                sqlx::query(&format!(
+                    "UPDATE qbit_pool_audit_bundles SET {mutation} WHERE block_hash=$1"
+                ))
+                .bind(&artifact.block_hash)
+                .execute(&source.pool)
+                .await?;
+                // The bytes still authenticate: availability passes, import has
+                // nothing to repair, and artifacts are served unchanged.
+                audit_completeness(&source.pool).await?.require_complete()?;
+                ensure!(recovery::import_cli(source, artifacts_dir)
+                    .await?
+                    .contains("Imported 0 audit bodies"));
+                ensure!(
+                    audit_canonical_bytes(&source.pool, &artifact.block_hash).await?
+                        == Some(artifact.canonical.clone())
+                );
+                ensure!(recovery::accounting_state(&source.pool).await? == accounting);
+                let current = recovery::evidence(source, pg_bin).await?;
+                ensure!(
+                    current["records"]["audits"]["count"] == baseline["records"]["audits"]["count"]
+                );
+                ensure!(
+                    current["records"]["audits"]["sha256"] != baseline["records"]["audits"]["sha256"],
+                    "audit metadata corruption was invisible to recovery evidence: {mutation}"
+                );
+                fingerprints.push(current["records"]["audits"]["sha256"].clone());
+                let mut unchanged = current;
+                unchanged["records"]["audits"] = baseline["records"]["audits"].clone();
+                ensure!(unchanged == baseline, "unrelated evidence changed: {mutation}");
+                sqlx::query(&format!(
+                    "UPDATE qbit_pool_audit_bundles SET ({METADATA})=(SELECT {METADATA} \
+                     FROM jsonb_populate_record(NULL::qbit_pool_audit_bundles,$2)) WHERE block_hash=$1"
+                ))
+                .bind(&artifact.block_hash)
+                .bind(&original)
+                .execute(&source.pool)
+                .await?;
+                ensure!(recovery::evidence(source, pg_bin).await? == baseline);
+            }
+            // Stored values, not a flag: distinct corruptions must not collide.
+            ensure!(
+                fingerprints[0] != fingerprints[1],
+                "distinct audit metadata corruptions collided: {pair:?}"
             );
         }
     }
