@@ -448,6 +448,10 @@ def executable_word(words: list[str]) -> int | None:
             option = unquote(words[index])
             if option in {"--help", "--version"} or (program == "sudo" and option in {"-l", "-ll", "--list", "-V"}):
                 return None
+            if program == "sudo" and (option == "--edit" or re.match(r"-[ABbEHkNnPSis]*e", option)):
+                # Edit mode takes filenames. Only no-argument flags may precede
+                # e in a cluster: -ne edits, while -pe gives p the prompt "e".
+                return None
             if program == "command" and option in {"-v", "-V"}:
                 return None  # executable lookup prints information; it runs nothing
             if option == "--":
@@ -2124,6 +2128,40 @@ class ScannerTests(unittest.TestCase):
             ):
                 with self.subTest(option=option, arguments=arguments):
                     self.assertEqual(self.commands(f"sudo {option} {arguments}"), [])
+
+    def test_sudo_edit_mode_arguments_are_not_commands(self) -> None:
+        for options in (
+            "-e", "--edit", "'-e'", "-ne", "-en", "-Hne", "-euprism",
+            "-nepPrompt", "-n -u prism --edit", "-D /tmp -e",
+        ):
+            for argument in (
+                "python3 -m lab.prism.deleted", "python3 lab/prism/deleted.py",
+                "sh -c 'python3 -m lab.prism.deleted'",
+            ):
+                with self.subTest(options=options, argument=argument):
+                    text = f"sudo {options} -- {argument}"
+                    self.assertEqual(self.commands(text), [])
+                    self.assertEqual(len(self.references(text)), 1)
+                    self.assertEqual(
+                        self.commands(text + "; python3 lab/prism/storm.py"),
+                        ["lab/prism/storm.py"],
+                    )
+        self.assertEqual(self.commands("sudo -e python3 -m lab.prism.deleted"), [])
+        self.assertEqual(self.commands("env sudo -ne -- python3 lab/prism/deleted.py"), [])
+        text = "```sh\nsudo -e \\\n  -- python3 -m lab.prism.deleted\npython3 lab/prism/storm.py\n```"
+        self.assertEqual(self.located(text), [(4, "lab/prism/storm.py")])
+
+    def test_sudo_option_arguments_containing_edit_flags_preserve_commands(self) -> None:
+        for options in (
+            "-p e", "-pe", "-peditor", "--prompt=editor", "-p -e",
+            "-u editor", "-ueditor", "-geditors", "-D repo", "-Drepo",
+            "--chdir=repo", "-D -e",
+        ):
+            with self.subTest(options=options):
+                self.assertEqual(
+                    self.commands(f"sudo {options} python3 lab/prism/storm.py"),
+                    ["lab/prism/storm.py"],
+                )
 
     def test_multiline_quoted_arguments_remain_data(self) -> None:
         for quote in ("'", '"'):
