@@ -32,6 +32,9 @@ pub use connect::{SessionAllocationExhausted, SessionId};
 mod difficulty;
 mod fanout;
 mod fatal_state;
+mod instances;
+pub(crate) use instances::{live_instances, unavailable_live_instances, LiveInstancesReport};
+pub use instances::{HeartbeatHealth, HeartbeatStatus};
 mod jobs;
 pub use jobs::{
     CompactPrepared, IssuedJobSave, PreparedAuditHashes, PreparedDependency, PreparedTemplate,
