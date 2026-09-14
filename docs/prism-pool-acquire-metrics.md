@@ -12,6 +12,13 @@ records one `result="failure"` observation with its elapsed duration. Creating
 and dropping an acquisition future without polling it records nothing.
 An acquisition still waiting has not yet contributed to `_count`.
 
+Ledger and collector checkouts use one observer and Tokio's monotonic clock.
+In an unpaused runtime this measures real elapsed time. In a paused test
+runtime it follows the runtime's controlled clock; ledger checkouts now share
+the collector's existing behavior in those tests. Constructing an unpolled
+future or acquiring without a metrics handle reads no observation clock.
+Advisory-lock observations retain their separate standard monotonic clock.
+
 ## Coverage
 
 In addition to the existing ledger transaction and metrics collector

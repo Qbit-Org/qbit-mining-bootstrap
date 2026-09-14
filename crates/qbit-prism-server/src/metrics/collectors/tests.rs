@@ -23,7 +23,7 @@ async fn cancelled_acquisition_records_one_failure_with_elapsed_wait() {
     let metrics = Metrics::default();
     let error = tokio::time::timeout(
         Duration::from_secs(3),
-        observe_pool_acquire(&metrics, std::future::pending::<sqlx::Result<()>>()),
+        observe_pool_acquire(Some(&metrics), std::future::pending::<sqlx::Result<()>>()),
     )
     .await
     .unwrap_err();
@@ -36,7 +36,7 @@ async fn cancelled_acquisition_records_one_failure_with_elapsed_wait() {
 #[tokio::test(start_paused = true)]
 async fn successful_acquisition_records_once_and_preserves_returned_value() {
     let metrics = Metrics::default();
-    let value = observe_pool_acquire(&metrics, async {
+    let value = observe_pool_acquire(Some(&metrics), async {
         tokio::time::sleep(Duration::from_millis(125)).await;
         Ok(Box::new(42))
     })
@@ -52,7 +52,7 @@ async fn successful_acquisition_records_once_and_preserves_returned_value() {
 #[tokio::test(start_paused = true)]
 async fn failed_acquisition_records_once_and_preserves_returned_error() {
     let metrics = Metrics::default();
-    let error = observe_pool_acquire(&metrics, async {
+    let error = observe_pool_acquire(Some(&metrics), async {
         tokio::time::sleep(Duration::from_millis(250)).await;
         Err::<(), _>(sqlx::Error::PoolClosed)
     })
@@ -69,7 +69,7 @@ async fn failed_acquisition_records_once_and_preserves_returned_error() {
 async fn cancellation_after_acquisition_does_not_extend_wait_or_record_failure() {
     let metrics = Metrics::default();
     assert!(tokio::time::timeout(Duration::from_secs(3), async {
-        observe_pool_acquire(&metrics, async {
+        observe_pool_acquire(Some(&metrics), async {
             tokio::time::sleep(Duration::from_millis(125)).await;
             Ok(())
         })
@@ -85,8 +85,34 @@ async fn cancellation_after_acquisition_does_not_extend_wait_or_record_failure()
 #[tokio::test(start_paused = true)]
 async fn unpolled_acquisition_does_not_fabricate_an_observation() {
     let metrics = Metrics::default();
-    let acquisition = observe_pool_acquire(&metrics, std::future::pending::<sqlx::Result<()>>());
+    let acquisition =
+        observe_pool_acquire(Some(&metrics), std::future::pending::<sqlx::Result<()>>());
     tokio::time::advance(Duration::from_secs(3)).await;
     drop(acquisition);
     assert_observations(&metrics, (0., 0.), (0., 0.));
+}
+
+#[tokio::test(start_paused = true)]
+async fn acquisition_clock_starts_at_first_poll_not_future_construction() {
+    let metrics = Metrics::default();
+    let acquisition = observe_pool_acquire(Some(&metrics), async {
+        tokio::time::sleep(Duration::from_millis(125)).await;
+        Ok(42)
+    });
+    tokio::time::advance(Duration::from_secs(30)).await;
+    assert_observations(&metrics, (0., 0.), (0., 0.));
+    assert_eq!(acquisition.await.unwrap(), 42);
+    assert_observations(&metrics, (1., 0.125), (0., 0.));
+}
+
+#[tokio::test]
+async fn cancelling_an_unattached_acquisition_drops_its_resources() {
+    let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+    let mut acquisition = Box::pin(observe_pool_acquire(None, async move {
+        receiver.await.unwrap();
+        Ok(())
+    }));
+    assert!(futures_util::poll!(&mut acquisition).is_pending());
+    drop(acquisition);
+    assert!(sender.is_closed());
 }

@@ -6,7 +6,7 @@ use std::{future::Future, path::Path, sync::Arc, time::Duration};
 use tokio::sync::watch;
 
 /// Records exactly once, including when the acquisition future is cancelled.
-/// Its lifetime ends before transaction work, so only pool wait is measured.
+/// Its lifetime ends before SQL or BEGIN, so only checkout is measured.
 struct PoolAcquireObservation<'a> {
     metrics: &'a Metrics,
     started: tokio::time::Instant,
@@ -20,18 +20,25 @@ impl Drop for PoolAcquireObservation<'_> {
     }
 }
 
-async fn observe_pool_acquire<T>(
-    metrics: &Metrics,
+/// The shared ledger/collector checkout boundary. Tokio's monotonic clock
+/// measures real elapsed time normally and controlled time in a paused runtime.
+/// Neither the guard nor its clock is read before first poll or without metrics.
+pub(crate) async fn observe_pool_acquire<T>(
+    metrics: Option<&Metrics>,
     acquire: impl Future<Output = sqlx::Result<T>>,
 ) -> sqlx::Result<T> {
-    let mut observation = PoolAcquireObservation {
+    let mut observation = metrics.map(|metrics| PoolAcquireObservation {
         metrics,
         started: tokio::time::Instant::now(),
         outcome: Outcome::Failure,
-    };
+    });
     let result = acquire.await;
-    if result.is_ok() {
-        observation.outcome = Outcome::Success;
+    if let Some(observation) = &mut observation {
+        observation.outcome = if result.is_ok() {
+            Outcome::Success
+        } else {
+            Outcome::Failure
+        };
     }
     result
 }
@@ -64,7 +71,7 @@ pub fn process(proc_path: &Path) -> Result<ProcessMetrics> {
 /// A/#266 must extend the pending predicate when new outbox states land.
 pub async fn database(pool: &PgPool, metrics: &Metrics) -> Result<DatabaseMetrics> {
     tokio::time::timeout(Duration::from_secs(3), async {
-        let mut connection = observe_pool_acquire(metrics, pool.acquire()).await?;
+        let mut connection = observe_pool_acquire(Some(metrics), pool.acquire()).await?;
         let mut tx = connection.begin().await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .execute(&mut *tx).await?;

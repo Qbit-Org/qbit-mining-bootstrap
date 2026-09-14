@@ -1,7 +1,7 @@
 //! One checkout boundary for ledger transactions and direct queries.
-use super::{Ledger, Metrics, Outcome, PgPool, Postgres, WaitGuard, WaitKind};
+use super::{Ledger, Metrics, PgPool, Postgres};
+use crate::metrics::collectors::observe_pool_acquire;
 use sqlx::pool::PoolConnection;
-use std::future::Future;
 
 impl Ledger {
     /// Acquire a connection and record only its checkout duration, including
@@ -16,25 +16,7 @@ pub(super) async fn acquire(
     pool: &PgPool,
     metrics: Option<&Metrics>,
 ) -> sqlx::Result<PoolConnection<Postgres>> {
-    observe(metrics, pool.acquire()).await
-}
-
-async fn observe<T>(
-    metrics: Option<&Metrics>,
-    acquisition: impl Future<Output = sqlx::Result<T>>,
-) -> sqlx::Result<T> {
-    // Arm on first poll, not future construction. Drop records one failure if
-    // cancellation interrupts acquisition; complete disarms before SQL runs.
-    let guard = metrics.map(|metrics| WaitGuard::arm(metrics, WaitKind::PoolAcquire));
-    let acquired = acquisition.await;
-    if let Some(guard) = guard {
-        guard.complete(if acquired.is_ok() {
-            Outcome::Success
-        } else {
-            Outcome::Failure
-        });
-    }
-    acquired
+    observe_pool_acquire(metrics, pool.acquire()).await
 }
 
 #[cfg(test)]
