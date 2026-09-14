@@ -726,7 +726,15 @@ The side report repeats all of this under `honest_value_notes`.
   stamped on.
 - **Unknown is never zero.** A measurement that could not be taken is `null`
   with a reason. A peak RSS from Linux's `VmHWM` is labelled a kernel peak; on
-  macOS it is a sampled maximum, and on other platforms it is `null`.
+  macOS it is a sampled maximum, and on other platforms it is `null`. A
+  per-phase replication observation whose view could not be read carries
+  `error` with `synchronous_standby_names: null` and no rows, rather than
+  the empty name and empty row list a primary with no standby shows; a
+  `pg_stat_activity` the sampler could not read at startup is named as the
+  reason every waiter is counted, rather than reading as "no frontend
+  carried its name"; and a re-offer or scheduled block that reached a
+  session while it had no connection is a `client.failures` entry of its
+  kind, rather than a silent drop that read the same as an unanswered one.
 - **Time to reconnect is the outage, not the last handshake.** The
   `reconnects` block's `time_to_reconnect_milliseconds` runs from the moment a
   session's connection went -- the socket closing, or the deliberate close

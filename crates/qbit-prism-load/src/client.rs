@@ -625,7 +625,44 @@ async fn run_session(
                                     paused.store(false, Ordering::Relaxed);
                                 }
                                 Some(Control::Pause) => paused.store(true, Ordering::Relaxed),
-                                Some(_) => {}
+                                // Already reconnecting: the request is being
+                                // honoured, under the phase that was stamped
+                                // when the connection went.
+                                Some(Control::Reconnect { .. }) => {}
+                                // Work that needs a connection cannot be held
+                                // until there is one -- the block would be
+                                // built on a stale job, the re-offer's answer
+                                // would arrive after the census -- and used
+                                // to be dropped here without a trace, so a
+                                // re-offer that was never sent and one the
+                                // server never answered read the same
+                                // (EP-OBSERVABILITY). Each is reported as
+                                // the failure it is.
+                                Some(Control::ScheduledBlock) => {
+                                    let _ = shared.events.send(Event::Failure(ClientFailure {
+                                        session: config.index,
+                                        phase: shared.phase(),
+                                        kind: FailureKind::ScheduledBlock,
+                                        recorded: false,
+                                        error: "scheduled block: the session had no connection \
+                                                (reconnecting)"
+                                            .into(),
+                                        at: Instant::now(),
+                                    }));
+                                }
+                                Some(Control::Reoffer { share_id, .. }) => {
+                                    let _ = shared.events.send(Event::Failure(ClientFailure {
+                                        session: config.index,
+                                        phase: shared.phase(),
+                                        kind: FailureKind::Reoffer,
+                                        recorded: false,
+                                        error: format!(
+                                            "re-offer of {share_id}: the session had no \
+                                             connection (reconnecting), so it was never sent"
+                                        ),
+                                        at: Instant::now(),
+                                    }));
+                                }
                             }
                         }
                         _ = tokio::time::sleep(Duration::from_millis(250)) => {}

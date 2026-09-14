@@ -1259,6 +1259,80 @@ async fn a_reconnect_across_several_failed_attempts_reports_the_whole_outage() -
     Ok(())
 }
 
+/// A re-offer or a scheduled block that reaches a session while it has no
+/// connection cannot be held until there is one, and used to be dropped
+/// without a trace: a re-offer never sent and one the server never answered
+/// then read the same in the mid-flight census. Each is reported as the
+/// failure it is, under its kind, so the offer accounting and the census
+/// can say which it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn work_that_reaches_a_disconnected_session_is_reported_not_dropped() -> Result<()> {
+    use std::time::Duration;
+    let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+    let shared = Arc::new(client::SessionShared {
+        phase: std::sync::RwLock::new("mid_flight_kill".to_owned()),
+        events,
+        record_notifies: std::sync::atomic::AtomicBool::new(false),
+    });
+    // Nothing listens on port 1, so the session never holds a connection.
+    let handle = client::spawn_session(session_config(3), 1, "127.0.0.1:1".into(), shared, 1);
+    handle.control.send(client::Control::Reoffer {
+        share_id: "pload1abc.s00003:lost".into(),
+        job_id: "job-1".into(),
+        extranonce2_hex: String::new(),
+        ntime_hex: String::new(),
+        nonce_hex: String::new(),
+        header_hex: String::new(),
+    })?;
+    handle.control.send(client::Control::ScheduledBlock)?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut failures = Vec::new();
+    while failures.len() < 2 {
+        let event = tokio::time::timeout_at(deadline, inbox.recv())
+            .await
+            .expect("both failures are reported within the deadline")
+            .expect("the session is still running");
+        match event {
+            client::Event::Failure(failure) => failures.push(failure),
+            client::Event::Reconnect(record) => assert!(!record.completed, "{record:?}"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    let _ = handle.control.send(client::Control::Stop);
+    tokio::time::timeout(Duration::from_secs(5), handle.task).await??;
+    let kinds: Vec<client::FailureKind> = failures.iter().map(|f| f.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            client::FailureKind::Reoffer,
+            client::FailureKind::ScheduledBlock
+        ]
+    );
+    for failure in &failures {
+        assert_eq!(failure.session, 3);
+        assert_eq!(failure.phase, "mid_flight_kill");
+        assert!(!failure.recorded, "no submit record carries it");
+        assert!(
+            failure.error.contains("no connection"),
+            "the failure says why: {}",
+            failure.error
+        );
+    }
+    assert!(
+        failures[0].error.contains("pload1abc.s00003:lost"),
+        "the re-offer names its share: {}",
+        failures[0].error
+    );
+    assert_eq!(
+        handle
+            .outstanding
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "nothing was counted as outstanding"
+    );
+    Ok(())
+}
+
 /// A client-initiated reconnect waits for the session's outstanding submits
 /// before it closes the socket, and the wait is the configured share-commit
 /// timeout plus the drain margin, the deadline the phase boundaries and the
@@ -3738,6 +3812,46 @@ fn the_harness_reads_its_own_postgres_binary_variable() {
     ] {
         assert_ne!(qbit_prism_load::cluster::PG_BIN_DIR_VAR, shared);
     }
+}
+
+/// The lock sampler attributes rows by `application_name` only when every
+/// frontend's was seen in `pg_stat_activity`; otherwise every waiter is
+/// counted and the report says why. A `pg_stat_activity` that could not be
+/// read used to arrive as an empty list -- what "no frontend carried its
+/// name" looks like -- so the report blamed the driver for the sampler's own
+/// blindness.
+#[test]
+fn an_unreadable_pg_stat_activity_is_named_as_the_reason_every_waiter_is_counted() {
+    let frontends = vec!["load-fe-0".to_owned(), "load-fe-1".to_owned()];
+    let (names, reason) = run::lock_attribution(&frontends, Ok(frontends.clone()));
+    assert_eq!(names, frontends);
+    assert!(reason.contains("seen in pg_stat_activity"), "{reason}");
+
+    let (names, reason) = run::lock_attribution(
+        &frontends,
+        Ok(vec!["load-fe-0".to_owned(), "psql".to_owned()]),
+    );
+    assert!(names.is_empty());
+    assert!(reason.contains("for 1 of 2 frontends"), "{reason}");
+    assert!(
+        reason.contains("every PRISM advisory-lock waiter"),
+        "{reason}"
+    );
+
+    let (names, reason) = run::lock_attribution(
+        &frontends,
+        Err("permission denied for view pg_stat_activity".into()),
+    );
+    assert!(names.is_empty());
+    assert!(
+        reason.contains("could not be read") && reason.contains("permission denied"),
+        "{reason}"
+    );
+    assert!(reason.contains("is unknown"), "{reason}");
+    assert!(
+        !reason.contains("for 0 of 2"),
+        "an unreadable view is not a driver that carried no name: {reason}"
+    );
 }
 
 #[test]

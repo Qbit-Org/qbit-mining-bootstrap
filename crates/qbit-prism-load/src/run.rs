@@ -114,6 +114,58 @@ pub fn artifact_kind(
     }
 }
 
+/// Which backends the lock sampler attributes to this run's frontends, and
+/// the sentence the report says about it: every frontend's
+/// `application_name` was seen in `pg_stat_activity`, so rows are
+/// attributed by it; or not, so every waiter in the database is counted
+/// and the sentence says why. `live_names` is what `pg_stat_activity`
+/// showed, or the reason it could not be read.
+///
+/// An unreadable view used to arrive as an empty list, which is exactly
+/// what "no frontend carried its name" looks like, so the report blamed
+/// the driver for the sampler's own blindness (EP-OBSERVABILITY).
+pub fn lock_attribution(
+    frontend_names: &[String],
+    live_names: std::result::Result<Vec<String>, String>,
+) -> (Vec<String>, String) {
+    let live_names = match live_names {
+        Ok(names) => names,
+        Err(error) => {
+            return (
+                Vec::new(),
+                format!(
+                    "every PRISM advisory-lock waiter in this database is counted: \
+                     pg_stat_activity could not be read at startup ({error}), so whether the \
+                     driver carried application_name for the {} frontends is unknown. A \
+                     foreign holder of the same advisory lock would distort these numbers.",
+                    frontend_names.len()
+                ),
+            );
+        }
+    };
+    let attributed = frontend_names
+        .iter()
+        .filter(|name| live_names.contains(name))
+        .count();
+    if attributed == frontend_names.len() {
+        (
+            frontend_names.to_vec(),
+            "application_name carried in PRISM_DATABASE_URL and seen in pg_stat_activity"
+                .to_owned(),
+        )
+    } else {
+        (
+            Vec::new(),
+            format!(
+                "every PRISM advisory-lock waiter in this database is counted: the driver \
+                 carried application_name for {attributed} of {} frontends ({live_names:?} \
+                 seen). A foreign holder of the same advisory lock would distort these numbers.",
+                frontend_names.len()
+            ),
+        )
+    }
+}
+
 /// The first hard refusal among the classified log lines, verbatim.
 pub fn hard_block_line(blocked: &[BlockedLog]) -> Option<String> {
     blocked
@@ -917,35 +969,14 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         .iter()
         .map(|child| child.spec.instance_id.clone())
         .collect();
-    let live_names: Vec<String> = sqlx::query_scalar::<_, String>(
+    let live_names = sqlx::query_scalar::<_, String>(
         "SELECT DISTINCT COALESCE(application_name,'') FROM pg_stat_activity \
          WHERE datname = current_database()",
     )
     .fetch_all(&side)
     .await
-    .unwrap_or_default();
-    let attributed: Vec<String> = frontend_names
-        .iter()
-        .filter(|name| live_names.contains(name))
-        .cloned()
-        .collect();
-    let (sampler_names, attribution) = if attributed.len() == frontend_names.len() {
-        (
-            frontend_names.clone(),
-            "application_name carried in PRISM_DATABASE_URL and seen in pg_stat_activity"
-                .to_owned(),
-        )
-    } else {
-        (
-            Vec::new(),
-            format!(
-                "every PRISM advisory-lock waiter in this database is counted: the driver                  carried application_name for {} of {} frontends ({:?} seen). A foreign holder                  of the same advisory lock would distort these numbers.",
-                attributed.len(),
-                frontend_names.len(),
-                live_names
-            ),
-        )
-    };
+    .map_err(|error| format!("{error:#}"));
+    let (sampler_names, attribution) = lock_attribution(&frontend_names, live_names);
     let lock_sampler = LockSampler::start(
         side.clone(),
         Duration::from_millis(args.lock_sample_interval_ms),

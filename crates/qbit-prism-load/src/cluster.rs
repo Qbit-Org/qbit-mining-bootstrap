@@ -61,30 +61,59 @@ pub struct ReplicationRow {
 }
 
 /// The replication view at one instant.
+///
+/// A view that could not be read is recorded as unread, with the reason:
+/// `synchronous_standby_names` is `null` and `rows` is empty with `error`
+/// set. It used to come back as an empty name and no rows, which is exactly
+/// what a primary with no standby looks like, so a phase boundary at which
+/// `pg_stat_replication` was unreadable read as "no standby" and the
+/// premise check's own `unknown` state had no counterpart in the per-phase
+/// observations (EP-OBSERVABILITY).
 #[derive(Clone, Debug, Serialize)]
 pub struct ReplicationObservation {
     pub at: chrono::DateTime<chrono::Utc>,
     pub label: String,
-    pub synchronous_standby_names: String,
+    /// `None` when `SHOW synchronous_standby_names` failed; see `error`.
+    pub synchronous_standby_names: Option<String>,
     pub rows: Vec<ReplicationRow>,
+    /// Why the view, or the setting, could not be read, when it could not.
+    /// `rows` is then not an observation of anything.
+    pub error: Option<String>,
 }
 
 pub async fn observe_replication(pool: &PgPool, label: &str) -> Result<ReplicationObservation> {
-    let names: String = sqlx::query_scalar("SHOW synchronous_standby_names")
-        .fetch_one(pool)
-        .await
-        .unwrap_or_default();
+    let names: std::result::Result<String, sqlx::Error> =
+        sqlx::query_scalar("SHOW synchronous_standby_names")
+            .fetch_one(pool)
+            .await;
     let rows = sqlx::query(
         "SELECT application_name,state,sync_state,sent_lsn::text,write_lsn::text,\
          flush_lsn::text,replay_lsn::text FROM pg_stat_replication",
     )
     .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    .await;
+    let mut errors = Vec::new();
+    let names = match names {
+        Ok(names) => Some(names),
+        Err(error) => {
+            errors.push(format!(
+                "synchronous_standby_names could not be read: {error}"
+            ));
+            None
+        }
+    };
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(error) => {
+            errors.push(format!("pg_stat_replication could not be read: {error}"));
+            Vec::new()
+        }
+    };
     Ok(ReplicationObservation {
         at: chrono::Utc::now(),
         label: label.to_owned(),
         synchronous_standby_names: names,
+        error: (!errors.is_empty()).then(|| errors.join("; ")),
         rows: rows
             .into_iter()
             .map(|row| ReplicationRow {
