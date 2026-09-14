@@ -9,7 +9,8 @@ iterations, and ``docker`` answers ``inspect`` and ``exec`` from fixed bodies
 with a fault injected at a chosen call. The contract under test is the one
 #318's review asked for: ``capture`` ends a run itself after 86,400 s of
 samples from its first, publishes ``soak-complete`` only after the final
-sample and its post-read identity check have passed, and does so by a rename
+sample, its post-read identity check and the check that its reads ended in
+cadence with the previous sample's have passed, and does so by a rename
 so that a failed or interrupted write leaves no marker; the gate judges a
 directory only when it holds that marker and no ``soak-invalid``, so a run
 cut short after the judge's 82,800 s floor cannot pass.
@@ -254,6 +255,75 @@ class SoakCaptureTests(unittest.TestCase):
         self.assertEqual((gate.returncode, gate.stdout), (1, ""))
         self.assertIn("soak-invalid says why the run is invalid", gate.stderr)
         self.assertEqual(soak.gate_and_judge().returncode, 1)
+
+    def test_final_sample_whose_reads_stall_for_an_hour_is_invalid(self) -> None:
+        # Codex's case: the 289th sample's pre-read inspect (call 578) stalls
+        # for an hour while the identity and both bodies stay healthy. `now`
+        # was read before the stall, so the row is stamped 86400 for a process
+        # observed at 90000; the post-read identity check passes, and the
+        # completion check used to read that stale `now` and publish a marker
+        # spanning 0..86400, with no next iteration to see the gap.
+        for shell in ("sh", "bash"):
+            with self.subTest(shell=shell):
+                soak = SoakRun(
+                    shell,
+                    STUB_SNIPPET_AT_INSPECT=str(2 * SAMPLES_24H),
+                    STUB_SNIPPET='echo 90000 > "$STUB/clock"',
+                )
+                result = soak.capture()
+                self.assertEqual((result.returncode, soak.unexpected()), (1, ""))
+                self.assertEqual(soak.entries(), ["soak-invalid", "soak-metrics.log", "soak-process.log", "soak-rss.csv"])
+                self.assertEqual(result.stderr, (soak.run / "soak-invalid").read_text())
+                self.assertEqual(
+                    soak.lines("soak-invalid"),
+                    ["T+90000: soak invalid, the reads for the sample at 86400 ended at 90000, 3900 s after the previous sample's ended at 86100"],
+                )
+                rss = soak.lines("soak-rss.csv")
+                self.assertEqual((len(rss), rss[-1]), (SAMPLES_24H, f"86400,{RSS_KB * 1024}"))
+                self.assertEqual(len(soak.lines("soak-process.log")), SAMPLES_24H)
+                alone = soak.judge_alone()
+                self.assertEqual(alone.returncode, 0, alone)
+                self.assertIn("first_breach_at=none", alone.stdout)
+                self.assert_no_marker_at_all(soak)
+                gate = soak.gate()
+                self.assertEqual((gate.returncode, gate.stdout), (1, ""))
+                self.assertIn("soak-invalid says why the run is invalid", gate.stderr)
+                self.assertEqual(soak.gate_and_judge().returncode, 1)
+
+    def test_sample_reads_get_the_minute_the_gap_tolerance_leaves_them(self) -> None:
+        # From one sample's end to the next is the 300 s sleep plus the later
+        # sample's reads, so the 360 s tolerance leaves the reads 60 s. A
+        # non-final sample that overran it was already caught, by the next
+        # iteration's start-time check; the final sample is held to the same
+        # minute by the end-time check, where it used to complete with a
+        # marker for reads of any length.
+        final_pre_read = str(2 * SAMPLES_24H)
+        soak = SoakRun("sh", STUB_SNIPPET_AT_INSPECT=final_pre_read, STUB_SNIPPET='echo 86460 > "$STUB/clock"')
+        result = soak.capture()
+        self.assertEqual((result.returncode, result.stderr, soak.unexpected()), (0, "", ""))
+        self.assertEqual(soak.entries(), ["soak-complete", "soak-metrics.log", "soak-process.log", "soak-rss.csv"])
+        late_marker = "T+86460: soak complete, the samples from 0 to 86400 span 86400 s"
+        self.assertEqual(soak.lines("soak-complete"), [late_marker])
+        self.assertEqual(soak.lines("soak-rss.csv")[-1], f"86400,{RSS_KB * 1024}")
+        gate = soak.gate()
+        self.assertEqual((gate.returncode, gate.stdout, gate.stderr), (0, late_marker + "\n", ""))
+
+        for sample, ended, expected in (
+            (SAMPLES_24H, 86461, "T+86461: soak invalid, the reads for the sample at 86400 ended at 86461, 361 s after the previous sample's ended at 86100"),
+            (2, 361, "T+361: soak invalid, the reads for the sample at 300 ended at 361, 361 s after the previous sample's ended at 0"),
+        ):
+            with self.subTest(sample=sample):
+                soak = SoakRun("sh", STUB_SNIPPET_AT_INSPECT=str(2 * sample), STUB_SNIPPET=f'echo {ended} > "$STUB/clock"')
+                result = soak.capture()
+                self.assertEqual((result.returncode, soak.unexpected()), (1, ""))
+                self.assertEqual(soak.entries(), ["soak-invalid", "soak-metrics.log", "soak-process.log", "soak-rss.csv"])
+                self.assertEqual(soak.lines("soak-invalid"), [expected])
+                self.assertEqual(len(soak.lines("soak-rss.csv")), sample)
+                self.assert_no_marker_at_all(soak)
+                gate = soak.gate()
+                self.assertEqual((gate.returncode, gate.stdout), (1, ""))
+                self.assertIn("soak-invalid says why the run is invalid", gate.stderr)
+                self.assertEqual(soak.gate_and_judge().returncode, 1)
 
     @unittest.skipUnless(Path("/dev/full").exists(), "needs /dev/full to fail a write")
     def test_marker_write_that_fails_publishes_no_marker_even_when_invalid_cannot_be_written(self) -> None:

@@ -446,12 +446,13 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    defines `capture`, which takes the samples in a loop, and then calls it.
    Before every sample it checks that no more than 360 s have passed since
    the previous one and that it is still reading the process the run
-   started with, after the sample's reads it reads the identity again, and
-   it stops the run as invalid when any of these checks fails or when one
-   of its appends to the run's files does. It ends the run itself, as
-   complete, after the first sample taken 86,400 s or more after the
-   first, once that sample has passed every check, by writing
-   `soak-complete` and returning `0`:
+   started with, after the sample's reads it reads the identity again and
+   then the clock, which must be no more than 360 s past the time the
+   previous sample's reads ended, and it stops the run as invalid when any
+   of these checks fails or when one of its appends to the run's files
+   does. It ends the run itself, as complete, after the first sample taken
+   86,400 s or more after the first, once that sample has passed every
+   check, by writing `soak-complete` and returning `0`:
 
    ```sh
    c=<prism-coordinator-container>
@@ -465,6 +466,7 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    capture() {
      first=$(process)
      prev=
+     prev_end=
      start=
      mkdir "$run" || return
      while true; do
@@ -547,6 +549,12 @@ two-hour cutover soak, which reads its own criteria from the same registry.
          } | invalid
          return 1
        fi
+       end=$(date +%s)
+       if [ -n "$prev_end" ] && [ $((end - prev_end)) -gt 360 ]; then
+         echo "$(date -u +%FT%TZ): soak invalid, the reads for the sample at $now ended at $end, $((end - prev_end)) s after the previous sample's ended at $prev_end" | invalid
+         return 1
+       fi
+       prev_end=$end
        if [ $((now - start)) -ge 86400 ]; then
          printf '%s\n' "$(date -u +%FT%TZ): soak complete, the samples from $start to $now span $((now - start)) s" > "$run/soak-complete.tmp" \
            && mv "$run/soak-complete.tmp" "$run/soak-complete" || {
@@ -658,6 +666,28 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    whose loop was ended some other way, is held to the same interval. The
    run is invalid and starts over from step 2.
 
+   The last sample's reads are the hole that check cannot see. A row is
+   stamped with the `now` read before the sample's reads, so a
+   `docker inspect` or `docker exec ... cat` that stalls inside them shows
+   only in the next iteration's `now`, which is what the check above
+   compares, and the last iteration of a valid run has no next iteration,
+   because `capture` ends the run after the sample that completes the 24 h.
+   Until now a stall of an hour in that sample's reads passed both identity
+   checks, because the process had not changed, and the completion check
+   read the sample's stale `now`: the run ended with a row stamped 86,400 s
+   after the first that described the process an hour later, a marker that
+   gave that stamp as the end of the span, and nothing in the directory to
+   tell it from a run in cadence. So the clock is read again after the
+   post-read identity check, and each sample's end is held to the previous
+   sample's end as its start is held to the previous start: past 360 s it
+   prints the sample's time, when its reads ended and how long after the
+   previous sample's that was, to stderr, and stops, before the completion
+   check can run. The 300 s of sleep lie inside that interval, so the check
+   leaves the reads the same minute the tolerance above does, and holds the
+   last sample's reads to it with no next iteration needed; a hole in the
+   sleep itself is still seen first by the check above, before anything is
+   read for the iteration. The run is invalid and starts over from step 2.
+
    The metrics sample is held to the same rule. The correlated series is what
    reads an RSS excursion back at its own five-minute sample, so a scrape
    that fails, or whose header says `stale` or `unavailable`, would leave
@@ -719,19 +749,19 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    and a directory judged on its files alone passed. So the loop keeps the
    time of its first sample, the first row of the CSV, and ends the run
    itself: after the first sample taken 86,400 s or more after it, once
-   that sample's reads, appends and both identity checks have passed, it
-   writes one line, the time and the span the samples cover, to
-   `$run/soak-complete.tmp`, renames that to `$run/soak-complete`, and
-   returns `0`. The marker is published by the rename, so it appears whole
-   or not at all. A redirect straight to the marker's name would create
-   the file before the first byte is written, and a write that then
-   failed, on a full disk, could keep `invalid` from writing
-   `soak-invalid` on the same disk in the same moment, leaving an empty
-   `soak-complete` and no `soak-invalid`, which is the one directory the
-   gate must never accept. The rename is a single operation inside the run
-   directory: a write or rename that fails, or an interruption between the
-   two, leaves at most `soak-complete.tmp`, which step 6 does not read, and
-   a write or rename that fails also ends the run as invalid through
+   that sample's reads, appends, both identity checks and the check on the
+   time its reads ended have passed, it writes one line, the time and the
+   span the samples cover, to `$run/soak-complete.tmp`, renames that to
+   `$run/soak-complete`, and returns `0`. The marker is published by the
+   rename, so it appears whole or not at all. A redirect straight to the
+   marker's name would create the file before the first byte is written,
+   and a write that then failed, on a full disk, could keep `invalid` from
+   writing `soak-invalid` on the same disk in the same moment, leaving an
+   empty `soak-complete` and no `soak-invalid`, which is the one directory
+   the gate must never accept. The rename is a single operation inside the
+   run directory: a write or rename that fails, or an interruption between
+   the two, leaves at most `soak-complete.tmp`, which step 6 does not read,
+   and a write or rename that fails also ends the run as invalid through
    `invalid`, like a failed append, so the run is invalid whether or not
    that message reaches the disk. Step 6 reads the two markers before the
    CSV: `soak-invalid` makes the run invalid whatever else the directory
