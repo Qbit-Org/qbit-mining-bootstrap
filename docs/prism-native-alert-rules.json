@@ -521,10 +521,10 @@
         "alert_class": "prism-runtime"
       },
       "summary": "PrismDatabasePoolWaitHigh",
-      "description": "Only actual collector PgPool::acquire waits are timed. Cancellation is covered by collector availability; no advisory-lock rule until #283/A/C populate it. Pool p99 >0.5 seconds from at least ten completed acquisitions in five minutes; provisional, measure in #291.",
+      "description": "Actual PgPool::acquire waits from metrics collection and instrumented ledger transactions, including share processing; BEGIN, query execution and advisory-lock waits are outside this timer. Non-transaction queries issued directly through the pool are not timed. Success and failure observations are combined; collector availability remains a separate guard. Pool p99 >0.5 seconds from at least ten observed acquisition attempts in five minutes; provisional, measure in #291.",
       "no_data_state": "OK",
       "exec_err_state": "OK",
-      "basis": "Pool p99 >0.5 seconds from at least ten completed acquisitions in five minutes; provisional, measure in #291.",
+      "basis": "Collector and instrumented ledger transaction pool-acquire p99 >0.5 seconds, combining success and failure, from at least ten observed acquisition attempts in five minutes; provisional, measure in #291.",
       "producer_refs": [
         "crates/qbit-prism-server/src/metrics/registry.rs#L68",
         "crates/qbit-prism-server/src/metrics/registry.rs#L70",
