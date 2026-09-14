@@ -305,7 +305,7 @@ target/release/qbit-prism-load \
 | 2 | The harness failed before it could measure anything |
 | 3 | Blocked: no frontend served work, or a log showed a refusal |
 | 4 | A durability loss: an acknowledged share is missing from PostgreSQL, or a committed share was never acknowledged and nothing explains it |
-| 5 | An ACK/commit divergence: PostgreSQL holds a share the server refused with `ledger-confirmation-failed` (#324) |
+| 5 | An ACK/commit divergence: PostgreSQL holds a share the server refused, either with `ledger-confirmation-failed` or with `ledger-outcome-unknown` (#324) |
 | 6 | The run was aborted, by a signal or by the memory floor |
 | 7 | Rejections classified as harness bugs |
 
@@ -428,6 +428,15 @@ The side report repeats all of this under `honest_value_notes`.
   in `unexpected_committed_share_ids` and in `rejected_valid_shares`, and it
   exits 5. The server-side bug is #324. It is reported apart from a durability loss because only a loss
   means credited work disappeared.
+- **An unknown outcome is kept apart from both.** #333 answers
+  `ledger-outcome-unknown` when the COMMIT still has no reply after the commit
+  deadline and its grace window: the server is saying it does not know whether
+  the append landed. A share PostgreSQL then holds is in
+  `unknown_outcome_commits` rather than in `ack_commit_divergence` or in
+  `durability_findings`, and it exits 5 as well. Three separate buckets, because
+  they are three different claims: the server said no and was wrong, the server
+  said it did not know, and nothing explains the row at all. Only the last is a
+  durability bug.
 - **`offered_valid_shares`** counts shares the harness believed valid when it
   offered them: every acknowledged share, plus every rejection that is not a
   race the server was entitled to lose, plus every submit that received no

@@ -71,9 +71,10 @@ pub fn classify(rejection: &Rejection) -> RejectionClass {
             RejectionClass::Expected
         }
         "unknown-job" | "pool-closed" => RejectionClass::Expected,
-        "backend-rpc-unavailable" | "ledger-confirmation-failed" | "internal-error" => {
-            RejectionClass::Backend
-        }
+        "backend-rpc-unavailable"
+        | "ledger-confirmation-failed"
+        | "ledger-outcome-unknown"
+        | "internal-error" => RejectionClass::Backend,
         "" => {
             // `too many connections for username` carries code 20 and no
             // reason_id (`stratum.rs`, authorize).
@@ -100,6 +101,20 @@ pub const NOT_CONFIRMED_BY_DATABASE: &str = "share was not confirmed by the data
 
 pub fn is_confirmation_failure(rejection: &Rejection) -> bool {
     rejection.reason_id.as_deref() == Some(LEDGER_CONFIRMATION_FAILED)
+}
+
+/// The rejection #333 introduces for a COMMIT that still has no reply once the
+/// server has waited past `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS` and its grace
+/// window (Qbit-Org/qbit-mining-bootstrap#324).
+///
+/// It is deliberately non-committal: the server is saying it does not know
+/// whether the append landed, not that it did not. So, like
+/// `ledger-confirmation-failed`, it can be followed by the share appearing in
+/// PostgreSQL, and the harness must not read that as a durability loss.
+pub const LEDGER_OUTCOME_UNKNOWN: &str = "ledger-outcome-unknown";
+
+pub fn is_outcome_unknown(rejection: &Rejection) -> bool {
+    rejection.reason_id.as_deref() == Some(LEDGER_OUTCOME_UNKNOWN)
 }
 
 /// True for the two payout/tip rebuild messages the contract calls out as

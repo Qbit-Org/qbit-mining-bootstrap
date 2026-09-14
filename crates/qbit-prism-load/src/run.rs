@@ -900,7 +900,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         .iter()
         .filter(|record| !record.reoffer && bug_rejection(record))
         .collect();
-    let (durability_findings, divergences) = classify_gaps(
+    let (durability_findings, divergences, unknown_outcome_commits) = classify_gaps(
         &runs,
         &phase_reconciliations,
         &attribution,
@@ -1054,6 +1054,16 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "count": divergences.len(),
             "shares": divergences,
         },
+        "unknown_outcome_commits": {
+            "definition": "a share PostgreSQL holds that the server answered \
+                           ledger-outcome-unknown. Nothing was lost and the answer was honest \
+                           -- the server had waited past the commit deadline and its grace \
+                           window without a reply -- but the miner was still refused a share \
+                           the database holds.",
+            "server_issue": "Qbit-Org/qbit-mining-bootstrap#324",
+            "count": unknown_outcome_commits.len(),
+            "shares": unknown_outcome_commits,
+        },
         "honest_value_notes": report::honest_value_notes(),
         "drain": {
             "note": "sessions quiesce before the run closes their sockets; anything still \
@@ -1113,6 +1123,14 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "{} shares committed after the server refused them with \
              ledger-confirmation-failed; see {}",
             divergences.len(),
+            report_path.display()
+        );
+        return Ok(EXIT_ACK_COMMIT_DIVERGENCE);
+    }
+    if !unknown_outcome_commits.is_empty() {
+        eprintln!(
+            "{} shares committed after the server answered ledger-outcome-unknown; see {}",
+            unknown_outcome_commits.len(),
             report_path.display()
         );
         return Ok(EXIT_ACK_COMMIT_DIVERGENCE);
@@ -1946,6 +1964,11 @@ pub enum GapKind {
     /// PostgreSQL holds it, and the server had already refused it with
     /// `ledger-confirmation-failed`. Nothing was lost.
     AckCommitDivergence,
+    /// PostgreSQL holds it, and the server had already answered
+    /// `ledger-outcome-unknown`: it said it did not know whether the append
+    /// landed. Nothing was lost, and the answer was honest, but the miner was
+    /// still refused a share the database holds.
+    UnknownOutcomeCommitted,
     /// PostgreSQL holds it and nothing explains why no acknowledgement
     /// covers it.
     DurabilityLoss,
@@ -1953,16 +1976,18 @@ pub enum GapKind {
 
 /// Decide from the submit record the harness has, if any.
 pub fn classify_committed_gap(record: Option<&SubmitRecord>) -> GapKind {
-    let confirmation_failure = record
-        .and_then(|record| match &record.outcome {
-            Outcome::Rejected(rejection) => Some(rejection),
-            _ => None,
-        })
-        .is_some_and(classify::is_confirmation_failure);
-    if confirmation_failure {
-        GapKind::AckCommitDivergence
-    } else {
-        GapKind::DurabilityLoss
+    let rejection = record.and_then(|record| match &record.outcome {
+        Outcome::Rejected(rejection) => Some(rejection),
+        _ => None,
+    });
+    match rejection {
+        Some(rejection) if classify::is_confirmation_failure(rejection) => {
+            GapKind::AckCommitDivergence
+        }
+        Some(rejection) if classify::is_outcome_unknown(rejection) => {
+            GapKind::UnknownOutcomeCommitted
+        }
+        _ => GapKind::DurabilityLoss,
     }
 }
 
@@ -1972,9 +1997,10 @@ fn classify_gaps(
     attribution: &digest::UnexpectedAttribution,
     submits: &[SubmitRecord],
     share_commit_timeout_seconds: f64,
-) -> (Value, Vec<Value>) {
+) -> (Value, Vec<Value>, Vec<Value>) {
     let mut findings = Vec::new();
     let mut divergences = Vec::new();
+    let mut unknown_outcomes = Vec::new();
     let by_share: HashMap<&str, &SubmitRecord> = submits
         .iter()
         .filter(|record| !record.reoffer)
@@ -2014,8 +2040,12 @@ fn classify_gaps(
                 Outcome::Rejected(rejection) => Some(rejection),
                 _ => None,
             });
-            match classify_committed_gap(record) {
-                GapKind::AckCommitDivergence => divergences.push(json!({
+            let kind = classify_committed_gap(record);
+            if matches!(
+                kind,
+                GapKind::AckCommitDivergence | GapKind::UnknownOutcomeCommitted
+            ) {
+                let detail = json!({
                     "share_id": share,
                     "phase": phase.plan.name,
                     "frontend": record.map(|record| record.frontend),
@@ -2029,8 +2059,14 @@ fn classify_gaps(
                     "response_after_commit_deadline": record
                         .and_then(|r| r.latency_millis)
                         .map(|latency| latency >= share_commit_timeout_seconds * 1000.0),
-                })),
-                GapKind::DurabilityLoss => unexplained.push(share.clone()),
+                });
+                if kind == GapKind::AckCommitDivergence {
+                    divergences.push(detail);
+                } else {
+                    unknown_outcomes.push(detail);
+                }
+            } else {
+                unexplained.push(share.clone());
             }
         }
         if !unexplained.is_empty() {
@@ -2042,7 +2078,7 @@ fn classify_gaps(
             }));
         }
     }
-    (json!(findings), divergences)
+    (json!(findings), divergences, unknown_outcomes)
 }
 
 async fn finish_blocked(

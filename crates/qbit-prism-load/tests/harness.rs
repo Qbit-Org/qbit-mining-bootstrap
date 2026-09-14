@@ -1037,6 +1037,36 @@ fn a_committed_share_is_a_divergence_only_when_a_confirmation_failure_explains_i
 }
 
 #[test]
+fn an_unknown_outcome_commit_is_neither_a_divergence_nor_a_loss() {
+    // #333 answers `ledger-outcome-unknown` when the COMMIT still has no reply
+    // after the commit deadline and its grace window. The server is saying it
+    // does not know, so a later commit is possible and is not a lost share.
+    // Reading it as a durability loss would raise a false data-loss alarm.
+    use qbit_prism_load::client::Outcome;
+    use qbit_prism_load::run::GapKind;
+    let unknown = rejection(
+        20,
+        Some(classify::LEDGER_OUTCOME_UNKNOWN),
+        "share commit outcome is unknown",
+    );
+    assert!(classify::is_outcome_unknown(&unknown));
+    assert!(
+        !classify::is_confirmation_failure(&unknown),
+        "an unknown outcome is not the same claim as a confirmation failure"
+    );
+    assert_eq!(
+        classify::classify(&unknown),
+        RejectionClass::Backend,
+        "an unknown outcome is a backend result, not an unrecognised reason"
+    );
+    let record = submit_record("slow_database", Outcome::Rejected(unknown));
+    assert_eq!(
+        run::classify_committed_gap(Some(&record)),
+        GapKind::UnknownOutcomeCommitted
+    );
+}
+
+#[test]
 fn only_entitled_races_are_kept_out_of_the_offered_set() {
     use qbit_prism_load::client::Outcome;
     let mut records = Vec::new();
