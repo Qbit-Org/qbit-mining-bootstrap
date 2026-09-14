@@ -217,7 +217,11 @@ INTERPRETER_CANDIDATE = re.compile(rf"(?=(?<![^{WORD_BREAK}'\"])(?P<interpreter>
 # the word against the target grammar: a word that then names no `lab`
 # module or script (`$VAR`, `json.tool`, `lab.prism.` with nothing after the
 # dot) is not a `lab` command.
-MODULE_TARGET = re.compile(r"lab(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
+# CPython's `-m` resolves filenames, not Python identifiers: hyphens,
+# leading digits, Unicode and quoted spaces can all name runnable modules.
+# Keep nonempty dotted segments; paths, shell variables and backslash
+# escapes stay outside this lexical check, as described in the docstring.
+MODULE_TARGET = re.compile(r"lab(?:\.[^./\\$\x00]+)+")
 SCRIPT_TARGET = re.compile(r"lab/[A-Za-z0-9_./\-]+\.py")
 DOT_SEGMENTS = re.compile(r"^(?:\./)+")
 MATCHING_QUOTES = re.compile(QUOTED_STRING)
@@ -541,6 +545,51 @@ class ScannerTests(unittest.TestCase):
         tracked = self.TRACKED | {"lab/prism/tool.py", "lab/pkg/__init__.py", "lab/pkg/__main__.py"}
         text = "python3 -m lab.prism.tool\npython -m lab.pkg\npython3 lab/prism/tool.py"
         self.assertEqual(dead_commands(text, tracked), [])
+
+    def test_non_identifier_module_targets_are_caught(self) -> None:
+        for module in (
+            "lab.prism.deleted-module",
+            "lab.prism.123module",
+            "lab.prism.-module",
+            "lab.prism.café",
+            "lab.prism.module name",
+            "lab.prism.module+name",
+            "lab.prism.pkg-name.deleted-module",
+        ):
+            relative = module.replace(".", "/")
+            missing = f"{relative}.py or {relative}/__main__.py"
+            for option in (f"-m '{module}'", f'-m "{module}"', f"-OOm'{module}'"):
+                with self.subTest(module=module, option=option):
+                    command = f"python3 {option}"
+                    self.assertEqual(dead_commands(command, self.TRACKED), [(1, command, missing)])
+                    self.assertEqual(dead_commands(command, self.TRACKED | {f"{relative}.py"}), [])
+                    self.assertEqual(dead_commands(command, self.TRACKED | {f"{relative}/__main__.py"}), [])
+                    tracked = self.TRACKED | {relative, f"{relative}/__init__.py"}
+                    self.assertEqual(dead_commands(command, tracked), [(1, command, missing)])
+
+    def test_hyphenated_module_spellings_report_the_complete_target(self) -> None:
+        missing = "lab/prism/deleted-module.py or lab/prism/deleted-module/__main__.py"
+        # An existing identifier prefix must not make the full target pass.
+        tracked = self.TRACKED | {"lab/prism/deleted.py"}
+        for command in (
+            "python3 -m lab.prism.deleted-module",
+            "python3 -mlab.prism.deleted-module",
+            'python3 -m "lab.prism."deleted-module',
+            "python3 -m $'lab.prism.deleted-module'",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(dead_commands(command, tracked), [(1, command, missing)])
+        text = "```bash\npython3 -m \\\n  lab.prism.deleted-module --help\n```"
+        self.assertEqual(self.located(text), [(2, missing)])
+
+    def test_hyphenated_command_cannot_hide_within_reference_ratchet(self) -> None:
+        prose = "The retired module `lab.prism.deleted` is historical."
+        command = "python3 -m lab.prism.deleted-module"
+        self.assertEqual(len(self.references(prose)), len(self.references(command)))
+        self.assertEqual(
+            self.commands(command),
+            ["lab/prism/deleted-module.py or lab/prism/deleted-module/__main__.py"],
+        )
 
     # Verified on CPython 3.14: `python3 -m lab.pkg` with only `lab/pkg/__init__.py`,
     # or with a bare `lab/pkg/` directory, prints "No module named
@@ -907,7 +956,7 @@ class ScannerTests(unittest.TestCase):
             "python3 -m $MODULE rss-bound",
             'python3 -m "$MODULE"',
             'python3 -m "json."tool',
-            "python3 -m lab.prism.x-y",
+            "python3 -m lab.prism..x",
             "python3 -m lab.prism.x.",
             'python3 "$SCRIPT" --decide',
             'python3 "lab/prism/"storm --decide',
