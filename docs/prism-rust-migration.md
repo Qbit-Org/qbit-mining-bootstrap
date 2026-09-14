@@ -239,8 +239,11 @@ so migration refuses it by name and definition, regardless of validation or
 enforcement state. Constraints on the operator's own tables are kept.
 An extra `NOT NULL` column on a release table without a default, identity
 or generated expression is also drift: native inserts omit it and would
-fail. Nullable, defaulted, identity and generated extra columns remain
-accepted. Extra unique, expression or partial indexes on release tables are
+fail. Extra defaults, identities and generated expressions are also refused:
+PostgreSQL can evaluate them during native writes, and migration cannot prove
+that they will succeed (for example, a generated `10 / writer_epoch` fails
+for native epoch-zero shares). Only plain nullable extra columns remain
+accepted; columns on operator-only tables are unaffected. Extra unique, expression or partial indexes on release tables are
 drift too: a unique index on `((1)) WHERE writer_epoch = 0` permits legacy
 rows but rejects the second native share, and expressions or predicates
 can fail when evaluated for native writes. Migration names the index and

@@ -1471,7 +1471,8 @@ fn sequence_differences(expected: &SequenceDefinition, found: &SequenceDefinitio
 /// Policies and triggers on tables the release does not create are not
 /// reported. A release constraint must be validated in the source unless
 /// it is one of `NOT_VALID_EXEMPT`. Extra columns must allow native inserts
-/// to omit them: nullable, defaulted, identity or generated columns may stay.
+/// to omit them without evaluating unverified expressions: only plain nullable
+/// extra columns may stay; defaults, identities and generated columns are drift.
 /// Extra unique, expression or partial indexes on release tables are drift:
 /// they can constrain or evaluate native writes, even when not query-valid.
 /// Nonunique plain column indexes remain tolerated extras.
@@ -1509,11 +1510,14 @@ fn compare_fingerprints(
         }
         for (column, definition) in found_columns {
             if !columns.contains_key(column) {
-                if definition.not_null
-                    && definition.default.is_none()
-                    && definition.identity.is_empty()
-                    && definition.generated.is_empty()
+                if definition.default.is_some()
+                    || !definition.identity.is_empty()
+                    || !definition.generated.is_empty()
                 {
+                    comparison.drift.push(format!(
+                        "column {table}.{column} has an extra default, identity or generated expression; native writes can evaluate it"
+                    ));
+                } else if definition.not_null {
                     comparison.drift.push(format!(
                         "column {table}.{column} is an extra NOT NULL column without a default, identity or generated expression; native inserts omit it"
                     ));
@@ -3074,6 +3078,50 @@ mod tests {
         let comparison = compare_fingerprints(&expected, &found);
         assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
         assert_eq!(comparison.extra, vec!["table operator_notes"]);
+    }
+
+    #[test]
+    fn extra_columns_must_allow_omission_without_executing_expressions() {
+        let mut expected = SchemaFingerprint::default();
+        expected
+            .tables
+            .insert("t".into(), table(&[("a", column("bigint", true))]));
+        let mut found = SchemaFingerprint {
+            tables: expected.tables.clone(),
+            ..SchemaFingerprint::default()
+        };
+        let mut defaulted = column("bigint", false);
+        defaulted.default = Some("(10 / 0)".into());
+        let mut generated = column("bigint", false);
+        generated.generated = "s".into();
+        let mut identity = column("bigint", true);
+        identity.identity = "a".into();
+        for definition in [defaulted, generated, identity] {
+            found
+                .tables
+                .get_mut("t")
+                .unwrap()
+                .columns
+                .insert("extra".into(), definition.clone());
+            found
+                .tables
+                .insert("operator_notes".into(), table(&[("extra", definition)]));
+            let comparison = compare_fingerprints(&expected, &found);
+            assert_eq!(comparison.drift, vec!["column t.extra has an extra default, identity or generated expression; native writes can evaluate it"]);
+            assert_eq!(comparison.extra, vec!["table operator_notes"]);
+        }
+        found
+            .tables
+            .get_mut("t")
+            .unwrap()
+            .columns
+            .insert("extra".into(), column("bigint", false));
+        let comparison = compare_fingerprints(&expected, &found);
+        assert!(comparison.drift.is_empty());
+        assert_eq!(
+            comparison.extra,
+            vec!["column t.extra", "table operator_notes"]
+        );
     }
 
     #[test]

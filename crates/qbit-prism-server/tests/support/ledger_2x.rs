@@ -1718,10 +1718,7 @@ async fn extra_write_affecting_index_is_refused_naming_it_and_rolls_back() -> Re
 /// Accept it only after the operator makes omission possible again.
 #[tokio::test]
 async fn required_extra_column_is_refused_naming_it_and_rolls_back() -> Result<()> {
-    for (state, nonce, repair) in [
-        (SourceState::Pre258, 6601, "SET DEFAULT 'native'"),
-        (SourceState::Applied258, 6602, "DROP NOT NULL"),
-    ] {
+    for (state, nonce) in [(SourceState::Pre258, 6601), (SourceState::Applied258, 6602)] {
         let Some(db) = Database::open().await? else {
             return Ok(());
         };
@@ -1764,8 +1761,8 @@ async fn required_extra_column_is_refused_naming_it_and_rolls_back() -> Result<(
         assert!(sqlx::query_scalar::<_, bool>("SELECT attnotnull AND NOT atthasdef FROM pg_attribute WHERE attrelid='qbit_share_ledger'::regclass AND attname='operator_note'")
             .fetch_one(&pool).await?);
 
-        // Each way PostgreSQL can supply an omitted column remains supported.
-        sqlx::raw_sql(&format!("ALTER TABLE qbit_share_ledger ALTER COLUMN operator_note {repair}; ALTER TABLE qbit_share_ledger ADD COLUMN operator_nullable text, ADD COLUMN operator_default text NOT NULL DEFAULT 'defaulted', ADD COLUMN operator_identity bigint GENERATED ALWAYS AS IDENTITY, ADD COLUMN operator_generated bigint GENERATED ALWAYS AS (writer_epoch + 1) STORED NOT NULL"))
+        // Plain nullable columns need no expression evaluation for omission.
+        sqlx::raw_sql("ALTER TABLE qbit_share_ledger ALTER COLUMN operator_note DROP NOT NULL; ALTER TABLE qbit_share_ledger ADD COLUMN operator_nullable text")
             .execute(&pool).await?;
         let ledger = db.ledger("a").await?;
         assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
@@ -1774,16 +1771,9 @@ async fn required_extra_column_is_refused_naming_it_and_rolls_back() -> Result<(
             Some(state.as_str().to_owned())
         );
         exercise_native_writers(&ledger, 1, nonce).await?;
-        let (note, supplied): (Option<String>, bool) = sqlx::query_as("SELECT operator_note, operator_nullable IS NULL AND operator_default='defaulted' AND operator_identity IS NOT NULL AND operator_generated=1 FROM qbit_share_ledger WHERE share_id=$1")
+        let (note, supplied): (Option<String>, bool) = sqlx::query_as("SELECT operator_note, operator_nullable IS NULL FROM qbit_share_ledger WHERE share_id=$1")
             .bind(share(1).share_id).fetch_one(&pool).await?;
-        assert_eq!(
-            note.as_deref(),
-            if state == SourceState::Pre258 {
-                Some("native")
-            } else {
-                None
-            }
-        );
+        assert_eq!(note, None);
         assert!(supplied);
         assert_eq!(
             sqlx::query_scalar::<_, String>(
@@ -1795,6 +1785,48 @@ async fn required_extra_column_is_refused_naming_it_and_rolls_back() -> Result<(
         );
         pool.close().await;
         db.close(vec![ledger]).await?;
+    }
+    Ok(())
+}
+
+/// Omitted columns can still execute defaults or generated expressions.
+/// Refusal preserves source data; plain nullable columns work after repair.
+#[tokio::test]
+async fn executable_extra_column_is_refused_naming_it_and_rolls_back() -> Result<()> {
+    for state in [SourceState::Pre258, SourceState::Applied258] {
+        for (ddl, repair) in [
+            ("ADD COLUMN operator_value bigint GENERATED ALWAYS AS (10 / writer_epoch) STORED", "DROP EXPRESSION"),
+            ("ADD COLUMN operator_value bigint; ALTER TABLE qbit_share_ledger ALTER COLUMN operator_value SET DEFAULT (10 / 0)", "DROP DEFAULT"),
+        ] {
+            let Some(db) = Database::open().await? else { return Ok(()); };
+            let pool = PgPool::connect(&db.url).await?;
+            apply_frozen_2x_schema(&pool, state).await?;
+            insert_share_as_writer(&pool, "legacy:1", 1).await?;
+            sqlx::raw_sql(&format!("ALTER TABLE qbit_share_ledger {ddl}"))
+                .execute(&pool).await?;
+            let refused = insert_share_as_writer(&pool, "native:0", 0).await
+                .err().context("the expression accepted the native insert")?.to_string();
+            assert!(refused.contains("division by zero"), "{refused}");
+            let objects = schema_objects(&pool).await?;
+            let rows: Vec<Value> = sqlx::query_scalar("SELECT to_jsonb(s) FROM qbit_share_ledger s")
+                .fetch_all(&pool).await?;
+            let error = db.ledger("a").await.err()
+                .context("migration accepted an executable extra column")?.to_string();
+            assert!(error.contains("refusing to migrate a drifted 001 source"), "{error}");
+            assert!(error.contains("column qbit_share_ledger.operator_value has an extra default, identity or generated expression; native writes can evaluate it"), "{error}");
+            assert!(error.contains("Nothing was changed"), "{error}");
+            assert!(native_tables_absent(&pool).await?);
+            assert_eq!(schema_objects(&pool).await?, objects);
+            assert_eq!(sqlx::query_scalar::<_, Value>("SELECT to_jsonb(s) FROM qbit_share_ledger s")
+                .fetch_all(&pool).await?, rows);
+            sqlx::raw_sql(&format!("ALTER TABLE qbit_share_ledger ALTER COLUMN operator_value {repair}"))
+                .execute(&pool).await?;
+            let ledger = db.ledger("a").await?;
+            assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+            exercise_native_writers(&ledger, 1, 6701).await?;
+            pool.close().await;
+            db.close(vec![ledger]).await?;
+        }
     }
     Ok(())
 }
