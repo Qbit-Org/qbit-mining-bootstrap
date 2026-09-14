@@ -417,10 +417,11 @@ async fn capture_rejects_mismatched_original_window_without_changing_identity() 
 }
 
 #[tokio::test]
-async fn fresh_capture_saves_without_publication_and_preserves_inline_conflicts() {
+async fn established_readiness_allows_unpublished_capture_and_preserves_inline_conflicts() {
     for empty in [false, true] {
         let mut f = Fixture::new(Duration::from_secs(10)).await;
-        // The fixture supplies original builder outputs without database I/O.
+        // The fixture has an established poll and supplies original builder
+        // outputs without database I/O. This is not the cold-start contract.
         // Remove its access view: fresh capture must not read a publication.
         let original = f.coordinator.prepared.write().await.take().unwrap();
         let mut snapshot = (*original.snapshot).clone();
@@ -516,6 +517,64 @@ async fn fresh_capture_saves_without_publication_and_preserves_inline_conflicts(
         let jobs = f.store.jobs.lock().unwrap();
         assert_eq!(jobs[&occupied].payload, inline);
         assert_eq!(jobs[&occupied].expires_at_ms, 130_000);
+    }
+}
+
+#[tokio::test]
+async fn compact_save_refuses_cold_start_and_readiness_invalidation() {
+    for phase in ["cold", "before capture", "during capture", "after capture"] {
+        let f = Fixture::new(Duration::from_secs(10)).await;
+        let original = f.coordinator.prepared.write().await.take().unwrap();
+        *f.coordinator.observed_tip.write().await = TipState::default();
+        match phase {
+            "cold" => *f.coordinator.readiness.write().await = ReadinessState::default(),
+            "before capture" => f.coordinator.invalidate_readiness().await,
+            _ => {}
+        }
+        // A successful current observation is insufficient by itself: it
+        // must not manufacture last_poll or undo an earlier invalidation.
+        f.detect(1).await;
+        let mut source = original_build(&original);
+        let probe = ReleaseProbe(Arc::new(prepared_storage::RepairProbe::default()));
+        if phase == "during capture" {
+            source = OriginalPreparedBuild::with_capture_probe(source, probe.0.clone());
+        }
+        let capture = tokio::spawn({
+            let c = f.coordinator.clone();
+            async move { c.capture_compact_prepared(source, 130_000).await }
+        });
+        if phase == "during capture" {
+            tokio::time::timeout(Duration::from_secs(5), probe.0.entered.notified())
+                .await
+                .unwrap();
+            assert_eq!(f.coordinator.build_slots.available_permits(), 0);
+            f.coordinator.invalidate_readiness().await;
+            probe.0.release();
+        }
+        let captured = capture.await.unwrap().unwrap();
+        if phase == "after capture" {
+            f.coordinator.invalidate_readiness().await;
+        }
+        let generation = f.coordinator.readiness.read().await.generation;
+        assert!(f.coordinator.readiness.read().await.last_poll.is_none());
+        let error = f
+            .coordinator
+            .save_captured_compact(&captured)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "tip polling unavailable", "{phase}");
+        assert!(f.store.compact.save_calls.lock().unwrap().is_empty());
+        assert!(f.store.jobs.lock().unwrap().is_empty());
+        assert!(f.coordinator.prepared.read().await.is_none());
+        let readiness = f.coordinator.readiness.read().await;
+        assert!(readiness.last_poll.is_none());
+        assert_eq!(readiness.generation, generation);
+        assert_eq!(f.coordinator.build_slots.available_permits(), 1);
+        assert_eq!(
+            captured.record.payout_revision,
+            original.snapshot.payout_revision
+        );
+        assert_eq!(captured.original_expires_at_ms, 130_000);
     }
 }
 
