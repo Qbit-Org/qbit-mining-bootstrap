@@ -1537,6 +1537,69 @@ async fn ledger_epochs(pool: &PgPool) -> Result<Vec<(String, i64)>> {
     )
 }
 
+/// An extra CHECK can accept every legacy row while refusing native writes.
+/// Refusal must preserve both frozen sources; only the operator removes it.
+#[tokio::test]
+async fn extra_constraint_on_a_release_table_is_refused_naming_it_and_rolls_back() -> Result<()> {
+    for (state, nonce) in [(SourceState::Pre258, 6501), (SourceState::Applied258, 6502)] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let pool = PgPool::connect(&db.url).await?;
+        apply_frozen_2x_schema(&pool, state).await?;
+        insert_share_as_writer(&pool, "legacy:1", 1).await?;
+        sqlx::raw_sql("ALTER TABLE qbit_share_ledger ADD CONSTRAINT operator_epoch_check CHECK (writer_epoch > 0); CREATE TABLE operator_notes(note text CONSTRAINT operator_note_check CHECK (note <> ''))")
+            .execute(&pool).await?;
+        let refused = insert_share_as_writer(&pool, "native:0", 0)
+            .await
+            .err()
+            .context("the CHECK accepted writer_epoch 0")?
+            .to_string();
+        assert!(refused.contains("operator_epoch_check"), "{refused}");
+        let objects = schema_objects(&pool).await?;
+        let legacy = ledger_epochs(&pool).await?;
+        let error = db
+            .ledger("a")
+            .await
+            .err()
+            .context("migration accepted a behavior-changing extra constraint")?
+            .to_string();
+        assert!(
+            error.contains("refusing to migrate a drifted 001 source"),
+            "{error}"
+        );
+        assert!(error.contains("1 object(s) differ"), "{error}");
+        assert!(error.contains("constraint operator_epoch_check on qbit_share_ledger: CHECK ((writer_epoch > 0)); the release does not create it"), "{error}");
+        assert!(!error.contains("operator_note_check"), "{error}");
+        assert!(error.contains("Nothing was changed"), "{error}");
+        assert!(native_tables_absent(&pool).await?, "refusal ran native DDL");
+        assert_eq!(schema_objects(&pool).await?, objects);
+        assert_eq!(ledger_epochs(&pool).await?, legacy);
+        assert!(sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='qbit_share_ledger'::regclass AND conname='operator_epoch_check' AND convalidated)")
+            .fetch_one(&pool).await?);
+
+        sqlx::raw_sql("ALTER TABLE qbit_share_ledger DROP CONSTRAINT operator_epoch_check")
+            .execute(&pool)
+            .await?;
+        let ledger = db.ledger("a").await?;
+        assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+        assert_eq!(
+            ledger.migration_source().await?.map(|s| s.source_state),
+            Some(state.as_str().to_owned())
+        );
+        assert!(sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='operator_notes'::regclass AND conname='operator_note_check')")
+            .fetch_one(&pool).await?);
+        exercise_native_writers(&ledger, 1, nonce).await?;
+        assert_eq!(
+            ledger_epochs(&pool).await?,
+            [legacy, vec![(share(1).share_id, 0)]].concat()
+        );
+        pool.close().await;
+        db.close(vec![ledger]).await?;
+    }
+    Ok(())
+}
+
 /// The operator's own triggers, as `table.trigger=state`.
 async fn operator_triggers(pool: &PgPool) -> Result<Vec<String>> {
     Ok(sqlx::query_scalar("SELECT c.relname::text||'.'||t.tgname::text||'='||t.tgenabled::text FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid WHERE c.relnamespace=current_schema()::regnamespace AND NOT t.tgisinternal AND t.tgname LIKE 'operator%' ORDER BY 1")

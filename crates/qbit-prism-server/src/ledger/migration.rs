@@ -1454,10 +1454,11 @@ fn sequence_differences(expected: &SequenceDefinition, found: &SequenceDefinitio
 /// lacks is not reported twice. A table or sequence must also have the
 /// release's persistence: UNLOGGED is drift, whatever its columns say. A
 /// release table must have the release's row-level security flags, and
-/// exactly the release's policies and triggers: unlike an extra constraint
-/// or index, a policy or trigger the release does not have on a release
-/// table is drift, not extra. A policy changes which rows the migrator and
-/// the native writers see rather than adding to the schema; a trigger fires
+/// exactly the release's constraints, policies and triggers: an additional
+/// constraint, policy or trigger on a release table is drift, not extra.
+/// An extra constraint can reject native writes that satisfy the release
+/// schema. A policy changes which rows the migrator and the native writers
+/// see rather than adding to the schema; a trigger fires
 /// on the rows they write and can refuse them (one that rejects
 /// `writer_epoch = 0` lets the legacy writer's leased epochs through and
 /// fails every native share insert, which writes epoch 0) or rewrite them.
@@ -1567,8 +1568,8 @@ fn compare_fingerprints(
         let expected_constraints = expected.constraints.get(table).unwrap_or(&empty);
         for (definition, constraint) in constraints {
             if !expected_constraints.contains_key(definition) {
-                comparison.extra.push(format!(
-                    "constraint {} on {table}: {definition}",
+                comparison.drift.push(format!(
+                    "constraint {} on {table}: {definition}; the release does not create it",
                     constraint.name
                 ));
             }
@@ -2924,8 +2925,8 @@ mod tests {
                 "constraint outbox_share_fk on qbit_block_candidate_outbox differs: enforcement triggers expected 4 enabled, found 4 disabled",
             ]
         );
-        // Enabled again, nothing to report; an extra constraint with
-        // disabled triggers is the operator's own and stays an extra.
+        // Enabled again, the release constraint matches; an extra constraint
+        // on its table is drift even with disabled enforcement triggers.
         let outbox = found
             .constraints
             .get_mut("qbit_block_candidate_outbox")
@@ -2936,11 +2937,11 @@ mod tests {
             foreign_key("operator_fk", "DDDD"),
         );
         let comparison = compare_fingerprints(&expected, &found);
-        assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
         assert_eq!(
-            comparison.extra,
-            vec!["constraint operator_fk on qbit_block_candidate_outbox: FOREIGN KEY (share_id) REFERENCES operator_shares(share_id)"]
+            comparison.drift,
+            vec!["constraint operator_fk on qbit_block_candidate_outbox: FOREIGN KEY (share_id) REFERENCES operator_shares(share_id); the release does not create it"]
         );
+        assert!(comparison.extra.is_empty(), "{:?}", comparison.extra);
         assert_eq!(enforcement_summary(&[]), "none");
     }
 
@@ -3632,7 +3633,7 @@ mod tests {
         }
         let comparison = compare_fingerprints(&expected, &found);
         assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
-        // An extra constraint is extra whatever its state.
+        // An extra constraint is drift even when existing rows were not checked.
         found
             .constraints
             .get_mut("qbit_block_candidate_outbox")
@@ -3642,11 +3643,11 @@ mod tests {
                 constraint("operator_check", false),
             );
         let comparison = compare_fingerprints(&expected, &found);
-        assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
         assert_eq!(
-            comparison.extra,
-            vec!["constraint operator_check on qbit_block_candidate_outbox: CHECK ((share_id <> 'x'::text))"]
+            comparison.drift,
+            vec!["constraint operator_check on qbit_block_candidate_outbox: CHECK ((share_id <> 'x'::text)); the release does not create it"]
         );
+        assert!(comparison.extra.is_empty(), "{:?}", comparison.extra);
     }
 
     #[test]
