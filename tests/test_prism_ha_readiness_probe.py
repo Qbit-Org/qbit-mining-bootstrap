@@ -43,6 +43,10 @@ class ReadinessProbeTests(unittest.TestCase):
         self.assertLessEqual(events[-1][0] + 1.0, 13.0)
         with self.assertRaises(ValueError):
             run_timeline([(0.0, BAD, 0), (1.0, BAD, 0)])
+        with self.assertRaises(ValueError):
+            run_timeline([(0.0, BAD, 3.0), (2.0, BAD, 0)])
+        with self.assertRaises(ValueError):
+            run_timeline([(0.0, BAD, math.nan)])
 
     def test_transient_rebuild_does_not_eject(self):
         p = ReadinessProbe()

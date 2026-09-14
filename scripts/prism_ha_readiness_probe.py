@@ -67,11 +67,20 @@ def run_timeline(
     """Run starts on a monotonic schedule; rejects overlapping/early probes."""
     probe = ReadinessProbe(config)
     previous = None
+    previous_elapsed = 0.0
     states = []
     for started_at, response, elapsed in sequence:
-        if previous is not None and started_at - previous < config.interval_s:
+        if not math.isfinite(started_at) or started_at < 0:
+            raise ValueError("probe starts must be finite and non-negative")
+        if not math.isfinite(elapsed) or elapsed < 0:
+            raise ValueError("probe durations must be finite and non-negative")
+        if previous is not None and (
+            started_at - previous < config.interval_s
+            or started_at < previous + previous_elapsed
+        ):
             raise ValueError("probe starts must honor the configured monotonic interval")
         previous = started_at
+        previous_elapsed = elapsed
         states.append(probe.observe(response, elapsed))
     return states
 
