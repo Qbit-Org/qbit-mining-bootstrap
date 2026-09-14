@@ -60,11 +60,7 @@ pub(super) async fn hashrate_series(
     dual: bool,
 ) -> ApiResult<Value> {
     let (seconds, range_seconds) = chart_parameters(range, bucket);
-    let smoothing = std::env::var("PRISM_PUBLIC_HASHRATE_SMOOTHING_SECONDS")
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(1800)
-        .clamp(0, 86400);
+    let smoothing = state.config.hashrate_smoothing_seconds;
     let context = if smoothing / seconds >= 2 {
         (smoothing / seconds) * seconds
     } else {

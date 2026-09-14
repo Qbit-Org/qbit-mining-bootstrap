@@ -313,8 +313,8 @@ under decision D2 in #260, and belong in the operator release notes. Their
 payout effect is recorded in
 [Payout differences from 2.x.x (decision D2)](#payout-differences-from-2xx).
 
-`2.x.x` also read `PRISM_STRATUM_SHARE_WEIGHT` (default 1) and
-`PRISM_STRATUM_SHARE_WEIGHTS_JSON` (default empty), a JSON object keyed by miner
+`2.x.x` also read `PRISM_STRATUM_SHARE_WEIGHT` (default 1) and <!-- retired-setting: PRISM_STRATUM_SHARE_WEIGHT -->
+`PRISM_STRATUM_SHARE_WEIGHTS_JSON` (default empty), a JSON object keyed by miner <!-- retired-setting: PRISM_STRATUM_SHARE_WEIGHTS_JSON -->
 username or payout address. A worker with an entry in that object was credited
 `max(1, override)` instead of its share target's difficulty; the default weight
 only filled the job's delivered `share_weight` field. `3.x.x` does not support
@@ -349,7 +349,7 @@ All vectors use the day-one floor of 14720 sats.
   - miner-a has a 30-difficulty share and miner-b a 20-difficulty share in the ledger.
   - miner-b solves a 500000000-sat block.
 - **2.x.x:** miner-b is paid 500000000.
-  - Two distinct miners is below the `PRISM_MIN_READY_MINERS` gate (default 3).
+  - Two distinct miners is below the `PRISM_MIN_READY_MINERS` gate (default 3). <!-- retired-setting: PRISM_MIN_READY_MINERS -->
   - So the job is a collection job: one synthetic solver share, and the solver
     is paid the whole coinbase.
 - **3.x.x:** miner-a is paid 300000000 and miner-b 200000000.

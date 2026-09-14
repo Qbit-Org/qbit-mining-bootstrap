@@ -60,7 +60,7 @@ load and total CPU allocation stated separately. More frontends provide routing
 and process redundancy, but every share still crosses one PostgreSQL commit and
 ordering boundary. Report measured scaling; do not infer it from thread count.
 
-The retained [optional v2 qualification validator](prism-capacity-readiness.md)
+The retained [optional v3 qualification validator](prism-capacity-readiness.md)
 checks a strict evidence record. The repository's synthetic builder benchmark
 does not generate a qualification artifact or replace the complete load runner.
 

@@ -1,13 +1,12 @@
 //! Scrape-time freshness for the last complete metrics publication.
-use super::{env_num, HeaderValue, IntoResponse, Response};
+use super::{HeaderValue, IntoResponse, Response};
 use std::time::{Duration, Instant};
 
-pub(crate) fn health_stale_after() -> Duration {
-    Duration::from_secs(
-        env_num("PRISM_HEALTH_REFRESH_SECONDS", 2)
-            .saturating_mul(3)
-            .max(15),
-    )
+/// Three missed publications, never less than fifteen seconds.
+pub(crate) fn health_stale_after(refresh_interval: Duration) -> Duration {
+    refresh_interval
+        .saturating_mul(3)
+        .max(Duration::from_secs(15))
 }
 
 #[derive(Clone, Default)]

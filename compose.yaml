@@ -514,17 +514,12 @@ services:
       nofile:
         soft: ${PRISM_COORDINATOR_NOFILE_SOFT:-65536}
         hard: ${PRISM_COORDINATOR_NOFILE_HARD:-524288}
-      # Unlimited core dumps for native-crash forensics. Where the dump lands
-      # is decided by the *host's* /proc/sys/kernel/core_pattern (it is not
-      # namespaced): a relative pattern such as "core" writes into the crashed
-      # process's cwd inside the container — /app for this image — and, with
-      # restart: on-failure reusing the same container, survives the restart;
-      # retrieve it with `docker cp <container>:/app/core`. A pipe pattern
-      # (e.g. |systemd-coredump or apport) delivers the dump to that handler
-      # on the host instead — look it up there with `coredumpctl`.
+      # No core dumps: a frontend holds both signing seeds in memory (#260 D4),
+      # and the host's core_pattern could write them to disk or hand them to a
+      # host crash handler. The image entrypoint also lowers this limit.
       core:
-        soft: -1
-        hard: -1
+        soft: 0
+        hard: 0
     build:
       context: .
       dockerfile: lab/prism/Dockerfile
@@ -550,6 +545,14 @@ services:
       PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX: ${PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX:-}
       PRISM_MANIFEST_SIGNING_SEED_HEX: ${PRISM_MANIFEST_SIGNING_SEED_HEX:-}
       PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX: ${PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX:-}
+      # Mounted-file alternatives; compose.production.yaml sets these and
+      # clears the direct seeds above.
+      PRISM_MANIFEST_SIGNING_SEED_HEX_FILE: ${PRISM_MANIFEST_SIGNING_SEED_HEX_FILE:-}
+      PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX_FILE: ${PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX_FILE:-}
+      # Optional bearer token for the operator listener; the built-in
+      # healthcheck sends it. Configure at most one of the two forms.
+      PRISM_OPERATOR_BEARER_TOKEN: ${PRISM_OPERATOR_BEARER_TOKEN:-}
+      PRISM_OPERATOR_BEARER_TOKEN_FILE: ${PRISM_OPERATOR_BEARER_TOKEN_FILE:-}
       PRISM_AUDIT_DIR: ${PRISM_AUDIT_DIR:-/var/lib/qbit-prism/audit}
       PRISM_AUDIT_BIND: ${PRISM_AUDIT_BIND:-127.0.0.1}
       PRISM_AUDIT_PORT: ${PRISM_AUDIT_PORT:-3341}
@@ -704,6 +707,10 @@ services:
       context: .
       dockerfile: lab/prism/Dockerfile
     command: ["qbit-prism-server", "public-api"]
+    ulimits:
+      core:
+        soft: 0
+        hard: 0
     # Deliberately NOT depends_on prism-coordinator. The public tier must
     # survive coordinator restarts -- that independence is a large part of why
     # the surface was extracted -- so it waits only on the database it reads,
@@ -720,9 +727,6 @@ services:
       QBIT_RPC_USER: ${QBIT_RPC_USER:-qbitrpc}
       QBIT_RPC_PASSWORD: ${QBIT_RPC_PASSWORD:-change-this}
       PGPASSWORD: ${PRISM_POSTGRES_PASSWORD:-change-this}
-      PRISM_POSTGRES_DB: ${PRISM_POSTGRES_DB:-qbit}
-      PRISM_POSTGRES_USER: ${PRISM_POSTGRES_USER:-qbit}
-      PRISM_POSTGRES_PASSWORD: ${PRISM_POSTGRES_PASSWORD:-change-this}
       # The standby, under its own operator knob. Reusing PRISM_DATABASE_URL
       # here would let a .env that names the primary -- which the coordinator's
       # entry legitimately does -- silently point the public tier back at it,

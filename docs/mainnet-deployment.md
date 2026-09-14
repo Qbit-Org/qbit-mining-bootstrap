@@ -78,6 +78,43 @@ Create each directory before rendering Compose, then grant only the correspondin
 runtime the required access. Compose refuses to create missing production bind
 paths.
 
+### PRISM signing secrets
+
+Each mining frontend reads its two signing seeds from files, not from the
+environment (#260 D4). Keep the secrets directory outside the checkout and off
+shared storage:
+
+```dotenv
+PRISM_SECRETS_SOURCE=/srv/qbit-mining-bootstrap/mainnet/prism/secrets
+```
+
+The production override mounts it read-only at `/run/secrets/qbit-prism` in
+`prism-coordinator`, and in `prism-coordinator-2` under the HA overlay. It
+points `PRISM_MANIFEST_SIGNING_SEED_HEX_FILE` and
+`PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX_FILE` at the files below and clears
+the direct seed variables; `scripts/check-env.sh` rejects nonblank direct
+values. `prism-public-api` receives neither the mount nor a seed. The PRISM
+image runs as UID and GID 10001, which must be able to read both files:
+
+```bash
+secrets=/srv/qbit-mining-bootstrap/mainnet/prism/secrets
+sudo install -d -m 0500 -o 10001 -g 10001 "$secrets"
+printf '%s\n' "$PRISM_MANIFEST_SIGNING_SEED_HEX" |
+  sudo install -m 0400 -o 10001 -g 10001 /dev/stdin "$secrets/manifest-signing-seed-hex"
+printf '%s\n' "$PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX" |
+  sudo install -m 0400 -o 10001 -g 10001 /dev/stdin "$secrets/ledger-attestation-signing-seed-hex"
+unset PRISM_MANIFEST_SIGNING_SEED_HEX PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX
+```
+
+To require a bearer token on the operator listener, write it to
+`operator-bearer-token` in the same directory with the same ownership and mode,
+and set
+`PRISM_OPERATOR_BEARER_TOKEN_FILE=/run/secrets/qbit-prism/operator-bearer-token`.
+The built-in healthcheck sends it. The image entrypoint and Compose set both
+core limits to zero. The Linux server also disables process dumpability before
+reading credentials, covering host crash collectors that ignore those limits.
+See [native configuration hardening](prism-configuration.md#mounted-signing-seeds).
+
 `PRISM_POSTGRES_WAL_SOURCE` is the primary's live WAL directory. Separating it
 from `PGDATA` permits an independent capacity and I/O boundary only when the two
 paths are backed by different mounts or devices. Two directories on one
@@ -367,7 +404,8 @@ migration guide.
 
 ### Native process health and shutdown
 
-The image starts `qbit-prism-server` directly as PID 1. SIGTERM closes admission
+The image runs as UID 10001; its entrypoint disables core dumps and executes
+`qbit-prism-server` as PID 1. SIGTERM closes admission
 and initiates a bounded task drain; durable candidate/CTV intents remain
 recoverable if the process exits before completing them. `/healthz` fails when
 published work is stale, its payout revision is obsolete, or job delivery cannot

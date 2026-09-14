@@ -126,9 +126,8 @@ impl Ledger {
     }
 }
 
-// The server publishes every two seconds. Use the configured database's clock
-// and a fixed 15-second window, not the caller's clock or an HA election.
-const INSTANCE_FRESHNESS_SECONDS: f64 = 15.0;
+// Sample with the configured database's clock. The reader supplies the same
+// cadence-derived freshness budget used by health and metrics snapshots.
 const LIVE_INSTANCES_QUERY: &str = r#"
 WITH sample AS (SELECT clock_timestamp() AS observed_at)
 SELECT observed_at::text, COALESCE((
@@ -159,12 +158,13 @@ pub(crate) struct LiveInstancesReport {
 pub(crate) fn unavailable_live_instances(
     status: &'static str,
     warning: &'static str,
+    freshness: Duration,
 ) -> LiveInstancesReport {
     LiveInstancesReport {
         status,
         observed_at: None,
         clock: "PostgreSQL clock_timestamp() via PRISM_DATABASE_URL",
-        freshness_seconds: INSTANCE_FRESHNESS_SECONDS,
+        freshness_seconds: freshness.as_secs_f64(),
         count: None,
         instance_ids: None,
         instances: None,
@@ -176,7 +176,7 @@ pub(crate) fn unavailable_live_instances(
     }
 }
 
-pub(crate) async fn live_instances(database_url: &str) -> LiveInstancesReport {
+pub(crate) async fn live_instances(database_url: &str, freshness: Duration) -> LiveInstancesReport {
     // A separate read-only connection avoids Ledger::connect's heartbeat write.
     // Config already resolved/validated the DSN; do not read environment again.
     let result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -190,23 +190,29 @@ pub(crate) async fn live_instances(database_url: &str) -> LiveInstancesReport {
     })
     .await;
     match result {
-        Ok(Ok((observed_at, rows))) => summarize_live_instances(&observed_at, rows),
+        Ok(Ok((observed_at, rows))) => summarize_live_instances(freshness, &observed_at, rows),
         // Do not print connection errors: they may contain a credentialed DSN.
         _ => unavailable_live_instances(
             "failed",
             "Heartbeat read failed or exceeded 5 seconds; HA is unknown",
+            freshness,
         ),
     }
 }
 
-fn summarize_live_instances(observed_at: &str, rows: Value) -> LiveInstancesReport {
+fn summarize_live_instances(
+    freshness: Duration,
+    observed_at: &str,
+    rows: Value,
+) -> LiveInstancesReport {
+    let freshness_seconds = freshness.as_secs_f64();
     let mut live = Vec::new();
     let mut stale = Vec::new();
     let mut inactive = Vec::new();
     let mut unknown = Vec::new();
     for row in rows.as_array().into_iter().flatten() {
         match row["age_seconds"].as_f64() {
-            Some(age) if age > INSTANCE_FRESHNESS_SECONDS => stale.push(row.clone()),
+            Some(age) if age > freshness_seconds => stale.push(row.clone()),
             Some(age) if age >= 0.0 => {
                 match serde_json::from_value::<HeartbeatStatus>(row["status"].clone()) {
                     Ok(HeartbeatStatus::Health(_)) => live.push(row.clone()),
@@ -234,7 +240,7 @@ fn summarize_live_instances(observed_at: &str, rows: Value) -> LiveInstancesRepo
         status,
         observed_at: Some(observed_at.to_owned()),
         clock: "PostgreSQL clock_timestamp() via PRISM_DATABASE_URL",
-        freshness_seconds: INSTANCE_FRESHNESS_SECONDS,
+        freshness_seconds,
         count: unknown.is_empty().then_some(live.len()),
         instance_ids: Some(live.iter().map(|row| row["instance_id"].clone()).collect()),
         single_instance: (unknown.is_empty() && !live.is_empty()).then_some(live.len() == 1),
@@ -255,6 +261,8 @@ fn summarize_live_instances(observed_at: &str, rows: Value) -> LiveInstancesRepo
 #[cfg(test)]
 mod live_instance_tests {
     use super::*;
+
+    const DEFAULT_FRESHNESS: Duration = Duration::from_secs(15);
 
     fn row(id: &str, age: f64, status: Value) -> Value {
         json!({"instance_id":id, "age_seconds":age, "status":status})
@@ -285,7 +293,11 @@ mod live_instance_tests {
         let decoded: HeartbeatStatus = serde_json::from_value(stored.clone())?;
         assert!(matches!(decoded, HeartbeatStatus::Health(_)));
         assert_eq!(serde_json::to_value(decoded)?, stored);
-        let report = summarize_live_instances("db-time", json!([row("legacy", 0.0, stored)]));
+        let report = summarize_live_instances(
+            DEFAULT_FRESHNESS,
+            "db-time",
+            json!([row("legacy", 0.0, stored)]),
+        );
         assert_eq!(report.count, Some(1));
         Ok(())
     }
@@ -311,7 +323,11 @@ mod live_instance_tests {
             serde_json::from_value::<HeartbeatStatus>(stored.clone())?,
             HeartbeatStatus::Health(_)
         ));
-        let report = summarize_live_instances("db-time", json!([row("legacy", 1.0, stored)]));
+        let report = summarize_live_instances(
+            DEFAULT_FRESHNESS,
+            "db-time",
+            json!([row("legacy", 1.0, stored)]),
+        );
         assert_eq!(report.count, Some(1));
         assert_eq!(report.inactive_instances.unwrap().len(), 0);
         // The original reader falls back to lifecycle if health is malformed.
@@ -340,6 +356,7 @@ mod live_instance_tests {
             json!({"schema":1,"ready":true}),
         ] {
             let report = summarize_live_instances(
+                DEFAULT_FRESHNESS,
                 "db-time",
                 json!([
                     row("live", 1.0, health()),
@@ -352,7 +369,11 @@ mod live_instance_tests {
             assert_eq!(report.instances.unwrap().len(), 1);
             assert_eq!(report.unknown_instances.unwrap().len(), 1);
             // Staleness takes precedence over payload classification.
-            let report = summarize_live_instances("db-time", json!([row("old", 16.0, stored)]));
+            let report = summarize_live_instances(
+                DEFAULT_FRESHNESS,
+                "db-time",
+                json!([row("old", 16.0, stored)]),
+            );
             assert_eq!(report.status, "stale");
             assert_eq!(report.count, Some(0));
         }
@@ -360,7 +381,7 @@ mod live_instance_tests {
 
     #[test]
     fn empty_table_is_not_live() {
-        let report = summarize_live_instances("db-time", json!([]));
+        let report = summarize_live_instances(DEFAULT_FRESHNESS, "db-time", json!([]));
         assert_eq!(report.status, "empty");
         assert_eq!(report.count, Some(0));
         assert_eq!(report.single_instance, None);
@@ -368,7 +389,11 @@ mod live_instance_tests {
 
     #[test]
     fn stale_rows_do_not_count() {
-        let report = summarize_live_instances("db-time", json!([row("old", 16.0, health())]));
+        let report = summarize_live_instances(
+            DEFAULT_FRESHNESS,
+            "db-time",
+            json!([row("old", 16.0, health())]),
+        );
         assert_eq!(report.status, "stale");
         assert_eq!(report.count, Some(0));
         assert_eq!(report.single_instance, None);
@@ -377,6 +402,7 @@ mod live_instance_tests {
     #[test]
     fn startup_rows_are_inactive_not_live() {
         let report = summarize_live_instances(
+            DEFAULT_FRESHNESS,
             "db-time",
             json!([
                 row("starting", 0.0, json!({"state":"starting"})),
@@ -392,6 +418,7 @@ mod live_instance_tests {
     #[test]
     fn inclusive_freshness_boundary_and_unready_servers_are_live() {
         let report = summarize_live_instances(
+            DEFAULT_FRESHNESS,
             "db-time",
             json!([row("a", 15.0, health()), row("b", 0.0, health())]),
         );
@@ -403,14 +430,42 @@ mod live_instance_tests {
 
     #[test]
     fn single_live_instance_warns() {
-        let report = summarize_live_instances("db-time", json!([row("a", 1.0, health())]));
+        let report = summarize_live_instances(
+            DEFAULT_FRESHNESS,
+            "db-time",
+            json!([row("a", 1.0, health())]),
+        );
         assert_eq!(report.single_instance, Some(true));
         assert!(report.ha_warning.is_some());
     }
 
     #[test]
+    fn slow_heartbeat_cadence_preserves_ha_until_the_freshness_boundary() {
+        let freshness = crate::api::health_stale_after(Duration::from_secs(20));
+        let report = summarize_live_instances(
+            freshness,
+            "db-time",
+            json!([
+                row("between-publications", 19.0, health()),
+                row("boundary", 60.0, health()),
+                row("expired", 60.001, health())
+            ]),
+        );
+        assert_eq!(report.status, "observed");
+        assert_eq!(report.freshness_seconds, 60.0);
+        assert_eq!(report.count, Some(2));
+        assert_eq!(report.single_instance, Some(false));
+        assert_eq!(report.ha_warning, None);
+        assert_eq!(report.stale_instances.unwrap()[0]["instance_id"], "expired");
+    }
+
+    #[test]
     fn future_dated_row_is_unknown() {
-        let report = summarize_live_instances("db-time", json!([row("a", -1.0, health())]));
+        let report = summarize_live_instances(
+            DEFAULT_FRESHNESS,
+            "db-time",
+            json!([row("a", -1.0, health())]),
+        );
         assert_eq!(report.status, "unknown");
         assert_eq!(report.count, None);
         assert_eq!(report.single_instance, None);
@@ -418,10 +473,15 @@ mod live_instance_tests {
 
     #[tokio::test]
     async fn failed_heartbeat_connection_is_not_zero_or_healthy() {
-        let report = live_instances("postgresql://127.0.0.1:0/unavailable").await;
+        let report = live_instances(
+            "postgresql://127.0.0.1:0/unavailable",
+            Duration::from_secs(60),
+        )
+        .await;
         assert_eq!(report.status, "failed");
         assert_eq!(report.count, None);
         assert_eq!(report.observed_at, None);
+        assert_eq!(report.freshness_seconds, 60.0);
     }
 
     #[tokio::test]
@@ -440,7 +500,7 @@ mod live_instance_tests {
         let (at, rows) = sqlx::query_as::<_, (String, Value)>(LIVE_INSTANCES_QUERY)
             .fetch_one(&mut *connection)
             .await?;
-        let report = summarize_live_instances(&at, rows);
+        let report = summarize_live_instances(DEFAULT_FRESHNESS, &at, rows);
         assert_eq!(report.status, "empty");
         assert_eq!(report.count, Some(0));
         sqlx::query("INSERT INTO qbit_prism_instances VALUES ('old', clock_timestamp() - interval '1 minute', $1)")
@@ -449,7 +509,7 @@ mod live_instance_tests {
         let (at, rows) = sqlx::query_as::<_, (String, Value)>(LIVE_INSTANCES_QUERY)
             .fetch_one(&mut *connection)
             .await?;
-        let report = summarize_live_instances(&at, rows);
+        let report = summarize_live_instances(DEFAULT_FRESHNESS, &at, rows);
         assert_eq!(report.status, "stale");
         assert_eq!(report.count, Some(0));
         assert_eq!(report.stale_instances.unwrap()[0]["instance_id"], "old");
@@ -479,7 +539,7 @@ mod live_instance_tests {
             let (at, rows) = sqlx::query_as::<_, (String, Value)>(LIVE_INSTANCES_QUERY)
                 .fetch_one(&pool)
                 .await?;
-            let report = summarize_live_instances(&at, rows);
+            let report = summarize_live_instances(DEFAULT_FRESHNESS, &at, rows);
             assert_eq!(
                 report.count,
                 Some(usize::from(matches!(status, HeartbeatStatus::Health(_))))

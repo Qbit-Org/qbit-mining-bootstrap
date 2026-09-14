@@ -56,11 +56,11 @@ they fixed or configured no longer exists on this line:
   import them. PRs #245, #248, #250, #252, #253, #256, #259, and #292 fixed
   that runtime; their commits are ancestors of this line, but their Python
   files are removed. Only `lab/prism/Dockerfile` remains.
-- The `PRISM_BLOCK_REPLAY_PAGE_SIZE` knob. Its only reader was the Python
+- The `PRISM_BLOCK_REPLAY_PAGE_SIZE` knob. Its only reader was the Python <!-- retired-setting: PRISM_BLOCK_REPLAY_PAGE_SIZE -->
   coordinator configuration, and the native lane claims one candidate at a
   time.
-- The `PRISM_CANDIDATE_STORAGE_VERSION`, `PRISM_CANDIDATE_SPOOL_DIR`, and
-  `PRISM_CANDIDATE_SPOOL_RESERVATION_BYTES` settings. No file on this line
+- The `PRISM_CANDIDATE_STORAGE_VERSION`, `PRISM_CANDIDATE_SPOOL_DIR`, and <!-- retired-setting: PRISM_CANDIDATE_STORAGE_VERSION --> <!-- retired-setting: PRISM_CANDIDATE_SPOOL_DIR -->
+  `PRISM_CANDIDATE_SPOOL_RESERVATION_BYTES` settings. No file on this line <!-- retired-setting: PRISM_CANDIDATE_SPOOL_RESERVATION_BYTES -->
   reads them.
 - The Python offline pending-block recovery command
   (`lab.prism.recover_pending_blocks`) and its runbook steps.
