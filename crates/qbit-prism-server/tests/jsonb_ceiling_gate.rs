@@ -176,12 +176,6 @@ const KNOWN_VIOLATIONS: &[Violation] = &[
         column: "candidate",
         phase: PHASE_ENQUEUE,
     },
-    // 1 window copy: reward_manifest.shares survives the `remove("shares")`. Removed by #267.
-    Violation {
-        table: "qbit_pool_audit_bundles",
-        column: "audit_bundle",
-        phase: PHASE_LANDING,
-    },
 ];
 
 /// Phases the gate is knowingly unable to drive. Empty at this base commit:
