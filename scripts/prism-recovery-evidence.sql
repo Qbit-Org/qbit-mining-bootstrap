@@ -7,6 +7,84 @@ BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
 SET LOCAL TIME ZONE 'UTC';
 SET LOCAL bytea_output = 'hex';
 
+-- Startup refuses a database at migration 6 whose capability declaration or
+-- source record is missing, substituted or unreadable
+-- (require_known_capabilities and require_migration_source). Refuse it here
+-- too, so a restore that cannot start yields no evidence. Only the current
+-- schema's own tables count: search_path must not resolve a lost table to
+-- another ledger's. Frozen 2.x and pre-006 native schemas, whose #258
+-- declaration of 2 remains valid, are not checked. Metadata is validated,
+-- never exported: routine migration provenance must not change evidence.
+DO $metadata$
+DECLARE
+    history regclass := to_regclass('qbit_prism_schema_migrations');
+    hint constant text := 'Startup refuses this database. Restore the full backup, including the metadata tables of the current schema, then export again.';
+    native boolean;
+    metadata text;
+    relation record;
+    capability_table text;
+    source_table text;
+    capability record;
+    declared boolean := false;
+    source record;
+    source_rows bigint;
+BEGIN
+    IF history IS NULL THEN
+        RETURN;
+    END IF;
+    EXECUTE format('SELECT EXISTS (SELECT 1 FROM %s WHERE version >= 6)', history) INTO native;
+    IF NOT native THEN
+        RETURN;
+    END IF;
+    FOREACH metadata IN ARRAY ARRAY['qbit_prism_schema_capabilities', 'qbit_prism_migration_source'] LOOP
+        SELECT n.nspname IS NOT DISTINCT FROM current_schema() AS in_current_schema,
+               format('%I.%I', n.nspname, c.relname) AS qualified, c.relkind::text AS kind,
+               c.relrowsecurity OR c.relforcerowsecurity AS row_security
+        INTO relation
+        FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.oid = to_regclass(metadata);
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'database is at schema migration 6 but has no % in the current schema %', metadata, current_schema() USING HINT = hint;
+        ELSIF NOT relation.in_current_schema THEN
+            RAISE EXCEPTION '% resolves to %, outside the current schema %; refusing another schema''s metadata', metadata, relation.qualified, current_schema() USING HINT = hint;
+        ELSIF relation.kind <> 'r' THEN
+            RAISE EXCEPTION '% must be an ordinary table (found relation kind %)', metadata, relation.kind USING HINT = hint;
+        ELSIF metadata = 'qbit_prism_schema_capabilities' AND relation.row_security THEN
+            RAISE EXCEPTION 'qbit_prism_schema_capabilities has row-level security enabled or forced; refusing possibly hidden capability rows' USING HINT = hint;
+        END IF;
+        IF metadata = 'qbit_prism_schema_capabilities' THEN
+            capability_table := relation.qualified;
+        ELSE
+            source_table := relation.qualified;
+        END IF;
+    END LOOP;
+    -- Startup decodes capability as text and capability_value as int4, and
+    -- understands candidate_storage_version 1 only once 006 has run.
+    FOR capability IN EXECUTE format('SELECT capability, capability_value, pg_typeof(capability)::text AS name_type, pg_typeof(capability_value)::text AS value_type FROM %s', capability_table) LOOP
+        IF capability.name_type <> 'text' OR capability.value_type <> 'integer'
+           OR capability.capability IS NULL OR capability.capability_value IS NULL THEN
+            RAISE EXCEPTION 'qbit_prism_schema_capabilities has an unreadable row: capability % (%), capability_value % (%)', capability.capability, capability.name_type, capability.capability_value, capability.value_type USING HINT = hint;
+        ELSIF capability.capability <> 'candidate_storage_version' THEN
+            RAISE EXCEPTION 'database declares capability % = %, which this server does not understand', capability.capability, capability.capability_value USING HINT = hint;
+        ELSIF capability.capability_value <> 1 THEN
+            RAISE EXCEPTION 'database declares candidate_storage_version = %, but this server understands candidate_storage_version 1 to 1 only', capability.capability_value USING HINT = hint;
+        END IF;
+        declared := true;
+    END LOOP;
+    IF NOT declared THEN
+        RAISE EXCEPTION 'database is at schema migration 6 but qbit_prism_schema_capabilities has no candidate_storage_version row' USING HINT = hint;
+    END IF;
+    -- The singleton row startup decodes into MigrationSource.
+    EXECUTE format('SELECT concat_ws('','', pg_typeof(source_state), pg_typeof(source_release), pg_typeof(source_commit), pg_typeof(candidate_storage_version), pg_typeof(prior_schema_version), pg_typeof(migrated_by), pg_typeof(migrated_at)) AS types, source_state IS NULL OR prior_schema_version IS NULL OR migrated_by IS NULL OR migrated_at IS NULL AS incomplete FROM %s WHERE singleton LIMIT 1', source_table) INTO source;
+    GET DIAGNOSTICS source_rows = ROW_COUNT;
+    IF source_rows = 0 THEN
+        RAISE EXCEPTION 'database is at schema migration 6 but qbit_prism_migration_source has no singleton row' USING HINT = hint;
+    ELSIF source.types <> 'text,text,text,integer,integer,text,timestamp with time zone' OR source.incomplete THEN
+        RAISE EXCEPTION 'qbit_prism_migration_source has an unreadable singleton row (column types %, required value missing: %)', source.types, source.incomplete USING HINT = hint;
+    END IF;
+END
+$metadata$;
+
 SELECT jsonb_build_object('kind', 'shares', 'row', to_jsonb(s))
 FROM qbit_share_ledger s ORDER BY share_seq;
 

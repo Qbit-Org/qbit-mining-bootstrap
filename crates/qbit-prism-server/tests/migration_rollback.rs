@@ -594,6 +594,7 @@ async fn assert_share_hash_fingerprints(raw: &str, pg_bin: &std::path::Path) -> 
                 ensure!(missing.unwrap_err().to_string().contains(table));
                 ensure!(recovery::evidence(&source, pg_bin).await? == native);
             }
+            assert_native_metadata_required(&source, &restored, pg_bin, &native).await?;
             Ok::<_, anyhow::Error>(())
         }.await;
         ledger.pool.close().await;
@@ -602,6 +603,124 @@ async fn assert_share_hash_fingerprints(raw: &str, pg_bin: &std::path::Path) -> 
     source.close().await?;
     restored.close().await?;
     result
+}
+
+/// Startup refuses a database at migration 6 whose capability declaration or
+/// source record is missing, substituted or unreadable. Export must refuse the
+/// same database, and must not read another ledger's metadata through
+/// search_path, while intact metadata leaves evidence unchanged.
+async fn assert_native_metadata_required(
+    source: &recovery::Database,
+    restored: &recovery::Database,
+    pg_bin: &std::path::Path,
+    native: &serde_json::Value,
+) -> Result<()> {
+    const SAVE_SOURCE: &str =
+        "ALTER TABLE qbit_prism_migration_source RENAME TO saved_recovery_metadata";
+    const RESTORE_SOURCE: &str =
+        "ALTER TABLE saved_recovery_metadata RENAME TO qbit_prism_migration_source";
+    const SAVE_CAPABILITIES: &str =
+        "ALTER TABLE qbit_prism_schema_capabilities RENAME TO saved_recovery_metadata";
+    const RESTORE_CAPABILITIES: &str =
+        "ALTER TABLE saved_recovery_metadata RENAME TO qbit_prism_schema_capabilities";
+    let replace_source = |columns: &str| {
+        format!("{SAVE_SOURCE}; CREATE TABLE qbit_prism_migration_source AS SELECT singleton,source_state,source_release,source_commit,candidate_storage_version,{columns} FROM saved_recovery_metadata")
+    };
+    for (mutation, revert, refusal) in [
+        (SAVE_CAPABILITIES.to_owned(), RESTORE_CAPABILITIES.to_owned(), "has no qbit_prism_schema_capabilities"),
+        (
+            format!("{SAVE_CAPABILITIES}; CREATE VIEW qbit_prism_schema_capabilities AS SELECT * FROM saved_recovery_metadata"),
+            format!("DROP VIEW qbit_prism_schema_capabilities; {RESTORE_CAPABILITIES}"),
+            "qbit_prism_schema_capabilities must be an ordinary table",
+        ),
+        (
+            "ALTER TABLE qbit_prism_schema_capabilities ENABLE ROW LEVEL SECURITY".into(),
+            "ALTER TABLE qbit_prism_schema_capabilities DISABLE ROW LEVEL SECURITY".into(),
+            "row-level security",
+        ),
+        (
+            "DELETE FROM qbit_prism_schema_capabilities".into(),
+            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',1)".into(),
+            "has no candidate_storage_version row",
+        ),
+        (
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=2".into(),
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=1".into(),
+            "declares candidate_storage_version = 2",
+        ),
+        (
+            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('sealed_share_pages',1)".into(),
+            "DELETE FROM qbit_prism_schema_capabilities WHERE capability='sealed_share_pages'".into(),
+            "declares capability sealed_share_pages = 1",
+        ),
+        (SAVE_SOURCE.to_owned(), RESTORE_SOURCE.to_owned(), "has no qbit_prism_migration_source"),
+        (
+            format!("{SAVE_SOURCE}; CREATE VIEW qbit_prism_migration_source AS SELECT * FROM saved_recovery_metadata"),
+            format!("DROP VIEW qbit_prism_migration_source; {RESTORE_SOURCE}"),
+            "qbit_prism_migration_source must be an ordinary table",
+        ),
+        (
+            format!("{SAVE_SOURCE}; CREATE TABLE qbit_prism_migration_source (LIKE saved_recovery_metadata INCLUDING ALL)"),
+            format!("DROP TABLE qbit_prism_migration_source; {RESTORE_SOURCE}"),
+            "qbit_prism_migration_source has no singleton row",
+        ),
+        (
+            replace_source("prior_schema_version,NULL::text AS migrated_by,migrated_at"),
+            format!("DROP TABLE qbit_prism_migration_source; {RESTORE_SOURCE}"),
+            "qbit_prism_migration_source has an unreadable singleton row",
+        ),
+        (
+            replace_source("prior_schema_version::bigint AS prior_schema_version,migrated_by,migrated_at"),
+            format!("DROP TABLE qbit_prism_migration_source; {RESTORE_SOURCE}"),
+            "qbit_prism_migration_source has an unreadable singleton row",
+        ),
+    ] {
+        sqlx::raw_sql(&mutation).execute(&source.pool).await?;
+        let refused = recovery::evidence(source, pg_bin).await;
+        sqlx::raw_sql(&revert).execute(&source.pool).await?;
+        let error = match refused {
+            Ok(_) => anyhow::bail!("export accepted metadata startup refuses: {mutation}"),
+            Err(error) => error.to_string(),
+        };
+        ensure!(error.contains(refusal), "{mutation}: {error}");
+        ensure!(recovery::evidence(source, pg_bin).await? == *native);
+    }
+
+    // The restored ledger later in search_path has complete metadata. It
+    // must neither change intact evidence nor stand in for a lost table.
+    let layered = recovery::Database {
+        admin: source.admin.clone(),
+        pool: source.pool.clone(),
+        schema: format!("{}, {}", source.schema, restored.schema),
+        url: source.url.clone(),
+    };
+    ensure!(recovery::evidence(&layered, pg_bin).await? == *native);
+    for (save, restore, table) in [
+        (
+            SAVE_CAPABILITIES,
+            RESTORE_CAPABILITIES,
+            "qbit_prism_schema_capabilities",
+        ),
+        (SAVE_SOURCE, RESTORE_SOURCE, "qbit_prism_migration_source"),
+    ] {
+        sqlx::query(save).execute(&source.pool).await?;
+        let hidden = recovery::evidence(&layered, pg_bin).await;
+        sqlx::query(restore).execute(&source.pool).await?;
+        let error = match hidden {
+            Ok(_) => anyhow::bail!("export read {table} from another schema"),
+            Err(error) => error.to_string(),
+        };
+        ensure!(
+            error.contains(&format!(
+                "resolves to {}.{table}, outside the current schema {}",
+                restored.schema, source.schema
+            )),
+            "{error}"
+        );
+    }
+    ensure!(recovery::evidence(&layered, pg_bin).await? == *native);
+    ensure!(recovery::evidence(restored, pg_bin).await? == *native);
+    Ok(())
 }
 
 async fn assert_candidate_payload_fingerprints(
