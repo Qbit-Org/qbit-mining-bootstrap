@@ -26,7 +26,11 @@ measure.
   build profile of both binaries either way. The profile is read from the
   Cargo directory the binary sits in, after following symlinks, so a copied
   or installed binary has an unknown profile, and an unknown profile needs
-  the same override: it cannot be shown to be a release build.
+  the same override: it cannot be shown to be a release build. The override
+  admits the run and nothing more: like `--allow-dirty-tree` and
+  `--allow-unverified-server-revision` it forces `artifact_kind: "example"`,
+  because only a server shown to be a release build can produce
+  qualification evidence.
 
   ```sh
   cargo build --locked --release -p qbit-prism-server -p qbit-prism-load
@@ -84,7 +88,7 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--server-bin` | the `qbit-prism-server` beside this binary | Frontend executable |
-| `--allow-debug-server` | off | Run a server whose build profile is debug, or cannot be determined from its location, anyway |
+| `--allow-debug-server` | off | Run a server whose build profile is debug, or cannot be determined from its location, anyway; forces `artifact_kind: example` |
 | `--allow-dirty-tree` | off | Run with modified tracked files; forces `artifact_kind: example` |
 | `--allow-unverified-server-revision` | off | Run a server binary that cannot be tied to this checkout's HEAD (no Cargo dep-info beside it, or a source or manifest newer than it); forces `artifact_kind: example` |
 | `--example-artifact` | off | Emit `artifact_kind: example` from a clean tree |

@@ -83,6 +83,34 @@ pub fn drain_limit(share_commit_timeout_seconds: f64) -> Duration {
     Duration::from_secs_f64(share_commit_timeout_seconds.max(0.0)) + DRAIN_MARGIN
 }
 
+/// Which `artifact_kind` a run earns, from what was established at entry.
+///
+/// Qualification evidence needs every premise the artifact rests on: a
+/// clean tree, so the revision names the code that ran; a server binary
+/// shown to be what that tree builds; and a server shown to be a release
+/// build, because a debug build does not measure capacity. Each override
+/// that admits a run short of one of those forces `example`. The profile
+/// used to be left out: `--allow-debug-server` admitted a `target/debug`
+/// binary, the dep-info still established its revision, and the artifact
+/// came out as `qualification` while the harness's own refusal text said
+/// the build measured nothing (EP-OBSERVABILITY).
+pub fn artifact_kind(
+    dirty: bool,
+    example_requested: bool,
+    revision_established: bool,
+    server_profile: frontend::BuildProfile,
+) -> &'static str {
+    if dirty
+        || example_requested
+        || !revision_established
+        || server_profile != frontend::BuildProfile::Release
+    {
+        artifact::ARTIFACT_EXAMPLE
+    } else {
+        artifact::ARTIFACT_QUALIFICATION
+    }
+}
+
 /// The first hard refusal among the classified log lines, verbatim.
 pub fn hard_block_line(blocked: &[BlockedLog]) -> Option<String> {
     blocked
@@ -584,11 +612,12 @@ pub async fn execute(args: Args) -> Result<i32> {
     let server_bytes =
         std::fs::read(&server_bin).with_context(|| format!("reading {}", server_bin.display()))?;
     let server_digest = format!("sha256:{}", hex::encode(Sha256::digest(&server_bytes)));
-    let artifact_kind = if dirty || args.example_artifact || !revision_evidence.is_established() {
-        artifact::ARTIFACT_EXAMPLE
-    } else {
-        artifact::ARTIFACT_QUALIFICATION
-    }
+    let artifact_kind = artifact_kind(
+        dirty,
+        args.example_artifact,
+        revision_evidence.is_established(),
+        server_profile,
+    )
     .to_owned();
 
     // --- file descriptors -------------------------------------------------

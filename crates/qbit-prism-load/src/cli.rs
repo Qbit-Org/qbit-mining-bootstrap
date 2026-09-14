@@ -44,7 +44,8 @@ pub struct Args {
     #[arg(long)]
     pub server_bin: Option<PathBuf>,
     /// Run a server whose build profile is debug, or cannot be determined
-    /// from its location, anyway. Neither is a capacity measurement.
+    /// from its location, anyway. Neither is a capacity measurement, so
+    /// this forces `artifact_kind: example`.
     #[arg(long)]
     pub allow_debug_server: bool,
     /// Run with modified tracked files. Forces `artifact_kind: example`.

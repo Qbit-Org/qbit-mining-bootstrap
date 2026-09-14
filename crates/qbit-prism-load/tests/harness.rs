@@ -787,6 +787,43 @@ fn an_unknown_build_profile_needs_the_debug_override() -> Result<()> {
     Ok(())
 }
 
+/// `--allow-debug-server` admits a `target/debug` binary, the dep-info beside
+/// it still establishes the revision, and the artifact came out as
+/// `qualification`: evidence the harness's own refusal text says measures
+/// nothing. A non-release profile forces `example`, the way a dirty tree and
+/// an unverified revision already do; the unknown profile is not a release
+/// build either.
+#[test]
+fn a_debug_or_unknown_server_profile_forces_example_evidence() {
+    use qbit_prism_load::frontend::BuildProfile;
+    assert_eq!(
+        run::artifact_kind(false, false, true, BuildProfile::Release),
+        artifact::ARTIFACT_QUALIFICATION,
+        "every premise established is qualification"
+    );
+    for profile in [BuildProfile::Debug, BuildProfile::Unknown] {
+        assert_eq!(
+            run::artifact_kind(false, false, true, profile),
+            artifact::ARTIFACT_EXAMPLE,
+            "a {profile:?} server with a clean tree and an established revision is not \
+             qualification evidence"
+        );
+    }
+    // The other overrides still force example on their own.
+    assert_eq!(
+        run::artifact_kind(true, false, true, BuildProfile::Release),
+        artifact::ARTIFACT_EXAMPLE
+    );
+    assert_eq!(
+        run::artifact_kind(false, true, true, BuildProfile::Release),
+        artifact::ARTIFACT_EXAMPLE
+    );
+    assert_eq!(
+        run::artifact_kind(false, false, false, BuildProfile::Release),
+        artifact::ARTIFACT_EXAMPLE
+    );
+}
+
 // --- a minimal Stratum server -------------------------------------------
 
 /// The smallest Stratum server a session can complete a handshake with:

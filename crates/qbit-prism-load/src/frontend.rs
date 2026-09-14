@@ -287,7 +287,10 @@ pub fn build_profile(path: &Path) -> BuildProfile {
 /// Whether a server of this profile may be driven. Only a build shown to be a
 /// release build measures capacity; a debug build and a build whose profile
 /// cannot be determined both need `--allow-debug-server`, because an unknown
-/// profile is not evidence of a release build.
+/// profile is not evidence of a release build. The override admits the run
+/// and nothing more: the artifact it produces is `example` evidence
+/// (`run::artifact_kind`), the same way a dirty tree's or an unverified
+/// binary's is.
 pub fn check_server_profile(profile: BuildProfile, allow_debug: bool, path: &Path) -> Result<()> {
     match profile {
         BuildProfile::Release => Ok(()),
@@ -295,7 +298,7 @@ pub fn check_server_profile(profile: BuildProfile, allow_debug: bool, path: &Pat
             ensure!(
                 allow_debug,
                 "{} is a debug build, which does not measure capacity; pass \
-                 --allow-debug-server to run it anyway",
+                 --allow-debug-server to run it anyway, which forces artifact_kind example",
                 path.display()
             );
             Ok(())
@@ -306,7 +309,7 @@ pub fn check_server_profile(profile: BuildProfile, allow_debug: bool, path: &Pat
                 "the build profile of {} cannot be determined: it is not in a Cargo debug or \
                  release directory, so it cannot be shown to be a release build; build it with \
                  --release and point --server-bin at target/release, or pass \
-                 --allow-debug-server to run it anyway",
+                 --allow-debug-server to run it anyway, which forces artifact_kind example",
                 path.display()
             );
             Ok(())
