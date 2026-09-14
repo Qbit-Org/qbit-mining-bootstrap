@@ -20,8 +20,9 @@ a. No runnable ``python -m lab.…`` or ``python lab/….py`` command invokes a
    and does not follow ``cd``, ``PYTHONPATH`` or other environment
    indirection, aliases, shell variables, or backslash escapes. Shell comments,
    ordinary arguments and heredoc bodies run no command of their own. Command
-   positions include simple shell lists, the env/sudo/nohup/command/exec and
-   docker/podman exec wrappers, and literal sh/bash/dash/ksh/zsh ``-c`` strings.
+   positions include shell lists, brace groups and loop conditions/bodies,
+   the env/sudo/nohup/command/exec and docker/podman exec wrappers, and literal
+   sh/bash/dash/ksh/zsh ``-c`` strings.
    Other launcher grammars, shell evaluation of stdin, and expansions inside
    quoted arguments or heredocs are outside this lexical check.
 b. Every ``lab/prism/…`` path or ``lab.prism.…`` module reference resolves to a
@@ -425,9 +426,13 @@ ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*=")
 def executable_word(words: list[str]) -> int | None:
     """Index of the executable after the supported literal launcher prefixes."""
     index = 0
+    # Reserved words are syntax only when unquoted in shell command position;
+    # after an assignment or launcher they are ordinary executable arguments.
+    while index < len(words) and words[index] in {"!", "if", "then", "elif", "else", "do", "{", "while", "until"}:
+        index += 1
     while index < len(words):
         word = unquote(words[index])
-        if ASSIGNMENT.match(words[index]) or words[index] in {"!", "if", "then", "elif", "else", "do"}:
+        if ASSIGNMENT.match(words[index]):
             index += 1
             continue
         program = word.rsplit("/", 1)[-1]
@@ -1668,6 +1673,44 @@ class ScannerTests(unittest.TestCase):
         )
         self.assertEqual(self.commands("python3.14 -OO lab/prism/storm.py"), ["lab/prism/storm.py"])
         self.assertEqual(self.commands("python2 -m lab.prism.process_telemetry"), [])
+
+    def test_compound_shell_commands_are_scanned(self) -> None:
+        for command, missing in (
+            ("python3 -m lab.example.deleted", "lab/example/deleted.py or lab/example/deleted/__main__.py"),
+            ("python3 lab/example/deleted.py", "lab/example/deleted.py"),
+        ):
+            for text in (
+                f"{{ {command}; }}",
+                f"{{ {{ env X=1 {command}; }}; }}",
+                f"while {command}; do break; done",
+                f"until {command}; do break; done",
+                f"while true; do {{ {command}; }}; break; done",
+                f"for item in one two; do {command}; done",
+                f"if {{ {command}; }}; then true; fi",
+                f"sh -c '{{ {command}; }}'",
+            ):
+                with self.subTest(text=text):
+                    self.assertEqual(self.located(text), [(1, missing)])
+            text = f"```sh\nwhile\n  {{ {command}; }}\ndo\n  break\ndone\n```"
+            self.assertEqual(self.located(text), [(3, missing)])
+            self.assertEqual(list(dead_commands(text, {"lab/example/deleted.py"})), [])
+
+    def test_compound_shell_prefixes_in_data_are_not_commands(self) -> None:
+        command = "python3 -m lab.example.deleted"
+        for keyword in ("{", "while", "until"):
+            for prefix in (
+                f"'{keyword}'", f'"{keyword}"', f"echo {keyword}",
+                f"env {keyword}", f"command -- {keyword}", f"X=1 {keyword}",
+            ):
+                with self.subTest(prefix=prefix):
+                    self.assertEqual(self.commands(f"{prefix} {command}"), [])
+        for text in (
+            f"for item in while {command}; do echo done; done",
+            f"{{ echo {command}; }}",
+            f"while echo {command}; do break; done",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.commands(text), [])
 
     def test_inline_code_is_neither_a_module_nor_a_script_command(self) -> None:
         # `-c cmd` runs its argument and ends the option list; the prose contract
