@@ -196,6 +196,15 @@ pub struct ReconnectRecord {
     pub reason: String,
     pub completed: bool,
     pub error: Option<String>,
+    /// Measured from the moment the previous connection went -- the socket
+    /// closing, or the deliberate close after a reconnect was asked for and
+    /// the session had quiesced -- to the end of this attempt. For a
+    /// completed reconnect that is the whole outage, every failed attempt
+    /// and backoff included; for a failed attempt it is how long the
+    /// session had been without a connection when the attempt failed. It
+    /// used to restart on every attempt, so a frontend unavailable across
+    /// several of them reported its final handshake as the time to
+    /// reconnect (EP-OBSERVABILITY).
     pub seconds: f64,
 }
 
@@ -564,9 +573,12 @@ async fn run_session(
     // completion labelled a late reconnect with the next phase, and the
     // phase that configured it lost the event (EP-STATE).
     let mut reconnect_phase = String::new();
+    // When the connection now being sought was lost or given up. Every
+    // attempt's record measures from here, so the outage is what is
+    // reported, not the attempt that finally ended it.
+    let mut reconnect_started = Instant::now();
     while !stopping {
         if connection.is_none() {
-            let started = Instant::now();
             match connect(&config, &address, &shared, &frontend).await {
                 Ok(fresh) => {
                     let _ = shared.events.send(Event::Connected {
@@ -581,7 +593,7 @@ async fn run_session(
                             reason: reconnect_reason.clone(),
                             completed: true,
                             error: None,
-                            seconds: started.elapsed().as_secs_f64(),
+                            seconds: reconnect_started.elapsed().as_secs_f64(),
                         }));
                     }
                     connection = Some(fresh);
@@ -599,7 +611,7 @@ async fn run_session(
                         reason: reconnect_reason.clone(),
                         completed: false,
                         error: Some(format!("{error:#}")),
-                        seconds: started.elapsed().as_secs_f64(),
+                        seconds: reconnect_started.elapsed().as_secs_f64(),
                     }));
                     // Wait for a control message or a short backoff, so a
                     // frontend that is still restarting is not hammered.
@@ -648,6 +660,7 @@ async fn run_session(
                             quiesce(active, &shared, &config, &frontend, &outstanding).await;
                             active.drop_reader();
                             connection = None;
+                            reconnect_started = Instant::now();
                             reconnect_reason = "retarget".into();
                         }
                     }
@@ -661,6 +674,7 @@ async fn run_session(
                         quiesce(active, &shared, &config, &frontend, &outstanding).await;
                         active.drop_reader();
                         connection = None;
+                        reconnect_started = Instant::now();
                         reconnect_reason = reason;
                     }
                     Some(Control::ScheduledBlock) => {
@@ -737,6 +751,7 @@ async fn run_session(
                         });
                         active.drop_reader();
                         connection = None;
+                        reconnect_started = Instant::now();
                         reconnect_reason = format!("socket closed: {reason}");
                     }
                 }

@@ -876,6 +876,9 @@ struct FakeStratum {
     release_authorize: tokio::sync::watch::Sender<bool>,
     release_submits: tokio::sync::watch::Sender<bool>,
     submits: Arc<std::sync::atomic::AtomicUsize>,
+    /// How many of the next accepted connections are closed at once, before
+    /// a line is read: a frontend that is up but not yet serving.
+    drop_connections: Arc<std::sync::atomic::AtomicUsize>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -902,11 +905,24 @@ async fn fake_stratum_with(options: StratumOptions) -> FakeStratum {
     let (release_submits, submit_release) = tokio::sync::watch::channel(!options.hold_submits);
     let submits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = submits.clone();
+    let drop_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let to_drop = drop_connections.clone();
     let task = tokio::spawn(async move {
         loop {
             let Ok((socket, _)) = listener.accept().await else {
                 break;
             };
+            if to_drop
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |left| left.checked_sub(1),
+                )
+                .is_ok()
+            {
+                drop(socket);
+                continue;
+            }
             tokio::spawn(serve_stratum(
                 socket,
                 release.clone(),
@@ -921,6 +937,7 @@ async fn fake_stratum_with(options: StratumOptions) -> FakeStratum {
         release_authorize,
         release_submits,
         submits,
+        drop_connections,
         _task: task,
     }
 }
@@ -1092,6 +1109,100 @@ async fn quiesced_submit(
     let _ = handle.control.send(client::Control::Stop);
     tokio::time::timeout(std::time::Duration::from_secs(5), handle.task).await??;
     Ok((record, waited))
+}
+
+/// `time_to_reconnect_milliseconds` is what the reconnect phase publishes,
+/// and it measured only the attempt that succeeded: the start instant was
+/// recreated on every pass through the retry loop, so a frontend unavailable
+/// across several attempts reported its final handshake -- milliseconds --
+/// for an outage of seconds. The instant is taken once, when the connection
+/// goes, and every attempt's record measures from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnect_across_several_failed_attempts_reports_the_whole_outage() -> Result<()> {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let server = fake_stratum(false).await;
+    let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+    let shared = Arc::new(client::SessionShared {
+        phase: std::sync::RwLock::new("reconnect".to_owned()),
+        events,
+        record_notifies: std::sync::atomic::AtomicBool::new(false),
+    });
+    let handle = client::spawn_session(session_config(0), 0, server.address.clone(), shared, 1);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let event = tokio::time::timeout_at(deadline, inbox.recv())
+            .await
+            .expect("the session connects within the deadline")
+            .expect("the session is still running");
+        if matches!(event, client::Event::Connected { .. }) {
+            break;
+        }
+    }
+    // The next three connections are accepted and closed before the
+    // handshake, so the reconnect fails three times and backs off 250 ms
+    // after each failure before the fourth attempt completes.
+    let dropped = 3usize;
+    server.drop_connections.store(dropped, Ordering::SeqCst);
+    let asked = std::time::Instant::now();
+    handle.control.send(client::Control::Reconnect {
+        reason: "client-initiated".into(),
+        phase: Arc::from("reconnect"),
+    })?;
+    let mut records = Vec::new();
+    let completed = loop {
+        let event = tokio::time::timeout_at(deadline, inbox.recv())
+            .await
+            .expect("the reconnect completes within the deadline")
+            .expect("the session is still running");
+        if let client::Event::Reconnect(record) = event {
+            let done = record.completed;
+            records.push(record);
+            if done {
+                break records.last().cloned().expect("just pushed");
+            }
+        }
+    };
+    let outage = asked.elapsed();
+    let _ = handle.control.send(client::Control::Stop);
+    tokio::time::timeout(Duration::from_secs(5), handle.task).await??;
+
+    let failed: Vec<&client::ReconnectRecord> =
+        records.iter().filter(|record| !record.completed).collect();
+    assert_eq!(failed.len(), dropped, "{records:?}");
+    for record in &failed {
+        assert_eq!(record.phase, "reconnect");
+        assert_eq!(record.reason, "client-initiated");
+        assert!(
+            record
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("socket closed")),
+            "{record:?}"
+        );
+    }
+    // Three backoffs of 250 ms sit inside the outage, so a reported time
+    // under that is the last handshake and not the outage.
+    let floor = Duration::from_millis(250) * dropped as u32;
+    assert!(
+        completed.seconds >= floor.as_secs_f64(),
+        "the completed reconnect reports {} s, less than the {floor:?} its own backoffs took",
+        completed.seconds
+    );
+    assert!(
+        completed.seconds <= outage.as_secs_f64(),
+        "it cannot report more than the outage the test observed ({outage:?}): {}",
+        completed.seconds
+    );
+    // Each failed attempt reports how long the session had been without a
+    // connection, so the series is non-decreasing and ends below the total.
+    let mut previous = 0.0f64;
+    for record in &failed {
+        assert!(record.seconds >= previous, "{records:?}");
+        previous = record.seconds;
+    }
+    assert!(previous <= completed.seconds, "{records:?}");
+    Ok(())
 }
 
 /// A client-initiated reconnect waits for the session's outstanding submits

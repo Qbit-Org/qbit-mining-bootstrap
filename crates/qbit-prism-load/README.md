@@ -705,6 +705,15 @@ The side report repeats all of this under `honest_value_notes`.
 - **Unknown is never zero.** A measurement that could not be taken is `null`
   with a reason. A peak RSS from Linux's `VmHWM` is labelled a kernel peak; on
   macOS it is a sampled maximum, and on other platforms it is `null`.
+- **Time to reconnect is the outage, not the last handshake.** The
+  `reconnects` block's `time_to_reconnect_milliseconds` runs from the moment a
+  session's connection went -- the socket closing, or the deliberate close
+  after a client-initiated reconnect quiesced -- to the job that completes the
+  reconnect, with every failed attempt and backoff in between. It used to
+  restart on each attempt, so a frontend unavailable across several attempts
+  reported a multi-second outage as the milliseconds its final handshake took.
+  A failed attempt's `seconds` is how long the session had been without a
+  connection when that attempt failed.
 - **Time to usable work stops at the next tip.** `time_to_usable_work`
   credits a session with work on a tip only for a `mining.notify` that
   arrived while that tip was the node's tip; each entry records

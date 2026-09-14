@@ -2526,7 +2526,10 @@ fn reconnect_report(collected: &Collected) -> Value {
         }
     }
     json!({
-        "definition": "a completed reconnect is a close followed by a re-authorize and a job",
+        "definition": "a completed reconnect is a close followed by a re-authorize and a job; \
+                       time_to_reconnect_milliseconds runs from the close to the job, every \
+                       failed attempt and backoff in between included, so it is the outage \
+                       and not the handshake that ended it",
         "by_phase": by_phase.into_iter().map(|(phase, (completed, failed, seconds))| {
             let summary = measure::summarize(
                 seconds.iter().map(|s| s * 1000.0).collect(),
