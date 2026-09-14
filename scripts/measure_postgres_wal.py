@@ -19,15 +19,20 @@ def measure(dsn: str, sql: str, source: str, config: str) -> dict:
         raise ValueError("SQL operation must not be empty")
     if parsed.query or parsed.password or parsed.hostname not in (None, "localhost", "127.0.0.1", "::1") or not dsn.startswith("postgresql://"):
         raise ValueError("refusing non-local or ambiguous DSN; use explicit loopback target")
-    setup = time.monotonic(); start = psql(dsn, "select pg_current_wal_lsn()"); setup_seconds = time.monotonic()-setup
+    setup = time.monotonic()
+    try: start = psql(dsn, "select pg_current_wal_lsn()")
+    except RuntimeError as exc: raise RuntimeError(f"initial connection failed: {exc}") from exc
+    setup_seconds = time.monotonic()-setup
     began = time.monotonic()
     try:
         psql(dsn, sql)
     except RuntimeError as exc:
-        return {"outcome":"operation_failed", "measurement_scope":"server-wide", "source":source, "config":config, "operation_seconds":time.monotonic()-began, "setup_seconds":setup_seconds, "error":str(exc)}
-    end = psql(dsn, "select pg_current_wal_lsn()")
-    delta = float(psql(dsn, f"select pg_wal_lsn_diff('{end}','{start}')"))
-    return {"outcome":"ok", "measurement_scope":"server-wide", "source":source, "config":config, "start_lsn":start, "end_lsn":end, "wal_bytes":delta, "operation_seconds":time.monotonic()-began, "setup_seconds":setup_seconds}
+        return {"outcome":"operation_failed", "execution_stage":"operation", "side_effect_status":"unknown", "measurement_scope":"server-wide", "source":source, "config":config, "operation_seconds":time.monotonic()-began, "setup_seconds":setup_seconds, "error":str(exc)}
+    try: end = psql(dsn, "select pg_current_wal_lsn()")
+    except RuntimeError as exc: return {"outcome":"measurement_failed", "operation_status":"succeeded", "measurement_status":"failed", "execution_stage":"post-operation", "measurement_scope":"server-wide", "source":source, "config":config, "operation_seconds":time.monotonic()-began, "setup_seconds":setup_seconds, "error":str(exc)}
+    try: delta = float(psql(dsn, f"select pg_wal_lsn_diff('{end}','{start}')"))
+    except RuntimeError as exc: return {"outcome":"measurement_failed", "operation_status":"succeeded", "measurement_status":"failed", "execution_stage":"post-operation", "measurement_scope":"server-wide", "source":source, "config":config, "operation_seconds":time.monotonic()-began, "setup_seconds":setup_seconds, "error":str(exc)}
+    return {"outcome":"ok", "operation_status":"succeeded", "measurement_status":"succeeded", "measurement_scope":"server-wide", "source":source, "config":config, "start_lsn":start, "end_lsn":end, "wal_bytes":delta, "operation_seconds":time.monotonic()-began, "setup_seconds":setup_seconds}
 
 def main() -> int:
     ap=argparse.ArgumentParser(); ap.add_argument("--dsn", required=True); ap.add_argument("--sql", required=True); ap.add_argument("--source", default="caller-operation"); ap.add_argument("--config", required=True)
