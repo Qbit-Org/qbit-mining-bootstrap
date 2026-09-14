@@ -30,6 +30,29 @@ pub(super) enum SaveOutcome {
 
 /// Classify a finished share-pass append by how far its gate got.
 ///
+/// Leave a candidate enqueue that outlived the acknowledgement bound running,
+/// and log its outcome once it resolves. Cancelling it could strand a COMMIT
+/// that was already sent.
+fn follow_enqueue(handle: JoinHandle<Result<bool>>, share_id: String, block_hash: String) {
+    tokio::spawn(async move {
+        let (outcome, error) = match handle.await {
+            Ok(Ok(true)) => ("enqueued", None),
+            Ok(Ok(false)) => ("already-enqueued", None),
+            Ok(Err(error)) => ("error", Some(format!("{error:#}"))),
+            Err(error) => ("task-ended", Some(error.to_string())),
+        };
+        tracing::warn!(
+            share_id,
+            block_hash,
+            path = "block-only",
+            phase = "enqueue-pending",
+            outcome,
+            error,
+            "unknown share outcome resolved"
+        );
+    });
+}
+
 /// Before `Committing`, COMMIT was never sent, so every error is definite.
 /// After it, only a severity-ERROR reply to COMMIT proves a rollback; any
 /// other failure may follow a durable commit. A success whose COMMIT took the
@@ -104,8 +127,13 @@ pub(super) fn enqueue_failed_before_commit(error: &anyhow::Error) -> bool {
 /// A spawned share append. If the submission itself is cancelled first, an
 /// append that may still be refused is closed and aborted, as dropping it
 /// did before; one already committing, or carrying a block, runs on.
+/// An append's result together with how long COMMIT took. The duration is
+/// measured inside the task, so a late poll of this handle cannot count
+/// scheduler delay as database time.
+type AppendJoin = (Result<bool>, Option<Duration>);
+
 struct AppendTask {
-    handle: Option<JoinHandle<Result<bool>>>,
+    handle: Option<JoinHandle<AppendJoin>>,
     gate: Arc<CommitGate>,
     refusable: bool,
 }
@@ -115,7 +143,7 @@ impl AppendTask {
     async fn finish_by(
         &mut self,
         deadline: tokio::time::Instant,
-    ) -> Option<std::result::Result<Result<bool>, JoinError>> {
+    ) -> Option<std::result::Result<AppendJoin, JoinError>> {
         let handle = self.handle.as_mut()?;
         let joined = tokio::time::timeout_at(deadline, handle).await.ok()?;
         self.handle = None;
@@ -139,7 +167,7 @@ impl AppendTask {
         };
         tokio::spawn(async move {
             match handle.await {
-                Ok(Ok(true)) => {
+                Ok((Ok(true), _)) => {
                     tracing::warn!(
                         share_id,
                         path,
@@ -148,7 +176,7 @@ impl AppendTask {
                         "unknown share outcome resolved"
                     )
                 }
-                Ok(Ok(false)) => {
+                Ok((Ok(false), _)) => {
                     tracing::warn!(
                         share_id,
                         path,
@@ -157,7 +185,7 @@ impl AppendTask {
                         "unknown share outcome resolved"
                     )
                 }
-                Ok(Err(error)) => {
+                Ok((Err(error), _)) => {
                     tracing::warn!(share_id, path, phase, outcome = "error", %error, "unknown share outcome resolved")
                 }
                 Err(error) => {
@@ -408,9 +436,13 @@ impl Coordinator {
         let task_gate = gate.clone();
         let mut task = AppendTask {
             handle: Some(tokio::spawn(async move {
-                ledger
-                    .append_at_revision(share, candidate, revision, task_gate)
-                    .await
+                let result = ledger
+                    .append_at_revision(share, candidate, revision, task_gate.clone())
+                    .await;
+                // Measured here, not at the join: a coordinator task that is
+                // scheduled late must not turn a durable commit into unknown.
+                let commit_elapsed = task_gate.committing_since().map(|since| since.elapsed());
+                (result, commit_elapsed)
             })),
             gate: gate.clone(),
             refusable,
@@ -445,12 +477,11 @@ impl Coordinator {
                 detail: "the append had not finished by the acknowledgement deadline".into(),
             };
         };
-        classify_share_append(
-            joined,
-            gate.state(),
-            gate.committing_since().map(|since| since.elapsed()),
-            self.statement_timeout,
-        )
+        let (joined, commit_elapsed) = match joined {
+            Ok((result, commit_elapsed)) => (Ok(result), commit_elapsed),
+            Err(error) => (Err(error), None),
+        };
+        classify_share_append(joined, gate.state(), commit_elapsed, self.statement_timeout)
     }
 
     /// Credit a block-only proof once its candidate is confirmed on the active
@@ -489,16 +520,20 @@ impl Coordinator {
             Ok(Ok(false)) => {}
         }
         // The enqueue commits the pending outbox row and the deferred share
-        // together. It runs to completion: cutting it off could discard the
-        // reply to a COMMIT that was already sent.
+        // together, so it is never cut off: dropping it could discard the reply
+        // to a COMMIT that was already sent. Only the wait for it is bounded,
+        // so a degraded database cannot hold the acknowledgement past `bound`.
         let mut phase = "candidate-pending";
-        match self.ledger.enqueue_candidate_once(candidate).await {
-            Ok(true) => {}
-            Ok(false) => return SaveOutcome::Duplicate,
-            Err(error) if enqueue_failed_before_commit(&error) => {
+        let ledger = self.ledger.clone();
+        let mut enqueue =
+            tokio::spawn(async move { ledger.enqueue_candidate_once(candidate).await });
+        match tokio::time::timeout_at(bound, &mut enqueue).await {
+            Ok(Ok(Ok(true))) => {}
+            Ok(Ok(Ok(false))) => return SaveOutcome::Duplicate,
+            Ok(Ok(Err(error))) if enqueue_failed_before_commit(&error) => {
                 return SaveOutcome::Failed(error)
             }
-            Err(error) => {
+            Ok(Ok(Err(error))) => {
                 tracing::warn!(
                     share_id = %share.share_id,
                     block_hash,
@@ -507,6 +542,24 @@ impl Coordinator {
                     "block-only enqueue outcome unknown; following the outbox"
                 );
                 phase = "enqueue-unknown";
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    share_id = %share.share_id,
+                    block_hash,
+                    path = "block-only",
+                    %error,
+                    "block-only enqueue task ended without a result; following the outbox"
+                );
+                phase = "enqueue-unknown";
+            }
+            Err(_) => {
+                follow_enqueue(enqueue, share.share_id.clone(), block_hash.to_string());
+                return SaveOutcome::Unknown {
+                    phase: "enqueue-pending",
+                    detail: "the candidate enqueue had not finished by the acknowledgement bound"
+                        .into(),
+                };
             }
         }
         // A block below the advertised share target earns only proven network

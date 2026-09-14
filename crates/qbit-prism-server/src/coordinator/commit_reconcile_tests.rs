@@ -869,3 +869,59 @@ async fn commit_reconcile_block_only_poll_errors_are_retried_then_unknown() -> R
     .await;
     settle(outcome, fixture.close().await)
 }
+
+/// A degraded database must not hold the acknowledgement past the block-only
+/// bound. The enqueue itself is never cut off, so the miner is answered unknown
+/// while the candidate still lands afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commit_reconcile_block_only_enqueue_past_the_bound_is_unknown() -> Result<()> {
+    let Some(raw) = database_url()? else {
+        return Ok(());
+    };
+    let _serial = TEST_LOCK.lock().await;
+    let fixture = Fixture::open(&raw, |config| {
+        config.block_only_ack_timeout = Duration::from_millis(1500)
+    })
+    .await?;
+    let outcome = async {
+        let proof = fixture.proof(true).await?;
+        let (share_id, block_hash) = (proof.share_id.clone(), proof.block_hash.clone());
+        let (mut holder, holder_pid) = fixture.hold_order_lock().await?;
+        let started = TokioInstant::now();
+        let (submitted, _log) = fixture.submit(proof);
+        wait_until_blocked(&fixture, holder_pid).await?;
+        let answer = answer(submitted).await?;
+        let waited = started.elapsed();
+        ensure!(
+            reason(&answer).as_deref() == Some("ledger-outcome-unknown"),
+            "an enqueue still running at the bound was answered {:?}",
+            reason(&answer)
+        );
+        // Well inside the 5 s lock_timeout, so the answer came from the bound
+        // rather than from the enqueue failing.
+        ensure!(
+            waited < Duration::from_secs(4),
+            "the acknowledgement outlived the block-only bound by {waited:?}"
+        );
+        ensure!(
+            fixture.outbox_state(&block_hash).await?.is_none(),
+            "the candidate cannot be enqueued while the order lock is held"
+        );
+        // The enqueue was never cut off: it commits once the lock is released.
+        sqlx::query(&format!("SELECT pg_advisory_unlock({ORDER_LOCK_KEY})"))
+            .execute(&mut *holder)
+            .await?;
+        until("the pending candidate", || async {
+            Ok(fixture.outbox_state(&block_hash).await?.as_deref() == Some("pending"))
+        })
+        .await?;
+        ensure!(
+            fixture.rows(&share_id).await? == 0,
+            "a block-only proof must not be credited before confirmation"
+        );
+        drop(holder);
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    settle(outcome, fixture.close().await)
+}
