@@ -2050,6 +2050,77 @@ async fn pre_006_native_schema_declaring_a_newer_capability_is_refused_before_an
     db.close(vec![earlier, migrated]).await
 }
 
+/// A migration record with 3 and not 2: every native build records both in
+/// one transaction, so the record was edited or restored selectively.
+/// Migrate refuses it before any DDL, so the missing 006 stays missing
+/// rather than being applied above a broken record, and it neither re-runs
+/// 002 nor records it unseen; a start without initialize refuses the gap.
+/// Recorded again by the operator, the same database migrates.
+#[tokio::test]
+async fn native_record_with_3_and_not_2_is_refused_before_any_ddl_and_not_repaired() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    let earlier = db.ledger("earlier-build").await?;
+    undo_006(&pool, SourceState::Pre258).await?;
+    sqlx::query("DELETE FROM qbit_prism_schema_migrations WHERE version=2")
+        .execute(&pool)
+        .await?;
+    assert_eq!(schema_versions(&pool).await?, [3, 4, 5, 8, 9]);
+    let before = schema_objects(&pool).await?;
+    let error = db
+        .ledger("this-build")
+        .await
+        .err()
+        .context("migrate accepted a record with 3 and not 2")?
+        .to_string();
+    assert!(
+        error.contains("refusing to migrate a native database at schema migrations 3, 4, 5, 8, 9 before any DDL: migration 3 is recorded and 2 is not"),
+        "{error}"
+    );
+    assert!(
+        error.contains("Nothing was changed")
+            && error.contains("INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)"),
+        "{error}"
+    );
+    // Unchanged: the record as it was, no 006 object, the schema as it was.
+    assert_eq!(schema_versions(&pool).await?, [3, 4, 5, 8, 9]);
+    assert!(objects_006_absent(&pool, SourceState::Pre258).await?);
+    assert_eq!(schema_objects(&pool).await?, before);
+    // A start without initialize refuses the gap and changes nothing either.
+    let error = Ledger::connect(&db.url, "cold".into(), 8, false)
+        .await
+        .err()
+        .context("a non-initializing start accepted a record with 3 and not 2")?
+        .to_string();
+    assert!(
+        error.contains(
+            "missing migration(s) 2, 6; this server requires 2, 3, 4, 5, 6, 8, 9 and found 3, 4, 5, 8, 9"
+        ),
+        "{error}"
+    );
+    assert_eq!(schema_versions(&pool).await?, [3, 4, 5, 8, 9]);
+    assert_eq!(schema_objects(&pool).await?, before);
+    // Recorded again once 002's objects are verified present, the same
+    // database migrates: 006 runs, nothing else is re-run.
+    let applied_003 = applied_at(&pool, 3).await?;
+    sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)")
+        .execute(&pool)
+        .await?;
+    let migrated = db.ledger("this-build").await?;
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    assert_eq!(applied_at(&pool, 3).await?, applied_003);
+    assert!(
+        !objects_006_absent(&pool, SourceState::Pre258).await?,
+        "006 did not run"
+    );
+    exercise_native_writers(&migrated, 1, 6101).await?;
+    pool.close().await;
+    db.close(vec![earlier, migrated]).await
+}
+
 #[tokio::test]
 async fn pre_006_native_schema_with_only_native_pending_candidates_migrates_and_keeps_them_claimable(
 ) -> Result<()> {

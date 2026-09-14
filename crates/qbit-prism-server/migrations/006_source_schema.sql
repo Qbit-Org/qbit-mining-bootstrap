@@ -27,7 +27,9 @@
 -- checked before that drain check, and before 004, 005 and this migration
 -- (or 009 on a database already at 6) run: a row beyond this release is
 -- refused before any DDL, the newer verdict above, so migrate never alters
--- a database a newer release wrote. Connect refuses the same rows again.
+-- a database a newer release wrote. Connect refuses the same rows again. A
+-- record with 3 and not 2, which no native build writes, is refused before
+-- any DDL too: nothing re-runs 002 on a database at 3 or records it unseen.
 --
 -- The release definitions come from the migrator applying the same release
 -- SQL (001, plus 002 for a #258 source) to a scratch schema under a

@@ -316,6 +316,16 @@ candidate_storage_version = 3, but this server understands candidate_storage_ver
 PRISM release wrote this database; upgrade the server before starting it here
 ```
 
+A migration record with 3 and not 2 is refused before any DDL as well. Every
+native build records both in the one transaction that applies them, so such
+a record was edited or restored selectively; every start refuses the gap,
+and `migrate` neither re-runs `002_multi_instance.sql` on a database at 3
+nor records it unseen, which would vouch for objects it never checked, so
+004 to 009 are not applied above it either. Restore the full pre-migration
+backup, or, once every object 002 creates is verified present, record it by
+hand (`INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)`) and
+migrate again.
+
 **What was migrated.** After a successful migration
 `qbit_prism_migration_source` holds one row: the accepted source state
 (`pre_258`, `258_applied`, `fresh`, or `native` for a database that was

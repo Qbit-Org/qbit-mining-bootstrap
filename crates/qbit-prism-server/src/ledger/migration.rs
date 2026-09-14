@@ -502,6 +502,23 @@ fn refuse_newer_native_database(versions: &[i32], inventory: &SourceInventory) -
     Ok(())
 }
 
+/// A native database whose record has 3 and not 2. Every native build
+/// records both in the one transaction that applies them, so such a record
+/// was edited or restored selectively. Only 2 can be hidden that way: 3
+/// applies it, and every later migration is checked on its own.
+/// `require_schema_version` refuses the gap at every start, and
+/// `migrate_schema` neither re-runs 002 on a database at 3 nor records it
+/// unseen, which would vouch for objects this run never checked, so nothing
+/// would repair it. Refused before any DDL, naming the remedy.
+fn refuse_inconsistent_native_record(versions: &[i32]) -> Result<()> {
+    ensure!(
+        !versions.contains(&3) || versions.contains(&2),
+        "refusing to migrate a native database at schema migrations {} before any DDL: migration 3 is recorded and 2 is not, and every native build records both in one transaction, so the migration record was edited or restored selectively; every start refuses the gap, and no migrate repairs it, because 002_multi_instance.sql is not re-run on a database at 3 and recording it unseen would vouch for objects this run never checked. Nothing was changed. Restore the full pre-migration backup, or, once every object 002_multi_instance.sql creates is verified present, record it with INSERT INTO qbit_prism_schema_migrations(version) VALUES(2) and migrate again",
+        schema_version_list(versions)
+    );
+    Ok(())
+}
+
 /// Refuse a pending 2.x.x row the native claim lane cannot replay, with the
 /// predicate built from the outbox columns that exist. The capability row is
 /// not consulted: 002 upserts it whatever the writer stored, so only rows say
@@ -1978,7 +1995,11 @@ pub(super) async fn migrate_schema(
         // `classify_source` refuses them on a 2.x.x source: otherwise 004,
         // 005 and 006, or 008 and 009, would alter a database a newer
         // release wrote and record their versions, and only the connect-time
-        // gate, after the commit, would refuse it.
+        // gate, after the commit, would refuse it. A record with 3 and not
+        // 2, which no native build writes, is refused first: 004 to 009
+        // must not run above a record every start refuses and no migrate
+        // repairs.
+        refuse_inconsistent_native_record(&versions)?;
         let inventory = inspect_source_schema(tx).await?;
         refuse_newer_native_database(&versions, &inventory)?;
         if !versions.contains(&6) {
@@ -3176,6 +3197,26 @@ mod tests {
         let comparison = compare_fingerprints(&expected, &found);
         assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
         assert_eq!(comparison.extra, vec!["table operator_notes"]);
+    }
+
+    #[test]
+    fn a_record_with_3_and_not_2_is_refused_naming_the_record_and_the_remedy() {
+        refuse_inconsistent_native_record(&[]).unwrap();
+        refuse_inconsistent_native_record(&[2, 3, 4, 5, 6, 8, 9]).unwrap();
+        // Without 3 the 2.x.x path runs, which applies 2 before 3.
+        refuse_inconsistent_native_record(&[2]).unwrap();
+        let error = refuse_inconsistent_native_record(&[3, 4, 5, 8, 9])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("refusing to migrate a native database at schema migrations 3, 4, 5, 8, 9 before any DDL: migration 3 is recorded and 2 is not"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Nothing was changed")
+                && error.contains("INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -58,6 +58,7 @@ qbit-prism-server::ledger_postgres::two_x::legacy_2x_failed_native_migration_rol
 qbit-prism-server::ledger_postgres::two_x::legacy_2x_upgrade_repairs_partial_carry_seed_and_preserves_shared_state
 qbit-prism-server::ledger_postgres::two_x::migrate_role_without_create_on_the_database_is_told_the_grant_it_needs
 qbit-prism-server::ledger_postgres::two_x::native_publication_ordinal_survives_reactivation_and_excludes_rejected_candidates
+qbit-prism-server::ledger_postgres::two_x::native_record_with_3_and_not_2_is_refused_before_any_ddl_and_not_repaired
 qbit-prism-server::ledger_postgres::two_x::newer_storage_version_or_capability_is_refused_at_migrate_and_at_connect
 qbit-prism-server::ledger_postgres::two_x::partial_001_source_is_refused_before_any_ddl_naming_the_objects_present
 qbit-prism-server::ledger_postgres::two_x::partial_002_source_is_refused_naming_the_missing_object
