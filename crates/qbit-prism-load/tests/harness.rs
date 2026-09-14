@@ -2224,6 +2224,56 @@ fn database_urls_are_rewritten_onto_the_delay_proxy() -> Result<()> {
     Ok(())
 }
 
+/// `postgresql://user@[::1]/db` is a URL SQLx accepts, so the proxy has to
+/// front it too. Testing the authority for a colon took the colons inside
+/// the brackets for a port, returned `[::1]` with none, and the run failed
+/// at the proxy's lookup after SQLx had already connected. The port is the
+/// one outside the closing bracket, or the default when there is none, and
+/// the URL is read with the parser that accepted it rather than a second
+/// one that disagrees with it at the edges.
+#[test]
+fn a_bracketed_ipv6_authority_keeps_or_gains_its_port() -> Result<()> {
+    // Bracketed, without and with a port; the port is the one after the
+    // bracket, never a colon inside it.
+    assert_eq!(run::host_port("postgresql://user@[::1]/db")?, "[::1]:5432");
+    assert_eq!(
+        run::host_port("postgresql://user:pw@[::1]:6000/db?sslmode=disable")?,
+        "[::1]:6000"
+    );
+    assert_eq!(
+        run::host_port("postgresql://[2001:db8::10]:5433/db")?,
+        "[2001:db8::10]:5433"
+    );
+    // The hostname and IPv4 forms are unchanged.
+    assert_eq!(run::host_port("postgresql://u@host/db")?, "host:5432");
+    assert_eq!(run::host_port("postgresql://u@host:6000/db")?, "host:6000");
+    assert_eq!(
+        run::host_port("postgresql://u@10.0.0.5:5433/db")?,
+        "10.0.0.5:5433"
+    );
+    // The libpq-style parameters SQLx honours are honoured here too, since
+    // they name what SQLx actually dialled.
+    assert_eq!(
+        run::host_port("postgres:///db?host=db.internal&port=5433")?,
+        "db.internal:5433"
+    );
+    assert_eq!(run::host_port("postgresql:///db")?, "localhost:5432");
+    // What the proxy cannot front is refused with the reason, not resolved.
+    let socket = run::host_port("postgresql:///db?host=/var/run/postgresql").unwrap_err();
+    assert!(format!("{socket:#}").contains("Unix socket"), "{socket:#}");
+    let junk = run::host_port("not-a-url").unwrap_err();
+    assert!(
+        format!("{junk:#}").contains("parsing the database URL"),
+        "{junk:#}"
+    );
+    // The proxied URL composes with the rewrite the run applies afterwards.
+    assert_eq!(
+        run::rewrite_host("postgresql://user@[::1]/db", "127.0.0.1:2")?,
+        "postgresql://user@127.0.0.1:2/db"
+    );
+    Ok(())
+}
+
 /// `--database-url postgresql://user@postgres.example/db` is an ordinary URL,
 /// and the SQLx connections before the proxy accept the name, so the proxy
 /// has to as well: it resolves the host once at entry, tries every address

@@ -1608,23 +1608,35 @@ fn free_port() -> Result<u16> {
         .port())
 }
 
-/// `host:port` of a `postgresql://` URL.
+/// `host:port` of a `postgresql://` URL, for the delay proxy to dial.
+///
+/// The URL is read with the parser SQLx already accepted it with, so the host
+/// and port the proxy fronts are the ones SQLx connected to: a hostname, an
+/// IPv4 or a bracketed IPv6 literal, with or without an explicit port, or a
+/// `host`/`port` query parameter, and the default port when none is given.
+/// Testing the authority for a colon, as this once did, took the colons
+/// inside `[::1]` for a port and handed the proxy an address without one
+/// (EP-VALIDATION). An IPv6 literal is bracketed on the way out, which is
+/// the form a `host:port` lookup needs.
 pub fn host_port(url: &str) -> Result<String> {
-    let rest = url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .context("database URL has no scheme")?;
-    let rest = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
-    let authority = rest
-        .split(['/', '?'])
-        .next()
-        .context("database URL has no host")?;
-    ensure!(!authority.is_empty(), "database URL has no host");
-    Ok(if authority.contains(':') {
-        authority.to_owned()
+    let options: sqlx::postgres::PgConnectOptions = url.parse().with_context(|| {
+        format!(
+            "parsing the database URL {}",
+            frontend::redact_url_secrets(url)
+        )
+    })?;
+    ensure!(
+        options.get_socket().is_none(),
+        "the database URL names a Unix socket, which the delay proxy cannot front; give it a \
+         TCP host"
+    );
+    let host = options.get_host();
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
     } else {
-        format!("{authority}:5432")
-    })
+        host.to_owned()
+    };
+    Ok(format!("{host}:{}", options.get_port()))
 }
 
 /// Add an `application_name` parameter, so `pg_stat_activity` can say which
