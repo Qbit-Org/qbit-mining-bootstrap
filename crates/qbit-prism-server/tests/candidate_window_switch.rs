@@ -33,6 +33,7 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// 2023-11-14T22:13:20Z: every seeded share sits before any snapshot anchor.
 const ANCHOR: i64 = 1_700_000_000_000;
 const ORDER_LOCK: i64 = 0x505249534d000002;
+const SETTLEMENT_LOCK: i64 = 0x505249534d000003;
 const WINDOW_COLUMNS: [&str; 6] = [
     "window_anchor_ms",
     "window_prior_balances_sha256",
@@ -1066,6 +1067,122 @@ async fn configure_refuses_a_rotation_over_pending_foreign_signed_candidates() -
                 .configure("fingerprint-rotated", &other_signer_keys())
                 .await?;
             ensure!(rotated.config_fingerprint() == Some("fingerprint-rotated"));
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// The full-equality durable-range proof runs before the settlement lock is
+/// taken, and only a row count runs under it.
+///
+/// #267 moved that proof out of the settlement transaction so the lock is never
+/// held for a window-sized read; this slice made the read paged so it never
+/// occupies a runtime thread either. Reconciling the two is the step that can
+/// quietly undo the first: keep this slice's version of `persist_audit_snapshot`
+/// through a rebase and the full read goes back under the lock. The result
+/// stays correct, every other test still passes, and only the lock hold grows,
+/// so nothing else in the suite can tell.
+///
+/// This pins the placement without measuring anything. A second connection
+/// holds `SETTLEMENT_LOCK`, so the landing blocks on it after its proof has
+/// run. While it waits, one share's `ntime` is altered: full equality notices
+/// that, a `count(*)` over the same predicate cannot. The landing must then
+/// succeed, which it can only do if it read and compared the shares *before*
+/// taking the lock. Move the full read back under the lock and this fails with
+/// "audit share snapshot differs from canonical database history".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_durable_range_proof_runs_before_the_settlement_lock() -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            let ledger = db.ledger("proof-before-lock").await?;
+            seed_carry(&ledger.pool).await?;
+            for id in 1..=6 {
+                ledger.append(appended_share(id), None).await?;
+            }
+            let snapshot = ledger.snapshot(100).await?;
+            let block = found(&snapshot, 61)?;
+            ledger.enqueue_candidate(block.candidate.clone()).await?;
+            let claim = block.claim(
+                ledger
+                    .claim_candidate(60)
+                    .await?
+                    .context("the row was not claimable")?,
+            );
+
+            // Hold the settlement lock on a connection of its own, so the
+            // landing reaches it and waits.
+            let mut holder = db.pool.acquire().await?;
+            sqlx::query("SELECT pg_advisory_lock($1)")
+                .bind(SETTLEMENT_LOCK)
+                .execute(&mut *holder)
+                .await?;
+
+            let landing = tokio::spawn({
+                let ledger = ledger.clone();
+                async move {
+                    ledger
+                        .land_candidate(&claim, &keys().1.public_key_hex())
+                        .await
+                }
+            });
+
+            // Wait until the landing is genuinely blocked on that lock rather
+            // than merely slow, so the alteration below lands between its proof
+            // and its transaction.
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted AND classid=$1 AND objid=$2)",
+                )
+                .bind((SETTLEMENT_LOCK >> 32) as i32)
+                .bind((SETTLEMENT_LOCK & 0xffff_ffff) as i32)
+                .fetch_one(&db.pool)
+                .await?;
+                if waiting {
+                    break;
+                }
+                ensure!(
+                    std::time::Instant::now() < deadline,
+                    "the landing never waited on the settlement lock"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            // `ntime` is not part of the counted share, so this leaves the row
+            // count, the reward manifest and every signature alone: only a full
+            // field-by-field comparison can see it. Accepted history is
+            // immutable in production and a trigger enforces that, which is the
+            // property being relied on everywhere else; it is lifted here for
+            // one statement, inside this test's own disposable schema, because
+            // simulating a ledger that disagrees with the claim is the whole
+            // point. It goes straight back on.
+            sqlx::query("ALTER TABLE qbit_share_ledger DISABLE TRIGGER qbit_prism_immutable_share_history")
+                .execute(&ledger.pool)
+                .await?;
+            let altered = sqlx::query("UPDATE qbit_share_ledger SET ntime=ntime+1 WHERE share_seq=$1")
+                .bind(3i64)
+                .execute(&ledger.pool)
+                .await?
+                .rows_affected();
+            sqlx::query("ALTER TABLE qbit_share_ledger ENABLE TRIGGER qbit_prism_immutable_share_history")
+                .execute(&ledger.pool)
+                .await?;
+            ensure!(altered == 1, "the test altered {altered} shares, expected 1");
+
+            sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(SETTLEMENT_LOCK)
+                .execute(&mut *holder)
+                .await?;
+            drop(holder);
+
+            tokio::time::timeout(Duration::from_secs(60), landing)
+                .await
+                .map_err(|_| anyhow!("the landing did not finish once the lock was released"))??
+                .context(
+                    "the landing read share payloads under the settlement lock: it saw an \
+                     alteration made after its proof had already run",
+                )?;
             Ok(())
         })
     })
