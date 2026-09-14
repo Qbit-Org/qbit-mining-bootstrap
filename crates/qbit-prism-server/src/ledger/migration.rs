@@ -483,6 +483,45 @@ pub(super) fn refuse_unknown_capabilities(rows: &[(String, i32)]) -> Result<()> 
     Ok(())
 }
 
+/// The capability every native database declares once 006 has run.
+const DECLARED_CAPABILITY: &str = "candidate_storage_version";
+
+/// A database at migration 6 declares `candidate_storage_version`: 006
+/// created the table and the row, and nothing native removes either. Their
+/// absence is a dropped table or a deleted row, after which the database can
+/// no longer say which PRISM release wrote it, so it is refused rather than
+/// read as a legacy state, which has no meaning once 006 has run. `rows` is
+/// `None` when the table is missing. The caller has established that 6 is
+/// recorded.
+fn require_declared_capabilities(rows: Option<&[(String, i32)]>) -> Result<()> {
+    let Some(rows) = rows else {
+        bail!("database is at schema migration 6 but has no qbit_prism_schema_capabilities: 006 created it and nothing native drops it, so the table was dropped or restored selectively and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every candidate row is known to be one this server or the 2.x.x release wrote, re-create the table and its {DECLARED_CAPABILITY} row from migrations/006_source_schema.sql (1; 2 for a #258 source), then start or migrate again");
+    };
+    ensure!(
+        rows.iter().any(|(name, _)| name == DECLARED_CAPABILITY),
+        "database is at schema migration 6 but qbit_prism_schema_capabilities has no {DECLARED_CAPABILITY} row: 006 declared it and nothing native deletes it, so the row was deleted and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every candidate row is known to be one this server or the 2.x.x release wrote, declare it again with INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('{DECLARED_CAPABILITY}',1) (2 for a #258 source), then start or migrate again"
+    );
+    Ok(())
+}
+
+/// The native path's refusal of a database at 6 that no longer declares
+/// its capabilities, before any DDL: otherwise 008 or 009 would run above
+/// the missing declaration and only the connect-time gate, after the
+/// commit, would refuse it. `versions` is the recorded migration set, named
+/// in the refusal.
+fn refuse_undeclared_native_database(versions: &[i32], inventory: &SourceInventory) -> Result<()> {
+    if !versions.contains(&6) {
+        return Ok(());
+    }
+    if let Err(reason) = require_declared_capabilities(inventory.capabilities.as_deref()) {
+        bail!(
+            "refusing to migrate a native database at schema migrations {} before any DDL: {reason}",
+            schema_version_list(versions)
+        );
+    }
+    Ok(())
+}
+
 /// The native path's "newer" verdict: refuse a database an earlier 3.x.x
 /// build migrated and a newer release then wrote, before any DDL, as
 /// `classify_source` refuses a 2.x.x source. Without this, 004, 005 and
@@ -2001,6 +2040,9 @@ pub(super) async fn migrate_schema(
         // repairs.
         refuse_inconsistent_native_record(&versions)?;
         let inventory = inspect_source_schema(tx).await?;
+        // A database at 6 that no longer declares its capabilities is
+        // refused before 008 or 009 run above it, as connect refuses it.
+        refuse_undeclared_native_database(&versions, &inventory)?;
         refuse_newer_native_database(&versions, &inventory)?;
         if !versions.contains(&6) {
             // Native schema 3, 4 or 5, with or without 008 and 009. That
@@ -2115,18 +2157,24 @@ pub(super) async fn require_schema_version(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-/// The connect-time gate: refuse capabilities or storage versions the
-/// binary does not understand. Every start runs it, with or without
-/// `initialize`; `migrate_schema` refused the same rows before any DDL.
+/// The connect-time gate: the database must declare its capabilities, and
+/// every capability or storage version it declares must be one the binary
+/// understands. Every start runs it, with or without `initialize`, after
+/// `require_schema_version` has established that 006 ran, so a missing
+/// table or row is a dropped or deleted declaration, never a legacy state;
+/// `migrate_schema` refused the same database before any DDL.
 pub(super) async fn require_known_capabilities(pool: &PgPool) -> Result<()> {
     let declared: bool =
         sqlx::query_scalar("SELECT to_regclass('qbit_prism_schema_capabilities') IS NOT NULL")
             .fetch_one(pool)
             .await?;
-    if declared {
-        refuse_unknown_capabilities(&read_capabilities(pool).await?)?;
-    }
-    Ok(())
+    let rows = if declared {
+        Some(read_capabilities(pool).await?)
+    } else {
+        None
+    };
+    require_declared_capabilities(rows.as_deref())?;
+    refuse_unknown_capabilities(rows.as_deref().unwrap_or_default())
 }
 
 /// The standalone 2.x SQL remains atomic under plain psql. SQLx already owns
@@ -3215,6 +3263,46 @@ mod tests {
         assert!(
             error.contains("Nothing was changed")
                 && error.contains("INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_database_at_6_must_declare_its_candidate_storage_version() {
+        let declared = |rows: &[(&str, i32)]| {
+            let rows: Vec<(String, i32)> = rows
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), *value))
+                .collect();
+            require_declared_capabilities(Some(&rows))
+        };
+        declared(&[("candidate_storage_version", 1)]).unwrap();
+        declared(&[("candidate_storage_version", 2), ("sealed_share_pages", 1)]).unwrap();
+        let error = require_declared_capabilities(None).unwrap_err().to_string();
+        assert!(
+            error.starts_with(
+                "database is at schema migration 6 but has no qbit_prism_schema_capabilities"
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains("006_source_schema.sql") && error.contains("start or migrate again"),
+            "{error}"
+        );
+        let error = declared(&[("sealed_share_pages", 1)])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("database is at schema migration 6 but qbit_prism_schema_capabilities has no candidate_storage_version row"),
+            "{error}"
+        );
+        assert!(
+            error.contains("VALUES('candidate_storage_version',1)"),
+            "{error}"
+        );
+        let error = declared(&[]).unwrap_err().to_string();
+        assert!(
+            error.contains("has no candidate_storage_version row"),
             "{error}"
         );
     }

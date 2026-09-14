@@ -1625,6 +1625,98 @@ async fn newer_storage_version_or_capability_is_refused_at_migrate_and_at_connec
     db.close(vec![ledger, follower]).await
 }
 
+/// A database at 6 declares `candidate_storage_version`: 006 created the
+/// table and the row, and nothing native removes them. Without the row, or
+/// the table, the database can no longer say which release wrote it, so a
+/// start refuses it instead of reading the absence as a legacy state, and
+/// migrate refuses it before any DDL rather than applying a missing 009
+/// above it. Declared again as 006 declares it, the database starts and
+/// migrates.
+#[tokio::test]
+async fn migrated_database_without_its_capability_declaration_is_refused_at_connect_and_at_migrate(
+) -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    let ledger = db.ledger("init").await?;
+    let row_gone = "database is at schema migration 6 but qbit_prism_schema_capabilities has no candidate_storage_version row";
+    let table_gone = "database is at schema migration 6 but has no qbit_prism_schema_capabilities";
+    // On the migrated database: the row deleted, then the table dropped,
+    // refused with and without initialize, and nothing changes.
+    for (statement, message, remedy) in [
+        (
+            "DELETE FROM qbit_prism_schema_capabilities WHERE capability='candidate_storage_version'",
+            row_gone,
+            "VALUES('candidate_storage_version',1)",
+        ),
+        (
+            "DROP TABLE qbit_prism_schema_capabilities",
+            table_gone,
+            "006_source_schema.sql",
+        ),
+    ] {
+        sqlx::raw_sql(statement).execute(&pool).await?;
+        let before = schema_objects(&pool).await?;
+        for initialize in [false, true] {
+            let error = Ledger::connect(&db.url, "cold".into(), 8, initialize)
+                .await
+                .err()
+                .with_context(|| {
+                    format!("connect(initialize={initialize}) accepted a database at 6 without its capability declaration ({statement})")
+                })?
+                .to_string();
+            assert!(error.contains(message), "{error}");
+            assert!(error.contains(remedy), "{error}");
+            if initialize {
+                assert!(
+                    error.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 8, 9 before any DDL"),
+                    "{error}"
+                );
+            }
+            assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+            assert_eq!(schema_objects(&pool).await?, before);
+        }
+    }
+    // Declared again as 006 declares it, the database starts.
+    sqlx::raw_sql(include_str!("../../migrations/006_source_schema.sql"))
+        .execute(&pool)
+        .await?;
+    assert_eq!(capability(&pool).await?, Some(1));
+    let follower = Ledger::connect(&db.url, "cold".into(), 8, false).await?;
+    // With 009 missing as well, migrate refuses the missing row before any
+    // DDL: 009 is not applied above it. Declared again, it is.
+    undo_009(&pool).await?;
+    sqlx::raw_sql(
+        "DELETE FROM qbit_prism_schema_capabilities WHERE capability='candidate_storage_version'",
+    )
+    .execute(&pool)
+    .await?;
+    let before = schema_objects(&pool).await?;
+    let error = db
+        .ledger("this-build")
+        .await
+        .err()
+        .context("migrate applied 009 above a missing capability declaration")?
+        .to_string();
+    assert!(
+        error.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 8 before any DDL"),
+        "{error}"
+    );
+    assert!(error.contains(row_gone), "{error}");
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 8]);
+    assert_eq!(schema_objects(&pool).await?, before);
+    sqlx::raw_sql("INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',1)")
+        .execute(&pool).await?;
+    let migrated = db.ledger("this-build").await?;
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    assert_eq!(capability(&pool).await?, Some(1));
+    exercise_native_writers(&migrated, 1, 6201).await?;
+    pool.close().await;
+    db.close(vec![ledger, follower, migrated]).await
+}
+
 /// Simulate the database a build without migration 009 left: the current
 /// migration, then 009 undone. Its table, its job index and the sequence
 /// cycle go with the version row, so 009 can run again.

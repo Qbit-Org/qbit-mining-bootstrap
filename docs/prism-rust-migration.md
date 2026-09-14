@@ -342,6 +342,11 @@ reserved by another workstream, so 008 or 009 being present never stands in
 for a missing 006. A database missing any of them is refused at connect, naming
 the gap, before any accounting statement runs, and so is one declaring a
 capability or `candidate_storage_version` this release does not understand.
+A database at 6 must declare its capabilities: 006 created
+`qbit_prism_schema_capabilities` and its `candidate_storage_version` row and
+nothing native removes them, so a start refuses a database missing either,
+naming the remedy, rather than reading the absence as a legacy state, and
+`migrate` refuses the same database before any DDL.
 A migration this release does not know is accepted with a warning that names
 it: native migrations are additive, and a release whose format an older
 binary must not touch declares a capability. With the native default

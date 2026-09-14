@@ -100,7 +100,10 @@ CREATE TABLE IF NOT EXISTS qbit_prism_migration_source (
 -- Every native database declares its capabilities, so a process refuses a
 -- database newer than itself at connect. A #258 source keeps its row at 2;
 -- every other source declares the version 1 JSONB candidates native writers
--- produce. DO NOTHING keeps whatever the source declared.
+-- produce. DO NOTHING keeps whatever the source declared. Nothing native
+-- removes the table or the row: a database at 6 without either is refused
+-- at connect, and before any DDL at migrate, rather than read as a legacy
+-- state.
 CREATE TABLE IF NOT EXISTS qbit_prism_schema_capabilities (
     capability text PRIMARY KEY,
     capability_value integer NOT NULL,
