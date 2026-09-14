@@ -58,7 +58,7 @@ const SHORT_LEASE: CandidateLease = CandidateLease {
 };
 
 // Deliberately long ledger transactions share advisory locks across schemas.
-static TEST_LOCK: Mutex<()> = Mutex::const_new(());
+use super::test_serial::TEST_LOCK;
 
 #[derive(Default)]
 struct ReplyGate {
