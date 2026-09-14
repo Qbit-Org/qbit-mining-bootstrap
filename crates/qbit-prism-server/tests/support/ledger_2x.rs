@@ -1602,7 +1602,7 @@ async fn extra_constraint_on_a_release_table_is_refused_naming_it_and_rolls_back
 
 /// Extra unique keys, expressions and predicates can accept legacy rows
 /// while rejecting native epoch-zero writes. Refusal preserves the source;
-/// plain column indexes and indexes on the operator's own tables survive.
+/// indexes on the operator's own tables survive.
 #[tokio::test]
 async fn extra_write_affecting_index_is_refused_naming_it_and_rolls_back() -> Result<()> {
     for state in [SourceState::Pre258, SourceState::Applied258] {
@@ -1635,7 +1635,7 @@ async fn extra_write_affecting_index_is_refused_naming_it_and_rolls_back() -> Re
             apply_frozen_2x_schema(&pool, state).await?;
             insert_share_as_writer(&pool, "legacy:1", 1).await?;
             sqlx::raw_sql(ddl).execute(&pool).await?;
-            sqlx::raw_sql("CREATE INDEX operator_miner_idx ON qbit_share_ledger (miner_id); CREATE TABLE operator_notes(note text NOT NULL); CREATE UNIQUE INDEX operator_notes_idx ON operator_notes ((lower(note))) WHERE note <> ''")
+            sqlx::raw_sql("CREATE TABLE operator_notes(note text NOT NULL); CREATE UNIQUE INDEX operator_notes_idx ON operator_notes ((lower(note))) WHERE note <> ''")
                 .execute(&pool).await?;
             if unique {
                 insert_share_as_writer(&pool, "native:probe", 0).await?;
@@ -1673,7 +1673,6 @@ async fn extra_write_affecting_index_is_refused_naming_it_and_rolls_back() -> Re
             )), "{error}");
             assert!(error.contains("Nothing was changed"), "{error}");
             assert!(!error.contains("operator_notes"), "{error}");
-            assert!(!error.contains("operator_miner_idx"), "{error}");
             assert!(native_tables_absent(&pool).await?, "refusal ran native DDL");
             assert_eq!(schema_objects(&pool).await?, objects);
             assert_eq!(
@@ -1705,8 +1704,96 @@ async fn extra_write_affecting_index_is_refused_naming_it_and_rolls_back() -> Re
                     .fetch_one(&pool).await?,
                 if unique { 3 } else { 2 }
             );
-            assert!(sqlx::query_scalar::<_, bool>("SELECT to_regclass('operator_miner_idx') IS NOT NULL AND to_regclass('operator_notes_idx') IS NOT NULL")
+            assert!(sqlx::query_scalar::<_, bool>("SELECT to_regclass('operator_notes_idx') IS NOT NULL")
                 .fetch_one(&pool).await?);
+            pool.close().await;
+            db.close(vec![ledger]).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Even a plain index can run an operator class that rejects native rows.
+#[tokio::test]
+async fn extra_plain_or_custom_operator_index_is_refused_and_rolls_back() -> Result<()> {
+    for state in [SourceState::Pre258, SourceState::Applied258] {
+        for custom in [true, false] {
+            let Some(db) = Database::open().await? else {
+                return Ok(());
+            };
+            let pool = PgPool::connect(&db.url).await?;
+            apply_frozen_2x_schema(&pool, state).await?;
+            insert_share_as_writer(&pool, "legacy:1", 1).await?;
+            sqlx::raw_sql("CREATE FUNCTION operator_epoch_compare(bigint,bigint) RETURNS integer LANGUAGE plpgsql IMMUTABLE STRICT AS $$ BEGIN IF $1=0 OR $2=0 THEN RAISE EXCEPTION 'operator epoch zero'; END IF; RETURN btint8cmp($1,$2); END $$; CREATE OPERATOR CLASS operator_epoch_ops FOR TYPE bigint USING btree AS OPERATOR 1 <(bigint,bigint), OPERATOR 2 <=(bigint,bigint), OPERATOR 3 =(bigint,bigint), OPERATOR 4 >=(bigint,bigint), OPERATOR 5 >(bigint,bigint), FUNCTION 1 operator_epoch_compare(bigint,bigint); CREATE TABLE operator_notes(epoch bigint); INSERT INTO operator_notes VALUES(1); CREATE INDEX operator_notes_idx ON operator_notes(epoch operator_epoch_ops)").execute(&pool).await?;
+            let opclass = if custom { "operator_epoch_ops" } else { "" };
+            sqlx::raw_sql(&format!(
+                "CREATE INDEX operator_native_epoch ON qbit_share_ledger(writer_epoch {opclass})"
+            ))
+            .execute(&pool)
+            .await?;
+            if custom {
+                let error = insert_share_as_writer(&pool, "native:0", 0)
+                    .await
+                    .err()
+                    .context("custom comparator accepted epoch zero")?
+                    .to_string();
+                assert!(error.contains("operator epoch zero"), "{error}");
+            }
+            let objects = schema_objects(&pool).await?;
+            let rows: Vec<Value> =
+                sqlx::query_scalar("SELECT to_jsonb(s) FROM qbit_share_ledger s")
+                    .fetch_all(&pool)
+                    .await?;
+            let definition: String =
+                sqlx::query_scalar("SELECT pg_get_indexdef('operator_native_epoch'::regclass)")
+                    .fetch_one(&pool)
+                    .await?;
+            let error = db
+                .ledger("a")
+                .await
+                .err()
+                .context("migration accepted a plain extra index")?
+                .to_string();
+            assert!(
+                error.contains("refusing to migrate a drifted 001 source"),
+                "{error}"
+            );
+            assert!(
+                error.contains(
+                    "index operator_native_epoch on qbit_share_ledger is an extra plain index"
+                ),
+                "{error}"
+            );
+            assert!(!error.contains("operator_notes_idx"), "{error}");
+            assert!(error.contains("Nothing was changed"), "{error}");
+            assert!(native_tables_absent(&pool).await?);
+            assert_eq!(schema_objects(&pool).await?, objects);
+            assert_eq!(
+                sqlx::query_scalar::<_, Value>("SELECT to_jsonb(s) FROM qbit_share_ledger s")
+                    .fetch_all(&pool)
+                    .await?,
+                rows
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, String>(
+                    "SELECT pg_get_indexdef('operator_native_epoch'::regclass)"
+                )
+                .fetch_one(&pool)
+                .await?,
+                definition
+            );
+            sqlx::raw_sql("DROP INDEX operator_native_epoch")
+                .execute(&pool)
+                .await?;
+            let ledger = db.ledger("a").await?;
+            exercise_native_writers(&ledger, 1, 7301).await?;
+            let error = sqlx::query("INSERT INTO operator_notes VALUES(0)")
+                .execute(&pool)
+                .await
+                .err()
+                .context("operator-only index was not preserved")?
+                .to_string();
+            assert!(error.contains("operator epoch zero"), "{error}");
             pool.close().await;
             db.close(vec![ledger]).await?;
         }
@@ -2409,7 +2496,7 @@ async fn tolerated_source_differences_still_migrate() -> Result<()> {
     // different physical position with its data; the NOT VALID mark 001
     // itself leaves on an upgraded table; and a share sequence a 2.x.x
     // deployment has advanced, which is data, not structure.
-    sqlx::raw_sql("CREATE TABLE operator_notes(note_id bigserial PRIMARY KEY, note text NOT NULL); ALTER TABLE qbit_share_ledger ADD COLUMN operator_note text; CREATE INDEX qbit_share_ledger_operator_idx ON qbit_share_ledger (miner_id); ALTER TABLE qbit_pool_blocks ADD COLUMN parent_hash_moved text; UPDATE qbit_pool_blocks SET parent_hash_moved=parent_hash; ALTER TABLE qbit_pool_blocks DROP COLUMN parent_hash; ALTER TABLE qbit_pool_blocks RENAME COLUMN parent_hash_moved TO parent_hash; ALTER TABLE qbit_pool_blocks ALTER COLUMN parent_hash SET NOT NULL; ALTER TABLE qbit_share_ledger DROP CONSTRAINT qbit_share_ledger_credit_policy_check; ALTER TABLE qbit_share_ledger ADD CONSTRAINT qbit_share_ledger_credit_policy_check CHECK (credit_policy IS NULL OR credit_policy IN ('stale-grace')) NOT VALID; SELECT setval('qbit_share_ledger_share_seq_seq', 5000000)")
+    sqlx::raw_sql("CREATE TABLE operator_notes(note_id bigserial PRIMARY KEY, note text NOT NULL); ALTER TABLE qbit_share_ledger ADD COLUMN operator_note text; ALTER TABLE qbit_pool_blocks ADD COLUMN parent_hash_moved text; UPDATE qbit_pool_blocks SET parent_hash_moved=parent_hash; ALTER TABLE qbit_pool_blocks DROP COLUMN parent_hash; ALTER TABLE qbit_pool_blocks RENAME COLUMN parent_hash_moved TO parent_hash; ALTER TABLE qbit_pool_blocks ALTER COLUMN parent_hash SET NOT NULL; ALTER TABLE qbit_share_ledger DROP CONSTRAINT qbit_share_ledger_credit_policy_check; ALTER TABLE qbit_share_ledger ADD CONSTRAINT qbit_share_ledger_credit_policy_check CHECK (credit_policy IS NULL OR credit_policy IN ('stale-grace')) NOT VALID; SELECT setval('qbit_share_ledger_share_seq_seq', 5000000)")
         .execute(&pool).await?;
     let order: Vec<String> = sqlx::query_scalar("SELECT attname::text FROM pg_attribute WHERE attrelid=to_regclass('qbit_pool_blocks') AND attnum>0 AND NOT attisdropped ORDER BY attnum")
         .fetch_all(&pool).await?;
@@ -2421,7 +2508,7 @@ async fn tolerated_source_differences_still_migrate() -> Result<()> {
         Some("pre_258".into())
     );
     // The extras and the moved column survive, with the data.
-    assert!(sqlx::query_scalar::<_,bool>("SELECT to_regclass('operator_notes') IS NOT NULL AND to_regclass('qbit_share_ledger_operator_idx') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass('qbit_share_ledger') AND attname='operator_note' AND NOT attisdropped)").fetch_one(&pool).await?);
+    assert!(sqlx::query_scalar::<_,bool>("SELECT to_regclass('operator_notes') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass('qbit_share_ledger') AND attname='operator_note' AND NOT attisdropped)").fetch_one(&pool).await?);
     assert_eq!(
         sqlx::query_scalar::<_, String>(
             "SELECT parent_hash FROM qbit_pool_blocks WHERE block_hash=repeat('aa',32)"

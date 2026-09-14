@@ -260,15 +260,14 @@ that they will succeed (for example, a generated `10 / writer_epoch` fails
 for native epoch-zero shares). Only plain nullable extra columns remain
 accepted, and their types must not be domains. Domain defaults, constraints
 and nullability can reject an omitted value even when the column itself
-looks nullable. Columns on operator-only tables are unaffected. Extra unique, expression or partial indexes on release tables are
-drift too: a unique index on `((1)) WHERE writer_epoch = 0` permits legacy
-rows but rejects the second native share, and expressions or predicates
-can fail when evaluated for native writes. Migration names the index and
-refuses it even if it is not valid for queries. Nonunique indexes on plain
-columns without a predicate remain accepted, as do indexes on the operator's
-own tables. These columns and extra tables, accepted indexes, functions and
-sequences are kept and logged at warning level. A missing or different object
-refuses the migration:
+looks nullable. Columns on operator-only tables are unaffected. All extra
+indexes on release tables are refused, including plain nonunique indexes: an access method or custom operator
+class can execute code that rejects native writes. Unique, expression and
+partial indexes can also constrain or evaluate writes. The migrator reports
+the index without removing it; review and remove extra release-table indexes
+before migrating. Indexes on operator-only tables remain accepted.
+Accepted columns and extra tables, functions and sequences are kept and
+logged at warning level. A missing or different object refuses the migration:
 
 ```
 refusing to migrate a drifted 001 source: after 001_share_ledger.sql ran, the database does not

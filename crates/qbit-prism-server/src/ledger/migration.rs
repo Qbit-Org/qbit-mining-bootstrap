@@ -1577,9 +1577,9 @@ fn sequence_differences(expected: &SequenceDefinition, found: &SequenceDefinitio
 /// it is one of `NOT_VALID_EXEMPT`. Extra columns must allow native inserts
 /// to omit them without evaluating unverified expressions: only plain nullable
 /// extra columns may stay; defaults, identities and generated columns are drift.
-/// Extra unique, expression or partial indexes on release tables are drift:
-/// they can constrain or evaluate native writes, even when not query-valid.
-/// Nonunique plain column indexes remain tolerated extras.
+/// All extra indexes on release tables are drift, even when not query-valid:
+/// a plain index can evaluate native writes through its access method or
+/// operator class, just as unique, expression and partial indexes can.
 /// A sequence is compared by its structure only: the value it has reached
 /// is the source's data.
 fn compare_fingerprints(
@@ -1740,7 +1740,7 @@ fn compare_fingerprints(
     }
     for (name, index) in &found.indexes {
         if expected.tables.contains_key(&index.table) && !expected.indexes.contains_key(name) {
-            let effects: Vec<_> = [
+            let mut effects: Vec<_> = [
                 (index.unique, "unique"),
                 (index.expression, "expression"),
                 (index.partial, "partial"),
@@ -1749,15 +1749,12 @@ fn compare_fingerprints(
             .filter_map(|(present, effect)| present.then_some(effect))
             .collect();
             if effects.is_empty() {
-                comparison
-                    .extra
-                    .push(format!("index {name} on {}", index.table));
-            } else {
-                comparison.drift.push(format!(
-                    "index {name} on {} is an extra {} index; it can constrain or evaluate native writes",
-                    index.table, effects.join(", ")
-                ));
+                effects.push("plain");
             }
+            comparison.drift.push(format!(
+                "index {name} on {} is an extra {} index; it can constrain or evaluate native writes",
+                index.table, effects.join(", ")
+            ));
         }
     }
     for ((table, name), trigger) in &expected.triggers {
@@ -3384,6 +3381,7 @@ mod tests {
             (false, true, false, "expression"),
             (false, false, true, "partial"),
             (true, true, true, "unique, expression, partial"),
+            (false, false, false, "plain"),
         ] {
             for valid in [true, false] {
                 found.indexes.insert(
@@ -3415,17 +3413,6 @@ mod tests {
                 assert!(compare_fingerprints(&expected, &found).drift.is_empty());
             }
         }
-        let index = found.indexes.get_mut("operator_epoch_idx").unwrap();
-        index.table = "qbit_share_ledger".into();
-        index.unique = false;
-        index.expression = false;
-        index.partial = false;
-        let comparison = compare_fingerprints(&expected, &found);
-        assert!(comparison.drift.is_empty());
-        assert_eq!(
-            comparison.extra,
-            vec!["index operator_epoch_idx on qbit_share_ledger"]
-        );
     }
 
     #[test]
@@ -3501,14 +3488,13 @@ mod tests {
             vec![
                 "missing table gone",
                 "column t.a differs: type expected bigint, found numeric",
+                "index t_extra_idx on t is an extra plain index; it can constrain or evaluate native writes",
             ]
         );
-        assert_eq!(
-            comparison.extra,
-            vec!["column t.extra", "table other", "index t_extra_idx on t"]
-        );
+        assert_eq!(comparison.extra, vec!["column t.extra", "table other"]);
 
         // A matching source has nothing to report.
+        found.indexes.remove("t_extra_idx");
         found
             .tables
             .insert("gone".into(), table(&[("x", column("text", true))]));

@@ -91,10 +91,10 @@
 -- triggers that enforce a foreign key is compared too: disabled by a
 -- superuser, the constraint keeps its definition and validation while no
 -- new row is checked against it. Column order, comments and auto-generated
--- constraint names are ignored. Extra unique, expression or partial indexes
--- on release tables are drift: they can constrain or evaluate native writes,
--- even when not valid for queries. Nonunique plain-column indexes without a
--- predicate and indexes on operator-owned tables remain accepted.
+-- constraint names are ignored. All extra indexes on release tables are
+-- drift, even when not valid for queries: plain indexes can evaluate native
+-- writes through their access methods or operator classes too. Indexes on
+-- operator-owned tables remain accepted.
 -- Accepted extra objects are kept and logged; a
 -- missing or different one fails the migration, which rolls back whole.
 
