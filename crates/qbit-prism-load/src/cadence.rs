@@ -828,7 +828,12 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                 // Time to new-revision work. The wire carries no payout
                 // revision, so the first clean_jobs=true notify at or after
                 // the bump stands in for it, and is labelled as an
-                // approximation.
+                // approximation. The search ends at the span's end: the next
+                // landing's own clean_jobs notify is that landing's work,
+                // and a frontend that had not served the new revision by
+                // then is reported as such rather than credited with the
+                // later job -- which understated the time and stopped the
+                // rejected-before count at the wrong event (EP-STATE).
                 let mut revision_work: Vec<f64> = Vec::new();
                 let mut first_revision_work: Option<Instant> = None;
                 if let Some(bump) = reference {
@@ -840,6 +845,7 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                                 notify.session == *session
                                     && notify.clean_jobs
                                     && notify.at >= bump.monotonic
+                                    && notify.at < end
                             })
                             .map(|notify| notify.at)
                             .min()
@@ -853,6 +859,14 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                 }
                 let rejected_before_new_revision_work = first_revision_work
                     .map(|at| mine.iter().filter(|rejection| rejection.at < at).count());
+                // Unknown is not zero: a frontend with no new-revision work
+                // inside the span is its own outcome, with its own reason.
+                let new_revision_work_unavailable_reason =
+                    match (reference, revision_work.is_empty()) {
+                        (None, _) => Some(NO_REFERENCE_BUMP),
+                        (Some(_), true) => Some(NO_NEW_REVISION_WORK_IN_SPAN),
+                        (Some(_), false) => None,
+                    };
 
                 // Lost valid work: the client only ever offers a nonce that
                 // meets the share target, so every rebuild-pending rejection
@@ -917,16 +931,11 @@ pub fn build(inputs: &ReportInputs<'_>) -> Value {
                     "sessions_with_new_tip_work": tip_work.len(),
                     "time_to_new_revision_work_millis": millis_summary(&revision_work),
                     "sessions_with_new_revision_work": revision_work.len(),
+                    "new_revision_work_unavailable_reason": new_revision_work_unavailable_reason,
                     "new_revision_work_approximation": NEW_REVISION_APPROXIMATION,
                     "rejected_before_new_revision_work": rejected_before_new_revision_work,
                     "rejected_before_new_revision_work_unavailable_reason":
-                        rejected_before_new_revision_work.is_none().then(|| {
-                            if reference.is_none() {
-                                "no bump was attributed to this landing"
-                            } else {
-                                "no session on this frontend received a clean_jobs job after the bump"
-                            }
-                        }),
+                        new_revision_work_unavailable_reason,
                     "lost_valid_shares": lost.len(),
                     "lost_valid_shares_found_in_postgres": lost
                         .iter()
@@ -1201,10 +1210,23 @@ fn no_landing_reason(
 /// carries.
 pub const NEW_REVISION_APPROXIMATION: &str =
     "approximate: mining.notify carries no payout revision, so the first notify with \
-     clean_jobs=true at or after the bump stands in for the first job built at the new \
-     revision. clean_jobs is set when the parent or the payout revision differs from the \
-     session's last job (stratum.rs, deliver_job), so inside a landing's span, after the tip \
-     has already been served, it is the rebuild at the new revision.";
+     clean_jobs=true at or after the bump and before the end of the landing's span stands in \
+     for the first job built at the new revision. clean_jobs is set when the parent or the \
+     payout revision differs from the session's last job (stratum.rs, deliver_job), so inside \
+     a landing's span, after the tip has already been served, it is the rebuild at the new \
+     revision. A clean_jobs notify after the span is the next landing's work and is never \
+     counted for this one.";
+
+/// Why a frontend's new-revision figures are absent: no bump to measure from.
+pub const NO_REFERENCE_BUMP: &str = "no bump was attributed to this landing";
+/// Why a frontend's new-revision figures are absent: the bump happened, but
+/// no session on the frontend saw a job at the new revision before the span
+/// ended. The next landing's job is its own and is not borrowed.
+pub const NO_NEW_REVISION_WORK_IN_SPAN: &str =
+    "no session on this frontend received a clean_jobs job between the bump and the end of \
+     the landing's span: the frontend had not served work at the new revision before the next \
+     landing's tip change (or the phase's end), and the next landing's job is not borrowed \
+     for it";
 
 /// Exactly how every window and time in this section is measured, and on which
 /// clock.
@@ -1266,8 +1288,11 @@ pub fn definitions() -> Value {
                            both measured from it.",
         "rejected_before_new_revision_work": "rebuild-pending rejections that frontend returned \
                                               between the landing's tip change and the earliest \
-                                              new-revision work on any of its sessions. Null, with \
-                                              a reason, when there was no bump or no such job.",
+                                              new-revision work on any of its sessions inside the \
+                                              landing's span. Null, with a reason, when there was \
+                                              no bump or no such job inside the span; a job seen \
+                                              only after the span is the next landing's and stops \
+                                              nothing here.",
         "lost_valid_shares": "every rebuild-pending rejection in the span. The client only submits \
                               a nonce it has already checked against the share target, so each one \
                               is a valid share the pool discarded. None is persisted, which is \

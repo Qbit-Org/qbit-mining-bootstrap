@@ -240,18 +240,25 @@ over every session is in the same section, through the harness's own
 
 **Time to new-revision work is an approximation, and is labelled as one.**
 `mining.notify` carries no payout revision, so the first notify with
-`clean_jobs=true` at or after the bump stands in for the first job built at the
-new revision. `clean_jobs` is set when the parent *or* the payout revision
-differs from the session's last job (`stratum.rs`, `deliver_job`), so inside a
-landing's window — after the new tip has already been served — it is the
-rebuild at the new revision. The bump it is measured from is the last bump
-attributed to the landing: the revision a frontend has to reach before it stops
-answering `new payout work is pending`.
+`clean_jobs=true` at or after the bump *and before the end of the landing's
+span* stands in for the first job built at the new revision. `clean_jobs` is
+set when the parent *or* the payout revision differs from the session's last
+job (`stratum.rs`, `deliver_job`), so inside a landing's window — after the new
+tip has already been served — it is the rebuild at the new revision. The bump
+it is measured from is the last bump attributed to the landing: the revision a
+frontend has to reach before it stops answering `new payout work is pending`.
+
+The search stops at the span's end. The next landing's own `clean_jobs` notify
+is that landing's work, and a frontend that had not served the new revision by
+then is reported as such: `sessions_with_new_revision_work` is 0, the time is
+`null`, and `new_revision_work_unavailable_reason` says no job at the new
+revision was seen inside the span. Borrowing the later job would have
+understated the time and stopped the count below at the wrong event.
 
 `rejected_before_new_revision_work` counts the rebuild-pending rejections a
 frontend returned between the landing and the earliest new-revision work on any
-of its sessions. It is `null`, with a reason, when there was no bump or no such
-job.
+of its sessions inside the span. It is `null`, with the same reason, when there
+was no bump or no such job inside the span.
 
 The label travels with the numbers: every object that carries a new-revision
 figure carries `new_revision_work_approximation` beside it — the per-landing,

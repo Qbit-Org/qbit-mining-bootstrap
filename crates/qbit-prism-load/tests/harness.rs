@@ -3984,6 +3984,220 @@ fn rejections_and_bumps_are_attributed_to_the_landing_they_follow() {
     assert!(document["definitions"]["combined_rebuild_pending_window"].is_string());
 }
 
+/// A frontend that has not served the new revision by the time the next
+/// landing's tip changes must be reported as such. The search for the first
+/// `clean_jobs` job used to run to the end of the phase, so the *next*
+/// landing's own clean_jobs notify was selected and reported as this
+/// landing's new-revision work: time_to_new_revision_work was understated
+/// and rejected_before_new_revision_work stopped at the wrong event. The
+/// search now ends at the landing's span, and an empty result is its own
+/// outcome with its own reason.
+#[test]
+fn new_revision_work_is_never_borrowed_from_the_next_landing() {
+    use qbit_prism_load::cadence;
+    let base = std::time::Instant::now();
+    let landings = vec![
+        cadence::Landing {
+            index: 0,
+            scheduled_offset_seconds: 5.0,
+            requested_monotonic: at(base, 5_000),
+            requested_wall: chrono::Utc::now(),
+            session: 0,
+            frontend: 0,
+        },
+        cadence::Landing {
+            index: 1,
+            scheduled_offset_seconds: 14.0,
+            requested_monotonic: at(base, 14_000),
+            requested_wall: chrono::Utc::now(),
+            session: 1,
+            frontend: 0,
+        },
+    ];
+    let submits = vec![
+        dense_submit(
+            HASH_ZERO,
+            0,
+            0,
+            at(base, 5_100),
+            at(base, 5_200),
+            client::Outcome::Accepted,
+            true,
+        ),
+        dense_submit(
+            HASH_ONE,
+            1,
+            0,
+            at(base, 14_100),
+            at(base, 14_200),
+            client::Outcome::Accepted,
+            true,
+        ),
+        // Landing 0's span: two payout-pending rejections after its bump,
+        // and the frontend never serves the new revision before landing 1.
+        dense_submit(
+            &"2".repeat(64),
+            2,
+            0,
+            at(base, 7_900),
+            at(base, 8_000),
+            pending(classify::NEW_PAYOUT_WORK_PENDING),
+            false,
+        ),
+        dense_submit(
+            &"3".repeat(64),
+            2,
+            0,
+            at(base, 11_900),
+            at(base, 12_000),
+            pending(classify::NEW_PAYOUT_WORK_PENDING),
+            false,
+        ),
+        // Landing 1's span: one rejection before its new-revision job.
+        dense_submit(
+            &"4".repeat(64),
+            2,
+            0,
+            at(base, 16_600),
+            at(base, 16_700),
+            pending(classify::NEW_PAYOUT_WORK_PENDING),
+            false,
+        ),
+    ];
+    let node_submissions = vec![
+        node_submission(HASH_ZERO, 104, true),
+        node_submission(HASH_ONE, 105, true),
+    ];
+    let tip_changes = vec![
+        pool_tip(HASH_ZERO, 104, at(base, 7_000)),
+        pool_tip(HASH_ONE, 105, at(base, 16_000)),
+    ];
+    let revisions = cadence::RevisionSeries {
+        interval_ms: 25,
+        samples: 9_000,
+        errors: 0,
+        first_error: None,
+        baseline: Some(bump(4, None, base)),
+        changes: vec![
+            bump(5, Some(4), at(base, 7_500)),
+            bump(6, Some(5), at(base, 16_500)),
+        ],
+    };
+    // The only clean_jobs job on the frontend arrives after landing 1's tip
+    // change: it is landing 1's work, 300 ms after landing 1's bump.
+    let notifies = vec![client::NotifySighting {
+        session: 2,
+        frontend: 0,
+        job_id: "job-c".into(),
+        tip: HASH_ONE.to_owned(),
+        clean_jobs: true,
+        at: at(base, 16_800),
+    }];
+    let tips = Vec::new();
+    let failures = Vec::new();
+    let frontends = vec![health(0)];
+    let session_frontend = vec![0usize, 0, 0];
+    let gaps = vec![9.0];
+    let offsets = vec![5.0, 14.0];
+    let committed = std::collections::BTreeSet::new();
+    let document = cadence::build(&cadence::ReportInputs {
+        cadence: cadence::Cadence::Dense,
+        gaps: &gaps,
+        offsets: &offsets,
+        phase_seconds: 240,
+        phase_rate: 50.0,
+        phase_started: base,
+        phase_started_wall: chrono::Utc::now(),
+        phase_ended: at(base, 240_000),
+        phase_duration_millis: 240_000,
+        landing_budget: 2,
+        slots_over_budget: 0,
+        landings: &landings,
+        revisions: Some(&revisions),
+        submits: &submits,
+        notifies: &notifies,
+        tips: &tips,
+        node_submissions: &node_submissions,
+        tip_changes: &tip_changes,
+        session_frontend: &session_frontend,
+        frontends: &frontends,
+        failures: &failures,
+        committed: &committed,
+        aborted: None,
+    });
+    assert_eq!(document["landings"], json!(2));
+
+    // Landing 0: its bump was attributed, but no job at the new revision was
+    // seen inside its span. That is the outcome, with its reason; the next
+    // landing's job at 16.8 s is not reported as 9.3 s of this landing's
+    // rebuild, and the two rejections are not counted against it.
+    let first = &document["landing_records"][0]["frontends"][0];
+    assert_eq!(first["reference_bump"]["revision"], json!(5));
+    assert_eq!(first["sessions_with_new_revision_work"], json!(0));
+    assert_eq!(
+        first["time_to_new_revision_work_millis"]["samples"],
+        json!(0)
+    );
+    assert!(first["time_to_new_revision_work_millis"]["max"].is_null());
+    assert_eq!(
+        first["new_revision_work_unavailable_reason"],
+        json!(cadence::NO_NEW_REVISION_WORK_IN_SPAN)
+    );
+    assert!(
+        first["rejected_before_new_revision_work"].is_null(),
+        "no new-revision work in the span, so nothing to count up to: {}",
+        first["rejected_before_new_revision_work"]
+    );
+    assert_eq!(
+        first["rejected_before_new_revision_work_unavailable_reason"],
+        json!(cadence::NO_NEW_REVISION_WORK_IN_SPAN)
+    );
+    assert_eq!(
+        first["payout_pending_window"]["count"],
+        json!(2),
+        "the window itself is still measured"
+    );
+
+    // Landing 1: its own job, 300 ms after its own bump, with one rejection
+    // before it.
+    let second = &document["landing_records"][1]["frontends"][0];
+    assert_eq!(second["reference_bump"]["revision"], json!(6));
+    assert_eq!(second["sessions_with_new_revision_work"], json!(1));
+    assert_eq!(
+        second["time_to_new_revision_work_millis"]["max"],
+        json!(300.0)
+    );
+    assert!(second["new_revision_work_unavailable_reason"].is_null());
+    assert_eq!(second["rejected_before_new_revision_work"], json!(1));
+
+    // The summaries hold landing 1's figures only: nothing was invented for
+    // landing 0.
+    let overall = &document["summaries"]["overall"];
+    assert_eq!(
+        overall["time_to_new_revision_work_max_millis"]["samples"],
+        json!(1)
+    );
+    assert_eq!(
+        overall["time_to_new_revision_work_max_millis"]["max"],
+        json!(300.0)
+    );
+    assert_eq!(
+        overall["rejected_before_new_revision_work_per_landing"]["samples"],
+        json!(1)
+    );
+    assert_eq!(
+        overall["rejected_before_new_revision_work_per_landing"]["max"],
+        json!(1.0)
+    );
+    assert!(
+        document["definitions"]["time_to_new_revision_work"]
+            .as_str()
+            .expect("a definition")
+            .contains("before the end of the landing's span"),
+        "the definition says where the search stops"
+    );
+}
+
 #[test]
 fn a_landing_with_a_window_is_counted_as_having_one() {
     // A span -- and therefore a window -- is granted on the landing's own pool
