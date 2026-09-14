@@ -634,6 +634,45 @@ fn a_password_inside_any_url_valued_variable_never_reaches_a_report() {
     );
 }
 
+/// SQLx reads a URL's query keys percent-decoded (`url.query_pairs()`), so
+/// `pass%77ord=secret` sets the password. The redaction compared the encoded
+/// spelling, so that value survived into both reports. The key is compared
+/// as SQLx reads it and written back as it came.
+#[test]
+fn a_percent_encoded_password_key_is_redacted_as_sqlx_reads_it() {
+    let password = "hunter2-Sup3r_Secret";
+    for (url, expected) in [
+        (
+            format!("postgresql://db.example/qbit?pass%77ord={password}&sslmode=require"),
+            "postgresql://db.example/qbit?pass%77ord=<redacted>&sslmode=require",
+        ),
+        (
+            format!("postgresql://db.example/qbit?%70%61%73%73%77%6F%72%64={password}"),
+            "postgresql://db.example/qbit?%70%61%73%73%77%6F%72%64=<redacted>",
+        ),
+        (
+            format!("postgresql://alex:{password}@db.example/qbit?PASS%57ORD={password}#f"),
+            "postgresql://alex:<redacted>@db.example/qbit?PASS%57ORD=<redacted>#f",
+        ),
+    ] {
+        let redacted = frontend::redact_url_secrets(&url);
+        assert!(
+            !redacted.contains(password),
+            "{url} still carries the password: {redacted}"
+        );
+        assert_eq!(redacted, expected);
+    }
+    // SQLx's decoder takes `+` for a space and keeps a malformed escape as
+    // written, so neither of these is the password key, and neither value
+    // is a secret the redaction may invent.
+    assert_eq!(
+        frontend::redact_url_secrets("postgresql://h/d?pass+word=x&pass%zzword=y"),
+        "postgresql://h/d?pass+word=x&pass%zzword=y"
+    );
+    assert_eq!(frontend::percent_decode("pass%77ord"), "password");
+    assert_eq!(frontend::percent_decode("a+b%2"), "a b%2");
+}
+
 /// A scratch directory under the system temp dir, removed on drop.
 struct ScratchDir(std::path::PathBuf);
 

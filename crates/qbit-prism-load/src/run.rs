@@ -2303,38 +2303,8 @@ pub fn rewrite_host(url: &str, host_port: &str) -> Result<String> {
 /// `host` here as it is there.
 fn names_endpoint(pair: &str) -> bool {
     let key = pair.split_once('=').map_or(pair, |(key, _)| key);
-    let decoded = percent_decode(key);
+    let decoded = frontend::percent_decode(key);
     ENDPOINT_PARAMETERS.contains(&decoded.as_str())
-}
-
-/// Decode `%XX` escapes and `+` in one query-string component, as a
-/// form-encoded reader does; an escape that is not two hex digits is kept
-/// as written, the way SQLx's decoder keeps it.
-fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'%' if index + 2 < bytes.len()
-                && bytes[index + 1].is_ascii_hexdigit()
-                && bytes[index + 2].is_ascii_hexdigit() =>
-            {
-                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).expect("ascii");
-                out.push(u8::from_str_radix(hex, 16).expect("two hex digits"));
-                index += 3;
-            }
-            b'+' => {
-                out.push(b' ');
-                index += 1;
-            }
-            byte => {
-                out.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The least a round trip can cost under a one-way per-chunk delay: the

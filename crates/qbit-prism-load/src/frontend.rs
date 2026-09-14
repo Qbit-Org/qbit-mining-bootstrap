@@ -211,6 +211,12 @@ pub const REDACTED: &str = "<redacted>";
 /// authority's userinfo, and the value of any `password` query parameter
 /// (the form libpq and sqlx also accept). Anything that is not a URL is
 /// returned unchanged.
+///
+/// The query key is compared as SQLx reads it, percent-decoded: SQLx takes
+/// `pass%77ord=secret` as the password, so the redaction has to as well.
+/// Comparing the encoded spelling let that value through into both reports
+/// (EP-OBSERVABILITY). The key is written back as it came, so the URL stays
+/// the one the frontend was given, minus the secret.
 pub fn redact_url_secrets(value: &str) -> String {
     let Some((scheme, rest)) = value.split_once("://") else {
         return value.to_owned();
@@ -233,7 +239,7 @@ pub fn redact_url_secrets(value: &str) -> String {
             let query = query
                 .split('&')
                 .map(|pair| match pair.split_once('=') {
-                    Some((name, _)) if name.eq_ignore_ascii_case("password") => {
+                    Some((name, _)) if percent_decode(name).eq_ignore_ascii_case("password") => {
                         format!("{name}={REDACTED}")
                     }
                     _ => pair.to_owned(),
@@ -248,6 +254,39 @@ pub fn redact_url_secrets(value: &str) -> String {
         None => tail.to_owned(),
     };
     format!("{scheme}://{authority}{tail}")
+}
+
+/// Decode `%XX` escapes and `+` in one query-string component, as a
+/// form-encoded reader does; an escape that is not two hex digits is kept
+/// as written, the way SQLx's decoder keeps it. This is how SQLx reads a
+/// URL's query keys, so it is how every key comparison in the harness --
+/// the endpoint parameters the proxy rewrite drops, the `password`
+/// parameter the redaction strips -- has to read them.
+pub fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len()
+                && bytes[index + 1].is_ascii_hexdigit()
+                && bytes[index + 2].is_ascii_hexdigit() =>
+            {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).expect("ascii");
+                out.push(u8::from_str_radix(hex, 16).expect("two hex digits"));
+                index += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Build profile of a binary, inferred from its Cargo output directory.
