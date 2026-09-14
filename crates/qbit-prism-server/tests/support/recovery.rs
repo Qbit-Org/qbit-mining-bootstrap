@@ -252,7 +252,7 @@ pub async fn assert_artifacts(pool: &PgPool, artifacts: &[Artifact]) -> Result<(
 /// executing the restored SQL through SQLx; only a random test schema name is
 /// remapped, so the original database never receives restore statements.
 pub async fn backup(db: &Database, pg_bin: &Path) -> Result<Vec<u8>> {
-    let output = Command::new(pg_bin.join("pg_dump"))
+    let output = postgres_command(db, pg_bin, "pg_dump")?
         .args([
             "--format=custom",
             "--inserts",
@@ -261,7 +261,6 @@ pub async fn backup(db: &Database, pg_bin: &Path) -> Result<Vec<u8>> {
             "--schema",
         ])
         .arg(&db.schema)
-        .env("PGDATABASE", &db.url)
         .output()
         .await?;
     ensure!(
@@ -274,6 +273,40 @@ pub async fn backup(db: &Database, pg_bin: &Path) -> Result<Vec<u8>> {
         "not a PostgreSQL archive"
     );
     Ok(output.stdout)
+}
+
+// libpq expands a connection URI supplied as dbname, but not one inherited
+// through PGDATABASE. Keep passwords out of the process argument list.
+fn postgres_command(db: &Database, pg_bin: &Path, program: &str) -> Result<Command> {
+    let mut url = url::Url::parse(&db.url)?;
+    let mut password = url
+        .password()
+        .map(|value| {
+            percent_encoding::percent_decode_str(value)
+                .decode_utf8()
+                .map(String::from)
+        })
+        .transpose()?;
+    url.set_password(None)
+        .map_err(|_| anyhow::anyhow!("invalid PostgreSQL connection URL"))?;
+    let options: Vec<(String, String)> = url
+        .query_pairs()
+        .filter_map(|(key, value)| {
+            if key == "password" {
+                password = Some(value.into_owned());
+                None
+            } else {
+                Some((key.into_owned(), value.into_owned()))
+            }
+        })
+        .collect();
+    url.query_pairs_mut().clear().extend_pairs(options);
+    let mut command = Command::new(pg_bin.join(program));
+    command.arg("--dbname").arg(url.as_str());
+    if let Some(password) = password {
+        command.env("PGPASSWORD", password);
+    }
+    Ok(command)
 }
 
 pub async fn restore(
@@ -330,9 +363,8 @@ pub async fn evidence_with_bytea(db: &Database, pg_bin: &Path, format: &str) -> 
         "../../../../scripts/prism-recovery-evidence.sql"
     ))?;
     input.seek(SeekFrom::Start(0))?;
-    let output = Command::new(pg_bin.join("psql"))
+    let output = postgres_command(db, pg_bin, "psql")?
         .args(["-XqAt", "-v", "ON_ERROR_STOP=1"])
-        .env("PGDATABASE", &db.url)
         .stdin(Stdio::from(input))
         .output()
         .await?;
