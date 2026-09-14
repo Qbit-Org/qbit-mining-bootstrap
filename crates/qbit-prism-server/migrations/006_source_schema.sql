@@ -42,10 +42,12 @@
 -- release does not (qbit_prism_schema_migrations, the migrator's own, is
 -- never reserved), and, per release table, every column a native migration
 -- adds to it with ADD COLUMN IF NOT EXISTS. A source that already has one
--- of them is a native collision, refused before any DDL and naming the
--- objects: a native migration's IF NOT EXISTS would keep such an object or
--- column whatever it holds, and the migration would record a schema it did
--- not build. Nothing is dropped; the operator restores the backup or
+-- of them, or holds a reserved relation name with a relation of another
+-- kind (a view, an index backing an operator's constraint), is a native
+-- collision, refused before any DDL and naming the objects: a native
+-- migration's IF NOT EXISTS would keep such an object or column whatever it
+-- holds, or skip its own object for the name, and the migration would
+-- record a schema it did not build. Nothing is dropped; the operator restores the backup or
 -- removes the objects. An object or column in both readings, the
 -- capability table on a #258 source for instance, or the outbox's
 -- storage_version there (002 added it; on a pre-#258 source this migration

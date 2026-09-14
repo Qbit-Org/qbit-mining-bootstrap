@@ -941,6 +941,78 @@ async fn two_x_source_with_stray_native_objects_is_refused_naming_each_before_an
     Ok(())
 }
 
+/// A reserved name held by a relation of another kind: a view under the
+/// name of a native table, and an operator table whose unique constraint is
+/// named `qbit_prism_candidate_claim_idx`, so its index owns that name.
+/// `IF NOT EXISTS` looks at the name alone, so 002 would skip the outbox
+/// index it meant to create, record the migration anyway, and leave
+/// candidate polling to scan the outbox. Refused before any DDL on an empty
+/// database and on a 2.x.x source alike, naming each by what holds the
+/// name; renamed, the same database migrates and 002's index is on the
+/// outbox.
+#[tokio::test]
+async fn reserved_name_held_by_a_relation_of_another_kind_is_refused_before_any_ddl() -> Result<()>
+{
+    for (state, nonce) in [(SourceState::Fresh, 6501), (SourceState::Pre258, 6502)] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let pool = PgPool::connect(&db.url).await?;
+        apply_frozen_2x_schema(&pool, state).await?;
+        sqlx::raw_sql("CREATE TABLE operator_notes(note_id bigint NOT NULL, note text, CONSTRAINT qbit_prism_candidate_claim_idx UNIQUE (note_id)); CREATE VIEW qbit_prism_jobs AS SELECT 1 AS job_id")
+            .execute(&pool).await?;
+        let before = schema_objects(&pool).await?;
+        let error = db
+            .ledger("this-build")
+            .await
+            .err()
+            .with_context(|| {
+                format!("migrate accepted a {state:?} source with reserved names held by a view and a constraint-backed index")
+            })?
+            .to_string();
+        let holder = match state {
+            SourceState::Fresh => "empty database",
+            _ => "2.x.x database",
+        };
+        assert!(
+            error.contains(&format!("refusing to migrate a native collision source before any DDL: the {holder} already holds 2 object(s) that the native migrations create and the 2.x.x release does not (view qbit_prism_jobs; index qbit_prism_candidate_claim_idx backing constraint qbit_prism_candidate_claim_idx on operator_notes)")),
+            "{error}"
+        );
+        assert!(
+            error.contains("skip its own object where a relation of another kind holds the name")
+                && error.contains("Nothing was changed"),
+            "{error}"
+        );
+        // Unchanged: no migrator table, every object as it was, the view
+        // still there.
+        assert!(migrator_table_absent(&pool).await?);
+        assert_eq!(schema_objects(&pool).await?, before);
+        assert!(
+            sqlx::query_scalar::<_, bool>("SELECT to_regclass('qbit_prism_jobs') IS NOT NULL AND to_regclass('qbit_prism_candidate_claim_idx') IS NOT NULL")
+                .fetch_one(&pool).await?
+        );
+        // Renamed, the same database migrates; the operator's objects are
+        // kept and 002's index is on the outbox.
+        sqlx::raw_sql("ALTER TABLE operator_notes RENAME CONSTRAINT qbit_prism_candidate_claim_idx TO operator_notes_note_id_key; ALTER VIEW qbit_prism_jobs RENAME TO operator_jobs")
+            .execute(&pool).await?;
+        let ledger = db.ledger("this-build").await?;
+        assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT tablename::text FROM pg_indexes WHERE schemaname=current_schema() AND indexname='qbit_prism_candidate_claim_idx'")
+                .fetch_one(&pool).await?,
+            "qbit_block_candidate_outbox"
+        );
+        assert!(
+            sqlx::query_scalar::<_, bool>("SELECT to_regclass('operator_jobs') IS NOT NULL AND to_regclass('operator_notes_note_id_key') IS NOT NULL")
+                .fetch_one(&pool).await?
+        );
+        exercise_native_writers(&ledger, 1, nonce).await?;
+        pool.close().await;
+        db.close(vec![ledger]).await?;
+    }
+    Ok(())
+}
+
 /// The type of a column of the test schema as the server renders it, or
 /// `None` when the table has no such column.
 async fn column_type(pool: &PgPool, table: &str, column: &str) -> Result<Option<String>> {

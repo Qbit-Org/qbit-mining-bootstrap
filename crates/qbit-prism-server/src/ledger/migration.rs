@@ -754,6 +754,55 @@ struct SchemaFingerprint {
     /// Keyed by name: the sequences behind `serial` columns and the ones
     /// created explicitly alike.
     sequences: BTreeMap<String, SequenceDefinition>,
+    /// Every relation no other map models, by name: the indexes that back
+    /// a constraint, views, materialized views, partitioned tables and
+    /// indexes, foreign tables and composite types. Relations of every kind
+    /// share one namespace, and `IF NOT EXISTS` looks at the name alone, so
+    /// `objects_present` counts a reserved name held by any of them; the
+    /// release comparison does not read this map, a constraint-backed index
+    /// being compared through its constraint.
+    other_relations: BTreeMap<String, OtherRelation>,
+}
+
+/// A relation of a kind no other map of `SchemaFingerprint` models.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OtherRelation {
+    /// How a refusal names it: `index x backing constraint k on t`, `view
+    /// v`.
+    description: String,
+    /// For an index backing a constraint, the table the constraint is on.
+    constraint_table: Option<String>,
+}
+
+impl SchemaFingerprint {
+    /// Every relation by name, the way a refusal names it, with the table
+    /// of an index that backs a constraint: the tables, sequences and
+    /// indexes, and the relations of every other kind.
+    fn relations(&self) -> BTreeMap<&str, (String, Option<&str>)> {
+        let mut all = BTreeMap::new();
+        for name in self.tables.keys() {
+            all.insert(name.as_str(), (format!("table {name}"), None));
+        }
+        for name in self.sequences.keys() {
+            all.insert(name.as_str(), (format!("sequence {name}"), None));
+        }
+        for (name, index) in &self.indexes {
+            all.insert(
+                name.as_str(),
+                (format!("index {name} on {}", index.table), None),
+            );
+        }
+        for (name, relation) in &self.other_relations {
+            all.insert(
+                name.as_str(),
+                (
+                    relation.description.clone(),
+                    relation.constraint_table.as_deref(),
+                ),
+            );
+        }
+        all
+    }
 }
 
 /// What the source has that the release does not create (`extra`, kept and
@@ -1038,6 +1087,42 @@ async fn fingerprint_schema(
                 max: row.try_get("max")?,
                 cache: row.try_get("cache")?,
                 cycle: row.try_get("cycle")?,
+            },
+        );
+    }
+    // Every other relation that holds a name: the constraint-backed indexes
+    // the index reading left out, and the kinds no map above models. TOAST
+    // tables live in pg_toast and never here.
+    let rows = sqlx::query("SELECT c.relname::text AS name,c.relkind::text AS kind,(SELECT t.relname::text FROM pg_index x JOIN pg_class t ON t.oid=x.indrelid WHERE x.indexrelid=c.oid) AS table_name,(SELECT k.conname::text FROM pg_constraint k WHERE k.conindid=c.oid AND k.contype IN ('p','u','x') ORDER BY k.conname LIMIT 1) AS constraint_name FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind IN ('i','I','v','m','p','f','c') ORDER BY 1")
+        .bind(namespace).fetch_all(&mut **tx).await?;
+    for row in &rows {
+        let name: String = row.try_get("name")?;
+        let kind: String = row.try_get("kind")?;
+        let table: Option<String> = row.try_get("table_name")?;
+        let constraint: Option<String> = row.try_get("constraint_name")?;
+        let mut constraint_table = None;
+        let description = match (kind.as_str(), table, constraint) {
+            ("i" | "I", Some(table), Some(constraint)) => {
+                let description =
+                    format!("index {name} backing constraint {constraint} on {table}");
+                constraint_table = Some(table);
+                description
+            }
+            // A plain index is in `indexes`; a partitioned one is not.
+            ("i", _, None) => continue,
+            ("I", Some(table), None) => format!("partitioned index {name} on {table}"),
+            ("v", ..) => format!("view {name}"),
+            ("m", ..) => format!("materialized view {name}"),
+            ("p", ..) => format!("partitioned table {name}"),
+            ("f", ..) => format!("foreign table {name}"),
+            ("c", ..) => format!("composite type {name}"),
+            (kind, ..) => format!("relation {name} of kind {kind}"),
+        };
+        fingerprint.other_relations.insert(
+            name,
+            OtherRelation {
+                description,
+                constraint_table,
             },
         );
     }
@@ -1829,6 +1914,13 @@ fn reserved_objects(native: &SchemaFingerprint, release: &SchemaFingerprint) -> 
             objects.functions.insert(key.clone(), definition.clone());
         }
     }
+    for (name, relation) in &native.other_relations {
+        if !release.other_relations.contains_key(name) {
+            objects
+                .other_relations
+                .insert(name.clone(), relation.clone());
+        }
+    }
     ReservedObjects { objects, columns }
 }
 
@@ -1842,27 +1934,37 @@ async fn source_fingerprint(
     let mut found = fingerprint_schema(tx, source_schema).await?;
     found.tables.remove("qbit_prism_schema_migrations");
     found.constraints.remove("qbit_prism_schema_migrations");
+    found
+        .other_relations
+        .remove("qbit_prism_schema_migrations_pkey");
     Ok(found)
 }
 
 /// Every table, sequence, index, trigger and function of `expected` that
-/// the source already has, named the way the drift report names them.
+/// the source already has, named the way the drift report names them. A
+/// relation's name is taken whatever kind of relation holds it, because
+/// `IF NOT EXISTS` looks at the name alone: a view under a table's name, or
+/// an index backing an operator's constraint under an index's name, is
+/// present and is named by what holds the name. An index backing a
+/// constraint of an expected table goes with that table, which is named on
+/// its own when present, so it is not named twice.
 fn objects_present(expected: &SchemaFingerprint, found: &SchemaFingerprint) -> Vec<String> {
+    let found_relations = found.relations();
     let mut present = Vec::new();
-    for table in expected.tables.keys() {
-        if found.tables.contains_key(table) {
-            present.push(format!("table {table}"));
+    let names = expected
+        .tables
+        .keys()
+        .chain(expected.sequences.keys())
+        .chain(expected.indexes.keys())
+        .chain(expected.other_relations.keys());
+    for name in names {
+        let Some((description, constraint_table)) = found_relations.get(name.as_str()) else {
+            continue;
+        };
+        if constraint_table.is_some_and(|table| expected.tables.contains_key(table)) {
+            continue;
         }
-    }
-    for name in expected.sequences.keys() {
-        if found.sequences.contains_key(name) {
-            present.push(format!("sequence {name}"));
-        }
-    }
-    for name in expected.indexes.keys() {
-        if let Some(actual) = found.indexes.get(name) {
-            present.push(format!("index {name} on {}", actual.table));
-        }
+        present.push(description.clone());
     }
     for (table, name) in expected.triggers.keys() {
         if found.triggers.contains_key(&(table.clone(), name.clone())) {
@@ -1930,9 +2032,12 @@ fn columns_present(
 /// migration creates and the release does not must not be there yet, on a
 /// 2.x.x source or an empty database alike: a native migration's `IF NOT
 /// EXISTS` would keep it whatever it holds, the migration would record a
-/// schema it did not build, and the writers would fail only afterwards.
-/// Refused before any DDL, naming the objects. Nothing is dropped: what
-/// such an object holds is the operator's to judge.
+/// schema it did not build, and the writers would fail only afterwards. A
+/// reserved relation name held by a relation of another kind, a view or an
+/// index backing an operator's constraint, is the same collision: `IF NOT
+/// EXISTS` would skip the native object for it. Refused before any DDL,
+/// naming the objects. Nothing is dropped: what such an object holds is
+/// the operator's to judge.
 fn require_no_native_collision(
     state: SourceState,
     reserved: &ReservedObjects,
@@ -1942,7 +2047,7 @@ fn require_no_native_collision(
     present.extend(columns_present(&reserved.columns, found));
     ensure!(
         present.is_empty(),
-        "refusing to migrate a {STATE_NATIVE_COLLISION} source before any DDL: the {} already holds {} object(s) that the native migrations create and the 2.x.x release does not ({}), so a native migration's IF NOT EXISTS would keep each such table, sequence, index, trigger, function or column whatever it holds and the migration would record a schema it did not build. Nothing was changed. Restore the full pre-migration backup, or check what those objects hold and remove them yourself, then migrate again",
+        "refusing to migrate a {STATE_NATIVE_COLLISION} source before any DDL: the {} already holds {} object(s) that the native migrations create and the 2.x.x release does not ({}), so a native migration's IF NOT EXISTS would keep each such table, sequence, index, trigger, function or column whatever it holds, or skip its own object where a relation of another kind holds the name, and the migration would record a schema it did not build. Nothing was changed. Restore the full pre-migration backup, or check what those objects hold and remove them yourself, then migrate again",
         match state {
             SourceState::Fresh => "empty database",
             _ => "2.x.x database",
@@ -2641,6 +2746,22 @@ mod tests {
         assert_eq!(constraint_key("CHECK ((a > 0))"), "CHECK ((a > 0))");
     }
 
+    /// A relation of another kind: a view, say.
+    fn other(description: &str) -> OtherRelation {
+        OtherRelation {
+            description: description.to_owned(),
+            constraint_table: None,
+        }
+    }
+
+    /// The index backing `constraint` on `table`, under `name`.
+    fn backing_index(name: &str, constraint: &str, table: &str) -> OtherRelation {
+        OtherRelation {
+            description: format!("index {name} backing constraint {constraint} on {table}"),
+            constraint_table: Some(table.to_owned()),
+        }
+    }
+
     fn constraint(name: &str, validated: bool) -> ConstraintDefinition {
         ConstraintDefinition {
             name: name.to_owned(),
@@ -3062,6 +3183,166 @@ mod tests {
                 "index qbit_pool_blocks_maturity_idx on qbit_pool_blocks",
                 "trigger qbit_pool_blocks_guard on qbit_pool_blocks",
             ]
+        );
+        // A release name held by a relation of another kind is a leftover
+        // too: 001's IF NOT EXISTS looks at the name alone.
+        let mut found = SchemaFingerprint::default();
+        found
+            .other_relations
+            .insert("qbit_pool_blocks".into(), other("view qbit_pool_blocks"));
+        found.indexes.insert(
+            "qbit_audit_publication_sequence_seq".into(),
+            IndexDefinition {
+                table: "operator_notes".into(),
+                definition: "CREATE INDEX qbit_audit_publication_sequence_seq ON operator_notes USING btree (note)".into(),
+                valid: true,
+            },
+        );
+        assert_eq!(
+            objects_present(&expected, &found),
+            vec![
+                "view qbit_pool_blocks",
+                "index qbit_audit_publication_sequence_seq on operator_notes",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reserved_name_held_by_a_relation_of_another_kind_is_a_collision() {
+        let mut reserved = ReservedObjects::default();
+        reserved.objects.tables.insert(
+            "qbit_prism_jobs".into(),
+            table(&[("job_id", column("text", true))]),
+        );
+        reserved.objects.sequences.insert(
+            "qbit_prism_session_sequence".into(),
+            sequence("bigint", 1, 4294967295),
+        );
+        reserved.objects.indexes.insert(
+            "qbit_prism_candidate_claim_idx".into(),
+            IndexDefinition {
+                table: "qbit_block_candidate_outbox".into(),
+                definition: "CREATE INDEX qbit_prism_candidate_claim_idx ON qbit_block_candidate_outbox USING btree (next_attempt_at)".into(),
+                valid: true,
+            },
+        );
+        reserved.objects.other_relations.insert(
+            "qbit_prism_jobs_pkey".into(),
+            backing_index(
+                "qbit_prism_jobs_pkey",
+                "qbit_prism_jobs_pkey",
+                "qbit_prism_jobs",
+            ),
+        );
+        // A view under the table's name, a plain index under the sequence's,
+        // an index backing an operator's constraint under the index's, and
+        // a plain index under the primary key's: each named by what holds
+        // the name, tables, sequences and indexes first.
+        let mut found = SchemaFingerprint::default();
+        found
+            .other_relations
+            .insert("qbit_prism_jobs".into(), other("view qbit_prism_jobs"));
+        found.indexes.insert(
+            "qbit_prism_session_sequence".into(),
+            IndexDefinition {
+                table: "operator_notes".into(),
+                definition:
+                    "CREATE INDEX qbit_prism_session_sequence ON operator_notes USING btree (note)"
+                        .into(),
+                valid: true,
+            },
+        );
+        found.other_relations.insert(
+            "qbit_prism_candidate_claim_idx".into(),
+            backing_index(
+                "qbit_prism_candidate_claim_idx",
+                "qbit_prism_candidate_claim_idx",
+                "operator_notes",
+            ),
+        );
+        found.indexes.insert(
+            "qbit_prism_jobs_pkey".into(),
+            IndexDefinition {
+                table: "operator_notes".into(),
+                definition:
+                    "CREATE INDEX qbit_prism_jobs_pkey ON operator_notes USING btree (note_id)"
+                        .into(),
+                valid: true,
+            },
+        );
+        assert_eq!(
+            objects_present(&reserved.objects, &found),
+            vec![
+                "view qbit_prism_jobs",
+                "index qbit_prism_session_sequence on operator_notes",
+                "index qbit_prism_candidate_claim_idx backing constraint qbit_prism_candidate_claim_idx on operator_notes",
+                "index qbit_prism_jobs_pkey on operator_notes",
+            ]
+        );
+        let error = require_no_native_collision(SourceState::Pre258, &reserved, &found)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("already holds 4 object(s)")
+                && error.contains(
+                    "skip its own object where a relation of another kind holds the name"
+                ),
+            "{error}"
+        );
+        // A stray native table is named once: the index backing its own
+        // primary key goes with it.
+        let mut found = SchemaFingerprint::default();
+        found.tables.insert(
+            "qbit_prism_jobs".into(),
+            table(&[("job_id", column("text", true))]),
+        );
+        found.other_relations.insert(
+            "qbit_prism_jobs_pkey".into(),
+            backing_index(
+                "qbit_prism_jobs_pkey",
+                "qbit_prism_jobs_pkey",
+                "qbit_prism_jobs",
+            ),
+        );
+        assert_eq!(
+            objects_present(&reserved.objects, &found),
+            vec!["table qbit_prism_jobs"]
+        );
+        // The release's own constraint-backed index is in both readings and
+        // never reserved; the native one is.
+        let mut native = SchemaFingerprint::default();
+        native.other_relations.insert(
+            "qbit_share_ledger_pkey".into(),
+            backing_index(
+                "qbit_share_ledger_pkey",
+                "qbit_share_ledger_pkey",
+                "qbit_share_ledger",
+            ),
+        );
+        native.other_relations.insert(
+            "qbit_prism_jobs_pkey".into(),
+            backing_index(
+                "qbit_prism_jobs_pkey",
+                "qbit_prism_jobs_pkey",
+                "qbit_prism_jobs",
+            ),
+        );
+        let mut release = SchemaFingerprint::default();
+        release.other_relations.insert(
+            "qbit_share_ledger_pkey".into(),
+            backing_index(
+                "qbit_share_ledger_pkey",
+                "qbit_share_ledger_pkey",
+                "qbit_share_ledger",
+            ),
+        );
+        assert_eq!(
+            reserved_objects(&native, &release)
+                .objects
+                .other_relations
+                .keys()
+                .collect::<Vec<_>>(),
+            ["qbit_prism_jobs_pkey"]
         );
     }
 
