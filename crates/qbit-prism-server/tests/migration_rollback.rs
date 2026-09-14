@@ -133,6 +133,7 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         .await?;
         let before = recovery::accounting_state(&source.pool).await?;
         let source_evidence = recovery::evidence(&source, pg_bin).await?;
+        assert_share_sequence_fingerprint(&source, pg_bin, &source_evidence).await?;
         ensure!(
             recovery::evidence_with_bytea(&source, pg_bin, "escape").await? == source_evidence,
             "connection bytea defaults changed the recovery fingerprints"
@@ -165,6 +166,7 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         ensure!(recovery::accounting_state(&source.pool).await? == before);
         ensure!(recovery::evidence(&source, pg_bin).await? == source_evidence);
         assert_canonical_audit_fingerprints(&source, pg_bin, &artifacts, artifacts_dir.path()).await?;
+        assert_share_sequence_fingerprint(&source, pg_bin, &source_evidence).await?;
         assert_imported_audit_metadata_fingerprints(&source, pg_bin, &artifacts, artifacts_dir.path())
             .await?;
         recovery::restore(&archive, &source, &restored, pg_bin).await?;
@@ -440,6 +442,51 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
     source.close().await?;
     restored.close().await?;
     result
+}
+
+async fn assert_share_sequence_fingerprint(
+    db: &recovery::Database,
+    pg_bin: &std::path::Path,
+    baseline: &serde_json::Value,
+) -> Result<()> {
+    let original: (i64, bool) =
+        sqlx::query_as("SELECT last_value, is_called FROM qbit_share_ledger_share_seq_seq")
+            .fetch_one(&db.pool)
+            .await?;
+    for (last_value, is_called) in [(2_i64, true), (original.0, !original.1)] {
+        sqlx::query("SELECT setval('qbit_share_ledger_share_seq_seq',$1,$2)")
+            .bind(last_value)
+            .bind(is_called)
+            .execute(&db.pool)
+            .await?;
+        let changed = recovery::evidence(db, pg_bin).await;
+        sqlx::query("SELECT setval('qbit_share_ledger_share_seq_seq',$1,$2)")
+            .bind(original.0)
+            .bind(original.1)
+            .execute(&db.pool)
+            .await?;
+        let mut changed = changed?;
+        ensure!(changed["records"]["shares"] == baseline["records"]["shares"]);
+        ensure!(
+            changed["records"]["share_sequence"] != baseline["records"]["share_sequence"],
+            "share allocator change was invisible: {last_value}, {is_called}"
+        );
+        changed["records"]["share_sequence"] = baseline["records"]["share_sequence"].clone();
+        ensure!(
+            changed == *baseline,
+            "unrelated evidence changed with sequence state"
+        );
+    }
+    sqlx::query("ALTER SEQUENCE qbit_share_ledger_share_seq_seq RENAME TO saved_share_sequence")
+        .execute(&db.pool)
+        .await?;
+    let missing = recovery::evidence(db, pg_bin).await;
+    sqlx::query("ALTER SEQUENCE saved_share_sequence RENAME TO qbit_share_ledger_share_seq_seq")
+        .execute(&db.pool)
+        .await?;
+    ensure!(missing.is_err(), "missing share allocator was accepted");
+    ensure!(recovery::evidence(db, pg_bin).await? == *baseline);
+    Ok(())
 }
 
 async fn assert_canonical_audit_fingerprints(

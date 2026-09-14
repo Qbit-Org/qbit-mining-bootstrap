@@ -87,6 +87,11 @@ $metadata$;
 
 SELECT jsonb_build_object('kind', 'shares', 'row', to_jsonb(s))
 FROM qbit_share_ledger s ORDER BY share_seq;
+-- Rows alone do not preserve the next allocation, including gaps left by
+-- rolled-back writes. Read sequence state without consuming a value.
+SELECT jsonb_build_object('kind', 'share_sequence', 'row', jsonb_build_object(
+    'last_value', last_value, 'is_called', is_called))
+FROM qbit_share_ledger_share_seq_seq;
 
 SELECT jsonb_build_object('kind', 'blocks', 'row', jsonb_build_object(
     'block_hash', block_hash, 'block_height', block_height,

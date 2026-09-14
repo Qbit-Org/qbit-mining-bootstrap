@@ -68,6 +68,10 @@ class RecoveryEvidenceTests(unittest.TestCase):
     def test_recovery_obligations_change_summary_without_share_or_ctv_state_changes(self):
         baseline = module.summarize(iter(closing()))
         for kind, row, change in (
+            ("share_sequence", {"last_value": 40, "is_called": True},
+             {"last_value": 2}),
+            ("share_sequence", {"last_value": 40, "is_called": True},
+             {"is_called": False}),
             ("share_hashes", {"header_hash": "ab", "share_id": "first"},
              {"share_id": "later"}),
             ("audit_bodies", {"block_hash": "ab", "audit_bundle": {"schema": "native"}},
