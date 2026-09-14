@@ -769,6 +769,10 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         record_notifies: std::sync::atomic::AtomicBool::new(false),
     });
     let mut sessions: Vec<SessionHandle> = Vec::with_capacity(args.sessions);
+    // One deadline for everything that waits on the server to answer a
+    // submit: the phase boundaries, the drained restart, and each session's
+    // own quiesce before a deliberate close.
+    let quiesce_limit = drain_limit(args.share_commit_timeout_seconds);
     for index in 0..args.sessions {
         let frontend_index = index % args.frontends;
         let config = SessionConfig {
@@ -779,6 +783,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             version_rolling_mask: qbit_prism_server::codec::VERSION_ROLLING_MASK,
             connect_timeout: Duration::from_secs(20),
             handshake_timeout: Duration::from_secs(args.work_timeout.min(120)),
+            quiesce_limit,
         };
         sessions.push(client::spawn_session(
             config,

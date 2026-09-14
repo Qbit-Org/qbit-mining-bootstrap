@@ -323,6 +323,15 @@ pub struct SessionConfig {
     pub version_rolling_mask: u32,
     pub connect_timeout: Duration,
     pub handshake_timeout: Duration,
+    /// How long a deliberate close -- a client-initiated reconnect, a
+    /// retarget that asks for a fresh connection -- waits for the session's
+    /// outstanding submits to settle before the socket goes. The run derives
+    /// it from the configured share-commit timeout plus the drain margin
+    /// (`run::drain_limit`), the one deadline the phase boundaries and the
+    /// drained restart already wait: a submit the server is still allowed to
+    /// be working on is never turned into a `NoResponse` by the harness's
+    /// own close (EP-ERRORS).
+    pub quiesce_limit: Duration,
 }
 
 /// Shared, live run state a session reads.
@@ -710,8 +719,19 @@ fn drain_work(
     }
 }
 
+/// How often the quiesce re-checks its deadline while no line arrives. A
+/// poll interval, not a wait on anything the server governs.
+const QUIESCE_POLL: Duration = Duration::from_millis(500);
+
 /// Wait for every outstanding submit to settle before a deliberate close, so a
 /// planned reconnect never manufactures indeterminate shares.
+///
+/// The wait is `config.quiesce_limit`: the configured share-commit timeout
+/// plus the drain margin. A fixed 20 s here was reachable with
+/// `--share-commit-timeout-seconds` above 20, and then a submit the server
+/// was still legitimately working on was recorded as `NoResponse` by the
+/// harness's own close, and a later commit of it read as a durability loss
+/// that the configured deadline had never permitted (EP-ERRORS).
 async fn quiesce(
     connection: &mut Connection,
     shared: &Arc<SessionShared>,
@@ -719,9 +739,9 @@ async fn quiesce(
     frontend: &Arc<AtomicUsize>,
     outstanding: &Arc<AtomicUsize>,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + config.quiesce_limit;
     while !connection.pending.is_empty() && Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(500), connection.lines.recv()).await {
+        match tokio::time::timeout(QUIESCE_POLL, connection.lines.recv()).await {
             Ok(Some(Incoming::Line(line))) => {
                 let _ = handle_line(connection, &line, config, shared, frontend, outstanding);
             }
@@ -737,7 +757,12 @@ async fn quiesce(
         }
     }
     if !connection.pending.is_empty() {
-        fail_pending(connection, "quiesce timed out", shared, config, outstanding);
+        let reason = format!(
+            "quiesce timed out after {:.1?}, the configured share-commit timeout plus its \
+             margin, with the submit still unanswered",
+            config.quiesce_limit
+        );
+        fail_pending(connection, &reason, shared, config, outstanding);
     }
 }
 

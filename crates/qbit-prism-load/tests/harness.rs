@@ -784,10 +784,13 @@ fn an_unknown_build_profile_needs_the_debug_override() -> Result<()> {
 /// The smallest Stratum server a session can complete a handshake with:
 /// subscribe, configure, authorize, one job, and `true` to every submit.
 /// `release_authorize` gates the authorize reply, which keeps a session
-/// inside its handshake for as long as a test needs.
+/// inside its handshake for as long as a test needs; `release_submits`
+/// gates every submit reply the same way, which keeps a submit outstanding
+/// for as long as a test needs.
 struct FakeStratum {
     address: String,
     release_authorize: tokio::sync::watch::Sender<bool>,
+    release_submits: tokio::sync::watch::Sender<bool>,
     submits: Arc<std::sync::atomic::AtomicUsize>,
     _task: tokio::task::JoinHandle<()>,
 }
@@ -795,6 +798,7 @@ struct FakeStratum {
 #[derive(Clone, Copy, Default)]
 struct StratumOptions {
     hold_authorize: bool,
+    hold_submits: bool,
     /// A `mining.set_difficulty` to push after authorize, before the job.
     advertised_difficulty: Option<f64>,
 }
@@ -811,6 +815,7 @@ async fn fake_stratum_with(options: StratumOptions) -> FakeStratum {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let (release_authorize, release) = tokio::sync::watch::channel(!options.hold_authorize);
+    let (release_submits, submit_release) = tokio::sync::watch::channel(!options.hold_submits);
     let submits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = submits.clone();
     let task = tokio::spawn(async move {
@@ -821,6 +826,7 @@ async fn fake_stratum_with(options: StratumOptions) -> FakeStratum {
             tokio::spawn(serve_stratum(
                 socket,
                 release.clone(),
+                submit_release.clone(),
                 counter.clone(),
                 options.advertised_difficulty,
             ));
@@ -829,6 +835,7 @@ async fn fake_stratum_with(options: StratumOptions) -> FakeStratum {
     FakeStratum {
         address,
         release_authorize,
+        release_submits,
         submits,
         _task: task,
     }
@@ -837,6 +844,7 @@ async fn fake_stratum_with(options: StratumOptions) -> FakeStratum {
 async fn serve_stratum(
     socket: tokio::net::TcpStream,
     mut release: tokio::sync::watch::Receiver<bool>,
+    mut submit_release: tokio::sync::watch::Receiver<bool>,
     submits: Arc<std::sync::atomic::AtomicUsize>,
     advertised_difficulty: Option<f64>,
 ) {
@@ -873,6 +881,11 @@ async fn serve_stratum(
             }
             Some("mining.submit") => {
                 submits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                while !*submit_release.borrow() {
+                    if submit_release.changed().await.is_err() {
+                        return;
+                    }
+                }
                 json!({"id": id, "error": null, "result": true})
             }
             _ => continue,
@@ -913,7 +926,140 @@ fn session_config(index: usize) -> client::SessionConfig {
         version_rolling_mask: codec::VERSION_ROLLING_MASK,
         connect_timeout: std::time::Duration::from_secs(5),
         handshake_timeout: std::time::Duration::from_secs(20),
+        // What the run derives from the default 15 s commit timeout.
+        quiesce_limit: run::drain_limit(15.0),
     }
+}
+
+/// Wait for the fake server to have `count` submits in hand.
+async fn submits_received(server: &FakeStratum, count: usize) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while server.submits.load(std::sync::atomic::Ordering::SeqCst) < count {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the server received {} of {count} submits",
+            server.submits.load(std::sync::atomic::Ordering::SeqCst)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// Drive one session with one submit held on the server, ask it to
+/// reconnect, and return its record for that submit with how long the
+/// session waited before producing it. `release_after` lets the server
+/// answer part-way through the wait.
+async fn quiesced_submit(
+    quiesce_limit: std::time::Duration,
+    release_after: Option<std::time::Duration>,
+) -> Result<(client::SubmitRecord, std::time::Duration)> {
+    let server = fake_stratum_with(StratumOptions {
+        hold_submits: true,
+        ..Default::default()
+    })
+    .await;
+    let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+    let shared = Arc::new(client::SessionShared {
+        phase: std::sync::RwLock::new("reconnect".to_owned()),
+        events,
+        record_notifies: std::sync::atomic::AtomicBool::new(false),
+    });
+    let config = client::SessionConfig {
+        quiesce_limit,
+        ..session_config(0)
+    };
+    let handle = client::spawn_session(config, 0, server.address.clone(), shared.clone(), 1);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let event = tokio::time::timeout_at(deadline, inbox.recv())
+            .await
+            .expect("the session connects within the deadline")
+            .expect("the session is still running");
+        if matches!(event, client::Event::Connected { .. }) {
+            break;
+        }
+    }
+    let phase: Arc<str> = Arc::from("reconnect");
+    assert!(handle.try_offer(1, &phase));
+    submits_received(&server, 1).await;
+
+    let asked = std::time::Instant::now();
+    handle.control.send(client::Control::Reconnect {
+        reason: "client-initiated".into(),
+        phase: phase.clone(),
+    })?;
+    if let Some(after) = release_after {
+        let release = server.release_submits.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            let _ = release.send(true);
+        });
+    }
+    let record = loop {
+        let event = tokio::time::timeout_at(deadline, inbox.recv())
+            .await
+            .expect("the held submit is settled one way or the other within the deadline")
+            .expect("the session is still running");
+        if let client::Event::Submit(record) = event {
+            break *record;
+        }
+    };
+    let waited = asked.elapsed();
+    let _ = server.release_submits.send(true);
+    let _ = handle.control.send(client::Control::Stop);
+    tokio::time::timeout(std::time::Duration::from_secs(5), handle.task).await??;
+    Ok((record, waited))
+}
+
+/// A client-initiated reconnect waits for the session's outstanding submits
+/// before it closes the socket, and the wait is the configured share-commit
+/// timeout plus the drain margin, the deadline the phase boundaries and the
+/// drained restart already use. It was a fixed 20 s: with
+/// `--share-commit-timeout-seconds` above that, a submit the server was
+/// still legitimately working on was recorded as no-response by the
+/// harness's own close, and a later commit of it read as a durability loss.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnect_waits_the_configured_commit_timeout_for_an_outstanding_submit() -> Result<()> {
+    // The wait is the configured limit, not a constant: with a 1 s limit
+    // the held submit is given up after about a second, where the fixed
+    // deadline held the reconnect for 20 s.
+    let (record, waited) = quiesced_submit(std::time::Duration::from_secs(1), None).await?;
+    let client::Outcome::NoResponse { reason } = &record.outcome else {
+        panic!("a submit still unanswered at the limit is no-response: {record:?}");
+    };
+    assert!(reason.contains("quiesce timed out"), "{reason}");
+    assert!(
+        reason.contains("1.0s") && reason.contains("share-commit timeout"),
+        "the record says how long it was given and why: {reason}"
+    );
+    assert!(
+        waited >= std::time::Duration::from_millis(900),
+        "the whole limit is waited: {waited:?}"
+    );
+    assert!(
+        waited < std::time::Duration::from_secs(10),
+        "the limit is the configured one, not the fixed 20 s: {waited:?}"
+    );
+
+    // And a submit the server answers inside the configured limit is
+    // recorded as answered, however long that took: nothing is manufactured
+    // while the server is still allowed to be working.
+    let (record, waited) = quiesced_submit(
+        std::time::Duration::from_secs(8),
+        Some(std::time::Duration::from_millis(2_500)),
+    )
+    .await?;
+    assert!(
+        matches!(record.outcome, client::Outcome::Accepted),
+        "answered inside the limit: {record:?}"
+    );
+    assert!(
+        waited >= std::time::Duration::from_millis(2_400),
+        "the answer came after the hold: {waited:?}"
+    );
+    assert!(record
+        .latency_millis
+        .is_some_and(|millis| millis >= 2_400.0));
+    Ok(())
 }
 
 /// A phase's rate and its artifact must describe the same offers. An offer

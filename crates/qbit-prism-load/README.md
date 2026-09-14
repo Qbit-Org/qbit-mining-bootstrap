@@ -144,7 +144,14 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
    reconnect that lands on a paused session does not lift the pause. If the
    submits never settle the frontend is not killed and the run aborts
    (exit 6) rather than turning the harness's own in-flight submits into
-   lost acknowledgements. A reconnect is attributed to the phase that asked
+   lost acknowledgements. A client-initiated reconnect quiesces the same
+   way before it closes its socket: the session waits for its outstanding
+   submits to settle for up to the share-commit timeout plus that same 5 s
+   margin, so a planned close never turns a submit the server is still
+   allowed to be working on into a `no-response` record that a later commit
+   would make read as a durability loss. A submit still unanswered after
+   that is recorded as `no-response` with the wait it was given. A
+   reconnect is attributed to the phase that asked
    for it: one started near the end of this phase and completed after the
    next began is still counted in `reconnect_events`, not under the phase it
    happened to finish in, the same way a submit belongs to the phase that
