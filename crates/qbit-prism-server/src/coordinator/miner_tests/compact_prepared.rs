@@ -1,6 +1,7 @@
 use super::*;
 use crate::coordinator::prepared_storage::compact::{
-    CapturedCompactPrepared, CompactOwner, OriginalPreparedBuild,
+    CanonicalCompactBalances, CapturedCompactPrepared, CompactOwner, IncompatibleCompactBuild,
+    OriginalPreparedBuild,
 };
 use crate::ledger::{PayoutState, StoredCompactPrepared};
 use work_ledger::WorkLedger;
@@ -70,6 +71,268 @@ async fn cleanup_finished(f: &Fixture) {
     .unwrap();
     drop(permit);
     assert_eq!(f.coordinator.build_slots.available_permits(), 1);
+}
+
+fn build_balance_order_bundle(
+    snapshot: &Snapshot,
+    found: FoundBlock,
+    inputs: &BundleInputs,
+    suffix: String,
+) -> AuditBundle {
+    let manifest = ManifestSigningKey::from_seed_hex(&hash(0x11)).unwrap();
+    let ledger = ManifestSigningKey::from_seed_hex(&hash(0x22)).unwrap();
+    if let Some(ctv) = &inputs.ctv {
+        qbit_prism::build_audit_bundle_with_ctv_settlement_options(
+            snapshot.shares.clone(),
+            found,
+            snapshot.prior_balances.clone(),
+            inputs.payout_policy.clone(),
+            ctv.direct_floor_sats,
+            ctv.settlement_config,
+            ctv.fanout_fee_policy,
+            Some(suffix),
+            vec![],
+            &manifest,
+            &ledger,
+        )
+        .unwrap()
+    } else {
+        qbit_prism::build_audit_bundle_with_coinbase_options(
+            snapshot.shares.clone(),
+            found,
+            snapshot.prior_balances.clone(),
+            inputs.payout_policy.clone(),
+            Some(suffix),
+            vec![],
+            &manifest,
+            &ledger,
+        )
+        .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn canonical_inputs_precede_original_hash_and_roundtrip_without_rewriting_legacy() {
+    use crate::coordinator::prepared_storage::compact::CompactDropProbe;
+    let runtime_thread = std::thread::current().id();
+    for ctv in [false, true] {
+        let f = Fixture::build(
+            Duration::from_secs(10),
+            |config| config.ctv_enabled = ctv,
+            None,
+        )
+        .await;
+        let original = f.coordinator.prepared.read().await.clone().unwrap();
+        let inputs = BundleInputs::capture(&f.coordinator.config, None).unwrap();
+        let mut raw = (*original.snapshot).clone();
+        // SQL under a natural-language collation can yield a before B, while
+        // the immutable balance blob's bytewise comparator yields B before a.
+        raw.prior_balances = vec![
+            qbit_prism::CarryForwardBalance {
+                recipient_id: "miner-a".into(),
+                order_key: "a-order".into(),
+                p2mr_program_hex: hash(0x11),
+                balance_sats: 1000,
+            },
+            qbit_prism::CarryForwardBalance {
+                recipient_id: "miner-b".into(),
+                order_key: "B-order".into(),
+                p2mr_program_hex: hash(0x22),
+                balance_sats: 500,
+            },
+        ];
+        let found = original.bundle.as_ref().unwrap().found_block.clone();
+        let suffix = original.stored.coinbase_suffix.clone();
+        let permit = f
+            .coordinator
+            .build_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let (raw, snapshot, legacy, bundle) = tokio::task::spawn_blocking({
+            let inputs = inputs.clone();
+            let found = found.clone();
+            let suffix = suffix.clone();
+            move || {
+                let _permit = permit;
+                let legacy =
+                    build_balance_order_bundle(&raw, found.clone(), &inputs, suffix.clone());
+                let mut canonical = raw.clone();
+                canonical.prior_balances = CanonicalCompactBalances::prepare(
+                    std::mem::take(&mut canonical.prior_balances),
+                    &_permit,
+                )
+                .into_original_build();
+                // The first compact original bundle is built only AFTER its
+                // typed inputs have their final order, never normalized later.
+                let bundle = build_balance_order_bundle(&canonical, found, &inputs, suffix);
+                (raw, Arc::new(canonical), legacy, bundle)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(raw.prior_balances[0].order_key, "a-order");
+        assert_eq!(snapshot.prior_balances[0].order_key, "B-order");
+        assert_eq!(
+            qbit_prism::prior_balances_digest(&raw.prior_balances),
+            qbit_prism::prior_balances_digest(&snapshot.prior_balances)
+        );
+        // Both ordinary and CTV payout values, signed outputs and attestations
+        // are unchanged. Only the original bundle's input array order differs.
+        assert_eq!(bundle.reward_manifest, legacy.reward_manifest);
+        assert_eq!(bundle.payout_policy_manifest, legacy.payout_policy_manifest);
+        assert_eq!(
+            bundle.signed_coinbase_manifest,
+            legacy.signed_coinbase_manifest
+        );
+        assert_eq!(
+            bundle.ledger_window_attestation,
+            legacy.ledger_window_attestation
+        );
+        assert_eq!(
+            bundle.ctv_fanout_manifest_set,
+            legacy.ctv_fanout_manifest_set
+        );
+        let report =
+            qbit_prism::verify_audit_bundle(&bundle, &inputs.signer_keys.ledger_key_hex).unwrap();
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        assert_ne!(
+            report.audit_bundle_sha256_hex,
+            hex::encode(Sha256::digest(&legacy_bytes))
+        );
+        let window = WindowRef::from_snapshot(&snapshot).unwrap();
+        let stored = Arc::new(StoredPrepared {
+            template: original.template.clone(),
+            snapshot: snapshot.clone(),
+            bundle: Some(Arc::new(bundle.clone())),
+            fee: None,
+            fingerprint: original.fingerprint.clone(),
+            generation: original.generation,
+            parent_of_tip: original.parent_of_tip.clone(),
+            coinbase_suffix: suffix.clone(),
+        });
+        let source = OriginalPreparedBuild::from_original_build(
+            format!("prepared:canonical:{}", uuid::Uuid::new_v4().simple()),
+            stored,
+            window,
+            inputs.clone(),
+        );
+        let captured = f
+            .coordinator
+            .capture_compact_prepared(source, 130_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            captured
+                .record
+                .audit_hashes
+                .as_ref()
+                .unwrap()
+                .audit_bundle_sha256,
+            report.audit_bundle_sha256_hex
+        );
+        let issued = issued(&f, &captured);
+        f.store
+            .compact
+            .reads
+            .lock()
+            .unwrap()
+            .push_back(Ok(Some(observation(&captured))));
+        script_window(&f, &captured);
+        let hydrated = f
+            .coordinator
+            .hydrate_compact_inputs(&issued)
+            .await
+            .unwrap()
+            .unwrap();
+        let rebuilt = hydrated
+            .spawn_blocking(move |owned| {
+                build_balance_order_bundle(&owned.snapshot, found, &owned.inputs, suffix)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&rebuilt).unwrap(),
+            serde_json::to_vec(&bundle).unwrap()
+        );
+        let rebuilt_report =
+            qbit_prism::verify_audit_bundle(&rebuilt, &inputs.signer_keys.ledger_key_hex).unwrap();
+        assert_eq!(
+            rebuilt_report.audit_bundle_sha256_hex,
+            report.audit_bundle_sha256_hex
+        );
+        assert_eq!(
+            rebuilt_report.coinbase_manifest_sha256_hex,
+            report.coinbase_manifest_sha256_hex
+        );
+
+        for keep_raw_snapshot in [true, false] {
+            let incompatible = Arc::new(StoredPrepared {
+                template: original.template.clone(),
+                snapshot: if keep_raw_snapshot {
+                    Arc::new(raw.clone())
+                } else {
+                    snapshot.clone()
+                },
+                bundle: Some(Arc::new(legacy.clone())),
+                fee: None,
+                fingerprint: original.fingerprint.clone(),
+                generation: original.generation,
+                parent_of_tip: original.parent_of_tip.clone(),
+                coinbase_suffix: original.stored.coinbase_suffix.clone(),
+            });
+            let source = OriginalPreparedBuild::from_original_build(
+                format!("prepared:incompatible:{}", uuid::Uuid::new_v4().simple()),
+                incompatible,
+                window,
+                inputs.clone(),
+            );
+            let (dropped, receive) = tokio::sync::oneshot::channel();
+            let release = ReleaseProbe(Arc::new(prepared_storage::RepairProbe::default()));
+            let source = OriginalPreparedBuild::with_drop_probe(
+                source,
+                CompactDropProbe {
+                    dropped: Some(dropped),
+                    release: release.0.clone(),
+                    runtime_thread,
+                },
+            );
+            let capture = tokio::spawn({
+                let c = f.coordinator.clone();
+                async move { c.capture_compact_prepared(source, 130_000).await }
+            });
+            let dropped_on = tokio::time::timeout(Duration::from_secs(5), receive)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(dropped_on, runtime_thread);
+            assert_eq!(
+                f.coordinator.build_slots.available_permits(),
+                0,
+                "rejected original inputs retain admission through their cleanup"
+            );
+            release.0.release();
+            let Err(error) = capture.await.unwrap() else {
+                panic!("a completed noncanonical bundle cannot acquire a new audit identity")
+            };
+            assert_eq!(f.coordinator.build_slots.available_permits(), 1);
+            assert!(matches!(
+                (
+                    keep_raw_snapshot,
+                    error.downcast::<IncompatibleCompactBuild>().unwrap()
+                ),
+                (true, IncompatibleCompactBuild::NonCanonicalBalances)
+                    | (false, IncompatibleCompactBuild::BundleBalancesMismatch)
+            ));
+            assert_eq!(serde_json::to_vec(&legacy).unwrap(), legacy_bytes);
+        }
+        assert!(f.store.compact.save_calls.lock().unwrap().is_empty());
+        assert!(Arc::ptr_eq(
+            f.coordinator.prepared.read().await.as_ref().unwrap(),
+            &original
+        ));
+    }
 }
 
 #[tokio::test]

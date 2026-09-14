@@ -4,6 +4,9 @@
 //! needs atomic typed issued-save/repair and post-build authority checks under
 //! the existing outer operation deadline. The storage migration requires all
 //! frontends stopped and old candidates drained; this is not a rolling writer.
+//! A future refresh caller must prepare CanonicalCompactBalances before its
+//! original bundle build. Existing SQL-order legacy builds remain unchanged;
+//! completed noncanonical bundles cannot be converted by rewriting their hash.
 use super::*;
 use crate::ledger::{CompactPrepared, PreparedAuditHashes, PreparedTemplate};
 
@@ -60,6 +63,44 @@ pub(in crate::coordinator) struct CapturedCompactPrepared {
     pub original_expires_at_ms: i64,
 }
 
+/// Original-build input, prepared before any bundle or audit hash exists.
+pub(in crate::coordinator) struct CanonicalCompactBalances(Vec<qbit_prism::CarryForwardBalance>);
+
+fn balance_order(
+    left: &qbit_prism::CarryForwardBalance,
+    right: &qbit_prism::CarryForwardBalance,
+) -> std::cmp::Ordering {
+    left.order_key
+        .cmp(&right.order_key)
+        .then_with(|| left.recipient_id.cmp(&right.recipient_id))
+        .then_with(|| left.p2mr_program_hex.cmp(&right.p2mr_program_hex))
+}
+
+impl CanonicalCompactBalances {
+    /// Run inside the original build's blocking owner, before constructing its
+    /// snapshot/bundle. Borrow that admission; never acquire a nested slot.
+    /// This changes input order only, using the immutable blob's comparator.
+    pub fn prepare(
+        mut balances: Vec<qbit_prism::CarryForwardBalance>,
+        _admission: &tokio::sync::OwnedSemaphorePermit,
+    ) -> Self {
+        balances.sort_by(balance_order);
+        Self(balances)
+    }
+
+    pub fn into_original_build(self) -> Vec<qbit_prism::CarryForwardBalance> {
+        self.0
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(in crate::coordinator) enum IncompatibleCompactBuild {
+    #[error("original compact build balances are not in canonical order")]
+    NonCanonicalBalances,
+    #[error("original bundle balances differ from compact build inputs")]
+    BundleBalancesMismatch,
+}
+
 /// Explicit handoff from the original builder, before either persistence
 /// format reserves the key. Legacy/resumed Prepared cannot recover historical
 /// CTV/version inputs, so there is intentionally no conversion from Prepared.
@@ -71,6 +112,8 @@ pub(in crate::coordinator) struct OriginalPreparedBuild {
     created: Instant,
     #[cfg(test)]
     capture_probe: Option<Arc<RepairProbe>>,
+    #[cfg(test)]
+    drop_probe: Option<CompactDropProbe>,
 }
 
 impl OriginalPreparedBuild {
@@ -91,6 +134,8 @@ impl OriginalPreparedBuild {
             created: Instant::now(),
             #[cfg(test)]
             capture_probe: None,
+            #[cfg(test)]
+            drop_probe: None,
         })
     }
 
@@ -100,6 +145,15 @@ impl OriginalPreparedBuild {
         probe: Arc<RepairProbe>,
     ) -> CompactOwner<Self> {
         source.value.as_mut().unwrap().capture_probe = Some(probe);
+        source
+    }
+
+    #[cfg(test)]
+    pub fn with_drop_probe(
+        mut source: CompactOwner<Self>,
+        probe: CompactDropProbe,
+    ) -> CompactOwner<Self> {
+        source.value.as_mut().unwrap().drop_probe = Some(probe);
         source
     }
 }
@@ -291,25 +345,42 @@ impl Coordinator {
         let encoded = admitted
             .spawn_blocking(move |(source, permit)| {
                 let _permit = permit;
+                // A local declared after admission drops first, including
+                // rejection before any source fields move into Prepared.
+                let original_source = source;
                 #[cfg(test)]
-                if let Some(probe) = &source.capture_probe {
+                if let Some(probe) = &original_source.capture_probe {
                     probe.block();
+                }
+                // The original build must already have used canonical input.
+                // Sorting here would silently change a completed audit's hash.
+                let balances = &original_source.stored.snapshot.prior_balances;
+                if !balances.is_sorted_by(|a, b| !balance_order(a, b).is_gt()) {
+                    return Err(IncompatibleCompactBuild::NonCanonicalBalances.into());
+                }
+                if original_source
+                    .stored
+                    .bundle
+                    .as_ref()
+                    .is_some_and(|bundle| bundle.prior_balances != *balances)
+                {
+                    return Err(IncompatibleCompactBuild::BundleBalancesMismatch.into());
                 }
                 // Only original parts enter this private authority view. Neither
                 // this assembly nor capture publishes it or reads configuration.
-                let stored = source.stored;
+                let stored = original_source.stored;
                 let original = Arc::new(Prepared {
                     template: stored.template.clone(),
                     snapshot: stored.snapshot.clone(),
-                    window: source.window,
-                    inputs: source.inputs,
+                    window: original_source.window,
+                    inputs: original_source.inputs,
                     bundle: stored.bundle.clone(),
                     base_wire: None,
-                    storage_key: source.storage_key,
+                    storage_key: original_source.storage_key,
                     fee: stored.fee,
                     fingerprint: stored.fingerprint.clone(),
                     generation: stored.generation,
-                    created: source.created,
+                    created: original_source.created,
                     parent_of_tip: stored.parent_of_tip.clone(),
                     stored,
                     repair: Arc::new(Mutex::new(())),
