@@ -84,7 +84,7 @@ def prose_reference_pattern(root: str, separator: str) -> re.Pattern[str]:
     )
 
 
-PATH_REFERENCE = prose_reference_pattern(r"lab/prism", "/")
+PATH_REFERENCE = prose_reference_pattern(r"\blab/prism", "/")
 MODULE_REFERENCE = prose_reference_pattern(r"\blab\.prism", r"\.")
 PROSE_TRAILING_PUNCTUATION = ".,;:!?*()[]{}|"
 URL_REFERENCE_PREFIX = re.compile(r"https?://\S+/$")
@@ -1026,6 +1026,16 @@ class ScannerTests(unittest.TestCase):
         for reference in ("lab/prismatic/tool", "lab.prismatic.tool", "lab/prism-old/tool", "lab.prism-old.tool"):
             with self.subTest(reference=reference):
                 self.assertEqual(self.references(f"See `{reference}`."), [])
+
+    def test_prose_reference_roots_require_a_leading_word_boundary(self) -> None:
+        for root in ("lab/prism/deleted.py", "lab.prism.deleted"):
+            for prefix in ("col", "my_", "3", "é"):
+                for quote in ("", "`", "'", '"'):
+                    with self.subTest(root=root, prefix=prefix, quote=quote):
+                        self.assertEqual(self.references(f"See {quote}{prefix}{root}{quote}."), [])
+            for prefix in ("", "./", "../", "/"):
+                with self.subTest(root=root, prefix=prefix):
+                    self.assertEqual(self.references(f"See `{prefix}{root}`."), [root])
 
     def test_module_commands_with_missing_targets_are_caught(self) -> None:
         self.assertEqual(
