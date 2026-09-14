@@ -2220,3 +2220,6 @@ mod window_ref_tests;
 
 #[cfg(test)]
 mod window_switch_tests;
+
+#[cfg(test)]
+mod window_incident_tests;
