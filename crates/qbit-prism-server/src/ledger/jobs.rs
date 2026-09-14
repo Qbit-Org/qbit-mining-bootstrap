@@ -1,5 +1,8 @@
 use super::*;
 
+mod prepared;
+pub use prepared::{CompactPrepared, PreparedAuditHashes, PreparedTemplate, StoredCompactPrepared};
+
 /// Immutable identity of the shared record referenced by an issued job.
 #[derive(Clone, Copy, Debug)]
 pub struct PreparedDependency<'a> {

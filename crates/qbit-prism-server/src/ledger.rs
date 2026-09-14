@@ -36,7 +36,10 @@ mod instances;
 pub(crate) use instances::{live_instances, unavailable_live_instances, LiveInstancesReport};
 pub use instances::{HeartbeatHealth, HeartbeatStatus};
 mod jobs;
-pub use jobs::{IssuedJobSave, PreparedDependency};
+pub use jobs::{
+    CompactPrepared, IssuedJobSave, PreparedAuditHashes, PreparedDependency, PreparedTemplate,
+    StoredCompactPrepared,
+};
 mod migration;
 mod window;
 pub use difficulty::WorkerDifficulty;
