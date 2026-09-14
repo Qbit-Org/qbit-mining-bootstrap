@@ -332,21 +332,22 @@ ignored the rest, so `82800,300,000` judged as 300 bytes and `0,100,garbage`
 set the baseline. The capture loop below writes exactly two fields, and a row
 with a third was corrupted somewhere between the loop and the judge, so it is
 refused rather than read. The samples are sorted by timestamp before they
-are judged, as the Python tool sorted them, so concatenated partial logs judge
-the same as a single file; comment and blank lines are still skipped wherever
-they sort, and a malformed row still exits `2`. The warm-up runs from the
-earliest sample and includes a sample taken exactly one hour after it, as it
-did in the Python tool; only later samples are judged against the bound. The
-command prints the baseline, the bound, the post-warm-up peak and its time, and
-the first breach time, and exits `0` on pass, `1` on fail, `2` on unusable
-input. The span floor is the Python tool's default: `min_span=82800` refuses a
-series that spans less than 23 hours from its first sample to its last, not one
-shorter than the soak. The tool's source recorded the hour of slack as
-tolerance for a late first sample; the run itself is still the 24 h that step 2
-below asks for. The slope guard the Python tool offered (a leak slow enough to
-stay under the multiple inside 24 hours) has no replacement in the runbook;
-take it from the RSS series on the deployment's dashboard, whose rules #279
-owns.
+are judged, as the Python tool sorted them, so concatenated partial logs of
+one run judge the same as a single file; comment and blank lines are still
+skipped wherever they sort, and a malformed row still exits `2`. The same sort
+is why two runs must never share a file, which step 3 below prevents with a
+directory per run. The warm-up runs from the earliest sample and includes a
+sample taken exactly one hour after it, as it did in the Python tool; only
+later samples are judged against the bound. The command prints the baseline,
+the bound, the post-warm-up peak and its time, and the first breach time, and
+exits `0` on pass, `1` on fail, `2` on unusable input. The span floor is the
+Python tool's default: `min_span=82800` refuses a series that spans less than
+23 hours from its first sample to its last, not one shorter than the soak. The
+tool's source recorded the hour of slack as tolerance for a late first sample;
+the run itself is still the 24 h that step 2 below asks for. The slope guard
+the Python tool offered (a leak slow enough to stay under the multiple inside
+24 hours) has no replacement in the runbook; take it from the RSS series on
+the deployment's dashboard, whose rules #279 owns.
 
 When it fails: the first breach time says whether the growth is the steady
 slope (breach hours in) or an excursion (breach right after a candidate storm
@@ -422,14 +423,16 @@ two-hour cutover soak, which reads its own criteria from the same registry.
 
    ```sh
    c=<prism-coordinator-container>
+   run=soak-$(date -u +%Y%m%dT%H%M%SZ)
    process() {
      docker inspect --format '{{.State.Status}} {{.State.StartedAt}} {{.RestartCount}}' "$c"
    }
    first=$(process)
+   mkdir "$run" &&
    while true; do
      now=$(date +%s)
      current=$(process)
-     echo "$now $current" >> soak-process.log
+     echo "$now $current" >> "$run/soak-process.log"
      if [ "$current" != "$first" ]; then
        echo "$(date -u +%FT%TZ): soak invalid, the coordinator is not the process the run started with" >&2
        echo "  at start: $first" >&2
@@ -442,7 +445,7 @@ two-hour cutover soak, which reads its own criteria from the same registry.
        /^VmRSS:/ && $2 ~ /^[0-9]+$/ && $3 == "kB" { n++; row = now "," $2 * 1024 }
        END { if (n == 1) print row }')
      case $rss in
-       "$now",[0-9]*) echo "$rss" >> soak-rss.csv ;;
+       "$now",[0-9]*) echo "$rss" >> "$run/soak-rss.csv" ;;
        *)
          echo "$(date -u +%FT%TZ): soak invalid, no RSS sample at $now" >&2
          if [ "$rc" -ne 0 ]; then echo "  docker exec exited $rc" >&2; fi
@@ -473,7 +476,7 @@ two-hour cutover soak, which reads its own criteria from the same registry.
      fi
      printf '%s\n' "$metrics" \
        | grep -E '^(x-prism-metrics-state:|qbit_prism_(process_resident_memory_bytes|collector_available|collector_age_seconds|runtime_lag_seconds|runtime_task_stalled|runtime_poll_lag_seconds|database_pool_acquire_seconds(_bucket|_sum|_count)|connections|authorized_clients|accepted_shares_total|block_candidates_pending)[ {])' \
-       | sed "s/^/$now /" >> soak-metrics.log
+       | sed "s/^/$now /" >> "$run/soak-metrics.log"
      sleep 300
    done
    ```
@@ -490,9 +493,22 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    policy made, and `Status` catches a process that exited and was not
    restarted. `soak-process.log` keeps one reading per sample, so a later
    reader can show the run was one process. Any change during the soak
-   invalidates the run: keep the message and the log, attach
+   invalidates the run: keep the message and the run directory, attach
    `docker logs "$c"` (the container keeps the exited process's output), and
    start over from step 2.
+
+   A run that starts over must not write into the files of the run it
+   replaces. The judge sorts the samples by timestamp before it reads them,
+   so a `soak-rss.csv` shared by two runs would take its first hour, and so
+   its baseline, from the earlier run, judge the later run against that
+   baseline, and satisfy the span floor with the earlier run's first sample
+   and the later run's last; the two logs would splice the same way. So
+   every run writes into its own directory, named for its UTC start time,
+   and the loop is chained to the `mkdir` that creates it: `mkdir` without
+   `-p` refuses a name that already exists, and on that refusal the loop
+   does not run at all rather than append to whatever the name holds. The
+   earlier run's directory stays as it was, which is the record the restart
+   rule asks to keep.
 
    A missing sample invalidates the run for the same reason. The bound assumes
    an unbroken five-minute series: its span floor only checks the first and
@@ -547,24 +563,25 @@ two-hour cutover soak, which reads its own criteria from the same registry.
 
    ```sh
    docker exec "$c" curl -sS --max-time 5 http://127.0.0.1:3341/metrics \
-     | grep -E '^qbit_prism_share_ack_seconds' > share-ack-h01.txt
+     | grep -E '^qbit_prism_share_ack_seconds' > "$run/share-ack-h01.txt"
    ```
 
 4. **Snapshot** the full `/metrics` body, headers included, at hour 1 (the
    baseline), hour 24, and at any breach:
 
    ```sh
-   docker exec "$c" curl -sS --max-time 5 -D - http://127.0.0.1:3341/metrics > metrics-h01.txt
+   docker exec "$c" curl -sS --max-time 5 -D - http://127.0.0.1:3341/metrics > "$run/metrics-h01.txt"
    ```
 
    This replaces the census step: there is no heap walk on the native server,
    and the body at the breach is what the correlated reading works from.
 5. **Trim** is retired with `malloc_trim`; there is nothing to send at hour 23.
-6. **Judge** each run with the `awk` bound check above against
-   `soak-rss.csv`. A run whose capture loop stopped on a process change, a
-   missing RSS sample or a metrics scrape that failed, was not fresh, had its
-   process collector unavailable or carried no usable RSS value is not
-   judged: it is invalid and is run again from step 2.
+6. **Judge** each run with the `awk` bound check above against its own
+   `$run/soak-rss.csv`; the check names `soak-rss.csv`, so run it inside the
+   run directory or substitute the path. A run whose capture loop stopped on
+   a process change, a missing RSS sample or a metrics scrape that failed,
+   was not fresh, had its process collector unavailable or carried no usable
+   RSS value is not judged: it is invalid and is run again from step 2.
    Pass: exit `0`, and share-ack p99 at hour 24 within the
    alert threshold configured for the deployment (the native rules are
    #279's). Fail: exit `1`, or a share-ack regression between hour 1 and hour
@@ -572,9 +589,10 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    `qbit_prism_runtime_task_stalled` sample at 1 with its timestamp; a stall
    that coincides with an RSS excursion is the first thing to explain.
 7. **Record** on issue #291, which owns cutover qualification: the verdict
-   line, `soak-rss.csv`, `soak-metrics.log`, the three share-ack histograms,
-   the hour-1, hour-24 and breach snapshots, the image ID, and the redacted
-   deploy dotenv. The glibc version inside the image
+   line, the run directory (`soak-process.log`, `soak-rss.csv`,
+   `soak-metrics.log`, the three share-ack histograms, and the hour-1,
+   hour-24 and breach snapshots), the image ID, and the redacted deploy
+   dotenv. The glibc version inside the image
    (`docker exec "$c" ldd --version`) still belongs in the record, because
    the process uses it as its allocator.
 8. **The post-storm drain re-run** on #185 is retired; the storm rig was a
