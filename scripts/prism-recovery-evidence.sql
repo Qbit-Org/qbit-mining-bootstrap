@@ -34,7 +34,11 @@ SELECT jsonb_build_object('kind', 'candidates', 'row', jsonb_build_object(
 FROM qbit_block_candidate_outbox ORDER BY block_hash COLLATE "C";
 SELECT jsonb_build_object('kind', 'ctv_sets', 'row', jsonb_build_object(
     'block_hash', block_hash, 'manifest_set_sha256', manifest_set_sha256,
-    'parent_coinbase_txid', parent_coinbase_txid, 'fanout_count', fanout_count))
+    'manifest_set_json', manifest_set_json, 'manifest_set', manifest_set,
+    'settlement_mode', settlement_mode,
+    'parent_coinbase_txid', parent_coinbase_txid, 'parent_coinbase_tx_hex', parent_coinbase_tx_hex,
+    'fanout_count', fanout_count, 'fanout_output_sum_sats', fanout_output_sum_sats,
+    'covenant_output_value_sats', covenant_output_value_sats))
 FROM qbit_ctv_fanout_sets ORDER BY block_hash COLLATE "C";
 -- Keep the immutable payout payload in the fingerprint while excluding native
 -- claim/confirmation metadata that does not exist in the frozen 2.x schema.

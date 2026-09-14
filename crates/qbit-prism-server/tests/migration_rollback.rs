@@ -247,6 +247,32 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         for (db, schema) in [(&source, "native"), (&restored, "frozen 2.x")] {
             let mut prior = recovery::evidence(db, pg_bin).await?;
             for mutation in [
+                "manifest_set_json='{} '",
+                "manifest_set='{\"corrupted\":true}'",
+                "settlement_mode='hybrid_coinbase_ctv_fanout'",
+                "parent_coinbase_tx_hex='01'",
+                "fanout_output_sum_sats=999",
+                "covenant_output_value_sats=1001",
+            ] {
+                sqlx::query(&format!(
+                    "UPDATE {}.qbit_ctv_fanout_sets SET {mutation} WHERE block_hash=repeat('50',32)",
+                    db.schema
+                ))
+                .execute(&db.pool)
+                .await?;
+                let current = recovery::evidence(db, pg_bin).await?;
+                ensure!(current["records"]["ctv_sets"]["count"] == 1);
+                ensure!(
+                    current["records"]["ctv_sets"]["sha256"]
+                        != prior["records"]["ctv_sets"]["sha256"],
+                    "{schema} CTV manifest-set payload change was invisible to recovery evidence: {mutation}"
+                );
+                let mut unchanged = current.clone();
+                unchanged["records"]["ctv_sets"] = prior["records"]["ctv_sets"].clone();
+                ensure!(unchanged == prior, "unrelated accounting changed with {mutation}");
+                prior = current;
+            }
+            for mutation in [
                 "manifest_json='{} '",
                 "manifest='{\"corrupted\":true}'",
                 "manifest_sha256=repeat('aa',32)",
