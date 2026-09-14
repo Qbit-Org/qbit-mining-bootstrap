@@ -46,20 +46,65 @@ pub const EXIT_ABORTED: i32 = 6;
 /// Rejections that can only happen if the harness offered bad work.
 pub const EXIT_HARNESS_BUG_REJECTIONS: i32 = 7;
 
+/// Everything the sessions reported, folded by the collector task.
 #[derive(Default)]
-struct Collected {
-    submits: Vec<SubmitRecord>,
-    reconnects: Vec<client::ReconnectRecord>,
-    tips: Vec<TipSighting>,
+pub struct Collected {
+    pub submits: Vec<SubmitRecord>,
+    pub reconnects: Vec<client::ReconnectRecord>,
+    pub tips: Vec<TipSighting>,
     /// Only recorded while a phase asks for them; see
     /// `SessionShared::record_notifies`.
-    notifies: Vec<NotifySighting>,
-    discarded_block_solutions: u64,
-    discarded_offers: u64,
-    difficulty_mismatches: Vec<(usize, f64, f64)>,
-    failures: Vec<(usize, String, Instant)>,
-    connects: u64,
-    disconnects: Vec<(usize, usize, String)>,
+    pub notifies: Vec<NotifySighting>,
+    pub discarded_block_solutions: u64,
+    pub discarded_offers: u64,
+    pub difficulty_mismatches: Vec<(usize, f64, f64)>,
+    pub failures: Vec<(usize, String, Instant)>,
+    /// Every successful connection, including reconnects: a count of events,
+    /// not of sessions.
+    pub connects: u64,
+    pub disconnects: Vec<(usize, usize, String)>,
+    /// The sessions currently holding work: added on `Connected`, removed on
+    /// `Disconnected`. A session that connected, dropped and reconnected is
+    /// in here once, so this is what the startup gate reads (EP-STATE).
+    pub holding_work: BTreeSet<usize>,
+}
+
+impl Collected {
+    pub fn apply(&mut self, event: Event) {
+        match event {
+            Event::Submit(record) => self.submits.push(*record),
+            Event::Reconnect(record) => self.reconnects.push(record),
+            Event::Tip(sighting) => self.tips.push(sighting),
+            Event::Notify(sighting) => self.notifies.push(sighting),
+            Event::DiscardedBlockSolution { .. } => self.discarded_block_solutions += 1,
+            Event::DiscardedOffer { .. } => self.discarded_offers += 1,
+            Event::DifficultyMismatch {
+                session,
+                advertised,
+                configured,
+            } => self
+                .difficulty_mismatches
+                .push((session, advertised, configured)),
+            Event::Connected { session, .. } => {
+                self.connects += 1;
+                self.holding_work.insert(session);
+            }
+            Event::Disconnected {
+                session,
+                frontend,
+                reason,
+            } => {
+                self.holding_work.remove(&session);
+                self.disconnects.push((session, frontend, reason));
+            }
+            Event::Failure { session, error, at } => self.failures.push((session, error, at)),
+        }
+    }
+
+    /// How many distinct sessions hold work right now.
+    pub fn sessions_holding_work(&self) -> usize {
+        self.holding_work.len()
+    }
 }
 
 struct PhaseRun {
@@ -423,31 +468,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         let collected = collected.clone();
         tokio::spawn(async move {
             while let Some(event) = events_rx.recv().await {
-                let mut state = collected.lock().expect("collector lock");
-                match event {
-                    Event::Submit(record) => state.submits.push(*record),
-                    Event::Reconnect(record) => state.reconnects.push(record),
-                    Event::Tip(sighting) => state.tips.push(sighting),
-                    Event::Notify(sighting) => state.notifies.push(sighting),
-                    Event::DiscardedBlockSolution { .. } => state.discarded_block_solutions += 1,
-                    Event::DiscardedOffer { .. } => state.discarded_offers += 1,
-                    Event::DifficultyMismatch {
-                        session,
-                        advertised,
-                        configured,
-                    } => state
-                        .difficulty_mismatches
-                        .push((session, advertised, configured)),
-                    Event::Connected { .. } => state.connects += 1,
-                    Event::Disconnected {
-                        session,
-                        frontend,
-                        reason,
-                    } => state.disconnects.push((session, frontend, reason)),
-                    Event::Failure { session, error, at } => {
-                        state.failures.push((session, error, at))
-                    }
-                }
+                collected.lock().expect("collector lock").apply(event);
             }
         })
     };
@@ -476,11 +497,17 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             args.max_outstanding_per_session,
         ));
     }
-    // Every session must hold work before the first phase starts.
+    // Every session must hold work before the first phase starts. This is
+    // read per session, not as a count of connection events: a session that
+    // dropped and reconnected while another was still in its handshake would
+    // otherwise satisfy the total on the other's behalf.
     let work_deadline = Instant::now() + Duration::from_secs(args.work_timeout);
     loop {
-        let connected = collected.lock().expect("collector lock").connects;
-        if connected as usize >= args.sessions {
+        let connected = collected
+            .lock()
+            .expect("collector lock")
+            .sessions_holding_work();
+        if connected >= args.sessions {
             break;
         }
         if Instant::now() >= work_deadline {

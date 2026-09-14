@@ -1354,6 +1354,54 @@ fn the_two_reconciliation_gaps_have_distinct_exit_codes() {
     assert_ne!(run::EXIT_ACK_COMMIT_DIVERGENCE, run::EXIT_OK);
 }
 
+/// The startup gate's precondition is that every session holds work. A
+/// count of connection events cannot say that: one session that dropped and
+/// reconnected produces two events and would stand in for another session
+/// that never finished its handshake. The gate reads distinct sessions that
+/// are connected right now.
+#[test]
+fn the_startup_gate_counts_sessions_holding_work_not_connection_events() {
+    let mut collected = run::Collected::default();
+    let connected = |session: usize| client::Event::Connected {
+        session,
+        frontend: 0,
+    };
+    // Session 0 connects, drops and reconnects while session 1 is still in
+    // its handshake: two connection events, one session with work.
+    collected.apply(connected(0));
+    collected.apply(client::Event::Disconnected {
+        session: 0,
+        frontend: 0,
+        reason: "end of stream".into(),
+    });
+    collected.apply(connected(0));
+    assert_eq!(collected.connects, 2, "the event count is still reported");
+    assert_eq!(
+        collected.sessions_holding_work(),
+        1,
+        "two events from one session are one session"
+    );
+    assert!(
+        collected.sessions_holding_work() < 2,
+        "a two-session run is not ready yet"
+    );
+    // A session that is currently disconnected does not hold work.
+    collected.apply(connected(1));
+    assert_eq!(collected.sessions_holding_work(), 2);
+    collected.apply(client::Event::Disconnected {
+        session: 1,
+        frontend: 0,
+        reason: "socket closed".into(),
+    });
+    assert_eq!(collected.sessions_holding_work(), 1);
+    collected.apply(connected(1));
+    assert_eq!(
+        collected.sessions_holding_work(),
+        2,
+        "now every session holds work"
+    );
+}
+
 #[test]
 fn the_harness_reads_its_own_postgres_binary_variable() {
     // The shared test-gate variables belong to the gate crate (#322); a second
