@@ -1889,13 +1889,9 @@ async fn mid_flight_kill(
         }
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let indeterminate: Vec<SubmitRecord> = {
+    let indeterminate = {
         let state = collected.lock().expect("collector lock");
-        state.submits[before.min(state.submits.len())..]
-            .iter()
-            .filter(|record| matches!(record.outcome, Outcome::NoResponse { .. }))
-            .cloned()
-            .collect()
+        indeterminate_after_kill(&state.submits, before, index)
     };
     for record in &indeterminate {
         if let Some(session) = sessions.get(record.session) {
@@ -1911,6 +1907,28 @@ async fn mid_flight_kill(
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
     Ok((indeterminate, outstanding))
+}
+
+/// The submits whose answer the kill destroyed: every no-response recorded
+/// since the kill began -- `since` is the length of the submit log at that
+/// instant -- on the killed frontend's own sessions. A no-response from a
+/// session on another frontend in the same window (a socket closed for its
+/// own reasons) is not the kill's and is neither counted in its census nor
+/// re-offered as one of its shares (EP-STATE).
+pub fn indeterminate_after_kill(
+    records: &[SubmitRecord],
+    since: usize,
+    frontend: usize,
+) -> Vec<SubmitRecord> {
+    records[since.min(records.len())..]
+        .iter()
+        .filter(|record| {
+            record.frontend == frontend
+                && !record.reoffer
+                && matches!(record.outcome, Outcome::NoResponse { .. })
+        })
+        .cloned()
+        .collect()
 }
 
 // --- helpers -------------------------------------------------------------

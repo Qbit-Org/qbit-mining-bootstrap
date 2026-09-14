@@ -2268,6 +2268,55 @@ fn submit_record(
     }
 }
 
+/// The mid-flight kill's census took every no-response recorded since the
+/// kill, whichever frontend's session produced it. A session on the other
+/// frontend whose socket closed in the same few seconds was counted as one
+/// of the kill's indeterminate shares and re-offered as such. The census is
+/// now the killed frontend's own sessions, since the kill.
+#[test]
+fn the_mid_flight_census_is_the_killed_frontend_s_own_no_responses() {
+    use qbit_prism_load::client::Outcome;
+    use qbit_prism_load::run::indeterminate_after_kill;
+    let no_response = |frontend: usize, share: &str| {
+        let mut record = submit_record(
+            "mid_flight_kill",
+            Outcome::NoResponse {
+                reason: "socket closed".into(),
+            },
+        );
+        record.frontend = frontend;
+        record.share_id = format!("pload1abc.s00001:{}", share.repeat(64));
+        record
+    };
+    let mut accepted_after = submit_record("mid_flight_kill", Outcome::Accepted);
+    accepted_after.frontend = 1;
+    let mut reoffer = no_response(1, "4");
+    reoffer.reoffer = true;
+    let records = vec![
+        // Before the kill: not in the window however it ended.
+        no_response(1, "0"),
+        // Since the kill: the killed frontend's victim, another frontend's
+        // own closed socket, an answered submit, and a re-offer.
+        no_response(1, "1"),
+        no_response(0, "2"),
+        accepted_after,
+        reoffer,
+    ];
+    let census = indeterminate_after_kill(&records, 1, 1);
+    assert_eq!(
+        census
+            .iter()
+            .map(|record| record.share_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![format!("pload1abc.s00001:{}", "1".repeat(64)).as_str()],
+        "one victim: frontend 1's no-response since the kill, and nothing from frontend 0"
+    );
+    assert!(
+        indeterminate_after_kill(&records, 10, 1).is_empty(),
+        "a since past the end is an empty window, not a panic"
+    );
+}
+
 #[test]
 fn a_committed_share_is_a_divergence_only_when_a_confirmation_failure_explains_it() {
     use qbit_prism_load::client::Outcome;
