@@ -5,7 +5,31 @@ use serde_json::json;
 use std::time::Duration;
 
 impl Ledger {
+    /// Read-only diagnostics remain available before the current migrations.
+    /// Recovery writes use connect_operator and its full startup gates.
+    pub async fn inspect_fatal_state(url: &str) -> Result<Value> {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(15))
+            .after_connect(|connection, _| {
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('default_transaction_read_only','on',false),set_config('statement_timeout','15s',false),set_config('lock_timeout','5s',false)")
+                        .execute(&mut *connection).await?;
+                    Ok(())
+                })
+            })
+            .connect(url)
+            .await?;
+        let state = Self::read_fatal_state(&pool).await;
+        pool.close().await;
+        state
+    }
+
     pub async fn fatal_state(&self) -> Result<Value> {
+        Self::read_fatal_state(&self.pool).await
+    }
+
+    async fn read_fatal_state(pool: &PgPool) -> Result<Value> {
         // to_jsonb also works before migration 010: an unavailable timestamp is
         // unknown, rather than the cluster's unrelated last-update timestamp.
         let mut state: Value = sqlx::query_scalar(
@@ -13,7 +37,7 @@ impl Ledger {
              'set_at', to_jsonb(c)->'fatal_error_set_at') \
              FROM qbit_prism_cluster c WHERE singleton",
         )
-        .fetch_one(&self.pool)
+        .fetch_one(pool)
         .await?;
         let (block, fanout) = fatal_subject(state["fatal_error"].as_str());
         state["block_hash"] = json!(block);

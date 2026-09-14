@@ -2031,11 +2031,22 @@ impl MiningBackend for Coordinator {
             // is a cache miss and the bundle is rebuilt, because the candidate
             // stores the inputs and a claim rebuilds from them.
             let inputs = BundleInputs::capture(&self.config, prepared.fee)?;
-            let reusable = prepared
+            // A stored bundle the current inputs no longer describe cannot be
+            // resumed at all. Rebuilding it here is not the answer either:
+            // `build_bundle` reads a worker as a request for a one-share
+            // bootstrap window, so on a non-empty window it would pair a
+            // bootstrap bundle with the original reference and
+            // `prepare_candidate` would refuse the block. Drop the cached work
+            // and let a fresh prepare produce it; a miss costs a rebuild, and
+            // resuming on inputs that do not match can cost a found block.
+            if prepared
                 .bundle
                 .as_ref()
-                .filter(|bundle| inputs.describes(bundle));
-            let (bundle, bootstrap_share) = match reusable {
+                .is_some_and(|bundle| !inputs.describes(bundle))
+            {
+                return Ok(None);
+            }
+            let (bundle, bootstrap_share) = match prepared.bundle.as_ref() {
                 Some(bundle) => (bundle.clone(), None),
                 None => {
                     let (bundle, bootstrap_share) = self

@@ -260,9 +260,9 @@ fn mining_configuration(config: &ApiConfig) -> Value {
     } else {
         config.stratum_host.clone()
     };
-    let primary = std::env::var("PRISM_PUBLIC_STRATUM_URL")
-        .ok()
-        .filter(|v| !v.is_empty())
+    let primary = config
+        .public_stratum_url
+        .clone()
         .unwrap_or_else(|| format!("stratum+tcp://{host}:{}", config.stratum_port));
     let endpoint = |label: &str, uri: String, fallback: u16| {
         let port = url::Url::parse(&uri)
@@ -272,14 +272,10 @@ fn mining_configuration(config: &ApiConfig) -> Value {
         json!({"label":label,"url":uri,"protocol":"stratum_v1","default_port":port})
     };
     let mut endpoints = vec![endpoint("Primary", primary.clone(), config.stratum_port)];
-    if let Some(port) = std::env::var("PRISM_STRATUM_HIGHDIFF_PORT")
-        .ok()
-        .and_then(|v| v.parse::<u16>().ok())
-        .filter(|v| *v > 0)
-    {
-        let highdiff = std::env::var("PRISM_PUBLIC_STRATUM_HIGHDIFF_URL")
-            .ok()
-            .filter(|v| !v.is_empty())
+    if let Some(port) = config.stratum_highdiff_port {
+        let highdiff = config
+            .public_stratum_highdiff_url
+            .clone()
             .or_else(|| {
                 let mut uri = url::Url::parse(&primary).ok()?;
                 uri.set_port(Some(port)).ok()?;
@@ -290,7 +286,7 @@ fn mining_configuration(config: &ApiConfig) -> Value {
     }
     wrap(
         "mining-configuration",
-        json!({"active_configuration_id":"default","configurations":[{"id":"default","label":env("PRISM_PUBLIC_CONFIGURATION_LABEL","PRISM default"),"description":env("PRISM_PUBLIC_CONFIGURATION_DESCRIPTION","Default PRISM Stratum endpoint using the pool's current block template and payout policy."),"pool_fee_bps":config.pool_fee_bps,"block_template_policy":env("PRISM_PUBLIC_BLOCK_TEMPLATE_POLICY","pool-selected qbit block template with PRISM payout settlement"),"stratum_endpoints":endpoints}]}),
+        json!({"active_configuration_id":"default","configurations":[{"id":"default","label":config.configuration_label,"description":config.configuration_description,"pool_fee_bps":config.pool_fee_bps,"block_template_policy":config.block_template_policy,"stratum_endpoints":endpoints}]}),
     )
 }
 async fn miner(state: &ApiState, id: &str) -> ApiResult<Value> {

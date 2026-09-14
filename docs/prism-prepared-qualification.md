@@ -1,7 +1,7 @@
 # Prepared-work qualification preparation
 
 This is preparation for #273, not refresh/resume acceptance evidence. At
-`2d1baa9e165092a0d37d4bb367c0d3795d1086f1`, the coordinator still persists and
+`3.x.x` base `12fda8119be0d7b115036a3047453d8ac0704e68`, the coordinator still persists and
 decodes inline `StoredPrepared`. The additive compact storage API is not its
 runtime path. No 400k or 500k database run, WAL budget, retention guarantee,
 or canonical A-to-B rebuild result is established by this preparation.

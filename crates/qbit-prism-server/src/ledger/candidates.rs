@@ -459,8 +459,33 @@ impl Ledger {
                         .await?;
             }
         }
+        // Decode by storage version. A v1 row carries its JSONB candidate; a
+        // #258 v2 row carries NULL and a chunk body this server does not
+        // import, and a later version is unknown. Those are parked inside the
+        // claim transaction so the due lane never offers them again.
+        let mut claimed = None;
+        if let Some(row) = row {
+            let block_hash: String = row.try_get("block_hash")?;
+            let storage_version: i32 = row.try_get("storage_version")?;
+            let candidate: Option<Value> = row.try_get("candidate")?;
+            match (storage_version, candidate) {
+                // Kept whole rather than reduced to its document: the decode
+                // below also authenticates the block bytes against
+                // `block_sha256`, and that digest scales with the block.
+                (1, Some(_)) => claimed = Some(row),
+                (version, candidate) => {
+                    let reason = if version == 1 {
+                        "pending storage_version 1 candidate has no JSONB body".to_owned()
+                    } else {
+                        format!("candidate storage_version {version} is not supported by this server; only version 1 JSONB candidates are (a #258 chunked body must be drained by the 2.x.x release)")
+                    };
+                    park_candidate(&mut tx, &block_hash, &token, &reason).await?;
+                    tracing::warn!(block=%block_hash, storage_version=version, has_body=candidate.is_some(), "parked a candidate this server cannot decode; operator action required");
+                }
+            }
+        }
         tx.commit().await?;
-        let Some(row) = row else {
+        let Some(row) = claimed else {
             return Ok(None);
         };
         // The document is O(1), but the block digest scales with the block,
@@ -794,11 +819,28 @@ async fn claim_candidate_lane(
         // an older candidate that has not yet received its first attempt.
         "ORDER BY next_attempt_at,created_at,block_hash"
     };
-    let query = format!("WITH next AS (SELECT block_hash FROM qbit_block_candidate_outbox WHERE state='pending' AND next_attempt_at<=clock_timestamp() AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()) {ordering} FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE qbit_block_candidate_outbox o SET claim_token=$1,claim_instance_id=$2,claim_expires_at=clock_timestamp()+$3*interval '1 second',attempt_count=attempt_count+1,updated_at=clock_timestamp() FROM next WHERE o.block_hash=next.block_hash RETURNING o.block_hash,o.candidate,o.candidate_sha256,o.block_bytes,o.window_anchor_ms,o.window_prior_balances_sha256,o.window_first_share_seq,o.window_last_share_seq,o.window_share_count,o.window_snapshot_sha256");
+    let query = format!("WITH next AS (SELECT block_hash FROM qbit_block_candidate_outbox WHERE state='pending' AND next_attempt_at<=clock_timestamp() AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()) {ordering} FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE qbit_block_candidate_outbox o SET claim_token=$1,claim_instance_id=$2,claim_expires_at=clock_timestamp()+$3*interval '1 second',attempt_count=attempt_count+1,updated_at=clock_timestamp() FROM next WHERE o.block_hash=next.block_hash RETURNING o.block_hash,o.storage_version,o.candidate,o.candidate_sha256,o.block_bytes,o.window_anchor_ms,o.window_prior_balances_sha256,o.window_first_share_seq,o.window_last_share_seq,o.window_share_count,o.window_snapshot_sha256");
     Ok(sqlx::query(&query)
         .bind(token)
         .bind(instance_id)
         .bind(lease_seconds)
         .fetch_optional(&mut **tx)
         .await?)
+}
+
+/// Park a claimed row this server cannot decode: release the claim, record
+/// why in `last_error`, and move `next_attempt_at` past every lease expiry.
+/// The row stays `pending` with its body untouched, so a release that reads
+/// it can pick it up by resetting `next_attempt_at`; until then it is
+/// operator work, not a retry loop.
+async fn park_candidate(
+    tx: &mut Transaction<'_, Postgres>,
+    block_hash: &str,
+    token: &str,
+    reason: &str,
+) -> Result<()> {
+    let parked = sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,last_error=$3,next_attempt_at='infinity',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='pending'")
+        .bind(block_hash).bind(token).bind(reason).execute(&mut **tx).await?.rows_affected();
+    ensure!(parked == 1, "candidate to park was not held by this claim");
+    Ok(())
 }
