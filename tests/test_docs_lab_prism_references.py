@@ -64,8 +64,22 @@ RATCHET = {
 QUOTED_HISTORY_SUFFIXES = frozenset({".patch", ".diff"})
 
 
-PATH_REFERENCE = re.compile(r"lab/prism(?:/[A-Za-z0-9_][A-Za-z0-9_.\-]*)*")
-MODULE_REFERENCE = re.compile(r"\blab\.prism(?:\.[A-Za-z_][A-Za-z0-9_]*)*\b")
+def prose_reference_pattern(root: str, separator: str) -> re.Pattern[str]:
+    # Quotes and backticks preserve literal spaces and punctuation. Bare
+    # references consume whole tokens; only trailing prose punctuation is
+    # removed below, so Dockerfile!old and tool*old cannot resolve as prefixes.
+    # A Markdown link's ]( or ][ ends its label, outside quoted literals.
+    literal = rf"{root}(?:{separator}.*?)?"
+    bare = rf"{root}(?:{separator}(?:(?!\]\(|\]\[)[^\s`'\"<>])+)?"
+    return re.compile(
+        rf"(?P<quote>[`'\"])(?P<literal>{literal})(?P=quote)|(?P<bare>{bare})"
+    )
+
+
+PATH_REFERENCE = prose_reference_pattern(r"lab/prism", "/")
+MODULE_REFERENCE = prose_reference_pattern(r"\blab\.prism", r"\.")
+PROSE_TRAILING_PUNCTUATION = ".,;:!?*()[]{}|"
+URL_REFERENCE_PREFIX = re.compile(r"https?://\S+/$")
 # `python3 -OO -X dev -m lab.a.b` and `python3.12 -Werror lab/a/b.py`. Every
 # option form `python3 --help` lists may sit between the interpreter and its
 # target: clustered flag letters, `-W`/`-X` with an attached or following
@@ -525,12 +539,17 @@ def dangling_references(text: str, tracked: frozenset[str]) -> list[tuple[int, s
         for match in PATH_REFERENCE.finditer(line):
             if PINNED_GITHUB_URL.search(line[: match.start()]):
                 continue
-            reference = match.group(0).rstrip(".")
+            reference = match.group("literal") or match.group("bare").rstrip(PROSE_TRAILING_PUNCTUATION)
+            if match.group("bare") and URL_REFERENCE_PREFIX.search(line[: match.start()]):
+                reference = re.split(r"[?#]", reference, maxsplit=1)[0]
+            if reference.endswith("/") and any(path.startswith(reference) for path in tracked):
+                continue
             if reference not in tracked:
                 found.append((number, reference))
         for match in MODULE_REFERENCE.finditer(line):
-            if not any(c in tracked for c in module_candidates(match.group(0))):
-                found.append((number, match.group(0)))
+            reference = match.group("literal") or match.group("bare").rstrip(PROSE_TRAILING_PUNCTUATION)
+            if not any(c in tracked for c in module_candidates(reference)):
+                found.append((number, reference))
     return found
 
 
@@ -651,6 +670,63 @@ class ScannerTests(unittest.TestCase):
 
     def test_dotted_module_to_deleted_file_is_dangling(self) -> None:
         self.assertEqual(self.references("see lab.prism.process_telemetry"), ["lab.prism.process_telemetry"])
+
+    def test_prose_references_do_not_resolve_truncated_prefixes(self) -> None:
+        tracked = self.TRACKED | {"lab/prism/tool.py"}
+        for suffix in (
+            "$old", "-deleted", "+old", "=old", "é", r"\old", "/old",
+            "!old", "*old", "?old", "#old", ",old", ";old", ":old", "(old", "[old", "{old", "|old",
+        ):
+            for reference, path in (
+                (f"lab/prism/Dockerfile{suffix}", f"lab/prism/Dockerfile{suffix}"),
+                (f"lab.prism.tool{suffix}", f"lab/prism/tool{suffix}.py"),
+            ):
+                with self.subTest(reference=reference):
+                    text = f"See {reference}."
+                    self.assertEqual(dangling_references(text, tracked), [(1, reference)])
+                    self.assertEqual(dangling_references(text, tracked | {path}), [])
+
+    def test_quoted_prose_references_preserve_the_complete_literal(self) -> None:
+        tracked = self.TRACKED | {"lab/prism/tool.py"}
+        for suffix in (" old", "$old", "-deleted", ".", ",old", "#old", "?old", "[old]", "(old)", "*old", "`old", "](old", "][old"):
+            for reference, path in (
+                (f"lab/prism/Dockerfile{suffix}", f"lab/prism/Dockerfile{suffix}"),
+                (f"lab.prism.tool{suffix}", f"lab/prism/tool{suffix.replace('.', '/')}.py"),
+            ):
+                for quote in ("`", "'", '"'):
+                    if quote in reference:
+                        continue
+                    with self.subTest(reference=reference, quote=quote):
+                        text = f"See {quote}{reference}{quote}."
+                        self.assertEqual(dangling_references(text, tracked), [(1, reference)])
+                        self.assertEqual(dangling_references(text, tracked | {path}), [])
+
+    def test_bare_prose_references_stop_at_surrounding_punctuation(self) -> None:
+        tracked = self.TRACKED | {"lab/prism/tool.py"}
+        for reference in ("lab/prism/Dockerfile", "lab.prism.tool"):
+            for surrounding in (
+                "{}.", "{},", "{};", "{}:", "{}!", "{}?", "({})", "[{}]", "<{}>", "**{}**",
+                "[{}](https://example.com)", "[{}][build]",
+            ):
+                with self.subTest(reference=reference, surrounding=surrounding):
+                    self.assertEqual(dangling_references(surrounding.format(reference), tracked), [])
+                    self.assertEqual(
+                        dangling_references(surrounding.format(reference + "$old"), tracked),
+                        [(1, reference + "$old")],
+                    )
+        self.assertEqual(
+            dangling_references("https://github.com/o/r/blob/main/lab/prism/Dockerfile#L1", tracked),
+            [],
+        )
+
+    def test_quoted_directory_references_require_a_tracked_descendant(self) -> None:
+        self.assertEqual(self.references("See `lab/prism/`."), [])
+        self.assertEqual(self.references("See `lab/prism/Dockerfile/`."), ["lab/prism/Dockerfile/"])
+
+    def test_prose_references_do_not_include_unrelated_namespaces(self) -> None:
+        for reference in ("lab/prismatic/tool", "lab.prismatic.tool", "lab/prism-old/tool", "lab.prism-old.tool"):
+            with self.subTest(reference=reference):
+                self.assertEqual(self.references(f"See `{reference}`."), [])
 
     def test_module_commands_with_missing_targets_are_caught(self) -> None:
         self.assertEqual(
