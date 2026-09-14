@@ -53,10 +53,26 @@ pub const EXIT_HARNESS_BUG_REJECTIONS: i32 = 7;
 /// did not measure.
 pub const EXIT_PREMISE_CONTRADICTED: i32 = 8;
 
-/// Added to the configured share-commit timeout to bound a drained restart's
-/// wait: the server answers a submit within the timeout, and its answer still
-/// has to cross the socket and be read.
-pub const DRAIN_MARGIN: Duration = Duration::from_secs(5);
+/// The server's `share_commit_grace`: how long past the share-commit timeout
+/// it goes on waiting for a COMMIT reply before answering
+/// `ledger-outcome-unknown`. It is set in
+/// `crates/qbit-prism-server/src/config.rs` (`Config::from_env`), is not an
+/// environment variable and is not exported, so the value is restated here
+/// and a test reads that file to keep the two the same. A submit can
+/// therefore be answered, legitimately, up to the commit timeout plus this
+/// grace after it was sent.
+pub const SERVER_SHARE_COMMIT_GRACE: Duration = Duration::from_secs(5);
+
+/// Added to the configured share-commit timeout to bound every drain the
+/// harness derives: the drained restart, the phase boundaries and the
+/// teardown. It must stay strictly greater than `SERVER_SHARE_COMMIT_GRACE`:
+/// the server may still legitimately answer until the timeout plus the
+/// grace, and its answer then has to cross the socket and be read. It used
+/// to equal the grace, so every drain gave up at exactly the moment the
+/// server was still allowed to answer, with nothing left for transit or
+/// scheduling (EP-ERRORS). The extra 5 s over the grace is the transit and
+/// scheduling allowance the margin used to consist of entirely.
+pub const DRAIN_MARGIN: Duration = Duration::from_secs(10);
 
 /// How long a drained restart waits for a frontend's sessions to have no
 /// submit outstanding. At least the commit timeout the frontends were

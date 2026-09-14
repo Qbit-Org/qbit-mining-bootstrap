@@ -4500,6 +4500,59 @@ async fn a_phase_delay_is_applied_only_once_the_previous_phase_has_settled() -> 
     Ok(())
 }
 
+/// `DRAIN_MARGIN` was 5 s and the server's `share_commit_grace` is also
+/// 5 s, so every drain the harness derived gave up at exactly the moment
+/// the server could still legitimately answer, with nothing left for
+/// transit or scheduling. The margin is now strictly greater than the
+/// grace. The server does not export the grace, so the harness restates it;
+/// this test reads the server's source to keep the restatement honest.
+#[test]
+fn the_drain_margin_is_wider_than_the_server_s_commit_grace() -> Result<()> {
+    use std::time::Duration;
+    assert!(
+        run::DRAIN_MARGIN > run::SERVER_SHARE_COMMIT_GRACE,
+        "the margin ({:?}) must leave time past the grace ({:?}) for the answer to cross the \
+         socket and be read",
+        run::DRAIN_MARGIN,
+        run::SERVER_SHARE_COMMIT_GRACE
+    );
+    assert!(
+        run::DRAIN_MARGIN >= run::SERVER_SHARE_COMMIT_GRACE + Duration::from_secs(1),
+        "at least a whole second past the grace"
+    );
+    assert_eq!(
+        run::drain_limit(15.0),
+        Duration::from_secs(15) + run::DRAIN_MARGIN,
+        "every drain the harness derives carries the margin"
+    );
+
+    // The server's value, from its own source: `Config::from_env` sets it
+    // as a literal, not from the environment.
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../qbit-prism-server/src/config.rs"
+    ))?;
+    let marker = "let share_commit_grace = Duration::from_secs(";
+    let start = source
+        .find(marker)
+        .expect("the server sets share_commit_grace with Duration::from_secs in Config::from_env")
+        + marker.len();
+    let literal: String = source[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    let grace: u64 = literal
+        .parse()
+        .expect("share_commit_grace is set from a whole number of seconds");
+    assert_eq!(
+        Duration::from_secs(grace),
+        run::SERVER_SHARE_COMMIT_GRACE,
+        "the harness restates the server's share_commit_grace; update \
+         SERVER_SHARE_COMMIT_GRACE and keep DRAIN_MARGIN ahead of it"
+    );
+    Ok(())
+}
+
 #[test]
 fn the_drain_limit_covers_the_configured_commit_timeout() {
     use std::time::Duration;

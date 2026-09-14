@@ -133,8 +133,9 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 4. **`reconnect`**, at least 60 s with at least 10 completed reconnects. With
    two or more frontends, one of them is restarted a third of the way in:
    its sessions are paused, their outstanding submits are allowed to settle
-   for up to the share-commit timeout plus 5 s, the process is killed and
-   relaunched, and the sessions are pointed back at it once `/healthz`
+   for up to the share-commit timeout plus the 10 s drain margin, the
+   process is killed and relaunched, and the sessions are pointed back at it
+   once `/healthz`
    answers. The restart is driven from the scheduler loop without stalling
    it, so the other frontends keep receiving their scheduled load during the
    outage, which is what the phase measures. A paused session is ineligible
@@ -146,7 +147,7 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
    (exit 6) rather than turning the harness's own in-flight submits into
    lost acknowledgements. A client-initiated reconnect quiesces the same
    way before it closes its socket: the session waits for its outstanding
-   submits to settle for up to the share-commit timeout plus that same 5 s
+   submits to settle for up to the share-commit timeout plus that same 10 s
    margin, so a planned close never turns a submit the server is still
    allowed to be working on into a `no-response` record that a later commit
    would make read as a durability loss. A submit still unanswered after
@@ -366,7 +367,7 @@ target/release/qbit-prism-load \
 | 3 | Blocked: no frontend served work, or a frontend log showed a hard refusal of the size -- at startup, or at any later point in the run. A refusal logged after the startup check (a scheduled-block rebuild hitting the JSONB ceiling, say, while ordinary shares kept flowing) is re-checked once the load stops: the artifact is withheld, `blocked.blocked` is `true` with the line under `blocked.error`, and the side report carries every number the run produced. A run blocked at startup writes only the side report. Either way an earlier run's artifact and profile were already removed when the invocation took `--out` |
 | 4 | A durability loss: an acknowledged share is missing from PostgreSQL, a committed share was never acknowledged and nothing explains it, or PostgreSQL holds a run-prefixed row that no phase offered |
 | 5 | An ACK/commit divergence: PostgreSQL holds a share the server refused, either with `ledger-confirmation-failed` or with `ledger-outcome-unknown` (#324) |
-| 6 | The run was aborted: the memory floor was crossed, a frontend exited, the `reconnect` phase's drained restart could not be performed because the frontend's sessions still had submits outstanding after the share-commit timeout plus a 5 s margin, a phase boundary could not change the proxy delay because the previous phase's submits were still outstanding after that same limit, or a delayed phase's round trip through the proxied URL did not pay the delay. No `capacity-evidence.json` is written (and an earlier run's was already removed when the invocation took `--out`), so an aborted run can never leave a self-validating artifact behind; the side report is still written, with `aborted` set, the cut-short phase marked `completed: false`, and `validator.artifact_written: false` with the reason |
+| 6 | The run was aborted: the memory floor was crossed, a frontend exited, the `reconnect` phase's drained restart could not be performed because the frontend's sessions still had submits outstanding after the share-commit timeout plus the 10 s drain margin, a phase boundary could not change the proxy delay because the previous phase's submits were still outstanding after that same limit, or a delayed phase's round trip through the proxied URL did not pay the delay. No `capacity-evidence.json` is written (and an earlier run's was already removed when the invocation took `--out`), so an aborted run can never leave a self-validating artifact behind; the side report is still written, with `aborted` set, the cut-short phase marked `completed: false`, and `validator.artifact_written: false` with the reason |
 | 7 | Rejections classified as harness bugs |
 | 8 | A premise of the measurement was contradicted. Either a frontend advertised, in `mining.set_difficulty`, a share difficulty other than the one the harness configured in `PRISM_STRATUM_SHARE_DIFF` -- the client mines the configured target either way, so with a lower advertised value its shares are still accepted and an artifact would validate while measuring a different amount of work per share than the configuration names; checked once every session holds work, before any phase, and again after the load stops -- or the replication mode observed in `pg_stat_replication` is not the one `--replication` declares, or could not be observed at all; checked at entry, before a frontend is launched, and again after the load stops. The artifact is withheld and the side report's `premise` block carries every difficulty mismatch with its session, advertised and configured values, and the declared and observed replication modes with the reason when one could not be observed |
 
@@ -612,14 +613,29 @@ The side report repeats all of this under `honest_value_notes`.
   nothing is offered while that settles, the wait is recorded in the next
   phase's entry as `previous_phase_settled_before_delay_change_seconds`
   (`null` when the delay did not change). If they have not settled after
-  the share-commit timeout plus 5 s the delay is left alone and the run
-  aborts (exit 6) rather than let a `reconnect` submit pay the slow-database
+  the share-commit timeout plus the 10 s drain margin the delay is left
+  alone and the run aborts (exit 6) rather than let a `reconnect` submit
+  pay the slow-database
   delay or a `slow_database` submit finish without it. The same limit holds
   at teardown, where the last phase's delay stays on until its submits have
   settled: the sessions are paused and given the share-commit timeout plus
-  5 s, the report's `drain` block records the limit, how long it took and
-  what was still outstanding, and only a submit the server's own deadline
-  had already passed is then recorded as `no-response` in its phase.
+  the 10 s drain margin, the report's `drain` block records the limit, how
+  long it took and what was still outstanding, and only a submit the
+  server's own deadline had already passed is then recorded as
+  `no-response` in its phase.
+- **The drain margin is wider than the server's commit grace.** The server
+  goes on waiting `share_commit_grace` (5 s, set in
+  `crates/qbit-prism-server/src/config.rs` and not an environment variable)
+  past the share-commit timeout for a COMMIT reply before it answers
+  `ledger-outcome-unknown`, so a submit can legitimately be answered up to
+  the timeout plus that grace after it was sent. Every drain the harness
+  derives waits the timeout plus a 10 s margin: strictly more than the
+  grace, with the difference left for the answer to cross the socket and be
+  read. The margin used to equal the grace, so every drain gave up at
+  exactly the moment the server was still allowed to answer. The harness
+  restates the server's value as `SERVER_SHARE_COMMIT_GRACE` rather than
+  importing it, because the server does not export it, and a test reads the
+  server's source to keep the two the same.
 - **Two advisory locks are sampled, and reported apart.** Each phase carries an
   `order_lock` block and a `settlement_lock` block, same shape, same own/foreign
   split, from the same polls. `ORDER_LOCK` (`0x505249534d000002`) is what a
