@@ -574,12 +574,15 @@ The side report repeats all of this under `honest_value_notes`.
   once every submit offered under the previous delay has been answered:
   nothing is offered while that settles, the wait is recorded in the next
   phase's entry as `previous_phase_settled_before_delay_change_seconds`
-  (`null` when the delay did not change), and the same rule holds at
-  teardown, where the last phase's delay stays on until its submits have
-  settled. If they have not settled after the share-commit timeout plus 5 s
-  the delay is left alone and the run aborts (exit 6) rather than let a
-  `reconnect` submit pay the slow-database delay or a `slow_database` submit
-  finish without it.
+  (`null` when the delay did not change). If they have not settled after
+  the share-commit timeout plus 5 s the delay is left alone and the run
+  aborts (exit 6) rather than let a `reconnect` submit pay the slow-database
+  delay or a `slow_database` submit finish without it. The same limit holds
+  at teardown, where the last phase's delay stays on until its submits have
+  settled: the sessions are paused and given the share-commit timeout plus
+  5 s, the report's `drain` block records the limit, how long it took and
+  what was still outstanding, and only a submit the server's own deadline
+  had already passed is then recorded as `no-response` in its phase.
 - **Two advisory locks are sampled, and reported apart.** Each phase carries an
   `order_lock` block and a `settlement_lock` block, same shape, same own/foreign
   split, from the same polls. `ORDER_LOCK` (`0x505249534d000002`) is what a

@@ -1071,22 +1071,18 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     // report a durability finding it created itself. The last phase's delay
     // stays on until its submits have settled, for the same reason the
     // phase boundaries wait: the answers still in flight are that phase's.
+    // The wait is the same limit the boundaries and the drained restart use,
+    // the configured share-commit timeout plus its margin: it was a fixed
+    // 90 s, which a commit timeout above 85 s outran, and a submit the server
+    // was still allowed to be working on then became a "run ended"
+    // no-response in the last artifact phase (EP-ERRORS).
     for session in &sessions {
         session.paused.store(true, Ordering::Relaxed);
         let _ = session.control.send(client::Control::Pause);
     }
-    let drain_deadline = Instant::now() + Duration::from_secs(90);
-    while Instant::now() < drain_deadline
-        && sessions
-            .iter()
-            .any(|session| session.outstanding.load(Ordering::Relaxed) > 0)
-    {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let undrained: usize = sessions
-        .iter()
-        .map(|session| session.outstanding.load(Ordering::Relaxed))
-        .sum();
+    let draining = Instant::now();
+    let undrained = settle_outstanding(&sessions, settle_limit).await;
+    let drained_seconds = draining.elapsed().as_secs_f64();
     delay_proxy.set_delay_millis(0);
     for session in &sessions {
         let _ = session.control.send(client::Control::Stop);
@@ -1524,8 +1520,13 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         },
         "honest_value_notes": report::honest_value_notes(),
         "drain": {
-            "note": "sessions quiesce before the run closes their sockets; anything still \
-                     outstanding here is a genuine lost acknowledgement",
+            "note": "sessions quiesce before the run closes their sockets, for up to the \
+                     configured share-commit timeout plus the drain margin -- the limit the \
+                     phase boundaries and the drained restart wait. A submit still outstanding \
+                     after that is one the server's own deadline had already passed, and it is \
+                     recorded as no-response (run ended) in its phase.",
+            "limit_seconds": settle_limit.as_secs_f64(),
+            "waited_seconds": drained_seconds,
             "submits_outstanding_at_stop": undrained,
         },
         "validator": validator_block(&evidence, args, slowest_rate, worst_p99),
