@@ -1,8 +1,10 @@
 //! JSONB ceiling gate for the PRISM payout window (issue #264, workstream #261).
 //!
 //! PostgreSQL refuses a JSONB container whose elements exceed 268,435,455
-//! bytes. Three native writes still embed the whole payout window, so they grow
-//! linearly with the share count and walk into that wall. This gate drives the
+//! bytes. Two native writes still embed the whole payout window, so they grow
+//! linearly with the share count and walk into that wall. Landing was a third
+//! until #267; it now stores neither share copy and rebuilds the counted window
+//! on read. This gate drives the
 //! five window-carrying phases (refresh, enqueue, claim, landing, import)
 //! against a real PostgreSQL 16, measures every JSONB column it can discover,
 //! projects each write to the target share count, and compares the set of
@@ -1368,7 +1370,7 @@ async fn pipeline_body(
         seconds,
         wal_bytes: wal,
         peak_rss_kib: peak_rss,
-        note: "audit body keeps reward_manifest.shares after remove(\"shares\")".into(),
+        note: "audit body stores neither share copy; the counted window is rebuilt on read".into(),
     });
     report!("[n={n}] landing: {} in {seconds:.2} s", status.label());
 
