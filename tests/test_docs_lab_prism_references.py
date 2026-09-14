@@ -470,12 +470,16 @@ def executable_word(words: list[str], offsets: list[int]) -> int | None:
     index = 0
     # Reserved words are syntax only when unquoted in shell command position;
     # after an assignment or launcher they are ordinary executable arguments.
-    while index < len(words) and words[index] in {"!", "if", "then", "elif", "else", "do", "{", "while", "until", "time"}:
+    while index < len(words) and words[index] in {"!", "if", "then", "elif", "else", "do", "{", "while", "until", "time", "coproc"}:
         prefix = words[index]
         index += 1
         # Bash's time prefix accepts one unquoted -p; quoted spellings are
         # executable words, just as quoted time is not a reserved word.
         if prefix == "time" and index < len(words) and words[index] == "-p":
+            index += 1
+        # A coprocess name precedes a compound command, never a simple one.
+        # Only unquoted openers handled by this loop introduce such a command.
+        if prefix == "coproc" and index + 1 < len(words) and words[index + 1] in {"{", "if", "while", "until"}:
             index += 1
     while index < len(words):
         word = unquote(words[index])
@@ -1877,6 +1881,47 @@ class ScannerTests(unittest.TestCase):
                 text = f"{prefix} {command}"
                 self.assertEqual(self.commands(text), [])
                 self.assertEqual(self.commands(text + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+
+    def test_coproc_prefixes_run_the_following_command(self) -> None:
+        for command, missing in (
+            ("python3 -m lab.example.deleted", "lab/example/deleted.py or lab/example/deleted/__main__.py"),
+            ("python3 lab/example/deleted.py", "lab/example/deleted.py"),
+        ):
+            for text in (
+                f"coproc {command}",
+                f"coproc env X=1 {command}",
+                f"coproc {{ {command}; }}",
+                f"coproc worker {{ {command}; }}",
+                f"coproc python3 {{ {command}; }}",
+                f"coproc worker ( {command} )",
+                f"coproc worker if {command}; then true; fi",
+                f"coproc worker while {command}; do break; done",
+                f"coproc worker until {command}; do break; done",
+                f"bash -c 'coproc worker {{ {command}; }}'",
+            ):
+                with self.subTest(text=text):
+                    self.assertEqual(self.located(text), [(1, missing)])
+                    self.assertEqual(dead_commands(text, {"lab/example/deleted.py"}), [])
+            text = f"```bash\ncoproc worker {{\n  {command};\n}}\n```"
+            self.assertEqual(self.located(text), [(3, missing)])
+            text = f"```bash\ncoproc \\\n  {command}\n```"
+            self.assertEqual(self.located(text), [(2, missing)])
+
+    def test_coproc_words_and_names_in_data_are_not_commands(self) -> None:
+        command = "python3 -m lab.example.deleted"
+        for prefix in (
+            "'coproc'", '"coproc"', "co'proc'", "$'coproc'",
+            "echo coproc", "printf '%s\\n' coproc", "env coproc",
+            "command -- coproc", "X=1 coproc",
+            "coproc printf", "coproc echo", "coproc worker",
+            "coproc worker '{'", 'coproc worker "{"',
+            "coproc worker time",
+        ):
+            with self.subTest(prefix=prefix):
+                text = f"{prefix} {command}"
+                self.assertEqual(self.commands(text), [])
+                self.assertEqual(self.commands(text + "; python3 lab/prism/storm.py"), ["lab/prism/storm.py"])
+        self.assertEqual(self.commands(f"coproc python3 {{ printf '%s\\n' {command}; }}"), [])
 
     def test_inline_code_is_neither_a_module_nor_a_script_command(self) -> None:
         # `-c cmd` runs its argument and ends the option list; the prose contract
