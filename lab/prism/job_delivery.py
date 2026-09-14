@@ -1019,6 +1019,13 @@ class JobDeliveryService:
     ) -> None:
         """Release failed first-job requests instead of stranding capacity."""
         runtime = self._runtime
+        with self._initial_job_admission_lock:
+            # Work has finished; the callback's argument is sufficient for
+            # bookkeeping and predecessor handoff below. An escaped delivery
+            # error can still own the producer's request through its traceback.
+            # Do not let that retired request point back to the storing Future.
+            if request.future is future:
+                request.future = None
         delivered = False
         if not future.cancelled():
             # Re-raising a stored task error here would add this request-owning

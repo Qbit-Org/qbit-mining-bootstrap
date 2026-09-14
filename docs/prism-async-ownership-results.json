@@ -1,0 +1,1709 @@
+{
+  "date": "2026-09-14",
+  "starting_sha": "ede86019aa20b8f2dce0fd110ba6e8a26d5c582b",
+  "branch": "audit-341-async-retention",
+  "integration_335_sha": "8ff3fb55443c2080bb689c8b6f2cb8c1385801fb",
+  "image": "python@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6",
+  "container_options": [
+    "--rm",
+    "--network",
+    "none",
+    "--read-only",
+    "--tmpfs",
+    "/tmp",
+    "-e",
+    "PYTHONDONTWRITEBYTECODE=1",
+    "-v",
+    "CHECKOUT:/src:ro",
+    "-w",
+    "/src"
+  ],
+  "source_sha256": {
+    "lab/prism/job_delivery.py": "86fea24d70b0e5b816e5aeaba638b3535b406bbb8d05e5ca44968757825f4d7e",
+    "lab/prism/payout_state.py": "61e0e3e2ed9965084e72cf079c2926c7828c40f2606a24ab0732b7d713fac6b0",
+    "tests/prism_async_ownership_support.py": "a717b7822b10bff19f756a6403c920d8b03e477419a3da1f15b84eaf571ba120",
+    "tests/test_prism_payout_preparation_ownership.py": "95570841f4ebe6f4ef5bb788f74308a8b663aaa8e3a0276b949031f70b6c519f",
+    "tests/test_prism_initial_job_ownership.py": "4e80f1eec1428f70aca8a6323a041ccc3c99970ed0a96d597b89d48235b5a37a",
+    "tests/test_prism_deferred_capacity_ownership.py": "4c2154c5facf7c6ca572d5f044b442eeb1bae95c07a0ea4369daf62d7a0f4b2f",
+    "tests/test_prism_vardiff_idle_ownership.py": "c5a2038919d080ae0f9904eca9aa40583bf82a057ce7022c30f9a4a74959881f",
+    "tests/perf/async_ownership_retirement.py": "ce9b2165ec0432dc5a453ce16fa8b4ad200b35d2de511bbb42d340b34f9ab628"
+  },
+  "tests": [
+    {
+      "source": "unchanged starting SHA plus new tests",
+      "python": "3.14.7",
+      "argv": [
+        "python",
+        "-m",
+        "unittest",
+        "tests.test_prism_payout_preparation_ownership",
+        "tests.test_prism_initial_job_ownership",
+        "tests.test_prism_deferred_capacity_ownership",
+        "tests.test_prism_vardiff_idle_ownership",
+        "-q"
+      ],
+      "tests": 37,
+      "seconds": 0.322,
+      "result": "FAILED (failures=7)",
+      "failures": [
+        "test_escaped_install_failure_lifetime_after_join (tests.test_prism_payout_preparation_ownership.PayoutPreparationOwnershipTests.test_escaped_install_failure_lifetime_after_join)",
+        "test_escaped_install_failure_releases_and_drains_latest_request (tests.test_prism_payout_preparation_ownership.PayoutPreparationOwnershipTests.test_escaped_install_failure_releases_and_drains_latest_request)",
+        "test_exceptional_phase_flush_retires_future (tests.test_prism_payout_preparation_ownership.PayoutPreparationOwnershipTests.test_exceptional_phase_flush_retires_future)",
+        "test_fatal_worker_exit_releases_slot_and_can_readmit (tests.test_prism_payout_preparation_ownership.PayoutPreparationOwnershipTests.test_fatal_worker_exit_releases_slot_and_can_readmit)",
+        "test_queued_shutdown_retires_future_and_latest_slot (tests.test_prism_payout_preparation_ownership.PayoutPreparationOwnershipTests.test_queued_shutdown_retires_future_and_latest_slot)",
+        "test_completion_before_registration (tests.test_prism_initial_job_ownership.InitialJobOwnershipTests.test_completion_before_registration)",
+        "test_delivery_failure_releases_producer_request (tests.test_prism_initial_job_ownership.InitialJobOwnershipTests.test_delivery_failure_releases_producer_request)"
+      ],
+      "log": ".context/audit-341/baseline-37-3147.log",
+      "log_sha256": "374a25cb3378c54624adb1716d01c6e3b04a23789ec0810eb48d0716ade5322d"
+    },
+    {
+      "source": "starting SHA plus focused patch",
+      "python": "3.14.7",
+      "argv": [
+        "python",
+        "-m",
+        "unittest",
+        "tests.test_prism_payout_preparation_ownership",
+        "tests.test_prism_initial_job_ownership",
+        "tests.test_prism_deferred_capacity_ownership",
+        "tests.test_prism_vardiff_idle_ownership",
+        "tests.test_prism_lease_monitor_stalls",
+        "tests.test_prism_job_build_retention",
+        "tests.test_prism_job_build_exception_retention",
+        "tests.test_prism_singleflight_exception_retention",
+        "tests.test_prism_bounded_executor",
+        "tests.test_prism_payout_state",
+        "tests.test_prism_initial_job_delivery",
+        "tests.test_prism_vardiff",
+        "tests.test_prism_vardiff_service",
+        "tests.test_prism_vardiff_resume",
+        "tests.test_prism_vardiff_durable_resume",
+        "tests.test_prism_vardiff_fast_arrival",
+        "tests.test_prism_admission_lock",
+        "tests.test_prism_reconnect_backpressure",
+        "tests.test_prism_retained_jobs",
+        "tests.test_prism_incremental_payout_window",
+        "tests.test_prism_payout_window_daemon_recenter",
+        "tests.test_prism_job_build_promises",
+        "tests.test_prism_job_builder",
+        "-q"
+      ],
+      "tests": 557,
+      "seconds": 11.412,
+      "result": "OK",
+      "failures": [],
+      "log": ".context/audit-341/relevant-557-3147.log",
+      "log_sha256": "138a1b537e217494c79c5b3a6967a198c72819ffbf1e9405dc276cca23f491f2"
+    },
+    {
+      "source": "starting SHA plus focused patch",
+      "python": "3.14.6",
+      "argv": [
+        "python",
+        "-m",
+        "unittest",
+        "tests.test_prism_payout_preparation_ownership",
+        "tests.test_prism_initial_job_ownership",
+        "tests.test_prism_deferred_capacity_ownership",
+        "tests.test_prism_vardiff_idle_ownership",
+        "-q"
+      ],
+      "tests": 37,
+      "seconds": 0.236,
+      "result": "OK",
+      "failures": [],
+      "log": ".context/audit-341/native-37-3146.log",
+      "log_sha256": "3f109d4e431a9951b4a7e078783053d34827edb506bcb0633914f9720c31914e"
+    },
+    {
+      "source": "#335 8ff3fb5 plus focused patch",
+      "python": "3.14.7",
+      "argv": [
+        "python",
+        "-m",
+        "unittest",
+        "tests.test_prism_payout_preparation_ownership",
+        "tests.test_prism_initial_job_ownership",
+        "tests.test_prism_deferred_capacity_ownership",
+        "tests.test_prism_vardiff_idle_ownership",
+        "tests.test_prism_async_failure_ownership",
+        "tests.test_prism_window_oracle",
+        "tests.test_prism_payout_state",
+        "tests.test_prism_initial_job_delivery",
+        "tests.test_prism_vardiff",
+        "tests.test_prism_bounded_executor",
+        "tests.test_prism_job_build_exception_retention",
+        "tests.test_prism_retained_jobs",
+        "tests.test_prism_reconnect_backpressure",
+        "tests.test_prism_metrics",
+        "-q"
+      ],
+      "tests": 329,
+      "seconds": 6.694,
+      "result": "OK",
+      "failures": [],
+      "log": ".context/audit-341/integration-8ff3fb5-3147.log",
+      "log_sha256": "269540b1544eedbe0e9e031c4c25a36cf97143b543dfbd097226c7a2b497197e"
+    }
+  ],
+  "replays": [
+    {
+      "source": "base patch",
+      "argv": [
+        "python",
+        "tests/perf/async_ownership_retirement.py",
+        "--rows",
+        "228397",
+        "--cycles",
+        "6"
+      ],
+      "runtime_source_identity": {
+        "python": "3.14.7 (main, Aug 31 2026, 23:42:40) [GCC 14.2.0]",
+        "platform": "Linux-7.0.12-linuxkit-aarch64-with-glibc2.41",
+        "gc_enabled": true,
+        "source_sha256": {
+          "lab/prism/payout_state.py": "61e0e3e2ed9965084e72cf079c2926c7828c40f2606a24ab0732b7d713fac6b0",
+          "lab/prism/job_delivery.py": "86fea24d70b0e5b816e5aeaba638b3535b406bbb8d05e5ca44968757825f4d7e",
+          "lab/prism/job_bundle.py": "c37dd24e69ed5e3fece583aac879343a3b2e8d35fc2386974276525b9e3914df",
+          "lab/prism/vardiff_service.py": "5868d2a1a633ccbfab47100badadac9ca95dd081068308f69bc896f900c876b6",
+          "lab/prism/share_ledger.py": "5fa870fe1b031fbfa6e899512859d9dcd9bf0920f04465d5a037b2f95ed034c3",
+          "tests/prism_async_ownership_support.py": "a717b7822b10bff19f756a6403c920d8b03e477419a3da1f15b84eaf571ba120",
+          "tests/test_prism_initial_job_ownership.py": "4e80f1eec1428f70aca8a6323a041ccc3c99970ed0a96d597b89d48235b5a37a",
+          "tests/test_prism_vardiff_idle_ownership.py": "c5a2038919d080ae0f9904eca9aa40583bf82a057ce7022c30f9a4a74959881f",
+          "tests/perf/async_ownership_retirement.py": "ce9b2165ec0432dc5a453ce16fa8b4ad200b35d2de511bbb42d340b34f9ab628"
+        }
+      },
+      "summaries": {
+        "payout": {
+          "cycles": 6,
+          "all_drains_equal": {
+            "live": {
+              "window": 2
+            },
+            "buffers": 2,
+            "canonical_bytes": 284582660,
+            "parsed_rows": 0
+          },
+          "maximum_canonical_bytes": 426873990,
+          "maximum_buffers": 3,
+          "maximum_parsed_rows": 0,
+          "rss_range_bytes": [
+            384446464,
+            386224128
+          ],
+          "first_allocator": {
+            "allocated_blocks": 224093,
+            "gc_trigger_count": [
+              1338,
+              5,
+              3
+            ],
+            "gc_collections": [
+              38,
+              3,
+              0
+            ],
+            "gc_collected": [
+              380,
+              26,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 60624896,
+            "malloc_in_use_bytes": 9822576,
+            "malloc_free_bytes": 50802320,
+            "malloc_mmapped_bytes": 285954048
+          },
+          "last_allocator": {
+            "allocated_blocks": 238193,
+            "gc_trigger_count": [
+              424,
+              8,
+              3
+            ],
+            "gc_collections": [
+              41,
+              3,
+              0
+            ],
+            "gc_collected": [
+              380,
+              26,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 61173760,
+            "malloc_in_use_bytes": 10331216,
+            "malloc_free_bytes": 50842544,
+            "malloc_mmapped_bytes": 285954048
+          },
+          "last_weak_registry": null
+        },
+        "deferred": {
+          "cycles": 6,
+          "all_drains_equal": {
+            "live": {
+              "window": 2
+            },
+            "buffers": 2,
+            "canonical_bytes": 284582660,
+            "parsed_rows": 0
+          },
+          "maximum_canonical_bytes": 426873990,
+          "maximum_buffers": 3,
+          "maximum_parsed_rows": 0,
+          "rss_range_bytes": [
+            384512000,
+            386224128
+          ],
+          "first_allocator": {
+            "allocated_blocks": 224106,
+            "gc_trigger_count": [
+              1350,
+              5,
+              3
+            ],
+            "gc_collections": [
+              38,
+              3,
+              0
+            ],
+            "gc_collected": [
+              380,
+              26,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 60624896,
+            "malloc_in_use_bytes": 9823888,
+            "malloc_free_bytes": 50801008,
+            "malloc_mmapped_bytes": 285954048
+          },
+          "last_allocator": {
+            "allocated_blocks": 238203,
+            "gc_trigger_count": [
+              432,
+              8,
+              3
+            ],
+            "gc_collections": [
+              41,
+              3,
+              0
+            ],
+            "gc_collected": [
+              380,
+              26,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 61173760,
+            "malloc_in_use_bytes": 10331344,
+            "malloc_free_bytes": 50842416,
+            "malloc_mmapped_bytes": 285954048
+          },
+          "last_weak_registry": null
+        },
+        "initial": {
+          "cycles": 6,
+          "all_drains_equal": {
+            "live": {
+              "window": 2
+            },
+            "buffers": 2,
+            "canonical_bytes": 284582660,
+            "parsed_rows": 0
+          },
+          "maximum_canonical_bytes": 426873990,
+          "maximum_buffers": 3,
+          "maximum_parsed_rows": 0,
+          "rss_range_bytes": [
+            385261568,
+            386277376
+          ],
+          "first_allocator": {
+            "allocated_blocks": 229477,
+            "gc_trigger_count": [
+              2,
+              6,
+              3
+            ],
+            "gc_collections": [
+              39,
+              3,
+              0
+            ],
+            "gc_collected": [
+              380,
+              26,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 60821504,
+            "malloc_in_use_bytes": 9913472,
+            "malloc_free_bytes": 50908032,
+            "malloc_mmapped_bytes": 285954048
+          },
+          "last_allocator": {
+            "allocated_blocks": 238962,
+            "gc_trigger_count": [
+              973,
+              8,
+              3
+            ],
+            "gc_collections": [
+              41,
+              3,
+              0
+            ],
+            "gc_collected": [
+              380,
+              26,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 61173760,
+            "malloc_in_use_bytes": 10377536,
+            "malloc_free_bytes": 50796224,
+            "malloc_mmapped_bytes": 285954048
+          },
+          "last_weak_registry": null
+        },
+        "vardiff": {
+          "cycles": 6,
+          "all_drains_equal": {
+            "live": {
+              "window": 2
+            },
+            "buffers": 2,
+            "canonical_bytes": 284582660,
+            "parsed_rows": 0
+          },
+          "maximum_canonical_bytes": 426873990,
+          "maximum_buffers": 3,
+          "maximum_parsed_rows": 0,
+          "rss_range_bytes": [
+            385490944,
+            386310144
+          ],
+          "first_allocator": {
+            "allocated_blocks": 232586,
+            "gc_trigger_count": [
+              418,
+              6,
+              3
+            ],
+            "gc_collections": [
+              39,
+              3,
+              0
+            ],
+            "gc_collected": [
+              380,
+              26,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 60821504,
+            "malloc_in_use_bytes": 9977312,
+            "malloc_free_bytes": 50844192,
+            "malloc_mmapped_bytes": 285954048
+          },
+          "last_allocator": {
+            "allocated_blocks": 239566,
+            "gc_trigger_count": [
+              1391,
+              8,
+              3
+            ],
+            "gc_collections": [
+              41,
+              3,
+              0
+            ],
+            "gc_collected": [
+              380,
+              26,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 61173760,
+            "malloc_in_use_bytes": 10421504,
+            "malloc_free_bytes": 50752256,
+            "malloc_mmapped_bytes": 285954048
+          },
+          "last_weak_registry": null
+        }
+      },
+      "final": {
+        "final": {
+          "live": {},
+          "buffers": 0,
+          "canonical_bytes": 0,
+          "parsed_rows": 0
+        },
+        "services_kept_alive": 13,
+        "rss_bytes": 101720064,
+        "allocator": {
+          "allocated_blocks": 239552,
+          "gc_trigger_count": [
+            1390,
+            8,
+            3
+          ],
+          "gc_collections": [
+            41,
+            3,
+            0
+          ],
+          "gc_collected": [
+            380,
+            26,
+            0
+          ],
+          "gc_uncollectable": [
+            0,
+            0,
+            0
+          ],
+          "threads": 1,
+          "malloc_info_available": true,
+          "malloc_arena_bytes": 61173760,
+          "malloc_in_use_bytes": 10291040,
+          "malloc_free_bytes": 50882720,
+          "malloc_mmapped_bytes": 1363968
+        },
+        "weak_registry": null,
+        "gc_enabled": true
+      },
+      "log": ".context/audit-341/replay-final-228397-3147.jsonl",
+      "log_sha256": "5398f495db32ac9138766dd5ab716cba1f0e8ed56d52f5fd99aba40f539c0022"
+    },
+    {
+      "source": "base patch",
+      "argv": [
+        "python",
+        "tests/perf/async_ownership_retirement.py",
+        "--rows",
+        "400000",
+        "--cycles",
+        "6"
+      ],
+      "runtime_source_identity": {
+        "python": "3.14.7 (main, Aug 31 2026, 23:42:40) [GCC 14.2.0]",
+        "platform": "Linux-7.0.12-linuxkit-aarch64-with-glibc2.41",
+        "gc_enabled": true,
+        "source_sha256": {
+          "lab/prism/payout_state.py": "61e0e3e2ed9965084e72cf079c2926c7828c40f2606a24ab0732b7d713fac6b0",
+          "lab/prism/job_delivery.py": "86fea24d70b0e5b816e5aeaba638b3535b406bbb8d05e5ca44968757825f4d7e",
+          "lab/prism/job_bundle.py": "c37dd24e69ed5e3fece583aac879343a3b2e8d35fc2386974276525b9e3914df",
+          "lab/prism/vardiff_service.py": "5868d2a1a633ccbfab47100badadac9ca95dd081068308f69bc896f900c876b6",
+          "lab/prism/share_ledger.py": "5fa870fe1b031fbfa6e899512859d9dcd9bf0920f04465d5a037b2f95ed034c3",
+          "tests/prism_async_ownership_support.py": "a717b7822b10bff19f756a6403c920d8b03e477419a3da1f15b84eaf571ba120",
+          "tests/test_prism_initial_job_ownership.py": "4e80f1eec1428f70aca8a6323a041ccc3c99970ed0a96d597b89d48235b5a37a",
+          "tests/test_prism_vardiff_idle_ownership.py": "c5a2038919d080ae0f9904eca9aa40583bf82a057ce7022c30f9a4a74959881f",
+          "tests/perf/async_ownership_retirement.py": "ce9b2165ec0432dc5a453ce16fa8b4ad200b35d2de511bbb42d340b34f9ab628"
+        }
+      },
+      "summaries": {
+        "payout": {
+          "cycles": 6,
+          "all_drains_equal": {
+            "live": {
+              "window": 2
+            },
+            "buffers": 2,
+            "canonical_bytes": 498399998,
+            "parsed_rows": 0
+          },
+          "maximum_canonical_bytes": 747599997,
+          "maximum_buffers": 3,
+          "maximum_parsed_rows": 0,
+          "rss_range_bytes": [
+            628441088,
+            630222848
+          ],
+          "first_allocator": {
+            "allocated_blocks": 224108,
+            "gc_trigger_count": [
+              1338,
+              5,
+              3
+            ],
+            "gc_collections": [
+              38,
+              3,
+              0
+            ],
+            "gc_collected": [
+              380,
+              26,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 90824704,
+            "malloc_in_use_bytes": 9822576,
+            "malloc_free_bytes": 81002128,
+            "malloc_mmapped_bytes": 499765248
+          },
+          "last_allocator": {
+            "allocated_blocks": 238212,
+            "gc_trigger_count": [
+              424,
+              8,
+              3
+            ],
+            "gc_collections": [
+              41,
+              3,
+              0
+            ],
+            "gc_collected": [
+              380,
+              26,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 91377664,
+            "malloc_in_use_bytes": 10331216,
+            "malloc_free_bytes": 81046448,
+            "malloc_mmapped_bytes": 499765248
+          },
+          "last_weak_registry": null
+        },
+        "deferred": {
+          "cycles": 6,
+          "all_drains_equal": {
+            "live": {
+              "window": 2
+            },
+            "buffers": 2,
+            "canonical_bytes": 498399998,
+            "parsed_rows": 0
+          },
+          "maximum_canonical_bytes": 747599997,
+          "maximum_buffers": 3,
+          "maximum_parsed_rows": 0,
+          "rss_range_bytes": [
+            628506624,
+            630222848
+          ],
+          "first_allocator": {
+            "allocated_blocks": 224119,
+            "gc_trigger_count": [
+              1350,
+              5,
+              3
+            ],
+            "gc_collections": [
+              38,
+              3,
+              0
+            ],
+            "gc_collected": [
+              380,
+              26,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 90824704,
+            "malloc_in_use_bytes": 9823888,
+            "malloc_free_bytes": 81000816,
+            "malloc_mmapped_bytes": 499765248
+          },
+          "last_allocator": {
+            "allocated_blocks": 238221,
+            "gc_trigger_count": [
+              432,
+              8,
+              3
+            ],
+            "gc_collections": [
+              41,
+              3,
+              0
+            ],
+            "gc_collected": [
+              380,
+              26,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 91377664,
+            "malloc_in_use_bytes": 10331344,
+            "malloc_free_bytes": 81046320,
+            "malloc_mmapped_bytes": 499765248
+          },
+          "last_weak_registry": null
+        },
+        "initial": {
+          "cycles": 6,
+          "all_drains_equal": {
+            "live": {
+              "window": 2
+            },
+            "buffers": 2,
+            "canonical_bytes": 498399998,
+            "parsed_rows": 0
+          },
+          "maximum_canonical_bytes": 747599997,
+          "maximum_buffers": 3,
+          "maximum_parsed_rows": 0,
+          "rss_range_bytes": [
+            629256192,
+            630276096
+          ],
+          "first_allocator": {
+            "allocated_blocks": 229496,
+            "gc_trigger_count": [
+              2,
+              6,
+              3
+            ],
+            "gc_collections": [
+              39,
+              3,
+              0
+            ],
+            "gc_collected": [
+              380,
+              26,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 91021312,
+            "malloc_in_use_bytes": 9913472,
+            "malloc_free_bytes": 81107840,
+            "malloc_mmapped_bytes": 499765248
+          },
+          "last_allocator": {
+            "allocated_blocks": 238982,
+            "gc_trigger_count": [
+              973,
+              8,
+              3
+            ],
+            "gc_collections": [
+              41,
+              3,
+              0
+            ],
+            "gc_collected": [
+              380,
+              26,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 91377664,
+            "malloc_in_use_bytes": 10377536,
+            "malloc_free_bytes": 81000128,
+            "malloc_mmapped_bytes": 499765248
+          },
+          "last_weak_registry": null
+        },
+        "vardiff": {
+          "cycles": 6,
+          "all_drains_equal": {
+            "live": {
+              "window": 2
+            },
+            "buffers": 2,
+            "canonical_bytes": 498399998,
+            "parsed_rows": 0
+          },
+          "maximum_canonical_bytes": 747599997,
+          "maximum_buffers": 3,
+          "maximum_parsed_rows": 0,
+          "rss_range_bytes": [
+            629485568,
+            630308864
+          ],
+          "first_allocator": {
+            "allocated_blocks": 232605,
+            "gc_trigger_count": [
+              418,
+              6,
+              3
+            ],
+            "gc_collections": [
+              39,
+              3,
+              0
+            ],
+            "gc_collected": [
+              380,
+              26,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 91021312,
+            "malloc_in_use_bytes": 9977312,
+            "malloc_free_bytes": 81044000,
+            "malloc_mmapped_bytes": 499765248
+          },
+          "last_allocator": {
+            "allocated_blocks": 239586,
+            "gc_trigger_count": [
+              1391,
+              8,
+              3
+            ],
+            "gc_collections": [
+              41,
+              3,
+              0
+            ],
+            "gc_collected": [
+              380,
+              26,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 91377664,
+            "malloc_in_use_bytes": 10421504,
+            "malloc_free_bytes": 80956160,
+            "malloc_mmapped_bytes": 499765248
+          },
+          "last_weak_registry": null
+        }
+      },
+      "final": {
+        "final": {
+          "live": {},
+          "buffers": 0,
+          "canonical_bytes": 0,
+          "parsed_rows": 0
+        },
+        "services_kept_alive": 13,
+        "rss_bytes": 131907584,
+        "allocator": {
+          "allocated_blocks": 239573,
+          "gc_trigger_count": [
+            1390,
+            8,
+            3
+          ],
+          "gc_collections": [
+            41,
+            3,
+            0
+          ],
+          "gc_collected": [
+            380,
+            26,
+            0
+          ],
+          "gc_uncollectable": [
+            0,
+            0,
+            0
+          ],
+          "threads": 1,
+          "malloc_info_available": true,
+          "malloc_arena_bytes": 91377664,
+          "malloc_in_use_bytes": 10291040,
+          "malloc_free_bytes": 81086624,
+          "malloc_mmapped_bytes": 1363968
+        },
+        "weak_registry": null,
+        "gc_enabled": true
+      },
+      "log": ".context/audit-341/replay-final-400000-3147.jsonl",
+      "log_sha256": "1087723a1a6d6d40b348c990a2fc63e993e0bfb3110ce93bf7585fe5cce8826c"
+    },
+    {
+      "source": "base patch",
+      "argv": [
+        "python",
+        "tests/perf/async_ownership_retirement.py",
+        "--rows",
+        "400000",
+        "--cycles",
+        "6",
+        "--parsed"
+      ],
+      "runtime_source_identity": {
+        "python": "3.14.7 (main, Aug 31 2026, 23:42:40) [GCC 14.2.0]",
+        "platform": "Linux-7.0.12-linuxkit-aarch64-with-glibc2.41",
+        "gc_enabled": true,
+        "source_sha256": {
+          "lab/prism/payout_state.py": "61e0e3e2ed9965084e72cf079c2926c7828c40f2606a24ab0732b7d713fac6b0",
+          "lab/prism/job_delivery.py": "86fea24d70b0e5b816e5aeaba638b3535b406bbb8d05e5ca44968757825f4d7e",
+          "lab/prism/job_bundle.py": "c37dd24e69ed5e3fece583aac879343a3b2e8d35fc2386974276525b9e3914df",
+          "lab/prism/vardiff_service.py": "5868d2a1a633ccbfab47100badadac9ca95dd081068308f69bc896f900c876b6",
+          "lab/prism/share_ledger.py": "5fa870fe1b031fbfa6e899512859d9dcd9bf0920f04465d5a037b2f95ed034c3",
+          "tests/prism_async_ownership_support.py": "a717b7822b10bff19f756a6403c920d8b03e477419a3da1f15b84eaf571ba120",
+          "tests/test_prism_initial_job_ownership.py": "4e80f1eec1428f70aca8a6323a041ccc3c99970ed0a96d597b89d48235b5a37a",
+          "tests/test_prism_vardiff_idle_ownership.py": "c5a2038919d080ae0f9904eca9aa40583bf82a057ce7022c30f9a4a74959881f",
+          "tests/perf/async_ownership_retirement.py": "ce9b2165ec0432dc5a453ce16fa8b4ad200b35d2de511bbb42d340b34f9ab628"
+        }
+      },
+      "summaries": {
+        "payout": {
+          "cycles": 6,
+          "all_drains_equal": {
+            "live": {
+              "window": 2
+            },
+            "buffers": 2,
+            "canonical_bytes": 498399998,
+            "parsed_rows": 800000
+          },
+          "maximum_canonical_bytes": 747599997,
+          "maximum_buffers": 3,
+          "maximum_parsed_rows": 1200000,
+          "rss_range_bytes": [
+            1511837696,
+            1838784512
+          ],
+          "first_allocator": {
+            "allocated_blocks": 2622530,
+            "gc_trigger_count": [
+              8,
+              9,
+              8
+            ],
+            "gc_collections": [
+              581,
+              52,
+              4
+            ],
+            "gc_collected": [
+              344,
+              62,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 814977024,
+            "malloc_in_use_bytes": 540830032,
+            "malloc_free_bytes": 274146992,
+            "malloc_mmapped_bytes": 499765248
+          },
+          "last_allocator": {
+            "allocated_blocks": 2637165,
+            "gc_trigger_count": [
+              2,
+              7,
+              9
+            ],
+            "gc_collections": [
+              5133,
+              466,
+              38
+            ],
+            "gc_collected": [
+              344,
+              62,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 1078784000,
+            "malloc_in_use_bytes": 541352704,
+            "malloc_free_bytes": 537431296,
+            "malloc_mmapped_bytes": 499765248
+          },
+          "last_weak_registry": null
+        },
+        "deferred": {
+          "cycles": 6,
+          "all_drains_equal": {
+            "live": {
+              "window": 2
+            },
+            "buffers": 2,
+            "canonical_bytes": 498399998,
+            "parsed_rows": 800000
+          },
+          "maximum_canonical_bytes": 747599997,
+          "maximum_buffers": 3,
+          "maximum_parsed_rows": 1200000,
+          "rss_range_bytes": [
+            1782484992,
+            1840840704
+          ],
+          "first_allocator": {
+            "allocated_blocks": 2622520,
+            "gc_trigger_count": [
+              3,
+              10,
+              5
+            ],
+            "gc_collections": [
+              945,
+              85,
+              7
+            ],
+            "gc_collected": [
+              344,
+              62,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 1078038528,
+            "malloc_in_use_bytes": 540842032,
+            "malloc_free_bytes": 537196496,
+            "malloc_mmapped_bytes": 499765248
+          },
+          "last_allocator": {
+            "allocated_blocks": 2637149,
+            "gc_trigger_count": [
+              3,
+              8,
+              6
+            ],
+            "gc_collections": [
+              5497,
+              499,
+              41
+            ],
+            "gc_collected": [
+              344,
+              62,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 1078784000,
+            "malloc_in_use_bytes": 541353616,
+            "malloc_free_bytes": 537430384,
+            "malloc_mmapped_bytes": 499765248
+          },
+          "last_weak_registry": null
+        },
+        "initial": {
+          "cycles": 6,
+          "all_drains_equal": {
+            "live": {
+              "window": 2
+            },
+            "buffers": 2,
+            "canonical_bytes": 498399998,
+            "parsed_rows": 800000
+          },
+          "maximum_canonical_bytes": 747599997,
+          "maximum_buffers": 3,
+          "maximum_parsed_rows": 1200000,
+          "rss_range_bytes": [
+            1784315904,
+            1841950720
+          ],
+          "first_allocator": {
+            "allocated_blocks": 2628089,
+            "gc_trigger_count": [
+              1,
+              5,
+              9
+            ],
+            "gc_collections": [
+              1127,
+              102,
+              8
+            ],
+            "gc_collected": [
+              344,
+              62,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 1078235136,
+            "malloc_in_use_bytes": 540926096,
+            "malloc_free_bytes": 537309040,
+            "malloc_mmapped_bytes": 499765248
+          },
+          "last_allocator": {
+            "allocated_blocks": 2638028,
+            "gc_trigger_count": [
+              1,
+              3,
+              10
+            ],
+            "gc_collections": [
+              5679,
+              516,
+              42
+            ],
+            "gc_collected": [
+              344,
+              62,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 1078784000,
+            "malloc_in_use_bytes": 541397824,
+            "malloc_free_bytes": 537386176,
+            "malloc_mmapped_bytes": 499765248
+          },
+          "last_weak_registry": null
+        },
+        "vardiff": {
+          "cycles": 6,
+          "all_drains_equal": {
+            "live": {
+              "window": 2
+            },
+            "buffers": 2,
+            "canonical_bytes": 498399998,
+            "parsed_rows": 800000
+          },
+          "maximum_canonical_bytes": 747599997,
+          "maximum_buffers": 3,
+          "maximum_parsed_rows": 1200000,
+          "rss_range_bytes": [
+            1788792832,
+            1844051968
+          ],
+          "first_allocator": {
+            "allocated_blocks": 2631230,
+            "gc_trigger_count": [
+              1,
+              11,
+              2
+            ],
+            "gc_collections": [
+              1309,
+              118,
+              10
+            ],
+            "gc_collected": [
+              344,
+              62,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 1078235136,
+            "malloc_in_use_bytes": 540995200,
+            "malloc_free_bytes": 537239936,
+            "malloc_mmapped_bytes": 499765248
+          },
+          "last_allocator": {
+            "allocated_blocks": 2638655,
+            "gc_trigger_count": [
+              1,
+              9,
+              4
+            ],
+            "gc_collections": [
+              5861,
+              532,
+              44
+            ],
+            "gc_collected": [
+              344,
+              62,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 1078784000,
+            "malloc_in_use_bytes": 541441232,
+            "malloc_free_bytes": 537342768,
+            "malloc_mmapped_bytes": 499765248
+          },
+          "last_weak_registry": null
+        }
+      },
+      "final": {
+        "final": {
+          "live": {},
+          "buffers": 0,
+          "canonical_bytes": 0,
+          "parsed_rows": 0
+        },
+        "services_kept_alive": 13,
+        "rss_bytes": 1200603136,
+        "allocator": {
+          "allocated_blocks": 238640,
+          "gc_trigger_count": [
+            3,
+            9,
+            4
+          ],
+          "gc_collections": [
+            5861,
+            532,
+            44
+          ],
+          "gc_collected": [
+            344,
+            62,
+            0
+          ],
+          "gc_uncollectable": [
+            0,
+            0,
+            0
+          ],
+          "threads": 1,
+          "malloc_info_available": true,
+          "malloc_arena_bytes": 1078784000,
+          "malloc_in_use_bytes": 10109056,
+          "malloc_free_bytes": 1068674944,
+          "malloc_mmapped_bytes": 1363968
+        },
+        "weak_registry": null,
+        "gc_enabled": true
+      },
+      "log": ".context/audit-341/replay-final-400000-parsed-3147.jsonl",
+      "log_sha256": "a46f2393efd0247f4731f1ae746d7bc0f7f25ce3e86c684d26fc7a74090c2142"
+    },
+    {
+      "source": "#335 8ff3fb5 integration",
+      "argv": [
+        "python",
+        "tests/perf/async_ownership_retirement.py",
+        "--rows",
+        "400000",
+        "--cycles",
+        "6",
+        "--parsed"
+      ],
+      "runtime_source_identity": {
+        "python": "3.14.7 (main, Aug 31 2026, 23:42:40) [GCC 14.2.0]",
+        "platform": "Linux-7.0.12-linuxkit-aarch64-with-glibc2.41",
+        "gc_enabled": true,
+        "source_sha256": {
+          "lab/prism/payout_state.py": "ac27ed7222e67c5732d359ffaba1b71a8040952fb5b81007681a74364429c985",
+          "lab/prism/job_delivery.py": "86fea24d70b0e5b816e5aeaba638b3535b406bbb8d05e5ca44968757825f4d7e",
+          "lab/prism/job_bundle.py": "2b349664abaaa8a699174e697c6b18c800cd15f0d9719cf8badd06aaefaedfa1",
+          "lab/prism/vardiff_service.py": "5868d2a1a633ccbfab47100badadac9ca95dd081068308f69bc896f900c876b6",
+          "lab/prism/share_ledger.py": "8ca0132e483e88ce8f64c207b5c1c800b91db7919f7003b245968637df724a7e",
+          "tests/prism_async_ownership_support.py": "a717b7822b10bff19f756a6403c920d8b03e477419a3da1f15b84eaf571ba120",
+          "tests/test_prism_initial_job_ownership.py": "4e80f1eec1428f70aca8a6323a041ccc3c99970ed0a96d597b89d48235b5a37a",
+          "tests/test_prism_vardiff_idle_ownership.py": "c5a2038919d080ae0f9904eca9aa40583bf82a057ce7022c30f9a4a74959881f",
+          "tests/perf/async_ownership_retirement.py": "ce9b2165ec0432dc5a453ce16fa8b4ad200b35d2de511bbb42d340b34f9ab628"
+        }
+      },
+      "summaries": {
+        "payout": {
+          "cycles": 6,
+          "all_drains_equal": {
+            "live": {
+              "window": 2
+            },
+            "buffers": 2,
+            "canonical_bytes": 498399998,
+            "parsed_rows": 800000
+          },
+          "maximum_canonical_bytes": 747599997,
+          "maximum_buffers": 3,
+          "maximum_parsed_rows": 1200000,
+          "rss_range_bytes": [
+            1512148992,
+            1840578560
+          ],
+          "first_allocator": {
+            "allocated_blocks": 2623448,
+            "gc_trigger_count": [
+              9,
+              3,
+              9
+            ],
+            "gc_collections": [
+              586,
+              53,
+              4
+            ],
+            "gc_collected": [
+              404,
+              2,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 816369664,
+            "malloc_in_use_bytes": 542040192,
+            "malloc_free_bytes": 274329472,
+            "malloc_mmapped_bytes": 498802688
+          },
+          "last_allocator": {
+            "allocated_blocks": 2638063,
+            "gc_trigger_count": [
+              2,
+              1,
+              3
+            ],
+            "gc_collections": [
+              5138,
+              467,
+              38
+            ],
+            "gc_collected": [
+              404,
+              2,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 1080049664,
+            "malloc_in_use_bytes": 542555120,
+            "malloc_free_bytes": 537494544,
+            "malloc_mmapped_bytes": 498802688
+          },
+          "last_weak_registry": {
+            "owners": 2,
+            "canonical_buffers": 2,
+            "canonical_bytes": 498399998,
+            "page_records": 0,
+            "parsed_records": 800000,
+            "observations_dropped_total": 0
+          }
+        },
+        "deferred": {
+          "cycles": 6,
+          "all_drains_equal": {
+            "live": {
+              "window": 2
+            },
+            "buffers": 2,
+            "canonical_bytes": 498399998,
+            "parsed_rows": 800000
+          },
+          "maximum_canonical_bytes": 747599997,
+          "maximum_buffers": 3,
+          "maximum_parsed_rows": 1200000,
+          "rss_range_bytes": [
+            1783644160,
+            1843683328
+          ],
+          "first_allocator": {
+            "allocated_blocks": 2623437,
+            "gc_trigger_count": [
+              2,
+              4,
+              7
+            ],
+            "gc_collections": [
+              950,
+              86,
+              7
+            ],
+            "gc_collected": [
+              404,
+              2,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 1079431168,
+            "malloc_in_use_bytes": 542045696,
+            "malloc_free_bytes": 537385472,
+            "malloc_mmapped_bytes": 498802688
+          },
+          "last_allocator": {
+            "allocated_blocks": 2638045,
+            "gc_trigger_count": [
+              2,
+              3,
+              10
+            ],
+            "gc_collections": [
+              5503,
+              500,
+              40
+            ],
+            "gc_collected": [
+              404,
+              2,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 1080049664,
+            "malloc_in_use_bytes": 542555248,
+            "malloc_free_bytes": 537494416,
+            "malloc_mmapped_bytes": 498802688
+          },
+          "last_weak_registry": {
+            "owners": 2,
+            "canonical_buffers": 2,
+            "canonical_bytes": 498399998,
+            "page_records": 0,
+            "parsed_records": 800000,
+            "observations_dropped_total": 0
+          }
+        },
+        "initial": {
+          "cycles": 6,
+          "all_drains_equal": {
+            "live": {
+              "window": 2
+            },
+            "buffers": 2,
+            "canonical_bytes": 498399998,
+            "parsed_rows": 800000
+          },
+          "maximum_canonical_bytes": 747599997,
+          "maximum_buffers": 3,
+          "maximum_parsed_rows": 1200000,
+          "rss_range_bytes": [
+            1786486784,
+            1843777536
+          ],
+          "first_allocator": {
+            "allocated_blocks": 2628997,
+            "gc_trigger_count": [
+              1,
+              10,
+              0
+            ],
+            "gc_collections": [
+              1132,
+              102,
+              9
+            ],
+            "gc_collected": [
+              404,
+              2,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 1079627776,
+            "malloc_in_use_bytes": 542134624,
+            "malloc_free_bytes": 537493152,
+            "malloc_mmapped_bytes": 498802688
+          },
+          "last_allocator": {
+            "allocated_blocks": 2638929,
+            "gc_trigger_count": [
+              1,
+              9,
+              4
+            ],
+            "gc_collections": [
+              5685,
+              516,
+              42
+            ],
+            "gc_collected": [
+              404,
+              2,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 1080049664,
+            "malloc_in_use_bytes": 542599600,
+            "malloc_free_bytes": 537450064,
+            "malloc_mmapped_bytes": 498802688
+          },
+          "last_weak_registry": {
+            "owners": 2,
+            "canonical_buffers": 2,
+            "canonical_bytes": 498399998,
+            "page_records": 0,
+            "parsed_records": 800000,
+            "observations_dropped_total": 0
+          }
+        },
+        "vardiff": {
+          "cycles": 6,
+          "all_drains_equal": {
+            "live": {
+              "window": 2
+            },
+            "buffers": 2,
+            "canonical_bytes": 498399998,
+            "parsed_rows": 800000
+          },
+          "maximum_canonical_bytes": 747599997,
+          "maximum_buffers": 3,
+          "maximum_parsed_rows": 1200000,
+          "rss_range_bytes": [
+            1789878272,
+            1845858304
+          ],
+          "first_allocator": {
+            "allocated_blocks": 2632135,
+            "gc_trigger_count": [
+              1,
+              5,
+              3
+            ],
+            "gc_collections": [
+              1314,
+              119,
+              10
+            ],
+            "gc_collected": [
+              404,
+              2,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 1079627776,
+            "malloc_in_use_bytes": 542199104,
+            "malloc_free_bytes": 537428672,
+            "malloc_mmapped_bytes": 498802688
+          },
+          "last_allocator": {
+            "allocated_blocks": 2639548,
+            "gc_trigger_count": [
+              1,
+              4,
+              8
+            ],
+            "gc_collections": [
+              5867,
+              533,
+              43
+            ],
+            "gc_collected": [
+              404,
+              2,
+              0
+            ],
+            "gc_uncollectable": [
+              0,
+              0,
+              0
+            ],
+            "threads": 1,
+            "malloc_info_available": true,
+            "malloc_arena_bytes": 1080049664,
+            "malloc_in_use_bytes": 542644160,
+            "malloc_free_bytes": 537405504,
+            "malloc_mmapped_bytes": 498802688
+          },
+          "last_weak_registry": {
+            "owners": 2,
+            "canonical_buffers": 2,
+            "canonical_bytes": 498399998,
+            "page_records": 0,
+            "parsed_records": 800000,
+            "observations_dropped_total": 0
+          }
+        }
+      },
+      "final": {
+        "final": {
+          "live": {},
+          "buffers": 0,
+          "canonical_bytes": 0,
+          "parsed_rows": 0
+        },
+        "services_kept_alive": 13,
+        "rss_bytes": 1201393664,
+        "allocator": {
+          "allocated_blocks": 239515,
+          "gc_trigger_count": [
+            3,
+            4,
+            8
+          ],
+          "gc_collections": [
+            5867,
+            533,
+            43
+          ],
+          "gc_collected": [
+            404,
+            2,
+            0
+          ],
+          "gc_uncollectable": [
+            0,
+            0,
+            0
+          ],
+          "threads": 1,
+          "malloc_info_available": true,
+          "malloc_arena_bytes": 1080049664,
+          "malloc_in_use_bytes": 11311168,
+          "malloc_free_bytes": 1068738496,
+          "malloc_mmapped_bytes": 401408
+        },
+        "weak_registry": {
+          "owners": 0,
+          "canonical_buffers": 0,
+          "canonical_bytes": 0,
+          "page_records": 0,
+          "parsed_records": 0,
+          "observations_dropped_total": 0
+        },
+        "gc_enabled": true
+      },
+      "log": ".context/audit-341/integration-8ff3fb5-replay-400000-parsed-3147.jsonl",
+      "log_sha256": "bdced8feba9d82ac894b7ee093e824e9154a2661d46ba200972f1a7c75a37893"
+    }
+  ]
+}

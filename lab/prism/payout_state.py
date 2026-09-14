@@ -35,6 +35,7 @@ import hashlib
 import json
 import threading
 import time
+import traceback
 from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 
 from lab.prism.accepted_preview_telemetry import (
@@ -2803,15 +2804,42 @@ class PayoutStateService:
                 if request is None:
                     runtime._payout_artifact_future = None
                     return
-            phases = runtime._job_build_phases()
-            phases.clear()
             try:
-                runtime._prepare_payout_ledger_artifact(
-                    *request,
-                    bypass_build_interval=bypass_build_interval,
-                )
-            finally:
-                runtime._flush_job_build_phases(phases)
+                try:
+                    phases = runtime._job_build_phases()
+                    phases.clear()
+                    try:
+                        runtime._prepare_payout_ledger_artifact(
+                            *request,
+                            bypass_build_interval=bypass_build_interval,
+                        )
+                    finally:
+                        runtime._flush_job_build_phases(phases)
+                except Exception:
+                    # Snapshot failures are normally caught inside the build,
+                    # but serialization, install and phase reporting can fail
+                    # after that catch. Report them without storing their
+                    # heavy traceback on the service's Future, then drain only
+                    # the latest queued request (never spin-retry this one).
+                    print("prism coordinator: payout artifact preparation failed", flush=True)
+                    traceback.print_exc()
+            except BaseException:
+                # Relinquish the failed Future, but hand already-accepted
+                # work to a successor before releasing the admission lock.
+                # Otherwise a fatal exit (including diagnostic failure) can
+                # strand the latest request until an unrelated schedule.
+                with runtime._payout_artifact_executor_lock:
+                    runtime._payout_artifact_future = None
+                    executor = runtime._payout_artifact_executor
+                    if (
+                        not runtime._payout_artifact_executor_shutdown
+                        and runtime._payout_artifact_requested is not None
+                        and executor is not None
+                    ):
+                        runtime._payout_artifact_future = executor.submit(
+                            runtime._payout_artifact_preparation_loop
+                        )
+                raise
 
     def _schedule_payout_ledger_artifact_preparation(
         self,
@@ -3196,8 +3224,12 @@ class PayoutStateService:
             runtime._payout_artifact_executor = None
             runtime._payout_artifact_executor_shutdown = True
             runtime._payout_artifact_requested = None
+            runtime._payout_artifact_requested_bypass = False
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=True)
+        with runtime._payout_artifact_executor_lock:
+            # A queued task cancelled by shutdown never enters the loop.
+            runtime._payout_artifact_future = None
 
     def _prepare_payout_state_artifact(
         self,
