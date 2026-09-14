@@ -88,6 +88,22 @@ PATH_REFERENCE = prose_reference_pattern(r"\blab/prism", "/")
 MODULE_REFERENCE = prose_reference_pattern(r"\blab\.prism", r"\.")
 PROSE_TRAILING_PUNCTUATION = ".,;:!?*()[]{}|"
 URL_REFERENCE_PREFIX = re.compile(r"https?://\S+/$")
+# A `lab/prism` path names the repository's own tree only where a path token
+# starts: at the start of a line or after whitespace, behind any Markdown
+# openers `( [ { < * |` that begin that token, or after a Markdown link's `](`;
+# then behind any opening quotes or backticks and at most one `./`. It also
+# starts directly after the ref of a GitHub blob, tree or raw URL. `\b` alone
+# matched inside `my-lab/prism`, `my*lab/prism`, `my(lab/prism`,
+# `my=lab/prism`, `vendor/lab/prism`, `/tmp/lab/prism` and
+# `https://example.com/lab/prism`, which are other paths. `../lab/prism` and
+# `/lab/prism` are not the root either: a scan of doc text does not know which
+# directory the doc sits in, so neither spelling can be resolved. Whitespace
+# still starts a token inside a code span, so `echo lab/prism/x` is read.
+PATH_ROOT_PREFIX = re.compile(
+    r"(?:(?:^|\s)[(\[{<*|]*[`'\"]*(?:\./)?"
+    r"|\]\([<`'\"]*(?:\./)?"
+    r"|https?://github\.com/[^/\s]+/[^/\s]+/(?:blob|tree|raw)/[^/\s]+/)$"
+)
 # `python3 -OO -X dev -m lab.a.b` and `python3.12 -Werror lab/a/b.py`. Every
 # option form `python3 --help` lists may sit between the interpreter and its
 # target: clustered flag letters, `-W`/`-X` with an attached or following
@@ -836,7 +852,8 @@ def dangling_references(text: str, tracked: frozenset[str]) -> list[tuple[int, s
     found = []
     for number, line in enumerate(text.splitlines(), 1):
         for match in PATH_REFERENCE.finditer(line):
-            if PINNED_GITHUB_URL.search(line[: match.start()]):
+            prefix = line[: match.start()]
+            if PINNED_GITHUB_URL.search(prefix) or not PATH_ROOT_PREFIX.search(prefix):
                 continue
             reference = match.group("literal") or match.group("bare").rstrip(PROSE_TRAILING_PUNCTUATION)
             if match.group("bare") and URL_REFERENCE_PREFIX.search(line[: match.start()]):
@@ -1037,9 +1054,37 @@ class ScannerTests(unittest.TestCase):
                 for quote in ("", "`", "'", '"'):
                     with self.subTest(root=root, prefix=prefix, quote=quote):
                         self.assertEqual(self.references(f"See {quote}{prefix}{root}{quote}."), [])
-            for prefix in ("", "./", "../", "/"):
-                with self.subTest(root=root, prefix=prefix):
-                    self.assertEqual(self.references(f"See `{prefix}{root}`."), [root])
+        for prefix in ("", "./", "../", "/"):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(self.references(f"See `{prefix}lab.prism.deleted`."), ["lab.prism.deleted"])
+
+    def test_path_references_start_at_the_repository_root(self) -> None:
+        root = "lab/prism/deleted.py"
+        for text in (
+            f"See {root}.", f"See `{root}`.", f"See '{root}'.", f'See "{root}".', f"See `./{root}`.",
+            f'See "./{root}".', f"{root} is gone.", f"[old]({root})", f"[old](./{root})", f"<{root}>",
+            f"**{root}**", f"|{root}|", f"[old](<{root}>)", f"(`{root}`)", f'["{root}"]', f'See `"{root}"`.',
+            f"https://github.com/o/r/blob/main/{root}#L1", f"https://github.com/o/r/tree/main/{root}",
+            f"https://github.com/o/r/raw/main/{root}", f"See `https://github.com/o/r/blob/main/{root}`.",
+            f'"https://github.com/o/r/blob/main/{root}"', f"Don't lose the students' `{root}`.",
+            f"It's {root}, isn't it?", f"Run `echo {root}`.", f"Run `python3 {root}`.", f"(**`{root}`**)",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.references(text), [root])
+                self.assertEqual(dangling_references(text, self.TRACKED | {root}), [])
+        for prefix in (
+            "my-", "my*", "my(", "my=", "my[", "my|", "my<", "--out=", "vendor/", "/tmp/", "../", "/", "~/",
+            "a.", "$HOME/", "@", "+", "C:\\", "my-\"", "https://example.com/",
+            "https://github.com/o/r/blob/main/vendor/",
+        ):
+            for quote in ("", "`", "'", '"'):
+                with self.subTest(prefix=prefix, quote=quote):
+                    self.assertEqual(self.references(f"See {quote}{prefix}{root}{quote}."), [])
+        for text in (f"See `my*(**{root}`.", f"See `my[`{root}`.", f"See `x](my*{root}`."):
+            with self.subTest(text=text):
+                self.assertEqual(self.references(text), [])
+        self.assertEqual(self.references(f"See `vendor/{root}` and `{root}`."), [root])
+        self.assertEqual(self.references(f"The students' `my*{root}` and `{root}` differ."), [root])
 
     def test_module_commands_with_missing_targets_are_caught(self) -> None:
         self.assertEqual(
