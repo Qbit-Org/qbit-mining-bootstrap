@@ -190,20 +190,67 @@ pub fn configuration_block(env: &BTreeMap<String, String>) -> Result<BTreeMap<St
 /// The environment as a report may print it.
 pub fn redacted(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     env.iter()
-        .map(|(key, value)| {
-            let redacted = SECRET_KEYS.contains(&key.as_str())
-                || key.contains("SEED")
-                || key.contains("PASSWORD");
-            (
-                key.clone(),
-                if redacted {
-                    "<redacted>".to_owned()
-                } else {
-                    value.clone()
-                },
-            )
-        })
+        .map(|(key, value)| (key.clone(), redact_value(key, value)))
         .collect()
+}
+
+/// One variable as a report may print it. A secret key loses its whole value;
+/// every other value loses any password a URL inside it carries, so a
+/// `postgresql://user:password@host/db` in `PRISM_DATABASE_URL` -- or in any
+/// URL-valued variable added later -- never reaches a file meant to be
+/// attached to an issue.
+pub fn redact_value(key: &str, value: &str) -> String {
+    let secret = SECRET_KEYS.contains(&key) || key.contains("SEED") || key.contains("PASSWORD");
+    if secret {
+        REDACTED.to_owned()
+    } else {
+        redact_url_secrets(value)
+    }
+}
+
+pub const REDACTED: &str = "<redacted>";
+
+/// Strip the password from a URL-shaped value: the password half of the
+/// authority's userinfo, and the value of any `password` query parameter
+/// (the form libpq and sqlx also accept). Anything that is not a URL is
+/// returned unchanged.
+pub fn redact_url_secrets(value: &str) -> String {
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return value.to_owned();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let authority = match authority.rsplit_once('@') {
+        Some((userinfo, host)) => match userinfo.split_once(':') {
+            Some((user, _password)) => format!("{user}:{REDACTED}@{host}"),
+            None => format!("{userinfo}@{host}"),
+        },
+        None => authority.to_owned(),
+    };
+    let tail = match tail.split_once('?') {
+        Some((path, query)) => {
+            let (query, fragment) = match query.split_once('#') {
+                Some((query, fragment)) => (query, Some(fragment)),
+                None => (query, None),
+            };
+            let query = query
+                .split('&')
+                .map(|pair| match pair.split_once('=') {
+                    Some((name, _)) if name.eq_ignore_ascii_case("password") => {
+                        format!("{name}={REDACTED}")
+                    }
+                    _ => pair.to_owned(),
+                })
+                .collect::<Vec<_>>()
+                .join("&");
+            match fragment {
+                Some(fragment) => format!("{path}?{query}#{fragment}"),
+                None => format!("{path}?{query}"),
+            }
+        }
+        None => tail.to_owned(),
+    };
+    format!("{scheme}://{authority}{tail}")
 }
 
 /// Build profile of a binary, inferred from its Cargo output directory.

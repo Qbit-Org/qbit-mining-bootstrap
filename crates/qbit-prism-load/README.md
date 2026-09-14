@@ -351,6 +351,14 @@ per-frontend window tables, the run summaries and a `definitions` block stating
 exactly how each window and time is measured and on which clock. It is
 additive: every other key keeps its shape, and the artifact is untouched.
 
+The frontend environment is printed redacted, here and in
+`database-profile.json`: the RPC password and the signing seeds are replaced
+outright, and any URL-valued variable loses the password in its userinfo and
+the value of any `password` query parameter. So a `--database-url` of
+`postgresql://user:secret@host/db` is recorded as
+`postgresql://user:<redacted>@host/db`, and the same rule covers every other
+URL the harness records.
+
 ### 4. Logs
 
 `logs/load-fe-<i>.stdout.log` and `logs/load-fe-<i>.stderr.log` per frontend,

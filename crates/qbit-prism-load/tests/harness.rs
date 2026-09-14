@@ -570,6 +570,62 @@ fn secrets_never_reach_a_report() {
     assert_eq!(redacted["QBIT_RPC_URL"], env["QBIT_RPC_URL"]);
 }
 
+/// `--database-url` in the usual `postgresql://user:password@host/db` form is
+/// carried as `PRISM_DATABASE_URL`, and both `database-profile.json` and the
+/// side report print the "redacted" environment, so the password has to go
+/// -- from that variable and from any other URL-valued one.
+#[test]
+fn a_password_inside_any_url_valued_variable_never_reaches_a_report() {
+    let password = "hunter2-Sup3r_Secret";
+    let mut env = sample_environment();
+    env.insert(
+        "PRISM_DATABASE_URL".into(),
+        format!("postgresql://alex:{password}@db.example:5432/qbit?sslmode=disable&application_name=load-fe-0"),
+    );
+    env.insert(
+        "SOME_FUTURE_URL".into(),
+        format!("https://svc:{password}@api.example/v1#frag"),
+    );
+    env.insert(
+        "PRISM_DATABASE_URL_PARAM_FORM".into(),
+        format!("postgresql://db.example/qbit?password={password}&sslmode=require"),
+    );
+    let redacted = frontend::redacted(&env);
+    for (key, value) in &redacted {
+        assert!(
+            !value.contains(password),
+            "{key} still carries the password: {value}"
+        );
+    }
+    assert_eq!(
+        redacted["PRISM_DATABASE_URL"],
+        "postgresql://alex:<redacted>@db.example:5432/qbit?sslmode=disable&application_name=load-fe-0",
+        "the user, host, port, database and non-secret parameters stay legible"
+    );
+    assert_eq!(
+        redacted["SOME_FUTURE_URL"],
+        "https://svc:<redacted>@api.example/v1#frag"
+    );
+    assert_eq!(
+        redacted["PRISM_DATABASE_URL_PARAM_FORM"],
+        "postgresql://db.example/qbit?password=<redacted>&sslmode=require"
+    );
+    // A URL without a password, and a value that is not a URL, are untouched.
+    assert_eq!(
+        frontend::redact_url_secrets("postgresql://u@127.0.0.1:5432/postgres"),
+        "postgresql://u@127.0.0.1:5432/postgres"
+    );
+    assert_eq!(frontend::redact_url_secrets("info"), "info");
+    assert_eq!(
+        frontend::redact_url_secrets("0.0000000122070312"),
+        "0.0000000122070312"
+    );
+    assert_eq!(
+        redacted["QBIT_RPC_URL"], env["QBIT_RPC_URL"],
+        "a URL with no userinfo is unchanged"
+    );
+}
+
 // --- artifact -------------------------------------------------------------
 
 fn sample_inputs() -> ArtifactInputs {
