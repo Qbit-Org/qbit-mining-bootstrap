@@ -352,19 +352,25 @@ async fn observed_readiness_failure_closes_cached_work_and_candidate_settlement(
                 proof.block_pass.then_some(proof)
             })
             .context("no constrained proof")?;
+        let context = &job.context;
+        let block_bytes = hex::decode(&proof.block_hex)?;
         let candidate = Candidate {
             block_hash: proof.block_hash_hex.clone(),
-            block_hex: proof.block_hex.clone(),
+            block_sha256: Candidate::block_digest_hex(&block_bytes),
             job_id: job.wire.job_id.clone(),
-            payout_revision: job.context.prepared.snapshot.payout_revision,
-            bundle: (*job.context.bundle).clone(),
-            coinbase_suffix_hex: Some(format!(
-                "{}{}{}",
-                hex::encode("/PRISM/"),
-                extra,
-                "00".repeat(8)
-            )),
+            payout_revision: context.prepared.snapshot.payout_revision,
+            window: context.prepared.window,
+            bootstrap_share: context.bootstrap_share.clone(),
+            found_block: context.bundle.found_block.clone(),
+            payout_policy: context.prepared.inputs.payout_policy.clone(),
+            ctv: context.prepared.inputs.ctv.clone(),
+            audit_builder_version: context.prepared.inputs.audit_builder_version,
+            signer_keys: context.prepared.inputs.signer_keys.clone(),
+            leased: false,
+            coinbase_suffix_hex: format!("{}{}{}", hex::encode("/PRISM/"), extra, "00".repeat(8)),
             deferred_share: None,
+            block_bytes,
+            as_issued_balances: Vec::new(),
         };
         coordinator.ledger.enqueue_candidate(candidate).await?;
         let claim = coordinator

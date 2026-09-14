@@ -11,7 +11,7 @@ use qbit_prism::{
 };
 use qbit_prism_server::ledger::{
     audit_canonical_bytes, BalanceSource, Candidate, CandidateClaim, IssuedJobSave, Ledger,
-    PreparedDependency, ShareRange, Snapshot, WindowError, WindowRef,
+    PreparedDependency, ShareRange, SignerKeys, Snapshot, WindowError, WindowRef,
 };
 use qbit_prism_test_gate as gate;
 use serde_json::{json, Value};
@@ -196,6 +196,8 @@ impl TestCandidate {
                 ..self.candidate
             },
             claim_token: token,
+            // A conflicting claim is never landed, so it needs no rebuilt parts.
+            parts: None,
         }
     }
 }
@@ -216,14 +218,50 @@ fn candidate(bundle: AuditBundle, payout_revision: i64, nonce: u32) -> Result<Te
     hash.reverse();
     block.push(1);
     block.extend(hex::decode(&report.coinbase_tx_hex)?);
+    let range = match (bundle.shares.first(), bundle.shares.last()) {
+        (Some(first), Some(last)) => Some(ShareRange {
+            first_share_seq: first.share_seq,
+            last_share_seq: last.share_seq,
+            share_count: u64::try_from(bundle.shares.len())?,
+            snapshot_sha256: Sha256::digest(serde_json::to_vec(&bundle.shares)?).into(),
+        }),
+        _ => None,
+    };
     let candidate = Candidate {
         block_hash: hex::encode(hash),
-        block_hex: hex::encode(block),
+        block_sha256: Candidate::block_digest_hex(&block),
         job_id: "job".into(),
         payout_revision,
-        bundle: bundle.clone(),
+        window: WindowRef {
+            anchor_ms: bundle.found_block.anchor_job_issued_at_ms,
+            prior_balances_digest: qbit_prism::prior_balances_digest(&bundle.prior_balances),
+            shares: range,
+        },
+        bootstrap_share: None,
+        found_block: bundle.found_block.clone(),
+        payout_policy: bundle.payout_policy.clone(),
+        ctv: None,
+        audit_builder_version: qbit_prism::AUDIT_BUILDER_VERSION,
+        signer_keys: SignerKeys {
+            manifest_key_hex: bundle
+                .signed_coinbase_manifest
+                .signature
+                .public_key_hex
+                .clone(),
+            ledger_key_hex: bundle
+                .ledger_window_attestation
+                .signature
+                .public_key_hex
+                .clone(),
+        },
+        leased: false,
+        coinbase_suffix_hex: bundle
+            .coinbase_script_sig_suffix_hex
+            .clone()
+            .unwrap_or_else(|| "00".repeat(12)),
         deferred_share: None,
-        coinbase_suffix_hex: None,
+        block_bytes: block,
+        as_issued_balances: Vec::new(),
     };
     Ok(TestCandidate { candidate, bundle })
 }
@@ -234,8 +272,8 @@ async fn claim(ledger: &Ledger, block: &TestCandidate) -> Result<CandidateClaim>
         .claim_candidate(60)
         .await?
         .context("enqueued candidate was not claimable")?;
-    ensure!(claim.candidate.block_hash == block.block_hash);
-    Ok(claim)
+    ensure!(claim.candidate.block_hash == block.candidate.block_hash);
+    Ok(claim.with_bundle(block.bundle.clone()))
 }
 
 async fn land_confirmed(ledger: &Ledger, block: &TestCandidate) -> Result<()> {

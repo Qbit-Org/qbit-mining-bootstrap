@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use qbit_prism::AcceptedShare;
 use qbit_prism_server::{
-    ledger::Ledger,
+    ledger::{Ledger, SignerKeys},
     metrics::{collectors, Metrics},
 };
 use qbit_prism_test_gate as gate;
@@ -18,6 +18,16 @@ use uuid::Uuid;
 /// `ORDER_LOCK` is scoped to the database, not to a test's throwaway schema,
 /// and the failure cases here hold it from a second session. Every gated test
 /// in this binary therefore runs one at a time.
+/// The signing keys `configure` pins alongside the fingerprint since #265.
+/// This suite measures lock and pool waits, not signing, so one fixed pair is
+/// enough; it only has to be the same pair on every call.
+fn signer_keys() -> SignerKeys {
+    SignerKeys {
+        manifest_key_hex: "11".repeat(32),
+        ledger_key_hex: "22".repeat(32),
+    }
+}
+
 static SERIAL: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(tokio::sync::Mutex::default);
 
 /// A short `lock_timeout` keeps the failure cases fast while staying far above
@@ -178,7 +188,7 @@ async fn recorded_by_outcome(database: &Database, pools: &mut Vec<PgPool>) -> Re
     let fingerprint = "wait-metrics-fingerprint";
     let before = metrics.render();
     for _ in 0..5 {
-        ledger.configure(fingerprint).await?;
+        ledger.configure(fingerprint, &signer_keys()).await?;
     }
     let after = metrics.render();
     assert_eq!(delta(&before, &after, POOL_SUCCESS), 5.);
@@ -194,9 +204,12 @@ async fn recorded_by_outcome(database: &Database, pools: &mut Vec<PgPool>) -> Re
     }
     let before = metrics.render();
     assert!(
-        tokio::time::timeout(Duration::from_millis(100), ledger.configure(fingerprint))
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            ledger.configure(fingerprint, &signer_keys())
+        )
+        .await
+        .is_err(),
         "the transaction must still be waiting for a connection"
     );
     let after = metrics.render();
@@ -209,14 +222,14 @@ async fn recorded_by_outcome(database: &Database, pools: &mut Vec<PgPool>) -> Re
     // Cancellation released the waiter: the pool works again once freed.
     drop(held);
     let before = metrics.render();
-    ledger.configure(fingerprint).await?;
+    ledger.configure(fingerprint, &signer_keys()).await?;
     assert_eq!(delta(&before, &metrics.render(), POOL_SUCCESS), 1.);
 
     // 9. A failed acquisition is recorded as a failure, not lost. Last,
     // because it closes the pool.
     ledger.pool.close().await;
     let before = metrics.render();
-    assert!(ledger.configure(fingerprint).await.is_err());
+    assert!(ledger.configure(fingerprint, &signer_keys()).await.is_err());
     assert_eq!(delta(&before, &metrics.render(), POOL_FAILURE), 1.);
     Ok(())
 }

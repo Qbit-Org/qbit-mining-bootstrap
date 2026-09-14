@@ -106,12 +106,9 @@ one line; the checker counts it once. An unwritable manifest fails the test.
 
 ## The expected list and the proof
 
-[test/prism-gated-tests.txt](../test/prism-gated-tests.txt) lists every gated
-test the `prism-native-postgres` job must execute, one id per line, sorted.
-The number of test ids in that file is the minimum count; see the file for
-the current list and the `check-gate-manifest` success line from
-[scripts/check_gate_manifest.py](../scripts/check_gate_manifest.py) for the
-count verified in a green run.
+`test/prism-gated-tests.txt` lists every gated test the `prism-native-postgres`
+job must execute, one id per line, sorted; 114 today. Its length is the minimum
+count.
 After the job's three `cargo test` invocations (the whole workspace with
 `--nocapture`, then the two explicit `--ignored` runs), it runs
 

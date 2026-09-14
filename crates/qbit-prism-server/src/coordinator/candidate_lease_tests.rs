@@ -54,10 +54,11 @@ const SHORT_LEASE: CandidateLease = CandidateLease {
     seconds: 1,
     interval: Duration::from_millis(100),
     timeout: Duration::from_millis(300),
+    rebuild_deadline: Duration::from_secs(60),
 };
 
 // Deliberately long ledger transactions share advisory locks across schemas.
-static TEST_LOCK: Mutex<()> = Mutex::const_new(());
+use super::test_serial::TEST_LOCK;
 
 #[derive(Default)]
 struct ReplyGate {
@@ -230,6 +231,9 @@ impl Fixture {
             )
             .await?;
         let snapshot = coordinator.ledger.snapshot(100).await?;
+        let window = WindowRef::from_snapshot(&snapshot)?;
+        let manifest_key = ManifestSigningKey::from_seed_hex(&"11".repeat(32))?;
+        let ledger_key = ManifestSigningKey::from_seed_hex(&"22".repeat(32))?;
         let bundle = qbit_prism::build_audit_bundle_with_coinbase_options(
             snapshot.shares,
             FoundBlock {
@@ -242,8 +246,8 @@ impl Fixture {
             qbit_prism::PayoutPolicy::day_one_default(),
             Some("00".repeat(12)),
             vec![],
-            &ManifestSigningKey::from_seed_hex(&"11".repeat(32))?,
-            &ManifestSigningKey::from_seed_hex(&"22".repeat(32))?,
+            &manifest_key,
+            &ledger_key,
         )?;
         let template = json!({"version":0x20000000u32,"bits":"207fffff","curtime":1_800_000_000u32,
             "previousblockhash":"aa".repeat(32),"transactions":[]});
@@ -271,16 +275,26 @@ impl Fixture {
                 proof.block_pass.then_some(proof)
             })
             .context("constrained block proof missing")?;
+        let block_bytes = hex::decode(&proof.block_hex)?;
         coordinator
             .ledger
             .enqueue_candidate(Candidate {
                 block_hash: proof.block_hash_hex,
-                block_hex: proof.block_hex,
+                block_sha256: Candidate::block_digest_hex(&block_bytes),
                 job_id: job.job_id,
                 payout_revision: snapshot.payout_revision,
-                bundle,
-                coinbase_suffix_hex: Some("00".repeat(12)),
+                window,
+                bootstrap_share: None,
+                found_block: bundle.found_block.clone(),
+                payout_policy: qbit_prism::PayoutPolicy::day_one_default(),
+                ctv: None,
+                audit_builder_version: qbit_prism::AUDIT_BUILDER_VERSION,
+                signer_keys: SignerKeys::of(&manifest_key, &ledger_key),
+                leased: false,
+                coinbase_suffix_hex: "00".repeat(12),
                 deferred_share: None,
+                block_bytes,
+                as_issued_balances: Vec::new(),
             })
             .await?;
         let claim = coordinator
