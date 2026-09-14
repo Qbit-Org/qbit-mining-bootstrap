@@ -1,7 +1,10 @@
 use crate::{
     codec,
     config::Config,
-    ledger::{BlockObservation, Candidate, CandidateClaim, HeartbeatHealth, Ledger, Snapshot},
+    ledger::{
+        BalanceSource, BlockObservation, Candidate, CandidateClaim, HeartbeatHealth, Ledger,
+        Snapshot, Window, WindowError, WindowRef,
+    },
     rpc::Rpc,
     stratum::{MiningBackend, MiningJob, StaleGrace, StratumError, Worker},
 };
@@ -46,6 +49,11 @@ pub struct Prepared {
     repair_probe: std::sync::Mutex<Option<Arc<prepared_storage::RepairProbe>>>,
     pub template: Value,
     pub snapshot: Arc<Snapshot>,
+    /// The reference for `snapshot`'s window, computed once per non-cached
+    /// refresh and carried with the work instead of being re-derived. #265's
+    /// next PR clones it at submit, so a found block never re-digests the
+    /// window on the share path.
+    pub window: WindowRef,
     pub bundle: Option<Arc<AuditBundle>>,
     pub base_wire: Option<codec::Job>,
     pub storage_key: String,
@@ -97,6 +105,12 @@ pub struct Coordinator {
     work_ledger: Arc<dyn work_ledger::WorkLedger>,
     pub last_error: RwLock<Option<String>>,
     build_slots: Arc<Semaphore>,
+    /// Bounds how many `Ledger::read_window` calls hold a pool connection at
+    /// once. `build_slots` alone does not: `PRISM_JOB_BUILD_EXECUTOR_WORKERS`
+    /// may exceed `PRISM_DATABASE_MAX_CONNECTIONS`, and the pool is shared with
+    /// share appends and the candidate-lease heartbeat, which must not wait out
+    /// the 15 s acquire timeout behind a multi-page read.
+    window_reads: Arc<Semaphore>,
     refresh_lock: Mutex<()>,
     identities: Mutex<HashMap<String, (Worker, Instant)>>,
     chain_cache: Mutex<Option<ChainCache>>,
@@ -131,6 +145,24 @@ const CANDIDATE_LEASE: CandidateLease = CandidateLease {
     interval: Duration::from_secs(30),
     timeout: Duration::from_secs(5),
 };
+
+/// How many `Ledger::read_window` calls may hold a pool connection at once:
+/// `clamp(database_max_connections - 2, 1, build_workers)`.
+///
+/// Two connections are always left over, so a share append and the
+/// candidate-lease heartbeat never wait out the pool's 15 s acquire timeout
+/// behind multi-page window reads; a failed heartbeat drops recoverable claim
+/// work. The ceiling is `build_workers`, because a caller holds its
+/// `build_slots` permit across the read, so no more reads can be in flight
+/// than there are build slots. The floor is 1: one read at a time still makes
+/// progress, and `PRISM_DATABASE_MAX_CONNECTIONS` can be as low as 4 while the
+/// pool itself is opened with at least 2 connections.
+fn window_read_permits(database_connections: u32, build_workers: usize) -> usize {
+    usize::try_from(database_connections)
+        .unwrap_or(usize::MAX)
+        .saturating_sub(2)
+        .clamp(1, build_workers.max(1))
+}
 
 fn protocol_error(reason: &'static str, message: &str) -> StratumError {
     let code = match reason {
@@ -348,6 +380,10 @@ impl Coordinator {
         Ok(Arc::new(Self {
             metrics,
             build_slots: Arc::new(Semaphore::new(config.build_workers)),
+            window_reads: Arc::new(Semaphore::new(window_read_permits(
+                config.database_connections,
+                config.build_workers,
+            ))),
             config: Arc::new(config),
             submit_ledger: ledger.clone(),
             work_ledger: ledger.clone(),
@@ -620,23 +656,36 @@ impl Coordinator {
             }
         }
         let snapshot = Arc::new(self.work_ledger.snapshot(network).await?);
-        let bundle = if snapshot.shares.is_empty() {
-            None
+        // The reference is computed once per non-cached refresh and travels
+        // with the work; submit clones it rather than re-digesting the window
+        // on the share path (#265's next PR).
+        let (bundle, window) = if snapshot.shares.is_empty() {
+            // An empty window reaches only the O(recipients) balances digest,
+            // microseconds, so it stays on this thread.
+            (None, WindowRef::from_snapshot(&snapshot)?)
         } else {
-            Some(Arc::new(
-                self.build_bundle(
-                    snapshot.clone(),
-                    template.clone(),
-                    None,
-                    format!(
-                        "{}{}",
-                        hex::encode(&self.config.coinbase_tag),
-                        "00".repeat(4 + self.config.extranonce2_size)
-                    ),
-                    fee,
-                )
-                .await?,
-            ))
+            // Serializing and hashing the window is 0.7 to 1.4 s of blocking
+            // work at 400,000 shares. Run it beside the bundle build rather
+            // than after it, so it adds no wait of its own; `refresh_lock`
+            // already makes refresh single-flight, and this takes no
+            // `build_slots` permit.
+            let reference = {
+                let snapshot = snapshot.clone();
+                tokio::task::spawn_blocking(move || WindowRef::from_snapshot(&snapshot))
+            };
+            let build = self.build_bundle(
+                snapshot.clone(),
+                template.clone(),
+                None,
+                format!(
+                    "{}{}",
+                    hex::encode(&self.config.coinbase_tag),
+                    "00".repeat(4 + self.config.extranonce2_size)
+                ),
+                fee,
+            );
+            let (built, reference) = tokio::join!(build, reference);
+            (Some(Arc::new(built?)), reference??)
         };
         let base_wire = if let Some(bundle) = &bundle {
             let template = template.clone();
@@ -758,6 +807,7 @@ impl Coordinator {
             repair_probe: Default::default(),
             template,
             snapshot,
+            window,
             bundle,
             base_wire,
             storage_key,
@@ -770,6 +820,50 @@ impl Coordinator {
         readiness.last_poll = Some(Instant::now());
         self.refresh.send_replace(generation);
         Ok(())
+    }
+
+    /// Read a referenced window under a `window_reads` permit.
+    ///
+    /// The one entry point callers use. The design record's order is: the
+    /// caller takes its own `build_slots` permit **first** and holds it across
+    /// this read and the rebuild that follows; the `window_reads` permit is
+    /// taken after it and released as soon as the read returns, before the
+    /// rebuild, so at least two pool connections always stay free. Waiting for
+    /// it counts against the caller's deadline.
+    ///
+    /// The permit is owned and handed to `Ledger::read_window_with_permit`,
+    /// which holds it across the whole read, including the off-runtime cleanup
+    /// a cancellation leaves behind, and releases it the moment the read
+    /// returns. `Ledger::read_window` is awaited there on the runtime, never
+    /// wrapped in `spawn_blocking`: it owns its own blocking hand-offs, one per
+    /// page, and an outer blocking wrapper would starve them.
+    ///
+    /// The claim rebuild calls this under its 60 s deadline and the
+    /// `build_slots` permit it already holds.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the claim rebuild that calls it lands with the candidate switch"
+        )
+    )]
+    async fn read_window(
+        &self,
+        window: &WindowRef,
+        balances: BalanceSource,
+    ) -> Result<Window, WindowError> {
+        // Nothing closes this semaphore; a closed one could only mean the
+        // process is shutting down, which callers treat as transient exactly
+        // as they treat a closed pool.
+        let permit = self
+            .window_reads
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| WindowError::Database(sqlx::Error::PoolClosed))?;
+        self.ledger
+            .read_window_with_permit(window, balances, permit)
+            .await
     }
 
     async fn build_bundle(
@@ -1537,8 +1631,16 @@ impl MiningBackend for Coordinator {
             let Some(payload) = self.work_ledger.job(&stored.prepared_key).await? else {
                 return Ok(None);
             };
-            let prepared: Arc<StoredPrepared> =
-                tokio::task::spawn_blocking(move || serde_json::from_value(payload)).await??;
+            // The decode already runs off the runtime, and the reference is
+            // whole-window work over the snapshot it produces, so both happen
+            // in the one blocking task. #273 replaces this with the reference
+            // the stored payload will carry.
+            let (prepared, window) = tokio::task::spawn_blocking(move || {
+                let prepared: Arc<StoredPrepared> = serde_json::from_value(payload)?;
+                let window = WindowRef::from_snapshot(&prepared.snapshot)?;
+                Ok::<_, anyhow::Error>((prepared, window))
+            })
+            .await??;
             let current = self
                 .prepared
                 .read()
@@ -1622,6 +1724,7 @@ impl MiningBackend for Coordinator {
                 repair_probe: Default::default(),
                 template: prepared.template.clone(),
                 snapshot: prepared.snapshot.clone(),
+                window,
                 bundle: Some(bundle.clone()),
                 base_wire: None,
                 storage_key: stored.prepared_key,
@@ -1769,3 +1872,6 @@ mod d2_bootstrap_tests;
 
 #[cfg(test)]
 mod d2_test_support;
+
+#[cfg(test)]
+mod window_ref_tests;
