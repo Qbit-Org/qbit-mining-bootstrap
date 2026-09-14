@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import tempfile
 
+from prism_pool_wait_scenarios import TITLE as POOL_WAIT_TITLE, pool_wait_tests
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -27,6 +29,8 @@ def main():
                               "docs/prism-postgres-alert-rules.json"]
              for rule in load(path)["rules"]]
     expressions = {rule["title"]: rule["expr"].replace("__NETWORK__", "mainnet") for rule in rules}
+    pool_rule = next(rule for rule in rules if rule["title"] == POOL_WAIT_TITLE)
+    pool_alert, pool_tests = pool_wait_tests(pool_rule, expressions[POOL_WAIT_TITLE])
     tests = []
     for scenario in json.loads(args.scenarios.read_text()):
         tests.append({
@@ -48,6 +52,8 @@ def main():
         # JSON is valid YAML; no Python YAML dependency is needed by this check.
         checked_rules = [{"record": "prism_contract_" + name.replace(" ", "_"), "expr": expr}
                          for name, expr in expressions.items()]
+        checked_rules.append(pool_alert)
+        tests.extend(pool_tests)
         for rule in load("docs/prism-postgres-alert-rules.json")["rules"]:
             assert rule["evaluator"] == "gt" and rule["threshold"] == 0
             checked_rules.append({"alert": rule["title"], "expr": f"({expressions[rule['title']]}) > 0",
@@ -60,7 +66,8 @@ def main():
         subprocess.run([args.promtool, "check", "rules", str(path / "rules.yml")], check=True)
         subprocess.run([args.promtool, "test", "rules", str(path / "tests.yml")], check=True)
     print(f"{len(rules)} expressions; {len(tests)} scenarios; "
-          f"{sum(len(test['promql_expr_test']) for test in tests)} assertions passed")
+          f"{sum(len(test['promql_expr_test']) for test in tests)} expression assertions; "
+          f"{sum(len(test.get('alert_rule_test', [])) for test in tests)} alert assertions passed")
 
 
 if __name__ == "__main__":

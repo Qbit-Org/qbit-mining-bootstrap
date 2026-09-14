@@ -510,7 +510,7 @@
       "uid": "qbit-prism-database-pool-wait",
       "title": "PrismDatabasePoolWaitHigh",
       "role": "run",
-      "expr": "((histogram_quantile(0.99, sum by (job, instance, network, le) (rate(qbit_prism_database_pool_acquire_seconds_bucket{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m]))) > bool 0.5) and on(job, instance, network) (sum by (job, instance, network) (increase(qbit_prism_database_pool_acquire_seconds_count{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m])) >= 10)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0)) and on(job, instance, network) (qbit_prism_collector_available{job=\"qbit-prism\",network=\"__NETWORK__\",collector=\"database\"} == 1)",
+      "expr": "((histogram_quantile(0.99, sum by (job, instance, network, le) (rate(qbit_prism_database_pool_acquire_seconds_bucket{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m]))) > bool 0.5) and on(job, instance, network) (sum by (job, instance, network) (increase(qbit_prism_database_pool_acquire_seconds_count{job=\"qbit-prism\",network=\"__NETWORK__\"}[5m])) >= 10)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))",
       "condition_type": "threshold",
       "evaluator": "gt",
       "threshold": 0,
