@@ -794,9 +794,47 @@ two-hour cutover soak, which reads its own criteria from the same registry.
    histogram at hours 1, 12 and 24 for the latency comparison:
 
    ```sh
-   docker exec "$c" curl -sS --max-time 5 http://127.0.0.1:3341/metrics \
-     | grep -E '^qbit_prism_share_ack_seconds' > "$run/share-ack-h01.txt"
+   share_ack_snapshot() (
+     snapshot=$1
+     metrics=$(docker exec "$c" curl -fsS --max-time 5 -D - http://127.0.0.1:3341/metrics) || {
+       echo "share-ack snapshot failed: metrics scrape failed" >&2
+       exit 1
+     }
+     lines=$(printf '%s\n' "$metrics" | awk '
+       BEGIN { in_headers = 1 }
+       { sub(/\r$/, "") }
+       in_headers {
+         headers = headers $0 "\n"
+         if (tolower($0) == "x-prism-metrics-state: fresh") fresh = 1
+         if ($0 == "") in_headers = 0
+         next
+       }
+       /^qbit_prism_share_ack_seconds_(bucket|sum|count)[{ ]/ { histogram = histogram $0 "\n" }
+       END {
+         if (!fresh || histogram == "") exit 1
+         printf "%s%s", headers, histogram
+       }') || {
+       echo "share-ack snapshot failed: fresh state header and histogram required" >&2
+       exit 1
+     }
+     if ! printf '%s\n' "$lines" > "$snapshot.tmp" || ! mv "$snapshot.tmp" "$snapshot"; then
+       echo "share-ack snapshot failed: could not publish $snapshot" >&2
+       exit 1
+     fi
+   )
+   share_ack_snapshot "$run/share-ack-h01.txt"
    ```
+
+   At hours 12 and 24, call the same function with
+   `"$run/share-ack-h12.txt"` and `"$run/share-ack-h24.txt"`, respectively.
+   Each file keeps the response headers and the histogram from the same
+   successful scrape. A cached response can return HTTP 200 with a `stale`
+   or `unavailable` state, so the function requires the `fresh` header before
+   writing anything. It publishes the snapshot by renaming a completed
+   temporary file; a failed write leaves no partial snapshot at the final
+   name. Use only the final `.txt` files for the latency comparison. If any
+   call fails, the run lacks usable latency evidence: keep its directory
+   and repeat the soak from step 2.
 
 4. **Snapshot** the full `/metrics` body, headers included, at hour 1 (the
    baseline), hour 24, and at any breach:

@@ -126,6 +126,7 @@ def fence_containing(needle: str) -> str:
 CAPTURE = fence_containing("capture() {")
 GATE = fence_containing("completed() {")
 JUDGE = fence_containing("min_span=82800")
+SHARE_ACK = fence_containing('"$run/share-ack-h01.txt"')
 assert CAPTURE.count(PLACEHOLDER) == 1
 assert GATE.endswith("}\ncompleted\n")
 
@@ -176,6 +177,70 @@ class SoakRun:
 
 
 COMPLETE_LINE = "T+86400: soak complete, the samples from 0 to 86400 span 86400 s"
+
+
+class ShareAckSnapshotTests(unittest.TestCase):
+    HISTOGRAM = (
+        'qbit_prism_share_ack_seconds_bucket{result="accepted",le="+Inf"} 5\n'
+        'qbit_prism_share_ack_seconds_sum{result="accepted"} 0.1\n'
+        'qbit_prism_share_ack_seconds_count{result="accepted"} 5\n'
+    )
+
+    def snapshot(
+        self, shell: str, state: str | None, *, status: int = 0, histogram: bool = True,
+    ) -> tuple[subprocess.CompletedProcess[str], str | None]:
+        with tempfile.TemporaryDirectory(prefix="share-ack-snapshot-") as directory:
+            work = Path(directory)
+            headers = "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n"
+            if state is not None:
+                headers += f"x-prism-metrics-state: {state}\r\n"
+            body = "qbit_prism_connections 3\n" + (self.HISTOGRAM if histogram else "")
+            (work / "response").write_bytes((headers + "\r\n" + body).encode())
+            # Like curl, the stub includes headers only when asked with -D -.
+            script = r'''
+docker() {
+  case " $* " in
+    *" -D - "*) cat response ;;
+    *) sed '1,/^\r$/d' response ;;
+  esac
+  return "$SCRAPE_STATUS"
+}
+c=stub-container
+run=.
+''' + SHARE_ACK
+            result = subprocess.run(
+                [shell, "-c", script], cwd=work, capture_output=True, text=True,
+                env={**os.environ, "SCRAPE_STATUS": str(status)}, timeout=10,
+            )
+            target = work / "share-ack-h01.txt"
+            return result, target.read_text() if target.exists() else None
+
+    def test_fresh_snapshot_keeps_headers_and_histogram(self) -> None:
+        for shell in ("sh", "bash"):
+            with self.subTest(shell=shell):
+                result, snapshot = self.snapshot(shell, "fresh")
+                self.assertEqual((result.returncode, result.stderr), (0, ""))
+                self.assertEqual(
+                    snapshot,
+                    "HTTP/1.1 200 OK\ncontent-type: text/plain\n"
+                    "x-prism-metrics-state: fresh\n\n" + self.HISTOGRAM,
+                )
+
+    def test_stale_unavailable_or_missing_header_publishes_no_snapshot(self) -> None:
+        for shell in ("sh", "bash"):
+            for state in ("stale", "unavailable", None):
+                with self.subTest(shell=shell, state=state):
+                    result, snapshot = self.snapshot(shell, state)
+                    self.assertNotEqual(result.returncode, 0, result)
+                    self.assertIsNone(snapshot)
+
+    def test_failed_scrape_or_missing_histogram_publishes_no_snapshot(self) -> None:
+        for shell in ("sh", "bash"):
+            for status, histogram in ((28, True), (22, False), (0, False)):
+                with self.subTest(shell=shell, status=status, histogram=histogram):
+                    result, snapshot = self.snapshot(shell, "fresh", status=status, histogram=histogram)
+                    self.assertNotEqual(result.returncode, 0, result)
+                    self.assertIsNone(snapshot)
 
 
 class SoakCaptureTests(unittest.TestCase):
