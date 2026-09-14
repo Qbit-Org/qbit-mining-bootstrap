@@ -2344,6 +2344,65 @@ async fn require_release_schema(
     Ok(())
 }
 
+/// Version rows are trusted only after their storage and behavior are checked.
+/// Read catalogs before querying rows so RLS, views and rewrite rules cannot
+/// influence source classification. Native history permits no extra behavior.
+async fn require_migration_history(connection: &mut sqlx::PgConnection) -> Result<()> {
+    let valid: bool = sqlx::query_scalar(
+        r#"SELECT EXISTS (
+            SELECT 1 FROM pg_class c JOIN pg_am am ON am.oid=c.relam
+            WHERE c.oid=to_regclass('qbit_prism_schema_migrations')
+              AND c.relnamespace=current_schema()::regnamespace
+              AND c.relkind='r' AND c.relpersistence='p' AND am.amname='heap'
+              AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
+              AND NOT EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid)
+              AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid=c.oid)
+              AND NOT EXISTS (SELECT 1 FROM pg_rewrite WHERE ev_class=c.oid)
+              AND NOT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid=c.oid)
+              AND (SELECT count(*) FROM pg_attribute WHERE attrelid=c.oid AND attnum>0 AND NOT attisdropped)=2
+              AND EXISTS (
+                  SELECT 1 FROM pg_attribute a
+                  WHERE a.attrelid=c.oid AND a.attname='version' AND NOT a.attisdropped
+                    AND a.atttypid='pg_catalog.int4'::regtype AND a.atttypmod=-1
+                    AND a.attnotnull AND a.attidentity='' AND a.attgenerated=''
+                    AND NOT EXISTS (SELECT 1 FROM pg_attrdef WHERE adrelid=c.oid AND adnum=a.attnum)
+              )
+              AND EXISTS (
+                  SELECT 1 FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+                  WHERE a.attrelid=c.oid AND a.attname='applied_at' AND NOT a.attisdropped
+                    AND a.atttypid='pg_catalog.timestamptz'::regtype AND a.atttypmod=-1
+                    AND a.attnotnull AND a.attidentity='' AND a.attgenerated=''
+                    AND pg_get_expr(d.adbin,d.adrelid) IN ('clock_timestamp()', 'pg_catalog.clock_timestamp()')
+                    AND NOT EXISTS (
+                        SELECT 1 FROM pg_depend dep WHERE dep.classid='pg_attrdef'::regclass
+                          AND dep.objid=d.oid AND dep.refclassid='pg_proc'::regclass
+                          AND dep.refobjid<>'pg_catalog.clock_timestamp()'::regprocedure
+                    )
+              )
+              AND (SELECT count(*) FROM pg_constraint WHERE conrelid=c.oid OR confrelid=c.oid)=1
+              AND (SELECT count(*) FROM pg_index WHERE indrelid=c.oid)=1
+              AND EXISTS (
+                  SELECT 1 FROM pg_constraint k JOIN pg_index i ON i.indexrelid=k.conindid
+                  JOIN pg_attribute a ON a.attrelid=c.oid AND a.attname='version' AND NOT a.attisdropped
+                  JOIN pg_opclass op ON op.oid=i.indclass[0]
+                  JOIN pg_am iam ON iam.oid=op.opcmethod
+                  WHERE k.conrelid=c.oid AND k.contype='p' AND k.convalidated
+                    AND NOT k.condeferrable AND NOT k.condeferred AND k.conkey=ARRAY[a.attnum]
+                    AND i.indrelid=c.oid AND i.indisprimary AND i.indisunique
+                    AND i.indisvalid AND i.indisready AND i.indislive
+                    AND i.indnatts=1 AND i.indnkeyatts=1 AND i.indkey[0]=a.attnum
+                    AND i.indexprs IS NULL AND i.indpred IS NULL
+                    AND op.opcnamespace='pg_catalog'::regnamespace
+                    AND op.opcname='int4_ops' AND iam.amname='btree'
+              )
+        )"#,
+    ).fetch_one(connection).await?;
+    ensure!(valid,
+        "refusing qbit_prism_schema_migrations before any DDL: migration history must have the native logged-table, version primary-key and applied_at definitions, without extra columns, constraints, indexes, triggers, rules, inheritance or row security. Nothing was changed. Restore the full backup or review and repair the history table before starting or migrating again"
+    );
+    Ok(())
+}
+
 /// Apply the base schema and every native migration inside the caller's
 /// transaction, which holds the migration lock throughout. Refusals happen
 /// before any DDL or roll the transaction back, so a refused database is
@@ -2355,7 +2414,19 @@ pub(super) async fn migrate_schema(
 ) -> Result<()> {
     lock(tx, MIGRATION_LOCK, metrics).await?;
     require_source_schema_resolution(tx).await?;
-    sqlx::raw_sql("CREATE TABLE IF NOT EXISTS qbit_prism_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())").execute(&mut **tx).await?;
+    let history_exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('qbit_prism_schema_migrations') IS NOT NULL")
+            .fetch_one(&mut **tx)
+            .await?;
+    if history_exists {
+        sqlx::query("LOCK TABLE ONLY qbit_prism_schema_migrations IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut **tx)
+            .await
+            .context("refusing qbit_prism_schema_migrations before any DDL: cannot lock the migration-history table for validation")?;
+        require_migration_history(&mut *tx).await?;
+    } else {
+        sqlx::raw_sql("CREATE TABLE qbit_prism_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())").execute(&mut **tx).await?;
+    }
     // Each applied migration is tracked on its own, not as a high-water mark:
     // 007 is reserved by an independent workstream, so a later number must
     // not hide an earlier gap. Every step runs when its own version is
@@ -2364,6 +2435,10 @@ pub(super) async fn migrate_schema(
         sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations ORDER BY version")
             .fetch_all(&mut **tx)
             .await?;
+    ensure!(
+        !history_exists || versions.contains(&3),
+        "refusing a non-native qbit_prism_schema_migrations before any DDL: a fresh or 2.x.x source cannot already contain native migration history without migration 3. Nothing was changed. Restore the full backup, or review and move the pre-existing object aside before migrating again"
+    );
     // The highest migration recorded before this run, which the source
     // record keeps as `prior_schema_version`.
     let prior_version = versions.iter().copied().max().unwrap_or(0);
@@ -2570,9 +2645,11 @@ pub(super) async fn require_schema_version(pool: &PgPool) -> Result<()> {
         "database has no native PRISM schema (qbit_prism_schema_migrations is missing) and this server requires schema migrations {}: run `qbit-prism-server migrate`, or start with PRISM_POSTGRES_INIT_SCHEMA=1, after draining the 2.x.x deployment",
         schema_version_list(REQUIRED_SCHEMA_VERSIONS)
     );
+    let mut connection = pool.acquire().await?;
+    require_migration_history(&mut connection).await?;
     let applied: Vec<i32> =
         sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations ORDER BY version")
-            .fetch_all(pool)
+            .fetch_all(&mut *connection)
             .await?;
     let missing: Vec<i32> = REQUIRED_SCHEMA_VERSIONS
         .iter()

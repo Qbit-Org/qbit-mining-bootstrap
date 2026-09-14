@@ -3571,6 +3571,96 @@ async fn native_record_with_3_and_not_2_is_refused_before_any_ddl_and_not_repair
     db.close(vec![earlier, migrated]).await
 }
 
+/// A pre-existing history table is not part of either frozen 2.x release.
+/// A trigger that swallows INSERT must never leave native DDL committed.
+#[tokio::test]
+async fn non_native_source_refuses_preexisting_migration_history() -> Result<()> {
+    for state in [
+        SourceState::Fresh,
+        SourceState::Pre258,
+        SourceState::Applied258,
+    ] {
+        for alteration in [
+            "CREATE FUNCTION operator_skip_history() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$; CREATE TRIGGER skip_history BEFORE INSERT ON qbit_prism_schema_migrations FOR EACH ROW EXECUTE FUNCTION operator_skip_history()",
+            "CREATE RULE skip_history AS ON INSERT TO qbit_prism_schema_migrations DO INSTEAD NOTHING",
+            "",
+        ] {
+            let Some(db) = Database::open().await? else { return Ok(()); };
+            let pool = PgPool::connect(&db.url).await?;
+            if state != SourceState::Fresh {
+                apply_frozen_2x_schema(&pool, state).await?;
+            }
+            sqlx::raw_sql("CREATE TABLE qbit_prism_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())")
+                .execute(&pool).await?;
+            sqlx::raw_sql(alteration).execute(&pool).await?;
+            let objects = schema_objects(&pool).await?;
+            let error = db.ledger("history-check").await.err()
+                .context("migration accepted a non-native history table")?;
+            assert_eq!(schema_objects(&pool).await?, objects, "migration committed DDL despite the invalid history table");
+            assert!(schema_versions(&pool).await?.is_empty());
+            let error = format!("{error:#}");
+            assert!(error.contains("qbit_prism_schema_migrations") && error.contains("before any DDL"), "{error}");
+            // Move the operator-owned table aside; its rows and behavior remain.
+            sqlx::raw_sql("ALTER TABLE qbit_prism_schema_migrations RENAME TO operator_preserved_history")
+                .execute(&pool).await?;
+            let migrated = db.ledger("history-check").await?;
+            assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+            assert_eq!(migrated.migration_source().await?.context("source")?.source_state, state.as_str());
+            pool.close().await;
+            db.close(vec![migrated]).await?;
+        }
+    }
+    Ok(())
+}
+
+/// History must be an ordinary table with exactly the native definition and
+/// no write/read behavior layered on it, even if its version rows look valid.
+#[tokio::test]
+async fn native_migration_history_drift_is_refused_before_later_ddl() -> Result<()> {
+    for (alteration, repair) in [
+        ("CREATE FUNCTION operator_skip_history() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$; CREATE TRIGGER skip_history BEFORE INSERT ON qbit_prism_schema_migrations FOR EACH ROW EXECUTE FUNCTION operator_skip_history()", "DROP TRIGGER skip_history ON qbit_prism_schema_migrations"),
+        ("CREATE RULE skip_history AS ON INSERT TO qbit_prism_schema_migrations DO INSTEAD NOTHING", "DROP RULE skip_history ON qbit_prism_schema_migrations"),
+        ("ALTER TABLE qbit_prism_schema_migrations ENABLE ROW LEVEL SECURITY; ALTER TABLE qbit_prism_schema_migrations FORCE ROW LEVEL SECURITY; CREATE POLICY hide_history ON qbit_prism_schema_migrations USING (false)", "DROP POLICY hide_history ON qbit_prism_schema_migrations; ALTER TABLE qbit_prism_schema_migrations DISABLE ROW LEVEL SECURITY; ALTER TABLE qbit_prism_schema_migrations NO FORCE ROW LEVEL SECURITY"),
+        ("CREATE POLICY hide_history ON qbit_prism_schema_migrations USING (false)", "DROP POLICY hide_history ON qbit_prism_schema_migrations"),
+        ("ALTER TABLE qbit_prism_schema_migrations ADD COLUMN operator_extra integer", "ALTER TABLE qbit_prism_schema_migrations DROP COLUMN operator_extra"),
+        ("ALTER TABLE qbit_prism_schema_migrations ALTER COLUMN applied_at SET DEFAULT now()", "ALTER TABLE qbit_prism_schema_migrations ALTER COLUMN applied_at SET DEFAULT clock_timestamp()"),
+        ("ALTER TABLE qbit_prism_schema_migrations ALTER COLUMN version TYPE bigint", "ALTER TABLE qbit_prism_schema_migrations ALTER COLUMN version TYPE integer"),
+        ("ALTER TABLE qbit_prism_schema_migrations ADD CONSTRAINT operator_limit CHECK(version<>9)", "ALTER TABLE qbit_prism_schema_migrations DROP CONSTRAINT operator_limit"),
+        ("CREATE INDEX operator_history_index ON qbit_prism_schema_migrations((version+1))", "DROP INDEX operator_history_index"),
+        ("CREATE TABLE operator_child_history() INHERITS(qbit_prism_schema_migrations)", "ALTER TABLE operator_child_history NO INHERIT qbit_prism_schema_migrations"),
+        ("CREATE TABLE operator_history_refs(version integer REFERENCES qbit_prism_schema_migrations(version))", "ALTER TABLE operator_history_refs DROP CONSTRAINT operator_history_refs_version_fkey"),
+        ("ALTER TABLE qbit_prism_schema_migrations DROP CONSTRAINT qbit_prism_schema_migrations_pkey", "ALTER TABLE qbit_prism_schema_migrations ADD PRIMARY KEY(version)"),
+        ("ALTER TABLE qbit_prism_schema_migrations SET UNLOGGED", "ALTER TABLE qbit_prism_schema_migrations SET LOGGED"),
+    ] {
+        let Some(db) = Database::open().await? else { return Ok(()); };
+        let pool = PgPool::connect(&db.url).await?;
+        let earlier = db.ledger("earlier").await?;
+        let source = earlier.migration_source().await?;
+        undo_009(&pool).await?;
+        sqlx::raw_sql(alteration).execute(&pool).await?;
+        let objects = schema_objects(&pool).await?;
+        let rows: Vec<Value> = sqlx::query_scalar("SELECT to_jsonb(m) FROM qbit_prism_schema_migrations m ORDER BY version")
+            .fetch_all(&pool).await?;
+        for initialize in [true, false] {
+            let error = Ledger::connect(&db.url, "history-check".into(), 8, initialize).await.err()
+                .with_context(|| format!("accepted history drift: {alteration}"))?;
+            let error = format!("{error:#}");
+            assert!(error.contains("qbit_prism_schema_migrations"), "{error}");
+            if initialize { assert!(error.contains("before any DDL"), "{error}"); }
+            assert_eq!(schema_objects(&pool).await?, objects, "{alteration}");
+            assert_eq!(sqlx::query_scalar::<_,Value>("SELECT to_jsonb(m) FROM qbit_prism_schema_migrations m ORDER BY version").fetch_all(&pool).await?, rows);
+            assert_eq!(earlier.migration_source().await?, source);
+        }
+        sqlx::raw_sql(repair).execute(&pool).await?;
+        let migrated = db.ledger("history-check").await?;
+        assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+        assert_eq!(migrated.migration_source().await?, source);
+        pool.close().await;
+        db.close(vec![earlier, migrated]).await?;
+    }
+    Ok(())
+}
+
 /// A pre-006 native database cannot already have source metadata: even a
 /// complete table could carry provenance this migration did not establish.
 #[tokio::test]

@@ -410,6 +410,14 @@ backup, or, once every object 002 creates is verified present, record it by
 hand (`INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)`) and
 migrate again.
 
+Migration history itself is validated before its rows are trusted at startup
+or migration. `qbit_prism_schema_migrations` must retain its native logged-table,
+integer primary-key and timestamp definitions, without extra columns,
+constraints, indexes, triggers, rules, inheritance or row security. A fresh
+or 2.x.x source must not already hold this table without migration 3. Refusal
+leaves the database unchanged; restore the full backup or review and repair
+the history table (move a non-native object aside) before retrying.
+
 **What was migrated.** After a successful migration
 `qbit_prism_migration_source` holds one row: the accepted source state
 (`pre_258`, `258_applied`, `fresh`, or `native` for a database that was
