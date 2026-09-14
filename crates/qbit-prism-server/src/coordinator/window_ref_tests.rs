@@ -365,8 +365,10 @@ async fn the_entry_point_holds_a_window_read_permit_only_while_it_reads() -> Res
                 .map(|window| window.shares.len())
         });
         ensure!(
-            tokio::time::timeout(Duration::from_millis(500), async {
-                // The read must not begin while the only permit is held.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                // The read must not begin while the only permit is held: give
+                // it 500 ms in which it would finish if it did not wait.
+                tokio::time::sleep(Duration::from_millis(500)).await;
             })
             .await
             .is_ok(),
