@@ -1,10 +1,43 @@
 //! Work preparation I/O; orchestration and miner decisions stay in Coordinator.
 use super::*;
-use crate::ledger::{IssuedJobSave, PoolBlock, PreparedDependency};
+use crate::ledger::{
+    CompactPrepared, IssuedJobSave, PayoutState, PoolBlock, PreparedDependency, PreparedTemplate,
+    StoredCompactPrepared,
+};
 use futures_util::future::BoxFuture;
 
 pub(super) trait WorkLedger: Send + Sync {
+    // Instrument the real coordinator-owned cleanup, not the fake reader's drop.
+    #[cfg(test)]
+    fn compact_drop_probe(&self) -> Option<prepared_storage::compact::CompactDropProbe> {
+        None
+    }
     fn payout_revision(&self) -> BoxFuture<'_, Result<i64>>;
+    // Additive compact-prepared seam; runtime callers still use inline jobs.
+    #[allow(dead_code)]
+    fn payout_state(&self) -> BoxFuture<'_, Result<PayoutState, WindowError>>;
+    #[allow(dead_code)]
+    fn read_window_with_permit<'a>(
+        &'a self,
+        window: &'a WindowRef,
+        balances: BalanceSource,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> BoxFuture<'a, Result<Window, WindowError>>;
+    #[allow(dead_code, clippy::too_many_arguments)]
+    fn save_compact_prepared<'a>(
+        &'a self,
+        key: &'a str,
+        record: &'a CompactPrepared,
+        template: &'a PreparedTemplate,
+        balances: &'a [qbit_prism::CarryForwardBalance],
+        expected_current_revision: i64,
+        expires_at_ms: i64,
+    ) -> BoxFuture<'a, Result<bool>>;
+    #[allow(dead_code)]
+    fn compact_prepared<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<StoredCompactPrepared>>>;
     fn observe_chain_view<'a>(
         &'a self,
         tip: &'a str,
@@ -45,6 +78,44 @@ pub(super) trait WorkLedger: Send + Sync {
 impl WorkLedger for Ledger {
     fn payout_revision(&self) -> BoxFuture<'_, Result<i64>> {
         Box::pin(Ledger::payout_revision(self))
+    }
+    fn payout_state(&self) -> BoxFuture<'_, Result<PayoutState, WindowError>> {
+        Box::pin(Ledger::payout_state(self))
+    }
+    fn read_window_with_permit<'a>(
+        &'a self,
+        window: &'a WindowRef,
+        balances: BalanceSource,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> BoxFuture<'a, Result<Window, WindowError>> {
+        Box::pin(Ledger::read_window_with_permit(
+            self, window, balances, permit,
+        ))
+    }
+    fn save_compact_prepared<'a>(
+        &'a self,
+        key: &'a str,
+        record: &'a CompactPrepared,
+        template: &'a PreparedTemplate,
+        balances: &'a [qbit_prism::CarryForwardBalance],
+        expected_current_revision: i64,
+        expires_at_ms: i64,
+    ) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(Ledger::save_compact_prepared(
+            self,
+            key,
+            record,
+            template,
+            balances,
+            expected_current_revision,
+            expires_at_ms,
+        ))
+    }
+    fn compact_prepared<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<StoredCompactPrepared>>> {
+        Box::pin(Ledger::compact_prepared(self, key))
     }
     fn observe_chain_view<'a>(
         &'a self,

@@ -2,6 +2,10 @@
 use super::*;
 use crate::ledger::{IssuedJobSave, PreparedDependency};
 
+// Preparatory only: no refresh, resume or issued-publication caller yet.
+#[allow(dead_code)]
+pub(super) mod compact;
+
 impl Coordinator {
     pub(super) async fn save_issued_record(
         &self,

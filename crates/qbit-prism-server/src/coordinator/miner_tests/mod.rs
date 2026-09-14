@@ -13,6 +13,7 @@ use submit_ledger::CommitGate;
 mod admission_races;
 mod blockwait;
 mod commit_reconcile;
+mod compact_prepared;
 mod config;
 mod credit;
 mod interleavings;
@@ -40,6 +41,7 @@ pub(crate) struct MemoryLedger {
     pub append_gate: StdMutex<Option<Arc<Gate>>>,
     pub fail_revision: AtomicBool,
     pub jobs: StdMutex<HashMap<String, work_store::MemoryJob>>,
+    pub compact: work_store::CompactStore,
     pub clock_offset_ms: AtomicI64,
     pub snapshot: StdMutex<Option<Snapshot>>,
     pub tip: StdMutex<Option<String>>,
