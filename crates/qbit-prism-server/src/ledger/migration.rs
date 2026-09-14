@@ -1454,14 +1454,17 @@ fn sequence_differences(expected: &SequenceDefinition, found: &SequenceDefinitio
 /// lacks is not reported twice. A table or sequence must also have the
 /// release's persistence: UNLOGGED is drift, whatever its columns say. A
 /// release table must have the release's row-level security flags, and
-/// exactly the release's policies: unlike an extra constraint, index or
-/// trigger, a policy the release does not have on a release table is drift,
-/// not extra, because it changes which rows the migrator and the native
-/// writers see rather than adding to the schema. Policies on tables the
-/// release does not create are not reported. A release constraint must be
-/// validated in the source unless it is one of `NOT_VALID_EXEMPT`. A
-/// sequence is compared by its structure only: the value it has reached is
-/// the source's data.
+/// exactly the release's policies and triggers: unlike an extra constraint
+/// or index, a policy or trigger the release does not have on a release
+/// table is drift, not extra. A policy changes which rows the migrator and
+/// the native writers see rather than adding to the schema; a trigger fires
+/// on the rows they write and can refuse them (one that rejects
+/// `writer_epoch = 0` lets the legacy writer's leased epochs through and
+/// fails every native share insert, which writes epoch 0) or rewrite them.
+/// Policies and triggers on tables the release does not create are not
+/// reported. A release constraint must be validated in the source unless
+/// it is one of `NOT_VALID_EXEMPT`. A sequence is compared by its structure
+/// only: the value it has reached is the source's data.
 fn compare_fingerprints(
     expected: &SchemaFingerprint,
     found: &SchemaFingerprint,
@@ -1629,14 +1632,29 @@ fn compare_fingerprints(
             Some(_) => {}
         }
     }
-    for (table, name) in found.triggers.keys() {
-        if expected.tables.contains_key(table)
-            && !expected
+    for ((table, name), trigger) in &found.triggers {
+        if !expected.tables.contains_key(table)
+            || expected
                 .triggers
                 .contains_key(&(table.clone(), name.clone()))
         {
-            comparison.extra.push(format!("trigger {name} on {table}"));
+            continue;
         }
+        // Not an extra: it can refuse or rewrite rows the migrator and the
+        // native writers put in a release table.
+        let release_trigger_on_table = expected
+            .triggers
+            .keys()
+            .any(|(release_table, _)| release_table == table);
+        comparison.drift.push(format!(
+            "trigger {name} on {table}: {}; the release {}",
+            trigger.definition,
+            if release_trigger_on_table {
+                "does not create it"
+            } else {
+                "has no trigger on this table"
+            }
+        ));
     }
     for ((table, name), policy) in &expected.policies {
         if !found.tables.contains_key(table) {
@@ -2063,9 +2081,9 @@ fn require_no_native_collision(
 /// took before any DDL. On a fresh database 001 just created everything,
 /// so this passes trivially; it runs there too, as a second guard. Extra
 /// objects, columns, constraints, indexes and sequences are kept and
-/// logged; a missing or different one, or row-level security on a release
-/// table, fails the migration, which rolls back whole, so the database is
-/// unchanged.
+/// logged; a missing or different one, row-level security on a release
+/// table, or a policy or trigger the release does not create on one, fails
+/// the migration, which rolls back whole, so the database is unchanged.
 async fn require_release_schema(
     tx: &mut Transaction<'_, Postgres>,
     state: SourceState,
@@ -2924,6 +2942,101 @@ mod tests {
             vec!["constraint operator_fk on qbit_block_candidate_outbox: FOREIGN KEY (share_id) REFERENCES operator_shares(share_id)"]
         );
         assert_eq!(enforcement_summary(&[]), "none");
+    }
+
+    /// A user trigger as `pg_get_triggerdef` renders it, enabled.
+    fn trigger(definition: &str) -> TriggerDefinition {
+        TriggerDefinition {
+            definition: definition.to_owned(),
+            enabled: "O".into(),
+        }
+    }
+
+    #[test]
+    fn a_trigger_the_release_does_not_create_on_a_release_table_is_drift() {
+        let release_sync = "CREATE TRIGGER qbit_pool_blocks_carry_forward_current_sync AFTER INSERT OR UPDATE OR DELETE ON qbit_pool_blocks FOR EACH ROW EXECUTE FUNCTION qbit_pool_blocks_carry_forward_current_sync()";
+        let epoch_guard = "CREATE TRIGGER operator_epoch_guard BEFORE INSERT ON qbit_share_ledger FOR EACH ROW EXECUTE FUNCTION operator_reject_epoch_zero()";
+        let blocks_audit = "CREATE TRIGGER operator_blocks_audit AFTER INSERT ON qbit_pool_blocks FOR EACH ROW EXECUTE FUNCTION operator_audit_blocks()";
+        let sync_key = (
+            "qbit_pool_blocks".to_owned(),
+            "qbit_pool_blocks_carry_forward_current_sync".to_owned(),
+        );
+        let guard_key = (
+            "qbit_share_ledger".to_owned(),
+            "operator_epoch_guard".to_owned(),
+        );
+        let audit_key = (
+            "qbit_pool_blocks".to_owned(),
+            "operator_blocks_audit".to_owned(),
+        );
+        let mut expected = SchemaFingerprint::default();
+        expected.tables.insert(
+            "qbit_share_ledger".into(),
+            table(&[("writer_epoch", column("bigint", true))]),
+        );
+        expected.tables.insert(
+            "qbit_pool_blocks".into(),
+            table(&[("block_hash", column("text", true))]),
+        );
+        expected
+            .triggers
+            .insert(sync_key.clone(), trigger(release_sync));
+        // The release's own trigger; an operator's guard on the ledger,
+        // which the release leaves without triggers; a second trigger on
+        // the blocks table beside the release's; and a trigger on the
+        // operator's own table. The two on release tables are drift, named
+        // with what they run and why the release lacks them; the operator's
+        // table is extra and its trigger is theirs.
+        let mut found = SchemaFingerprint {
+            tables: expected.tables.clone(),
+            triggers: expected.triggers.clone(),
+            ..SchemaFingerprint::default()
+        };
+        found.tables.insert(
+            "operator_notes".into(),
+            table(&[("note", column("text", true))]),
+        );
+        found
+            .triggers
+            .insert(guard_key.clone(), trigger(epoch_guard));
+        found
+            .triggers
+            .insert(audit_key.clone(), trigger(blocks_audit));
+        found.triggers.insert(
+            ("operator_notes".into(), "operator_notes_stamp".into()),
+            trigger("CREATE TRIGGER operator_notes_stamp BEFORE INSERT ON operator_notes FOR EACH ROW EXECUTE FUNCTION operator_notes_stamp()"),
+        );
+        let drift = vec![
+            format!("trigger operator_blocks_audit on qbit_pool_blocks: {blocks_audit}; the release does not create it"),
+            format!("trigger operator_epoch_guard on qbit_share_ledger: {epoch_guard}; the release has no trigger on this table"),
+        ];
+        let comparison = compare_fingerprints(&expected, &found);
+        assert_eq!(comparison.drift, drift);
+        assert_eq!(comparison.extra, vec!["table operator_notes"]);
+        // Disabled, it is still not the release's table.
+        found.triggers.get_mut(&guard_key).unwrap().enabled = "D".into();
+        let comparison = compare_fingerprints(&expected, &found);
+        assert_eq!(comparison.drift, drift);
+        // A release trigger the source lacks is missing, named before the
+        // ones the source should not have.
+        found.triggers.remove(&sync_key);
+        let comparison = compare_fingerprints(&expected, &found);
+        assert_eq!(
+            comparison.drift,
+            [
+                vec!["missing trigger qbit_pool_blocks_carry_forward_current_sync on qbit_pool_blocks".to_owned()],
+                drift,
+            ]
+            .concat()
+        );
+        // The release's triggers and no other: nothing to report but the
+        // operator's table.
+        found.triggers.insert(sync_key, trigger(release_sync));
+        found.triggers.remove(&guard_key);
+        found.triggers.remove(&audit_key);
+        let comparison = compare_fingerprints(&expected, &found);
+        assert!(comparison.drift.is_empty(), "{:?}", comparison.drift);
+        assert_eq!(comparison.extra, vec!["table operator_notes"]);
     }
 
     #[test]

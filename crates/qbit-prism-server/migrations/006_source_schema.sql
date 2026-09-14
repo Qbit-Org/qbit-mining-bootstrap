@@ -74,9 +74,14 @@
 -- and WITH CHECK: a policy that hides rows from the migrate role, or forced
 -- security with no policy, would make the drain check see an empty outbox
 -- and the native claim lane never see the legacy rows, so a policy on a
--- release table is drift, not an extra. A release table must have no child
--- table and no parent: a child created with INHERITS has its rows read with
--- the parent's, unchecked by the release constraints. A sequence is
+-- release table is drift, not an extra. So is a trigger the release does
+-- not create on a release table: it can refuse rows the migrator and
+-- the native writers put there (a guard rejecting
+-- writer_epoch = 0, which every native share insert writes) or rewrite
+-- them; a trigger on an operator's own table is theirs and is kept. A
+-- release table must have no child table and no parent: a child created
+-- with INHERITS has its rows read with the parent's, unchecked by the
+-- release constraints. A sequence is
 -- compared by its structure (type, start, increment, bounds, cache, cycle),
 -- never by the value it has reached. A constraint's validation state is
 -- compared: a release constraint left NOT VALID in the source is drift,

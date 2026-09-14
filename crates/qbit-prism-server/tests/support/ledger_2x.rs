@@ -1521,6 +1521,145 @@ async fn release_foreign_key_with_disabled_enforcement_triggers_is_refused_namin
     db.close(vec![ledger]).await
 }
 
+/// A share row as a 2.x.x writer holding lease epoch `epoch` inserts it.
+async fn insert_share_as_writer(pool: &PgPool, share_id: &str, epoch: i64) -> Result<()> {
+    sqlx::query("INSERT INTO qbit_share_ledger(share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,writer_id,writer_epoch) VALUES($1,'miner','miner',decode(repeat('11',32),'hex'),1,100,100,'job',clock_timestamp(),1800000000,'python',$2)")
+        .bind(share_id).bind(epoch).execute(pool).await?;
+    Ok(())
+}
+
+/// Every share with the epoch its writer stamped, in commit order.
+async fn ledger_epochs(pool: &PgPool) -> Result<Vec<(String, i64)>> {
+    Ok(
+        sqlx::query_as("SELECT share_id,writer_epoch FROM qbit_share_ledger ORDER BY share_seq")
+            .fetch_all(pool)
+            .await?,
+    )
+}
+
+/// The operator's own triggers, as `table.trigger=state`.
+async fn operator_triggers(pool: &PgPool) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar("SELECT c.relname::text||'.'||t.tgname::text||'='||t.tgenabled::text FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid WHERE c.relnamespace=current_schema()::regnamespace AND NOT t.tgisinternal AND t.tgname LIKE 'operator%' ORDER BY 1")
+        .fetch_all(pool).await?)
+}
+
+/// A trigger the release does not create on a release table: an operator's
+/// guard that refuses `writer_epoch = 0`, which the 2.x.x writer's leased
+/// epochs never trip and every native share insert, which writes epoch 0,
+/// would. Refused naming the trigger and its table, rolled back whole with
+/// the trigger and the legacy rows as they were; without the guard the
+/// same source migrates and the native writers work. A trigger on the
+/// operator's own table is theirs and survives. Both frozen sources.
+#[tokio::test]
+async fn extra_trigger_on_a_release_table_is_refused_naming_it_and_rolls_back() -> Result<()> {
+    for (state, nonce) in [(SourceState::Pre258, 6401), (SourceState::Applied258, 6402)] {
+        let Some(db) = Database::open().await? else {
+            return Ok(());
+        };
+        let pool = PgPool::connect(&db.url).await?;
+        apply_frozen_2x_schema(&pool, state).await?;
+        let terminal = legacy_hash(0x37);
+        insert_v1_terminal(&pool, &terminal, "submitted").await?;
+        sqlx::raw_sql("CREATE FUNCTION operator_reject_epoch_zero() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.writer_epoch = 0 THEN RAISE EXCEPTION 'operator guard: writer_epoch 0 is not a leased epoch'; END IF; RETURN NEW; END $$; CREATE TRIGGER operator_epoch_guard BEFORE INSERT ON qbit_share_ledger FOR EACH ROW EXECUTE FUNCTION operator_reject_epoch_zero(); CREATE TABLE operator_notes(note_id bigserial PRIMARY KEY, note text NOT NULL, noted_at timestamptz); CREATE FUNCTION operator_notes_stamp() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.noted_at := clock_timestamp(); RETURN NEW; END $$; CREATE TRIGGER operator_notes_stamp BEFORE INSERT ON operator_notes FOR EACH ROW EXECUTE FUNCTION operator_notes_stamp()")
+            .execute(&pool).await?;
+        // The guard lets the legacy writer's share through and refuses the
+        // native writer's.
+        insert_share_as_writer(&pool, "legacy:1", 1).await?;
+        let refused = insert_share_as_writer(&pool, "native:0", 0)
+            .await
+            .err()
+            .context("the guard accepted writer_epoch 0")?
+            .to_string();
+        assert!(
+            refused.contains("operator guard: writer_epoch 0 is not a leased epoch"),
+            "{refused}"
+        );
+        let guarded = vec![
+            "operator_notes.operator_notes_stamp=O".to_owned(),
+            "qbit_share_ledger.operator_epoch_guard=O".to_owned(),
+        ];
+        assert_eq!(operator_triggers(&pool).await?, guarded);
+        let legacy = vec![("legacy:1".to_owned(), 1)];
+        assert_eq!(ledger_epochs(&pool).await?, legacy);
+        let objects = schema_objects(&pool).await?;
+        let (release, files) = match state {
+            SourceState::Applied258 => (
+                "v2.0.2",
+                "001_share_ledger.sql and 002_candidate_bodies.sql",
+            ),
+            _ => ("v2.0.1", "001_share_ledger.sql"),
+        };
+        let error = db
+            .ledger("a")
+            .await
+            .err()
+            .context(
+                "migration accepted a release table with a trigger the release does not create",
+            )?
+            .to_string();
+        assert!(
+            error.contains("refusing to migrate a drifted 001 source"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!(
+                "does not match the v2.0.x release schema ({release}, {files}), 1 object(s) differ"
+            )),
+            "{error}"
+        );
+        assert!(
+            error.contains("trigger operator_epoch_guard on qbit_share_ledger: CREATE TRIGGER operator_epoch_guard BEFORE INSERT ON qbit_share_ledger FOR EACH ROW EXECUTE FUNCTION operator_reject_epoch_zero(); the release has no trigger on this table"),
+            "{error}"
+        );
+        assert!(!error.contains("operator_notes"), "{error}");
+        assert!(error.contains("Nothing was changed"), "{error}");
+        // Rolled back whole: no native table or version, the same objects,
+        // both triggers and the legacy rows as they were.
+        assert!(native_tables_absent(&pool).await?, "refusal ran DDL");
+        assert_eq!(schema_objects(&pool).await?, objects);
+        assert_eq!(operator_triggers(&pool).await?, guarded);
+        assert_eq!(ledger_epochs(&pool).await?, legacy);
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT block_hash,state FROM qbit_block_candidate_outbox ORDER BY block_hash",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(rows, vec![(terminal.clone(), "submitted".into())]);
+        // Without the guard (the operator's decision, not the migrator's)
+        // the same source migrates and is recorded as what it was; the
+        // operator's table keeps a trigger that still fires; the native
+        // writers put their epoch-0 shares after the legacy one.
+        sqlx::raw_sql("DROP TRIGGER operator_epoch_guard ON qbit_share_ledger")
+            .execute(&pool)
+            .await?;
+        let ledger = db.ledger("a").await?;
+        assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+        assert_eq!(
+            ledger.migration_source().await?.map(|s| s.source_state),
+            Some(state.as_str().to_owned())
+        );
+        assert_eq!(
+            operator_triggers(&pool).await?,
+            vec!["operator_notes.operator_notes_stamp=O".to_owned()]
+        );
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "INSERT INTO operator_notes(note) VALUES('kept') RETURNING noted_at IS NOT NULL"
+            )
+            .fetch_one(&pool)
+            .await?
+        );
+        exercise_native_writers(&ledger, 1, nonce).await?;
+        assert_eq!(
+            ledger_epochs(&pool).await?,
+            [legacy, vec![(share(1).share_id, 0)]].concat()
+        );
+        pool.close().await;
+        db.close(vec![ledger]).await?;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn row_level_security_on_a_release_table_is_refused_naming_it_and_rolls_back() -> Result<()> {
     let Some(db) = Database::open().await? else {

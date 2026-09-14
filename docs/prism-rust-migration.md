@@ -94,7 +94,7 @@ release definition:
 | partial 002 | some 002 objects or the capability row, but not all (v2.0.2 applies 001 and 002 as two script calls, and a restart between them leaves this) | refuse, naming the missing object; finish 002 with the v2.0.2 release (`PRISM_POSTGRES_INIT_SCHEMA=1`) or restore the backup |
 | newer | `candidate_storage_version > 2`, or a capability this release does not know | refuse before any DDL; a newer PRISM release wrote the database. A database that is already native gets the same check first, before 004, 005, 006 or 009 run, so `migrate` never alters a database a newer release wrote |
 | native collision | a table, sequence, index, trigger, function or column that a native migration (`002_multi_instance.sql` to `009_wrap_safe_sessions.sql`) creates and the `2.x.x` release does not is already present, in an empty database or a `2.x.x` one, or a reserved relation name is held by a relation of another kind (a view, an index backing an operator's constraint): a leftover of an earlier native attempt, a selective restore, or something installed by hand | refuse before any DDL, naming the objects; nothing is dropped; restore the full pre-migration backup, or check what the objects hold and remove them, then migrate again |
-| drifted 001 | a 001 (or 002) object whose definition, after 001 has run, differs from the frozen release: a table, column, index, sequence or named constraint that 001's `IF NOT EXISTS` skipped, or any 002 object, with a dropped constraint, a changed type, nullability or default, a different index definition, an altered sequence (a lowered maximum, a different increment), a table or sequence made `UNLOGGED` (or temporary), a release constraint left `NOT VALID` (other than the pinned `qbit_share_ledger_credit_policy_check`), a release foreign key whose enforcement triggers were disabled, row-level security enabled or forced on a release table or a policy on one, a child table created with `INHERITS` on a release table or a release table made a child or partition of another, a replaced function body or a disabled trigger | refuse transactionally, naming each object and what differs; the migration rolls back and the database is unchanged; restore the pre-migration backup or bring the database to the release schema with the `2.x.x` release, then migrate again |
+| drifted 001 | a 001 (or 002) object whose definition, after 001 has run, differs from the frozen release: a table, column, index, sequence or named constraint that 001's `IF NOT EXISTS` skipped, or any 002 object, with a dropped constraint, a changed type, nullability or default, a different index definition, an altered sequence (a lowered maximum, a different increment), a table or sequence made `UNLOGGED` (or temporary), a release constraint left `NOT VALID` (other than the pinned `qbit_share_ledger_credit_policy_check`), a release foreign key whose enforcement triggers were disabled, row-level security enabled or forced on a release table or a policy on one, a child table created with `INHERITS` on a release table or a release table made a child or partition of another, a replaced function body, a disabled trigger or a trigger the release does not create on a release table | refuse transactionally, naming each object and what differs; the migration rolls back and the database is unchanged; restore the pre-migration backup or bring the database to the release schema with the `2.x.x` release, then migrate again |
 
 **The release definitions.** They are not a stored fingerprint: before any
 DDL touches the source, inside the migration transaction, the migrator opens
@@ -224,7 +224,16 @@ no new row is checked against it, and 001 never re-enables a trigger it did
 not create, so it is drift (`constraint
 qbit_block_candidate_outbox_share_id_fkey on qbit_block_candidate_outbox
 differs: enforcement triggers expected 4 enabled, found 4 disabled`).
-Extra tables, columns, constraints, indexes, triggers, functions and
+A trigger the release does not create on a release table is drift too, not
+an extra: it can refuse or rewrite rows the migrator and the native writers
+put there. A guard that rejects `writer_epoch =
+0`, say, lets the `2.x.x` writer's leased epochs through and fails every
+native share insert, which writes epoch 0, so it is named with what it runs
+(`trigger operator_epoch_guard on qbit_share_ledger: CREATE TRIGGER
+operator_epoch_guard BEFORE INSERT ON qbit_share_ledger FOR EACH ROW EXECUTE
+FUNCTION operator_reject_epoch_zero(); the release has no trigger on this
+table`); a trigger on a table the release does not create is the operator's
+own and is kept. Extra tables, columns, constraints, indexes, functions and
 sequences are kept and logged at warning level. A missing or different
 object refuses the migration:
 
