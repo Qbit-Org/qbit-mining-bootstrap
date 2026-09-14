@@ -307,7 +307,7 @@ not a graph someone reads. The Python tool that computed the verdict left with
 sort -t, -k1,1n soak-rss.csv | awk -F, -v warmup=3600 -v multiple=2.0 -v min_span=82800 '
   function numeric(s) { return s ~ /^[ \t]*-?([0-9]+\.?[0-9]*|\.[0-9]+)[ \t]*$/ }
   /^[ \t]*(#|$)/ { next }
-  NF < 2 || !numeric($1) || !numeric($2) { bad = $0; unusable = 1; exit }
+  NF != 2 || !numeric($1) || !numeric($2) { bad = $0; unusable = 1; exit }
   $2 < 0 { next }
   { if (t0 == "") t0 = $1
     if ($1 - t0 <= warmup) { if ($2 > base) base = $2; next }
@@ -324,9 +324,14 @@ sort -t, -k1,1n soak-rss.csv | awk -F, -v warmup=3600 -v multiple=2.0 -v min_spa
 
 The input is one `seconds,rss_bytes` line per sample (absolute epoch seconds
 are fine). `#` comments and blank lines are skipped and `-1` samples are
-ignored; any other row that is not `seconds,rss_bytes` is unusable input (exit
-`2`), as it was in the Python tool, so a truncated row during an excursion
-cannot pass as a skipped one. The samples are sorted by timestamp before they
+ignored; any other row that is not exactly two numeric fields is unusable
+input (exit `2`), so a truncated row during an excursion cannot pass as a
+skipped one, as it could not in the Python tool. The field count is exact,
+which is stricter than the Python tool: it read the first two fields and
+ignored the rest, so `82800,300,000` judged as 300 bytes and `0,100,garbage`
+set the baseline. The capture loop below writes exactly two fields, and a row
+with a third was corrupted somewhere between the loop and the judge, so it is
+refused rather than read. The samples are sorted by timestamp before they
 are judged, as the Python tool sorted them, so concatenated partial logs judge
 the same as a single file; comment and blank lines are still skipped wherever
 they sort, and a malformed row still exits `2`. The warm-up runs from the
