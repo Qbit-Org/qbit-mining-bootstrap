@@ -1370,7 +1370,7 @@ fn the_artifact_builder_produces_evidence_the_validator_accepts() -> Result<()> 
 /// withholds the file on abort and removes a stale one at the same path.
 #[test]
 fn an_aborted_run_withholds_the_artifact_and_removes_a_stale_one() -> Result<()> {
-    use qbit_prism_load::artifact::{write_or_withhold, Evidence};
+    use qbit_prism_load::artifact::{write_or_withhold, Evidence, Withhold};
     let dir = ScratchDir::new("withhold");
     let path = dir.path().join("capacity-evidence.json");
     std::fs::write(
@@ -1381,7 +1381,9 @@ fn an_aborted_run_withholds_the_artifact_and_removes_a_stale_one() -> Result<()>
 
     let withheld = write_or_withhold(
         &inputs,
-        Some("MemAvailable fell to 512 MiB, below the 4096 MiB floor"),
+        Some(&Withhold::Aborted(
+            "MemAvailable fell to 512 MiB, below the 4096 MiB floor".into(),
+        )),
         dir.path(),
         "qbit-prism-server",
     )?;
@@ -1404,7 +1406,12 @@ fn an_aborted_run_withholds_the_artifact_and_removes_a_stale_one() -> Result<()>
     let Evidence::Withheld {
         stale_artifact_removed,
         ..
-    } = write_or_withhold(&inputs, Some("load-fe-1 exited"), dir.path(), "srv")?
+    } = write_or_withhold(
+        &inputs,
+        Some(&Withhold::Aborted("load-fe-1 exited".into())),
+        dir.path(),
+        "srv",
+    )?
     else {
         panic!("still withheld");
     };
@@ -1426,6 +1433,131 @@ fn an_aborted_run_withholds_the_artifact_and_removes_a_stale_one() -> Result<()>
     assert!(verdict.valid, "{:?}", verdict.error_chain);
     assert!(command.contains("capacity-evidence"));
     assert_eq!(document["artifact_kind"], "qualification");
+    Ok(())
+}
+
+/// A hard refusal is a hard refusal whenever it is logged. The startup check
+/// caught one at launch, but a JSONB-ceiling refusal logged later -- during
+/// a scheduled-block rebuild, with ordinary shares still being accepted --
+/// was only appended to `blocked.log_matches` by the final scan: the run
+/// still built and validated the artifact, reported `blocked: false`, and
+/// could exit 0. The late scan is now re-checked with `is_hard_block`, the
+/// artifact is withheld with the line as its reason, and the run exits 3
+/// ahead of every other outcome.
+#[test]
+fn a_hard_block_logged_after_startup_withholds_the_artifact_and_exits_blocked() -> Result<()> {
+    use qbit_prism_load::artifact::{write_or_withhold, Evidence, Withhold};
+    use qbit_prism_load::classify::{classify_log_line, BlockedKind};
+    use qbit_prism_load::run::{hard_block_line, withhold_decision, RunOutcome};
+
+    let ceiling = "2026-09-14T12:00:00Z WARN qbit_prism_server::coordinator: job persistence \
+                   deferred error=total size of jsonb array elements exceeds the maximum of \
+                   268435455 bytes";
+    let deferral = "2026-09-14T12:00:01Z WARN qbit_prism_server::coordinator: template refresh \
+                    deferred error=chain view unavailable";
+    let ceiling_log = classify_log_line(ceiling).expect("the ceiling line is a refusal");
+    let deferral_log = classify_log_line(deferral).expect("the deferral line is a refusal");
+    assert_eq!(ceiling_log.kind, BlockedKind::JsonbCeiling);
+    assert_eq!(deferral_log.kind, BlockedKind::RefreshDeferred);
+
+    // A transient deferral alone is not a block; the ceiling is, wherever it
+    // sits in the scan.
+    assert_eq!(hard_block_line(std::slice::from_ref(&deferral_log)), None);
+    assert_eq!(
+        hard_block_line(&[deferral_log.clone(), ceiling_log.clone()]).as_deref(),
+        Some(ceiling)
+    );
+
+    // The decision: a late hard block withholds, and outranks an abort.
+    assert_eq!(withhold_decision(None, None), None);
+    assert_eq!(
+        withhold_decision(None, Some("load-fe-1 exited unexpectedly")),
+        Some(Withhold::Aborted("load-fe-1 exited unexpectedly".into()))
+    );
+    let blocked = withhold_decision(Some(ceiling), Some("load-fe-1 exited unexpectedly"))
+        .expect("a hard block withholds the artifact");
+    assert_eq!(blocked, Withhold::Blocked(ceiling.to_owned()));
+    assert!(blocked.reason().contains(ceiling), "{}", blocked.reason());
+    assert!(blocked.reason().contains("blocked"), "{}", blocked.reason());
+
+    // The exit code: 3, ahead of the abort and ahead of every finding a run
+    // with a refused size may also carry.
+    let clean = RunOutcome {
+        withhold: None,
+        durability_findings: 0,
+        harness_bug_rejections: 0,
+        divergences: 0,
+        unknown_outcome_commits: 0,
+    };
+    assert_eq!(clean.exit_code(), run::EXIT_OK);
+    assert_eq!(clean.explanation(std::path::Path::new("r.json")), None);
+    let late = RunOutcome {
+        withhold: Some(&blocked),
+        durability_findings: 1,
+        harness_bug_rejections: 1,
+        divergences: 1,
+        unknown_outcome_commits: 1,
+    };
+    assert_eq!(late.exit_code(), run::EXIT_BLOCKED);
+    let explanation = late
+        .explanation(std::path::Path::new("r.json"))
+        .expect("a blocked run says so");
+    assert!(explanation.starts_with("run blocked:"), "{explanation}");
+    assert!(explanation.contains(ceiling), "{explanation}");
+    let aborted = Withhold::Aborted("MemAvailable fell".into());
+    assert_eq!(
+        RunOutcome {
+            withhold: Some(&aborted),
+            ..late
+        }
+        .exit_code(),
+        run::EXIT_ABORTED
+    );
+    assert_eq!(
+        RunOutcome {
+            withhold: None,
+            ..late
+        }
+        .exit_code(),
+        run::EXIT_DURABILITY,
+        "with nothing withheld the findings decide, in their existing order"
+    );
+    assert_eq!(
+        RunOutcome {
+            withhold: None,
+            durability_findings: 0,
+            ..late
+        }
+        .exit_code(),
+        run::EXIT_HARNESS_BUG_REJECTIONS
+    );
+    assert_eq!(
+        RunOutcome {
+            withhold: None,
+            durability_findings: 0,
+            harness_bug_rejections: 0,
+            ..late
+        }
+        .exit_code(),
+        run::EXIT_ACK_COMMIT_DIVERGENCE
+    );
+
+    // The artifact step: inputs that would build a valid artifact are
+    // withheld under a late block exactly as under an abort, and a stale
+    // artifact at the path goes with it.
+    let dir = ScratchDir::new("late-block");
+    let path = dir.path().join("capacity-evidence.json");
+    std::fs::write(&path, b"{\"schema\": \"stale artifact\"}")?;
+    let Evidence::Withheld {
+        reason,
+        stale_artifact_removed,
+    } = write_or_withhold(&sample_inputs(), Some(&blocked), dir.path(), "srv")?
+    else {
+        panic!("a late hard block must not write an artifact");
+    };
+    assert!(reason.contains(ceiling), "{reason}");
+    assert!(stale_artifact_removed);
+    assert!(!path.exists(), "nothing self-validating survives the block");
     Ok(())
 }
 

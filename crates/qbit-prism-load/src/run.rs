@@ -2,7 +2,7 @@
 //! reconciliation and outputs.
 
 use crate::{
-    artifact::{self, ArtifactInputs, PhaseEvidence},
+    artifact::{self, ArtifactInputs, PhaseEvidence, Withhold},
     cadence::{self, FrontendHealth, Landing, RevisionSampler, RevisionSeries},
     classify::{self, BlockedLog, Rejection, RejectionClass},
     cli::{phases, Args, PhasePlan},
@@ -61,6 +61,97 @@ pub const DRAIN_MARGIN: Duration = Duration::from_secs(5);
 pub fn drain_limit(share_commit_timeout_seconds: f64) -> Duration {
     Duration::from_secs_f64(share_commit_timeout_seconds.max(0.0)) + DRAIN_MARGIN
 }
+
+/// The first hard refusal among the classified log lines, verbatim.
+pub fn hard_block_line(blocked: &[BlockedLog]) -> Option<String> {
+    blocked
+        .iter()
+        .find(|log| classify::is_hard_block(log))
+        .map(|log| log.line.clone())
+}
+
+/// Whether the artifact is withheld, and why, from what the run observed.
+///
+/// A hard refusal in a frontend log outranks an abort: the refusal is a
+/// result about the size, the abort a fact about this run, and a run that
+/// did both is blocked first. Both stay in the side report whichever one
+/// names the withholding.
+pub fn withhold_decision(hard_block: Option<&str>, aborted: Option<&str>) -> Option<Withhold> {
+    if let Some(line) = hard_block {
+        return Some(Withhold::Blocked(line.to_owned()));
+    }
+    aborted.map(|reason| Withhold::Aborted(reason.to_owned()))
+}
+
+/// What the run's exit code is decided from, once the side report is
+/// written. Kept apart from the report so the order of precedence is one
+/// function that a test can pin.
+#[derive(Clone, Copy, Debug)]
+pub struct RunOutcome<'a> {
+    pub withhold: Option<&'a Withhold>,
+    pub durability_findings: usize,
+    pub harness_bug_rejections: usize,
+    pub divergences: usize,
+    pub unknown_outcome_commits: usize,
+}
+
+impl RunOutcome<'_> {
+    /// The exit code, in order of precedence: a withheld artifact first
+    /// (blocked, then aborted), then the reconciliation findings, then the
+    /// harness-bug rejections, then the two divergence buckets.
+    pub fn exit_code(&self) -> i32 {
+        match self.withhold {
+            Some(Withhold::Blocked(_)) => return EXIT_BLOCKED,
+            Some(Withhold::Aborted(_)) => return EXIT_ABORTED,
+            None => {}
+        }
+        if self.durability_findings > 0 {
+            return EXIT_DURABILITY;
+        }
+        if self.harness_bug_rejections > 0 {
+            return EXIT_HARNESS_BUG_REJECTIONS;
+        }
+        if self.divergences > 0 || self.unknown_outcome_commits > 0 {
+            return EXIT_ACK_COMMIT_DIVERGENCE;
+        }
+        EXIT_OK
+    }
+
+    /// One line for stderr saying why the code is what it is, or nothing
+    /// for a clean run.
+    pub fn explanation(&self, report_path: &std::path::Path) -> Option<String> {
+        let report = report_path.display();
+        Some(match self.withhold {
+            Some(Withhold::Blocked(line)) => format!("run blocked: {line}; see {report}"),
+            Some(Withhold::Aborted(reason)) => format!("run aborted: {reason}"),
+            None if self.durability_findings > 0 => {
+                format!("durability findings recorded; see {report}")
+            }
+            None if self.harness_bug_rejections > 0 => format!(
+                "{} rejections classified as harness bugs; see {report}",
+                self.harness_bug_rejections
+            ),
+            None if self.divergences > 0 => format!(
+                "{} shares committed after the server refused them with \
+                 ledger-confirmation-failed; see {report}",
+                self.divergences
+            ),
+            None if self.unknown_outcome_commits > 0 => format!(
+                "{} shares committed after the server answered ledger-outcome-unknown; see \
+                 {report}",
+                self.unknown_outcome_commits
+            ),
+            None => return None,
+        })
+    }
+}
+
+/// What the side report says beside a blocked run's log lines.
+pub const BLOCKED_NOTE: &str =
+    "Window sizes of 200k and above are refused until #273 (the PostgreSQL JSONB container \
+     ceiling), and found-block candidates are refused at 400k until #265. A refusal is a \
+     result, never something to work around, and it is a result whenever it is logged: at \
+     startup, or later in the run once ordinary shares were already flowing.";
 
 /// What applying a phase's delay to the proxy did.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -520,12 +611,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     for child in &frontends {
         blocked.extend(scan_logs(&child.read_stderr()));
     }
-    if blocked.iter().any(classify::is_hard_block) {
-        let text = blocked
-            .iter()
-            .find(|log| classify::is_hard_block(log))
-            .map(|log| log.line.clone())
-            .unwrap_or_default();
+    if let Some(text) = hard_block_line(&blocked) {
         return finish_blocked(args, &ctx, frontends, blocked, text).await;
     }
 
@@ -897,6 +983,15 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     for child in &frontends {
         blocked.extend(scan_logs(&child.read_stderr()));
     }
+    // The startup check ran before any phase. A refusal logged after it -- a
+    // scheduled-block rebuild hitting the JSONB ceiling, say -- is the same
+    // hard block seen late, and ordinary shares can keep flowing past a
+    // candidate refusal, so nothing downstream would necessarily catch it.
+    // It is re-checked here: the artifact is withheld and the run exits
+    // blocked, as it would have at startup, with the whole side report
+    // (EP-OBSERVABILITY).
+    let late_hard_block = hard_block_line(&blocked);
+    let withhold = withhold_decision(late_hard_block.as_deref(), aborted.as_deref());
     let window_at_end =
         window::observed_window_length(&side, solution.scaled_network_difficulty).await?;
 
@@ -1094,11 +1189,14 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     };
     // An aborted run gets no artifact: its evidence is incomplete however
     // complete a partial phase looks, and `artifact::build` would refuse a
-    // run that never reached all three required phases anyway (EP-ERRORS).
-    // The side report below still carries every number, marked aborted.
+    // run that never reached all three required phases anyway. Neither does
+    // a run whose frontend logged a hard refusal of the size at any point:
+    // its numbers may be complete and still describe a size the server did
+    // not serve in full (EP-ERRORS). The side report below still carries
+    // every number, with the reason.
     let evidence = artifact::write_or_withhold(
         &inputs,
-        aborted.as_deref(),
+        withhold.as_ref(),
         &args.out,
         &ctx.server_bin.display().to_string(),
     )?;
@@ -1259,8 +1357,10 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         })).collect::<Vec<_>>(),
         "harness_bug_rejection_count": harness_bugs.len(),
         "blocked": {
-            "blocked": false,
+            "blocked": late_hard_block.is_some(),
+            "error": late_hard_block.as_deref(),
             "log_matches": blocked,
+            "note": BLOCKED_NOTE,
         },
         "durability_findings": durability_findings,
         "ack_commit_divergence": {
@@ -1303,47 +1403,17 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         child.kill();
     }
     side.close().await;
-    if let Some(reason) = aborted {
-        eprintln!("run aborted: {reason}");
-        return Ok(EXIT_ABORTED);
+    let outcome = RunOutcome {
+        withhold: withhold.as_ref(),
+        durability_findings: durability_findings.as_array().map(Vec::len).unwrap_or(0),
+        harness_bug_rejections: harness_bugs.len(),
+        divergences: divergences.len(),
+        unknown_outcome_commits: unknown_outcome_commits.len(),
+    };
+    if let Some(line) = outcome.explanation(&report_path) {
+        eprintln!("{line}");
     }
-    if !durability_findings
-        .as_array()
-        .map(Vec::is_empty)
-        .unwrap_or(true)
-    {
-        eprintln!(
-            "durability findings recorded; see {}",
-            report_path.display()
-        );
-        return Ok(EXIT_DURABILITY);
-    }
-    if !harness_bugs.is_empty() {
-        eprintln!(
-            "{} rejections classified as harness bugs; see {}",
-            harness_bugs.len(),
-            report_path.display()
-        );
-        return Ok(EXIT_HARNESS_BUG_REJECTIONS);
-    }
-    if !divergences.is_empty() {
-        eprintln!(
-            "{} shares committed after the server refused them with \
-             ledger-confirmation-failed; see {}",
-            divergences.len(),
-            report_path.display()
-        );
-        return Ok(EXIT_ACK_COMMIT_DIVERGENCE);
-    }
-    if !unknown_outcome_commits.is_empty() {
-        eprintln!(
-            "{} shares committed after the server answered ledger-outcome-unknown; see {}",
-            unknown_outcome_commits.len(),
-            report_path.display()
-        );
-        return Ok(EXIT_ACK_COMMIT_DIVERGENCE);
-    }
-    Ok(EXIT_OK)
+    Ok(outcome.exit_code())
 }
 
 // --- phase driving -------------------------------------------------------
@@ -2486,9 +2556,7 @@ async fn finish_blocked(
             "blocked": true,
             "error": error,
             "log_matches": blocked,
-            "note": "Window sizes of 200k and above are refused until #273 (the PostgreSQL JSONB \
-                     container ceiling), and found-block candidates are refused at 400k until \
-                     #265. A refusal is a result, never something to work around.",
+            "note": BLOCKED_NOTE,
         },
         "topology": {
             "frontends": args.frontends,

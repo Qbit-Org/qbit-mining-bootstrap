@@ -350,7 +350,7 @@ target/release/qbit-prism-load \
 |---|---|
 | 0 | The run completed and reconciled exactly |
 | 2 | The harness failed before it could measure anything |
-| 3 | Blocked: no frontend served work, or a log showed a refusal. Only the side report is written, and an earlier run's artifact and profile were already removed when the invocation took `--out` |
+| 3 | Blocked: no frontend served work, or a frontend log showed a hard refusal of the size -- at startup, or at any later point in the run. A refusal logged after the startup check (a scheduled-block rebuild hitting the JSONB ceiling, say, while ordinary shares kept flowing) is re-checked once the load stops: the artifact is withheld, `blocked.blocked` is `true` with the line under `blocked.error`, and the side report carries every number the run produced. A run blocked at startup writes only the side report. Either way an earlier run's artifact and profile were already removed when the invocation took `--out` |
 | 4 | A durability loss: an acknowledged share is missing from PostgreSQL, or a committed share was never acknowledged and nothing explains it |
 | 5 | An ACK/commit divergence: PostgreSQL holds a share the server refused, either with `ledger-confirmation-failed` or with `ledger-outcome-unknown` (#324) |
 | 6 | The run was aborted: the memory floor was crossed, a frontend exited, the `reconnect` phase's drained restart could not be performed because the frontend's sessions still had submits outstanding after the share-commit timeout plus a 5 s margin, a phase boundary could not change the proxy delay because the previous phase's submits were still outstanding after that same limit, or a delayed phase's round trip through the proxied URL did not pay the delay. No `capacity-evidence.json` is written (and an earlier run's was already removed when the invocation took `--out`), so an aborted run can never leave a self-validating artifact behind; the side report is still written, with `aborted` set, the cut-short phase marked `completed: false`, and `validator.artifact_written: false` with the reason |
@@ -692,7 +692,12 @@ outcome is reported.
 
 Some sizes are refused today. A refusal is a result, never something to work
 around: the harness records the run as blocked with the error text from the
-log, writes the side report and exits 3.
+log, writes the side report and exits 3. That holds whenever the refusal is
+logged. At startup no phase runs. Later in the run -- a candidate refused at
+landing while ordinary shares keep being accepted -- the phases complete and
+their numbers go into the side report, but the artifact is withheld and the
+run still exits 3: the numbers describe a size the server did not serve in
+full, and nothing downstream is guaranteed to notice a refused candidate.
 
 | Size | Refused by | Unblocked by |
 |---|---|---|

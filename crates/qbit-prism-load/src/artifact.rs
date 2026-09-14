@@ -187,27 +187,56 @@ pub enum Evidence {
         verdict: Verdict,
         command: String,
     },
-    /// The run aborted: no artifact is written, and any artifact an earlier
-    /// run left at the same path is removed so nothing self-validating
-    /// survives an abort.
+    /// The run earned no artifact (see [`Withhold`]): none is written, and
+    /// any artifact an earlier run left at the same path is removed so
+    /// nothing self-validating survives the run.
     Withheld {
         reason: String,
         stale_artifact_removed: bool,
     },
 }
 
-/// Build, write and validate the artifact, or withhold it if the run
-/// aborted. An aborted run can have fewer than the required phases, or a
-/// partial phase that looks complete, and either way its numbers are not
-/// capacity evidence; the side report still carries them, marked aborted.
+/// Why a run's artifact is withheld. Each is a different claim about the
+/// run, and the side report says which one applied (EP-ERRORS).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Withhold {
+    /// The run aborted: the memory floor, a frontend exit, a drain that did
+    /// not complete. Its numbers cover only the part that ran.
+    Aborted(String),
+    /// A frontend log showed a hard refusal of this window size at some point
+    /// in the run. The line is carried verbatim. The startup check catches a
+    /// refusal at launch; this is the same refusal seen later -- during a
+    /// scheduled-block rebuild, say -- when ordinary shares may have kept
+    /// flowing and the numbers look complete.
+    Blocked(String),
+}
+
+impl Withhold {
+    /// The reason as the side report and the summary print it.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Aborted(reason) => format!("the run aborted: {reason}"),
+            Self::Blocked(line) => format!(
+                "a frontend log showed a hard refusal of this window size, so the run is \
+                 blocked and its numbers are not evidence for the size: {line}"
+            ),
+        }
+    }
+}
+
+/// Build, write and validate the artifact, or withhold it. An aborted run
+/// can have fewer than the required phases, or a partial phase that looks
+/// complete; a blocked run can have every phase and still measured a size
+/// the server refused to serve in full. Either way its numbers are not
+/// capacity evidence; the side report still carries them, with the reason.
 pub fn write_or_withhold(
     inputs: &ArtifactInputs,
-    aborted: Option<&str>,
+    withhold: Option<&Withhold>,
     out: &std::path::Path,
     server_bin: &str,
 ) -> Result<Evidence> {
     let path = out.join("capacity-evidence.json");
-    if let Some(reason) = aborted {
+    if let Some(withhold) = withhold {
         let stale_artifact_removed = match std::fs::remove_file(&path) {
             Ok(()) => true,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -216,7 +245,7 @@ pub fn write_or_withhold(
             }
         };
         return Ok(Evidence::Withheld {
-            reason: format!("the run aborted: {reason}"),
+            reason: withhold.reason(),
             stale_artifact_removed,
         });
     }
