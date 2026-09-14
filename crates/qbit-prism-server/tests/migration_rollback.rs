@@ -834,7 +834,7 @@ async fn assert_candidate_payload_fingerprints(
     pg_bin: &std::path::Path,
     artifact: &recovery::Artifact,
 ) -> Result<()> {
-    use qbit_prism_server::ledger::Candidate;
+    use qbit_prism_server::ledger::{Candidate, SignerKeys, WindowRef};
     use sha2::{Digest, Sha256};
 
     let source = recovery::Database::open(raw).await?;
@@ -853,14 +853,35 @@ async fn assert_candidate_payload_fingerprints(
             let block = [0_u8; 81];
             let mut hash = Sha256::digest(Sha256::digest(&block[..80])).to_vec();
             hash.reverse();
+            let bundle: qbit_prism::AuditBundle = serde_json::from_slice(&artifact.canonical)?;
+            let mut bootstrap = recovery::share(1);
+            bootstrap.share_id = "bootstrap-share".into();
+            bootstrap.job_id = "bootstrap-job".into();
             let candidate = Candidate {
                 block_hash: hex::encode(hash),
-                block_hex: hex::encode(block),
+                block_sha256: Candidate::block_digest_hex(&block),
                 job_id: "recovery-candidate".into(),
                 payout_revision: 0,
-                bundle: serde_json::from_slice(&artifact.canonical)?,
-                coinbase_suffix_hex: None,
+                window: WindowRef {
+                    shares: None,
+                    prior_balances_digest: qbit_prism::prior_balances_digest(&[]),
+                    anchor_ms: bundle.found_block.anchor_job_issued_at_ms,
+                },
+                bootstrap_share: Some(bootstrap),
+                found_block: bundle.found_block,
+                payout_policy: bundle.payout_policy,
+                ctv: None,
+                audit_builder_version: qbit_prism::AUDIT_BUILDER_VERSION,
+                signer_keys: SignerKeys::of(
+                    &qbit_pool_builder::ManifestSigningKey::from_seed_hex(&"42".repeat(32))?,
+                    &recovery::ledger_key(),
+                ),
+                leased: false,
+                coinbase_suffix_hex: bundle.coinbase_script_sig_suffix_hex
+                    .unwrap_or_else(|| "00".repeat(12)),
                 deferred_share: None,
+                block_bytes: block.to_vec(),
+                as_issued_balances: Vec::new(),
             };
             let body = serde_json::to_value(&candidate)?;
             let digest = hex::encode(Sha256::digest(serde_json::to_vec(&candidate)?));
@@ -868,6 +889,7 @@ async fn assert_candidate_payload_fingerprints(
             let baseline = recovery::evidence(&source, pg_bin).await?;
             ensure!(baseline["pending_candidates"] == 1);
             let claim = ledger.claim_candidate(60).await?.expect("pending candidate");
+            ensure!(claim.candidate.block_bytes == block);
             ensure!(serde_json::to_value(claim.candidate)? == body);
             ensure!(recovery::evidence(&source, pg_bin).await? == baseline,
                 "candidate claim ownership changed recovery evidence");
@@ -877,8 +899,9 @@ async fn assert_candidate_payload_fingerprints(
             // Keep the declared digest, identity and pending state fixed.
             // JSON null is permitted by the schema but cannot deserialize.
             for mutation in [
-                "candidate=jsonb_set(candidate,'{block_hex}','\"deadbeef\"')",
-                "candidate=jsonb_set(candidate,'{bundle,found_block,network_difficulty}','101')",
+                "block_bytes=decode('deadbeef','hex')",
+                "candidate=jsonb_set(candidate,'{block_sha256}','\"deadbeef\"')",
+                "candidate=jsonb_set(candidate,'{found_block,network_difficulty}','101')",
                 "candidate='null'::jsonb",
                 "storage_version=3",
             ] {
@@ -894,8 +917,9 @@ async fn assert_candidate_payload_fingerprints(
                 let mut unchanged = current;
                 unchanged["records"]["candidates"] = baseline["records"]["candidates"].clone();
                 ensure!(unchanged == baseline, "unrelated evidence changed: {mutation}");
-                sqlx::query("UPDATE qbit_block_candidate_outbox SET candidate=$2,storage_version=1 WHERE block_hash=$1")
-                    .bind(&candidate.block_hash).bind(&body).execute(&source.pool).await?;
+                sqlx::query("UPDATE qbit_block_candidate_outbox SET candidate=$2,storage_version=1,block_bytes=$3 WHERE block_hash=$1")
+                    .bind(&candidate.block_hash).bind(&body).bind(&candidate.block_bytes)
+                    .execute(&source.pool).await?;
                 ensure!(recovery::evidence(&source, pg_bin).await? == baseline);
             }
             let archive = recovery::backup(&source, pg_bin).await?;
@@ -904,7 +928,9 @@ async fn assert_candidate_payload_fingerprints(
             let restored_ledger = Ledger::connect_operator(&restored.url, false).await?;
             let replayed = restored_ledger.claim_candidate(60).await;
             restored_ledger.pool.close().await;
-            ensure!(serde_json::to_value(replayed?.expect("restored pending candidate").candidate)? == body);
+            let replayed = replayed?.expect("restored pending candidate").candidate;
+            ensure!(replayed.block_bytes == block);
+            ensure!(serde_json::to_value(replayed)? == body);
             Ok::<_, anyhow::Error>(())
         }.await;
         ledger.pool.close().await;
