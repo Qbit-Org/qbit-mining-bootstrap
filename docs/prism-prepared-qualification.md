@@ -16,18 +16,48 @@ cargo +1.98.1 test --locked -p qbit-prism-server \
 The target reuses [WindowPlan](../crates/qbit-prism-server/tests/support/window_fixture.rs)
 from #264. Both 400,000 and 500,000 divide its existing window weight exactly;
 the tests check production-shaped serialized rows at sequence-width boundaries,
-the midpoint, and the final row without allocating either full window.
+the midpoint, and the final row without allocating either full window. The
+size band applies to the sampled average, matching the fixture's average-byte
+contract rather than imposing that band on each row.
 They test the failure behavior of the reusable
 [qualification assertions](../crates/qbit-prism-server/tests/support/prepared_work_assertions.rs).
 Synthetic byte strings and byte counts in these unit tests are guard inputs,
 never measured production evidence. There are no ignored or database-gated
 acceptance tests here and no new manifest IDs.
 
-The literal no-`shares`-key guard currently rejects even compact metadata:
-`CompactPrepared.window` embeds `WindowRef.shares: Option<ShareRange>`.
-The storage/runtime owner must settle whether the contract requires renaming
-that metadata or forbids only share arrays before wiring this guard. Do not
-silently weaken the assertion or change a persisted format in this preparation.
+## Share rows versus the literal key
+
+#273 literally requires the stored payload to have no `shares` key. The existing
+stored format does contain that key: `CompactPrepared.window` embeds
+`WindowRef.shares: Option<ShareRange>`. This preparation explicitly adopts a
+**no-materialized-share-rows** guard; it does not establish unchanged literal-key
+acceptance or close that checkbox. Final qualification and reconciliation of
+the literal wording remain open on #273.
+
+`assert_no_materialized_shares` rejects every `shares` key except at the exact
+root `window.shares` path. That exception requires the complete, existing
+`WindowRef` serialization: integer `anchor_ms`, 64-character lowercase-hex
+`prior_balances_digest`, and `shares` as either null (empty window) or an object
+with exactly `first_share_seq`, `last_share_seq`, `share_count`, and
+`snapshot_sha256`. Sequence bounds must be positive, ordered and fit SQL bigint;
+the positive count may not exceed the inclusive span (gaps are valid), and the
+snapshot digest must be 64-character lowercase hex. Missing, extra or malformed
+metadata fields fail. Arrays at `window.shares`, hidden arrays, and any `shares`
+key elsewhere fail, including nulls and metadata-shaped objects.
+
+The guard reuses `WindowRef` deserialization and requires exact serialization
+round-trip equality, since the existing deserializer otherwise ignores unknown
+fields and defaults a missing optional range. It checks payload structure, not
+digest authenticity or the full prepared-record contract. No stored field,
+format version, runtime serializer or upstream schema changes here.
+
+The serializer trace is `Ledger::save_compact_prepared` to
+[`encode_record`](../crates/qbit-prism-server/src/ledger/jobs/prepared.rs), which
+calls `serde_json::to_value(record)` and adds `original_expires_at_ms` without
+renaming or removing the range. The pure tests build actual `CompactPrepared`
+records from empty and nonempty `Snapshot` references and use that serialization
+plus expiry envelope. They exercise both valid shapes and legacy/hidden-array
+negative controls without claiming a database write or runtime activation.
 
 ## Runtime binding for the integration owner
 
@@ -52,7 +82,9 @@ refresh, or collector loops during the measurement bracket.
    extraction, not copying a second inventory or weakening the all-pipeline
    ratchet. Pass the largest uncompressed value to `assert_refresh_measurements`;
    compressed `pg_column_size` alone does not prove the whole-value bound.
-   Inspect the actual persisted prepared payload with `assert_no_shares_key`.
+   Inspect the actual persisted prepared payload with `assert_no_materialized_shares`.
+   Record its range-metadata exception explicitly; this is not proof of the
+   literal no-`shares`-key criterion.
 4. Refresh B outside A's WAL bracket so B has its own publication authority.
    Build and persist an issued job on A through `MiningBackend::build_job` and
    `persist_issued_job`, then call `MiningBackend::resume_job` on B with the

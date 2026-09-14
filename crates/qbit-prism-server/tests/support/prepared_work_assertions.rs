@@ -3,6 +3,8 @@
 //! deliberately fail qualification instead of becoming zero.
 
 use anyhow::{ensure, Context, Result};
+use qbit_prism_server::ledger::WindowRef;
+use serde::Deserialize;
 use serde_json::Value;
 
 pub const REGRESSION_SHARES: u64 = 400_000;
@@ -11,26 +13,58 @@ pub const JSONB_LIMIT_BYTES: u64 = 1_000_000;
 pub const WAL_LIMIT_BYTES: u64 = 5_000_000;
 
 /// Inspect the entire prepared payload, including nested objects and arrays.
-/// A WindowRef's optional `shares` range is metadata, so the compact storage
-/// adapter must supply the serialized job payload whose contract forbids that
-/// key, not an independently serialized WindowRef.
-pub fn assert_no_shares_key(payload: &Value) -> Result<()> {
+/// Only root `window.shares` may name shares: it must be the existing WindowRef
+/// metadata shape (null or ShareRange), never materialized share rows. This is
+/// explicitly narrower than #273's literal no-`shares`-key acceptance wording.
+pub fn assert_no_materialized_shares(payload: &Value) -> Result<()> {
+    inspect_prepared_payload(payload, true)
+}
+
+fn inspect_prepared_payload(payload: &Value, at_root: bool) -> Result<()> {
     match payload {
         Value::Object(fields) => {
             ensure!(
                 !fields.contains_key("shares"),
                 "stored payload contains shares key"
             );
-            for value in fields.values() {
-                assert_no_shares_key(value)?;
+            for (key, value) in fields {
+                if at_root && key == "window" {
+                    assert_window_metadata(value)?;
+                } else {
+                    inspect_prepared_payload(value, false)?;
+                }
             }
         }
         Value::Array(values) => {
             for value in values {
-                assert_no_shares_key(value)?;
+                inspect_prepared_payload(value, false)?;
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn assert_window_metadata(value: &Value) -> Result<()> {
+    // Reuse the actual serializer's integer and lowercase digest rules. Its
+    // deserializer ignores unknown fields and defaults missing Option fields;
+    // exact round-trip equality rejects both, including hidden share arrays.
+    let window = WindowRef::deserialize(value).context("invalid window metadata")?;
+    ensure!(
+        serde_json::to_value(window)? == *value,
+        "window metadata has missing, extra or noncanonical fields"
+    );
+    if let Some(range) = window.shares {
+        // Match the private ShareRange::bounds / CompactPrepared::validate
+        // constraints without changing their persisted representation.
+        ensure!(
+            range.first_share_seq >= 1
+                && range.last_share_seq >= range.first_share_seq
+                && i64::try_from(range.last_share_seq).is_ok()
+                && range.share_count >= 1
+                && range.share_count <= range.last_share_seq - range.first_share_seq + 1,
+            "invalid window range metadata"
+        );
     }
     Ok(())
 }
