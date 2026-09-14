@@ -159,6 +159,11 @@ pub async fn run(config: Config) -> Result<()> {
         TaskKind::HealthPublisher,
         publish_health(coordinator.clone(), api_state, stats, shutdown_rx.clone()),
     ));
+    tasks.spawn({
+        let ledger = coordinator.ledger.clone();
+        let shutdown = shutdown_rx.clone();
+        async move { prune_jobs(|| ledger.prune_expired_jobs(), shutdown).await }
+    });
     let failure = tokio::select! {
         result=signal()=>{result?;None},
         result=tasks.join_next()=>{Some(match result {Some(Ok(Err(error)))=>error,Some(Err(error))=>error.into(),_=>anyhow::anyhow!("critical PRISM task exited")})}
@@ -229,6 +234,36 @@ fn publication_ticks(state: &ApiState) -> tokio::time::Interval {
     tick
 }
 
+/// Keep bounded job cleanup at the original two-second cadence, independent
+/// of health publication and heartbeat latency. Never overlap prune batches.
+async fn prune_jobs<F: std::future::Future<Output = Result<u64>>>(
+    mut prune: impl FnMut() -> F,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let mut tick = tokio::time::interval(Duration::from_secs(2));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            _ = tick.tick() => {}
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            result = prune() => {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "job expiry failed");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn publish_health(
     coordinator: Arc<Coordinator>,
     state: ApiState,
@@ -279,9 +314,6 @@ async fn publish_health(
             .await
         {
             tracing::warn!(%error,"cluster heartbeat failed");
-        }
-        if let Err(error) = coordinator.ledger.prune_expired_jobs().await {
-            tracing::warn!(%error,"job expiry failed");
         }
     }
     Ok(())
@@ -490,5 +522,105 @@ mod tests {
         task.await.unwrap().unwrap();
         assert!(!runtime.snapshot_at(after_registration + budget).stalled());
         assert_healthy(state).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn job_pruning_retries_independently_of_a_daily_health_cadence() {
+        use futures_util::FutureExt;
+
+        let state = state_with(ApiConfig {
+            health_refresh_interval: Duration::from_secs(86400),
+            ..ApiConfig::default()
+        });
+        let mut health = publication_ticks(&state);
+        health.tick().await;
+        let (stop, shutdown) = watch::channel(false);
+        let (attempted, mut attempts) = tokio::sync::mpsc::unbounded_channel();
+        let mut count = 0;
+        let pruner = tokio::spawn(prune_jobs(
+            move || {
+                count += 1;
+                attempted.send(tokio::time::Instant::now()).unwrap();
+                std::future::ready(if count == 1 {
+                    Err(anyhow::anyhow!("temporary cleanup failure"))
+                } else {
+                    Ok(4096)
+                })
+            },
+            shutdown,
+        ));
+        let first = attempts.recv().await.unwrap();
+        for seconds in [2, 4, 6] {
+            let next = attempts.recv().await.unwrap();
+            assert_eq!(next - first, Duration::from_secs(seconds));
+            assert!(health.tick().now_or_never().is_none());
+        }
+        stop.send_replace(true);
+        pruner.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn job_pruning_serializes_slow_batches_and_skips_missed_ticks() {
+        let (stop, shutdown) = watch::channel(false);
+        let (attempted, mut attempts) = tokio::sync::mpsc::unbounded_channel();
+        let mut first_batch = true;
+        let pruner = tokio::spawn(prune_jobs(
+            move || {
+                attempted.send(tokio::time::Instant::now()).unwrap();
+                let slow = std::mem::take(&mut first_batch);
+                async move {
+                    if slow {
+                        tokio::time::sleep(Duration::from_secs(9)).await;
+                    }
+                    Ok(4096)
+                }
+            },
+            shutdown,
+        ));
+        let first = attempts.recv().await.unwrap();
+        // The overdue tick may run once after the slow batch, but its missed
+        // successors must not create a burst of database work.
+        for seconds in [9, 10, 12] {
+            assert_eq!(
+                attempts.recv().await.unwrap() - first,
+                Duration::from_secs(seconds)
+            );
+        }
+        stop.send_replace(true);
+        pruner.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn job_pruning_shutdown_cancels_an_in_flight_batch() {
+        let (stop, shutdown) = watch::channel(false);
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let mut entered = Some(entered);
+        let pruner = tokio::spawn(prune_jobs(
+            move || {
+                entered.take().unwrap().send(()).unwrap();
+                std::future::pending()
+            },
+            shutdown,
+        ));
+        started.await.unwrap();
+        stop.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), pruner)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn job_pruning_does_not_start_after_shutdown() {
+        let (_stop, shutdown) = watch::channel(true);
+        prune_jobs(
+            || -> std::future::Ready<Result<u64>> {
+                panic!("cleanup must not start after shutdown")
+            },
+            shutdown,
+        )
+        .await
+        .unwrap();
     }
 }
