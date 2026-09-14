@@ -31,8 +31,10 @@ SELECT jsonb_build_object('kind', 'payouts', 'row', to_jsonb(p))
 FROM qbit_pool_payout_entries p ORDER BY payout_entry_seq;
 SELECT jsonb_build_object('kind', 'candidates', 'row', jsonb_build_object(
     'block_hash', block_hash, 'share_id', share_id,
-    'candidate_sha256', candidate_sha256, 'state', state))
-FROM qbit_block_candidate_outbox ORDER BY block_hash COLLATE "C";
+    'candidate_sha256', candidate_sha256, 'state', state,
+    'candidate', candidate,
+    'storage_version', COALESCE(to_jsonb(o)->'storage_version', '1'::jsonb)))
+FROM qbit_block_candidate_outbox o ORDER BY block_hash COLLATE "C";
 SELECT jsonb_build_object('kind', 'ctv_sets', 'row', jsonb_build_object(
     'block_hash', block_hash, 'manifest_set_sha256', manifest_set_sha256,
     'manifest_set_json', manifest_set_json, 'manifest_set', manifest_set,

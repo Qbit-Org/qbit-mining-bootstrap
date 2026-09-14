@@ -332,6 +332,7 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         ensure!(unchanged == before_halt, "recovery history must independently distinguish a cleared halt");
 
         assert_native_audit_payload_fingerprints(&source, pg_bin, &artifacts[0]).await?;
+        assert_candidate_payload_fingerprints(raw, pg_bin, &artifacts[0]).await?;
 
         // Restore a native database containing both an active halt and a prior
         // clear event; their exact evidence must survive the backup roundtrip.
@@ -431,6 +432,92 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    source.close().await?;
+    restored.close().await?;
+    result
+}
+
+async fn assert_candidate_payload_fingerprints(
+    raw: &str,
+    pg_bin: &std::path::Path,
+    artifact: &recovery::Artifact,
+) -> Result<()> {
+    use qbit_prism_server::ledger::Candidate;
+    use sha2::{Digest, Sha256};
+
+    let source = recovery::Database::open(raw).await?;
+    let restored = recovery::Database::open(raw).await?;
+    let result = async {
+        // Pre-258 rows have no storage_version column. Migration adds version
+        // 1 without changing the evidence for an already-drained candidate.
+        sqlx::raw_sql(include_str!("fixtures/schema_2x/001_share_ledger.sql"))
+            .execute(&source.pool).await?;
+        sqlx::query("INSERT INTO qbit_block_candidate_outbox(block_hash,candidate_sha256,state,completed_at) VALUES(repeat('ef',32),repeat('ab',32),'abandoned',clock_timestamp())")
+            .execute(&source.pool).await?;
+        let legacy = recovery::evidence(&source, pg_bin).await?;
+        let ledger = Ledger::connect_operator(&source.url, true).await?;
+        let result = async {
+            ensure!(recovery::evidence(&source, pg_bin).await? == legacy);
+            let block = [0_u8; 81];
+            let mut hash = Sha256::digest(Sha256::digest(&block[..80])).to_vec();
+            hash.reverse();
+            let candidate = Candidate {
+                block_hash: hex::encode(hash),
+                block_hex: hex::encode(block),
+                job_id: "recovery-candidate".into(),
+                payout_revision: 0,
+                bundle: serde_json::from_slice(&artifact.canonical)?,
+                coinbase_suffix_hex: None,
+                deferred_share: None,
+            };
+            let body = serde_json::to_value(&candidate)?;
+            let digest = hex::encode(Sha256::digest(serde_json::to_vec(&candidate)?));
+            ledger.enqueue_candidate(candidate.clone()).await?;
+            let baseline = recovery::evidence(&source, pg_bin).await?;
+            ensure!(baseline["pending_candidates"] == 1);
+            let claim = ledger.claim_candidate(60).await?.expect("pending candidate");
+            ensure!(serde_json::to_value(claim.candidate)? == body);
+            ensure!(recovery::evidence(&source, pg_bin).await? == baseline,
+                "candidate claim ownership changed recovery evidence");
+            sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE block_hash=$1")
+                .bind(&candidate.block_hash).execute(&source.pool).await?;
+
+            // Keep the declared digest, identity and pending state fixed.
+            // JSON null is permitted by the schema but cannot deserialize.
+            for mutation in [
+                "candidate=jsonb_set(candidate,'{block_hex}','\"deadbeef\"')",
+                "candidate=jsonb_set(candidate,'{bundle,found_block,network_difficulty}','101')",
+                "candidate='null'::jsonb",
+                "storage_version=3",
+            ] {
+                sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET {mutation} WHERE block_hash=$1"))
+                    .bind(&candidate.block_hash).execute(&source.pool).await?;
+                let current = recovery::evidence(&source, pg_bin).await?;
+                ensure!(current["records"]["candidates"]["count"] == baseline["records"]["candidates"]["count"]);
+                ensure!(current["records"]["candidates"]["sha256"] != baseline["records"]["candidates"]["sha256"],
+                    "candidate recovery payload change was invisible: {mutation}");
+                let declared: String = sqlx::query_scalar("SELECT candidate_sha256 FROM qbit_block_candidate_outbox WHERE block_hash=$1")
+                    .bind(&candidate.block_hash).fetch_one(&source.pool).await?;
+                ensure!(declared == digest);
+                let mut unchanged = current;
+                unchanged["records"]["candidates"] = baseline["records"]["candidates"].clone();
+                ensure!(unchanged == baseline, "unrelated evidence changed: {mutation}");
+                sqlx::query("UPDATE qbit_block_candidate_outbox SET candidate=$2,storage_version=1 WHERE block_hash=$1")
+                    .bind(&candidate.block_hash).bind(&body).execute(&source.pool).await?;
+                ensure!(recovery::evidence(&source, pg_bin).await? == baseline);
+            }
+            let archive = recovery::backup(&source, pg_bin).await?;
+            recovery::restore(&archive, &source, &restored, pg_bin).await?;
+            ensure!(recovery::evidence(&restored, pg_bin).await? == baseline);
+            let restored_ledger = Ledger::connect_operator(&restored.url, false).await?;
+            let replayed = restored_ledger.claim_candidate(60).await;
+            restored_ledger.pool.close().await;
+            ensure!(serde_json::to_value(replayed?.expect("restored pending candidate").candidate)? == body);
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        ledger.pool.close().await;
+        result
+    }.await;
     source.close().await?;
     restored.close().await?;
     result
