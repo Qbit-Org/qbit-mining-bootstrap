@@ -1,4 +1,4 @@
-use super::audit::persist_audit_snapshot;
+use super::audit::{persist_audit_snapshot, verify_durable_range};
 use super::*;
 use qbit_prism::{verify_audit_bundle_with_ledger_public_key, AuditVerificationReport};
 
@@ -85,8 +85,24 @@ impl Ledger {
         let mut parent = block[4..36].to_vec();
         parent.reverse();
         let parent_hash = hex::encode(parent);
-        let mut tx = self.pool.begin().await?;
-        lock(&mut tx, SETTLEMENT_LOCK).await?;
+        // The proof that the window is the ledger's own history reads the
+        // whole range, so it runs before the settlement lock; under the lock
+        // the range is only counted. It is needed exactly where the snapshot
+        // is persisted: audit rows are never deleted, so a block that already
+        // has one takes the existing-row digest path below instead. A row
+        // that appears between this probe and the transaction lands on that
+        // same path.
+        let landed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM qbit_pool_audit_bundles WHERE block_hash=$1)",
+        )
+        .bind(&claim.candidate.block_hash)
+        .fetch_one(&self.pool)
+        .await?;
+        if !landed {
+            verify_durable_range(&self.pool, &claim.candidate.bundle).await?;
+        }
+        let mut tx = self.begin().await?;
+        self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         writable(&mut tx).await?;
         require_claim(&mut tx, claim).await?;
         if let Some(expected) = expected_revision {
@@ -133,10 +149,18 @@ impl Ledger {
         sqlx::query("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256) VALUES($1,$2,$3,$4,$5)")
             .bind(&claim.candidate.block_hash).bind(i64::try_from(report.block_height)?).bind(parent_hash).bind(&report.coinbase_txid).bind(&report.coinbase_manifest_sha256_hex).execute(&mut *tx).await?;
         let snapshot_digest = persist_audit_snapshot(&mut tx, &claim.candidate.bundle).await?;
+        // The stored body is the logical bundle minus both copies of the
+        // window: the top-level `shares` and the counted `reward_manifest.shares`,
+        // which is a pure fold over them. Reads rebuild the fold from the
+        // snapshot and prove the result against `audit_bundle_sha256`.
         let mut bundle_value = serde_json::to_value(&claim.candidate.bundle)?;
-        bundle_value
+        let body = bundle_value
             .as_object_mut()
-            .context("audit bundle is not an object")?
+            .context("audit bundle is not an object")?;
+        body.remove("shares");
+        body.get_mut("reward_manifest")
+            .and_then(Value::as_object_mut)
+            .context("audit reward manifest is not an object")?
             .remove("shares");
         sqlx::query("INSERT INTO qbit_pool_audit_bundles(block_hash,audit_bundle,audit_bundle_sha256,coinbase_tx_hex,audit_body_byte_len,schema_version,found_block_network_difficulty,found_block_coinbase_value_sats,audit_commitment_leaves_hex,witness_merkle_leaves_hex,share_snapshot_sha256,found_block_bits) VALUES($1,$2,$3,$4,$5,$6,$7::text::numeric,$8,$9,$10,$11,$12)")
             .bind(&claim.candidate.block_hash).bind(&bundle_value).bind(&report.audit_bundle_sha256_hex).bind(&report.coinbase_tx_hex)
@@ -177,9 +201,9 @@ impl Ledger {
         error: Option<&str>,
         expected_revision: i64,
     ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        lock(&mut tx, SETTLEMENT_LOCK).await?;
-        lock(&mut tx, ORDER_LOCK).await?;
+        let mut tx = self.begin().await?;
+        self.lock(&mut tx, SETTLEMENT_LOCK).await?;
+        self.lock(&mut tx, ORDER_LOCK).await?;
         writable(&mut tx).await?;
         let revision: i64 =
             sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton")
@@ -244,9 +268,9 @@ impl Ledger {
         tip_height: u64,
         expected_revision: i64,
     ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        lock(&mut tx, SETTLEMENT_LOCK).await?;
-        lock(&mut tx, ORDER_LOCK).await?;
+        let mut tx = self.begin().await?;
+        self.lock(&mut tx, SETTLEMENT_LOCK).await?;
+        self.lock(&mut tx, ORDER_LOCK).await?;
         writable(&mut tx).await?;
         let revision: i64 =
             sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton")
@@ -322,7 +346,7 @@ impl Ledger {
 
     pub async fn claim_fanout(&self, lease_seconds: i64) -> Result<Option<FanoutClaim>> {
         ensure!(lease_seconds > 0, "claim duration must be positive");
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin().await?;
         writable(&mut tx).await?;
         let token = Uuid::new_v4().to_string();
         let row = sqlx::query("WITH next AS (SELECT a.fanout_txid FROM qbit_ctv_fanout_artifacts a JOIN qbit_pool_blocks b USING(block_hash) WHERE b.chain_state='confirmed' AND b.maturity_state='mature' AND (a.settlement_status IN ('broadcastable','broadcast_submitted','failed') OR (a.settlement_status='confirmed' AND (a.confirmed_depth<1000 OR a.fanout_txid=(SELECT fanout_txid FROM qbit_ctv_fanout_artifacts WHERE settlement_status='confirmed' AND confirmed_depth>=1000 ORDER BY confirmed_block_height DESC,fanout_txid DESC LIMIT 1)))) AND (a.next_broadcast_attempt_at IS NULL OR a.next_broadcast_attempt_at<=clock_timestamp()) AND (a.claim_expires_at IS NULL OR a.claim_expires_at<=clock_timestamp()) ORDER BY (a.settlement_status='confirmed'),a.next_broadcast_attempt_at NULLS FIRST,b.block_height,a.chunk_index FOR UPDATE OF a SKIP LOCKED LIMIT 1) UPDATE qbit_ctv_fanout_artifacts a SET claim_token=$1,claim_instance_id=$2,claim_expires_at=clock_timestamp()+$3*interval '1 second' FROM next WHERE a.fanout_txid=next.fanout_txid RETURNING a.fanout_txid,a.block_hash,a.manifest,a.broadcast_attempt_count,jsonb_build_object('status',a.settlement_status,'confirmed_block_hash',a.confirmed_block_hash,'confirmed_block_height',a.confirmed_block_height,'confirmed_depth',a.confirmed_depth,'scan_next_height',a.spend_scan_next_height,'scan_anchor_height',a.spend_scan_anchor_height,'scan_anchor_hash',a.spend_scan_anchor_hash) AS progress")
@@ -389,8 +413,8 @@ impl Ledger {
             .contains(&status),
             "invalid fanout result status"
         );
-        let mut tx = self.pool.begin().await?;
-        lock(&mut tx, SETTLEMENT_LOCK).await?;
+        let mut tx = self.begin().await?;
+        self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         writable(&mut tx).await?;
         super::fanout::require_fanout(&mut tx, claim).await?;
         super::fanout::apply_progress(&mut tx, claim, status, submit_result.as_ref()).await?;
