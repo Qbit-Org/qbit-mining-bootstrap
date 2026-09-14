@@ -2213,6 +2213,8 @@ mod d2_bootstrap_tests;
 
 #[cfg(test)]
 mod d2_test_support;
+#[cfg(test)]
+mod test_serial;
 
 #[cfg(test)]
 mod window_ref_tests;

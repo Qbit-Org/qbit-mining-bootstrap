@@ -27,7 +27,7 @@ const PATIENCE: Duration = Duration::from_secs(20);
 const ORDER_LOCK_KEY: &str = "x'505249534d000002'::bigint";
 
 /// Deliberately long ledger transactions share advisory locks across schemas.
-static TEST_LOCK: Mutex<()> = Mutex::const_new(());
+use super::test_serial::TEST_LOCK;
 
 type Answer = std::result::Result<(), StratumError>;
 

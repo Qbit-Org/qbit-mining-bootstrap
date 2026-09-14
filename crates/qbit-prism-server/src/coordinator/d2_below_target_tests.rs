@@ -42,7 +42,7 @@ const NONCE_BUDGET: u32 = 200_000;
 const PATIENCE: Duration = Duration::from_secs(20);
 
 /// Deliberately long ledger transactions share advisory locks across schemas.
-static TEST_LOCK: Mutex<()> = Mutex::const_new(());
+use super::test_serial::TEST_LOCK;
 
 /// One vector case, looked up by name and checked for the invariants the
 /// migration guide promises before any of its numbers are used.
