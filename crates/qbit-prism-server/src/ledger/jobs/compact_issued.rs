@@ -217,8 +217,15 @@ impl Ledger {
             ensure!(same, "immutable compact prepared conflict");
             prepared::check_columns(&row, &repair.record)?;
             if !missing_record {
-                prepared::put_template(&mut tx, &repair.template).await?;
-                put_balances(&mut tx, repair).await?;
+                let same: bool = sqlx::query_scalar(
+                    "SELECT template_bytes=$2 FROM qbit_prism_templates WHERE template_sha256=$1",
+                )
+                .bind(&repair.template.digest)
+                .bind(&repair.template.bytes)
+                .fetch_one(&mut *tx)
+                .await?;
+                ensure!(same, "immutable prepared template conflict");
+                check_balances(&mut tx, repair).await?;
             }
         }
         require_live(&mut tx, expires).await?;
@@ -246,15 +253,20 @@ async fn put_balances(tx: &mut Transaction<'_, Postgres>, repair: &CompactRepair
     let inserted = sqlx::query("INSERT INTO qbit_prism_balance_snapshots(prior_balances_digest,balances) VALUES($1,$2) ON CONFLICT DO NOTHING")
         .bind(&digest).bind(&repair.balance_bytes).execute(&mut **tx).await?.rows_affected();
     if inserted == 0 {
-        let same: bool = sqlx::query_scalar(
-            "SELECT balances=$2 FROM qbit_prism_balance_snapshots WHERE prior_balances_digest=$1",
-        )
-        .bind(&digest)
-        .bind(&repair.balance_bytes)
-        .fetch_one(&mut **tx)
-        .await?;
-        ensure!(same, "immutable balance snapshot conflict");
+        check_balances(tx, repair).await?;
     }
+    Ok(())
+}
+
+async fn check_balances(tx: &mut Transaction<'_, Postgres>, repair: &CompactRepair) -> Result<()> {
+    let same: bool = sqlx::query_scalar(
+        "SELECT balances=$2 FROM qbit_prism_balance_snapshots WHERE prior_balances_digest=$1",
+    )
+    .bind(hex::encode(repair.record.window.prior_balances_digest))
+    .bind(&repair.balance_bytes)
+    .fetch_one(&mut **tx)
+    .await?;
+    ensure!(same, "immutable balance snapshot conflict");
     Ok(())
 }
 
@@ -270,7 +282,7 @@ impl CompactDependency<'_> {
     }
 
     fn check_row(&self, row: &PgRow) -> Result<()> {
-        let original: Value = row.try_get("original_expires_at_ms")?;
+        let original: Option<Value> = row.try_get("original_expires_at_ms")?;
         ensure!(
             row.try_get::<String, _>("parent_hash")? == self.parent
                 && row.try_get::<i64, _>("payout_revision")? == self.original_revision
@@ -280,7 +292,7 @@ impl CompactDependency<'_> {
                     == Some(self.template_sha256)
                 && row.try_get::<Option<String>, _>("window_prior_balances_sha256")?
                     == Some(hex::encode(self.prior_balances_digest))
-                && original.as_i64() == Some(self.original_expires_at_ms),
+                && original.as_ref().and_then(Value::as_i64) == Some(self.original_expires_at_ms),
             "immutable compact prepared dependency conflict"
         );
         ensure!(
@@ -304,7 +316,8 @@ async fn dependency_row(tx: &mut Transaction<'_, Postgres>, key: &str) -> Result
         window_anchor_ms,window_prior_balances_sha256,window_first_share_seq,
         window_last_share_seq,window_share_count,window_snapshot_sha256,template_sha256,
         payload->'original_expires_at_ms' AS original_expires_at_ms,
-        COALESCE(payload->'format_version'='1'::jsonb AND payload->>'format_version'='1'
+        COALESCE(payload->'format_version'=to_jsonb($2::integer)
+            AND payload->>'format_version'=($2::integer)::text
             AND payload->'parent_hash'=to_jsonb(parent_hash)
             AND payload->'payout_revision'=to_jsonb(payout_revision)
             AND payload->'template_sha256'=to_jsonb(template_sha256)
@@ -319,6 +332,7 @@ async fn dependency_row(tx: &mut Transaction<'_, Postgres>, key: &str) -> Result
         FROM qbit_prism_jobs WHERE job_id=$1 FOR KEY SHARE"#,
     )
     .bind(key)
+    .bind(i32::from(CompactPrepared::FORMAT_VERSION))
     .fetch_optional(&mut **tx)
     .await?)
 }

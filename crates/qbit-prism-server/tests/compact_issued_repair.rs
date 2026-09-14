@@ -499,6 +499,7 @@ async fn hot_metadata_rejects_payload_column_and_original_identity_mismatches() 
                 "payload=jsonb_set(payload,'{original_expires_at_ms}','null')",
                 "payload=jsonb_set(payload,'{original_expires_at_ms}','1.5')",
                 "payload=jsonb_set(payload,'{format_version}','\"1\"')",
+                "payload=jsonb_set(payload,'{format_version}','1.0')",
                 "payload=jsonb_set(payload,'{format_version}','99')",
                 "payload=jsonb_set(payload,'{window,anchor_ms}','1')",
             ] {
@@ -992,8 +993,9 @@ async fn legacy_inline_calls_and_cross_kind_errors_keep_their_existing_contract(
             let before = snapshot(db).await?;
             let payload = json!({"prepared_key":key,"expires_at_ms":expiry});
             let dependency = CompactDependency { key, ..original.dependency() };
-            ensure!(db.ledger.save_issued_job_compact("new-child", &payload, 0,
-                &original.record.parent_hash, expiry, dependency, None).await.is_err());
+            let error = db.ledger.save_issued_job_compact("new-child", &payload, 0,
+                &original.record.parent_hash, expiry, dependency, None).await.unwrap_err();
+            ensure!(error.to_string().contains("immutable compact prepared dependency conflict"));
             ensure!(snapshot(db).await? == before);
         }
         let before = snapshot(db).await?;
