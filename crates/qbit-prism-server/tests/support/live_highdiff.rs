@@ -349,6 +349,7 @@ async fn real_share_height_queries_use_template_parent_height() -> Result<()> {
             prepared: job.context.prepared.clone(),
             worker: job.context.worker.clone(),
             bundle: std::sync::Arc::new(bundle),
+            bootstrap_share: job.context.bootstrap_share.clone(),
         });
         let rejected = coordinator
             .submit(&worker, &malformed, submission.clone(), false.into())
