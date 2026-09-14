@@ -13,6 +13,7 @@ use submit_ledger::CommitGate;
 mod admission_races;
 mod blockwait;
 mod commit_reconcile;
+mod compact_prepared;
 mod config;
 mod credit;
 mod interleavings;
@@ -40,6 +41,7 @@ pub(crate) struct MemoryLedger {
     pub append_gate: StdMutex<Option<Arc<Gate>>>,
     pub fail_revision: AtomicBool,
     pub jobs: StdMutex<HashMap<String, work_store::MemoryJob>>,
+    pub compact: work_store::CompactStore,
     pub clock_offset_ms: AtomicI64,
     pub snapshot: StdMutex<Option<Snapshot>>,
     pub tip: StdMutex<Option<String>>,
@@ -311,6 +313,7 @@ impl Fixture {
             observed_tip: RwLock::new(TipState::default()),
             last_error: RwLock::new(None),
             build_slots: Arc::new(Semaphore::new(1)),
+            window_reads: Arc::new(Semaphore::new(1)),
             refresh_lock: Mutex::new(()),
             identities: Mutex::new(HashMap::new()),
             chain_cache: Mutex::new(None),
@@ -439,6 +442,16 @@ impl Fixture {
             }),
             repair: Arc::new(Mutex::new(())),
             repair_probe: Default::default(),
+            window: WindowRef::from_snapshot(&snapshot).expect("fixture window reference"),
+            inputs: BundleInputs {
+                payout_policy: qbit_prism::PayoutPolicy::day_one_default(),
+                ctv: None,
+                signer_keys: SignerKeys::of(
+                    &ManifestSigningKey::from_seed_hex(&hash(0x11)).unwrap(),
+                    &ManifestSigningKey::from_seed_hex(&hash(0x22)).unwrap(),
+                ),
+                audit_builder_version: qbit_prism::AUDIT_BUILDER_VERSION,
+            },
             template,
             snapshot,
             bundle: Some(bundle.clone()),
@@ -456,6 +469,7 @@ impl Fixture {
                 prepared,
                 worker,
                 bundle,
+                bootstrap_share: None,
             }),
         }
     }

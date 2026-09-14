@@ -102,7 +102,7 @@ fn live_sql_stays_pinned_to_the_frozen_2x_release() {
              release: {:?}). The migrator applies this file to every 2.x.x database, so its DDL \
              must stay identical to tests/fixtures/schema_2x/001_share_ledger.sql. Revert the DDL \
              change here and put it in a new numbered migration under \
-             crates/qbit-prism-server/migrations/ (007 is next; 008, 009 and 010 are taken), then add it to \
+             crates/qbit-prism-server/migrations/ (011 is next; 007, 008, 009 and 010 are taken), then add it to \
              REQUIRED_SCHEMA_VERSIONS in src/ledger/migration.rs",
             index + 1,
             live.get(index).map(String::as_str).unwrap_or("<end of file>"),
@@ -244,7 +244,7 @@ fn source_state_table_is_the_pinned_data() {
         SourceState::Applied258.release().map(|r| r.1),
         Some(RELEASE_COMMIT_2_0_2)
     );
-    assert_eq!(REQUIRED_SCHEMA_VERSIONS, [2, 3, 4, 5, 6, 8, 9, 10]);
+    assert_eq!(REQUIRED_SCHEMA_VERSIONS, [2, 3, 4, 5, 6, 7, 8, 9, 10]);
 }
 
 /// Build a 2.x.x source from the frozen release files. Each file is the
@@ -389,22 +389,24 @@ async fn schema_versions(pool: &PgPool) -> Result<Vec<i32>> {
 async fn exercise_native_writers(ledger: &Ledger, share_id: u64, nonce: u32) -> Result<String> {
     ledger.append(share(share_id), None).await?;
     let block = candidate(&ledger.snapshot(100).await?, nonce)?;
-    ledger.enqueue_candidate(block.clone()).await?;
-    let claim = ledger
-        .claim_candidate(60)
-        .await?
-        .context("native candidate not claimed")?;
-    assert_eq!(claim.candidate.block_hash, block.block_hash);
+    ledger.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(
+        ledger
+            .claim_candidate(60)
+            .await?
+            .context("native candidate not claimed")?,
+    );
+    assert_eq!(claim.candidate.block_hash, block.candidate.block_hash);
     ledger
         .land_candidate(&claim, &keys().1.public_key_hex())
         .await?;
     ledger.finish_candidate(&claim, true, None).await?;
     let row = sqlx::query("SELECT state,storage_version,candidate IS NULL AS detached FROM qbit_block_candidate_outbox WHERE block_hash=$1")
-        .bind(&block.block_hash).fetch_one(&ledger.pool).await?;
+        .bind(&block.candidate.block_hash).fetch_one(&ledger.pool).await?;
     assert_eq!(row.try_get::<String, _>("state")?, "submitted");
     assert_eq!(row.try_get::<i32, _>("storage_version")?, 1);
     assert!(row.try_get::<bool, _>("detached")?);
-    Ok(block.block_hash)
+    Ok(block.candidate.block_hash)
 }
 
 async fn parked_row(
@@ -2635,7 +2637,7 @@ async fn native_candidate_version_two_is_refused_without_claiming_or_migrating()
         .context("migration accepted unsupported runtime candidate version 2")?
         .to_string();
     assert!(error.contains("candidate_storage_version = 2"), "{error}");
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 8, 10]);
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 7, 8, 10]);
     assert_eq!(schema_objects(&pool).await?, objects);
     assert_eq!(capability(&pool).await?, Some(2));
     assert_eq!(
@@ -2706,7 +2708,7 @@ async fn native_capability_relation_must_be_an_ordinary_table() -> Result<()> {
             .context("migrated above a capability impostor")?;
         assert!(format!("{error:#}").contains("must be an ordinary table"));
         assert_eq!(schema_objects(&pool).await?, objects);
-        assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 8, 10]);
+        assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 7, 8, 10]);
         assert_eq!(sqlx::query_scalar::<_,i32>("SELECT capability_value FROM operator_real_capabilities WHERE capability='candidate_storage_version'").fetch_one(&pool).await?, 2);
         sqlx::raw_sql(&format!("DROP {kind} qbit_prism_schema_capabilities; ALTER TABLE operator_real_capabilities RENAME TO qbit_prism_schema_capabilities"))
             .execute(&pool).await?;
@@ -2723,7 +2725,7 @@ async fn native_capability_relation_must_be_an_ordinary_table() -> Result<()> {
             .err()
             .context("accepted the restored newer capability")?;
         assert!(format!("{error:#}").contains("candidate_storage_version = 2"));
-        assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 8, 10]);
+        assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 7, 8, 10]);
         pool.close().await;
         db.close(vec![earlier]).await?;
     }
@@ -2878,7 +2880,7 @@ async fn native_capabilities_with_row_level_security_are_refused_before_writes()
         .context("migration trusted a filtered capability table")?
         .to_string();
     assert!(error.contains("row-level security"), "{error}");
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 8, 10]);
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 7, 8, 10]);
     assert_eq!(schema_objects(&pool).await?, objects);
     assert_eq!(
         sqlx::query_scalar::<_, Value>(
@@ -2896,7 +2898,7 @@ async fn native_capabilities_with_row_level_security_are_refused_before_writes()
         .context("migration accepted the now-visible unknown capability")?
         .to_string();
     assert!(error.contains("sealed_share_pages"), "{error}");
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 8, 10]);
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 7, 8, 10]);
     sqlx::query("DELETE FROM qbit_prism_schema_capabilities WHERE capability='sealed_share_pages'")
         .execute(&limited_pool)
         .await?;
@@ -3026,7 +3028,7 @@ async fn migrated_database_without_its_capability_declaration_is_refused_at_conn
             assert!(error.contains(remedy), "{error}");
             if initialize {
                 assert!(
-                    error.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 8, 9, 10 before any DDL"),
+                    error.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10 before any DDL"),
                     "{error}"
                 );
             }
@@ -3056,11 +3058,11 @@ async fn migrated_database_without_its_capability_declaration_is_refused_at_conn
         .context("migrate applied 009 above a missing capability declaration")?
         .to_string();
     assert!(
-        error.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 8, 10 before any DDL"),
+        error.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 10 before any DDL"),
         "{error}"
     );
     assert!(error.contains(row_gone), "{error}");
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 8, 10]);
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 7, 8, 10]);
     assert_eq!(schema_objects(&pool).await?, before);
     sqlx::raw_sql("INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',1)")
         .execute(&pool).await?;
@@ -3188,7 +3190,7 @@ async fn migrated_database_without_readable_source_metadata_is_refused_before_la
                 .err()
                 .context("migrate applied 009 above invalid source metadata")?;
             let error = format!("{error:#}");
-            assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 8, 10]);
+            assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 7, 8, 10]);
             assert!(error.contains("qbit_prism_migration_source"), "{error}");
             assert!(error.contains("before any DDL"), "{error}");
             assert!(error.contains("Restore the full backup"), "{error}");
@@ -3218,7 +3220,7 @@ async fn undo_009(pool: &PgPool) -> Result<()> {
     assert_eq!(schema_versions(pool).await?, REQUIRED_SCHEMA_VERSIONS);
     sqlx::raw_sql("DELETE FROM qbit_prism_schema_migrations WHERE version=9; DROP TABLE qbit_prism_session_reservations; DROP INDEX qbit_prism_jobs_extranonce1_expiry_idx; ALTER SEQUENCE qbit_prism_session_sequence NO CYCLE")
         .execute(pool).await?;
-    assert_eq!(schema_versions(pool).await?, [2, 3, 4, 5, 6, 8, 10]);
+    assert_eq!(schema_versions(pool).await?, [2, 3, 4, 5, 6, 7, 8, 10]);
     Ok(())
 }
 
@@ -3236,7 +3238,7 @@ async fn startup_without_initialize_requires_the_current_schema_version() -> Res
         .context("a non-initializing start accepted a 2.x.x database")?
         .to_string();
     assert!(
-        error.contains("requires schema migrations 2, 3, 4, 5, 6, 8, 9, 10"),
+        error.contains("requires schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10"),
         "{error}"
     );
     assert!(error.contains("qbit-prism-server migrate"), "{error}");
@@ -3257,14 +3259,14 @@ async fn startup_without_initialize_requires_the_current_schema_version() -> Res
         .to_string();
     assert!(
         error.contains(
-            "missing migration(s) 9; this server requires 2, 3, 4, 5, 6, 8, 9, 10 and found 2, 3, 4, 5, 6, 8, 10"
+            "missing migration(s) 9; this server requires 2, 3, 4, 5, 6, 7, 8, 9, 10 and found 2, 3, 4, 5, 6, 7, 8, 10"
         ),
         "{error}"
     );
     assert!(error.contains("qbit-prism-server migrate"), "{error}");
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 8, 10],
+        [2, 3, 4, 5, 6, 7, 8, 10],
         "a non-initializing start ran a migration"
     );
     // Initializing brings it forward again, without rewriting the source record.
@@ -3276,12 +3278,13 @@ async fn startup_without_initialize_requires_the_current_schema_version() -> Res
     );
 
     // A migration this release does not know: a later release's additive
-    // migration ran first (007 is reserved), and a frontend still on this
-    // release keeps starting during the rollout. A format it must not touch
-    // is declared as a capability, which
+    // migration ran first, and a frontend still on this release keeps starting
+    // during the rollout. A format it must not touch is declared as a
+    // capability, which
     // newer_storage_version_or_capability_is_refused_at_migrate_and_at_connect
-    // covers.
-    sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(7)")
+    // covers. 007 used to stand in for the unknown migration here; it is this
+    // release's own since #265, so the next free number does.
+    sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(11)")
         .execute(&pool)
         .await?;
     let follower = Ledger::connect(&db.url, "cold".into(), 8, false)
@@ -3289,13 +3292,16 @@ async fn startup_without_initialize_requires_the_current_schema_version() -> Res
         .context("a start refused an additive unknown migration")?;
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 9, 10],
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
         "a non-initializing start rewrote the newer schema"
     );
     // Initializing on it is a no-op too: no migration is reapplied and the
     // source record stands.
     let initializer = db.ledger("init-on-newer").await?;
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(
+        schema_versions(&pool).await?,
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    );
     assert_eq!(
         initializer.migration_source().await?.map(|s| s.migrated_by),
         Some("init".into())
@@ -3328,7 +3334,7 @@ async fn native_migration_gap_collisions_are_refused_before_any_ddl() -> Result<
         assert!(error.contains("migration 5"), "{error}");
         assert!(error.contains(object), "{error}");
         assert!(error.contains("before any DDL"), "{error}");
-        assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 6, 8, 10]);
+        assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 6, 7, 8, 10]);
         assert_eq!(schema_objects(&pool).await?, before);
         assert_eq!(earlier.migration_source().await?, source);
         sqlx::raw_sql(remedy).execute(&pool).await?;
@@ -3451,13 +3457,13 @@ async fn startup_without_initialize_refuses_a_pre_006_native_schema_with_009() -
         .to_string();
     assert!(
         error.contains(
-            "missing migration(s) 6; this server requires 2, 3, 4, 5, 6, 8, 9, 10 and found 2, 3, 4, 5, 8, 9, 10"
+            "missing migration(s) 6; this server requires 2, 3, 4, 5, 6, 7, 8, 9, 10 and found 2, 3, 4, 5, 7, 8, 9, 10"
         ),
         "{error}"
     );
     assert!(error.contains("qbit-prism-server migrate"), "{error}");
     // Nothing ran: the same rows, and none of 006's objects.
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 8, 9, 10]);
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 7, 8, 9, 10]);
     assert!(objects_006_absent(&pool, SourceState::Pre258).await?);
     pool.close().await;
     db.close(vec![earlier]).await
@@ -3472,7 +3478,7 @@ async fn unknown_storage_version_row_is_parked_and_not_reclaimed_at_lease_expiry
     let b = db.ledger("b").await?;
     a.append(share(1), None).await?;
     let unknown = candidate(&a.snapshot(100).await?, 6001)?;
-    a.enqueue_candidate(unknown.clone()).await?;
+    a.enqueue_candidate(unknown.candidate.clone()).await?;
     // A later release's storage version on a row this binary cannot decode.
     sqlx::query("UPDATE qbit_block_candidate_outbox SET storage_version=3 WHERE block_hash=$1")
         .bind(&unknown.block_hash)
@@ -3502,7 +3508,7 @@ async fn unknown_storage_version_row_is_parked_and_not_reclaimed_at_lease_expiry
     assert_eq!(attempts, 1, "parked row was re-claimed");
     // Ordinary work is unaffected.
     let good = candidate(&a.snapshot(100).await?, 6002)?;
-    a.enqueue_candidate(good.clone()).await?;
+    a.enqueue_candidate(good.candidate.clone()).await?;
     let claim = b.claim_candidate(60).await?.context("good candidate")?;
     assert_eq!(claim.candidate.block_hash, good.block_hash);
     b.finish_candidate(&claim, false, Some("test")).await?;
@@ -3536,7 +3542,7 @@ async fn undo_006(pool: &PgPool, state: SourceState) -> Result<()> {
         sqlx::query("UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='candidate_storage_version'")
             .execute(pool).await?;
     }
-    assert_eq!(schema_versions(pool).await?, [2, 3, 4, 5, 8, 9, 10]);
+    assert_eq!(schema_versions(pool).await?, [2, 3, 4, 5, 7, 8, 9, 10]);
     assert!(objects_006_absent(pool, state).await?);
     Ok(())
 }
@@ -3579,7 +3585,7 @@ async fn pre_006_native_schema_on_a_258_source_refuses_a_pending_v2_row_before_a
         .context("migration 006 accepted a pre-006 native database with a pending v2 row")?
         .to_string();
     assert!(
-        error.contains("refusing to apply migration 006 to a native database at schema migrations 2, 3, 4, 5, 8, 9, 10: an earlier 3.x.x build migrated it before the drain rule covered these rows, and the legacy Python block outbox is not drained: 1 pending 2.x.x candidate row(s) cannot be replayed natively"),
+        error.contains("refusing to apply migration 006 to a native database at schema migrations 2, 3, 4, 5, 7, 8, 9, 10: an earlier 3.x.x build migrated it before the drain rule covered these rows, and the legacy Python block outbox is not drained: 1 pending 2.x.x candidate row(s) cannot be replayed natively"),
         "{error}"
     );
     assert!(
@@ -3594,7 +3600,7 @@ async fn pre_006_native_schema_on_a_258_source_refuses_a_pending_v2_row_before_a
         "{error}"
     );
     // Unchanged: migrations 2, 3, 4, 5, 8, 9, 10, no 006 object, the schema and the rows as they were.
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 8, 9, 10]);
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 7, 8, 9, 10]);
     assert!(objects_006_absent(&pool, SourceState::Applied258).await?);
     assert_eq!(schema_objects(&pool).await?, before);
     assert_eq!(pending_rows(&pool).await?, 1);
@@ -3743,7 +3749,7 @@ async fn pre_006_native_schema_declaring_a_newer_capability_is_refused_before_an
         )?
         .to_string();
     assert!(
-        error.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 8, 9, 10 before any DDL"),
+        error.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 7, 8, 9, 10 before any DDL"),
         "{error}"
     );
     assert!(
@@ -3753,7 +3759,7 @@ async fn pre_006_native_schema_declaring_a_newer_capability_is_refused_before_an
     assert!(error.contains("upgrade the server"), "{error}");
     // Unchanged: migrations 2, 3, 4, 5, 8, 9, 10, no 006 object, the schema and
     // the row as they were.
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 8, 9, 10]);
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 7, 8, 9, 10]);
     assert!(objects_006_absent(&pool, SourceState::Applied258).await?);
     assert_eq!(schema_objects(&pool).await?, before);
     assert_eq!(capability(&pool).await?, Some(3));
@@ -3768,7 +3774,7 @@ async fn pre_006_native_schema_declaring_a_newer_capability_is_refused_before_an
         error.contains("missing migration(s) 6") || error.contains("candidate_storage_version = 3"),
         "{error}"
     );
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 8, 9, 10]);
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 7, 8, 9, 10]);
     assert_eq!(schema_objects(&pool).await?, before);
     // Back at 2, a capability this release does not know is refused the
     // same way, naming it.
@@ -3781,14 +3787,14 @@ async fn pre_006_native_schema_declaring_a_newer_capability_is_refused_before_an
         .context("migrate accepted a pre-006 native database declaring an unknown capability")?
         .to_string();
     assert!(
-        error.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 8, 9, 10 before any DDL"),
+        error.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 7, 8, 9, 10 before any DDL"),
         "{error}"
     );
     assert!(
         error.contains("capability sealed_share_pages = 1, which this server does not understand"),
         "{error}"
     );
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 8, 9, 10]);
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 7, 8, 9, 10]);
     assert!(objects_006_absent(&pool, SourceState::Applied258).await?);
     assert_eq!(schema_objects(&pool).await?, before);
     assert_eq!(capability(&pool).await?, Some(2));
@@ -3832,7 +3838,7 @@ async fn native_record_with_3_and_not_2_is_refused_before_any_ddl_and_not_repair
     sqlx::query("DELETE FROM qbit_prism_schema_migrations WHERE version=2")
         .execute(&pool)
         .await?;
-    assert_eq!(schema_versions(&pool).await?, [3, 4, 5, 8, 9, 10]);
+    assert_eq!(schema_versions(&pool).await?, [3, 4, 5, 7, 8, 9, 10]);
     let before = schema_objects(&pool).await?;
     let error = db
         .ledger("this-build")
@@ -3841,7 +3847,7 @@ async fn native_record_with_3_and_not_2_is_refused_before_any_ddl_and_not_repair
         .context("migrate accepted a record with 3 and not 2")?
         .to_string();
     assert!(
-        error.contains("refusing to migrate a native database at schema migrations 3, 4, 5, 8, 9, 10 before any DDL: migration 3 is recorded and 2 is not"),
+        error.contains("refusing to migrate a native database at schema migrations 3, 4, 5, 7, 8, 9, 10 before any DDL: migration 3 is recorded and 2 is not"),
         "{error}"
     );
     assert!(
@@ -3850,7 +3856,7 @@ async fn native_record_with_3_and_not_2_is_refused_before_any_ddl_and_not_repair
         "{error}"
     );
     // Unchanged: the record as it was, no 006 object, the schema as it was.
-    assert_eq!(schema_versions(&pool).await?, [3, 4, 5, 8, 9, 10]);
+    assert_eq!(schema_versions(&pool).await?, [3, 4, 5, 7, 8, 9, 10]);
     assert!(objects_006_absent(&pool, SourceState::Pre258).await?);
     assert_eq!(schema_objects(&pool).await?, before);
     // A start without initialize refuses the gap and changes nothing either.
@@ -3861,11 +3867,11 @@ async fn native_record_with_3_and_not_2_is_refused_before_any_ddl_and_not_repair
         .to_string();
     assert!(
         error.contains(
-            "missing migration(s) 2, 6; this server requires 2, 3, 4, 5, 6, 8, 9, 10 and found 3, 4, 5, 8, 9, 10"
+            "missing migration(s) 2, 6; this server requires 2, 3, 4, 5, 6, 7, 8, 9, 10 and found 3, 4, 5, 7, 8, 9, 10"
         ),
         "{error}"
     );
-    assert_eq!(schema_versions(&pool).await?, [3, 4, 5, 8, 9, 10]);
+    assert_eq!(schema_versions(&pool).await?, [3, 4, 5, 7, 8, 9, 10]);
     assert_eq!(schema_objects(&pool).await?, before);
     // Recorded again once 002's objects are verified present, the same
     // database migrates: 006 runs, nothing else is re-run.
@@ -4075,7 +4081,7 @@ async fn pre_006_native_schema_refuses_a_malformed_storage_version_column() -> R
             let earlier = db.ledger("earlier-build").await?;
             earlier.append(share(1), None).await?;
             let block = candidate(&earlier.snapshot(100).await?, 7001)?;
-            earlier.enqueue_candidate(block.clone()).await?;
+            earlier.enqueue_candidate(block.candidate.clone()).await?;
             undo_006(&pool, state).await?;
             if state == SourceState::Pre258 {
                 sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox ADD COLUMN storage_version integer NOT NULL DEFAULT 1").execute(&pool).await?;
@@ -4144,11 +4150,13 @@ async fn pre_006_native_schema_refuses_a_malformed_storage_version_column() -> R
             sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox ALTER COLUMN storage_version TYPE integer, ALTER COLUMN storage_version SET NOT NULL, ALTER COLUMN storage_version SET DEFAULT 1").execute(&pool).await?;
             let migrated = db.ledger("this-build").await?;
             assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
-            let claim = migrated
-                .claim_candidate(60)
-                .await?
-                .context("existing native candidate was stranded")?;
-            assert_eq!(claim.candidate.block_hash, block.block_hash);
+            let claim = block.claim(
+                migrated
+                    .claim_candidate(60)
+                    .await?
+                    .context("existing native candidate was stranded")?,
+            );
+            assert_eq!(claim.candidate.block_hash, block.candidate.block_hash);
             migrated
                 .land_candidate(&claim, &keys().1.public_key_hex())
                 .await?;
@@ -4176,7 +4184,7 @@ async fn pre_006_native_schema_with_only_native_pending_candidates_migrates_and_
         // row, whose body carries payout_revision, bundle and block_hash.
         earlier.append(share(1), None).await?;
         let block = candidate(&earlier.snapshot(100).await?, 5601)?;
-        earlier.enqueue_candidate(block.clone()).await?;
+        earlier.enqueue_candidate(block.candidate.clone()).await?;
         undo_006(&pool, state).await?;
         assert_eq!(pending_rows(&pool).await?, 1);
         let migrated = db.ledger("this-build").await.with_context(|| {
@@ -4195,11 +4203,13 @@ async fn pre_006_native_schema_with_only_native_pending_candidates_migrates_and_
         };
         assert_eq!(source.candidate_storage_version, declared);
         assert_eq!(capability(&pool).await?, Some(1));
-        let claim = migrated
-            .claim_candidate(60)
-            .await?
-            .context("the native candidate is no longer claimable after 006")?;
-        assert_eq!(claim.candidate.block_hash, block.block_hash);
+        let claim = block.claim(
+            migrated
+                .claim_candidate(60)
+                .await?
+                .context("the native candidate is no longer claimable after 006")?,
+        );
+        assert_eq!(claim.candidate.block_hash, block.candidate.block_hash);
         migrated
             .land_candidate(&claim, &keys().1.public_key_hex())
             .await?;
@@ -4232,7 +4242,7 @@ async fn pre_006_native_schema_on_a_pre_258_source_refuses_an_undrained_v1_row_w
         .context("migration 006 accepted a pre-006 native database with an undrained v1 row")?
         .to_string();
     assert!(
-        error.contains("refusing to apply migration 006 to a native database at schema migrations 2, 3, 4, 5, 8, 9, 10"),
+        error.contains("refusing to apply migration 006 to a native database at schema migrations 2, 3, 4, 5, 7, 8, 9, 10"),
         "{error}"
     );
     assert!(
@@ -4243,7 +4253,7 @@ async fn pre_006_native_schema_on_a_pre_258_source_refuses_an_undrained_v1_row_w
         !error.contains("does not exist"),
         "pre-#258 native refusal was a SQL error: {error}"
     );
-    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 8, 9, 10]);
+    assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 7, 8, 9, 10]);
     assert!(objects_006_absent(&pool, SourceState::Pre258).await?);
     assert_eq!(pending_rows(&pool).await?, 1);
     drain_2x_row(&pool, &pending, false).await?;
@@ -4383,8 +4393,8 @@ async fn native_publication_ordinal_survives_reactivation_and_excludes_rejected_
     let ledger = db.ledger("a").await?;
     ledger.append(share(1), None).await?;
     let block = candidate(&ledger.snapshot(100).await?, 3001)?;
-    ledger.enqueue_candidate(block.clone()).await?;
-    let claim = ledger.claim_candidate(60).await?.unwrap();
+    ledger.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(ledger.claim_candidate(60).await?.unwrap());
     ledger
         .land_candidate(&claim, &keys().1.public_key_hex())
         .await?;
@@ -4432,8 +4442,8 @@ async fn native_publication_ordinal_survives_reactivation_and_excludes_rejected_
         .await?;
     assert!(sqlx::query_scalar::<_,bool>("SELECT inactive_since IS NULL AND audit_publication_sequence=$2 FROM qbit_pool_blocks WHERE block_hash=$1").bind(&block.block_hash).bind(ordinal).fetch_one(&ledger.pool).await?);
     let rejected = candidate(&ledger.snapshot(100).await?, 3002)?;
-    ledger.enqueue_candidate(rejected.clone()).await?;
-    let claim = ledger.claim_candidate(60).await?.unwrap();
+    ledger.enqueue_candidate(rejected.candidate.clone()).await?;
+    let claim = rejected.claim(ledger.claim_candidate(60).await?.unwrap());
     ledger
         .land_candidate(&claim, &keys().1.public_key_hex())
         .await?;
@@ -4452,8 +4462,8 @@ async fn canonical_2x_sidecar_import_preserves_exact_bytes_and_fails_closed() ->
     let ledger = db.ledger("a").await?;
     ledger.append(share(1), None).await?;
     let block = candidate(&ledger.snapshot(100).await?, 4001)?;
-    ledger.enqueue_candidate(block.clone()).await?;
-    let claim = ledger.claim_candidate(60).await?.unwrap();
+    ledger.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(ledger.claim_candidate(60).await?.unwrap());
     let report = ledger
         .land_candidate(&claim, &keys().1.public_key_hex())
         .await?;
@@ -4625,8 +4635,8 @@ async fn audit_range_query_uses_deadline_remaining_after_delayed_snapshot() -> R
     let ledger = db.ledger("audit-deadline").await?;
     ledger.append(share(9001), None).await?;
     let block = candidate(&ledger.snapshot(100).await?, 9001)?;
-    ledger.enqueue_candidate(block.clone()).await?;
-    let claim = ledger.claim_candidate(60).await?.unwrap();
+    ledger.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(ledger.claim_candidate(60).await?.unwrap());
     let report = ledger
         .land_candidate(&claim, &keys().1.public_key_hex())
         .await?;
@@ -4717,14 +4727,15 @@ async fn compact_bits_metadata_comes_from_durable_header_and_recovers_without_au
     let canonical = qbit_prism::canonical_audit_bundle_bytes(&block.bundle)?;
     // Deliberately asymmetric compact bytes prove display endianness. Their
     // value is independent of the audit's scaled network-difficulty integer.
-    let mut bytes = hex::decode(&block.block_hex)?;
+    let mut bytes = block.block_bytes.clone();
     bytes[72..76].copy_from_slice(&0x1d00ffffu32.to_le_bytes());
     let mut hash = Sha256::digest(Sha256::digest(&bytes[..80])).to_vec();
     hash.reverse();
     block.block_hash = hex::encode(hash);
-    block.block_hex = hex::encode(bytes);
-    a.enqueue_candidate(block.clone()).await?;
-    let claim = a.claim_candidate(60).await?.unwrap();
+    block.block_sha256 = Candidate::block_digest_hex(&bytes);
+    block.block_bytes = bytes;
+    a.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(a.claim_candidate(60).await?.unwrap());
     let report = a.land_candidate(&claim, &keys().1.public_key_hex()).await?;
     assert_eq!(
         sqlx::query_scalar::<_, String>(
@@ -4746,8 +4757,8 @@ async fn compact_bits_metadata_comes_from_durable_header_and_recovers_without_au
         .execute(&a.pool)
         .await?;
     sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE block_hash=$1").bind(&block.block_hash).execute(&a.pool).await?;
-    let recovered = b.claim_candidate(60).await?.unwrap();
-    assert_eq!(recovered.candidate.block_hex, block.block_hex);
+    let recovered = block.claim(b.claim_candidate(60).await?.unwrap());
+    assert_eq!(recovered.candidate.block_bytes, block.block_bytes);
     let recovered_report = b
         .land_candidate(&recovered, &keys().1.public_key_hex())
         .await?;
@@ -4814,9 +4825,9 @@ async fn api_get(app: &axum::Router, path: &str) -> Result<(axum::http::StatusCo
     Ok((status, serde_json::from_slice(&bytes)?))
 }
 
-async fn land_confirmed(ledger: &Ledger, block: &Candidate) -> Result<()> {
-    ledger.enqueue_candidate(block.clone()).await?;
-    let claim = ledger.claim_candidate(60).await?.unwrap();
+async fn land_confirmed(ledger: &Ledger, block: &TestCandidate) -> Result<()> {
+    ledger.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(ledger.claim_candidate(60).await?.unwrap());
     ledger
         .land_candidate(&claim, &keys().1.public_key_hex())
         .await?;
@@ -4827,7 +4838,7 @@ async fn land_confirmed(ledger: &Ledger, block: &Candidate) -> Result<()> {
 /// in the `body_uri` file, as the legacy import finds it.
 async fn externalize(
     pool: &PgPool,
-    block: &Candidate,
+    block: &TestCandidate,
     dir: &std::path::Path,
 ) -> Result<std::path::PathBuf> {
     let path = dir.join(format!("legacy-audit-{}.json", block.block_hash));
@@ -4875,7 +4886,7 @@ fn ensure_ok(status: axum::http::StatusCode, body: &Value) -> Result<()> {
 async fn dashboard_row_with_inline_import(
     app: &axum::Router,
     pool: &PgPool,
-    block: &Candidate,
+    block: &TestCandidate,
 ) -> Result<Value> {
     let current: Option<Value> =
         sqlx::query_scalar("SELECT audit_bundle FROM qbit_pool_audit_bundles WHERE block_hash=$1")
@@ -4934,7 +4945,9 @@ async fn imported_external_audit_is_served_from_canonical_bytes_without_the_lega
     let snapshot = ledger.snapshot(100).await?;
     let block = candidate_with_bundle(
         settled_bundle(&snapshot, 0, Default::default())?,
+        WindowRef::from_snapshot(&snapshot)?,
         snapshot.payout_revision,
+        None,
         5001,
     )?;
     let hash = block.block_hash.clone();
@@ -5127,7 +5140,13 @@ async fn imported_ctv_audit_backfills_and_links_without_the_legacy_file() -> Res
             ..Default::default()
         },
     )?;
-    let block = candidate_with_bundle(bundle, snapshot.payout_revision, 5201)?;
+    let block = candidate_with_bundle(
+        bundle,
+        WindowRef::from_snapshot(&snapshot)?,
+        snapshot.payout_revision,
+        Some(test_ctv()),
+        5201,
+    )?;
     let hash = block.block_hash.clone();
     land_confirmed(&ledger, &block).await?;
     let dir = tempfile::tempdir()?;
@@ -5383,7 +5402,9 @@ async fn decode_limit_outlives_a_dropped_request() -> Result<()> {
     let snapshot = ledger.snapshot(100).await?;
     let block = candidate_with_bundle(
         settled_bundle(&snapshot, 0, Default::default())?,
+        WindowRef::from_snapshot(&snapshot)?,
         snapshot.payout_revision,
+        None,
         5501,
     )?;
     let hash = block.block_hash.clone();

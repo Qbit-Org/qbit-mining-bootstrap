@@ -24,7 +24,7 @@ impl Ledger {
         ttl_seconds: u64,
     ) -> Result<Option<WorkerDifficulty>> {
         let row = sqlx::query("SELECT difficulty::text AS difficulty,floor(extract(epoch FROM evidence_at)*1000)::bigint AS evidence_at_ms,greatest(0,floor(extract(epoch FROM clock_timestamp()-evidence_at)*1000))::bigint AS age_ms FROM qbit_worker_difficulty WHERE listener=$1 AND worker_username=$2 AND evidence_at>=clock_timestamp()-$3::double precision*interval '1 second'")
-            .bind(listener).bind(username).bind(ttl_seconds as f64).fetch_optional(&self.pool).await?;
+            .bind(listener).bind(username).bind(ttl_seconds as f64).fetch_optional(&mut *self.acquire().await?).await?;
         let Some(row) = row else { return Ok(None) };
         let difficulty: f64 = row.try_get::<String, _>("difficulty")?.parse()?;
         // A legacy numeric outside the wire format is unusable as a hint.
@@ -88,6 +88,6 @@ impl Ledger {
 
     pub async fn share_accepted_at_ms(&self, share_id: &str) -> Result<Option<i64>> {
         Ok(sqlx::query_scalar("SELECT floor(extract(epoch FROM accepted_at)*1000)::bigint FROM qbit_share_ledger WHERE share_id=$1 AND accepted")
-            .bind(share_id).fetch_optional(&self.pool).await?)
+            .bind(share_id).fetch_optional(&mut *self.acquire().await?).await?)
     }
 }

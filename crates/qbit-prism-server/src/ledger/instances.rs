@@ -121,7 +121,7 @@ impl Ledger {
                 self.session_owner.token.clone().into(),
             );
         sqlx::query("INSERT INTO qbit_prism_instances(instance_id,status) VALUES($1,$2) ON CONFLICT(instance_id) DO UPDATE SET heartbeat_at=clock_timestamp(),status=EXCLUDED.status")
-            .bind(&self.instance_id).bind(status).execute(&self.pool).await?;
+            .bind(&self.instance_id).bind(status).execute(&mut *self.acquire().await?).await?;
         Ok(())
     }
 }

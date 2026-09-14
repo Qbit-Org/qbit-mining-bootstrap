@@ -1,5 +1,37 @@
 use super::*;
-use crate::ledger::{IssuedJobSave, PoolBlock, PreparedDependency};
+use crate::ledger::{
+    CompactPrepared, IssuedJobSave, PayoutState, PoolBlock, PreparedDependency, PreparedTemplate,
+    StoredCompactPrepared,
+};
+use std::collections::VecDeque;
+
+// Script typed observations rather than duplicate the database's blob codec.
+// The fake records only public template identity, never private blob bytes.
+#[derive(Default)]
+pub(crate) struct CompactStore {
+    pub reads: StdMutex<VecDeque<Result<Option<StoredCompactPrepared>>>>,
+    pub read_keys: StdMutex<Vec<String>>,
+    pub saves: StdMutex<VecDeque<Result<bool>>>,
+    pub save_calls: StdMutex<Vec<CompactSave>>,
+    pub states: StdMutex<VecDeque<Result<PayoutState, WindowError>>>,
+    pub windows: StdMutex<VecDeque<Result<Window, WindowError>>>,
+    pub window_calls: StdMutex<Vec<(WindowRef, BalanceSource)>>,
+    pub window_gate: StdMutex<Option<Arc<Gate>>>,
+    pub clock_gate: StdMutex<Option<Arc<Gate>>>,
+    pub fail_clock: AtomicBool,
+    pub(in crate::coordinator) drop_probe:
+        StdMutex<Option<prepared_storage::compact::CompactDropProbe>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CompactSave {
+    pub key: String,
+    pub record: CompactPrepared,
+    pub template_sha256: String,
+    pub balances: Vec<qbit_prism::CarryForwardBalance>,
+    pub current_revision: i64,
+    pub original_expires_at_ms: i64,
+}
 
 pub(crate) struct MemoryJob {
     pub payload: Value,
@@ -15,8 +47,93 @@ impl MemoryLedger {
 }
 
 impl work_ledger::WorkLedger for MemoryLedger {
+    fn compact_drop_probe(&self) -> Option<prepared_storage::compact::CompactDropProbe> {
+        self.compact.drop_probe.lock().unwrap().take()
+    }
     fn payout_revision(&self) -> BoxFuture<'_, Result<i64>> {
         submit_ledger::SubmitLedger::payout_revision(self)
+    }
+    fn payout_state(&self) -> BoxFuture<'_, Result<PayoutState, WindowError>> {
+        Box::pin(async {
+            self.compact
+                .states
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("script payout state")
+        })
+    }
+    fn read_window_with_permit<'a>(
+        &'a self,
+        window: &'a WindowRef,
+        balances: BalanceSource,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> BoxFuture<'a, Result<Window, WindowError>> {
+        Box::pin(async move {
+            let _permit = permit;
+            self.compact
+                .window_calls
+                .lock()
+                .unwrap()
+                .push((*window, balances));
+            let gate = self.compact.window_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+            self.compact
+                .windows
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("script window")
+        })
+    }
+    fn save_compact_prepared<'a>(
+        &'a self,
+        key: &'a str,
+        record: &'a CompactPrepared,
+        template: &'a PreparedTemplate,
+        balances: &'a [qbit_prism::CarryForwardBalance],
+        expected_current_revision: i64,
+        expires_at_ms: i64,
+    ) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            self.compact.save_calls.lock().unwrap().push(CompactSave {
+                key: key.into(),
+                record: record.clone(),
+                template_sha256: template.sha256().into(),
+                balances: balances.to_vec(),
+                current_revision: expected_current_revision,
+                original_expires_at_ms: expires_at_ms,
+            });
+            // Inline and compact payloads cannot reserve the same immutable
+            // key. Do not let a scripted success hide this producer conflict.
+            ensure!(
+                !self.jobs.lock().unwrap().contains_key(key),
+                "immutable compact prepared conflict"
+            );
+            self.compact
+                .saves
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("script compact save")
+        })
+    }
+    fn compact_prepared<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<StoredCompactPrepared>>> {
+        Box::pin(async move {
+            self.compact.read_keys.lock().unwrap().push(key.into());
+            self.compact
+                .reads
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("script compact read")
+        })
     }
     fn observe_chain_view<'a>(
         &'a self,
@@ -187,6 +304,16 @@ impl work_ledger::WorkLedger for MemoryLedger {
         })
     }
     fn now_ms(&self) -> BoxFuture<'_, Result<i64>> {
-        Box::pin(async { Ok(self.database_now()) })
+        Box::pin(async {
+            let gate = self.compact.clock_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+            if self.compact.fail_clock.load(Ordering::SeqCst) {
+                return Err(sqlx::Error::PoolClosed.into());
+            }
+            Ok(self.database_now())
+        })
     }
 }

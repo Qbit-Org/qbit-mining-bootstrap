@@ -1,7 +1,11 @@
 use crate::{
     codec,
     config::Config,
-    ledger::{BlockObservation, Candidate, CandidateClaim, HeartbeatHealth, Ledger, Snapshot},
+    ledger::{
+        authenticate_landed_audit, build_claim_parts, header_bits_hex, BalanceSource,
+        BlockObservation, Candidate, CandidateClaim, CandidateCtv, ClaimParts, HeartbeatHealth,
+        Ledger, SignerKeys, Snapshot, Window, WindowError, WindowRef,
+    },
     rpc::Rpc,
     stratum::{MiningBackend, MiningJob, StaleGrace, StratumError, Worker},
 };
@@ -9,7 +13,7 @@ use anyhow::{ensure, Context, Result};
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 use qbit_pool_builder::ManifestSigningKey;
-use qbit_prism::{AcceptedShare, AuditBundle, FanoutFeeRatePolicy, FoundBlock};
+use qbit_prism::{AcceptedShare, AuditBundle, FanoutFeeRatePolicy, FoundBlock, PayoutPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -34,6 +38,80 @@ pub struct JobContext {
     pub prepared: Arc<Prepared>,
     pub worker: Worker,
     pub bundle: Arc<AuditBundle>,
+    /// The synthetic share a per-worker bootstrap build fabricated for an
+    /// empty window, verbatim. It exists only here and in the bundle, and a
+    /// candidate found on this job stores it inline: its fields come from the
+    /// worker and the template the issuing frontend saw, which a claiming
+    /// frontend cannot re-derive.
+    pub bootstrap_share: Option<AcceptedShare>,
+}
+
+/// The builder inputs a job was built with, other than the window, captured
+/// where `build_bundle` reads them and carried beside the bundle. A candidate
+/// stores exactly these, so a rebuild reads no local configuration for any
+/// field that reaches the signed bundle.
+#[derive(Clone, Debug)]
+pub struct BundleInputs {
+    pub payout_policy: PayoutPolicy,
+    /// `Some` exactly when the CTV builder was used; its presence selects
+    /// the builder at a rebuild in place of `config.ctv_enabled`.
+    pub ctv: Option<CandidateCtv>,
+    /// The public keys of the seeds the bundle was signed with.
+    pub signer_keys: SignerKeys,
+    pub audit_builder_version: u16,
+}
+
+impl BundleInputs {
+    fn capture(config: &Config, fee: Option<FanoutFeeRatePolicy>) -> Result<Self> {
+        Ok(Self {
+            payout_policy: config.payout_policy.clone(),
+            ctv: config.ctv_enabled.then_some(CandidateCtv {
+                direct_floor_sats: config.ctv_direct_floor,
+                settlement_config: config.ctv_config,
+                fanout_fee_policy: fee,
+            }),
+            signer_keys: local_signer_keys(config)?,
+            audit_builder_version: qbit_prism::AUDIT_BUILDER_VERSION,
+        })
+    }
+
+    /// Whether a bundle this frontend stored was built with these inputs.
+    ///
+    /// A resumed job reuses the bundle it was issued with but captures its
+    /// inputs from configuration now, so if configuration moved in between the
+    /// two disagree. That matters since the candidate stores the inputs rather
+    /// than the bundle: a claim would rebuild from the current ones and produce
+    /// a coinbase the block does not commit to, failing before `submitblock`
+    /// and retrying until the job expires. A disagreement is therefore a cache
+    /// miss, and the bundle is rebuilt rather than mislabelled.
+    ///
+    /// Compared here is everything the bundle itself records about how it was
+    /// built: the payout policy, and the public keys that actually signed its
+    /// coinbase manifest and its ledger attestation. The CTV settlement inputs
+    /// and `audit_builder_version` are not recorded in a bundle, so a change to
+    /// either between issue and resume is still undetectable here; closing that
+    /// needs the issued job to store its inputs, which is #273's format.
+    fn describes(&self, bundle: &AuditBundle) -> bool {
+        bundle.payout_policy == self.payout_policy
+            && bundle
+                .signed_coinbase_manifest
+                .signature
+                .public_key_hex
+                .eq_ignore_ascii_case(&self.signer_keys.manifest_key_hex)
+            && bundle
+                .ledger_window_attestation
+                .signature
+                .public_key_hex
+                .eq_ignore_ascii_case(&self.signer_keys.ledger_key_hex)
+    }
+}
+
+/// The public keys of this frontend's signing seeds.
+fn local_signer_keys(config: &Config) -> Result<SignerKeys> {
+    Ok(SignerKeys::of(
+        &ManifestSigningKey::from_seed_hex(&config.manifest_seed)?,
+        &ManifestSigningKey::from_seed_hex(&config.ledger_seed)?,
+    ))
 }
 
 pub struct Prepared {
@@ -46,6 +124,14 @@ pub struct Prepared {
     repair_probe: std::sync::Mutex<Option<Arc<prepared_storage::RepairProbe>>>,
     pub template: Value,
     pub snapshot: Arc<Snapshot>,
+    /// The reference for `snapshot`'s window, computed once per non-cached
+    /// refresh and carried with the work instead of being re-derived. Submit
+    /// clones it into the candidate, so a found block never re-digests the
+    /// window on the share path.
+    pub window: WindowRef,
+    /// What `bundle` was built with, other than the window. A per-worker
+    /// bootstrap build uses the same inputs, and a candidate copies them.
+    pub inputs: BundleInputs,
     pub bundle: Option<Arc<AuditBundle>>,
     pub base_wire: Option<codec::Job>,
     pub storage_key: String,
@@ -97,6 +183,12 @@ pub struct Coordinator {
     work_ledger: Arc<dyn work_ledger::WorkLedger>,
     pub last_error: RwLock<Option<String>>,
     build_slots: Arc<Semaphore>,
+    /// Bounds how many `Ledger::read_window` calls hold a pool connection at
+    /// once. `build_slots` alone does not: `PRISM_JOB_BUILD_EXECUTOR_WORKERS`
+    /// may exceed `PRISM_DATABASE_MAX_CONNECTIONS`, and the pool is shared with
+    /// share appends and the candidate-lease heartbeat, which must not wait out
+    /// the 15 s acquire timeout behind a multi-page read.
+    window_reads: Arc<Semaphore>,
     refresh_lock: Mutex<()>,
     identities: Mutex<HashMap<String, (Worker, Instant)>>,
     chain_cache: Mutex<Option<ChainCache>>,
@@ -124,13 +216,113 @@ struct CandidateLease {
     seconds: i64,
     interval: Duration,
     timeout: Duration,
+    /// The one deadline around a claim's window read plus its rebuild. The
+    /// steps after it keep their own deadlines; the lease is not one, its
+    /// heartbeat renews it for as long as processing runs.
+    rebuild_deadline: Duration,
 }
 
 const CANDIDATE_LEASE: CandidateLease = CandidateLease {
     seconds: 120,
     interval: Duration::from_secs(30),
     timeout: Duration::from_secs(5),
+    rebuild_deadline: Duration::from_secs(60),
 };
+
+/// Why a claim's window read or rebuild did not produce parts, and what the
+/// claim does about it. Every variant is recoverable: the row is rescheduled
+/// through `retry_candidate` or finished only after `observe_candidate`
+/// proves the block superseded; nothing here abandons a candidate.
+#[derive(Debug)]
+enum RebuildFailure {
+    /// Fail this attempt with an alert and reschedule the row.
+    Retry(String),
+    /// The current balances are not the reference's: the candidate is
+    /// superseded, or it is the pool's own block. `observe_candidate` decides.
+    PriorBalancesChanged,
+}
+
+/// Map a window read error to the claim's action. A database error is not
+/// mapped: it propagates to `submit_loop`, whose retry releases the claim.
+fn classify_window_error(error: WindowError) -> Result<RebuildFailure> {
+    Ok(match error {
+        WindowError::PriorBalancesChanged { .. } => RebuildFailure::PriorBalancesChanged,
+        WindowError::Incomplete { expected, got } => RebuildFailure::Retry(format!(
+            "window range incomplete: expected {expected} shares, read {got}; rows pruned or missing, or a different predicate (#268 owns recovery)"
+        )),
+        WindowError::SnapshotDigestMismatch { expected, actual } => {
+            RebuildFailure::Retry(format!(
+                "window snapshot digest mismatch: reference {} read {}; corruption or a reference built from different bytes",
+                hex::encode(expected),
+                hex::encode(actual)
+            ))
+        }
+        WindowError::Decode(error) => {
+            RebuildFailure::Retry(format!("window decode error: {error:#}; corruption"))
+        }
+        WindowError::BalanceSnapshotMissing { digest } => RebuildFailure::Retry(format!(
+            "as-issued balance snapshot {} is missing; pruned or never written",
+            hex::encode(digest)
+        )),
+        // A cancelled or panicked blocking hand-off found nothing wrong with
+        // any row or digest: retryable, with its own alert, and never the
+        // corruption or abandon path.
+        WindowError::TaskFailed(error) => RebuildFailure::Retry(format!(
+            "window read blocking task cancelled or failed: {error}; retrying, not corruption"
+        )),
+        WindowError::Database(error) => return Err(error.into()),
+    })
+}
+
+/// Release a rebuilt window off the runtime. Dropping a 400,000-share window
+/// on a runtime worker would stall candidate-lease heartbeats and share
+/// processing, so every path, early returns included, hands it to a blocking
+/// thread instead.
+struct OffRuntime<T: Send + 'static>(Option<T>);
+
+impl<T: Send + 'static> OffRuntime<T> {
+    fn new(value: T) -> Self {
+        Self(Some(value))
+    }
+}
+
+impl<T: Send + 'static> std::ops::Deref for OffRuntime<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.0.as_ref().expect("owned until dropped")
+    }
+}
+
+impl<T: Send + 'static> Drop for OffRuntime<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.0.take() {
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    runtime.spawn_blocking(move || drop(value));
+                }
+                Err(_) => drop(value),
+            }
+        }
+    }
+}
+
+/// How many `Ledger::read_window` calls may hold a pool connection at once:
+/// `clamp(database_max_connections - 2, 1, build_workers)`.
+///
+/// Two connections are always left over, so a share append and the
+/// candidate-lease heartbeat never wait out the pool's 15 s acquire timeout
+/// behind multi-page window reads; a failed heartbeat drops recoverable claim
+/// work. The ceiling is `build_workers`, because a caller holds its
+/// `build_slots` permit across the read, so no more reads can be in flight
+/// than there are build slots. The floor is 1: one read at a time still makes
+/// progress, and `PRISM_DATABASE_MAX_CONNECTIONS` can be as low as 4 while the
+/// pool itself is opened with at least 2 connections.
+fn window_read_permits(database_connections: u32, build_workers: usize) -> usize {
+    usize::try_from(database_connections)
+        .unwrap_or(usize::MAX)
+        .saturating_sub(2)
+        .clamp(1, build_workers.max(1))
+}
 
 fn protocol_error(reason: &'static str, message: &str) -> StratumError {
     let code = match reason {
@@ -319,18 +511,21 @@ impl Coordinator {
         );
         if !config.initialize_schema {
             let ready: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM qbit_prism_schema_migrations WHERE version=9)",
+                "SELECT count(*)=2 FROM qbit_prism_schema_migrations WHERE version IN (7,9)",
             )
             .fetch_one(&ledger.pool)
             .await
             .context("schema migrations table missing; initialize the Prism schema")?;
             ensure!(
                 ready,
-                "Prism schema migration 009 is required for mining startup"
+                "Prism schema migrations 007 and 009 are required for mining startup"
             );
         }
         ledger
-            .configure(&config.fingerprint(genesis.as_str().context("invalid genesis hash")?)?)
+            .configure(
+                &config.fingerprint(genesis.as_str().context("invalid genesis hash")?)?,
+                &local_signer_keys(&config)?,
+            )
             .await?;
         // Read through the ledger pool, so this is the value its sessions run
         // with. PostgreSQL reports it in milliseconds; zero disables it.
@@ -348,6 +543,10 @@ impl Coordinator {
         Ok(Arc::new(Self {
             metrics,
             build_slots: Arc::new(Semaphore::new(config.build_workers)),
+            window_reads: Arc::new(Semaphore::new(window_read_permits(
+                config.database_connections,
+                config.build_workers,
+            ))),
             config: Arc::new(config),
             submit_ledger: ledger.clone(),
             work_ledger: ledger.clone(),
@@ -620,23 +819,41 @@ impl Coordinator {
             }
         }
         let snapshot = Arc::new(self.work_ledger.snapshot(network).await?);
-        let bundle = if snapshot.shares.is_empty() {
-            None
+        // Captured once per refresh, where the builder would otherwise read
+        // configuration: every job of this generation, the shared bundle and
+        // each per-worker bootstrap build, uses these, and submit copies them
+        // into the candidate.
+        let inputs = BundleInputs::capture(&self.config, fee)?;
+        // The reference is computed once per non-cached refresh and travels
+        // with the work; submit clones it rather than re-digesting the window
+        // on the share path.
+        let (bundle, window) = if snapshot.shares.is_empty() {
+            // An empty window reaches only the O(recipients) balances digest,
+            // microseconds, so it stays on this thread.
+            (None, WindowRef::from_snapshot(&snapshot)?)
         } else {
-            Some(Arc::new(
-                self.build_bundle(
-                    snapshot.clone(),
-                    template.clone(),
-                    None,
-                    format!(
-                        "{}{}",
-                        hex::encode(&self.config.coinbase_tag),
-                        "00".repeat(4 + self.config.extranonce2_size)
-                    ),
-                    fee,
-                )
-                .await?,
-            ))
+            // Serializing and hashing the window is 0.7 to 1.4 s of blocking
+            // work at 400,000 shares. Run it beside the bundle build rather
+            // than after it, so it adds no wait of its own; `refresh_lock`
+            // already makes refresh single-flight, and this takes no
+            // `build_slots` permit.
+            let reference = {
+                let snapshot = snapshot.clone();
+                tokio::task::spawn_blocking(move || WindowRef::from_snapshot(&snapshot))
+            };
+            let build = self.build_bundle(
+                snapshot.clone(),
+                template.clone(),
+                None,
+                format!(
+                    "{}{}",
+                    hex::encode(&self.config.coinbase_tag),
+                    "00".repeat(4 + self.config.extranonce2_size)
+                ),
+                inputs.clone(),
+            );
+            let (built, reference) = tokio::join!(build, reference);
+            (Some(Arc::new(built?.0)), reference??)
         };
         let base_wire = if let Some(bundle) = &bundle {
             let template = template.clone();
@@ -758,6 +975,8 @@ impl Coordinator {
             repair_probe: Default::default(),
             template,
             snapshot,
+            window,
+            inputs,
             bundle,
             base_wire,
             storage_key,
@@ -772,14 +991,56 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Read a referenced window under a `window_reads` permit.
+    ///
+    /// The one entry point callers use. The design record's order is: the
+    /// caller takes its own `build_slots` permit **first** and holds it across
+    /// this read and the rebuild that follows; the `window_reads` permit is
+    /// taken after it and released as soon as the read returns, before the
+    /// rebuild, so at least two pool connections always stay free. Waiting for
+    /// it counts against the caller's deadline.
+    ///
+    /// The permit is owned and handed to `Ledger::read_window_with_permit`,
+    /// which holds it across the whole read, including the off-runtime cleanup
+    /// a cancellation leaves behind, and releases it the moment the read
+    /// returns. `Ledger::read_window` is awaited there on the runtime, never
+    /// wrapped in `spawn_blocking`: it owns its own blocking hand-offs, one per
+    /// page, and an outer blocking wrapper would starve them.
+    ///
+    /// The claim rebuild calls this under its 60 s deadline and the
+    /// `build_slots` permit it already holds.
+    async fn read_window(
+        &self,
+        window: &WindowRef,
+        balances: BalanceSource,
+    ) -> Result<Window, WindowError> {
+        // Nothing closes this semaphore; a closed one could only mean the
+        // process is shutting down, which callers treat as transient exactly
+        // as they treat a closed pool.
+        let permit = self
+            .window_reads
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| WindowError::Database(sqlx::Error::PoolClosed))?;
+        self.ledger
+            .read_window_with_permit(window, balances, permit)
+            .await
+    }
+
+    /// Build a job's bundle from `inputs`, never from configuration: the only
+    /// configuration read here is the signing seeds, the signer, whose public
+    /// keys `inputs.signer_keys` already names. With `bootstrap` set, the
+    /// window is the one synthetic share fabricated from that worker, which
+    /// is returned beside the bundle so the job can carry it verbatim.
     async fn build_bundle(
         &self,
         snapshot: Arc<Snapshot>,
         template: Value,
         bootstrap: Option<Worker>,
         suffix: String,
-        fee: Option<FanoutFeeRatePolicy>,
-    ) -> Result<AuditBundle> {
+        inputs: BundleInputs,
+    ) -> Result<(AuditBundle, Option<AcceptedShare>)> {
         let permit = self.build_slots.clone().acquire_owned().await?;
         let config = self.config.clone();
         tokio::task::spawn_blocking(move || {
@@ -795,8 +1056,8 @@ impl Coordinator {
                 network_difficulty: network,
                 anchor_job_issued_at_ms: snapshot.anchor_ms,
             };
-            let shares = if let Some(worker) = bootstrap {
-                vec![AcceptedShare {
+            let bootstrap_share = if let Some(worker) = bootstrap {
+                Some(AcceptedShare {
                     share_seq: 1,
                     share_id: "bootstrap-share".into(),
                     miner_id: worker.payout_address.clone(),
@@ -813,42 +1074,51 @@ impl Coordinator {
                         .context("missing time")?
                         .try_into()?,
                     credit_policy: None,
-                }]
+                })
             } else {
-                snapshot.shares.clone()
+                None
+            };
+            let shares = match &bootstrap_share {
+                Some(share) => vec![share.clone()],
+                None => snapshot.shares.clone(),
             };
             let witnesses =
                 codec::witness_merkle_leaves_hex(&codec::transactions_from_template(&template)?);
             let manifest_key = ManifestSigningKey::from_seed_hex(&config.manifest_seed)?;
             let ledger_key = ManifestSigningKey::from_seed_hex(&config.ledger_seed)?;
+            ensure!(
+                inputs.signer_keys == SignerKeys::of(&manifest_key, &ledger_key),
+                "job inputs name signing keys other than this frontend's"
+            );
             // Prior-only recipients remain in the payout universe, including
             // during bootstrap after an empty reward window.
-            if config.ctv_enabled {
-                Ok(qbit_prism::build_audit_bundle_with_ctv_settlement_options(
+            let bundle = if let Some(ctv) = inputs.ctv {
+                qbit_prism::build_audit_bundle_with_ctv_settlement_options(
                     shares,
                     found,
                     snapshot.prior_balances.clone(),
-                    config.payout_policy.clone(),
-                    config.ctv_direct_floor,
-                    config.ctv_config,
-                    fee,
+                    inputs.payout_policy,
+                    ctv.direct_floor_sats,
+                    ctv.settlement_config,
+                    ctv.fanout_fee_policy,
                     Some(suffix),
                     witnesses,
                     &manifest_key,
                     &ledger_key,
-                )?)
+                )?
             } else {
-                Ok(qbit_prism::build_audit_bundle_with_coinbase_options(
+                qbit_prism::build_audit_bundle_with_coinbase_options(
                     shares,
                     found,
                     snapshot.prior_balances.clone(),
-                    config.payout_policy.clone(),
+                    inputs.payout_policy,
                     Some(suffix),
                     witnesses,
                     &manifest_key,
                     &ledger_key,
-                )?)
-            }
+                )?
+            };
+            Ok((bundle, bootstrap_share))
         })
         .await?
     }
@@ -929,7 +1199,7 @@ impl Coordinator {
     }
 
     async fn observe_candidate(&self, claim: &CandidateClaim) -> Result<(bool, i64, String)> {
-        let height = claim.candidate.bundle.found_block.block_height;
+        let height = claim.candidate.found_block.block_height;
         let info = self.ready_chain_info().await?;
         let tip_height = info["blocks"].as_u64().context("invalid tip height")?;
         let tip = info["bestblockhash"]
@@ -1066,20 +1336,192 @@ impl Coordinator {
         }
     }
 
+    /// Fail this attempt with an alert and reschedule the row. Never abandons.
+    async fn retry_with_alert(&self, claim: &CandidateClaim, reason: &str) -> Result<()> {
+        tracing::error!(
+            block = %claim.candidate.block_hash,
+            reason,
+            "ALERT: candidate attempt failed; the row is rescheduled, never abandoned"
+        );
+        self.ledger.retry_candidate(claim, reason).await
+    }
+
+    /// Whether the block's audit has already landed and, if so, whether the
+    /// landed row is the audit of this block: authenticated against the
+    /// candidate's block bytes, never read back as a body.
+    async fn landed_audit_authenticated(&self, claim: &CandidateClaim) -> Result<bool> {
+        let candidate = &claim.candidate;
+        let Some(landed) = self.ledger.landed_audit(&candidate.block_hash).await? else {
+            return Ok(false);
+        };
+        authenticate_landed_audit(candidate, &landed).with_context(|| {
+            format!(
+                "landed audit for block {} does not authenticate against the candidate's block",
+                candidate.block_hash
+            )
+        })?;
+        if landed.found_block_bits.is_none() {
+            self.ledger
+                .record_landed_audit_bits(
+                    &candidate.block_hash,
+                    &header_bits_hex(&candidate.block_bytes)?,
+                )
+                .await?;
+        }
+        Ok(true)
+    }
+
+    /// The stored builder version and signer keys must be this binary's, or
+    /// the reference is never rebuilt here: a rebuild under another builder or
+    /// other keys would produce bytes the coinbase does not commit to.
+    fn stored_inputs_mismatch(&self, candidate: &Candidate) -> Result<Option<String>> {
+        if candidate.audit_builder_version != qbit_prism::AUDIT_BUILDER_VERSION {
+            return Ok(Some(format!(
+                "candidate was built by audit builder version {} and this binary is version {}; not rebuilding, drain it with a matching frontend",
+                candidate.audit_builder_version,
+                qbit_prism::AUDIT_BUILDER_VERSION
+            )));
+        }
+        let local = local_signer_keys(&self.config)?;
+        if !candidate
+            .signer_keys
+            .manifest_key_hex
+            .eq_ignore_ascii_case(&local.manifest_key_hex)
+            || !candidate
+                .signer_keys
+                .ledger_key_hex
+                .eq_ignore_ascii_case(&local.ledger_key_hex)
+        {
+            return Ok(Some(format!(
+                "candidate was signed with keys manifest={} ledger={} and this frontend holds manifest={} ledger={}; not rebuilding, drain it with a frontend that holds those keys",
+                candidate.signer_keys.manifest_key_hex,
+                candidate.signer_keys.ledger_key_hex,
+                local.manifest_key_hex,
+                local.ledger_key_hex
+            )));
+        }
+        Ok(None)
+    }
+
+    /// Read the candidate's window and rebuild its audit parts, under the
+    /// `build_slots` permit and the one rebuild deadline.
+    ///
+    /// The `build_slots` permit is taken first and moves into the blocking
+    /// build, so it is released only when that build finishes. The
+    /// `window_reads` permit is taken after it, inside the deadline, and is
+    /// held for the read alone. `Ledger::read_window` is awaited on the
+    /// runtime; only the builder runs in `spawn_blocking`, and it is the
+    /// borrowing builder called directly, never `build_bundle`.
+    async fn rebuild_claim_parts(
+        &self,
+        claim: &CandidateClaim,
+        balances: BalanceSource,
+        lease: CandidateLease,
+    ) -> Result<Result<ClaimParts, RebuildFailure>> {
+        let permit = self.build_slots.clone().acquire_owned().await?;
+        let candidate = claim.candidate.clone();
+        let config = self.config.clone();
+        let rebuild = async {
+            let window = match self.read_window(&candidate.window, balances).await {
+                Ok(window) => window,
+                Err(error) => return classify_window_error(error).map(Err),
+            };
+            // No await between here and the hand-off: the window moves into
+            // the blocking build, which owns it and drops it there.
+            let build =
+                tokio_util::task::AbortOnDropHandle::new(tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let Window {
+                        shares,
+                        prior_balances,
+                        ..
+                    } = window;
+                    let manifest_key = ManifestSigningKey::from_seed_hex(&config.manifest_seed)?;
+                    let ledger_key = ManifestSigningKey::from_seed_hex(&config.ledger_seed)?;
+                    build_claim_parts(
+                        &candidate,
+                        shares,
+                        prior_balances,
+                        &manifest_key,
+                        &ledger_key,
+                    )
+                }));
+            Ok(Ok(build.await??))
+        };
+        match tokio::time::timeout(lease.rebuild_deadline, rebuild).await {
+            Ok(outcome) => outcome,
+            Err(_) => Ok(Err(RebuildFailure::Retry(format!(
+                "window read and audit rebuild exceeded the {} s deadline",
+                lease.rebuild_deadline.as_secs()
+            )))),
+        }
+    }
+
+    /// Rebuild the claim's parts, or settle the attempt. `Ok(None)` means the
+    /// attempt is over: the row was rescheduled or finished as superseded.
+    async fn rebuilt_claim(
+        &self,
+        claim: &CandidateClaim,
+        balances: BalanceSource,
+        lease: CandidateLease,
+        parent: &str,
+    ) -> Result<Option<OffRuntime<CandidateClaim>>> {
+        let candidate = &claim.candidate;
+        if let Some(reason) = self.stored_inputs_mismatch(candidate)? {
+            self.retry_with_alert(claim, &reason).await?;
+            return Ok(None);
+        }
+        match self.rebuild_claim_parts(claim, balances, lease).await? {
+            Ok(parts) => Ok(Some(OffRuntime::new(claim.clone().with_parts(parts)))),
+            Err(RebuildFailure::Retry(reason)) => {
+                self.retry_with_alert(claim, &reason).await?;
+                Ok(None)
+            }
+            Err(RebuildFailure::PriorBalancesChanged) => {
+                // Not a supersession by itself: the pool's own block reaching
+                // the tip moves the balances too. Finish only a block that is
+                // not active and whose revision or parent moved; an active
+                // block stays recoverable and is retried.
+                let (active, revision, tip) = self.observe_candidate(claim).await?;
+                if !active && (revision != candidate.payout_revision || tip != parent) {
+                    self.ledger
+                        .finish_candidate_at_revision(
+                            claim,
+                            false,
+                            Some("payout revision or parent superseded"),
+                            revision,
+                        )
+                        .await?;
+                } else {
+                    self.retry_with_alert(
+                        claim,
+                        "prior balances changed since the candidate was written while its block is still active or its revision unchanged; retrying",
+                    )
+                    .await?;
+                }
+                Ok(None)
+            }
+        }
+    }
+
     async fn process_candidate_inner(
         &self,
         claim: &CandidateClaim,
         lease: CandidateLease,
     ) -> Result<()> {
-        let parent = header_parent(&claim.candidate.block_hex)?;
+        let candidate = &claim.candidate;
+        let parent = header_parent(&candidate.block_bytes)?;
+        if candidate.leased {
+            return self.process_leased_candidate(claim, lease, &parent).await;
+        }
         if self.observed_tip.read().await.as_deref() != Some(parent.as_str())
-            || self.ledger.payout_revision().await? != claim.candidate.payout_revision
+            || self.ledger.payout_revision().await? != candidate.payout_revision
         {
             // Backlogged work commonly becomes stale before reaching scarce
             // build capacity. Cached hints only trigger this authoritative
             // probe; an already-active block still needs its audit recovered.
             let (active, revision, tip) = self.observe_candidate(claim).await?;
-            if !active && (revision != claim.candidate.payout_revision || tip != parent) {
+            if !active && (revision != candidate.payout_revision || tip != parent) {
                 self.ledger
                     .finish_candidate_at_revision(
                         claim,
@@ -1091,67 +1533,36 @@ impl Coordinator {
                 return Ok(());
             }
         }
-        let finalized;
-        let claim = if let Some(suffix) = &claim.candidate.coinbase_suffix_hex {
-            let bundle = &claim.candidate.bundle;
-            let config = self.config.clone();
-            let source = bundle.clone();
-            let suffix = suffix.clone();
-            let permit = self.build_slots.clone().acquire_owned().await?;
-            let rebuilt = tokio_util::task::AbortOnDropHandle::new(tokio::task::spawn_blocking(
-                move || -> Result<AuditBundle> {
-                    let _permit = permit;
-                    let manifest_key = ManifestSigningKey::from_seed_hex(&config.manifest_seed)?;
-                    let ledger_key = ManifestSigningKey::from_seed_hex(&config.ledger_seed)?;
-                    if config.ctv_enabled {
-                        Ok(qbit_prism::build_audit_bundle_with_ctv_settlement_options(
-                            source.shares,
-                            source.found_block,
-                            source.prior_balances,
-                            source.payout_policy,
-                            config.ctv_direct_floor,
-                            config.ctv_config,
-                            source.ctv_fanout_fee_policy,
-                            Some(suffix),
-                            source.witness_merkle_leaves_hex,
-                            &manifest_key,
-                            &ledger_key,
-                        )?)
-                    } else {
-                        Ok(qbit_prism::build_audit_bundle_with_coinbase_options(
-                            source.shares,
-                            source.found_block,
-                            source.prior_balances,
-                            source.payout_policy,
-                            Some(suffix),
-                            source.witness_merkle_leaves_hex,
-                            &manifest_key,
-                            &ledger_key,
-                        )?)
-                    }
-                },
-            ))
-            .await??;
-            let mut updated = claim.clone();
-            updated.candidate.bundle = rebuilt;
-            finalized = updated;
-            &finalized
+        // An earlier claim may have landed the audit and lost its lease. The
+        // landed row is authenticated against the block, not read back; a
+        // landed audit is not a submitted block, so the claim continues to
+        // observe, renew and submit exactly as one that landed it now.
+        let landed = self.landed_audit_authenticated(claim).await?;
+        let rebuilt = if landed {
+            None
         } else {
-            claim
+            match self
+                .rebuilt_claim(claim, BalanceSource::Current, lease, &parent)
+                .await?
+            {
+                Some(rebuilt) => Some(rebuilt),
+                None => return Ok(()),
+            }
         };
         let (active, revision, tip) = self.observe_candidate(claim).await?;
         if active {
-            self.ledger
-                .land_candidate_at_revision(claim, &self.config.ledger_public_key, revision)
-                .await?;
+            if let Some(rebuilt) = &rebuilt {
+                self.ledger
+                    .land_candidate_at_revision(rebuilt, &self.config.ledger_public_key, revision)
+                    .await?;
+            }
             self.ledger
                 .finish_candidate_at_revision(claim, true, None, revision)
                 .await?;
             self.wake.notify_one();
             return Ok(());
         }
-        let parent = header_parent(&claim.candidate.block_hex)?;
-        if revision != claim.candidate.payout_revision || tip != parent {
+        if revision != candidate.payout_revision || tip != parent {
             // Another claim may have sent this block before expiring. Landed
             // inactive records and deferred credit survive terminal outbox
             // disposition, so a late acceptance remains reconcilable.
@@ -1167,11 +1578,16 @@ impl Coordinator {
         }
         // This verified prepared record precedes the external RPC, so a
         // crash after node acceptance is recoverable by any cluster member.
-        self.ledger
-            .land_candidate(claim, &self.config.ledger_public_key)
-            .await?;
+        if let Some(rebuilt) = &rebuilt {
+            self.ledger
+                .land_candidate(rebuilt, &self.config.ledger_public_key)
+                .await?;
+        }
+        // The rebuilt window has done its work; release it off the runtime
+        // before the node round trips.
+        drop(rebuilt);
         let (active, revision, tip) = self.observe_candidate(claim).await?;
-        if active || revision != claim.candidate.payout_revision || tip != parent {
+        if active || revision != candidate.payout_revision || tip != parent {
             self.ledger
                 .finish_candidate_at_revision(
                     claim,
@@ -1185,17 +1601,63 @@ impl Coordinator {
         // Renewal failure cancels the attempt even between periodic ticks.
         // Recheck the strictly-live token at the external mutation boundary.
         self.renew_candidate(claim, lease).await?;
-        let result = self
-            .rpc
-            .call_timeout(
-                "submitblock",
-                json!([claim.candidate.block_hex]),
-                Some(self.config.block_submit_timeout),
-            )
-            .await?;
+        let result = self.submit_block(claim).await?;
         // A null response can still describe a known side-chain block; use
         // active-chain evidence before advancing the shared payout state.
         let (active, revision, _) = self.observe_candidate(claim).await?;
+        self.finish_after_submit(claim, active, revision, &result)
+            .await
+    }
+
+    /// A leased candidate (#273's replacement lease covered the work its
+    /// block was found on) is submitted before any terminal disposition and
+    /// before any rebuild: its balances are as issued, so a `Current` read
+    /// would report them changed and retry forever, and the pre-submit
+    /// supersession checks would discard the block. Only after `submitblock`
+    /// does it observe the chain, and it lands its audit, rebuilt from the
+    /// as-issued balances unless it has already landed, before it takes any
+    /// terminal outcome, whether the block is active or not.
+    async fn process_leased_candidate(
+        &self,
+        claim: &CandidateClaim,
+        lease: CandidateLease,
+        parent: &str,
+    ) -> Result<()> {
+        self.renew_candidate(claim, lease).await?;
+        let result = self.submit_block(claim).await?;
+        let (active, revision, _) = self.observe_candidate(claim).await?;
+        if !self.landed_audit_authenticated(claim).await? {
+            let Some(rebuilt) = self
+                .rebuilt_claim(claim, BalanceSource::AsIssued, lease, parent)
+                .await?
+            else {
+                return Ok(());
+            };
+            self.ledger
+                .land_candidate_at_revision(&rebuilt, &self.config.ledger_public_key, revision)
+                .await?;
+        }
+        self.finish_after_submit(claim, active, revision, &result)
+            .await
+    }
+
+    async fn submit_block(&self, claim: &CandidateClaim) -> Result<Value> {
+        self.rpc
+            .call_timeout(
+                "submitblock",
+                json!([hex::encode(&claim.candidate.block_bytes)]),
+                Some(self.config.block_submit_timeout),
+            )
+            .await
+    }
+
+    async fn finish_after_submit(
+        &self,
+        claim: &CandidateClaim,
+        active: bool,
+        revision: i64,
+        result: &Value,
+    ) -> Result<()> {
         if active {
             self.ledger
                 .finish_candidate_at_revision(claim, true, None, revision)
@@ -1269,9 +1731,9 @@ impl Coordinator {
     }
 }
 
-fn header_parent(block_hex: &str) -> Result<String> {
-    let bytes = hex::decode(block_hex.get(8..72).context("truncated block header")?)?;
-    Ok(hex::encode(bytes.into_iter().rev().collect::<Vec<_>>()))
+fn header_parent(block: &[u8]) -> Result<String> {
+    let bytes = block.get(4..36).context("truncated block header")?;
+    Ok(hex::encode(bytes.iter().rev().copied().collect::<Vec<_>>()))
 }
 
 impl MiningBackend for Coordinator {
@@ -1439,11 +1901,11 @@ impl MiningBackend for Coordinator {
                 .await?
                 .context("payout snapshot stale")?;
             self.ensure_job_fee_current(prepared.fee).await?;
-            let bundle = if let Some(bundle) = &prepared.bundle {
-                bundle.clone()
+            let (bundle, bootstrap_share) = if let Some(bundle) = &prepared.bundle {
+                (bundle.clone(), None)
             } else {
-                Arc::new(
-                    self.build_bundle(
+                let (bundle, bootstrap_share) = self
+                    .build_bundle(
                         prepared.snapshot.clone(),
                         prepared.template.clone(),
                         Some(worker.clone()),
@@ -1452,10 +1914,10 @@ impl MiningBackend for Coordinator {
                             hex::encode(&self.config.coinbase_tag),
                             "00".repeat(4 + self.config.extranonce2_size)
                         ),
-                        prepared.fee,
+                        prepared.inputs.clone(),
                     )
-                    .await?,
-                )
+                    .await?;
+                (Arc::new(bundle), bootstrap_share)
             };
             let id = format!(
                 "{}-{}",
@@ -1492,6 +1954,7 @@ impl MiningBackend for Coordinator {
                     prepared,
                     worker: worker.clone(),
                     bundle,
+                    bootstrap_share,
                 }),
             })
         };
@@ -1537,8 +2000,16 @@ impl MiningBackend for Coordinator {
             let Some(payload) = self.work_ledger.job(&stored.prepared_key).await? else {
                 return Ok(None);
             };
-            let prepared: Arc<StoredPrepared> =
-                tokio::task::spawn_blocking(move || serde_json::from_value(payload)).await??;
+            // The decode already runs off the runtime, and the reference is
+            // whole-window work over the snapshot it produces, so both happen
+            // in the one blocking task. #273 replaces this with the reference
+            // the stored payload will carry.
+            let (prepared, window) = tokio::task::spawn_blocking(move || {
+                let prepared: Arc<StoredPrepared> = serde_json::from_value(payload)?;
+                let window = WindowRef::from_snapshot(&prepared.snapshot)?;
+                Ok::<_, anyhow::Error>((prepared, window))
+            })
+            .await??;
             let current = self
                 .prepared
                 .read()
@@ -1554,18 +2025,41 @@ impl MiningBackend for Coordinator {
                 return Ok(None);
             }
             self.ensure_job_fee_current(prepared.fee).await?;
-            let bundle = match prepared.bundle.as_ref() {
-                Some(bundle) => bundle.clone(),
-                None => Arc::new(
-                    self.build_bundle(
-                        prepared.snapshot.clone(),
-                        prepared.template.clone(),
-                        Some(stored.worker.clone()),
-                        prepared.coinbase_suffix.clone(),
-                        prepared.fee,
-                    )
-                    .await?,
-                ),
+            // Until #273 stores them, a resume takes the inputs from this
+            // frontend's configuration, as it always has. The stored bundle is
+            // only reused when those inputs still describe it; otherwise this
+            // is a cache miss and the bundle is rebuilt, because the candidate
+            // stores the inputs and a claim rebuilds from them.
+            let inputs = BundleInputs::capture(&self.config, prepared.fee)?;
+            // A stored bundle the current inputs no longer describe cannot be
+            // resumed at all. Rebuilding it here is not the answer either:
+            // `build_bundle` reads a worker as a request for a one-share
+            // bootstrap window, so on a non-empty window it would pair a
+            // bootstrap bundle with the original reference and
+            // `prepare_candidate` would refuse the block. Drop the cached work
+            // and let a fresh prepare produce it; a miss costs a rebuild, and
+            // resuming on inputs that do not match can cost a found block.
+            if prepared
+                .bundle
+                .as_ref()
+                .is_some_and(|bundle| !inputs.describes(bundle))
+            {
+                return Ok(None);
+            }
+            let (bundle, bootstrap_share) = match prepared.bundle.as_ref() {
+                Some(bundle) => (bundle.clone(), None),
+                None => {
+                    let (bundle, bootstrap_share) = self
+                        .build_bundle(
+                            prepared.snapshot.clone(),
+                            prepared.template.clone(),
+                            Some(stored.worker.clone()),
+                            prepared.coinbase_suffix.clone(),
+                            inputs.clone(),
+                        )
+                        .await?;
+                    (Arc::new(bundle), bootstrap_share)
+                }
             };
             let template = prepared.template.clone();
             let wire_bundle = bundle.clone();
@@ -1622,6 +2116,8 @@ impl MiningBackend for Coordinator {
                 repair_probe: Default::default(),
                 template: prepared.template.clone(),
                 snapshot: prepared.snapshot.clone(),
+                window,
+                inputs,
                 bundle: Some(bundle.clone()),
                 base_wire: None,
                 storage_key: stored.prepared_key,
@@ -1637,6 +2133,7 @@ impl MiningBackend for Coordinator {
                     prepared,
                     worker: stored.worker,
                     bundle,
+                    bootstrap_share,
                 }),
             }))
         };
@@ -1769,3 +2266,14 @@ mod d2_bootstrap_tests;
 
 #[cfg(test)]
 mod d2_test_support;
+#[cfg(test)]
+mod test_serial;
+
+#[cfg(test)]
+mod window_ref_tests;
+
+#[cfg(test)]
+mod window_switch_tests;
+
+#[cfg(test)]
+mod window_incident_tests;

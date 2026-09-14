@@ -27,7 +27,9 @@ use qbit_prism::{
     build_audit_bundle, verify_audit_bundle_with_ledger_public_key, AcceptedShare, AuditBundle,
     FoundBlock, PayoutPolicy,
 };
-use qbit_prism_server::ledger::{BlockObservation, Candidate, Ledger, Snapshot};
+use qbit_prism_server::ledger::{
+    BlockObservation, Candidate, CandidateClaim, Ledger, SignerKeys, Snapshot, WindowRef,
+};
 use qbit_prism_test_gate as gate;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -316,7 +318,27 @@ fn ledger_public_key() -> String {
 
 /// A signed, verifiable candidate over the snapshot, as the coordinator
 /// enqueues after a network-target share.
-fn candidate(snapshot: &Snapshot, nonce: u32) -> Result<Candidate> {
+/// A candidate and the bundle it was found on. Since #265 the stored candidate
+/// holds a window reference, so a landing needs the parts attached separately.
+struct TestCandidate {
+    candidate: Candidate,
+    bundle: AuditBundle,
+}
+
+impl std::ops::Deref for TestCandidate {
+    type Target = Candidate;
+    fn deref(&self) -> &Candidate {
+        &self.candidate
+    }
+}
+
+impl TestCandidate {
+    fn claim(&self, claim: CandidateClaim) -> CandidateClaim {
+        claim.with_bundle(self.bundle.clone())
+    }
+}
+
+fn candidate(snapshot: &Snapshot, nonce: u32) -> Result<TestCandidate> {
     let (coinbase_key, ledger_key) = keys();
     let bundle = build_audit_bundle(
         snapshot.shares.clone(),
@@ -331,14 +353,20 @@ fn candidate(snapshot: &Snapshot, nonce: u32) -> Result<Candidate> {
         &coinbase_key,
         &ledger_key,
     )?;
-    candidate_with_bundle(bundle, snapshot.payout_revision, nonce)
+    candidate_with_bundle(
+        bundle,
+        WindowRef::from_snapshot(snapshot)?,
+        snapshot.payout_revision,
+        nonce,
+    )
 }
 
 fn candidate_with_bundle(
     bundle: AuditBundle,
+    window: WindowRef,
     payout_revision: i64,
     nonce: u32,
-) -> Result<Candidate> {
+) -> Result<TestCandidate> {
     let report = verify_audit_bundle_with_ledger_public_key(&bundle, &ledger_public_key())?;
     let mut block = vec![0u8; 80];
     block[..4].copy_from_slice(&0x20000000u32.to_le_bytes());
@@ -353,15 +381,29 @@ fn candidate_with_bundle(
     hash.reverse();
     block.push(1);
     block.extend(hex::decode(&report.coinbase_tx_hex)?);
-    Ok(Candidate {
+    let (coinbase_key, ledger_key) = keys();
+    let candidate = Candidate {
         block_hash: hex::encode(hash),
-        block_hex: hex::encode(block),
+        block_sha256: Candidate::block_digest_hex(&block),
         job_id: "job".into(),
         payout_revision,
-        bundle,
+        window,
+        bootstrap_share: None,
+        found_block: bundle.found_block.clone(),
+        payout_policy: bundle.payout_policy.clone(),
+        ctv: None,
+        audit_builder_version: qbit_prism::AUDIT_BUILDER_VERSION,
+        signer_keys: SignerKeys::of(&coinbase_key, &ledger_key),
+        leased: false,
+        coinbase_suffix_hex: bundle
+            .coinbase_script_sig_suffix_hex
+            .clone()
+            .unwrap_or_else(|| "00".repeat(12)),
         deferred_share: None,
-        coinbase_suffix_hex: None,
-    })
+        block_bytes: block,
+        as_issued_balances: Vec::new(),
+    };
+    Ok(TestCandidate { candidate, bundle })
 }
 
 /// Land and confirm a CTV-settled block with one fanout per miner, then
@@ -406,13 +448,20 @@ async fn mature_fanouts(ledger: &Ledger, count: u8) -> Result<String> {
             == Some(u32::from(count)),
         "fixture must produce one fanout per miner"
     );
-    let block = candidate_with_bundle(bundle, snapshot.payout_revision, 31)?;
-    let hash = block.block_hash.clone();
-    ledger.enqueue_candidate(block).await?;
-    let claim = ledger
-        .claim_candidate(60)
-        .await?
-        .context("fanout parent claim")?;
+    let block = candidate_with_bundle(
+        bundle,
+        WindowRef::from_snapshot(&snapshot)?,
+        snapshot.payout_revision,
+        31,
+    )?;
+    let hash = block.candidate.block_hash.clone();
+    ledger.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(
+        ledger
+            .claim_candidate(60)
+            .await?
+            .context("fanout parent claim")?,
+    );
     ledger
         .land_candidate(&claim, &ledger_key.public_key_hex())
         .await?;
@@ -636,19 +685,24 @@ async fn candidate_terminal_timeout_body(db: &Database) -> Result<()> {
     let key = ledger_public_key();
     direct.append(share(1), None).await?;
     let snapshot = direct.snapshot(100).await?;
+    let mut prepared = Vec::new();
     for nonce in [101, 102, 103] {
-        direct
-            .enqueue_candidate(candidate(&snapshot, nonce)?)
-            .await?;
+        let block = candidate(&snapshot, nonce)?;
+        direct.enqueue_candidate(block.candidate.clone()).await?;
+        prepared.push(block);
     }
     // Three production-like candidates, each claimed and landed by the
     // observed ledger, so each terminal write confirms prepared rows.
     let mut claims = Vec::new();
     for _ in 0..3 {
-        let claim = ledger
-            .claim_candidate(120)
-            .await?
-            .context("candidate claim")?;
+        // Every candidate here was found on the same window, so they share a
+        // bundle and any of them carries the parts a landing needs.
+        let claim = prepared[0].claim(
+            ledger
+                .claim_candidate(120)
+                .await?
+                .context("candidate claim")?,
+        );
         ledger.land_candidate(&claim, &key).await?;
         claims.push(claim);
     }
@@ -1148,9 +1202,9 @@ async fn candidate_backoff_body(db: &Database) -> Result<()> {
     a.append(share(1), None).await?;
     let snapshot = a.snapshot(100).await?;
     let block = candidate(&snapshot, 301)?;
-    let hash = block.block_hash.clone();
-    a.enqueue_candidate(block).await?;
-    let claim = a.claim_candidate(60).await?.context("candidate claim")?;
+    let hash = block.candidate.block_hash.clone();
+    a.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(a.claim_candidate(60).await?.context("candidate claim")?);
     a.land_candidate(&claim, &key).await?;
     let revision = a.payout_revision().await?;
     // A terminal write that fails: the worker's expected revision is stale.
@@ -1394,14 +1448,20 @@ async fn distinct_hashes_body(db: &Database) -> Result<()> {
     let key = ledger_public_key();
     a.append(share(1), None).await?;
     let snapshot = a.snapshot(100).await?;
+    let mut prepared = Vec::new();
     for nonce in [501, 502] {
-        a.enqueue_candidate(candidate(&snapshot, nonce)?).await?;
+        let block = candidate(&snapshot, nonce)?;
+        a.enqueue_candidate(block.candidate.clone()).await?;
+        prepared.push(block);
     }
-    let held = a.claim_candidate(120).await?.context("first claim")?;
-    let progressing = b
-        .claim_candidate(120)
-        .await?
-        .context("a second hash was not claimable while the first was held")?;
+    // Both were found on the same window and share a bundle, so either carries
+    // the parts a landing needs.
+    let held = prepared[0].claim(a.claim_candidate(120).await?.context("first claim")?);
+    let progressing = prepared[0].claim(
+        b.claim_candidate(120)
+            .await?
+            .context("a second hash was not claimable while the first was held")?,
+    );
     assert_ne!(held.candidate.block_hash, progressing.candidate.block_hash);
     assert_ne!(held.claim_token, progressing.claim_token);
     let held_hash = held.candidate.block_hash.clone();
@@ -1485,7 +1545,7 @@ async fn superseded_landing_body(db: &Database) -> Result<()> {
     let snapshot = a.snapshot(100).await?;
     let block = candidate(&snapshot, 601)?;
     let hash = block.block_hash.clone();
-    a.enqueue_candidate(block).await?;
+    a.enqueue_candidate(block.candidate.clone()).await?;
     let claim = a.claim_candidate(120).await?.context("candidate claim")?;
     let issued = snapshot.payout_revision;
     // Another frontend proves a stronger chain view: the shared authority
@@ -1552,8 +1612,9 @@ async fn restored_authority_body(db: &Database) -> Result<()> {
     let first = a.snapshot(100).await?;
     let checkpoint = candidate(&first, 701)?;
     let checkpoint_hash = checkpoint.block_hash.clone();
-    a.enqueue_candidate(checkpoint).await?;
-    let checkpoint_claim = a.claim_candidate(120).await?.context("checkpoint claim")?;
+    a.enqueue_candidate(checkpoint.candidate.clone()).await?;
+    let checkpoint_claim =
+        checkpoint.claim(a.claim_candidate(120).await?.context("checkpoint claim")?);
     a.land_candidate(&checkpoint_claim, &key).await?;
     a.finish_candidate_at_revision(&checkpoint_claim, true, None, first.payout_revision)
         .await?;
@@ -1571,8 +1632,8 @@ async fn restored_authority_body(db: &Database) -> Result<()> {
     let snapshot = a.snapshot(100).await?;
     let block = candidate(&snapshot, 702)?;
     let hash = block.block_hash.clone();
-    a.enqueue_candidate(block).await?;
-    let claim = a.claim_candidate(120).await?.context("candidate claim")?;
+    a.enqueue_candidate(block.candidate.clone()).await?;
+    let claim = block.claim(a.claim_candidate(120).await?.context("candidate claim")?);
     a.land_candidate(&claim, &key).await?;
     a.renew_candidate_claim(&claim, 1).await?;
     let revision = a.payout_revision().await?;

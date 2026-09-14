@@ -1,6 +1,8 @@
 use super::*;
 use crate::metrics::{LockKind, Metrics, Outcome};
 
+mod acquire;
+
 const SESSION_ALLOCATION_ATTEMPTS: usize = 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -126,12 +128,13 @@ impl Ledger {
             instance_id,
             session_owner: std::sync::Arc::new(SessionOwner::new_for_tests()),
             metrics: None,
+            config_fingerprint: std::sync::Arc::default(),
         }
     }
 
     /// Begin a ledger transaction, recording this ledger's pool acquisition.
     pub(super) async fn begin(&self) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
-        begin(&self.pool, self.metrics.as_deref()).await
+        Transaction::begin(self.acquire().await?, None).await
     }
 
     /// Take one advisory lock, recording this ledger's wait for it.
@@ -242,6 +245,7 @@ impl Ledger {
                 state: std::sync::Mutex::default(),
             }),
             metrics,
+            config_fingerprint: std::sync::Arc::default(),
         };
         let source = migration::require_migration_source(&ledger.pool).await?;
         tracing::info!(
@@ -261,7 +265,13 @@ impl Ledger {
 
     /// Every server in a cluster must agree on consensus, payout and signing
     /// configuration. The fingerprint excludes local ports and instance IDs.
-    pub async fn configure(&self, fingerprint: &str) -> Result<()> {
+    ///
+    /// `signer_keys` are this frontend's public signing keys. Writing a
+    /// fingerprint onto a reset (NULL) one is a rotation, and it is refused
+    /// in the same transaction while any pending outbox row stores other
+    /// keys: no frontend with the new keys could rebuild such a candidate,
+    /// and the rotation procedure drains and stops the old frontends first.
+    pub async fn configure(&self, fingerprint: &str, signer_keys: &SignerKeys) -> Result<()> {
         let mut tx = self.begin().await?;
         writable(&mut tx).await?;
         let saved: Option<String> = sqlx::query_scalar(
@@ -275,19 +285,45 @@ impl Ledger {
                 "cluster configuration fingerprint mismatch"
             );
         } else {
+            let foreign: Vec<String> = sqlx::query_scalar(
+                "SELECT block_hash FROM qbit_block_candidate_outbox WHERE state='pending' AND (candidate->'signer_keys'->>'manifest_key_hex' IS DISTINCT FROM $1 OR candidate->'signer_keys'->>'ledger_key_hex' IS DISTINCT FROM $2) ORDER BY block_hash",
+            )
+            .bind(&signer_keys.manifest_key_hex)
+            .bind(&signer_keys.ledger_key_hex)
+            .fetch_all(&mut *tx)
+            .await?;
+            ensure!(
+                foreign.is_empty(),
+                "refusing to pin a new cluster fingerprint: pending block candidates {} were signed with other keys. \
+                 Drain the outbox with the frontends that hold those keys, stop them, and only then reset the fingerprint",
+                foreign.join(", ")
+            );
             sqlx::query("UPDATE qbit_prism_cluster SET config_fingerprint=$1 WHERE singleton")
                 .bind(fingerprint)
                 .execute(&mut *tx)
                 .await?;
         }
         tx.commit().await?;
+        // Retained only once the pin or the match is durable. A later writer
+        // fence compares the row it re-reads `FOR SHARE` against this value.
+        let _ = self.config_fingerprint.set(fingerprint.to_owned());
         Ok(())
+    }
+
+    /// The cluster fingerprint this frontend pinned or verified in
+    /// [`Ledger::configure`], or `None` before `configure` has succeeded.
+    ///
+    /// Writers fence against a fingerprint reset by re-reading
+    /// `qbit_prism_cluster.config_fingerprint` `FOR SHARE` in their own
+    /// transaction and refusing when it is not this value.
+    pub fn config_fingerprint(&self) -> Option<&str> {
+        self.config_fingerprint.get().map(String::as_str)
     }
 
     pub async fn release_session_owner_reservations(&self) -> Result<()> {
         sqlx::query("DELETE FROM qbit_prism_session_reservations WHERE owner_token=$1")
             .bind(&self.session_owner.token)
-            .execute(&self.pool)
+            .execute(&mut *self.acquire().await?)
             .await?;
         Ok(())
     }
@@ -335,7 +371,7 @@ impl Ledger {
     }
 
     pub async fn payout_revision(&self) -> Result<i64> {
-        Ok(sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL AND NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'").fetch_one(&self.pool).await?)
+        Ok(sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL AND NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'").fetch_one(&mut *self.acquire().await?).await?)
     }
 }
 
@@ -452,16 +488,7 @@ async fn begin(
     pool: &PgPool,
     metrics: Option<&Metrics>,
 ) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
-    let guard = metrics.map(|metrics| WaitGuard::arm(metrics, WaitKind::PoolAcquire));
-    let acquired = pool.acquire().await;
-    if let Some(guard) = guard {
-        guard.complete(if acquired.is_ok() {
-            Outcome::Success
-        } else {
-            Outcome::Failure
-        });
-    }
-    Transaction::begin(acquired?, None).await
+    Transaction::begin(acquire::acquire(pool, metrics).await?, None).await
 }
 
 pub(super) async fn writable(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
