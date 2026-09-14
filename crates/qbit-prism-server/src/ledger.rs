@@ -32,7 +32,10 @@ pub use connect::{SessionAllocationExhausted, SessionId};
 mod difficulty;
 mod fanout;
 mod jobs;
-pub use jobs::{IssuedJobSave, PreparedDependency};
+pub use jobs::{
+    CompactPrepared, IssuedJobSave, PreparedAuditHashes, PreparedDependency, PreparedTemplate,
+    StoredCompactPrepared,
+};
 mod migration;
 mod window;
 pub use difficulty::WorkerDifficulty;
